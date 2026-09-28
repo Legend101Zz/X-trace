@@ -127,10 +127,19 @@ impl RepositoryPointer {
     /// parent `.xtrace` directory is created with owner-only
     /// permissions on Unix so the file cannot be read by other users.
     ///
+    /// The helper fails closed on Unix: every chmod step returns
+    /// [`CliError::StoreUnavailable`] on failure. If the write fails
+    /// after the database has been initialized, the repository is
+    /// left in an "initialized database, missing repo pointer" state;
+    /// a follow-up `init` returns the idempotency receipt and can
+    /// re-attempt the pointer write once the underlying I/O error
+    /// is resolved.
+    ///
     /// # Errors
     ///
     /// Returns [`CliError::StoreUnavailable`] when the filesystem
-    /// refuses the write; the file is never partially written.
+    /// refuses the write or any chmod step fails; the file is never
+    /// partially written.
     pub fn write(&self, repo: &Path) -> Result<(), CliError> {
         use std::fs;
         use std::io::Write as _;
@@ -144,7 +153,9 @@ impl RepositoryPointer {
         let pointer_path = pointer_dir.join(POINTER_FILENAME);
         fs::create_dir_all(&pointer_dir)
             .map_err(|err| CliError::StoreUnavailable(format!("create .xtrace: {err}")))?;
-        restrict_dir_owner_only(&pointer_dir);
+        // `0700` on the pointer directory prevents other users from
+        // enumerating or reading the file before the rename commits.
+        chmod_dir_owner_only(&pointer_dir)?;
         // Serialise the typed pointer through `toml` so a path
         // containing quotes, backslashes, or other TOML-significant
         // characters round-trips verbatim instead of corrupting the
@@ -163,7 +174,7 @@ impl RepositoryPointer {
         }
         fs::rename(&tmp, &pointer_path)
             .map_err(|err| CliError::StoreUnavailable(format!("rename pointer: {err}")))?;
-        restrict_file_owner_only(&pointer_path);
+        chmod_file_owner_only(&pointer_path)?;
         Ok(())
     }
 
@@ -297,66 +308,122 @@ where
     }
 }
 
-/// Restricts a directory's permissions to the owner on Unix. Best
-/// effort: a failure to chmod is non-fatal because the directory
-/// already exists and the file write that follows would have failed
-/// with a more diagnostic error.
+/// `chmod 0700` on the supplied directory on Unix. Fails closed:
+/// every metadata or chmod failure surfaces as
+/// [`CliError::StoreUnavailable`]. Off Unix, the helper returns
+/// `Ok(())` because Windows ACLs are managed through other APIs
+/// and no portable `chmod` equivalent exists.
 #[cfg(unix)]
-fn restrict_dir_owner_only(path: &Path) {
+fn chmod_dir_owner_only(path: &Path) -> Result<(), CliError> {
     use std::os::unix::fs::PermissionsExt as _;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(0o700);
-        let _ = std::fs::set_permissions(path, permissions);
-    }
+    let metadata = std::fs::metadata(path).map_err(|err| {
+        CliError::StoreUnavailable(format!("stat directory {}: {err}", path.display()))
+    })?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|err| CliError::StoreUnavailable(format!("chmod 0700 {}: {err}", path.display())))
 }
 
+/// `chmod 0700` on the supplied directory on Unix. Returns `Ok(())`
+/// off Unix (documented no-op).
 #[cfg(not(unix))]
-fn restrict_dir_owner_only(_path: &Path) {}
-
-/// Restricts a regular file's permissions to the owner on Unix.
-/// Best effort, mirroring [`restrict_dir_owner_only`].
-#[cfg(unix)]
-fn restrict_file_owner_only(path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(0o600);
-        let _ = std::fs::set_permissions(path, permissions);
-    }
+fn chmod_dir_owner_only(_path: &Path) -> Result<(), CliError> {
+    Ok(())
 }
 
-#[cfg(not(unix))]
-fn restrict_file_owner_only(_path: &Path) {}
+/// `chmod 0600` on the supplied file on Unix. Fails closed: every
+/// metadata or chmod failure (including a missing file) surfaces as
+/// [`CliError::StoreUnavailable`]. Off Unix, the helper returns
+/// `Ok(())`.
+#[cfg(unix)]
+fn chmod_file_owner_only(path: &Path) -> Result<(), CliError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let metadata = std::fs::metadata(path).map_err(|err| {
+        CliError::StoreUnavailable(format!("stat file {}: {err}", path.display()))
+    })?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|err| CliError::StoreUnavailable(format!("chmod 0600 {}: {err}", path.display())))
+}
 
-/// Sets owner-only permissions on the project directory. Callers must
-/// invoke this helper *before* SQLite creates the database file so
-/// the database file is born under a directory that other users on
-/// the host cannot enumerate. The helper is a no-op off Unix.
-pub fn restrict_project_dir(project_dir: &Path) {
-    restrict_dir_owner_only(project_dir);
+/// `chmod 0600` on the supplied file on Unix. Returns `Ok(())` off
+/// Unix (documented no-op).
+#[cfg(not(unix))]
+fn chmod_file_owner_only(_path: &Path) -> Result<(), CliError> {
+    Ok(())
+}
+
+/// Sets owner-only permissions on the project directory. Callers
+/// must invoke this helper *before* the SQLite database file is
+/// created so the directory's `0700` mode prevents another user on
+/// the host from enumerating or traversing into the project before
+/// the database file is born. Fails closed on Unix.
+pub fn restrict_project_dir(project_dir: &Path) -> Result<(), CliError> {
+    chmod_dir_owner_only(project_dir)
+}
+
+/// Pre-creates the SQLite database file with mode `0600` (using
+/// [`std::fs::OpenOptions`] plus
+/// [`std::os::unix::fs::OpenOptionsExt::mode`]) and verifies the
+/// mode before [`SqliteStore::open`] is called. The helper is
+/// invoked from `init` so the file is born owner-only and SQLite
+/// does not briefly expose it with the directory's default mode.
+/// `truncate(false)` keeps the helper safe to call against a
+/// pre-existing file. Fails closed on Unix; returns `Ok(())` off
+/// Unix (documented no-op).
+pub fn precreate_database_file(database: &Path) -> Result<(), CliError> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let _file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(database)
+            .map_err(|err| {
+                CliError::StoreUnavailable(format!(
+                    "precreate database {}: {err}",
+                    database.display()
+                ))
+            })?;
+        // A restrictive umask could strip the requested mode bits;
+        // verify and force `0600` before SqliteStore opens the file.
+        chmod_file_owner_only(database)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = database;
+    }
+    Ok(())
 }
 
 /// Sets owner-only permissions on the SQLite database file. Callers
-/// must invoke this helper immediately after [`SqliteStore::open`]
+/// invoke this helper immediately after [`SqliteStore::open`]
 /// returns so the file is never readable by another user even when
-/// it was just created. The helper is a no-op off Unix.
-pub fn restrict_database_file(database: &Path) {
-    restrict_file_owner_only(database);
+/// it was just created. Fails closed on Unix.
+pub fn restrict_database_file(database: &Path) -> Result<(), CliError> {
+    chmod_file_owner_only(database)
 }
 
 /// Sets owner-only permissions on a project directory and the SQLite
 /// file it contains when the platform supports it. The helper is
 /// idempotent and is used by every CLI entry point that touches a
-/// previously-created project directory (`status`, `open`). A failure
-/// to chmod is non-fatal because the caller reports the original I/O
-/// error rather than this permission adjustment.
-pub fn secure_project_dir(project_dir: &Path) {
-    restrict_dir_owner_only(project_dir);
+/// previously-created project directory (`status`, `open`) so a
+/// directory left loose by an older binary is repaired on the next
+/// invocation. Fails closed on Unix: a chmod failure on either the
+/// directory or the database file surfaces as
+/// [`CliError::StoreUnavailable`].
+pub fn secure_project_dir(project_dir: &Path) -> Result<(), CliError> {
+    chmod_dir_owner_only(project_dir)?;
     let database = project_dir.join(DATABASE_FILENAME);
     if database.exists() {
-        restrict_file_owner_only(&database);
+        chmod_file_owner_only(&database)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -585,7 +652,7 @@ mod tests {
         let project_dir = dir.join("project");
         std::fs::create_dir_all(&project_dir).expect("project");
         std::fs::write(project_dir.join(DATABASE_FILENAME), b"x").expect("database");
-        secure_project_dir(&project_dir);
+        secure_project_dir(&project_dir).expect("chmod");
         let dir_mode =
             std::fs::metadata(&project_dir).expect("dir metadata").permissions().mode() & 0o777;
         let file_mode = std::fs::metadata(project_dir.join(DATABASE_FILENAME))

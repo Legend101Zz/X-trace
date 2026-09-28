@@ -20,8 +20,8 @@ use xtrace_store::{SqliteStore, StoreErrorKind};
 use crate::error::CliError;
 use crate::output::write_success;
 use crate::paths::{
-    RepositoryPointer, UserDataPaths, restrict_database_file, restrict_project_dir,
-    secure_project_dir,
+    RepositoryPointer, UserDataPaths, precreate_database_file, restrict_database_file,
+    restrict_project_dir, secure_project_dir,
 };
 
 /// Top-level subcommand surface parsed by [`clap`].
@@ -129,23 +129,31 @@ where
     let project_directory = UserDataPaths::project_dir_with_home(&user_data_home, project_id)?;
     let database_path = UserDataPaths::database_path_with_home(&user_data_home, project_id)?;
     // Create the project directory and tighten its permissions to
-    // owner-only *before* SQLite creates the database file. Without
-    // this ordering, the freshly-created file would briefly inherit
-    // the directory's default permissions and be readable by other
-    // users on the host.
+    // owner-only *before* SQLite creates the database file. The
+    // directory's `0700` mode prevents another user on the host
+    // from traversing into the project before the database file is
+    // born; the file's `0600` mode below closes the same window on
+    // the file itself.
     std::fs::create_dir_all(&project_directory)
         .map_err(|err| CliError::StoreUnavailable(format!("create project dir: {err}")))?;
-    restrict_project_dir(&project_directory);
+    restrict_project_dir(&project_directory)?;
+    // Pre-create the database file with mode `0600` before SQLite
+    // opens it so the file is never readable by another user, even
+    // for a single instant. The helper verifies the mode after
+    // creation so a restrictive umask cannot strip the bits.
+    precreate_database_file(&database_path)?;
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
 
-    let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
-        .map_err(map_store_error)?;
-    // The database file was just created with default permissions.
-    // Restrict it to owner-only as soon as we hold the handle so the
-    // window between file creation and `secure_project_dir` does not
-    // expose the database.
-    restrict_database_file(&database_path);
+    let store = SqliteStore::open(
+        &database_path,
+        xtrace_store::OpenOptions::default().with_correlation_id(ctx.correlation_id),
+    )
+    .map_err(map_store_error)?;
+    // Defensive re-tightening: the precreate step already set
+    // `0600`, but a future change to the open path must not be
+    // able to widen the file's permissions silently.
+    restrict_database_file(&database_path)?;
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -175,16 +183,13 @@ where
         )
         .map_err(CliError::from)?;
 
-    // Defensive: re-tighten the directory and database permissions.
-    // The directory and file were already restricted above; this
-    // call only matters when an earlier call failed silently on a
-    // non-Unix host.
-    secure_project_dir(&project_directory);
-
     // Persist the repository pointer only after the application
-    // returns success. A failure here leaves the database created
-    // but uninitialized, which is consistent with the previous
-    // behavior and the documented retry expectations.
+    // returns success. If `pointer.write` fails, the local database
+    // has been initialized but the repository has no pointer file;
+    // a follow-up `init` returns the idempotency receipt and re-
+    // attempts the pointer write once the underlying I/O error is
+    // resolved. The repository is *not* rolled back to an
+    // uninitialized state.
     let pointer = RepositoryPointer { schema_version: 1, project_id, data_home: user_data_home };
     pointer.write(&repo)?;
 
@@ -209,13 +214,15 @@ where
 
     let store = SqliteStore::open(
         &database_path,
-        xtrace_store::OpenOptions::default().with_must_exist(true),
+        xtrace_store::OpenOptions::default()
+            .with_must_exist(true)
+            .with_correlation_id(ctx.correlation_id),
     )
     .map_err(map_store_error)?;
     // Defensively tighten the project directory and database file
     // permissions in case the directory was created by an older
-    // binary that did not enforce owner-only access. Best effort.
-    secure_project_dir(&project_directory);
+    // binary that did not enforce owner-only access. Fails closed.
+    secure_project_dir(&project_directory)?;
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -264,10 +271,12 @@ where
                 UserDataPaths::database_path_with_home(&data_home, pointer.project_id)?;
             let store = SqliteStore::open(
                 &database_path,
-                xtrace_store::OpenOptions::default().with_must_exist(true),
+                xtrace_store::OpenOptions::default()
+                    .with_must_exist(true)
+                    .with_correlation_id(ctx.correlation_id),
             )
             .map_err(map_store_error)?;
-            secure_project_dir(&project_directory);
+            secure_project_dir(&project_directory)?;
             let repository = SqliteProjectRepository::new(&store);
             let idempotency = SqliteIdempotencyStore::new(&store);
             let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -788,38 +797,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn failing_init_keeps_project_directory_owner_only() {
+    fn fresh_init_fails_after_storage_creation_keeps_owner_only_modes() {
         // Regression test for the permission ordering on the error
-        // path: a failing init (here, a duplicate fingerprint) must
-        // not leave the project directory or the database file
-        // world-readable. The chmod runs *before* the application
-        // facade executes, so the failure occurs after the modes
-        // were already tightened.
+        // path of a *fresh* init: a display name over 128 bytes is
+        // rejected by the application's validation after the project
+        // directory and database file have already been created and
+        // restricted. The fresh project directory and database file
+        // must remain `0700` and `0600` respectively; the user-data
+        // directory must contain exactly one project.
         use std::os::unix::fs::PermissionsExt as _;
-        let repo_dir = tempdir("perms-fail");
+        let repo_dir = tempdir("fresh-fail");
         std::fs::create_dir_all(&repo_dir).expect("repo");
-        let home = tempdir("perms-fail-home");
+        let home = tempdir("fresh-fail-home");
         let projects_root = home.join("projects");
         let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
         values.insert("XTRACE_DATA_HOME", home.clone());
         values.insert("HOME", repo_dir.clone());
         let env_reader = reader(values);
-        init(repo_dir.clone(), "Example".to_string(), String::new(), &env_reader)
-            .expect("first init");
-        // Re-running with a different idempotency key against the
-        // same repo triggers `XTR-PROJECT-EXISTS`. The directory
-        // created by the first init must remain `0700`.
-        let values = reader_with_none();
-        let env_reader_2 = move |var: &str| {
-            if var == "XTRACE_DATA_HOME" { Some(home.clone()) } else { values(var) }
-        };
-        let _ = init(
-            repo_dir.clone(),
-            "Example".to_string(),
-            "different-key".to_string(),
-            &env_reader_2,
-        )
-        .unwrap_err();
+        let oversized = "x".repeat(129);
+        let err = init(repo_dir.clone(), oversized, String::new(), &env_reader).unwrap_err();
+        assert!(
+            matches!(err, CliError::App(ref app) if app.category == xtrace_domain::ErrorCategory::Validation),
+            "oversized display name must surface as Validation, got {err:?}"
+        );
         let project_dir = std::fs::read_dir(&projects_root)
             .expect("projects dir")
             .filter_map(Result::ok)
@@ -828,6 +828,15 @@ mod tests {
         let dir_mode =
             std::fs::metadata(project_dir.path()).expect("dir metadata").permissions().mode()
                 & 0o777;
-        assert_eq!(dir_mode, 0o700, "failing init must not leave the directory world-readable");
+        let db_mode = std::fs::metadata(project_dir.path().join("metadata.sqlite3"))
+            .expect("db metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "fresh project directory must be 0700 after validation failure"
+        );
+        assert_eq!(db_mode, 0o600, "fresh database file must be 0600 after validation failure");
     }
 }

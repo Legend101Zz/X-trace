@@ -137,6 +137,20 @@ impl OpenOptions {
         self
     }
 
+    /// Sets the bootstrap correlation ID attached to pragma and
+    /// migration diagnostics. The value lives only in the
+    /// [`OpenOptions`] struct; the store itself does not retain
+    /// shared mutable correlation state. Repositories mint their
+    /// own infrastructure correlation ID per call and the
+    /// application boundary surfaces the request correlation ID;
+    /// this builder only controls which correlation ID is attached
+    /// to errors raised while bootstrapping the connection.
+    #[must_use]
+    pub fn with_correlation_id(mut self, id: CorrelationId) -> Self {
+        self.bootstrap_correlation_id = id;
+        self
+    }
+
     /// Requires the database file to already exist. When set,
     /// [`SqliteStore::open`] opens the file with
     /// [`rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE`] only so an
