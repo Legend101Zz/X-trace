@@ -1,0 +1,68 @@
+// XTP-Agent v1 wire envelope.
+//
+// Every XTP-Agent message is a single length-delimited `AgentEnvelope`
+// on the wire. The envelope carries a protocol major and minor version,
+// the runtime session identifier, a monotonic sequence number, an
+// adapter monotonic timestamp, and an explicit `oneof` payload.
+//
+// The envelope deliberately does not carry application data; every
+// payload follows its own schema. Future revisions add new payload
+// variants with new field numbers; existing field numbers must never
+// be removed or repurposed.
+
+syntax = "proto3";
+
+package xtp.agent.v1;
+
+import "xtp-agent/v1/capability.proto";
+import "xtp-agent/v1/handshake.proto";
+import "xtp-agent/v1/recording.proto";
+import "xtp-agent/v1/transport.proto";
+
+// Magic bytes that identify an XTP-Agent stream at the transport layer.
+// The first four bytes of every envelope are `0x58 0x54 0x50 0x01`
+// ("XTP1"). Slice 1A emits these through `prost`; the transport layer
+// is expected to validate the magic before length-decoding.
+enum WireMagic {
+    WIRE_MAGIC_UNSPECIFIED = 0;
+    WIRE_MAGIC_XTP1 = 1;
+}
+
+message AgentEnvelope {
+    // Protocol major version. Bumping requires orchestrator review
+    // and a compatibility test fixture update.
+    uint32 protocol_major = 1;
+    // Protocol minor version. Additive within the same major.
+    uint32 protocol_minor = 2;
+    // 16-byte runtime session identifier. Stable for the lifetime of a
+    // single adapter connection.
+    bytes runtime_session_id = 3;
+    // 1-based, strictly monotonic per-session sequence number.
+    uint64 session_seq = 4;
+    // Adapter monotonic nanoseconds. Used only for advisory timing;
+    // ordering uses `session_seq`.
+    fixed64 sent_monotonic_ns = 5;
+    // Stable message identifier. Allows late `Ack` and `Throttle`
+    // messages to reference the original.
+    string message_id = 6;
+    // Optional adapter-defined correlation token used to group related
+    // messages.
+    string correlation_token = 7;
+
+    oneof payload {
+        AdapterHello adapter_hello = 20;
+        DaemonHello daemon_hello = 21;
+        CapabilitySet capability_set = 22;
+        EndpointClaimBatch endpoint_claims = 23;
+        StaticPathBatch static_paths = 24;
+        RecordingStarted recording_started = 25;
+        EventBatch event_batch = 26;
+        RecordingFinished recording_finished = 27;
+        DropNotice drop_notice = 28;
+        Health health = 29;
+        Ack ack = 40;
+        Throttle throttle = 41;
+        CaptureCommand capture_command = 42;
+        ProtocolError protocol_error = 43;
+    }
+}

@@ -1,0 +1,4 @@
+# Slice 1A keeps a deliberately narrow clippy surface so the boundary
+# between "essential" and "style" stays visible. The actual lint
+# configuration lives in the workspace `[workspace.lints.clippy]` table
+# in `Cargo.toml`; this file only documents the policy intent.

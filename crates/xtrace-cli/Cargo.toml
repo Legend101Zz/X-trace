@@ -1,0 +1,28 @@
+[package]
+name = "xtrace-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Command-line entry point for X-trace."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "xtrace"
+path = "src/main.rs"
+
+[dependencies]
+xtrace-application = { path = "../xtrace-application" }
+xtrace-domain = { path = "../xtrace-domain" }
+xtrace-store = { path = "../xtrace-store" }
+clap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+toml = { workspace = true }

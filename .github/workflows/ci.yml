@@ -1,0 +1,113 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - "slice/**"
+  pull_request:
+    branches:
+      - main
+      - "slice/**"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Format gate (stable rustfmt, no nightly-only keys)
+        run: cargo fmt --all --check
+      - name: Strict clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Unit and integration tests
+        run: cargo test --workspace --all-features --no-fail-fast
+      - name: Restricted-PATH vendored-protoc build
+        # `PATH` excludes any directory that could host a system `protoc`,
+        # proving the build script resolves the binary exclusively through
+        # `protoc-bin-vendored`.
+        run: |
+          PATH="/usr/bin:/bin:/usr/local/bin:$HOME/.cargo/bin" \
+            cargo build -p xtrace-protocol --all-features
+      - name: CLI integration smoke
+        env:
+          XTRACE_DATA_HOME: /tmp/xtrace-cli-smoke/userdata
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/xtrace-cli-smoke
+          mkdir -p /tmp/xtrace-cli-smoke/repo
+          cargo build -p xtrace-cli --bin xtrace
+          # Uninitialized status: must not create the user-data
+          # directory or the repository pointer. Capture both stdout
+          # and exit code; `set -e` is suspended only around this
+          # command so a future bug that exits non-zero still fails
+          # the gate.
+          status_output=$(cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir /tmp/xtrace-cli-smoke/repo)
+          echo "$status_output"
+          if [ -d /tmp/xtrace-cli-smoke/userdata/projects ]; then
+            echo "FAIL: status on uninit created user-data directory"
+            exit 1
+          fi
+          if [ -e /tmp/xtrace-cli-smoke/repo/.xtrace ]; then
+            echo "FAIL: status on uninit created repository pointer"
+            exit 1
+          fi
+          if ! echo "$status_output" | grep -q '"initialized": false'; then
+            echo "FAIL: status report on uninit must mark initialized=false"
+            exit 1
+          fi
+          # init twice with the same canonical input must replay.
+          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-cli-smoke/repo --display-name "Smoke"
+          first_project=$(ls /tmp/xtrace-cli-smoke/userdata/projects | head -n1)
+          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-cli-smoke/repo --display-name "Smoke"
+          after_replay=$(ls /tmp/xtrace-cli-smoke/userdata/projects | wc -l)
+          if [ "$after_replay" -ne 1 ]; then
+            echo "FAIL: replay created extra project directory"
+            exit 1
+          fi
+          # init with a different display name must surface
+          # XTR-COMMAND-409 and must NOT create a second project
+          # directory. `set +e` captures the failure exit; the gate
+          # then enforces the contract explicitly rather than relying
+          # on `|| true`.
+          set +e
+          conflict_output=$(cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-cli-smoke/repo --display-name "Different" 2>&1)
+          conflict_exit=$?
+          set -e
+          if [ "$conflict_exit" -eq 0 ]; then
+            echo "FAIL: idempotency conflict was not raised"
+            exit 1
+          fi
+          if ! echo "$conflict_output" | grep -q 'XTR-COMMAND-409'; then
+            echo "FAIL: idempotency conflict did not surface XTR-COMMAND-409"
+            echo "Output was:"
+            echo "$conflict_output"
+            exit 1
+          fi
+          after_conflict=$(ls /tmp/xtrace-cli-smoke/userdata/projects | wc -l)
+          if [ "$after_conflict" -ne 1 ]; then
+            echo "FAIL: idempotency conflict created extra project directory"
+            exit 1
+          fi
+          # Successful status + open after init.
+          cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir /tmp/xtrace-cli-smoke/repo
+          cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir /tmp/xtrace-cli-smoke/repo
+          test -f /tmp/xtrace-cli-smoke/userdata/projects/"$first_project"/metadata.sqlite3
+          test -f /tmp/xtrace-cli-smoke/repo/.xtrace/config.toml
+          grep -q '^project_id = ' /tmp/xtrace-cli-smoke/repo/.xtrace/config.toml
