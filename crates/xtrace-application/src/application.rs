@@ -139,7 +139,7 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
         let run_id = self
             .repository
             .allocate_run(project_id, kind, &ctx.requested_by, idempotency_key, ctx.requested_at)
-            .map_err(port_error_to_app_error)?;
+            .map_err(|err| port_error_to_app_error(err, ctx.correlation_id))?;
         Ok(CommandReceipt::RunAllocated { run_id, idempotency_key: idempotency_key.to_string() })
     }
 
@@ -189,7 +189,9 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
                     active_capture_policy_id: None,
                     active_redaction_policy_id: None,
                 };
-                self.repository.insert_project(&project).map_err(port_error_to_app_error)?;
+                self.repository
+                    .insert_project(&project)
+                    .map_err(|err| port_error_to_app_error(err, ctx.correlation_id))?;
                 let receipt = CommandReceipt::ProjectInitialized {
                     project_id: project.id,
                     fingerprint,
@@ -205,7 +207,7 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
                 )?;
                 Ok(receipt)
             }
-            Err(err) => Err(port_error_to_app_error(err)),
+            Err(err) => Err(port_error_to_app_error(err, ctx.correlation_id)),
         }
     }
 
@@ -232,11 +234,11 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
         let fingerprint = RepositoryFingerprint::from_canonical_path(&cmd.canonical_repo_path);
         let project = match self.repository.load_project_by_fingerprint(&fingerprint) {
             Ok(project) => project,
-            Err(err) => return Err(port_error_to_app_error(err)),
+            Err(err) => return Err(port_error_to_app_error(err, ctx.correlation_id)),
         };
         self.repository
             .touch_last_opened(project.id(), ctx.requested_at)
-            .map_err(port_error_to_app_error)?;
+            .map_err(|err| port_error_to_app_error(err, ctx.correlation_id))?;
         let receipt = CommandReceipt::ProjectOpened {
             project_id: project.id(),
             idempotency_key: cmd.idempotency_key.clone(),
@@ -261,7 +263,7 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
         let fingerprint = RepositoryFingerprint::from_canonical_path(&query.canonical_repo_path);
         match self.repository.load_project_by_fingerprint(&fingerprint) {
             Ok(project) => Ok(QueryResult::Project(crate::commands::ProjectSnapshot::new(project))),
-            Err(err) => Err(port_error_to_app_error(err)),
+            Err(err) => Err(port_error_to_app_error(err, ctx.correlation_id)),
         }
     }
 
@@ -277,7 +279,7 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
         };
         let projects = match self.repository.list_projects() {
             Ok(projects) => projects,
-            Err(err) => return Err(port_error_to_app_error(err)),
+            Err(err) => return Err(port_error_to_app_error(err, ctx.correlation_id)),
         };
         let projects = projects
             .into_iter()
@@ -308,7 +310,10 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
     ) -> Result<Option<StoredReceipt>, AppError> {
         match self.idempotency.lookup_receipt(command_kind, idempotency_key) {
             Ok(receipt) => Ok(receipt),
-            Err(err) => Err(port_error_to_app_error(attach_correlation(err, correlation_id))),
+            Err(err) => Err(port_error_to_app_error(
+                attach_correlation(err, correlation_id),
+                correlation_id,
+            )),
         }
     }
 
@@ -351,7 +356,7 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
             Err(err) if err.kind() == PortErrorKind::AlreadyExists => {
                 Err(idempotency_conflict(idempotency_key, ctx.correlation_id, ctx.correlation_id))
             }
-            Err(err) => Err(port_error_to_app_error(err)),
+            Err(err) => Err(port_error_to_app_error(err, ctx.correlation_id)),
         }
     }
 }
@@ -362,12 +367,13 @@ const COMMAND_KIND_OPEN: &str = "open_project";
 
 /// Computes a canonical input digest for a command.
 ///
-/// The digest is the lowercase `b3:<hex>` form of a BLAKE3-256 hash
-/// over a deterministic, newline-separated encoding of the command
-/// arguments. The encoding is intentionally stringly-typed so the
-/// hash changes only when the canonical input changes; whitespace,
-/// JSON formatting, or other transient encodings must not affect
-/// the digest.
+/// The digest is a single BLAKE3-256 hash over a deterministic,
+/// newline-separated encoding of the command arguments, rendered in
+/// the canonical `b3:<lowercase hex>` form via
+/// [`xtrace_domain::ContentHash::of_bytes`]. The encoding is
+/// intentionally stringly-typed so the hash changes only when the
+/// canonical input changes; whitespace, JSON formatting, or other
+/// transient encodings must not affect the digest.
 fn canonical_input_digest(
     command_kind: &str,
     canonical_repo_path: &str,
@@ -379,9 +385,7 @@ fn canonical_input_digest(
     hasher.update(canonical_repo_path.as_bytes());
     hasher.update(b"\n");
     hasher.update(display_name.as_bytes());
-    let digest = hasher.finalize();
-    let bytes = digest.as_bytes();
-    xtrace_domain::ContentHash::of_bytes(bytes).to_canonical()
+    xtrace_domain::ContentHash::from_blake3_digest(hasher.finalize()).to_canonical()
 }
 
 fn deserialize_initialize_receipt(
@@ -438,8 +442,11 @@ fn idempotency_conflict(
 /// CLI failures with store-side logs.
 fn attach_correlation(err: PortError, correlation_id: CorrelationId) -> PortError {
     let source = err.source().map(str::to_owned);
-    PortError::new(err.kind(), err.message(), correlation_id)
-        .with_source(source.unwrap_or_default())
+    let mut rebuilt = PortError::new(err.kind(), err.message(), correlation_id);
+    if let Some(source) = source {
+        rebuilt = rebuilt.with_source(source);
+    }
+    rebuilt
 }
 
 /// Validates that a canonical repository path is a non-empty UTF-8
@@ -540,18 +547,28 @@ fn existing_project_error(
 }
 
 /// Translates an internal [`PortError`] into the public [`AppError`]
-/// contract. The mapping is total so port authors cannot accidentally
-/// leak a variant through the boundary.
-fn port_error_to_app_error(err: PortError) -> AppError {
+/// contract. The request correlation ID is preserved on the surface;
+/// the infrastructure-generated correlation ID is retained as a
+/// diagnostic detail so a future slice can correlate the two without
+/// losing the request identity. The mapping is total so port authors
+/// cannot accidentally leak a variant through the boundary.
+fn port_error_to_app_error(err: PortError, request_correlation_id: CorrelationId) -> AppError {
+    let infra_correlation_id = err.correlation_id();
     let mut builder = AppError::new(
         port_code(err.kind()),
         port_category(err.kind()),
         err.message(),
         port_retry(err.kind()),
-        err.correlation_id(),
+        request_correlation_id,
     );
     if let Some(source) = err.source() {
-        builder = builder.with_detail("source", source.to_string());
+        if !source.is_empty() {
+            builder = builder.with_detail("source", source.to_string());
+        }
+    }
+    if infra_correlation_id != request_correlation_id {
+        builder =
+            builder.with_detail("infrastructure_correlation_id", infra_correlation_id.to_string());
     }
     builder
 }
@@ -1054,6 +1071,7 @@ mod tests {
     #[test]
     fn port_error_translation_covers_every_kind() {
         let correlation = CorrelationId::new();
+        let request = CorrelationId::new();
         for kind in [
             PortErrorKind::Validation,
             PortErrorKind::AlreadyExists,
@@ -1066,12 +1084,13 @@ mod tests {
             PortErrorKind::Internal,
         ] {
             let err = PortError::new(kind, "message", correlation);
-            let app_error = port_error_to_app_error(err);
+            let app_error = port_error_to_app_error(err, request);
             // Every `PortErrorKind` maps to a stable `XTR-PORT-*` code.
             assert!(
                 app_error.code.as_str().starts_with("XTR-PORT-"),
                 "missing port code prefix for {kind:?}"
             );
+            assert_eq!(app_error.correlation_id, request);
         }
     }
 
@@ -1170,17 +1189,402 @@ mod tests {
     #[test]
     fn port_error_translation_preserves_correlation_id() {
         let original = CorrelationId::new();
+        let request = CorrelationId::new();
         let port = PortError::new(PortErrorKind::Corruption, "schema check failed", original)
             .with_source("underlying rusqlite error");
-        let app_error = port_error_to_app_error(port);
-        assert_eq!(app_error.correlation_id, original);
+        let app_error = port_error_to_app_error(port, request);
+        // The request correlation ID reaches the boundary, not the
+        // infrastructure-generated one.
+        assert_eq!(app_error.correlation_id, request);
         assert_eq!(app_error.category, ErrorCategory::Corruption);
+        // The infrastructure correlation is preserved as a diagnostic
+        // detail so a future slice can stitch request and store logs.
+        assert_eq!(
+            app_error.details.get("infrastructure_correlation_id").map(|scalar| match scalar {
+                xtrace_domain::SafeScalar::String(s) => s.clone(),
+                _ => String::new(),
+            }),
+            Some(original.to_string()),
+        );
         assert_eq!(
             app_error.details.get("source").map(|scalar| match scalar {
                 xtrace_domain::SafeScalar::String(s) => s.clone(),
                 _ => String::new(),
             }),
             Some("underlying rusqlite error".to_string()),
+        );
+    }
+
+    /// Project repository stub whose `insert_project` returns a
+    /// `PortErrorKind::Corruption` failure carrying the supplied
+    /// infra correlation ID. Other methods are guarded as "not
+    /// reached" so the application facade's early returns do not
+    /// silently succeed.
+    struct InsertFailureRepo(CorrelationId);
+    impl ProjectRepository for InsertFailureRepo {
+        fn insert_project(&self, _: &Project) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Corruption, "insert failed", self.0))
+        }
+        fn load_project_by_fingerprint(
+            &self,
+            _: &RepositoryFingerprint,
+        ) -> Result<Project, PortError> {
+            Err(PortError::new(PortErrorKind::NotFound, "not reached", CorrelationId::new()))
+        }
+        fn load_project_by_id(&self, _: ProjectId) -> Result<Project, PortError> {
+            Err(PortError::new(PortErrorKind::NotFound, "not reached", CorrelationId::new()))
+        }
+        fn list_projects(&self) -> Result<Vec<Project>, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn touch_last_opened(&self, _: ProjectId, _: WallTime) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn insert_run(&self, _: &Run, _: ProjectId, _: &str) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn load_run(&self, _: RunId) -> Result<Run, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn update_run_state(
+            &self,
+            _: RunId,
+            _: RunState,
+            _: Option<WallTime>,
+            _: Option<&str>,
+        ) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn allocate_run(
+            &self,
+            _: ProjectId,
+            _: RunKind,
+            _: &str,
+            _: &str,
+            _: WallTime,
+        ) -> Result<RunId, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+    }
+
+    #[test]
+    fn init_repository_failure_preserves_request_correlation_id() {
+        let infra = CorrelationId::new();
+        let request = CorrelationId::new();
+        let app: Application<InsertFailureRepo, StubIdempotencyStore> =
+            Application::new(InsertFailureRepo(infra), StubIdempotencyStore::new(), 1, 1, 0);
+        let mut context = RequestContext::new("tester", WallTime::now());
+        context.correlation_id = request;
+        let err = app
+            .execute(
+                Command::InitializeProject(InitializeProject {
+                    canonical_repo_path: "/tmp/example".to_string(),
+                    display_name: "Example".to_string(),
+                    idempotency_key: "idem".to_string(),
+                    project_id: ProjectId::new(),
+                }),
+                &context,
+            )
+            .unwrap_err();
+        // The request correlation reaches the boundary verbatim.
+        assert_eq!(err.correlation_id, request);
+        assert_eq!(err.category, ErrorCategory::Corruption);
+        // The infrastructure correlation is preserved as a diagnostic
+        // detail.
+        assert_eq!(
+            err.details.get("infrastructure_correlation_id").map(|scalar| match scalar {
+                xtrace_domain::SafeScalar::String(s) => s.clone(),
+                _ => String::new(),
+            }),
+            Some(infra.to_string()),
+        );
+        // Empty source must not appear as a detail.
+        let has_empty_source = matches!(
+            err.details.get("source"),
+            Some(xtrace_domain::SafeScalar::String(s)) if s.is_empty()
+        );
+        assert!(!has_empty_source, "empty source must not be attached as a detail");
+    }
+
+    /// Project repository stub whose `touch_last_opened` returns
+    /// a `PortErrorKind::Transport` failure carrying the supplied
+    /// infra correlation ID. `load_project_by_fingerprint` returns
+    /// a stub project so the open path proceeds to the touch step.
+    struct TouchFailureRepo(CorrelationId);
+    impl ProjectRepository for TouchFailureRepo {
+        fn insert_project(&self, _: &Project) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn load_project_by_fingerprint(
+            &self,
+            _: &RepositoryFingerprint,
+        ) -> Result<Project, PortError> {
+            Ok(Project {
+                id: ProjectId::new(),
+                canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/tmp/example"),
+                display_name: "Example".to_string(),
+                created_at: WallTime::now(),
+                last_opened_at: WallTime::now(),
+                config_schema_version: 1,
+                effective_config_hash: String::new(),
+                active_capture_policy_id: None,
+                active_redaction_policy_id: None,
+            })
+        }
+        fn load_project_by_id(&self, _: ProjectId) -> Result<Project, PortError> {
+            Err(PortError::new(PortErrorKind::NotFound, "not reached", CorrelationId::new()))
+        }
+        fn list_projects(&self) -> Result<Vec<Project>, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn touch_last_opened(&self, _: ProjectId, _: WallTime) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Transport, "touch failed", self.0))
+        }
+        fn insert_run(&self, _: &Run, _: ProjectId, _: &str) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn load_run(&self, _: RunId) -> Result<Run, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn update_run_state(
+            &self,
+            _: RunId,
+            _: RunState,
+            _: Option<WallTime>,
+            _: Option<&str>,
+        ) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn allocate_run(
+            &self,
+            _: ProjectId,
+            _: RunKind,
+            _: &str,
+            _: &str,
+            _: WallTime,
+        ) -> Result<RunId, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+    }
+
+    #[test]
+    fn open_touch_failure_preserves_request_correlation_id() {
+        let infra = CorrelationId::new();
+        let request = CorrelationId::new();
+        let app: Application<TouchFailureRepo, StubIdempotencyStore> =
+            Application::new(TouchFailureRepo(infra), StubIdempotencyStore::new(), 1, 1, 0);
+        let mut context = RequestContext::new("tester", WallTime::now());
+        context.correlation_id = request;
+        let err = app
+            .execute(
+                Command::OpenProject(OpenProject {
+                    canonical_repo_path: "/tmp/example".to_string(),
+                    idempotency_key: "idem".to_string(),
+                }),
+                &context,
+            )
+            .unwrap_err();
+        assert_eq!(err.correlation_id, request);
+        assert_eq!(err.category, ErrorCategory::Transport);
+        assert_eq!(
+            err.details.get("infrastructure_correlation_id").map(|scalar| match scalar {
+                xtrace_domain::SafeScalar::String(s) => s.clone(),
+                _ => String::new(),
+            }),
+            Some(infra.to_string()),
+        );
+    }
+
+    /// Project repository stub whose `list_projects` returns a
+    /// `PortErrorKind::Resource` failure carrying the supplied
+    /// infra correlation ID.
+    struct ListFailureRepo(CorrelationId);
+    impl ProjectRepository for ListFailureRepo {
+        fn insert_project(&self, _: &Project) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn load_project_by_fingerprint(
+            &self,
+            _: &RepositoryFingerprint,
+        ) -> Result<Project, PortError> {
+            Err(PortError::new(PortErrorKind::NotFound, "not reached", CorrelationId::new()))
+        }
+        fn load_project_by_id(&self, _: ProjectId) -> Result<Project, PortError> {
+            Err(PortError::new(PortErrorKind::NotFound, "not reached", CorrelationId::new()))
+        }
+        fn list_projects(&self) -> Result<Vec<Project>, PortError> {
+            Err(PortError::new(PortErrorKind::Resource, "list failed", self.0))
+        }
+        fn touch_last_opened(&self, _: ProjectId, _: WallTime) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn insert_run(&self, _: &Run, _: ProjectId, _: &str) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn load_run(&self, _: RunId) -> Result<Run, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn update_run_state(
+            &self,
+            _: RunId,
+            _: RunState,
+            _: Option<WallTime>,
+            _: Option<&str>,
+        ) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn allocate_run(
+            &self,
+            _: ProjectId,
+            _: RunKind,
+            _: &str,
+            _: &str,
+            _: WallTime,
+        ) -> Result<RunId, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+    }
+
+    #[test]
+    fn status_list_failure_preserves_request_correlation_id() {
+        let infra = CorrelationId::new();
+        let request = CorrelationId::new();
+        let app: Application<ListFailureRepo, StubIdempotencyStore> =
+            Application::new(ListFailureRepo(infra), StubIdempotencyStore::new(), 1, 1, 0);
+        let mut context = RequestContext::new("tester", WallTime::now());
+        context.correlation_id = request;
+        let err = app.query(Query::GetStoreStatus(GetStoreStatus), &context).unwrap_err();
+        assert_eq!(err.correlation_id, request);
+        assert_eq!(err.category, ErrorCategory::Resource);
+        assert_eq!(
+            err.details.get("infrastructure_correlation_id").map(|scalar| match scalar {
+                xtrace_domain::SafeScalar::String(s) => s.clone(),
+                _ => String::new(),
+            }),
+            Some(infra.to_string()),
+        );
+    }
+
+    /// Idempotency store stub whose `record_receipt` always fails
+    /// with a `PortErrorKind::Internal` carrying a distinct
+    /// infrastructure correlation ID.
+    struct RecordFailureIdem(CorrelationId);
+    impl IdempotencyStore for RecordFailureIdem {
+        fn lookup_receipt(&self, _: &str, _: &str) -> Result<Option<StoredReceipt>, PortError> {
+            Ok(None)
+        }
+        fn record_receipt(&self, _: &StoredReceipt) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "record failed", self.0))
+        }
+    }
+
+    #[test]
+    fn idempotency_record_failure_preserves_request_correlation_id() {
+        let infra = CorrelationId::new();
+        let request = CorrelationId::new();
+        let app: Application<StubRepository, RecordFailureIdem> =
+            Application::new(StubRepository::new(), RecordFailureIdem(infra), 1, 1, 0);
+        let mut context = RequestContext::new("tester", WallTime::now());
+        context.correlation_id = request;
+        let err = app
+            .execute(
+                Command::InitializeProject(InitializeProject {
+                    canonical_repo_path: "/tmp/example".to_string(),
+                    display_name: "Example".to_string(),
+                    idempotency_key: "idem".to_string(),
+                    project_id: ProjectId::new(),
+                }),
+                &context,
+            )
+            .unwrap_err();
+        assert_eq!(err.correlation_id, request);
+        assert_eq!(err.category, ErrorCategory::Internal);
+        assert_eq!(
+            err.details.get("infrastructure_correlation_id").map(|scalar| match scalar {
+                xtrace_domain::SafeScalar::String(s) => s.clone(),
+                _ => String::new(),
+            }),
+            Some(infra.to_string()),
+        );
+    }
+
+    #[test]
+    fn load_lookup_propagates_correlation_id_on_infrastructure_failure() {
+        // `load_project_by_fingerprint` failure (e.g. a SQL
+        // `Corruption` report) must surface as a typed
+        // `Corruption` `AppError` carrying the request correlation
+        // ID rather than an infrastructure-generated one.
+        struct LoadCorruptionRepo(CorrelationId);
+        impl ProjectRepository for LoadCorruptionRepo {
+            fn insert_project(&self, _: &Project) -> Result<(), PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn load_project_by_fingerprint(
+                &self,
+                _: &RepositoryFingerprint,
+            ) -> Result<Project, PortError> {
+                Err(PortError::new(PortErrorKind::Corruption, "schema corrupt", self.0))
+            }
+            fn load_project_by_id(&self, _: ProjectId) -> Result<Project, PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn list_projects(&self) -> Result<Vec<Project>, PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn touch_last_opened(&self, _: ProjectId, _: WallTime) -> Result<(), PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn insert_run(&self, _: &Run, _: ProjectId, _: &str) -> Result<(), PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn load_run(&self, _: RunId) -> Result<Run, PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn update_run_state(
+                &self,
+                _: RunId,
+                _: RunState,
+                _: Option<WallTime>,
+                _: Option<&str>,
+            ) -> Result<(), PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn allocate_run(
+                &self,
+                _: ProjectId,
+                _: RunKind,
+                _: &str,
+                _: &str,
+                _: WallTime,
+            ) -> Result<RunId, PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+        }
+        let infra = CorrelationId::new();
+        let request = CorrelationId::new();
+        let app: Application<LoadCorruptionRepo, StubIdempotencyStore> =
+            Application::new(LoadCorruptionRepo(infra), StubIdempotencyStore::new(), 1, 1, 0);
+        let mut context = RequestContext::new("tester", WallTime::now());
+        context.correlation_id = request;
+        let err = app
+            .execute(
+                Command::InitializeProject(InitializeProject {
+                    canonical_repo_path: "/tmp/example".to_string(),
+                    display_name: "Example".to_string(),
+                    idempotency_key: "idem".to_string(),
+                    project_id: ProjectId::new(),
+                }),
+                &context,
+            )
+            .unwrap_err();
+        assert_eq!(err.correlation_id, request);
+        assert_eq!(err.category, ErrorCategory::Corruption);
+        assert_eq!(
+            err.details.get("infrastructure_correlation_id").map(|scalar| match scalar {
+                xtrace_domain::SafeScalar::String(s) => s.clone(),
+                _ => String::new(),
+            }),
+            Some(infra.to_string()),
         );
     }
 }

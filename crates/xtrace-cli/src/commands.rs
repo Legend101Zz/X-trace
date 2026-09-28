@@ -19,7 +19,7 @@ use xtrace_store::{SqliteStore, StoreErrorKind};
 
 use crate::error::CliError;
 use crate::output::write_success;
-use crate::paths::{RepositoryPointer, UserDataPaths};
+use crate::paths::{RepositoryPointer, UserDataPaths, secure_project_dir};
 
 /// Top-level subcommand surface parsed by [`clap`].
 #[derive(Clone, Debug, Subcommand)]
@@ -60,39 +60,74 @@ pub enum XtraceCommand {
 pub fn run(command: XtraceCommand) -> Result<(), CliError> {
     match command {
         XtraceCommand::Init { project_dir, display_name, idempotency_key } => {
-            init(project_dir, display_name, idempotency_key)
+            init(project_dir, display_name, idempotency_key, &crate::paths::read_env_path)
         }
-        XtraceCommand::Open { project_dir, idempotency_key } => open(project_dir, idempotency_key),
-        XtraceCommand::Status { project_dir } => status(project_dir),
+        XtraceCommand::Open { project_dir, idempotency_key } => {
+            open(project_dir, idempotency_key, &crate::paths::read_env_path)
+        }
+        XtraceCommand::Status { project_dir } => status(project_dir, &crate::paths::read_env_path),
     }
 }
 
-fn init(
+/// Resolves the user-data home directory for the supplied pointer
+/// using the supplied environment reader.
+///
+/// Precedence:
+///
+/// 1. `XTRACE_DATA_HOME` when it points at an absolute path (the
+///    caller-level override wins by design).
+/// 2. The pointer's recorded `data_home` when the caller did not
+///    set an override.
+/// 3. The platform default via [`UserDataPaths::home_with`].
+fn resolve_data_home<F>(
+    pointer: Option<&RepositoryPointer>,
+    env_reader: &F,
+) -> Result<PathBuf, CliError>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
+    if let Some(value) = env_reader("XTRACE_DATA_HOME") {
+        if value.is_absolute() {
+            return Ok(value);
+        }
+    }
+    if let Some(pointer) = pointer {
+        if pointer.data_home.is_absolute() {
+            return Ok(pointer.data_home.clone());
+        }
+    }
+    UserDataPaths::home_with(env_reader)
+}
+
+fn init<F>(
     project_dir: PathBuf,
     display_name: String,
     idempotency_key: String,
-) -> Result<(), CliError> {
+    env_reader: &F,
+) -> Result<(), CliError>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
     let repo = resolve_repo(&project_dir)?;
-    let user_data_home = UserDataPaths::home()?;
     // Honour an existing pointer so re-running `init` against the
     // same repository uses the original project identifier. The
     // application facade's idempotency contract then either returns
     // the original receipt (same canonical input) or surfaces
     // `XTR-COMMAND-409` (different canonical input).
-    let project_id = match RepositoryPointer::read(&repo) {
-        Ok(pointer) => pointer.project_id,
-        Err(CliError::ProjectDirectoryMissing(_)) => ProjectId::new(),
-        Err(err) => return Err(err),
-    };
-    let project_directory = UserDataPaths::project_dir(project_id)?;
+    let existing_pointer = RepositoryPointer::read(&repo).ok();
+    let user_data_home = resolve_data_home(existing_pointer.as_ref(), env_reader)?;
+    let project_id =
+        existing_pointer.as_ref().map(|pointer| pointer.project_id).unwrap_or_default();
+    let project_directory = UserDataPaths::project_dir_with_home(&user_data_home, project_id)?;
     std::fs::create_dir_all(&project_directory)
         .map_err(|err| CliError::StoreUnavailable(format!("create project dir: {err}")))?;
-    let database_path = UserDataPaths::database_path(project_id)?;
+    let database_path = UserDataPaths::database_path_with_home(&user_data_home, project_id)?;
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
 
     let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
         .map_err(map_store_error)?;
+    store.set_correlation_id(ctx.correlation_id);
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -122,6 +157,11 @@ fn init(
         )
         .map_err(CliError::from)?;
 
+    // Tighten the directory and database permissions only after the
+    // application returns success: if `init` fails the directory is
+    // left untouched so a retry starts from a clean slate.
+    secure_project_dir(&project_directory);
+
     // Persist the repository pointer only after the application
     // returns success. If `init` fails the repository stays
     // uninitialized so a retry starts from a clean slate.
@@ -135,15 +175,22 @@ fn init(
     Ok(())
 }
 
-fn open(project_dir: PathBuf, idempotency_key: String) -> Result<(), CliError> {
+fn open<F>(project_dir: PathBuf, idempotency_key: String, env_reader: &F) -> Result<(), CliError>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
     let repo = resolve_repo(&project_dir)?;
     let pointer = RepositoryPointer::read(&repo)?;
-    let database_path = UserDataPaths::database_path(pointer.project_id)?;
+    let database_path = resolve_database_path(Some(&pointer), pointer.project_id, env_reader)?;
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
 
-    let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
-        .map_err(map_store_error)?;
+    let store = SqliteStore::open(
+        &database_path,
+        xtrace_store::OpenOptions::default().with_must_exist(true),
+    )
+    .map_err(map_store_error)?;
+    store.set_correlation_id(ctx.correlation_id);
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -171,7 +218,10 @@ fn open(project_dir: PathBuf, idempotency_key: String) -> Result<(), CliError> {
     Ok(())
 }
 
-fn status(project_dir: PathBuf) -> Result<(), CliError> {
+fn status<F>(project_dir: PathBuf, env_reader: &F) -> Result<(), CliError>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
     let repo = resolve_repo(&project_dir)?;
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
@@ -182,12 +232,14 @@ fn status(project_dir: PathBuf) -> Result<(), CliError> {
     // when the pointer is absent.
     let document = match RepositoryPointer::read(&repo) {
         Ok(pointer) => {
-            let database_path = UserDataPaths::database_path(pointer.project_id)?;
-            // Open read-by-side-effect: we need the bootstrap so the
-            // report names the schema version actually present on
-            // disk, but we never write from status.
-            let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
-                .map_err(map_store_error)?;
+            let database_path =
+                resolve_database_path(Some(&pointer), pointer.project_id, env_reader)?;
+            let store = SqliteStore::open(
+                &database_path,
+                xtrace_store::OpenOptions::default().with_must_exist(true),
+            )
+            .map_err(map_store_error)?;
+            store.set_correlation_id(ctx.correlation_id);
             let repository = SqliteProjectRepository::new(&store);
             let idempotency = SqliteIdempotencyStore::new(&store);
             let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -214,6 +266,20 @@ fn status(project_dir: PathBuf) -> Result<(), CliError> {
     let mut handle = stdout.lock();
     write_success(&mut handle, &document)?;
     Ok(())
+}
+
+/// Resolves the database path for the supplied pointer, honouring
+/// the precedence documented in [`resolve_data_home`].
+fn resolve_database_path<F>(
+    pointer: Option<&RepositoryPointer>,
+    project_id: ProjectId,
+    env_reader: &F,
+) -> Result<PathBuf, CliError>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
+    let home = resolve_data_home(pointer, env_reader)?;
+    UserDataPaths::database_path_with_home(&home, project_id)
 }
 
 fn resolve_repo(project_dir: &Path) -> Result<PathBuf, CliError> {
@@ -268,6 +334,7 @@ fn map_store_error(err: xtrace_store::StoreError) -> CliError {
         StoreErrorKind::SchemaOlder => CliError::StoreSchemaOlder(err.message().to_string()),
         StoreErrorKind::Transport => CliError::StoreUnavailable(err.message().to_string()),
         StoreErrorKind::Busy => CliError::StoreUnavailable(err.message().to_string()),
+        StoreErrorKind::Validation => CliError::StoreUnavailable(err.message().to_string()),
         _ => CliError::StoreUnavailable(err.message().to_string()),
     }
 }
@@ -372,5 +439,269 @@ impl StatusDocument {
             capabilities: report.capabilities,
             projects: report.projects,
         }
+    }
+}
+
+#[cfg(test)]
+// Tests assert on fallible fixture data and exercise fallible
+// branches that library code deliberately avoids. The workspace
+// denies `unsafe_code` and the `panic` lint, so the test module
+// allows them locally; `panic` only appears in invariant
+// assertions that should fail the test outright when violated.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests assert on fallible fixture data and explicit invariants"
+)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn tempdir(label: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("xtrace-cli-commands-{label}-{nanos}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// Maps a variable name to its configured value. Used to inject
+    /// environment state into the command resolver without mutating
+    /// the process-wide environment.
+    fn reader(values: HashMap<&'static str, PathBuf>) -> impl Fn(&str) -> Option<PathBuf> {
+        move |var: &str| values.get(var).cloned()
+    }
+
+    fn reader_with_none() -> impl Fn(&str) -> Option<PathBuf> {
+        reader(HashMap::new())
+    }
+
+    #[test]
+    fn resolve_data_home_prefers_explicit_override_over_pointer() {
+        let a = tempdir("a");
+        let b = tempdir("b");
+        let pointer = RepositoryPointer {
+            schema_version: 1,
+            project_id: ProjectId::new(),
+            data_home: a.clone(),
+        };
+        let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+        values.insert("XTRACE_DATA_HOME", b.clone());
+        let resolved = resolve_data_home(Some(&pointer), &reader(values)).expect("resolve");
+        assert_eq!(resolved, b);
+    }
+
+    #[test]
+    fn resolve_data_home_uses_pointer_when_no_explicit_override() {
+        let a = tempdir("pointer");
+        let pointer = RepositoryPointer {
+            schema_version: 1,
+            project_id: ProjectId::new(),
+            data_home: a.clone(),
+        };
+        let resolved = resolve_data_home(Some(&pointer), &reader_with_none()).expect("resolve");
+        assert_eq!(resolved, a);
+    }
+
+    #[test]
+    fn resolve_data_home_uses_platform_default_when_neither_override_nor_pointer() {
+        // No `XTRACE_DATA_HOME`, no pointer. The platform default
+        // (via `HOME` on macOS/Linux, `APPDATA` on Windows) must
+        // resolve to an absolute path.
+        let repo_dir = tempdir("platform-default");
+        let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+        values.insert("HOME", repo_dir.clone());
+        let resolved = resolve_data_home(None, &reader(values)).expect("resolve");
+        assert!(resolved.is_absolute());
+        // On macOS the default is `$HOME/Library/Application Support/xtrace`,
+        // on Linux it is `${HOME}/.local/share/xtrace`, on Windows
+        // `${APPDATA}/xtrace`. In every case the path must begin
+        // with the supplied HOME when HOME is the source.
+        assert!(
+            resolved.starts_with(&repo_dir),
+            "platform default must start with HOME, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn open_status_fail_without_mutating_when_pointer_db_missing() {
+        let repo_dir = tempdir("open-status");
+        std::fs::create_dir_all(&repo_dir).expect("repo");
+        let home = tempdir("home");
+        let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+        values.insert("XTRACE_DATA_HOME", home.clone());
+        values.insert("HOME", repo_dir.clone());
+        let env_reader = reader(values);
+        let pointer = RepositoryPointer {
+            schema_version: 1,
+            project_id: ProjectId::new(),
+            data_home: home.clone(),
+        };
+        pointer.write(&repo_dir).expect("write pointer");
+        // `open` must refuse a missing database without creating
+        // either the user-data directory or the SQLite file.
+        let err = open(repo_dir.clone(), String::new(), &env_reader).unwrap_err();
+        assert!(
+            matches!(err, CliError::StoreUnavailable(_)),
+            "open must fail without mutating: {err:?}"
+        );
+        assert!(!home.join("projects").exists(), "user-data directory must not be created");
+        // `status` follows the same discipline.
+        let err = status(repo_dir.clone(), &env_reader).unwrap_err();
+        assert!(
+            matches!(err, CliError::StoreUnavailable(_)),
+            "status must fail without mutating: {err:?}"
+        );
+        assert!(!home.join("projects").exists(), "user-data directory must not be created");
+    }
+
+    #[test]
+    fn uninit_status_creates_neither_user_data_directory_nor_pointer() {
+        let repo_dir = tempdir("uninit");
+        std::fs::create_dir_all(&repo_dir).expect("repo");
+        let home = tempdir("home");
+        let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+        values.insert("XTRACE_DATA_HOME", home.clone());
+        values.insert("HOME", repo_dir.clone());
+        let env_reader = reader(values);
+        // No pointer is present and `status` must produce an empty
+        // document without creating either the user-data directory or
+        // the repository pointer.
+        status(repo_dir.clone(), &env_reader).expect("status on uninit must succeed");
+        assert!(!home.join("projects").exists(), "user-data directory must not be created");
+        assert!(!repo_dir.join(".xtrace").exists(), "repository pointer must not be created");
+    }
+
+    #[test]
+    fn init_then_open_with_pointer_then_status_round_trips_under_changing_env() {
+        let repo_dir = tempdir("roundtrip");
+        std::fs::create_dir_all(&repo_dir).expect("repo");
+        let a = tempdir("a");
+        let b = tempdir("b");
+        {
+            let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+            values.insert("XTRACE_DATA_HOME", a.clone());
+            values.insert("HOME", repo_dir.clone());
+            init(repo_dir.clone(), "Example".to_string(), String::new(), &reader(values))
+                .expect("init under A");
+        }
+        // With the explicit override set to B, every command looks
+        // under B and refuses the absent database without mutating
+        // either home.
+        {
+            let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+            values.insert("XTRACE_DATA_HOME", b.clone());
+            values.insert("HOME", repo_dir.clone());
+            let env_reader = reader(values);
+            let open_err = open(repo_dir.clone(), String::new(), &env_reader).unwrap_err();
+            assert!(matches!(open_err, CliError::StoreUnavailable(_)));
+            let status_err = status(repo_dir.clone(), &env_reader).unwrap_err();
+            assert!(matches!(status_err, CliError::StoreUnavailable(_)));
+        }
+        // With the override cleared, the pointer-recorded A wins
+        // and the open succeeds.
+        {
+            let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+            values.insert("HOME", repo_dir.clone());
+            open(repo_dir.clone(), String::new(), &reader(values))
+                .expect("open under unset env uses pointer A");
+        }
+        // Database directory lives under A only.
+        let projects = a.join("projects");
+        assert!(projects.exists(), "user-data directory under A");
+        let b_projects = b.join("projects");
+        assert!(!b_projects.exists(), "user-data directory must not be created under B");
+    }
+
+    #[test]
+    fn explicit_override_takes_precedence_over_pointer_after_init() {
+        let repo_dir = tempdir("override");
+        std::fs::create_dir_all(&repo_dir).expect("repo");
+        let a = tempdir("a");
+        let b = tempdir("b");
+        {
+            let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+            values.insert("XTRACE_DATA_HOME", a.clone());
+            values.insert("HOME", repo_dir.clone());
+            init(repo_dir.clone(), "Example".to_string(), String::new(), &reader(values))
+                .expect("init under A");
+        }
+        // `open` with the explicit override set to an absolute path
+        // must look under B and fail without creating anything there
+        // because the database under B is absent.
+        {
+            let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+            values.insert("XTRACE_DATA_HOME", b.clone());
+            values.insert("HOME", repo_dir.clone());
+            let env_reader = reader(values);
+            let err = open(repo_dir.clone(), String::new(), &env_reader).unwrap_err();
+            assert!(matches!(err, CliError::StoreUnavailable(_)));
+            assert!(!b.join("projects").exists(), "no mutation under B");
+        }
+        // With the override cleared, `open` falls back to the
+        // pointer-recorded A and succeeds.
+        {
+            let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+            values.insert("HOME", repo_dir.clone());
+            open(repo_dir.clone(), String::new(), &reader(values))
+                .expect("open under unset env uses pointer A");
+        }
+    }
+
+    #[test]
+    fn same_input_replay_returns_original_initialize_receipt() {
+        // This guards the documented `init` idempotency contract:
+        // the same canonical input with the same idempotency key
+        // returns the original receipt and never creates a second
+        // project row or a second pointer.
+        let repo_dir = tempdir("replay");
+        std::fs::create_dir_all(&repo_dir).expect("repo");
+        let home = tempdir("home");
+        let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+        values.insert("XTRACE_DATA_HOME", home.clone());
+        values.insert("HOME", repo_dir.clone());
+        let env_reader = reader(values.clone());
+        init(repo_dir.clone(), "Example".to_string(), String::new(), &env_reader)
+            .expect("first init");
+        init(repo_dir.clone(), "Example".to_string(), String::new(), &env_reader)
+            .expect("second init is a replay");
+        // Exactly one project directory exists under `home`.
+        let project_dirs: Vec<_> = std::fs::read_dir(home.join("projects"))
+            .expect("projects dir")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(project_dirs.len(), 1, "second init must not add a new project directory");
+    }
+
+    #[test]
+    fn changed_input_replay_surfaces_xtr_command_409() {
+        // The CLI integration smoke gate relies on this: a second
+        // `init` with a different `display_name` reusing the
+        // computed idempotency key must surface
+        // `XTR-COMMAND-409` without mutating the project set.
+        let repo_dir = tempdir("conflict");
+        std::fs::create_dir_all(&repo_dir).expect("repo");
+        let home = tempdir("home");
+        let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+        values.insert("XTRACE_DATA_HOME", home.clone());
+        values.insert("HOME", repo_dir.clone());
+        let env_reader = reader(values.clone());
+        init(repo_dir.clone(), "Example".to_string(), String::new(), &env_reader)
+            .expect("first init");
+        let err =
+            init(repo_dir.clone(), "Renamed".to_string(), String::new(), &env_reader).unwrap_err();
+        match err {
+            CliError::App(app_error) => {
+                assert_eq!(app_error.code.as_str(), "XTR-COMMAND-409");
+                assert_eq!(app_error.category, xtrace_domain::ErrorCategory::Conflict);
+            }
+            other => panic!("expected XTR-COMMAND-409 conflict, got {other:?}"),
+        }
+        let project_dirs: Vec<_> = std::fs::read_dir(home.join("projects"))
+            .expect("projects dir")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(project_dirs.len(), 1, "conflict must not create a second project directory");
     }
 }

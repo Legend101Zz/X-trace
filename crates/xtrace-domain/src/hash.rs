@@ -28,6 +28,14 @@ impl ContentHash {
         Self(*digest.as_bytes())
     }
 
+    /// Wraps an already-computed BLAKE3-256 digest. Used by callers
+    /// that build the digest incrementally through a
+    /// [`blake3::Hasher`] and only need to tag the result.
+    #[must_use]
+    pub const fn from_blake3_digest(digest: blake3::Hash) -> Self {
+        Self(*digest.as_bytes())
+    }
+
     /// Returns the raw 32-byte digest.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
@@ -118,6 +126,15 @@ mod tests {
         let a = ContentHash::of_bytes(b"xtrace");
         let b = ContentHash::of_bytes(b"xtrace");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn from_blake3_digest_matches_of_bytes() {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"xtrace");
+        let from_hasher = ContentHash::from_blake3_digest(hasher.finalize());
+        let from_bytes = ContentHash::of_bytes(b"xtrace");
+        assert_eq!(from_hasher, from_bytes);
     }
 
     #[test]

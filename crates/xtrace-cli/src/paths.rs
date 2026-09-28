@@ -2,12 +2,18 @@
 //!
 //! Slice 1A keeps durable project state under the user-data home
 //! directory rather than inside the repository. The CLI resolves the
-//! home directory from `XTRACE_DATA_HOME` (when set) or from the
-//! platform default documented below, and writes a small
-//! `.xtrace/config.toml` pointer inside the repository so subsequent
-//! invocations can find the project.
+//! home directory in this order:
 //!
-//! User-data home (no `XTRACE_DATA_HOME` override):
+//! 1. `XTRACE_DATA_HOME` when it points at an absolute path (override);
+//! 2. the platform default for the host operating system, which
+//!    honours the conventional user-data environment variable for
+//!    that platform before falling back to `HOME`;
+//! 3. an explicit [`data_home`](RepositoryPointer::data_home) carried
+//!    by a previously-written pointer file (used when neither
+//!    override nor platform default is available, for example after a
+//!    repository migrates between machines).
+//!
+//! Platform defaults:
 //!
 //! - macOS: `$HOME/Library/Application Support/xtrace`
 //! - Linux: `${XDG_DATA_HOME:-~/.local/share}/xtrace`
@@ -43,6 +49,8 @@ const USER_DATA_HOME_ENV: &str = "XTRACE_DATA_HOME";
 const XTRACE_FOLDER: &str = "xtrace";
 /// Subdirectory that holds one folder per project.
 const PROJECTS_FOLDER: &str = "projects";
+/// Pointer file format version the binary understands.
+const POINTER_SCHEMA_VERSION: u32 = 1;
 
 /// Pointer file written into the repository root by `xtrace init`.
 ///
@@ -50,7 +58,7 @@ const PROJECTS_FOLDER: &str = "projects";
 /// and the absolute path of the user-data home used at init time.
 /// Future slices add more fields (active policy versions, capture
 /// settings, ...) without changing the file format's major version.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryPointer {
     /// Pointer file format version. Bumped together with schema
     /// changes that older binaries cannot read.
@@ -62,13 +70,63 @@ pub struct RepositoryPointer {
     pub data_home: PathBuf,
 }
 
+/// Typed view of the on-disk TOML shape. `Serialize`/`Deserialize`
+/// handle the wire format; the surrounding [`RepositoryPointer`] adds
+/// validation (schema version, absolute data home) so a corrupt
+/// pointer cannot silently move a project to a different storage
+/// location.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct RepositoryPointerToml {
+    /// Pointer file format version. Bumped together with schema
+    /// changes that older binaries cannot read.
+    schema_version: u32,
+    /// Stable project identifier recorded at `init` time.
+    project_id: ProjectId,
+    /// Absolute path of the user-data home directory the project
+    /// lives under.
+    data_home: PathBuf,
+}
+
+impl From<RepositoryPointer> for RepositoryPointerToml {
+    fn from(value: RepositoryPointer) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            project_id: value.project_id,
+            data_home: value.data_home,
+        }
+    }
+}
+
+impl TryFrom<RepositoryPointerToml> for RepositoryPointer {
+    type Error = CliError;
+    fn try_from(value: RepositoryPointerToml) -> Result<Self, Self::Error> {
+        if value.schema_version != POINTER_SCHEMA_VERSION {
+            return Err(CliError::StoreCorrupted(format!(
+                "unsupported pointer schema_version {} (binary expects {})",
+                value.schema_version, POINTER_SCHEMA_VERSION
+            )));
+        }
+        if !value.data_home.is_absolute() {
+            return Err(CliError::StoreCorrupted(format!(
+                "pointer data_home is not absolute: {}",
+                value.data_home.display()
+            )));
+        }
+        Ok(Self {
+            schema_version: value.schema_version,
+            project_id: value.project_id,
+            data_home: value.data_home,
+        })
+    }
+}
+
 impl RepositoryPointer {
     /// Returns the relative path of the pointer file inside the
     /// repository root (`.xtrace/config.toml`). Exposed so future
     /// CLI surfaces can refer to the same constant without
     /// duplicating the layout.
     #[must_use]
-    #[allow(dead_code, reason = "documentation constant; CLI uses paths:: constants directly")]
+    #[allow(dead_code, reason = "exposed for downstream callers and unit tests")]
     pub fn relative_path() -> &'static str {
         ".xtrace/config.toml"
     }
@@ -77,7 +135,7 @@ impl RepositoryPointer {
     /// The file is written atomically: the body first lands in a
     /// sibling `.tmp` file, then `rename` swaps it into place. The
     /// parent `.xtrace` directory is created with owner-only
-    /// permissions when possible.
+    /// permissions on Unix so the file cannot be read by other users.
     ///
     /// # Errors
     ///
@@ -86,26 +144,24 @@ impl RepositoryPointer {
     pub fn write(&self, repo: &Path) -> Result<(), CliError> {
         use std::fs;
         use std::io::Write as _;
+        if !self.data_home.is_absolute() {
+            return Err(CliError::StoreCorrupted(format!(
+                "refusing to write pointer with non-absolute data_home: {}",
+                self.data_home.display()
+            )));
+        }
         let pointer_dir = repo.join(POINTER_BASENAME);
         let pointer_path = pointer_dir.join(POINTER_FILENAME);
         fs::create_dir_all(&pointer_dir)
             .map_err(|err| CliError::StoreUnavailable(format!("create .xtrace: {err}")))?;
-        // Render canonical TOML so hand-inspection is unambiguous.
-        // The path lives on its own line because TOML string literals
-        // do not support trailing backslashes; writing the path as a
-        // single string is therefore sufficient and unambiguous.
-        let project_id = self.project_id.to_string();
-        let data_home = self.data_home.display().to_string();
-        let body = format!(
-            "# X-trace repository pointer.\n\
-             # Auto-generated by `xtrace init`. Do not edit by hand.\n\
-             schema_version = {schema}\n\
-             project_id = \"{project_id}\"\n\
-             data_home = \"{data_home}\"\n",
-            schema = self.schema_version,
-            project_id = project_id,
-            data_home = data_home,
-        );
+        restrict_dir_owner_only(&pointer_dir);
+        // Serialise the typed pointer through `toml` so a path
+        // containing quotes, backslashes, or other TOML-significant
+        // characters round-trips verbatim instead of corrupting the
+        // file.
+        let toml_value = RepositoryPointerToml::from(self.clone());
+        let body = toml::to_string_pretty(&toml_value)
+            .map_err(|err| CliError::StoreCorrupted(format!("serialize pointer: {err}")))?;
         let tmp = pointer_dir.join(format!("{POINTER_FILENAME}.tmp"));
         {
             let mut file = fs::File::create(&tmp)
@@ -117,6 +173,7 @@ impl RepositoryPointer {
         }
         fs::rename(&tmp, &pointer_path)
             .map_err(|err| CliError::StoreUnavailable(format!("rename pointer: {err}")))?;
+        restrict_file_owner_only(&pointer_path);
         Ok(())
     }
 
@@ -124,9 +181,11 @@ impl RepositoryPointer {
     ///
     /// # Errors
     ///
-    /// Returns [`CliError::StoreCorrupted`] when the file is
-    /// missing or unparseable, [`CliError::StoreUnavailable`] when
-    /// the filesystem refuses the read. The CLI surfaces a missing
+    /// Returns [`CliError::ProjectDirectoryMissing`] when the file is
+    /// absent, [`CliError::StoreCorrupted`] when the schema version
+    /// is unsupported, the data home is relative, or the body is
+    /// unparseable, [`CliError::StoreUnavailable`] when the
+    /// filesystem refuses the read. The CLI surfaces a missing
     /// pointer as a separate "uninitialized" error so callers can
     /// report the state truthfully.
     pub fn read(repo: &Path) -> Result<Self, CliError> {
@@ -141,13 +200,13 @@ impl RepositoryPointer {
                 CliError::StoreUnavailable(format!("read pointer: {err}"))
             }
         })?;
-        let parsed: RepositoryPointer = toml::from_str(&text).map_err(|err| {
+        let parsed: RepositoryPointerToml = toml::from_str(&text).map_err(|err| {
             CliError::StoreCorrupted(format!(
                 "invalid pointer file {}: {err}",
                 pointer_path.display()
             ))
         })?;
-        Ok(parsed)
+        parsed.try_into()
     }
 }
 
@@ -158,6 +217,7 @@ impl UserDataPaths {
     /// Resolves the absolute user-data home directory, preferring the
     /// `XTRACE_DATA_HOME` environment variable. Returns
     /// [`CliError::StoreUnavailable`] when no home can be derived.
+    #[allow(dead_code, reason = "exposed for downstream callers and unit tests")]
     pub fn home() -> Result<PathBuf, CliError> {
         Self::home_with(read_env_path)
     }
@@ -165,7 +225,15 @@ impl UserDataPaths {
     /// Resolves the user-data home directory using a caller-supplied
     /// environment reader. Exposed for tests so the resolver can be
     /// exercised without mutating process-wide state.
-    pub(crate) fn home_with<F>(env_reader: F) -> Result<PathBuf, CliError>
+    ///
+    /// Precedence:
+    ///
+    /// 1. `XTRACE_DATA_HOME` when it points at an absolute path.
+    /// 2. Platform-default lookup: the conventional user-data
+    ///    environment variable (`XDG_DATA_HOME` on Linux,
+    ///    `APPDATA` on Windows), falling back to `$HOME` when the
+    ///    platform variable is unset.
+    pub fn home_with<F>(env_reader: F) -> Result<PathBuf, CliError>
     where
         F: Fn(&str) -> Option<PathBuf>,
     {
@@ -176,7 +244,7 @@ impl UserDataPaths {
                 return Ok(value);
             }
         }
-        env_reader("HOME").and_then(|home| platform_user_data_home_from(&home)).ok_or_else(|| {
+        platform_user_data_home(&env_reader).ok_or_else(|| {
             CliError::StoreUnavailable(
                 "could not determine user-data home; set XTRACE_DATA_HOME".to_string(),
             )
@@ -184,15 +252,34 @@ impl UserDataPaths {
     }
 
     /// Resolves the absolute directory that holds the supplied
-    /// project's user-data state.
+    /// project's user-data state under the resolved user-data home.
+    #[allow(dead_code, reason = "exposed for downstream callers and unit tests")]
     pub fn project_dir(project_id: ProjectId) -> Result<PathBuf, CliError> {
         Ok(Self::home()?.join(PROJECTS_FOLDER).join(project_id.to_string()))
     }
 
     /// Resolves the absolute path of the SQLite database file for the
-    /// supplied project.
+    /// supplied project under the resolved user-data home.
+    #[allow(dead_code, reason = "exposed for downstream callers and unit tests")]
     pub fn database_path(project_id: ProjectId) -> Result<PathBuf, CliError> {
         Ok(Self::project_dir(project_id)?.join(DATABASE_FILENAME))
+    }
+
+    /// Resolves the absolute project directory under the supplied
+    /// user-data home. Used by callers that need to honour an
+    /// explicit override or a pointer-recorded data home without
+    /// changing the resolved default.
+    pub fn project_dir_with_home(home: &Path, project_id: ProjectId) -> Result<PathBuf, CliError> {
+        Ok(home.join(PROJECTS_FOLDER).join(project_id.to_string()))
+    }
+
+    /// Resolves the absolute database path under the supplied
+    /// user-data home.
+    pub fn database_path_with_home(
+        home: &Path,
+        project_id: ProjectId,
+    ) -> Result<PathBuf, CliError> {
+        Ok(Self::project_dir_with_home(home, project_id)?.join(DATABASE_FILENAME))
     }
 }
 
@@ -205,51 +292,86 @@ pub(crate) fn read_env_path(var: &str) -> Option<PathBuf> {
         .filter(|path| path.is_absolute())
 }
 
-#[cfg(target_os = "macos")]
-fn platform_user_data_home_from(home: &Path) -> Option<PathBuf> {
-    Some(home.join("Library").join("Application Support").join(XTRACE_FOLDER))
-}
-
-#[cfg(target_os = "linux")]
-fn platform_user_data_home_from(home: &Path) -> Option<PathBuf> {
-    Some(home.join(".local").join("share").join(XTRACE_FOLDER))
-}
-
-#[cfg(target_os = "windows")]
-fn platform_user_data_home_from(home: &Path) -> Option<PathBuf> {
-    Some(home.join(XTRACE_FOLDER))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn platform_user_data_home_from(_home: &Path) -> Option<PathBuf> {
-    None
-}
-
-#[cfg(target_os = "macos")]
-#[allow(dead_code, reason = "kept for binary-level fallback if home_with is bypassed")]
-fn platform_user_data_home() -> Option<PathBuf> {
-    read_env_path("HOME").and_then(|home| platform_user_data_home_from(&home))
-}
-
-#[cfg(target_os = "linux")]
-#[allow(dead_code, reason = "kept for binary-level fallback if home_with is bypassed")]
-fn platform_user_data_home() -> Option<PathBuf> {
-    if let Some(value) = read_env_path("XDG_DATA_HOME") {
-        return Some(value.join(XTRACE_FOLDER));
+/// Resolves the platform-default user-data home. The function is
+/// the single source of truth for the platform-specific lookup; each
+/// platform honours its conventional user-data environment variable
+/// before falling back to `$HOME` when the variable is unset.
+fn platform_user_data_home<F>(env_reader: &F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(value) = env_reader("XDG_DATA_HOME") {
+            return Some(value.join(XTRACE_FOLDER));
+        }
+        if let Some(home) = env_reader("HOME") {
+            return Some(home.join(".local").join("share").join(XTRACE_FOLDER));
+        }
+        None
     }
-    read_env_path("HOME").and_then(|home| platform_user_data_home_from(&home))
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(value) = env_reader("APPDATA") {
+            return Some(value.join(XTRACE_FOLDER));
+        }
+        env_reader("HOME").map(|home| home.join(XTRACE_FOLDER))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        env_reader("HOME")
+            .map(|home| home.join("Library").join("Application Support").join(XTRACE_FOLDER))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = env_reader;
+        None
+    }
 }
 
-#[cfg(target_os = "windows")]
-#[allow(dead_code, reason = "kept for binary-level fallback if home_with is bypassed")]
-fn platform_user_data_home() -> Option<PathBuf> {
-    read_env_path("APPDATA").map(|path| path.join(XTRACE_FOLDER))
+/// Restricts a directory's permissions to the owner on Unix. Best
+/// effort: a failure to chmod is non-fatal because the directory
+/// already exists and the file write that follows would have failed
+/// with a more diagnostic error.
+#[cfg(unix)]
+fn restrict_dir_owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        let _ = std::fs::set_permissions(path, permissions);
+    }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-#[allow(dead_code, reason = "kept for binary-level fallback if home_with is bypassed")]
-fn platform_user_data_home() -> Option<PathBuf> {
-    None
+#[cfg(not(unix))]
+fn restrict_dir_owner_only(_path: &Path) {}
+
+/// Restricts a regular file's permissions to the owner on Unix.
+/// Best effort, mirroring [`restrict_dir_owner_only`].
+#[cfg(unix)]
+fn restrict_file_owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        let _ = std::fs::set_permissions(path, permissions);
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_file_owner_only(_path: &Path) {}
+
+/// Sets owner-only permissions on a project directory and the SQLite
+/// file it contains when the platform supports it. Best-effort: a
+/// failure to chmod is non-fatal because the files already exist and
+/// the caller (CLI) reports the original I/O error rather than this
+/// permission adjustment.
+pub fn secure_project_dir(project_dir: &Path) {
+    restrict_dir_owner_only(project_dir);
+    let database = project_dir.join(DATABASE_FILENAME);
+    if database.exists() {
+        restrict_file_owner_only(&database);
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +384,25 @@ mod tests {
     #[test]
     fn relative_path_matches_documented_layout() {
         assert_eq!(RepositoryPointer::relative_path(), ".xtrace/config.toml");
+    }
+
+    #[test]
+    fn home_with_drives_project_and_database_paths() {
+        // The `home_with` resolver is the single source of truth
+        // for the path helpers. This test exercises the path
+        // helpers directly through the injected reader so the
+        // layout stays consistent across call sites.
+        let fake_home = PathBuf::from("/tmp/fake-home-resolver");
+        let reader = |var: &str| (var == "XTRACE_DATA_HOME").then(|| fake_home.clone());
+        let resolved = UserDataPaths::home_with(reader).expect("home resolves");
+        assert_eq!(resolved, fake_home);
+        let project_id = ProjectId::new();
+        let project_dir =
+            UserDataPaths::project_dir_with_home(&resolved, project_id).expect("project dir");
+        assert_eq!(project_dir, fake_home.join(PROJECTS_FOLDER).join(project_id.to_string()));
+        let database =
+            UserDataPaths::database_path_with_home(&resolved, project_id).expect("database path");
+        assert_eq!(database, project_dir.join(DATABASE_FILENAME));
     }
 
     #[test]
@@ -313,6 +454,45 @@ mod tests {
         assert!(resolved.is_err());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_platform_default_uses_xdg_data_home_when_set() {
+        let resolved = UserDataPaths::home_with(|var| match var {
+            USER_DATA_HOME_ENV => None,
+            "XDG_DATA_HOME" => Some(PathBuf::from("/tmp/xdg-data")),
+            _ => None,
+        })
+        .expect("home resolves");
+        assert_eq!(resolved, PathBuf::from("/tmp/xdg-data").join(XTRACE_FOLDER));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_platform_default_falls_back_to_home_when_xdg_unset() {
+        let resolved = UserDataPaths::home_with(|var| match var {
+            USER_DATA_HOME_ENV => None,
+            "HOME" => Some(PathBuf::from("/tmp/linux-home")),
+            _ => None,
+        })
+        .expect("home resolves");
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/linux-home").join(".local").join("share").join(XTRACE_FOLDER)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_platform_default_uses_appdata_when_set() {
+        let resolved = UserDataPaths::home_with(|var| match var {
+            USER_DATA_HOME_ENV => None,
+            "APPDATA" => Some(PathBuf::from(r"C:\Users\test\AppData\Roaming")),
+            _ => None,
+        })
+        .expect("home resolves");
+        assert_eq!(resolved, PathBuf::from(r"C:\Users\test\AppData\Roaming").join(XTRACE_FOLDER));
+    }
+
     #[test]
     fn pointer_round_trips_through_disk() {
         let dir = tempdir();
@@ -329,12 +509,112 @@ mod tests {
     }
 
     #[test]
+    fn pointer_round_trips_paths_with_quotes_and_spaces() {
+        let dir = tempdir();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let project_id = ProjectId::new();
+        // A path with double-quotes, single-quotes, backslashes, and
+        // spaces must round-trip without manual escaping.
+        let data_home = dir.join("user data \"with\" 'quotes' \\and\\ spaces");
+        std::fs::create_dir_all(&data_home).expect("user-data");
+        let pointer =
+            RepositoryPointer { schema_version: 1, project_id, data_home: data_home.clone() };
+        pointer.write(&repo).expect("write");
+        let loaded = RepositoryPointer::read(&repo).expect("read");
+        assert_eq!(loaded, pointer);
+        assert_eq!(loaded.data_home, data_home);
+    }
+
+    #[test]
     fn read_missing_pointer_is_recoverable() {
         let dir = tempdir();
         let repo = dir.join("missing-repo");
         std::fs::create_dir_all(&repo).expect("repo");
         let err = RepositoryPointer::read(&repo).unwrap_err();
         assert!(matches!(err, CliError::ProjectDirectoryMissing(_)));
+    }
+
+    #[test]
+    fn read_pointer_rejects_unsupported_schema_version() {
+        let dir = tempdir();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(repo.join(POINTER_BASENAME)).expect("pointer dir");
+        std::fs::write(
+            repo.join(POINTER_BASENAME).join(POINTER_FILENAME),
+            "schema_version = 99\nproject_id = \"00000000-0000-0000-0000-000000000000\"\ndata_home = \"/tmp/legacy\"\n",
+        )
+        .expect("write");
+        let err = RepositoryPointer::read(&repo).unwrap_err();
+        assert!(matches!(err, CliError::StoreCorrupted(_)));
+    }
+
+    #[test]
+    fn read_pointer_rejects_relative_data_home() {
+        let dir = tempdir();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(repo.join(POINTER_BASENAME)).expect("pointer dir");
+        std::fs::write(
+            repo.join(POINTER_BASENAME).join(POINTER_FILENAME),
+            "schema_version = 1\nproject_id = \"00000000-0000-0000-0000-000000000000\"\ndata_home = \"relative/path\"\n",
+        )
+        .expect("write");
+        let err = RepositoryPointer::read(&repo).unwrap_err();
+        assert!(matches!(err, CliError::StoreCorrupted(_)));
+    }
+
+    #[test]
+    fn write_pointer_rejects_relative_data_home() {
+        let dir = tempdir();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let pointer = RepositoryPointer {
+            schema_version: 1,
+            project_id: ProjectId::new(),
+            data_home: PathBuf::from("relative/path"),
+        };
+        let err = pointer.write(&repo).unwrap_err();
+        assert!(matches!(err, CliError::StoreCorrupted(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pointer_file_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let pointer = RepositoryPointer {
+            schema_version: 1,
+            project_id: ProjectId::new(),
+            data_home: dir.join("user-data"),
+        };
+        pointer.write(&repo).expect("write");
+        let metadata = std::fs::metadata(repo.join(POINTER_BASENAME).join(POINTER_FILENAME))
+            .expect("metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_directory_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir();
+        let project_dir = dir.join("project");
+        std::fs::create_dir_all(&project_dir).expect("project");
+        std::fs::write(project_dir.join(DATABASE_FILENAME), b"x").expect("database");
+        secure_project_dir(&project_dir);
+        let dir_mode =
+            std::fs::metadata(&project_dir).expect("dir metadata").permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(project_dir.join(DATABASE_FILENAME))
+            .expect("file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "project directory must be owner-only");
+        assert_eq!(file_mode, 0o600, "database file must be owner-only");
     }
 
     fn tempdir() -> PathBuf {

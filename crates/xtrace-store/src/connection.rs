@@ -99,6 +99,11 @@ pub struct OpenOptions {
     busy_timeout: BusyTimeout,
     app_version: String,
     correlation_id: CorrelationId,
+    /// When `true`, opening fails with
+    /// [`StoreErrorKind::Validation`] when the SQLite file does not
+    /// already exist. Used by callers (`open`, `status`) that must
+    /// refuse an absent project rather than create one implicitly.
+    must_exist: bool,
 }
 
 impl Default for OpenOptions {
@@ -107,6 +112,7 @@ impl Default for OpenOptions {
             busy_timeout: BusyTimeout::default(),
             app_version: STORE_APP_VERSION.to_string(),
             correlation_id: CorrelationId::new(),
+            must_exist: false,
         }
     }
 }
@@ -132,6 +138,23 @@ impl OpenOptions {
         self.correlation_id = id;
         self
     }
+
+    /// Requires the database file to already exist. When set,
+    /// [`SqliteStore::open`] returns
+    /// [`StoreErrorKind::Validation`] when the path is absent so the
+    /// caller can surface a truthful "uninitialized" error instead of
+    /// silently creating the file.
+    #[must_use]
+    pub fn with_must_exist(mut self, must_exist: bool) -> Self {
+        self.must_exist = must_exist;
+        self
+    }
+
+    /// Returns whether the open requires the file to already exist.
+    #[must_use]
+    pub const fn must_exist(&self) -> bool {
+        self.must_exist
+    }
 }
 
 /// Result of opening a store.
@@ -153,6 +176,11 @@ pub struct StoreBootstrap {
 pub struct SqliteStore {
     inner: std::sync::Arc<Mutex<Connection>>,
     bootstrap: StoreBootstrap,
+    /// Correlation ID threaded in by the application facade before
+    /// each port call. Repositories read this value so a port-side
+    /// failure surfaces the request's correlation ID rather than an
+    /// infrastructure-generated one.
+    current_correlation_id: std::sync::Arc<std::sync::Mutex<CorrelationId>>,
 }
 
 impl SqliteStore {
@@ -170,7 +198,9 @@ impl SqliteStore {
 
     /// Opens or creates a store at the supplied path. The parent
     /// directory must already exist; the store creates the database
-    /// file itself.
+    /// file itself unless [`OpenOptions::with_must_exist`] is set,
+    /// in which case opening an absent file fails with
+    /// [`StoreErrorKind::Validation`].
     ///
     /// # Errors
     ///
@@ -185,6 +215,13 @@ impl SqliteStore {
                     options.correlation_id,
                 ));
             }
+        }
+        if options.must_exist() && !path.exists() {
+            return Err(StoreError::new(
+                StoreErrorKind::Validation,
+                "database file does not exist; run `xtrace init` first",
+                options.correlation_id,
+            ));
         }
         let connection = Connection::open(path)
             .map_err(|err| StoreError::from_rusqlite(err, options.correlation_id))?;
@@ -208,7 +245,13 @@ impl SqliteStore {
             migrations::apply_pending(&connection, &options.app_version, options.correlation_id)?;
         let bootstrap =
             StoreBootstrap { database_path, schema_version, busy_timeout: options.busy_timeout };
-        Ok(Self { inner: std::sync::Arc::new(Mutex::new(connection)), bootstrap })
+        Ok(Self {
+            inner: std::sync::Arc::new(Mutex::new(connection)),
+            bootstrap,
+            current_correlation_id: std::sync::Arc::new(std::sync::Mutex::new(
+                options.correlation_id,
+            )),
+        })
     }
 
     /// Returns the bootstrap snapshot.
@@ -224,6 +267,25 @@ impl SqliteStore {
     #[must_use]
     pub fn project_repository(&self) -> SqliteProjectRepository<'_> {
         SqliteProjectRepository::new(self)
+    }
+
+    /// Sets the correlation ID used by port implementations for the
+    /// next call(s). The application facade calls this with the
+    /// request context's correlation ID before invoking a port so
+    /// infrastructure failures carry the request identity, not a
+    /// fresh [`CorrelationId::new`].
+    pub fn set_correlation_id(&self, id: CorrelationId) {
+        if let Ok(mut guard) = self.current_correlation_id.lock() {
+            *guard = id;
+        }
+    }
+
+    /// Returns the correlation ID currently in effect for port calls.
+    pub(crate) fn current_correlation_id(&self) -> CorrelationId {
+        self.current_correlation_id
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or_else(|_| CorrelationId::new())
     }
 
     /// Acquires the underlying connection lock. Used by sibling

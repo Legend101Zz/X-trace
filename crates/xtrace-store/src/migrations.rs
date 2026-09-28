@@ -19,21 +19,22 @@
 //!
 //! ## Identity and checksums
 //!
-//! The runner also records a deterministic BLAKE3-256 checksum of
-//! the entire migration catalog (labels concatenated with their SQL
-//! statements) in `schema_meta.catalog_checksum`. Opening a database
-//! whose stored checksum does not match the binary's compiled-in
-//! catalog fails with [`StoreErrorKind::SchemaIncompatible`] so a
-//! tampered or partially-applied schema cannot silently corrupt
-//! later slices. The checksum is computed only over the migrations
-//! the binary ships, so a newer binary that adds a migration can
-//! read an older checksum, recompute its own, and apply the missing
-//! delta.
+//! The runner records the BLAKE3-256 checksum of the *applied*
+//! prefix of the migration catalog — that is, the ordered
+//! concatenation of every migration whose version is less than or
+//! equal to the stored `schema_version`. The checksum is updated
+//! transactionally with the version bump, and the stored checksum is
+//! verified against the binary's compiled-in prefix *before* any
+//! pending migration runs so a tampered older checksum cannot be
+//! silently overwritten by a later migration's write. A mismatch on
+//! an already-migrated database fails with
+//! [`StoreErrorKind::SchemaIncompatible`] so a tampered or partially
+//! applied schema cannot corrupt later slices.
 
 use std::collections::BTreeMap;
 
 use rusqlite::Connection;
-use xtrace_domain::{ContentHash, CorrelationId, WallTime};
+use xtrace_domain::{CorrelationId, WallTime};
 
 use crate::error::{StoreError, StoreErrorKind};
 
@@ -71,30 +72,45 @@ impl Migrations {
         Self::catalog().into_iter().map(|record| (record.version, record)).collect()
     }
 
-    /// Returns the canonical identity for the compiled-in migration
-    /// catalog as the lowercase `b3:<hex>` form. The hash covers the
-    /// ordered `(label, version, statement)` triples so any textual
-    /// change to a migration produces a new identity.
+    /// Computes the BLAKE3-256 checksum of the supplied migration
+    /// slice, in version order, rendered as the lowercase
+    /// `b3:<lowercase hex>` form via
+    /// [`xtrace_domain::ContentHash::from_blake3_digest`].
     ///
-    /// [`ContentHash::to_canonical`]: xtrace_domain::ContentHash::to_canonical
+    /// The hash covers the ordered `(label, version, statement)`
+    /// triples so any textual change to a migration produces a new
+    /// identity. The function takes the slice directly so callers
+    /// can compute the prefix checksum (the applied portion of the
+    /// catalog) without copying the whole catalog.
     #[must_use]
-    pub fn catalog_checksum() -> String {
+    pub fn prefix_checksum(records: &[MigrationRecord]) -> String {
         let mut hasher = blake3::Hasher::new();
-        for record in Self::catalog() {
+        for record in records {
             hasher.update(&record.version.to_be_bytes());
             hasher.update(record.label.as_bytes());
             for statement in record.statements {
                 hasher.update(statement.as_bytes());
             }
         }
-        let digest = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(digest.as_bytes());
-        ContentHash::of_bytes(&bytes).to_canonical()
+        xtrace_domain::ContentHash::from_blake3_digest(hasher.finalize()).to_canonical()
+    }
+
+    /// Returns the canonical identity for the entire compiled-in
+    /// catalog. Equivalent to
+    /// [`Self::prefix_checksum`] applied to the full catalog and
+    /// exposed separately so existing callers do not have to
+    /// collect the catalog twice.
+    #[must_use]
+    pub fn catalog_checksum() -> String {
+        Self::prefix_checksum(&Self::catalog())
     }
 }
 
-/// First schema version. Created by `v0001_initial`.
+/// First schema version. Created by `v0001_initial`. The
+/// `applied_checksum` column records the BLAKE3-256 identity of the
+/// applied prefix of the migration catalog and is the canonical
+/// guarantee that the SQL the binary would emit matches the SQL
+/// that originally produced the schema.
 const INITIAL_SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS schema_meta (
     singleton           INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -102,7 +118,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     min_reader_version  INTEGER NOT NULL,
     migrated_at         TEXT NOT NULL,
     app_version         TEXT NOT NULL,
-    catalog_checksum    TEXT NOT NULL
+    applied_checksum    TEXT NOT NULL
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -175,18 +191,37 @@ CREATE INDEX IF NOT EXISTS projects_canonical_repo_hash
     ON projects (canonical_repo_hash);
 ";
 
-/// Applies every pending migration to the supplied connection.
+/// Applies every pending migration from the compiled-in catalog to
+/// the supplied connection.
 ///
 /// The function is total: it returns a [`StoreError`] describing the
-/// first failure it encounters. After a successful return the
-/// `schema_meta` singleton records the version reached.
+/// first failure it encounters. The applied-prefix checksum stored on
+/// disk is verified *before* any pending migration runs so a tampered
+/// older checksum cannot be silently overwritten by a later
+/// migration's write.
 pub fn apply_pending(
     connection: &Connection,
     app_version: &str,
     correlation_id: CorrelationId,
 ) -> Result<u32, StoreError> {
-    let catalog = Migrations::catalog_by_version();
-    let latest = Migrations::latest_version();
+    apply_catalog(connection, app_version, correlation_id, &Migrations::catalog())
+}
+
+/// Applies every migration in the supplied catalog that is not yet
+/// present on disk. The function is the test-friendly twin of
+/// [`apply_pending`]: it accepts an explicit catalog so a future
+/// slice (or a regression test) can exercise the
+/// "tampered-prefix / pending-next" interaction without modifying
+/// the compiled-in catalog.
+pub fn apply_catalog(
+    connection: &Connection,
+    app_version: &str,
+    correlation_id: CorrelationId,
+    catalog: &[MigrationRecord],
+) -> Result<u32, StoreError> {
+    let catalog_by_version: BTreeMap<u32, MigrationRecord> =
+        catalog.iter().map(|record| (record.version, record.clone())).collect();
+    let latest = catalog.last().map_or(0, |record| record.version);
 
     let current = current_schema_version(connection, correlation_id)?;
     if current > latest {
@@ -197,22 +232,23 @@ pub fn apply_pending(
         ));
     }
 
+    // Verify the on-disk prefix identity *before* running any
+    // pending migration. The check proves the SQL the binary would
+    // emit matches the SQL that originally produced the schema; a
+    // mismatch on an already-migrated database fails closed without
+    // mutating state.
+    verify_applied_checksum(connection, catalog, current, correlation_id)?;
+
     for version in (current + 1)..=latest {
-        let record = catalog.get(&version).ok_or_else(|| {
+        let record = catalog_by_version.get(&version).ok_or_else(|| {
             StoreError::new(
                 StoreErrorKind::SchemaIncompatible,
                 format!("missing migration v{version:04}"),
                 correlation_id,
             )
         })?;
-        apply_one(connection, record, app_version, correlation_id)?;
+        apply_one(connection, record, app_version, catalog, correlation_id)?;
     }
-
-    // Compare the catalog identity stored on disk against the binary's
-    // compiled-in catalog. A mismatch on a previously migrated
-    // database means the schema was tampered with or restored from
-    // an incompatible source; refuse to read it.
-    verify_catalog_checksum(connection, correlation_id)?;
 
     Ok(latest)
 }
@@ -221,6 +257,7 @@ fn apply_one(
     connection: &Connection,
     record: &MigrationRecord,
     app_version: &str,
+    catalog: &[MigrationRecord],
     correlation_id: CorrelationId,
 ) -> Result<(), StoreError> {
     let tx = connection
@@ -230,7 +267,7 @@ fn apply_one(
         tx.execute_batch(statement)
             .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
     }
-    record_schema_version(&tx, record.version, app_version, correlation_id)?;
+    record_schema_version(&tx, record.version, app_version, catalog, correlation_id)?;
     tx.commit().map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
     Ok(())
 }
@@ -269,41 +306,50 @@ fn current_schema_version(
     })
 }
 
-/// Compares the catalog checksum stored on disk against the
-/// compiled-in catalog. A mismatch on a previously migrated database
-/// is treated as incompatible because the SQL the binary would emit
-/// no longer matches the SQL that originally produced the schema.
-fn verify_catalog_checksum(
+/// Compares the on-disk applied-prefix checksum against the
+/// compiled-in catalog's prefix checksum. A mismatch on an
+/// already-migrated database is treated as incompatible because the
+/// SQL the binary would emit no longer matches the SQL that
+/// originally produced the schema.
+fn verify_applied_checksum(
     connection: &Connection,
+    catalog: &[MigrationRecord],
+    current: u32,
     correlation_id: CorrelationId,
 ) -> Result<(), StoreError> {
     // A fresh database has just been migrated in this call; the
     // stored checksum is the one we wrote so it always matches.
     // The check is therefore meaningful only after the first
     // migration has been applied during a previous open.
-    let present: bool = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'",
-            [],
-            |row| row.get::<_, i64>(0).map(|_| true),
-        )
-        .optional()
-        .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?
-        .unwrap_or(false);
-    if !present {
+    if current == 0 {
         return Ok(());
     }
     let stored: String = connection
-        .query_row("SELECT catalog_checksum FROM schema_meta WHERE singleton = 1", [], |row| {
+        .query_row("SELECT applied_checksum FROM schema_meta WHERE singleton = 1", [], |row| {
             row.get(0)
         })
         .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
-    let expected = Migrations::catalog_checksum();
+    // The catalog slice for the applied prefix contains every
+    // migration whose version is less than or equal to the stored
+    // `current`. A truncation here would itself indicate tampering,
+    // so we surface it explicitly rather than guessing.
+    let prefix: Vec<MigrationRecord> =
+        catalog.iter().filter(|record| record.version <= current).cloned().collect();
+    if prefix.len() as u32 != current {
+        return Err(StoreError::new(
+            StoreErrorKind::SchemaIncompatible,
+            format!(
+                "binary catalog is missing migrations up to v{current:04}; cannot verify prefix"
+            ),
+            correlation_id,
+        ));
+    }
+    let expected = Migrations::prefix_checksum(&prefix);
     if stored != expected {
         return Err(StoreError::new(
             StoreErrorKind::SchemaIncompatible,
             format!(
-                "stored migration catalog checksum {stored} does not match binary catalog {expected}"
+                "stored applied checksum {stored} does not match binary prefix checksum {expected}"
             ),
             correlation_id,
         ));
@@ -311,19 +357,25 @@ fn verify_catalog_checksum(
     Ok(())
 }
 
-/// Inserts (or replaces) the singleton `schema_meta` row.
+/// Inserts (or replaces) the singleton `schema_meta` row. The
+/// `applied_checksum` column is recomputed over the supplied
+/// catalog's prefix up to the new version and stored alongside the
+/// version bump in the same transaction.
 fn record_schema_version(
     connection: &Connection,
     version: u32,
     app_version: &str,
+    catalog: &[MigrationRecord],
     correlation_id: CorrelationId,
 ) -> Result<(), StoreError> {
     let now = WallTime::now().to_rfc3339();
-    let checksum = Migrations::catalog_checksum();
+    let prefix: Vec<MigrationRecord> =
+        catalog.iter().filter(|record| record.version <= version).cloned().collect();
+    let checksum = Migrations::prefix_checksum(&prefix);
     connection
         .execute(
             "INSERT OR REPLACE INTO schema_meta \
-             (singleton, schema_version, min_reader_version, migrated_at, app_version, catalog_checksum) \
+             (singleton, schema_version, min_reader_version, migrated_at, app_version, applied_checksum) \
              VALUES (1, ?1, ?1, ?2, ?3, ?4)",
             rusqlite::params![i64::from(version), now, app_version, checksum],
         )
@@ -382,30 +434,74 @@ mod tests {
     }
 
     #[test]
-    fn catalog_checksum_records_binary_identity() {
+    fn applied_checksum_records_binary_prefix_identity() {
         let conn = new_memory();
         apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply");
         let stored: String = conn
-            .query_row("SELECT catalog_checksum FROM schema_meta WHERE singleton = 1", [], |row| {
+            .query_row("SELECT applied_checksum FROM schema_meta WHERE singleton = 1", [], |row| {
                 row.get(0)
             })
             .expect("checksum row");
-        assert_eq!(stored, Migrations::catalog_checksum());
+        let expected = Migrations::prefix_checksum(&Migrations::catalog());
+        assert_eq!(stored, expected);
     }
 
     #[test]
-    fn tampered_checksum_is_rejected_as_incompatible() {
+    fn tampered_applied_checksum_is_rejected_before_pending_runs() {
+        // The regression we are guarding against: a future binary
+        // that ships a v2 migration could overwrite the on-disk
+        // checksum with the new full-catalog hash before the older
+        // checksum was verified. With the new design the older
+        // checksum is verified *before* any pending migration runs,
+        // so a tampered value is rejected without v2 mutating state.
         let conn = new_memory();
-        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply");
-        // Simulate tampering by overwriting the stored checksum with
-        // the wrong value. The next open must refuse the database.
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v1");
+        let v1 = Migrations::catalog();
+        let v1_count = table_count(&conn, "projects");
+
+        // Inject a pending v2 into the catalog (test fixture; not
+        // present in the compiled-in production catalog).
+        const V2_STATEMENT: &str =
+            "ALTER TABLE projects ADD COLUMN test_marker TEXT NOT NULL DEFAULT ''";
+        let catalog = vec![
+            v1[0].clone(),
+            MigrationRecord { version: 2, label: "v0002_marker", statements: &[V2_STATEMENT] },
+        ];
+
+        // Tamper the stored applied checksum.
         conn.execute(
-            "UPDATE schema_meta SET catalog_checksum = 'b3:0000000000000000000000000000000000000000000000000000000000000000' WHERE singleton = 1",
+            "UPDATE schema_meta SET applied_checksum = 'b3:0000000000000000000000000000000000000000000000000000000000000000' WHERE singleton = 1",
             [],
         )
         .expect("tamper checksum");
-        let err = apply_pending(&conn, "0.1.0-test", CorrelationId::new()).unwrap_err();
+
+        let err = apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &catalog)
+            .expect_err("tampered checksum must be rejected");
         assert_eq!(err.kind(), StoreErrorKind::SchemaIncompatible);
+        // v2 must not have run; the marker column must be absent.
+        assert_eq!(table_count(&conn, "projects"), v1_count);
+        let columns = list_columns(&conn, "projects");
+        assert!(
+            !columns.iter().any(|name| name == "test_marker"),
+            "v2 must not have mutated the schema when checksum was rejected"
+        );
+    }
+
+    #[test]
+    fn fresh_database_ignores_pending_catalog_without_checksum_failure() {
+        // A fresh database has no stored checksum. The verification
+        // step short-circuits and pending migrations apply as usual.
+        let conn = new_memory();
+        let v1 = Migrations::catalog();
+        const V2_STATEMENT: &str =
+            "ALTER TABLE projects ADD COLUMN another_marker TEXT NOT NULL DEFAULT ''";
+        let catalog = vec![
+            v1[0].clone(),
+            MigrationRecord { version: 2, label: "v0002_another", statements: &[V2_STATEMENT] },
+        ];
+        let reached =
+            apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &catalog).expect("apply");
+        assert_eq!(reached, 2);
     }
 
     #[test]
@@ -417,5 +513,16 @@ mod tests {
         let a = Migrations::catalog_checksum();
         let b = blake3::hash(b"alternate-migration-text").to_string();
         assert_ne!(a, b);
+    }
+
+    fn table_count(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |row| row.get(0))
+            .expect("count")
+    }
+
+    fn list_columns(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).expect("prepare");
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1)).expect("rows");
+        rows.filter_map(Result::ok).collect()
     }
 }

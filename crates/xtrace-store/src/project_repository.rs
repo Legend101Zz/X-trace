@@ -63,7 +63,7 @@ impl<'store> SqliteProjectRepository<'store> {
     }
 
     fn correlation_id(&self) -> CorrelationId {
-        CorrelationId::new()
+        self.store.current_correlation_id()
     }
 }
 

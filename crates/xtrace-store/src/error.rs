@@ -170,11 +170,7 @@ impl StoreError {
 #[cfg(test)]
 // Tests intentionally panic on invariant violations because the
 // failure mode is "test failed", not "library panicked".
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "tests assert on fallible fixture data"
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests assert on fallible fixture data")]
 mod tests {
     use super::*;
 
