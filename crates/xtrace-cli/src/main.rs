@@ -1,8 +1,9 @@
 //! X-trace command line interface.
 //!
 //! The CLI is the simplest client of the application facade. Each
-//! subcommand translates CLI arguments into a [`Command`] or
-//! [`Query`], invokes the application, and renders the result as
+//! subcommand translates CLI arguments into a
+//! [`xtrace_application::Command`] or [`xtrace_application::Query`],
+//! invokes the application, and renders the result as
 //! machine-readable JSON so downstream automation does not depend on
 //! human-readable output formatting.
 //!
@@ -15,9 +16,9 @@
 //! - `xtrace status` — emit a truthful machine-readable status report
 //!   for the local store.
 //!
-//! The CLI never claims capture or replay support. [`status`] sets
-//! `capture_supported` and `replay_supported` to `false` until a
-//! future slice wires the corresponding capabilities.
+//! The CLI never claims capture or replay support. The `status`
+//! subcommand sets `capture_supported` and `replay_supported` to
+//! `false` until a future slice wires the corresponding capabilities.
 //!
 //! ## Storage layout
 //!

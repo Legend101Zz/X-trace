@@ -6,7 +6,7 @@
 //! - the command and query types that clients (CLI, TUI, web) speak;
 //! - the port traits that infrastructure must implement;
 //! - the [`Application`] facade that orchestrates a single command or
-//!   query and returns typed [`AppError`]s;
+//!   query and returns typed [`xtrace_domain::AppError`]s;
 //! - the bridge between internal port errors and the public error
 //!   contract so domain rules stay in domain, transport stays in
 //!   transport, and neither leaks across the boundary.

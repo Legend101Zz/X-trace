@@ -4,7 +4,7 @@
 //! (CLI, TUI, daemon HTTP handlers). It owns the [`RequestContext`]
 //! factory, validates incoming commands and queries, orchestrates the
 //! relevant ports, and translates internal failures into typed
-//! [`AppError`] values.
+//! [`xtrace_domain::AppError`] values.
 //!
 //! The facade is intentionally generic over a single repository port
 //! and an idempotency-store port in Slice 1A. Future slices
@@ -92,8 +92,8 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
     ///
     /// # Errors
     ///
-    /// Returns [`AppError`] for every validation or port failure.
-    /// Validation failures are surfaced as
+    /// Returns [`xtrace_domain::AppError`] for every validation or
+    /// port failure. Validation failures are surfaced as
     /// [`ErrorCategory::Validation`]; port failures are translated
     /// into the matching [`ErrorCategory`] before crossing the
     /// boundary. A reused idempotency key with a different canonical
@@ -113,7 +113,8 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
     ///
     /// # Errors
     ///
-    /// Returns [`AppError`] for validation or port failures.
+    /// Returns [`xtrace_domain::AppError`] for validation or port
+    /// failures.
     pub fn query(&self, query: Query, ctx: &RequestContext) -> Result<QueryResult, AppError> {
         match query {
             Query::GetProject(query) => self.get_project(query, ctx),
@@ -121,12 +122,12 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
         }
     }
 
-    /// Convenience helper that allocates a [`RunId`] through the port
-    /// without exposing the port directly.
+    /// Convenience helper that allocates a [`xtrace_domain::RunId`]
+    /// through the port without exposing the port directly.
     ///
     /// # Errors
     ///
-    /// Returns [`AppError`] when the project is missing or the port
+    /// Returns [`xtrace_domain::AppError`] when the project is missing or the port
     /// fails to allocate the identifier.
     pub fn allocate_run(
         &self,
@@ -535,10 +536,11 @@ fn existing_project_error(
     .with_detail("fingerprint", fingerprint.as_str().to_string())
 }
 
-/// Translates an internal [`PortError`] into the public [`AppError`]
-/// contract. The request correlation ID is preserved on the surface;
-/// the infrastructure-generated correlation ID is retained as a
-/// diagnostic detail so a future slice can correlate the two without
+/// Translates an internal [`PortError`] into the public
+/// [`xtrace_domain::AppError`] contract. The request correlation ID
+/// is preserved on the surface; the infrastructure-generated
+/// correlation ID is retained as a diagnostic detail so a future
+/// slice can correlate the two without
 /// losing the request identity. The mapping is total so port authors
 /// cannot accidentally leak a variant through the boundary.
 fn port_error_to_app_error(err: PortError, request_correlation_id: CorrelationId) -> AppError {

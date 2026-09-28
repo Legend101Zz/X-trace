@@ -58,8 +58,8 @@ pub enum XtraceCommand {
 }
 
 /// Dispatches the supplied subcommand and writes the result to
-/// stdout. Errors propagate as [`CliError`] so [`main`] can render
-/// them.
+/// stdout. Errors propagate as [`CliError`] so the binary entry
+/// point can render them.
 pub fn run(command: XtraceCommand) -> Result<(), CliError> {
     match command {
         XtraceCommand::Init { project_dir, display_name, idempotency_key } => {
@@ -184,12 +184,17 @@ where
         .map_err(CliError::from)?;
 
     // Persist the repository pointer only after the application
-    // returns success. If `pointer.write` fails, the local database
-    // has been initialized but the repository has no pointer file;
-    // a follow-up `init` returns the idempotency receipt and re-
-    // attempts the pointer write once the underlying I/O error is
-    // resolved. The repository is *not* rolled back to an
-    // uninitialized state.
+    // returns success. The pointer is the only place the project ID
+    // is recorded outside the database, so a failed `pointer.write`
+    // leaves Slice 1A in a state it cannot recover from
+    // automatically: the database at
+    // `<data_home>/projects/<project_id>/` contains a project row
+    // but the repository has no `.xtrace/config.toml` pointer, and
+    // a subsequent `init` cannot locate the orphaned database
+    // because the CLI generates a fresh project ID on retry. Slice
+    // 1A does not redesign recovery; the bounded risk is that the
+    // orphaned `<data_home>/projects/<project_id>/` directory must
+    // be cleaned up manually.
     let pointer = RepositoryPointer { schema_version: 1, project_id, data_home: user_data_home };
     pointer.write(&repo)?;
 
@@ -212,6 +217,13 @@ where
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
 
+    // Repair the project directory and database file modes before
+    // SQLite touches the file. An older binary could have left the
+    // directory or database world-readable; tightening here ensures
+    // SQLite reads (and the migration runner) never see loose
+    // permissions, and a chmod failure surfaces before any data is
+    // read or migrated.
+    secure_project_dir(&project_directory)?;
     let store = SqliteStore::open(
         &database_path,
         xtrace_store::OpenOptions::default()
@@ -219,10 +231,6 @@ where
             .with_correlation_id(ctx.correlation_id),
     )
     .map_err(map_store_error)?;
-    // Defensively tighten the project directory and database file
-    // permissions in case the directory was created by an older
-    // binary that did not enforce owner-only access. Fails closed.
-    secure_project_dir(&project_directory)?;
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -269,6 +277,11 @@ where
                 UserDataPaths::project_dir_with_home(&data_home, pointer.project_id)?;
             let database_path =
                 UserDataPaths::database_path_with_home(&data_home, pointer.project_id)?;
+            // Repair the project directory and database file modes
+            // before SQLite touches the file so an older binary that
+            // left them world-readable is tightened (or rejected)
+            // before the migration runner reads the schema.
+            secure_project_dir(&project_directory)?;
             let store = SqliteStore::open(
                 &database_path,
                 xtrace_store::OpenOptions::default()
@@ -276,7 +289,6 @@ where
                     .with_correlation_id(ctx.correlation_id),
             )
             .map_err(map_store_error)?;
-            secure_project_dir(&project_directory)?;
             let repository = SqliteProjectRepository::new(&store);
             let idempotency = SqliteIdempotencyStore::new(&store);
             let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);

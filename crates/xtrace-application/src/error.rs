@@ -2,9 +2,9 @@
 //!
 //! Every port method returns a [`PortError`]. The [`Application`]
 //! facade converts each variant into the corresponding public
-//! [`AppError`] before the value crosses a boundary. This keeps
-//! domain rules and transport details confined to their respective
-//! layers.
+//! [`xtrace_domain::AppError`] before the value crosses a boundary.
+//! This keeps domain rules and transport details confined to their
+//! respective layers.
 //!
 //! [`Application`]: crate::application::Application
 

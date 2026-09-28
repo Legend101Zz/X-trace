@@ -129,11 +129,19 @@ impl RepositoryPointer {
     ///
     /// The helper fails closed on Unix: every chmod step returns
     /// [`CliError::StoreUnavailable`] on failure. If the write fails
-    /// after the database has been initialized, the repository is
-    /// left in an "initialized database, missing repo pointer" state;
-    /// a follow-up `init` returns the idempotency receipt and can
-    /// re-attempt the pointer write once the underlying I/O error
-    /// is resolved.
+    /// after the local database has been initialized, Slice 1A is
+    /// left in a state it cannot recover from automatically: the
+    /// database at `<data_home>/projects/<project_id>/` contains a
+    /// project row but the repository has no `.xtrace/config.toml`
+    /// pointer, and the CLI generated the project ID locally so it
+    /// cannot discover the orphaned directory from a missing pointer.
+    /// A subsequent `init` cannot replay the original receipt
+    /// through the public path because the CLI assigns a fresh
+    /// project ID on retry and the resulting pointer would resolve
+    /// to a different database. Slice 1A does not redesign recovery;
+    /// the bounded risk is that the orphaned
+    /// `<data_home>/projects/<project_id>/` directory must be
+    /// cleaned up manually.
     ///
     /// # Errors
     ///
@@ -367,10 +375,10 @@ pub fn restrict_project_dir(project_dir: &Path) -> Result<(), CliError> {
 /// Pre-creates the SQLite database file with mode `0600` (using
 /// [`std::fs::OpenOptions`] plus
 /// [`std::os::unix::fs::OpenOptionsExt::mode`]) and verifies the
-/// mode before [`SqliteStore::open`] is called. The helper is
-/// invoked from `init` so the file is born owner-only and SQLite
-/// does not briefly expose it with the directory's default mode.
-/// `truncate(false)` keeps the helper safe to call against a
+/// mode before [`xtrace_store::SqliteStore::open`] is called. The
+/// helper is invoked from `init` so the file is born owner-only and
+/// SQLite does not briefly expose it with the directory's default
+/// mode. `truncate(false)` keeps the helper safe to call against a
 /// pre-existing file. Fails closed on Unix; returns `Ok(())` off
 /// Unix (documented no-op).
 pub fn precreate_database_file(database: &Path) -> Result<(), CliError> {
@@ -402,9 +410,10 @@ pub fn precreate_database_file(database: &Path) -> Result<(), CliError> {
 }
 
 /// Sets owner-only permissions on the SQLite database file. Callers
-/// invoke this helper immediately after [`SqliteStore::open`]
-/// returns so the file is never readable by another user even when
-/// it was just created. Fails closed on Unix.
+/// invoke this helper immediately after
+/// [`xtrace_store::SqliteStore::open`] returns so the file is never
+/// readable by another user even when it was just created. Fails
+/// closed on Unix.
 pub fn restrict_database_file(database: &Path) -> Result<(), CliError> {
     chmod_file_owner_only(database)
 }

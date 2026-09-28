@@ -25,11 +25,13 @@ use crate::error::PortError;
 ///
 /// Implementations are expected to enforce uniqueness on
 /// `canonical_repo_hash`, propagate integrity errors as
-/// [`PortErrorKind::Corruption`], and translate schema-compatibility
-/// rejections into [`PortErrorKind::Compatibility`].
+/// [`crate::error::PortErrorKind::Corruption`], and translate
+/// schema-compatibility rejections into
+/// [`crate::error::PortErrorKind::Compatibility`].
 pub trait ProjectRepository: Send + Sync {
-    /// Inserts a new project. Returns [`PortErrorKind::AlreadyExists`]
-    /// when another project already owns the same fingerprint.
+    /// Inserts a new project. Returns
+    /// [`crate::error::PortErrorKind::AlreadyExists`] when another
+    /// project already owns the same fingerprint.
     ///
     /// # Errors
     ///
@@ -191,10 +193,10 @@ pub trait IdempotencyStore: Send + Sync {
 
     /// Persists a receipt. Implementations must treat
     /// `(command_kind, idempotency_key)` as unique within a project
-    /// and surface an `AlreadyExists` [`PortErrorKind`] when the key
-    /// is reused with a different canonical input. A retry with the
-    /// same canonical input must be a no-op so callers can record
-    /// idempotently.
+    /// and surface an `AlreadyExists`
+    /// [`crate::error::PortErrorKind`] when the key is reused with
+    /// a different canonical input. A retry with the same canonical
+    /// input must be a no-op so callers can record idempotently.
     ///
     /// # Errors
     ///
