@@ -98,7 +98,12 @@ impl Default for BusyTimeout {
 pub struct OpenOptions {
     busy_timeout: BusyTimeout,
     app_version: String,
-    correlation_id: CorrelationId,
+    /// Correlation ID attached to bootstrap diagnostics (pragma
+    /// application and migration runs). Per-request correlation IDs
+    /// are not threaded through this struct on purpose: repositories
+    /// mint their own infrastructure correlation IDs and the
+    /// application boundary surfaces the request correlation ID.
+    bootstrap_correlation_id: CorrelationId,
     /// When `true`, opening fails with
     /// [`StoreErrorKind::Validation`] when the SQLite file does not
     /// already exist. Used by callers (`open`, `status`) that must
@@ -111,7 +116,7 @@ impl Default for OpenOptions {
         Self {
             busy_timeout: BusyTimeout::default(),
             app_version: STORE_APP_VERSION.to_string(),
-            correlation_id: CorrelationId::new(),
+            bootstrap_correlation_id: CorrelationId::new(),
             must_exist: false,
         }
     }
@@ -132,18 +137,12 @@ impl OpenOptions {
         self
     }
 
-    /// Sets the correlation ID attached to bootstrap diagnostics.
-    #[must_use]
-    pub fn with_correlation_id(mut self, id: CorrelationId) -> Self {
-        self.correlation_id = id;
-        self
-    }
-
     /// Requires the database file to already exist. When set,
-    /// [`SqliteStore::open`] returns
-    /// [`StoreErrorKind::Validation`] when the path is absent so the
-    /// caller can surface a truthful "uninitialized" error instead of
-    /// silently creating the file.
+    /// [`SqliteStore::open`] opens the file with
+    /// [`rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE`] only so an
+    /// absent database is rejected without being created. The caller
+    /// surfaces a truthful "uninitialized" error instead of silently
+    /// creating the file.
     #[must_use]
     pub fn with_must_exist(mut self, must_exist: bool) -> Self {
         self.must_exist = must_exist;
@@ -176,11 +175,6 @@ pub struct StoreBootstrap {
 pub struct SqliteStore {
     inner: std::sync::Arc<Mutex<Connection>>,
     bootstrap: StoreBootstrap,
-    /// Correlation ID threaded in by the application facade before
-    /// each port call. Repositories read this value so a port-side
-    /// failure surfaces the request's correlation ID rather than an
-    /// infrastructure-generated one.
-    current_correlation_id: std::sync::Arc<std::sync::Mutex<CorrelationId>>,
 }
 
 impl SqliteStore {
@@ -191,40 +185,44 @@ impl SqliteStore {
     /// Returns [`StoreError`] when SQLite cannot open the connection
     /// or migrations fail.
     pub fn open_in_memory(options: OpenOptions) -> Result<Self, StoreError> {
+        let bootstrap = options.bootstrap_correlation_id;
         let connection = Connection::open_in_memory()
-            .map_err(|err| StoreError::from_rusqlite(err, options.correlation_id))?;
+            .map_err(|err| StoreError::from_rusqlite(err, bootstrap))?;
         Self::from_connection(connection, None, options)
     }
 
     /// Opens or creates a store at the supplied path. The parent
     /// directory must already exist; the store creates the database
     /// file itself unless [`OpenOptions::with_must_exist`] is set,
-    /// in which case opening an absent file fails with
-    /// [`StoreErrorKind::Validation`].
+    /// in which case the open flags exclude `SQLITE_OPEN_CREATE` so
+    /// an absent file is rejected atomically without being created.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when SQLite cannot open the connection,
     /// the parent directory does not exist, or migrations fail.
     pub fn open(path: &Path, options: OpenOptions) -> Result<Self, StoreError> {
+        let bootstrap = options.bootstrap_correlation_id;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 return Err(StoreError::new(
                     StoreErrorKind::Validation,
                     "parent directory of database file does not exist",
-                    options.correlation_id,
+                    bootstrap,
                 ));
             }
         }
-        if options.must_exist() && !path.exists() {
-            return Err(StoreError::new(
-                StoreErrorKind::Validation,
-                "database file does not exist; run `xtrace init` first",
-                options.correlation_id,
-            ));
-        }
-        let connection = Connection::open(path)
-            .map_err(|err| StoreError::from_rusqlite(err, options.correlation_id))?;
+        // When `must_exist` is set we open the file with read-write
+        // flags only so SQLite refuses to create the file. This closes
+        // the `path.exists()`-then-`Connection::open` race in which a
+        // missing database could be implicitly created.
+        let flags = if options.must_exist() {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        } else {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+        };
+        let connection = Connection::open_with_flags(path, flags)
+            .map_err(|err| StoreError::from_rusqlite(err, bootstrap))?;
         Self::from_connection(connection, Some(path.to_path_buf()), options)
     }
 
@@ -240,17 +238,15 @@ impl SqliteStore {
         database_path: Option<PathBuf>,
         options: OpenOptions,
     ) -> Result<Self, StoreError> {
-        apply_pragmas(&connection, options.busy_timeout, options.correlation_id)?;
+        let bootstrap = options.bootstrap_correlation_id;
+        apply_pragmas(&connection, options.busy_timeout, bootstrap)?;
         let schema_version =
-            migrations::apply_pending(&connection, &options.app_version, options.correlation_id)?;
-        let bootstrap =
+            migrations::apply_pending(&connection, &options.app_version, bootstrap)?;
+        let bootstrap_snapshot =
             StoreBootstrap { database_path, schema_version, busy_timeout: options.busy_timeout };
         Ok(Self {
             inner: std::sync::Arc::new(Mutex::new(connection)),
-            bootstrap,
-            current_correlation_id: std::sync::Arc::new(std::sync::Mutex::new(
-                options.correlation_id,
-            )),
+            bootstrap: bootstrap_snapshot,
         })
     }
 
@@ -267,25 +263,6 @@ impl SqliteStore {
     #[must_use]
     pub fn project_repository(&self) -> SqliteProjectRepository<'_> {
         SqliteProjectRepository::new(self)
-    }
-
-    /// Sets the correlation ID used by port implementations for the
-    /// next call(s). The application facade calls this with the
-    /// request context's correlation ID before invoking a port so
-    /// infrastructure failures carry the request identity, not a
-    /// fresh [`CorrelationId::new`].
-    pub fn set_correlation_id(&self, id: CorrelationId) {
-        if let Ok(mut guard) = self.current_correlation_id.lock() {
-            *guard = id;
-        }
-    }
-
-    /// Returns the correlation ID currently in effect for port calls.
-    pub(crate) fn current_correlation_id(&self) -> CorrelationId {
-        self.current_correlation_id
-            .lock()
-            .map(|guard| *guard)
-            .unwrap_or_else(|_| CorrelationId::new())
     }
 
     /// Acquires the underlying connection lock. Used by sibling
@@ -373,6 +350,22 @@ mod tests {
         let path = dir.join("missing").join("xtrace.sqlite3");
         let err = SqliteStore::open(&path, OpenOptions::default()).unwrap_err();
         assert_eq!(err.kind(), StoreErrorKind::Validation);
+    }
+
+    #[test]
+    fn must_exist_never_creates_the_database_file() {
+        // The previous `path.exists()` + `Connection::open` race
+        // could implicitly create a missing database even when the
+        // caller required it to already exist. With
+        // `SQLITE_OPEN_CREATE` excluded from the open flags the
+        // open returns a `Transport` failure (the typed mapping of
+        // SQLite's `CannotOpen` code) and the file remains absent.
+        let dir = tempdir();
+        let path = dir.join("must-exist.sqlite3");
+        let err =
+            SqliteStore::open(&path, OpenOptions::default().with_must_exist(true)).unwrap_err();
+        assert_eq!(err.kind(), StoreErrorKind::Transport);
+        assert!(!path.exists(), "must_exist must not create the SQLite file");
     }
 
     fn tempdir() -> PathBuf {

@@ -121,16 +121,6 @@ impl TryFrom<RepositoryPointerToml> for RepositoryPointer {
 }
 
 impl RepositoryPointer {
-    /// Returns the relative path of the pointer file inside the
-    /// repository root (`.xtrace/config.toml`). Exposed so future
-    /// CLI surfaces can refer to the same constant without
-    /// duplicating the layout.
-    #[must_use]
-    #[allow(dead_code, reason = "exposed for downstream callers and unit tests")]
-    pub fn relative_path() -> &'static str {
-        ".xtrace/config.toml"
-    }
-
     /// Writes the pointer file to the supplied repository root.
     /// The file is written atomically: the body first lands in a
     /// sibling `.tmp` file, then `rename` swaps it into place. The
@@ -214,14 +204,6 @@ impl RepositoryPointer {
 pub struct UserDataPaths;
 
 impl UserDataPaths {
-    /// Resolves the absolute user-data home directory, preferring the
-    /// `XTRACE_DATA_HOME` environment variable. Returns
-    /// [`CliError::StoreUnavailable`] when no home can be derived.
-    #[allow(dead_code, reason = "exposed for downstream callers and unit tests")]
-    pub fn home() -> Result<PathBuf, CliError> {
-        Self::home_with(read_env_path)
-    }
-
     /// Resolves the user-data home directory using a caller-supplied
     /// environment reader. Exposed for tests so the resolver can be
     /// exercised without mutating process-wide state.
@@ -249,20 +231,6 @@ impl UserDataPaths {
                 "could not determine user-data home; set XTRACE_DATA_HOME".to_string(),
             )
         })
-    }
-
-    /// Resolves the absolute directory that holds the supplied
-    /// project's user-data state under the resolved user-data home.
-    #[allow(dead_code, reason = "exposed for downstream callers and unit tests")]
-    pub fn project_dir(project_id: ProjectId) -> Result<PathBuf, CliError> {
-        Ok(Self::home()?.join(PROJECTS_FOLDER).join(project_id.to_string()))
-    }
-
-    /// Resolves the absolute path of the SQLite database file for the
-    /// supplied project under the resolved user-data home.
-    #[allow(dead_code, reason = "exposed for downstream callers and unit tests")]
-    pub fn database_path(project_id: ProjectId) -> Result<PathBuf, CliError> {
-        Ok(Self::project_dir(project_id)?.join(DATABASE_FILENAME))
     }
 
     /// Resolves the absolute project directory under the supplied
@@ -361,11 +329,28 @@ fn restrict_file_owner_only(path: &Path) {
 #[cfg(not(unix))]
 fn restrict_file_owner_only(_path: &Path) {}
 
+/// Sets owner-only permissions on the project directory. Callers must
+/// invoke this helper *before* SQLite creates the database file so
+/// the database file is born under a directory that other users on
+/// the host cannot enumerate. The helper is a no-op off Unix.
+pub fn restrict_project_dir(project_dir: &Path) {
+    restrict_dir_owner_only(project_dir);
+}
+
+/// Sets owner-only permissions on the SQLite database file. Callers
+/// must invoke this helper immediately after [`SqliteStore::open`]
+/// returns so the file is never readable by another user even when
+/// it was just created. The helper is a no-op off Unix.
+pub fn restrict_database_file(database: &Path) {
+    restrict_file_owner_only(database);
+}
+
 /// Sets owner-only permissions on a project directory and the SQLite
-/// file it contains when the platform supports it. Best-effort: a
-/// failure to chmod is non-fatal because the files already exist and
-/// the caller (CLI) reports the original I/O error rather than this
-/// permission adjustment.
+/// file it contains when the platform supports it. The helper is
+/// idempotent and is used by every CLI entry point that touches a
+/// previously-created project directory (`status`, `open`). A failure
+/// to chmod is non-fatal because the caller reports the original I/O
+/// error rather than this permission adjustment.
 pub fn secure_project_dir(project_dir: &Path) {
     restrict_dir_owner_only(project_dir);
     let database = project_dir.join(DATABASE_FILENAME);
@@ -380,11 +365,6 @@ pub fn secure_project_dir(project_dir: &Path) {
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests assert on fallible fixture data")]
 mod tests {
     use super::*;
-
-    #[test]
-    fn relative_path_matches_documented_layout() {
-        assert_eq!(RepositoryPointer::relative_path(), ".xtrace/config.toml");
-    }
 
     #[test]
     fn home_with_drives_project_and_database_paths() {

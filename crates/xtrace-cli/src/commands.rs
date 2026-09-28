@@ -13,13 +13,16 @@ use serde::Serialize;
 use xtrace_application::{
     Application, Command, GetStoreStatus, InitializeProject, OpenProject, Query, RequestContext,
 };
-use xtrace_domain::{ProjectId, WallTime};
+use xtrace_domain::WallTime;
 use xtrace_store::{CURRENT_SCHEMA_VERSION, SqliteIdempotencyStore, SqliteProjectRepository};
 use xtrace_store::{SqliteStore, StoreErrorKind};
 
 use crate::error::CliError;
 use crate::output::write_success;
-use crate::paths::{RepositoryPointer, UserDataPaths, secure_project_dir};
+use crate::paths::{
+    RepositoryPointer, UserDataPaths, restrict_database_file, restrict_project_dir,
+    secure_project_dir,
+};
 
 /// Top-level subcommand surface parsed by [`clap`].
 #[derive(Clone, Debug, Subcommand)]
@@ -110,24 +113,39 @@ where
 {
     let repo = resolve_repo(&project_dir)?;
     // Honour an existing pointer so re-running `init` against the
-    // same repository uses the original project identifier. The
-    // application facade's idempotency contract then either returns
-    // the original receipt (same canonical input) or surfaces
-    // `XTR-COMMAND-409` (different canonical input).
-    let existing_pointer = RepositoryPointer::read(&repo).ok();
+    // same repository uses the original project identifier. Only a
+    // missing pointer is treated as "fresh init"; every other
+    // pointer failure (corrupt body, unsupported schema version,
+    // relative `data_home`, I/O error) propagates so a corrupt
+    // pointer cannot be silently overwritten.
+    let existing_pointer = match RepositoryPointer::read(&repo) {
+        Ok(pointer) => Some(pointer),
+        Err(CliError::ProjectDirectoryMissing(_)) => None,
+        Err(err) => return Err(err),
+    };
     let user_data_home = resolve_data_home(existing_pointer.as_ref(), env_reader)?;
     let project_id =
         existing_pointer.as_ref().map(|pointer| pointer.project_id).unwrap_or_default();
     let project_directory = UserDataPaths::project_dir_with_home(&user_data_home, project_id)?;
+    let database_path = UserDataPaths::database_path_with_home(&user_data_home, project_id)?;
+    // Create the project directory and tighten its permissions to
+    // owner-only *before* SQLite creates the database file. Without
+    // this ordering, the freshly-created file would briefly inherit
+    // the directory's default permissions and be readable by other
+    // users on the host.
     std::fs::create_dir_all(&project_directory)
         .map_err(|err| CliError::StoreUnavailable(format!("create project dir: {err}")))?;
-    let database_path = UserDataPaths::database_path_with_home(&user_data_home, project_id)?;
+    restrict_project_dir(&project_directory);
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
 
     let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
         .map_err(map_store_error)?;
-    store.set_correlation_id(ctx.correlation_id);
+    // The database file was just created with default permissions.
+    // Restrict it to owner-only as soon as we hold the handle so the
+    // window between file creation and `secure_project_dir` does not
+    // expose the database.
+    restrict_database_file(&database_path);
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -157,14 +175,16 @@ where
         )
         .map_err(CliError::from)?;
 
-    // Tighten the directory and database permissions only after the
-    // application returns success: if `init` fails the directory is
-    // left untouched so a retry starts from a clean slate.
+    // Defensive: re-tighten the directory and database permissions.
+    // The directory and file were already restricted above; this
+    // call only matters when an earlier call failed silently on a
+    // non-Unix host.
     secure_project_dir(&project_directory);
 
     // Persist the repository pointer only after the application
-    // returns success. If `init` fails the repository stays
-    // uninitialized so a retry starts from a clean slate.
+    // returns success. A failure here leaves the database created
+    // but uninitialized, which is consistent with the previous
+    // behavior and the documented retry expectations.
     let pointer = RepositoryPointer { schema_version: 1, project_id, data_home: user_data_home };
     pointer.write(&repo)?;
 
@@ -181,7 +201,9 @@ where
 {
     let repo = resolve_repo(&project_dir)?;
     let pointer = RepositoryPointer::read(&repo)?;
-    let database_path = resolve_database_path(Some(&pointer), pointer.project_id, env_reader)?;
+    let data_home = resolve_data_home(Some(&pointer), env_reader)?;
+    let project_directory = UserDataPaths::project_dir_with_home(&data_home, pointer.project_id)?;
+    let database_path = UserDataPaths::database_path_with_home(&data_home, pointer.project_id)?;
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
 
@@ -190,7 +212,10 @@ where
         xtrace_store::OpenOptions::default().with_must_exist(true),
     )
     .map_err(map_store_error)?;
-    store.set_correlation_id(ctx.correlation_id);
+    // Defensively tighten the project directory and database file
+    // permissions in case the directory was created by an older
+    // binary that did not enforce owner-only access. Best effort.
+    secure_project_dir(&project_directory);
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -232,14 +257,17 @@ where
     // when the pointer is absent.
     let document = match RepositoryPointer::read(&repo) {
         Ok(pointer) => {
+            let data_home = resolve_data_home(Some(&pointer), env_reader)?;
+            let project_directory =
+                UserDataPaths::project_dir_with_home(&data_home, pointer.project_id)?;
             let database_path =
-                resolve_database_path(Some(&pointer), pointer.project_id, env_reader)?;
+                UserDataPaths::database_path_with_home(&data_home, pointer.project_id)?;
             let store = SqliteStore::open(
                 &database_path,
                 xtrace_store::OpenOptions::default().with_must_exist(true),
             )
             .map_err(map_store_error)?;
-            store.set_correlation_id(ctx.correlation_id);
+            secure_project_dir(&project_directory);
             let repository = SqliteProjectRepository::new(&store);
             let idempotency = SqliteIdempotencyStore::new(&store);
             let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -266,20 +294,6 @@ where
     let mut handle = stdout.lock();
     write_success(&mut handle, &document)?;
     Ok(())
-}
-
-/// Resolves the database path for the supplied pointer, honouring
-/// the precedence documented in [`resolve_data_home`].
-fn resolve_database_path<F>(
-    pointer: Option<&RepositoryPointer>,
-    project_id: ProjectId,
-    env_reader: &F,
-) -> Result<PathBuf, CliError>
-where
-    F: Fn(&str) -> Option<PathBuf>,
-{
-    let home = resolve_data_home(pointer, env_reader)?;
-    UserDataPaths::database_path_with_home(&home, project_id)
 }
 
 fn resolve_repo(project_dir: &Path) -> Result<PathBuf, CliError> {
@@ -457,6 +471,7 @@ impl StatusDocument {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use xtrace_domain::ProjectId;
 
     fn tempdir(label: &str) -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -703,5 +718,116 @@ mod tests {
             .filter_map(Result::ok)
             .collect();
         assert_eq!(project_dirs.len(), 1, "conflict must not create a second project directory");
+    }
+
+    #[test]
+    fn init_fails_when_pointer_is_corrupt_and_does_not_overwrite_or_create_user_data() {
+        // Regression test: a corrupt pointer file must surface as a
+        // corruption error rather than being silently treated as
+        // "no pointer" and overwritten by a fresh init. The user-data
+        // directory must not be created on the failure path so a
+        // retry starts from a clean slate.
+        let repo_dir = tempdir("corrupt");
+        std::fs::create_dir_all(&repo_dir).expect("repo");
+        std::fs::create_dir_all(repo_dir.join(".xtrace")).expect("pointer dir");
+        std::fs::write(repo_dir.join(".xtrace").join("config.toml"), "this-is-not-valid-toml = ")
+            .expect("write corrupt pointer");
+        let home = tempdir("home");
+        let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+        values.insert("XTRACE_DATA_HOME", home.clone());
+        values.insert("HOME", repo_dir.clone());
+        let env_reader = reader(values);
+        let err =
+            init(repo_dir.clone(), "Example".to_string(), String::new(), &env_reader).unwrap_err();
+        assert!(
+            matches!(err, CliError::StoreCorrupted(_)),
+            "corrupt pointer must surface as StoreCorrupted, got {err:?}"
+        );
+        // The corrupt pointer must remain untouched; the file system
+        // check below proves we did not overwrite it.
+        let pointer_text = std::fs::read_to_string(repo_dir.join(".xtrace").join("config.toml"))
+            .expect("pointer still readable");
+        assert_eq!(pointer_text, "this-is-not-valid-toml = ");
+        // No user-data directory must be created on the failure path.
+        assert!(!home.join("projects").exists(), "user-data must not be created on failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_enforces_owner_only_permissions_before_sqlite_creates_the_database() {
+        // Regression test for the permission ordering: the project
+        // directory must be `0700` and the database file `0600` once
+        // `init` returns. The test exercises a real CLI invocation
+        // and inspects the on-disk modes directly.
+        use std::os::unix::fs::PermissionsExt as _;
+        let repo_dir = tempdir("perms");
+        std::fs::create_dir_all(&repo_dir).expect("repo");
+        let home = tempdir("perms-home");
+        let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+        values.insert("XTRACE_DATA_HOME", home.clone());
+        values.insert("HOME", repo_dir.clone());
+        let env_reader = reader(values);
+        init(repo_dir.clone(), "Example".to_string(), String::new(), &env_reader).expect("init");
+        let projects = home.join("projects");
+        let project_dir = std::fs::read_dir(&projects)
+            .expect("projects dir")
+            .filter_map(Result::ok)
+            .next()
+            .expect("exactly one project directory");
+        let dir_mode =
+            std::fs::metadata(project_dir.path()).expect("dir metadata").permissions().mode()
+                & 0o777;
+        let db_mode = std::fs::metadata(project_dir.path().join("metadata.sqlite3"))
+            .expect("db metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "project directory must be owner-only");
+        assert_eq!(db_mode, 0o600, "database file must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_init_keeps_project_directory_owner_only() {
+        // Regression test for the permission ordering on the error
+        // path: a failing init (here, a duplicate fingerprint) must
+        // not leave the project directory or the database file
+        // world-readable. The chmod runs *before* the application
+        // facade executes, so the failure occurs after the modes
+        // were already tightened.
+        use std::os::unix::fs::PermissionsExt as _;
+        let repo_dir = tempdir("perms-fail");
+        std::fs::create_dir_all(&repo_dir).expect("repo");
+        let home = tempdir("perms-fail-home");
+        let projects_root = home.join("projects");
+        let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
+        values.insert("XTRACE_DATA_HOME", home.clone());
+        values.insert("HOME", repo_dir.clone());
+        let env_reader = reader(values);
+        init(repo_dir.clone(), "Example".to_string(), String::new(), &env_reader)
+            .expect("first init");
+        // Re-running with a different idempotency key against the
+        // same repo triggers `XTR-PROJECT-EXISTS`. The directory
+        // created by the first init must remain `0700`.
+        let values = reader_with_none();
+        let env_reader_2 = move |var: &str| {
+            if var == "XTRACE_DATA_HOME" { Some(home.clone()) } else { values(var) }
+        };
+        let _ = init(
+            repo_dir.clone(),
+            "Example".to_string(),
+            "different-key".to_string(),
+            &env_reader_2,
+        )
+        .unwrap_err();
+        let project_dir = std::fs::read_dir(&projects_root)
+            .expect("projects dir")
+            .filter_map(Result::ok)
+            .next()
+            .expect("exactly one project directory");
+        let dir_mode =
+            std::fs::metadata(project_dir.path()).expect("dir metadata").permissions().mode()
+                & 0o777;
+        assert_eq!(dir_mode, 0o700, "failing init must not leave the directory world-readable");
     }
 }

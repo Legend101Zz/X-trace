@@ -308,12 +308,14 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
         idempotency_key: &str,
         correlation_id: CorrelationId,
     ) -> Result<Option<StoredReceipt>, AppError> {
+        // The idempotency port mints its own infrastructure
+        // correlation ID per call. We pass it through to
+        // `port_error_to_app_error` so the original infrastructure
+        // identity is preserved as a diagnostic detail while the
+        // request correlation ID surfaces on the boundary.
         match self.idempotency.lookup_receipt(command_kind, idempotency_key) {
             Ok(receipt) => Ok(receipt),
-            Err(err) => Err(port_error_to_app_error(
-                attach_correlation(err, correlation_id),
-                correlation_id,
-            )),
+            Err(err) => Err(port_error_to_app_error(err, correlation_id)),
         }
     }
 
@@ -370,10 +372,10 @@ const COMMAND_KIND_OPEN: &str = "open_project";
 /// The digest is a single BLAKE3-256 hash over a deterministic,
 /// newline-separated encoding of the command arguments, rendered in
 /// the canonical `b3:<lowercase hex>` form via
-/// [`xtrace_domain::ContentHash::of_bytes`]. The encoding is
-/// intentionally stringly-typed so the hash changes only when the
-/// canonical input changes; whitespace, JSON formatting, or other
-/// transient encodings must not affect the digest.
+/// [`xtrace_domain::ContentHash::from_blake3_digest`]. The encoding
+/// is intentionally stringly-typed so the hash changes only when
+/// the canonical input changes; whitespace, JSON formatting, or
+/// other transient encodings must not affect the digest.
 fn canonical_input_digest(
     command_kind: &str,
     canonical_repo_path: &str,
@@ -434,19 +436,6 @@ fn idempotency_conflict(
     )
     .with_detail("idempotency_key", idempotency_key.to_string())
     .with_detail("original_correlation_id", original_correlation_id.to_string())
-}
-
-/// Attaches the supplied correlation ID to an existing port error
-/// without changing its kind or message. Infrastructure failures must
-/// preserve the request correlation ID so diagnostics can correlate
-/// CLI failures with store-side logs.
-fn attach_correlation(err: PortError, correlation_id: CorrelationId) -> PortError {
-    let source = err.source().map(str::to_owned);
-    let mut rebuilt = PortError::new(err.kind(), err.message(), correlation_id);
-    if let Some(source) = source {
-        rebuilt = rebuilt.with_source(source);
-    }
-    rebuilt
 }
 
 /// Validates that a canonical repository path is a non-empty UTF-8
@@ -1184,6 +1173,101 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.correlation_id, request);
         assert_eq!(err.category, ErrorCategory::Transport);
+    }
+
+    #[test]
+    fn concurrent_requests_share_a_store_without_racing_on_correlation_id() {
+        // Regression test for the race that existed when the store
+        // carried a single shared `current_correlation_id`. Two
+        // request contexts issued against the same `Application`
+        // (and therefore the same repository handle) must each
+        // surface their own request correlation ID at the boundary
+        // without one leaking into the other.
+        struct SharedCorruptionRepo;
+        impl ProjectRepository for SharedCorruptionRepo {
+            fn insert_project(&self, _: &Project) -> Result<(), PortError> {
+                Err(PortError::new(PortErrorKind::Corruption, "shared", CorrelationId::new()))
+            }
+            fn load_project_by_fingerprint(
+                &self,
+                _: &RepositoryFingerprint,
+            ) -> Result<Project, PortError> {
+                Err(PortError::new(PortErrorKind::Corruption, "shared", CorrelationId::new()))
+            }
+            fn load_project_by_id(&self, _: ProjectId) -> Result<Project, PortError> {
+                Err(PortError::new(PortErrorKind::NotFound, "not reached", CorrelationId::new()))
+            }
+            fn list_projects(&self) -> Result<Vec<Project>, PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn touch_last_opened(&self, _: ProjectId, _: WallTime) -> Result<(), PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn insert_run(&self, _: &Run, _: ProjectId, _: &str) -> Result<(), PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn load_run(&self, _: RunId) -> Result<Run, PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn update_run_state(
+                &self,
+                _: RunId,
+                _: RunState,
+                _: Option<WallTime>,
+                _: Option<&str>,
+            ) -> Result<(), PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+            fn allocate_run(
+                &self,
+                _: ProjectId,
+                _: RunKind,
+                _: &str,
+                _: &str,
+                _: WallTime,
+            ) -> Result<RunId, PortError> {
+                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+            }
+        }
+        let app: Application<SharedCorruptionRepo, StubIdempotencyStore> =
+            Application::new(SharedCorruptionRepo, StubIdempotencyStore::new(), 1, 1, 0);
+        let request_a = CorrelationId::new();
+        let request_b = CorrelationId::new();
+        let mut ctx_a = RequestContext::new("a", WallTime::now());
+        ctx_a.correlation_id = request_a;
+        let mut ctx_b = RequestContext::new("b", WallTime::now());
+        ctx_b.correlation_id = request_b;
+        let err_a = app
+            .execute(
+                Command::InitializeProject(InitializeProject {
+                    canonical_repo_path: "/tmp/example".to_string(),
+                    display_name: "Example".to_string(),
+                    idempotency_key: "idem-a".to_string(),
+                    project_id: ProjectId::new(),
+                }),
+                &ctx_a,
+            )
+            .unwrap_err();
+        let err_b = app
+            .execute(
+                Command::InitializeProject(InitializeProject {
+                    canonical_repo_path: "/tmp/example".to_string(),
+                    display_name: "Example".to_string(),
+                    idempotency_key: "idem-b".to_string(),
+                    project_id: ProjectId::new(),
+                }),
+                &ctx_b,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err_a.correlation_id, request_a,
+            "request A must surface its own correlation ID"
+        );
+        assert_eq!(
+            err_b.correlation_id, request_b,
+            "request B must surface its own correlation ID"
+        );
+        assert_ne!(err_a.correlation_id, err_b.correlation_id);
     }
 
     #[test]

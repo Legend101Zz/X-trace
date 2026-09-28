@@ -57,8 +57,13 @@ impl<'store> SqliteIdempotencyStore<'store> {
         builder
     }
 
+    /// Returns the infrastructure correlation ID used for this port
+    /// call. The application boundary surfaces the request's
+    /// correlation ID and attaches this value as a diagnostic detail;
+    /// minting a fresh ID per call prevents the request thread from
+    /// sharing the infrastructure identity with another request.
     fn correlation_id(&self) -> CorrelationId {
-        self.store.current_correlation_id()
+        CorrelationId::new()
     }
 }
 

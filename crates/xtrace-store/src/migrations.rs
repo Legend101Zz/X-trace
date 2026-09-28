@@ -204,23 +204,22 @@ pub fn apply_pending(
     app_version: &str,
     correlation_id: CorrelationId,
 ) -> Result<u32, StoreError> {
-    apply_catalog(connection, app_version, correlation_id, &Migrations::catalog())
+    apply_with_catalog(connection, app_version, correlation_id, &Migrations::catalog())
 }
 
 /// Applies every migration in the supplied catalog that is not yet
-/// present on disk. The function is the test-friendly twin of
-/// [`apply_pending`]: it accepts an explicit catalog so a future
-/// slice (or a regression test) can exercise the
-/// "tampered-prefix / pending-next" interaction without modifying
-/// the compiled-in catalog.
-pub fn apply_catalog(
+/// present on disk. Production code uses [`apply_pending`] so the
+/// compiled-in catalog stays the single source of truth; tests use
+/// the [`apply_catalog`] wrapper to inject a pending catalog or
+/// exercise the tampered-prefix interaction.
+fn apply_with_catalog(
     connection: &Connection,
     app_version: &str,
     correlation_id: CorrelationId,
     catalog: &[MigrationRecord],
 ) -> Result<u32, StoreError> {
     let catalog_by_version: BTreeMap<u32, MigrationRecord> =
-        catalog.iter().map(|record| (record.version, record.clone())).collect();
+        validate_catalog(catalog, correlation_id)?;
     let latest = catalog.last().map_or(0, |record| record.version);
 
     let current = current_schema_version(connection, correlation_id)?;
@@ -251,6 +250,88 @@ pub fn apply_catalog(
     }
 
     Ok(latest)
+}
+
+/// Test-only twin of [`apply_pending`] that accepts an explicit
+/// catalog. Production code must use [`apply_pending`] so the
+/// compiled-in catalog stays the single source of truth; tests use
+/// this entry point to inject pending migrations or exercise the
+/// tampered-prefix interaction.
+#[cfg(test)]
+pub(crate) fn apply_catalog(
+    connection: &Connection,
+    app_version: &str,
+    correlation_id: CorrelationId,
+    catalog: &[MigrationRecord],
+) -> Result<u32, StoreError> {
+    apply_with_catalog(connection, app_version, correlation_id, catalog)
+}
+
+/// Validates that the supplied catalog is well-formed: versions are
+/// unique, sorted in ascending order, and form a contiguous prefix
+/// starting at `1`. The function fails closed because every
+/// checksum and migration loop below assumes that property; a
+/// `BTreeMap`-based dedup would silently hide duplicates and an
+/// order-blind check would silently accept a reversed catalog.
+fn validate_catalog(
+    catalog: &[MigrationRecord],
+    correlation_id: CorrelationId,
+) -> Result<BTreeMap<u32, MigrationRecord>, StoreError> {
+    if catalog.is_empty() {
+        return Err(StoreError::new(
+            StoreErrorKind::SchemaIncompatible,
+            "migration catalog must not be empty",
+            correlation_id,
+        ));
+    }
+    // Reject unsorted catalogs *before* building the map so a
+    // reversed `[v2, v1]` does not silently pass the contiguity
+    // check once the keys are re-sorted by `BTreeMap`.
+    for pair in catalog.windows(2) {
+        if pair[0].version >= pair[1].version {
+            return Err(StoreError::new(
+                StoreErrorKind::SchemaIncompatible,
+                format!(
+                    "migration catalog must be strictly ascending; got v{:04} followed by v{:04}",
+                    pair[0].version, pair[1].version
+                ),
+                correlation_id,
+            ));
+        }
+    }
+    let mut by_version: BTreeMap<u32, MigrationRecord> = BTreeMap::new();
+    for record in catalog {
+        if by_version.insert(record.version, record.clone()).is_some() {
+            return Err(StoreError::new(
+                StoreErrorKind::SchemaIncompatible,
+                format!("duplicate migration version {}", record.version),
+                correlation_id,
+            ));
+        }
+    }
+    if by_version.keys().next().copied() != Some(1) {
+        return Err(StoreError::new(
+            StoreErrorKind::SchemaIncompatible,
+            format!(
+                "migration catalog must start at version 1, found {}",
+                by_version.keys().next().copied().unwrap_or(0)
+            ),
+            correlation_id,
+        ));
+    }
+    for (idx, version) in by_version.keys().enumerate() {
+        let expected = idx as u32 + 1;
+        if *version != expected {
+            return Err(StoreError::new(
+                StoreErrorKind::SchemaIncompatible,
+                format!(
+                    "migration catalog is not contiguous: expected v{expected:04}, found v{version:04}"
+                ),
+                correlation_id,
+            ));
+        }
+    }
+    Ok(by_version)
 }
 
 fn apply_one(
@@ -513,6 +594,100 @@ mod tests {
         let a = Migrations::catalog_checksum();
         let b = blake3::hash(b"alternate-migration-text").to_string();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn duplicate_catalog_versions_fail_closed_without_mutating_schema() {
+        // A catalog with two records sharing the same version must
+        // be rejected before any migration runs; a `BTreeMap`-based
+        // dedup would silently keep the last record and silently
+        // change the on-disk identity.
+        let conn = new_memory();
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v1");
+        let v1 = Migrations::catalog();
+        let column_count_before = list_columns(&conn, "projects").len();
+
+        let catalog = vec![
+            v1[0].clone(),
+            MigrationRecord {
+                version: 2,
+                label: "v0002_first",
+                statements: &[
+                    "ALTER TABLE projects ADD COLUMN first_marker TEXT NOT NULL DEFAULT ''",
+                ],
+            },
+            MigrationRecord {
+                version: 2,
+                label: "v0002_second",
+                statements: &[
+                    "ALTER TABLE projects ADD COLUMN second_marker TEXT NOT NULL DEFAULT ''",
+                ],
+            },
+        ];
+        let err = apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &catalog)
+            .expect_err("duplicate catalog versions must be rejected");
+        assert_eq!(err.kind(), StoreErrorKind::SchemaIncompatible);
+        // No mutation: neither marker column must be present.
+        let columns = list_columns(&conn, "projects");
+        assert_eq!(columns.len(), column_count_before);
+        assert!(!columns.iter().any(|name| name == "first_marker"));
+        assert!(!columns.iter().any(|name| name == "second_marker"));
+    }
+
+    #[test]
+    fn gapped_catalog_fails_closed_without_mutating_schema() {
+        // A catalog that skips v2 must fail closed. The migration
+        // runner must not silently insert only v1 and v3.
+        let conn = new_memory();
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v1");
+        let v1 = Migrations::catalog();
+        let column_count_before = list_columns(&conn, "projects").len();
+
+        let catalog = vec![
+            v1[0].clone(),
+            MigrationRecord {
+                version: 3,
+                label: "v0003_skip_two",
+                statements: &[
+                    "ALTER TABLE projects ADD COLUMN skipped_marker TEXT NOT NULL DEFAULT ''",
+                ],
+            },
+        ];
+        let err = apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &catalog)
+            .expect_err("gapped catalog must be rejected");
+        assert_eq!(err.kind(), StoreErrorKind::SchemaIncompatible);
+        let columns = list_columns(&conn, "projects");
+        assert_eq!(columns.len(), column_count_before);
+        assert!(!columns.iter().any(|name| name == "skipped_marker"));
+    }
+
+    #[test]
+    fn unsorted_catalog_fails_closed_without_mutating_schema() {
+        // The runner iterates `(current + 1)..=latest` so the catalog
+        // must be sorted in ascending order. A reversed catalog that
+        // also happens to be contiguous would otherwise have its
+        // checksum computed incorrectly.
+        let conn = new_memory();
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v1");
+        let v1 = Migrations::catalog();
+        let column_count_before = list_columns(&conn, "projects").len();
+
+        let catalog = vec![
+            MigrationRecord {
+                version: 2,
+                label: "v0002_unsorted",
+                statements: &[
+                    "ALTER TABLE projects ADD COLUMN unsorted_marker TEXT NOT NULL DEFAULT ''",
+                ],
+            },
+            v1[0].clone(),
+        ];
+        let err = apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &catalog)
+            .expect_err("unsorted catalog must be rejected");
+        assert_eq!(err.kind(), StoreErrorKind::SchemaIncompatible);
+        let columns = list_columns(&conn, "projects");
+        assert_eq!(columns.len(), column_count_before);
+        assert!(!columns.iter().any(|name| name == "unsorted_marker"));
     }
 
     fn table_count(conn: &Connection, name: &str) -> i64 {
