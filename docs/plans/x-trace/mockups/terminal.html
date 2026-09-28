@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>X-trace terminal prototype</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Azeret+Mono:ital,wght@0,400;0,500;0,600;1,500&family=Chivo:wght@400;600;700&display=swap');
+
+    :root {
+      color-scheme: dark;
+      --ink: #0e100f;
+      --panel: #141714;
+      --panel-2: #191c19;
+      --line: #31362f;
+      --line-soft: #242823;
+      --text: #edece6;
+      --muted: #999d93;
+      --dim: #676c65;
+      --accent: #f1a54b;
+      --accent-soft: #3b2a18;
+      --good: #a8c99c;
+      --bad: #e38174;
+      --radius: 6px;
+      --mono: "Azeret Mono", ui-monospace, monospace;
+      --sans: "Chivo", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      color: var(--text);
+      font-family: var(--mono);
+      background:
+        radial-gradient(circle at 84% -16%, rgba(241, 165, 75, .10), transparent 31rem),
+        repeating-linear-gradient(90deg, transparent 0 79px, rgba(255,255,255,.016) 80px),
+        var(--ink);
+      overflow-x: hidden;
+    }
+
+    button, input { font: inherit; }
+    button { color: inherit; }
+
+    .shell {
+      min-height: 100dvh;
+      display: grid;
+      grid-template-rows: 52px 1fr 34px;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: 250px 1fr auto;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      background: rgba(14, 16, 15, .88);
+      backdrop-filter: blur(12px);
+      padding: 0 18px;
+    }
+
+    .brand {
+      font-family: var(--sans);
+      font-weight: 700;
+      letter-spacing: -.045em;
+      font-size: 20px;
+    }
+
+    .brand span { color: var(--accent); }
+
+    .session {
+      justify-self: center;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .recording {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--good);
+    }
+
+    .recording::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      background: var(--good);
+      border-radius: 50%;
+      box-shadow: 0 0 0 4px rgba(168, 201, 156, .1);
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: 270px minmax(0, 1fr);
+      min-height: 0;
+    }
+
+    aside {
+      border-right: 1px solid var(--line);
+      padding: 18px 14px;
+      background: rgba(20, 23, 20, .65);
+    }
+
+    .aside-title {
+      color: var(--dim);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .13em;
+      margin: 0 8px 10px;
+    }
+
+    .quick-command {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 23px 1fr;
+      gap: 9px;
+      align-items: start;
+      border: 0;
+      border-left: 2px solid transparent;
+      border-radius: 0;
+      background: transparent;
+      text-align: left;
+      padding: 10px 8px;
+      cursor: pointer;
+      transition: background .16s ease, border-color .16s ease;
+    }
+
+    .quick-command:hover, .quick-command:focus-visible {
+      background: var(--panel-2);
+      border-left-color: var(--accent);
+      outline: none;
+    }
+
+    .quick-command:active { transform: translateY(1px); }
+
+    .key {
+      color: var(--accent);
+      font-weight: 600;
+      font-size: 11px;
+      padding-top: 2px;
+    }
+
+    .quick-command strong {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .quick-command small {
+      display: block;
+      color: var(--dim);
+      line-height: 1.45;
+      font-size: 9px;
+    }
+
+    .scope {
+      margin: 22px 8px 0;
+      padding-top: 16px;
+      border-top: 1px solid var(--line-soft);
+      font-size: 10px;
+      color: var(--muted);
+      line-height: 1.75;
+    }
+
+    .scope b { color: var(--text); font-weight: 500; }
+
+    .terminal-wrap {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) auto;
+    }
+
+    .terminal {
+      min-height: 0;
+      overflow-y: auto;
+      padding: 26px 30px 40px;
+      scrollbar-color: var(--line) transparent;
+    }
+
+    .line {
+      display: grid;
+      grid-template-columns: 52px minmax(0, 1fr);
+      gap: 18px;
+      font-size: 12px;
+      line-height: 1.72;
+      animation: line-in .28s cubic-bezier(.2,.8,.2,1) both;
+    }
+
+    .time { color: #555a54; user-select: none; }
+    .copy { white-space: pre-wrap; word-break: break-word; }
+    .command { color: var(--text); font-weight: 600; }
+    .accent { color: var(--accent); }
+    .muted { color: var(--muted); }
+    .good { color: var(--good); }
+    .bad { color: var(--bad); }
+    .strong { color: var(--text); font-weight: 600; }
+
+    .coverage {
+      margin: 16px 0 18px 70px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(100px, 1fr));
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      max-width: 760px;
+      background: #111311;
+      overflow: hidden;
+    }
+
+    .metric {
+      padding: 13px 15px;
+      border-right: 1px solid var(--line-soft);
+    }
+
+    .metric:last-child { border-right: 0; }
+    .metric span { display: block; color: var(--dim); font-size: 9px; margin-bottom: 7px; }
+    .metric strong { font-family: var(--sans); font-size: 21px; font-weight: 600; }
+    .metric.active strong { color: var(--accent); }
+
+    .input-row {
+      border-top: 1px solid var(--line);
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      min-height: 58px;
+      padding: 0 20px 0 30px;
+      background: rgba(14, 16, 15, .93);
+      gap: 12px;
+    }
+
+    .prompt { color: var(--accent); font-weight: 600; }
+    #commandInput {
+      width: 100%;
+      background: transparent;
+      border: 0;
+      outline: 0;
+      color: var(--text);
+      caret-color: var(--accent);
+      font-size: 12px;
+    }
+
+    #commandInput::placeholder { color: #565b54; }
+    .hint { color: var(--dim); font-size: 9px; }
+
+    footer {
+      display: grid;
+      grid-template-columns: 270px 1fr auto;
+      align-items: center;
+      border-top: 1px solid var(--line);
+      color: var(--dim);
+      font-size: 9px;
+      padding: 0 14px;
+      background: #101210;
+    }
+
+    .project { color: var(--muted); }
+    .mode { color: var(--accent); padding-right: 10px; }
+
+    .toast {
+      position: fixed;
+      right: 18px;
+      bottom: 50px;
+      border: 1px solid #594426;
+      background: #1c1811;
+      color: var(--text);
+      padding: 11px 14px;
+      border-radius: var(--radius);
+      font-size: 10px;
+      opacity: 0;
+      transform: translateY(8px);
+      pointer-events: none;
+      transition: opacity .2s ease, transform .2s ease;
+    }
+
+    .toast.show { opacity: 1; transform: none; }
+
+    @keyframes line-in {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: none; }
+    }
+
+    @media (max-width: 760px) {
+      .topbar { grid-template-columns: 1fr auto; }
+      .session { display: none; }
+      main { grid-template-columns: 1fr; }
+      aside { display: none; }
+      footer { grid-template-columns: 1fr auto; }
+      footer .project { display: none; }
+      .terminal { padding: 20px 16px 30px; }
+      .line { grid-template-columns: 44px 1fr; gap: 10px; font-size: 10px; }
+      .coverage { margin-left: 54px; grid-template-columns: repeat(2, 1fr); }
+      .metric:nth-child(2) { border-right: 0; }
+      .metric:nth-child(-n+2) { border-bottom: 1px solid var(--line-soft); }
+      .input-row { padding-left: 16px; }
+      .hint { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand"><span>X</span>-trace</div>
+      <div class="session">checkout-service / local</div>
+      <div class="recording" id="recordingLabel">recording pid 48123</div>
+    </header>
+
+    <main>
+      <aside aria-label="Quick commands">
+        <p class="aside-title">Run a command</p>
+        <button class="quick-command" data-command="xtrace init">
+          <span class="key">I</span><span><strong>Initialize</strong><small>Detect Java runtime, framework, build tool and source roots.</small></span>
+        </button>
+        <button class="quick-command" data-command="xtrace run -- ./mvnw spring-boot:run">
+          <span class="key">R</span><span><strong>Run with capture</strong><small>Start the app with the X-trace agent before class loading.</small></span>
+        </button>
+        <button class="quick-command" data-command="xtrace attach">
+          <span class="key">A</span><span><strong>Attach to JVM</strong><small>Connect to an application that is already running.</small></span>
+        </button>
+        <button class="quick-command" data-command="xtrace status">
+          <span class="key">S</span><span><strong>Coverage status</strong><small>See discovered endpoints and recorded scenarios.</small></span>
+        </button>
+        <button class="quick-command" data-command="xtrace open">
+          <span class="key">O</span><span><strong>Open canvas</strong><small>Open the local spatial trace viewer.</small></span>
+        </button>
+        <button class="quick-command" data-command="xtrace export --postman --curl">
+          <span class="key">E</span><span><strong>Export APIs</strong><small>Create OpenAPI, Postman and one cURL recipe per endpoint.</small></span>
+        </button>
+
+        <div class="scope">
+          <div>capture scope</div>
+          <b>dev.xtrace.checkout.*</b>
+          <div style="margin-top:9px">storage</div>
+          <b>local catalog v12 · 11 runs</b>
+        </div>
+      </aside>
+
+      <section class="terminal-wrap" aria-label="X-trace terminal">
+        <div class="terminal" id="terminal" role="log" aria-live="polite">
+          <div class="line"><span class="time">09:41:02</span><span class="copy command">$ xtrace init</span></div>
+          <div class="line"><span class="time">09:41:02</span><span class="copy"><span class="accent">X-trace</span> initialized in ./checkout-service</span></div>
+          <div class="line"><span class="time">09:41:02</span><span class="copy muted">framework  Spring Boot 3.4.2    runtime  Java 21    build  Maven</span></div>
+          <div class="line"><span class="time">09:41:03</span><span class="copy good">found 18 HTTP endpoints across 4 handlers</span></div>
+          <div class="line"><span class="time">09:41:19</span><span class="copy command">$ xtrace run -- ./mvnw spring-boot:run</span></div>
+          <div class="line"><span class="time">09:41:20</span><span class="copy"><span class="good">agent loaded</span>  pid 48123  collector http://127.0.0.1:7332</span></div>
+          <div class="line"><span class="time">09:41:24</span><span class="copy muted">waiting for application traffic. Requests are traced in the background.</span></div>
+          <div class="line"><span class="time">09:42:08</span><span class="copy"><span class="accent">captured</span>  POST /orders  <span class="muted">201  143 ms  28 spans</span></span></div>
+          <div class="line"><span class="time">09:42:12</span><span class="copy"><span class="accent">captured</span>  GET /orders/9041  <span class="muted">200  34 ms  11 spans</span></span></div>
+          <div class="line"><span class="time">09:42:40</span><span class="copy command">$ xtrace status</span></div>
+
+          <div class="coverage" aria-label="Endpoint coverage">
+            <div class="metric"><span>DISCOVERED</span><strong>18</strong></div>
+            <div class="metric active"><span>RECORDED</span><strong>7</strong></div>
+            <div class="metric"><span>SCENARIOS</span><strong>11</strong></div>
+            <div class="metric"><span>ERRORS</span><strong>1</strong></div>
+          </div>
+
+          <div class="line"><span class="time">09:42:40</span><span class="copy"><span class="good">7 recorded</span>   <span class="muted">9 waiting for traffic   2 excluded by policy</span></span></div>
+          <div class="line"><span class="time">09:42:40</span><span class="copy muted">viewer ready at <span class="strong">http://localhost:7331</span></span></div>
+        </div>
+
+        <form class="input-row" id="commandForm">
+          <span class="prompt">xtrace ›</span>
+          <input id="commandInput" aria-label="Command" autocomplete="off" spellcheck="false" placeholder="type a command or press a shortcut" />
+          <span class="hint">enter to run</span>
+        </form>
+      </section>
+    </main>
+
+    <footer>
+      <span>agent  connected</span>
+      <span class="project">main@73dc12f  /  sanitization on</span>
+      <span class="mode">local only</span>
+    </footer>
+  </div>
+
+  <div class="toast" id="toast">Opening http://localhost:7331</div>
+
+  <script>
+    const terminal = document.querySelector('#terminal');
+    const form = document.querySelector('#commandForm');
+    const input = document.querySelector('#commandInput');
+    const toast = document.querySelector('#toast');
+    let clock = 43;
+
+    const responses = {
+      'xtrace init': [
+        ['accent', 'workspace already initialized'],
+        ['muted', 'Spring Boot 3.4.2  Java 21  Maven  18 endpoints']
+      ],
+      'xtrace run -- ./mvnw spring-boot:run': [
+        ['good', 'agent already connected to pid 48123'],
+        ['muted', 'background capture continues. Press Ctrl+C to stop the app.']
+      ],
+      'xtrace attach': [
+        ['accent', 'select a JVM:  [1] checkout-service :8080   [2] surefire-test'],
+        ['muted', 'mock selection: attached to checkout-service, pid 48123']
+      ],
+      'xtrace status': [
+        ['good', '18 endpoints discovered, 7 recorded, 11 scenarios stored'],
+        ['bad', '1 failed trace: POST /refunds returned before correlation completed']
+      ],
+      'xtrace open': [
+        ['accent', 'opening spatial viewer at http://localhost:7331']
+      ],
+      'xtrace export --postman --curl': [
+        ['good', 'exported OpenAPI 3.1, Postman Collection v2.1, and 18 cURL recipes'],
+        ['muted', 'saved to ./xtrace-export/  ·  use --open-postman to sync and open a chosen workspace']
+      ]
+    };
+
+    function now() {
+      clock += 1;
+      return `09:42:${String(clock).padStart(2, '0')}`;
+    }
+
+    function addLine(text, className = '') {
+      const row = document.createElement('div');
+      row.className = 'line';
+      const time = document.createElement('span');
+      time.className = 'time';
+      time.textContent = now();
+      const copy = document.createElement('span');
+      copy.className = `copy ${className}`;
+      copy.textContent = text;
+      row.append(time, copy);
+      terminal.appendChild(row);
+      terminal.scrollTop = terminal.scrollHeight;
+    }
+
+    function run(command) {
+      const clean = command.trim();
+      if (!clean) return;
+      addLine(`$ ${clean}`, 'command');
+      const lines = responses[clean] || [['bad', `unknown command: ${clean}`], ['muted', 'try xtrace init, run, attach, status, open, or export']];
+      lines.forEach(([type, text], i) => setTimeout(() => addLine(text, type), 150 + i * 180));
+      if (clean === 'xtrace open') {
+        setTimeout(() => {
+          toast.classList.add('show');
+          setTimeout(() => toast.classList.remove('show'), 2200);
+        }, 280);
+      }
+    }
+
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      run(input.value);
+      input.value = '';
+    });
+
+    document.querySelectorAll('[data-command]').forEach((button) => {
+      button.addEventListener('click', () => {
+        input.value = button.dataset.command;
+        input.focus();
+      });
+    });
+
+    window.addEventListener('keydown', (event) => {
+      if (event.target === input || event.metaKey || event.ctrlKey || event.altKey) return;
+      const map = { i: 'xtrace init', r: 'xtrace run -- ./mvnw spring-boot:run', a: 'xtrace attach', s: 'xtrace status', o: 'xtrace open', e: 'xtrace export --postman --curl' };
+      if (map[event.key.toLowerCase()]) {
+        input.value = map[event.key.toLowerCase()];
+        input.focus();
+      }
+    });
+  </script>
+</body>
+</html>

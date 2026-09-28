@@ -1,0 +1,739 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>X-trace spatial trace prototype</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Azeret+Mono:wght@400;500;600&family=Chivo:wght@400;600;700&display=swap');
+
+    :root {
+      color-scheme: dark;
+      --ink: #0e100f;
+      --surface: #141714;
+      --surface-2: #191c19;
+      --surface-3: #20241f;
+      --line: #31362f;
+      --line-soft: #252a24;
+      --text: #eeede7;
+      --muted: #9a9f95;
+      --dim: #696f67;
+      --accent: #f1a54b;
+      --accent-dark: #332416;
+      --good: #a8c99c;
+      --bad: #e38174;
+      --radius: 6px;
+      --sans: "Chivo", sans-serif;
+      --mono: "Azeret Mono", ui-monospace, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body { margin: 0; font-family: var(--sans); background: var(--ink); color: var(--text); overflow: hidden; }
+    button, input, select { font: inherit; }
+    button { color: inherit; }
+
+    .app {
+      height: 100dvh;
+      display: grid;
+      grid-template-rows: 54px minmax(0, 1fr) 72px;
+      background:
+        radial-gradient(circle at 76% -10%, rgba(241,165,75,.08), transparent 25rem),
+        var(--ink);
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: 250px minmax(0, 1fr) auto;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      padding: 0 14px 0 18px;
+      background: rgba(14,16,15,.93);
+      backdrop-filter: blur(12px);
+      position: relative;
+      z-index: 5;
+    }
+
+    .brand { font-weight: 700; font-size: 19px; letter-spacing: -.045em; }
+    .brand span { color: var(--accent); }
+
+    .trace-title { min-width: 0; display: flex; align-items: center; gap: 10px; }
+    .verb { color: var(--accent); font-family: var(--mono); font-size: 10px; font-weight: 600; }
+    .path { font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .trace-meta { color: var(--dim); font-family: var(--mono); font-size: 9px; white-space: nowrap; }
+
+    .top-actions { display: flex; align-items: center; gap: 8px; }
+    .view-switch { display: flex; padding: 2px; border: 1px solid var(--line); border-radius: var(--radius); background: #101210; }
+    .view-switch button { height: 25px; min-width: 58px; padding: 0 9px; border: 0; border-radius: 4px; background: transparent; color: var(--dim); font-family: var(--mono); font-size: 8px; cursor: pointer; }
+    .view-switch button.active { background: var(--surface-3); color: var(--text); box-shadow: inset 0 0 0 1px #3b4039; }
+    .export-wrap { position: relative; }
+    .export-menu { display: none; position: absolute; right: 0; top: 36px; z-index: 20; width: 230px; padding: 6px; border: 1px solid var(--line); border-radius: var(--radius); background: #171a17; box-shadow: 0 18px 50px rgba(0,0,0,.42); }
+    .export-menu.open { display: block; }
+    .export-menu button { width: 100%; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 8px; padding: 9px 10px; border: 0; border-radius: 4px; background: transparent; text-align: left; cursor: pointer; }
+    .export-menu button:hover { background: var(--surface-3); }
+    .export-menu strong { font-family: var(--mono); font-size: 9px; font-weight: 500; }
+    .export-menu span { color: var(--dim); font-family: var(--mono); font-size: 7px; }
+    .export-menu em { color: var(--accent); font-family: var(--mono); font-size: 7px; font-style: normal; }
+    .state-select, .icon-btn, .scenario-select {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--muted);
+      border-radius: var(--radius);
+      min-height: 30px;
+      outline: none;
+    }
+    .state-select { padding: 0 28px 0 9px; font-family: var(--mono); font-size: 9px; }
+    .state-select:focus-visible, .icon-btn:focus-visible, .scenario-select:focus-visible { border-color: var(--accent); }
+    .icon-btn { min-width: 31px; padding: 0 8px; cursor: pointer; }
+    .icon-btn:hover { background: var(--surface-3); color: var(--text); }
+    .icon-btn:active { transform: translateY(1px); }
+
+    .workspace { display: grid; grid-template-columns: 252px minmax(0,1fr) 390px; min-height: 0; }
+
+    .sidebar {
+      background: rgba(20,23,20,.92);
+      border-right: 1px solid var(--line);
+      min-width: 0;
+      overflow-y: auto;
+      scrollbar-color: var(--line) transparent;
+    }
+
+    .search-wrap { padding: 14px; border-bottom: 1px solid var(--line-soft); }
+    .search-wrap label { display: block; color: var(--dim); font-family: var(--mono); font-size: 9px; margin-bottom: 8px; text-transform: uppercase; letter-spacing: .11em; }
+    .search { width: 100%; border: 1px solid var(--line); background: #101210; border-radius: var(--radius); color: var(--text); padding: 9px 10px; outline: 0; font-family: var(--mono); font-size: 10px; }
+    .search::placeholder { color: #5e635d; }
+    .search:focus { border-color: var(--accent); }
+
+    .coverage-strip { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid var(--line-soft); }
+    .coverage-stat { padding: 11px 14px; border-right: 1px solid var(--line-soft); }
+    .coverage-stat:last-child { border-right: 0; }
+    .coverage-stat b { display:block; font-size: 18px; font-weight: 600; }
+    .coverage-stat span { font-family: var(--mono); font-size: 8px; color: var(--dim); }
+
+    .group-title { padding: 16px 14px 7px; color: var(--dim); font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: .11em; }
+    .endpoint { width: 100%; background: transparent; border: 0; border-left: 2px solid transparent; padding: 10px 13px 10px 12px; text-align: left; cursor: pointer; display: grid; grid-template-columns: 38px minmax(0,1fr) auto; align-items: center; gap: 5px; }
+    .endpoint:hover { background: var(--surface-2); }
+    .endpoint.active { background: #1b1b16; border-left-color: var(--accent); }
+    .endpoint .method { font-family: var(--mono); font-size: 8px; color: var(--accent); font-weight: 600; }
+    .endpoint .url { min-width: 0; font-family: var(--mono); font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .endpoint .count { color: var(--dim); font-family: var(--mono); font-size: 8px; }
+    .endpoint[data-state="waiting"] .count { color: var(--dim); }
+    .endpoint[data-state="error"] .count { color: var(--bad); }
+
+    .trace-stage { position: relative; min-width: 0; min-height: 0; overflow: hidden; background: #111311; }
+    .canvas-shell { position: absolute; inset: 0; min-width: 0; min-height: 0; overflow: hidden; background-color: #111311; }
+    .canvas-shell::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image: radial-gradient(circle, #30352f 1px, transparent 1px);
+      background-size: 22px 22px;
+      opacity: .55;
+      pointer-events: none;
+    }
+    .trace-stage[data-view="linear"] .canvas-shell { display: none; }
+
+    .linear-shell { display: none; position: absolute; inset: 0; overflow: auto; background: linear-gradient(180deg, rgba(241,165,75,.025), transparent 15rem), #111311; }
+    .trace-stage[data-view="linear"] .linear-shell { display: block; }
+    .linear-filebar { position: sticky; top: 0; z-index: 3; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 20px; align-items: center; padding: 14px 24px; border-bottom: 1px solid var(--line); background: rgba(17,19,17,.94); backdrop-filter: blur(12px); }
+    .file-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 9px; }
+    .file-path span { color: var(--dim); }
+    .line-position { color: var(--muted); font-family: var(--mono); font-size: 8px; }
+    .linear-heading { max-width: 920px; margin: 0 auto 24px; display: flex; align-items: end; justify-content: space-between; gap: 20px; }
+    .linear-heading h2 { margin: 0 0 5px; font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: -.02em; }
+    .linear-heading p { margin: 0; color: var(--dim); font-family: var(--mono); font-size: 8px; line-height: 1.6; }
+    .evidence-chip { flex: 0 0 auto; border: 1px solid #4b573f; border-radius: 99px; padding: 5px 9px; color: var(--good); font-family: var(--mono); font-size: 8px; }
+    .code-theater { padding: clamp(30px, 5vw, 72px) clamp(30px, 6vw, 88px) 120px; }
+    .focus-code { max-width: 920px; margin: 0 auto; padding: 22px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); color: #c9ccc3; font-family: var(--mono); font-size: 11px; line-height: 1.85; overflow-x: auto; }
+    .focus-code .code-row { min-height: 28px; margin: 0; padding: 0 18px; grid-template-columns: minmax(max-content,1fr); }
+    .focus-code .code-row.hot { position: relative; padding: 8px 18px 8px 16px; background: linear-gradient(90deg, rgba(241,165,75,.16), rgba(241,165,75,.055)); border-left: 3px solid var(--accent); }
+    .focus-code .code-row.hot::before { content: "▶"; position: absolute; left: -20px; top: 10px; color: var(--accent); font-size: 8px; }
+    .focus-code .inline-values { padding: 7px 0 2px 42px; gap: 6px; }
+    .focus-code .inline-value { padding: 3px 7px; font-size: 8px; }
+    .code-foot { max-width: 920px; margin: 14px auto 0; display: flex; justify-content: space-between; gap: 20px; color: var(--dim); font-family: var(--mono); font-size: 8px; }
+    .code-foot strong { color: var(--text); font-weight: 500; }
+    .linear-trace { display: grid; gap: 3px; }
+    .linear-step { width: 100%; display: grid; grid-template-columns: 22px minmax(0,1fr) auto; gap: 8px; align-items: center; padding: 8px; border: 0; border-radius: 4px; background: transparent; text-align: left; cursor: pointer; }
+    .linear-step:hover { background: var(--surface-2); }
+    .linear-step.active { background: #1d1b15; box-shadow: inset 2px 0 0 var(--accent); }
+    .linear-index, .linear-kind, .linear-source, .linear-duration { font-family: var(--mono); font-size: 7px; }
+    .linear-index { color: var(--dim); text-align: center; }
+    .linear-kind { color: var(--accent); text-transform: uppercase; letter-spacing: .06em; }
+    .linear-call strong { display: block; margin: 3px 0 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 8px; font-weight: 600; }
+    .linear-source { color: var(--dim); }
+    .linear-duration { color: var(--muted); }
+    .linear-only { display: none; }
+    body[data-view="linear"] .linear-only { display: block; }
+    body[data-view="linear"] .canvas-only { display: none; }
+
+    .canvas {
+      position: absolute;
+      width: 1480px;
+      height: 820px;
+      left: 0;
+      top: 0;
+      transform-origin: 0 0;
+      will-change: transform;
+      cursor: grab;
+    }
+    .canvas.dragging { cursor: grabbing; }
+
+    .edge-layer { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+    .edge { fill: none; stroke: #444941; stroke-width: 1.5; }
+    .edge.visited { stroke: var(--accent); }
+    .edge.pending { stroke-dasharray: 6 7; }
+    .edge-pulse { fill: var(--accent); opacity: 0; }
+    .edge-pulse.run { opacity: 1; offset-path: path("M 250 220 C 340 220 360 175 455 175"); animation: travel 1.2s cubic-bezier(.55,0,.2,1) both; }
+
+    .node {
+      position: absolute;
+      width: 190px;
+      min-height: 84px;
+      padding: 13px 14px 12px;
+      border: 1px solid #3b4039;
+      border-radius: var(--radius);
+      background: rgba(22,25,22,.97);
+      box-shadow: 0 12px 28px rgba(5,8,5,.3);
+      cursor: pointer;
+      transition: border-color .18s ease, background .18s ease, transform .18s ease, opacity .18s ease;
+      opacity: .58;
+    }
+    .node:hover { opacity: 1; transform: translateY(-2px); }
+    .node.visited { opacity: 1; border-color: #6d5737; }
+    .node.active { opacity: 1; border-color: var(--accent); background: #1d1b15; box-shadow: inset 3px 0 0 var(--accent), 0 18px 40px rgba(5,8,5,.4); }
+    .node.selected:not(.active) { opacity: 1; border-color: var(--text); }
+    .node-kind { color: var(--dim); font-family: var(--mono); font-size: 8px; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 9px; }
+    .node-name { font-family: var(--mono); font-size: 10px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .node-detail { margin-top: 9px; display: flex; justify-content: space-between; color: var(--muted); font-family: var(--mono); font-size: 8px; }
+    .node.active .node-detail span:last-child { color: var(--accent); }
+    .node[data-kind="database"] { background-image: repeating-linear-gradient(0deg, transparent 0 8px, rgba(241,165,75,.03) 9px); }
+    .node[data-kind="external"] { border-style: dashed; }
+
+    .canvas-label { position: absolute; color: #5e645c; font-family: var(--mono); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+    .canvas-caption { position: absolute; width: 340px; color: #70766e; font-family: var(--mono); font-size: 9px; line-height: 1.6; }
+
+    .canvas-tools { position: absolute; left: 14px; bottom: 14px; z-index: 2; display: flex; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+    .canvas-tools button { border: 0; border-right: 1px solid var(--line); border-radius: 0; background: transparent; color: var(--muted); min-width: 32px; height: 30px; cursor: pointer; }
+    .canvas-tools button:last-child { border-right: 0; }
+    .canvas-tools button:hover { color: var(--text); background: var(--surface-3); }
+    .zoom-value { min-width: 48px !important; font-family: var(--mono); font-size: 9px; }
+
+    .minimap { position: absolute; right: 14px; bottom: 14px; width: 118px; height: 70px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(17,19,17,.9); overflow: hidden; }
+    .mini-node { position: absolute; width: 14px; height: 6px; border: 1px solid #62685f; background: #222621; }
+    .mini-node.active { background: var(--accent); border-color: var(--accent); }
+    .viewport-box { position:absolute; left: 10px; top: 8px; width: 66px; height: 43px; border: 1px solid rgba(241,165,75,.65); }
+
+    .inspector { background: rgba(20,23,20,.95); border-left: 1px solid var(--line); min-width: 0; overflow-y: auto; scrollbar-color: var(--line) transparent; }
+    .inspector-head { padding: 16px 17px; border-bottom: 1px solid var(--line-soft); }
+    .inspector-kicker { color: var(--accent); font-family: var(--mono); font-size: 8px; text-transform: uppercase; letter-spacing: .11em; }
+    .inspector h2 { margin: 8px 0 4px; font-family: var(--mono); font-size: 12px; font-weight: 600; }
+    .source-link { color: var(--muted); font-family: var(--mono); font-size: 8px; }
+
+    .inspector-section { padding: 15px 17px; border-bottom: 1px solid var(--line-soft); }
+    .inspector-section h3 { margin: 0 0 12px; color: var(--dim); font-family: var(--mono); font-size: 8px; font-weight: 500; text-transform: uppercase; letter-spacing: .12em; }
+    .datum { display: grid; grid-template-columns: 88px minmax(0,1fr); gap: 8px; margin-bottom: 9px; font-family: var(--mono); font-size: 8px; line-height: 1.45; }
+    .datum:last-child { margin-bottom: 0; }
+    .datum span:first-child { color: var(--dim); }
+    .datum span:last-child { color: var(--text); overflow-wrap: anywhere; }
+
+    .code {
+      padding: 12px;
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius);
+      background: #0f110f;
+      color: #c4c7be;
+      font-family: var(--mono);
+      font-size: 8px;
+      line-height: 1.65;
+      overflow-x: auto;
+    }
+    .code-row { display: grid; grid-template-columns: minmax(max-content,1fr); align-items: center; min-height: 18px; margin: 0 -12px; padding: 0 12px; }
+    .code-row .line-text { white-space: pre; }
+    .code-row.hot { color: var(--text); background: rgba(241,165,75,.12); border-left: 2px solid var(--accent); padding-left: 10px; }
+    .inline-values { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 0 5px 28px; }
+    .inline-value { padding: 2px 5px; border: 1px solid #5b4930; border-radius: 3px; background: #211b13; color: var(--accent); white-space: nowrap; font-size: 7px; }
+    .value-note { margin: 9px 0 0; color: var(--dim); font-family: var(--mono); font-size: 7px; line-height: 1.5; }
+
+    .replaybar {
+      display: grid;
+      grid-template-columns: 252px minmax(0,1fr) 390px;
+      border-top: 1px solid var(--line);
+      background: #101210;
+      position: relative;
+      z-index: 5;
+    }
+
+    .scenario { padding: 12px 14px; border-right: 1px solid var(--line); }
+    .scenario label { display: block; color: var(--dim); font-family: var(--mono); font-size: 8px; margin-bottom: 6px; }
+    .scenario-select { width: 100%; height: 29px; padding: 0 8px; font-family: var(--mono); font-size: 8px; }
+
+    .transport { min-width: 0; display: grid; grid-template-columns: auto minmax(120px,1fr) auto; align-items: center; gap: 15px; padding: 0 18px; }
+    .transport-buttons { display: flex; gap: 5px; }
+    .transport .icon-btn { background: var(--surface); }
+    .transport .play { background: var(--accent); color: #17130e; border-color: var(--accent); font-weight: 700; min-width: 38px; }
+    .timeline { position: relative; height: 18px; display: flex; align-items: center; }
+    .timeline input { width: 100%; accent-color: var(--accent); cursor: pointer; }
+    .step-count { color: var(--muted); font-family: var(--mono); font-size: 9px; white-space: nowrap; }
+
+    .runtime-summary { padding: 12px 16px; border-left: 1px solid var(--line); display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 12px; font-family: var(--mono); font-size: 8px; }
+    .runtime-summary strong { color: var(--good); font-weight: 500; }
+    .speed { border: 0; background: transparent; color: var(--accent); font-family: var(--mono); font-size: 9px; cursor: pointer; }
+
+    .state-layer { display: none; position: absolute; inset: 0; z-index: 4; background: rgba(14,16,15,.94); align-items: center; justify-content: center; }
+    .state-layer.visible { display: flex; }
+    .state-panel { width: min(420px, calc(100% - 40px)); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 24px; }
+    .state-panel h2 { margin: 0 0 8px; font-size: 17px; }
+    .state-panel p { color: var(--muted); font-family: var(--mono); font-size: 9px; line-height: 1.7; margin: 0; }
+    .state-action { margin-top: 16px; border: 1px solid var(--accent); border-radius: var(--radius); background: var(--accent-dark); color: var(--accent); padding: 8px 11px; font-family: var(--mono); font-size: 9px; cursor: pointer; }
+    .skeleton { height: 10px; margin-bottom: 10px; border-radius: 2px; background: linear-gradient(90deg,#242824 20%,#363b35 48%,#242824 78%); background-size: 220% 100%; animation: shimmer 1.2s linear infinite; }
+    .skeleton:nth-child(2) { width: 72%; }
+    .skeleton:nth-child(3) { width: 86%; }
+
+    @keyframes shimmer { to { background-position: -220% 0; } }
+    @keyframes travel { from { offset-distance: 0%; } to { offset-distance: 100%; } }
+
+    @media (max-width: 1050px) {
+      .workspace { grid-template-columns: 220px minmax(0,1fr); }
+      .inspector { display: none; }
+      .replaybar { grid-template-columns: 220px minmax(0,1fr); }
+      .runtime-summary { display: none; }
+      .topbar { grid-template-columns: 220px minmax(0,1fr) auto; }
+    }
+
+    @media (max-width: 720px) {
+      .topbar { grid-template-columns: 120px 1fr auto; }
+      .trace-meta, .state-select { display: none; }
+      .workspace { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      .replaybar { grid-template-columns: 1fr; }
+      .scenario { display: none; }
+      .transport { padding: 0 10px; }
+      .minimap { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body data-view="canvas">
+  <div class="app">
+    <header class="topbar">
+      <div class="brand"><span>X</span>-trace</div>
+      <div class="trace-title">
+        <span class="verb" id="topVerb">POST</span>
+        <span class="path" id="topPath">/orders</span>
+        <span class="trace-meta" id="topMeta">observed 143 ms / 28 spans</span>
+      </div>
+      <div class="top-actions">
+        <div class="view-switch" aria-label="Execution view">
+          <button class="active" data-view="canvas">Canvas</button>
+          <button data-view="linear">Linear</button>
+        </div>
+        <select class="state-select" id="stateSelect" aria-label="Prototype state">
+          <option value="ready">Ready state</option>
+          <option value="loading">Loading state</option>
+          <option value="empty">Empty state</option>
+          <option value="error">Error state</option>
+        </select>
+        <div class="export-wrap">
+          <button class="icon-btn" id="exportButton" aria-haspopup="menu" aria-expanded="false">Export</button>
+          <div class="export-menu" id="exportMenu" role="menu">
+            <button role="menuitem" data-export="postman"><span><strong>Open in Postman</strong><br>Sync collection to a chosen workspace</span><em>↗ app</em></button>
+            <button role="menuitem" data-export="bundle"><span><strong>Developer bundle</strong><br>OpenAPI 3.1 + Collection v2.1</span><em>.zip</em></button>
+            <button role="menuitem" data-export="curl"><span><strong>cURL recipes</strong><br>One command per endpoint + all.sh</span><em>.sh</em></button>
+          </div>
+        </div>
+        <button class="icon-btn" id="fitButton" aria-label="Fit canvas">Fit</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <nav class="sidebar" aria-label="Endpoints">
+        <div class="search-wrap">
+          <label for="endpointSearch">Endpoints</label>
+          <input class="search" id="endpointSearch" type="search" placeholder="Filter path or method" />
+        </div>
+        <div class="coverage-strip">
+          <div class="coverage-stat"><b>18</b><span>discovered</span></div>
+          <div class="coverage-stat"><b style="color:var(--accent)">7</b><span>recorded</span></div>
+        </div>
+        <div class="group-title">Orders</div>
+        <button class="endpoint active" data-endpoint="orders" data-state="recorded"><span class="method">POST</span><span class="url">/orders</span><span class="count">3</span></button>
+        <button class="endpoint" data-endpoint="order" data-state="recorded"><span class="method">GET</span><span class="url">/orders/{id}</span><span class="count">2</span></button>
+        <button class="endpoint" data-endpoint="cancel" data-state="waiting"><span class="method">POST</span><span class="url">/orders/{id}/cancel</span><span class="count">waiting</span></button>
+        <div class="group-title">Refunds</div>
+        <button class="endpoint" data-endpoint="refund" data-state="error"><span class="method">POST</span><span class="url">/refunds</span><span class="count">error</span></button>
+        <button class="endpoint" data-endpoint="refundGet" data-state="waiting"><span class="method">GET</span><span class="url">/refunds/{id}</span><span class="count">waiting</span></button>
+        <div class="group-title">Health</div>
+        <button class="endpoint" data-endpoint="health" data-state="recorded"><span class="method">GET</span><span class="url">/actuator/health</span><span class="count">1</span></button>
+      </nav>
+
+      <main class="trace-stage" id="traceStage" data-view="canvas" aria-label="Trace execution">
+        <section class="canvas-shell" id="canvasShell" aria-label="Trace flow canvas">
+          <div class="canvas" id="canvas">
+          <div class="canvas-label" style="left:90px;top:118px">request boundary</div>
+          <div class="canvas-label" style="left:335px;top:82px">application</div>
+          <div class="canvas-label" style="left:850px;top:118px">dependencies</div>
+          <div class="canvas-caption" style="left:335px;top:510px">Select any node to inspect arguments, source location and the recorded frame. Drag the canvas to move through the trace.</div>
+
+          <svg class="edge-layer" viewBox="0 0 1480 820" aria-hidden="true">
+            <path class="edge" data-edge="0" d="M 280 220 C 305 220 310 175 335 175" />
+            <path class="edge" data-edge="1" d="M 525 175 C 550 175 555 280 580 280" />
+            <path class="edge" data-edge="2" d="M 770 280 C 810 280 810 210 850 210" />
+            <path class="edge" data-edge="3" d="M 770 280 C 810 280 810 380 850 380" />
+            <path class="edge pending" data-edge="4" d="M 525 175 C 565 175 540 420 580 420" />
+            <circle class="edge-pulse" r="4"></circle>
+          </svg>
+
+          <button class="node" data-step="0" data-kind="request" style="left:90px;top:176px">
+            <div class="node-kind">HTTP request</div><div class="node-name">POST /orders</div><div class="node-detail"><span>trace root</span><span>0 ms</span></div>
+          </button>
+          <button class="node" data-step="1" data-kind="controller" style="left:335px;top:132px">
+            <div class="node-kind">Controller</div><div class="node-name">OrderController.create</div><div class="node-detail"><span>OrderController.java:42</span><span>3 ms</span></div>
+          </button>
+          <button class="node" data-step="2" data-kind="service" style="left:580px;top:237px">
+            <div class="node-kind">Service</div><div class="node-name">OrderService.place</div><div class="node-detail"><span>OrderService.java:71</span><span>129 ms</span></div>
+          </button>
+          <button class="node" data-step="3" data-kind="repository" style="left:850px;top:167px">
+            <div class="node-kind">Repository</div><div class="node-name">OrderRepository.save</div><div class="node-detail"><span>1 statement</span><span>18 ms</span></div>
+          </button>
+          <button class="node" data-step="4" data-kind="external" style="left:850px;top:337px">
+            <div class="node-kind">Outbound HTTP</div><div class="node-name">inventory.reserve</div><div class="node-detail"><span>POST /reservations</span><span>72 ms</span></div>
+          </button>
+          <button class="node" data-step="5" data-kind="database" style="left:580px;top:377px">
+            <div class="node-kind">Database</div><div class="node-name">checkout.orders</div><div class="node-detail"><span>INSERT</span><span>11 ms</span></div>
+          </button>
+          </div>
+
+          <div class="canvas-tools" aria-label="Canvas zoom">
+            <button id="zoomOut" aria-label="Zoom out">−</button>
+            <button class="zoom-value" id="zoomValue">78%</button>
+            <button id="zoomIn" aria-label="Zoom in">+</button>
+          </div>
+
+          <div class="minimap" aria-hidden="true">
+            <span class="mini-node active" style="left:10px;top:26px"></span><span class="mini-node" style="left:35px;top:19px"></span><span class="mini-node" style="left:61px;top:31px"></span><span class="mini-node" style="left:89px;top:21px"></span><span class="mini-node" style="left:89px;top:43px"></span>
+            <span class="viewport-box"></span>
+          </div>
+        </section>
+
+        <section class="linear-shell" id="linearShell" aria-label="Code-first execution replay">
+          <div class="linear-filebar">
+            <div class="file-path"><span>checkout-service / src / main / java /</span> <strong id="linearFile">OrderController.java</strong></div>
+            <div class="line-position" id="linearPosition">frame 1 · line 42 · observed</div>
+          </div>
+          <div class="code-theater">
+            <div class="linear-heading">
+              <div><h2 id="linearSymbol">POST /orders</h2><p>The code is the timeline. Each step moves the execution cursor and reveals values captured at that exact observation point.</p></div>
+              <span class="evidence-chip">● observed trace</span>
+            </div>
+            <div class="focus-code" id="linearCodeFrame" aria-live="polite"></div>
+            <div class="code-foot"><span><strong id="linearResult">201 Created</strong> result at this frame</span><span id="linearThread">http-nio-8080-exec-4 · +0 ms</span></div>
+          </div>
+        </section>
+
+        <div class="state-layer" id="stateLayer">
+          <div class="state-panel" id="statePanel"></div>
+        </div>
+      </main>
+
+      <aside class="inspector" aria-label="Selected trace frame">
+        <div class="inspector-head">
+          <div class="inspector-kicker" id="inspectorKind">HTTP request</div>
+          <h2 id="inspectorName">POST /orders</h2>
+          <div class="source-link" id="inspectorSource">Trace 8cf1a / frame 1</div>
+        </div>
+        <section class="inspector-section linear-only">
+          <h3>Execution rail</h3>
+          <div class="linear-trace">
+            <button class="linear-step" data-step="0"><span class="linear-index">01</span><span class="linear-call"><span class="linear-kind">request</span><strong>POST /orders</strong><span class="linear-source">trace boundary</span></span><span class="linear-duration">143 ms</span></button>
+            <button class="linear-step" data-step="1"><span class="linear-index">02</span><span class="linear-call"><span class="linear-kind">controller</span><strong>OrderController.create</strong><span class="linear-source">:42</span></span><span class="linear-duration">3 ms</span></button>
+            <button class="linear-step" data-step="2"><span class="linear-index">03</span><span class="linear-call"><span class="linear-kind">service</span><strong>OrderService.place</strong><span class="linear-source">:71</span></span><span class="linear-duration">129 ms</span></button>
+            <button class="linear-step" data-step="3"><span class="linear-index">04</span><span class="linear-call"><span class="linear-kind">repository</span><strong>OrderRepository.save</strong><span class="linear-source">:658</span></span><span class="linear-duration">18 ms</span></button>
+            <button class="linear-step" data-step="4"><span class="linear-index">05</span><span class="linear-call"><span class="linear-kind">outbound</span><strong>inventory.reserve</strong><span class="linear-source">:29</span></span><span class="linear-duration">72 ms</span></button>
+            <button class="linear-step" data-step="5"><span class="linear-index">06</span><span class="linear-call"><span class="linear-kind">database</span><strong>checkout.orders</strong><span class="linear-source">statement 1</span></span><span class="linear-duration">11 ms</span></button>
+          </div>
+        </section>
+        <section class="inspector-section canvas-only">
+          <h3>Observed frame</h3>
+          <div class="datum"><span>started</span><span id="frameStart">09:42:08.414</span></div>
+          <div class="datum"><span>duration</span><span id="frameDuration">143 ms</span></div>
+          <div class="datum"><span>thread</span><span id="frameThread">http-nio-8080-exec-4</span></div>
+          <div class="datum"><span>result</span><span id="frameResult">201 Created</span></div>
+        </section>
+        <section class="inspector-section">
+          <h3>Values at this step</h3>
+          <div id="valueList">
+            <div class="datum"><span>customerId</span><span>cust_7ea1</span></div>
+            <div class="datum"><span>items</span><span>2 entries</span></div>
+            <div class="datum"><span>idempotency</span><span>ord_2026_09_28_4f</span></div>
+          </div>
+        </section>
+        <section class="inspector-section canvas-only">
+          <h3>Source and data at this line</h3>
+          <div class="code" id="codeFrame"></div>
+          <p class="value-note">Inline values are recorded snapshots, not live variables. Redacted and unavailable values remain visibly marked.</p>
+        </section>
+      </aside>
+    </div>
+
+    <footer class="replaybar">
+      <div class="scenario">
+        <label for="scenarioSelect">Recorded scenario</label>
+        <select class="scenario-select" id="scenarioSelect">
+          <option>201 - card order accepted</option>
+          <option>409 - inventory rejected</option>
+          <option>400 - invalid request body</option>
+        </select>
+      </div>
+      <div class="transport">
+        <div class="transport-buttons">
+          <button class="icon-btn" id="previous" aria-label="Previous frame">‹</button>
+          <button class="icon-btn play" id="play" aria-label="Play trace">▶</button>
+          <button class="icon-btn" id="next" aria-label="Next frame">›</button>
+        </div>
+        <div class="timeline"><input id="timeline" type="range" min="0" max="5" value="0" aria-label="Trace frame" /></div>
+        <div class="step-count" id="stepCount">frame 1 / 6</div>
+      </div>
+      <div class="runtime-summary"><span><strong>observed</strong><br>main@73dc12f</span><button class="speed" id="speed">1x</button></div>
+    </footer>
+  </div>
+
+  <script>
+    const shell = document.querySelector('#canvasShell');
+    const traceStage = document.querySelector('#traceStage');
+    const canvas = document.querySelector('#canvas');
+    const nodes = [...document.querySelectorAll('.node')];
+    const linearSteps = [...document.querySelectorAll('.linear-step')];
+    const edges = [...document.querySelectorAll('.edge')];
+    const timeline = document.querySelector('#timeline');
+    const stepCount = document.querySelector('#stepCount');
+    const playButton = document.querySelector('#play');
+    const zoomValue = document.querySelector('#zoomValue');
+    let step = 0;
+    let playing = false;
+    let timer = null;
+    let speed = 1;
+    let zoom = .78;
+    let tx = 24;
+    let ty = 38;
+    let dragging = false;
+    let dragOrigin = null;
+    const offsets = ['+0 ms', '+2 ms', '+5 ms', '+94 ms', '+18 ms', '+112 ms'];
+
+    const frames = [
+      { kind:'HTTP request', name:'POST /orders', source:'Trace 8cf1a / frame 1', duration:'143 ms', result:'201 Created', values:[['customerId','cust_7ea1'],['items','2 entries'],['idempotency','ord_2026_09_28_4f']], code:'40  @PostMapping("/orders")\n41  ResponseEntity<Order> create(\n42    @Valid @RequestBody CreateOrder input\n43  ) {\n44    return ok(service.place(input));\n45  }', hot:2 },
+      { kind:'Controller', name:'OrderController.create', source:'OrderController.java:42', duration:'3 ms', result:'OrderResponse', values:[['input','CreateOrder'],['principal','user_407'],['valid','true']], code:'40  @PostMapping("/orders")\n41  ResponseEntity<Order> create(\n42    @Valid @RequestBody CreateOrder input\n43  ) {\n44    return ok(service.place(input));\n45  }', hot:4 },
+      { kind:'Service', name:'OrderService.place', source:'OrderService.java:71', duration:'129 ms', result:'Order#9041', values:[['customer','cust_7ea1'],['items','[SKU-81, SKU-14]'],['total','₹4,870.00']], code:'68  Order place(CreateOrder input) {\n69    Customer customer = currentCustomer();\n70    Reservation hold = inventory.reserve(input);\n71    Order order = Order.from(input, hold);\n72    return repository.save(order);\n73  }', hot:3 },
+      { kind:'Repository', name:'OrderRepository.save', source:'SimpleJpaRepository.java:658', duration:'18 ms', result:'Order#9041', values:[['entity','Order#9041'],['state','MANAGED'],['flush','deferred']], code:'655  public <S extends T> S save(S entity) {\n656    Assert.notNull(entity, "entity");\n657    if (entityInformation.isNew(entity)) {\n658      entityManager.persist(entity);\n659      return entity;\n660    }', hot:3 },
+      { kind:'Outbound HTTP', name:'inventory.reserve', source:'InventoryClient.java:29', duration:'72 ms', result:'200 OK', values:[['host','inventory:8081'],['attempt','1'],['reservation','hold_6d19']], code:'27  Reservation reserve(Order input) {\n28    return http.post()\n29      .uri("/reservations")\n30      .body(toRequest(input))\n31      .retrieve()\n32      .body(Reservation.class);', hot:2 },
+      { kind:'Database', name:'checkout.orders', source:'JDBC span / statement 1', duration:'11 ms', result:'1 row inserted', values:[['table','orders'],['connection','pool-1'],['rows','1']], code:'INSERT INTO orders\n  (id, customer_id, status, total)\nVALUES\n  (?, ?, ?, ?)', hot:1 }
+    ];
+
+    function escapeHTML(text) {
+      return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function renderCode(frame) {
+      const inline = frame.values.slice(0, 2).map(([key, value]) => `<span class="inline-value">${escapeHTML(key)} = ${escapeHTML(value)}</span>`).join('');
+      return frame.code.split('\n').map((line, i) => {
+        const active = i === frame.hot;
+        return `<div class="code-row${active ? ' hot' : ''}"><span class="line-text">${escapeHTML(line)}</span>${active ? `<span class="inline-values">${inline}</span>` : ''}</div>`;
+      }).join('');
+    }
+
+    function setStep(nextStep, fromPlayback = false) {
+      step = Math.max(0, Math.min(frames.length - 1, nextStep));
+      timeline.value = step;
+      stepCount.textContent = `frame ${step + 1} / ${frames.length}`;
+      nodes.forEach((node, index) => {
+        node.classList.toggle('visited', index <= step);
+        node.classList.toggle('active', index === step);
+        node.classList.toggle('selected', index === step);
+      });
+      linearSteps.forEach((item) => item.classList.toggle('active', Number(item.dataset.step) === step));
+      edges.forEach((edge, index) => edge.classList.toggle('visited', index < step));
+      document.querySelectorAll('.mini-node').forEach((node, index) => node.classList.toggle('active', index === Math.min(step, 4)));
+      const frame = frames[step];
+      document.querySelector('#inspectorKind').textContent = frame.kind;
+      document.querySelector('#inspectorName').textContent = frame.name;
+      document.querySelector('#inspectorSource').textContent = frame.source;
+      document.querySelector('#frameDuration').textContent = frame.duration;
+      document.querySelector('#frameResult').textContent = frame.result;
+      document.querySelector('#valueList').innerHTML = frame.values.map(([key,value]) => `<div class="datum"><span>${key}</span><span>${value}</span></div>`).join('');
+      document.querySelector('#codeFrame').innerHTML = renderCode(frame);
+      document.querySelector('#linearCodeFrame').innerHTML = renderCode(frame);
+      const sourceParts = frame.source.match(/([^/]+):(\d+)$/);
+      document.querySelector('#linearFile').textContent = sourceParts ? sourceParts[1] : frame.source;
+      document.querySelector('#linearPosition').textContent = `frame ${step + 1} · ${sourceParts ? `line ${sourceParts[2]}` : 'interaction'} · observed`;
+      document.querySelector('#linearSymbol').textContent = frame.name;
+      document.querySelector('#linearResult').textContent = frame.result;
+      document.querySelector('#linearThread').textContent = `http-nio-8080-exec-4 · ${offsets[step]}`;
+      if (fromPlayback) {
+        const active = nodes[step];
+        active.animate([{transform:'translateY(-2px) scale(.98)'},{transform:'translateY(-2px) scale(1)'}], {duration:260, easing:'cubic-bezier(.2,.8,.2,1)'});
+        document.querySelector('#linearCodeFrame .hot')?.animate([{background:'rgba(241,165,75,.28)'},{background:'rgba(241,165,75,.16)'}], {duration:420, easing:'ease-out'});
+      }
+    }
+
+    function stop() {
+      playing = false;
+      clearInterval(timer);
+      playButton.textContent = '▶';
+      playButton.setAttribute('aria-label','Play trace');
+    }
+
+    function play() {
+      if (playing) return stop();
+      if (step === frames.length - 1) setStep(0);
+      playing = true;
+      playButton.textContent = 'Ⅱ';
+      playButton.setAttribute('aria-label','Pause trace');
+      timer = setInterval(() => {
+        if (step >= frames.length - 1) return stop();
+        setStep(step + 1, true);
+      }, 1050 / speed);
+    }
+
+    function applyTransform() {
+      canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${zoom})`;
+      zoomValue.textContent = `${Math.round(zoom * 100)}%`;
+    }
+
+    function setZoom(value) {
+      zoom = Math.max(.35, Math.min(1.25, value));
+      applyTransform();
+    }
+
+    function fitGraph() {
+      const graph = { x:70, y:70, width:990, height:510 };
+      zoom = Math.min((shell.clientWidth - 50) / graph.width, (shell.clientHeight - 50) / graph.height, 1);
+      tx = (shell.clientWidth - graph.width * zoom) / 2 - graph.x * zoom;
+      ty = (shell.clientHeight - graph.height * zoom) / 2 - graph.y * zoom;
+      applyTransform();
+    }
+
+    nodes.forEach((node) => node.addEventListener('click', () => setStep(Number(node.dataset.step))));
+    linearSteps.forEach((item) => item.addEventListener('click', () => setStep(Number(item.dataset.step))));
+    timeline.addEventListener('input', () => { stop(); setStep(Number(timeline.value)); });
+    playButton.addEventListener('click', play);
+    document.querySelector('#previous').addEventListener('click', () => { stop(); setStep(step - 1); });
+    document.querySelector('#next').addEventListener('click', () => { stop(); setStep(step + 1); });
+    document.querySelector('#zoomIn').addEventListener('click', () => setZoom(zoom + .1));
+    document.querySelector('#zoomOut').addEventListener('click', () => setZoom(zoom - .1));
+    document.querySelector('#fitButton').addEventListener('click', () => {
+      if (traceStage.dataset.view === 'canvas') fitGraph();
+      else document.querySelector('.linear-step.active')?.scrollIntoView({ block:'center', behavior:'smooth' });
+    });
+    document.querySelector('#zoomValue').addEventListener('click', () => { zoom = 1; applyTransform(); });
+
+    document.querySelectorAll('.view-switch [data-view]').forEach((button) => {
+      button.addEventListener('click', () => {
+        document.querySelectorAll('.view-switch [data-view]').forEach((item) => item.classList.toggle('active', item === button));
+        traceStage.dataset.view = button.dataset.view;
+        document.body.dataset.view = button.dataset.view;
+        document.querySelector('#fitButton').textContent = button.dataset.view === 'canvas' ? 'Fit' : 'Focus';
+      });
+    });
+
+    const exportButton = document.querySelector('#exportButton');
+    const exportMenu = document.querySelector('#exportMenu');
+    exportButton.addEventListener('click', () => {
+      const open = exportMenu.classList.toggle('open');
+      exportButton.setAttribute('aria-expanded', String(open));
+    });
+    exportMenu.querySelectorAll('[data-export]').forEach((button) => button.addEventListener('click', () => {
+      const messages = {
+        postman: 'Postman collection prepared · choose workspace to continue',
+        bundle: 'Developer bundle prepared · OpenAPI 3.1 + Postman v2.1',
+        curl: 'cURL recipes prepared · 18 endpoint commands + all.sh'
+      };
+      document.querySelector('#topMeta').textContent = messages[button.dataset.export];
+      exportMenu.classList.remove('open');
+      exportButton.setAttribute('aria-expanded','false');
+    }));
+
+    document.querySelector('#speed').addEventListener('click', (event) => {
+      const values = [1, 1.5, 2];
+      speed = values[(values.indexOf(speed) + 1) % values.length];
+      event.currentTarget.textContent = `${speed}x`;
+      if (playing) { stop(); play(); }
+    });
+
+    canvas.addEventListener('pointerdown', (event) => {
+      if (event.target.closest('.node')) return;
+      dragging = true;
+      canvas.classList.add('dragging');
+      dragOrigin = { x: event.clientX - tx, y: event.clientY - ty };
+      canvas.setPointerCapture(event.pointerId);
+    });
+    canvas.addEventListener('pointermove', (event) => {
+      if (!dragging) return;
+      tx = event.clientX - dragOrigin.x;
+      ty = event.clientY - dragOrigin.y;
+      applyTransform();
+    });
+    canvas.addEventListener('pointerup', () => { dragging = false; canvas.classList.remove('dragging'); });
+
+    shell.addEventListener('wheel', (event) => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      setZoom(zoom + (event.deltaY < 0 ? .06 : -.06));
+    }, { passive:false });
+
+    const endpointData = {
+      orders: ['POST','/orders','observed 143 ms / 28 spans','201 - card order accepted'],
+      order: ['GET','/orders/{id}','observed 34 ms / 11 spans','200 - order found'],
+      cancel: ['POST','/orders/{id}/cancel','waiting for first request','No recorded scenario'],
+      refund: ['POST','/refunds','trace incomplete / correlation error','500 - provider timeout'],
+      refundGet: ['GET','/refunds/{id}','waiting for first request','No recorded scenario'],
+      health: ['GET','/actuator/health','observed 5 ms / 3 spans','200 - healthy']
+    };
+
+    document.querySelectorAll('.endpoint').forEach((endpoint) => {
+      endpoint.addEventListener('click', () => {
+        document.querySelectorAll('.endpoint').forEach(item => item.classList.remove('active'));
+        endpoint.classList.add('active');
+        const data = endpointData[endpoint.dataset.endpoint];
+        document.querySelector('#topVerb').textContent = data[0];
+        document.querySelector('#topPath').textContent = data[1];
+        document.querySelector('#topMeta').textContent = data[2];
+        document.querySelector('#scenarioSelect').innerHTML = `<option>${data[3]}</option>`;
+        if (endpoint.dataset.state === 'waiting') setPrototypeState('empty');
+        else if (endpoint.dataset.state === 'error') setPrototypeState('error');
+        else setPrototypeState('ready');
+      });
+    });
+
+    document.querySelector('#endpointSearch').addEventListener('input', (event) => {
+      const query = event.target.value.toLowerCase();
+      document.querySelectorAll('.endpoint').forEach((endpoint) => {
+        endpoint.hidden = !endpoint.textContent.toLowerCase().includes(query);
+      });
+    });
+
+    const stateLayer = document.querySelector('#stateLayer');
+    const statePanel = document.querySelector('#statePanel');
+    const stateSelect = document.querySelector('#stateSelect');
+    function setPrototypeState(state) {
+      stateSelect.value = state;
+      stateLayer.classList.toggle('visible', state !== 'ready');
+      if (state === 'loading') statePanel.innerHTML = '<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div><p style="margin-top:16px">Resolving recorded frames and source locations.</p>';
+      if (state === 'empty') statePanel.innerHTML = '<h2>No observed trace yet</h2><p>Explore the labelled inferred path now, or keep X-trace running and call this endpoint from your app, tests, API client or an explicitly requested exercise plan.</p><button class="state-action" data-dismiss>Return to recorded trace</button>';
+      if (state === 'error') statePanel.innerHTML = '<h2>Trace ended early</h2><p>The request was captured, but correlation stopped before the response returned. Inspect the partial events or record the scenario again.</p><button class="state-action" data-dismiss>Show partial trace</button>';
+      statePanel.querySelector('[data-dismiss]')?.addEventListener('click', () => setPrototypeState('ready'));
+    }
+    stateSelect.addEventListener('change', () => setPrototypeState(stateSelect.value));
+
+    document.querySelector('#scenarioSelect').addEventListener('change', (event) => {
+      const option = event.target.selectedIndex;
+      stop();
+      setStep(option === 0 ? 0 : option === 1 ? 2 : 1);
+    });
+
+    fitGraph();
+    setStep(0);
+  </script>
+</body>
+</html>
