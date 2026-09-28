@@ -18,6 +18,16 @@
 //! The CLI never claims capture or replay support. [`status`] sets
 //! `capture_supported` and `replay_supported` to `false` until a
 //! future slice wires the corresponding capabilities.
+//!
+//! ## Storage layout
+//!
+//! Project state lives under the user-data home directory
+//! (`XTRACE_DATA_HOME` or the platform default). Each project owns
+//! one `<user_data_home>/projects/<project-id>/metadata.sqlite3`
+//! file. The repository holds only a `.xtrace/config.toml` pointer
+//! that records the project identifier and the user-data home used
+//! at `init` time. Status on an uninitialized repository reports the
+//! empty state without opening or creating any database.
 
 #![allow(clippy::module_name_repetitions, reason = "CLI modules are named after their subcommands")]
 #![cfg_attr(
@@ -28,7 +38,7 @@
 mod commands;
 mod error;
 mod output;
-mod store_paths;
+mod paths;
 
 use clap::Parser;
 use commands::XtraceCommand;

@@ -107,6 +107,11 @@ impl FromStr for WallTime {
 #[repr(transparent)]
 pub struct MonotonicNs(pub u64);
 
+/// Maximum representable non-negative nanosecond difference. Matches
+/// `i64::MAX` and therefore caps the returned [`Duration`] at roughly
+/// 292 years; differences above this value saturate rather than wrap.
+pub const MAX_SATURATED_NANOS: i64 = i64::MAX;
+
 impl MonotonicNs {
     /// Wraps a raw monotonic reading.
     #[must_use]
@@ -115,6 +120,11 @@ impl MonotonicNs {
     }
 
     /// Computes the signed delta between two readings.
+    ///
+    /// The result is computed in `i128` so the worst-case subtraction
+    /// of two `u64` values cannot overflow; callers receive the full
+    /// signed range and decide how to project it onto their own
+    /// duration type.
     #[must_use]
     pub fn delta(self, other: Self) -> i128 {
         i128::from(self.0) - i128::from(other.0)
@@ -122,14 +132,25 @@ impl MonotonicNs {
 
     /// Returns the elapsed duration since `earlier`.
     ///
-    /// Returns `Duration::ZERO` if `earlier` is greater than `self`.
+    /// Negative deltas clamp to `Duration::ZERO`. Positive deltas that
+    /// would overflow `i64` nanoseconds saturate at
+    /// [`MAX_SATURATED_NANOS`] so the returned [`Duration`] is always
+    /// representable. The saturation is explicit rather than panicking
+    /// because monotonic readings are adapter-supplied and a runaway
+    /// counter must not crash the daemon.
     #[must_use]
     pub fn elapsed_since(self, earlier: Self) -> Duration {
-        if self.0 >= earlier.0 {
-            Duration::nanoseconds((self.0 - earlier.0) as i64)
-        } else {
-            Duration::ZERO
+        // Compute the difference in `i128` to avoid the `u64`
+        // subtraction edge case. Saturating to `MAX_SATURATED_NANOS`
+        // preserves the explicit-behavior contract: a caller receives
+        // the largest representable duration and never a negative
+        // value, never a panic, and never a silent wrap.
+        let diff = self.delta(earlier);
+        if diff <= 0 {
+            return Duration::ZERO;
         }
+        let nanos = i64::try_from(diff).unwrap_or(MAX_SATURATED_NANOS);
+        Duration::nanoseconds(nanos)
     }
 }
 
@@ -192,5 +213,45 @@ mod tests {
         let b = MonotonicNs::from_raw(100);
         assert_eq!(a.elapsed_since(b), Duration::nanoseconds(200));
         assert_eq!(b.elapsed_since(a), Duration::ZERO);
+    }
+
+    #[test]
+    fn monotonic_elapsed_saturates_on_overflow() {
+        // The previous `as i64` cast would silently wrap; the new
+        // implementation must saturate instead. Choose a delta that
+        // overflows `i64::MAX` nanoseconds (~292 years) and confirm
+        // the result clamps to the documented saturation point.
+        let earlier = MonotonicNs::from_raw(0);
+        let later = MonotonicNs::from_raw(u64::MAX);
+        assert_eq!(later.elapsed_since(earlier), Duration::nanoseconds(MAX_SATURATED_NANOS));
+    }
+
+    #[test]
+    fn monotonic_elapsed_saturates_at_i64_max_boundary() {
+        // The exact `i64::MAX` nanosecond delta must survive
+        // conversion; values strictly above must still saturate.
+        let earlier = MonotonicNs::from_raw(0);
+        let boundary = MonotonicNs::from_raw(MAX_SATURATED_NANOS as u64);
+        assert_eq!(
+            boundary.elapsed_since(earlier),
+            Duration::nanoseconds(MAX_SATURATED_NANOS),
+            "boundary value must convert exactly",
+        );
+        let overflow = MonotonicNs::from_raw(MAX_SATURATED_NANOS as u64 + 1);
+        assert_eq!(
+            overflow.elapsed_since(earlier),
+            Duration::nanoseconds(MAX_SATURATED_NANOS),
+            "value above i64::MAX must saturate",
+        );
+    }
+
+    #[test]
+    fn monotonic_delta_never_overflows() {
+        // `i128` is wide enough to hold the full u64 difference
+        // without overflow even at the extremes.
+        let lo = MonotonicNs::from_raw(0);
+        let hi = MonotonicNs::from_raw(u64::MAX);
+        assert_eq!(hi.delta(lo), i128::from(u64::MAX));
+        assert_eq!(lo.delta(hi), -i128::from(u64::MAX));
     }
 }

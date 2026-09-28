@@ -55,7 +55,7 @@ pub use ids::{
     ClaimId, CorrelationId, FrameId, InteractionId, OperationId, OperationVersionId, PolicyId,
     ProjectId, RecordingId, RunId, RuntimeSessionId, SourceArtifactId, SourceRevisionId,
 };
-pub use project::{Project, RepositoryFingerprint};
+pub use project::{FingerprintParseError, Project, RepositoryFingerprint};
 pub use provenance::{EvidenceRef, LimitationCode, ProducerIdentity, ProvenanceKind};
 pub use run::{Run, RunKind, RunState};
 pub use time::{MonotonicNs, WallTime};

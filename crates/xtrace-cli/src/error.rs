@@ -8,7 +8,8 @@ use xtrace_domain::AppError;
 use xtrace_domain::ErrorCategory;
 
 /// CLI-side error. Either an [`AppError`] from the application facade
-/// or an early-failure (invalid argument, missing directory).
+/// or an early-failure (invalid argument, missing directory, missing
+/// repository pointer, ...).
 #[derive(Debug)]
 pub enum CliError {
     /// Application facade returned an error.
@@ -17,6 +18,10 @@ pub enum CliError {
     InvalidArgument(String),
     /// The supplied project directory could not be located.
     ProjectDirectoryMissing(String),
+    /// The local store schema is newer than this binary supports.
+    StoreSchemaNewer(String),
+    /// The local store schema is older than this binary supports.
+    StoreSchemaOlder(String),
     /// The local store is corrupted beyond recovery.
     StoreCorrupted(String),
     /// The local store cannot be reached (I/O error).
@@ -35,6 +40,8 @@ impl CliError {
             Self::App(err) => exit_code_for_category(err.category),
             Self::InvalidArgument(_) => 2,
             Self::ProjectDirectoryMissing(_) => 3,
+            Self::StoreSchemaNewer(_) => 6,
+            Self::StoreSchemaOlder(_) => 6,
             Self::StoreCorrupted(_) => 4,
             Self::StoreUnavailable(_) => 5,
         }
@@ -66,6 +73,8 @@ impl std::fmt::Display for CliError {
             Self::ProjectDirectoryMissing(message) => {
                 write!(f, "project directory missing: {message}")
             }
+            Self::StoreSchemaNewer(message) => write!(f, "store schema newer: {message}"),
+            Self::StoreSchemaOlder(message) => write!(f, "store schema older: {message}"),
             Self::StoreCorrupted(message) => write!(f, "store corrupted: {message}"),
             Self::StoreUnavailable(message) => write!(f, "store unavailable: {message}"),
         }

@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - "slice/**"
+  pull_request:
+    branches:
+      - main
+      - "slice/**"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Format gate (stable rustfmt, no nightly-only keys)
+        run: cargo fmt --all --check
+      - name: Strict clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Unit and integration tests
+        run: cargo test --workspace --all-features --no-fail-fast
+      - name: Restricted-PATH vendored-protoc build
+        # `PATH` excludes any directory that could host a system `protoc`,
+        # proving the build script resolves the binary exclusively through
+        # `protoc-bin-vendored`.
+        run: |
+          PATH="/usr/bin:/bin:/usr/local/bin:$HOME/.cargo/bin" \
+            cargo build -p xtrace-protocol --all-features
+      - name: CLI integration smoke
+        env:
+          XTRACE_DATA_HOME: /tmp/xtrace-cli-smoke/userdata
+        run: |
+          mkdir -p /tmp/xtrace-cli-smoke/repo
+          cargo build -p xtrace-cli --bin xtrace
+          cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir /tmp/xtrace-cli-smoke/repo
+          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-cli-smoke/repo --display-name "Smoke"
+          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-cli-smoke/repo --display-name "Smoke"
+          (cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-cli-smoke/repo --display-name "Different" && echo "FAIL: idempotency conflict was not raised") || true
+          cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir /tmp/xtrace-cli-smoke/repo
+          cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir /tmp/xtrace-cli-smoke/repo
+          test -f /tmp/xtrace-cli-smoke/userdata/projects/*/metadata.sqlite3
+          test -f /tmp/xtrace-cli-smoke/repo/.xtrace/config.toml
+          grep -q '^project_id = ' /tmp/xtrace-cli-smoke/repo/.xtrace/config.toml

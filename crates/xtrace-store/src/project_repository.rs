@@ -52,6 +52,7 @@ impl<'store> SqliteProjectRepository<'store> {
             StoreErrorKind::Corruption => PortErrorKind::Corruption,
             StoreErrorKind::Transport => PortErrorKind::Transport,
             StoreErrorKind::Busy => PortErrorKind::Resource,
+            StoreErrorKind::Resource => PortErrorKind::Resource,
             StoreErrorKind::Internal => PortErrorKind::Internal,
         };
         let mut builder = PortError::new(kind, err.message(), err.correlation_id());
@@ -406,9 +407,20 @@ fn map_project_row(row: &Row<'_>) -> rusqlite::Result<Project> {
     let config_schema_version = u32::try_from(config_schema_version).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Integer, Box::new(err))
     })?;
+    let canonical_repo_hash = RepositoryFingerprint::try_from_canonical(&canonical_repo_hash)
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("column canonical_repo_hash: {err}"),
+                )),
+            )
+        })?;
     Ok(Project {
         id: ProjectId::from_uuid(project_id),
-        canonical_repo_hash: RepositoryFingerprint::from_canonical(&canonical_repo_hash),
+        canonical_repo_hash,
         display_name,
         created_at,
         last_opened_at,

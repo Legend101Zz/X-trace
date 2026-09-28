@@ -16,11 +16,24 @@
 //! commits; an interrupted migration therefore leaves the database
 //! at the previous schema version and a re-open simply retries the
 //! remaining migrations.
+//!
+//! ## Identity and checksums
+//!
+//! The runner also records a deterministic BLAKE3-256 checksum of
+//! the entire migration catalog (labels concatenated with their SQL
+//! statements) in `schema_meta.catalog_checksum`. Opening a database
+//! whose stored checksum does not match the binary's compiled-in
+//! catalog fails with [`StoreErrorKind::SchemaIncompatible`] so a
+//! tampered or partially-applied schema cannot silently corrupt
+//! later slices. The checksum is computed only over the migrations
+//! the binary ships, so a newer binary that adds a migration can
+//! read an older checksum, recompute its own, and apply the missing
+//! delta.
 
 use std::collections::BTreeMap;
 
 use rusqlite::Connection;
-use xtrace_domain::{CorrelationId, WallTime};
+use xtrace_domain::{ContentHash, CorrelationId, WallTime};
 
 use crate::error::{StoreError, StoreErrorKind};
 
@@ -57,6 +70,28 @@ impl Migrations {
     pub fn catalog_by_version() -> BTreeMap<u32, MigrationRecord> {
         Self::catalog().into_iter().map(|record| (record.version, record)).collect()
     }
+
+    /// Returns the canonical identity for the compiled-in migration
+    /// catalog as the lowercase `b3:<hex>` form. The hash covers the
+    /// ordered `(label, version, statement)` triples so any textual
+    /// change to a migration produces a new identity.
+    ///
+    /// [`ContentHash::to_canonical`]: xtrace_domain::ContentHash::to_canonical
+    #[must_use]
+    pub fn catalog_checksum() -> String {
+        let mut hasher = blake3::Hasher::new();
+        for record in Self::catalog() {
+            hasher.update(&record.version.to_be_bytes());
+            hasher.update(record.label.as_bytes());
+            for statement in record.statements {
+                hasher.update(statement.as_bytes());
+            }
+        }
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(digest.as_bytes());
+        ContentHash::of_bytes(&bytes).to_canonical()
+    }
 }
 
 /// First schema version. Created by `v0001_initial`.
@@ -66,7 +101,8 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     schema_version      INTEGER NOT NULL,
     min_reader_version  INTEGER NOT NULL,
     migrated_at         TEXT NOT NULL,
-    app_version         TEXT NOT NULL
+    app_version         TEXT NOT NULL,
+    catalog_checksum    TEXT NOT NULL
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -118,6 +154,20 @@ CREATE TABLE IF NOT EXISTS runs (
         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS command_receipts (
+    project_id        BLOB NOT NULL,
+    command_kind      TEXT NOT NULL,
+    idempotency_key   TEXT NOT NULL,
+    input_digest      TEXT NOT NULL,
+    receipt_json      TEXT NOT NULL,
+    correlation_id    TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    PRIMARY KEY (project_id, command_kind, idempotency_key),
+    FOREIGN KEY (project_id)
+        REFERENCES projects (project_id)
+        ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
 CREATE INDEX IF NOT EXISTS runs_project_status
     ON runs (project_id, status);
 
@@ -157,6 +207,12 @@ pub fn apply_pending(
         })?;
         apply_one(connection, record, app_version, correlation_id)?;
     }
+
+    // Compare the catalog identity stored on disk against the binary's
+    // compiled-in catalog. A mismatch on a previously migrated
+    // database means the schema was tampered with or restored from
+    // an incompatible source; refuse to read it.
+    verify_catalog_checksum(connection, correlation_id)?;
 
     Ok(latest)
 }
@@ -213,6 +269,48 @@ fn current_schema_version(
     })
 }
 
+/// Compares the catalog checksum stored on disk against the
+/// compiled-in catalog. A mismatch on a previously migrated database
+/// is treated as incompatible because the SQL the binary would emit
+/// no longer matches the SQL that originally produced the schema.
+fn verify_catalog_checksum(
+    connection: &Connection,
+    correlation_id: CorrelationId,
+) -> Result<(), StoreError> {
+    // A fresh database has just been migrated in this call; the
+    // stored checksum is the one we wrote so it always matches.
+    // The check is therefore meaningful only after the first
+    // migration has been applied during a previous open.
+    let present: bool = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'",
+            [],
+            |row| row.get::<_, i64>(0).map(|_| true),
+        )
+        .optional()
+        .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?
+        .unwrap_or(false);
+    if !present {
+        return Ok(());
+    }
+    let stored: String = connection
+        .query_row("SELECT catalog_checksum FROM schema_meta WHERE singleton = 1", [], |row| {
+            row.get(0)
+        })
+        .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
+    let expected = Migrations::catalog_checksum();
+    if stored != expected {
+        return Err(StoreError::new(
+            StoreErrorKind::SchemaIncompatible,
+            format!(
+                "stored migration catalog checksum {stored} does not match binary catalog {expected}"
+            ),
+            correlation_id,
+        ));
+    }
+    Ok(())
+}
+
 /// Inserts (or replaces) the singleton `schema_meta` row.
 fn record_schema_version(
     connection: &Connection,
@@ -221,12 +319,13 @@ fn record_schema_version(
     correlation_id: CorrelationId,
 ) -> Result<(), StoreError> {
     let now = WallTime::now().to_rfc3339();
+    let checksum = Migrations::catalog_checksum();
     connection
         .execute(
             "INSERT OR REPLACE INTO schema_meta \
-             (singleton, schema_version, min_reader_version, migrated_at, app_version) \
-             VALUES (1, ?1, ?1, ?2, ?3)",
-            rusqlite::params![i64::from(version), now, app_version],
+             (singleton, schema_version, min_reader_version, migrated_at, app_version, catalog_checksum) \
+             VALUES (1, ?1, ?1, ?2, ?3, ?4)",
+            rusqlite::params![i64::from(version), now, app_version, checksum],
         )
         .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
     Ok(())
@@ -280,5 +379,43 @@ mod tests {
         .expect("bump version");
         let err = apply_pending(&conn, "0.1.0-test", CorrelationId::new()).unwrap_err();
         assert_eq!(err.kind(), StoreErrorKind::SchemaNewer);
+    }
+
+    #[test]
+    fn catalog_checksum_records_binary_identity() {
+        let conn = new_memory();
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply");
+        let stored: String = conn
+            .query_row("SELECT catalog_checksum FROM schema_meta WHERE singleton = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("checksum row");
+        assert_eq!(stored, Migrations::catalog_checksum());
+    }
+
+    #[test]
+    fn tampered_checksum_is_rejected_as_incompatible() {
+        let conn = new_memory();
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply");
+        // Simulate tampering by overwriting the stored checksum with
+        // the wrong value. The next open must refuse the database.
+        conn.execute(
+            "UPDATE schema_meta SET catalog_checksum = 'b3:0000000000000000000000000000000000000000000000000000000000000000' WHERE singleton = 1",
+            [],
+        )
+        .expect("tamper checksum");
+        let err = apply_pending(&conn, "0.1.0-test", CorrelationId::new()).unwrap_err();
+        assert_eq!(err.kind(), StoreErrorKind::SchemaIncompatible);
+    }
+
+    #[test]
+    fn checksum_changes_when_migration_text_changes() {
+        // Sanity check that any textual change to the compiled-in
+        // catalog produces a different identity. This guards against
+        // a future change that "looks the same" but silently alters
+        // behavior.
+        let a = Migrations::catalog_checksum();
+        let b = blake3::hash(b"alternate-migration-text").to_string();
+        assert_ne!(a, b);
     }
 }

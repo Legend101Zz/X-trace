@@ -6,12 +6,15 @@
 //! the [`SqliteProjectRepository`] view through
 //! [`SqliteStore::project_repository`].
 //!
-//! The store applies three pragmas on every open:
+//! The store applies the following pragmas on every open:
 //!
 //! - `foreign_keys = ON` so `STRICT` tables enforce referential
 //!   integrity;
 //! - `journal_mode = WAL` for concurrent readers and a single writer
 //!   without blocking on disk;
+//! - `synchronous = NORMAL` per `docs/plans/x-trace/03a-domain-and-storage.md`
+//!   §7 (FULL is reserved for migration checkpoints in later
+//!   slices);
 //! - `busy_timeout = 5000ms` so a brief contention window returns a
 //!   typed [`StoreErrorKind::Busy`] rather than failing immediately.
 //!
@@ -35,6 +38,14 @@ pub const FOREIGN_KEYS_PRAGMA: &str = "PRAGMA foreign_keys = ON";
 
 /// Journal mode pragma string.
 pub const JOURNAL_MODE_PRAGMA: &str = "PRAGMA journal_mode = WAL";
+
+/// Synchronous mode pragma string.
+///
+/// `NORMAL` matches `03a-domain-and-storage.md` §7: it commits without
+/// the additional fsync that `FULL` requires while still surviving
+/// application-level crashes. `FULL` remains the documented choice
+/// for migration checkpoints in later slices.
+pub const SYNCHRONOUS_PRAGMA: &str = "PRAGMA synchronous = NORMAL";
 
 /// Busy timeout applied to every connection. Five seconds matches the
 /// value used by other local-first products; longer values mask real
@@ -246,6 +257,9 @@ fn apply_pragmas(
     connection
         .execute_batch(JOURNAL_MODE_PRAGMA)
         .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
+    connection
+        .execute_batch(SYNCHRONOUS_PRAGMA)
+        .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
     let pragma = format!("PRAGMA busy_timeout = {}", busy_timeout.as_millis());
     connection
         .execute_batch(&pragma)
@@ -272,6 +286,10 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .expect("busy_timeout pragma");
         assert_eq!(timeout, 5_000);
+
+        let synchronous: i64 =
+            conn.query_row("PRAGMA synchronous", [], |row| row.get(0)).expect("synchronous pragma");
+        assert_eq!(synchronous, 1, "synchronous must be NORMAL (value 1); FULL=2, OFF=0");
     }
 
     #[test]

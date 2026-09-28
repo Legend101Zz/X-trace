@@ -35,6 +35,8 @@ pub enum StoreErrorKind {
     Transport,
     /// SQLite was busy and the busy timeout elapsed.
     Busy,
+    /// Underlying resource exhaustion (memory, file descriptors).
+    Resource,
     /// A catch-all for unexpected SQLite errors that do not map to a
     /// more specific category.
     Internal,
@@ -94,6 +96,14 @@ impl StoreError {
     /// Maps a [`rusqlite::Error`] into a [`StoreError`] using the
     /// supplied correlation ID. The mapping is total; every
     /// `rusqlite::Error` variant maps to one [`StoreErrorKind`].
+    ///
+    /// SQLite reports I/O failures through `SqliteFailure` with the
+    /// `SystemIoFailure` code, but `Open` failures and the
+    /// `CannotOpen` code travel through the same variant. The
+    /// mapping funnels every disk-level error into
+    /// [`StoreErrorKind::Transport`] so the application facade can
+    /// preserve the request correlation ID and surface a retryable
+    /// category to clients.
     pub fn from_rusqlite(error: rusqlite::Error, correlation_id: CorrelationId) -> Self {
         let (kind, message) = match &error {
             rusqlite::Error::SqliteFailure(code, _)
@@ -120,6 +130,17 @@ impl StoreError {
             {
                 (StoreErrorKind::Corruption, "database file is corrupt")
             }
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.code == rusqlite::ErrorCode::SystemIoFailure
+                    || code.code == rusqlite::ErrorCode::CannotOpen =>
+            {
+                (StoreErrorKind::Transport, "SQLite reported a transport-level error")
+            }
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.code == rusqlite::ErrorCode::OutOfMemory =>
+            {
+                (StoreErrorKind::Resource, "SQLite exhausted available memory")
+            }
             rusqlite::Error::InvalidQuery
             | rusqlite::Error::InvalidParameterName(_)
             | rusqlite::Error::InvalidColumnIndex(_)
@@ -143,5 +164,32 @@ impl StoreError {
             _ => (StoreErrorKind::Internal, "unexpected SQLite error"),
         };
         Self::new(kind, message, correlation_id).with_source(error.to_string())
+    }
+}
+
+#[cfg(test)]
+// Tests intentionally panic on invariant violations because the
+// failure mode is "test failed", not "library panicked".
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests assert on fallible fixture data"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_rusqlite_preserves_correlation_id_for_known_variants() {
+        let correlation_id = CorrelationId::new();
+        let cases = [
+            (rusqlite::Error::QueryReturnedNoRows, StoreErrorKind::NotFound),
+            (rusqlite::Error::InvalidQuery, StoreErrorKind::Validation),
+            (rusqlite::Error::InvalidColumnIndex(0), StoreErrorKind::Validation),
+        ];
+        for (error, expected) in cases {
+            let mapped = StoreError::from_rusqlite(error, correlation_id);
+            assert_eq!(mapped.kind(), expected);
+            assert_eq!(mapped.correlation_id(), correlation_id);
+        }
     }
 }

@@ -6,20 +6,20 @@
 //! application facade is the single source of truth for what the
 //! CLI is allowed to do.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use serde::Serialize;
 use xtrace_application::{
     Application, Command, GetStoreStatus, InitializeProject, OpenProject, Query, RequestContext,
 };
-use xtrace_domain::WallTime;
-use xtrace_store::CURRENT_SCHEMA_VERSION;
-use xtrace_store::SqliteProjectRepository;
+use xtrace_domain::{ProjectId, WallTime};
+use xtrace_store::{CURRENT_SCHEMA_VERSION, SqliteIdempotencyStore, SqliteProjectRepository};
+use xtrace_store::{SqliteStore, StoreErrorKind};
 
 use crate::error::CliError;
 use crate::output::write_success;
-use crate::store_paths::StoreLocator;
+use crate::paths::{RepositoryPointer, UserDataPaths};
 
 /// Top-level subcommand surface parsed by [`clap`].
 #[derive(Clone, Debug, Subcommand)]
@@ -32,8 +32,8 @@ pub enum XtraceCommand {
         /// Display name shown in `xtrace status` and the UI surfaces.
         #[arg(long = "display-name", value_name = "NAME", default_value = "")]
         display_name: String,
-        /// Idempotency key. Repeated runs with the same key return
-        /// the original receipt.
+        /// Idempotency key. Repeated runs with the same key and the
+        /// same canonical input return the original receipt.
         #[arg(long = "idempotency-key", value_name = "KEY", default_value = "")]
         idempotency_key: String,
     },
@@ -72,96 +72,181 @@ fn init(
     display_name: String,
     idempotency_key: String,
 ) -> Result<(), CliError> {
-    let locator = StoreLocator::from_project_dir(&project_dir)?;
+    let repo = resolve_repo(&project_dir)?;
+    let user_data_home = UserDataPaths::home()?;
+    // Honour an existing pointer so re-running `init` against the
+    // same repository uses the original project identifier. The
+    // application facade's idempotency contract then either returns
+    // the original receipt (same canonical input) or surfaces
+    // `XTR-COMMAND-409` (different canonical input).
+    let project_id = match RepositoryPointer::read(&repo) {
+        Ok(pointer) => pointer.project_id,
+        Err(CliError::ProjectDirectoryMissing(_)) => ProjectId::new(),
+        Err(err) => return Err(err),
+    };
+    let project_directory = UserDataPaths::project_dir(project_id)?;
+    std::fs::create_dir_all(&project_directory)
+        .map_err(|err| CliError::StoreUnavailable(format!("create project dir: {err}")))?;
+    let database_path = UserDataPaths::database_path(project_id)?;
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
 
-    // Build the application facade before opening the store so a
-    // validation failure (e.g. empty display name) does not touch the
-    // filesystem.
-    let store = locator.open_store()?;
+    let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
+        .map_err(map_store_error)?;
     let repository = SqliteProjectRepository::new(&store);
-    let app = Application::new(repository, CURRENT_SCHEMA_VERSION, 1, 0);
-    let canonical = locator.project_dir.display().to_string();
+    let idempotency = SqliteIdempotencyStore::new(&store);
+    let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
+
+    let canonical = repo.display().to_string();
     let resolved_display_name = if display_name.trim().is_empty() {
-        locator
-            .project_dir
-            .file_name()
+        repo.file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| canonical.clone())
     } else {
         display_name
     };
     let resolved_idempotency_key = if idempotency_key.trim().is_empty() {
-        format!("xtrace-init-{}", locator.project_dir.display())
+        format!("xtrace-init-{canonical}")
     } else {
         idempotency_key
     };
-    let receipt = app.execute(
-        Command::InitializeProject(InitializeProject {
-            canonical_repo_path: canonical,
-            display_name: resolved_display_name,
-            idempotency_key: resolved_idempotency_key,
-        }),
-        &ctx,
-    )?;
+    let receipt = app
+        .execute(
+            Command::InitializeProject(InitializeProject {
+                canonical_repo_path: canonical,
+                display_name: resolved_display_name,
+                idempotency_key: resolved_idempotency_key,
+                project_id,
+            }),
+            &ctx,
+        )
+        .map_err(CliError::from)?;
+
+    // Persist the repository pointer only after the application
+    // returns success. If `init` fails the repository stays
+    // uninitialized so a retry starts from a clean slate.
+    let pointer = RepositoryPointer { schema_version: 1, project_id, data_home: user_data_home };
+    pointer.write(&repo)?;
+
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    let document = InitDocument::from_receipt(&receipt, &locator);
+    let document = InitDocument::from_receipt(&receipt, &pointer, &database_path);
     write_success(&mut handle, &document)?;
     Ok(())
 }
 
 fn open(project_dir: PathBuf, idempotency_key: String) -> Result<(), CliError> {
-    let locator = StoreLocator::from_project_dir(&project_dir)?;
+    let repo = resolve_repo(&project_dir)?;
+    let pointer = RepositoryPointer::read(&repo)?;
+    let database_path = UserDataPaths::database_path(pointer.project_id)?;
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
 
-    let store = locator.open_store()?;
+    let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
+        .map_err(map_store_error)?;
     let repository = SqliteProjectRepository::new(&store);
-    let app = Application::new(repository, CURRENT_SCHEMA_VERSION, 1, 0);
-    let canonical = locator.project_dir.display().to_string();
+    let idempotency = SqliteIdempotencyStore::new(&store);
+    let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
+
+    let canonical = repo.display().to_string();
     let resolved_idempotency_key = if idempotency_key.trim().is_empty() {
-        format!("xtrace-open-{}", locator.project_dir.display())
+        format!("xtrace-open-{canonical}")
     } else {
         idempotency_key
     };
-    let receipt = app.execute(
-        Command::OpenProject(OpenProject {
-            canonical_repo_path: canonical,
-            idempotency_key: resolved_idempotency_key,
-        }),
-        &ctx,
-    )?;
+    let receipt = app
+        .execute(
+            Command::OpenProject(OpenProject {
+                canonical_repo_path: canonical,
+                idempotency_key: resolved_idempotency_key,
+            }),
+            &ctx,
+        )
+        .map_err(CliError::from)?;
+
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    let document = OpenDocument::from_receipt(&receipt, &locator);
+    let document = OpenDocument::from_receipt(&receipt, &pointer, &database_path);
     write_success(&mut handle, &document)?;
     Ok(())
 }
 
 fn status(project_dir: PathBuf) -> Result<(), CliError> {
-    let locator = StoreLocator::from_project_dir(&project_dir)?;
+    let repo = resolve_repo(&project_dir)?;
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
 
-    let store = locator.open_store()?;
-    let repository = SqliteProjectRepository::new(&store);
-    let app = Application::new(repository, CURRENT_SCHEMA_VERSION, 1, 0);
-    let result = app.query(Query::GetStoreStatus(GetStoreStatus), &ctx)?;
+    // Status on an uninitialized repository reports the empty state
+    // without opening or creating any database file. The check is
+    // purely about the pointer file; the database is never touched
+    // when the pointer is absent.
+    let document = match RepositoryPointer::read(&repo) {
+        Ok(pointer) => {
+            let database_path = UserDataPaths::database_path(pointer.project_id)?;
+            // Open read-by-side-effect: we need the bootstrap so the
+            // report names the schema version actually present on
+            // disk, but we never write from status.
+            let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
+                .map_err(map_store_error)?;
+            let repository = SqliteProjectRepository::new(&store);
+            let idempotency = SqliteIdempotencyStore::new(&store);
+            let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
+            let result = app.query(Query::GetStoreStatus(GetStoreStatus), &ctx)?;
+            match result {
+                xtrace_application::QueryResult::StoreStatus(report) => {
+                    StatusDocument::from_report(
+                        report,
+                        store.bootstrap().schema_version,
+                        &pointer,
+                        &database_path,
+                    )
+                }
+                xtrace_application::QueryResult::Project(_) => {
+                    unreachable!("GetStoreStatus must produce a StoreStatus variant")
+                }
+            }
+        }
+        Err(CliError::ProjectDirectoryMissing(_)) => empty_status_document(&repo),
+        Err(err) => return Err(err),
+    };
+
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    match result {
-        xtrace_application::QueryResult::StoreStatus(report) => {
-            let document =
-                StatusDocument::from_report(report, store.bootstrap().schema_version, &locator);
-            write_success(&mut handle, &document)?;
-        }
-        xtrace_application::QueryResult::Project(_) => {
-            unreachable!("GetStoreStatus must produce a StoreStatus variant")
-        }
-    }
+    write_success(&mut handle, &document)?;
     Ok(())
+}
+
+fn resolve_repo(project_dir: &Path) -> Result<PathBuf, CliError> {
+    if !project_dir.exists() {
+        return Err(CliError::ProjectDirectoryMissing(project_dir.display().to_string()));
+    }
+    if !project_dir.is_dir() {
+        return Err(CliError::InvalidArgument(format!(
+            "project path is not a directory: {}",
+            project_dir.display()
+        )));
+    }
+    project_dir.canonicalize().map_err(|err| CliError::StoreUnavailable(err.to_string()))
+}
+
+fn empty_status_document(repo: &Path) -> StatusDocument {
+    let canonical = repo.display().to_string();
+    let capabilities = xtrace_application::CapabilityReport {
+        store_schema_version: CURRENT_SCHEMA_VERSION,
+        protocol_major: 1,
+        protocol_minor: 0,
+        capture_supported: false,
+        replay_supported: false,
+    };
+    StatusDocument {
+        kind: "store_status",
+        initialized: false,
+        project_dir: canonical,
+        database_path: String::new(),
+        store_schema_version: 0,
+        capabilities,
+        projects: Vec::new(),
+    }
 }
 
 /// Best-effort "who ran the command" placeholder. The CLI does not
@@ -173,6 +258,20 @@ fn env_user() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// Maps [`xtrace_store::StoreError`] categories into [`CliError`].
+fn map_store_error(err: xtrace_store::StoreError) -> CliError {
+    match err.kind() {
+        StoreErrorKind::Corruption | StoreErrorKind::SchemaIncompatible => {
+            CliError::StoreCorrupted(err.message().to_string())
+        }
+        StoreErrorKind::SchemaNewer => CliError::StoreSchemaNewer(err.message().to_string()),
+        StoreErrorKind::SchemaOlder => CliError::StoreSchemaOlder(err.message().to_string()),
+        StoreErrorKind::Transport => CliError::StoreUnavailable(err.message().to_string()),
+        StoreErrorKind::Busy => CliError::StoreUnavailable(err.message().to_string()),
+        _ => CliError::StoreUnavailable(err.message().to_string()),
+    }
+}
+
 /// Stable JSON shape of an `init` receipt.
 #[derive(Debug, Serialize)]
 pub struct InitDocument {
@@ -182,11 +281,16 @@ pub struct InitDocument {
     pub idempotency_key: String,
     pub project_dir: String,
     pub database_path: String,
+    pub data_home: String,
     pub schema_version: u32,
 }
 
 impl InitDocument {
-    fn from_receipt(receipt: &xtrace_application::CommandReceipt, locator: &StoreLocator) -> Self {
+    fn from_receipt(
+        receipt: &xtrace_application::CommandReceipt,
+        pointer: &RepositoryPointer,
+        database_path: &Path,
+    ) -> Self {
         match receipt {
             xtrace_application::CommandReceipt::ProjectInitialized {
                 project_id,
@@ -197,8 +301,9 @@ impl InitDocument {
                 project_id: project_id.to_string(),
                 fingerprint: fingerprint.as_str().to_string(),
                 idempotency_key: idempotency_key.clone(),
-                project_dir: locator.project_dir.display().to_string(),
-                database_path: locator.database_path.display().to_string(),
+                project_dir: pointer.data_home.display().to_string(),
+                database_path: database_path.display().to_string(),
+                data_home: pointer.data_home.display().to_string(),
                 schema_version: CURRENT_SCHEMA_VERSION,
             },
             _ => unreachable!("InitializeProject must yield a ProjectInitialized receipt"),
@@ -217,15 +322,19 @@ pub struct OpenDocument {
 }
 
 impl OpenDocument {
-    fn from_receipt(receipt: &xtrace_application::CommandReceipt, locator: &StoreLocator) -> Self {
+    fn from_receipt(
+        receipt: &xtrace_application::CommandReceipt,
+        pointer: &RepositoryPointer,
+        database_path: &Path,
+    ) -> Self {
         match receipt {
             xtrace_application::CommandReceipt::ProjectOpened { project_id, idempotency_key } => {
                 Self {
                     kind: "project_opened",
                     project_id: project_id.to_string(),
                     idempotency_key: idempotency_key.clone(),
-                    project_dir: locator.project_dir.display().to_string(),
-                    database_path: locator.database_path.display().to_string(),
+                    project_dir: pointer.data_home.display().to_string(),
+                    database_path: database_path.display().to_string(),
                 }
             }
             _ => unreachable!("OpenProject must yield a ProjectOpened receipt"),
@@ -237,6 +346,9 @@ impl OpenDocument {
 #[derive(Debug, Serialize)]
 pub struct StatusDocument {
     pub kind: &'static str,
+    /// `false` when the repository pointer is absent. The CLI emits
+    /// an empty report in that case without touching the database.
+    pub initialized: bool,
     pub project_dir: String,
     pub database_path: String,
     pub store_schema_version: u32,
@@ -248,12 +360,14 @@ impl StatusDocument {
     fn from_report(
         report: xtrace_application::StoreStatusReport,
         schema_version: u32,
-        locator: &StoreLocator,
+        pointer: &RepositoryPointer,
+        database_path: &Path,
     ) -> Self {
         Self {
             kind: "store_status",
-            project_dir: locator.project_dir.display().to_string(),
-            database_path: locator.database_path.display().to_string(),
+            initialized: true,
+            project_dir: pointer.data_home.display().to_string(),
+            database_path: database_path.display().to_string(),
             store_schema_version: schema_version,
             capabilities: report.capabilities,
             projects: report.projects,

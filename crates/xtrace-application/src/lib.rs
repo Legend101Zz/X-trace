@@ -44,7 +44,7 @@ pub mod queries;
 pub use application::{Application, RequestContext};
 pub use commands::{Command, CommandReceipt, InitializeProject, OpenProject};
 pub use error::{PortError, PortErrorKind};
-pub use ports::ProjectRepository;
+pub use ports::{IdempotencyStore, ProjectRepository, StoredReceipt};
 pub use queries::{
     CapabilityReport, GetProject, GetStoreStatus, ProjectStatus, Query, QueryResult,
     StoreStatusReport,

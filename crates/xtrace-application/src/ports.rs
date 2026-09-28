@@ -8,13 +8,15 @@
 //! slice can move them onto an async runtime without changing the
 //! trait signatures.
 //!
-//! Slice 1A ships a single port: [`ProjectRepository`]. Future slices
-//! add `RunRepository`, `RecordingRepository`, `CatalogRepository`,
-//! `SessionRepository`, and the inbound ports used by the language
-//! adapters and the daemon HTTP surface.
+//! Slice 1A ships two ports: [`ProjectRepository`] for the project
+//! aggregate and [`IdempotencyStore`] for the durable command-receipt
+//! table. Future slices add `RunRepository`, `RecordingRepository`,
+//! `CatalogRepository`, `SessionRepository`, and the inbound ports
+//! used by the language adapters and the daemon HTTP surface.
 
 use xtrace_domain::{
-    Project, ProjectId, RepositoryFingerprint, Run, RunId, RunKind, RunState, WallTime,
+    CorrelationId, Project, ProjectId, RepositoryFingerprint, Run, RunId, RunKind, RunState,
+    WallTime,
 };
 
 use crate::error::PortError;
@@ -135,4 +137,70 @@ pub trait ProjectRepository: Send + Sync {
         idempotency_key: &str,
         requested_at: WallTime,
     ) -> Result<RunId, PortError>;
+}
+
+/// One durable command receipt persisted by [`IdempotencyStore`].
+///
+/// The receipt stores the serialized receipt body, the canonical
+/// input digest computed by the application layer, the correlation
+/// ID assigned to the original request, and the wall-clock time the
+/// receipt was written. Subsequent calls with the same idempotency
+/// key use these fields to detect replays and conflicts.
+#[derive(Clone, Debug)]
+pub struct StoredReceipt {
+    /// Stable identifier of the project the command targeted.
+    pub project_id: ProjectId,
+    /// Kind of command the receipt belongs to (e.g. `initialize_project`).
+    pub command_kind: String,
+    /// Caller-supplied idempotency key.
+    pub idempotency_key: String,
+    /// Canonical-input digest the application layer computed.
+    pub input_digest: String,
+    /// Original correlation ID assigned to the producing request.
+    pub correlation_id: CorrelationId,
+    /// Wall-clock time the receipt was first recorded.
+    pub created_at: WallTime,
+    /// JSON-serialized receipt body returned to the original caller.
+    pub receipt_json: String,
+}
+
+/// Durability contract for command idempotency.
+///
+/// Every command that can be replayed must record its receipt through
+/// this port before the application returns success. The application
+/// facade consults [`IdempotencyStore::lookup_receipt`] before
+/// executing a command and returns either the original receipt
+/// (same canonical input) or an `XTR-COMMAND-409` error
+/// (different canonical input). A `None` result means the key has
+/// never been used.
+pub trait IdempotencyStore: Send + Sync {
+    /// Looks up a stored receipt for the supplied command kind and
+    /// idempotency key. Returns `Ok(None)` when the key has never
+    /// been recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortError`] with kind `Corruption`, `Transport`, or
+    /// `Internal` for storage failures. Validation failures are
+    /// surfaced as `Validation`.
+    fn lookup_receipt(
+        &self,
+        command_kind: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<StoredReceipt>, PortError>;
+
+    /// Persists a receipt. Implementations must treat
+    /// `(command_kind, idempotency_key)` as unique within a project
+    /// and surface an `AlreadyExists` [`PortErrorKind`] when the key
+    /// is reused with a different canonical input. A retry with the
+    /// same canonical input must be a no-op so callers can record
+    /// idempotently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortError`] with kind `AlreadyExists` when a
+    /// different input is already stored, `Validation` for invalid
+    /// arguments, and `Corruption`, `Transport`, or `Internal` for
+    /// storage failures.
+    fn record_receipt(&self, receipt: &StoredReceipt) -> Result<(), PortError>;
 }
