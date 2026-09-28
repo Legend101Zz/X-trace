@@ -16,6 +16,13 @@ xtrace-domain = { path = "../xtrace-domain" }
 prost = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# HMAC-SHA256 + SHA-256 power the AdapterHello/DaemonHello transcript
+# proof defined in `docs/plans/x-trace/03b-protocol-and-api.md` §2.4.
+# The proof is keyed by the per-runtime-session secret read from the
+# bootstrap artifact out of band, so the secret never crosses the wire.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+constant_time_eq = { workspace = true }
 
 [build-dependencies]
 # `prost-build` invokes a `protoc` binary. We never probe `PATH`, set
