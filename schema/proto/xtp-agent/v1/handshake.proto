@@ -1,0 +1,74 @@
+// XTP-Agent v1 handshake messages.
+//
+// `AdapterHello` and `DaemonHello` establish a session after the
+// transport-level authentication handshake. They are part of the
+// authenticated transcript but are not part of the durable event
+// sequence.
+
+syntax = "proto3";
+
+package xtp.agent.v1;
+
+// Identity and capabilities of an adapter.
+message AdapterHello {
+    // Adapter name (e.g. `xtrace-java-agent`).
+    string adapter_name = 1;
+    // Adapter version (SemVer).
+    string adapter_version = 2;
+    // Adapter build hash (BLAKE3-256 in lowercase hex).
+    string adapter_build_hash = 3;
+    // Optional signing identity claimed by the adapter.
+    string signing_identity = 4;
+    // Adapter manifest digest.
+    string manifest_digest = 5;
+    // Language (`java`, `node`, ...).
+    string language = 6;
+    // Runtime name (`openjdk`, `node`).
+    string runtime_name = 7;
+    // Runtime version.
+    string runtime_version = 8;
+    // Process identifier reported by the adapter.
+    int64 pid = 9;
+    // Process start time as adapter-reported monotonic nanoseconds.
+    fixed64 process_start_monotonic_ns = 10;
+    // Parent launch identifier (empty for attach).
+    string parent_launch_id = 11;
+    // Repository fingerprint (BLAKE3 of the canonical absolute path).
+    string repository_fingerprint = 12;
+    // Maximum protocol major offered by the adapter.
+    uint32 protocol_major_max = 13;
+    // Maximum protocol minor offered by the adapter.
+    uint32 protocol_minor_max = 14;
+    // Random client nonce used in the transcript proof.
+    bytes client_nonce = 15;
+    // HMAC over the TLS exporter, runtime session identifier, nonces,
+    // and manifest digest.
+    bytes hmac = 16;
+}
+
+// Identity and accepted protocol reply from the daemon.
+message DaemonHello {
+    // Selected protocol major.
+    uint32 protocol_major = 1;
+    // Selected protocol minor.
+    uint32 protocol_minor = 2;
+    // Daemon build version (SemVer).
+    string daemon_version = 3;
+    // Accepted manifest digest.
+    string manifest_digest = 4;
+    // Random server nonce used in the transcript proof.
+    bytes server_nonce = 5;
+    // HMAC over the TLS exporter, runtime session identifier, nonces,
+    // and manifest digest.
+    bytes hmac = 6;
+    // Maximum envelope size in bytes (default 1 MiB).
+    uint32 max_envelope_bytes = 7;
+    // Maximum batch size in events.
+    uint32 max_batch_events = 8;
+    // Initial capture policy identifier.
+    string initial_capture_policy_id = 9;
+    // Redaction policy digest in effect.
+    string redaction_policy_digest = 10;
+    // Server-side monotonic nanoseconds at hello time.
+    fixed64 server_monotonic_ns = 11;
+}

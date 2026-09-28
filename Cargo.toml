@@ -1,0 +1,111 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xtrace-domain",
+    "crates/xtrace-application",
+    "crates/xtrace-protocol",
+    "crates/xtrace-store",
+    "crates/xtrace-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+authors = ["X-trace contributors"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# Slice 1A keeps a small, deliberate lint surface so the noise stays low
+# and every denied lint corresponds to a real bug class we have seen in
+# similar Rust workspaces. Each allow below records a deliberate
+# compromise, not a default.
+pedantic = { level = "allow", priority = -1 }
+# `#[allow(...)]` attributes are the standard mechanism for narrowing
+# lints in generated code, build scripts, and micro-benchmarks. We
+# keep the `allow_attributes_without_reason` companion warning so the
+# rationale must be documented in source.
+allow_attributes = "allow"
+allow_attributes_without_reason = "warn"
+# Library code must never call `unwrap` or `expect` on a `Result` or
+# `Option` so domain errors remain typed and never panic. Crates apply
+# these via `#![cfg_attr(not(test), deny(...))]` at the crate root so
+# tests can still use them on expected successes.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "deny"
+# Panic-bearing `todo!()` and `unimplemented!()` macros are forbidden
+# in production code paths.
+todo = "deny"
+unimplemented = "deny"
+# `AppError` carries enough context (code, message, remediation,
+# details, correlation ID) that its `Err` variant is intentionally
+# larger than the default threshold. The contract in `03-program-design.md`
+# §7 makes every field mandatory; boxing would hide it from match
+# exhaustiveness checks in the future.
+result_large_err = "allow"
+
+[workspace.dependencies]
+# Core
+thiserror = { version = "1.0", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+# ID and hash primitives
+uuid = { version = "1.10", features = ["v7", "serde"] }
+blake3 = { version = "1.5", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# Time
+time = { version = "0.3", default-features = false, features = [
+    "std",
+    "formatting",
+    "macros",
+    "parsing",
+    "serde-human-readable",
+] }
+
+# Serialization for canonical JSON snapshots (config, policy, signature payloads)
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = [
+    "alloc",
+    "std",
+] }
+
+# CLI
+clap = { version = "4.5", default-features = false, features = [
+    "std",
+    "derive",
+    "error-context",
+    "usage",
+    "help",
+] }
+
+# Embedded SQLite
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Protobuf runtime
+prost = { version = "0.13", default-features = false, features = ["std", "derive"] }
+
+# Protobuf build
+# `prost-build` invokes a `protoc` binary. We resolve the binary from
+# `protoc-bin-vendored`, which bundles Google's prebuilt `protoc` per
+# target, so the build never probes `PATH`, never sets `PROTOC`, and
+# never installs `protobuf-compiler` on the host.
+prost-build = { version = "0.13", default-features = false }
+protoc-bin-vendored = { version = "3.2", default-features = false }
+
+[profile.dev]
+debug = 1
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false

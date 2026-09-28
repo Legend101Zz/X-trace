@@ -1,0 +1,28 @@
+[package]
+name = "xtrace-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Generated XTP protocol bindings and translation to domain DTOs."
+
+[lints]
+workspace = true
+
+[dependencies]
+xtrace-domain = { path = "../xtrace-domain" }
+prost = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+# `prost-build` invokes a `protoc` binary. We never probe `PATH`, set
+# `PROTOC`, or install `protobuf-compiler` on the host. The binary
+# comes from `protoc-bin-vendored`, which embeds Google's prebuilt
+# `protoc` for the active target. The path it returns is passed
+# directly to `Config::protoc_executable`, which is the safe API
+# supported by `prost-build` 0.13 and does not mutate the environment.
+prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }

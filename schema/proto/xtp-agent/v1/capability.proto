@@ -1,0 +1,114 @@
+// XTP-Agent v1 capability and discovery messages.
+//
+// Capabilities describe what the adapter can do. Each capability is a
+// named string plus a free-form configuration map so the protocol can
+// evolve without renumbering fields.
+
+syntax = "proto3";
+
+package xtp.agent.v1;
+
+// A single negotiated capability.
+message Capability {
+    // Capability name (`endpoint_discovery`, `method_frames`, ...).
+    string name = 1;
+    // Optional configuration for the capability. Keys and values are
+    // capability-specific.
+    map<string, string> config = 2;
+}
+
+// Capability set sent by the adapter after hello.
+message CapabilitySet {
+    // Capabilities the adapter claims.
+    repeated Capability capabilities = 1;
+}
+
+// A discovered endpoint claim.
+message EndpointClaim {
+    // Stable claim identifier assigned by the adapter.
+    string claim_id = 1;
+    // HTTP operation key.
+    HttpOperationKey operation = 2;
+    // Claim provenance.
+    ClaimProvenance provenance = 3;
+    // Handler reference.
+    HandlerRef handler = 4;
+    // Optional source ranges backing the claim.
+    repeated SourceRange source_ranges = 5;
+    // Confidence in `[0.0, 1.0]`. `-1` means unspecified.
+    float confidence = 6;
+    // Stable reason codes explaining limitations of the claim.
+    repeated string limitations = 7;
+}
+
+// Batched endpoint claims.
+message EndpointClaimBatch {
+    // `true` if the batch represents a complete snapshot of the
+    // adapter's claims. `false` means it is an incremental update.
+    bool complete = 1;
+    // Claim entries.
+    repeated EndpointClaim claims = 2;
+}
+
+// Static path hypothesis emitted by an analyzer.
+message StaticPathBatch {
+    // Stable hypothesis identifier.
+    string hypothesis_id = 1;
+    // Operation the hypothesis is about.
+    string operation_id = 2;
+    // Producer manifest digest.
+    string producer_manifest_digest = 3;
+    // Source revision identifier.
+    string source_revision_id = 4;
+    // Confidence score in `[0.0, 1.0]`.
+    float confidence = 5;
+    // Stable limitation codes.
+    repeated string limitations = 6;
+}
+
+// Provenance classification for a claim.
+enum ClaimProvenance {
+    CLAIM_PROVENANCE_UNSPECIFIED = 0;
+    CLAIM_PROVENANCE_STATIC_INFERRED = 1;
+    CLAIM_PROVENANCE_RUNTIME_DISCOVERED = 2;
+    CLAIM_PROVENANCE_OBSERVED = 3;
+    CLAIM_PROVENANCE_PARTIAL_OBSERVATION = 4;
+    CLAIM_PROVENANCE_IMPORTED_SPEC = 5;
+    CLAIM_PROVENANCE_USER_DECLARED = 6;
+}
+
+// HTTP operation key used to derive an `OperationId`.
+message HttpOperationKey {
+    // Transport binding (`http`).
+    string transport = 1;
+    // HTTP method (uppercase).
+    string method = 2;
+    // Normalized route shape (e.g. `/orders/{id}`).
+    string normalized_route_shape = 3;
+    // Application component (e.g. `order-service`).
+    string application_component = 4;
+    // Virtual-host / base-path identity.
+    string binding_key = 5;
+}
+
+// Reference to a concrete handler.
+message HandlerRef {
+    // Optional language-specific identity.
+    string symbol = 1;
+    // Source range backing the handler reference.
+    SourceRange source = 2;
+}
+
+// A range of source code.
+message SourceRange {
+    // Repository-relative UTF-8 path.
+    string path = 1;
+    // 1-based start line.
+    uint32 start_line = 2;
+    // 1-based start column.
+    uint32 start_column = 3;
+    // 1-based end line (inclusive).
+    uint32 end_line = 4;
+    // 1-based end column (inclusive).
+    uint32 end_column = 5;
+}

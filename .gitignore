@@ -1,0 +1,31 @@
+# Cargo build artifacts and dependency caches are routed to the external SSD
+# via the environment variables documented in AGENTS.md. This .gitignore is
+# intentionally minimal: it must only keep generated and local-state files out
+# of source control without masking anything the orchestrator needs to review.
+
+/target
+**/target
+
+# Cargo.lock is intentionally committed for an application workspace, but the
+# target directory and build cache must never be tracked.
+**/*.rs.bk
+**/*.pdb
+
+# Local editor and tool state.
+.idea/
+.vscode/
+*.iml
+
+# Local override files and machine-specific environment.
+.cargo/config.toml.local
+.env
+.env.*
+
+# Generated protocol artifacts produced by `cargo build` are reproducible and
+# live next to the source `.proto` files, but their build cache must not be
+# tracked.
+crates/xtrace-protocol/build/
+crates/xtrace-protocol/src/generated/
+
+# Test scratch stores that should never escape the working tree.
+/tmp/

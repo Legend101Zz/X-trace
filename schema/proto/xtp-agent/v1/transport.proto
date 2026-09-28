@@ -1,0 +1,99 @@
+// XTP-Agent v1 transport-level messages.
+//
+// These messages carry backpressure, health, and daemon-issued commands
+// on the same envelope channel as the recording stream. They never
+// contain recording data.
+
+syntax = "proto3";
+
+package xtp.agent.v1;
+
+// Periodic health message sent every ten seconds while idle.
+message Health {
+    // Adapter monotonic nanoseconds at send time.
+    fixed64 monotonic_ns = 1;
+    // Current queue depth in batches.
+    uint32 queue_depth_batches = 2;
+    // Current memory usage estimate in bytes.
+    uint64 resident_bytes = 3;
+    // Optional free-form status string.
+    string status = 4;
+}
+
+// Acknowledgement from the daemon. Reports the highest contiguous
+// sequence numbers made durable.
+message Ack {
+    // Highest contiguous `session_seq` made durable.
+    uint64 highest_contiguous_session_seq = 1;
+    // Highest contiguous `recording_seq` per active recording.
+    map<string, uint64> highest_contiguous_recording_seq = 2;
+    // Durability stage.
+    AckDurability durability = 3;
+    // Rejected message IDs with stable reason codes.
+    repeated RejectedMessage rejected = 4;
+}
+
+enum AckDurability {
+    ACK_DURABILITY_UNSPECIFIED = 0;
+    ACK_DURABILITY_STAGED = 1;
+    ACK_DURABILITY_COMMITTED = 2;
+}
+
+message RejectedMessage {
+    string message_id = 1;
+    string reason_code = 2;
+}
+
+// Backpressure signal from the daemon.
+message Throttle {
+    // Throttle level. Higher values shed more data.
+    uint32 level = 1;
+    // Optional human-readable hint.
+    string hint = 2;
+}
+
+// Notice that the adapter dropped events under priority-based shedding.
+message DropNotice {
+    bytes recording_id = 1;
+    // Priority bucket that was shed.
+    uint32 priority = 2;
+    // Number of events dropped in this notice.
+    uint64 count = 3;
+    // Stable reason code.
+    string reason_code = 4;
+}
+
+// Daemon-issued capture command.
+message CaptureCommand {
+    // Monotonic command sequence number.
+    uint64 command_seq = 1;
+    // Command kind.
+    CaptureCommandKind kind = 2;
+    // Operation selectors for `ARM_FOCUSED_CAPTURE`.
+    repeated string operation_ids = 3;
+    // Package / file allowlist for focused capture.
+    repeated string package_filters = 4;
+    // Maximum number of requests to capture under focused mode.
+    uint32 max_match_count = 5;
+    // Wall-clock nanoseconds when the command expires.
+    fixed64 expiry_monotonic_ns = 6;
+    // Approval reference (run identifier) backing the command.
+    string approval_ref = 7;
+}
+
+enum CaptureCommandKind {
+    CAPTURE_COMMAND_KIND_UNSPECIFIED = 0;
+    CAPTURE_COMMAND_KIND_UPDATE_STANDARD_POLICY = 1;
+    CAPTURE_COMMAND_KIND_ARM_FOCUSED_CAPTURE = 2;
+    CAPTURE_COMMAND_KIND_DISARM_FOCUSED_CAPTURE = 3;
+    CAPTURE_COMMAND_KIND_STOP_ACCEPTING_RECORDINGS = 4;
+    CAPTURE_COMMAND_KIND_FLUSH_AND_CLOSE = 5;
+    CAPTURE_COMMAND_KIND_REQUEST_DISCOVERY_SNAPSHOT = 6;
+    CAPTURE_COMMAND_KIND_REQUEST_RETRANSMIT = 7;
+}
+
+// Protocol-level error returned by either side.
+message ProtocolError {
+    string code = 1;
+    string message = 2;
+}

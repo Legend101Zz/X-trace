@@ -1,0 +1,228 @@
+// XTP-Agent v1 recording stream.
+//
+// A recording begins with `RecordingStarted`, proceeds through one or
+// more `EventBatch` messages, and ends with `RecordingFinished`. Events
+// are strictly ordered within a recording by `recording_seq`; `session_seq`
+// provides adapter-level ordering across recordings.
+
+syntax = "proto3";
+
+package xtp.agent.v1;
+
+import "xtp-agent/v1/capability.proto";
+
+// Top-level marker that opens a recording aggregate.
+message RecordingStarted {
+    // Recording identifier assigned by the adapter.
+    bytes recording_id = 1;
+    // First sequence number in the recording.
+    uint64 recording_seq = 2;
+    // HTTP method (uppercase).
+    string method = 3;
+    // Matched route template, when known.
+    string matched_route_template = 4;
+    // Sanitized URL shape.
+    string url_shape = 5;
+    // Candidate operation IDs and their match evidence.
+    repeated OperationCandidate operation_candidates = 6;
+    // Adapter monotonic nanoseconds at request start.
+    fixed64 start_monotonic_ns = 7;
+    // Thread or task identifier.
+    string thread_or_task_id = 8;
+    // Optional async context identifier.
+    string async_context_id = 9;
+    // Capture policy identifier in effect.
+    string capture_policy_id = 10;
+    // Capture policy digest.
+    string capture_policy_digest = 11;
+    // Redaction policy digest in effect.
+    string redaction_policy_digest = 12;
+    // Source revision identifier active when the recording opened.
+    string source_revision_id = 13;
+}
+
+// Candidate operation resolved by the adapter.
+message OperationCandidate {
+    // Operation identifier.
+    bytes operation_id = 1;
+    // Match evidence string (e.g. `route_template_match`).
+    string evidence = 2;
+}
+
+// Batched recording events.
+message EventBatch {
+    // Recording the batch belongs to.
+    bytes recording_id = 1;
+    // Event entries, ordered by ascending `recording_seq`.
+    repeated RecordingEvent events = 2;
+}
+
+// A single event within a recording.
+message RecordingEvent {
+    // Stable event identifier.
+    string event_id = 1;
+    // Strictly increasing sequence number within the recording.
+    uint64 recording_seq = 2;
+    // Parent event identifier.
+    string parent_event_id = 3;
+    // Optional async parent event identifier.
+    string async_parent_event_id = 4;
+    // Adapter monotonic nanoseconds.
+    fixed64 monotonic_ns = 5;
+    // Event priority. Lower values are dropped first.
+    uint32 priority = 6;
+    // Event kind.
+    RecordingEventKind kind = 7;
+    // Symbol or logical name (method, table, host).
+    string symbol = 8;
+    // Source range.
+    SourceRange source = 9;
+    // Optional value snapshot payload.
+    CapturedValue value = 10;
+    // Optional interaction payload.
+    Interaction interaction = 11;
+    // Optional exception payload.
+    ExceptionPayload exception = 12;
+}
+
+// Event kind discriminator.
+enum RecordingEventKind {
+    RECORDING_EVENT_KIND_UNSPECIFIED = 0;
+    RECORDING_EVENT_KIND_REQUEST_UPDATE = 1;
+    RECORDING_EVENT_KIND_FRAME_ENTER = 2;
+    RECORDING_EVENT_KIND_FRAME_EXIT = 3;
+    RECORDING_EVENT_KIND_FRAME_THROW = 4;
+    RECORDING_EVENT_KIND_LINE_CURSOR = 5;
+    RECORDING_EVENT_KIND_VALUE_SNAPSHOT = 6;
+    RECORDING_EVENT_KIND_DATABASE_START = 7;
+    RECORDING_EVENT_KIND_DATABASE_END = 8;
+    RECORDING_EVENT_KIND_OUTBOUND_HTTP_START = 9;
+    RECORDING_EVENT_KIND_OUTBOUND_HTTP_END = 10;
+    RECORDING_EVENT_KIND_ASYNC_LINK = 11;
+    RECORDING_EVENT_KIND_EXCEPTION = 12;
+    RECORDING_EVENT_KIND_RESPONSE = 13;
+    RECORDING_EVENT_KIND_GAP = 14;
+}
+
+// Captured value union. Mirrors the domain vocabulary.
+message CapturedValue {
+    oneof value {
+        CapturedValueCaptured captured = 1;
+        CapturedValueRedacted redacted = 2;
+        CapturedValueTruncated truncated = 3;
+        CapturedValueUnavailable unavailable = 4;
+        CapturedValueDropped dropped = 5;
+    }
+}
+
+message CapturedValueCaptured {
+    ValueShape shape = 1;
+    string preview = 2;
+    bytes content_hash = 3;
+}
+
+message CapturedValueRedacted {
+    string rule_id = 1;
+    ValueShape shape_hint = 2;
+}
+
+message CapturedValueTruncated {
+    string preview = 1;
+    uint64 original_size_lower_bound = 2;
+    uint64 limit = 3;
+}
+
+message CapturedValueUnavailable {
+    UnavailableReason reason = 1;
+}
+
+message CapturedValueDropped {
+    DropReason reason = 1;
+}
+
+// Coarse shape classification for a captured value.
+enum ValueShape {
+    VALUE_SHAPE_UNSPECIFIED = 0;
+    VALUE_SHAPE_STRING = 1;
+    VALUE_SHAPE_BOOLEAN = 2;
+    VALUE_SHAPE_INTEGER_8 = 3;
+    VALUE_SHAPE_INTEGER_16 = 4;
+    VALUE_SHAPE_INTEGER_32 = 5;
+    VALUE_SHAPE_INTEGER_64 = 6;
+    VALUE_SHAPE_FLOAT_32 = 7;
+    VALUE_SHAPE_FLOAT_64 = 8;
+    VALUE_SHAPE_NULL = 9;
+    VALUE_SHAPE_BYTES = 10;
+    VALUE_SHAPE_LIST = 11;
+    VALUE_SHAPE_OBJECT = 12;
+    VALUE_SHAPE_UNKNOWN = 13;
+}
+
+// Reason a value was unavailable.
+enum UnavailableReason {
+    UNAVAILABLE_REASON_UNSPECIFIED = 0;
+    UNAVAILABLE_REASON_CAPABILITY_UNSUPPORTED = 1;
+    UNAVAILABLE_REASON_DEBUG_METADATA_ABSENT = 2;
+    UNAVAILABLE_REASON_CAPTURE_BUDGET_EXHAUSTED = 3;
+    UNAVAILABLE_REASON_SOURCE_ARTIFACT_MISSING = 4;
+    UNAVAILABLE_REASON_RECORDER_DISCONNECTED = 5;
+}
+
+// Reason a value was dropped.
+enum DropReason {
+    DROP_REASON_UNSPECIFIED = 0;
+    DROP_REASON_BACKPRESSURE_SHED = 1;
+    DROP_REASON_QUEUE_FULL = 2;
+    DROP_REASON_SEQUENCE_GAP = 3;
+    DROP_REASON_ADAPTER_DROPPED = 4;
+}
+
+// Interaction payload.
+message Interaction {
+    InteractionKind kind = 1;
+    string driver = 2;
+    string schema = 3;
+    string table = 4;
+    string host = 5;
+    string method = 6;
+    string path = 7;
+    CapturedValue request_summary = 8;
+    CapturedValue response_summary = 9;
+    CapturedValue error = 10;
+}
+
+// Interaction kind discriminator.
+enum InteractionKind {
+    INTERACTION_KIND_UNSPECIFIED = 0;
+    INTERACTION_KIND_DATABASE = 1;
+    INTERACTION_KIND_OUTBOUND_HTTP = 2;
+    INTERACTION_KIND_MESSAGING = 3;
+    INTERACTION_KIND_FILESYSTEM = 4;
+    INTERACTION_KIND_FRAMEWORK = 5;
+}
+
+// Exception payload.
+message ExceptionPayload {
+    string exception_type = 1;
+    string sanitized_message = 2;
+    repeated string stack_frames = 3;
+}
+
+// Top-level marker that closes a recording aggregate.
+message RecordingFinished {
+    // Recording identifier.
+    bytes recording_id = 1;
+    // Final sequence number accepted by the adapter.
+    uint64 final_recording_seq = 2;
+    // Adapter-observed duration in nanoseconds.
+    fixed64 duration_ns = 3;
+    // Captured response summary.
+    CapturedValue response_summary = 4;
+    // Drop counters by priority bucket.
+    map<uint32, uint64> drop_counts_by_priority = 5;
+    // Stable codes for capabilities that were advertised but not
+    // exercised (e.g. `focused_locals` when no focused capture was armed).
+    repeated string unsupported_capability_codes = 6;
+    // Digest over the emitted event IDs in order.
+    bytes event_digest = 7;
+}
