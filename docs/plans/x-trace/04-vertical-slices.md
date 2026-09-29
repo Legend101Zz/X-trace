@@ -87,7 +87,10 @@ flowchart TD
     S8 --> S9
 ```
 
-Slices 3, 4, and the early UI work of Slice 6 can proceed in parallel after Slice 2, but shared schemas, migrations, application commands, generated clients, and replay semantics remain centrally owned and merged in a controlled order.
+Slices 3, 4, and the early UI work of Slice 6 can proceed in parallel after
+Slice 2 only within an explicitly user-approved phase. Shared schemas,
+migrations, application commands, generated clients, and replay semantics remain
+centrally owned and merged in a controlled order.
 
 ## 5. Slice 1 — One real Spring Boot request from launch to Linear replay
 
@@ -567,7 +570,22 @@ Central ownership is retained for:
 
 Parallel lanes use isolated fixtures and branches. They may propose shared changes, but do not independently merge conflicting schema/migration/API edits.
 
-## 16. Slice change control
+## 16. Approval-gated implementation control
+
+Every bounded implementation phase follows `Phase -> Implement -> Review ->
+Verify -> Status -> user approval -> Next phase`. The main orchestrator owns
+decomposition, shared architecture, independent review, and independent testing.
+GPT-5.6 Terra and Luna agents may be used for implementation, review, debugging,
+or architecture checks at Medium or High reasoning according to the phase's
+complexity.
+
+Workers commit coherent branch changes but do not merge or push `main`. After a
+phase is reviewed and verified, the orchestrator stops and reports completed
+work, changes, verification, issues or decisions, remaining work, and the exact
+next proposed phase. The next phase, merge, push, or any background continuation
+requires explicit user approval; no automation may cross that boundary.
+
+## 17. Slice change control
 
 - A slice may be split when its user-visible outcome remains intact and risk becomes easier to verify.
 - A slice may not be marked complete by removing a failure/privacy/compatibility criterion; that requires a documented scope decision.
@@ -575,7 +593,7 @@ Parallel lanes use isolated fixtures and branches. They may propose shared chang
 - If a Gate 3 contract proves wrong, work pauses at that boundary, records an ADR, amends Gate 3, and then updates this plan.
 - Known gaps are product data and release evidence, not notes hidden in implementation issues.
 
-## 17. Gate 4 acceptance decisions
+## 18. Gate 4 acceptance decisions
 
 Approval of this gate accepts:
 
@@ -588,4 +606,7 @@ Approval of this gate accepts:
 7. release labels are earned only at their stated checkpoints;
 8. X-trace v1 requires the security, recovery, packaging, performance, compatibility, accessibility, and ten-minute usability gates in Slice 9.
 
-After approval, implementation starts with Slice 1. Later slices remain plans until all dependency and exit criteria ahead of them are satisfied.
+Gate 4 approval authorizes Slice 1 planning, not automatic progression. Later
+slices remain plans until their dependencies and exit criteria are satisfied
+and the user explicitly approves their proposed phase under the implementation
+control above.

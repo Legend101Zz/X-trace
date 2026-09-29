@@ -8,8 +8,17 @@ The approved product, architecture, program design, and vertical-slice plan unde
 - Prefer the smallest real end-to-end implementation over broad scaffolding.
 - A slice must exercise a real framework application through the packaged product path. Mocks alone do not complete a slice.
 - Do not change shared domain semantics, Protobuf/OpenAPI schemas, SQLite migrations, XTF format, redaction vocabulary, or replay navigation without explicit orchestrator review.
-- Commit coherent changes on the assigned branch. The orchestrator reviews, verifies, and merges to `main`.
+- Use GPT-5.6 Terra or Luna agents for implementation and review work when delegation is useful; select Medium or High reasoning for the complexity of the bounded slice. The main orchestrator remains responsible for decomposition, architecture coherence, and independent review and testing.
+- Commit coherent changes on the assigned branch. Agents must not merge or push `main`; the orchestrator alone reviews, verifies, and may merge or push after the required approval.
 - Never include secrets, credentials, captured private data, or local absolute paths in source, fixtures, logs, snapshots, evidence, or commits.
+
+## Approval-gated phase workflow
+
+Every phase follows this fixed boundary: `Phase -> Implement -> Review -> Verify -> Status -> user approval -> Next phase`.
+
+- The orchestrator defines a small, verifiable phase and its acceptance checks before implementation. Work may use multiple bounded agents for implementation, review, debugging, or architecture checks, but their output is untrusted until independently reviewed and tested by the orchestrator.
+- After review and verification, stop. The phase status report must enumerate: completed work; files or behavior changed; tests and verification run; issues or decisions; remaining work; and the exact next proposed phase.
+- Do not start, merge, push, schedule, or continue the next phase until the user explicitly approves that proposed next phase. No background automation may continue implementation across an approval boundary.
 
 ## Code quality
 
@@ -38,4 +47,3 @@ Do not commit caches or generated build output.
 ## Reference posture
 
 Use the primary references and repositories listed in `02-architecture.md`. Learn from their boundaries, compatibility practices, and tests. Copy code only when license compatibility and attribution are explicitly verified; architectural inspiration is not permission to copy.
-
