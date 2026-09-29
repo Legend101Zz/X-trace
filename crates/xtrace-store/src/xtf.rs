@@ -240,6 +240,55 @@ pub enum XtfCodecError {
 /// Returns [`XtfCodecError`] when the input does not form one bounded,
 /// contiguous segment or compression cannot finish successfully.
 pub fn encode_segment(input: &XtfSegmentInput) -> Result<EncodedXtfSegment, XtfCodecError> {
+    let logical = encode_logical_segment(input)?;
+    let compressed_bytes = compress_logical_bytes(logical.logical_bytes())?;
+    Ok(EncodedXtfSegment {
+        logical_bytes: logical.logical_bytes,
+        compressed_bytes,
+        content_hash: logical.content_hash,
+        footer_prefix_digest: logical.footer_prefix_digest,
+        event_count: logical.event_count,
+        first_recording_seq: logical.first_recording_seq,
+        last_recording_seq: logical.last_recording_seq,
+    })
+}
+
+/// Internal logical-stream seam used by the durable writer to order its
+/// logical-file sync before compression. The public convenience encoder above
+/// composes this with [`compress_logical_bytes`].
+pub(crate) struct LogicalXtfSegment {
+    logical_bytes: Vec<u8>,
+    content_hash: ContentHash,
+    footer_prefix_digest: ContentHash,
+    event_count: u64,
+    first_recording_seq: u64,
+    last_recording_seq: u64,
+}
+
+impl LogicalXtfSegment {
+    pub(crate) fn logical_bytes(&self) -> &[u8] {
+        &self.logical_bytes
+    }
+    pub(crate) const fn content_hash(&self) -> ContentHash {
+        self.content_hash
+    }
+    pub(crate) const fn footer_prefix_digest(&self) -> ContentHash {
+        self.footer_prefix_digest
+    }
+    pub(crate) const fn event_count(&self) -> u64 {
+        self.event_count
+    }
+    pub(crate) const fn first_recording_seq(&self) -> u64 {
+        self.first_recording_seq
+    }
+    pub(crate) const fn last_recording_seq(&self) -> u64 {
+        self.last_recording_seq
+    }
+}
+
+pub(crate) fn encode_logical_segment(
+    input: &XtfSegmentInput,
+) -> Result<LogicalXtfSegment, XtfCodecError> {
     let derived = validate_events(&input.events)?;
     let header = XtfHeader {
         format_major: u32::from(FORMAT_MAJOR),
@@ -252,18 +301,26 @@ pub fn encode_segment(input: &XtfSegmentInput) -> Result<EncodedXtfSegment, XtfC
         event_count: derived.event_count,
     };
     let logical = encode_logical_stream(&header, &input.events, derived)?;
-    let content_hash = ContentHash::of_bytes(&logical.bytes);
-    let compressed_bytes = compress_logical(&logical.bytes, ZSTD_LEVEL)?;
-
-    Ok(EncodedXtfSegment {
+    Ok(LogicalXtfSegment {
+        content_hash: ContentHash::of_bytes(&logical.bytes),
         logical_bytes: logical.bytes,
-        compressed_bytes,
-        content_hash,
         footer_prefix_digest: logical.footer_prefix_digest,
         event_count: derived.event_count,
         first_recording_seq: derived.first_recording_seq,
         last_recording_seq: derived.last_recording_seq,
     })
+}
+
+pub(crate) fn compress_logical_bytes(logical_bytes: &[u8]) -> Result<Vec<u8>, XtfCodecError> {
+    compress_logical(logical_bytes, ZSTD_LEVEL)
+}
+
+#[cfg(test)]
+pub(crate) fn compress_logical_at_level(
+    logical_bytes: &[u8],
+    level: i32,
+) -> Result<Vec<u8>, XtfCodecError> {
+    compress_logical(logical_bytes, level)
 }
 
 /// Fully verifies one checksummed, single-frame compressed XTF object.

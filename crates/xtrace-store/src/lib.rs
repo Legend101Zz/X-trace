@@ -52,7 +52,8 @@ pub use migrations::{MigrationRecord, Migrations};
 pub use project_repository::SqliteProjectRepository;
 pub use recording_store::{
     BeginRecordingDisposition, BeginRecordingReceipt, BeginRecordingRequest, RecordingStoreError,
-    RecordingStoreErrorCategory, RecordingStoreErrorKind, SqliteRecordingStore,
+    RecordingStoreErrorCategory, RecordingStoreErrorKind, SegmentCommitDisposition,
+    SegmentCommitReceipt, SegmentCommitRequest, SqliteRecordingStore,
 };
 pub use xtf::{
     EncodedXtfSegment, VerifiedXtfSegment, XtfCodecError, XtfSegmentInput, encode_segment,

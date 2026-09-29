@@ -308,6 +308,11 @@ impl SqliteStore {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_lock_connection(&self) -> Option<MutexGuard<'_, Connection>> {
+        self.inner.connection.try_lock().ok()
+    }
+
     /// Acquires the shared recording writer guard.
     ///
     /// Recording persistence obtains this before any recording read and keeps
