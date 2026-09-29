@@ -36,4 +36,6 @@ rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 prost = { workspace = true }
+rusqlite = { workspace = true }
 tempfile = "3.10"
+zstd = { workspace = true }

@@ -1287,6 +1287,7 @@ dependencies = [
  "clap",
  "fs4",
  "prost",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",
@@ -1301,6 +1302,7 @@ dependencies = [
  "xtrace-domain",
  "xtrace-protocol",
  "xtrace-store",
+ "zstd",
 ]
 
 [[package]]
@@ -1370,6 +1372,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protoc-bin-vendored",
+ "serde_json",
  "sha2",
  "thiserror",
  "tracing",

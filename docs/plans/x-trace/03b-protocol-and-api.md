@@ -49,16 +49,18 @@ message AgentEnvelope {
   uint64 session_seq = 4;
   fixed64 sent_monotonic_ns = 5;
   string message_id = 6;
+  string correlation_token = 7;
   oneof payload {
     AdapterHello adapter_hello = 20;
-    CapabilitySet capability_set = 21;
-    EndpointClaimBatch endpoint_claims = 22;
-    StaticPathBatch static_paths = 23;
-    RecordingStarted recording_started = 24;
-    EventBatch event_batch = 25;
-    RecordingFinished recording_finished = 26;
-    DropNotice drop_notice = 27;
-    Health health = 28;
+    DaemonHello daemon_hello = 21;
+    CapabilitySet capability_set = 22;
+    EndpointClaimBatch endpoint_claims = 23;
+    StaticPathBatch static_paths = 24;
+    RecordingStarted recording_started = 25;
+    EventBatch event_batch = 26;
+    RecordingFinished recording_finished = 27;
+    DropNotice drop_notice = 28;
+    Health health = 29;
     Ack ack = 40;
     Throttle throttle = 41;
     CaptureCommand capture_command = 42;

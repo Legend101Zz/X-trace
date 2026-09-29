@@ -1,0 +1,10 @@
+{
+  "name": "@xtrace/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "dependencies": { "@bufbuild/protobuf": "2.16.0" }
+}

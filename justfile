@@ -28,8 +28,15 @@ lint:
 build:
     cargo build --workspace --all-features
 
-# Run the full test suite.
-test:
+# Install, generate-check, build, and test the Node XTP workspace. The Rust
+# daemon integration test consumes the synthetic client's generated dist files.
+node-check:
+    npm ci --prefix adapters/node
+    npm run generate:check --prefix adapters/node
+    npm test --prefix adapters/node
+
+# Run Node validation/build before the full Rust test suite.
+test: node-check
     cargo test --workspace --all-features
 
 # Rebuild generated protocol bindings and confirm they are in sync.
@@ -70,5 +77,5 @@ smoke-cli:
     cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir "$repo"
     rm -rf "$smoke_root"
 
-# Run every gate a handoff requires.
+# Run every gate a handoff requires, including Node prerequisites via test.
 ci: format lint test

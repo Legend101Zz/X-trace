@@ -5,6 +5,9 @@
 
 /target
 **/target
+adapters/node/node_modules/
+adapters/node/**/dist/
+adapters/node/npm-debug.log*
 
 # Cargo.lock is intentionally committed for an application workspace, but the
 # target directory and build cache must never be tracked.

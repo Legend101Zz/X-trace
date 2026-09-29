@@ -1,0 +1,24 @@
+{
+  "name": "@xtrace/node-workspace",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "workspaces": ["packages/*", "examples/*"],
+  "scripts": {
+    "generate": "buf generate ../../schema/proto --template buf.gen.yaml",
+    "generate:check": "node scripts/check-generated.mjs",
+    "build:protocol": "npm run build --workspace @xtrace/protocol",
+    "build:core": "npm run build --workspace @xtrace/adapter-core",
+    "build:synthetic": "npm run build --workspace @xtrace/synthetic-client",
+    "build": "npm run build:protocol && npm run build:core && npm run build:synthetic",
+    "typecheck": "npm run build",
+    "test": "npm run build && node --test packages/adapter-core/dist/test/*.test.js",
+    "synthetic": "node examples/synthetic-client/dist/main.js"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "1.73.0",
+    "@bufbuild/protoc-gen-es": "2.16.0",
+    "@types/node": "26.6.3",
+    "typescript": "7.0.2"
+  }
+}

@@ -19,10 +19,10 @@ import "xtp-agent/v1/handshake.proto";
 import "xtp-agent/v1/recording.proto";
 import "xtp-agent/v1/transport.proto";
 
-// Magic bytes that identify an XTP-Agent stream at the transport layer.
-// The first four bytes of every envelope are `0x58 0x54 0x50 0x01`
-// ("XTP1"). Slice 1A emits these through `prost`; the transport layer
-// is expected to validate the magic before length-decoding.
+// Reserved compatibility enum. WireMagic is not a prefix on XTP-Agent
+// connections: every message is framed as a four-byte big-endian length
+// followed directly by an encoded AgentEnvelope. Do not add this enum to
+// transport framing without an explicit protocol revision.
 enum WireMagic {
     WIRE_MAGIC_UNSPECIFIED = 0;
     WIRE_MAGIC_XTP1 = 1;
