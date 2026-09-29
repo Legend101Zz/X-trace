@@ -1,11 +1,17 @@
 //! Typed errors raised by the daemon library.
 //!
-//! Every variant carries a stable [`ProtocolErrorCode`] that can be
-//! rendered to the wire as a `ProtocolError.code` value, plus a
-//! user-safe message that never embeds a captured value or secret.
-//! Internal errors retain the underlying cause as a string for the
-//! owner-only diagnostic log; that string is never serialized into
-//! the public error chain.
+//! Every variant carries a stable [`ProtocolErrorCode`] that the
+//! session/connection layer renders to the wire as a
+//! `ProtocolError.code` value, plus a `String` payload that is an
+//! owner-only diagnostic. `DaemonError` payloads are intended for
+//! the daemon operator's log and may include file paths, loopback
+//! bind addresses, and OS error text so the operator can correlate
+//! the failure with a system log entry. `DaemonError` values are
+//! not automatically serialized as wire `ProtocolError` envelopes:
+//! those are constructed separately by the session and connection
+//! paths and may include bounded validation or framing detail.
+//! Code that builds the wire envelope must never insert session
+//! secret or private-key material.
 
 use std::io;
 
@@ -82,18 +88,31 @@ impl std::fmt::Display for ProtocolErrorCode {
 
 /// Public error returned by the daemon library API.
 ///
-/// The error chain never carries the session secret, the certificate
-/// pin, or captured values. Internal I/O errors retain the underlying
-/// OS error code only so the owner-only diagnostic log can correlate
-/// the failure with a system log entry.
+/// `DaemonError` payloads are owner-only diagnostics: they are not
+/// automatically serialized as wire `ProtocolError` envelopes. The
+/// wire envelope is constructed separately by the session and
+/// connection paths and may include bounded validation or framing
+/// detail. The code that builds those envelopes must never insert
+/// session secret or private-key material.
+///
+/// Callers that build a `DaemonError` from a context carrying the
+/// certificate pin, the session secret, or peer-supplied data must
+/// avoid embedding that material in the payload: each variant's
+/// `String` is rendered as part of the operator-visible diagnostic
+/// log, and [`DaemonError::TlsConfig`] in particular is reachable
+/// from paths that already hold the bootstrap pin.
 #[derive(Debug, Error)]
 pub enum DaemonError {
     /// Configuration refused by validation. The daemon never reaches
     /// the bind step when this variant is raised.
     #[error("invalid daemon configuration: {0}")]
     InvalidConfig(String),
-    /// The OS refused the loopback bind. The diagnostic string omits
-    /// the configured host so logs do not leak internal addresses.
+    /// The OS refused the loopback bind. The diagnostic string is an
+    /// owner-only entry: it preserves the resolved loopback socket
+    /// address (which carries the OS-assigned port) and the
+    /// underlying OS error text so the operator can correlate the
+    /// failure with a system log entry. The string is not part of
+    /// the wire `ProtocolError` envelope sent to the adapter.
     #[error("loopback bind failed: {0}")]
     BindFailed(String),
     /// The bootstrap artifact could not be written or removed.

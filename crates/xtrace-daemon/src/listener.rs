@@ -24,8 +24,14 @@ use crate::error::DaemonError;
 
 /// Result of binding to a loopback address.
 pub struct LoopbackListener {
-    /// The bound TCP listener. Cheap to clone because the underlying
-    /// type holds an `Arc`.
+    /// The bound TCP listener. Neither [`LoopbackListener`] nor
+    /// [`TokioTcpListener`] is `Clone`; the inner listener is owned
+    /// by value and is only handed out via
+    /// [`LoopbackListener::into_inner`]. `accept` takes `&self`
+    /// because Tokio's [`TcpListener`](tokio::net::TcpListener) is
+    /// designed to accept connections on a shared reference; the
+    /// listening socket stays with this [`LoopbackListener`] for its
+    /// entire lifetime.
     inner: TokioTcpListener,
     /// Address the listener is bound to. Reported through the
     /// bootstrap artifact.
@@ -64,18 +70,19 @@ impl LoopbackListener {
         Ok(Self { inner, local_addr })
     }
 
-    /// Accepts the next inbound connection. The method is a thin
-    /// wrapper around [`TokioTcpListener::accept`] that maps the I/O
-    /// error into a [`DaemonError`]. The supervisor treats an accept
-    /// failure as fatal: the listener errors are not transient, so
-    /// the loop signals shutdown, drains every in-flight connection,
-    /// and surfaces the error to the caller rather than masking it.
+    /// Accepts the next inbound connection. A thin wrapper around
+    /// [`TokioTcpListener::accept`] that maps the I/O error into a
+    /// [`DaemonError`]. The supervisor treats an accept failure as
+    /// fatal: the listener errors are not transient, so the loop
+    /// signals shutdown, drains in-flight connections, and surfaces
+    /// the error rather than masking it.
     ///
     /// # Errors
     ///
-    /// Returns [`DaemonError::BindFailed`] when the underlying accept
-    /// fails; the underlying I/O error is preserved as a string but
-    /// never embeds a captured value.
+    /// Returns [`DaemonError::BindFailed`] when the underlying
+    /// accept fails; the resulting string is an owner-only diagnostic
+    /// and is not part of the wire `ProtocolError` envelope sent to
+    /// the adapter.
     pub async fn accept(&self) -> Result<(tokio::net::TcpStream, SocketAddr), DaemonError> {
         self.inner.accept().await.map_err(|err| DaemonError::BindFailed(format!("accept: {err}")))
     }

@@ -98,10 +98,15 @@ impl EphemeralPrivateKey {
 /// Bundled TLS materials ready to be installed into a tokio acceptor.
 ///
 /// The struct owns only the [`Arc<ServerConfig>`] and the public
-/// certificate pin. The private key and the DER-encoded leaf are
-/// consumed by [`TlsServerMaterials::build`] and never duplicated;
-/// there is no `Clone` implementation and no public accessor for the
-/// DER bytes.
+/// certificate pin. The `EphemeralPrivateKey` wrapper protects and
+/// zeroizes only the serialized PKCS#8 DER `Vec<u8>` while the
+/// wrapper owns it; once [`TlsServerMaterials::build`] moves those
+/// bytes into rustls the wrapper has nothing left to clear. The
+/// [`rcgen::KeyPair`] that produced the DER and the [`rustls`]
+/// server config that consumes it retain their own internal
+/// representations of the key material that this module does not
+/// observe. The wrapper has no public DER accessor and the
+/// [`TlsServerMaterials`] type has no `Clone` implementation.
 pub struct TlsServerMaterials {
     /// Fully configured server config.
     server_config: Arc<ServerConfig>,
