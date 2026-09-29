@@ -1741,7 +1741,6 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-    use xtrace_domain::ids::Id as _;
     use xtrace_protocol::generated::agent::RecordingEvent;
     use xtrace_protocol::xtf::XtfEventEnvelope;
 

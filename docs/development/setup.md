@@ -12,6 +12,8 @@ and run the Slice 1A gates from a fresh checkout.
 - No system `protoc`. The build pulls Google's prebuilt `protoc` from
   `protoc-bin-vendored` at compile time.
 - Node.js 22 or newer and npm, for the synthetic XTP conformance client.
+- A Java 17 JDK, for the Java synthetic XTP conformance client. The checked-in
+  Gradle wrapper supplies Gradle 9.8.0 and verifies its distribution checksum.
 
 ## Caches
 
@@ -27,8 +29,9 @@ PNPM_HOME=/path/to/cache/pnpm
 NPM_CONFIG_CACHE=/path/to/cache/npm
 ```
 
-The variables are optional; cargo falls back to its built-in locations when
-they are unset.
+The variables are optional; each tool falls back to its built-in locations
+when they are unset. Set `GRADLE_USER_HOME` when large Gradle downloads and
+caches should live outside the system disk.
 
 The Node workspace also keeps its npm cache configurable through
 `NPM_CONFIG_CACHE`. Generated protobuf bindings and compiled TypeScript are
@@ -49,9 +52,9 @@ Run from the repository root:
 | Restricted-PATH build (see below)                  | Verify vendored protoc without a system `protoc`     |
 | CLI smoke (see below)                              | End-to-end init / status / open walkthrough         |
 
-The `justfile` exposes `just ci`, `just lint`, and `just test`. The `test` and
-`ci` recipes install, codegen-check, and build/test the Node workspace before
-running the Rust workspace tests.
+The `justfile` exposes `just ci`, `just lint`, `just test`, `just node-check`,
+and `just java-check`. The `test` and `ci` recipes prepare both language
+workspaces before running the Rust workspace tests.
 
 ### Node XTP conformance client
 
@@ -80,6 +83,36 @@ Apache-2.0 licensing: Buf's generator/runtime and CLI are Apache-2.0,
 `@bufbuild/protobuf` declares Apache-2.0 AND BSD-3-Clause, TypeScript is Apache-2.0,
 and `hash-wasm`, `uuid`, and `@types/node` are MIT. Exact versions are recorded
 in `adapters/node/package.json` and `package-lock.json`.
+
+### Java XTP conformance client
+
+The Java 17 workspace is also protocol-only. It generates Java protobuf
+classes at build time from `schema/proto`; generated sources and build output
+are intentionally not checked in. Dependency locking, SHA-256 verification
+metadata, and the Gradle distribution checksum are committed. Protoc artifact
+verification covers Linux x86_64/AArch64, macOS x86_64/AArch64, and Windows
+x86_64 builds; the private bootstrap reader and live acceptance executable are
+Unix-only.
+
+```bash
+export GRADLE_USER_HOME=/path/to/cache/gradle
+adapters/java/gradlew -p adapters/java --dependency-verification strict \
+  clean test installDist
+cargo test -p xtrace-cli --test java_synthetic_adapter
+```
+
+The private client accepts only `--bootstrap <path>`. It validates the
+owner-only one-shot file, pins the exact TLS leaf certificate before sending
+XTP data, uses an isolated Conscrypt provider for the TLS exporter, and proves
+four `Staged` acknowledgements plus the selected-root SQLite/XTF artifact. It
+prints one credential-free JSON receipt with `capture_supported: false`.
+
+This is not `-javaagent`, `premain`, attach support, or framework
+instrumentation. Spring Boot, Spring MVC, Servlet, endpoint discovery, request
+capture, and user-application support remain future slices. The exact direct
+pins are recorded in `adapters/java/build.gradle.kts`: Protobuf, Conscrypt,
+Jackson Core, Bouncy Castle, and JUnit. The build uses only their Maven Central
+artifacts and enforces committed SHA-256 dependency metadata.
 
 ### Restricted-PATH build
 

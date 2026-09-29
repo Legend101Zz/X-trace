@@ -382,7 +382,7 @@ fn chmod_file_owner_only(path: &Path) -> Result<(), CliError> {
         })?;
         validate_database_file_metadata(&updated_descriptor)?;
         ensure_same_file(&updated_descriptor, &path_metadata)?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]

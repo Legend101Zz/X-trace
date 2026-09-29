@@ -680,7 +680,6 @@ impl<'a> LogicalReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use prost::Message as _;
     use xtrace_protocol::generated::agent::RecordingEvent;
 
     use super::*;
