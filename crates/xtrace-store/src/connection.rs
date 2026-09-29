@@ -21,7 +21,7 @@
 //! [`StoreErrorKind::Busy`]: crate::error::StoreErrorKind::Busy
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::Connection;
 use xtrace_domain::CorrelationId;
@@ -187,8 +187,18 @@ pub struct StoreBootstrap {
 /// Bundled SQLite store. Cheap to clone (`Arc` inside).
 #[derive(Clone, Debug)]
 pub struct SqliteStore {
-    inner: std::sync::Arc<Mutex<Connection>>,
+    inner: Arc<StoreInner>,
     bootstrap: StoreBootstrap,
+}
+
+#[derive(Debug)]
+struct StoreInner {
+    connection: Mutex<Connection>,
+    // This lock owns recording-wide ordering across every clone and every
+    // borrowed recording-store view. It intentionally remains separate from
+    // the connection lock because later commits hold it across filesystem and
+    // SQLite boundaries.
+    recording_writer: Mutex<()>,
 }
 
 impl SqliteStore {
@@ -259,7 +269,10 @@ impl SqliteStore {
         let bootstrap_snapshot =
             StoreBootstrap { database_path, schema_version, busy_timeout: options.busy_timeout };
         Ok(Self {
-            inner: std::sync::Arc::new(Mutex::new(connection)),
+            inner: Arc::new(StoreInner {
+                connection: Mutex::new(connection),
+                recording_writer: Mutex::new(()),
+            }),
             bootstrap: bootstrap_snapshot,
         })
     }
@@ -282,17 +295,40 @@ impl SqliteStore {
     /// Acquires the underlying connection lock. Used by sibling
     /// repositories (added in later slices) that share the same
     /// connection mutex.
-    pub(crate) fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
+    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         // Locking a `Mutex` only fails when poisoned. Poisoning
         // means a previous holder panicked; treat it as corruption
         // because the database may be in an inconsistent state.
-        self.inner.lock().map_err(|_| {
+        self.inner.connection.lock().map_err(|_| {
             StoreError::new(
                 StoreErrorKind::Corruption,
                 "store connection mutex was poisoned by a panic",
                 CorrelationId::new(),
             )
         })
+    }
+
+    /// Acquires the shared recording writer guard.
+    ///
+    /// Recording persistence obtains this before any recording read and keeps
+    /// it across its complete operation. The guard is shared by every clone
+    /// because it lives in [`StoreInner`], not in a repository view.
+    pub(crate) fn lock_recording_writer(
+        &self,
+        correlation_id: CorrelationId,
+    ) -> Result<MutexGuard<'_, ()>, StoreError> {
+        self.inner.recording_writer.lock().map_err(|_| {
+            StoreError::new(
+                StoreErrorKind::Corruption,
+                "recording writer mutex was poisoned by a panic",
+                correlation_id,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_lock_recording_writer(&self) -> Option<MutexGuard<'_, ()>> {
+        self.inner.recording_writer.try_lock().ok()
     }
 }
 
