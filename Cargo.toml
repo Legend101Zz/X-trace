@@ -97,6 +97,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Protobuf runtime
 prost = { version = "0.13", default-features = false, features = ["std", "derive"] }
 
+# Immutable XTF segments use a single checksummed Zstandard frame. Default
+# features are disabled to keep legacy, dictionary-building, and optional
+# compression features out of the storage dependency surface.
+zstd = { version = "0.13.3", default-features = false }
+
 # Protobuf build
 # `prost-build` invokes a `protoc` binary. We resolve the binary from
 # `protoc-bin-vendored`, which bundles Google's prebuilt `protoc` per
