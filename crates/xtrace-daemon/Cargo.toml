@@ -40,3 +40,7 @@ zeroize = { workspace = true }
 # so integration tests can exercise the daemon without a separate
 # runtime dependency.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+# RAII temporary directories for integration tests. The crate's
+# `TempDir` guard removes the directory on drop so a panic in a test
+# never strands an unwiped bootstrap artifact or secret-bearing file.
+tempfile = "3.10"

@@ -97,7 +97,7 @@ pub mod session;
 pub mod tls;
 
 pub use bootstrap::{BootstrapArtifact, BootstrapArtifactFields, BootstrapOwner};
-pub use config::{ChannelCapacity, DaemonConfig, LOOPBACK_HOST, LoopbackPolicy};
+pub use config::{DaemonConfig, LOOPBACK_HOST, LoopbackPolicy, OutboundCapacity};
 pub use daemon::{
     BoundDaemon, DaemonBuilder, MonotonicClock, ShutdownSignal, TLS_EXPORTER_LABEL,
     TLS_EXPORTER_LEN,
@@ -108,7 +108,7 @@ pub use listener::LoopbackListener;
 pub use runtime::{AdapterHelloAck, IncomingEnvelope, OutgoingCommand};
 pub use secret::SessionSecret;
 pub use session::{HandshakeInputs, HandshakeRole, Session};
-pub use tls::{EphemeralCertificate, TlsServerMaterials, build_pinned_client_config};
+pub use tls::{TlsServerMaterials, build_pinned_client_config};
 
 /// Re-export of the XTP-Agent protocol handshake helpers so callers
 /// (the fake adapter in particular) can compute and verify the

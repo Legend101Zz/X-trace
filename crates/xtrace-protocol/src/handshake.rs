@@ -13,17 +13,18 @@
 //!           || len(client_nonce)          || client_nonce
 //!           || len(server_nonce)          || server_nonce
 //!           || len(manifest_digest)       || manifest_digest
-//!           || len(project_context)       || project_context
 //! )
 //! ```
 //!
-//! The TLS exporter is obtained through the
-//! `rustls::Exporter` trait; the runtime session identifier, manifest
-//! digest, and project context are negotiated via the bootstrap
-//! artifact; the nonces are random per-connection. The project context
-//! is an unambiguous canonical encoding of the bootstrap project
-//! identifier so a peer that has accepted the wrong project identity
-//! can never produce a matching tag.
+//! The TLS exporter is obtained through `rustls`'s
+//! `export_keying_material` method on the server-side connection (the
+//! `rustls` crate does not expose an `Exporter` trait; the method lives
+//! on the connection type). The runtime session identifier, manifest
+//! digest, and the negotiated nonces are the only inputs the
+//! transcript binds; project identity is represented by the bootstrap
+//! `project_id` together with `AdapterHello.repository_fingerprint` and
+//! validated separately against the canonical
+//! `xtrace_domain::RepositoryFingerprint` negotiated out of band.
 //!
 //! The transcript is fixed-length encoded per chunk: every variable
 //! field is preceded by its byte length as a 32-bit big-endian
@@ -44,6 +45,14 @@
 //! session sequencing live in [`crate::envelope`] and
 //! [`crate::generated::agent`] so the cryptographic proof stays
 //! confined to this single reviewed module.
+//!
+//! ## HMAC key size
+//!
+//! HMAC-SHA256 accepts keys of any length; SHA-256's block size is a
+//! documented implementation threshold for performance but not a
+//! validity constraint. The 256-bit per-runtime-session secret used in
+//! production is well within bounds and the API has no key-length error
+//! path on success.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -55,41 +64,20 @@ use sha2::Sha256;
 /// hash the same byte sequence.
 const TRANSCRIPT_LABEL: &[u8] = b"xtrace-handshake-v1";
 
-/// Canonical label for the project context chunk folded into the
-/// transcript proof. The label binds the project identity into the
-/// HMAC input even though the v1 envelope has no explicit project
-/// field; the daemon and the adapter must derive the same byte
-/// sequence from the same bootstrap project identifier.
-pub const PROJECT_CONTEXT_LABEL: &[u8] = b"xtrace/project/v1:";
-
 /// Placeholder nonce used by the inbound `AdapterHello` for the
 /// server nonce the adapter has not yet seen. The 32-byte length
 /// matches the documented nonce size so the byte layout stays
 /// consistent across both directions.
 pub const ZERO_NONCE: [u8; 32] = [0u8; 32];
 
-/// Builds the canonical project context chunk from the supplied
-/// project identifier bytes. The returned vector is the unambiguous
-/// byte sequence both sides fold into the HMAC input. The chunk is
-/// not validated here; the caller owns the project identity and must
-/// pass the canonical UUID bytes negotiated at bootstrap.
-#[must_use]
-pub fn project_context(project_id_bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PROJECT_CONTEXT_LABEL.len() + project_id_bytes.len());
-    out.extend_from_slice(PROJECT_CONTEXT_LABEL);
-    out.extend_from_slice(project_id_bytes);
-    out
-}
-
 /// Hashes the supplied transcript into a 32-byte HMAC-SHA256 tag.
 ///
-/// # Errors
-///
-/// Returns [`TranscriptProofError::Mac`] when the HMAC key is too
-/// long for the underlying hash function. SHA-256 accepts any key
-/// up to its block size (64 bytes); the daemon's 256-bit session
-/// secret is always within bounds so this branch is unreachable
-/// in production and exists only to keep the public API total.
+/// The function never refuses the supplied key: HMAC-SHA256 accepts
+/// any byte slice and only hashes a pre-padded copy internally. The
+/// returned [`Result`] exists so future SHA-3 variants, which may
+/// restrict the key length, can be slotted into the same signature
+/// without breaking callers; today the `Ok` arm is the only outcome
+/// the production caller observes.
 pub fn compute_transcript_proof(
     session_secret: &[u8],
     tls_exporter: &[u8],
@@ -97,7 +85,6 @@ pub fn compute_transcript_proof(
     client_nonce: &[u8],
     server_nonce: &[u8],
     manifest_digest: &[u8],
-    project_context: &[u8],
 ) -> Result<[u8; 32], TranscriptProofError> {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(session_secret).map_err(|_| TranscriptProofError::Mac)?;
@@ -112,8 +99,6 @@ pub fn compute_transcript_proof(
     mac.update(server_nonce);
     mac.update(&(manifest_digest.len() as u32).to_be_bytes());
     mac.update(manifest_digest);
-    mac.update(&(project_context.len() as u32).to_be_bytes());
-    mac.update(project_context);
     let tag = mac.finalize().into_bytes();
     let mut out = [0u8; 32];
     out.copy_from_slice(&tag);
@@ -140,7 +125,6 @@ pub fn verify_transcript_proof(
     client_nonce: &[u8],
     server_nonce: &[u8],
     manifest_digest: &[u8],
-    project_context: &[u8],
     expected: &[u8],
 ) -> Result<(), TranscriptProofError> {
     let computed = compute_transcript_proof(
@@ -150,7 +134,6 @@ pub fn verify_transcript_proof(
         client_nonce,
         server_nonce,
         manifest_digest,
-        project_context,
     )?;
     if expected.len() != computed.len() {
         return Err(TranscriptProofError::Mismatch);
@@ -173,9 +156,9 @@ pub enum TranscriptProofError {
     /// specific verification steps through error variants.
     #[error("transcript proof mismatch")]
     Mismatch,
-    /// The HMAC key was rejected by the underlying primitive. This
-    /// branch is unreachable for the documented 256-bit session
-    /// secret and exists only to keep the API total.
+    /// The HMAC primitive refused the supplied key. HMAC-SHA256
+    /// accepts any key length; the variant exists so the public API
+    /// stays total when SHA-3 or another future hash is wired in.
     #[error("hmac primitive refused the supplied key")]
     Mac,
 }
@@ -191,9 +174,8 @@ mod tests {
         client: &[u8],
         server: &[u8],
         manifest: &[u8],
-        project: &[u8],
     ) -> [u8; 32] {
-        compute_transcript_proof(secret, exporter, session, client, server, manifest, project)
+        compute_transcript_proof(secret, exporter, session, client, server, manifest)
             .expect("HMAC accepts the test secret")
     }
 
@@ -205,20 +187,17 @@ mod tests {
         let client = [0xaa_u8; 32];
         let server = [0xbb_u8; 32];
         let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
-        let project = project_context(b"01900000-0000-7000-8000-000000000000");
 
-        let first = proof(secret, exporter, session, &client, &server, manifest, &project);
-        let second = proof(secret, exporter, session, &client, &server, manifest, &project);
+        let first = proof(secret, exporter, session, &client, &server, manifest);
+        let second = proof(secret, exporter, session, &client, &server, manifest);
         assert_eq!(first, second);
 
         // Flipping any field must change the proof so a verifier
         // catches every kind of transcript tampering.
-        let wrong_secret =
-            proof(b"other-secret", exporter, session, &client, &server, manifest, &project);
+        let wrong_secret = proof(b"other-secret", exporter, session, &client, &server, manifest);
         assert_ne!(wrong_secret, first);
 
-        let wrong_exporter =
-            proof(secret, b"different", session, &client, &server, manifest, &project);
+        let wrong_exporter = proof(secret, b"different", session, &client, &server, manifest);
         assert_ne!(wrong_exporter, first);
 
         let wrong_session = proof(
@@ -228,16 +207,13 @@ mod tests {
             &client,
             &server,
             manifest,
-            &project,
         );
         assert_ne!(wrong_session, first);
 
-        let wrong_client =
-            proof(secret, exporter, session, &[0xcc; 32], &server, manifest, &project);
+        let wrong_client = proof(secret, exporter, session, &[0xcc; 32], &server, manifest);
         assert_ne!(wrong_client, first);
 
-        let wrong_server =
-            proof(secret, exporter, session, &client, &[0xdd; 32], manifest, &project);
+        let wrong_server = proof(secret, exporter, session, &client, &[0xdd; 32], manifest);
         assert_ne!(wrong_server, first);
 
         let wrong_manifest = proof(
@@ -247,20 +223,8 @@ mod tests {
             &client,
             &server,
             b"b3:1111111111111111111111111111111111111111111111111111111111111111",
-            &project,
         );
         assert_ne!(wrong_manifest, first);
-
-        let wrong_project = proof(
-            secret,
-            exporter,
-            session,
-            &client,
-            &server,
-            manifest,
-            project_context(b"01999999-0000-7000-8000-000000000000").as_slice(),
-        );
-        assert_ne!(wrong_project, first);
     }
 
     #[test]
@@ -271,8 +235,7 @@ mod tests {
         let client = [0xaa_u8; 32];
         let server = [0xbb_u8; 32];
         let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
-        let project = project_context(b"01900000-0000-7000-8000-000000000000");
-        let proof_value = proof(secret, exporter, session, &client, &server, manifest, &project);
+        let proof_value = proof(secret, exporter, session, &client, &server, manifest);
         verify_transcript_proof(
             secret,
             exporter,
@@ -280,7 +243,6 @@ mod tests {
             &client,
             &server,
             manifest,
-            &project,
             &proof_value,
         )
         .expect("matching proof verifies");
@@ -293,7 +255,6 @@ mod tests {
             &client,
             &server,
             manifest,
-            &project,
             &proof_value[..31],
         );
         assert!(matches!(err, Err(TranscriptProofError::Mismatch)));
@@ -302,16 +263,19 @@ mod tests {
         let mut tampered = proof_value;
         tampered[0] ^= 0x01;
         let err = verify_transcript_proof(
-            secret, exporter, session, &client, &server, manifest, &project, &tampered,
+            secret, exporter, session, &client, &server, manifest, &tampered,
         );
         assert!(matches!(err, Err(TranscriptProofError::Mismatch)));
     }
 
     #[test]
-    fn project_context_encodes_label_and_id_unambiguously() {
-        let id = b"01900000-0000-7000-8000-000000000000";
-        let ctx = project_context(id);
-        assert!(ctx.starts_with(PROJECT_CONTEXT_LABEL));
-        assert_eq!(&ctx[PROJECT_CONTEXT_LABEL.len()..], id);
+    fn proof_accepts_keys_longer_than_sha256_block_size() {
+        // SHA-256's internal block size is 64 bytes; HMAC pre-hashes
+        // longer keys but never refuses them. This guards against a
+        // future regression that would start rejecting over-length
+        // keys and breaking the transcript.
+        let long_key = vec![0x5a; 96];
+        let tag = proof(&long_key, b"exporter", b"session", &[0xaa; 32], &[0xbb; 32], b"manifest");
+        assert_eq!(tag.len(), 32);
     }
 }

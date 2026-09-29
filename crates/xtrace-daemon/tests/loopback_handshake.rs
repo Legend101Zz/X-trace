@@ -4,13 +4,19 @@
 //! loopback port, connect with a real rustls client configured to
 //! pin the daemon's certificate, exercise the `AdapterHello` /
 //! `DaemonHello` transcript proof over the negotiated TLS 1.3
-//! channel, and exchange post-hello traffic. The tests prove the
-//! Slice 1B acceptance criteria:
+//! channel, and exchange post-hello traffic. Every test runs against
+//! the live [`BoundDaemon::serve`] future so the post-hello
+//! writer-task split and the bounded outbound capacity are exercised
+//! for real, not stubbed out.
+//!
+//! The Slice 1B acceptance criteria this file proves:
 //!
 //! - the daemon binds loopback only and refuses any other bind
-//!   policy through the production address validator;
+//!   address through the production [`xtrace_daemon::validate_loopback`]
+//!   entry point;
 //! - the ephemeral certificate is pinned through a real rustls
-//!   verifier so a different daemon certificate never connects;
+//!   verifier so a different daemon certificate never connects
+//!   (verified via TLS verification failure, not connection refusal);
 //! - the per-connection TLS exporter is folded into the
 //!   `AdapterHello`/`DaemonHello` HMAC transcript proof rather than
 //!   a placeholder;
@@ -28,11 +34,15 @@
 //!   protocol version;
 //! - the runtime `Ack` for an accepted envelope has an empty
 //!   `rejected` list and a stable `XTR-DAEMON-SESSION-SEQUENCE`
-//!   rejection for replay or gap.
+//!   rejection for replay or gap;
+//! - the bounded outbound capacity of 1 still delivers every ACK
+//!   under a timeout without deadlock (regression coverage for the
+//!   pre-fix reader/writer deadlock).
 
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
+    clippy::panic,
     reason = "integration tests assert on fallible fixture data and supervisor paths"
 )]
 
@@ -40,24 +50,53 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
+use tempfile::TempDir;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use xtrace_daemon::bootstrap::{BootstrapArtifact, BootstrapArtifactFields};
+use xtrace_daemon::listener::validate_loopback;
+
 use xtrace_daemon::{
     BoundDaemon, DaemonBuilder, DaemonConfig, DaemonError, HandshakeInputs, HandshakeRole,
-    LoopbackPolicy, Session, SessionSecret, TLS_EXPORTER_LABEL, build_pinned_client_config,
+    LoopbackPolicy, OutboundCapacity, Session, SessionSecret, TLS_EXPORTER_LABEL,
+    build_pinned_client_config,
 };
 use xtrace_domain::ids::Id as _;
-use xtrace_domain::{ProjectId, RuntimeSessionId};
+use xtrace_domain::{ProjectId, RepositoryFingerprint as DomainFingerprint, RuntimeSessionId};
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
 use xtrace_protocol::generated::agent::{
-    AdapterHello, AgentEnvelope, Capability, CapabilitySet, Health,
+    AdapterHello, AgentEnvelope, Capability, CapabilitySet, Health, ProtocolError,
 };
-use xtrace_protocol::handshake::{self, project_context};
+use xtrace_protocol::handshake;
 
-const EXPECTED_REPOSITORY_FINGERPRINT: &str = "expected-repo-fingerprint";
-const WRONG_REPOSITORY_FINGERPRINT: &str = "wrong-repo-fingerprint";
+/// Canonical fingerprint used by every happy-path integration test.
+/// The value is the canonical `b3:<64 lowercase hex>` form produced
+/// by `RepositoryFingerprint::from_canonical_path`; tests pass it
+/// through `try_from_canonical` so any malformed input would be
+/// rejected at the daemon boundary.
+const EXPECTED_REPOSITORY_FINGERPRINT: &str =
+    "b3:1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Distinct canonical fingerprint used by the wrong-binding test.
+const WRONG_REPOSITORY_FINGERPRINT: &str =
+    "b3:2222222222222222222222222222222222222222222222222222222222222222";
+
+/// Canonical manifest digest carried in the AdapterHello transcript.
+/// The value is intentionally distinct from the certificate pin so
+/// the happy path cannot conflate the two identities.
+const HAPPY_MANIFEST_DIGEST: &str =
+    "b3:3333333333333333333333333333333333333333333333333333333333333333";
+
+/// Default budget for any helper that waits for the daemon to emit
+/// an `Ack` or `ProtocolError`. The bounded deadline makes a
+/// regression fail rather than hang the test suite forever.
+const READ_ENVELOPE_BUDGET: Duration = Duration::from_secs(5);
+
+fn expected_fingerprint() -> DomainFingerprint {
+    DomainFingerprint::try_from_canonical(EXPECTED_REPOSITORY_FINGERPRINT)
+        .expect("canonical fingerprint")
+}
 
 /// Builds a fresh daemon bound to loopback with a TLS 1.3-only
 /// configuration. Returns the bound daemon, the bootstrap secret it
@@ -68,8 +107,10 @@ const WRONG_REPOSITORY_FINGERPRINT: &str = "wrong-repo-fingerprint";
 async fn spawn_daemon(
     bootstrap_path: std::path::PathBuf,
     health_interval: Duration,
-    channel_capacity: usize,
-    repository_fingerprint: &str,
+    outbound_capacity: usize,
+    repository_fingerprint: &DomainFingerprint,
+    project_id: ProjectId,
+    runtime_session_id: RuntimeSessionId,
 ) -> Result<
     (BoundDaemon, SessionSecret, RuntimeSessionId, ProjectId, std::net::SocketAddr, String),
     DaemonError,
@@ -79,14 +120,11 @@ async fn spawn_daemon(
         health_interval,
         ..DaemonConfig::default()
     };
-    config.channel_capacity =
-        xtrace_daemon::ChannelCapacity::new(channel_capacity).unwrap_or_default();
-    let project_id = ProjectId::new();
-    let runtime_session_id = RuntimeSessionId::new();
+    config.outbound_capacity = OutboundCapacity::new(outbound_capacity).unwrap_or_default();
     let bound = DaemonBuilder::new(config)
         .with_project_id(project_id)
         .with_runtime_session_id(runtime_session_id)
-        .with_expected_repository_fingerprint(repository_fingerprint.to_string())
+        .with_expected_repository_fingerprint(repository_fingerprint.clone())
         .with_bootstrap_artifact(bootstrap_path.clone())
         .bind()
         .await?;
@@ -143,14 +181,12 @@ fn build_adapter_hello(
     secret: &[u8],
     tls_exporter: &[u8],
     runtime_session_id: &RuntimeSessionId,
-    project_id: &ProjectId,
     manifest_digest: &str,
     client_nonce: &[u8],
     repository_fingerprint: &str,
     protocol_major_max: u32,
     protocol_minor_max: u32,
 ) -> AdapterHello {
-    let ctx = project_context(project_id.as_uuid().as_bytes());
     let proof = handshake::compute_transcript_proof(
         secret,
         tls_exporter,
@@ -158,7 +194,6 @@ fn build_adapter_hello(
         client_nonce,
         &handshake::ZERO_NONCE,
         manifest_digest.as_bytes(),
-        &ctx,
     )
     .expect("HMAC accepts the test secret");
     AdapterHello {
@@ -193,12 +228,10 @@ fn compute_expected_daemon_proof(
     secret: &[u8],
     tls_exporter: &[u8],
     runtime_session_id: &RuntimeSessionId,
-    project_id: &ProjectId,
     server_nonce: &[u8],
     client_nonce: &[u8],
     manifest_digest: &str,
 ) -> [u8; 32] {
-    let ctx = project_context(project_id.as_uuid().as_bytes());
     handshake::compute_transcript_proof(
         secret,
         tls_exporter,
@@ -206,7 +239,6 @@ fn compute_expected_daemon_proof(
         client_nonce,
         server_nonce,
         manifest_digest.as_bytes(),
-        &ctx,
     )
     .expect("HMAC accepts the test secret")
 }
@@ -268,17 +300,45 @@ where
         .map_err(|err| std::io::Error::other(format!("decode envelope: {err}")))
 }
 
+/// Reads one length-prefixed envelope from the supplied stream with
+/// a bounded [`READ_ENVELOPE_BUDGET`]. Tests use this in place of
+/// [`read_envelope`] whenever a single envelope is expected so a
+/// regression that hangs the reader surfaces as a test failure
+/// rather than a CI hang.
+async fn read_envelope_bounded<R>(reader: &mut R, label: &str) -> AgentEnvelope
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    match tokio::time::timeout(READ_ENVELOPE_BUDGET, read_envelope(reader)).await {
+        Ok(Ok(env)) => env,
+        Ok(Err(err)) => panic!("{label}: read failed: {err}"),
+        Err(_) => panic!("{label}: timed out waiting for envelope after {READ_ENVELOPE_BUDGET:?}"),
+    }
+}
+
 /// Reads envelopes from the supplied stream until the next `Ack`
 /// payload arrives, dropping any intervening `Health` echoes from
 /// the daemon's periodic ticker. The helper makes the post-hello
 /// happy path deterministic when the daemon emits a Health between
-/// the adapter's outbound messages.
+/// the adapter's outbound messages. A bounded [`READ_ENVELOPE_BUDGET`]
+/// makes the helper fail rather than hang when the daemon never
+/// delivers the expected payload.
 async fn next_ack<R>(reader: &mut R, label: &str) -> xtrace_protocol::generated::agent::Ack
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let start = std::time::Instant::now();
     loop {
-        let envelope = read_envelope(reader).await.expect(label);
+        let envelope = match tokio::time::timeout(
+            READ_ENVELOPE_BUDGET.saturating_sub(start.elapsed()),
+            read_envelope(reader),
+        )
+        .await
+        {
+            Ok(Ok(env)) => env,
+            Ok(Err(err)) => panic!("{label}: read failed: {err}"),
+            Err(_) => panic!("{label}: timed out waiting for Ack after {READ_ENVELOPE_BUDGET:?}"),
+        };
         match envelope.payload {
             Some(PayloadOneof::Ack(ack)) => return ack,
             Some(PayloadOneof::Health(_)) => continue,
@@ -289,6 +349,40 @@ where
                 );
             }
             other => unreachable!("expected Ack after {label}, got {other:?}"),
+        }
+    }
+}
+
+/// Reads envelopes from the supplied stream until the next
+/// `ProtocolError` arrives, dropping any intervening `Health`
+/// echoes from the daemon's periodic ticker. A bounded
+/// [`READ_ENVELOPE_BUDGET`] keeps a regression that never delivers
+/// the error from hanging the suite.
+async fn next_protocol_error<R>(reader: &mut R, label: &str) -> ProtocolError
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let start = std::time::Instant::now();
+    loop {
+        let envelope = match tokio::time::timeout(
+            READ_ENVELOPE_BUDGET.saturating_sub(start.elapsed()),
+            read_envelope(reader),
+        )
+        .await
+        {
+            Ok(Ok(env)) => env,
+            Ok(Err(err)) => panic!("{label}: read failed: {err}"),
+            Err(_) => panic!(
+                "{label}: timed out waiting for ProtocolError after {READ_ENVELOPE_BUDGET:?}"
+            ),
+        };
+        match envelope.payload {
+            Some(PayloadOneof::ProtocolError(err)) => return err,
+            Some(PayloadOneof::Health(_)) => continue,
+            Some(other) => {
+                unreachable!("unexpected payload before ProtocolError after {label}: {other:?}")
+            }
+            None => unreachable!("empty envelope after {label}"),
         }
     }
 }
@@ -312,37 +406,25 @@ async fn connect_pinned(
         .map_err(|err| std::io::Error::other(format!("tls connect: {err}")))
 }
 
-/// Builds a unique test directory under `std::env::temp_dir()` for
-/// bootstrap and other temporary files. The directory is cleaned up
-/// at the end of every test even when the test panics.
-fn unique_dir(label: &str) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos =
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let path = std::env::temp_dir()
-        .join(format!("xtrace-daemon-{label}-{}-{counter}-{nanos}", std::process::id(),));
-    std::fs::create_dir_all(&path).expect("mkdir");
-    path
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loopback_happy_path_handshake_and_post_hello_traffic() {
-    let dir = unique_dir("happy");
-    let bootstrap_path = dir.join("bootstrap.json");
-    let (bound, secret, session_id, project_id, address, pin) = spawn_daemon(
+    let temp = TempDir::new().expect("temp dir");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, secret, _, _, address, pin) = spawn_daemon(
         bootstrap_path.clone(),
         Duration::from_millis(50),
         64,
-        EXPECTED_REPOSITORY_FINGERPRINT,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
     )
     .await
     .expect("bind");
     let (shutdown_tx, daemon_handle) = daemon_task(bound);
 
     let client_nonce = [0x77_u8; 32];
-    let manifest_digest = pin.clone();
 
     let mut tls_stream = connect_pinned(address, &pin).await.expect("pinned connect");
     let mut exporter_buf = [0u8; 32];
@@ -357,8 +439,7 @@ async fn loopback_happy_path_handshake_and_post_hello_traffic() {
         secret.read_secret(),
         &exporter,
         &session_id,
-        &project_id,
-        &manifest_digest,
+        HAPPY_MANIFEST_DIGEST,
         &client_nonce,
         EXPECTED_REPOSITORY_FINGERPRINT,
         1,
@@ -369,7 +450,7 @@ async fn loopback_happy_path_handshake_and_post_hello_traffic() {
         .await
         .expect("write adapter hello");
 
-    let daemon_hello_envelope = read_envelope(&mut reader).await.expect("daemon hello");
+    let daemon_hello_envelope = read_envelope_bounded(&mut reader, "daemon hello").await;
     let daemon_hello = match daemon_hello_envelope.payload {
         Some(PayloadOneof::DaemonHello(hello)) => hello,
         other => unreachable!("expected DaemonHello, got {other:?}"),
@@ -378,16 +459,19 @@ async fn loopback_happy_path_handshake_and_post_hello_traffic() {
     assert_eq!(daemon_hello.protocol_minor, 0);
     assert_eq!(daemon_hello.max_envelope_bytes, 1024 * 1024);
     assert_eq!(daemon_hello.max_batch_events, 256);
-    assert_eq!(daemon_hello.manifest_digest, manifest_digest);
+    assert_eq!(daemon_hello.manifest_digest, HAPPY_MANIFEST_DIGEST);
+    assert_ne!(
+        daemon_hello.manifest_digest, pin,
+        "manifest digest must differ from the certificate pin"
+    );
     assert_eq!(daemon_hello.server_nonce.len(), 32);
     let expected_proof = compute_expected_daemon_proof(
         secret.read_secret(),
         &exporter,
         &session_id,
-        &project_id,
         &daemon_hello.server_nonce,
         &client_nonce,
-        &manifest_digest,
+        HAPPY_MANIFEST_DIGEST,
     );
     assert_eq!(
         daemon_hello.hmac.as_ref(),
@@ -426,39 +510,45 @@ async fn loopback_happy_path_handshake_and_post_hello_traffic() {
     drop(tls_stream);
     let _ = shutdown_tx.send(());
     daemon_handle.await.expect("daemon task").expect("serve");
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pinned_client_rejects_wrong_certificate_at_tls_verification() {
-    let dir = unique_dir("wrong-pin");
-    let bootstrap_a = dir.join("bootstrap-a.json");
-    let bootstrap_b = dir.join("bootstrap-b.json");
+    // The wrong-pin path connects to a live daemon using a
+    // different pin. The test proves the failure happens at TLS
+    // verification, not at TCP connect.
+    let temp_a = TempDir::new().expect("temp a");
+    let temp_b = TempDir::new().expect("temp b");
+    let bootstrap_a = temp_a.path().join("bootstrap-a.json");
+    let bootstrap_b = temp_b.path().join("bootstrap-b.json");
 
-    let mut cfg =
-        DaemonConfig { loopback_policy: LoopbackPolicy::V4Only, ..DaemonConfig::default() };
-    cfg.channel_capacity = xtrace_daemon::ChannelCapacity::default();
-    let first = DaemonBuilder::new(cfg)
-        .with_project_id(ProjectId::new())
-        .with_runtime_session_id(RuntimeSessionId::new())
-        .with_expected_repository_fingerprint(EXPECTED_REPOSITORY_FINGERPRINT.to_string())
-        .with_bootstrap_artifact(bootstrap_a.clone())
-        .bind()
-        .await
-        .expect("first bind");
+    let project_id_a = ProjectId::new();
+    let session_id_a = RuntimeSessionId::new();
+    let first = DaemonBuilder::new(DaemonConfig {
+        loopback_policy: LoopbackPolicy::V4Only,
+        ..DaemonConfig::default()
+    })
+    .with_project_id(project_id_a)
+    .with_runtime_session_id(session_id_a)
+    .with_expected_repository_fingerprint(expected_fingerprint())
+    .with_bootstrap_artifact(bootstrap_a.clone())
+    .bind()
+    .await
+    .expect("first bind");
     let first_pin = first.certificate_pin().to_string();
 
-    let mut cfg2 =
-        DaemonConfig { loopback_policy: LoopbackPolicy::V4Only, ..DaemonConfig::default() };
-    cfg2.channel_capacity = xtrace_daemon::ChannelCapacity::default();
-    let second = DaemonBuilder::new(cfg2)
-        .with_project_id(ProjectId::new())
-        .with_runtime_session_id(RuntimeSessionId::new())
-        .with_expected_repository_fingerprint(EXPECTED_REPOSITORY_FINGERPRINT.to_string())
-        .with_bootstrap_artifact(bootstrap_b.clone())
-        .bind()
-        .await
-        .expect("second bind");
+    let second = DaemonBuilder::new(DaemonConfig {
+        loopback_policy: LoopbackPolicy::V4Only,
+        ..DaemonConfig::default()
+    })
+    .with_project_id(ProjectId::new())
+    .with_runtime_session_id(RuntimeSessionId::new())
+    .with_expected_repository_fingerprint(expected_fingerprint())
+    .with_bootstrap_artifact(bootstrap_b.clone())
+    .bind()
+    .await
+    .expect("second bind");
     let second_address = second.local_addr();
     // The second daemon stays up so the pinned client can attempt a
     // TLS handshake against a different certificate. We use a
@@ -490,18 +580,23 @@ async fn pinned_client_rejects_wrong_certificate_at_tls_verification() {
     let _ = second_tx.send(());
     let _ = handle.await;
     let _ = second_handle.await;
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(temp_a);
+    drop(temp_b);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_transcript_proof_is_rejected_with_documented_code() {
-    let dir = unique_dir("wrong-proof");
-    let bootstrap_path = dir.join("bootstrap.json");
-    let (bound, secret, session_id, project_id, address, pin) = spawn_daemon(
+    let temp = TempDir::new().expect("temp");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, _secret, _, _, address, pin) = spawn_daemon(
         bootstrap_path.clone(),
         Duration::from_millis(50),
         64,
-        EXPECTED_REPOSITORY_FINGERPRINT,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
     )
     .await
     .expect("bind");
@@ -521,8 +616,7 @@ async fn wrong_transcript_proof_is_rejected_with_documented_code() {
         &wrong_secret,
         &exporter,
         &session_id,
-        &project_id,
-        &pin,
+        HAPPY_MANIFEST_DIGEST,
         &[0x42_u8; 32],
         EXPECTED_REPOSITORY_FINGERPRINT,
         1,
@@ -534,7 +628,7 @@ async fn wrong_transcript_proof_is_rejected_with_documented_code() {
         .expect("write adapter hello");
 
     let protocol_error_envelope =
-        read_envelope(&mut reader).await.expect("protocol error envelope");
+        read_envelope_bounded(&mut reader, "protocol error envelope").await;
     let err = match protocol_error_envelope.payload {
         Some(PayloadOneof::ProtocolError(err)) => err,
         other => unreachable!("expected ProtocolError, got {other:?}"),
@@ -546,64 +640,7 @@ async fn wrong_transcript_proof_is_rejected_with_documented_code() {
     drop(tls_stream);
     let _ = shutdown_tx.send(());
     daemon_handle.await.expect("daemon task").expect("serve");
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = secret;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wrong_session_secret_is_rejected_with_hello_proof_code() {
-    let dir = unique_dir("wrong-secret");
-    let bootstrap_path = dir.join("bootstrap.json");
-    let (bound, _, session_id, project_id, address, pin) = spawn_daemon(
-        bootstrap_path.clone(),
-        Duration::from_millis(50),
-        64,
-        EXPECTED_REPOSITORY_FINGERPRINT,
-    )
-    .await
-    .expect("bind");
-    let (shutdown_tx, daemon_handle) = daemon_task(bound);
-
-    let mut tls_stream = connect_pinned(address, &pin).await.expect("pinned connect");
-    let mut exporter_buf = [0u8; 32];
-    tls_stream
-        .get_ref()
-        .1
-        .export_keying_material(&mut exporter_buf, TLS_EXPORTER_LABEL, None)
-        .expect("client exporter");
-    let exporter = exporter_buf.to_vec();
-
-    let alt_secret = [0x99_u8; 32];
-    let adapter_hello = build_adapter_hello(
-        &alt_secret,
-        &exporter,
-        &session_id,
-        &project_id,
-        &pin,
-        &[0x55_u8; 32],
-        EXPECTED_REPOSITORY_FINGERPRINT,
-        1,
-        0,
-    );
-    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
-    write_envelope(&mut writer, PayloadOneof::AdapterHello(adapter_hello), &session_id, 0, 1)
-        .await
-        .expect("write adapter hello");
-
-    let protocol_error_envelope =
-        read_envelope(&mut reader).await.expect("protocol error envelope");
-    let err = match protocol_error_envelope.payload {
-        Some(PayloadOneof::ProtocolError(err)) => err,
-        other => unreachable!("expected ProtocolError, got {other:?}"),
-    };
-    assert_eq!(err.code, "XTR-DAEMON-HELLO-PROOF");
-
-    drop(reader);
-    drop(writer);
-    drop(tls_stream);
-    let _ = shutdown_tx.send(());
-    daemon_handle.await.expect("daemon task").expect("serve");
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -611,53 +648,82 @@ async fn non_loopback_bind_is_rejected_by_address_validator() {
     // Production callers must not be able to bind a non-loopback
     // address through the loopback address validator. The daemon
     // binds the kernel socket through `LoopbackListener`; here we
-    // exercise the public `is_loopback_ip` and the loopback-only
-    // bind rejection by attempting a non-loopback bind and
-    // confirming the helper reports the address as not loopback.
-    use xtrace_daemon::listener::is_loopback_ip;
-    assert!(!is_loopback_ip("10.0.0.1".parse().unwrap()));
-    assert!(!is_loopback_ip("8.8.8.8".parse().unwrap()));
-    let bound = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = bound.local_addr().expect("addr");
-    assert!(is_loopback_ip(addr.ip()));
+    // exercise the production [`validate_loopback`] entry point
+    // directly so the rejection is observed at the boundary the
+    // brief requires, not just inside a predicate.
+    let public: std::net::SocketAddr = "8.8.8.8:443".parse().unwrap();
+    let err = validate_loopback(public).unwrap_err();
+    let rendered = format!("{err}");
+    assert!(rendered.contains("non-loopback"), "got {rendered}");
+
+    let private: std::net::SocketAddr = "10.0.0.1:443".parse().unwrap();
+    assert!(validate_loopback(private).is_err());
+
+    let loopback_v4: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    assert!(validate_loopback(loopback_v4).is_ok());
+
+    let loopback_v6: std::net::SocketAddr = "[::1]:0".parse().unwrap();
+    assert!(validate_loopback(loopback_v6).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_frame_is_rejected_with_frame_too_large() {
-    let dir = unique_dir("oversized");
-    let bootstrap_path = dir.join("bootstrap.json");
-    let (bound, _, _, _, address, _) = spawn_daemon(
+    // Establish a pinned TLS listener and write an oversized
+    // length prefix directly into the framed reader. The daemon
+    // emits a `ProtocolError` with code `XTR-DAEMON-FRAME-TOO-LARGE`.
+    let temp = TempDir::new().expect("temp");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, _secret, _, _, address, pin) = spawn_daemon(
         bootstrap_path.clone(),
         Duration::from_millis(50),
         64,
-        EXPECTED_REPOSITORY_FINGERPRINT,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
     )
     .await
     .expect("bind");
     let (shutdown_tx, daemon_handle) = daemon_task(bound);
 
-    // Open a TCP socket without TLS to send an oversized length
-    // prefix directly into the framed reader.
-    let mut stream = TcpStream::connect(address).await.expect("tcp connect");
+    // Real pinned TLS connection.
+    let mut tls_stream = connect_pinned(address, &pin).await.expect("pinned connect");
+    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
     // Announce a length greater than the daemon's 1 MiB envelope
-    // limit. The exact byte value 2 MiB triggers TooLarge.
-    stream.write_all(&(2u32 * 1024 * 1024).to_be_bytes()).await.expect("write length");
-    let _ = stream.shutdown().await;
-    drop(stream);
+    // limit. The reader rejects the announced length before any
+    // allocation.
+    writer.write_all(&(2u32 * 1024 * 1024).to_be_bytes()).await.expect("write length");
+    let _ = writer.shutdown().await;
+    drop(writer);
+
+    let envelope = read_envelope_bounded(&mut reader, "protocol error envelope").await;
+    let err = match envelope.payload {
+        Some(PayloadOneof::ProtocolError(err)) => err,
+        other => unreachable!("expected ProtocolError, got {other:?}"),
+    };
+    assert_eq!(err.code, "XTR-DAEMON-FRAME-TOO-LARGE");
+
+    drop(reader);
+    drop(tls_stream);
     let _ = shutdown_tx.send(());
     let _ = daemon_handle.await;
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incompatible_protocol_version_is_rejected_with_documented_code() {
-    let dir = unique_dir("proto-mismatch");
-    let bootstrap_path = dir.join("bootstrap.json");
-    let (bound, secret, session_id, project_id, address, pin) = spawn_daemon(
+    let temp = TempDir::new().expect("temp");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, secret, _, _, address, pin) = spawn_daemon(
         bootstrap_path.clone(),
         Duration::from_millis(50),
         64,
-        EXPECTED_REPOSITORY_FINGERPRINT,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
     )
     .await
     .expect("bind");
@@ -678,8 +744,7 @@ async fn incompatible_protocol_version_is_rejected_with_documented_code() {
         secret.read_secret(),
         &exporter,
         &session_id,
-        &project_id,
-        &pin,
+        HAPPY_MANIFEST_DIGEST,
         &[0x33_u8; 32],
         EXPECTED_REPOSITORY_FINGERPRINT,
         0,
@@ -691,7 +756,7 @@ async fn incompatible_protocol_version_is_rejected_with_documented_code() {
         .expect("write adapter hello");
 
     let protocol_error_envelope =
-        read_envelope(&mut reader).await.expect("protocol error envelope");
+        read_envelope_bounded(&mut reader, "protocol error envelope").await;
     let err = match protocol_error_envelope.payload {
         Some(PayloadOneof::ProtocolError(err)) => err,
         other => unreachable!("expected ProtocolError, got {other:?}"),
@@ -703,18 +768,22 @@ async fn incompatible_protocol_version_is_rejected_with_documented_code() {
     drop(tls_stream);
     let _ = shutdown_tx.send(());
     daemon_handle.await.expect("daemon task").expect("serve");
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_runtime_session_id_is_rejected_with_session_identity_code() {
-    let dir = unique_dir("wrong-session");
-    let bootstrap_path = dir.join("bootstrap.json");
-    let (bound, secret, _session_id, project_id, address, pin) = spawn_daemon(
+    let temp = TempDir::new().expect("temp");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, secret, _, _, address, pin) = spawn_daemon(
         bootstrap_path.clone(),
         Duration::from_millis(50),
         64,
-        EXPECTED_REPOSITORY_FINGERPRINT,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
     )
     .await
     .expect("bind");
@@ -734,8 +803,7 @@ async fn wrong_runtime_session_id_is_rejected_with_session_identity_code() {
         secret.read_secret(),
         &exporter,
         &wrong_session_id,
-        &project_id,
-        &pin,
+        HAPPY_MANIFEST_DIGEST,
         &[0x33_u8; 32],
         EXPECTED_REPOSITORY_FINGERPRINT,
         1,
@@ -747,7 +815,7 @@ async fn wrong_runtime_session_id_is_rejected_with_session_identity_code() {
         .expect("write adapter hello");
 
     let protocol_error_envelope =
-        read_envelope(&mut reader).await.expect("protocol error envelope");
+        read_envelope_bounded(&mut reader, "protocol error envelope").await;
     let err = match protocol_error_envelope.payload {
         Some(PayloadOneof::ProtocolError(err)) => err,
         other => unreachable!("expected ProtocolError, got {other:?}"),
@@ -759,18 +827,22 @@ async fn wrong_runtime_session_id_is_rejected_with_session_identity_code() {
     drop(tls_stream);
     let _ = shutdown_tx.send(());
     daemon_handle.await.expect("daemon task").expect("serve");
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_repository_binding_is_rejected_with_project_identity_code() {
-    let dir = unique_dir("wrong-repo");
-    let bootstrap_path = dir.join("bootstrap.json");
-    let (bound, secret, session_id, project_id, address, pin) = spawn_daemon(
+    let temp = TempDir::new().expect("temp");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, secret, _, _, address, pin) = spawn_daemon(
         bootstrap_path.clone(),
         Duration::from_millis(50),
         64,
-        EXPECTED_REPOSITORY_FINGERPRINT,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
     )
     .await
     .expect("bind");
@@ -789,8 +861,7 @@ async fn wrong_repository_binding_is_rejected_with_project_identity_code() {
         secret.read_secret(),
         &exporter,
         &session_id,
-        &project_id,
-        &pin,
+        HAPPY_MANIFEST_DIGEST,
         &[0x33_u8; 32],
         WRONG_REPOSITORY_FINGERPRINT,
         1,
@@ -802,7 +873,7 @@ async fn wrong_repository_binding_is_rejected_with_project_identity_code() {
         .expect("write adapter hello");
 
     let protocol_error_envelope =
-        read_envelope(&mut reader).await.expect("protocol error envelope");
+        read_envelope_bounded(&mut reader, "protocol error envelope").await;
     let err = match protocol_error_envelope.payload {
         Some(PayloadOneof::ProtocolError(err)) => err,
         other => unreachable!("expected ProtocolError, got {other:?}"),
@@ -814,18 +885,22 @@ async fn wrong_repository_binding_is_rejected_with_project_identity_code() {
     drop(tls_stream);
     let _ = shutdown_tx.send(());
     daemon_handle.await.expect("daemon task").expect("serve");
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gap_is_rejected_with_session_sequence_code() {
-    let dir = unique_dir("gap");
-    let bootstrap_path = dir.join("bootstrap.json");
-    let (bound, secret, session_id, project_id, address, pin) = spawn_daemon(
+    let temp = TempDir::new().expect("temp");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, secret, _, _, address, pin) = spawn_daemon(
         bootstrap_path.clone(),
         Duration::from_millis(50),
         64,
-        EXPECTED_REPOSITORY_FINGERPRINT,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
     )
     .await
     .expect("bind");
@@ -844,8 +919,7 @@ async fn gap_is_rejected_with_session_sequence_code() {
         secret.read_secret(),
         &exporter,
         &session_id,
-        &project_id,
-        &pin,
+        HAPPY_MANIFEST_DIGEST,
         &[0x33_u8; 32],
         EXPECTED_REPOSITORY_FINGERPRINT,
         1,
@@ -855,7 +929,7 @@ async fn gap_is_rejected_with_session_sequence_code() {
     write_envelope(&mut writer, PayloadOneof::AdapterHello(adapter_hello), &session_id, 0, 1)
         .await
         .expect("write adapter hello");
-    let _ = read_envelope(&mut reader).await.expect("daemon hello");
+    let _ = read_envelope_bounded(&mut reader, "daemon hello").await;
 
     let capabilities = CapabilitySet {
         capabilities: vec![Capability {
@@ -867,11 +941,7 @@ async fn gap_is_rejected_with_session_sequence_code() {
     write_envelope(&mut writer, PayloadOneof::CapabilitySet(capabilities), &session_id, 3, 5)
         .await
         .expect("write capability set gap");
-    let err_envelope = read_envelope(&mut reader).await.expect("gap error");
-    let err = match err_envelope.payload {
-        Some(PayloadOneof::ProtocolError(err)) => err,
-        other => unreachable!("expected ProtocolError, got {other:?}"),
-    };
+    let err = next_protocol_error(&mut reader, "gap error").await;
     assert_eq!(err.code, "XTR-DAEMON-SESSION-SEQUENCE");
 
     drop(reader);
@@ -879,26 +949,189 @@ async fn gap_is_rejected_with_session_sequence_code() {
     drop(tls_stream);
     let _ = shutdown_tx.send(());
     daemon_handle.await.expect("daemon task").expect("serve");
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_with_live_authenticated_client() {
-    let dir = unique_dir("shutdown");
-    let bootstrap_path = dir.join("bootstrap.json");
-    let (bound, secret, session_id, project_id, address, pin) = spawn_daemon(
+async fn replay_is_rejected_with_session_sequence_code() {
+    // Authenticate and exchange seq 1. Resend seq 1 and observe
+    // the documented `XTR-DAEMON-SESSION-SEQUENCE` rejection.
+    let temp = TempDir::new().expect("temp");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, secret, _, _, address, pin) = spawn_daemon(
         bootstrap_path.clone(),
         Duration::from_millis(50),
         64,
-        EXPECTED_REPOSITORY_FINGERPRINT,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
     )
     .await
     .expect("bind");
     let (shutdown_tx, daemon_handle) = daemon_task(bound);
 
-    // Open one authenticated connection and keep it alive across
-    // shutdown. The supervisor must observe the connection, close
-    // it, and join the task before serve returns.
+    let mut tls_stream = connect_pinned(address, &pin).await.expect("pinned connect");
+    let mut exporter_buf = [0u8; 32];
+    tls_stream
+        .get_ref()
+        .1
+        .export_keying_material(&mut exporter_buf, TLS_EXPORTER_LABEL, None)
+        .expect("client exporter");
+    let exporter = exporter_buf.to_vec();
+
+    let adapter_hello = build_adapter_hello(
+        secret.read_secret(),
+        &exporter,
+        &session_id,
+        HAPPY_MANIFEST_DIGEST,
+        &[0x33_u8; 32],
+        EXPECTED_REPOSITORY_FINGERPRINT,
+        1,
+        0,
+    );
+    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    write_envelope(&mut writer, PayloadOneof::AdapterHello(adapter_hello), &session_id, 0, 1)
+        .await
+        .expect("write adapter hello");
+    let _ = read_envelope_bounded(&mut reader, "daemon hello").await;
+
+    let capabilities = CapabilitySet {
+        capabilities: vec![Capability {
+            name: "endpoint_discovery".to_string(),
+            config: Default::default(),
+        }],
+    };
+    write_envelope(
+        &mut writer,
+        PayloadOneof::CapabilitySet(capabilities.clone()),
+        &session_id,
+        1,
+        2,
+    )
+    .await
+    .expect("write seq 1");
+    let ack = next_ack(&mut reader, "ack 1").await;
+    assert_eq!(ack.highest_contiguous_session_seq, 1);
+
+    // Resend seq 1; the daemon must observe the replay and emit
+    // the documented error code.
+    write_envelope(&mut writer, PayloadOneof::CapabilitySet(capabilities), &session_id, 1, 3)
+        .await
+        .expect("resend seq 1");
+    let err = next_protocol_error(&mut reader, "replay error").await;
+    assert_eq!(err.code, "XTR-DAEMON-SESSION-SEQUENCE");
+
+    drop(reader);
+    drop(writer);
+    drop(tls_stream);
+    let _ = shutdown_tx.send(());
+    daemon_handle.await.expect("daemon task").expect("serve");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capacity_one_outbound_still_delivers_every_ack_without_deadlock() {
+    // Regression coverage for the pre-fix reader/writer deadlock.
+    // The outbound capacity of 1 used to deadlock the connection
+    // because the reader task owned both halves of the TLS stream;
+    // the dedicated writer task drains the channel one frame at a
+    // time, so the reader always makes progress.
+    let temp = TempDir::new().expect("temp");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, secret, _, _, address, pin) = spawn_daemon(
+        bootstrap_path.clone(),
+        Duration::from_secs(60),
+        1,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+    )
+    .await
+    .expect("bind");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+
+    let mut tls_stream = connect_pinned(address, &pin).await.expect("pinned connect");
+    let mut exporter_buf = [0u8; 32];
+    tls_stream
+        .get_ref()
+        .1
+        .export_keying_material(&mut exporter_buf, TLS_EXPORTER_LABEL, None)
+        .expect("client exporter");
+    let exporter = exporter_buf.to_vec();
+
+    let adapter_hello = build_adapter_hello(
+        secret.read_secret(),
+        &exporter,
+        &session_id,
+        HAPPY_MANIFEST_DIGEST,
+        &[0x33_u8; 32],
+        EXPECTED_REPOSITORY_FINGERPRINT,
+        1,
+        0,
+    );
+    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    write_envelope(&mut writer, PayloadOneof::AdapterHello(adapter_hello), &session_id, 0, 1)
+        .await
+        .expect("write adapter hello");
+    let _ = read_envelope_bounded(&mut reader, "daemon hello").await;
+
+    let capabilities = CapabilitySet {
+        capabilities: vec![Capability {
+            name: "endpoint_discovery".to_string(),
+            config: Default::default(),
+        }],
+    };
+    let count = 4u64;
+    for seq in 1..=count {
+        write_envelope(
+            &mut writer,
+            PayloadOneof::CapabilitySet(capabilities.clone()),
+            &session_id,
+            seq,
+            seq + 1,
+        )
+        .await
+        .expect("write seq");
+        let ack = next_ack(&mut reader, "ack").await;
+        assert_eq!(ack.highest_contiguous_session_seq, seq);
+    }
+
+    drop(reader);
+    drop(writer);
+    drop(tls_stream);
+    let _ = shutdown_tx.send(());
+    // Bound the shutdown to a generous budget so a regression
+    // surfaces as a test failure rather than hanging the suite.
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("shutdown timed out")
+        .expect("daemon task")
+        .expect("serve");
+    drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_with_live_authenticated_client() {
+    let temp = TempDir::new().expect("temp");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, secret, _, _, address, pin) = spawn_daemon(
+        bootstrap_path.clone(),
+        Duration::from_millis(50),
+        64,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+    )
+    .await
+    .expect("bind");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+
     let mut tls_stream = connect_pinned(address, &pin).await.expect("pinned connect");
     let mut exporter_buf = [0u8; 32];
     tls_stream
@@ -911,8 +1144,7 @@ async fn shutdown_with_live_authenticated_client() {
         secret.read_secret(),
         &exporter,
         &session_id,
-        &project_id,
-        &pin,
+        HAPPY_MANIFEST_DIGEST,
         &[0x33_u8; 32],
         EXPECTED_REPOSITORY_FINGERPRINT,
         1,
@@ -922,9 +1154,7 @@ async fn shutdown_with_live_authenticated_client() {
     write_envelope(&mut writer, PayloadOneof::AdapterHello(adapter_hello), &session_id, 0, 1)
         .await
         .expect("write adapter hello");
-    let _ = read_envelope(&mut reader).await.expect("daemon hello");
-    // Sleep briefly so the connection task has reached the
-    // post-hello state before we trigger shutdown.
+    let _ = read_envelope_bounded(&mut reader, "daemon hello").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let _ = shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(5), daemon_handle)
@@ -935,18 +1165,22 @@ async fn shutdown_with_live_authenticated_client() {
     drop(reader);
     drop(writer);
     drop(tls_stream);
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_artifact_round_trips_pin_and_session_secret() {
-    let dir = unique_dir("bootstrap-roundtrip");
-    let bootstrap_path = dir.join("bootstrap.json");
-    let (bound, _secret, session_id, project_id, _address, pin) = spawn_daemon(
+    let temp = TempDir::new().expect("temp");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, _secret, _, _, _address, pin) = spawn_daemon(
         bootstrap_path.clone(),
         Duration::from_millis(50),
         64,
-        EXPECTED_REPOSITORY_FINGERPRINT,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
     )
     .await
     .expect("bind");
@@ -970,17 +1204,15 @@ async fn bootstrap_artifact_round_trips_pin_and_session_secret() {
     let _ = shutdown_tx.send(());
     daemon_handle.await.expect("daemon task").expect("serve");
     assert!(!bootstrap_path.exists(), "bootstrap file must be removed on orderly shutdown");
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(temp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_fields_helper_serialises_canonical_layout() {
-    // Bootstrap fields round-trip through the helper and serde
-    // without losing any field; this guards the wire layout for
-    // future adapter implementations reading the artifact.
     let session = RuntimeSessionId::new();
     let project = ProjectId::new();
     let secret = SessionSecret::generate().expect("secret");
+    let fingerprint = expected_fingerprint();
     let fields = BootstrapArtifactFields::new(
         "127.0.0.1".to_string(),
         49152,
@@ -988,13 +1220,16 @@ async fn bootstrap_fields_helper_serialises_canonical_layout() {
         session,
         &secret,
         project,
-        EXPECTED_REPOSITORY_FINGERPRINT.to_string(),
+        fingerprint.clone(),
         1,
         0,
     );
     let json = serde_json::to_string(&fields).expect("serialize");
     let parsed: BootstrapArtifactFields = serde_json::from_str(&json).expect("parse");
     assert_eq!(parsed, fields);
+    let parsed_fingerprint =
+        parsed.expected_repository_fingerprint().expect("canonical fingerprint");
+    assert_eq!(parsed_fingerprint, fingerprint);
 }
 
 #[tokio::test]
@@ -1008,7 +1243,7 @@ async fn session_rejects_adapter_role_when_building_daemon_hello() {
         max_batch_events: 1,
         max_protocol_major: 1,
         max_protocol_minor: 0,
-        expected_repository_fingerprint: "expected-repo".to_string(),
+        expected_repository_fingerprint: expected_fingerprint(),
         health_interval: xtrace_daemon::runtime::HealthInterval::default(),
         role: HandshakeRole::Adapter,
     };
@@ -1022,7 +1257,6 @@ async fn verify_transcript_proof_round_trip_with_real_layout() {
     let secret = [0x42_u8; 32];
     let exporter = [0x99_u8; 32];
     let session = RuntimeSessionId::new();
-    let project = ProjectId::new();
     let server = [0xab_u8; 32];
     let client = [0xcd_u8; 32];
     let manifest = "b3:0000000000000000000000000000000000000000000000000000000000000000";
@@ -1033,7 +1267,6 @@ async fn verify_transcript_proof_round_trip_with_real_layout() {
         &client,
         &server,
         manifest.as_bytes(),
-        &handshake::project_context(project.as_uuid().as_bytes()),
     )
     .expect("HMAC accepts the test secret");
     handshake::verify_transcript_proof(
@@ -1043,7 +1276,6 @@ async fn verify_transcript_proof_round_trip_with_real_layout() {
         &client,
         &server,
         manifest.as_bytes(),
-        &handshake::project_context(project.as_uuid().as_bytes()),
         &tag,
     )
     .expect("canonical layout verifies");

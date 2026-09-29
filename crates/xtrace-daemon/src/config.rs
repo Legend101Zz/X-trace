@@ -16,28 +16,29 @@ use xtrace_protocol::envelope::{DEFAULT_MAX_BATCH_EVENTS, DEFAULT_MAX_ENVELOPE_B
 /// [`LoopbackPolicy::V6Only`].
 pub const LOOPBACK_HOST: &str = "127.0.0.1";
 
-/// Default ingress channel capacity for one connection. Matches the
-/// `adapter socket decode` row of `02-architecture.md` §6
-/// (`64 batches`) so a slow consumer experiences TCP/TLS backpressure
-/// rather than unbounded buffering.
-pub const DEFAULT_CHANNEL_CAPACITY: usize = 64;
+/// Default outbound command capacity for one connection. The number
+/// matches the `adapter socket decode` row of `02-architecture.md` §6
+/// (`64 batches`) so a slow consumer experiences TLS write backpressure
+/// rather than unbounded buffering. The capacity governs the channel
+/// the reader/health tasks feed into the writer task.
+pub const DEFAULT_OUTBOUND_CAPACITY: usize = 64;
 
 /// Default health interval. The architecture requires a `Health`
 /// message every ten seconds while idle; the constant is shared with
 /// the connection supervisor.
 pub const DEFAULT_HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Bounded queue capacity for the ingress channel feeding the
-/// per-connection task.
+/// Bounded queue capacity for the outbound command channel feeding
+/// the writer task.
 ///
 /// The wrapper exists so configuration can be deserialized in a later
 /// slice without breaking the public signature. The current
 /// constructor validates the lower bound because a zero capacity
 /// would deadlock the supervisor at runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChannelCapacity(usize);
+pub struct OutboundCapacity(usize);
 
-impl ChannelCapacity {
+impl OutboundCapacity {
     /// Constructs a capacity from the supplied value. Returns
     /// `None` when the value is zero.
     #[must_use]
@@ -52,9 +53,9 @@ impl ChannelCapacity {
     }
 }
 
-impl Default for ChannelCapacity {
+impl Default for OutboundCapacity {
     fn default() -> Self {
-        Self(DEFAULT_CHANNEL_CAPACITY)
+        Self(DEFAULT_OUTBOUND_CAPACITY)
     }
 }
 
@@ -101,8 +102,12 @@ pub struct DaemonConfig {
     /// `xtrace_protocol::generated::agent::DaemonHello` reply so the
     /// adapter can size its outgoing batches without renegotiation.
     pub max_batch_events: u32,
-    /// Capacity of the per-connection ingress channel.
-    pub channel_capacity: ChannelCapacity,
+    /// Capacity of the per-connection outbound command channel
+    /// feeding the writer task. Renamed from the previous
+    /// `channel_capacity` to keep the contract honest: the channel is
+    /// exclusively outbound now that the writer task owns the
+    /// encoder.
+    pub outbound_capacity: OutboundCapacity,
     /// Health interval sent back to the adapter.
     pub health_interval: Duration,
     /// Loopback enforcement policy.
@@ -114,7 +119,7 @@ impl Default for DaemonConfig {
         Self {
             max_envelope_bytes: DEFAULT_MAX_ENVELOPE_BYTES,
             max_batch_events: DEFAULT_MAX_BATCH_EVENTS,
-            channel_capacity: ChannelCapacity::default(),
+            outbound_capacity: OutboundCapacity::default(),
             health_interval: DEFAULT_HEALTH_INTERVAL,
             loopback_policy: LoopbackPolicy::default(),
         }
@@ -126,9 +131,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn channel_capacity_rejects_zero() {
-        assert!(ChannelCapacity::new(0).is_none());
-        let cap = ChannelCapacity::new(64).expect("non-zero is accepted");
+    fn outbound_capacity_rejects_zero() {
+        assert!(OutboundCapacity::new(0).is_none());
+        let cap = OutboundCapacity::new(64).expect("non-zero is accepted");
         assert_eq!(cap.as_usize(), 64);
     }
 
@@ -147,5 +152,6 @@ mod tests {
         assert_eq!(cfg.max_envelope_bytes, DEFAULT_MAX_ENVELOPE_BYTES);
         assert_eq!(cfg.max_batch_events, DEFAULT_MAX_BATCH_EVENTS);
         assert_eq!(cfg.health_interval, DEFAULT_HEALTH_INTERVAL);
+        assert_eq!(cfg.outbound_capacity.as_usize(), DEFAULT_OUTBOUND_CAPACITY);
     }
 }

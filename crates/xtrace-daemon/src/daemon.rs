@@ -8,26 +8,34 @@
 //! [`BoundDaemon`] owns the listener and exposes a
 //! [`BoundDaemon::serve`] future that completes on shutdown.
 //!
-//! The run loop supervises one [`tokio::task`] per connection. Every
-//! task is awaited before the run future returns so an orderly
-//! shutdown is provably complete.
+//! The run loop supervises a [`tokio::task::JoinSet`] of connection
+//! tasks; each completed task is reaped before the next accept to
+//! keep the supervisor's bookkeeping bounded. Each connection spawns
+//! a structured pair: the reader task owns the inbound half and the
+//! session state, while a dedicated writer task owns the outbound
+//! encoder and drains a bounded command channel. Both helpers observe
+//! the shared shutdown signal and are joined before the connection
+//! task returns so no detached work survives a connection close.
 
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
+use prost::Message;
 use prost::bytes::Bytes;
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls::server::ServerConfig;
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 use xtrace_domain::ids::Id;
-use xtrace_domain::{ProjectId, RuntimeSessionId};
+use xtrace_domain::{ProjectId, RepositoryFingerprint, RuntimeSessionId};
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
+use xtrace_protocol::generated::agent as wire;
 use xtrace_protocol::generated::agent::{AgentEnvelope, ProtocolError};
 
 use crate::bootstrap::{BootstrapArtifact, BootstrapArtifactFields, BootstrapOwner};
@@ -37,8 +45,8 @@ use crate::framing::{EnvelopeAsyncDecoder, EnvelopeAsyncEncoder};
 use crate::listener::LoopbackListener;
 use crate::runtime::HealthInterval;
 use crate::secret::SessionSecret;
-use crate::session::{HandshakeInputs, HandshakeRole, Session};
-use crate::tls::{EphemeralCertificate, TlsServerMaterials};
+use crate::session::{HandshakeInputs, HandshakeRole, Session, SessionError};
+use crate::tls::TlsServerMaterials;
 
 /// Length in bytes of the TLS exporter keying material the daemon
 /// requests from rustls after the handshake completes. The value
@@ -56,10 +64,6 @@ pub const SERVER_NONCE_LEN: usize = 32;
 /// The value matches `u64::MAX` and is used only to convert the
 /// process-local instant without losing information.
 const MONOTONIC_CEILING_NS: u128 = u64::MAX as u128;
-/// Monotonic epoch the daemon references. Using a process-local
-/// [`Instant`] keeps the clock independent of the wall clock so the
-/// value cannot jump backwards under a wall-clock adjustment.
-type Monotonic = Instant;
 
 /// Process-local monotonic clock. The instant is captured the first
 /// time the daemon starts and every `now_ns` value is a
@@ -69,14 +73,14 @@ pub struct MonotonicClock {
     /// Process-local origin the daemon reports from. Set when the
     /// clock is constructed so the first value is approximately
     /// zero, never negative, and independent of wall-clock changes.
-    origin: Monotonic,
+    origin: Instant,
 }
 
 impl MonotonicClock {
     /// Returns a fresh clock anchored to the current [`Instant`].
     #[must_use]
     pub fn new() -> Self {
-        Self { origin: Monotonic::now() }
+        Self { origin: Instant::now() }
     }
 
     /// Returns the elapsed nanoseconds since the clock's origin.
@@ -137,6 +141,92 @@ fn shared_shutdown_channel() -> (watch::Sender<bool>, ShutdownSignal) {
     (tx, ShutdownSignal { rx })
 }
 
+/// Per-connection cancellation handle. The connection task owns the
+/// sender; the health producer owns the receiver. Raising the signal
+/// stops the health producer without preempting the writer task so a
+/// queued `ProtocolError` is guaranteed to reach the wire before the
+/// connection closes. The writer task observes only the global
+/// daemon shutdown and natural encoder failures.
+struct ConnectionCancel {
+    rx: watch::Receiver<bool>,
+}
+
+impl ConnectionCancel {
+    /// Constructs a fresh signal. Returns the owning sender and a
+    /// receiver for the helper task that must observe the signal.
+    fn new() -> (watch::Sender<bool>, Self) {
+        let (tx, rx) = watch::channel(false);
+        (tx, Self { rx })
+    }
+
+    /// Awaits the next cancellation transition. Resolves immediately
+    /// when the cancel has already fired.
+    async fn wait(&mut self) {
+        if *self.rx.borrow() {
+            return;
+        }
+        let _ = self.rx.changed().await;
+    }
+}
+
+/// Frame the writer task serializes onto the wire.
+struct OutboundFrame {
+    payload: PayloadOneof,
+}
+
+/// Dedicated writer task. The task owns the encoder exclusively and
+/// drains a bounded command channel so the reader/validator is never
+/// blocked on a slow consumer. Outbound sequencing uses checked
+/// arithmetic so an overflow is reported rather than silently
+/// wrapping. The writer observes only the global daemon shutdown;
+/// connection-local cancellation drives the health producer and the
+/// reader, not this task, so a queued `ProtocolError` is guaranteed
+/// to reach the wire before the writer observes the closing
+/// `rx.recv() -> None`. Peer disconnect naturally fails the next
+/// encoder write so the task tears down without an extra signal.
+async fn run_outbound_writer<W>(
+    mut encoder: EnvelopeAsyncEncoder<W>,
+    mut rx: mpsc::Receiver<OutboundFrame>,
+    negotiated_major: u32,
+    negotiated_minor: u32,
+    runtime_session_id: [u8; 16],
+    clock: MonotonicClock,
+    mut shutdown: ShutdownSignal,
+) where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut next_seq: u64 = 1;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.wait() => break,
+            next = rx.recv() => match next {
+                Some(frame) => {
+                    let seq = next_seq;
+                    next_seq = match next_seq.checked_add(1) {
+                        Some(value) => value,
+                        None => break,
+                    };
+                    let envelope = AgentEnvelope {
+                        protocol_major: negotiated_major,
+                        protocol_minor: negotiated_minor,
+                        runtime_session_id: Bytes::copy_from_slice(&runtime_session_id),
+                        session_seq: seq,
+                        sent_monotonic_ns: clock.now_ns(),
+                        message_id: format!("daemon-{seq}"),
+                        correlation_token: String::new(),
+                        payload: Some(frame.payload),
+                    };
+                    if encoder.write_envelope(&envelope).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+}
+
 /// Bound daemon state: a loopback listener, TLS materials, and the
 /// freshly minted session secret. The struct is the input to
 /// [`BoundDaemon::serve`].
@@ -149,7 +239,7 @@ pub struct BoundDaemon {
     project_id: ProjectId,
     /// Expected repository fingerprint the daemon enforces on every
     /// inbound `AdapterHello`.
-    expected_repository_fingerprint: String,
+    expected_repository_fingerprint: RepositoryFingerprint,
     /// Optional bootstrap artifact guard. `Some` when the daemon owns
     /// the file; `None` when the caller has read it themselves.
     bootstrap: Option<BootstrapArtifact>,
@@ -162,20 +252,12 @@ impl BoundDaemon {
         self.listener.local_addr()
     }
 
-    /// Returns the ephemeral certificate. Tests use the
-    /// certificate-der accessor to seed the wrong-pin verifier; the
-    /// daemon does not expose the private key.
-    #[must_use]
-    pub fn certificate(&self) -> &EphemeralCertificate {
-        &self.tls_materials.certificate
-    }
-
     /// Returns the SHA-256 pin of the bound certificate. Production
     /// adapters read this value from the bootstrap artifact; tests
     /// use it to construct a pinned verifier.
     #[must_use]
     pub fn certificate_pin(&self) -> &str {
-        self.tls_materials.certificate.pin()
+        self.tls_materials.certificate_pin()
     }
 
     /// Returns the runtime session identifier.
@@ -192,7 +274,7 @@ impl BoundDaemon {
 
     /// Returns the expected repository fingerprint.
     #[must_use]
-    pub fn expected_repository_fingerprint(&self) -> &str {
+    pub fn expected_repository_fingerprint(&self) -> &RepositoryFingerprint {
         &self.expected_repository_fingerprint
     }
 
@@ -219,18 +301,22 @@ impl BoundDaemon {
         let _bootstrap = self.bootstrap;
 
         let (shutdown_tx, mut shutdown_signal) = shared_shutdown_channel();
-        let clock = MonotonicClock::new();
+        // Keep an extra sender in scope so a listener-level failure
+        // can deterministically raise the global shutdown signal
+        // without having to wait on the user-supplied shutdown future.
+        let shutdown_tx_for_supervisor = shutdown_tx.clone();
+        let shutdown_signal_inner = shutdown_signal.clone();
         let ctx = SupervisorContext {
             config,
-            tls_config: tls_materials.server_config.clone(),
+            tls_config: tls_materials.server_config(),
             session_secret: session_secret.clone(),
             runtime_session_id,
             project_id,
             expected_repository_fingerprint,
-            shutdown: shutdown_signal.clone(),
+            shutdown: shutdown_signal_inner,
         };
 
-        let mut tasks: Vec<JoinHandle<Result<(), DaemonError>>> = Vec::new();
+        let mut connections: JoinSet<Result<(), DaemonError>> = JoinSet::new();
         let shutdown_observer: JoinHandle<()> = tokio::spawn(async move {
             shutdown.await;
             let _ = shutdown_tx.send(true);
@@ -243,31 +329,55 @@ impl BoundDaemon {
                     debug!("daemon supervisor received shutdown signal");
                     break;
                 }
+                // Reap completed connection tasks so the join set
+                // never grows without bound when sequential clients
+                // disconnect.
+                Some(joined) = connections.join_next() => {
+                    if let Err(err) = joined {
+                        warn!(error = %err, "connection task join failed");
+                    }
+                }
                 accept_result = listener.accept() => {
                     let (stream, peer) = match accept_result {
                         Ok(pair) => pair,
                         Err(err) => {
                             warn!(error = %err, "listener accept failed");
-                            if tasks.is_empty() {
-                                return Err(err);
+                            // Signal the global shutdown so every
+                            // in-flight connection tears down
+                            // deterministically, then drain the
+                            // supervisor before returning the accept
+                            // error to the caller.
+                            let _ = shutdown_tx_for_supervisor.send(true);
+                            shutdown_observer.abort();
+                            let _ = shutdown_observer.await;
+                            while let Some(joined) = connections.join_next().await {
+                                if let Err(err) = joined {
+                                    warn!(error = %err, "shutdown join failed");
+                                }
                             }
-                            return join_tasks(tasks).await.and(Err(err));
+                            return Err(err);
                         }
                     };
                     debug!(peer = %peer, "daemon accepted new connection");
                     let task_ctx = ctx.clone();
-                    let task_clock = clock;
-                    let task = tokio::spawn(async move {
+                    let task_clock = MonotonicClock::new();
+                    connections.spawn(async move {
                         handle_connection(task_ctx, stream, task_clock).await
                     });
-                    tasks.push(task);
                 }
             }
         }
 
         shutdown_observer.abort();
         let _ = shutdown_observer.await;
-        join_tasks(tasks).await
+        // Drain every connection before returning so the future is
+        // observably complete.
+        while let Some(joined) = connections.join_next().await {
+            if let Err(err) = joined {
+                warn!(error = %err, "shutdown join failed");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -282,7 +392,7 @@ async fn handle_connection(
 ) -> Result<(), DaemonError> {
     let mut shutdown = ctx.shutdown.clone();
     let acceptor = tokio_rustls::TlsAcceptor::from(ctx.tls_config.clone());
-    let tls_stream = tokio::select! {
+    let mut tls_stream = tokio::select! {
         biased;
         _ = shutdown.wait() => return Ok(()),
         result = acceptor.accept(stream) => match result {
@@ -300,13 +410,36 @@ async fn handle_connection(
             return Ok(());
         }
     };
-    let (reader, writer) = tokio::io::split(tls_stream);
+
+    // Read and validate the inbound hello on the full TLS stream so
+    // we still own both halves; only after `DaemonHello` is on the
+    // wire do we hand the write half off to a dedicated task.
+    let max_envelope_bytes = ctx.config.max_envelope_bytes;
+    let first = tokio::select! {
+        biased;
+        _ = shutdown.wait() => return Ok(()),
+        result = read_envelope_from_stream(&mut tls_stream, max_envelope_bytes) => match result {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                let code = envelope_error_code(& err);
+                let _ = send_protocol_error_stream(
+                    &mut tls_stream,
+                    max_envelope_bytes,
+                    code.as_str(),
+                    &format!("{err}"),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    };
+
     let mut session = Session::new(HandshakeInputs {
         session_secret: ctx.session_secret.clone(),
         tls_exporter,
         runtime_session_id: ctx.runtime_session_id,
         project_id: ctx.project_id,
-        max_envelope_bytes: ctx.config.max_envelope_bytes,
+        max_envelope_bytes,
         max_batch_events: ctx.config.max_batch_events,
         max_protocol_major: 1,
         max_protocol_minor: 0,
@@ -314,62 +447,97 @@ async fn handle_connection(
         health_interval: HealthInterval(ctx.config.health_interval),
         role: HandshakeRole::Daemon,
     });
-    let mut decoder = EnvelopeAsyncDecoder::new(reader, session.max_envelope_bytes());
-    let mut encoder = EnvelopeAsyncEncoder::new(writer, session.max_envelope_bytes());
-
-    let first = tokio::select! {
-        biased;
-        _ = shutdown.wait() => return Ok(()),
-        result = decoder.read_envelope() => match result {
-            Ok(envelope) => envelope,
-            Err(err) => {
-                let code = envelope_error_code(& err);
-                return send_protocol_error(
-                    & session,
-                    & mut encoder,
-                    & ProtocolError {
-                        code: code.as_str().to_string(),
-                        message: format!("{err}"),
-                    },
-                )
-                .await;
-            }
-        }
-    };
 
     if let Err(err) = session.accept_adapter_hello(&first) {
-        return send_protocol_error(&session, &mut encoder, &err.to_protocol_error()).await;
+        let _ = send_protocol_error_stream(
+            &mut tls_stream,
+            max_envelope_bytes,
+            err.code.as_str(),
+            &err.detail,
+        )
+        .await;
+        return Ok(());
     }
 
     let server_nonce = random_server_nonce()?;
+    let negotiated = session.negotiated().ok_or_else(|| {
+        DaemonError::Transport(
+            "daemon hello requested before AdapterHello was validated".to_string(),
+        )
+    })?;
     let envelope = match session.build_daemon_hello(server_nonce, clock.now_ns()) {
         Ok(envelope) => envelope,
         Err(err) => {
-            return send_protocol_error(&session, &mut encoder, &err.to_protocol_error()).await;
+            let _ = send_protocol_error_stream(
+                &mut tls_stream,
+                max_envelope_bytes,
+                err.code.as_str(),
+                &err.detail,
+            )
+            .await;
+            return Ok(());
         }
     };
-    if let Err(err) = encoder.write_envelope(&envelope).await {
-        return Err(DaemonError::Transport(format!("write daemon hello: {err}")));
+    if !write_initial_envelope_stream(&mut tls_stream, &envelope).await {
+        return Err(DaemonError::Transport("write daemon hello".to_string()));
     }
 
-    let (tx, mut rx) =
-        mpsc::channel::<crate::runtime::OutgoingCommand>(ctx.config.channel_capacity.as_usize());
-    let health_session = session.clone();
+    // Now split the stream and hand the write half to a dedicated
+    // task. The reader keeps the read half and the session state;
+    // helper tasks (health, ACK) post frames into the same channel.
+    let (read_half, write_half) = tokio::io::split(tls_stream);
+    let mut decoder = EnvelopeAsyncDecoder::new(read_half, max_envelope_bytes);
+    let writer = EnvelopeAsyncEncoder::new(write_half, max_envelope_bytes);
+    let (tx, rx) = mpsc::channel::<OutboundFrame>(ctx.config.outbound_capacity.as_usize());
+    let writer_runtime_session_id: [u8; 16] = {
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(session.runtime_session_id().as_uuid().as_bytes());
+        buf
+    };
+    let health_interval = session.health_interval().0.max(StdDuration::from_secs(1));
+    let writer_clock = clock;
+    let writer_shutdown = ctx.shutdown.clone();
+    let (conn_cancel_tx, conn_cancel_rx) = ConnectionCancel::new();
+    let writer_task: JoinHandle<()> = tokio::spawn(async move {
+        run_outbound_writer(
+            writer,
+            rx,
+            negotiated.major,
+            negotiated.minor,
+            writer_runtime_session_id,
+            writer_clock,
+            writer_shutdown,
+        )
+        .await
+    });
+
+    // Health ticker publishes into the same outbound channel. The
+    // task observes both the global daemon shutdown and the
+    // per-connection cancellation signal so a reader-side error
+    // deterministically stops the ticker without waiting on the
+    // global shutdown.
     let health_tx = tx.clone();
-    let mut health_shutdown = ctx.shutdown.clone();
     let health_clock = clock;
+    let mut health_global_shutdown = ctx.shutdown.clone();
+    let mut health_conn_cancel = conn_cancel_rx;
     let health_task: JoinHandle<()> = tokio::spawn(async move {
-        let interval = health_session.health_interval().0.max(StdDuration::from_secs(1));
-        let mut ticker = tokio::time::interval(interval);
+        let mut ticker = tokio::time::interval(health_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
-                _ = health_shutdown.wait() => break,
+                _ = health_global_shutdown.wait() => break,
+                _ = health_conn_cancel.wait() => break,
                 _ = ticker.tick() => {
                     let now_ns = health_clock.now_ns();
-                    let cmd = health_session.next_health(now_ns);
-                    if health_tx.send(cmd).await.is_err() {
+                    let payload = PayloadOneof::Health(wire::Health {
+                        monotonic_ns: now_ns,
+                        queue_depth_batches: 0,
+                        resident_bytes: 0,
+                        status: "ok".to_string(),
+                    });
+                    let frame = OutboundFrame { payload };
+                    if health_tx.send(frame).await.is_err() {
                         break;
                     }
                 }
@@ -377,62 +545,84 @@ async fn handle_connection(
         }
     });
 
-    let mut outbound_seq: u64 = 1;
-    let post_hello_result: Result<(), crate::session::SessionError> = async {
+    let mut post_hello_session = session;
+    let post_hello_tx = tx;
+    let post_hello_result: Result<(), SessionError> = async {
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown.wait() => break,
+                _ = shutdown.wait() => return Ok(()),
                 incoming = decoder.read_envelope() => {
                     let envelope = match incoming {
                         Ok(env) => env,
                         Err(err) => {
                             let code = envelope_error_code(& err);
-                            return Err(crate::session::SessionError::new(
+                            return Err(SessionError::new(
                                 code,
                                 format!("read envelope: {err}"),
                             ));
                         }
                     };
-                    let (_incoming, ack) = session.accept_post_hello(& envelope)?;
-                    if tx.send(ack).await.is_err() {
-                        break;
+                    match post_hello_session.accept_post_hello(&envelope) {
+                        Ok((_incoming, ack)) => {
+                            let frame = OutboundFrame {
+                                payload: ack.into_envelope_payload(),
+                            };
+                            if post_hello_tx.send(frame).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        Err(err) => {
+                            // Deliver the documented ProtocolError to
+                            // the adapter before the connection tears
+                            // down. The frame goes through the same
+                            // writer task so it is sequenced with any
+                            // in-flight Health or ACK frames; the
+                            // teardown below waits for the writer to
+                            // drain the channel before the TLS stream
+                            // is dropped.
+                            let frame = OutboundFrame {
+                                payload: PayloadOneof::ProtocolError(
+                                    err.to_protocol_error(),
+                                ),
+                            };
+                            let _ = post_hello_tx.send(frame).await;
+                            return Err(err);
+                        }
                     }
                 }
-                Some(cmd) = rx.recv() => {
-                    let payload = cmd.into_envelope_payload();
-                    let envelope = AgentEnvelope {
-                        protocol_major: session.inputs().max_protocol_major,
-                        protocol_minor: session.inputs().max_protocol_minor,
-                        runtime_session_id: Bytes::copy_from_slice(session.runtime_session_id().as_uuid().as_bytes()),
-                        session_seq: outbound_seq,
-                        sent_monotonic_ns: clock.now_ns(),
-                        message_id: format!("daemon-{outbound_seq}"),
-                        correlation_token: String::new(),
-                        payload: Some(payload),
-                    };
-                    outbound_seq = match outbound_seq.checked_add(1) {
-                        Some(next) => next,
-                        None => break,
-                    };
-                    if encoder.write_envelope(& envelope).await.is_err() {
-                        break;
-                    }
-                }
-                else => break,
             }
         }
-        Ok(())
     }
     .await;
 
-    health_task.abort();
+    // Tear down helpers in the precise order documented by the
+    // connection-local lifecycle:
+    //
+    // 1. Raise the connection-local cancellation so the health
+    //    producer observes it and stops publishing Health frames.
+    // 2. Await the health task so it drops its `tx` clone, leaving
+    //    only the reader's `tx` holding the writer channel open.
+    // 3. Drop the reader's `tx`; the writer observes `None` from
+    //    `rx.recv()` and drains any remaining frames to the wire
+    //    before exiting.
+    // 4. Await the writer task so the TLS write half is dropped only
+    //    after every queued frame has been flushed.
+    //
+    // Global daemon shutdown remains the outer bound; it preempted
+    // the reader's `select!` above and propagates into the writer via
+    // its own `select!` arm so the writer never blocks the supervisor
+    // on a peer that has already disconnected.
+    let _ = conn_cancel_tx.send(true);
     let _ = health_task.await;
-    drop(rx);
-    drop(tx);
+    drop(post_hello_tx);
+    let _ = writer_task.await;
 
     if let Err(err) = post_hello_result {
-        let _ = send_protocol_error(&session, &mut encoder, &err.to_protocol_error()).await;
+        // The writer task has already drained the ProtocolError
+        // frame above; the supervisor's diagnostic log records the
+        // failure mode for the operator.
+        debug!(code = %err.code, "post-hello session error");
     }
     Ok(())
 }
@@ -446,53 +636,88 @@ fn envelope_error_code(err: &std::io::Error) -> ProtocolErrorCode {
     }
 }
 
-async fn send_protocol_error<W>(
-    session: &Session,
-    encoder: &mut EnvelopeAsyncEncoder<W>,
-    err: &ProtocolError,
-) -> Result<(), DaemonError>
+/// Reads one length-prefixed envelope from the supplied tokio TLS
+/// stream without permanently splitting it.
+async fn read_envelope_from_stream<S>(
+    tls_stream: &mut S,
+    max_envelope_bytes: u32,
+) -> std::io::Result<AgentEnvelope>
 where
-    W: tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut header = [0u8; 4];
+    tls_stream.read_exact(&mut header).await?;
+    let announced = u32::from_be_bytes(header);
+    if announced > max_envelope_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("envelope length {announced} exceeds limit {max_envelope_bytes}"),
+        ));
+    }
+    let announced = usize::try_from(announced)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid length"))?;
+    if announced == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty envelope"));
+    }
+    let mut body = vec![0u8; announced];
+    tls_stream.read_exact(&mut body).await?;
+    AgentEnvelope::decode(body.as_slice())
+        .map_err(|err| std::io::Error::other(format!("decode envelope: {err}")))
+}
+
+/// Writes one length-prefixed envelope directly through the tokio
+/// TLS stream, encoding the protobuf body in place.
+async fn write_initial_envelope_stream<S>(tls_stream: &mut S, envelope: &AgentEnvelope) -> bool
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = Vec::with_capacity(envelope.encoded_len());
+    if envelope.encode(&mut buf).is_err() {
+        return false;
+    }
+    let len = match u32::try_from(buf.len()) {
+        Ok(len) => len,
+        Err(_) => return false,
+    };
+    if tls_stream.write_all(&len.to_be_bytes()).await.is_err() {
+        return false;
+    }
+    tls_stream.write_all(&buf).await.is_ok()
+}
+
+/// Emits a `ProtocolError` directly through the tokio TLS stream
+/// before the writer half is handed off. Used only on the pre-split
+/// path so the protocol-error envelope is delivered before close.
+async fn send_protocol_error_stream<S>(
+    tls_stream: &mut S,
+    max_envelope_bytes: u32,
+    code: &str,
+    message: &str,
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
 {
     let envelope = AgentEnvelope {
-        protocol_major: session.inputs().max_protocol_major,
-        protocol_minor: session.inputs().max_protocol_minor,
-        runtime_session_id: Bytes::copy_from_slice(
-            session.runtime_session_id().as_uuid().as_bytes(),
-        ),
+        protocol_major: 1,
+        protocol_minor: 0,
+        runtime_session_id: Bytes::new(),
         session_seq: 0,
         sent_monotonic_ns: MonotonicClock::new().now_ns(),
         message_id: "daemon-error".to_string(),
         correlation_token: String::new(),
-        payload: Some(PayloadOneof::ProtocolError(err.clone())),
+        payload: Some(PayloadOneof::ProtocolError(ProtocolError {
+            code: code.to_string(),
+            message: message.to_string(),
+        })),
     };
-    encoder
-        .write_envelope(&envelope)
-        .await
-        .map_err(|err| DaemonError::Transport(format!("write protocol error: {err}")))
-}
-
-async fn join_tasks(tasks: Vec<JoinHandle<Result<(), DaemonError>>>) -> Result<(), DaemonError> {
-    let mut first_error: Option<DaemonError> = None;
-    for task in tasks {
-        match task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-            Err(join_err) => {
-                if first_error.is_none() {
-                    first_error = Some(DaemonError::Join(format!("{join_err}")));
-                }
-            }
-        }
+    if !write_initial_envelope_stream(tls_stream, &envelope).await {
+        return Err(std::io::Error::other("failed to write protocol error"));
     }
-    match first_error {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
+    // The limit is advisory; the helper never exceeds it because the
+    // envelope is bounded by the static `ProtocolError` payload size.
+    let _ = max_envelope_bytes;
+    Ok(())
 }
 
 fn random_server_nonce() -> Result<Vec<u8>, DaemonError> {
@@ -542,7 +767,7 @@ struct SupervisorContext {
     session_secret: SessionSecret,
     runtime_session_id: RuntimeSessionId,
     project_id: ProjectId,
-    expected_repository_fingerprint: String,
+    expected_repository_fingerprint: RepositoryFingerprint,
     /// Shared shutdown signal observed by the supervisor, every
     /// connection, and every helper task.
     shutdown: ShutdownSignal,
@@ -554,7 +779,7 @@ pub struct DaemonBuilder {
     config: DaemonConfig,
     project_id: Option<ProjectId>,
     runtime_session_id: Option<RuntimeSessionId>,
-    expected_repository_fingerprint: Option<String>,
+    expected_repository_fingerprint: Option<RepositoryFingerprint>,
     bootstrap_artifact: Option<PathBuf>,
 }
 
@@ -587,9 +812,14 @@ impl DaemonBuilder {
     }
 
     /// Sets the expected repository fingerprint the daemon enforces
-    /// on every inbound `AdapterHello`. Required.
+    /// on every inbound `AdapterHello`. The fingerprint must already
+    /// be a canonical `b3:<64 lowercase hex>` value because the
+    /// builder takes it by value rather than parsing user input.
     #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
-    pub fn with_expected_repository_fingerprint(mut self, fingerprint: String) -> Self {
+    pub fn with_expected_repository_fingerprint(
+        mut self,
+        fingerprint: RepositoryFingerprint,
+    ) -> Self {
         self.expected_repository_fingerprint = Some(fingerprint);
         self
     }
@@ -628,8 +858,7 @@ impl DaemonBuilder {
                 )
             })?;
         let listener = LoopbackListener::bind(self.config.loopback_policy).await?;
-        let certificate = EphemeralCertificate::generate()?;
-        let tls_materials = TlsServerMaterials::build(certificate)?;
+        let tls_materials = TlsServerMaterials::build()?;
         let session_secret = SessionSecret::generate()
             .map_err(|err| DaemonError::Bootstrap(format!("session secret: {err}")))?;
         let bootstrap = self
@@ -639,7 +868,7 @@ impl DaemonBuilder {
                 let fields = BootstrapArtifactFields::new(
                     listener.local_addr().ip().to_string(),
                     listener.local_addr().port(),
-                    tls_materials.certificate.pin().to_string(),
+                    tls_materials.certificate_pin().to_string(),
                     runtime_session_id,
                     &session_secret,
                     project_id,
@@ -672,7 +901,6 @@ impl DaemonBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xtrace_protocol::handshake::{compute_transcript_proof, verify_transcript_proof};
 
     /// The exporter label is part of the protocol contract: both the
     /// daemon and the adapter feed it to `export_keying_material` so
@@ -705,24 +933,22 @@ mod tests {
         let session = b"01900000-0000-0000-0000-000000000000";
         let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
         let client = [0xaa_u8; 32];
-        let inbound = compute_transcript_proof(
+        let inbound = xtrace_protocol::handshake::compute_transcript_proof(
             secret,
             exporter,
             session,
             &client,
             &xtrace_protocol::handshake::ZERO_NONCE,
             manifest,
-            &xtrace_protocol::handshake::project_context(b"01900000-0000-7000-8000-000000000000"),
         )
         .expect("HMAC accepts the test secret");
-        verify_transcript_proof(
+        xtrace_protocol::handshake::verify_transcript_proof(
             secret,
             exporter,
             session,
             &client,
             &xtrace_protocol::handshake::ZERO_NONCE,
             manifest,
-            &xtrace_protocol::handshake::project_context(b"01900000-0000-7000-8000-000000000000"),
             &inbound,
         )
         .expect("inbound verifier accepts the canonical layout");
@@ -730,25 +956,18 @@ mod tests {
 
     /// The outbound `DaemonHello` proof uses the daemon's server
     /// nonce together with the recovered client nonce (no zero
-    /// placeholder) and the project context chunk. The layout is
-    /// symmetric with the inbound direction minus the placeholder.
+    /// placeholder). The layout is symmetric with the inbound
+    /// direction minus the placeholder.
     #[test]
     fn daemon_proof_layout_uses_real_client_nonce_for_outbound_direction() {
         let secret = b"a]8=ZxW6Mf7n3Q!2";
         let exporter = b"tls-exporter-bytes";
         let session = b"01900000-0000-0000-0000-000000000000";
-        let project = b"01900000-0000-7000-8000-000000000000";
         let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
         let client = [0xaa_u8; 32];
         let server = [0xbb_u8; 32];
-        let outbound = compute_transcript_proof(
-            secret,
-            exporter,
-            session,
-            &client,
-            &server,
-            manifest,
-            &xtrace_protocol::handshake::project_context(project),
+        let outbound = xtrace_protocol::handshake::compute_transcript_proof(
+            secret, exporter, session, &client, &server, manifest,
         )
         .expect("HMAC accepts the test secret");
         assert_eq!(outbound.len(), 32);
@@ -761,5 +980,16 @@ mod tests {
         std::thread::sleep(StdDuration::from_millis(2));
         let second = clock.now_ns();
         assert!(second >= first, "monotonic clock must not regress");
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_already_set_resolves_immediately() {
+        let (tx, mut signal) = shared_shutdown_channel();
+        tx.send(true).expect("send");
+        // The future must complete on the first poll because the
+        // channel already carries the shutdown value.
+        let start = Instant::now();
+        signal.wait().await;
+        assert!(start.elapsed() < StdDuration::from_secs(1));
     }
 }

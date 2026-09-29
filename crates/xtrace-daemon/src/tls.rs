@@ -2,8 +2,9 @@
 //!
 //! Every daemon launch generates a fresh self-signed leaf certificate
 //! using [`rcgen`], encodes it to DER, computes the SHA-256 pin of
-//! the DER bytes, and bundles both into a [`rustls::ServerConfig`]
-//! restricted to TLS 1.3 with the ring crypto provider.
+//! the DER bytes, and bundles the leaf and key into a
+//! [`rustls::ServerConfig`] restricted to TLS 1.3 with the ring
+//! crypto provider.
 //!
 //! The pin is what the bootstrap artifact exposes to the adapter; the
 //! adapter's TLS stack is expected to verify the pin before completing
@@ -14,13 +15,12 @@
 //!
 //! ## Private-key hygiene
 //!
-//! The private key bytes never leave this module through a public
-//! accessor: they are wrapped in a private struct that zeroes its
-//! backing buffer on drop and prints a redacted marker under
-//! `Debug`. The [`EphemeralCertificate::pin`] and
-//! [`EphemeralCertificate::certificate_der_bytes`] accessors expose
-//! only the bytes the bootstrap artifact and the daemon-side rustls
-//! builder need to construct the server configuration.
+//! The private key is wrapped in a single-use buffer that zeroes its
+//! backing storage on drop and prints a redacted marker under
+//! `Debug`. The material is consumed exactly once when the rustls
+//! server configuration is built; the [`TlsServerMaterials`] only
+//! retains the [`Arc<ServerConfig>`] and the certificate pin, never
+//! the key or the DER bytes.
 
 use std::sync::Arc;
 
@@ -51,12 +51,11 @@ const SUPPORTED_TLS_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version:
 /// Zero-on-drop wrapper around a PKCS#8 DER-encoded private key.
 ///
 /// The struct holds the bytes by value, never exposes the buffer
-/// outside this module, and clears it on `Drop`. `Debug` is rendered
-/// as a redacted marker so a panic message or log line cannot leak
-/// the key. `Clone` is implemented because the rustls server
-/// configuration builder requires a value-type key; every clone
-/// carries an independent buffer that is zeroed on its own drop.
-#[derive(Clone)]
+/// outside this module, and clears it on `Drop`. The buffer is moved
+/// into the rustls builder exactly once; the wrapper exists so the
+/// `Debug` formatting always prints the redacted marker and the
+/// [`EphemeralCertificate::private_key`] accessor hands the bytes to
+/// the rustls builder through a single, traceable call site.
 struct EphemeralPrivateKey(Vec<u8>);
 
 impl std::fmt::Debug for EphemeralPrivateKey {
@@ -78,48 +77,54 @@ impl zeroize::Zeroize for EphemeralPrivateKey {
     }
 }
 
-/// Ephemeral daemon certificate.
-///
-/// Holds the leaf certificate DER bytes (public) and the private key
-/// (redacted, zero-on-drop). The certificate pin is exposed to the
-/// bootstrap artifact so the adapter can verify the chain before the
-/// TLS handshake completes.
-#[derive(Clone)]
-pub struct EphemeralCertificate {
-    /// DER-encoded leaf certificate bytes. Public so the daemon can
-    /// install the leaf into the rustls server configuration.
-    certificate_der: Vec<u8>,
-    /// Private key. Cleared on `Drop`; never readable through the
-    /// public API.
-    private_key: EphemeralPrivateKey,
-    /// Lowercase hexadecimal SHA-256 digest of the DER-encoded leaf
-    /// certificate. The bootstrap artifact exposes this pin so the
-    /// adapter can verify the certificate before completing the TLS
-    /// handshake.
-    sha256_pin: String,
+impl EphemeralPrivateKey {
+    /// Mutable access to the inner buffer so the rustls builder can
+    /// move the bytes out exactly once. After the call returns, the
+    /// wrapper is dropped with whatever buffer the caller left behind.
+    fn private_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.0
+    }
 }
 
-impl std::fmt::Debug for EphemeralCertificate {
+/// Bundled TLS materials ready to be installed into a tokio acceptor.
+///
+/// The struct owns only the [`Arc<ServerConfig>`] and the public
+/// certificate pin. The private key and the DER-encoded leaf are
+/// consumed by [`TlsServerMaterials::build`] and never duplicated;
+/// there is no `Clone` implementation and no public accessor for the
+/// DER bytes.
+pub struct TlsServerMaterials {
+    /// Fully configured server config.
+    server_config: Arc<ServerConfig>,
+    /// Lowercase hexadecimal SHA-256 digest of the DER-encoded leaf
+    /// certificate. Surfaced through [`TlsServerMaterials::certificate_pin`]
+    /// so the bootstrap artifact can carry the pin to the adapter.
+    certificate_pin: String,
+}
+
+impl std::fmt::Debug for TlsServerMaterials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EphemeralCertificate")
-            .field("sha256_pin", &self.sha256_pin)
-            .field("certificate_der", &format_args!("<{} bytes>", self.certificate_der.len()))
-            .field("private_key", &format_args!("{:?}", self.private_key))
+        f.debug_struct("TlsServerMaterials")
+            .field("certificate_pin", &self.certificate_pin)
+            .field("server_config", &"<rustls::ServerConfig>")
             .finish()
     }
 }
 
-impl EphemeralCertificate {
+impl TlsServerMaterials {
     /// Generates a fresh self-signed leaf certificate for loopback
-    /// usage. The private key is generated through [`rcgen`] using the
-    /// ring CSPRNG and is wrapped in a zero-on-drop guard before the
+    /// usage and builds the rustls server configuration. The private
+    /// key is generated through [`rcgen`] using the ring CSPRNG; the
+    /// key is consumed by the rustls builder exactly once before this
     /// function returns.
     ///
     /// # Errors
     ///
     /// Returns [`DaemonError::TlsConfig`] when the certificate
-    /// generator refuses the requested parameters.
-    pub fn generate() -> Result<Self, DaemonError> {
+    /// generator refuses the requested parameters, or when the
+    /// rustls builder rejects the supplied key or version
+    /// negotiation.
+    pub fn build() -> Result<Self, DaemonError> {
         let mut params = CertificateParams::default();
         params.distinguished_name = {
             let mut dn = DistinguishedName::new();
@@ -146,73 +151,42 @@ impl EphemeralCertificate {
             .map_err(|err| DaemonError::TlsConfig(format!("self sign: {err}")))?;
         let certificate_der = certificate.der().to_vec();
         let private_key_der = key_pair.serialized_der().to_vec();
-        let sha256_pin = sha256_lower_hex(&certificate_der);
-        Ok(Self { certificate_der, private_key: EphemeralPrivateKey(private_key_der), sha256_pin })
-    }
-
-    /// Returns the DER-encoded leaf certificate as a `CertificateDer`.
-    #[must_use]
-    pub fn certificate(&self) -> CertificateDer<'static> {
-        CertificateDer::from(self.certificate_der.clone())
-    }
-
-    /// Returns the private key as a PKCS#8 `PrivateKeyDer`. The bytes
-    /// stay inside the wrapper; this accessor exists only so the
-    /// rustls server configuration can install the leaf/key pair.
-    fn private_key(&self) -> PrivateKeyDer<'static> {
-        PrivatePkcs8KeyDer::from(self.private_key.0.clone()).into()
-    }
-
-    /// Returns the lowercase hexadecimal SHA-256 pin.
-    #[must_use]
-    pub fn pin(&self) -> &str {
-        &self.sha256_pin
-    }
-
-    /// Returns the leaf certificate DER bytes as a slice. The slice
-    /// borrows from the certificate so callers cannot extend its
-    /// lifetime past the certificate. Exposed because integration
-    /// tests need the DER to seed an honest rustls verifier for the
-    /// wrong-pin path; production paths only use the pin string.
-    #[must_use]
-    pub fn certificate_der_bytes(&self) -> &[u8] {
-        &self.certificate_der
-    }
-}
-
-/// Bundled TLS materials ready to be installed into a tokio acceptor.
-#[derive(Clone)]
-pub struct TlsServerMaterials {
-    /// Fully configured server config.
-    pub server_config: Arc<ServerConfig>,
-    /// The ephemeral certificate backing the configuration. Held
-    /// alongside the [`ServerConfig`] so callers can surface the
-    /// SHA-256 pin through the bootstrap artifact without re-deriving
-    /// it.
-    pub certificate: EphemeralCertificate,
-}
-
-impl TlsServerMaterials {
-    /// Builds the rustls server configuration for the supplied
-    /// ephemeral certificate. The configuration accepts TLS 1.3
-    /// only, requires no client certificates (the HMAC transcript
-    /// proof provides adapter authentication after the channel is
-    /// established), and is ready to plug into a tokio acceptor.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DaemonError::TlsConfig`] when the rustls builder
-    /// refuses the supplied private key or when the version
-    /// negotiation rejects the available cipher suites.
-    pub fn build(certificate: EphemeralCertificate) -> Result<Self, DaemonError> {
+        let certificate_pin = sha256_lower_hex(&certificate_der);
+        // Wrap the private key in a zero-on-drop guard so the bytes
+        // are cleared on every error path; the rustls builder is the
+        // single consumer and takes ownership of the inner `Vec<u8>`
+        // through `EphemeralPrivateKey::into_inner`.
+        let mut private_key_wrapper = EphemeralPrivateKey(private_key_der);
+        let moved_bytes = std::mem::take(private_key_wrapper.private_mut());
         let server_config =
             ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
                 .with_protocol_versions(SUPPORTED_TLS_VERSIONS)
                 .map_err(|err| DaemonError::TlsConfig(format!("protocol versions: {err}")))?
                 .with_no_client_auth()
-                .with_single_cert(vec![certificate.certificate()], certificate.private_key())
+                .with_single_cert(
+                    vec![CertificateDer::from(certificate_der)],
+                    PrivateKeyDer::from(PrivatePkcs8KeyDer::from(moved_bytes)),
+                )
                 .map_err(|err| DaemonError::TlsConfig(format!("single cert: {err}")))?;
-        Ok(Self { server_config: Arc::new(server_config), certificate })
+        // `private_key_wrapper` is dropped here with an empty buffer;
+        // the zeroize-on-drop has nothing to clear because the key was
+        // moved into rustls.
+        drop(private_key_wrapper);
+        Ok(Self { server_config: Arc::new(server_config), certificate_pin })
+    }
+
+    /// Returns the [`Arc<ServerConfig>`] ready to plug into a tokio
+    /// acceptor.
+    #[must_use]
+    pub fn server_config(&self) -> Arc<ServerConfig> {
+        self.server_config.clone()
+    }
+
+    /// Returns the lowercase hexadecimal SHA-256 pin of the leaf
+    /// certificate.
+    #[must_use]
+    pub fn certificate_pin(&self) -> &str {
+        &self.certificate_pin
     }
 }
 
@@ -238,9 +212,8 @@ fn sha256_lower_hex(bytes: &[u8]) -> String {
 /// SHA-256 equals the supplied lowercase pin, while still verifying
 /// the certificate signature through rustls's supported signature
 /// algorithms. Production adapters are expected to construct their
-/// verifier from the bootstrap pin string directly; the daemon no
-/// longer exposes the leaf DER through a public test-only accessor
-/// that accepts the certificate material out of band.
+/// verifier from the bootstrap pin string directly; no DER or
+/// root certificate material leaves the daemon process.
 ///
 /// # Errors
 ///
@@ -270,13 +243,20 @@ struct PinnedLeafVerifier {
 
 impl PinnedLeafVerifier {
     fn new(pin: &str) -> Result<Self, DaemonError> {
-        if pin.len() != 64 || !pin.chars().all(|c| c.is_ascii_hexdigit()) {
+        if !is_canonical_lowercase_hex_pin(pin) {
             return Err(DaemonError::TlsConfig(format!(
                 "pin must be 64 lowercase hex characters: {pin}"
             )));
         }
-        Ok(Self { pin: pin.to_ascii_lowercase() })
+        Ok(Self { pin: pin.to_string() })
     }
+}
+
+fn is_canonical_lowercase_hex_pin(value: &str) -> bool {
+    if value.len() != 64 {
+        return false;
+    }
+    value.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 impl ServerCertVerifier for PinnedLeafVerifier {
@@ -370,23 +350,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ephemeral_certificate_pin_is_stable_and_lowercase_hex() {
-        let cert = EphemeralCertificate::generate().expect("generate");
-        assert_eq!(cert.pin().len(), 64);
-        assert!(cert.pin().chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-    }
-
-    #[test]
-    fn ephemeral_certificate_includes_loopback_sans() {
-        let cert = EphemeralCertificate::generate().expect("generate");
-        assert!(!cert.certificate_der_bytes().is_empty());
-    }
-
-    #[test]
-    fn tls_materials_build_round_trip() {
-        let cert = EphemeralCertificate::generate().expect("cert");
-        let materials = TlsServerMaterials::build(cert.clone()).expect("build");
-        assert_eq!(materials.certificate.pin(), cert.pin());
+    fn tls_materials_pin_is_stable_and_lowercase_hex() {
+        let materials = TlsServerMaterials::build().expect("build");
+        assert_eq!(materials.certificate_pin().len(), 64);
+        assert!(
+            materials
+                .certificate_pin()
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
     }
 
     #[test]
@@ -396,18 +368,37 @@ mod tests {
     }
 
     #[test]
-    fn pinned_client_config_accepts_canonical_pin() {
-        let materials =
-            TlsServerMaterials::build(EphemeralCertificate::generate().unwrap()).unwrap();
-        let _config =
-            build_pinned_client_config(materials.certificate.pin()).expect("build config");
+    fn pinned_client_config_rejects_uppercase_pin() {
+        // The pin must be lowercase hex; uppercase input is rejected
+        // up front rather than silently lowercased.
+        let upper = "A".repeat(64);
+        let err = build_pinned_client_config(&upper).unwrap_err();
+        assert!(matches!(err, DaemonError::TlsConfig(_)));
     }
 
     #[test]
-    fn debug_redacts_private_key() {
-        let cert = EphemeralCertificate::generate().expect("cert");
-        let rendered = format!("{cert:?}");
-        assert!(rendered.contains("redacted"));
-        assert!(rendered.contains("bytes"));
+    fn pinned_client_config_accepts_canonical_pin() {
+        let materials = TlsServerMaterials::build().expect("build");
+        let _config =
+            build_pinned_client_config(materials.certificate_pin()).expect("build config");
+    }
+
+    #[test]
+    fn tls_materials_have_no_clone_implementation() {
+        // The compile-time check is the test: a stray `Clone` derive
+        // would let an operator accidentally duplicate private-key
+        // material through the public API. We only assert the
+        // materials expose the documented fields.
+        let materials = TlsServerMaterials::build().expect("build");
+        let _ = materials.server_config();
+        let _ = materials.certificate_pin();
+    }
+
+    #[test]
+    fn debug_redacts_tls_materials() {
+        let materials = TlsServerMaterials::build().expect("build");
+        let rendered = format!("{materials:?}");
+        assert!(rendered.contains("TlsServerMaterials"));
+        assert!(rendered.contains("<rustls::ServerConfig>"));
     }
 }

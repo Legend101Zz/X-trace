@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
 use xtrace_protocol::generated::agent::{CapabilitySet, DaemonHello, Health, ProtocolError};
-use xtrace_protocol::handshake::{ZERO_NONCE, project_context, verify_transcript_proof};
+use xtrace_protocol::handshake::{ZERO_NONCE, verify_transcript_proof};
 
 #[cfg(test)]
 use prost::bytes::Bytes;
@@ -33,10 +33,7 @@ impl Default for HealthInterval {
 /// [`CapabilitySet`] and [`Health`] traffic.
 #[derive(Clone, Debug)]
 pub struct AdapterHelloAck {
-    /// Negotiated protocol major version. Always equal to the
-    /// daemon's `max_envelope_bytes` value but mirrored here so the
-    /// supervisor can log the negotiated envelope without re-reading
-    /// the bootstrap artifact.
+    /// Negotiated protocol major version.
     pub protocol_major: u32,
     /// Negotiated protocol minor version.
     pub protocol_minor: u32,
@@ -59,6 +56,23 @@ pub enum IncomingEnvelope {
     CapabilitySet(CapabilitySet),
     /// Adapter sent a [`Health`] update.
     Health(Health),
+}
+
+impl IncomingEnvelope {
+    /// Returns a short, redacted-status string describing the
+    /// envelope. Used by tests that assert the session retains
+    /// accepted envelopes in the volatile staging buffer; production
+    /// code does not need the helper. The value is taken from the
+    /// `Health.status` field when present and otherwise from the
+    /// `CapabilitySet` capability count, so no captured value from
+    /// an arbitrary adapter payload escapes the helper.
+    #[must_use]
+    pub fn status(&self) -> String {
+        match self {
+            Self::Health(health) => health.status.clone(),
+            Self::CapabilitySet(set) => format!("capabilities={}", set.capabilities.len()),
+        }
+    }
 }
 
 /// Outbound command the supervisor wants to emit to the adapter.
@@ -98,6 +112,12 @@ impl OutgoingCommand {
 /// typed wire inputs so the session layer does not need to know
 /// about the byte layout.
 ///
+/// Project identity is enforced by the session layer against
+/// `AdapterHello.repository_fingerprint` and the bootstrap-anchored
+/// `xtrace_domain::RepositoryFingerprint`. The transcript itself only
+/// binds the project_id through the negotiated `runtime_session_id`
+/// carried in the bootstrap artifact.
+///
 /// # Errors
 ///
 /// Returns the same error as [`verify_transcript_proof`] when the
@@ -106,10 +126,8 @@ pub fn verify_adapter_hello(
     session_secret: &[u8],
     tls_exporter: &[u8],
     runtime_session_id: &[u8],
-    project_id: &[u8],
     hello: &xtrace_protocol::generated::agent::AdapterHello,
 ) -> Result<(), xtrace_protocol::handshake::TranscriptProofError> {
-    let ctx = project_context(project_id);
     // The adapter does not know the daemon's server nonce when it
     // emits `AdapterHello`, so the inbound direction uses the
     // documented zero placeholder for that field. Both sides agree
@@ -121,7 +139,6 @@ pub fn verify_adapter_hello(
         &hello.client_nonce,
         &ZERO_NONCE,
         hello.manifest_digest.as_bytes(),
-        &ctx,
         &hello.hmac,
     )
 }
@@ -136,20 +153,18 @@ pub fn verify_adapter_hello(
 /// Returns the same [`xtrace_protocol::handshake::TranscriptProofError`]
 /// variant as `compute_transcript_proof` when the underlying HMAC
 /// primitive refuses the supplied key. The 256-bit session secret is
-/// always within SHA-256's block-size bound so the error path is
-/// unreachable in production; the result is reported rather than
+/// accepted by HMAC-SHA256 so the error path is unreachable for the
+/// documented production key; the result is reported rather than
 /// panicked because library code must not call `expect`.
 #[must_use = "compute_daemon_hello_proof returns a Result that the supervisor must propagate"]
 pub fn compute_daemon_hello_proof(
     session_secret: &[u8],
     tls_exporter: &[u8],
     runtime_session_id: &[u8],
-    project_id: &[u8],
     client_nonce: &[u8],
     server_nonce: &[u8],
     manifest_digest: &[u8],
 ) -> Result<[u8; 32], xtrace_protocol::handshake::TranscriptProofError> {
-    let ctx = project_context(project_id);
     xtrace_protocol::handshake::compute_transcript_proof(
         session_secret,
         tls_exporter,
@@ -157,7 +172,6 @@ pub fn compute_daemon_hello_proof(
         client_nonce,
         server_nonce,
         manifest_digest,
-        &ctx,
     )
 }
 
@@ -216,7 +230,6 @@ mod tests {
         let secret = b"a]8=ZxW6Mf7n3Q!2";
         let exporter = b"tls-exporter-bytes";
         let session = b"01900000-0000-0000-0000-000000000000";
-        let project = b"01900000-0000-7000-8000-000000000000";
         let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
         // Inbound direction: AdapterHello uses the placeholder
         // server nonce because the server nonce is unknown yet.
@@ -228,7 +241,6 @@ mod tests {
             &client_nonce,
             &xtrace_protocol::handshake::ZERO_NONCE,
             manifest,
-            &xtrace_protocol::handshake::project_context(project),
         )
         .expect("HMAC accepts the test secret");
         let hello = xtrace_protocol::generated::agent::AdapterHello {
@@ -249,7 +261,7 @@ mod tests {
             client_nonce: Bytes::copy_from_slice(&client_nonce),
             hmac: Bytes::copy_from_slice(&adapter_proof),
         };
-        verify_adapter_hello(secret, exporter, session, project, &hello).expect("verify");
+        verify_adapter_hello(secret, exporter, session, &hello).expect("verify");
 
         // Outbound direction: DaemonHello uses the real client nonce
         // (recovered from the validated AdapterHello) plus the real
@@ -260,7 +272,6 @@ mod tests {
             secret,
             exporter,
             session,
-            project,
             &client_nonce,
             &server_nonce,
             manifest,
@@ -285,7 +296,6 @@ mod tests {
         let secret = b"a]8=ZxW6Mf7n3Q!2";
         let exporter = b"tls-exporter-bytes";
         let session = b"01900000-0000-0000-0000-000000000000";
-        let project = b"01900000-0000-7000-8000-000000000000";
         let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
         let client_nonce = [0xaa_u8; 32];
         let hello = xtrace_protocol::generated::agent::AdapterHello {
@@ -307,7 +317,7 @@ mod tests {
             // Tampered proof: every byte is one off the correct tag.
             hmac: Bytes::copy_from_slice(&[0u8; 32]),
         };
-        let err = verify_adapter_hello(secret, exporter, session, project, &hello).unwrap_err();
+        let err = verify_adapter_hello(secret, exporter, session, &hello).unwrap_err();
         assert!(matches!(err, xtrace_protocol::handshake::TranscriptProofError::Mismatch));
     }
 
