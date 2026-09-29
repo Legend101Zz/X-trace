@@ -2,16 +2,17 @@
 //!
 //! Slice 1A keeps durable project state under the user-data home
 //! directory rather than inside the repository. The CLI resolves the
-//! home directory in this order:
+//! home directory at the command level in this order:
 //!
-//! 1. `XTRACE_DATA_HOME` when it points at an absolute path (override);
-//! 2. the platform default for the host operating system, which
-//!    honours the conventional user-data environment variable for
-//!    that platform before falling back to `HOME`;
-//! 3. an explicit [`data_home`](RepositoryPointer::data_home) carried
-//!    by a previously-written pointer file (used when neither
-//!    override nor platform default is available, for example after a
-//!    repository migrates between machines).
+//! 1. `XTRACE_DATA_HOME` when it points at an absolute path (the
+//!    explicit override is used directly as the application root);
+//! 2. the [`data_home`](RepositoryPointer::data_home) recorded in an
+//!    existing repository pointer, when no override is set;
+//! 3. the platform default, via [`UserDataPaths::home_with`].
+//!
+//! [`UserDataPaths::home_with`] itself only handles the override
+//! followed by the platform default; the pointer is consulted by the
+//! command-level resolver before that helper is called.
 //!
 //! Platform defaults:
 //!

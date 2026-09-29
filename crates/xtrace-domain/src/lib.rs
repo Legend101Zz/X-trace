@@ -50,7 +50,7 @@ pub mod time;
 pub mod value;
 
 pub use error::{AppError, ErrorCategory, ErrorCode, Remediation, RetryAdvice, SafeScalar, codes};
-pub use hash::ContentHash;
+pub use hash::{ContentHash, HashParseError};
 pub use ids::{
     ClaimId, CorrelationId, FrameId, InteractionId, OperationId, OperationVersionId, PolicyId,
     ProjectId, RecordingId, RunId, RuntimeSessionId, SourceArtifactId, SourceRevisionId,

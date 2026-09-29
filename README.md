@@ -29,15 +29,20 @@ into domain DTOs flows through `xtrace-protocol::translate`.
 
 ## Storage layout
 
-Project state lives under the user-data home directory, not inside the
-repository:
+Project state lives under the resolved user-data home directory, not inside
+the repository:
 
 ```text
-<user_data_home>/xtrace/projects/<project-id>/metadata.sqlite3
+<resolved_data_home>/projects/<project-id>/metadata.sqlite3
 ```
 
-The user-data home is `XTRACE_DATA_HOME` when set (must be absolute), otherwise
-the platform default documented in `crates/xtrace-cli/src/paths.rs`:
+The resolved home is `XTRACE_DATA_HOME` when set to an absolute path, used
+directly as the application root. When the override is absent, the platform
+default documented in `crates/xtrace-cli/src/paths.rs` is used, and that
+default already lives under `xtrace/...` because the resolver appends the
+application folder itself. So an explicit `XTRACE_DATA_HOME` must not add
+another `xtrace` segment, and the platform defaults shown below already
+include the trailing `xtrace`:
 
 - macOS: `$HOME/Library/Application Support/xtrace`
 - Linux: `${XDG_DATA_HOME:-~/.local/share}/xtrace`

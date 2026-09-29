@@ -23,6 +23,7 @@
 )]
 
 pub mod envelope;
+pub mod handshake;
 pub mod translate;
 
 pub use xtp as generated;
