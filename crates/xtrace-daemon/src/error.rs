@@ -2,16 +2,19 @@
 //!
 //! Every variant carries a stable [`ProtocolErrorCode`] that the
 //! session/connection layer renders to the wire as a
-//! `ProtocolError.code` value, plus a `String` payload that is an
-//! owner-only diagnostic. `DaemonError` payloads are intended for
-//! the daemon operator's log and may include file paths, loopback
-//! bind addresses, and OS error text so the operator can correlate
-//! the failure with a system log entry. `DaemonError` values are
-//! not automatically serialized as wire `ProtocolError` envelopes:
-//! those are constructed separately by the session and connection
-//! paths and may include bounded validation or framing detail.
-//! Code that builds the wire envelope must never insert session
-//! secret or private-key material.
+//! `ProtocolError.code` value, plus an owner-only diagnostic
+//! payload rendered into the operator's log via the variant's
+//! `Display` implementation. Most variants carry a `String`; the
+//! [`DaemonError::Io`] variant carries the underlying
+//! [`std::io::Error`] instead. `DaemonError` payloads are intended
+//! for the daemon operator's log and may include file paths,
+//! loopback bind addresses, and OS error text so the operator can
+//! correlate the failure with a system log entry. `DaemonError`
+//! values are not automatically serialized as wire `ProtocolError`
+//! envelopes: those are constructed separately by the session and
+//! connection paths and may include bounded validation or framing
+//! detail. Code that builds the wire envelope must never insert
+//! session secret or private-key material.
 
 use std::io;
 
@@ -98,9 +101,12 @@ impl std::fmt::Display for ProtocolErrorCode {
 /// Callers that build a `DaemonError` from a context carrying the
 /// certificate pin, the session secret, or peer-supplied data must
 /// avoid embedding that material in the payload: each variant's
-/// `String` is rendered as part of the operator-visible diagnostic
-/// log, and [`DaemonError::TlsConfig`] in particular is reachable
-/// from paths that already hold the bootstrap pin.
+/// diagnostic text — the `String` for most variants and the
+/// underlying `io::Error` for [`DaemonError::Io`] — is rendered as
+/// part of the operator-visible diagnostic log via the variant's
+/// `Display` implementation, and [`DaemonError::TlsConfig`] in
+/// particular is reachable from paths that already hold the
+/// bootstrap pin.
 #[derive(Debug, Error)]
 pub enum DaemonError {
     /// Configuration refused by validation. The daemon never reaches
