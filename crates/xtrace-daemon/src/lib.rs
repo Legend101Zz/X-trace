@@ -106,7 +106,7 @@ pub use daemon::{
 pub use error::{DaemonError, ProtocolErrorCode};
 pub use framing::{EnvelopeAsyncDecoder, EnvelopeAsyncEncoder, EnvelopeDecoder, EnvelopeEncoder};
 pub use listener::LoopbackListener;
-pub use runtime::{AdapterHelloAck, IncomingEnvelope, OutgoingCommand};
+pub use runtime::{AdapterHelloAck, IncomingEnvelope, OutgoingCommand, PostHelloAdmission};
 pub use secret::SessionSecret;
 pub use session::{HandshakeInputs, HandshakeRole, Session};
 pub use tls::{TlsServerMaterials, build_pinned_client_config};

@@ -16,9 +16,11 @@
 //! admits the wire `CapabilitySet`, `Health`, and recording payloads
 //! (`RecordingStarted`, `EventBatch`, `RecordingFinished`) as typed
 //! [`IncomingEnvelope`] variants, retains each in the bounded
-//! `staged_incoming` queue, and returns [`AckDurability::Staged`].
-//! Recording-level validation, lifecycle, persistence, and `Committed`
-//! belong to the downstream ingester.
+//! `staged_incoming` queue, and returns [`AckDurability::Staged`]
+//! with the canonical recording watermarks the wired
+//! [`xtrace_ingest::IngestValidator`] returns. Persistence,
+//! `Committed` durability, and terminal recording state are still
+//! downstream of this slice.
 //!
 //! ## Inbound `AdapterHello` invariants
 //!
@@ -56,19 +58,23 @@
 //! [`HandshakeInputs`] as the immutable inputs handed to a session at
 // construction time.
 
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 
 use prost::bytes::Bytes;
+use uuid::Uuid;
+use xtrace_domain::RecordingId;
 use xtrace_domain::ids::Id;
 use xtrace_domain::{ContentHash, ProjectId, RepositoryFingerprint, RuntimeSessionId};
+use xtrace_ingest::{Acceptance, IngestConfig, IngestError, IngestValidator};
 use xtrace_protocol::envelope::check_protocol_version;
 use xtrace_protocol::generated::agent as wire;
 use xtrace_protocol::generated::agent::{Ack, AckDurability, AgentEnvelope, ProtocolError};
 
 use crate::error::ProtocolErrorCode;
 use crate::runtime::{
-    AdapterHelloAck, HealthInterval, IncomingEnvelope, OutgoingCommand, build_protocol_error,
-    compute_daemon_hello_proof, verify_adapter_hello,
+    AdapterHelloAck, HealthInterval, IncomingEnvelope, OutgoingCommand, PostHelloAdmission,
+    build_protocol_error, compute_daemon_hello_proof, verify_adapter_hello,
 };
 use crate::secret::SessionSecret;
 
@@ -143,9 +149,16 @@ pub struct NegotiatedProtocol {
 ///
 /// `Session` is `Send` but not `Clone`: the supervisor hands the
 /// session value to the reader task, which is the only owner. Health,
-/// capability staging, and post-hello validation run against the same
-/// task; cloning would duplicate the secret-bearing inputs and the
-/// negotiated protocol minor.
+/// capability staging, recording validation, and post-hello
+/// validation run against the same task; cloning would duplicate
+/// the secret-bearing inputs and the negotiated protocol minor.
+///
+/// Each [`Session`] owns exactly one [`IngestValidator`] so the
+/// post-hello recording payloads from one authenticated connection
+/// share a single lifecycle and per-recording event-budget state.
+/// Recording IDs accepted by different sessions cannot leak across
+/// connections: the validator is private to the session that
+/// created it and is dropped on connection close.
 #[derive(Debug)]
 pub struct Session {
     inputs: HandshakeInputs,
@@ -172,33 +185,50 @@ pub struct Session {
     /// `AdapterHello`. `None` until the daemon accepts the hello.
     negotiated: Option<NegotiatedProtocol>,
     /// Volatile staging buffer for accepted post-hello envelopes.
-    /// Every [`IncomingEnvelope`] the session accepts is appended to
-    /// this buffer before the matching [`Ack`] is released so the
-    /// [`AckDurability::Staged`] value is honest: the daemon has
-    /// actually retained the accepted data, even though it is
-    /// process-local and lost on connection close.
     /// Bounded by `STAGED_INCOMING_LIMIT` so a runaway adapter
     /// cannot grow the buffer without bound.
     staged_incoming: std::collections::VecDeque<(u64, IncomingEnvelope)>,
+    /// Recording validator owned by this session; session-local so
+    /// two recordings accepted on different connections cannot leak
+    /// into each other's per-recording state. Dropped on connection
+    /// close.
+    ingest_validator: IngestValidator,
 }
 
-/// Maximum number of accepted envelopes retained in the volatile
-/// staging buffer. Beyond this bound the session refuses new
-/// envelopes with [`ProtocolErrorCode::SessionSequence`] and the
-/// supervisor closes the connection, matching the bounded-queue
-/// discipline enforced by the architecture-level budgets. Kept
-/// private so production callers cannot grow the staging buffer
-/// through a public constant; tests inside this module inspect the
-/// typed state directly.
+/// Upper bound on the volatile staging buffer. Beyond this bound the
+/// session refuses new envelopes with [`ProtocolErrorCode::SessionSequence`]
+/// and the supervisor closes the connection, matching the
+/// bounded-queue discipline enforced by the architecture-level budgets.
+/// The same value is also used as the
+/// [`xtrace_ingest::IngestConfig::max_active_recordings`] budget:
+/// every distinct accepted recording consumes at least one retained
+/// `RecordingStarted` envelope, so the staging buffer is the direct
+/// upper bound on the number of recordings the validator can track.
 const STAGED_INCOMING_LIMIT: usize = 256;
 
 impl Session {
     /// Constructs a fresh session over the supplied inputs. The
     /// `next_expected_seq` starts at 1 per
     /// `03b-protocol-and-api.md` §2.3 ("`session_seq` begins at 1
-    /// after authentication").
+    /// after authentication"). The owned [`IngestValidator`] is sized
+    /// to the staging limit.
     #[must_use]
     pub fn new(inputs: HandshakeInputs) -> Self {
+        let active_recordings =
+            NonZeroUsize::new(STAGED_INCOMING_LIMIT).unwrap_or(NonZeroUsize::MIN);
+        let ingest_config = IngestConfig::new(active_recordings);
+        Self::new_with_ingest_config(inputs, ingest_config)
+    }
+
+    /// Constructs a fresh session with an explicit
+    /// [`IngestConfig`]. Module-private helper used by
+    /// [`Session::new`] to derive the production validator config
+    /// and by nested tests to exercise the
+    /// [`IngestError::ActiveCapacityReached`] and
+    /// [`IngestError::EventCapacityReached`] boundaries without
+    /// reshaping the staging buffer.
+    #[must_use]
+    fn new_with_ingest_config(inputs: HandshakeInputs, ingest_config: IngestConfig) -> Self {
         Self {
             inputs,
             next_expected_seq: 1,
@@ -207,7 +237,17 @@ impl Session {
             adapter_manifest_digest: None,
             negotiated: None,
             staged_incoming: std::collections::VecDeque::with_capacity(STAGED_INCOMING_LIMIT),
+            ingest_validator: IngestValidator::new(ingest_config),
         }
+    }
+
+    /// Returns the underlying [`IngestValidator`] owned by this
+    /// session. Test-only: production callers leave the validator
+    /// untouched.
+    #[must_use]
+    #[cfg(test)]
+    pub fn ingest_validator(&self) -> &IngestValidator {
+        &self.ingest_validator
     }
 
     /// Returns the immutable inputs the session was constructed with.
@@ -437,19 +477,33 @@ impl Session {
         })
     }
 
-    /// Validates a post-hello inbound envelope and returns the
-    /// decoded [`IncomingEnvelope`] together with the matching
-    /// [`OutgoingCommand::Ack`] the supervisor must emit.
+    /// Validates a post-hello inbound envelope and returns the matching
+    /// [`PostHelloAdmission`] the supervisor must serialize next.
+    ///
+    /// Validation is layered so a later failure leaves every session
+    /// field untouched: the session preflights the bounded staging
+    /// capacity and the `session_seq` overflow guard before reaching
+    /// the recording validator, and the validator's rejection paths
+    /// are no-mutation on its side (a successful verdict still
+    /// advances the per-recording lifecycle inside the validator).
     ///
     /// # Errors
     ///
     /// Returns [`SessionError`] when the envelope fails any of the
-    /// post-hello identity, sequence, or framing checks. The
-    /// supervisor must close the connection on any error.
+    /// post-hello identity, sequence, framing, or recording
+    /// validation checks. Every ingest rejection carries
+    /// `code == ProtocolErrorCode::CaptureIngest`; callers
+    /// distinguish recoverability from a session-fatal ingest
+    /// rejection by inspecting
+    /// [`SessionError::ingest_error`] together with
+    /// [`xtrace_ingest::IngestError::is_session_fatal`]. Every
+    /// non-ingest [`SessionError`] is session-fatal for the
+    /// connection: the supervisor must close the socket and must
+    /// not emit a `CaptureCommand` to solicit a retry.
     pub fn accept_post_hello(
         &mut self,
         envelope: &AgentEnvelope,
-    ) -> Result<(IncomingEnvelope, OutgoingCommand), SessionError> {
+    ) -> Result<PostHelloAdmission, SessionError> {
         let negotiated = self.negotiated.ok_or_else(|| {
             SessionError::new(
                 ProtocolErrorCode::SessionIdentity,
@@ -486,63 +540,21 @@ impl Session {
             }
             return Err(SessionError::new(ProtocolErrorCode::SessionSequence, "gap".to_string()));
         }
-        let incoming = match &envelope.payload {
-            Some(wire::agent_envelope::Payload::CapabilitySet(set)) => {
-                IncomingEnvelope::CapabilitySet(set.clone())
-            }
-            Some(wire::agent_envelope::Payload::Health(health)) => {
-                IncomingEnvelope::Health(health.clone())
-            }
-            Some(wire::agent_envelope::Payload::RecordingStarted(started)) => {
-                IncomingEnvelope::RecordingStarted(started.clone())
-            }
-            Some(wire::agent_envelope::Payload::EventBatch(batch)) => {
-                IncomingEnvelope::EventBatch(batch.clone())
-            }
-            Some(wire::agent_envelope::Payload::RecordingFinished(finished)) => {
-                IncomingEnvelope::RecordingFinished(finished.clone())
-            }
-            Some(wire::agent_envelope::Payload::ProtocolError(err)) => {
-                return Err(SessionError::new(
-                    ProtocolErrorCode::HelloDecode,
-                    format!("adapter returned ProtocolError: {}", err.message),
-                ));
-            }
-            Some(other) => {
-                return Err(SessionError::new(
-                    ProtocolErrorCode::HelloDecode,
-                    format!("unsupported payload after hello: {}", payload_kind(other)),
-                ));
-            }
-            None => {
-                return Err(SessionError::new(
-                    ProtocolErrorCode::HelloDecode,
-                    "envelope carried no payload after hello".to_string(),
-                ));
-            }
-        };
-        // Volatile staging: the bounded buffer retains every accepted
-        // `IncomingEnvelope` so the matching `Ack` honestly reports
-        // `AckDurability::Staged`. The limit mirrors the architecture
-        // ingest capacity so an adapter that outpaces the daemon
-        // surfaces a sequence error instead of growing the buffer.
+        // Cross-layer preflight: the bounded staging buffer and the
+        // monotonic `session_seq` guard are checked before the
+        // validator runs so a later validator error cannot leave
+        // either field advanced without a matching staged envelope.
+        // `checked_add` is preferred over `saturating_add` because a
+        // sequence counter that silently stops advancing would mask
+        // a bug as success. The exhaustion is unreachable in practice
+        // because the session lifetime is bounded by the configured
+        // queue capacity and the admission control.
         if self.staged_incoming.len() >= STAGED_INCOMING_LIMIT {
             return Err(SessionError::new(
                 ProtocolErrorCode::SessionSequence,
                 "staged ingress capacity exhausted".to_string(),
             ));
         }
-        // Compute the next sequence value before mutating either
-        // field. An overflow leaves every session field unchanged so
-        // the connection cannot accidentally retain a staged envelope
-        // that the session then refuses to acknowledge: either the
-        // envelope is staged together with the advanced sequence, or
-        // neither field moves. `checked_add` is preferred over
-        // `saturating_add` because a sequence counter that silently
-        // stops advancing would mask a bug as success. The exhaustion
-        // is unreachable in practice because the session lifetime is
-        // bounded by the configured queue capacity and the admission
-        // control.
         let staged_seq = self.next_expected_seq;
         let next_seq = self.next_expected_seq.checked_add(1).ok_or_else(|| {
             SessionError::new(
@@ -550,10 +562,135 @@ impl Session {
                 "session_seq overflow".to_string(),
             )
         })?;
-        self.staged_incoming.push_back((staged_seq, incoming.clone()));
+
+        match &envelope.payload {
+            Some(wire::agent_envelope::Payload::CapabilitySet(set)) => {
+                let incoming = IncomingEnvelope::CapabilitySet(set.clone());
+                Ok(self.admit_simple(incoming, staged_seq, next_seq))
+            }
+            Some(wire::agent_envelope::Payload::Health(health)) => {
+                let incoming = IncomingEnvelope::Health(health.clone());
+                Ok(self.admit_simple(incoming, staged_seq, next_seq))
+            }
+            Some(wire::agent_envelope::Payload::RecordingStarted(started)) => {
+                let recording_id = decode_recording_id(&started.recording_id)
+                    .map_err(SessionError::with_ingest)?;
+                // Captured before `accept_started` so a `StartedRetry`
+                // verdict reports the watermark that was already on
+                // file.
+                let default_watermark = self.ingest_validator.highest_contiguous_seq(recording_id);
+                let acceptance = self
+                    .ingest_validator
+                    .accept_started(started)
+                    .map_err(SessionError::with_ingest)?;
+                let incoming = IncomingEnvelope::RecordingStarted(started.clone());
+                Ok(self.admit_recording(
+                    recording_id,
+                    incoming,
+                    acceptance,
+                    default_watermark,
+                    staged_seq,
+                    next_seq,
+                ))
+            }
+            Some(wire::agent_envelope::Payload::EventBatch(batch)) => {
+                let recording_id =
+                    decode_recording_id(&batch.recording_id).map_err(SessionError::with_ingest)?;
+                let acceptance = self
+                    .ingest_validator
+                    .accept_events(batch)
+                    .map_err(SessionError::with_ingest)?;
+                let incoming = IncomingEnvelope::EventBatch(batch.clone());
+                Ok(self.admit_recording(
+                    recording_id,
+                    incoming,
+                    acceptance,
+                    None,
+                    staged_seq,
+                    next_seq,
+                ))
+            }
+            Some(wire::agent_envelope::Payload::RecordingFinished(finished)) => {
+                let recording_id = decode_recording_id(&finished.recording_id)
+                    .map_err(SessionError::with_ingest)?;
+                // The just-validated `final_recording_seq` is the
+                // authoritative structural watermark for both
+                // `Finalizing` and `FinishedRetry`.
+                let structural_watermark = finished.final_recording_seq;
+                let acceptance = self
+                    .ingest_validator
+                    .accept_finished(finished)
+                    .map_err(SessionError::with_ingest)?;
+                let incoming = IncomingEnvelope::RecordingFinished(finished.clone());
+                Ok(self.admit_recording(
+                    recording_id,
+                    incoming,
+                    acceptance,
+                    Some(structural_watermark),
+                    staged_seq,
+                    next_seq,
+                ))
+            }
+            Some(wire::agent_envelope::Payload::ProtocolError(err)) => Err(SessionError::new(
+                ProtocolErrorCode::HelloDecode,
+                format!("adapter returned ProtocolError: {}", err.message),
+            )),
+            Some(other) => Err(SessionError::new(
+                ProtocolErrorCode::HelloDecode,
+                format!("unsupported payload after hello: {}", payload_kind(other)),
+            )),
+            None => Err(SessionError::new(
+                ProtocolErrorCode::HelloDecode,
+                "envelope carried no payload after hello".to_string(),
+            )),
+        }
+    }
+
+    /// Commits a `CapabilitySet` or `Health` envelope and returns the
+    /// matching [`PostHelloAdmission`] with an empty watermark map
+    /// because the validator does not examine these variants.
+    fn admit_simple(
+        &mut self,
+        incoming: IncomingEnvelope,
+        staged_seq: u64,
+        next_seq: u64,
+    ) -> PostHelloAdmission {
+        self.stage_committed(staged_seq, incoming.clone(), next_seq);
+        let ack = build_ack(next_seq - 1, std::collections::HashMap::new());
+        PostHelloAdmission { incoming, acceptance: None, command: OutgoingCommand::Ack(ack) }
+    }
+
+    /// Commits a recording variant envelope and returns the matching
+    /// [`PostHelloAdmission`] with a single-entry watermark map keyed
+    /// by the canonical lowercase UUID. See [`recording_watermark`]
+    /// for the per-variant seed contract.
+    fn admit_recording(
+        &mut self,
+        recording_id: RecordingId,
+        incoming: IncomingEnvelope,
+        acceptance: Acceptance,
+        watermark: Option<u64>,
+        staged_seq: u64,
+        next_seq: u64,
+    ) -> PostHelloAdmission {
+        let watermark = recording_watermark(&acceptance, watermark);
+        let mut recording_watermarks = std::collections::HashMap::with_capacity(1);
+        recording_watermarks.insert(recording_id.as_string(), watermark);
+        self.stage_committed(staged_seq, incoming.clone(), next_seq);
+        let ack = build_ack(next_seq - 1, recording_watermarks);
+        PostHelloAdmission {
+            incoming,
+            acceptance: Some(acceptance),
+            command: OutgoingCommand::Ack(ack),
+        }
+    }
+
+    /// Commits the staged envelope and the advanced sequence in one
+    /// step. Any validator error causes this helper to be skipped, so
+    /// a partially admitted envelope is unreachable.
+    fn stage_committed(&mut self, staged_seq: u64, incoming: IncomingEnvelope, next_seq: u64) {
+        self.staged_incoming.push_back((staged_seq, incoming));
         self.next_expected_seq = next_seq;
-        let ack = build_ack(next_seq - 1);
-        Ok((incoming, OutgoingCommand::Ack(ack)))
     }
 
     /// Returns the next outgoing `Health` message the supervisor
@@ -627,19 +764,29 @@ fn payload_kind(payload: &wire::agent_envelope::Payload) -> &'static str {
     }
 }
 
-fn build_ack(highest_session_seq: u64) -> Ack {
-    // Successful acknowledgement carries an empty `rejected` list.
-    // A message is rejected when it explicitly violates a stable rule;
-    // honest acknowledgement does not stamp the message id with a
-    // empty reason code because that is semantically a rejection.
+fn build_ack(
+    highest_session_seq: u64,
+    recording_watermarks: std::collections::HashMap<String, u64>,
+) -> Ack {
+    // Successful acknowledgement carries an empty `rejected` list
+    // because a message is only rejected when it explicitly violates
+    // a stable rule; honest acknowledgement never stamps an empty
+    // reason code on the message id.
     //
     // `AckDurability::Staged` documents that the acknowledged data is
-    // held in connection/session memory (not on durable storage) and
-    // is therefore volatile; nothing in this crate ever reports it as
-    // committed until a future slice wires the real ingester.
+    // held in connection/session memory and is therefore volatile;
+    // nothing in this crate ever reports it as committed.
+    //
+    // `highest_contiguous_recording_seq` carries the canonical
+    // lowercase UUID of every accepted recording alongside its
+    // current highest contiguous `recording_seq` watermark, or an
+    // empty map for non-recording envelopes. Every key is the
+    // canonical UUID form rendered from the validated
+    // [`xtrace_domain::RecordingId`] rather than from the wire bytes,
+    // and every recording ACK carries exactly one entry.
     Ack {
         highest_contiguous_session_seq: highest_session_seq,
-        highest_contiguous_recording_seq: Default::default(),
+        highest_contiguous_recording_seq: recording_watermarks,
         durability: AckDurability::Staged as i32,
         rejected: Vec::new(),
     }
@@ -647,23 +794,51 @@ fn build_ack(highest_session_seq: u64) -> Ack {
 
 /// Failure mode of a session state transition. The supervisor maps
 /// the [`ProtocolErrorCode`] to a stable `ProtocolError` envelope and
-/// closes the connection.
+/// closes the connection (or, for a recoverable ingest rejection,
+/// continues the loop so the adapter can retry the same
+/// `session_seq`).
 #[derive(Debug)]
 pub struct SessionError {
-    /// Stable `XTR-DAEMON-*` code that maps directly onto the wire
-    /// `ProtocolError.code` field. Carrying it on the error struct
-    /// avoids string parsing on the supervisor side.
+    /// Stable wire code. Always an `XTR-DAEMON-*` value except when
+    /// the wired `xtrace-ingest` validator rejected the envelope, in
+    /// which case it is `XTR-CAPTURE-INGEST`.
     pub code: ProtocolErrorCode,
     /// Human-readable diagnostic that never embeds a captured value,
-    /// secret, or peer-supplied identifier.
+    /// secret, or peer-supplied identifier. When
+    /// [`SessionError::ingest_error`] is `Some`, the diagnostic names
+    /// the [`xtrace_ingest::IngestError`] variant rather than any
+    /// payload bytes.
     pub detail: String,
+    /// Typed [`xtrace_ingest::IngestError`] retained for callers that
+    /// need to inspect the underlying reason; always `Some(_)` when
+    /// `code == ProtocolErrorCode::CaptureIngest`.
+    ingest: Option<IngestError>,
 }
 
 impl SessionError {
-    /// Builds a session error from a raw `(code, detail)` pair.
+    /// Builds a session error from a raw `(code, detail)` pair with
+    /// no attached ingest reason.
     #[must_use]
     pub const fn new(code: ProtocolErrorCode, detail: String) -> Self {
-        Self { code, detail }
+        Self { code, detail, ingest: None }
+    }
+
+    /// Builds a session error that retains the typed
+    /// [`xtrace_ingest::IngestError`] returned by the wired validator.
+    /// The session-level code is always
+    /// [`ProtocolErrorCode::CaptureIngest`].
+    #[must_use]
+    pub fn with_ingest(err: IngestError) -> Self {
+        let detail = format!("ingest rejection: {}", ingest_variant_name(&err));
+        Self { code: ProtocolErrorCode::CaptureIngest, detail, ingest: Some(err) }
+    }
+
+    /// Returns the typed [`xtrace_ingest::IngestError`] when this
+    /// error was produced by the session-bound validator, or `None`
+    /// for every other failure mode.
+    #[must_use]
+    pub fn ingest_error(&self) -> Option<&IngestError> {
+        self.ingest.as_ref()
     }
 
     /// Converts an envelope-decoding failure into a session error.
@@ -680,7 +855,7 @@ impl SessionError {
             }
             _ => fallback,
         };
-        Self { code, detail: format!("{err}") }
+        Self { code, detail: format!("{err}"), ingest: None }
     }
 
     /// Renders the error into the wire `ProtocolError` envelope.
@@ -700,7 +875,62 @@ impl std::fmt::Display for SessionError {
     }
 }
 
-impl std::error::Error for SessionError {}
+impl std::error::Error for SessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.ingest.as_ref().map(|err| err as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// Names the [`xtrace_ingest::IngestError`] variant without leaking
+/// any captured value into the operator-facing detail.
+fn ingest_variant_name(err: &IngestError) -> &'static str {
+    match err {
+        IngestError::InvalidStartSeq { .. } => "invalid_start_seq",
+        IngestError::UnknownRecording(_) => "unknown_recording",
+        IngestError::NonMonotonicBatch { .. } => "non_monotonic_batch",
+        IngestError::InvalidRecordingId { .. } => "invalid_recording_id",
+        IngestError::ReplayPayloadMismatch { .. } => "replay_payload_mismatch",
+        IngestError::RetransmissionNeeded { .. } => "retransmission_needed",
+        IngestError::EventAfterFinalization { .. } => "event_after_finalization",
+        IngestError::FinishSeqMismatch { .. } => "finish_seq_mismatch",
+        IngestError::StartedConflict(_) => "started_conflict",
+        IngestError::FinishedConflict(_) => "finished_conflict",
+        IngestError::ActiveCapacityReached { .. } => "active_capacity_reached",
+        IngestError::EventCapacityReached { .. } => "event_capacity_reached",
+    }
+}
+
+/// Decodes a wire `recording_id` byte string into a typed
+/// [`RecordingId`]; returns the same
+/// [`xtrace_ingest::IngestError::InvalidRecordingId`] the validator
+/// would produce for the same input.
+fn decode_recording_id(bytes: &[u8]) -> Result<RecordingId, IngestError> {
+    if bytes.len() != 16 {
+        return Err(IngestError::InvalidRecordingId { got: bytes.len() });
+    }
+    let uuid = Uuid::from_slice(bytes)
+        .map_err(|_| IngestError::InvalidRecordingId { got: bytes.len() })?;
+    Ok(RecordingId::from_uuid(uuid))
+}
+
+/// Computes the `recording_seq` watermark the session reports on the
+/// matching `Ack`. `watermark` is the seed passed in by the caller:
+/// the pre-call `highest_contiguous_seq` for `RecordingStarted`, and
+/// the just-validated `final_recording_seq` for `RecordingFinished`.
+/// `EventBatch` ignores the seed because the verdict carries its own
+/// `highest_contiguous`. The `unwrap_or(1)` fallback is defensive
+/// and unreachable on the production path: a successful
+/// `accept_started` always leaves the validator with a non-`None`
+/// entry, and `final_recording_seq` is at least 1 when
+/// `accept_finished` returns `Ok`.
+fn recording_watermark(acceptance: &Acceptance, watermark: Option<u64>) -> u64 {
+    match acceptance {
+        Acceptance::Started => 1,
+        Acceptance::StartedRetry => watermark.unwrap_or(1),
+        Acceptance::Events { highest_contiguous, .. } => *highest_contiguous,
+        Acceptance::Finalizing | Acceptance::FinishedRetry => watermark.unwrap_or(1),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1170,14 +1400,15 @@ mod tests {
                 status: "ok".to_string(),
             }),
         );
-        let (_incoming, cmd) = session.accept_post_hello(&envelope).expect("accept");
-        let ack = match cmd {
+        let admission = session.accept_post_hello(&envelope).expect("accept");
+        let ack = match admission.command {
             OutgoingCommand::Ack(ack) => ack,
             other => unreachable!("expected Ack, got {other:?}"),
         };
         assert!(ack.rejected.is_empty());
         assert_eq!(ack.highest_contiguous_session_seq, 1);
         assert_eq!(ack.durability, AckDurability::Staged as i32);
+        assert!(admission.acceptance.is_none(), "Health envelopes must not produce a verdict");
     }
 
     /// [`AckDurability::Staged`] is only honest when the session has
@@ -1204,11 +1435,12 @@ mod tests {
                     status: format!("seq-{seq}"),
                 }),
             );
-            let (_incoming, cmd) = session.accept_post_hello(&envelope).expect("accept");
-            match cmd {
+            let admission = session.accept_post_hello(&envelope).expect("accept");
+            match admission.command {
                 OutgoingCommand::Ack(_) => {}
                 other => unreachable!("expected Ack, got {other:?}"),
             }
+            assert!(admission.acceptance.is_none(), "Health envelopes must not produce a verdict");
         }
         assert_eq!(session.staged_incoming.len(), 3, "every accepted envelope must be staged");
         let staged = &session.staged_incoming;
@@ -1273,74 +1505,53 @@ mod tests {
     #[test]
     fn accept_post_hello_admits_recording_wire_payloads_in_order() {
         // Invariant: every accepted recording payload is staged under
-        // its `session_seq` and acknowledged as `Staged`.
-        fn admit(
-            session: &mut Session,
-            session_id: RuntimeSessionId,
-            seq: u64,
-            payload: PayloadOneof,
-        ) -> IncomingEnvelope {
-            let envelope = envelope_with_payload(session_id, seq, payload);
-            let (incoming, cmd) = session.accept_post_hello(&envelope).expect("admit");
-            match cmd {
-                OutgoingCommand::Ack(ack) => {
-                    assert_eq!(ack.highest_contiguous_session_seq, seq);
-                    assert_eq!(ack.durability, AckDurability::Staged as i32);
-                    assert!(ack.rejected.is_empty());
-                }
-                other => unreachable!("expected Ack, got {other:?}"),
-            }
-            incoming
-        }
-
+        // its `session_seq`, carries the canonical recording
+        // watermark on the matching `Ack`, exposes the typed
+        // `Acceptance` verdict, and is acknowledged as `Staged`.
         let (mut session, session_id, _) = session_after_hello();
-        assert!(session.staged_incoming.is_empty());
+        let key = canonical_key(0x01);
 
-        let recording_id = Bytes::copy_from_slice(&[0x01; 16]);
-        let started_payload = PayloadOneof::RecordingStarted(wire::RecordingStarted {
-            recording_id: recording_id.clone(),
-            method: "GET".to_string(),
-            ..wire::RecordingStarted::default()
-        });
-        let batch_payload = PayloadOneof::EventBatch(wire::EventBatch {
-            recording_id: recording_id.clone(),
-            events: vec![wire::RecordingEvent {
-                event_id: "ev-1".to_string(),
-                recording_seq: 7,
-                ..wire::RecordingEvent::default()
-            }],
-        });
-        let finished_payload = PayloadOneof::RecordingFinished(wire::RecordingFinished {
-            recording_id,
-            final_recording_seq: 7,
-            ..wire::RecordingFinished::default()
-        });
+        let start = session
+            .accept_post_hello(&envelope_with_payload(
+                session_id,
+                1,
+                PayloadOneof::RecordingStarted(valid_started(0x01)),
+            ))
+            .expect("start");
+        let batch = session
+            .accept_post_hello(&envelope_with_payload(
+                session_id,
+                2,
+                PayloadOneof::EventBatch(batch_with(0x01, vec![event(2, 0xaa)])),
+            ))
+            .expect("batch");
+        let finish = session
+            .accept_post_hello(&envelope_with_payload(
+                session_id,
+                3,
+                PayloadOneof::RecordingFinished(finished(0x01, 2)),
+            ))
+            .expect("finish");
 
-        let started = admit(&mut session, session_id, 1, started_payload);
-        let batch = admit(&mut session, session_id, 2, batch_payload);
-        let finished = admit(&mut session, session_id, 3, finished_payload);
+        assert!(matches!(start.acceptance, Some(Acceptance::Started)));
+        assert!(matches!(
+            batch.acceptance,
+            Some(Acceptance::Events { accepted: 1, duplicates: 0, highest_contiguous: 2 })
+        ));
+        assert!(matches!(finish.acceptance, Some(Acceptance::Finalizing)));
 
-        match started {
-            IncomingEnvelope::RecordingStarted(s) => assert_eq!(s.method, "GET"),
-            other => unreachable!("expected RecordingStarted, got {other:?}"),
-        }
-        match batch {
-            IncomingEnvelope::EventBatch(b) => {
-                assert_eq!(b.events.len(), 1);
-                assert_eq!(b.events[0].event_id, "ev-1");
-                assert_eq!(b.events[0].recording_seq, 7);
-            }
-            other => unreachable!("expected EventBatch, got {other:?}"),
-        }
-        match finished {
-            IncomingEnvelope::RecordingFinished(f) => assert_eq!(f.final_recording_seq, 7),
-            other => unreachable!("expected RecordingFinished, got {other:?}"),
+        // Every recording ACK carries exactly one canonical watermark
+        // keyed by the lowercase UUID string.
+        let expected = [(&start, 1u64), (&batch, 2), (&finish, 2)];
+        for (admission, watermark) in expected {
+            let map = watermarks(admission);
+            assert_eq!(map.len(), 1, "exactly one recording watermark per ACK");
+            assert_eq!(map.get(&key), Some(&watermark));
+            assert!(map.keys().all(|k| k == &key));
         }
 
-        let staged = &session.staged_incoming;
-        assert_eq!(staged.len(), 3);
-        assert!(staged.iter().zip(1u64..).all(|((s, _), i)| *s == i));
         assert_eq!(session.next_expected_seq, 4);
+        assert_eq!(session.staged_incoming.len(), 3);
     }
 
     #[test]
@@ -1367,21 +1578,28 @@ mod tests {
         assert!(session.staged_incoming.is_empty());
         assert_eq!(session.next_expected_seq, before_seq);
 
-        // A subsequent recording payload at the same sequence is
-        // still admissible: the prior rejection must not have
-        // burned the sequence slot.
+        // A subsequent recording payload at the same sequence is still
+        // admissible: the prior rejection must not have burned the
+        // sequence slot. The fixture uses the minimum valid
+        // recording start so the wired validator accepts it.
+        let recording_id = Bytes::copy_from_slice(&[0x01; 16]);
         let started = envelope_with_payload(
             session_id,
             1,
-            PayloadOneof::RecordingStarted(wire::RecordingStarted::default()),
+            PayloadOneof::RecordingStarted(wire::RecordingStarted {
+                recording_id: recording_id.clone(),
+                recording_seq: 1,
+                ..wire::RecordingStarted::default()
+            }),
         );
-        let (_incoming, cmd) = session.accept_post_hello(&started).expect("admit");
-        let ack = match cmd {
+        let admission = session.accept_post_hello(&started).expect("admit");
+        let ack = match admission.command {
             OutgoingCommand::Ack(ack) => ack,
             other => unreachable!("expected Ack, got {other:?}"),
         };
         assert_eq!(ack.highest_contiguous_session_seq, 1);
         assert_eq!(ack.durability, AckDurability::Staged as i32);
+        assert!(ack.rejected.is_empty());
         assert_eq!(session.staged_incoming.len(), 1);
         assert_eq!(session.next_expected_seq, before_seq + 1);
     }
@@ -1530,5 +1748,324 @@ mod tests {
         );
         let err = session.accept_adapter_hello(&envelope).unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::HelloDecode);
+    }
+
+    // Helpers shared by the new ingest integration cases.
+    fn rid_bytes(seed: u8) -> Bytes {
+        Bytes::copy_from_slice(&[seed; 16])
+    }
+
+    fn valid_started(seed: u8) -> wire::RecordingStarted {
+        wire::RecordingStarted {
+            recording_id: rid_bytes(seed),
+            recording_seq: 1,
+            method: "GET".to_string(),
+            ..wire::RecordingStarted::default()
+        }
+    }
+
+    fn event(seq: u64, body: u8) -> wire::RecordingEvent {
+        wire::RecordingEvent {
+            event_id: format!("ev-{body}"),
+            recording_seq: seq,
+            ..wire::RecordingEvent::default()
+        }
+    }
+
+    fn batch_with(seed: u8, events: Vec<wire::RecordingEvent>) -> wire::EventBatch {
+        wire::EventBatch { recording_id: rid_bytes(seed), events }
+    }
+
+    fn finished(seed: u8, final_seq: u64) -> wire::RecordingFinished {
+        wire::RecordingFinished {
+            recording_id: rid_bytes(seed),
+            final_recording_seq: final_seq,
+            ..wire::RecordingFinished::default()
+        }
+    }
+
+    fn canonical_key(seed: u8) -> String {
+        xtrace_domain::RecordingId::from_uuid(uuid::Uuid::from_bytes([seed; 16])).as_string()
+    }
+
+    fn watermarks(admission: &PostHelloAdmission) -> &std::collections::HashMap<String, u64> {
+        match &admission.command {
+            OutgoingCommand::Ack(ack) => &ack.highest_contiguous_recording_seq,
+            other => unreachable!("expected Ack, got {other:?}"),
+        }
+    }
+
+    fn drive(session: &mut Session, sid: RuntimeSessionId, seq: u64, payload: PayloadOneof) {
+        let envelope = envelope_with_payload(sid, seq, payload);
+        session.accept_post_hello(&envelope).expect("drive must admit");
+    }
+
+    #[test]
+    fn accept_post_hello_interleaves_two_recording_ids_independently() {
+        let (mut session, sid, _) = session_after_hello();
+        let key_a = canonical_key(0xa1);
+        let key_b = canonical_key(0xb2);
+
+        let timeline = [
+            (1u64, PayloadOneof::RecordingStarted(valid_started(0xa1)), key_a.clone(), 1u64),
+            (2, PayloadOneof::RecordingStarted(valid_started(0xb2)), key_b.clone(), 1),
+            (3, PayloadOneof::EventBatch(batch_with(0xa1, vec![event(2, 0x01)])), key_a.clone(), 2),
+            (4, PayloadOneof::EventBatch(batch_with(0xb2, vec![event(2, 0x02)])), key_b.clone(), 2),
+            (5, PayloadOneof::EventBatch(batch_with(0xa1, vec![event(3, 0x03)])), key_a.clone(), 3),
+            (6, PayloadOneof::RecordingFinished(finished(0xb2, 2)), key_b, 2),
+            (7, PayloadOneof::RecordingFinished(finished(0xa1, 3)), key_a, 3),
+        ];
+
+        let mut previous = 0u64;
+        for (seq, payload, key, expected_watermark) in timeline {
+            let envelope = envelope_with_payload(sid, seq, payload);
+            let a = session.accept_post_hello(&envelope).expect("admit");
+            assert_eq!(seq, previous + 1);
+            previous = seq;
+            let map = watermarks(&a);
+            assert_eq!(map.len(), 1);
+            assert_eq!(map.get(&key), Some(&expected_watermark));
+        }
+
+        assert_eq!(session.next_expected_seq, 8);
+        assert_eq!(session.ingest_validator().len(), 2);
+    }
+
+    #[test]
+    fn accept_post_hello_recording_retries_do_not_burn_watermark() {
+        let (mut session, sid, _) = session_after_hello();
+        let key = canonical_key(0xc3);
+
+        for (seq, payload) in [
+            (1u64, PayloadOneof::RecordingStarted(valid_started(0xc3))),
+            (2, PayloadOneof::EventBatch(batch_with(0xc3, vec![event(2, 0xaa), event(3, 0xab)]))),
+            (3, PayloadOneof::RecordingFinished(finished(0xc3, 3))),
+        ] {
+            drive(&mut session, sid, seq, payload);
+        }
+
+        let start = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                4,
+                PayloadOneof::RecordingStarted(valid_started(0xc3)),
+            ))
+            .expect("retry start");
+        assert!(matches!(start.acceptance, Some(Acceptance::StartedRetry)));
+        assert_eq!(watermarks(&start).get(&key), Some(&3));
+
+        let batch = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                5,
+                PayloadOneof::EventBatch(batch_with(0xc3, vec![event(2, 0xaa), event(3, 0xab)])),
+            ))
+            .expect("retry batch");
+        assert!(matches!(
+            batch.acceptance,
+            Some(Acceptance::Events { accepted: 0, duplicates: 2, highest_contiguous: 3 })
+        ));
+        assert_eq!(watermarks(&batch).get(&key), Some(&3));
+
+        let finish = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                6,
+                PayloadOneof::RecordingFinished(finished(0xc3, 3)),
+            ))
+            .expect("retry finish");
+        assert!(matches!(finish.acceptance, Some(Acceptance::FinishedRetry)));
+        assert_eq!(watermarks(&finish).get(&key), Some(&3));
+
+        assert_eq!(session.next_expected_seq, 7);
+    }
+
+    /// Compact rejection table: every representative cross-layer
+    /// failure surfaces `XTR-CAPTURE-INGEST`, leaves the typed cause
+    /// inspectable through `ingest_error()`, preserves the staging
+    /// buffer and sequence counter, and accepts a corrected envelope
+    /// at the same `session_seq`. Exhaustive variant coverage lives in
+    /// `xtrace-ingest`; this test only proves the cross-layer
+    /// projection.
+    #[test]
+    fn accept_post_hello_recording_rejections_preserve_session_state() {
+        struct Case {
+            name: &'static str,
+            setup: Vec<PayloadOneof>,
+            rejected: PayloadOneof,
+            assert: fn(&IngestError),
+        }
+        let cases = [
+            Case {
+                name: "malformed_id",
+                setup: Vec::new(),
+                rejected: PayloadOneof::RecordingStarted(wire::RecordingStarted {
+                    recording_id: Bytes::copy_from_slice(&[0xab; 15]),
+                    recording_seq: 1,
+                    method: "GET".to_string(),
+                    ..wire::RecordingStarted::default()
+                }),
+                assert: |err| assert!(matches!(err, IngestError::InvalidRecordingId { got: 15 })),
+            },
+            Case {
+                name: "recoverable_gap",
+                setup: vec![PayloadOneof::RecordingStarted(valid_started(0x01))],
+                rejected: PayloadOneof::EventBatch(batch_with(0x01, vec![event(4, 0xaa)])),
+                assert: |err| assert!(matches!(err, IngestError::RetransmissionNeeded { .. })),
+            },
+            Case {
+                name: "fatal_changed_replay",
+                setup: vec![
+                    PayloadOneof::RecordingStarted(valid_started(0x01)),
+                    PayloadOneof::EventBatch(batch_with(0x01, vec![event(2, 0xaa)])),
+                ],
+                rejected: PayloadOneof::EventBatch(batch_with(0x01, vec![event(2, 0xff)])),
+                assert: |err| assert!(matches!(err, IngestError::ReplayPayloadMismatch { .. })),
+            },
+            Case {
+                name: "finish_mismatch",
+                setup: vec![PayloadOneof::RecordingStarted(valid_started(0x01))],
+                rejected: PayloadOneof::RecordingFinished(finished(0x01, 99)),
+                assert: |err| assert!(matches!(err, IngestError::FinishSeqMismatch { .. })),
+            },
+            Case {
+                name: "event_after_finalization",
+                setup: vec![
+                    PayloadOneof::RecordingStarted(valid_started(0x01)),
+                    PayloadOneof::EventBatch(batch_with(0x01, vec![event(2, 0xaa)])),
+                    PayloadOneof::RecordingFinished(finished(0x01, 2)),
+                ],
+                rejected: PayloadOneof::EventBatch(batch_with(0x01, vec![event(3, 0xab)])),
+                assert: |err| assert!(matches!(err, IngestError::EventAfterFinalization { .. })),
+            },
+        ];
+
+        for case in &cases {
+            let Case { name, setup, rejected, assert } = case;
+            let mut session = session_after_hello().0;
+            let sid = session.inputs().runtime_session_id;
+            for setup_payload in setup {
+                let seq = session.next_expected_seq;
+                session
+                    .accept_post_hello(&envelope_with_payload(sid, seq, setup_payload.clone()))
+                    .expect("setup");
+            }
+            let before_seq = session.next_expected_seq;
+            let before_staged = session.staged_incoming.len();
+            let err = session
+                .accept_post_hello(&envelope_with_payload(sid, before_seq, rejected.clone()))
+                .unwrap_err();
+
+            assert_eq!(err.code, ProtocolErrorCode::CaptureIngest, "case {name}: code");
+            assert!(err.detail.starts_with("ingest rejection: "));
+            assert!(!err.detail.contains("GET") && !err.detail.contains("ev-"));
+            assert(err.ingest_error().expect("typed ingest retained"));
+            assert!(std::error::Error::source(&err).is_some());
+            assert_eq!(session.next_expected_seq, before_seq);
+            assert_eq!(session.staged_incoming.len(), before_staged);
+
+            // A corrected envelope at the same session_seq succeeds, proving the
+            // slot was not burned.
+            let a = session
+                .accept_post_hello(&envelope_with_payload(
+                    sid,
+                    before_seq,
+                    PayloadOneof::RecordingStarted(valid_started(0x01)),
+                ))
+                .expect("corrected");
+            assert!(watermarks(&a).contains_key(&canonical_key(0x01)));
+            assert_eq!(session.next_expected_seq, before_seq + 1);
+        }
+    }
+
+    #[test]
+    fn accept_post_hello_capacity_rejections_leave_session_untouched() {
+        // Active capacity reached: a second start is rejected without
+        // disturbing the first recording.
+        let mut session = session_with_ingest(IngestConfig::new(NonZeroUsize::new(1).unwrap()));
+        let sid = session.inputs().runtime_session_id;
+        drive(&mut session, sid, 1, PayloadOneof::RecordingStarted(valid_started(0x01)));
+        let err = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                2,
+                PayloadOneof::RecordingStarted(valid_started(0x02)),
+            ))
+            .unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::CaptureIngest);
+        assert!(matches!(err.ingest_error(), Some(IngestError::ActiveCapacityReached { .. })));
+        assert_eq!(session.next_expected_seq, 2);
+        assert_eq!(session.staged_incoming.len(), 1);
+
+        // Event capacity reached: a single-event budget refuses a
+        // contiguous new event without disturbing the digest table.
+        let mut session = session_with_ingest(
+            IngestConfig::new(NonZeroUsize::new(8).unwrap())
+                .with_limit(NonZeroUsize::new(1).unwrap()),
+        );
+        let sid = session.inputs().runtime_session_id;
+        drive(&mut session, sid, 1, PayloadOneof::RecordingStarted(valid_started(0x01)));
+        drive(
+            &mut session,
+            sid,
+            2,
+            PayloadOneof::EventBatch(batch_with(0x01, vec![event(2, 0xaa)])),
+        );
+        let err = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                3,
+                PayloadOneof::EventBatch(batch_with(0x01, vec![event(3, 0xab)])),
+            ))
+            .unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::CaptureIngest);
+        assert!(matches!(err.ingest_error(), Some(IngestError::EventCapacityReached { .. })));
+        assert_eq!(session.next_expected_seq, 3);
+
+        // Default `Session::new` sizes `max_active_recordings` to the
+        // staging limit (every recording consumes at least one
+        // `RecordingStarted` envelope).
+        let session = Session::new(sample_inputs(vec![0xab; 32]));
+        assert_eq!(
+            session.ingest_validator().config().max_active_recordings.get(),
+            STAGED_INCOMING_LIMIT,
+        );
+    }
+
+    fn session_with_ingest(ingest_config: IngestConfig) -> Session {
+        let mut inputs = sample_inputs(vec![0xab; 32]);
+        inputs.session_secret = SessionSecret::from_bytes(&[0xab; 32]).expect("secret");
+        let mut session = Session::new_with_ingest_config(inputs, ingest_config);
+        let sid = session.inputs().runtime_session_id;
+        let secret = session.inputs().session_secret.read_secret().to_vec();
+        let hello = sample_adapter_hello(&session, &secret, CANONICAL_MANIFEST);
+        session
+            .accept_adapter_hello(&envelope_with_payload(sid, 0, PayloadOneof::AdapterHello(hello)))
+            .expect("hello");
+        session
+    }
+
+    #[test]
+    fn session_error_with_ingest_maps_to_xtr_capture_ingest() {
+        let err = SessionError::with_ingest(IngestError::InvalidStartSeq {
+            recording_id: xtrace_domain::RecordingId::from_uuid(uuid::Uuid::from_bytes([0x42; 16])),
+            got: 9,
+        });
+        assert_eq!(err.code.as_str(), "XTR-CAPTURE-INGEST");
+        assert!(err.detail.contains("invalid_start_seq"));
+        assert!(
+            !err.detail.contains("42"),
+            "detail must not embed recording bytes: {:?}",
+            err.detail
+        );
+        let ingest = err.ingest_error().expect("typed ingest retained");
+        assert!(matches!(ingest, IngestError::InvalidStartSeq { got: 9, .. }));
+        let wire = err.to_protocol_error();
+        assert_eq!(wire.code, "XTR-CAPTURE-INGEST");
+        assert!(std::error::Error::source(&err).is_some());
+
+        let plain = SessionError::new(ProtocolErrorCode::SessionSequence, "gap".to_string());
+        assert!(plain.ingest_error().is_none());
+        assert!(std::error::Error::source(&plain).is_none());
     }
 }

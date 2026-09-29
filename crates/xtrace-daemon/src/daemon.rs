@@ -675,30 +675,50 @@ async fn handle_connection(
                         }
                     };
                     match post_hello_session.accept_post_hello(&envelope) {
-                        Ok((_incoming, ack)) => {
+                        Ok(admission) => {
                             let frame = OutboundFrame {
-                                payload: ack.into_envelope_payload(),
+                                payload: admission.command.into_envelope_payload(),
                             };
                             if post_hello_tx.send(frame).await.is_err() {
                                 return Ok(());
                             }
                         }
                         Err(err) => {
-                            // Deliver the documented ProtocolError to
-                            // the adapter before the connection tears
-                            // down. The frame goes through the same
-                            // writer task so it is sequenced with any
-                            // in-flight Health or ACK frames; the
-                            // teardown below waits for the writer to
-                            // drain the channel before the TLS stream
-                            // is dropped.
+                            // The post-hello loop has two control
+                            // branches on `Err`:
+                            //
+                            // 1. A recoverable ingest rejection
+                            //    (typed via `ingest_error()` and not
+                            //    session-fatal): deliver the safe
+                            //    `XTR-CAPTURE-INGEST` `ProtocolError`
+                            //    and continue the loop so a corrected
+                            //    envelope at the same `session_seq`
+                            //    can succeed. The session left its
+                            //    state untouched.
+                            // 2. A session-fatal ingest rejection or
+                            //    any non-ingest error: deliver the
+                            //    safe variant-only `ProtocolError`
+                            //    and close the connection.
+                            //
+                            // The frame goes through the same writer
+                            // task so it is sequenced with any
+                            // in-flight Health or ACK frames. If the
+                            // send fails the writer or peer is gone
+                            // and the loop has nothing left to do.
+                            // No retransmit `CaptureCommand` is
+                            // emitted in this slice.
+                            let recoverable_ingest = err
+                                .ingest_error()
+                                .is_some_and(|ingest| !ingest.is_session_fatal());
                             let frame = OutboundFrame {
-                                payload: PayloadOneof::ProtocolError(
-                                    err.to_protocol_error(),
-                                ),
+                                payload: PayloadOneof::ProtocolError(err.to_protocol_error()),
                             };
-                            let _ = post_hello_tx.send(frame).await;
-                            return Err(err);
+                            if post_hello_tx.send(frame).await.is_err() {
+                                return Ok(());
+                            }
+                            if !recoverable_ingest {
+                                return Err(err);
+                            }
                         }
                     }
                 }
