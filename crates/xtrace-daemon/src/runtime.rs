@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
 use xtrace_protocol::generated::agent::{CapabilitySet, DaemonHello, Health, ProtocolError};
-use xtrace_protocol::handshake::verify_transcript_proof;
+use xtrace_protocol::handshake::{ZERO_NONCE, project_context, verify_transcript_proof};
 
 #[cfg(test)]
 use prost::bytes::Bytes;
@@ -106,58 +106,58 @@ pub fn verify_adapter_hello(
     session_secret: &[u8],
     tls_exporter: &[u8],
     runtime_session_id: &[u8],
+    project_id: &[u8],
     hello: &xtrace_protocol::generated::agent::AdapterHello,
 ) -> Result<(), xtrace_protocol::handshake::TranscriptProofError> {
+    let ctx = project_context(project_id);
+    // The adapter does not know the daemon's server nonce when it
+    // emits `AdapterHello`, so the inbound direction uses the
+    // documented zero placeholder for that field. Both sides agree
+    // on the placeholder length so the HMAC layout stays canonical.
     verify_transcript_proof(
         session_secret,
         tls_exporter,
         runtime_session_id,
         &hello.client_nonce,
-        // `server_nonce` is not yet established when the adapter sends
-        // AdapterHello; the daemon supplies its own non-zero nonce in
-        // `DaemonHello` and verifies the client proof using that
-        // nonce during the inbound `AdapterHello` exchange. For the
-        // inbound verification we substitute a fixed zero nonce so
-        // the byte layout matches the wire helper exactly; the same
-        // canonical layout is reused on the outbound direction.
-        &[0u8; 32],
+        &ZERO_NONCE,
         hello.manifest_digest.as_bytes(),
+        &ctx,
         &hello.hmac,
     )
 }
 
 /// Inverse helper: the daemon computes the [`DaemonHello`] HMAC using
-/// the server nonce and the same canonical layout. Returns the
-/// 32-byte tag.
+/// the real client nonce (recovered from the validated `AdapterHello`)
+/// and the daemon's own server nonce. The transcript proof no longer
+/// carries any zero-nonce placeholder.
 ///
 /// # Errors
 ///
 /// Returns the same [`xtrace_protocol::handshake::TranscriptProofError`]
 /// variant as `compute_transcript_proof` when the underlying HMAC
-/// primitive refuses the supplied key. The 256-bit session secret
-/// is always within SHA-256's block-size bound so the error path
-/// is unreachable in production; the result is reported rather than
+/// primitive refuses the supplied key. The 256-bit session secret is
+/// always within SHA-256's block-size bound so the error path is
+/// unreachable in production; the result is reported rather than
 /// panicked because library code must not call `expect`.
 #[must_use = "compute_daemon_hello_proof returns a Result that the supervisor must propagate"]
 pub fn compute_daemon_hello_proof(
     session_secret: &[u8],
     tls_exporter: &[u8],
     runtime_session_id: &[u8],
+    project_id: &[u8],
+    client_nonce: &[u8],
     server_nonce: &[u8],
     manifest_digest: &[u8],
 ) -> Result<[u8; 32], xtrace_protocol::handshake::TranscriptProofError> {
+    let ctx = project_context(project_id);
     xtrace_protocol::handshake::compute_transcript_proof(
         session_secret,
         tls_exporter,
         runtime_session_id,
-        // The client nonce is unknown to the daemon when computing
-        // its own outbound HMAC, but the canonical layout requires a
-        // fixed-length chunk. We substitute the documented zero
-        // nonce so the byte layout is identical to the inbound
-        // direction; the adapter verifies using its own nonce.
-        &[0u8; 32],
+        client_nonce,
         server_nonce,
         manifest_digest,
+        &ctx,
     )
 }
 
@@ -216,17 +216,19 @@ mod tests {
         let secret = b"a]8=ZxW6Mf7n3Q!2";
         let exporter = b"tls-exporter-bytes";
         let session = b"01900000-0000-0000-0000-000000000000";
+        let project = b"01900000-0000-7000-8000-000000000000";
         let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
-        // Inbound direction (AdapterHello uses the placeholder
-        // server nonce because the server nonce is unknown yet).
-        let client_nonce = [0xaa_u8; 16];
+        // Inbound direction: AdapterHello uses the placeholder
+        // server nonce because the server nonce is unknown yet.
+        let client_nonce = [0xaa_u8; 32];
         let adapter_proof = xtrace_protocol::handshake::compute_transcript_proof(
             secret,
             exporter,
             session,
             &client_nonce,
-            &[0u8; 32],
+            &xtrace_protocol::handshake::ZERO_NONCE,
             manifest,
+            &xtrace_protocol::handshake::project_context(project),
         )
         .expect("HMAC accepts the test secret");
         let hello = xtrace_protocol::generated::agent::AdapterHello {
@@ -247,14 +249,23 @@ mod tests {
             client_nonce: Bytes::copy_from_slice(&client_nonce),
             hmac: Bytes::copy_from_slice(&adapter_proof),
         };
-        verify_adapter_hello(secret, exporter, session, &hello).expect("verify");
+        verify_adapter_hello(secret, exporter, session, project, &hello).expect("verify");
 
-        // Outbound direction (DaemonHello uses the real server
-        // nonce and the placeholder client nonce).
-        let server_nonce = [0xbb_u8; 16];
-        let daemon_proof =
-            compute_daemon_hello_proof(secret, exporter, session, &server_nonce, manifest)
-                .expect("HMAC accepts the test secret");
+        // Outbound direction: DaemonHello uses the real client nonce
+        // (recovered from the validated AdapterHello) plus the real
+        // server nonce. No placeholder nonce remains in the bytes the
+        // daemon emits.
+        let server_nonce = [0xbb_u8; 32];
+        let daemon_proof = compute_daemon_hello_proof(
+            secret,
+            exporter,
+            session,
+            project,
+            &client_nonce,
+            &server_nonce,
+            manifest,
+        )
+        .expect("HMAC accepts the test secret");
         let hello = build_daemon_hello(
             &server_nonce,
             daemon_proof,
@@ -274,8 +285,9 @@ mod tests {
         let secret = b"a]8=ZxW6Mf7n3Q!2";
         let exporter = b"tls-exporter-bytes";
         let session = b"01900000-0000-0000-0000-000000000000";
+        let project = b"01900000-0000-7000-8000-000000000000";
         let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
-        let client_nonce = [0xaa_u8; 16];
+        let client_nonce = [0xaa_u8; 32];
         let hello = xtrace_protocol::generated::agent::AdapterHello {
             adapter_name: "fake".to_string(),
             adapter_version: "0.0.0".to_string(),
@@ -295,7 +307,7 @@ mod tests {
             // Tampered proof: every byte is one off the correct tag.
             hmac: Bytes::copy_from_slice(&[0u8; 32]),
         };
-        let err = verify_adapter_hello(secret, exporter, session, &hello).unwrap_err();
+        let err = verify_adapter_hello(secret, exporter, session, project, &hello).unwrap_err();
         assert!(matches!(err, xtrace_protocol::handshake::TranscriptProofError::Mismatch));
     }
 

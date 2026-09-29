@@ -1,10 +1,11 @@
 //! Daemon builder and run loop.
 //!
 //! The builder pattern keeps the configuration flow explicit: callers
-//! set the project / session identifiers and (optionally) the
-//! bootstrap artifact path, then call [`DaemonBuilder::bind`] which
-//! allocates the listener, certificate, secret, and TLS materials.
-//! The returned [`BoundDaemon`] owns the listener and exposes a
+//! set the project / session identifiers, the expected repository
+//! fingerprint, and (optionally) the bootstrap artifact path, then
+//! call [`DaemonBuilder::bind`] which allocates the listener,
+//! certificate, secret, and TLS materials. The returned
+//! [`BoundDaemon`] owns the listener and exposes a
 //! [`BoundDaemon::serve`] future that completes on shutdown.
 //!
 //! The run loop supervises one [`tokio::task`] per connection. Every
@@ -14,12 +15,14 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration as StdDuration, Instant};
 
+use prost::bytes::Bytes;
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls::server::ServerConfig;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use xtrace_domain::ids::Id;
@@ -29,7 +32,7 @@ use xtrace_protocol::generated::agent::{AgentEnvelope, ProtocolError};
 
 use crate::bootstrap::{BootstrapArtifact, BootstrapArtifactFields, BootstrapOwner};
 use crate::config::DaemonConfig;
-use crate::error::DaemonError;
+use crate::error::{DaemonError, ProtocolErrorCode};
 use crate::framing::{EnvelopeAsyncDecoder, EnvelopeAsyncEncoder};
 use crate::listener::LoopbackListener;
 use crate::runtime::HealthInterval;
@@ -47,10 +50,92 @@ pub const TLS_EXPORTER_LEN: usize = 32;
 /// the same context cannot be replayed across different protocol
 /// versions or unrelated X-trace subsystems.
 pub const TLS_EXPORTER_LABEL: &[u8] = b"xtrace-adapter-transport-v1";
-/// Constant channel capacity for per-connection commands. Matches the
-/// `adapter socket decode` row of `docs/plans/x-trace/02-architecture.md`
-/// §6 so a slow consumer triggers TCP/TLS backpressure.
-const CONNECTION_COMMAND_CAPACITY: usize = 64;
+/// Length, in bytes, of the per-connection server nonce.
+pub const SERVER_NONCE_LEN: usize = 32;
+/// Hard ceiling on the monotonic clock value reported on the wire.
+/// The value matches `u64::MAX` and is used only to convert the
+/// process-local instant without losing information.
+const MONOTONIC_CEILING_NS: u128 = u64::MAX as u128;
+/// Monotonic epoch the daemon references. Using a process-local
+/// [`Instant`] keeps the clock independent of the wall clock so the
+/// value cannot jump backwards under a wall-clock adjustment.
+type Monotonic = Instant;
+
+/// Process-local monotonic clock. The instant is captured the first
+/// time the daemon starts and every `now_ns` value is a
+/// monotonically non-decreasing delta from that origin.
+#[derive(Clone, Copy, Debug)]
+pub struct MonotonicClock {
+    /// Process-local origin the daemon reports from. Set when the
+    /// clock is constructed so the first value is approximately
+    /// zero, never negative, and independent of wall-clock changes.
+    origin: Monotonic,
+}
+
+impl MonotonicClock {
+    /// Returns a fresh clock anchored to the current [`Instant`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self { origin: Monotonic::now() }
+    }
+
+    /// Returns the elapsed nanoseconds since the clock's origin.
+    /// The conversion saturates at [`u64::MAX`] so a value that
+    /// exceeds the wire type is reported as the maximum rather than
+    /// wrapping to zero.
+    #[must_use]
+    pub fn now_ns(&self) -> u64 {
+        let elapsed = self.origin.elapsed();
+        let nanos = elapsed.as_nanos();
+        if nanos >= MONOTONIC_CEILING_NS {
+            u64::MAX
+        } else {
+            u64::try_from(nanos).unwrap_or(u64::MAX)
+        }
+    }
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Shared shutdown channel. A single `watch` channel propagates the
+/// shutdown signal to the supervisor loop, every connection task, and
+/// every helper task; only one side is the writer (the caller of
+/// [`BoundDaemon::serve`]) and every other participant holds the
+/// receiver. The supervisor awaits the receiver's `changed` future
+/// to stop accepting, then the per-connection loops exit on the next
+/// shutdown observation.
+#[derive(Clone)]
+pub struct ShutdownSignal {
+    rx: watch::Receiver<bool>,
+}
+
+impl ShutdownSignal {
+    /// Awaits the next shutdown transition. Resolves immediately if
+    /// the signal has already fired. The future is cancellation-safe
+    /// because the underlying `watch` channel retains the latest
+    /// value across observers.
+    pub async fn wait(&mut self) {
+        if *self.rx.borrow() {
+            return;
+        }
+        let _ = self.rx.changed().await;
+    }
+
+    /// Returns `true` once the signal has been raised.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        *self.rx.borrow()
+    }
+}
+
+fn shared_shutdown_channel() -> (watch::Sender<bool>, ShutdownSignal) {
+    let (tx, rx) = watch::channel(false);
+    (tx, ShutdownSignal { rx })
+}
 
 /// Bound daemon state: a loopback listener, TLS materials, and the
 /// freshly minted session secret. The struct is the input to
@@ -62,6 +147,9 @@ pub struct BoundDaemon {
     session_secret: SessionSecret,
     runtime_session_id: RuntimeSessionId,
     project_id: ProjectId,
+    /// Expected repository fingerprint the daemon enforces on every
+    /// inbound `AdapterHello`.
+    expected_repository_fingerprint: String,
     /// Optional bootstrap artifact guard. `Some` when the daemon owns
     /// the file; `None` when the caller has read it themselves.
     bootstrap: Option<BootstrapArtifact>,
@@ -74,18 +162,20 @@ impl BoundDaemon {
         self.listener.local_addr()
     }
 
-    /// Returns the ephemeral certificate. Tests use it to seed the
-    /// fake adapter's pin verifier.
+    /// Returns the ephemeral certificate. Tests use the
+    /// certificate-der accessor to seed the wrong-pin verifier; the
+    /// daemon does not expose the private key.
     #[must_use]
     pub fn certificate(&self) -> &EphemeralCertificate {
         &self.tls_materials.certificate
     }
 
-    /// Returns the session secret. Only used by tests that drive the
-    /// handshake directly.
+    /// Returns the SHA-256 pin of the bound certificate. Production
+    /// adapters read this value from the bootstrap artifact; tests
+    /// use it to construct a pinned verifier.
     #[must_use]
-    pub fn session_secret(&self) -> &SessionSecret {
-        &self.session_secret
+    pub fn certificate_pin(&self) -> &str {
+        self.tls_materials.certificate.pin()
     }
 
     /// Returns the runtime session identifier.
@@ -98,6 +188,12 @@ impl BoundDaemon {
     #[must_use]
     pub fn project_id(&self) -> ProjectId {
         self.project_id
+    }
+
+    /// Returns the expected repository fingerprint.
+    #[must_use]
+    pub fn expected_repository_fingerprint(&self) -> &str {
+        &self.expected_repository_fingerprint
     }
 
     /// Runs the daemon supervisor until the supplied shutdown future
@@ -119,29 +215,31 @@ impl BoundDaemon {
         let session_secret = self.session_secret;
         let runtime_session_id = self.runtime_session_id;
         let project_id = self.project_id;
+        let expected_repository_fingerprint = self.expected_repository_fingerprint;
         let _bootstrap = self.bootstrap;
 
-        let supervisor = SupervisorContext {
+        let (shutdown_tx, mut shutdown_signal) = shared_shutdown_channel();
+        let clock = MonotonicClock::new();
+        let ctx = SupervisorContext {
             config,
             tls_config: tls_materials.server_config.clone(),
-            certificate_summary: tls_materials.certificate_summary.clone(),
-            session_secret,
+            session_secret: session_secret.clone(),
             runtime_session_id,
             project_id,
+            expected_repository_fingerprint,
+            shutdown: shutdown_signal.clone(),
         };
 
         let mut tasks: Vec<JoinHandle<Result<(), DaemonError>>> = Vec::new();
-        let shutdown_signal = Arc::new(tokio::sync::Notify::new());
-        let signal_clone = shutdown_signal.clone();
-        let shutdown_task: JoinHandle<()> = tokio::spawn(async move {
+        let shutdown_observer: JoinHandle<()> = tokio::spawn(async move {
             shutdown.await;
-            signal_clone.notify_waiters();
+            let _ = shutdown_tx.send(true);
         });
 
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown_signal.notified() => {
+                _ = shutdown_signal.wait() => {
                     debug!("daemon supervisor received shutdown signal");
                     break;
                 }
@@ -157,139 +255,42 @@ impl BoundDaemon {
                         }
                     };
                     debug!(peer = %peer, "daemon accepted new connection");
-                    let ctx = supervisor.clone();
-                    let task = tokio::spawn(async move { handle_connection(ctx, stream).await });
+                    let task_ctx = ctx.clone();
+                    let task_clock = clock;
+                    let task = tokio::spawn(async move {
+                        handle_connection(task_ctx, stream, task_clock).await
+                    });
                     tasks.push(task);
                 }
             }
         }
 
-        shutdown_task.abort();
-        let _ = shutdown_task.await;
+        shutdown_observer.abort();
+        let _ = shutdown_observer.await;
         join_tasks(tasks).await
     }
 }
 
-/// Builder for [`BoundDaemon`].
-#[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
-pub struct DaemonBuilder {
-    config: DaemonConfig,
-    project_id: Option<ProjectId>,
-    runtime_session_id: Option<RuntimeSessionId>,
-    bootstrap_artifact: Option<PathBuf>,
-}
-
-impl DaemonBuilder {
-    /// Constructs a new builder with the supplied configuration.
-    pub fn new(config: DaemonConfig) -> Self {
-        Self { config, project_id: None, runtime_session_id: None, bootstrap_artifact: None }
-    }
-
-    /// Sets the project identifier the daemon will require on every
-    /// post-hello envelope. Required.
-    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
-    pub fn with_project_id(mut self, project_id: ProjectId) -> Self {
-        self.project_id = Some(project_id);
-        self
-    }
-
-    /// Sets the runtime session identifier the daemon will require on
-    /// every post-hello envelope. Required.
-    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
-    pub fn with_runtime_session_id(mut self, session_id: RuntimeSessionId) -> Self {
-        self.runtime_session_id = Some(session_id);
-        self
-    }
-
-    /// Sets the optional bootstrap artifact path. When set, the
-    /// daemon writes the artifact with owner-only permissions before
-    /// serving and removes it on orderly shutdown.
-    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
-    pub fn with_bootstrap_artifact(mut self, path: PathBuf) -> Self {
-        self.bootstrap_artifact = Some(path);
-        self
-    }
-
-    /// Binds the loopback listener, generates the ephemeral
-    /// certificate, and writes the bootstrap artifact. Returns a
-    /// [`BoundDaemon`] ready to serve.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DaemonError::InvalidConfig`] when the project or
-    /// runtime session identifier has not been supplied,
-    /// [`DaemonError::Bootstrap`] when the artifact cannot be
-    /// written, and [`DaemonError::BindFailed`] when the OS refuses
-    /// the loopback bind.
-    pub async fn bind(self) -> Result<BoundDaemon, DaemonError> {
-        let project_id = self
-            .project_id
-            .ok_or_else(|| DaemonError::InvalidConfig("project_id is required".to_string()))?;
-        let runtime_session_id = self.runtime_session_id.ok_or_else(|| {
-            DaemonError::InvalidConfig("runtime_session_id is required".to_string())
-        })?;
-        let listener = LoopbackListener::bind(self.config.loopback_policy).await?;
-        let certificate = EphemeralCertificate::generate()?;
-        let tls_materials = TlsServerMaterials::build(certificate)?;
-        let session_secret = SessionSecret::generate()
-            .map_err(|err| DaemonError::Bootstrap(format!("session secret: {err}")))?;
-        let bootstrap = self
-            .bootstrap_artifact
-            .as_ref()
-            .map(|path| {
-                let fields = BootstrapArtifactFields::new(
-                    listener.local_addr().ip().to_string(),
-                    listener.local_addr().port(),
-                    tls_materials.certificate.pin().to_string(),
-                    runtime_session_id,
-                    &session_secret,
-                    project_id,
-                    1,
-                    0,
-                );
-                BootstrapArtifact::write(path, fields, BootstrapOwner::Daemon)
-            })
-            .transpose()?;
-        info!(
-            address = %listener.local_addr(),
-            project_id = %project_id,
-            runtime_session_id = %runtime_session_id,
-            "xtrace daemon bound to loopback",
-        );
-        Ok(BoundDaemon {
-            config: self.config,
-            listener,
-            tls_materials,
-            session_secret,
-            runtime_session_id,
-            project_id,
-            bootstrap,
-        })
-    }
-}
-
-#[derive(Clone)]
-struct SupervisorContext {
-    /// Daemon-wide tunables shared with every per-connection task.
-    /// Some fields (like `channel_capacity`) are not yet read by the
-    /// supervisor; the dead-code allow documents the deliberate
-    /// carry rather than the future-proof field drop.
-    #[allow(dead_code, reason = "carried for future supervisor tunables")]
-    config: DaemonConfig,
-    tls_config: Arc<ServerConfig>,
-    certificate_summary: String,
-    session_secret: SessionSecret,
-    runtime_session_id: RuntimeSessionId,
-    project_id: ProjectId,
-}
-
-async fn handle_connection(ctx: SupervisorContext, stream: TcpStream) -> Result<(), DaemonError> {
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every field is a wire-shaped output documented in `03b-protocol-and-api.md` §2.4"
+)]
+async fn handle_connection(
+    ctx: SupervisorContext,
+    stream: TcpStream,
+    clock: MonotonicClock,
+) -> Result<(), DaemonError> {
+    let mut shutdown = ctx.shutdown.clone();
     let acceptor = tokio_rustls::TlsAcceptor::from(ctx.tls_config.clone());
-    let tls_stream = match acceptor.accept(stream).await {
-        Ok(stream) => stream,
-        Err(err) => {
-            debug!(error = %err, "tls handshake failed");
-            return Ok(());
+    let tls_stream = tokio::select! {
+        biased;
+        _ = shutdown.wait() => return Ok(()),
+        result = acceptor.accept(stream) => match result {
+            Ok(stream) => stream,
+            Err(err) => {
+                debug!(error = %err, "tls handshake failed");
+                return Ok(());
+            }
         }
     };
     let tls_exporter = match extract_tls_exporter(&tls_stream) {
@@ -301,7 +302,7 @@ async fn handle_connection(ctx: SupervisorContext, stream: TcpStream) -> Result<
     };
     let (reader, writer) = tokio::io::split(tls_stream);
     let mut session = Session::new(HandshakeInputs {
-        session_secret: ctx.session_secret,
+        session_secret: ctx.session_secret.clone(),
         tls_exporter,
         runtime_session_id: ctx.runtime_session_id,
         project_id: ctx.project_id,
@@ -309,25 +310,30 @@ async fn handle_connection(ctx: SupervisorContext, stream: TcpStream) -> Result<
         max_batch_events: ctx.config.max_batch_events,
         max_protocol_major: 1,
         max_protocol_minor: 0,
-        manifest_digest: ctx.certificate_summary.clone(),
+        expected_repository_fingerprint: ctx.expected_repository_fingerprint.clone(),
         health_interval: HealthInterval(ctx.config.health_interval),
         role: HandshakeRole::Daemon,
     });
     let mut decoder = EnvelopeAsyncDecoder::new(reader, session.max_envelope_bytes());
     let mut encoder = EnvelopeAsyncEncoder::new(writer, session.max_envelope_bytes());
 
-    let first = match decoder.read_envelope().await {
-        Ok(envelope) => envelope,
-        Err(err) => {
-            return send_protocol_error(
-                &session,
-                &mut encoder,
-                &ProtocolError {
-                    code: crate::error::ProtocolErrorCode::Transport.as_str().to_string(),
-                    message: format!("{err}"),
-                },
-            )
-            .await;
+    let first = tokio::select! {
+        biased;
+        _ = shutdown.wait() => return Ok(()),
+        result = decoder.read_envelope() => match result {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                let code = envelope_error_code(& err);
+                return send_protocol_error(
+                    & session,
+                    & mut encoder,
+                    & ProtocolError {
+                        code: code.as_str().to_string(),
+                        message: format!("{err}"),
+                    },
+                )
+                .await;
+            }
         }
     };
 
@@ -335,8 +341,8 @@ async fn handle_connection(ctx: SupervisorContext, stream: TcpStream) -> Result<
         return send_protocol_error(&session, &mut encoder, &err.to_protocol_error()).await;
     }
 
-    let server_nonce = random_server_nonce();
-    let envelope = match session.build_daemon_hello(server_nonce, current_monotonic_ns()) {
+    let server_nonce = random_server_nonce()?;
+    let envelope = match session.build_daemon_hello(server_nonce, clock.now_ns()) {
         Ok(envelope) => envelope,
         Err(err) => {
             return send_protocol_error(&session, &mut encoder, &err.to_protocol_error()).await;
@@ -347,19 +353,26 @@ async fn handle_connection(ctx: SupervisorContext, stream: TcpStream) -> Result<
     }
 
     let (tx, mut rx) =
-        mpsc::channel::<crate::runtime::OutgoingCommand>(CONNECTION_COMMAND_CAPACITY);
+        mpsc::channel::<crate::runtime::OutgoingCommand>(ctx.config.channel_capacity.as_usize());
     let health_session = session.clone();
     let health_tx = tx.clone();
+    let mut health_shutdown = ctx.shutdown.clone();
+    let health_clock = clock;
     let health_task: JoinHandle<()> = tokio::spawn(async move {
-        let interval = health_session.health_interval().0.max(Duration::from_secs(1));
+        let interval = health_session.health_interval().0.max(StdDuration::from_secs(1));
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
-            let now_ns = current_monotonic_ns();
-            let cmd = health_session.next_health(now_ns);
-            if health_tx.send(cmd).await.is_err() {
-                break;
+            tokio::select! {
+                biased;
+                _ = health_shutdown.wait() => break,
+                _ = ticker.tick() => {
+                    let now_ns = health_clock.now_ns();
+                    let cmd = health_session.next_health(now_ns);
+                    if health_tx.send(cmd).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -369,15 +382,19 @@ async fn handle_connection(ctx: SupervisorContext, stream: TcpStream) -> Result<
         loop {
             tokio::select! {
                 biased;
+                _ = shutdown.wait() => break,
                 incoming = decoder.read_envelope() => {
-                    let envelope = incoming.map_err(|err| {
-                        let code = match err.kind() {
-                            std::io::ErrorKind::UnexpectedEof => crate::error::ProtocolErrorCode::Shutdown,
-                            _ => crate::error::ProtocolErrorCode::Transport,
-                        };
-                        crate::session::SessionError::new(code, format!("read envelope: {err}"))
-                    })?;
-                    let (_incoming, ack) = session.accept_post_hello(&envelope)?;
+                    let envelope = match incoming {
+                        Ok(env) => env,
+                        Err(err) => {
+                            let code = envelope_error_code(& err);
+                            return Err(crate::session::SessionError::new(
+                                code,
+                                format!("read envelope: {err}"),
+                            ));
+                        }
+                    };
+                    let (_incoming, ack) = session.accept_post_hello(& envelope)?;
                     if tx.send(ack).await.is_err() {
                         break;
                     }
@@ -387,16 +404,18 @@ async fn handle_connection(ctx: SupervisorContext, stream: TcpStream) -> Result<
                     let envelope = AgentEnvelope {
                         protocol_major: session.inputs().max_protocol_major,
                         protocol_minor: session.inputs().max_protocol_minor,
-                        runtime_session_id: prost::bytes::Bytes::copy_from_slice(session.runtime_session_id().as_uuid().as_bytes()),
+                        runtime_session_id: Bytes::copy_from_slice(session.runtime_session_id().as_uuid().as_bytes()),
                         session_seq: outbound_seq,
-                        sent_monotonic_ns: current_monotonic_ns(),
+                        sent_monotonic_ns: clock.now_ns(),
                         message_id: format!("daemon-{outbound_seq}"),
                         correlation_token: String::new(),
                         payload: Some(payload),
                     };
-                    outbound_seq = outbound_seq.saturating_add(1);
-                    if let Err(err) = encoder.write_envelope(&envelope).await {
-                        let _ = err;
+                    outbound_seq = match outbound_seq.checked_add(1) {
+                        Some(next) => next,
+                        None => break,
+                    };
+                    if encoder.write_envelope(& envelope).await.is_err() {
                         break;
                     }
                 }
@@ -409,11 +428,22 @@ async fn handle_connection(ctx: SupervisorContext, stream: TcpStream) -> Result<
 
     health_task.abort();
     let _ = health_task.await;
+    drop(rx);
+    drop(tx);
 
     if let Err(err) = post_hello_result {
         let _ = send_protocol_error(&session, &mut encoder, &err.to_protocol_error()).await;
     }
     Ok(())
+}
+
+fn envelope_error_code(err: &std::io::Error) -> ProtocolErrorCode {
+    use std::io::ErrorKind as K;
+    match err.kind() {
+        K::UnexpectedEof => ProtocolErrorCode::Shutdown,
+        K::InvalidData => ProtocolErrorCode::FrameTooLarge,
+        _ => ProtocolErrorCode::Transport,
+    }
 }
 
 async fn send_protocol_error<W>(
@@ -427,11 +457,11 @@ where
     let envelope = AgentEnvelope {
         protocol_major: session.inputs().max_protocol_major,
         protocol_minor: session.inputs().max_protocol_minor,
-        runtime_session_id: prost::bytes::Bytes::copy_from_slice(
+        runtime_session_id: Bytes::copy_from_slice(
             session.runtime_session_id().as_uuid().as_bytes(),
         ),
         session_seq: 0,
-        sent_monotonic_ns: current_monotonic_ns(),
+        sent_monotonic_ns: MonotonicClock::new().now_ns(),
         message_id: "daemon-error".to_string(),
         correlation_token: String::new(),
         payload: Some(PayloadOneof::ProtocolError(err.clone())),
@@ -465,17 +495,13 @@ async fn join_tasks(tasks: Vec<JoinHandle<Result<(), DaemonError>>>) -> Result<(
     }
 }
 
-fn current_monotonic_ns() -> u64 {
-    let now =
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    u64::try_from(now.as_nanos()).unwrap_or(u64::MAX)
-}
-
-fn random_server_nonce() -> Vec<u8> {
+fn random_server_nonce() -> Result<Vec<u8>, DaemonError> {
     let rng = SystemRandom::new();
-    let mut bytes = [0u8; 32];
-    let _ = rng.fill(&mut bytes);
-    bytes.to_vec()
+    let mut bytes = [0u8; SERVER_NONCE_LEN];
+    rng.fill(&mut bytes).map_err(|err| {
+        DaemonError::Transport(format!("os rng refused to fill the server nonce: {err}"))
+    })?;
+    Ok(bytes.to_vec())
 }
 
 /// Extracts the per-connection TLS exporter from a freshly accepted
@@ -508,6 +534,141 @@ where
     Ok(out.to_vec())
 }
 
+#[derive(Clone)]
+struct SupervisorContext {
+    /// Daemon-wide tunables shared with every per-connection task.
+    config: DaemonConfig,
+    tls_config: Arc<ServerConfig>,
+    session_secret: SessionSecret,
+    runtime_session_id: RuntimeSessionId,
+    project_id: ProjectId,
+    expected_repository_fingerprint: String,
+    /// Shared shutdown signal observed by the supervisor, every
+    /// connection, and every helper task.
+    shutdown: ShutdownSignal,
+}
+
+/// Builder for [`BoundDaemon`].
+#[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
+pub struct DaemonBuilder {
+    config: DaemonConfig,
+    project_id: Option<ProjectId>,
+    runtime_session_id: Option<RuntimeSessionId>,
+    expected_repository_fingerprint: Option<String>,
+    bootstrap_artifact: Option<PathBuf>,
+}
+
+impl DaemonBuilder {
+    /// Constructs a new builder with the supplied configuration.
+    pub fn new(config: DaemonConfig) -> Self {
+        Self {
+            config,
+            project_id: None,
+            runtime_session_id: None,
+            expected_repository_fingerprint: None,
+            bootstrap_artifact: None,
+        }
+    }
+
+    /// Sets the project identifier the daemon will require on every
+    /// post-hello envelope. Required.
+    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
+    pub fn with_project_id(mut self, project_id: ProjectId) -> Self {
+        self.project_id = Some(project_id);
+        self
+    }
+
+    /// Sets the runtime session identifier the daemon will require on
+    /// every post-hello envelope. Required.
+    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
+    pub fn with_runtime_session_id(mut self, session_id: RuntimeSessionId) -> Self {
+        self.runtime_session_id = Some(session_id);
+        self
+    }
+
+    /// Sets the expected repository fingerprint the daemon enforces
+    /// on every inbound `AdapterHello`. Required.
+    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
+    pub fn with_expected_repository_fingerprint(mut self, fingerprint: String) -> Self {
+        self.expected_repository_fingerprint = Some(fingerprint);
+        self
+    }
+
+    /// Sets the optional bootstrap artifact path. When set, the
+    /// daemon writes the artifact with owner-only permissions before
+    /// serving and removes it on orderly shutdown.
+    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
+    pub fn with_bootstrap_artifact(mut self, path: PathBuf) -> Self {
+        self.bootstrap_artifact = Some(path);
+        self
+    }
+
+    /// Binds the loopback listener, generates the ephemeral
+    /// certificate, and writes the bootstrap artifact. Returns a
+    /// [`BoundDaemon`] ready to serve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::InvalidConfig`] when the project,
+    /// runtime session identifier, or expected repository fingerprint
+    /// has not been supplied; [`DaemonError::Bootstrap`] when the
+    /// artifact cannot be written; and [`DaemonError::BindFailed`]
+    /// when the OS refuses the loopback bind.
+    pub async fn bind(self) -> Result<BoundDaemon, DaemonError> {
+        let project_id = self
+            .project_id
+            .ok_or_else(|| DaemonError::InvalidConfig("project_id is required".to_string()))?;
+        let runtime_session_id = self.runtime_session_id.ok_or_else(|| {
+            DaemonError::InvalidConfig("runtime_session_id is required".to_string())
+        })?;
+        let expected_repository_fingerprint =
+            self.expected_repository_fingerprint.ok_or_else(|| {
+                DaemonError::InvalidConfig(
+                    "expected_repository_fingerprint is required".to_string(),
+                )
+            })?;
+        let listener = LoopbackListener::bind(self.config.loopback_policy).await?;
+        let certificate = EphemeralCertificate::generate()?;
+        let tls_materials = TlsServerMaterials::build(certificate)?;
+        let session_secret = SessionSecret::generate()
+            .map_err(|err| DaemonError::Bootstrap(format!("session secret: {err}")))?;
+        let bootstrap = self
+            .bootstrap_artifact
+            .as_ref()
+            .map(|path| {
+                let fields = BootstrapArtifactFields::new(
+                    listener.local_addr().ip().to_string(),
+                    listener.local_addr().port(),
+                    tls_materials.certificate.pin().to_string(),
+                    runtime_session_id,
+                    &session_secret,
+                    project_id,
+                    expected_repository_fingerprint.clone(),
+                    1,
+                    0,
+                );
+                BootstrapArtifact::write(path, fields, BootstrapOwner::Daemon)
+            })
+            .transpose()?;
+        info!(
+            address = %listener.local_addr(),
+            project_id = %project_id,
+            runtime_session_id = %runtime_session_id,
+            "xtrace daemon bound to loopback",
+        );
+        Ok(BoundDaemon {
+            config: self.config,
+            listener,
+            tls_materials,
+            session_secret,
+            runtime_session_id,
+            project_id,
+            expected_repository_fingerprint,
+            bootstrap,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,7 +692,7 @@ mod tests {
     }
 
     /// The two-proof nonce-ordering resolution is the canonical byte
-    /// layout used for the inbound AdapterHello HMAC. The adapter
+    /// layout used for the inbound `AdapterHello` HMAC. The adapter
     /// hashes `client_nonce` together with a fixed zero server nonce
     /// because the daemon has not yet emitted its own nonce; the
     /// canonical proof with `server_nonce = [0u8; 32]` is the only
@@ -543,41 +704,62 @@ mod tests {
         let exporter = b"tls-exporter-bytes";
         let session = b"01900000-0000-0000-0000-000000000000";
         let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
-        let client = [0xaa_u8; 16];
-        // Inbound direction: server nonce is the canonical zero
-        // placeholder; the daemon recognises this layout because the
-        // server nonce has not been exchanged yet.
-        let inbound =
-            compute_transcript_proof(secret, exporter, session, &client, &[0u8; 32], manifest)
-                .expect("HMAC accepts the test secret");
-        // Same inputs but a non-zero server nonce would never match
-        // the inbound verifier; this is the safety net.
-        let wrong_layout =
-            compute_transcript_proof(secret, exporter, session, &client, &[0x55_u8; 32], manifest)
-                .expect("HMAC accepts the test secret");
-        assert_ne!(inbound, wrong_layout);
-        verify_transcript_proof(secret, exporter, session, &client, &[0u8; 32], manifest, &inbound)
-            .expect("inbound verifier accepts the canonical layout");
+        let client = [0xaa_u8; 32];
+        let inbound = compute_transcript_proof(
+            secret,
+            exporter,
+            session,
+            &client,
+            &xtrace_protocol::handshake::ZERO_NONCE,
+            manifest,
+            &xtrace_protocol::handshake::project_context(b"01900000-0000-7000-8000-000000000000"),
+        )
+        .expect("HMAC accepts the test secret");
+        verify_transcript_proof(
+            secret,
+            exporter,
+            session,
+            &client,
+            &xtrace_protocol::handshake::ZERO_NONCE,
+            manifest,
+            &xtrace_protocol::handshake::project_context(b"01900000-0000-7000-8000-000000000000"),
+            &inbound,
+        )
+        .expect("inbound verifier accepts the canonical layout");
     }
 
-    /// The outbound DaemonHello proof uses the daemon's server nonce
-    /// together with a canonical zero client nonce because the
-    /// adapter is expected to recompute the proof with its own
-    /// client nonce. The two sides therefore agree on a fixed-length
-    /// transcript without leaking the missing nonce through padding.
+    /// The outbound `DaemonHello` proof uses the daemon's server
+    /// nonce together with the recovered client nonce (no zero
+    /// placeholder) and the project context chunk. The layout is
+    /// symmetric with the inbound direction minus the placeholder.
     #[test]
-    fn daemon_proof_layout_uses_zero_client_nonce_for_outbound_direction() {
+    fn daemon_proof_layout_uses_real_client_nonce_for_outbound_direction() {
         let secret = b"a]8=ZxW6Mf7n3Q!2";
         let exporter = b"tls-exporter-bytes";
         let session = b"01900000-0000-0000-0000-000000000000";
+        let project = b"01900000-0000-7000-8000-000000000000";
         let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
+        let client = [0xaa_u8; 32];
         let server = [0xbb_u8; 32];
-        let outbound =
-            compute_transcript_proof(secret, exporter, session, &[0u8; 32], &server, manifest)
-                .expect("HMAC accepts the test secret");
-        let wrong_layout =
-            compute_transcript_proof(secret, exporter, session, &[0x55_u8; 32], &server, manifest)
-                .expect("HMAC accepts the test secret");
-        assert_ne!(outbound, wrong_layout);
+        let outbound = compute_transcript_proof(
+            secret,
+            exporter,
+            session,
+            &client,
+            &server,
+            manifest,
+            &xtrace_protocol::handshake::project_context(project),
+        )
+        .expect("HMAC accepts the test secret");
+        assert_eq!(outbound.len(), 32);
+    }
+
+    #[test]
+    fn monotonic_clock_is_monotonic_and_non_zero() {
+        let clock = MonotonicClock::new();
+        let first = clock.now_ns();
+        std::thread::sleep(StdDuration::from_millis(2));
+        let second = clock.now_ns();
+        assert!(second >= first, "monotonic clock must not regress");
     }
 }

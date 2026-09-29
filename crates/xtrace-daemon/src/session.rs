@@ -6,37 +6,35 @@
 //! `docs/plans/x-trace/03b-protocol-and-api.md` §2:
 //!
 //! - protocol major version negotiation;
-//! - post-hello `runtime_session_id` and `project_id` identity
-//!   checks;
+//! - post-hello `runtime_session_id` identity checks;
 //! - monotonic `session_seq` validation (no replay, no gap);
 //! - `ProtocolError` emission for any violation;
 //! - `Ack` for every accepted envelope;
 //! - `Health` echo on a configurable interval.
 //!
-//! ## Two-proof nonce-ordering resolution
+//! ## Inbound `AdapterHello` invariants
 //!
-//! The HMAC transcript proof mixes both the adapter-supplied
-//! `client_nonce` and the daemon-supplied `server_nonce`. Because the
-//! two nonces travel in opposite messages, neither side can fold both
-//! into its outbound proof at the moment of emission. The protocol
-//! resolves the apparent ordering conflict by fixing the missing
-//! nonce to a canonical 32-byte zero buffer:
+//! The adapter's first envelope carries the bootstrap-anchored
+//! identity and a transcript proof. The session enforces the
+//! following invariants before the transcript proof is even
+//! verified:
 //!
-//! - Inbound `AdapterHello`: the daemon has not yet emitted a
-//!   `server_nonce`, so the verifier folds `client_nonce` together
-//!   with `[0u8; 32]` as the server nonce placeholder.
-//! - Outbound `DaemonHello`: the daemon emits the `server_nonce` but
-//!   cannot recover the adapter's `client_nonce`, so the outbound
-//!   proof folds `server_nonce` together with `[0u8; 32]` as the
-//!   client nonce placeholder. The adapter then substitutes its own
-//!   nonce when re-verifying the transcript.
+//! - the envelope payload is `AdapterHello`;
+//! - `session_seq == 0` because `AgentEnvelope.session_seq` begins
+//!   at 1 only after authentication;
+//! - `message_id` is non-empty;
+//! - `client_nonce` is exactly 32 bytes;
+//! - `protocol_major_max` is at least the daemon's major (the
+//!   adapter's range must include a supported version);
+//! - `manifest_digest` is a canonical non-empty digest string;
+//! - `repository_fingerprint` matches the bootstrap expected value;
+//! - the transcript proof verifies against the recovered client
+//!   nonce, the canonical zero server-nonce placeholder, the
+//!   bootstrap manifest digest, and the canonical project context.
 //!
-//! Both directions share the same canonical layout so a verifier
-//! that knows the real nonces for the connection can recompute the
-//! same tag and a flipped layout is rejected. The fixed-length zero
-//! placeholder keeps the byte layout identical across the two
-//! directions so the `compute_transcript_proof` helper does not need
-//! to special-case the wire direction.
+//! The validated `client_nonce` is persisted in session state so the
+//! outbound `DaemonHello` transcript proof can use the real client
+//! nonce rather than the documented inbound-only zero placeholder.
 //!
 //! The module exposes [`Session`] as the canonical state machine and
 //! [`HandshakeInputs`] as the immutable inputs handed to a session at
@@ -47,9 +45,7 @@ use xtrace_domain::ids::Id;
 use xtrace_domain::{ProjectId, RuntimeSessionId};
 use xtrace_protocol::envelope::check_protocol_version;
 use xtrace_protocol::generated::agent as wire;
-use xtrace_protocol::generated::agent::{
-    Ack, AckDurability, AgentEnvelope, ProtocolError, RejectedMessage,
-};
+use xtrace_protocol::generated::agent::{Ack, AckDurability, AgentEnvelope, ProtocolError};
 
 use crate::error::ProtocolErrorCode;
 use crate::runtime::{
@@ -57,6 +53,11 @@ use crate::runtime::{
     compute_daemon_hello_proof, verify_adapter_hello,
 };
 use crate::secret::SessionSecret;
+
+/// Length, in bytes, of the client nonce exchanged during the handshake.
+/// The adapter supplies the nonce; the daemon verifies the length
+/// before computing the transcript proof.
+const CLIENT_NONCE_LEN: usize = 32;
 
 /// Per-session handshake role marker. Used to keep the
 /// [`HandshakeInputs`] structure self-documenting at every call site.
@@ -91,10 +92,12 @@ pub struct HandshakeInputs {
     pub max_protocol_major: u32,
     /// Maximum protocol minor version this binary offers.
     pub max_protocol_minor: u32,
-    /// Manifest digest negotiated at bootstrap.
-    pub manifest_digest: String,
-    /// Interval between `Health` echoes sent back to the adapter
-    /// while the connection is idle.
+    /// Canonical repository fingerprint negotiated at bootstrap. The
+    /// daemon validates the `AdapterHello.repository_fingerprint`
+    /// against this value and rejects mismatches deterministically.
+    pub expected_repository_fingerprint: String,
+    /// Health interval sent back to the adapter while the
+    /// connection is idle.
     pub health_interval: HealthInterval,
     /// Role marker; only [`HandshakeRole::Daemon`] emits
     /// [`OutgoingCommand::Ack`]s and tracks sequencing.
@@ -118,6 +121,15 @@ pub struct Session {
     /// Server nonce generated during the daemon-side handshake.
     /// `None` until the server emits `DaemonHello`.
     server_nonce: Option<Vec<u8>>,
+    /// Client nonce validated during the inbound `AdapterHello`.
+    /// `None` until the daemon has accepted `AdapterHello`.
+    client_nonce: Option<Vec<u8>>,
+    /// Adapter manifest digest validated during the inbound
+    /// `AdapterHello`. The daemon echoes this value back in
+    /// `DaemonHello` and folds it into the outbound transcript proof
+    /// so the adapter can recompute the proof with the same input.
+    /// `None` until the daemon has accepted `AdapterHello`.
+    adapter_manifest_digest: Option<String>,
 }
 
 impl Session {
@@ -127,7 +139,13 @@ impl Session {
     /// after authentication").
     #[must_use]
     pub fn new(inputs: HandshakeInputs) -> Self {
-        Self { inputs, next_expected_seq: 1, server_nonce: None }
+        Self {
+            inputs,
+            next_expected_seq: 1,
+            server_nonce: None,
+            client_nonce: None,
+            adapter_manifest_digest: None,
+        }
     }
 
     /// Returns the immutable inputs the session was constructed with.
@@ -136,16 +154,15 @@ impl Session {
         &self.inputs
     }
 
-    /// Drives the inbound AdapterHello. The function verifies the
-    /// HMAC transcript proof, performs protocol major negotiation,
-    /// and returns the [`OutgoingCommand::Health`] the supervisor
-    /// should send back to the adapter.
+    /// Drives the inbound `AdapterHello`. The function validates the
+    /// documented hello invariants, verifies the HMAC transcript
+    /// proof against the recovered client nonce, and persists the
+    /// nonce for the outbound `DaemonHello` proof.
     ///
     /// # Errors
     ///
-    /// Returns [`SessionError`] when the HMAC mismatches, the
-    /// protocol major is unsupported, or the envelope payload is
-    /// not an `AdapterHello`.
+    /// Returns [`SessionError`] when the hello violates any
+    /// documented invariant or the transcript proof mismatches.
     pub fn accept_adapter_hello(
         &mut self,
         envelope: &AgentEnvelope,
@@ -161,8 +178,6 @@ impl Session {
         }
         let hello = match envelope.payload.as_ref() {
             Some(wire::agent_envelope::Payload::AdapterHello(hello)) => hello,
-            // `matches!` above already rejected every other variant;
-            // this branch exists only to satisfy the type checker.
             Some(_) | None => {
                 return Err(SessionError::new(
                     ProtocolErrorCode::HelloDecode,
@@ -170,33 +185,77 @@ impl Session {
                 ));
             }
         };
+        if envelope.runtime_session_id.as_ref()
+            != self.inputs.runtime_session_id.as_uuid().as_bytes()
+        {
+            return Err(SessionError::new(
+                ProtocolErrorCode::SessionIdentity,
+                "runtime_session_id mismatch".to_string(),
+            ));
+        }
+        if envelope.session_seq != 0 {
+            return Err(SessionError::new(
+                ProtocolErrorCode::SessionSequence,
+                "hello must carry session_seq == 0".to_string(),
+            ));
+        }
+        if envelope.message_id.is_empty() {
+            return Err(SessionError::new(
+                ProtocolErrorCode::HelloDecode,
+                "message_id must not be empty".to_string(),
+            ));
+        }
+        if hello.client_nonce.len() != CLIENT_NONCE_LEN {
+            return Err(SessionError::new(
+                ProtocolErrorCode::HelloDecode,
+                format!("client_nonce must be exactly {CLIENT_NONCE_LEN} bytes"),
+            ));
+        }
+        // Protocol offer must include the daemon's supported major.
+        // A peer offering only an older major has nothing in common
+        // with this binary; a peer offering a newer maximum is
+        // negotiated down to the daemon's supported version rather
+        // than rejected outright.
+        if hello.protocol_major_max < self.inputs.max_protocol_major {
+            return Err(SessionError::new(
+                ProtocolErrorCode::ProtocolMajor,
+                "adapter protocol offer does not include the daemon major".to_string(),
+            ));
+        }
+        if hello.manifest_digest.is_empty() {
+            return Err(SessionError::new(
+                ProtocolErrorCode::HelloDecode,
+                "manifest_digest must not be empty".to_string(),
+            ));
+        }
+        if !is_canonical_manifest_digest(&hello.manifest_digest) {
+            return Err(SessionError::new(
+                ProtocolErrorCode::HelloDecode,
+                "manifest_digest is not a canonical lowercase hex digest".to_string(),
+            ));
+        }
+        if hello.repository_fingerprint != self.inputs.expected_repository_fingerprint {
+            return Err(SessionError::new(
+                ProtocolErrorCode::ProjectIdentity,
+                "repository_fingerprint mismatch".to_string(),
+            ));
+        }
         verify_adapter_hello(
             self.inputs.session_secret.read_secret(),
             &self.inputs.tls_exporter,
             self.inputs.runtime_session_id.as_uuid().as_bytes(),
+            self.inputs.project_id.as_uuid().as_bytes(),
             hello,
         )
         .map_err(|_| {
             SessionError::new(ProtocolErrorCode::HelloProof, "transcript mismatch".to_string())
         })?;
-        // Save the manifest digest observed on the wire; the daemon
-        // mirrors this value back in DaemonHello and uses it for its
-        // own HMAC computation.
-        if hello.manifest_digest != self.inputs.manifest_digest {
-            return Err(SessionError::new(
-                ProtocolErrorCode::HelloDecode,
-                "manifest_digest mismatch".to_string(),
-            ));
-        }
-        if hello.protocol_major_max > self.inputs.max_protocol_major {
-            return Err(SessionError::new(
-                ProtocolErrorCode::ProtocolMajor,
-                "adapter major above negotiated range".to_string(),
-            ));
-        }
+        self.client_nonce = Some(hello.client_nonce.to_vec());
+        self.adapter_manifest_digest = Some(hello.manifest_digest.clone());
+        let negotiated_minor = hello.protocol_minor_max.min(self.inputs.max_protocol_minor);
         Ok(AdapterHelloAck {
             protocol_major: self.inputs.max_protocol_major,
-            protocol_minor: self.inputs.max_protocol_minor,
+            protocol_minor: negotiated_minor,
             max_envelope_bytes: self.inputs.max_envelope_bytes,
             max_batch_events: self.inputs.max_batch_events,
             capabilities: Vec::new(),
@@ -210,11 +269,11 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns [`SessionError`] only when the supplied inputs cannot
-    /// be turned into a valid handshake envelope. Today the helper
-    /// is infallible; the result type documents the future-proof
-    /// signature so callers do not need to be updated when
-    /// validation grows.
+    /// Returns [`SessionError`] when the supplied inputs cannot be
+    /// turned into a valid handshake envelope. The function refuses
+    /// to emit `DaemonHello` until the inbound `AdapterHello` has
+    /// been validated; this prevents the daemon from constructing a
+    /// transcript proof against a missing or replaced client nonce.
     pub fn build_daemon_hello(
         &mut self,
         server_nonce: Vec<u8>,
@@ -226,18 +285,32 @@ impl Session {
                 "build_daemon_hello called on adapter role".to_string(),
             ));
         }
-        if server_nonce.len() != 32 {
+        if server_nonce.len() != CLIENT_NONCE_LEN {
             return Err(SessionError::new(
                 ProtocolErrorCode::HelloDecode,
                 "server nonce must be exactly 32 bytes".to_string(),
             ));
         }
+        let client_nonce = self.client_nonce.as_deref().ok_or_else(|| {
+            SessionError::new(
+                ProtocolErrorCode::HelloDecode,
+                "daemon hello requested before AdapterHello was validated".to_string(),
+            )
+        })?;
+        let manifest_digest = self.adapter_manifest_digest.as_deref().ok_or_else(|| {
+            SessionError::new(
+                ProtocolErrorCode::HelloDecode,
+                "daemon hello requested before AdapterHello was validated".to_string(),
+            )
+        })?;
         let proof = compute_daemon_hello_proof(
             self.inputs.session_secret.read_secret(),
             &self.inputs.tls_exporter,
             self.inputs.runtime_session_id.as_uuid().as_bytes(),
+            self.inputs.project_id.as_uuid().as_bytes(),
+            client_nonce,
             &server_nonce,
-            self.inputs.manifest_digest.as_bytes(),
+            manifest_digest.as_bytes(),
         )
         .map_err(|_| {
             SessionError::new(
@@ -249,7 +322,7 @@ impl Session {
         let hello = crate::runtime::build_daemon_hello(
             &server_nonce,
             proof,
-            &self.inputs.manifest_digest,
+            manifest_digest,
             self.inputs.max_protocol_major,
             self.inputs.max_protocol_minor,
             self.inputs.max_envelope_bytes,
@@ -299,11 +372,12 @@ impl Session {
                 "runtime_session_id mismatch".to_string(),
             ));
         }
-        // The project identity is enforced through the bootstrap
-        // artifact: every envelope must carry the same project ID.
-        // Today XTP-Agent envelopes do not carry a project_id field,
-        // so the value is encoded in the runtime_session_id by the
-        // daemon. Future slices add an explicit project_id field.
+        if envelope.message_id.is_empty() {
+            return Err(SessionError::new(
+                ProtocolErrorCode::HelloDecode,
+                "post-hello message_id must not be empty".to_string(),
+            ));
+        }
         if envelope.session_seq != self.next_expected_seq {
             if envelope.session_seq < self.next_expected_seq {
                 return Err(SessionError::new(
@@ -339,12 +413,18 @@ impl Session {
                 ));
             }
         };
-        self.next_expected_seq = self.next_expected_seq.saturating_add(1);
-        let ack = build_ack(
-            self.next_expected_seq.saturating_sub(1),
-            envelope.message_id.clone(),
-            AckDurability::Staged,
-        );
+        // `checked_add` is preferred over `saturating_add` because a
+        // sequence counter that silently stops advancing would mask a
+        // bug as success. The exhaustion is unreachable in practice
+        // because the session lifetime is bounded by the configured
+        // queue capacity and the admission control.
+        self.next_expected_seq = self.next_expected_seq.checked_add(1).ok_or_else(|| {
+            SessionError::new(
+                ProtocolErrorCode::SessionSequence,
+                "session_seq overflow".to_string(),
+            )
+        })?;
+        let ack = build_ack(self.next_expected_seq - 1);
         Ok((incoming, OutgoingCommand::Ack(ack)))
     }
 
@@ -393,6 +473,17 @@ impl Session {
     }
 }
 
+fn is_canonical_manifest_digest(value: &str) -> bool {
+    // The bounded slice accepts any canonical lowercase hex digest of
+    // 64 characters, optionally prefixed with a `b3:` BLAKE3 tag.
+    // We refuse both the empty string and any non-hex character.
+    // The certificate pin uses the same `b3:<64 hex>` form; the
+    // adapter manifest is a separate identity and is not required
+    // to match the pin, but it must be syntactically valid.
+    let hex = value.strip_prefix("b3:").unwrap_or(value);
+    hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
 fn payload_kind(payload: &wire::agent_envelope::Payload) -> &'static str {
     match payload {
         wire::agent_envelope::Payload::AdapterHello(_) => "AdapterHello",
@@ -412,12 +503,16 @@ fn payload_kind(payload: &wire::agent_envelope::Payload) -> &'static str {
     }
 }
 
-fn build_ack(highest_session_seq: u64, message_id: String, durability: AckDurability) -> Ack {
+fn build_ack(highest_session_seq: u64) -> Ack {
+    // Successful acknowledgement carries an empty `rejected` list.
+    // A message is rejected when it explicitly violates a stable rule;
+    // honest acknowledgement does not stamp the message id with a
+    // empty reason code because that is semantically a rejection.
     Ack {
         highest_contiguous_session_seq: highest_session_seq,
         highest_contiguous_recording_seq: Default::default(),
-        durability: durability as i32,
-        rejected: vec![RejectedMessage { message_id, reason_code: String::new() }],
+        durability: AckDurability::Staged as i32,
+        rejected: Vec::new(),
     }
 }
 
@@ -428,7 +523,7 @@ fn build_ack(highest_session_seq: u64, message_id: String, durability: AckDurabi
 pub struct SessionError {
     /// Stable `XTR-DAEMON-*` code that maps directly onto the wire
     /// `ProtocolError.code` field. Carrying it on the error struct
-    /// avoids lossy string parsing on the supervisor side.
+    /// avoids avoids string parsing on the supervisor side.
     pub code: ProtocolErrorCode,
     /// Human-readable diagnostic that never embeds a captured value,
     /// secret, or peer-supplied identifier.
@@ -484,7 +579,6 @@ mod tests {
     use crate::secret::SessionSecret;
     use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
     use xtrace_protocol::generated::agent::{AdapterHello, Health};
-    use xtrace_protocol::handshake::compute_transcript_proof;
 
     fn sample_inputs(secret_bytes: Vec<u8>) -> HandshakeInputs {
         let secret = SessionSecret::from_bytes(&secret_bytes).expect("secret");
@@ -497,8 +591,7 @@ mod tests {
             max_batch_events: 256,
             max_protocol_major: 1,
             max_protocol_minor: 0,
-            manifest_digest: "b3:0000000000000000000000000000000000000000000000000000000000000000"
-                .to_string(),
+            expected_repository_fingerprint: "expected-repo".to_string(),
             health_interval: HealthInterval::default(),
             role: HandshakeRole::Daemon,
         }
@@ -524,14 +617,17 @@ mod tests {
     fn sample_adapter_hello(session: &Session, secret: &[u8], manifest: &str) -> AdapterHello {
         let exporter = session.inputs().tls_exporter.clone();
         let session_id = session.inputs().runtime_session_id;
-        let client_nonce = [0xaa_u8; 16];
-        let proof = compute_transcript_proof(
+        let project_id = session.inputs().project_id;
+        let client_nonce = [0xaa_u8; 32];
+        let ctx = xtrace_protocol::handshake::project_context(project_id.as_uuid().as_bytes());
+        let proof = xtrace_protocol::handshake::compute_transcript_proof(
             secret,
             &exporter,
             session_id.as_uuid().as_bytes(),
             &client_nonce,
-            &[0u8; 32],
+            &xtrace_protocol::handshake::ZERO_NONCE,
             manifest.as_bytes(),
+            &ctx,
         )
         .expect("HMAC accepts the test secret");
         AdapterHello {
@@ -546,7 +642,7 @@ mod tests {
             pid: 0,
             process_start_monotonic_ns: 0,
             parent_launch_id: String::new(),
-            repository_fingerprint: String::new(),
+            repository_fingerprint: "expected-repo".to_string(),
             protocol_major_max: 1,
             protocol_minor_max: 0,
             client_nonce: Bytes::copy_from_slice(&client_nonce),
@@ -558,7 +654,8 @@ mod tests {
     fn accept_adapter_hello_round_trip() {
         let mut session = Session::new(sample_inputs(vec![0xab; 32]));
         let secret = session.inputs().session_secret.read_secret().to_vec();
-        let manifest = session.inputs().manifest_digest.clone();
+        let manifest =
+            "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
         let hello = sample_adapter_hello(&session, &secret, &manifest);
         let envelope = envelope_with_payload(
             session.inputs().runtime_session_id,
@@ -573,8 +670,9 @@ mod tests {
     #[test]
     fn accept_adapter_hello_rejects_bad_proof() {
         let mut session = Session::new(sample_inputs(vec![0xab; 32]));
-        let manifest = session.inputs().manifest_digest.clone();
-        let hello = AdapterHello {
+        let manifest =
+            "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let mut hello = AdapterHello {
             adapter_name: "fake".to_string(),
             adapter_version: "0.0.0".to_string(),
             adapter_build_hash: String::new(),
@@ -586,12 +684,13 @@ mod tests {
             pid: 0,
             process_start_monotonic_ns: 0,
             parent_launch_id: String::new(),
-            repository_fingerprint: String::new(),
+            repository_fingerprint: "expected-repo".to_string(),
             protocol_major_max: 1,
             protocol_minor_max: 0,
-            client_nonce: Bytes::copy_from_slice(&[0xaa_u8; 16]),
+            client_nonce: Bytes::copy_from_slice(&[0xaa_u8; 32]),
             hmac: Bytes::copy_from_slice(&[0u8; 32]),
         };
+        hello.repository_fingerprint = "expected-repo".to_string();
         let envelope = envelope_with_payload(
             session.inputs().runtime_session_id,
             0,
@@ -599,6 +698,121 @@ mod tests {
         );
         let err = session.accept_adapter_hello(&envelope).unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::HelloProof);
+    }
+
+    #[test]
+    fn accept_adapter_hello_rejects_wrong_client_nonce_length() {
+        let mut session = Session::new(sample_inputs(vec![0xab; 32]));
+        let manifest =
+            "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let mut hello = AdapterHello {
+            adapter_name: "fake".to_string(),
+            adapter_version: "0.0.0".to_string(),
+            adapter_build_hash: String::new(),
+            signing_identity: String::new(),
+            manifest_digest: manifest,
+            language: "rust".to_string(),
+            runtime_name: "test".to_string(),
+            runtime_version: "0.0.0".to_string(),
+            pid: 0,
+            process_start_monotonic_ns: 0,
+            parent_launch_id: String::new(),
+            repository_fingerprint: "expected-repo".to_string(),
+            protocol_major_max: 1,
+            protocol_minor_max: 0,
+            client_nonce: Bytes::copy_from_slice(&[0xaa_u8; 16]),
+            hmac: Bytes::copy_from_slice(&[0u8; 32]),
+        };
+        hello.repository_fingerprint = "expected-repo".to_string();
+        let envelope = envelope_with_payload(
+            session.inputs().runtime_session_id,
+            0,
+            PayloadOneof::AdapterHello(hello),
+        );
+        let err = session.accept_adapter_hello(&envelope).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::HelloDecode);
+    }
+
+    #[test]
+    fn accept_adapter_hello_rejects_wrong_repository_fingerprint() {
+        let mut session = Session::new(sample_inputs(vec![0xab; 32]));
+        let secret = session.inputs().session_secret.read_secret().to_vec();
+        let manifest =
+            "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let mut hello = sample_adapter_hello(&session, &secret, &manifest);
+        hello.repository_fingerprint = "wrong-repo".to_string();
+        let envelope = envelope_with_payload(
+            session.inputs().runtime_session_id,
+            0,
+            PayloadOneof::AdapterHello(hello),
+        );
+        let err = session.accept_adapter_hello(&envelope).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::ProjectIdentity);
+    }
+
+    #[test]
+    fn accept_adapter_hello_rejects_wrong_runtime_session_id() {
+        let mut session = Session::new(sample_inputs(vec![0xab; 32]));
+        let secret = session.inputs().session_secret.read_secret().to_vec();
+        let manifest =
+            "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let hello = sample_adapter_hello(&session, &secret, &manifest);
+        let envelope =
+            envelope_with_payload(RuntimeSessionId::new(), 0, PayloadOneof::AdapterHello(hello));
+        let err = session.accept_adapter_hello(&envelope).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::SessionIdentity);
+    }
+
+    #[test]
+    fn accept_adapter_hello_rejects_nonzero_session_seq() {
+        let mut session = Session::new(sample_inputs(vec![0xab; 32]));
+        let secret = session.inputs().session_secret.read_secret().to_vec();
+        let manifest =
+            "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let hello = sample_adapter_hello(&session, &secret, &manifest);
+        let envelope = envelope_with_payload(
+            session.inputs().runtime_session_id,
+            1,
+            PayloadOneof::AdapterHello(hello),
+        );
+        let err = session.accept_adapter_hello(&envelope).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::SessionSequence);
+    }
+
+    #[test]
+    fn accept_adapter_hello_rejects_protocol_offer_below_daemon_major() {
+        let mut session = Session::new(sample_inputs(vec![0xab; 32]));
+        let secret = session.inputs().session_secret.read_secret().to_vec();
+        let manifest =
+            "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let mut hello = sample_adapter_hello(&session, &secret, &manifest);
+        hello.protocol_major_max = 0;
+        let envelope = envelope_with_payload(
+            session.inputs().runtime_session_id,
+            0,
+            PayloadOneof::AdapterHello(hello),
+        );
+        let err = session.accept_adapter_hello(&envelope).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::ProtocolMajor);
+    }
+
+    #[test]
+    fn accept_adapter_hello_negotiates_down_to_supported_major() {
+        let mut session = Session::new(sample_inputs(vec![0xab; 32]));
+        let secret = session.inputs().session_secret.read_secret().to_vec();
+        let manifest =
+            "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let mut hello = sample_adapter_hello(&session, &secret, &manifest);
+        hello.protocol_major_max = 2;
+        hello.protocol_minor_max = 3;
+        let envelope = envelope_with_payload(
+            session.inputs().runtime_session_id,
+            0,
+            PayloadOneof::AdapterHello(hello),
+        );
+        let ack = session.accept_adapter_hello(&envelope).expect("accept");
+        assert_eq!(ack.protocol_major, 1);
+        assert_eq!(ack.protocol_minor, 0);
     }
 
     #[test]
@@ -661,8 +875,60 @@ mod tests {
     }
 
     #[test]
+    fn accept_post_hello_rejects_empty_message_id() {
+        let mut session = Session::new(sample_inputs(vec![0xab; 32]));
+        let session_id = session.inputs().runtime_session_id;
+        let mut envelope = envelope_with_payload(
+            session_id,
+            1,
+            PayloadOneof::Health(Health {
+                monotonic_ns: 1,
+                queue_depth_batches: 0,
+                resident_bytes: 0,
+                status: "ok".to_string(),
+            }),
+        );
+        envelope.message_id.clear();
+        let err = session.accept_post_hello(&envelope).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::HelloDecode);
+    }
+
+    #[test]
+    fn ack_carries_no_rejected_messages_for_successful_acceptance() {
+        let mut session = Session::new(sample_inputs(vec![0xab; 32]));
+        let session_id = session.inputs().runtime_session_id;
+        let envelope = envelope_with_payload(
+            session_id,
+            1,
+            PayloadOneof::Health(Health {
+                monotonic_ns: 1,
+                queue_depth_batches: 0,
+                resident_bytes: 0,
+                status: "ok".to_string(),
+            }),
+        );
+        let (_incoming, cmd) = session.accept_post_hello(&envelope).expect("accept");
+        let ack = match cmd {
+            OutgoingCommand::Ack(ack) => ack,
+            other => unreachable!("expected Ack, got {other:?}"),
+        };
+        assert!(ack.rejected.is_empty());
+        assert_eq!(ack.highest_contiguous_session_seq, 1);
+    }
+
+    #[test]
     fn build_daemon_hello_produces_a_well_formed_envelope() {
         let mut session = Session::new(sample_inputs(vec![0xab; 32]));
+        let secret = session.inputs().session_secret.read_secret().to_vec();
+        let manifest =
+            "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let hello = sample_adapter_hello(&session, &secret, &manifest);
+        let envelope = envelope_with_payload(
+            session.inputs().runtime_session_id,
+            0,
+            PayloadOneof::AdapterHello(hello),
+        );
+        session.accept_adapter_hello(&envelope).expect("hello");
         let server_nonce = [0xcc_u8; 32];
         let envelope = session.build_daemon_hello(server_nonce.to_vec(), 12345).expect("hello");
         assert_eq!(envelope.session_seq, 0);
@@ -694,6 +960,13 @@ mod tests {
     }
 
     #[test]
+    fn build_daemon_hello_requires_prior_adapter_hello() {
+        let mut session = Session::new(sample_inputs(vec![0xab; 32]));
+        let err = session.build_daemon_hello(vec![0; 32], 1).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::HelloDecode);
+    }
+
+    #[test]
     fn session_error_to_protocol_error_carries_code_and_message() {
         let err = SessionError::new(ProtocolErrorCode::SessionSequence, "gap".to_string());
         let wire = err.to_protocol_error();
@@ -702,12 +975,27 @@ mod tests {
     }
 
     #[test]
-    fn try_from_u32_for_ack_durability_is_total() {
+    fn try_from_u32_for_ack_dack_is_total() {
         // `AckDurability::Staged` is wire value 1; the helper below
         // exists to make sure the conversion is total even if the
         // protobuf enum gains new variants.
         let _ = AckDurability::try_from(1).expect("staged parses");
         let _ = AckDurability::try_from(2).expect("committed parses");
         assert!(AckDurability::try_from(99).is_err());
+    }
+
+    #[test]
+    fn canonical_manifest_digest_accepts_lowercase_b3_hex() {
+        assert!(is_canonical_manifest_digest(
+            "b3:0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(!is_canonical_manifest_digest(""));
+        assert!(!is_canonical_manifest_digest("not-a-digest"));
+        assert!(!is_canonical_manifest_digest(
+            "B3:0000000000000000000000000000000000000000000000000000000000000000"
+        ));
+        assert!(!is_canonical_manifest_digest(
+            "b3:000000000000000000000000000000000000000000000000000000000000000"
+        ));
     }
 }

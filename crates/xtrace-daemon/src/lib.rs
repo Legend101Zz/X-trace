@@ -42,10 +42,12 @@
 //! let project_id = ProjectId::new();
 //! let session_id = RuntimeSessionId::new();
 //! let bootstrap_path = PathBuf::from("/tmp/xtrace-bootstrap.json");
+//! let expected_repository_fingerprint = "expected-repo".to_string();
 //!
 //! let bound = DaemonBuilder::new(config)
 //!     .with_project_id(project_id)
 //!     .with_runtime_session_id(session_id)
+//!     .with_expected_repository_fingerprint(expected_repository_fingerprint)
 //!     .with_bootstrap_artifact(bootstrap_path)
 //!     .bind()
 //!     .await?;
@@ -96,7 +98,10 @@ pub mod tls;
 
 pub use bootstrap::{BootstrapArtifact, BootstrapArtifactFields, BootstrapOwner};
 pub use config::{ChannelCapacity, DaemonConfig, LOOPBACK_HOST, LoopbackPolicy};
-pub use daemon::{BoundDaemon, DaemonBuilder, TLS_EXPORTER_LABEL, TLS_EXPORTER_LEN};
+pub use daemon::{
+    BoundDaemon, DaemonBuilder, MonotonicClock, ShutdownSignal, TLS_EXPORTER_LABEL,
+    TLS_EXPORTER_LEN,
+};
 pub use error::{DaemonError, ProtocolErrorCode};
 pub use framing::{EnvelopeAsyncDecoder, EnvelopeAsyncEncoder, EnvelopeDecoder, EnvelopeEncoder};
 pub use listener::LoopbackListener;

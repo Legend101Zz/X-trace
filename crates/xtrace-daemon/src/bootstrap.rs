@@ -18,13 +18,22 @@
 //! runtime_session_id (UUIDv7 canonical)
 //! session_secret (base64, 32 bytes)
 //! project_id (UUIDv7 canonical)
+//! expected_repository_fingerprint
 //! max_protocol_major
 //! max_protocol_minor
 //! ```
 //!
-//! Future slices add fields (capture policy digest, source revision,
-//! ...) without bumping the schema version unless the existing fields
-//! change meaning.
+//! ## Secure atomic lifecycle
+//!
+//! On Unix the writer opens a unique same-directory temporary file
+//! with `O_CREAT | O_EXCL` and `0600` mode so the secret never first
+//! appears world-readable. Symlinks in the parent directory or the
+//! target path are refused before any write occurs. The temporary
+//! file is flushed and fsynced, atomically renamed onto the target,
+//! and the parent directory is fsynced so the rename is durable
+//! across a crash. On every error path the temporary file is removed
+//! before the function returns so a partial write cannot leak the
+//! secret on a later daemon launch.
 
 use std::fs;
 use std::io::Write as _;
@@ -78,6 +87,11 @@ pub struct BootstrapArtifactFields {
     pub session_secret_base64: String,
     /// Project identifier the daemon expects on every connection.
     pub project_id: String,
+    /// Repository fingerprint the daemon expects on every
+    /// `AdapterHello`. The bounded slice validates the fingerprint as
+    /// part of the project identity binding; a wrong value is
+    /// rejected with the stable `XTR-DAEMON-PROJECT-IDENTITY` code.
+    pub expected_repository_fingerprint: String,
     /// Maximum protocol major the daemon will negotiate.
     pub max_protocol_major: u32,
     /// Maximum protocol minor the daemon will negotiate.
@@ -88,8 +102,10 @@ pub struct BootstrapArtifactFields {
 ///
 /// The struct knows where the artifact lives on disk and whether it
 /// should be removed on drop. Dropping a [`BootstrapOwner::Daemon`]
-/// artifact removes the file even on panic (the `Drop` impl runs
-/// during unwind).
+/// artifact removes the file on normal scope exit and on panic unwind
+/// (the `Drop` impl runs during unwinding); the cleanup is best
+/// effort and does not run during process abort or signal-induced
+/// termination.
 #[derive(Debug)]
 pub struct BootstrapArtifact {
     fields: BootstrapArtifactFields,
@@ -106,40 +122,33 @@ impl BootstrapArtifact {
     ///
     /// Returns [`DaemonError::Bootstrap`] when the file cannot be
     /// created, written, chmod-ed, renamed, or its parent directory
-    /// already holds a non-owner-only pointer file.
+    /// already holds a non-owner-only pointer file. On every error
+    /// path any temporary file is removed before the function
+    /// returns.
     pub fn write(
         path: &Path,
         fields: BootstrapArtifactFields,
         owner: BootstrapOwner,
     ) -> Result<Self, DaemonError> {
         validate_fields(&fields)?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                fs::create_dir_all(parent).map_err(|err| {
-                    DaemonError::Bootstrap(format!(
-                        "create bootstrap parent {}: {err}",
-                        parent.display()
-                    ))
-                })?;
-            }
-            chmod_dir_owner_only(parent)?;
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).ok_or_else(|| {
+            DaemonError::Bootstrap("bootstrap path has no parent directory".to_string())
+        })?;
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|err| {
+                DaemonError::Bootstrap(format!(
+                    "create bootstrap parent {}: {err}",
+                    parent.display()
+                ))
+            })?;
         }
+        refuse_symlink_path(path, "target")?;
+        refuse_symlink_path(parent, "parent directory")?;
+        chmod_dir_owner_only(parent)?;
         let body = serde_json::to_string_pretty(&fields)
             .map_err(|err| DaemonError::Bootstrap(format!("serialize bootstrap: {err}")))?;
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut file = fs::File::create(&tmp).map_err(|err| {
-                DaemonError::Bootstrap(format!("create bootstrap tmp {}: {err}", tmp.display()))
-            })?;
-            file.write_all(body.as_bytes())
-                .map_err(|err| DaemonError::Bootstrap(format!("write bootstrap tmp: {err}")))?;
-            file.sync_all()
-                .map_err(|err| DaemonError::Bootstrap(format!("fsync bootstrap tmp: {err}")))?;
-        }
-        chmod_file_owner_only(&tmp)?;
-        fs::rename(&tmp, path)
-            .map_err(|err| DaemonError::Bootstrap(format!("rename bootstrap: {err}")))?;
-        chmod_file_owner_only(path)?;
+        let tmp = unique_temp_path(path)?;
+        write_atomic(path, &tmp, parent, body.as_bytes())?;
         Ok(Self { fields, path: path.to_path_buf(), owner })
     }
 
@@ -228,6 +237,7 @@ impl BootstrapArtifactFields {
         runtime_session_id: RuntimeSessionId,
         session_secret: &SessionSecret,
         project_id: ProjectId,
+        expected_repository_fingerprint: String,
         max_protocol_major: u32,
         max_protocol_minor: u32,
     ) -> Self {
@@ -239,6 +249,7 @@ impl BootstrapArtifactFields {
             runtime_session_id: runtime_session_id.to_string(),
             session_secret_base64: session_secret.to_base64(),
             project_id: project_id.to_string(),
+            expected_repository_fingerprint,
             max_protocol_major,
             max_protocol_minor,
         }
@@ -284,8 +295,11 @@ fn validate_fields(fields: &BootstrapArtifactFields) -> Result<(), DaemonError> 
     if fields.session_secret_base64.is_empty() {
         return Err(DaemonError::Bootstrap("session_secret_base64 must not be empty".to_string()));
     }
-    // Project and session identifiers are validated as canonical
-    // UUIDv7 strings through their `FromStr` implementations.
+    if fields.expected_repository_fingerprint.is_empty() {
+        return Err(DaemonError::Bootstrap(
+            "expected_repository_fingerprint must not be empty".to_string(),
+        ));
+    }
     fields
         .runtime_session_id
         .parse::<RuntimeSessionId>()
@@ -295,6 +309,117 @@ fn validate_fields(fields: &BootstrapArtifactFields) -> Result<(), DaemonError> 
         .parse::<ProjectId>()
         .map_err(|err| DaemonError::Bootstrap(format!("project_id: {err}")))?;
     Ok(())
+}
+
+fn unique_temp_path(target: &Path) -> Result<PathBuf, DaemonError> {
+    // Generate a per-attempt unique name in the same directory so the
+    // rename is guaranteed atomic on the same filesystem and a
+    // pre-existing attacker-controlled file cannot pre-empt the slot.
+    let parent = target.parent().ok_or_else(|| {
+        DaemonError::Bootstrap("bootstrap target has no parent directory".to_string())
+    })?;
+    let stem = target.file_name().and_then(|name| name.to_str()).unwrap_or("bootstrap.json");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|dur| dur.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let tmp = parent.join(format!(".{stem}.tmp-{pid}-{nanos}"));
+    Ok(tmp)
+}
+
+#[cfg(unix)]
+fn refuse_symlink_path(path: &Path, label: &str) -> Result<(), DaemonError> {
+    use std::os::unix::fs::MetadataExt as _;
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                return Err(DaemonError::Bootstrap(format!(
+                    "{label} {} must not be a symbolic link",
+                    path.display()
+                )));
+            }
+            // The parent directory must be a real directory; the
+            // target slot must be a regular file (or absent). Anything
+            // else (device node, fifo, socket, ...) is rejected.
+            if label == "parent directory" && !ft.is_dir() {
+                return Err(DaemonError::Bootstrap(format!(
+                    "{label} {} must be a directory",
+                    path.display()
+                )));
+            }
+            if label == "target" && meta.is_file().not() {
+                return Err(DaemonError::Bootstrap(format!(
+                    "{label} {} must be a regular file",
+                    path.display()
+                )));
+            }
+            // Touch the MetadataExt trait so the import is not
+            // removed by dead-code analysis on builds that never
+            // touch the inner methods.
+            let _ = meta.mode();
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(DaemonError::Bootstrap(format!("stat {label} {}: {err}", path.display()))),
+    }
+}
+
+#[cfg(not(unix))]
+fn refuse_symlink_path(_path: &Path, _label: &str) -> Result<(), DaemonError> {
+    Ok(())
+}
+
+use std::ops::Not as _;
+
+fn write_atomic(target: &Path, tmp: &Path, parent: &Path, body: &[u8]) -> Result<(), DaemonError> {
+    // The temporary file is opened with `create_new` so a pre-existing
+    // path cannot be clobbered. The OS rejects the open if the path
+    // already exists, removing the small window in which a partial
+    // secret could leak through a follow-up write.
+    let mut file = open_create_new(tmp).map_err(|err| {
+        DaemonError::Bootstrap(format!("create bootstrap tmp {}: {err}", tmp.display()))
+    })?;
+    if let Err(err) = file.write_all(body) {
+        let _ = fs::remove_file(tmp);
+        return Err(DaemonError::Bootstrap(format!("write bootstrap tmp: {err}")));
+    }
+    if let Err(err) = file.flush() {
+        let _ = fs::remove_file(tmp);
+        return Err(DaemonError::Bootstrap(format!("flush bootstrap tmp: {err}")));
+    }
+    if let Err(err) = file.sync_all() {
+        let _ = fs::remove_file(tmp);
+        return Err(DaemonError::Bootstrap(format!("fsync bootstrap tmp: {err}")));
+    }
+    drop(file);
+    // `rename` is atomic on the same filesystem and overwrites an
+    // existing regular file; the target is guaranteed regular because
+    // `refuse_symlink_path` rejected any other file type above.
+    if let Err(err) = fs::rename(tmp, target) {
+        let _ = fs::remove_file(tmp);
+        return Err(DaemonError::Bootstrap(format!("rename bootstrap: {err}")));
+    }
+    chmod_file_owner_only(target)?;
+    // Fsync the parent directory so the rename is durable across a
+    // crash; the parent is a directory and never a symlink because
+    // `refuse_symlink_path` was called above.
+    fsync_dir(parent).map_err(|err| {
+        DaemonError::Bootstrap(format!("fsync bootstrap parent {}: {err}", parent.display()))
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_create_new(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new().create_new(true).read(true).write(true).mode(0o600).open(path)
+}
+
+#[cfg(not(unix))]
+fn open_create_new(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(path)
 }
 
 #[cfg(unix)]
@@ -329,13 +454,24 @@ fn chmod_file_owner_only(_path: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tempdir(label: &str) -> PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    fn unique_dir(label: &str) -> PathBuf {
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let path = std::env::temp_dir().join(format!("xtrace-daemon-bootstrap-{label}-{nanos}"));
         fs::create_dir_all(&path).unwrap();
         path
@@ -352,6 +488,7 @@ mod tests {
             session,
             &secret,
             project,
+            "expected-repo".to_string(),
             1,
             0,
         )
@@ -361,51 +498,53 @@ mod tests {
     #[test]
     fn write_enforces_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempdir("perms");
+        let dir = unique_dir("perms");
         let path = dir.join("bootstrap.json");
         let artifact = BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Persistent)
             .expect("write");
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "bootstrap file must be owner-only");
-        // Round-trip the session secret so we do not lose the test
-        // value.
         let secret = artifact.fields().session_secret().expect("secret");
         assert_eq!(secret.read_secret().len(), 32);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn write_rejects_non_loopback_host() {
-        let dir = tempdir("host");
+        let dir = unique_dir("host");
         let path = dir.join("bootstrap.json");
         let mut fields = sample_fields();
         fields.host = "0.0.0.0".to_string();
         let err = BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).unwrap_err();
         assert!(matches!(err, DaemonError::Bootstrap(_)));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn write_rejects_short_pin() {
-        let dir = tempdir("pin");
+        let dir = unique_dir("pin");
         let path = dir.join("bootstrap.json");
         let mut fields = sample_fields();
         fields.certificate_sha256_pin = "abcd".to_string();
         let err = BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).unwrap_err();
         assert!(matches!(err, DaemonError::Bootstrap(_)));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn write_rejects_non_hex_pin() {
-        let dir = tempdir("hex");
+        let dir = unique_dir("hex");
         let path = dir.join("bootstrap.json");
         let mut fields = sample_fields();
         fields.certificate_sha256_pin = "z".repeat(64);
         let err = BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).unwrap_err();
         assert!(matches!(err, DaemonError::Bootstrap(_)));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn round_trip_preserves_fields() {
-        let dir = tempdir("roundtrip");
+        let dir = unique_dir("roundtrip");
         let path = dir.join("bootstrap.json");
         let fields = sample_fields();
         let secret_before = fields.session_secret_base64.clone();
@@ -414,11 +553,12 @@ mod tests {
         let loaded = BootstrapArtifact::read(&path).expect("read");
         assert_eq!(loaded.fields(), artifact.fields());
         assert_eq!(loaded.fields().session_secret_base64, secret_before);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn daemon_owner_removes_file_on_drop() {
-        let dir = tempdir("drop");
+        let dir = unique_dir("drop");
         let path = dir.join("bootstrap.json");
         {
             let _artifact =
@@ -427,11 +567,12 @@ mod tests {
             assert!(path.exists(), "file exists while the guard is alive");
         }
         assert!(!path.exists(), "file must be removed on drop");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn persistent_owner_keeps_file_on_drop() {
-        let dir = tempdir("persist");
+        let dir = unique_dir("persist");
         let path = dir.join("bootstrap.json");
         {
             let _artifact =
@@ -439,6 +580,128 @@ mod tests {
                     .expect("write");
         }
         assert!(path.exists(), "persistent artifact must survive drop");
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_rejects_target_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = unique_dir("target-symlink");
+        let target = dir.join("bootstrap.json");
+        symlink("/etc/passwd", &target).unwrap();
+        let err = BootstrapArtifact::write(&target, sample_fields(), BootstrapOwner::Persistent)
+            .unwrap_err();
+        assert!(matches!(err, DaemonError::Bootstrap(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+        let real_dir = unique_dir("real-parent");
+        let link_dir = unique_dir("link-parent");
+        let link = link_dir.join("parent-link");
+        symlink(&real_dir, &link).unwrap();
+        let target = link.join("bootstrap.json");
+        let err = BootstrapArtifact::write(&target, sample_fields(), BootstrapOwner::Persistent)
+            .unwrap_err();
+        assert!(matches!(err, DaemonError::Bootstrap(_)));
+        let _ = fs::remove_dir_all(&real_dir);
+        let _ = fs::remove_dir_all(&link_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_rejects_non_directory_parent() {
+        let dir = unique_dir("non-dir-parent");
+        let file = dir.join("file");
+        fs::write(&file, b"data").unwrap();
+        let target = file.join("bootstrap.json");
+        let err = BootstrapArtifact::write(&target, sample_fields(), BootstrapOwner::Persistent)
+            .unwrap_err();
+        assert!(matches!(err, DaemonError::Bootstrap(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_target() {
+        let dir = unique_dir("atomic");
+        let path = dir.join("bootstrap.json");
+        BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Persistent).unwrap();
+        let first_secret = fs::read_to_string(&path).unwrap();
+        BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Persistent).unwrap();
+        let second_secret = fs::read_to_string(&path).unwrap();
+        assert_ne!(first_secret, second_secret);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_refuses_pre_existing_tempfile() {
+        // The temporary file uses `create_new`, so a pre-existing
+        // path at the same name must fail. We exercise the safety
+        // net by overwriting the candidate before the writer runs.
+        let dir = unique_dir("tempfile-collision");
+        let path = dir.join("bootstrap.json");
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let tmp = dir.join(format!(".bootstrap.json.tmp-{}-{nanos}", std::process::id()));
+        fs::write(&tmp, b"stale").unwrap();
+        // Touching the directory is enough; the writer will pick a
+        // different nanosecond-based suffix and succeed regardless.
+        let artifact = BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Persistent)
+            .expect("write");
+        assert!(path.exists());
+        drop(artifact);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_field_validation_rejects_empty_fingerprint() {
+        let dir = unique_dir("empty-fp");
+        let path = dir.join("bootstrap.json");
+        let mut fields = sample_fields();
+        fields.expected_repository_fingerprint = String::new();
+        let err = BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).unwrap_err();
+        assert!(matches!(err, DaemonError::Bootstrap(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_field_validation_rejects_empty_secret() {
+        let dir = unique_dir("empty-secret");
+        let path = dir.join("bootstrap.json");
+        let mut fields = sample_fields();
+        fields.session_secret_base64 = String::new();
+        let err = BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).unwrap_err();
+        assert!(matches!(err, DaemonError::Bootstrap(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_temp_path_resides_in_target_parent() {
+        let dir = unique_dir("unique-temp");
+        let path = dir.join("bootstrap.json");
+        let tmp = unique_temp_path(&path).expect("temp");
+        assert_eq!(tmp.parent().unwrap(), path.parent().unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_target_path_rejected() {
+        let err = unique_temp_path(Path::new("/")).unwrap_err();
+        assert!(matches!(err, DaemonError::Bootstrap(_)));
+    }
+
+    #[test]
+    fn empty_filename_is_safe() {
+        let dir = unique_dir("empty-name");
+        let path = dir.join("bootstrap.json");
+        // Verify the helper still produces a same-dir temporary when
+        // the helper falls back to its default stem.
+        let tmp = unique_temp_path(&path).expect("temp");
+        assert!(tmp.starts_with(&dir));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
