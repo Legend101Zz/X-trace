@@ -1573,6 +1573,11 @@ async fn loopback_recording_wire_admission_acks_through_session_seq_three() {
         .expect("write adapter hello");
     let _ = read_envelope_bounded(&mut reader, "daemon hello").await;
 
+    // Slice 1C.3 fixture: the structural start carries
+    // `recording_seq == 1`; the empty `EventBatch` is a valid no-op
+    // for the known recording; the finish marker matches the
+    // validator's highest contiguous value (1 because no events
+    // were accepted).
     let recording_id = Bytes::copy_from_slice(&[0xa1_u8; 16]);
     let payloads = [
         (
@@ -1580,6 +1585,7 @@ async fn loopback_recording_wire_admission_acks_through_session_seq_three() {
             PayloadOneof::RecordingStarted(RecordingStarted {
                 recording_id: recording_id.clone(),
                 method: "GET".to_string(),
+                recording_seq: 1,
                 ..RecordingStarted::default()
             }),
         ),
@@ -1587,13 +1593,14 @@ async fn loopback_recording_wire_admission_acks_through_session_seq_three() {
             2,
             PayloadOneof::EventBatch(EventBatch {
                 recording_id: recording_id.clone(),
-                ..EventBatch::default()
+                events: Vec::new(),
             }),
         ),
         (
             3,
             PayloadOneof::RecordingFinished(RecordingFinished {
                 recording_id,
+                final_recording_seq: 1,
                 ..RecordingFinished::default()
             }),
         ),
@@ -1613,6 +1620,11 @@ async fn loopback_recording_wire_admission_acks_through_session_seq_three() {
             xtrace_protocol::generated::agent::AckDurability::Staged as i32,
             "wire-admission ACK must report Staged durability; durable storage is out of scope",
         );
+        assert_eq!(
+            ack.highest_contiguous_recording_seq.len(),
+            1,
+            "every recording ACK must report the canonical recording watermark",
+        );
     }
 
     drop(reader);
@@ -1621,6 +1633,144 @@ async fn loopback_recording_wire_admission_acks_through_session_seq_three() {
     let _ = shutdown_tx.send(());
     // Bound the shutdown so a regression surfaces as a test failure
     // rather than hanging the suite.
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("shutdown timed out")
+        .expect("daemon task")
+        .expect("serve");
+    drop(temp);
+}
+
+// Slice 1C.3 recoverable path: send an invalid recording envelope,
+// observe the safe `XTR-CAPTURE-INGEST` `ProtocolError`, resend a
+// corrected envelope at the same `session_seq`, receive a `Staged`
+// ACK, and then complete a valid start/event/finish journey with
+// canonical watermark values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_recording_recoverable_rejection_then_valid_journey() {
+    let temp = TempDir::new().expect("temp dir");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, secret, _, _, address, pin) = spawn_daemon(
+        bootstrap_path.clone(),
+        Duration::from_secs(60),
+        64,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+    )
+    .await
+    .expect("bind");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+
+    let client_nonce = [0x6c_u8; 32];
+    let mut tls_stream = connect_pinned(address, &pin).await.expect("pinned connect");
+    let mut exporter_buf = [0u8; 32];
+    tls_stream
+        .get_ref()
+        .1
+        .export_keying_material(&mut exporter_buf, TLS_EXPORTER_LABEL, None)
+        .expect("client exporter");
+    let exporter = exporter_buf.to_vec();
+
+    let adapter_hello = build_adapter_hello(
+        secret.read_secret(),
+        &exporter,
+        &session_id,
+        HAPPY_MANIFEST_DIGEST,
+        &client_nonce,
+        EXPECTED_REPOSITORY_FINGERPRINT,
+        1,
+        0,
+    );
+    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    write_envelope(&mut writer, PayloadOneof::AdapterHello(adapter_hello), &session_id, 0, 1)
+        .await
+        .expect("write adapter hello");
+    let _ = read_envelope_bounded(&mut reader, "daemon hello").await;
+
+    let recording_id_bytes = Bytes::copy_from_slice(&[0xa2_u8; 16]);
+    let canonical_key =
+        xtrace_domain::RecordingId::from_uuid(uuid::Uuid::from_bytes([0xa2; 16])).as_string();
+
+    // First attempt: a `RecordingStarted` with the wrong `recording_seq`
+    // is a recoverable `InvalidStartSeq` rejection.
+    let invalid = PayloadOneof::RecordingStarted(RecordingStarted {
+        recording_id: recording_id_bytes.clone(),
+        recording_seq: 7,
+        method: "GET".to_string(),
+        ..RecordingStarted::default()
+    });
+    write_envelope(&mut writer, invalid, &session_id, 1, 2).await.expect("write invalid start");
+    let protocol_error = next_protocol_error(&mut reader, "ingest error").await;
+    assert_eq!(
+        protocol_error.code, "XTR-CAPTURE-INGEST",
+        "recoverable ingest rejection must surface the safe capture-ingest code",
+    );
+    assert_eq!(
+        protocol_error.message, "ingest rejection: invalid_start_seq",
+        "recoverable ingest rejection must surface the exact safe variant name",
+    );
+    assert!(
+        !protocol_error.message.contains("GET")
+            && !protocol_error.message.contains("payload")
+            && !protocol_error.message.contains("recording"),
+        "ProtocolError message must not embed captured values, got {:?}",
+        protocol_error.message,
+    );
+
+    // Corrected envelope at the same session_seq succeeds with a
+    // Staged ACK carrying the canonical recording watermark.
+    let corrected = PayloadOneof::RecordingStarted(RecordingStarted {
+        recording_id: recording_id_bytes.clone(),
+        recording_seq: 1,
+        method: "GET".to_string(),
+        ..RecordingStarted::default()
+    });
+    write_envelope(&mut writer, corrected, &session_id, 1, 3).await.expect("write corrected start");
+    let ack = next_ack(&mut reader, "ack start").await;
+    assert_eq!(ack.highest_contiguous_session_seq, 1);
+    assert_eq!(
+        ack.durability,
+        xtrace_protocol::generated::agent::AckDurability::Staged as i32,
+        "Staged ACK after recoverable rejection must still report Staged durability",
+    );
+    assert!(ack.rejected.is_empty());
+    assert_eq!(
+        ack.highest_contiguous_recording_seq.get(&canonical_key),
+        Some(&1),
+        "Staged ACK must carry the canonical recording watermark",
+    );
+
+    // Complete the valid start -> event -> finish journey.
+    let batch = PayloadOneof::EventBatch(EventBatch {
+        recording_id: recording_id_bytes.clone(),
+        events: vec![xtrace_protocol::generated::agent::RecordingEvent {
+            event_id: "ev-1".to_string(),
+            recording_seq: 2,
+            ..Default::default()
+        }],
+    });
+    write_envelope(&mut writer, batch, &session_id, 2, 2).await.expect("write event batch");
+    let ack = next_ack(&mut reader, "ack batch").await;
+    assert_eq!(ack.highest_contiguous_session_seq, 2);
+    assert_eq!(ack.highest_contiguous_recording_seq.get(&canonical_key), Some(&2));
+
+    let finish = PayloadOneof::RecordingFinished(RecordingFinished {
+        recording_id: recording_id_bytes,
+        final_recording_seq: 2,
+        ..RecordingFinished::default()
+    });
+    write_envelope(&mut writer, finish, &session_id, 3, 3).await.expect("write finish");
+    let ack = next_ack(&mut reader, "ack finish").await;
+    assert_eq!(ack.highest_contiguous_session_seq, 3);
+    assert_eq!(ack.highest_contiguous_recording_seq.get(&canonical_key), Some(&2));
+
+    drop(reader);
+    drop(writer);
+    drop(tls_stream);
+    let _ = shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(5), daemon_handle)
         .await
         .expect("shutdown timed out")

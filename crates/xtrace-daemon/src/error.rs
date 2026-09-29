@@ -15,6 +15,15 @@
 //! connection paths and may include bounded validation or framing
 //! detail. Code that builds the wire envelope must never insert
 //! session secret or private-key material.
+//!
+//! Every code lives in the `XTR-DAEMON-*` namespace except
+//! [`ProtocolErrorCode::CaptureIngest`], which is the one
+//! capture-ingress exception that lives in the `XTR-CAPTURE-INGEST`
+//! family. The session renders every [`xtrace_ingest::IngestError`]
+//! produced by the session-bound validator as that single safe
+//! variant label; the full typed error and every payload-bearing
+//! field remain local to the daemon, and the wire `ProtocolError`
+//! envelope contains only the stable safe variant label.
 
 use std::io;
 
@@ -22,10 +31,9 @@ use thiserror::Error;
 
 /// Stable error code families used in `ProtocolError` messages.
 ///
-/// Codes follow the `XTR-DAEMON-*` namespace documented in
-/// `docs/plans/x-trace/03-program-design.md` §7. New codes require an
-/// ADR and must be added to this enum so a downstream adapter sees the
-/// exact set the daemon can emit.
+/// Codes follow the `XTR-DAEMON-*` namespace; new codes require an
+/// ADR and must be added to this enum so a downstream adapter sees
+/// the exact set the daemon can emit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProtocolErrorCode {
     /// Listener could not bind to the loopback address.
@@ -60,6 +68,20 @@ pub enum ProtocolErrorCode {
     Bootstrap,
     /// Supervisor was ordered to shut down; the connection is closing.
     Shutdown,
+    /// Wire code `XTR-CAPTURE-INGEST`: the single capture-ingress code
+    /// emitted for every rejection returned by the session-bound
+    /// [`xtrace_ingest::IngestValidator`]. It keeps the protocol
+    /// surface narrow even though the underlying [`xtrace_ingest::IngestError`]
+    /// carries many variants; the full typed error and every
+    /// payload-bearing field remain local to the daemon, and the
+    /// wire `ProtocolError` envelope contains only the stable safe
+    /// variant label. The typed reason is exposed through
+    /// [`crate::session::SessionError::ingest_error`] together with
+    /// [`xtrace_ingest::IngestError::is_session_fatal`] so the
+    /// supervisor can distinguish recoverable from session-fatal
+    /// ingest rejections without ever round-tripping a payload
+    /// across the wire.
+    CaptureIngest,
 }
 
 impl ProtocolErrorCode {
@@ -79,6 +101,7 @@ impl ProtocolErrorCode {
             Self::Transport => "XTR-DAEMON-TRANSPORT",
             Self::Bootstrap => "XTR-DAEMON-BOOTSTRAP",
             Self::Shutdown => "XTR-DAEMON-SHUTDOWN",
+            Self::CaptureIngest => "XTR-CAPTURE-INGEST",
         }
     }
 }
@@ -182,7 +205,10 @@ mod tests {
     }
 
     #[test]
-    fn protocol_error_codes_have_xtr_prefix() {
+    fn protocol_error_codes_have_xtr_daemon_prefix() {
+        // Every legacy variant must keep the `XTR-DAEMON-*` family so
+        // a downstream adapter's stable prefix filter still matches;
+        // adding a new code requires an ADR and updating this list.
         for code in [
             ProtocolErrorCode::Bind,
             ProtocolErrorCode::TlsHandshake,
@@ -197,7 +223,20 @@ mod tests {
             ProtocolErrorCode::Bootstrap,
             ProtocolErrorCode::Shutdown,
         ] {
-            assert!(code.as_str().starts_with("XTR-DAEMON-"));
+            assert!(
+                code.as_str().starts_with("XTR-DAEMON-"),
+                "legacy protocol error code must carry the XTR-DAEMON- prefix, got {}",
+                code.as_str()
+            );
         }
+        // The capture-ingest code lives in its own family; the
+        // session uses it for every `IngestError` so the wire surface
+        // stays narrow even though the underlying typed error carries
+        // many variants.
+        assert_eq!(
+            ProtocolErrorCode::CaptureIngest.as_str(),
+            "XTR-CAPTURE-INGEST",
+            "CaptureIngest must equal the capture-ingest wire code exactly",
+        );
     }
 }

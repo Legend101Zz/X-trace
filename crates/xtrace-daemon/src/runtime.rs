@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use xtrace_ingest::Acceptance;
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
 use xtrace_protocol::generated::agent::{
     CapabilitySet, DaemonHello, EventBatch, Health, ProtocolError, RecordingFinished,
@@ -51,12 +52,11 @@ pub struct AdapterHelloAck {
 
 /// Envelope received from the adapter after the handshake completes.
 ///
-/// The supervisor decodes incoming bytes into this enum so the
-/// session task can pattern-match without touching protobuf types.
 /// Recording wire payloads (`RecordingStarted`, `EventBatch`,
-/// `RecordingFinished`) are staged verbatim and acknowledged with
-/// `AckDurability::Staged`; validation, lifecycle, and persistence
-/// belong to the downstream ingester.
+/// `RecordingFinished`) are validated through the session-bound
+/// `xtrace-ingest` validator before staging and acknowledged with
+/// `AckDurability::Staged`; persistence, `Committed` durability, and
+/// terminal recording lifecycle remain downstream of this slice.
 #[derive(Clone, Debug)]
 pub enum IncomingEnvelope {
     /// Adapter supplied its initial [`CapabilitySet`].
@@ -69,6 +69,19 @@ pub enum IncomingEnvelope {
     EventBatch(EventBatch),
     /// Adapter signalled the end of a recording session.
     RecordingFinished(RecordingFinished),
+}
+
+/// Successful outcome of a single post-hello admission. `acceptance`
+/// is `None` for `CapabilitySet` and `Health` because the validator
+/// does not examine those variants.
+#[derive(Clone, Debug)]
+pub struct PostHelloAdmission {
+    /// Typed accepted envelope.
+    pub incoming: IncomingEnvelope,
+    /// Validator verdict for the accepted envelope.
+    pub acceptance: Option<Acceptance>,
+    /// Outbound command the supervisor must serialize next.
+    pub command: OutgoingCommand,
 }
 
 /// Outbound command the supervisor wants to emit to the adapter.
