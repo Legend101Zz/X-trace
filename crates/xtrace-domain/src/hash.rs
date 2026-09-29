@@ -14,7 +14,11 @@ const BLAKE3_PREFIX: &str = "b3:";
 /// 256-bit content hash tagged with its algorithm.
 ///
 /// Persisted as a 32-byte blob in SQLite and as the lowercase
-/// `b3:<hex>` form on the wire.
+/// `b3:<hex>` form on the wire. `FromStr` accepts uppercase hex
+/// digits because the underlying hex decoder is case-insensitive;
+/// callers comparing wire input against `to_canonical` must do an
+/// exact string equality check rather than rely on round-trip
+/// parsing.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 #[repr(transparent)]
@@ -42,7 +46,11 @@ impl ContentHash {
         &self.0
     }
 
-    /// Renders the canonical `b3:<hex>` form.
+    /// Renders the canonical `b3:<lowercase hex>` form. Callers
+    /// comparing wire input against this output must do an exact
+    /// string comparison; `ContentHash::from_str` accepts uppercase
+    /// hex digits so byte-equality is the only reliable equality
+    /// check across the parse boundary.
     #[must_use]
     pub fn to_canonical(&self) -> String {
         let mut out = String::with_capacity(3 + 64);

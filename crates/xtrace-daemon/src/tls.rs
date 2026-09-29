@@ -15,12 +15,20 @@
 //!
 //! ## Private-key hygiene
 //!
-//! The private key is wrapped in a single-use buffer that zeroes its
-//! backing storage on drop and prints a redacted marker under
-//! `Debug`. The material is consumed exactly once when the rustls
-//! server configuration is built; the [`TlsServerMaterials`] only
-//! retains the [`Arc<ServerConfig>`] and the certificate pin, never
-//! the key or the DER bytes.
+//! The private key bytes are wrapped in a module-private
+//! zero-on-drop buffer (`EphemeralPrivateKey`) that prints a redacted
+//! marker under `Debug`. The wrapper holds the DER bytes until
+//! [`TlsServerMaterials::build`] moves them into rustls via
+//! [`std::mem::take`] on the wrapper's `private_mut` accessor;
+//! after the handoff rustls owns the key material and the wrapper
+//! is dropped with an empty buffer. The wrapper can only zeroize
+//! bytes it still owns: pre-handoff drops and drops after a failed
+//! rustls builder call clear the original DER buffer, but once the
+//! `Vec<u8>` is moved into rustls the type has no view of those
+//! bytes. [`TlsServerMaterials`] has no `Clone` implementation, no
+//! DER accessor, and no public escape for the key; the only
+//! observable TLS state is the [`rustls::ServerConfig`] arc and the
+//! certificate pin string.
 
 use std::sync::Arc;
 
@@ -52,10 +60,11 @@ const SUPPORTED_TLS_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version:
 ///
 /// The struct holds the bytes by value, never exposes the buffer
 /// outside this module, and clears it on `Drop`. The buffer is moved
-/// into the rustls builder exactly once; the wrapper exists so the
-/// `Debug` formatting always prints the redacted marker and the
-/// [`EphemeralCertificate::private_key`] accessor hands the bytes to
-/// the rustls builder through a single, traceable call site.
+/// into the rustls builder exactly once through
+/// [`EphemeralPrivateKey::private_mut`], which the builder caller
+/// drains with `std::mem::take`. The wrapper exists so the `Debug`
+/// formatting always prints the redacted marker and the single
+/// traceable call site hands the bytes to rustls.
 struct EphemeralPrivateKey(Vec<u8>);
 
 impl std::fmt::Debug for EphemeralPrivateKey {
@@ -155,7 +164,10 @@ impl TlsServerMaterials {
         // Wrap the private key in a zero-on-drop guard so the bytes
         // are cleared on every error path; the rustls builder is the
         // single consumer and takes ownership of the inner `Vec<u8>`
-        // through `EphemeralPrivateKey::into_inner`.
+        // by draining the wrapper through `private_mut`. Once the
+        // bytes move into rustls the wrapper has nothing left to
+        // zeroize; the rustls builder owns the material from that
+        // point on.
         let mut private_key_wrapper = EphemeralPrivateKey(private_key_der);
         let moved_bytes = std::mem::take(private_key_wrapper.private_mut());
         let server_config =

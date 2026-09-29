@@ -6,18 +6,21 @@
 //! artifact on the adapter side and recomputed into the
 //! [`xtrace_protocol::handshake`] HMAC tag on both ends.
 //!
-//! The type deliberately has no `Debug` or `Display` implementation:
-//! the secret must not be copied into a log, surfaced through
-//! diagnostics, or formatted into an error chain. `Clone` is derived
-//! because the bootstrap serializer needs its own copy that gets
-//! dropped with the rest of the bootstrap artifact; production callers
-//! outside the bootstrap path are expected to move the value rather
-//! than clone it. The `Drop` impl zeroes the backing buffer through
-//! the [`zeroize`] crate so a memory snapshot of the process never
-//! retains the secret.
-//!
-//! `Debug` prints a redacted marker so an accidental `{:?}` in a log
-//! line never leaks the secret bytes.
+//! `Debug` prints a redacted marker and there is no `Display`
+//! implementation, so the secret cannot be copied into a log,
+//! surfaced through diagnostics, or formatted into an error chain.
+//! `Clone` is derived because the daemon owns the secret in several
+//! independent places: the `BoundDaemon` value, the per-connection
+//! `SupervisorContext` (a clone handed to each connection task so the
+//! original can stay in the supervisor), and the bootstrap artifact
+//! that the adapter reads back. Every clone is owned by exactly one
+//! owner at a time and zeroizes its backing buffer on drop. The
+//! zeroize guarantee is best-effort: it covers the bytes the type
+//! still owns at drop time and does not cover process abort, signal
+//! termination, optimizer-elided writes, or any transient copy the
+//! compiler may produce. `read_secret` and `read_secret_zeroizing`
+//! are the only accessors that return raw bytes; the type never
+//! surfaces the secret through any other path.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -33,14 +36,18 @@ pub const SESSION_SECRET_LEN: usize = 32;
 ///
 /// The struct intentionally exposes the secret only through the
 /// `read_secret` accessor so callers cannot accidentally format it.
-/// `Clone` is derived because the bootstrap artifact is serialized
-/// once and dropped on shutdown; the in-memory copy carried by the
-/// supervisor is not duplicated.
+/// `Clone` is derived because the secret lives in several independent
+/// owners at once: the `BoundDaemon` value, the per-connection
+/// `SupervisorContext`, and the bootstrap artifact. Every clone is
+/// zeroized when its owner is dropped.
 ///
 /// `Debug` prints a redacted marker rather than the secret bytes so
 /// an accidental `{:?}` in a log line never leaks the secret. The
 /// accessor `read_secret` is the only path that returns the raw
-/// bytes.
+/// bytes. The zeroize-on-drop guarantee is best-effort and covers
+/// only the bytes the type still owns at drop time; it does not
+/// cover process abort, signal-induced termination, or compiler
+/// copies made during arithmetic or moves.
 #[derive(Clone)]
 pub struct SessionSecret([u8; SESSION_SECRET_LEN]);
 
@@ -58,10 +65,11 @@ impl Zeroize for SessionSecret {
 
 impl Drop for SessionSecret {
     fn drop(&mut self) {
-        // Zeroize the backing buffer so a leaked memory snapshot does
-        // not leak the secret. Drop runs on normal scope exit and on
-        // unwind; the implementation does not run during process
-        // abort or any external signal-induced termination.
+        // Best-effort: zeroize the backing buffer the type still owns
+        // at drop time. Drop runs on normal scope exit and on unwind;
+        // it does not run during process abort or external signal
+        // termination, and any compiler-introduced transient copy is
+        // outside the type's reach.
         self.0.zeroize();
     }
 }
@@ -128,7 +136,10 @@ impl SessionSecret {
     /// callers that need a transient copy of the secret cannot leak
     /// it through the borrow stack. The helper exists to keep the
     /// HMAC call sites honest; the daemon itself never clones the
-    /// secret outside this accessor.
+    /// secret outside this accessor. The zeroize-on-drop is best-effort
+    /// for the returned guard only; the backing buffer of the
+    /// `SessionSecret` itself is zeroized on its own drop, but neither
+    /// path covers process abort or compiler-introduced transient copies.
     #[must_use]
     pub fn read_secret_zeroizing(&self) -> Zeroizing<[u8; SESSION_SECRET_LEN]> {
         Zeroizing::new(self.0)

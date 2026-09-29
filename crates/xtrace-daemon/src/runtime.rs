@@ -58,23 +58,6 @@ pub enum IncomingEnvelope {
     Health(Health),
 }
 
-impl IncomingEnvelope {
-    /// Returns a short, redacted-status string describing the
-    /// envelope. Used by tests that assert the session retains
-    /// accepted envelopes in the volatile staging buffer; production
-    /// code does not need the helper. The value is taken from the
-    /// `Health.status` field when present and otherwise from the
-    /// `CapabilitySet` capability count, so no captured value from
-    /// an arbitrary adapter payload escapes the helper.
-    #[must_use]
-    pub fn status(&self) -> String {
-        match self {
-            Self::Health(health) => health.status.clone(),
-            Self::CapabilitySet(set) => format!("capabilities={}", set.capabilities.len()),
-        }
-    }
-}
-
 /// Outbound command the supervisor wants to emit to the adapter.
 ///
 /// The enum is the supervisor-side mirror of the wire
@@ -112,11 +95,13 @@ impl OutgoingCommand {
 /// typed wire inputs so the session layer does not need to know
 /// about the byte layout.
 ///
-/// Project identity is enforced by the session layer against
-/// `AdapterHello.repository_fingerprint` and the bootstrap-anchored
-/// `xtrace_domain::RepositoryFingerprint`. The transcript itself only
-/// binds the project_id through the negotiated `runtime_session_id`
-/// carried in the bootstrap artifact.
+/// Project identity is enforced separately by the session layer
+/// against `AdapterHello.repository_fingerprint` and the
+/// bootstrap-anchored `xtrace_domain::RepositoryFingerprint`; the
+/// transcript proof is bound to `runtime_session_id` (per connection)
+/// and the negotiated protocol range, never to `project_id`. The
+/// `project_id` is carried out-of-band in the bootstrap artifact and
+/// is not part of the handshake transcript.
 ///
 /// # Errors
 ///

@@ -27,7 +27,10 @@
 //! - `protocol_major_max` is at least the daemon's major (the
 //!   adapter's range must include a supported version);
 //! - `manifest_digest` is a canonical `xtrace_domain::ContentHash`
-//!   (`b3:` + 64 lowercase hex);
+//!   (`b3:` + 64 lowercase hex); the daemon validates byte equality
+//!   against [`ContentHash::to_canonical`] rather than relying on
+//!   `ContentHash::from_str` alone, because the parser accepts
+//!   uppercase hex digits case-insensitively;
 //! - `repository_fingerprint` is a canonical
 //!   `xtrace_domain::RepositoryFingerprint` and matches the bootstrap
 //!   expected value;
@@ -159,7 +162,7 @@ pub struct Session {
     /// [`AckDurability::Staged`] value is honest: the daemon has
     /// actually retained the accepted data, even though it is
     /// process-local and lost on connection close.
-    /// Bounded by [`STAGED_INCOMING_LIMIT`] so a runaway adapter
+    /// Bounded by `STAGED_INCOMING_LIMIT` so a runaway adapter
     /// cannot grow the buffer without bound.
     staged_incoming: std::collections::VecDeque<(u64, IncomingEnvelope)>,
 }
@@ -168,8 +171,11 @@ pub struct Session {
 /// staging buffer. Beyond this bound the session refuses new
 /// envelopes with [`ProtocolErrorCode::SessionSequence`] and the
 /// supervisor closes the connection, matching the bounded-queue
-/// discipline enforced by the architecture-level budgets.
-pub const STAGED_INCOMING_LIMIT: usize = 256;
+/// discipline enforced by the architecture-level budgets. Kept
+/// private so production callers cannot grow the staging buffer
+/// through a public constant; tests inside this module inspect the
+/// typed state directly.
+const STAGED_INCOMING_LIMIT: usize = 256;
 
 impl Session {
     /// Constructs a fresh session over the supplied inputs. The
@@ -269,6 +275,21 @@ impl Session {
                 format!("manifest_digest is not a canonical ContentHash: {err}"),
             )
         })?;
+        // Reject non-canonical wire encodings even when the underlying
+        // hex digits parse successfully. `ContentHash::from_str`
+        // accepts uppercase A-F because the `hex` crate decodes
+        // case-insensitively; without this guard a peer could send
+        // `b3:...AAA...` and have the transcript proof computed over
+        // the canonical form without ever declaring the encoding it
+        // actually used. Canonical validation happens before proof
+        // verification so the proof is always computed over exactly
+        // the wire string the adapter emitted.
+        if hello.manifest_digest != manifest_digest.to_canonical() {
+            return Err(SessionError::new(
+                ProtocolErrorCode::HelloDecode,
+                "manifest_digest must be canonical lowercase b3:<hex>".to_string(),
+            ));
+        }
         let repository_fingerprint = RepositoryFingerprint::try_from_canonical(
             &hello.repository_fingerprint,
         )
@@ -487,20 +508,27 @@ impl Session {
                 "staged ingress capacity exhausted".to_string(),
             ));
         }
+        // Compute the next sequence value before mutating either
+        // field. An overflow leaves every session field unchanged so
+        // the connection cannot accidentally retain a staged envelope
+        // that the session then refuses to acknowledge: either the
+        // envelope is staged together with the advanced sequence, or
+        // neither field moves. `checked_add` is preferred over
+        // `saturating_add` because a sequence counter that silently
+        // stops advancing would mask a bug as success. The exhaustion
+        // is unreachable in practice because the session lifetime is
+        // bounded by the configured queue capacity and the admission
+        // control.
         let staged_seq = self.next_expected_seq;
-        self.staged_incoming.push_back((staged_seq, incoming.clone()));
-        // `checked_add` is preferred over `saturating_add` because a
-        // sequence counter that silently stops advancing would mask a
-        // bug as success. The exhaustion is unreachable in practice
-        // because the session lifetime is bounded by the configured
-        // queue capacity and the admission control.
-        self.next_expected_seq = self.next_expected_seq.checked_add(1).ok_or_else(|| {
+        let next_seq = self.next_expected_seq.checked_add(1).ok_or_else(|| {
             SessionError::new(
                 ProtocolErrorCode::SessionSequence,
                 "session_seq overflow".to_string(),
             )
         })?;
-        let ack = build_ack(self.next_expected_seq - 1);
+        self.staged_incoming.push_back((staged_seq, incoming.clone()));
+        self.next_expected_seq = next_seq;
+        let ack = build_ack(next_seq - 1);
         Ok((incoming, OutgoingCommand::Ack(ack)))
     }
 
@@ -553,21 +581,6 @@ impl Session {
     #[must_use]
     pub fn negotiated(&self) -> Option<NegotiatedProtocol> {
         self.negotiated
-    }
-
-    /// Returns the volatile staging buffer of accepted post-hello
-    /// envelopes together with their assigned `session_seq`. The
-    /// buffer is the source of the [`AckDurability::Staged`] value
-    /// every successful [`Ack`] carries: a staged envelope is
-    /// retained in process-local memory before the ACK is released,
-    /// so the data has not been dropped. The buffer is bounded by
-    /// [`STAGED_INCOMING_LIMIT`]; once the bound is reached the
-    /// session refuses further envelopes with a sequence error. The
-    /// buffer is process-local and lost on connection close; nothing
-    /// in this slice describes the data as durable or committed.
-    #[must_use]
-    pub fn staged_incoming(&self) -> &std::collections::VecDeque<(u64, IncomingEnvelope)> {
-        &self.staged_incoming
     }
 }
 
@@ -905,6 +918,73 @@ mod tests {
     }
 
     #[test]
+    fn accept_adapter_hello_rejects_non_canonical_lowercase_prefix_uppercase_hex() {
+        // Regression: `ContentHash::from_str` accepts uppercase hex
+        // digits because the `hex` crate decodes case-insensitively,
+        // so a peer sending `b3:<uppercase>` slips past the prefix
+        // check and parses to the same digest. The session must
+        // refuse the wire encoding before computing the transcript
+        // proof so the adapter cannot mint a proof over the canonical
+        // bytes and present a non-canonical wire string. The HMAC in
+        // this test is computed over the exact non-canonical string
+        // so a passing test would actually demonstrate the proof
+        // reaching `verify_adapter_hello`; a rejection at the
+        // canonical-validation guard proves the new behavior.
+        let non_canonical_manifest =
+            "b3:00000000000000000000000000000000000000000000000000000000ABCDEF01";
+        assert!(
+            ContentHash::from_str(non_canonical_manifest).is_ok(),
+            "the test premise requires the underlying parser to accept the non-canonical form"
+        );
+
+        let mut session = Session::new(sample_inputs(vec![0xab; 32]));
+        let secret = session.inputs().session_secret.read_secret().to_vec();
+        let client_nonce = [0xaa_u8; 32];
+        let exporter = session.inputs().tls_exporter.clone();
+        let session_id_uuid = session.inputs().runtime_session_id.as_uuid();
+        let session_id_bytes = session_id_uuid.as_bytes();
+        let proof = xtrace_protocol::handshake::compute_transcript_proof(
+            &secret,
+            &exporter,
+            session_id_bytes,
+            &client_nonce,
+            &xtrace_protocol::handshake::ZERO_NONCE,
+            non_canonical_manifest.as_bytes(),
+        )
+        .expect("HMAC accepts the test secret");
+        let hello = AdapterHello {
+            adapter_name: "fake".to_string(),
+            adapter_version: "0.0.0".to_string(),
+            adapter_build_hash: String::new(),
+            signing_identity: String::new(),
+            manifest_digest: non_canonical_manifest.to_string(),
+            language: "rust".to_string(),
+            runtime_name: "test".to_string(),
+            runtime_version: "0.0.0".to_string(),
+            pid: 0,
+            process_start_monotonic_ns: 0,
+            parent_launch_id: String::new(),
+            repository_fingerprint: CANONICAL_FINGERPRINT.to_string(),
+            protocol_major_max: 1,
+            protocol_minor_max: 0,
+            client_nonce: Bytes::copy_from_slice(&client_nonce),
+            hmac: Bytes::copy_from_slice(&proof),
+        };
+        let envelope = envelope_with_payload(
+            session.inputs().runtime_session_id,
+            0,
+            PayloadOneof::AdapterHello(hello),
+        );
+        let err = session.accept_adapter_hello(&envelope).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::HelloDecode);
+        assert!(
+            err.detail.contains("canonical"),
+            "rejection must surface the canonical-form requirement, got: {}",
+            err.detail
+        );
+    }
+
+    #[test]
     fn accept_adapter_hello_rejects_uppercase_fingerprint() {
         let mut session = Session::new(sample_inputs(vec![0xab; 32]));
         let secret = session.inputs().session_secret.read_secret().to_vec();
@@ -1080,11 +1160,15 @@ mod tests {
     /// actually retained the accepted `IncomingEnvelope` in the
     /// volatile staging buffer before the matching `Ack` is released.
     /// The test drives three accepted envelopes and inspects the
-    /// staging buffer to prove the data is process-local and bounded.
+    /// private staging buffer directly to prove the data is
+    /// process-local and bounded. The pattern match on the
+    /// `IncomingEnvelope` variant replaces the removed
+    /// `IncomingEnvelope::status` helper so production surface
+    /// stays minimal.
     #[test]
     fn staged_incoming_buffer_retains_every_accepted_envelope() {
         let (mut session, session_id, _) = session_after_hello();
-        assert!(session.staged_incoming().is_empty());
+        assert!(session.staged_incoming.is_empty());
         for seq in 1..=3u64 {
             let envelope = envelope_with_payload(
                 session_id,
@@ -1102,19 +1186,64 @@ mod tests {
                 other => unreachable!("expected Ack, got {other:?}"),
             }
         }
-        let staged = session.staged_incoming();
-        assert_eq!(staged.len(), 3, "every accepted envelope must be staged");
-        let pairs: Vec<(u64, &IncomingEnvelope)> = staged.iter().map(|(s, e)| (*s, e)).collect();
-        assert_eq!(pairs[0].0, 1);
-        assert_eq!(pairs[1].0, 2);
-        assert_eq!(pairs[2].0, 3);
+        assert_eq!(session.staged_incoming.len(), 3, "every accepted envelope must be staged");
+        let staged = &session.staged_incoming;
+        assert_eq!(staged[0].0, 1);
+        assert_eq!(staged[1].0, 2);
+        assert_eq!(staged[2].0, 3);
         // The volatile buffer retains the raw payloads so an operator
         // inspecting the process can see what was acknowledged without
         // touching durable storage. A future slice will replace the
         // buffer with a real ingester; today the data is explicitly
         // documented as volatile.
-        assert_eq!(staged.front().unwrap().1.clone().status(), "seq-1");
-        assert_eq!(staged.back().unwrap().1.clone().status(), "seq-3");
+        match &staged.front().unwrap().1 {
+            IncomingEnvelope::Health(health) => assert_eq!(health.status, "seq-1"),
+            other => unreachable!("expected Health envelope, got {other:?}"),
+        }
+        match &staged.back().unwrap().1 {
+            IncomingEnvelope::Health(health) => assert_eq!(health.status, "seq-3"),
+            other => unreachable!("expected Health envelope, got {other:?}"),
+        }
+    }
+
+    /// `accept_post_hello` must leave every session field unchanged
+    /// when the post-validation sequence advancement overflows. A
+    /// regression that mutated `staged_incoming` before discovering
+    /// the overflow would leave the session holding data it just
+    /// refused to acknowledge; this test forces `next_expected_seq`
+    /// to `u64::MAX` so the next accepted envelope overflows and
+    /// asserts that the staging buffer is still empty and the
+    /// counter is still at the saturation point.
+    #[test]
+    fn accept_post_hello_overflow_leaves_session_state_unchanged() {
+        let (mut session, session_id, _) = session_after_hello();
+        session.next_expected_seq = u64::MAX;
+        let envelope = envelope_with_payload(
+            session_id,
+            u64::MAX,
+            PayloadOneof::Health(Health {
+                monotonic_ns: 1,
+                queue_depth_batches: 0,
+                resident_bytes: 0,
+                status: "overflow-probe".to_string(),
+            }),
+        );
+        let err = session.accept_post_hello(&envelope).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::SessionSequence);
+        assert!(
+            err.detail.contains("overflow"),
+            "rejection must surface the overflow detail, got: {}",
+            err.detail
+        );
+        assert!(
+            session.staged_incoming.is_empty(),
+            "staged buffer must be empty after an overflow rejection"
+        );
+        assert_eq!(
+            session.next_expected_seq,
+            u64::MAX,
+            "sequence counter must not advance past the overflow point"
+        );
     }
 
     #[test]
