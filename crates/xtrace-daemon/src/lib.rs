@@ -84,13 +84,6 @@
         reason = "tests assert on fallible fixture data and exercise supervisor paths"
     )
 )]
-#![cfg_attr(
-    test,
-    allow(
-        clippy::panic,
-        reason = "supervisor classification tests deliberately panic inside spawned tasks"
-    )
-)]
 
 pub mod bootstrap;
 pub mod config;

@@ -1664,12 +1664,13 @@ mod tests {
 
     /// When `try_release` fails non-`NotFound` and the supervisor
     /// hands the artifact to `Drop` without a follow-up retry, the
-    /// fallback path inside `Drop` performs a final attempt and
-    /// logs once when that fallback also fails. The test forces
-    /// both attempts to fail and asserts the file remains on disk
-    /// after `Drop`; the second test in this module covers the
-    /// happy-path fallback that removes the file once the
-    /// directory permission is restored before drop.
+    /// fallback path inside `Drop` performs a final attempt. The
+    /// test forces the explicit attempt to fail by installing a
+    /// read-only parent directory, then restores the directory
+    /// permissions before dropping the artifact so the `Drop`
+    /// fallback succeeds and removes the file. The unrelated happy
+    /// path is covered by
+    /// [`Self::drop_removes_unreleased_daemon_artifact_as_fallback`].
     #[cfg(unix)]
     #[test]
     fn drop_fallback_releases_when_try_release_already_failed() {
@@ -1690,7 +1691,17 @@ mod tests {
         // parent so the `Drop` fallback is the only path that
         // can recover the cleanup.
         let _ro = ReadOnlyDirGuard::new(dir.clone());
-        let first = artifact.try_release().expect_err("unlink must fail under read-only parent");
+        let first_err =
+            artifact.try_release().expect_err("unlink must fail under read-only parent");
+        let rendered = format!("{first_err}");
+        assert!(
+            matches!(first_err, DaemonError::Bootstrap(_)),
+            "explicit attempt must surface a Bootstrap error so the Drop fallback is reached, got {first_err:?}",
+        );
+        assert!(
+            rendered.contains("remove bootstrap"),
+            "error must report the unlink failure, got: {rendered}",
+        );
         assert!(path.exists(), "file must still exist after a failed explicit release");
 
         // Drop the read-only guard first so the directory is
@@ -1703,7 +1714,6 @@ mod tests {
             !path.exists(),
             "Drop fallback must remove the file when the prior try_release left the state retryable",
         );
-        let _ = first; // suppress unused warning for the diagnostic-only value
         let _ = fs::remove_dir_all(&dir);
     }
 

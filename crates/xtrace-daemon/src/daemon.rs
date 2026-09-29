@@ -1368,6 +1368,10 @@ mod tests {
     /// finishes first. A regression that returns `Some` on a clean
     /// drain or fabricates a join wrap from a connection error would
     /// fail the assertions below.
+    #[allow(
+        clippy::panic,
+        reason = "the panic-in-spawned-task branch deliberately exercises the join-wrap classification"
+    )]
     #[tokio::test]
     async fn drain_connections_returns_first_observed_error() {
         // First drain: every task completes cleanly; the helper
@@ -1395,8 +1399,8 @@ mod tests {
         // surface the wrapped join error rather than swallowing the
         // panic. The `panic!` lives inside the spawned task so the
         // lint reports on the closure body rather than the call
-        // site; the `#![cfg_attr(test, allow(clippy::panic))]` at
-        // the crate root carries the necessary exception.
+        // site; the narrow `#[allow(clippy::panic, ...)]` on this
+        // test function carries the necessary exception.
         let mut panic_only: JoinSet<Result<(), DaemonError>> = JoinSet::new();
         panic_only.spawn(async { panic!("deliberate panic") });
         let first = drain_connections(&mut panic_only).await;
@@ -1431,45 +1435,45 @@ mod tests {
     /// later drain failure is discarded — is the only thing under
     /// test.
     ///
-    /// The test synchronises the second task through a
-    /// `tokio::sync::Notify` so the second failure is guaranteed to
-    /// surface during drain rather than being reordered by the
-    /// runtime scheduler. The `Notify` is held open until the
-    /// helper releases it; this gives the test deterministic
-    /// ordering without any sleep or poll loop.
+    /// The test synchronises the second task through a test-owned
+    /// `tokio::sync::oneshot` gate so the drain failure is
+    /// guaranteed to surface during drain rather than being
+    /// reordered by the runtime scheduler. The trigger task
+    /// completes immediately; the drain task is parked on the
+    /// receiver until the test has collected and verified the
+    /// trigger via `join_next`, and only then does the test send
+    /// the gate. This gives the test deterministic ordering
+    /// without any sleep, poll loop, or `Notify`-based scheduling
+    /// assumption.
     #[tokio::test]
     async fn supervisor_preserves_trigger_error_over_drain_failure() {
-        use std::sync::Arc as StdArc;
-        use tokio::sync::Notify;
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let gate = StdArc::new(Notify::new());
-        let gate_for_drain = gate.clone();
         let mut set: JoinSet<Result<(), DaemonError>> = JoinSet::new();
+        // The triggering failure arrives first and completes
+        // immediately. The drain task is parked awaiting the
+        // receiver, so it cannot complete until the test has
+        // verified the trigger via `join_next` and then explicitly
+        // sent the gate. That guarantees the drain failure is
+        // observed after the trigger — never before it — without
+        // any sleep or `Notify`-based scheduling assumption.
+        set.spawn(async { Err(DaemonError::Transport("trigger".to_string())) });
         set.spawn(async move {
-            // The triggering failure arrives first. We hold the
-            // gate release until after the supervisor helper has
-            // collected the trigger via `join_next`, so the drain
-            // failure below is guaranteed to be observed after the
-            // trigger — never before it.
-            let result = Err(DaemonError::Transport("trigger".to_string()));
-            gate_for_drain.notify_one();
-            result
-        });
-        set.spawn(async move {
-            // The drain failure waits for the trigger to be
-            // observed so the test never depends on scheduler
-            // order. Once released, it reports a different error.
-            gate.notified().await;
+            let _ = gate_rx.await;
             Err(DaemonError::Bootstrap("drain".to_string()))
         });
 
-        // Collect the trigger the same way `serve` does: pull the
-        // first completion out of `join_next`, then call the
-        // supervisor helper.
+        // Collect and verify the trigger the same way `serve`
+        // does: pull the first completion out of `join_next`,
+        // assert it is the trigger, then release the gate so the
+        // drain task can surface its error during the subsequent
+        // drain performed by `shutdown_after_trigger`.
         let trigger = match set.join_next().await.expect("trigger join") {
             Ok(Err(err)) => err,
             other => unreachable!("expected trigger error, got {other:?}"),
         };
+        let _ = gate_tx.send(());
+
         let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
         let observer: JoinHandle<()> = tokio::spawn(async move {});
         let mut observer = observer;
