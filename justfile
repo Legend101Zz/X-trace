@@ -35,8 +35,13 @@ node-check:
     npm run generate:check --prefix adapters/node
     npm test --prefix adapters/node
 
-# Run Node validation/build before the full Rust test suite.
-test: node-check
+# Generate Java protobuf bindings, run unit tests, and install the private
+# synthetic client consumed by the Rust daemon acceptance test.
+java-check:
+    cd adapters/java && ./gradlew --dependency-verification strict clean test installDist
+
+# Run both language protocol foundations before the full Rust test suite.
+test: node-check java-check
     cargo test --workspace --all-features
 
 # Rebuild generated protocol bindings and confirm they are in sync.
@@ -77,5 +82,5 @@ smoke-cli:
     cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir "$repo"
     rm -rf "$smoke_root"
 
-# Run every gate a handoff requires, including Node prerequisites via test.
+# Run every gate a handoff requires, including language-client prerequisites.
 ci: format lint test

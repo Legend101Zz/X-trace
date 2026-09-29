@@ -11,6 +11,12 @@ daemon and prove a staged XTP recording reached selected-root XTF storage; it
 does not instrument Node applications or declare Node capture support. See
 `docs/development/setup.md` for the exact acceptance commands and boundary.
 
+The Java 17 workspace under `adapters/java` has the same deliberately narrow
+boundary. Its private synthetic client proves that Conscrypt's TLS exporter,
+the canonical protobuf framing, and staged persistence interoperate with the
+Rust daemon. It is not a Java agent and does not yet instrument Spring,
+Spring Boot, Servlet, or ordinary JVM applications.
+
 ## Crate layout
 
 | Crate               | Purpose                                                                |
@@ -93,7 +99,13 @@ npm ci --prefix adapters/node
 npm run generate:check --prefix adapters/node
 npm test --prefix adapters/node
 
-# Run the Rust suite, including the Node-to-daemon persistence test
+# Verify dependencies, generate Java bindings, test, and install the private
+# Java 17 synthetic client used by the Rust integration suite
+GRADLE_USER_HOME=/path/to/cache/gradle \
+  adapters/java/gradlew -p adapters/java --dependency-verification strict \
+  clean test installDist
+
+# Run the Rust suite, including both language-to-daemon persistence tests
 cargo build --workspace --all-features
 cargo test --workspace --all-features
 
@@ -103,9 +115,9 @@ cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir /tmp/xtrace-smok
 cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir /tmp/xtrace-smoke
 ```
 
-`just test` and `just ci` perform the Node preparation and checks before Rust
-tests, so their daemon integration test does not depend on prebuilt `dist`
-files from another job or checkout.
+`just test` and `just ci` prepare both language workspaces before Rust tests,
+so their daemon integration tests do not depend on ignored build output from
+another job or checkout.
 
 The status report on an uninitialized repository is a single JSON document
 that names no projects and reports `initialized: false` without touching
