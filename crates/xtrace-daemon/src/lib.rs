@@ -36,13 +36,14 @@
 //! # async fn demo() -> Result<(), xtrace_daemon::DaemonError> {
 //! use std::path::PathBuf;
 //! use xtrace_daemon::{DaemonBuilder, DaemonConfig};
-//! use xtrace_domain::{ProjectId, RuntimeSessionId};
+//! use xtrace_domain::{ProjectId, RepositoryFingerprint, RuntimeSessionId};
 //!
 //! let config = DaemonConfig::default();
 //! let project_id = ProjectId::new();
 //! let session_id = RuntimeSessionId::new();
 //! let bootstrap_path = PathBuf::from("/tmp/xtrace-bootstrap.json");
-//! let expected_repository_fingerprint = "expected-repo".to_string();
+//! let expected_repository_fingerprint =
+//!     RepositoryFingerprint::from_canonical_path("/tmp/xtrace-demo-repo");
 //!
 //! let bound = DaemonBuilder::new(config)
 //!     .with_project_id(project_id)
