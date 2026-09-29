@@ -10,7 +10,10 @@
 use std::time::Duration;
 
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
-use xtrace_protocol::generated::agent::{CapabilitySet, DaemonHello, Health, ProtocolError};
+use xtrace_protocol::generated::agent::{
+    CapabilitySet, DaemonHello, EventBatch, Health, ProtocolError, RecordingFinished,
+    RecordingStarted,
+};
 use xtrace_protocol::handshake::{ZERO_NONCE, verify_transcript_proof};
 
 #[cfg(test)]
@@ -50,12 +53,22 @@ pub struct AdapterHelloAck {
 ///
 /// The supervisor decodes incoming bytes into this enum so the
 /// session task can pattern-match without touching protobuf types.
+/// Recording wire payloads (`RecordingStarted`, `EventBatch`,
+/// `RecordingFinished`) are staged verbatim and acknowledged with
+/// `AckDurability::Staged`; validation, lifecycle, and persistence
+/// belong to the downstream ingester.
 #[derive(Clone, Debug)]
 pub enum IncomingEnvelope {
     /// Adapter supplied its initial [`CapabilitySet`].
     CapabilitySet(CapabilitySet),
     /// Adapter sent a [`Health`] update.
     Health(Health),
+    /// Adapter signalled the start of a recording session.
+    RecordingStarted(RecordingStarted),
+    /// Adapter forwarded a batch of recording events.
+    EventBatch(EventBatch),
+    /// Adapter signalled the end of a recording session.
+    RecordingFinished(RecordingFinished),
 }
 
 /// Outbound command the supervisor wants to emit to the adapter.

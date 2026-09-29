@@ -50,6 +50,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
+use prost::bytes::Bytes;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
@@ -66,7 +67,8 @@ use xtrace_domain::ids::Id as _;
 use xtrace_domain::{ProjectId, RepositoryFingerprint as DomainFingerprint, RuntimeSessionId};
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
 use xtrace_protocol::generated::agent::{
-    AdapterHello, AgentEnvelope, Capability, CapabilitySet, Health, ProtocolError,
+    AdapterHello, AgentEnvelope, Capability, CapabilitySet, EventBatch, Health, ProtocolError,
+    RecordingFinished, RecordingStarted,
 };
 use xtrace_protocol::handshake;
 
@@ -1518,5 +1520,111 @@ async fn peer_disconnect_during_daemon_hello_does_not_take_down_listener() {
         .await
         .expect("daemon task")
         .expect("serve must complete cleanly because the peer disconnect was normalised to Ok(())");
+    drop(temp);
+}
+
+// `RecordingStarted` -> one `EventBatch` -> `RecordingFinished`
+// at `session_seq` 1, 2, 3 must each be admitted by the daemon's
+// session over the real TLS 1.3 loopback and acknowledged with a
+// `Staged` `Ack` whose `highest_contiguous_session_seq` matches the
+// accepted sequence. The bounded helpers fail rather than hang if
+// any ACK never arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_recording_wire_admission_acks_through_session_seq_three() {
+    let temp = TempDir::new().expect("temp dir");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, secret, _, _, address, pin) = spawn_daemon(
+        bootstrap_path.clone(),
+        Duration::from_secs(60),
+        64,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+    )
+    .await
+    .expect("bind");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+
+    let client_nonce = [0x6a_u8; 32];
+    let mut tls_stream = connect_pinned(address, &pin).await.expect("pinned connect");
+    let mut exporter_buf = [0u8; 32];
+    tls_stream
+        .get_ref()
+        .1
+        .export_keying_material(&mut exporter_buf, TLS_EXPORTER_LABEL, None)
+        .expect("client exporter");
+    let exporter = exporter_buf.to_vec();
+
+    let adapter_hello = build_adapter_hello(
+        secret.read_secret(),
+        &exporter,
+        &session_id,
+        HAPPY_MANIFEST_DIGEST,
+        &client_nonce,
+        EXPECTED_REPOSITORY_FINGERPRINT,
+        1,
+        0,
+    );
+    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    write_envelope(&mut writer, PayloadOneof::AdapterHello(adapter_hello), &session_id, 0, 1)
+        .await
+        .expect("write adapter hello");
+    let _ = read_envelope_bounded(&mut reader, "daemon hello").await;
+
+    let recording_id = Bytes::copy_from_slice(&[0xa1_u8; 16]);
+    let payloads = [
+        (
+            1u64,
+            PayloadOneof::RecordingStarted(RecordingStarted {
+                recording_id: recording_id.clone(),
+                method: "GET".to_string(),
+                ..RecordingStarted::default()
+            }),
+        ),
+        (
+            2,
+            PayloadOneof::EventBatch(EventBatch {
+                recording_id: recording_id.clone(),
+                ..EventBatch::default()
+            }),
+        ),
+        (
+            3,
+            PayloadOneof::RecordingFinished(RecordingFinished {
+                recording_id,
+                ..RecordingFinished::default()
+            }),
+        ),
+    ];
+    for (seq, payload) in &payloads {
+        write_envelope(&mut writer, payload.clone(), &session_id, *seq, seq + 1)
+            .await
+            .expect("write recording envelope");
+        let ack = next_ack(&mut reader, "ack").await;
+        assert_eq!(
+            ack.highest_contiguous_session_seq, *seq,
+            "session_seq {seq} must be acknowledged in order",
+        );
+        assert!(ack.rejected.is_empty(), "successful ack must carry no rejected messages");
+        assert_eq!(
+            ack.durability,
+            xtrace_protocol::generated::agent::AckDurability::Staged as i32,
+            "wire-admission ACK must report Staged durability; durable storage is out of scope",
+        );
+    }
+
+    drop(reader);
+    drop(writer);
+    drop(tls_stream);
+    let _ = shutdown_tx.send(());
+    // Bound the shutdown so a regression surfaces as a test failure
+    // rather than hanging the suite.
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("shutdown timed out")
+        .expect("daemon task")
+        .expect("serve");
     drop(temp);
 }
