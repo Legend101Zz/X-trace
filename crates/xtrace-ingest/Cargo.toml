@@ -1,0 +1,20 @@
+[package]
+name = "xtrace-ingest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Recording assembler boundary: validates per-recording sequence, lifecycle, and idempotency before durability."
+
+[lints]
+workspace = true
+
+[dependencies]
+xtrace-domain = { path = "../xtrace-domain" }
+xtrace-protocol = { path = "../xtrace-protocol" }
+blake3 = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
