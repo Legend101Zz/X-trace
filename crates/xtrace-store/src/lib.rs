@@ -39,6 +39,7 @@ pub mod error;
 pub mod idempotency_repository;
 pub mod migrations;
 pub mod project_repository;
+pub mod xtf;
 
 pub use connection::{
     BusyTimeout, CURRENT_SCHEMA_VERSION, OpenOptions, STORE_ABI_VERSION, SqliteStore,
@@ -48,3 +49,7 @@ pub use error::{StoreError, StoreErrorKind};
 pub use idempotency_repository::SqliteIdempotencyStore;
 pub use migrations::{MigrationRecord, Migrations};
 pub use project_repository::SqliteProjectRepository;
+pub use xtf::{
+    EncodedXtfSegment, VerifiedXtfSegment, XtfCodecError, XtfSegmentInput, encode_segment,
+    max_compressed_segment_bytes, verify_compressed_segment,
+};
