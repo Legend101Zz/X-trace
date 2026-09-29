@@ -1252,6 +1252,136 @@ async fn session_rejects_adapter_role_when_building_daemon_hello() {
     assert!(format!("{err}").contains("adapter role"));
 }
 
+/// Slice 1B §2.1 deletion contract: the owner-readable bootstrap
+/// file is removed exactly once after `DaemonHello` has been
+/// written to the wire, while a failed proof exchange leaves it
+/// available for a legitimate retry, and the daemon stays up
+/// throughout. The test proves every leg of the lifecycle on a real
+/// loopback daemon: pre-negotiation existence, post-failed-proof
+/// survival, and post-successful-DaemonHello deletion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_artifact_is_deleted_only_after_successful_daemon_hello() {
+    let temp = TempDir::new().expect("temp");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let (bound, secret, _, _, address, pin) = spawn_daemon(
+        bootstrap_path.clone(),
+        Duration::from_secs(60),
+        64,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+    )
+    .await
+    .expect("bind");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+
+    // 1. Pre-negotiation: the bootstrap file is on disk with the
+    //    daemon-owned permissions.
+    assert!(bootstrap_path.exists(), "bootstrap file must exist before any negotiation begins",);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&bootstrap_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "bootstrap file must remain owner-only");
+    }
+
+    // 2. Failed proof: connect with a wrong secret, observe the
+    //    documented `XTR-DAEMON-HELLO-PROOF` rejection, and confirm
+    //    the bootstrap file survives so a legitimate retry can read
+    //    it.
+    {
+        let mut tls_stream = connect_pinned(address, &pin).await.expect("pinned connect bad");
+        let wrong_secret = [0x99_u8; 32];
+        let mut exporter_buf = [0u8; 32];
+        tls_stream
+            .get_ref()
+            .1
+            .export_keying_material(&mut exporter_buf, TLS_EXPORTER_LABEL, None)
+            .expect("exporter");
+        let adapter_hello = build_adapter_hello(
+            &wrong_secret,
+            &exporter_buf,
+            &session_id,
+            HAPPY_MANIFEST_DIGEST,
+            &[0x42_u8; 32],
+            EXPECTED_REPOSITORY_FINGERPRINT,
+            1,
+            0,
+        );
+        let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+        write_envelope(&mut writer, PayloadOneof::AdapterHello(adapter_hello), &session_id, 0, 1)
+            .await
+            .expect("write bad hello");
+        let envelope = read_envelope_bounded(&mut reader, "protocol error").await;
+        match envelope.payload {
+            Some(PayloadOneof::ProtocolError(err)) => {
+                assert_eq!(err.code, "XTR-DAEMON-HELLO-PROOF");
+            }
+            other => unreachable!("expected ProtocolError, got {other:?}"),
+        }
+        drop(reader);
+        drop(writer);
+        drop(tls_stream);
+    }
+    assert!(
+        bootstrap_path.exists(),
+        "bootstrap file must survive a failed proof exchange so a legitimate retry can read it",
+    );
+
+    // 3. Successful proof: connect with the real secret, exchange
+    //    `AdapterHello`/`DaemonHello`, and confirm the file is gone
+    //    while the daemon is still running.
+    {
+        let mut tls_stream = connect_pinned(address, &pin).await.expect("pinned connect good");
+        let mut exporter_buf = [0u8; 32];
+        tls_stream
+            .get_ref()
+            .1
+            .export_keying_material(&mut exporter_buf, TLS_EXPORTER_LABEL, None)
+            .expect("exporter");
+        let adapter_hello = build_adapter_hello(
+            secret.read_secret(),
+            &exporter_buf,
+            &session_id,
+            HAPPY_MANIFEST_DIGEST,
+            &[0x77_u8; 32],
+            EXPECTED_REPOSITORY_FINGERPRINT,
+            1,
+            0,
+        );
+        let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+        write_envelope(&mut writer, PayloadOneof::AdapterHello(adapter_hello), &session_id, 0, 1)
+            .await
+            .expect("write good hello");
+        let daemon_hello_envelope = read_envelope_bounded(&mut reader, "daemon hello").await;
+        match daemon_hello_envelope.payload {
+            Some(PayloadOneof::DaemonHello(_)) => {}
+            other => unreachable!("expected DaemonHello, got {other:?}"),
+        }
+        drop(reader);
+        drop(writer);
+        drop(tls_stream);
+    }
+    // The daemon is still running; the §2.1 contract says the file
+    // is removed as soon as `DaemonHello` is on the wire. The brief
+    // requires bounded waiting so a regression surfaces as a test
+    // failure rather than hanging the suite.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while bootstrap_path.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !bootstrap_path.exists(),
+        "bootstrap file must be deleted while the daemon is still running after a successful DaemonHello",
+    );
+
+    let _ = shutdown_tx.send(());
+    daemon_handle.await.expect("daemon task").expect("serve");
+    drop(temp);
+}
+
 #[tokio::test]
 async fn verify_transcript_proof_round_trip_with_real_layout() {
     let secret = [0x42_u8; 32];

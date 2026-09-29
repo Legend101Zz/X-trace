@@ -30,13 +30,15 @@
 //!   (`b3:` + 64 lowercase hex); the daemon validates byte equality
 //!   against [`ContentHash::to_canonical`] rather than relying on
 //!   `ContentHash::from_str` alone, because the parser accepts
-//!   uppercase hex digits case-insensitively;
+//!   uppercase hex digits case-insensitively. The manifest digest
+//!   arrives in the wire envelope itself; it is authenticated by the
+//!   transcript proof but never sourced from the bootstrap file;
 //! - `repository_fingerprint` is a canonical
 //!   `xtrace_domain::RepositoryFingerprint` and matches the bootstrap
 //!   expected value;
 //! - the transcript proof verifies against the recovered client
 //!   nonce, the canonical zero server-nonce placeholder, and the
-//!   bootstrap manifest digest.
+//!   wire `manifest_digest`.
 //!
 //! The validated `client_nonce` is persisted in session state so the
 //! outbound `DaemonHello` transcript proof can use the real client
@@ -102,7 +104,12 @@ pub struct HandshakeInputs {
     pub max_protocol_minor: u32,
     /// Canonical repository fingerprint negotiated at bootstrap. The
     /// daemon validates the `AdapterHello.repository_fingerprint`
-    /// against this value and rejects mismatches deterministically.
+    /// against this value and rejects mismatches deterministically;
+    /// the fingerprint arrives out of band through the bootstrap
+    /// artifact and is enforced on every inbound `AdapterHello`. The
+    /// fingerprint has no relation to the wire `manifest_digest`,
+    /// which is supplied by the adapter and authenticated by the
+    /// transcript proof.
     pub expected_repository_fingerprint: RepositoryFingerprint,
     /// Health interval sent back to the adapter while the
     /// connection is idle.

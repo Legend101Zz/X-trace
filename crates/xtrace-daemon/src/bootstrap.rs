@@ -4,7 +4,10 @@
 //! startup; it then launches the target process with the secret and
 //! pin available through normal file-system reads rather than through
 //! process arguments. The artifact is written atomically with
-//! `0600` permissions, never logged, and removed on orderly shutdown.
+//! `0600` permissions, never logged, and removed after the
+//! negotiated session is established (`docs/plans/x-trace/03b-protocol-and-api.md`
+//! §2.1: "Bootstrap files expire, are deleted after negotiation, and
+//! are never copied to diagnostics.").
 //!
 //! The schema is intentionally minimal: it carries only the values an
 //! adapter needs to complete the handshake documented in
@@ -41,13 +44,28 @@
 //! every subsequent read. The reader also enforces `0600` permission
 //! bits on Unix so a deployment where another user can write to the
 //! target slot cannot impersonate the daemon.
+//!
+//! ## Deletion after negotiation
+//!
+//! Once the daemon finishes writing `DaemonHello` to the wire, the
+//! shared `Arc<BootstrapArtifact>` value is passed through
+//! [`BootstrapArtifact::try_release`]; the atomic flag inside the
+//! struct guarantees exactly one successful `unlink` even when
+//! concurrent connection tasks race on the same handle. Failed
+//! proof exchanges never call the release path so a legitimate
+//! retry against the same daemon launch can re-read the artifact.
+//! The `Drop` impl reuses the same atomic, so an orderly shutdown
+//! still removes the file when no connection ever reached the
+//! post-hello milestone.
 
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use xtrace_domain::{ProjectId, RepositoryFingerprint, RuntimeSessionId};
+use zeroize::Zeroize;
 
 use crate::error::DaemonError;
 use crate::secret::SessionSecret;
@@ -55,6 +73,10 @@ use crate::secret::SessionSecret;
 /// Schema version this binary writes and reads. Bumped together with
 /// field changes that older binaries cannot interpret.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Marker written by the redacted `Debug` implementation so tests and
+/// log scrapers can assert the session secret is never serialized.
+const SESSION_SECRET_REDACTED: &str = "<redacted>";
 
 /// Owner of the bootstrap artifact. The owner marker controls whether
 /// the artifact is removed on drop. A `Persistent` artifact outlives
@@ -70,7 +92,15 @@ pub enum BootstrapOwner {
 }
 
 /// On-disk bootstrap artifact fields.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Debug` is implemented manually so the session secret is never
+/// serialized through formatter machinery. `Clone`, `Serialize`,
+/// `Deserialize`, `PartialEq`, and `Eq` are derived because the
+/// wire/file contract and the equality probes documented in the module
+/// header depend on them; the secret value still travels through
+/// `serialize` / `deserialize` on the bootstrap file itself, but never
+/// through `format!`, `{:?}`, log macros, or the redacted accessor.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapArtifactFields {
     /// Schema version the artifact was written under.
     pub schema_version: u32,
@@ -91,6 +121,16 @@ pub struct BootstrapArtifactFields {
     pub runtime_session_id: String,
     /// Base64-encoded 256-bit session secret. Used by the adapter as
     /// the HMAC key for the AdapterHello/DaemonHello transcript proof.
+    ///
+    /// The string is zeroized best-effort when this struct is dropped
+    /// so the heap-allocated buffer the value still owns at drop time
+    /// is cleared. The guarantee is intentionally limited: zeroize
+    /// only covers the bytes this value still owns; any clone dropped
+    /// earlier only zeroes its own copy, any clone dropped later only
+    /// zeroes its own copy, and any compiler-introduced transient
+    /// copy or read access through [`serde`] before drop is outside
+    /// this type's reach. Process abort, signal-induced termination,
+    /// and optimizer-elided writes are not covered either.
     pub session_secret_base64: String,
     /// Project identifier the daemon expects on every connection.
     pub project_id: String,
@@ -106,19 +146,74 @@ pub struct BootstrapArtifactFields {
     pub max_protocol_minor: u32,
 }
 
+impl std::fmt::Debug for BootstrapArtifactFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapArtifactFields")
+            .field("schema_version", &self.schema_version)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("certificate_sha256_pin", &self.certificate_sha256_pin)
+            .field("runtime_session_id", &self.runtime_session_id)
+            .field("session_secret_base64", &SESSION_SECRET_REDACTED)
+            .field("project_id", &self.project_id)
+            .field("expected_repository_fingerprint", &self.expected_repository_fingerprint)
+            .field("max_protocol_major", &self.max_protocol_major)
+            .field("max_protocol_minor", &self.max_protocol_minor)
+            .finish()
+    }
+}
+
+impl Drop for BootstrapArtifactFields {
+    fn drop(&mut self) {
+        // Best-effort zeroize of the secret's heap buffer. The
+        // documented limited guarantee is reproduced in the field's
+        // rustdoc; the goal is to clear the bytes this struct still
+        // owns at drop time, nothing more.
+        let bytes = std::mem::take(&mut self.session_secret_base64).into_bytes();
+        let mut bytes = bytes;
+        bytes.zeroize();
+    }
+}
+
 /// Owner-managed bootstrap artifact.
 ///
 /// The struct knows where the artifact lives on disk and whether it
-/// should be removed on drop. Dropping a [`BootstrapOwner::Daemon`]
-/// artifact removes the file on normal scope exit and on panic unwind
-/// (the `Drop` impl runs during unwinding); the cleanup is best
-/// effort and does not run during process abort or signal-induced
-/// termination.
-#[derive(Debug)]
+/// should be removed on drop. The release path is split into three
+/// layers so the `docs/plans/x-trace/03b-protocol-and-api.md` §2.1
+/// contract is satisfied: a successful `DaemonHello` write calls
+/// [`BootstrapArtifact::try_release`] on the shared `Arc<...>` value
+/// so the artifact is removed exactly once during normal operation;
+/// the `Drop` impl calls the same helper as a fallback so an orderly
+/// daemon shutdown still cleans up if no connection ever succeeded;
+/// the [`BootstrapOwner::Persistent`] variant skips both paths so
+/// integration tests can inspect the artifact after the daemon exits.
+///
+/// `Debug` is implemented manually so the redacted
+/// [`BootstrapArtifactFields`] marker is the only secret-bearing
+/// string that can reach a log line or a diagnostic dump.
 pub struct BootstrapArtifact {
     fields: BootstrapArtifactFields,
     path: PathBuf,
     owner: BootstrapOwner,
+    /// Atomic flag marking whether the artifact has already been
+    /// released on disk. Set exactly once across the lifetime of the
+    /// daemon so concurrent connection tasks racing on the same
+    /// `Arc<BootstrapArtifact>` cannot delete the file twice; the
+    /// supervisor and every connection task call
+    /// [`BootstrapArtifact::try_release`] through `&self` and rely on
+    /// the flag for race-free idempotency.
+    released: AtomicBool,
+}
+
+impl std::fmt::Debug for BootstrapArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapArtifact")
+            .field("fields", &self.fields)
+            .field("path", &self.path)
+            .field("owner", &self.owner)
+            .field("released", &self.released.load(Ordering::Acquire))
+            .finish()
+    }
 }
 
 impl BootstrapArtifact {
@@ -156,7 +251,7 @@ impl BootstrapArtifact {
         let body = serde_json::to_string_pretty(&fields)
             .map_err(|err| DaemonError::Bootstrap(format!("serialize bootstrap: {err}")))?;
         write_atomic(path, parent, body.as_bytes())?;
-        Ok(Self { fields, path: path.to_path_buf(), owner })
+        Ok(Self { fields, path: path.to_path_buf(), owner, released: AtomicBool::new(false) })
     }
 
     /// Reads an existing artifact from disk.
@@ -184,7 +279,12 @@ impl BootstrapArtifact {
         let fields: BootstrapArtifactFields = serde_json::from_str(&text)
             .map_err(|err| DaemonError::Bootstrap(format!("parse bootstrap: {err}")))?;
         validate_fields(&fields)?;
-        Ok(Self { fields, path: path.to_path_buf(), owner: BootstrapOwner::Persistent })
+        Ok(Self {
+            fields,
+            path: path.to_path_buf(),
+            owner: BootstrapOwner::Persistent,
+            released: AtomicBool::new(false),
+        })
     }
 
     /// Returns the parsed fields.
@@ -197,6 +297,49 @@ impl BootstrapArtifact {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Attempts to remove the on-disk artifact exactly once. The
+    /// method is the shared call site the supervisor and every
+    /// connection task go through to honour the
+    /// `docs/plans/x-trace/03b-protocol-and-api.md` §2.1 contract
+    /// that the bootstrap file is deleted after the negotiated
+    /// session is established. The atomic flag inside the struct
+    /// guarantees the file is removed at most once even when
+    /// concurrent connection tasks race on the same `Arc<...>`
+    /// handle.
+    ///
+    /// Returns `true` when this call performed the deletion and
+    /// `false` when the artifact had already been released (either by
+    /// a previous successful handshake or by an earlier orderly
+    /// shutdown). A [`BootstrapOwner::Persistent`] artifact never
+    /// releases; the function returns `false` without touching the
+    /// filesystem.
+    ///
+    /// The deletion is best-effort: a non-`NotFound` I/O error is
+    /// surfaced as a warning but does not propagate; the `Drop` impl
+    /// also calls this helper so the next scope exit retries the
+    /// removal.
+    #[must_use]
+    pub fn try_release(&self) -> bool {
+        if self.owner == BootstrapOwner::Persistent {
+            return false;
+        }
+        if self.released.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => {
+                tracing::warn!(
+                    bootstrap = %self.path.display(),
+                    error = %err,
+                    "failed to remove bootstrap artifact on release",
+                );
+                false
+            }
+        }
     }
 
     /// Re-reads the on-disk artifact. Used by integration tests that
@@ -230,22 +373,12 @@ impl BootstrapArtifact {
 
 impl Drop for BootstrapArtifact {
     fn drop(&mut self) {
-        if self.owner == BootstrapOwner::Persistent {
-            return;
-        }
-        match fs::remove_file(&self.path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                // Best-effort cleanup; the daemon cannot repair an
-                // unwritable filesystem from here.
-                tracing::warn!(
-                    bootstrap = %self.path.display(),
-                    error = %err,
-                    "failed to remove bootstrap artifact on shutdown",
-                );
-            }
-        }
+        // Fallback cleanup path: when no connection ever completes a
+        // successful `DaemonHello`, the orderly shutdown still has to
+        // honour the §2.1 deletion contract. The atomic flag prevents
+        // a double-deletion when a connection task already called
+        // [`BootstrapArtifact::try_release`] on this instance.
+        let _ = self.try_release();
     }
 }
 
@@ -655,6 +788,7 @@ fn fsync_dir(_path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use xtrace_domain::ContentHash;
 
@@ -1142,5 +1276,136 @@ mod tests {
         assert_eq!(canonical.len(), 67);
         let parsed = ContentHash::from_str(&canonical).expect("parse");
         assert_eq!(parsed, hash);
+    }
+
+    /// Seeded canary: the session secret is the only field that must
+    /// never appear under `Debug`. The test plants a recognisable
+    /// base64-shaped string into `session_secret_base64` and asserts
+    /// that `{:?}` does not contain the canary while it does contain
+    /// the redacted marker. The field name itself is allowed to
+    /// appear in the rendered struct so an operator can still tell
+    /// which field was redacted.
+    #[test]
+    fn debug_redacts_session_secret_in_bootstrap_artifact_fields() {
+        // `XXXXCANARYBASE64XXXX` is a recognisable 20-byte string;
+        // base64-encoding it produces a value the writer accepts and
+        // the round-trip parser recognises, while leaving a substring
+        // that no other field can accidentally match.
+        const CANARY_SECRET: &str = "XXXXCANARYBASE64XXXX";
+        let mut fields = sample_fields();
+        fields.session_secret_base64 = CANARY_SECRET.to_string();
+        let rendered = format!("{fields:?}");
+        assert!(
+            !rendered.contains(CANARY_SECRET),
+            "Debug output must not contain the canary secret, got: {rendered}",
+        );
+        assert!(
+            rendered.contains(SESSION_SECRET_REDACTED),
+            "Debug output must surface a redacted marker, got: {rendered}",
+        );
+    }
+
+    /// Seeded canary: the wrapping `BootstrapArtifact` Debug output
+    /// must inherit the same redaction because the manual impl calls
+    /// through to the redacted field Debug.
+    #[test]
+    fn debug_redacts_session_secret_in_bootstrap_artifact() {
+        const CANARY_SECRET: &str = "YYYYCANARYBASE64YYYY";
+        let dir = unique_dir("debug-redact");
+        let path = dir.join("bootstrap.json");
+        let mut fields = sample_fields();
+        fields.session_secret_base64 = CANARY_SECRET.to_string();
+        let artifact =
+            BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).expect("write");
+        let rendered = format!("{artifact:?}");
+        assert!(
+            !rendered.contains(CANARY_SECRET),
+            "Debug output must not contain the canary secret, got: {rendered}",
+        );
+        assert!(
+            rendered.contains(SESSION_SECRET_REDACTED),
+            "Debug output must surface a redacted marker, got: {rendered}",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `try_release` returns `true` exactly once on a `Daemon`-owned
+    /// artifact even when called from concurrent callers on the same
+    /// handle.
+    #[test]
+    fn try_release_is_idempotent_under_concurrent_calls() {
+        let dir = unique_dir("release-race");
+        let path = dir.join("bootstrap.json");
+        let artifact = Arc::new(
+            BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Daemon)
+                .expect("write"),
+        );
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let artifact = Arc::clone(&artifact);
+            handles.push(std::thread::spawn(move || artifact.try_release()));
+        }
+        let winners: Vec<bool> =
+            handles.into_iter().map(|handle| handle.join().expect("join")).collect();
+        let winner_count = winners.iter().filter(|&&won| won).count();
+        assert_eq!(
+            winner_count, 1,
+            "exactly one caller must perform the deletion; got {winner_count} winners"
+        );
+        assert!(!path.exists(), "bootstrap file must be gone after release");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `try_release` is a no-op on a `Persistent` artifact so
+    /// integration tests can keep the file around for inspection.
+    #[test]
+    fn try_release_is_a_noop_on_persistent_artifact() {
+        let dir = unique_dir("release-persistent");
+        let path = dir.join("bootstrap.json");
+        let artifact = BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Persistent)
+            .expect("write");
+        assert!(!artifact.try_release(), "persistent artifact must report no release");
+        assert!(path.exists(), "persistent artifact must remain on disk");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `Drop` on a `Daemon`-owned artifact that was never released
+    /// still removes the file; this is the fallback cleanup path the
+    /// §2.1 deletion contract depends on.
+    #[test]
+    fn drop_removes_unreleased_daemon_artifact_as_fallback() {
+        let dir = unique_dir("drop-fallback");
+        let path = dir.join("bootstrap.json");
+        {
+            let _artifact =
+                BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Daemon)
+                    .expect("write");
+            assert!(path.exists());
+        }
+        assert!(!path.exists(), "Drop must remove the artifact when no caller released it");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `Drop` after `try_release` is a no-op: the atomic flag stops
+    /// the fallback cleanup from racing the explicit release.
+    #[test]
+    fn drop_after_try_release_is_a_noop() {
+        let dir = unique_dir("drop-after-release");
+        let path = dir.join("bootstrap.json");
+        let artifact = BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Daemon)
+            .expect("write");
+        assert!(artifact.try_release(), "explicit release wins");
+        assert!(!path.exists());
+        // Re-create a sentinel file under the same path; if Drop
+        // accidentally deletes it the assertion fails. The check
+        // pins the atomic-flag contract: once released, Drop is a
+        // no-op regardless of what is on disk afterwards.
+        fs::write(&path, b"sentinel").expect("sentinel");
+        drop(artifact);
+        assert!(
+            path.exists(),
+            "Drop must not delete a file released earlier; the sentinel must remain"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

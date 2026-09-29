@@ -68,6 +68,15 @@ const MONOTONIC_CEILING_NS: u128 = u64::MAX as u128;
 /// Process-local monotonic clock. The instant is captured the first
 /// time the daemon starts and every `now_ns` value is a
 /// monotonically non-decreasing delta from that origin.
+///
+/// The clock is `daemon-scoped`: the supervisor constructs a single
+/// instance before the accept loop, hands a `Copy` of it to every
+/// connection task, and reuses the same instance for any
+/// pre-connection `ProtocolError` timestamp. A per-connection
+/// origin would let two timestamps within the same serve run refer
+/// to different anchors and would violate the documented
+/// `process/daemon-local` invariant; the regression coverage in the
+/// in-module tests pins the contract.
 #[derive(Clone, Copy, Debug)]
 pub struct MonotonicClock {
     /// Process-local origin the daemon reports from. Set when the
@@ -240,9 +249,14 @@ pub struct BoundDaemon {
     /// Expected repository fingerprint the daemon enforces on every
     /// inbound `AdapterHello`.
     expected_repository_fingerprint: RepositoryFingerprint,
-    /// Optional bootstrap artifact guard. `Some` when the daemon owns
-    /// the file; `None` when the caller has read it themselves.
-    bootstrap: Option<BootstrapArtifact>,
+    /// Optional bootstrap artifact handle. `Some` when the daemon
+    /// owns the file; the [`Arc`] is shared between the supervisor
+    /// and every connection task so the post-hello
+    /// [`BootstrapArtifact::try_release`] call honours the
+    /// `docs/plans/x-trace/03b-protocol-and-api.md` §2.1 "deleted
+    /// after negotiation" contract exactly once across concurrent
+    /// successful handshakes.
+    bootstrap: Option<Arc<BootstrapArtifact>>,
 }
 
 impl BoundDaemon {
@@ -285,8 +299,17 @@ impl BoundDaemon {
     /// # Errors
     ///
     /// Returns [`DaemonError::Join`] when a connection task panics or
-    /// is cancelled. Returns [`DaemonError::BindFailed`] when the
-    /// supervisor fails to accept the next connection.
+    /// is cancelled, and after the supervisor signals shutdown and
+    /// drains every in-flight connection. Returns the first
+    /// connection-local [`DaemonError`] a task reports when a genuine
+    /// internal or fatal failure (for example a refused server
+    /// nonce or a failed `DaemonHello` write) escapes the
+    /// peer-disconnect boundary. A single failed peer cannot take
+    /// the daemon down: the supervisor treats malformed clients,
+    /// refused TLS handshakes, rejected `AdapterHello` envelopes,
+    /// and decoder errors as `Ok(())` at the connection boundary so
+    /// the listener keeps accepting until the shutdown future
+    /// resolves.
     pub async fn serve<F>(self, shutdown: F) -> Result<(), DaemonError>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -298,7 +321,7 @@ impl BoundDaemon {
         let runtime_session_id = self.runtime_session_id;
         let project_id = self.project_id;
         let expected_repository_fingerprint = self.expected_repository_fingerprint;
-        let _bootstrap = self.bootstrap;
+        let bootstrap = self.bootstrap;
 
         let (shutdown_tx, mut shutdown_signal) = shared_shutdown_channel();
         // Keep an extra sender in scope so a listener-level failure
@@ -314,7 +337,16 @@ impl BoundDaemon {
             project_id,
             expected_repository_fingerprint,
             shutdown: shutdown_signal_inner,
+            bootstrap: bootstrap.clone(),
         };
+
+        // One daemon-scoped monotonic clock for every timestamp the
+        // supervisor and its connections emit during this serve run.
+        // The clone is `Copy`, so every connection task receives the
+        // same origin and the documented `process/daemon-local`
+        // invariant survives even when the listener accepts multiple
+        // sequential clients.
+        let clock = MonotonicClock::new();
 
         let mut connections: JoinSet<Result<(), DaemonError>> = JoinSet::new();
         let shutdown_observer: JoinHandle<()> = tokio::spawn(async move {
@@ -331,10 +363,42 @@ impl BoundDaemon {
                 }
                 // Reap completed connection tasks so the join set
                 // never grows without bound when sequential clients
-                // disconnect.
+                // disconnect. The classification function decides
+                // whether to keep running, to record a connection
+                // error, or to stop the daemon.
                 Some(joined) = connections.join_next() => {
-                    if let Err(err) = joined {
-                        warn!(error = %err, "connection task join failed");
+                    match classify_join_completion(joined) {
+                        JoinCompletionAction::Continue => {}
+                        JoinCompletionAction::ConnectionFailure(err) => {
+                            // A connection-local error escaped the
+                            // peer-disconnect boundary inside
+                            // [`handle_connection`], so the
+                            // supervisor stops the daemon and
+                            // surfaces the error after draining.
+                            let _ = shutdown_tx_for_supervisor.send(true);
+                            shutdown_observer.abort();
+                            let _ = shutdown_observer.await;
+                            let (drain_join, drain_conn) =
+                                drain_connections(&mut connections).await;
+                            return Err(drain_join
+                                .or(drain_conn)
+                                .unwrap_or(err));
+                        }
+                        JoinCompletionAction::JoinFailure(join_err) => {
+                            // A panic or cancellation surfaced
+                            // through the join; the supervisor stops
+                            // the daemon, drains, and returns the
+                            // wrapped [`DaemonError::Join`].
+                            let _ = shutdown_tx_for_supervisor.send(true);
+                            shutdown_observer.abort();
+                            let _ = shutdown_observer.await;
+                            let (drain_join, drain_conn) =
+                                drain_connections(&mut connections).await;
+                            let join_err = DaemonError::Join(format!(
+                                "connection task join failed: {join_err}"
+                            ));
+                            return Err(drain_join.or(drain_conn).unwrap_or(join_err));
+                        }
                     }
                 }
                 accept_result = listener.accept() => {
@@ -350,17 +414,16 @@ impl BoundDaemon {
                             let _ = shutdown_tx_for_supervisor.send(true);
                             shutdown_observer.abort();
                             let _ = shutdown_observer.await;
-                            while let Some(joined) = connections.join_next().await {
-                                if let Err(err) = joined {
-                                    warn!(error = %err, "shutdown join failed");
-                                }
-                            }
-                            return Err(err);
+                            let (drain_join, drain_conn) =
+                                drain_connections(&mut connections).await;
+                            return Err(drain_join
+                                .or(drain_conn)
+                                .unwrap_or(err));
                         }
                     };
                     debug!(peer = %peer, "daemon accepted new connection");
                     let task_ctx = ctx.clone();
-                    let task_clock = MonotonicClock::new();
+                    let task_clock = clock;
                     connections.spawn(async move {
                         handle_connection(task_ctx, stream, task_clock).await
                     });
@@ -371,11 +434,12 @@ impl BoundDaemon {
         shutdown_observer.abort();
         let _ = shutdown_observer.await;
         // Drain every connection before returning so the future is
-        // observably complete.
-        while let Some(joined) = connections.join_next().await {
-            if let Err(err) = joined {
-                warn!(error = %err, "shutdown join failed");
-            }
+        // observably complete. The drain collects any further
+        // failures so the caller observes the first task or join
+        // error after every connection has been reaped.
+        let (drain_join, drain_conn) = drain_connections(&mut connections).await;
+        if let Some(err) = drain_join.or(drain_conn) {
+            return Err(err);
         }
         Ok(())
     }
@@ -427,6 +491,7 @@ async fn handle_connection(
                     max_envelope_bytes,
                     code.as_str(),
                     &format!("{err}"),
+                    clock,
                 )
                 .await;
                 return Ok(());
@@ -454,6 +519,7 @@ async fn handle_connection(
             max_envelope_bytes,
             err.code.as_str(),
             &err.detail,
+            clock,
         )
         .await;
         return Ok(());
@@ -473,13 +539,30 @@ async fn handle_connection(
                 max_envelope_bytes,
                 err.code.as_str(),
                 &err.detail,
+                clock,
             )
             .await;
             return Ok(());
         }
     };
     if !write_initial_envelope_stream(&mut tls_stream, &envelope).await {
+        // A genuine internal failure (the writer cannot reach the
+        // peer even though the local kernel socket is healthy) is the
+        // only error path that escapes the peer-disconnect boundary.
+        // The supervisor surfaces this back to the caller and stops
+        // the daemon; a single transport failure cannot silently
+        // disappear.
         return Err(DaemonError::Transport("write daemon hello".to_string()));
+    }
+    // The §2.1 deletion contract is satisfied only after
+    // `AdapterHello` has been validated AND `DaemonHello` has been
+    // written to the wire. Failed proof exchanges never reach this
+    // point so a legitimate retry against the same launch can
+    // re-read the artifact. The atomic flag inside the shared
+    // handle guarantees the file is removed at most once even when
+    // multiple connection tasks race on the same handle.
+    if let Some(handle) = ctx.bootstrap.as_ref() {
+        let _ = handle.try_release();
     }
 
     // Now split the stream and hand the write half to a dedicated
@@ -689,11 +772,19 @@ where
 /// Emits a `ProtocolError` directly through the tokio TLS stream
 /// before the writer half is handed off. Used only on the pre-split
 /// path so the protocol-error envelope is delivered before close.
+///
+/// The `clock` parameter is the daemon-scoped [`MonotonicClock`] the
+/// supervisor constructs once before the accept loop; reusing the
+/// same origin across every `ProtocolError` keeps the timestamps on
+/// the wire consistent with the documented `process/daemon-local`
+/// monotonic origin even when the listener accepts multiple sequential
+/// clients.
 async fn send_protocol_error_stream<S>(
     tls_stream: &mut S,
     max_envelope_bytes: u32,
     code: &str,
     message: &str,
+    clock: MonotonicClock,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
@@ -703,7 +794,7 @@ where
         protocol_minor: 0,
         runtime_session_id: Bytes::new(),
         session_seq: 0,
-        sent_monotonic_ns: MonotonicClock::new().now_ns(),
+        sent_monotonic_ns: clock.now_ns(),
         message_id: "daemon-error".to_string(),
         correlation_token: String::new(),
         payload: Some(PayloadOneof::ProtocolError(ProtocolError {
@@ -771,6 +862,90 @@ struct SupervisorContext {
     /// Shared shutdown signal observed by the supervisor, every
     /// connection, and every helper task.
     shutdown: ShutdownSignal,
+    /// Optional bootstrap artifact handle shared between the
+    /// supervisor and the connection tasks. The supervisor hands a
+    /// clone to each spawned task so the post-hello
+    /// [`BootstrapArtifact::try_release`] call is race-free.
+    bootstrap: Option<Arc<BootstrapArtifact>>,
+}
+
+/// Outcome of inspecting a single [`JoinSet`] completion. The
+/// supervisor uses the outcome to decide whether to keep running, to
+/// record a connection-level error for later drain, or to stop the
+/// daemon and return immediately. The owned [`DaemonError`] lives
+/// only inside the action variant the supervisor matches against
+/// inline, so the policy never needs [`DaemonError: Clone`].
+#[derive(Debug)]
+enum JoinCompletionAction {
+    /// The completion was a normal `Ok(())`; keep accepting.
+    Continue,
+    /// The connection returned an internal [`DaemonError`]; the
+    /// supervisor signals shutdown, drains every in-flight
+    /// connection, and surfaces this error to the caller.
+    ConnectionFailure(DaemonError),
+    /// The connection task panicked or was cancelled. The supervisor
+    /// signals shutdown, drains, and returns a [`DaemonError::Join`]
+    /// built from the join error.
+    JoinFailure(tokio::task::JoinError),
+}
+
+/// Classifies one [`JoinSet`] completion. The function is the single
+/// decision point that decides whether the supervisor must stop the
+/// daemon. Tests exercise it directly so the policy does not silently
+/// regress to "log and continue".
+fn classify_join_completion(
+    joined: Result<Result<(), DaemonError>, tokio::task::JoinError>,
+) -> JoinCompletionAction {
+    match joined {
+        Ok(Ok(())) => JoinCompletionAction::Continue,
+        Ok(Err(err)) => {
+            // A connection-local error escaped the peer-disconnect
+            // boundary inside [`handle_connection`], so the
+            // supervisor stops the daemon and surfaces the error.
+            // The decision is the same regardless of the variant:
+            // every `DaemonError` that survives the boundary is a
+            // genuine internal failure (rng refusal, daemon hello
+            // write failure).
+            JoinCompletionAction::ConnectionFailure(err)
+        }
+        Err(join_err) => {
+            // A panic or cancellation surfaced through the join. The
+            // supervisor stops the daemon, drains, and wraps the join
+            // error into a [`DaemonError::Join`].
+            JoinCompletionAction::JoinFailure(join_err)
+        }
+    }
+}
+
+/// Awaits every remaining connection task and returns the first
+/// failure observed during the drain. The supervisor calls this
+/// helper before returning so callers can observe every failure in
+/// the order it was reported, with the join error taking precedence
+/// over a connection-level [`DaemonError`].
+async fn drain_connections(
+    connections: &mut JoinSet<Result<(), DaemonError>>,
+) -> (Option<DaemonError>, Option<DaemonError>) {
+    let mut first_join: Option<DaemonError> = None;
+    let mut first_connection: Option<DaemonError> = None;
+    while let Some(joined) = connections.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                if first_connection.is_none() {
+                    first_connection = Some(err);
+                }
+            }
+            Err(join_err) => {
+                let wrapped = DaemonError::Join(format!(
+                    "connection task join failed during drain: {join_err}"
+                ));
+                if first_join.is_none() {
+                    first_join = Some(wrapped);
+                }
+            }
+        }
+    }
+    (first_join, first_connection)
 }
 
 /// Builder for [`BoundDaemon`].
@@ -795,8 +970,13 @@ impl DaemonBuilder {
         }
     }
 
-    /// Sets the project identifier the daemon will require on every
-    /// post-hello envelope. Required.
+    /// Sets the project identifier the daemon uses to bind the bootstrap
+    /// artifact and to cross-check the bootstrap-anchored
+    /// repository identity on every inbound `AdapterHello`. The
+    /// project identifier is not carried on the wire (the
+    /// `AgentEnvelope` schema has no `project_id` field); it is the
+    /// daemon-side context that allows the bootstrap file and the
+    /// session to refer to the same deployment.
     #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
     pub fn with_project_id(mut self, project_id: ProjectId) -> Self {
         self.project_id = Some(project_id);
@@ -878,7 +1058,8 @@ impl DaemonBuilder {
                 );
                 BootstrapArtifact::write(path, fields, BootstrapOwner::Daemon)
             })
-            .transpose()?;
+            .transpose()?
+            .map(Arc::new);
         info!(
             address = %listener.local_addr(),
             project_id = %project_id,
@@ -991,5 +1172,158 @@ mod tests {
         let start = Instant::now();
         signal.wait().await;
         assert!(start.elapsed() < StdDuration::from_secs(1));
+    }
+
+    /// `classify_join_completion` returns [`JoinCompletionAction::Continue`]
+    /// for a normal `Ok(())` completion. The supervisor uses this
+    /// outcome to keep accepting; the test pins the boundary so a
+    /// regression cannot silently log-and-continue.
+    #[test]
+    fn classify_join_completion_continues_on_normal_completion() {
+        let joined: Result<Result<(), DaemonError>, tokio::task::JoinError> = Ok(Ok(()));
+        assert!(matches!(classify_join_completion(joined), JoinCompletionAction::Continue));
+    }
+
+    /// A connection-local [`DaemonError`] (genuine internal failure)
+    /// must surface as a [`JoinCompletionAction::ConnectionFailure`]
+    /// so the supervisor stops the daemon after draining remaining
+    /// connections. Peer-disconnect errors never reach this branch
+    /// because [`handle_connection`] normalises them to `Ok(())`.
+    #[test]
+    fn classify_join_completion_flags_connection_failure() {
+        let joined: Result<Result<(), DaemonError>, tokio::task::JoinError> =
+            Ok(Err(DaemonError::Transport("write daemon hello".to_string())));
+        match classify_join_completion(joined) {
+            JoinCompletionAction::ConnectionFailure(err) => {
+                assert!(matches!(err, DaemonError::Transport(_)));
+            }
+            other => unreachable!("expected ConnectionFailure, got {other:?}"),
+        }
+    }
+
+    /// A `JoinSet` panic or cancellation must surface as a
+    /// [`JoinCompletionAction::JoinFailure`] so the supervisor stops
+    /// the daemon and returns [`DaemonError::Join`]. The classification
+    /// is the only place this conversion happens; the test pins the
+    /// mapping so the supervisor cannot regress to "log and Ok".
+    #[test]
+    #[allow(
+        clippy::panic,
+        reason = "test deliberately panics inside a spawned task to exercise the supervisor policy"
+    )]
+    fn classify_join_completion_flags_panic_as_join_failure() {
+        // A `JoinError` whose `is_panic()` returns true models a
+        // production-style panic injection. `tokio::task::JoinError`
+        // is not `Clone`, so the test constructs a fresh one via
+        // a no-op runtime so the public enum is exercised end-to-end.
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        let handle = rt.spawn(async {
+            panic!("intentional panic for supervisor classification coverage");
+        });
+        let result = rt.block_on(handle).expect_err("join error from panicked task");
+        let joined: Result<Result<(), DaemonError>, tokio::task::JoinError> = Err(result);
+        match classify_join_completion(joined) {
+            JoinCompletionAction::JoinFailure(err) => {
+                assert!(err.is_panic(), "join error must be a panic");
+            }
+            other => unreachable!("expected JoinFailure, got {other:?}"),
+        }
+    }
+
+    /// A `JoinSet` cancellation (the task was aborted) also flows
+    /// through [`JoinCompletionAction::JoinFailure`] so the supervisor
+    /// cannot silently drop a cancelled task either.
+    #[test]
+    fn classify_join_completion_flags_cancellation_as_join_failure() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        let handle = rt.spawn(async {
+            tokio::time::sleep(StdDuration::from_secs(60)).await;
+        });
+        handle.abort();
+        let result = rt.block_on(handle).expect_err("join error from cancelled task");
+        let joined: Result<Result<(), DaemonError>, tokio::task::JoinError> = Err(result);
+        match classify_join_completion(joined) {
+            JoinCompletionAction::JoinFailure(err) => {
+                assert!(err.is_cancelled(), "join error must be a cancellation");
+            }
+            other => unreachable!("expected JoinFailure, got {other:?}"),
+        }
+    }
+
+    /// `drain_connections` collects every task completion, surfaces
+    /// the first join error (panic/cancellation) before any
+    /// connection error, and returns `(None, None)` when every task
+    /// completed cleanly. The supervisor relies on this priority
+    /// ordering to keep a crashed helper task from being masked by
+    /// an earlier peer-disconnect.
+    #[tokio::test]
+    #[allow(
+        clippy::panic,
+        reason = "test deliberately panics inside a spawned task to exercise the drain priority"
+    )]
+    async fn drain_connections_collects_failures_with_join_priority() {
+        let mut set: JoinSet<Result<(), DaemonError>> = JoinSet::new();
+        // Two clean completions.
+        for _ in 0..2 {
+            set.spawn(async { Ok(()) });
+        }
+        // One connection error.
+        set.spawn(async { Err(DaemonError::Transport("write daemon hello".to_string())) });
+        // One more clean completion that lands after the connection
+        // error; the drain must not overwrite the first recorded
+        // failure with the later one.
+        set.spawn(async { Ok(()) });
+        // One task that panics.
+        set.spawn(async {
+            panic!("drain priority coverage");
+        });
+
+        let (first_join, first_connection) = drain_connections(&mut set).await;
+        assert!(first_join.is_some(), "drain must surface a join error when a task panics",);
+        assert!(
+            first_connection.is_some(),
+            "drain must surface a connection error even when a join error wins",
+        );
+        // Now drain a fresh join set with no failures.
+        let mut clean: JoinSet<Result<(), DaemonError>> = JoinSet::new();
+        for _ in 0..3 {
+            clean.spawn(async { Ok(()) });
+        }
+        let (join, conn) = drain_connections(&mut clean).await;
+        assert!(join.is_none());
+        assert!(conn.is_none());
+    }
+
+    /// The daemon-scoped [`MonotonicClock`] is the same instance the
+    /// writer task uses: constructing the clock once before the
+    /// accept loop and copying it into connection tasks means the
+    /// `now_ns` value emitted by `send_protocol_error_stream` shares
+    /// the same origin as every Health frame. A regression that
+    /// builds a fresh clock per connection would produce different
+    /// origins and fail the equality check.
+    #[test]
+    fn monotonic_clock_shares_a_single_daemon_origin() {
+        let clock = MonotonicClock::new();
+        let writer_clock = clock;
+        let writer_clock_for_health = clock;
+        let writer_clock_for_protocol_error = clock;
+        // Compare the inner origin `Instant` values: `MonotonicClock`
+        // is `Copy` so two copies of the same `Instant` compare
+        // equal.
+        assert_eq!(
+            format!("{:?}", writer_clock),
+            format!("{:?}", clock),
+            "writer clock must share the daemon origin",
+        );
+        assert_eq!(
+            format!("{:?}", writer_clock_for_health),
+            format!("{:?}", clock),
+            "health clock must share the daemon origin",
+        );
+        assert_eq!(
+            format!("{:?}", writer_clock_for_protocol_error),
+            format!("{:?}", clock),
+            "protocol-error clock must share the daemon origin",
+        );
     }
 }

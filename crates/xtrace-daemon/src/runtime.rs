@@ -95,13 +95,18 @@ impl OutgoingCommand {
 /// typed wire inputs so the session layer does not need to know
 /// about the byte layout.
 ///
-/// Project identity is enforced separately by the session layer
-/// against `AdapterHello.repository_fingerprint` and the
-/// bootstrap-anchored `xtrace_domain::RepositoryFingerprint`; the
-/// transcript proof is bound to `runtime_session_id` (per connection)
-/// and the negotiated protocol range, never to `project_id`. The
-/// `project_id` is carried out-of-band in the bootstrap artifact and
-/// is not part of the handshake transcript.
+/// The transcript proof is bound to the TLS exporter, the runtime
+/// session identifier, the client nonce, the server nonce (zero
+/// placeholder on the inbound direction), and the manifest digest
+/// carried in the inbound `AdapterHello`. Protocol major/minor
+/// negotiation is validated separately against `AdapterHello`'s
+/// `protocol_major_max` and `protocol_minor_max` fields; the
+/// negotiated range is not part of the HMAC transcript. Project
+/// identity is enforced separately by the session layer against
+/// `AdapterHello.repository_fingerprint` and the bootstrap-anchored
+/// `xtrace_domain::RepositoryFingerprint`; the bootstrap artifact
+/// carries the expected fingerprint out of band, and the manifest
+/// digest arrives in the wire envelope.
 ///
 /// # Errors
 ///

@@ -66,8 +66,10 @@ impl LoopbackListener {
 
     /// Accepts the next inbound connection. The method is a thin
     /// wrapper around [`TokioTcpListener::accept`] that maps the I/O
-    /// error into a [`DaemonError`] so the supervisor can continue
-    /// running after a single failed accept.
+    /// error into a [`DaemonError`]. The supervisor treats an accept
+    /// failure as fatal: the listener errors are not transient, so
+    /// the loop signals shutdown, drains every in-flight connection,
+    /// and surfaces the error to the caller rather than masking it.
     ///
     /// # Errors
     ///

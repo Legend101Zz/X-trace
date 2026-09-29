@@ -33,7 +33,12 @@ pub enum ProtocolErrorCode {
     /// `runtime_session_id` carried by a post-hello envelope does not
     /// match the one negotiated at handshake time.
     SessionIdentity,
-    /// `project_id` does not match the bootstrap artifact.
+    /// Repository fingerprint in `AdapterHello` does not match the
+    /// value the daemon expected from the bootstrap artifact. The
+    /// enforcement uses the bootstrap-anchored repository
+    /// fingerprint rather than the wire `project_id`; the
+    /// `AgentEnvelope` schema has no `project_id` field and the
+    /// identifier is used only to bind the bootstrap context.
     ProjectIdentity,
     /// `session_seq` is out of order: replay (already acknowledged) or
     /// gap (skipped sequence number).
