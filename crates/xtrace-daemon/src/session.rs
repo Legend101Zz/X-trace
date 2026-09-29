@@ -12,6 +12,14 @@
 //! - `Ack` for every accepted envelope;
 //! - `Health` echo on a configurable interval.
 //!
+//! After the authenticated handshake, [`Session::accept_post_hello`]
+//! admits the wire `CapabilitySet`, `Health`, and recording payloads
+//! (`RecordingStarted`, `EventBatch`, `RecordingFinished`) as typed
+//! [`IncomingEnvelope`] variants, retains each in the bounded
+//! `staged_incoming` queue, and returns [`AckDurability::Staged`].
+//! Recording-level validation, lifecycle, persistence, and `Committed`
+//! belong to the downstream ingester.
+//!
 //! ## Inbound `AdapterHello` invariants
 //!
 //! The adapter's first envelope carries the bootstrap-anchored
@@ -164,7 +172,7 @@ pub struct Session {
     /// `AdapterHello`. `None` until the daemon accepts the hello.
     negotiated: Option<NegotiatedProtocol>,
     /// Volatile staging buffer for accepted post-hello envelopes.
-    /// Every `IncomingEnvelope` the session accepts is appended to
+    /// Every [`IncomingEnvelope`] the session accepts is appended to
     /// this buffer before the matching [`Ack`] is released so the
     /// [`AckDurability::Staged`] value is honest: the daemon has
     /// actually retained the accepted data, even though it is
@@ -484,6 +492,15 @@ impl Session {
             }
             Some(wire::agent_envelope::Payload::Health(health)) => {
                 IncomingEnvelope::Health(health.clone())
+            }
+            Some(wire::agent_envelope::Payload::RecordingStarted(started)) => {
+                IncomingEnvelope::RecordingStarted(started.clone())
+            }
+            Some(wire::agent_envelope::Payload::EventBatch(batch)) => {
+                IncomingEnvelope::EventBatch(batch.clone())
+            }
+            Some(wire::agent_envelope::Payload::RecordingFinished(finished)) => {
+                IncomingEnvelope::RecordingFinished(finished.clone())
             }
             Some(wire::agent_envelope::Payload::ProtocolError(err)) => {
                 return Err(SessionError::new(
@@ -1251,6 +1268,122 @@ mod tests {
             u64::MAX,
             "sequence counter must not advance past the overflow point"
         );
+    }
+
+    #[test]
+    fn accept_post_hello_admits_recording_wire_payloads_in_order() {
+        // Invariant: every accepted recording payload is staged under
+        // its `session_seq` and acknowledged as `Staged`.
+        fn admit(
+            session: &mut Session,
+            session_id: RuntimeSessionId,
+            seq: u64,
+            payload: PayloadOneof,
+        ) -> IncomingEnvelope {
+            let envelope = envelope_with_payload(session_id, seq, payload);
+            let (incoming, cmd) = session.accept_post_hello(&envelope).expect("admit");
+            match cmd {
+                OutgoingCommand::Ack(ack) => {
+                    assert_eq!(ack.highest_contiguous_session_seq, seq);
+                    assert_eq!(ack.durability, AckDurability::Staged as i32);
+                    assert!(ack.rejected.is_empty());
+                }
+                other => unreachable!("expected Ack, got {other:?}"),
+            }
+            incoming
+        }
+
+        let (mut session, session_id, _) = session_after_hello();
+        assert!(session.staged_incoming.is_empty());
+
+        let recording_id = Bytes::copy_from_slice(&[0x01; 16]);
+        let started_payload = PayloadOneof::RecordingStarted(wire::RecordingStarted {
+            recording_id: recording_id.clone(),
+            method: "GET".to_string(),
+            ..wire::RecordingStarted::default()
+        });
+        let batch_payload = PayloadOneof::EventBatch(wire::EventBatch {
+            recording_id: recording_id.clone(),
+            events: vec![wire::RecordingEvent {
+                event_id: "ev-1".to_string(),
+                recording_seq: 7,
+                ..wire::RecordingEvent::default()
+            }],
+        });
+        let finished_payload = PayloadOneof::RecordingFinished(wire::RecordingFinished {
+            recording_id,
+            final_recording_seq: 7,
+            ..wire::RecordingFinished::default()
+        });
+
+        let started = admit(&mut session, session_id, 1, started_payload);
+        let batch = admit(&mut session, session_id, 2, batch_payload);
+        let finished = admit(&mut session, session_id, 3, finished_payload);
+
+        match started {
+            IncomingEnvelope::RecordingStarted(s) => assert_eq!(s.method, "GET"),
+            other => unreachable!("expected RecordingStarted, got {other:?}"),
+        }
+        match batch {
+            IncomingEnvelope::EventBatch(b) => {
+                assert_eq!(b.events.len(), 1);
+                assert_eq!(b.events[0].event_id, "ev-1");
+                assert_eq!(b.events[0].recording_seq, 7);
+            }
+            other => unreachable!("expected EventBatch, got {other:?}"),
+        }
+        match finished {
+            IncomingEnvelope::RecordingFinished(f) => assert_eq!(f.final_recording_seq, 7),
+            other => unreachable!("expected RecordingFinished, got {other:?}"),
+        }
+
+        let staged = &session.staged_incoming;
+        assert_eq!(staged.len(), 3);
+        assert!(staged.iter().zip(1u64..).all(|((s, _), i)| *s == i));
+        assert_eq!(session.next_expected_seq, 4);
+    }
+
+    #[test]
+    fn accept_post_hello_rejects_unsupported_payload_without_state_mutation() {
+        let (mut session, session_id, _) = session_after_hello();
+        let before_seq = session.next_expected_seq;
+        assert!(session.staged_incoming.is_empty());
+
+        // `EndpointClaimBatch` is a documented wire payload that the
+        // session does not yet admit; the rejection must leave every
+        // session field untouched.
+        let unsupported = envelope_with_payload(
+            session_id,
+            1,
+            PayloadOneof::EndpointClaims(wire::EndpointClaimBatch::default()),
+        );
+        let err = session.accept_post_hello(&unsupported).unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::HelloDecode);
+        assert!(
+            err.detail.contains("unsupported payload after hello"),
+            "rejection detail must name the unsupported payload, got: {}",
+            err.detail,
+        );
+        assert!(session.staged_incoming.is_empty());
+        assert_eq!(session.next_expected_seq, before_seq);
+
+        // A subsequent recording payload at the same sequence is
+        // still admissible: the prior rejection must not have
+        // burned the sequence slot.
+        let started = envelope_with_payload(
+            session_id,
+            1,
+            PayloadOneof::RecordingStarted(wire::RecordingStarted::default()),
+        );
+        let (_incoming, cmd) = session.accept_post_hello(&started).expect("admit");
+        let ack = match cmd {
+            OutgoingCommand::Ack(ack) => ack,
+            other => unreachable!("expected Ack, got {other:?}"),
+        };
+        assert_eq!(ack.highest_contiguous_session_seq, 1);
+        assert_eq!(ack.durability, AckDurability::Staged as i32);
+        assert_eq!(session.staged_incoming.len(), 1);
+        assert_eq!(session.next_expected_seq, before_seq + 1);
     }
 
     #[test]
