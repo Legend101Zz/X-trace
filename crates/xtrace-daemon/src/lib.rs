@@ -22,10 +22,12 @@
 //!   AdapterHello/DaemonHello exchange, validates session sequencing,
 //!   emits ACK + Health, and shuts down on the cancellation token.
 //!
-//! The crate deliberately stops short of recording assembly, SQLite
-//! ingestion, the HTTP/WebSocket client API, the Java/Node adapters,
-//! and the TUI. Those surfaces belong to later slices and depend on
-//! the boundary this crate establishes.
+//! Recording assembly and persistence are owned by an optional
+//! [`xtrace_application::recording::RecordingCapture`] injected through
+//! [`DaemonBuilder::with_recording_capture`]. The daemon translates admitted
+//! wire events and runs that use case on a bounded blocking lane; it has no
+//! production dependency on a concrete store. The crate still stops short of
+//! the HTTP/WebSocket client API, Java/Node adapters, and TUI.
 //!
 //! ## Library API
 //!
@@ -92,6 +94,7 @@ pub mod daemon;
 pub mod error;
 pub mod framing;
 pub mod listener;
+mod recording_pipeline;
 pub mod runtime;
 pub mod secret;
 pub mod session;
@@ -108,7 +111,7 @@ pub use framing::{EnvelopeAsyncDecoder, EnvelopeAsyncEncoder, EnvelopeDecoder, E
 pub use listener::LoopbackListener;
 pub use runtime::{AdapterHelloAck, IncomingEnvelope, OutgoingCommand, PostHelloAdmission};
 pub use secret::SessionSecret;
-pub use session::{HandshakeInputs, HandshakeRole, Session};
+pub use session::{HandshakeInputs, HandshakeRole, Session, StagedReleaseError};
 pub use tls::{TlsServerMaterials, build_pinned_client_config};
 
 /// Re-export of the XTP-Agent protocol handshake helpers so callers

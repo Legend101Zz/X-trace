@@ -1299,9 +1299,11 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uuid",
+ "xtrace-application",
  "xtrace-domain",
  "xtrace-ingest",
  "xtrace-protocol",
+ "xtrace-store",
  "zeroize",
 ]
 
@@ -1356,6 +1358,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "time",
  "tracing",

@@ -40,6 +40,7 @@ pub mod commands;
 pub mod error;
 pub mod ports;
 pub mod queries;
+pub mod recording;
 
 pub use application::{Application, RequestContext};
 pub use commands::{Command, CommandReceipt, InitializeProject, OpenProject};
@@ -48,4 +49,12 @@ pub use ports::{IdempotencyStore, ProjectRepository, StoredReceipt};
 pub use queries::{
     CapabilityReport, GetProject, GetStoreStatus, ProjectStatus, Query, QueryResult,
     StoreStatusReport,
+};
+pub use recording::{
+    AcceptedRecordingEvent, BeginRecording, BeginRecordingDisposition, BeginRecordingReceipt,
+    DEFAULT_MAX_RETAINED_RECORDINGS, DEFAULT_SEGMENT_EVENT_BYTES, DEFAULT_SEGMENT_EVENTS,
+    DEFAULT_SEGMENT_SPAN_NS, FinishRecording, FinishRecordingReceipt, MAX_RECORDED_EVENTS,
+    MAX_XTF_EVENT_ENVELOPE_BYTES, PersistRecordingSegment, PersistSegmentDisposition,
+    PersistSegmentReceipt, RecordEvents, RecordEventsReceipt, RecordingCapture,
+    RecordingCaptureService, RecordingPersistencePort, SegmentPolicy,
 };

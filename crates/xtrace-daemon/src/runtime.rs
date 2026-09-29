@@ -55,8 +55,11 @@ pub struct AdapterHelloAck {
 /// Recording wire payloads (`RecordingStarted`, `EventBatch`,
 /// `RecordingFinished`) are validated through the session-bound
 /// `xtrace-ingest` validator before staging and acknowledged with
-/// `AckDurability::Staged`; persistence, `Committed` durability, and
-/// terminal recording lifecycle remain downstream of this slice.
+/// `AckDurability::Staged`. When a capture use case is configured, the
+/// supervisor dispatches each admitted message to it before releasing the
+/// staged queue front and emitting that same `Staged` ACK. This type remains
+/// independent of persistence, `Committed` durability, and terminal recording
+/// lifecycle transitions.
 #[derive(Clone, Debug)]
 pub enum IncomingEnvelope {
     /// Adapter supplied its initial [`CapabilitySet`].

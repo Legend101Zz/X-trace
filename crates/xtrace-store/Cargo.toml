@@ -26,3 +26,6 @@ uuid = { workspace = true }
 hex = { workspace = true }
 blake3 = { workspace = true }
 zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

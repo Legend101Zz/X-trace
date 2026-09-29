@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 xtrace-domain = { path = "../xtrace-domain" }
+xtrace-application = { path = "../xtrace-application" }
 xtrace-protocol = { path = "../xtrace-protocol" }
 xtrace-ingest = { path = "../xtrace-ingest" }
 async-trait = { workspace = true }
@@ -45,3 +46,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sy
 # `TempDir` guard removes the directory on drop so a panic in a test
 # never strands an unwiped bootstrap artifact or secret-bearing file.
 tempfile = "3.10"
+xtrace-store = { path = "../xtrace-store" }
