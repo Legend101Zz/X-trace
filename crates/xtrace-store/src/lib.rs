@@ -39,6 +39,7 @@ pub mod error;
 pub mod idempotency_repository;
 pub mod migrations;
 pub mod project_repository;
+pub mod recording_port;
 pub mod recording_store;
 pub mod xtf;
 
@@ -50,6 +51,7 @@ pub use error::{StoreError, StoreErrorKind};
 pub use idempotency_repository::SqliteIdempotencyStore;
 pub use migrations::{MigrationRecord, Migrations};
 pub use project_repository::SqliteProjectRepository;
+pub use recording_port::SqliteRecordingPersistence;
 pub use recording_store::{
     BeginRecordingDisposition, BeginRecordingReceipt, BeginRecordingRequest, RecordingStoreError,
     RecordingStoreErrorCategory, RecordingStoreErrorKind, SegmentCommitDisposition,
