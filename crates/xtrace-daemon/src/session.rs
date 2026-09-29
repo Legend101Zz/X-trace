@@ -19,8 +19,10 @@
 //! `staged_incoming` queue, and returns [`AckDurability::Staged`]
 //! with the canonical recording watermarks the wired
 //! [`xtrace_ingest::IngestValidator`] returns. Persistence,
-//! `Committed` durability, and terminal recording state are still
-//! downstream of this slice.
+//! `Committed` durability, and terminal recording state remain outside
+//! this IO-free session state machine. The daemon supervisor may dispatch
+//! an admission to its optional application capture use case before releasing
+//! the staged queue front and emitting the same `Staged` ACK.
 //!
 //! ## Inbound `AdapterHello` invariants
 //!
@@ -205,6 +207,23 @@ pub struct Session {
 /// `RecordingStarted` envelope, so the staging buffer is the direct
 /// upper bound on the number of recordings the validator can track.
 const STAGED_INCOMING_LIMIT: usize = 256;
+
+/// Error returned when the staged incoming queue front does not match the
+/// envelope whose processing completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum StagedReleaseError {
+    /// No admitted envelope remains staged.
+    #[error("staged incoming queue is empty")]
+    Empty,
+    /// The queue front belongs to a different session sequence.
+    #[error("staged incoming front sequence mismatch: expected {expected}, found {actual}")]
+    FrontMismatch {
+        /// Session sequence the caller attempted to release.
+        expected: u64,
+        /// Session sequence currently at the queue front.
+        actual: u64,
+    },
+}
 
 impl Session {
     /// Constructs a fresh session over the supplied inputs. The
@@ -644,6 +663,35 @@ impl Session {
                 "envelope carried no payload after hello".to_string(),
             )),
         }
+    }
+
+    /// Releases exactly the staged queue front for an envelope after its
+    /// configured downstream handling succeeds.
+    ///
+    /// A mismatch or empty queue leaves the session unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StagedReleaseError::Empty`] when no envelope is staged, or
+    /// [`StagedReleaseError::FrontMismatch`] when the front sequence differs
+    /// from `expected_session_seq`.
+    pub fn release_staged_front(
+        &mut self,
+        expected_session_seq: u64,
+    ) -> Result<(), StagedReleaseError> {
+        let Some((actual_session_seq, _)) = self.staged_incoming.front() else {
+            return Err(StagedReleaseError::Empty);
+        };
+        if *actual_session_seq != expected_session_seq {
+            return Err(StagedReleaseError::FrontMismatch {
+                expected: expected_session_seq,
+                actual: *actual_session_seq,
+            });
+        }
+        let Some(_) = self.staged_incoming.pop_front() else {
+            return Err(StagedReleaseError::Empty);
+        };
+        Ok(())
     }
 
     /// Commits a `CapabilitySet` or `Health` envelope and returns the
@@ -1552,6 +1600,32 @@ mod tests {
 
         assert_eq!(session.next_expected_seq, 4);
         assert_eq!(session.staged_incoming.len(), 3);
+    }
+
+    #[test]
+    fn staged_release_requires_exact_front_and_errors_do_not_mutate_queue() {
+        let (mut session, sid, _) = session_after_hello();
+        drive(&mut session, sid, 1, PayloadOneof::CapabilitySet(wire::CapabilitySet::default()));
+        drive(&mut session, sid, 2, PayloadOneof::Health(wire::Health::default()));
+        assert_eq!(session.staged_incoming.len(), 2);
+
+        assert_eq!(
+            session.release_staged_front(2),
+            Err(StagedReleaseError::FrontMismatch { expected: 2, actual: 1 }),
+        );
+        assert_eq!(session.staged_incoming.len(), 2);
+        assert_eq!(session.staged_incoming.front().map(|entry| entry.0), Some(1));
+
+        session.release_staged_front(1).expect("release exact front");
+        assert_eq!(session.staged_incoming.len(), 1);
+        assert_eq!(
+            session.release_staged_front(1),
+            Err(StagedReleaseError::FrontMismatch { expected: 1, actual: 2 }),
+        );
+        assert_eq!(session.staged_incoming.len(), 1);
+        session.release_staged_front(2).expect("release next exact front");
+        assert_eq!(session.release_staged_front(3), Err(StagedReleaseError::Empty));
+        assert!(session.staged_incoming.is_empty());
     }
 
     #[test]

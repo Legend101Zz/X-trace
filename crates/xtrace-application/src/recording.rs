@@ -326,6 +326,23 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
         })
     }
 
+    fn release_unbegun_reservation(
+        &self,
+        recording_id: RecordingId,
+        assembly: &SharedAssembly<P::Event>,
+    ) -> Result<(), PortError> {
+        let mut recordings = lock(&self.recordings)?;
+        let points_to_assembly =
+            recordings.get(&recording_id).is_some_and(|current| Arc::ptr_eq(current, assembly));
+        if points_to_assembly && Arc::strong_count(assembly) == 2 {
+            let state = lock(assembly)?;
+            if !state.begun {
+                recordings.remove(&recording_id);
+            }
+        }
+        Ok(())
+    }
+
     fn commit_pending(&self, state: &mut RecordingAssembly<P::Event>) -> Result<usize, PortError> {
         let Some(pending) = state.pending.as_ref() else {
             return Ok(0);
@@ -456,7 +473,25 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
             runtime_session_id: state.runtime_session_id,
             opened_at: state.opened_at,
         };
-        let receipt = self.port.begin_recording(&stable)?;
+        let receipt = match self.port.begin_recording(&stable) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let definitive = matches!(
+                    error.kind(),
+                    PortErrorKind::Validation
+                        | PortErrorKind::AlreadyExists
+                        | PortErrorKind::NotFound
+                        | PortErrorKind::Conflict
+                        | PortErrorKind::Compatibility
+                        | PortErrorKind::Corruption
+                );
+                drop(state);
+                if definitive {
+                    self.release_unbegun_reservation(request.recording_id, &recording)?;
+                }
+                return Err(error);
+            }
+        };
         if receipt.recording_id != state.recording_id {
             return Err(capture_error(
                 PortErrorKind::Internal,
@@ -686,7 +721,8 @@ fn capture_error(kind: PortErrorKind, message: &'static str) -> PortError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
     use uuid::Uuid;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -779,6 +815,122 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BeginFailurePort {
+        attempts: Mutex<Vec<BeginRecording>>,
+        next_error: Mutex<Option<PortError>>,
+        fail_on_call: usize,
+    }
+
+    impl BeginFailurePort {
+        fn failing_once(kind: PortErrorKind) -> Self {
+            Self::failing_on_call(0, kind)
+        }
+
+        fn failing_on_call(call: usize, kind: PortErrorKind) -> Self {
+            Self {
+                attempts: Mutex::new(Vec::new()),
+                next_error: Mutex::new(Some(capture_error(kind, "injected begin failure"))),
+                fail_on_call: call,
+            }
+        }
+    }
+
+    impl RecordingPersistencePort for BeginFailurePort {
+        type Event = TestEvent;
+
+        fn begin_recording(
+            &self,
+            request: &BeginRecording,
+        ) -> Result<BeginRecordingReceipt, PortError> {
+            let call = {
+                let mut attempts = self.attempts.lock().expect("begin attempts");
+                let call = attempts.len();
+                attempts.push(*request);
+                call
+            };
+            if call == self.fail_on_call {
+                if let Some(error) = self.next_error.lock().expect("begin error").take() {
+                    return Err(error);
+                }
+            }
+            Ok(BeginRecordingReceipt {
+                recording_id: request.recording_id,
+                disposition: BeginRecordingDisposition::Inserted,
+            })
+        }
+
+        fn validate_event(
+            &self,
+            _event: &AcceptedRecordingEvent<Self::Event>,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        fn persist_segment(
+            &self,
+            request: &PersistRecordingSegment<Self::Event>,
+        ) -> Result<PersistSegmentReceipt, PortError> {
+            Ok(PersistSegmentReceipt {
+                recording_id: request.recording_id,
+                segment_ordinal: request.segment_ordinal,
+                disposition: PersistSegmentDisposition::Inserted,
+            })
+        }
+    }
+
+    struct ConcurrentBeginFailurePort {
+        calls: AtomicUsize,
+        first_entered: std::sync::mpsc::Sender<()>,
+        release_first: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl RecordingPersistencePort for ConcurrentBeginFailurePort {
+        type Event = TestEvent;
+
+        fn begin_recording(
+            &self,
+            request: &BeginRecording,
+        ) -> Result<BeginRecordingReceipt, PortError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.first_entered
+                    .send(())
+                    .map_err(|_| capture_error(PortErrorKind::Internal, "test signal closed"))?;
+                self.release_first
+                    .lock()
+                    .map_err(|_| capture_error(PortErrorKind::Internal, "test gate poisoned"))?
+                    .recv()
+                    .map_err(|_| capture_error(PortErrorKind::Internal, "test gate closed"))?;
+            }
+            if call < 2 {
+                return Err(capture_error(PortErrorKind::Conflict, "injected definitive failure"));
+            }
+            Ok(BeginRecordingReceipt {
+                recording_id: request.recording_id,
+                disposition: BeginRecordingDisposition::Inserted,
+            })
+        }
+
+        fn validate_event(
+            &self,
+            _event: &AcceptedRecordingEvent<Self::Event>,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        fn persist_segment(
+            &self,
+            request: &PersistRecordingSegment<Self::Event>,
+        ) -> Result<PersistSegmentReceipt, PortError> {
+            Ok(PersistSegmentReceipt {
+                recording_id: request.recording_id,
+                segment_ordinal: request.segment_ordinal,
+                disposition: PersistSegmentDisposition::Inserted,
+            })
+        }
+    }
+
     fn id<T: From<Uuid>>(seed: u8) -> T {
         T::from(Uuid::from_bytes([seed; 16]))
     }
@@ -849,6 +1001,166 @@ mod tests {
             service.recording(third.recording_id).err().map(|error| error.kind()),
             Some(PortErrorKind::NotFound),
         );
+    }
+
+    #[test]
+    fn definitive_begin_errors_release_new_reservations_for_all_definitive_kinds() {
+        for kind in [
+            PortErrorKind::Validation,
+            PortErrorKind::AlreadyExists,
+            PortErrorKind::NotFound,
+            PortErrorKind::Conflict,
+            PortErrorKind::Compatibility,
+            PortErrorKind::Corruption,
+        ] {
+            let port = Arc::new(BeginFailurePort::failing_once(kind));
+            let service = RecordingCaptureService::new(
+                Arc::clone(&port),
+                SegmentPolicy::default(),
+                NonZeroUsize::new(1).expect("non-zero recording limit"),
+            );
+            let rejected = begin(wall(1));
+            let error = service.begin_recording(rejected).expect_err("injected failure");
+            assert_eq!(error.kind(), kind);
+
+            let distinct = BeginRecording { recording_id: id(0x77), ..rejected };
+            service.begin_recording(distinct).expect("definitive failure released capacity");
+            assert_eq!(port.attempts.lock().expect("attempts").len(), 2);
+        }
+    }
+
+    #[test]
+    fn serialized_definitive_failures_release_after_the_last_caller() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let port = Arc::new(ConcurrentBeginFailurePort {
+            calls: AtomicUsize::new(0),
+            first_entered: entered_tx,
+            release_first: Mutex::new(release_rx),
+        });
+        let service = Arc::new(RecordingCaptureService::new(
+            Arc::clone(&port),
+            SegmentPolicy::default(),
+            NonZeroUsize::new(1).expect("non-zero recording limit"),
+        ));
+        let request = begin(wall(1));
+        let first_service = Arc::clone(&service);
+        let first = std::thread::spawn(move || first_service.begin_recording(request));
+        entered_rx.recv_timeout(Duration::from_secs(5)).expect("first port call entered");
+
+        let second_service = Arc::clone(&service);
+        let second = std::thread::spawn(move || second_service.begin_recording(request));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let owners = service
+                .recordings
+                .lock()
+                .expect("recordings")
+                .get(&request.recording_id)
+                .map(Arc::strong_count)
+                .unwrap_or_default();
+            if owners >= 3 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "second begin did not retain the assembly");
+            std::thread::yield_now();
+        }
+
+        release_tx.send(()).expect("release first port call");
+        assert_eq!(
+            first.join().expect("first begin thread").expect_err("first failure").kind(),
+            PortErrorKind::Conflict
+        );
+        assert_eq!(
+            second.join().expect("second begin thread").expect_err("second failure").kind(),
+            PortErrorKind::Conflict
+        );
+
+        let distinct = BeginRecording { recording_id: id(0x77), ..request };
+        service.begin_recording(distinct).expect("last definitive failure released capacity");
+        assert_eq!(port.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn later_definitive_begin_error_does_not_remove_a_begun_recording() {
+        let port = Arc::new(BeginFailurePort::failing_on_call(1, PortErrorKind::Conflict));
+        let service = RecordingCaptureService::new(
+            Arc::clone(&port),
+            SegmentPolicy::default(),
+            NonZeroUsize::new(1).expect("non-zero recording limit"),
+        );
+        let begun = begin(wall(1));
+        service.begin_recording(begun).expect("first begin succeeds");
+        let error = service
+            .begin_recording(BeginRecording { opened_at: wall(2), ..begun })
+            .expect_err("later retry fails definitively");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+
+        let distinct = BeginRecording { recording_id: id(0x77), ..begun };
+        let capacity_error =
+            service.begin_recording(distinct).expect_err("begun reservation remains retained");
+        assert_eq!(capacity_error.kind(), PortErrorKind::Resource);
+        assert_eq!(port.attempts.lock().expect("attempts").len(), 2);
+    }
+
+    #[test]
+    fn begin_reservation_cleanup_retains_an_assembly_with_another_live_owner() {
+        let port = Arc::new(FakePort::default());
+        let service = RecordingCaptureService::new(
+            port,
+            SegmentPolicy::default(),
+            NonZeroUsize::new(1).expect("non-zero recording limit"),
+        );
+        let request = begin(wall(1));
+        let assembly = Arc::new(Mutex::new(RecordingAssembly::new(request)));
+        service
+            .recordings
+            .lock()
+            .expect("recordings")
+            .insert(request.recording_id, Arc::clone(&assembly));
+        let concurrent_owner = Arc::clone(&assembly);
+
+        service
+            .release_unbegun_reservation(request.recording_id, &assembly)
+            .expect("conservative cleanup");
+        assert!(service.recordings.lock().expect("recordings").contains_key(&request.recording_id));
+
+        drop(concurrent_owner);
+        service
+            .release_unbegun_reservation(request.recording_id, &assembly)
+            .expect("unreferenced cleanup");
+        assert!(
+            !service.recordings.lock().expect("recordings").contains_key(&request.recording_id)
+        );
+    }
+
+    #[test]
+    fn ambiguous_begin_errors_retain_identity_and_capacity_for_retry() {
+        for kind in [PortErrorKind::Resource, PortErrorKind::Transport, PortErrorKind::Internal] {
+            let port = Arc::new(BeginFailurePort::failing_once(kind));
+            let service = RecordingCaptureService::new(
+                Arc::clone(&port),
+                SegmentPolicy::default(),
+                NonZeroUsize::new(1).expect("non-zero recording limit"),
+            );
+            let first = begin(wall(1));
+            let error = service.begin_recording(first).expect_err("injected failure");
+            assert_eq!(error.kind(), kind);
+
+            let distinct = BeginRecording { recording_id: id(0x77), ..first };
+            let capacity_error =
+                service.begin_recording(distinct).expect_err("ambiguous reservation is retained");
+            assert_eq!(capacity_error.kind(), PortErrorKind::Resource);
+            assert_eq!(port.attempts.lock().expect("attempts").len(), 1);
+
+            service
+                .begin_recording(BeginRecording { opened_at: wall(2), ..first })
+                .expect("same ID can retry");
+            let attempts = port.attempts.lock().expect("attempts");
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0].opened_at, wall(1));
+            assert_eq!(attempts[1].opened_at, wall(1));
+        }
     }
 
     #[test]

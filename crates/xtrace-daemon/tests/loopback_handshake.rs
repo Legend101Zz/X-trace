@@ -58,19 +58,30 @@ use tokio_rustls::TlsConnector;
 use xtrace_daemon::bootstrap::{BootstrapArtifact, BootstrapArtifactFields};
 use xtrace_daemon::listener::validate_loopback;
 
+use xtrace_application::recording::{
+    BeginRecording, BeginRecordingDisposition, BeginRecordingReceipt,
+    DEFAULT_MAX_RETAINED_RECORDINGS, FinishRecording, FinishRecordingReceipt, RecordEvents,
+    RecordEventsReceipt, RecordingCapture, SegmentPolicy,
+};
+use xtrace_application::{PortError, PortErrorKind, ProjectRepository};
 use xtrace_daemon::{
     BoundDaemon, DaemonBuilder, DaemonConfig, DaemonError, HandshakeInputs, HandshakeRole,
     LoopbackPolicy, OutboundCapacity, Session, SessionSecret, TLS_EXPORTER_LABEL,
     build_pinned_client_config,
 };
 use xtrace_domain::ids::Id as _;
-use xtrace_domain::{ProjectId, RepositoryFingerprint as DomainFingerprint, RuntimeSessionId};
+use xtrace_domain::{
+    Project, ProjectId, RecordingId, RepositoryFingerprint as DomainFingerprint,
+    RepositoryFingerprint, RuntimeSessionId, WallTime,
+};
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
 use xtrace_protocol::generated::agent::{
-    AdapterHello, AgentEnvelope, Capability, CapabilitySet, EventBatch, Health, ProtocolError,
-    RecordingFinished, RecordingStarted,
+    AckDurability, AdapterHello, AgentEnvelope, Capability, CapabilitySet, EventBatch, Health,
+    ProtocolError, RecordingEvent, RecordingFinished, RecordingStarted,
 };
 use xtrace_protocol::handshake;
+use xtrace_protocol::xtf::XtfEventEnvelope;
+use xtrace_store::{OpenOptions, SqliteRecordingPersistence, SqliteStore};
 
 /// Canonical fingerprint used by every happy-path integration test.
 /// The value is the canonical `b3:<64 lowercase hex>` form produced
@@ -128,6 +139,38 @@ async fn spawn_daemon(
         .with_runtime_session_id(runtime_session_id)
         .with_expected_repository_fingerprint(repository_fingerprint.clone())
         .with_bootstrap_artifact(bootstrap_path.clone())
+        .bind()
+        .await?;
+    let secret = read_bootstrap_secret(&bootstrap_path);
+    let address = bound.local_addr();
+    let pin = bound.certificate_pin().to_string();
+    Ok((bound, secret, runtime_session_id, project_id, address, pin))
+}
+
+async fn spawn_daemon_with_capture(
+    bootstrap_path: std::path::PathBuf,
+    health_interval: Duration,
+    outbound_capacity: usize,
+    repository_fingerprint: &DomainFingerprint,
+    project_id: ProjectId,
+    runtime_session_id: RuntimeSessionId,
+    capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>>,
+) -> Result<
+    (BoundDaemon, SessionSecret, RuntimeSessionId, ProjectId, std::net::SocketAddr, String),
+    DaemonError,
+> {
+    let mut config = DaemonConfig {
+        loopback_policy: LoopbackPolicy::V4Only,
+        health_interval,
+        ..DaemonConfig::default()
+    };
+    config.outbound_capacity = OutboundCapacity::new(outbound_capacity).unwrap_or_default();
+    let bound = DaemonBuilder::new(config)
+        .with_project_id(project_id)
+        .with_runtime_session_id(runtime_session_id)
+        .with_expected_repository_fingerprint(repository_fingerprint.clone())
+        .with_bootstrap_artifact(bootstrap_path.clone())
+        .with_recording_capture(capture)
         .bind()
         .await?;
     let secret = read_bootstrap_secret(&bootstrap_path);
@@ -406,6 +449,106 @@ async fn connect_pinned(
         .connect(server_name, stream)
         .await
         .map_err(|err| std::io::Error::other(format!("tls connect: {err}")))
+}
+
+async fn connect_authenticated(
+    address: std::net::SocketAddr,
+    pin: &str,
+    secret: &SessionSecret,
+    session_id: &RuntimeSessionId,
+    client_nonce: &[u8; 32],
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let mut tls_stream = connect_pinned(address, pin).await.expect("pinned connect");
+    let mut exporter = [0u8; 32];
+    tls_stream
+        .get_ref()
+        .1
+        .export_keying_material(&mut exporter, TLS_EXPORTER_LABEL, None)
+        .expect("client exporter");
+    let hello = build_adapter_hello(
+        secret.read_secret(),
+        &exporter,
+        session_id,
+        HAPPY_MANIFEST_DIGEST,
+        client_nonce,
+        EXPECTED_REPOSITORY_FINGERPRINT,
+        1,
+        0,
+    );
+    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    write_envelope(&mut writer, PayloadOneof::AdapterHello(hello), session_id, 0, 1)
+        .await
+        .expect("write AdapterHello");
+    let daemon_hello = read_envelope_bounded(&mut reader, "DaemonHello").await;
+    assert!(matches!(daemon_hello.payload, Some(PayloadOneof::DaemonHello(_))));
+    drop(reader);
+    drop(writer);
+    tls_stream
+}
+
+#[derive(Default)]
+struct ObservedCapture {
+    operations: std::sync::Mutex<Vec<&'static str>>,
+    fail_next_begin: std::sync::atomic::AtomicBool,
+}
+
+impl ObservedCapture {
+    fn operations(&self) -> Vec<&'static str> {
+        self.operations.lock().expect("capture operations").clone()
+    }
+}
+
+impl RecordingCapture for ObservedCapture {
+    type Event = XtfEventEnvelope;
+
+    fn begin_recording(&self, request: BeginRecording) -> Result<BeginRecordingReceipt, PortError> {
+        self.operations.lock().expect("capture operations").push("start");
+        if self.fail_next_begin.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(PortError::new(
+                PortErrorKind::Internal,
+                "captured private message that must not go on the wire",
+                xtrace_domain::CorrelationId::new(),
+            )
+            .with_source("private source detail"));
+        }
+        Ok(BeginRecordingReceipt {
+            recording_id: request.recording_id,
+            disposition: BeginRecordingDisposition::Inserted,
+        })
+    }
+
+    fn record_events(
+        &self,
+        request: RecordEvents<Self::Event>,
+    ) -> Result<RecordEventsReceipt, PortError> {
+        self.operations.lock().expect("capture operations").push("batch");
+        Ok(RecordEventsReceipt { accepted: request.events.len(), ..RecordEventsReceipt::default() })
+    }
+
+    fn finish_recording(
+        &self,
+        request: FinishRecording,
+    ) -> Result<FinishRecordingReceipt, PortError> {
+        self.operations.lock().expect("capture operations").push("finish");
+        Ok(FinishRecordingReceipt {
+            recording_id: request.recording_id,
+            persisted_segments: 0,
+            exact_replay: false,
+        })
+    }
+}
+
+fn secure_tempdir(prefix: &str) -> TempDir {
+    let temp_base = std::env::temp_dir().canonicalize().expect("canonical temp base");
+    let directory =
+        tempfile::Builder::new().prefix(prefix).tempdir_in(temp_base).expect("temp directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-only temp directory");
+    }
+    directory
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1777,4 +1920,331 @@ async fn loopback_recording_recoverable_rejection_then_valid_journey() {
         .expect("daemon task")
         .expect("serve");
     drop(temp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_capture_runs_before_each_staged_ack_in_message_order() {
+    let temp = secure_tempdir("xtrace-capture-live-");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let capture = Arc::new(ObservedCapture::default());
+    let capture_port: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>> = capture.clone();
+    let (bound, secret, _, _, address, pin) = spawn_daemon_with_capture(
+        bootstrap_path,
+        Duration::from_secs(60),
+        8,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+        capture_port,
+    )
+    .await
+    .expect("bind configured daemon");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+    let mut tls_stream =
+        connect_authenticated(address, &pin, &secret, &session_id, &[0x81; 32]).await;
+    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    let recording_id = Bytes::copy_from_slice(&[0x31; 16]);
+
+    write_envelope(
+        &mut writer,
+        PayloadOneof::RecordingStarted(RecordingStarted {
+            recording_id: recording_id.clone(),
+            recording_seq: 1,
+            method: "GET".to_owned(),
+            ..RecordingStarted::default()
+        }),
+        &session_id,
+        1,
+        1,
+    )
+    .await
+    .expect("write start");
+    let ack = next_ack(&mut reader, "start ACK").await;
+    assert_eq!(ack.durability, AckDurability::Staged as i32);
+    assert_eq!(capture.operations(), ["start"]);
+
+    write_envelope(
+        &mut writer,
+        PayloadOneof::EventBatch(EventBatch {
+            recording_id: recording_id.clone(),
+            events: vec![RecordingEvent {
+                event_id: "live-event".to_owned(),
+                recording_seq: 2,
+                monotonic_ns: 12,
+                ..RecordingEvent::default()
+            }],
+        }),
+        &session_id,
+        2,
+        2,
+    )
+    .await
+    .expect("write batch");
+    let ack = next_ack(&mut reader, "batch ACK").await;
+    assert_eq!(ack.durability, AckDurability::Staged as i32);
+    assert_eq!(capture.operations(), ["start", "batch"]);
+
+    write_envelope(
+        &mut writer,
+        PayloadOneof::RecordingFinished(RecordingFinished {
+            recording_id,
+            final_recording_seq: 2,
+            ..RecordingFinished::default()
+        }),
+        &session_id,
+        3,
+        3,
+    )
+    .await
+    .expect("write finish");
+    let ack = next_ack(&mut reader, "finish ACK").await;
+    assert_eq!(ack.durability, AckDurability::Staged as i32);
+    assert_eq!(capture.operations(), ["start", "batch", "finish"]);
+
+    drop(reader);
+    drop(writer);
+    drop(tls_stream);
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("shutdown timed out")
+        .expect("daemon task")
+        .expect("serve");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_failure_is_safe_closes_only_connection_and_supervisor_accepts_again() {
+    let temp = secure_tempdir("xtrace-capture-failure-");
+    let bootstrap_path = temp.path().join("bootstrap.json");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let capture = Arc::new(ObservedCapture::default());
+    capture.fail_next_begin.store(true, std::sync::atomic::Ordering::SeqCst);
+    let capture_port: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>> = capture.clone();
+    let (bound, secret, _, _, address, pin) = spawn_daemon_with_capture(
+        bootstrap_path,
+        Duration::from_secs(60),
+        8,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+        capture_port,
+    )
+    .await
+    .expect("bind configured daemon");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+
+    let mut failed_stream =
+        connect_authenticated(address, &pin, &secret, &session_id, &[0x82; 32]).await;
+    let (mut failed_reader, mut failed_writer) = tokio::io::split(&mut failed_stream);
+    write_envelope(
+        &mut failed_writer,
+        PayloadOneof::RecordingStarted(RecordingStarted {
+            recording_id: Bytes::copy_from_slice(&[0x32; 16]),
+            recording_seq: 1,
+            method: "private-method".to_owned(),
+            ..RecordingStarted::default()
+        }),
+        &session_id,
+        1,
+        1,
+    )
+    .await
+    .expect("write failing start");
+    let error = next_protocol_error(&mut failed_reader, "capture failure").await;
+    assert_eq!(error.code, "XTR-DAEMON-TRANSPORT");
+    assert_eq!(error.message, "recording capture operation failed");
+    assert!(!error.message.contains("private"));
+    let close = tokio::time::timeout(READ_ENVELOPE_BUDGET, read_envelope(&mut failed_reader))
+        .await
+        .expect("connection close timeout");
+    assert!(close.is_err(), "capture failure must close the connection");
+    drop(failed_reader);
+    drop(failed_writer);
+    drop(failed_stream);
+
+    let mut recovered_stream =
+        connect_authenticated(address, &pin, &secret, &session_id, &[0x83; 32]).await;
+    let (mut reader, mut writer) = tokio::io::split(&mut recovered_stream);
+    write_envelope(
+        &mut writer,
+        PayloadOneof::RecordingStarted(RecordingStarted {
+            recording_id: Bytes::copy_from_slice(&[0x33; 16]),
+            recording_seq: 1,
+            method: "GET".to_owned(),
+            ..RecordingStarted::default()
+        }),
+        &session_id,
+        1,
+        1,
+    )
+    .await
+    .expect("write subsequent start");
+    let ack = next_ack(&mut reader, "subsequent connection ACK").await;
+    assert_eq!(ack.durability, AckDurability::Staged as i32);
+    assert_eq!(capture.operations(), ["start", "start"]);
+
+    drop(reader);
+    drop(writer);
+    drop(recovered_stream);
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("shutdown timed out")
+        .expect("daemon task")
+        .expect("serve");
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .expect("owner-only path permissions");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_daemon_persists_verified_sqlite_segment_with_staged_acks() {
+    let daemon_temp = secure_tempdir("xtrace-sqlite-daemon-");
+    let bootstrap_path = daemon_temp.path().join("bootstrap.json");
+    let project_root = secure_tempdir("xtrace-project-data-");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let store =
+        SqliteStore::open(&project_root.path().join("metadata.sqlite3"), OpenOptions::default())
+            .expect("open project SQLite store");
+    #[cfg(unix)]
+    set_owner_only(&project_root.path().join("metadata.sqlite3"), 0o600);
+    let timestamp = WallTime::now();
+    let project = Project {
+        id: project_id,
+        canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/fixture/repo"),
+        display_name: "daemon integration project".to_owned(),
+        created_at: timestamp,
+        last_opened_at: timestamp,
+        config_schema_version: 1,
+        effective_config_hash: String::new(),
+        active_capture_policy_id: None,
+        active_redaction_policy_id: None,
+    };
+    store.project_repository().insert_project(&project).expect("insert project");
+
+    let adapter = Arc::new(SqliteRecordingPersistence::new(store, project_root.path()));
+    let capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>> =
+        Arc::new(xtrace_application::recording::RecordingCaptureService::new(
+            adapter.clone(),
+            SegmentPolicy::default(),
+            std::num::NonZeroUsize::new(DEFAULT_MAX_RETAINED_RECORDINGS)
+                .expect("non-zero retained recording limit"),
+        ));
+    let (bound, secret, _, _, address, pin) = spawn_daemon_with_capture(
+        bootstrap_path,
+        Duration::from_secs(60),
+        8,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+        capture,
+    )
+    .await
+    .expect("bind SQLite-backed daemon");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+    let mut tls_stream =
+        connect_authenticated(address, &pin, &secret, &session_id, &[0x84; 32]).await;
+    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    let recording_id_bytes = Bytes::copy_from_slice(&[0x34; 16]);
+    let recording_id = RecordingId::from_uuid(uuid::Uuid::from_bytes([0x34; 16]));
+
+    write_envelope(
+        &mut writer,
+        PayloadOneof::RecordingStarted(RecordingStarted {
+            recording_id: recording_id_bytes.clone(),
+            recording_seq: 1,
+            method: "GET".to_owned(),
+            ..RecordingStarted::default()
+        }),
+        &session_id,
+        1,
+        1,
+    )
+    .await
+    .expect("write start");
+    assert_eq!(
+        next_ack(&mut reader, "SQLite start ACK").await.durability,
+        AckDurability::Staged as i32
+    );
+
+    let event = RecordingEvent {
+        event_id: "sqlite-event-2".to_owned(),
+        recording_seq: 2,
+        monotonic_ns: 23,
+        ..RecordingEvent::default()
+    };
+    write_envelope(
+        &mut writer,
+        PayloadOneof::EventBatch(EventBatch {
+            recording_id: recording_id_bytes.clone(),
+            events: vec![event.clone()],
+        }),
+        &session_id,
+        2,
+        2,
+    )
+    .await
+    .expect("write batch");
+    assert_eq!(
+        next_ack(&mut reader, "SQLite batch ACK").await.durability,
+        AckDurability::Staged as i32
+    );
+
+    write_envelope(
+        &mut writer,
+        PayloadOneof::RecordingFinished(RecordingFinished {
+            recording_id: recording_id_bytes,
+            final_recording_seq: 2,
+            ..RecordingFinished::default()
+        }),
+        &session_id,
+        3,
+        3,
+    )
+    .await
+    .expect("write finish");
+    assert_eq!(
+        next_ack(&mut reader, "SQLite finish ACK").await.durability,
+        AckDurability::Staged as i32
+    );
+
+    let payload = XtfEventEnvelope { recording_seq: 2, event: Some(event) };
+    let segment = xtrace_application::recording::PersistRecordingSegment {
+        project_id,
+        recording_id,
+        segment_ordinal: 0,
+        events: vec![xtrace_application::recording::AcceptedRecordingEvent {
+            recording_seq: 2,
+            monotonic_ns: 23,
+            canonical_bytes: payload.encode_to_vec(),
+            payload,
+        }],
+    };
+    let verified = xtrace_application::recording::RecordingPersistencePort::persist_segment(
+        adapter.as_ref(),
+        &segment,
+    )
+    .expect("SQLite exact replay verifies committed object and segment");
+    assert_eq!(
+        verified.disposition,
+        xtrace_application::recording::PersistSegmentDisposition::ExactReplay
+    );
+
+    drop(reader);
+    drop(writer);
+    drop(tls_stream);
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("shutdown timed out")
+        .expect("daemon task")
+        .expect("serve");
 }

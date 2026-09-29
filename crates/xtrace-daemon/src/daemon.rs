@@ -33,17 +33,20 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
+use xtrace_application::recording::RecordingCapture;
 use xtrace_domain::ids::Id;
 use xtrace_domain::{ProjectId, RepositoryFingerprint, RuntimeSessionId};
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
 use xtrace_protocol::generated::agent as wire;
 use xtrace_protocol::generated::agent::{AgentEnvelope, ProtocolError};
+use xtrace_protocol::xtf::XtfEventEnvelope;
 
 use crate::bootstrap::{BootstrapArtifact, BootstrapArtifactFields, BootstrapOwner};
 use crate::config::DaemonConfig;
 use crate::error::{DaemonError, ProtocolErrorCode};
 use crate::framing::{EnvelopeAsyncDecoder, EnvelopeAsyncEncoder};
 use crate::listener::LoopbackListener;
+use crate::recording_pipeline::{RecordingPipeline, RecordingPipelineError};
 use crate::runtime::HealthInterval;
 use crate::secret::SessionSecret;
 use crate::session::{HandshakeInputs, HandshakeRole, Session, SessionError};
@@ -146,7 +149,7 @@ impl ShutdownSignal {
     }
 }
 
-fn shared_shutdown_channel() -> (watch::Sender<bool>, ShutdownSignal) {
+pub(crate) fn shared_shutdown_channel() -> (watch::Sender<bool>, ShutdownSignal) {
     let (tx, rx) = watch::channel(false);
     (tx, ShutdownSignal { rx })
 }
@@ -258,6 +261,7 @@ pub struct BoundDaemon {
     /// after negotiation" contract exactly once across concurrent
     /// successful handshakes.
     bootstrap: Option<Arc<BootstrapArtifact>>,
+    recording_pipeline: Option<RecordingPipeline>,
 }
 
 impl BoundDaemon {
@@ -296,6 +300,15 @@ impl BoundDaemon {
     /// Runs the daemon supervisor until the supplied shutdown future
     /// resolves. Every connection is awaited before the future
     /// returns so an orderly shutdown is observable from the caller.
+    /// # Cancellation safety
+    ///
+    /// The supported graceful path is to resolve the supplied shutdown
+    /// future and continue awaiting this method: queued capture work is
+    /// cancelled, while started synchronous capture work is awaited.
+    /// Abruptly dropping or cancelling this `serve` future cannot preempt
+    /// an already-started `spawn_blocking` operation; that operation may
+    /// continue until its synchronous port call returns. This API does not
+    /// promise a wall-clock deadline for such work.
     ///
     /// # Errors
     ///
@@ -324,6 +337,7 @@ impl BoundDaemon {
         let project_id = self.project_id;
         let expected_repository_fingerprint = self.expected_repository_fingerprint;
         let bootstrap = self.bootstrap;
+        let recording_pipeline = self.recording_pipeline;
 
         let (shutdown_tx, mut shutdown_signal) = shared_shutdown_channel();
         // Keep an extra sender in scope so a listener-level failure
@@ -340,6 +354,7 @@ impl BoundDaemon {
             expected_repository_fingerprint,
             shutdown: shutdown_signal_inner,
             bootstrap: bootstrap.clone(),
+            recording_pipeline,
         };
 
         // One daemon-scoped monotonic clock for every timestamp the
@@ -676,6 +691,55 @@ async fn handle_connection(
                     };
                     match post_hello_session.accept_post_hello(&envelope) {
                         Ok(admission) => {
+                            if let Some(pipeline) = ctx.recording_pipeline.as_ref() {
+                                if let Err(err) = pipeline
+                                    .process(
+                                        admission.incoming.clone(),
+                                        ctx.project_id,
+                                        ctx.runtime_session_id,
+                                        ctx.shutdown.clone(),
+                                    )
+                                    .await
+                                {
+                                    if matches!(&err, RecordingPipelineError::Cancelled) {
+                                        return Ok(());
+                                    }
+                                    log_recording_pipeline_error(&err);
+                                    let frame = OutboundFrame {
+                                        payload: PayloadOneof::ProtocolError(
+                                            crate::runtime::build_protocol_error(
+                                                ProtocolErrorCode::Transport.as_str(),
+                                                "recording capture operation failed",
+                                            ),
+                                        ),
+                                    };
+                                    if post_hello_tx.send(frame).await.is_err() {
+                                        return Ok(());
+                                    }
+                                    return Ok(());
+                                }
+                                if let Err(err) = post_hello_session
+                                    .release_staged_front(envelope.session_seq)
+                                {
+                                    warn!(
+                                        expected_session_seq = envelope.session_seq,
+                                        ?err,
+                                        "recording capture staged-front release failed",
+                                    );
+                                    let frame = OutboundFrame {
+                                        payload: PayloadOneof::ProtocolError(
+                                            crate::runtime::build_protocol_error(
+                                                ProtocolErrorCode::SessionSequence.as_str(),
+                                                "staged capture admission could not be released",
+                                            ),
+                                        ),
+                                    };
+                                    if post_hello_tx.send(frame).await.is_err() {
+                                        return Ok(());
+                                    }
+                                    return Ok(());
+                                }
+                            }
                             let frame = OutboundFrame {
                                 payload: admission.command.into_envelope_payload(),
                             };
@@ -764,6 +828,39 @@ fn envelope_error_code(err: &std::io::Error) -> ProtocolErrorCode {
         K::UnexpectedEof => ProtocolErrorCode::Shutdown,
         K::InvalidData => ProtocolErrorCode::FrameTooLarge,
         _ => ProtocolErrorCode::Transport,
+    }
+}
+
+fn log_recording_pipeline_error(error: &RecordingPipelineError) {
+    match error {
+        RecordingPipelineError::Port(error) => warn!(
+            code = %ProtocolErrorCode::Transport,
+            kind = ?error.kind(),
+            correlation_id = %error.correlation_id(),
+            "recording capture operation failed",
+        ),
+        RecordingPipelineError::Join(error) => warn!(
+            code = %ProtocolErrorCode::Transport,
+            panicked = error.is_panic(),
+            cancelled = error.is_cancelled(),
+            "recording blocking task failed",
+        ),
+        RecordingPipelineError::LaneClosed => warn!(
+            code = %ProtocolErrorCode::Transport,
+            "recording blocking lane closed",
+        ),
+        RecordingPipelineError::QueueFull => warn!(
+            code = %ProtocolErrorCode::Transport,
+            "recording blocking lane is full",
+        ),
+        RecordingPipelineError::Cancelled => warn!(
+            code = %ProtocolErrorCode::Transport,
+            "queued recording operation cancelled by daemon shutdown",
+        ),
+        RecordingPipelineError::InvalidRecordingId => warn!(
+            code = %ProtocolErrorCode::Transport,
+            "validated recording identifier could not be translated",
+        ),
     }
 }
 
@@ -951,6 +1048,8 @@ struct SupervisorContext {
     /// clone to each spawned task so the post-hello
     /// `try_release` call is race-free.
     bootstrap: Option<Arc<BootstrapArtifact>>,
+    /// Optional daemon-scoped application recording pipeline.
+    recording_pipeline: Option<RecordingPipeline>,
 }
 
 /// Outcome of inspecting a single [`JoinSet`] completion. The
@@ -1084,6 +1183,7 @@ pub struct DaemonBuilder {
     runtime_session_id: Option<RuntimeSessionId>,
     expected_repository_fingerprint: Option<RepositoryFingerprint>,
     bootstrap_artifact: Option<PathBuf>,
+    recording_capture: Option<Arc<dyn RecordingCapture<Event = XtfEventEnvelope>>>,
 }
 
 impl DaemonBuilder {
@@ -1095,6 +1195,7 @@ impl DaemonBuilder {
             runtime_session_id: None,
             expected_repository_fingerprint: None,
             bootstrap_artifact: None,
+            recording_capture: None,
         }
     }
 
@@ -1140,6 +1241,18 @@ impl DaemonBuilder {
     #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
     pub fn with_bootstrap_artifact(mut self, path: PathBuf) -> Self {
         self.bootstrap_artifact = Some(path);
+        self
+    }
+
+    /// Injects an application-owned capture use case. Recording operations
+    /// execute on the daemon's bounded blocking lane before their `Staged` ACK
+    /// is released. When omitted, post-hello handling is unchanged.
+    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
+    pub fn with_recording_capture(
+        mut self,
+        capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>>,
+    ) -> Self {
+        self.recording_capture = Some(capture);
         self
     }
 
@@ -1205,6 +1318,7 @@ impl DaemonBuilder {
             project_id,
             expected_repository_fingerprint,
             bootstrap,
+            recording_pipeline: self.recording_capture.map(RecordingPipeline::new),
         })
     }
 }
