@@ -96,7 +96,7 @@ pub mod secret;
 pub mod session;
 pub mod tls;
 
-pub use bootstrap::{BootstrapArtifact, BootstrapArtifactFields, BootstrapOwner};
+pub use bootstrap::{BootstrapArtifact, BootstrapArtifactFields, BootstrapOwner, ReleaseOutcome};
 pub use config::{DaemonConfig, LOOPBACK_HOST, LoopbackPolicy, OutboundCapacity};
 pub use daemon::{
     BoundDaemon, DaemonBuilder, MonotonicClock, ShutdownSignal, TLS_EXPORTER_LABEL,

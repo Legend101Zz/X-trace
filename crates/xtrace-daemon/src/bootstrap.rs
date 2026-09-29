@@ -49,19 +49,30 @@
 //!
 //! Once the daemon finishes writing `DaemonHello` to the wire, the
 //! shared `Arc<BootstrapArtifact>` value is passed through
-//! [`BootstrapArtifact::try_release`]; the atomic flag inside the
-//! struct guarantees exactly one successful `unlink` even when
-//! concurrent connection tasks race on the same handle. Failed
-//! proof exchanges never call the release path so a legitimate
-//! retry against the same daemon launch can re-read the artifact.
-//! The `Drop` impl reuses the same atomic, so an orderly shutdown
-//! still removes the file when no connection ever reached the
-//! post-hello milestone.
+//! [`BootstrapArtifact::try_release`]. The release path is
+//! serialised through a small [`std::sync::Mutex`] that protects
+//! both the released flag and the [`std::fs::remove_file`] syscall;
+//! the lock is uncontended in the common case and only wraps a
+//! single local syscall, so it does not introduce meaningful
+//! contention. On success or [`std::io::ErrorKind::NotFound`] the
+//! released flag is set so concurrent callers racing on the same
+//! `Arc<...>` see [`ReleaseOutcome::AlreadyReleased`]; on any other
+//! failure the flag is left unset so a later call from the explicit
+//! release path, the [`Drop`] impl, or a second connection's
+//! post-hello milestone can retry. Failed proof exchanges never
+//! call the release path so a legitimate retry against the same
+//! daemon launch can re-read the artifact.
+//!
+//! The [`Drop`] impl calls [`BootstrapArtifact::try_release`] as a
+//! fallback so an orderly shutdown still removes the file when no
+//! connection ever reached the post-hello milestone. The fallback
+//! is best-effort: a non-`NotFound` I/O error is logged at error
+//! level and the original `Drop` continues without panicking.
 
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use xtrace_domain::{ProjectId, RepositoryFingerprint, RuntimeSessionId};
@@ -132,7 +143,13 @@ pub struct BootstrapArtifactFields {
     /// this type's reach. Process abort, signal-induced termination,
     /// and optimizer-elided writes are not covered either.
     pub session_secret_base64: String,
-    /// Project identifier the daemon expects on every connection.
+    /// Project identifier the daemon writes into the bootstrap
+    /// artifact and retains as daemon-side context for the lifetime
+    /// of the runtime session. The identifier is **not** carried on
+    /// the wire (the `AgentEnvelope` schema has no `project_id`
+    /// field) and does **not** participate in the
+    /// `expected_repository_fingerprint` comparison performed on
+    /// every inbound `AdapterHello`.
     pub project_id: String,
     /// Repository fingerprint the daemon expects on every
     /// `AdapterHello`. Stored in the canonical `b3:<64 lowercase hex>`
@@ -175,6 +192,33 @@ impl Drop for BootstrapArtifactFields {
     }
 }
 
+/// Outcome reported by [`BootstrapArtifact::try_release`].
+///
+/// The variant tells the caller whether this invocation actually
+/// performed the on-disk deletion or merely observed an earlier
+/// successful release. Security-sensitive callers must surface an
+/// `Err` from the helper rather than treat any non-`Released`
+/// outcome as success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    /// This call performed the on-disk deletion.
+    Released,
+    /// The artifact had already been released by an earlier caller;
+    /// no filesystem work happened on this call.
+    AlreadyReleased,
+}
+
+/// Internal release state guarded by [`BootstrapArtifact::release_lock`].
+#[derive(Debug)]
+enum ReleaseState {
+    /// The artifact has not yet been released; a fresh `remove_file`
+    /// attempt is allowed.
+    Pending,
+    /// The artifact has been released (or never existed); subsequent
+    /// callers see [`ReleaseOutcome::AlreadyReleased`].
+    Released,
+}
+
 /// Owner-managed bootstrap artifact.
 ///
 /// The struct knows where the artifact lives on disk and whether it
@@ -188,6 +232,14 @@ impl Drop for BootstrapArtifactFields {
 /// the [`BootstrapOwner::Persistent`] variant skips both paths so
 /// integration tests can inspect the artifact after the daemon exits.
 ///
+/// The release helper is race-free under concurrent connection tasks:
+/// a small [`Mutex`] serialises the released flag and the
+/// [`std::fs::remove_file`] syscall so the flag is set only after a
+/// successful unlink (or a `NotFound`). A failed non-`NotFound`
+/// unlink leaves the flag unset so a subsequent caller, the
+/// `Drop` impl, or a second connection's post-hello milestone can
+/// retry without re-issuing the work that already succeeded.
+///
 /// `Debug` is implemented manually so the redacted
 /// [`BootstrapArtifactFields`] marker is the only secret-bearing
 /// string that can reach a log line or a diagnostic dump.
@@ -195,23 +247,25 @@ pub struct BootstrapArtifact {
     fields: BootstrapArtifactFields,
     path: PathBuf,
     owner: BootstrapOwner,
-    /// Atomic flag marking whether the artifact has already been
-    /// released on disk. Set exactly once across the lifetime of the
-    /// daemon so concurrent connection tasks racing on the same
-    /// `Arc<BootstrapArtifact>` cannot delete the file twice; the
-    /// supervisor and every connection task call
-    /// [`BootstrapArtifact::try_release`] through `&self` and rely on
-    /// the flag for race-free idempotency.
-    released: AtomicBool,
+    /// Serialises the released flag and the unlink syscall so the
+    /// flag is observed exactly when the file has actually been
+    /// removed (or was already absent). The lock is uncontended in
+    /// the common case and only wraps a single local syscall, so it
+    /// does not introduce meaningful contention.
+    release_lock: Mutex<ReleaseState>,
 }
 
 impl std::fmt::Debug for BootstrapArtifact {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let released = matches!(
+            *self.release_lock.lock().unwrap_or_else(|err| err.into_inner()),
+            ReleaseState::Released,
+        );
         f.debug_struct("BootstrapArtifact")
             .field("fields", &self.fields)
             .field("path", &self.path)
             .field("owner", &self.owner)
-            .field("released", &self.released.load(Ordering::Acquire))
+            .field("released", &released)
             .finish()
     }
 }
@@ -251,7 +305,12 @@ impl BootstrapArtifact {
         let body = serde_json::to_string_pretty(&fields)
             .map_err(|err| DaemonError::Bootstrap(format!("serialize bootstrap: {err}")))?;
         write_atomic(path, parent, body.as_bytes())?;
-        Ok(Self { fields, path: path.to_path_buf(), owner, released: AtomicBool::new(false) })
+        Ok(Self {
+            fields,
+            path: path.to_path_buf(),
+            owner,
+            release_lock: Mutex::new(ReleaseState::Pending),
+        })
     }
 
     /// Reads an existing artifact from disk.
@@ -283,7 +342,7 @@ impl BootstrapArtifact {
             fields,
             path: path.to_path_buf(),
             owner: BootstrapOwner::Persistent,
-            released: AtomicBool::new(false),
+            release_lock: Mutex::new(ReleaseState::Pending),
         })
     }
 
@@ -304,40 +363,61 @@ impl BootstrapArtifact {
     /// connection task go through to honour the
     /// `docs/plans/x-trace/03b-protocol-and-api.md` §2.1 contract
     /// that the bootstrap file is deleted after the negotiated
-    /// session is established. The atomic flag inside the struct
-    /// guarantees the file is removed at most once even when
-    /// concurrent connection tasks race on the same `Arc<...>`
-    /// handle.
+    /// session is established.
     ///
-    /// Returns `true` when this call performed the deletion and
-    /// `false` when the artifact had already been released (either by
-    /// a previous successful handshake or by an earlier orderly
-    /// shutdown). A [`BootstrapOwner::Persistent`] artifact never
-    /// releases; the function returns `false` without touching the
-    /// filesystem.
+    /// The returned [`ReleaseOutcome`] tells the caller whether this
+    /// invocation performed the deletion ([`ReleaseOutcome::Released`])
+    /// or merely observed an earlier successful release
+    /// ([`ReleaseOutcome::AlreadyReleased`]). A
+    /// [`BootstrapOwner::Persistent`] artifact never touches the
+    /// filesystem and always reports [`ReleaseOutcome::AlreadyReleased`]
+    /// so integration tests can poll the helper without leaking
+    /// state into the daemon's cleanup path.
     ///
-    /// The deletion is best-effort: a non-`NotFound` I/O error is
-    /// surfaced as a warning but does not propagate; the `Drop` impl
-    /// also calls this helper so the next scope exit retries the
-    /// removal.
-    #[must_use]
-    pub fn try_release(&self) -> bool {
+    /// A non-`NotFound` I/O failure is returned as
+    /// [`DaemonError::Bootstrap`] so the supervisor can stop the
+    /// daemon with a real security-cleanup error instead of silently
+    /// reducing it to a boolean. The released flag is **not** set on
+    /// such a failure so a subsequent caller, the `Drop` impl, or a
+    /// later connection's post-hello milestone can retry the
+    /// removal; on success or `NotFound` the flag is set so the
+    /// next caller sees [`ReleaseOutcome::AlreadyReleased`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::Bootstrap`] when the underlying
+    /// [`std::fs::remove_file`] fails with an error other than
+    /// [`std::io::ErrorKind::NotFound`]. The diagnostic message
+    /// never embeds the session secret or any other captured value.
+    pub fn try_release(&self) -> Result<ReleaseOutcome, DaemonError> {
         if self.owner == BootstrapOwner::Persistent {
-            return false;
+            return Ok(ReleaseOutcome::AlreadyReleased);
         }
-        if self.released.swap(true, Ordering::AcqRel) {
-            return false;
+        let mut state = self.release_lock.lock().unwrap_or_else(|err| err.into_inner());
+        if matches!(*state, ReleaseState::Released) {
+            return Ok(ReleaseOutcome::AlreadyReleased);
         }
         match fs::remove_file(&self.path) {
-            Ok(()) => true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Ok(()) => {
+                *state = ReleaseState::Released;
+                Ok(ReleaseOutcome::Released)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // The file is already gone; mark the artifact as
+                // released so subsequent callers see a stable view.
+                *state = ReleaseState::Released;
+                Ok(ReleaseOutcome::Released)
+            }
             Err(err) => {
                 tracing::warn!(
                     bootstrap = %self.path.display(),
                     error = %err,
-                    "failed to remove bootstrap artifact on release",
+                    "failed to remove bootstrap artifact on release; release state remains retryable",
                 );
-                false
+                Err(DaemonError::Bootstrap(format!(
+                    "remove bootstrap {}: {err}",
+                    self.path.display()
+                )))
             }
         }
     }
@@ -375,10 +455,30 @@ impl Drop for BootstrapArtifact {
     fn drop(&mut self) {
         // Fallback cleanup path: when no connection ever completes a
         // successful `DaemonHello`, the orderly shutdown still has to
-        // honour the §2.1 deletion contract. The atomic flag prevents
-        // a double-deletion when a connection task already called
-        // [`BootstrapArtifact::try_release`] on this instance.
-        let _ = self.try_release();
+        // honour the §2.1 deletion contract. The mutex-guarded flag
+        // prevents a double-deletion when a connection task already
+        // called [`BootstrapArtifact::try_release`] on this instance,
+        // and the helper returns an `Err` rather than silently
+        // masking a real cleanup failure. A persistent artifact is
+        // a no-op here, matching the explicit-release contract.
+        //
+        // The drop path is best-effort: a non-`NotFound` failure is
+        // logged at error level so the diagnostic is visible in the
+        // owner-only log, but the original `Drop` continues without
+        // panicking. A later caller (the next test, the supervisor
+        // cleanup pass, or another connection's post-hello milestone)
+        // can still retry because the released flag was not set on
+        // failure.
+        match self.try_release() {
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!(
+                    bootstrap = %self.path.display(),
+                    error = %err,
+                    "bootstrap artifact drop fallback failed; the file remains on disk",
+                );
+            }
+        }
     }
 }
 
@@ -488,9 +588,19 @@ fn validate_fields(fields: &BootstrapArtifactFields) -> Result<(), DaemonError> 
             "certificate_sha256_pin must be 64 lowercase hex bytes".to_string(),
         ));
     }
-    if fields.session_secret_base64.is_empty() {
-        return Err(DaemonError::Bootstrap("session_secret_base64 must not be empty".to_string()));
-    }
+    // Reject any non-empty but malformed or wrong-length base64
+    // value at the storage boundary. The schema promises that
+    // `session_secret_base64` decodes to exactly 32 bytes; a value
+    // that fails that contract must never reach the daemon because
+    // the HMAC verification would reject it after a wasted round
+    // trip, and a malformed value silently accepted here would let
+    // a hostile launcher supply a secret of an unexpected shape.
+    //
+    // The diagnostic message intentionally omits the supplied secret
+    // so the error string is safe to log or surface through a
+    // `ProtocolError`.
+    SessionSecret::from_base64(&fields.session_secret_base64)
+        .map_err(|err| DaemonError::Bootstrap(format!("session_secret_base64: {err}")))?;
     // Re-parse the fingerprint through the canonical type so any
     // uppercase, malformed, or missing-prefix value is refused at
     // the storage boundary.
@@ -1287,16 +1397,25 @@ mod tests {
     /// which field was redacted.
     #[test]
     fn debug_redacts_session_secret_in_bootstrap_artifact_fields() {
-        // `XXXXCANARYBASE64XXXX` is a recognisable 20-byte string;
-        // base64-encoding it produces a value the writer accepts and
-        // the round-trip parser recognises, while leaving a substring
-        // that no other field can accidentally match.
-        const CANARY_SECRET: &str = "XXXXCANARYBASE64XXXX";
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        // A 32-byte recognisable pattern that encodes to a base64
+        // string the validation accepts; the test plants the
+        // encoded form into `session_secret_base64` so the value
+        // would appear under `{:?}` if the manual `Debug` impl
+        // forgot to redact.
+        let canary_bytes: [u8; 32] = std::array::from_fn(|i| {
+            // 0xCA / 0xFE / 0xBA / 0xBE repeating produces a
+            // base64 string with distinct characters per position
+            // and a recognisable substring when not redacted.
+            [0xCA, 0xFE, 0xBA, 0xBE][i % 4]
+        });
+        let canary_secret = STANDARD.encode(canary_bytes);
         let mut fields = sample_fields();
-        fields.session_secret_base64 = CANARY_SECRET.to_string();
+        fields.session_secret_base64 = canary_secret.clone();
         let rendered = format!("{fields:?}");
         assert!(
-            !rendered.contains(CANARY_SECRET),
+            !rendered.contains(&canary_secret),
             "Debug output must not contain the canary secret, got: {rendered}",
         );
         assert!(
@@ -1310,16 +1429,24 @@ mod tests {
     /// through to the redacted field Debug.
     #[test]
     fn debug_redacts_session_secret_in_bootstrap_artifact() {
-        const CANARY_SECRET: &str = "YYYYCANARYBASE64YYYY";
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        let canary_bytes: [u8; 32] = std::array::from_fn(|i| {
+            // Different pattern from the field-level canary so a
+            // regression in the wrapping struct cannot accidentally
+            // satisfy both tests.
+            [0xDE, 0xAD, 0xBE, 0xEF][i % 4]
+        });
+        let canary_secret = STANDARD.encode(canary_bytes);
         let dir = unique_dir("debug-redact");
         let path = dir.join("bootstrap.json");
         let mut fields = sample_fields();
-        fields.session_secret_base64 = CANARY_SECRET.to_string();
+        fields.session_secret_base64 = canary_secret.clone();
         let artifact =
             BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).expect("write");
         let rendered = format!("{artifact:?}");
         assert!(
-            !rendered.contains(CANARY_SECRET),
+            !rendered.contains(&canary_secret),
             "Debug output must not contain the canary secret, got: {rendered}",
         );
         assert!(
@@ -1329,9 +1456,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// `try_release` returns `true` exactly once on a `Daemon`-owned
-    /// artifact even when called from concurrent callers on the same
-    /// handle.
+    /// `try_release` returns [`ReleaseOutcome::Released`] exactly
+    /// once on a `Daemon`-owned artifact even when called from
+    /// concurrent callers on the same handle. Every other caller
+    /// sees [`ReleaseOutcome::AlreadyReleased`] without touching
+    /// the filesystem.
     #[test]
     fn try_release_is_idempotent_under_concurrent_calls() {
         let dir = unique_dir("release-race");
@@ -1345,12 +1474,21 @@ mod tests {
             let artifact = Arc::clone(&artifact);
             handles.push(std::thread::spawn(move || artifact.try_release()));
         }
-        let winners: Vec<bool> =
-            handles.into_iter().map(|handle| handle.join().expect("join")).collect();
-        let winner_count = winners.iter().filter(|&&won| won).count();
+        let outcomes: Vec<ReleaseOutcome> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("join").expect("release ok"))
+            .collect();
+        let released_count = outcomes.iter().filter(|&&o| o == ReleaseOutcome::Released).count();
+        let already_count =
+            outcomes.iter().filter(|&&o| o == ReleaseOutcome::AlreadyReleased).count();
         assert_eq!(
-            winner_count, 1,
-            "exactly one caller must perform the deletion; got {winner_count} winners"
+            released_count, 1,
+            "exactly one caller must perform the deletion; got {released_count} winners"
+        );
+        assert_eq!(
+            already_count,
+            outcomes.len() - 1,
+            "every other caller must observe AlreadyReleased"
         );
         assert!(!path.exists(), "bootstrap file must be gone after release");
         let _ = fs::remove_dir_all(&dir);
@@ -1358,13 +1496,19 @@ mod tests {
 
     /// `try_release` is a no-op on a `Persistent` artifact so
     /// integration tests can keep the file around for inspection.
+    /// The helper reports [`ReleaseOutcome::AlreadyReleased`]
+    /// without touching the filesystem.
     #[test]
     fn try_release_is_a_noop_on_persistent_artifact() {
         let dir = unique_dir("release-persistent");
         let path = dir.join("bootstrap.json");
         let artifact = BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Persistent)
             .expect("write");
-        assert!(!artifact.try_release(), "persistent artifact must report no release");
+        assert_eq!(
+            artifact.try_release().expect("persistent release"),
+            ReleaseOutcome::AlreadyReleased,
+            "persistent artifact must report AlreadyReleased",
+        );
         assert!(path.exists(), "persistent artifact must remain on disk");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1386,25 +1530,231 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// `Drop` after `try_release` is a no-op: the atomic flag stops
-    /// the fallback cleanup from racing the explicit release.
+    /// `Drop` after `try_release` is a no-op: the mutex-guarded flag
+    /// stops the fallback cleanup from racing the explicit release.
     #[test]
     fn drop_after_try_release_is_a_noop() {
         let dir = unique_dir("drop-after-release");
         let path = dir.join("bootstrap.json");
         let artifact = BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Daemon)
             .expect("write");
-        assert!(artifact.try_release(), "explicit release wins");
+        assert_eq!(
+            artifact.try_release().expect("release"),
+            ReleaseOutcome::Released,
+            "explicit release wins",
+        );
         assert!(!path.exists());
         // Re-create a sentinel file under the same path; if Drop
         // accidentally deletes it the assertion fails. The check
-        // pins the atomic-flag contract: once released, Drop is a
+        // pins the release-state contract: once released, Drop is a
         // no-op regardless of what is on disk afterwards.
         fs::write(&path, b"sentinel").expect("sentinel");
         drop(artifact);
         assert!(
             path.exists(),
             "Drop must not delete a file released earlier; the sentinel must remain"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `try_release` is genuinely retryable after a non-`NotFound`
+    /// failure. The test removes the directory write bit so the
+    /// `unlink` call returns `EACCES`, asserts the helper reports
+    /// the typed error and leaves the file on disk, restores the
+    /// permission, retries, and asserts the second attempt succeeds
+    /// and removes the file. The test runs on Unix only because the
+    /// retry mechanism relies on POSIX permission semantics.
+    ///
+    /// The probe at the top of the test detects an environment in
+    /// which directory permissions do not gate unlink (typically
+    /// when the test runs as a uid the kernel bypasses DAC for)
+    /// and skips the rest of the assertions in that case so the
+    /// suite still reports a meaningful result instead of a false
+    /// negative.
+    #[cfg(unix)]
+    #[test]
+    fn try_release_failure_is_retryable_via_drop_and_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = unique_dir("release-retry");
+        let path = dir.join("bootstrap.json");
+        let artifact = Arc::new(
+            BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Daemon)
+                .expect("write"),
+        );
+
+        // Probe whether directory write bits gate `unlink` for the
+        // current uid. When the kernel ignores DAC (typically root)
+        // the test cannot exercise the retry path it is designed to
+        // cover, so we skip with a recorded reason rather than
+        // silently passing on a test that did not actually run.
+        let probe_dir = unique_dir("release-retry-probe");
+        let probe_path = probe_dir.join("probe.json");
+        fs::write(&probe_path, b"probe").expect("probe file");
+        let mut probe_perms = fs::metadata(&probe_dir).expect("probe meta").permissions();
+        probe_perms.set_mode(0o500);
+        fs::set_permissions(&probe_dir, probe_perms).expect("probe chmod");
+        let unlink_succeeded_with_ro_dir = fs::remove_file(&probe_path).is_ok();
+        if unlink_succeeded_with_ro_dir {
+            eprintln!(
+                "skipping try_release retry test: directory write bits do not gate unlink for this uid",
+            );
+            // Restore the probe directory's permissions so the
+            // cleanup helper below can remove it.
+            let mut probe_perms = fs::metadata(&probe_dir).expect("probe meta").permissions();
+            probe_perms.set_mode(0o700);
+            fs::set_permissions(&probe_dir, probe_perms).expect("probe chmod restore");
+            let _ = fs::remove_dir_all(&probe_dir);
+            drop(artifact);
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let _ = fs::remove_dir_all(&probe_dir);
+
+        // Apply the same read-only parent layout to the artifact's
+        // parent so the daemon's `unlink` is forced to fail.
+        let mut perms = fs::metadata(&dir).expect("dir meta").permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(&dir, perms).expect("chmod ro dir");
+
+        let first = artifact.try_release().expect_err("unlink must fail under read-only parent");
+        let rendered = format!("{first}");
+        assert!(
+            rendered.contains("remove bootstrap"),
+            "error must report the unlink failure, got: {rendered}",
+        );
+        assert!(path.exists(), "file must still exist after a failed release");
+        let debug = format!("{artifact:?}");
+        assert!(
+            debug.contains("released: false"),
+            "released flag must remain unset after a failed release; got: {debug}",
+        );
+
+        // Restore the parent directory permissions so the retry
+        // succeeds. The state stays retryable because the failure
+        // path never flipped the flag.
+        let mut perms = fs::metadata(&dir).expect("dir meta").permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&dir, perms).expect("chmod restore");
+
+        let second = artifact.try_release().expect("retry must succeed");
+        assert_eq!(second, ReleaseOutcome::Released, "retry must report Released");
+        assert!(!path.exists(), "file must be removed after a successful retry");
+        let debug = format!("{artifact:?}");
+        assert!(
+            debug.contains("released: true"),
+            "released flag must be set after a successful release; got: {debug}",
+        );
+
+        // Drop after a successful release is still a no-op: the
+        // sentinel file written below survives because the release
+        // state is already terminal.
+        fs::write(&path, b"sentinel-after-retry").expect("sentinel");
+        drop(artifact);
+        assert!(
+            path.exists(),
+            "Drop must not delete a file released earlier; the sentinel must remain",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `validate_fields` rejects a `session_secret_base64` value that
+    /// is non-empty but not valid base64. The error message must not
+    /// embed the offending input so the diagnostic is safe to log.
+    #[test]
+    fn validate_fields_rejects_malformed_session_secret_base64() {
+        let dir = unique_dir("malformed-secret");
+        let path = dir.join("bootstrap.json");
+        let mut fields = sample_fields();
+        fields.session_secret_base64 = "@@@not-base64@@@".to_string();
+        let err = BootstrapArtifact::write(&path, fields.clone(), BootstrapOwner::Persistent)
+            .unwrap_err();
+        let rendered = format!("{err}");
+        assert!(matches!(err, DaemonError::Bootstrap(_)));
+        assert!(
+            rendered.contains("session_secret_base64"),
+            "error must name the field, got: {rendered}",
+        );
+        assert!(
+            !rendered.contains(&fields.session_secret_base64),
+            "error must not embed the supplied secret, got: {rendered}",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `validate_fields` rejects a base64 value that decodes to a
+    /// length other than 32 bytes. The schema promises exactly
+    /// 32 bytes; a shorter or longer payload is refused at the
+    /// storage boundary.
+    #[test]
+    fn validate_fields_rejects_wrong_length_session_secret_base64() {
+        let dir = unique_dir("wrong-length-secret");
+        let path = dir.join("bootstrap.json");
+        // `AAAA` decodes to 3 bytes, well below the required 32.
+        let mut fields = sample_fields();
+        fields.session_secret_base64 = "AAAA".to_string();
+        let err = BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).unwrap_err();
+        assert!(matches!(err, DaemonError::Bootstrap(_)));
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("session_secret_base64"),
+            "error must name the field, got: {rendered}",
+        );
+        assert!(
+            !rendered.contains("AAAA"),
+            "error must not embed the supplied secret, got: {rendered}",
+        );
+
+        // A base64 value that decodes to more than 32 bytes is also
+        // refused; construct one from 33 random bytes.
+        let long = {
+            use base64::Engine as _;
+            use base64::engine::general_purpose::STANDARD;
+            STANDARD.encode([0x33u8; 33])
+        };
+        let mut fields = sample_fields();
+        fields.session_secret_base64 = long.clone();
+        let err = BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).unwrap_err();
+        let rendered = format!("{err}");
+        assert!(matches!(err, DaemonError::Bootstrap(_)));
+        assert!(
+            !rendered.contains(&long),
+            "error must not embed the supplied secret, got: {rendered}",
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `read` applies the same base64 contract on the load path so
+    /// a tampered bootstrap file is rejected even when the writer
+    /// was honest. The error must not embed the supplied secret.
+    /// The test seeds the file with owner-only permissions so the
+    /// owner-only check passes and the validation step is the one
+    /// that fires.
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_malformed_session_secret_base64() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = unique_dir("read-malformed-secret");
+        let path = dir.join("bootstrap.json");
+        let mut fields = sample_fields();
+        fields.session_secret_base64 = "@@@not-base64@@@".to_string();
+        let raw = serde_json::to_string(&fields).expect("serialise");
+        fs::write(&path, raw).expect("write");
+        // Restore owner-only permissions so the validation step is
+        // reached rather than the owner-only check on the load
+        // path.
+        let mut perms = fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms).expect("chmod");
+        let err = BootstrapArtifact::read(&path).unwrap_err();
+        let rendered = format!("{err}");
+        assert!(matches!(err, DaemonError::Bootstrap(_)));
+        assert!(
+            rendered.contains("session_secret_base64"),
+            "error must name the field, got: {rendered}",
+        );
+        assert!(
+            !rendered.contains("@@@not-base64@@@"),
+            "error must not embed the supplied secret, got: {rendered}",
         );
         let _ = fs::remove_dir_all(&dir);
     }
