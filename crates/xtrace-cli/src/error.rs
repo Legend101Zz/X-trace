@@ -4,6 +4,7 @@
 //! can emit a single machine-readable error document and exit with a
 //! stable status code.
 
+use xtrace_daemon::ProtocolErrorCode;
 use xtrace_domain::AppError;
 use xtrace_domain::ErrorCategory;
 
@@ -26,6 +27,12 @@ pub enum CliError {
     StoreCorrupted(String),
     /// The local store cannot be reached (I/O error).
     StoreUnavailable(String),
+    /// Another daemon currently holds this project's advisory lock.
+    DaemonAlreadyRunning,
+    /// Durable recording daemon support is unavailable on this platform.
+    DaemonUnsupportedPlatform,
+    /// Daemon operation failed with a stable daemon-owned error code.
+    DaemonFailure(ProtocolErrorCode),
 }
 
 impl CliError {
@@ -44,6 +51,9 @@ impl CliError {
             Self::StoreSchemaOlder(_) => 6,
             Self::StoreCorrupted(_) => 4,
             Self::StoreUnavailable(_) => 5,
+            Self::DaemonAlreadyRunning => 5,
+            Self::DaemonUnsupportedPlatform => 6,
+            Self::DaemonFailure(_) => 5,
         }
     }
 }
@@ -77,6 +87,13 @@ impl std::fmt::Display for CliError {
             Self::StoreSchemaOlder(message) => write!(f, "store schema older: {message}"),
             Self::StoreCorrupted(message) => write!(f, "store corrupted: {message}"),
             Self::StoreUnavailable(message) => write!(f, "store unavailable: {message}"),
+            Self::DaemonAlreadyRunning => {
+                f.write_str("a daemon is already running for this project")
+            }
+            Self::DaemonUnsupportedPlatform => {
+                f.write_str("durable recording daemon is unsupported on this platform")
+            }
+            Self::DaemonFailure(code) => write!(f, "daemon operation failed ({})", code.as_str()),
         }
     }
 }

@@ -27,6 +27,17 @@ pub fn write_success<W: Write, T: Serialize>(writer: &mut W, value: &T) -> io::R
     Ok(())
 }
 
+/// Writes one compact JSON document followed by a newline.
+///
+/// Long-running commands use this form so readiness can be consumed as one
+/// complete line while the process remains active.
+pub fn write_success_line<W: Write, T: Serialize>(writer: &mut W, value: &T) -> io::Result<()> {
+    serde_json::to_writer(&mut *writer, value)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+
 /// Render the supplied CLI error as a single JSON document on stderr.
 ///
 /// # Errors
@@ -137,6 +148,39 @@ impl ErrorDocument {
                 details: BTreeMapString(std::collections::BTreeMap::new()),
                 exit_code: error.exit_code(),
             },
+            CliError::DaemonAlreadyRunning => Self {
+                kind: "error",
+                code: "XTR-CLI-DAEMON-LOCKED".to_string(),
+                category: "resource".to_string(),
+                message: "a daemon is already running for this project".to_string(),
+                remediation: Vec::new(),
+                details: BTreeMapString(std::collections::BTreeMap::new()),
+                exit_code: error.exit_code(),
+            },
+            CliError::DaemonUnsupportedPlatform => Self {
+                kind: "error",
+                code: "XTR-CLI-DAEMON-UNSUPPORTED".to_string(),
+                category: "compatibility".to_string(),
+                message: "durable recording daemon is unsupported on this platform".to_string(),
+                remediation: Vec::new(),
+                details: BTreeMapString(std::collections::BTreeMap::new()),
+                exit_code: error.exit_code(),
+            },
+            CliError::DaemonFailure(code) => Self {
+                kind: "error",
+                code: code.as_str().to_string(),
+                category: "daemon".to_string(),
+                message: "daemon operation failed".to_string(),
+                remediation: Vec::new(),
+                details: BTreeMapString(
+                    std::iter::once((
+                        "daemon_code".to_string(),
+                        serde_json::Value::String(code.as_str().to_string()),
+                    ))
+                    .collect(),
+                ),
+                exit_code: error.exit_code(),
+            },
         }
     }
 }
@@ -174,5 +218,28 @@ fn scalar_to_json(scalar: &SafeScalar) -> serde_json::Value {
         SafeScalar::Float(value) => serde_json::Number::from_f64(*value)
             .map_or_else(|| serde_json::Value::Null, serde_json::Value::Number),
         SafeScalar::String(value) => serde_json::Value::String(value.clone()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, reason = "the test serializes a fixed safe error document")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_errors_keep_the_stable_code_without_rendering_source_detail() {
+        let error = CliError::DaemonFailure(xtrace_daemon::ProtocolErrorCode::Bind);
+        let document = ErrorDocument::from_error(&error);
+        assert_eq!(document.code, "XTR-DAEMON-BIND");
+        assert_eq!(document.details.0["daemon_code"], "XTR-DAEMON-BIND");
+        assert_eq!(document.message, "daemon operation failed");
+    }
+
+    #[test]
+    fn unsupported_daemon_platform_has_a_stable_cli_code() {
+        let error = CliError::DaemonUnsupportedPlatform;
+        let document = ErrorDocument::from_error(&error);
+        assert_eq!(document.code, "XTR-CLI-DAEMON-UNSUPPORTED");
+        assert_eq!(document.category, "compatibility");
     }
 }
