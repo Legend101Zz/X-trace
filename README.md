@@ -5,6 +5,12 @@ ships the minimal Rust foundation: a workspace of five crates, one forward-only
 SQLite migration, the XTP-Agent protobuf bindings, and a small CLI that can
 initialize a project, open it, and report a truthful spine status.
 
+The Node 22 workspace under `adapters/node` is a protocol/conformance
+foundation only. Its private synthetic client can authenticate to the local
+daemon and prove a staged XTP recording reached selected-root XTF storage; it
+does not instrument Node applications or declare Node capture support. See
+`docs/development/setup.md` for the exact acceptance commands and boundary.
+
 ## Crate layout
 
 | Crate               | Purpose                                                                |
@@ -82,7 +88,12 @@ restricted-PATH build to verify the vendored path.
 ## Quick start
 
 ```bash
-# Run an end-to-end smoke (requires network only for vendored protoc download)
+# Prepare and validate the Node XTP workspace (Node 22+, npm)
+npm ci --prefix adapters/node
+npm run generate:check --prefix adapters/node
+npm test --prefix adapters/node
+
+# Run the Rust suite, including the Node-to-daemon persistence test
 cargo build --workspace --all-features
 cargo test --workspace --all-features
 
@@ -91,6 +102,10 @@ cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-smoke
 cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir /tmp/xtrace-smoke
 cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir /tmp/xtrace-smoke
 ```
+
+`just test` and `just ci` perform the Node preparation and checks before Rust
+tests, so their daemon integration test does not depend on prebuilt `dist`
+files from another job or checkout.
 
 The status report on an uninitialized repository is a single JSON document
 that names no projects and reports `initialized: false` without touching

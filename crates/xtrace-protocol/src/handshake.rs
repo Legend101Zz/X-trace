@@ -167,6 +167,43 @@ pub enum TranscriptProofError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shared_node_and_rust_handshake_golden_matches() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../schema/fixtures/xtp-agent/handshake-vector.json"
+        ))
+        .expect("shared transcript fixture JSON");
+        let bytes = |field: &str| {
+            vector[field]
+                .as_str()
+                .expect("hex fixture field")
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    let pair = std::str::from_utf8(pair).expect("ASCII hex");
+                    u8::from_str_radix(pair, 16).expect("valid hex")
+                })
+                .collect::<Vec<_>>()
+        };
+        let secret = bytes("session_secret_hex");
+        let exporter = bytes("tls_exporter_hex");
+        let session = bytes("runtime_session_id_hex");
+        let client = bytes("client_nonce_hex");
+        let server = bytes("server_nonce_hex");
+        let manifest = vector["manifest_digest"].as_str().expect("manifest fixture");
+        let expected = bytes("expected_hmac_hex");
+        let actual = compute_transcript_proof(
+            &secret,
+            &exporter,
+            &session,
+            &client,
+            &server,
+            manifest.as_bytes(),
+        )
+        .expect("transcript proof");
+        assert_eq!(actual.as_slice(), expected);
+    }
+
     fn proof(
         secret: &[u8],
         exporter: &[u8],

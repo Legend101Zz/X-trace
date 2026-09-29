@@ -19,6 +19,7 @@ Every phase follows this fixed boundary: `Phase -> Implement -> Review -> Verify
 - The orchestrator defines a small, verifiable phase and its acceptance checks before implementation. Work may use multiple bounded agents for implementation, review, debugging, or architecture checks, but their output is untrusted until independently reviewed and tested by the orchestrator.
 - After review and verification, stop. The phase status report must enumerate: completed work; files or behavior changed; tests and verification run; issues or decisions; remaining work; and the exact next proposed phase.
 - Do not start, merge, push, schedule, or continue the next phase until the user explicitly approves that proposed next phase. No background automation may continue implementation across an approval boundary.
+- The user may explicitly authorize a bounded multi-phase autonomous batch as an exception to the per-phase approval stop. That authorization is approval only for the named batch scope and deadline; record it in the execution checkpoint before continuing. This does not waive any slice gate: each slice still requires its own implementation, independent review, verification, and merge decision before moving forward. Do not merge an unreviewed or unverified slice, exceed the authorized scope/deadline, or infer authorization from urgency or silence. Provide the user a consolidated review of the completed batch afterward.
 
 ## Code quality
 
@@ -40,6 +41,7 @@ CARGO_TARGET_DIR=/Volumes/Mrigesh SSD/.cache/xtrace/cargo-target
 GRADLE_USER_HOME=/Volumes/Mrigesh SSD/.cache/xtrace/gradle
 XDG_CACHE_HOME=/Volumes/Mrigesh SSD/.cache/xtrace/xdg
 PNPM_HOME=/Volumes/Mrigesh SSD/.cache/xtrace/pnpm
+NPM_CONFIG_CACHE=/Volumes/Mrigesh SSD/.cache/xtrace/npm
 ```
 
 Do not commit caches or generated build output.

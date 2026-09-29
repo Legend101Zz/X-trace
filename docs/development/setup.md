@@ -11,23 +11,30 @@ and run the Slice 1A gates from a fresh checkout.
   on Linux, MSVC on Windows). No system SQLite is required.
 - No system `protoc`. The build pulls Google's prebuilt `protoc` from
   `protoc-bin-vendored` at compile time.
+- Node.js 22 or newer and npm, for the synthetic XTP conformance client.
 
 ## Caches
 
-`AGENTS.md` documents the recommended cache layout for this worktree.
-The defaults keep build artifacts on the external SSD so a fresh checkout
-does not fill the system disk:
+Caches are configurable. Point these variables at a suitable local cache root
+to keep build artifacts outside the checkout:
 
 ```text
-CARGO_HOME=/Volumes/Mrigesh SSD/.cache/xtrace/cargo
-CARGO_TARGET_DIR=/Volumes/Mrigesh SSD/.cache/xtrace/cargo-target
-GRADLE_USER_HOME=/Volumes/Mrigesh SSD/.cache/xtrace/gradle
-XDG_CACHE_HOME=/Volumes/Mrigesh SSD/.cache/xtrace/xdg
-PNPM_HOME=/Volumes/Mrigesh SSD/.cache/xtrace/pnpm
+CARGO_HOME=/path/to/cache/cargo
+CARGO_TARGET_DIR=/path/to/cache/cargo-target
+GRADLE_USER_HOME=/path/to/cache/gradle
+XDG_CACHE_HOME=/path/to/cache/xdg
+PNPM_HOME=/path/to/cache/pnpm
+NPM_CONFIG_CACHE=/path/to/cache/npm
 ```
 
 The variables are optional; cargo falls back to its built-in locations when
 they are unset.
+
+The Node workspace also keeps its npm cache configurable through
+`NPM_CONFIG_CACHE`. Generated protobuf bindings and compiled TypeScript are
+not npm cache data: the bindings are checked in under
+`adapters/node/packages/protocol/src/gen`, while `node_modules` and `dist`
+remain ignored build outputs.
 
 ## Workspace commands
 
@@ -42,8 +49,37 @@ Run from the repository root:
 | Restricted-PATH build (see below)                  | Verify vendored protoc without a system `protoc`     |
 | CLI smoke (see below)                              | End-to-end init / status / open walkthrough         |
 
-The `justfile` exposes the same set through `just ci`, `just lint`, and
-`just test` for convenience.
+The `justfile` exposes `just ci`, `just lint`, and `just test`. The `test` and
+`ci` recipes install, codegen-check, and build/test the Node workspace before
+running the Rust workspace tests.
+
+### Node XTP conformance client
+
+The Node 22 workspace is a protocol-only foundation, not a runtime capture
+adapter. Its synthetic client and daemon acceptance test are Unix-only. It
+generates TypeScript bindings from the canonical Rust daemon schemas, then runs
+a private synthetic client against `xtrace daemon`:
+
+```bash
+npm ci --prefix adapters/node
+npm run generate:check --prefix adapters/node
+npm test --prefix adapters/node
+cargo test -p xtrace-cli --test node_synthetic_adapter
+```
+
+The integration test uses only the daemon's one-shot bootstrap path, validates
+the certificate pin before sending XTP application data, proves the TLS
+exporter-bound HMAC transcript, and verifies `Staged` acknowledgements plus a
+fully verified XTF segment under the selected project's SQLite root. The
+fixture is synthetic. This slice does not claim adapter support, framework
+instrumentation, signatures, reconnect, daemon commands, `Committed` ACKs,
+terminal recording state, or replay/UI support.
+
+The pinned direct dependency licenses are compatible with the root MIT or
+Apache-2.0 licensing: Buf's generator/runtime and CLI are Apache-2.0,
+`@bufbuild/protobuf` declares Apache-2.0 AND BSD-3-Clause, TypeScript is Apache-2.0,
+and `hash-wasm`, `uuid`, and `@types/node` are MIT. Exact versions are recorded
+in `adapters/node/package.json` and `package-lock.json`.
 
 ### Restricted-PATH build
 

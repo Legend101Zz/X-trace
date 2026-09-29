@@ -14,14 +14,51 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  node-client:
+    runs-on: ubuntu-latest
+    env:
+      NPM_CONFIG_CACHE: ${{ runner.temp }}/xtrace-npm-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-node-client-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-node-client-cargo-
+      - name: Install exact Node workspace dependencies
+        run: npm ci --prefix adapters/node
+      - name: Check canonical Protobuf code generation
+        run: npm run generate:check --prefix adapters/node
+      - name: Typecheck and Node unit tests
+        run: npm test --prefix adapters/node
+      - name: Node client to daemon and selected-root XTF acceptance
+        run: cargo test -p xtrace-cli --test node_synthetic_adapter -- --nocapture
+
   gates:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install and validate Node protocol workspace
+        run: |
+          npm ci --prefix adapters/node
+          npm run generate:check --prefix adapters/node
+          npm test --prefix adapters/node
       - name: Cache cargo registry and target
         uses: actions/cache@v4
         with:
