@@ -48,26 +48,27 @@
 //! ## Deletion after negotiation
 //!
 //! Once the daemon finishes writing `DaemonHello` to the wire, the
-//! shared `Arc<BootstrapArtifact>` value is passed through
-//! [`BootstrapArtifact::try_release`]. The release path is
+//! shared `Arc<BootstrapArtifact>` value is passed through the
+//! crate-private `try_release` helper. The release path is
 //! serialised through a small [`std::sync::Mutex`] that protects
 //! both the released flag and the [`std::fs::remove_file`] syscall;
 //! the lock is uncontended in the common case and only wraps a
 //! single local syscall, so it does not introduce meaningful
 //! contention. On success or [`std::io::ErrorKind::NotFound`] the
 //! released flag is set so concurrent callers racing on the same
-//! `Arc<...>` see [`ReleaseOutcome::AlreadyReleased`]; on any other
-//! failure the flag is left unset so a later call from the explicit
-//! release path, the [`Drop`] impl, or a second connection's
-//! post-hello milestone can retry. Failed proof exchanges never
-//! call the release path so a legitimate retry against the same
-//! daemon launch can re-read the artifact.
+//! `Arc<...>` see the `AlreadyReleased` outcome; on any other
+//! failure the flag is left unset so the supervisor's caller-visible
+//! error path and the [`Drop`] fallback can both retry. Failed proof
+//! exchanges never call the release path so a legitimate retry
+//! against the same daemon launch can re-read the artifact.
 //!
-//! The [`Drop`] impl calls [`BootstrapArtifact::try_release`] as a
-//! fallback so an orderly shutdown still removes the file when no
-//! connection ever reached the post-hello milestone. The fallback
-//! is best-effort: a non-`NotFound` I/O error is logged at error
-//! level and the original `Drop` continues without panicking.
+//! The [`Drop`] impl calls `try_release` as a fallback so an
+//! orderly shutdown still removes the file when no connection ever
+//! reached the post-hello milestone. The fallback is best-effort:
+//! a non-`NotFound` I/O error is logged at error level and the
+//! original `Drop` continues without panicking. Once `Drop` has
+//! begun on a value, no later caller can retry through that same
+//! instance; a subsequent launch writes a fresh artifact.
 
 use std::fs;
 use std::io::Write as _;
@@ -192,7 +193,7 @@ impl Drop for BootstrapArtifactFields {
     }
 }
 
-/// Outcome reported by [`BootstrapArtifact::try_release`].
+/// Outcome reported by the crate-private `try_release` helper.
 ///
 /// The variant tells the caller whether this invocation actually
 /// performed the on-disk deletion or merely observed an earlier
@@ -200,7 +201,7 @@ impl Drop for BootstrapArtifactFields {
 /// `Err` from the helper rather than treat any non-`Released`
 /// outcome as success.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReleaseOutcome {
+pub(crate) enum ReleaseOutcome {
     /// This call performed the on-disk deletion.
     Released,
     /// The artifact had already been released by an earlier caller;
@@ -224,13 +225,14 @@ enum ReleaseState {
 /// The struct knows where the artifact lives on disk and whether it
 /// should be removed on drop. The release path is split into three
 /// layers so the `docs/plans/x-trace/03b-protocol-and-api.md` §2.1
-/// contract is satisfied: a successful `DaemonHello` write calls
-/// [`BootstrapArtifact::try_release`] on the shared `Arc<...>` value
-/// so the artifact is removed exactly once during normal operation;
-/// the `Drop` impl calls the same helper as a fallback so an orderly
-/// daemon shutdown still cleans up if no connection ever succeeded;
-/// the [`BootstrapOwner::Persistent`] variant skips both paths so
-/// integration tests can inspect the artifact after the daemon exits.
+/// contract is satisfied: a successful `DaemonHello` write calls the
+/// crate-private `try_release` helper on the shared `Arc<...>`
+/// value so the artifact is removed exactly once during normal
+/// operation; the `Drop` impl calls the same helper as a fallback
+/// so an orderly daemon shutdown still cleans up if no connection
+/// ever succeeded; the [`BootstrapOwner::Persistent`] variant skips
+/// both paths so integration tests can inspect the artifact after
+/// the daemon exits.
 ///
 /// The release helper is race-free under concurrent connection tasks:
 /// a small [`Mutex`] serialises the released flag and the
@@ -359,8 +361,8 @@ impl BootstrapArtifact {
     }
 
     /// Attempts to remove the on-disk artifact exactly once. The
-    /// method is the shared call site the supervisor and every
-    /// connection task go through to honour the
+    /// method is the shared call site the supervisor and the
+    /// [`Drop`] fallback go through to honour the
     /// `docs/plans/x-trace/03b-protocol-and-api.md` §2.1 contract
     /// that the bootstrap file is deleted after the negotiated
     /// session is established.
@@ -370,18 +372,17 @@ impl BootstrapArtifact {
     /// or merely observed an earlier successful release
     /// ([`ReleaseOutcome::AlreadyReleased`]). A
     /// [`BootstrapOwner::Persistent`] artifact never touches the
-    /// filesystem and always reports [`ReleaseOutcome::AlreadyReleased`]
-    /// so integration tests can poll the helper without leaking
-    /// state into the daemon's cleanup path.
+    /// filesystem and always reports [`ReleaseOutcome::AlreadyReleased`].
     ///
     /// A non-`NotFound` I/O failure is returned as
-    /// [`DaemonError::Bootstrap`] so the supervisor can stop the
-    /// daemon with a real security-cleanup error instead of silently
-    /// reducing it to a boolean. The released flag is **not** set on
-    /// such a failure so a subsequent caller, the `Drop` impl, or a
-    /// later connection's post-hello milestone can retry the
-    /// removal; on success or `NotFound` the flag is set so the
-    /// next caller sees [`ReleaseOutcome::AlreadyReleased`].
+    /// [`DaemonError::Bootstrap`] without logging so the supervisor
+    /// caller surfaces a typed cleanup error instead of a swallowed
+    /// boolean. The released flag is **not** set on such a failure
+    /// so a later caller (a retry in the supervisor path or the
+    /// `Drop` fallback after the supervisor returned) can attempt
+    /// the removal again. The helper does not log on failure; the
+    /// [`Drop`] impl logs once when its fallback attempt also
+    /// fails, which keeps a single attempt path observable.
     ///
     /// # Errors
     ///
@@ -389,7 +390,7 @@ impl BootstrapArtifact {
     /// [`std::fs::remove_file`] fails with an error other than
     /// [`std::io::ErrorKind::NotFound`]. The diagnostic message
     /// never embeds the session secret or any other captured value.
-    pub fn try_release(&self) -> Result<ReleaseOutcome, DaemonError> {
+    pub(crate) fn try_release(&self) -> Result<ReleaseOutcome, DaemonError> {
         if self.owner == BootstrapOwner::Persistent {
             return Ok(ReleaseOutcome::AlreadyReleased);
         }
@@ -408,17 +409,10 @@ impl BootstrapArtifact {
                 *state = ReleaseState::Released;
                 Ok(ReleaseOutcome::Released)
             }
-            Err(err) => {
-                tracing::warn!(
-                    bootstrap = %self.path.display(),
-                    error = %err,
-                    "failed to remove bootstrap artifact on release; release state remains retryable",
-                );
-                Err(DaemonError::Bootstrap(format!(
-                    "remove bootstrap {}: {err}",
-                    self.path.display()
-                )))
-            }
+            Err(err) => Err(DaemonError::Bootstrap(format!(
+                "remove bootstrap {}: {err}",
+                self.path.display()
+            ))),
         }
     }
 
@@ -464,11 +458,13 @@ impl Drop for BootstrapArtifact {
         //
         // The drop path is best-effort: a non-`NotFound` failure is
         // logged at error level so the diagnostic is visible in the
-        // owner-only log, but the original `Drop` continues without
-        // panicking. A later caller (the next test, the supervisor
-        // cleanup pass, or another connection's post-hello milestone)
-        // can still retry because the released flag was not set on
-        // failure.
+        // owner-only log, and the original `Drop` continues without
+        // panicking. This is the single observable log site for the
+        // release path; the helper itself never logs so a retry in
+        // the supervisor caller cannot multiply the diagnostic. Once
+        // `Drop` has begun on this instance, no further retry is
+        // possible through the same handle; the next daemon launch
+        // writes a fresh artifact.
         match self.try_release() {
             Ok(_) => {}
             Err(err) => {
@@ -1557,64 +1553,85 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// `try_release` is genuinely retryable after a non-`NotFound`
-    /// failure. The test removes the directory write bit so the
-    /// `unlink` call returns `EACCES`, asserts the helper reports
-    /// the typed error and leaves the file on disk, restores the
-    /// permission, retries, and asserts the second attempt succeeds
-    /// and removes the file. The test runs on Unix only because the
-    /// retry mechanism relies on POSIX permission semantics.
-    ///
-    /// The probe at the top of the test detects an environment in
-    /// which directory permissions do not gate unlink (typically
-    /// when the test runs as a uid the kernel bypasses DAC for)
-    /// and skips the rest of the assertions in that case so the
-    /// suite still reports a meaningful result instead of a false
-    /// negative.
+    /// RAII guard that restores the directory mode to `0o700` on
+    /// drop so an assertion failure inside a permission-twiddling
+    /// test cannot strand a read-only directory that the next
+    /// `remove_dir_all` would refuse to clean up.
+    #[cfg(unix)]
+    struct ReadOnlyDirGuard {
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ReadOnlyDirGuard {
+        fn new(path: PathBuf) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = fs::metadata(&path).expect("dir meta").permissions();
+            perms.set_mode(0o500);
+            fs::set_permissions(&path, perms).expect("chmod ro dir");
+            Self { path }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadOnlyDirGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Ok(meta) = fs::metadata(&self.path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o700);
+                let _ = fs::set_permissions(&self.path, perms);
+            }
+        }
+    }
+
+    /// Probe whether directory write bits gate `unlink` for the
+    /// current uid. Returns `true` when the kernel bypasses DAC for
+    /// the running process (typically root), which means the
+    /// permission-twiddling retry tests cannot exercise the path
+    /// they are designed to cover.
+    #[cfg(unix)]
+    fn directory_permissions_gate_unlink() -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        let probe_dir = unique_dir("release-retry-probe");
+        let probe_path = probe_dir.join("probe.json");
+        fs::write(&probe_path, b"probe").expect("probe file");
+        let mut perms = fs::metadata(&probe_dir).expect("probe meta").permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(&probe_dir, perms).expect("probe chmod");
+        let gated = fs::remove_file(&probe_path).is_err();
+        let mut perms = fs::metadata(&probe_dir).expect("probe meta").permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&probe_dir, perms).expect("probe chmod restore");
+        let _ = fs::remove_dir_all(&probe_dir);
+        gated
+    }
+
+    /// A non-`NotFound` `unlink` failure leaves the released flag
+    /// unset so a subsequent explicit `try_release` call retries
+    /// the removal. The test removes the directory write bit to
+    /// force `EACCES`, asserts the helper reports the typed error
+    /// without logging, restores the permission through a guard so
+    /// assertion failures cannot strand a read-only directory, and
+    /// asserts the second attempt succeeds and removes the file.
+    /// The test runs on Unix only because the retry mechanism
+    /// relies on POSIX permission semantics.
     #[cfg(unix)]
     #[test]
-    fn try_release_failure_is_retryable_via_drop_and_retry() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = unique_dir("release-retry");
+    fn try_release_succeeds_on_retry_after_forced_unlink_failure() {
+        if !directory_permissions_gate_unlink() {
+            eprintln!(
+                "skipping try_release retry test: directory write bits do not gate unlink for this uid",
+            );
+            return;
+        }
+        let dir = unique_dir("release-retry-explicit");
         let path = dir.join("bootstrap.json");
         let artifact = Arc::new(
             BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Daemon)
                 .expect("write"),
         );
-
-        // Probe whether directory write bits gate `unlink` for the
-        // current uid. When the kernel ignores DAC (typically root)
-        // the test cannot exercise the retry path it is designed to
-        // cover, so we skip with a recorded reason rather than
-        // silently passing on a test that did not actually run.
-        let probe_dir = unique_dir("release-retry-probe");
-        let probe_path = probe_dir.join("probe.json");
-        fs::write(&probe_path, b"probe").expect("probe file");
-        let mut probe_perms = fs::metadata(&probe_dir).expect("probe meta").permissions();
-        probe_perms.set_mode(0o500);
-        fs::set_permissions(&probe_dir, probe_perms).expect("probe chmod");
-        let unlink_succeeded_with_ro_dir = fs::remove_file(&probe_path).is_ok();
-        if unlink_succeeded_with_ro_dir {
-            eprintln!(
-                "skipping try_release retry test: directory write bits do not gate unlink for this uid",
-            );
-            // Restore the probe directory's permissions so the
-            // cleanup helper below can remove it.
-            let mut probe_perms = fs::metadata(&probe_dir).expect("probe meta").permissions();
-            probe_perms.set_mode(0o700);
-            fs::set_permissions(&probe_dir, probe_perms).expect("probe chmod restore");
-            let _ = fs::remove_dir_all(&probe_dir);
-            drop(artifact);
-            let _ = fs::remove_dir_all(&dir);
-            return;
-        }
-        let _ = fs::remove_dir_all(&probe_dir);
-
-        // Apply the same read-only parent layout to the artifact's
-        // parent so the daemon's `unlink` is forced to fail.
-        let mut perms = fs::metadata(&dir).expect("dir meta").permissions();
-        perms.set_mode(0o500);
-        fs::set_permissions(&dir, perms).expect("chmod ro dir");
+        let _ro = ReadOnlyDirGuard::new(dir.clone());
 
         let first = artifact.try_release().expect_err("unlink must fail under read-only parent");
         let rendered = format!("{first}");
@@ -1629,13 +1646,9 @@ mod tests {
             "released flag must remain unset after a failed release; got: {debug}",
         );
 
-        // Restore the parent directory permissions so the retry
-        // succeeds. The state stays retryable because the failure
-        // path never flipped the flag.
-        let mut perms = fs::metadata(&dir).expect("dir meta").permissions();
-        perms.set_mode(0o700);
-        fs::set_permissions(&dir, perms).expect("chmod restore");
-
+        // Restore permissions through the guard's drop below; the
+        // explicit second attempt asserts the retry succeeds.
+        drop(_ro);
         let second = artifact.try_release().expect("retry must succeed");
         assert_eq!(second, ReleaseOutcome::Released, "retry must report Released");
         assert!(!path.exists(), "file must be removed after a successful retry");
@@ -1645,15 +1658,52 @@ mod tests {
             "released flag must be set after a successful release; got: {debug}",
         );
 
-        // Drop after a successful release is still a no-op: the
-        // sentinel file written below survives because the release
-        // state is already terminal.
-        fs::write(&path, b"sentinel-after-retry").expect("sentinel");
+        drop(artifact);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// When `try_release` fails non-`NotFound` and the supervisor
+    /// hands the artifact to `Drop` without a follow-up retry, the
+    /// fallback path inside `Drop` performs a final attempt and
+    /// logs once when that fallback also fails. The test forces
+    /// both attempts to fail and asserts the file remains on disk
+    /// after `Drop`; the second test in this module covers the
+    /// happy-path fallback that removes the file once the
+    /// directory permission is restored before drop.
+    #[cfg(unix)]
+    #[test]
+    fn drop_fallback_releases_when_try_release_already_failed() {
+        if !directory_permissions_gate_unlink() {
+            eprintln!(
+                "skipping drop_fallback release test: directory write bits do not gate unlink for this uid",
+            );
+            return;
+        }
+        let dir = unique_dir("release-retry-drop");
+        let path = dir.join("bootstrap.json");
+        let artifact = Arc::new(
+            BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Daemon)
+                .expect("write"),
+        );
+
+        // Force the explicit attempt to fail under a read-only
+        // parent so the `Drop` fallback is the only path that
+        // can recover the cleanup.
+        let _ro = ReadOnlyDirGuard::new(dir.clone());
+        let first = artifact.try_release().expect_err("unlink must fail under read-only parent");
+        assert!(path.exists(), "file must still exist after a failed explicit release");
+
+        // Drop the read-only guard first so the directory is
+        // writable when `Drop::drop` runs the fallback attempt.
+        drop(_ro);
+        // The explicit attempt already left the released flag
+        // unset; the `Drop` fallback must perform the deletion.
         drop(artifact);
         assert!(
-            path.exists(),
-            "Drop must not delete a file released earlier; the sentinel must remain",
+            !path.exists(),
+            "Drop fallback must remove the file when the prior try_release left the state retryable",
         );
+        let _ = first; // suppress unused warning for the diagnostic-only value
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -671,6 +671,14 @@ async fn oversized_frame_is_rejected_with_frame_too_large() {
     // Establish a pinned TLS listener and write an oversized
     // length prefix directly into the framed reader. The daemon
     // emits a `ProtocolError` with code `XTR-DAEMON-FRAME-TOO-LARGE`.
+    //
+    // The write half must stay alive while the reader drains the
+    // `ProtocolError` envelope; calling `shutdown()` on the client
+    // TLS stream before reading would deliver a TLS close_notify
+    // alert that races the daemon's `ProtocolError` write and
+    // occasionally closes the listener before the daemon can
+    // respond. Keeping the writer open and dropping it after the
+    // bounded read removes the race without any timing primitive.
     let temp = TempDir::new().expect("temp");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
@@ -687,15 +695,13 @@ async fn oversized_frame_is_rejected_with_frame_too_large() {
     .expect("bind");
     let (shutdown_tx, daemon_handle) = daemon_task(bound);
 
-    // Real pinned TLS connection.
     let mut tls_stream = connect_pinned(address, &pin).await.expect("pinned connect");
     let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
     // Announce a length greater than the daemon's 1 MiB envelope
     // limit. The reader rejects the announced length before any
-    // allocation.
+    // allocation, then the daemon writes a ProtocolError before
+    // closing.
     writer.write_all(&(2u32 * 1024 * 1024).to_be_bytes()).await.expect("write length");
-    let _ = writer.shutdown().await;
-    drop(writer);
 
     let envelope = read_envelope_bounded(&mut reader, "protocol error envelope").await;
     let err = match envelope.payload {
@@ -704,6 +710,7 @@ async fn oversized_frame_is_rejected_with_frame_too_large() {
     };
     assert_eq!(err.code, "XTR-DAEMON-FRAME-TOO-LARGE");
 
+    drop(writer);
     drop(reader);
     drop(tls_stream);
     let _ = shutdown_tx.send(());
@@ -1413,17 +1420,12 @@ async fn verify_transcript_proof_round_trip_with_real_layout() {
 
 /// Slice 1B review round 5 defect 3: a peer disconnect during the
 /// `DaemonHello` write must remain connection-local. The test
-/// sends a valid `AdapterHello`, aborts the TCP stream before
-/// reading `DaemonHello`, and asserts the daemon supervisor
-/// continues to accept subsequent connections and complete a fresh
-/// full handshake.
-///
-/// TCP timing is nondeterministic — the daemon may have already
-/// written `DaemonHello` before the peer closes, or it may have
-/// not — so the test observes the supervisor policy by retrying
-/// the second connection until it succeeds under a bounded
-/// deadline. The point is the supervisor policy (the listener
-/// stays up after a peer disconnect), not a specific race outcome.
+/// sends a valid `AdapterHello`, drops the TLS stream without
+/// reading `DaemonHello`, and then opens a fresh pinned connection
+/// that completes the full handshake. The supervisor policy under
+/// test is that the listener stays up after a peer disconnect; the
+/// direct second connection is sufficient to demonstrate the
+/// policy without polling loops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_disconnect_during_daemon_hello_does_not_take_down_listener() {
     let temp = TempDir::new().expect("temp");
@@ -1442,11 +1444,9 @@ async fn peer_disconnect_during_daemon_hello_does_not_take_down_listener() {
     .expect("bind");
     let (shutdown_tx, daemon_handle) = daemon_task(bound);
 
-    // 1. Open a pinned TLS connection, send a valid AdapterHello,
-    //    then close the connection without reading the DaemonHello
-    //    reply. This is the documented peer-disconnect pattern:
-    //    the daemon sees a healthy local socket but the peer has
-    //    already closed both halves of the connection.
+    // 1. Send a valid AdapterHello, then drop the TLS stream
+    //    without reading DaemonHello. This is the documented
+    //    peer-disconnect shape the daemon must normalise to Ok(()).
     {
         let mut tls_stream =
             connect_pinned(address, &pin).await.expect("pinned connect disconnect");
@@ -1470,110 +1470,48 @@ async fn peer_disconnect_during_daemon_hello_does_not_take_down_listener() {
         write_envelope(&mut writer, PayloadOneof::AdapterHello(adapter_hello), &session_id, 0, 1)
             .await
             .expect("write adapter hello");
-        // Drop both halves without reading DaemonHello. This is the
-        // peer-disconnect shape the daemon must normalise to Ok(()).
         drop(_reader);
         drop(writer);
         drop(tls_stream);
     }
 
-    // 2. The supervisor must still be alive and must accept a
-    //    subsequent connection. We poll under a bounded deadline
-    //    because the daemon may need a brief moment to finish
-    //    tearing down the first connection before accepting the
-    //    second one.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut second_ok = false;
-    while std::time::Instant::now() < deadline && !second_ok {
-        let connect_attempt =
-            tokio::time::timeout(Duration::from_millis(250), connect_pinned(address, &pin)).await;
-        match connect_attempt {
-            Ok(Ok(mut tls_stream)) => {
-                let mut exporter_buf = [0u8; 32];
-                let exporter_result = tls_stream.get_ref().1.export_keying_material(
-                    &mut exporter_buf,
-                    TLS_EXPORTER_LABEL,
-                    None,
-                );
-                if exporter_result.is_err() {
-                    let _ = tls_stream.shutdown().await;
-                    drop(tls_stream);
-                    continue;
-                }
-                let adapter_hello = build_adapter_hello(
-                    secret.read_secret(),
-                    &exporter_buf,
-                    &session_id,
-                    HAPPY_MANIFEST_DIGEST,
-                    &[0x55_u8; 32],
-                    EXPECTED_REPOSITORY_FINGERPRINT,
-                    1,
-                    0,
-                );
-                let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
-                if write_envelope(
-                    &mut writer,
-                    PayloadOneof::AdapterHello(adapter_hello),
-                    &session_id,
-                    0,
-                    1,
-                )
-                .await
-                .is_err()
-                {
-                    let _ = tls_stream.shutdown().await;
-                    drop(tls_stream);
-                    continue;
-                }
-                match tokio::time::timeout(Duration::from_secs(2), read_envelope(&mut reader)).await
-                {
-                    Ok(Ok(envelope)) => match envelope.payload {
-                        Some(PayloadOneof::DaemonHello(_)) => {
-                            second_ok = true;
-                        }
-                        Some(PayloadOneof::ProtocolError(err)) => {
-                            // A ProtocolError here would mean the
-                            // daemon's state is corrupted by the
-                            // earlier peer-disconnect path; fail
-                            // loudly rather than retry.
-                            panic!(
-                                "unexpected ProtocolError on second connection after peer disconnect: {} {}",
-                                err.code, err.message,
-                            );
-                        }
-                        other => panic!("unexpected payload on second connection: {other:?}"),
-                    },
-                    Ok(Err(err)) => {
-                        let _ = tls_stream.shutdown().await;
-                        drop(tls_stream);
-                        eprintln!("second connection read failed; retrying: {err}");
-                        continue;
-                    }
-                    Err(_) => {
-                        let _ = tls_stream.shutdown().await;
-                        drop(tls_stream);
-                        eprintln!("second connection timed out; retrying");
-                        continue;
-                    }
-                }
-                let _ = tls_stream.shutdown().await;
-                drop(tls_stream);
-            }
-            Ok(Err(err)) => {
-                eprintln!("second connect failed; retrying: {err}");
-                continue;
-            }
-            Err(_) => {
-                // Local timeout on the connect; retry until the
-                // outer deadline.
-                continue;
-            }
-        }
-    }
-    assert!(
-        second_ok,
-        "listener must accept a second connection after a peer disconnect during DaemonHello",
+    // 2. The listener must accept a fresh connection and complete
+    //    a full handshake after the peer disconnect.
+    let mut tls_stream = connect_pinned(address, &pin).await.expect("second pinned connect");
+    let mut exporter_buf = [0u8; 32];
+    tls_stream
+        .get_ref()
+        .1
+        .export_keying_material(&mut exporter_buf, TLS_EXPORTER_LABEL, None)
+        .expect("second client exporter");
+    let adapter_hello = build_adapter_hello(
+        secret.read_secret(),
+        &exporter_buf,
+        &session_id,
+        HAPPY_MANIFEST_DIGEST,
+        &[0x55_u8; 32],
+        EXPECTED_REPOSITORY_FINGERPRINT,
+        1,
+        0,
     );
+    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    write_envelope(&mut writer, PayloadOneof::AdapterHello(adapter_hello), &session_id, 0, 1)
+        .await
+        .expect("write second adapter hello");
+    let envelope = read_envelope_bounded(&mut reader, "second daemon hello").await;
+    match envelope.payload {
+        Some(PayloadOneof::DaemonHello(_)) => {}
+        Some(PayloadOneof::ProtocolError(err)) => {
+            panic!(
+                "unexpected ProtocolError on second connection after peer disconnect: {} {}",
+                err.code, err.message,
+            );
+        }
+        other => panic!("unexpected payload on second connection: {other:?}"),
+    }
+    drop(reader);
+    drop(writer);
+    drop(tls_stream);
 
     let _ = shutdown_tx.send(());
     daemon_handle

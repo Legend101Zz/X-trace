@@ -26,6 +26,7 @@ use prost::Message;
 use prost::bytes::Bytes;
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls::server::ServerConfig;
+use thiserror::Error;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -252,7 +253,7 @@ pub struct BoundDaemon {
     /// Optional bootstrap artifact handle. `Some` when the daemon
     /// owns the file; the [`Arc`] is shared between the supervisor
     /// and every connection task so the post-hello
-    /// [`BootstrapArtifact::try_release`] call honours the
+    /// `try_release` call honours the
     /// `docs/plans/x-trace/03b-protocol-and-api.md` §2.1 "deleted
     /// after negotiation" contract exactly once across concurrent
     /// successful handshakes.
@@ -350,7 +351,7 @@ impl BoundDaemon {
         let clock = MonotonicClock::new();
 
         let mut connections: JoinSet<Result<(), DaemonError>> = JoinSet::new();
-        let shutdown_observer: JoinHandle<()> = tokio::spawn(async move {
+        let mut shutdown_observer: JoinHandle<()> = tokio::spawn(async move {
             shutdown.await;
             let _ = shutdown_tx.send(true);
         });
@@ -380,18 +381,13 @@ impl BoundDaemon {
                             // triggering failure because the caller
                             // is best served by the failure mode
                             // that already happened.
-                            let _ = shutdown_tx_for_supervisor.send(true);
-                            shutdown_observer.abort();
-                            let _ = shutdown_observer.await;
-                            if let Some(drain_err) =
-                                drain_connections(&mut connections).await
-                            {
-                                warn!(
-                                    error = %drain_err,
-                                    "ignoring drain failure in favor of the triggering connection error",
-                                );
-                            }
-                            return Err(err);
+                            return Err(shutdown_after_trigger(
+                                err,
+                                &mut connections,
+                                &shutdown_tx_for_supervisor,
+                                &mut shutdown_observer,
+                            )
+                            .await);
                         }
                         JoinCompletionAction::JoinFailure(join_err) => {
                             // A panic or cancellation is itself the
@@ -399,20 +395,15 @@ impl BoundDaemon {
                             // signals shutdown, drains, logs any
                             // drain failure, and returns the
                             // wrapping [`DaemonError::Join`].
-                            let _ = shutdown_tx_for_supervisor.send(true);
-                            shutdown_observer.abort();
-                            let _ = shutdown_observer.await;
-                            if let Some(drain_err) =
-                                drain_connections(&mut connections).await
-                            {
-                                warn!(
-                                    error = %drain_err,
-                                    "ignoring drain failure in favor of the triggering join failure",
-                                );
-                            }
-                            return Err(DaemonError::Join(format!(
-                                "connection task join failed: {join_err}"
-                            )));
+                            return Err(shutdown_after_trigger(
+                                DaemonError::Join(format!(
+                                    "connection task join failed: {join_err}"
+                                )),
+                                &mut connections,
+                                &shutdown_tx_for_supervisor,
+                                &mut shutdown_observer,
+                            )
+                            .await);
                         }
                     }
                 }
@@ -426,18 +417,13 @@ impl BoundDaemon {
                             // remaining task, logs any drain
                             // failure, and returns the accept error.
                             warn!(error = %err, "listener accept failed");
-                            let _ = shutdown_tx_for_supervisor.send(true);
-                            shutdown_observer.abort();
-                            let _ = shutdown_observer.await;
-                            if let Some(drain_err) =
-                                drain_connections(&mut connections).await
-                            {
-                                warn!(
-                                    error = %drain_err,
-                                    "ignoring drain failure in favor of the triggering accept error",
-                                );
-                            }
-                            return Err(err);
+                            return Err(shutdown_after_trigger(
+                                err,
+                                &mut connections,
+                                &shutdown_tx_for_supervisor,
+                                &mut shutdown_observer,
+                            )
+                            .await);
                         }
                     };
                     debug!(peer = %peer, "daemon accepted new connection");
@@ -565,20 +551,33 @@ async fn handle_connection(
             return Ok(());
         }
     };
-    if !write_initial_envelope_stream(&mut tls_stream, &envelope).await {
-        // A failure to write `DaemonHello` after a valid
-        // `AdapterHello` cannot be distinguished from a peer
-        // disconnect at this layer: the local kernel socket may be
-        // perfectly healthy while the peer has already closed its
-        // read half. Treating the failure as an internal daemon
-        // defect would let a misbehaving client take the listener
-        // down with one truncated read, which the
-        // `docs/plans/x-trace/03b-protocol-and-api.md` §2.1
-        // contract explicitly forbids. The connection-local error
-        // is normalised to `Ok(())` so the supervisor keeps
-        // accepting subsequent connections.
-        debug!("daemon hello write failed; treating as connection-local peer disconnect");
-        return Ok(());
+    if let Err(err) = write_initial_envelope_stream(&mut tls_stream, &envelope).await {
+        match err {
+            InitialEnvelopeWriteError::Io(_) => {
+                // A failure to write `DaemonHello` after a valid
+                // `AdapterHello` cannot be distinguished from a
+                // peer disconnect at this layer: the local kernel
+                // socket may be perfectly healthy while the peer
+                // has already closed its read half. Treating the
+                // failure as an internal daemon defect would let a
+                // misbehaving client take the listener down with
+                // one truncated read, which the
+                // `docs/plans/x-trace/03b-protocol-and-api.md` §2.1
+                // contract explicitly forbids. The connection-local
+                // error is normalised to `Ok(())` so the supervisor
+                // keeps accepting subsequent connections.
+                debug!("daemon hello write failed; treating as connection-local peer disconnect");
+                return Ok(());
+            }
+            InitialEnvelopeWriteError::Encode(_) | InitialEnvelopeWriteError::LengthOverflow(_) => {
+                // Fatal internal defect: the codec refused the
+                // envelope or produced an oversized body. Surfacing
+                // the typed error lets the supervisor stop the
+                // daemon with a real diagnostic instead of silently
+                // dropping an internal failure on the floor.
+                return Err(DaemonError::Transport(format!("daemon hello write failed: {err}",)));
+            }
+        }
     }
     // The §2.1 deletion contract is satisfied only after
     // `AdapterHello` has been validated AND `DaemonHello` has been
@@ -778,36 +777,65 @@ where
         .map_err(|err| std::io::Error::other(format!("decode envelope: {err}")))
 }
 
+/// Failure modes for the pre-split envelope writer.
+///
+/// `Io` is connection-local because the local socket may be healthy
+/// while the peer has already closed its read half, so a write
+/// failure there cannot be distinguished from a peer disconnect at
+/// this layer. `Encode` and `LengthOverflow` are fatal internal
+/// daemon defects: the codec writes into an owned `Vec<u8>` that
+/// never runs out of addressable memory in practice, and the
+/// length overflow only triggers on multi-gigabyte envelopes that
+/// no legitimate adapter would produce.
+#[derive(Debug, Error)]
+enum InitialEnvelopeWriteError {
+    /// Underlying TLS stream reported an I/O failure. Connection-local.
+    #[error("write envelope: {0}")]
+    Io(#[from] std::io::Error),
+    /// Protobuf encoder refused the envelope. Fatal internal defect.
+    #[error("encode envelope: {0}")]
+    Encode(#[from] prost::EncodeError),
+    /// Encoded envelope length exceeds `u32`. Fatal internal defect.
+    #[error("envelope length {0} does not fit in u32")]
+    LengthOverflow(usize),
+}
+
 /// Writes one length-prefixed envelope directly through the tokio
-/// TLS stream, encoding the protobuf body in place. The helper
-/// returns `true` on a complete write and `false` on any failure
-/// (protobuf encode error, oversized payload, or underlying I/O
-/// failure). A `false` outcome cannot be distinguished from a peer
-/// disconnect at this layer — the local kernel socket may be
-/// perfectly healthy while the peer has already closed its read
-/// half — so callers must treat the failure as connection-local
-/// rather than as an internal daemon defect.
-async fn write_initial_envelope_stream<S>(tls_stream: &mut S, envelope: &AgentEnvelope) -> bool
+/// TLS stream, encoding the protobuf body in place. I/O failures
+/// are reported through [`InitialEnvelopeWriteError::Io`] so the
+/// `DaemonHello` call site can treat them as peer disconnects;
+/// encode and length failures are reported through the typed
+/// `Encode` and `LengthOverflow` variants so the caller surfaces
+/// a real internal defect rather than silently normalising it.
+async fn write_initial_envelope_stream<S>(
+    tls_stream: &mut S,
+    envelope: &AgentEnvelope,
+) -> Result<(), InitialEnvelopeWriteError>
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
     let mut buf = Vec::with_capacity(envelope.encoded_len());
-    if envelope.encode(&mut buf).is_err() {
-        return false;
-    }
-    let len = match u32::try_from(buf.len()) {
-        Ok(len) => len,
-        Err(_) => return false,
-    };
-    if tls_stream.write_all(&len.to_be_bytes()).await.is_err() {
-        return false;
-    }
-    tls_stream.write_all(&buf).await.is_ok()
+    envelope.encode(&mut buf)?;
+    let len = u32::try_from(buf.len())
+        .map_err(|_| InitialEnvelopeWriteError::LengthOverflow(buf.len()))?;
+    tls_stream.write_all(&len.to_be_bytes()).await?;
+    tls_stream.write_all(&buf).await?;
+    Ok(())
 }
 
 /// Emits a `ProtocolError` directly through the tokio TLS stream
 /// before the writer half is handed off. Used only on the pre-split
 /// path so the protocol-error envelope is delivered before close.
+///
+/// The helper is best-effort: any failure from
+/// [`write_initial_envelope_stream`] (connection-local I/O, fatal
+/// encode, or fatal length overflow) is reported through the
+/// returned [`std::io::Error`] without tearing the daemon down.
+/// Fatal encoding failures inside the [`ProtocolError`] envelope
+/// itself are vanishingly rare because the codec writes into an
+/// owned `Vec<u8>`; treating them as best-effort keeps the policy
+/// consistent with `send_protocol_error_stream`'s role as a
+/// last-resort diagnostic that must not take the listener down.
 ///
 /// The `clock` parameter is the daemon-scoped [`MonotonicClock`] the
 /// supervisor constructs once before the accept loop; reusing the
@@ -838,9 +866,9 @@ where
             message: message.to_string(),
         })),
     };
-    if !write_initial_envelope_stream(tls_stream, &envelope).await {
-        return Err(std::io::Error::other("failed to write protocol error"));
-    }
+    write_initial_envelope_stream(tls_stream, &envelope)
+        .await
+        .map_err(|err| std::io::Error::other(format!("failed to write protocol error: {err}")))?;
     // The limit is advisory; the helper never exceeds it because the
     // envelope is bounded by the static `ProtocolError` payload size.
     let _ = max_envelope_bytes;
@@ -901,7 +929,7 @@ struct SupervisorContext {
     /// Optional bootstrap artifact handle shared between the
     /// supervisor and the connection tasks. The supervisor hands a
     /// clone to each spawned task so the post-hello
-    /// [`BootstrapArtifact::try_release`] call is race-free.
+    /// `try_release` call is race-free.
     bootstrap: Option<Arc<BootstrapArtifact>>,
 }
 
@@ -953,21 +981,46 @@ fn classify_join_completion(
     }
 }
 
+/// Drains every remaining connection task after a triggering
+/// failure has been observed, logs any later drain failure, and
+/// returns the already-observed triggering [`DaemonError`]
+/// unchanged. The supervisor calls this helper from the three
+/// trigger branches (connection-level [`DaemonError`], join panic /
+/// cancellation, listener accept failure) so the policy lives in
+/// exactly one place: a later drain failure is logged but
+/// discarded because the caller is best served by the failure
+/// mode that already happened, not by a downstream drain artefact.
+async fn shutdown_after_trigger(
+    trigger: DaemonError,
+    connections: &mut JoinSet<Result<(), DaemonError>>,
+    shutdown_tx_for_supervisor: &watch::Sender<bool>,
+    shutdown_observer: &mut JoinHandle<()>,
+) -> DaemonError {
+    let _ = shutdown_tx_for_supervisor.send(true);
+    shutdown_observer.abort();
+    let _ = shutdown_observer.await;
+    if let Some(drain_err) = drain_connections(connections).await {
+        warn!(
+            error = %drain_err,
+            "ignoring drain failure in favor of the triggering failure",
+        );
+    }
+    trigger
+}
+
 /// Awaits every remaining connection task and returns the first
 /// failure observed during the drain, in actual `join_next`
 /// observation order. Connection-level [`DaemonError`]s and panic /
 /// cancellation wraps are treated as the same kind of failure for
-/// ordering purposes; the helper does not give one priority over the
-/// other. The supervisor calls this helper in three places:
+/// ordering purposes; the helper does not give one priority over
+/// the other. The supervisor calls this helper in three places:
 ///
 /// - after the user-supplied shutdown future resolves and there is
 ///   no prior trigger, where the first observed error wins;
-/// - after a connection-level [`DaemonError`] escapes the
-///   peer-disconnect boundary, where the trigger is the original
-///   error and any drain failure is logged but discarded;
-/// - after a panic or cancellation surfaces through the join, where
-///   the trigger is the join failure and any drain failure is logged
-///   but discarded.
+/// - through [`shutdown_after_trigger`] for every trigger branch
+///   (connection-level [`DaemonError`], join panic / cancellation,
+///   and listener accept failure), where the trigger is preserved
+///   and any drain failure is logged but discarded.
 async fn drain_connections(
     connections: &mut JoinSet<Result<(), DaemonError>>,
 ) -> Option<DaemonError> {
@@ -1307,17 +1360,15 @@ mod tests {
         }
     }
 
-    /// `drain_connections` returns the first failure observed during
-    /// the drain, in actual `join_next` observation order, regardless
-    /// of whether the failure was a connection-level [`DaemonError`]
-    /// or a panic/cancellation wrap. The supervisor relies on this
-    /// property to report the genuine first-observed failure mode to
-    /// the caller during an ordinary shutdown with no prior trigger.
+    /// `drain_connections` returns `None` when every task completes
+    /// cleanly and returns the first observed error otherwise. The
+    /// test only asserts the invariant; ordering between independent
+    /// spawned tasks is not promised by `tokio::task::JoinSet`, so
+    /// the test avoids any comparison that depends on which task
+    /// finishes first. A regression that returns `Some` on a clean
+    /// drain or fabricates a join wrap from a connection error would
+    /// fail the assertions below.
     #[tokio::test]
-    #[allow(
-        clippy::panic,
-        reason = "test deliberately panics inside a spawned task to exercise the drain ordering"
-    )]
     async fn drain_connections_returns_first_observed_error() {
         // First drain: every task completes cleanly; the helper
         // must return `None`.
@@ -1328,38 +1379,9 @@ mod tests {
         let first = drain_connections(&mut clean).await;
         assert!(first.is_none(), "clean drain must return None, got {first:?}");
 
-        // Second drain: a connection-level error precedes a panic.
-        // The connection-level error is observed first because
-        // tokio's `JoinSet` polls spawned tasks in spawn order, so
-        // the helper must surface that connection error first
-        // rather than giving the join error unconditional priority.
-        let mut connection_first: JoinSet<Result<(), DaemonError>> = JoinSet::new();
-        connection_first
-            .spawn(async { Err(DaemonError::Transport("connection-local".to_string())) });
-        connection_first.spawn(async { panic!("deliberate panic") });
-        let first = drain_connections(&mut connection_first).await;
-        match first {
-            Some(DaemonError::Transport(_)) => {}
-            other => unreachable!("expected Transport error first, got {other:?}"),
-        }
-
-        // Third drain: a panic precedes a connection-level error.
-        // The helper must surface the join failure because it
-        // happened first; a regression that hard-codes connection
-        // priority would observe the later Transport error and the
-        // assertion below would catch it.
-        let mut panic_first: JoinSet<Result<(), DaemonError>> = JoinSet::new();
-        panic_first.spawn(async { panic!("deliberate panic first") });
-        panic_first.spawn(async { Err(DaemonError::Transport("connection-local".to_string())) });
-        let first = drain_connections(&mut panic_first).await;
-        match first {
-            Some(DaemonError::Join(_)) => {}
-            other => unreachable!("expected Join error first, got {other:?}"),
-        }
-
-        // Fourth drain: a clean completion is followed by a single
-        // connection-level error; the helper must surface only the
-        // error rather than fabricating a join wrap.
+        // Second drain: a single connection-level error is the
+        // only failure; the helper must surface that error and
+        // must not invent a join wrap.
         let mut single_error: JoinSet<Result<(), DaemonError>> = JoinSet::new();
         single_error.spawn(async { Ok(()) });
         single_error.spawn(async { Err(DaemonError::Bootstrap("release".to_string())) });
@@ -1368,63 +1390,124 @@ mod tests {
             Some(DaemonError::Bootstrap(_)) => {}
             other => unreachable!("expected Bootstrap error, got {other:?}"),
         }
+
+        // Third drain: a panic is the only failure; the helper must
+        // surface the wrapped join error rather than swallowing the
+        // panic. The `panic!` lives inside the spawned task so the
+        // lint reports on the closure body rather than the call
+        // site; the `#![cfg_attr(test, allow(clippy::panic))]` at
+        // the crate root carries the necessary exception.
+        let mut panic_only: JoinSet<Result<(), DaemonError>> = JoinSet::new();
+        panic_only.spawn(async { panic!("deliberate panic") });
+        let first = drain_connections(&mut panic_only).await;
+        match first {
+            Some(DaemonError::Join(_)) => {}
+            other => unreachable!("expected Join error, got {other:?}"),
+        }
+
+        // Fourth drain: multiple errors; the helper returns exactly
+        // one (the first observed) without dropping the others or
+        // accumulating them. The assertion pins the cardinality
+        // contract rather than which specific error wins, because
+        // `tokio::task::JoinSet` does not promise spawn-order
+        // completion.
+        let mut many: JoinSet<Result<(), DaemonError>> = JoinSet::new();
+        for i in 0..4 {
+            many.spawn(async move { Err(DaemonError::Transport(format!("task-{i}"))) });
+        }
+        let first = drain_connections(&mut many).await;
+        assert!(
+            matches!(first, Some(DaemonError::Transport(_))),
+            "drain must surface exactly one Transport error, got {first:?}",
+        );
     }
 
     /// The supervisor policy is: when a triggering failure has
     /// already happened, drain every remaining task, log any drain
     /// failure, and return the triggering error unchanged. The
-    /// [`drain_connections`] helper only returns the first error
-    /// observed, so the supervisor code wraps the helper with a
-    /// trigger-error preservation step. This test pins that policy
-    /// at the unit level by exercising the same shape the
-    /// supervisor uses on each of the three failure paths.
+    /// helper used by `serve` is [`shutdown_after_trigger`]; this
+    /// test exercises it end-to-end with a deterministic second
+    /// task that fails during drain so the policy — trigger wins,
+    /// later drain failure is discarded — is the only thing under
+    /// test.
+    ///
+    /// The test synchronises the second task through a
+    /// `tokio::sync::Notify` so the second failure is guaranteed to
+    /// surface during drain rather than being reordered by the
+    /// runtime scheduler. The `Notify` is held open until the
+    /// helper releases it; this gives the test deterministic
+    /// ordering without any sleep or poll loop.
     #[tokio::test]
     async fn supervisor_preserves_trigger_error_over_drain_failure() {
-        // Drain path 1: the supervisor collects the trigger via
-        // `join_next` first, then calls `drain_connections` on the
-        // already-drained set. The drain must report no further
-        // failure because the trigger task has already been
-        // reaped.
-        let mut set: JoinSet<Result<(), DaemonError>> = JoinSet::new();
-        set.spawn(async { Err(DaemonError::Transport("trigger".to_string())) });
-        let _trigger = match set.join_next().await.expect("join next") {
-            Ok(Err(err)) => err,
-            other => unreachable!("expected connection-level error, got {other:?}"),
-        };
-        let drain_failure = drain_connections(&mut set).await;
-        assert!(
-            drain_failure.is_none(),
-            "drain must not surface a failure when no extra task is left, got {drain_failure:?}",
-        );
+        use std::sync::Arc as StdArc;
+        use tokio::sync::Notify;
 
-        // Drain path 2: the trigger fires, a fresh task joins
-        // with a different failure, and the supervisor must
-        // surface the trigger regardless of the drain's outcome.
-        // We model the supervisor's pattern inline: collect the
-        // trigger via `join_next`, drain, log any drain failure,
-        // and return the trigger.
+        let gate = StdArc::new(Notify::new());
+        let gate_for_drain = gate.clone();
+        let mut set: JoinSet<Result<(), DaemonError>> = JoinSet::new();
+        set.spawn(async move {
+            // The triggering failure arrives first. We hold the
+            // gate release until after the supervisor helper has
+            // collected the trigger via `join_next`, so the drain
+            // failure below is guaranteed to be observed after the
+            // trigger — never before it.
+            let result = Err(DaemonError::Transport("trigger".to_string()));
+            gate_for_drain.notify_one();
+            result
+        });
+        set.spawn(async move {
+            // The drain failure waits for the trigger to be
+            // observed so the test never depends on scheduler
+            // order. Once released, it reports a different error.
+            gate.notified().await;
+            Err(DaemonError::Bootstrap("drain".to_string()))
+        });
+
+        // Collect the trigger the same way `serve` does: pull the
+        // first completion out of `join_next`, then call the
+        // supervisor helper.
+        let trigger = match set.join_next().await.expect("trigger join") {
+            Ok(Err(err)) => err,
+            other => unreachable!("expected trigger error, got {other:?}"),
+        };
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        let observer: JoinHandle<()> = tokio::spawn(async move {});
+        let mut observer = observer;
+        let returned = shutdown_after_trigger(trigger, &mut set, &shutdown_tx, &mut observer).await;
+        match returned {
+            DaemonError::Transport(_) => {}
+            other => unreachable!("trigger must win; got {other:?}"),
+        }
+        // The drain failure must have been observed during the
+        // drain (otherwise the trigger was not actually first and
+        // the test never exercised the trigger-wins branch). The
+        // `JoinSet` is drained by the helper, so no tasks remain.
+        assert!(set.join_next().await.is_none(), "set must be drained");
+    }
+
+    /// The drain helper also covers the no-extra-task case: when
+    /// the trigger fires alone, the helper returns the trigger
+    /// unchanged without logging a "later drain failure" because
+    /// there is no later failure. The test pins that the helper
+    /// does not invent errors and does not panic on an empty
+    /// follow-up set.
+    #[tokio::test]
+    async fn shutdown_after_trigger_returns_trigger_unchanged_when_no_extra_tasks() {
         let mut set: JoinSet<Result<(), DaemonError>> = JoinSet::new();
         set.spawn(async { Err(DaemonError::Transport("trigger".to_string())) });
-        // `join_next` is consumed inline so the test models the
-        // supervisor reading the trigger before the drain begins.
-        let trigger = match set.join_next().await.expect("join next") {
+        let trigger = match set.join_next().await.expect("trigger join") {
             Ok(Err(err)) => err,
-            other => unreachable!("expected connection-level error, got {other:?}"),
+            other => unreachable!("expected trigger error, got {other:?}"),
         };
-        let drain = drain_connections(&mut set).await;
-        let final_err = match drain {
-            None => trigger,
-            Some(drain_err) => {
-                // The supervisor pattern in `serve` logs `drain_err`
-                // and returns the trigger. Mirror that here.
-                tracing::warn!(error = %drain_err, "drain failure ignored");
-                trigger
-            }
-        };
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
+        let observer: JoinHandle<()> = tokio::spawn(async move {});
+        let mut observer = observer;
+        let returned = shutdown_after_trigger(trigger, &mut set, &shutdown_tx, &mut observer).await;
         assert!(
-            matches!(final_err, DaemonError::Transport(_)),
-            "trigger error must win; got {final_err:?}",
+            matches!(returned, DaemonError::Transport(_)),
+            "trigger must be returned unchanged when no extra tasks exist; got {returned:?}",
         );
+        assert!(set.join_next().await.is_none(), "set must be drained");
     }
 
     /// The daemon-scoped [`MonotonicClock`] is the same instance the

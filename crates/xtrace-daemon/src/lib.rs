@@ -84,6 +84,13 @@
         reason = "tests assert on fallible fixture data and exercise supervisor paths"
     )
 )]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::panic,
+        reason = "supervisor classification tests deliberately panic inside spawned tasks"
+    )
+)]
 
 pub mod bootstrap;
 pub mod config;
@@ -96,7 +103,7 @@ pub mod secret;
 pub mod session;
 pub mod tls;
 
-pub use bootstrap::{BootstrapArtifact, BootstrapArtifactFields, BootstrapOwner, ReleaseOutcome};
+pub use bootstrap::{BootstrapArtifact, BootstrapArtifactFields, BootstrapOwner};
 pub use config::{DaemonConfig, LOOPBACK_HOST, LoopbackPolicy, OutboundCapacity};
 pub use daemon::{
     BoundDaemon, DaemonBuilder, MonotonicClock, ShutdownSignal, TLS_EXPORTER_LABEL,
