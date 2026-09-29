@@ -1307,6 +1307,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "xtrace-ingest"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "prost",
+ "thiserror",
+ "uuid",
+ "xtrace-domain",
+ "xtrace-protocol",
+]
+
+[[package]]
 name = "xtrace-protocol"
 version = "0.1.0"
 dependencies = [

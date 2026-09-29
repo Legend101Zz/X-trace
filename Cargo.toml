@@ -4,6 +4,7 @@ members = [
     "crates/xtrace-domain",
     "crates/xtrace-application",
     "crates/xtrace-protocol",
+    "crates/xtrace-ingest",
     "crates/xtrace-store",
     "crates/xtrace-cli",
     "crates/xtrace-daemon",
