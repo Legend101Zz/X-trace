@@ -6,12 +6,11 @@
 //! network stack. The bound port is always OS-assigned; callers see
 //! the resolved [`SocketAddr`] through [`LoopbackListener::local_addr`].
 
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener};
 
 use tokio::net::TcpListener as TokioTcpListener;
 
-use crate::config::{LOOPBACK_HOST, LoopbackPolicy};
+use crate::config::LoopbackPolicy;
 use crate::error::DaemonError;
 
 /// Result of binding to a loopback address.
@@ -34,25 +33,21 @@ impl LoopbackListener {
     /// bind or the resolved address is unexpectedly not loopback.
     pub async fn bind(policy: LoopbackPolicy) -> Result<Self, DaemonError> {
         let socket_addr = loopback_socket_addr(policy)?;
-        let std_listener = TcpListener::bind(socket_addr).map_err(|err| {
-            DaemonError::BindFailed(format!(
-                "bind {socket_addr}: {err}"
-            ))
-        })?;
-        std_listener.set_nonblocking(true).map_err(|err| {
-            DaemonError::BindFailed(format!("set_nonblocking: {err}"))
-        })?;
-        let local_addr = std_listener.local_addr().map_err(|err| {
-            DaemonError::BindFailed(format!("local_addr: {err}"))
-        })?;
+        let std_listener = TcpListener::bind(socket_addr)
+            .map_err(|err| DaemonError::BindFailed(format!("bind {socket_addr}: {err}")))?;
+        std_listener
+            .set_nonblocking(true)
+            .map_err(|err| DaemonError::BindFailed(format!("set_nonblocking: {err}")))?;
+        let local_addr = std_listener
+            .local_addr()
+            .map_err(|err| DaemonError::BindFailed(format!("local_addr: {err}")))?;
         if !local_addr.ip().is_loopback() {
             return Err(DaemonError::BindFailed(format!(
                 "bound to non-loopback address {local_addr}"
             )));
         }
-        let inner = TokioTcpListener::from_std(std_listener).map_err(|err| {
-            DaemonError::BindFailed(format!("from_std: {err}"))
-        })?;
+        let inner = TokioTcpListener::from_std(std_listener)
+            .map_err(|err| DaemonError::BindFailed(format!("from_std: {err}")))?;
         Ok(Self { inner, local_addr })
     }
 
@@ -67,9 +62,7 @@ impl LoopbackListener {
     /// fails; the underlying I/O error is preserved as a string but
     /// never embeds a captured value.
     pub async fn accept(&self) -> Result<(tokio::net::TcpStream, SocketAddr), DaemonError> {
-        self.inner.accept().await.map_err(|err| {
-            DaemonError::BindFailed(format!("accept: {err}"))
-        })
+        self.inner.accept().await.map_err(|err| DaemonError::BindFailed(format!("accept: {err}")))
     }
 
     /// Returns the local address the listener is bound to.
@@ -89,16 +82,10 @@ impl LoopbackListener {
 
 fn loopback_socket_addr(policy: LoopbackPolicy) -> Result<SocketAddr, DaemonError> {
     match policy {
-        LoopbackPolicy::V4Only => Ok(SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
-            0,
-        ))),
-        LoopbackPolicy::V6Only => Ok(SocketAddr::V6(SocketAddrV6::new(
-            Ipv6Addr::LOCALHOST,
-            0,
-            0,
-            0,
-        ))),
+        LoopbackPolicy::V4Only => Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))),
+        LoopbackPolicy::V6Only => {
+            Ok(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)))
+        }
         LoopbackPolicy::Any => {
             // Pick the IPv4 loopback by default; tests can override
             // through the explicit policy variants. The OS will still
@@ -125,9 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_picks_an_os_assigned_loopback_port() {
-        let listener = LoopbackListener::bind(LoopbackPolicy::V4Only)
-            .await
-            .expect("bind");
+        let listener = LoopbackListener::bind(LoopbackPolicy::V4Only).await.expect("bind");
         let addr = listener.local_addr();
         assert!(addr.ip().is_loopback());
         assert_ne!(addr.port(), 0);
@@ -135,11 +120,7 @@ mod tests {
 
     #[test]
     fn loopback_socket_addr_returns_loopback_for_every_policy() {
-        for policy in [
-            LoopbackPolicy::V4Only,
-            LoopbackPolicy::V6Only,
-            LoopbackPolicy::Any,
-        ] {
+        for policy in [LoopbackPolicy::V4Only, LoopbackPolicy::V6Only, LoopbackPolicy::Any] {
             let addr = loopback_socket_addr(policy).expect("addr");
             assert!(is_loopback_ip(addr.ip()));
             assert_eq!(addr.port(), 0, "OS-assigned port must be zero");
@@ -168,9 +149,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_returns_a_stream_with_a_loopback_peer() {
-        let listener = LoopbackListener::bind(LoopbackPolicy::V4Only)
-            .await
-            .expect("bind");
+        let listener = LoopbackListener::bind(LoopbackPolicy::V4Only).await.expect("bind");
         let addr = listener.local_addr();
         let connector = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let (server_stream, peer) = listener.accept().await.expect("accept");
@@ -180,6 +159,4 @@ mod tests {
     }
 
     // Suppress unused-warning on `io` when only used in doctests.
-    #[allow(dead_code)]
-    fn _io(_: io::Result<()>) {}
 }

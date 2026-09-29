@@ -13,8 +13,8 @@
 //! helper can hand it to the adapter without changing process
 //! arguments.
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use ring::rand::{SecureRandom, SystemRandom};
 use zeroize::{Zeroize, Zeroizing};
 

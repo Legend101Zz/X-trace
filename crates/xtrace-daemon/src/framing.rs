@@ -56,10 +56,7 @@ impl<'a, W: Write> EnvelopeEncoder<'a, W> {
         if len > self.codec.max_envelope_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "envelope length {len} exceeds limit {}",
-                    self.codec.max_envelope_bytes
-                ),
+                format!("envelope length {len} exceeds limit {}", self.codec.max_envelope_bytes),
             ));
         }
         self.writer.write_all(&len.to_be_bytes())?;
@@ -89,9 +86,23 @@ impl<'a, R: Read> EnvelopeDecoder<'a, R> {
     /// the stream ends mid-envelope, the announced length exceeds the
     /// negotiated limit, or the protobuf decoder rejects the bytes.
     pub fn read_envelope(&mut self) -> io::Result<AgentEnvelope> {
-        self.codec
-            .read_from(&mut self.reader)
-            .map_err(|err| io::Error::other(format!("read envelope: {err}")))
+        self.codec.read_from(&mut self.reader).map_err(map_envelope_error)
+    }
+}
+
+fn map_envelope_error(err: xtrace_protocol::envelope::EnvelopeError) -> io::Error {
+    use xtrace_protocol::envelope::EnvelopeError as E;
+    match &err {
+        E::TooLarge { .. } | E::BadLength(_) | E::BadMagic => {
+            io::Error::new(io::ErrorKind::InvalidData, format!("read envelope: {err}"))
+        }
+        E::Truncated { .. } => {
+            io::Error::new(io::ErrorKind::UnexpectedEof, format!("read envelope: {err}"))
+        }
+        E::ProtocolVersion { .. } => {
+            io::Error::new(io::ErrorKind::InvalidData, format!("read envelope: {err}"))
+        }
+        E::Decode(_) | E::Encode(_) | E::Io(_) => io::Error::other(format!("read envelope: {err}")),
     }
 }
 
@@ -137,10 +148,7 @@ impl<W: AsyncWrite + Unpin> EnvelopeAsyncEncoder<W> {
         if len > self.codec.max_envelope_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "envelope length {len} exceeds limit {}",
-                    self.codec.max_envelope_bytes
-                ),
+                format!("envelope length {len} exceeds limit {}", self.codec.max_envelope_bytes),
             ));
         }
         self.writer.write_all(&len.to_be_bytes()).await?;
@@ -187,10 +195,7 @@ impl<R: AsyncRead + Unpin> EnvelopeAsyncDecoder<R> {
         let announced = usize::try_from(announced)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid length"))?;
         if announced == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "empty envelope",
-            ));
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "empty envelope"));
         }
         let mut body = vec![0u8; announced];
         self.reader.read_exact(&mut body).await?;
@@ -237,13 +242,11 @@ mod tests {
     #[test]
     fn encoder_refuses_oversize_envelope() {
         let mut envelope = sample_envelope();
-        if let xtp_payload_ctor::PayloadOneof::Health(ref mut h) = envelope.payload.as_mut().unwrap() {
+        if let Some(xtp_payload_ctor::PayloadOneof::Health(h)) = envelope.payload.as_mut() {
             h.status = "x".repeat(64);
         }
         let mut buf = Vec::new();
-        let err = EnvelopeEncoder::new(&mut buf, 16)
-            .write_envelope(&envelope)
-            .unwrap_err();
+        let err = EnvelopeEncoder::new(&mut buf, 16).write_envelope(&envelope).unwrap_err();
         assert!(matches!(err.kind(), io::ErrorKind::InvalidData));
     }
 
@@ -252,9 +255,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&u32::to_be_bytes(u32::MAX));
         let mut cursor = buf.as_slice();
-        let err = EnvelopeDecoder::new(&mut cursor, 1024)
-            .read_envelope()
-            .unwrap_err();
+        let err = EnvelopeDecoder::new(&mut cursor, 1024).read_envelope().unwrap_err();
         assert!(matches!(err.kind(), io::ErrorKind::InvalidData));
     }
 }

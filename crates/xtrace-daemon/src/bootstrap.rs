@@ -124,28 +124,21 @@ impl BootstrapArtifact {
             }
             chmod_dir_owner_only(parent)?;
         }
-        let body = serde_json::to_string_pretty(&fields).map_err(|err| {
-            DaemonError::Bootstrap(format!("serialize bootstrap: {err}"))
-        })?;
+        let body = serde_json::to_string_pretty(&fields)
+            .map_err(|err| DaemonError::Bootstrap(format!("serialize bootstrap: {err}")))?;
         let tmp = path.with_extension("json.tmp");
         {
             let mut file = fs::File::create(&tmp).map_err(|err| {
-                DaemonError::Bootstrap(format!(
-                    "create bootstrap tmp {}: {err}",
-                    tmp.display()
-                ))
+                DaemonError::Bootstrap(format!("create bootstrap tmp {}: {err}", tmp.display()))
             })?;
-            file.write_all(body.as_bytes()).map_err(|err| {
-                DaemonError::Bootstrap(format!("write bootstrap tmp: {err}"))
-            })?;
-            file.sync_all().map_err(|err| {
-                DaemonError::Bootstrap(format!("fsync bootstrap tmp: {err}"))
-            })?;
+            file.write_all(body.as_bytes())
+                .map_err(|err| DaemonError::Bootstrap(format!("write bootstrap tmp: {err}")))?;
+            file.sync_all()
+                .map_err(|err| DaemonError::Bootstrap(format!("fsync bootstrap tmp: {err}")))?;
         }
         chmod_file_owner_only(&tmp)?;
-        fs::rename(&tmp, path).map_err(|err| {
-            DaemonError::Bootstrap(format!("rename bootstrap: {err}"))
-        })?;
+        fs::rename(&tmp, path)
+            .map_err(|err| DaemonError::Bootstrap(format!("rename bootstrap: {err}")))?;
         chmod_file_owner_only(path)?;
         Ok(Self { fields, path: path.to_path_buf(), owner })
     }
@@ -159,12 +152,10 @@ impl BootstrapArtifact {
     /// session secret because the [`BootstrapArtifactFields`] fields
     /// are validated before the function returns.
     pub fn read(path: &Path) -> Result<Self, DaemonError> {
-        let text = fs::read_to_string(path).map_err(|err| {
-            DaemonError::Bootstrap(format!("read bootstrap: {err}"))
-        })?;
-        let fields: BootstrapArtifactFields = serde_json::from_str(&text).map_err(|err| {
-            DaemonError::Bootstrap(format!("parse bootstrap: {err}"))
-        })?;
+        let text = fs::read_to_string(path)
+            .map_err(|err| DaemonError::Bootstrap(format!("read bootstrap: {err}")))?;
+        let fields: BootstrapArtifactFields = serde_json::from_str(&text)
+            .map_err(|err| DaemonError::Bootstrap(format!("parse bootstrap: {err}")))?;
         validate_fields(&fields)?;
         Ok(Self { fields, path: path.to_path_buf(), owner: BootstrapOwner::Persistent })
     }
@@ -189,12 +180,10 @@ impl BootstrapArtifact {
     /// Returns [`DaemonError::Bootstrap`] for any I/O or parse
     /// failure.
     pub fn reload(&mut self) -> Result<(), DaemonError> {
-        let text = fs::read_to_string(&self.path).map_err(|err| {
-            DaemonError::Bootstrap(format!("read bootstrap: {err}"))
-        })?;
-        let fields: BootstrapArtifactFields = serde_json::from_str(&text).map_err(|err| {
-            DaemonError::Bootstrap(format!("parse bootstrap: {err}"))
-        })?;
+        let text = fs::read_to_string(&self.path)
+            .map_err(|err| DaemonError::Bootstrap(format!("read bootstrap: {err}")))?;
+        let fields: BootstrapArtifactFields = serde_json::from_str(&text)
+            .map_err(|err| DaemonError::Bootstrap(format!("parse bootstrap: {err}")))?;
         validate_fields(&fields)?;
         self.fields = fields;
         Ok(())
@@ -223,7 +212,14 @@ impl Drop for BootstrapArtifact {
 }
 
 impl BootstrapArtifactFields {
-    /// Constructs a new field set from a daemon bind result.
+    /// Constructs a new field set from a daemon bind result. Every
+    /// field is sourced directly from the daemon's bind state so
+    /// the bootstrap file is the only legitimate place to look up
+    /// the session secret, certificate pin, and identity triple.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "all eight fields are independent daemon-bind outputs the launcher must read out of band"
+    )]
     #[must_use]
     pub fn new(
         host: String,
@@ -286,9 +282,7 @@ fn validate_fields(fields: &BootstrapArtifactFields) -> Result<(), DaemonError> 
         ));
     }
     if fields.session_secret_base64.is_empty() {
-        return Err(DaemonError::Bootstrap(
-            "session_secret_base64 must not be empty".to_string(),
-        ));
+        return Err(DaemonError::Bootstrap("session_secret_base64 must not be empty".to_string()));
     }
     // Project and session identifiers are validated as canonical
     // UUIDv7 strings through their `FromStr` implementations.
@@ -306,9 +300,8 @@ fn validate_fields(fields: &BootstrapArtifactFields) -> Result<(), DaemonError> 
 #[cfg(unix)]
 fn chmod_dir_owner_only(path: &Path) -> Result<(), DaemonError> {
     use std::os::unix::fs::PermissionsExt as _;
-    let metadata = fs::metadata(path).map_err(|err| {
-        DaemonError::Bootstrap(format!("stat dir {}: {err}", path.display()))
-    })?;
+    let metadata = fs::metadata(path)
+        .map_err(|err| DaemonError::Bootstrap(format!("stat dir {}: {err}", path.display())))?;
     let mut permissions = metadata.permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(path, permissions)
@@ -323,9 +316,8 @@ fn chmod_dir_owner_only(_path: &Path) -> Result<(), DaemonError> {
 #[cfg(unix)]
 fn chmod_file_owner_only(path: &Path) -> Result<(), DaemonError> {
     use std::os::unix::fs::PermissionsExt as _;
-    let metadata = fs::metadata(path).map_err(|err| {
-        DaemonError::Bootstrap(format!("stat file {}: {err}", path.display()))
-    })?;
+    let metadata = fs::metadata(path)
+        .map_err(|err| DaemonError::Bootstrap(format!("stat file {}: {err}", path.display())))?;
     let mut permissions = metadata.permissions();
     permissions.set_mode(0o600);
     fs::set_permissions(path, permissions)
@@ -371,12 +363,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempdir("perms");
         let path = dir.join("bootstrap.json");
-        let artifact = BootstrapArtifact::write(
-            &path,
-            sample_fields(),
-            BootstrapOwner::Persistent,
-        )
-        .expect("write");
+        let artifact = BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Persistent)
+            .expect("write");
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "bootstrap file must be owner-only");
         // Round-trip the session secret so we do not lose the test
@@ -391,12 +379,7 @@ mod tests {
         let path = dir.join("bootstrap.json");
         let mut fields = sample_fields();
         fields.host = "0.0.0.0".to_string();
-        let err = BootstrapArtifact::write(
-            &path,
-            fields,
-            BootstrapOwner::Persistent,
-        )
-        .unwrap_err();
+        let err = BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).unwrap_err();
         assert!(matches!(err, DaemonError::Bootstrap(_)));
     }
 
@@ -406,12 +389,7 @@ mod tests {
         let path = dir.join("bootstrap.json");
         let mut fields = sample_fields();
         fields.certificate_sha256_pin = "abcd".to_string();
-        let err = BootstrapArtifact::write(
-            &path,
-            fields,
-            BootstrapOwner::Persistent,
-        )
-        .unwrap_err();
+        let err = BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).unwrap_err();
         assert!(matches!(err, DaemonError::Bootstrap(_)));
     }
 
@@ -421,12 +399,7 @@ mod tests {
         let path = dir.join("bootstrap.json");
         let mut fields = sample_fields();
         fields.certificate_sha256_pin = "z".repeat(64);
-        let err = BootstrapArtifact::write(
-            &path,
-            fields,
-            BootstrapOwner::Persistent,
-        )
-        .unwrap_err();
+        let err = BootstrapArtifact::write(&path, fields, BootstrapOwner::Persistent).unwrap_err();
         assert!(matches!(err, DaemonError::Bootstrap(_)));
     }
 
@@ -436,12 +409,8 @@ mod tests {
         let path = dir.join("bootstrap.json");
         let fields = sample_fields();
         let secret_before = fields.session_secret_base64.clone();
-        let artifact = BootstrapArtifact::write(
-            &path,
-            fields.clone(),
-            BootstrapOwner::Persistent,
-        )
-        .expect("write");
+        let artifact = BootstrapArtifact::write(&path, fields.clone(), BootstrapOwner::Persistent)
+            .expect("write");
         let loaded = BootstrapArtifact::read(&path).expect("read");
         assert_eq!(loaded.fields(), artifact.fields());
         assert_eq!(loaded.fields().session_secret_base64, secret_before);
@@ -452,12 +421,9 @@ mod tests {
         let dir = tempdir("drop");
         let path = dir.join("bootstrap.json");
         {
-            let _artifact = BootstrapArtifact::write(
-                &path,
-                sample_fields(),
-                BootstrapOwner::Daemon,
-            )
-            .expect("write");
+            let _artifact =
+                BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Daemon)
+                    .expect("write");
             assert!(path.exists(), "file exists while the guard is alive");
         }
         assert!(!path.exists(), "file must be removed on drop");
@@ -468,12 +434,9 @@ mod tests {
         let dir = tempdir("persist");
         let path = dir.join("bootstrap.json");
         {
-            let _artifact = BootstrapArtifact::write(
-                &path,
-                sample_fields(),
-                BootstrapOwner::Persistent,
-            )
-            .expect("write");
+            let _artifact =
+                BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Persistent)
+                    .expect("write");
         }
         assert!(path.exists(), "persistent artifact must survive drop");
         let _ = fs::remove_file(&path);

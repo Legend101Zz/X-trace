@@ -14,10 +14,9 @@
 
 use std::sync::Arc;
 
-use rcgen::{CertificateParams, DistinguishedName, KeyPair, SanType};
-use ring::rand::SystemRandom;
+use rcgen::{CertificateParams, DistinguishedName, DnType, Ia5String, KeyPair, SanType};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{ClientConfig, RootCertStore, ServerConfig, SupportedProtocolVersion};
 use sha2::{Digest, Sha256};
 
 use crate::error::DaemonError;
@@ -26,6 +25,13 @@ use crate::error::DaemonError;
 /// generic `localhost` entry plus the two IPv4 / IPv6 loopback
 /// literals cover every loopback-only client configuration.
 const LOOPBACK_SANS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
+/// Single supported TLS protocol version. TLS 1.3 is mandatory for the
+/// pinned adapter transport documented in `docs/plans/x-trace/03-program-design.md`
+/// §11 because the exporter keying material, AEAD suite guarantees,
+/// and session secret HMAC transcript are defined against the TLS 1.3
+/// key schedule. Earlier versions are not negotiated.
+const SUPPORTED_TLS_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
 /// Ephemeral daemon certificate.
 #[derive(Clone, Debug)]
@@ -54,19 +60,22 @@ impl EphemeralCertificate {
         let mut params = CertificateParams::default();
         params.distinguished_name = {
             let mut dn = DistinguishedName::new();
-            dn.push(rcgen::DnType::CommonName, "xtrace-daemon");
+            dn.push(DnType::CommonName, "xtrace-daemon");
             dn
         };
-        params.subject_alt_names = LOOPBACK_SANS
+        let sans = LOOPBACK_SANS
             .iter()
             .map(|host| {
                 if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                    SanType::IpAddress(ip)
+                    Ok(SanType::IpAddress(ip))
                 } else {
-                    SanType::DnsName(host.to_string())
+                    Ia5String::try_from(*host).map(SanType::DnsName).map_err(|err| {
+                        DaemonError::TlsConfig(format!("invalid dns san {host}: {err}"))
+                    })
                 }
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
+        params.subject_alt_names = sans;
         let key_pair =
             KeyPair::generate().map_err(|err| DaemonError::TlsConfig(format!("keypair: {err}")))?;
         let certificate = params
@@ -128,36 +137,29 @@ impl TlsServerMaterials {
     /// refuses the supplied private key or when the version
     /// negotiation rejects the available cipher suites.
     pub fn build(certificate: EphemeralCertificate) -> Result<Self, DaemonError> {
-        let server_config = ServerConfig::builder_with_provider(
-            rustls::crypto::ring::default_provider().into(),
-        )
-        .with_safe_default_protocol_versions()
-        .map_err(|err| DaemonError::TlsConfig(format!("protocol versions: {err}")))?
-        .with_no_client_auth()
-        .with_single_cert(vec![certificate.certificate()], certificate.private_key())
-        .map_err(|err| DaemonError::TlsConfig(format!("single cert: {err}")))?;
+        let server_config =
+            ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+                .with_protocol_versions(SUPPORTED_TLS_VERSIONS)
+                .map_err(|err| DaemonError::TlsConfig(format!("protocol versions: {err}")))?
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate.certificate()], certificate.private_key())
+                .map_err(|err| DaemonError::TlsConfig(format!("single cert: {err}")))?;
         let certificate_summary = certificate.pin().to_string();
-        Ok(Self {
-            server_config: Arc::new(server_config),
-            certificate,
-            certificate_summary,
-        })
+        Ok(Self { server_config: Arc::new(server_config), certificate, certificate_summary })
     }
 }
 
 /// Builds a `rustls::ClientConfig` that pins a single certificate by
-/// its SHA-256 digest. Used by the fake adapter in the integration
-/// tests so the assertion is "TLS works against a real rustls client",
-/// not "we hand-rolled a verifier that happens to skip the chain".
+/// its SHA-256 digest and accepts TLS 1.3 only. Used by the fake
+/// adapter in the integration tests so the assertion is "TLS works
+/// against a real rustls client", not "we hand-rolled a verifier that
+/// happens to skip the chain".
 ///
 /// # Errors
 ///
 /// Returns [`DaemonError::TlsConfig`] when the verifier cannot be
 /// built from the supplied certificate.
-#[allow(dead_code, reason = "used by external fake adapter and tests")]
-pub fn build_pinned_client_config(
-    certificate_der: &[u8],
-) -> Result<ClientConfig, DaemonError> {
+pub fn build_pinned_client_config(certificate_der: &[u8]) -> Result<ClientConfig, DaemonError> {
     let mut roots = RootCertStore::empty();
     roots
         .add(CertificateDer::from(certificate_der.to_vec()))
@@ -168,13 +170,12 @@ pub fn build_pinned_client_config(
     )
     .build()
     .map_err(|err| DaemonError::TlsConfig(format!("client verifier: {err}")))?;
-    let config = ClientConfig::builder_with_provider(
-        rustls::crypto::ring::default_provider().into(),
-    )
-    .with_safe_default_protocol_versions()
-    .map_err(|err| DaemonError::TlsConfig(format!("client versions: {err}")))?
-    .with_webpki_verifier(verifier)
-    .with_no_client_auth();
+    let config =
+        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_protocol_versions(SUPPORTED_TLS_VERSIONS)
+            .map_err(|err| DaemonError::TlsConfig(format!("client versions: {err}")))?
+            .with_webpki_verifier(verifier)
+            .with_no_client_auth();
     Ok(config)
 }
 

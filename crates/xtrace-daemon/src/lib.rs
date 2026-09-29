@@ -50,9 +50,14 @@
 //!     .bind()
 //!     .await?;
 //!
-//! // Drop the guard on orderly shutdown to remove the artifact.
+//! // `tokio::signal::ctrl_c()` requires the `signal` feature, which the
+//! // daemon does not enable by default. The example below uses a
+//! // one-shot future resolved after a short delay; production callers
+//! // are expected to wire the shutdown future to their own signal
+//! // source (for example `tokio::signal::ctrl_c()` from an enabled
+//! // feature, or a `CancellationToken` from the application layer).
 //! let shutdown = async {
-//!     let _ = tokio::signal::ctrl_c().await;
+//!     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 //! };
 //! bound.serve(shutdown).await?;
 //! # Ok(()) }
@@ -64,10 +69,7 @@
 //! until the supplied shutdown future resolves or every connection
 //! closes.
 
-#![allow(
-    clippy::module_name_repetitions,
-    reason = "daemon modules are named after their entities"
-)]
+#![allow(clippy::module_name_repetitions, reason = "daemon modules are named after their entities")]
 #![cfg_attr(
     not(test),
     deny(clippy::unwrap_used, clippy::expect_used, reason = "library code must not panic")
@@ -93,17 +95,15 @@ pub mod session;
 pub mod tls;
 
 pub use bootstrap::{BootstrapArtifact, BootstrapArtifactFields, BootstrapOwner};
-pub use config::{DaemonConfig, ChannelCapacity, LOOPBACK_HOST, LoopbackPolicy};
-pub use daemon::{BoundDaemon, DaemonBuilder};
+pub use config::{ChannelCapacity, DaemonConfig, LOOPBACK_HOST, LoopbackPolicy};
+pub use daemon::{BoundDaemon, DaemonBuilder, TLS_EXPORTER_LABEL, TLS_EXPORTER_LEN};
 pub use error::{DaemonError, ProtocolErrorCode};
-pub use framing::{
-    EnvelopeAsyncDecoder, EnvelopeAsyncEncoder, EnvelopeDecoder, EnvelopeEncoder,
-};
+pub use framing::{EnvelopeAsyncDecoder, EnvelopeAsyncEncoder, EnvelopeDecoder, EnvelopeEncoder};
 pub use listener::LoopbackListener;
 pub use runtime::{AdapterHelloAck, IncomingEnvelope, OutgoingCommand};
 pub use secret::SessionSecret;
-pub use session::{HandshakeInputs, HandshakeRole};
-pub use tls::{EphemeralCertificate, TlsServerMaterials};
+pub use session::{HandshakeInputs, HandshakeRole, Session};
+pub use tls::{EphemeralCertificate, TlsServerMaterials, build_pinned_client_config};
 
 /// Re-export of the XTP-Agent protocol handshake helpers so callers
 /// (the fake adapter in particular) can compute and verify the

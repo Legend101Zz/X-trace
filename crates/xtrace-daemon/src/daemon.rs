@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls::server::ServerConfig;
-use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -38,8 +37,16 @@ use crate::secret::SessionSecret;
 use crate::session::{HandshakeInputs, HandshakeRole, Session};
 use crate::tls::{EphemeralCertificate, TlsServerMaterials};
 
-/// TLS exporter placeholder length.
+/// Length in bytes of the TLS exporter keying material the daemon
+/// requests from rustls after the handshake completes. The value
+/// matches the XTP-Agent transcript proof tag size so the entire
+/// exporter can be folded into the HMAC without truncation.
 pub const TLS_EXPORTER_LEN: usize = 32;
+/// Stable exporter label used on both sides of the handshake. The
+/// label is encoded into the rustls `export_keying_material` call so
+/// the same context cannot be replayed across different protocol
+/// versions or unrelated X-trace subsystems.
+pub const TLS_EXPORTER_LABEL: &[u8] = b"xtrace-adapter-transport-v1";
 /// Constant channel capacity for per-connection commands. Matches the
 /// `adapter socket decode` row of `docs/plans/x-trace/02-architecture.md`
 /// §6 so a slow consumer triggers TCP/TLS backpressure.
@@ -55,8 +62,6 @@ pub struct BoundDaemon {
     session_secret: SessionSecret,
     runtime_session_id: RuntimeSessionId,
     project_id: ProjectId,
-    /// TLS exporter placeholder used for the transcript proof.
-    tls_exporter_for_probe: Vec<u8>,
     /// Optional bootstrap artifact guard. `Some` when the daemon owns
     /// the file; `None` when the caller has read it themselves.
     bootstrap: Option<BootstrapArtifact>,
@@ -95,14 +100,6 @@ impl BoundDaemon {
         self.project_id
     }
 
-    /// Returns the configured TLS exporter placeholder. Tests use the
-    /// value to recompute the transcript proof against the daemon's
-    /// expectations.
-    #[must_use]
-    pub fn tls_exporter(&self) -> &[u8] {
-        &self.tls_exporter_for_probe
-    }
-
     /// Runs the daemon supervisor until the supplied shutdown future
     /// resolves. Every connection is awaited before the future
     /// returns so an orderly shutdown is observable from the caller.
@@ -122,8 +119,6 @@ impl BoundDaemon {
         let session_secret = self.session_secret;
         let runtime_session_id = self.runtime_session_id;
         let project_id = self.project_id;
-        let tls_exporter_for_probe =
-            tls_exporter_placeholder(tls_materials.certificate.pin(), runtime_session_id);
         let _bootstrap = self.bootstrap;
 
         let supervisor = SupervisorContext {
@@ -133,17 +128,15 @@ impl BoundDaemon {
             session_secret,
             runtime_session_id,
             project_id,
-            tls_exporter_for_probe: tls_exporter_for_probe.clone(),
         };
 
         let mut tasks: Vec<JoinHandle<Result<(), DaemonError>>> = Vec::new();
-        let mut shutdown_task: Option<JoinHandle<()>> = None;
         let shutdown_signal = Arc::new(tokio::sync::Notify::new());
         let signal_clone = shutdown_signal.clone();
-        shutdown_task = Some(tokio::spawn(async move {
+        let shutdown_task: JoinHandle<()> = tokio::spawn(async move {
             shutdown.await;
             signal_clone.notify_waiters();
-        }));
+        });
 
         loop {
             tokio::select! {
@@ -171,9 +164,8 @@ impl BoundDaemon {
             }
         }
 
-        if let Some(task) = shutdown_task.take() {
-            task.abort();
-        }
+        shutdown_task.abort();
+        let _ = shutdown_task.await;
         join_tasks(tasks).await
     }
 }
@@ -189,19 +181,13 @@ pub struct DaemonBuilder {
 
 impl DaemonBuilder {
     /// Constructs a new builder with the supplied configuration.
-    #[must_use]
     pub fn new(config: DaemonConfig) -> Self {
-        Self {
-            config,
-            project_id: None,
-            runtime_session_id: None,
-            bootstrap_artifact: None,
-        }
+        Self { config, project_id: None, runtime_session_id: None, bootstrap_artifact: None }
     }
 
     /// Sets the project identifier the daemon will require on every
     /// post-hello envelope. Required.
-    #[must_use]
+    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
     pub fn with_project_id(mut self, project_id: ProjectId) -> Self {
         self.project_id = Some(project_id);
         self
@@ -209,7 +195,7 @@ impl DaemonBuilder {
 
     /// Sets the runtime session identifier the daemon will require on
     /// every post-hello envelope. Required.
-    #[must_use]
+    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
     pub fn with_runtime_session_id(mut self, session_id: RuntimeSessionId) -> Self {
         self.runtime_session_id = Some(session_id);
         self
@@ -218,7 +204,7 @@ impl DaemonBuilder {
     /// Sets the optional bootstrap artifact path. When set, the
     /// daemon writes the artifact with owner-only permissions before
     /// serving and removes it on orderly shutdown.
-    #[must_use]
+    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
     pub fn with_bootstrap_artifact(mut self, path: PathBuf) -> Self {
         self.bootstrap_artifact = Some(path);
         self
@@ -245,9 +231,8 @@ impl DaemonBuilder {
         let listener = LoopbackListener::bind(self.config.loopback_policy).await?;
         let certificate = EphemeralCertificate::generate()?;
         let tls_materials = TlsServerMaterials::build(certificate)?;
-        let session_secret = SessionSecret::generate().map_err(|err| {
-            DaemonError::Bootstrap(format!("session secret: {err}"))
-        })?;
+        let session_secret = SessionSecret::generate()
+            .map_err(|err| DaemonError::Bootstrap(format!("session secret: {err}")))?;
         let bootstrap = self
             .bootstrap_artifact
             .as_ref()
@@ -271,8 +256,6 @@ impl DaemonBuilder {
             runtime_session_id = %runtime_session_id,
             "xtrace daemon bound to loopback",
         );
-        let tls_exporter_for_probe =
-            tls_exporter_placeholder(tls_materials.certificate.pin(), runtime_session_id);
         Ok(BoundDaemon {
             config: self.config,
             listener,
@@ -280,7 +263,6 @@ impl DaemonBuilder {
             session_secret,
             runtime_session_id,
             project_id,
-            tls_exporter_for_probe,
             bootstrap,
         })
     }
@@ -288,22 +270,20 @@ impl DaemonBuilder {
 
 #[derive(Clone)]
 struct SupervisorContext {
-    #[allow(dead_code)]
+    /// Daemon-wide tunables shared with every per-connection task.
+    /// Some fields (like `channel_capacity`) are not yet read by the
+    /// supervisor; the dead-code allow documents the deliberate
+    /// carry rather than the future-proof field drop.
+    #[allow(dead_code, reason = "carried for future supervisor tunables")]
     config: DaemonConfig,
     tls_config: Arc<ServerConfig>,
     certificate_summary: String,
     session_secret: SessionSecret,
     runtime_session_id: RuntimeSessionId,
     project_id: ProjectId,
-    /// Bytes used in place of the TLS exporter for the transcript
-    /// proof. See [`tls_exporter_placeholder`] for the rationale.
-    tls_exporter_for_probe: Vec<u8>,
 }
 
-async fn handle_connection(
-    ctx: SupervisorContext,
-    stream: TcpStream,
-) -> Result<(), DaemonError> {
+async fn handle_connection(ctx: SupervisorContext, stream: TcpStream) -> Result<(), DaemonError> {
     let acceptor = tokio_rustls::TlsAcceptor::from(ctx.tls_config.clone());
     let tls_stream = match acceptor.accept(stream).await {
         Ok(stream) => stream,
@@ -312,10 +292,17 @@ async fn handle_connection(
             return Ok(());
         }
     };
+    let tls_exporter = match extract_tls_exporter(&tls_stream) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            debug!(error = %err, "tls exporter extraction failed");
+            return Ok(());
+        }
+    };
     let (reader, writer) = tokio::io::split(tls_stream);
     let mut session = Session::new(HandshakeInputs {
         session_secret: ctx.session_secret,
-        tls_exporter: ctx.tls_exporter_for_probe.clone(),
+        tls_exporter,
         runtime_session_id: ctx.runtime_session_id,
         project_id: ctx.project_id,
         max_envelope_bytes: ctx.config.max_envelope_bytes,
@@ -333,7 +320,7 @@ async fn handle_connection(
         Ok(envelope) => envelope,
         Err(err) => {
             return send_protocol_error(
-                &mut session,
+                &session,
                 &mut encoder,
                 &ProtocolError {
                     code: crate::error::ProtocolErrorCode::Transport.as_str().to_string(),
@@ -345,19 +332,22 @@ async fn handle_connection(
     };
 
     if let Err(err) = session.accept_adapter_hello(&first) {
-        return send_protocol_error(&mut session, &mut encoder, &err.to_protocol_error()).await;
+        return send_protocol_error(&session, &mut encoder, &err.to_protocol_error()).await;
     }
 
     let server_nonce = random_server_nonce();
     let envelope = match session.build_daemon_hello(server_nonce, current_monotonic_ns()) {
         Ok(envelope) => envelope,
-        Err(err) => return send_protocol_error(&mut session, &mut encoder, &err.to_protocol_error()).await,
+        Err(err) => {
+            return send_protocol_error(&session, &mut encoder, &err.to_protocol_error()).await;
+        }
     };
     if let Err(err) = encoder.write_envelope(&envelope).await {
         return Err(DaemonError::Transport(format!("write daemon hello: {err}")));
     }
 
-    let (tx, mut rx) = mpsc::channel::<crate::runtime::OutgoingCommand>(CONNECTION_COMMAND_CAPACITY);
+    let (tx, mut rx) =
+        mpsc::channel::<crate::runtime::OutgoingCommand>(CONNECTION_COMMAND_CAPACITY);
     let health_session = session.clone();
     let health_tx = tx.clone();
     let health_task: JoinHandle<()> = tokio::spawn(async move {
@@ -421,7 +411,7 @@ async fn handle_connection(
     let _ = health_task.await;
 
     if let Err(err) = post_hello_result {
-        let _ = send_protocol_error(&mut session, &mut encoder, &err.to_protocol_error()).await;
+        let _ = send_protocol_error(&session, &mut encoder, &err.to_protocol_error()).await;
     }
     Ok(())
 }
@@ -437,7 +427,9 @@ where
     let envelope = AgentEnvelope {
         protocol_major: session.inputs().max_protocol_major,
         protocol_minor: session.inputs().max_protocol_minor,
-        runtime_session_id: prost::bytes::Bytes::copy_from_slice(session.runtime_session_id().as_uuid().as_bytes()),
+        runtime_session_id: prost::bytes::Bytes::copy_from_slice(
+            session.runtime_session_id().as_uuid().as_bytes(),
+        ),
         session_seq: 0,
         sent_monotonic_ns: current_monotonic_ns(),
         message_id: "daemon-error".to_string(),
@@ -450,9 +442,7 @@ where
         .map_err(|err| DaemonError::Transport(format!("write protocol error: {err}")))
 }
 
-async fn join_tasks(
-    tasks: Vec<JoinHandle<Result<(), DaemonError>>>,
-) -> Result<(), DaemonError> {
+async fn join_tasks(tasks: Vec<JoinHandle<Result<(), DaemonError>>>) -> Result<(), DaemonError> {
     let mut first_error: Option<DaemonError> = None;
     for task in tasks {
         match task.await {
@@ -476,9 +466,8 @@ async fn join_tasks(
 }
 
 fn current_monotonic_ns() -> u64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     u64::try_from(now.as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -489,42 +478,106 @@ fn random_server_nonce() -> Vec<u8> {
     bytes.to_vec()
 }
 
-/// TLS exporter placeholder used by the supervisor.
+/// Extracts the per-connection TLS exporter from a freshly accepted
+/// rustls server stream.
 ///
-/// The approved handshake binds the HMAC transcript proof to the
-/// `rustls` TLS exporter. `tokio_rustls` does not expose the
-/// exporter through a stable, test-friendly API today; the
-/// placeholder substitutes a deterministic 32-byte value derived
-/// from the certificate pin and the runtime session identifier so
-/// the transcript proof remains reproducible. The full exporter
-/// extraction is documented as the next-smallest increment.
-pub fn tls_exporter_placeholder(pin: &str, session_id: RuntimeSessionId) -> Vec<u8> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"xtrace-tls-exporter-v1");
-    hasher.update(pin.as_bytes());
-    hasher.update(session_id.as_uuid().as_bytes());
-    let digest = hasher.finalize();
+/// The exporter is the RFC 5705 keying material derived from the TLS
+/// 1.3 key schedule and labelled with [`TLS_EXPORTER_LABEL`]. The
+/// adapter must call `export_keying_material` with the same label and
+/// the same empty context so the daemon and the adapter agree on the
+/// byte sequence folded into the AdapterHello/DaemonHello HMAC
+/// transcript proof.
+///
+/// # Errors
+///
+/// Returns [`DaemonError::Transport`] when rustls reports the
+/// handshake has not completed, the negotiated cipher suite does not
+/// support exporters, or the requested length is zero. The exporter
+/// label and context are stable across releases so an error here
+/// means the rustls ABI or TLS 1.3 implementation is wrong.
+fn extract_tls_exporter<S>(
+    tls_stream: &tokio_rustls::server::TlsStream<S>,
+) -> Result<Vec<u8>, DaemonError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (_, conn) = tls_stream.get_ref();
     let mut out = [0u8; TLS_EXPORTER_LEN];
-    out.copy_from_slice(&digest.as_bytes()[..TLS_EXPORTER_LEN]);
-    out.to_vec()
+    conn.export_keying_material(&mut out, TLS_EXPORTER_LABEL, None)
+        .map_err(|err| DaemonError::Transport(format!("tls exporter: {err}")))?;
+    Ok(out.to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xtrace_protocol::handshake::{compute_transcript_proof, verify_transcript_proof};
 
+    /// The exporter label is part of the protocol contract: both the
+    /// daemon and the adapter feed it to `export_keying_material` so
+    /// the same byte sequence flows into the transcript proof. Any
+    /// change requires an ADR and a coordinated adapter update.
     #[test]
-    fn tls_exporter_placeholder_is_deterministic_and_field_sensitive() {
-        let pin = "a".repeat(64);
-        let session = RuntimeSessionId::new();
-        let first = tls_exporter_placeholder(&pin, session);
-        let second = tls_exporter_placeholder(&pin, session);
-        assert_eq!(first, second);
-        assert_eq!(first.len(), TLS_EXPORTER_LEN);
-        let other = tls_exporter_placeholder(&"b".repeat(64), session);
-        assert_ne!(first, other);
-        let other_session = RuntimeSessionId::new();
-        let other = tls_exporter_placeholder(&pin, other_session);
-        assert_ne!(first, other);
+    fn exporter_label_matches_the_documented_v1_contract() {
+        assert_eq!(TLS_EXPORTER_LABEL, b"xtrace-adapter-transport-v1");
+    }
+
+    /// The exporter length matches the HMAC tag size so the value
+    /// can be folded into the transcript proof without truncation
+    /// or zero-padding. Changing it requires a Gate 3 amendment.
+    #[test]
+    fn exporter_length_matches_transcript_proof_tag_size() {
+        assert_eq!(TLS_EXPORTER_LEN, 32);
+    }
+
+    /// The two-proof nonce-ordering resolution is the canonical byte
+    /// layout used for the inbound AdapterHello HMAC. The adapter
+    /// hashes `client_nonce` together with a fixed zero server nonce
+    /// because the daemon has not yet emitted its own nonce; the
+    /// canonical proof with `server_nonce = [0u8; 32]` is the only
+    /// value the daemon accepts at this stage. A flipped layout
+    /// would let an attacker reuse an old transcript.
+    #[test]
+    fn adapter_proof_layout_uses_zero_server_nonce_until_daemon_hello() {
+        let secret = b"a]8=ZxW6Mf7n3Q!2";
+        let exporter = b"tls-exporter-bytes";
+        let session = b"01900000-0000-0000-0000-000000000000";
+        let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
+        let client = [0xaa_u8; 16];
+        // Inbound direction: server nonce is the canonical zero
+        // placeholder; the daemon recognises this layout because the
+        // server nonce has not been exchanged yet.
+        let inbound =
+            compute_transcript_proof(secret, exporter, session, &client, &[0u8; 32], manifest)
+                .expect("HMAC accepts the test secret");
+        // Same inputs but a non-zero server nonce would never match
+        // the inbound verifier; this is the safety net.
+        let wrong_layout =
+            compute_transcript_proof(secret, exporter, session, &client, &[0x55_u8; 32], manifest)
+                .expect("HMAC accepts the test secret");
+        assert_ne!(inbound, wrong_layout);
+        verify_transcript_proof(secret, exporter, session, &client, &[0u8; 32], manifest, &inbound)
+            .expect("inbound verifier accepts the canonical layout");
+    }
+
+    /// The outbound DaemonHello proof uses the daemon's server nonce
+    /// together with a canonical zero client nonce because the
+    /// adapter is expected to recompute the proof with its own
+    /// client nonce. The two sides therefore agree on a fixed-length
+    /// transcript without leaking the missing nonce through padding.
+    #[test]
+    fn daemon_proof_layout_uses_zero_client_nonce_for_outbound_direction() {
+        let secret = b"a]8=ZxW6Mf7n3Q!2";
+        let exporter = b"tls-exporter-bytes";
+        let session = b"01900000-0000-0000-0000-000000000000";
+        let manifest = b"b3:0000000000000000000000000000000000000000000000000000000000000000";
+        let server = [0xbb_u8; 32];
+        let outbound =
+            compute_transcript_proof(secret, exporter, session, &[0u8; 32], &server, manifest)
+                .expect("HMAC accepts the test secret");
+        let wrong_layout =
+            compute_transcript_proof(secret, exporter, session, &[0x55_u8; 32], &server, manifest)
+                .expect("HMAC accepts the test secret");
+        assert_ne!(outbound, wrong_layout);
     }
 }

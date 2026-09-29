@@ -63,20 +63,17 @@ impl Default for ChannelCapacity {
 /// The daemon must bind to `127.0.0.1` and `::1` only. Constructors
 /// reject non-loopback addresses so a misconfigured launch command
 /// fails fast before any TCP socket is created.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LoopbackPolicy {
     /// Bind to `127.0.0.1` on an OS-assigned port.
     V4Only,
     /// Bind to `::1` on an OS-assigned port.
     V6Only,
-    /// Bind to whichever family the OS reports as loopback.
+    /// Bind to whichever family the OS reports as loopback. The
+    /// default value matches the documented IPv4 preference in the
+    /// architecture decisions for the daemon.
+    #[default]
     Any,
-}
-
-impl Default for LoopbackPolicy {
-    fn default() -> Self {
-        Self::Any
-    }
 }
 
 impl LoopbackPolicy {
@@ -100,7 +97,9 @@ pub struct DaemonConfig {
     /// Maximum envelope size in bytes accepted on the wire. Defaults
     /// to the architecture-level one-mebibyte cap.
     pub max_envelope_bytes: u32,
-    /// Maximum batch size in events. Surfaces in [`DaemonHello`].
+    /// Maximum batch size in events. Surfaces in the
+    /// `xtrace_protocol::generated::agent::DaemonHello` reply so the
+    /// adapter can size its outgoing batches without renegotiation.
     pub max_batch_events: u32,
     /// Capacity of the per-connection ingress channel.
     pub channel_capacity: ChannelCapacity,
@@ -137,8 +136,9 @@ mod tests {
     fn loopback_policy_host_is_loopback_for_every_variant() {
         assert_eq!(LoopbackPolicy::V4Only.host(), "127.0.0.1");
         assert_eq!(LoopbackPolicy::V6Only.host(), "::1");
-        assert!(LoopbackPolicy::Any.host().starts_with("127.")
-            || LoopbackPolicy::Any.host() == "::1");
+        assert!(
+            LoopbackPolicy::Any.host().starts_with("127.") || LoopbackPolicy::Any.host() == "::1"
+        );
     }
 
     #[test]

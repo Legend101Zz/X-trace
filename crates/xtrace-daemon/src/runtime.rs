@@ -5,15 +5,16 @@
 //! envelopes that the supervisor decoded from the TLS stream,
 //! outgoing commands the supervisor sends, and the adapter-side
 //! [`AdapterHelloAck`] that the supervisor returns once the
-//! [`AdapterHello`] transcript proof has been verified.
+//! adapter `AdapterHello` transcript proof has been verified.
 
 use std::time::Duration;
 
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
-use xtrace_protocol::generated::agent::{
-    AgentEnvelope, CapabilitySet, DaemonHello, Health, ProtocolError,
-};
+use xtrace_protocol::generated::agent::{CapabilitySet, DaemonHello, Health, ProtocolError};
 use xtrace_protocol::handshake::verify_transcript_proof;
+
+#[cfg(test)]
+use prost::bytes::Bytes;
 
 /// Default `Health` interval sent back to the adapter while idle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +26,7 @@ impl Default for HealthInterval {
     }
 }
 
-/// Result of a successful [`AdapterHello`] exchange.
+/// Result of a successful adapter `AdapterHello` exchange.
 ///
 /// The supervisor forwards this receipt to the [`crate::session`]
 /// layer so the adapter may immediately begin sending
@@ -78,8 +79,8 @@ pub enum OutgoingCommand {
 }
 
 impl OutgoingCommand {
-    /// Builds the [`AgentEnvelope`] that carries this command. The
-    /// caller fills `runtime_session_id`, `session_seq`,
+    /// Builds the wire `AgentEnvelope` payload that carries this
+    /// command. The caller fills `runtime_session_id`, `session_seq`,
     /// `sent_monotonic_ns`, and `message_id` after the call.
     #[must_use]
     pub fn into_envelope_payload(self) -> PayloadOneof {
@@ -91,11 +92,11 @@ impl OutgoingCommand {
     }
 }
 
-/// Verifies an [`AdapterHello`] HMAC against the supplied session
-/// secret and TLS exporter. The function is a thin wrapper around the
-/// protocol-level [`verify_transcript_proof`] that takes typed wire
-/// inputs so the session layer does not need to know about the byte
-/// layout.
+/// Verifies an adapter `AdapterHello` HMAC against the supplied
+/// session secret and TLS exporter. The function is a thin wrapper
+/// around the protocol-level [`verify_transcript_proof`] that takes
+/// typed wire inputs so the session layer does not need to know
+/// about the byte layout.
 ///
 /// # Errors
 ///
@@ -128,14 +129,23 @@ pub fn verify_adapter_hello(
 /// Inverse helper: the daemon computes the [`DaemonHello`] HMAC using
 /// the server nonce and the same canonical layout. Returns the
 /// 32-byte tag.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns the same [`xtrace_protocol::handshake::TranscriptProofError`]
+/// variant as `compute_transcript_proof` when the underlying HMAC
+/// primitive refuses the supplied key. The 256-bit session secret
+/// is always within SHA-256's block-size bound so the error path
+/// is unreachable in production; the result is reported rather than
+/// panicked because library code must not call `expect`.
+#[must_use = "compute_daemon_hello_proof returns a Result that the supervisor must propagate"]
 pub fn compute_daemon_hello_proof(
     session_secret: &[u8],
     tls_exporter: &[u8],
     runtime_session_id: &[u8],
     server_nonce: &[u8],
     manifest_digest: &[u8],
-) -> [u8; 32] {
+) -> Result<[u8; 32], xtrace_protocol::handshake::TranscriptProofError> {
     xtrace_protocol::handshake::compute_transcript_proof(
         session_secret,
         tls_exporter,
@@ -159,6 +169,10 @@ pub fn compute_daemon_hello_proof(
 /// Returns no error today; the helper exists so the signature stays
 /// stable if a future field demands validation.
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every field is a wire-shaped output documented in `03b-protocol-and-api.md` §2.4"
+)]
 pub fn build_daemon_hello(
     server_nonce: &[u8],
     proof: [u8; 32],
@@ -213,7 +227,8 @@ mod tests {
             &client_nonce,
             &[0u8; 32],
             manifest,
-        );
+        )
+        .expect("HMAC accepts the test secret");
         let hello = xtrace_protocol::generated::agent::AdapterHello {
             adapter_name: "fake".to_string(),
             adapter_version: "0.0.0".to_string(),
@@ -229,21 +244,17 @@ mod tests {
             repository_fingerprint: String::new(),
             protocol_major_max: 1,
             protocol_minor_max: 0,
-            client_nonce: client_nonce.to_vec(),
-            hmac: adapter_proof.to_vec(),
+            client_nonce: Bytes::copy_from_slice(&client_nonce),
+            hmac: Bytes::copy_from_slice(&adapter_proof),
         };
         verify_adapter_hello(secret, exporter, session, &hello).expect("verify");
 
         // Outbound direction (DaemonHello uses the real server
         // nonce and the placeholder client nonce).
         let server_nonce = [0xbb_u8; 16];
-        let daemon_proof = compute_daemon_hello_proof(
-            secret,
-            exporter,
-            session,
-            &server_nonce,
-            manifest,
-        );
+        let daemon_proof =
+            compute_daemon_hello_proof(secret, exporter, session, &server_nonce, manifest)
+                .expect("HMAC accepts the test secret");
         let hello = build_daemon_hello(
             &server_nonce,
             daemon_proof,
@@ -280,15 +291,12 @@ mod tests {
             repository_fingerprint: String::new(),
             protocol_major_max: 1,
             protocol_minor_max: 0,
-            client_nonce: client_nonce.to_vec(),
+            client_nonce: Bytes::copy_from_slice(&client_nonce),
             // Tampered proof: every byte is one off the correct tag.
-            hmac: vec![0u8; 32],
+            hmac: Bytes::copy_from_slice(&[0u8; 32]),
         };
         let err = verify_adapter_hello(secret, exporter, session, &hello).unwrap_err();
-        assert!(matches!(
-            err,
-            xtrace_protocol::handshake::TranscriptProofError::Mismatch
-        ));
+        assert!(matches!(err, xtrace_protocol::handshake::TranscriptProofError::Mismatch));
     }
 
     #[test]
@@ -309,7 +317,7 @@ mod tests {
         let payload = OutgoingCommand::Health(health.clone()).into_envelope_payload();
         match payload {
             PayloadOneof::Health(out) => assert_eq!(out.status, "ok"),
-            _ => panic!("expected health payload"),
+            other => unreachable!("`Health` payload mapped to wrong variant: {other:?}"),
         }
     }
 }

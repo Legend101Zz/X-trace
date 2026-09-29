@@ -1269,7 +1269,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
- "blake3",
  "constant_time_eq 0.3.1",
  "hex",
  "hmac",
