@@ -55,12 +55,28 @@ pub enum XtraceCommand {
         #[arg(long = "project-dir", value_name = "DIR")]
         project_dir: PathBuf,
     },
+    /// Run the Unix-only foreground, project-scoped XTP recording ingress daemon.
+    ///
+    /// This command durably writes sealed event segments and retains the
+    /// protocol's `Staged` ACK behavior. It does not launch a language adapter
+    /// or claim that one is available.
+    ///
+    /// SIGINT and SIGTERM request graceful shutdown and wait for in-flight
+    /// daemon work. SIGKILL cannot run cleanup; the next daemon start that
+    /// obtains the project lock removes only recognized stale runtime files.
+    /// The current bootstrap artifact has no time-based expiry; expiry is
+    /// deferred, and a SIGKILL may leave it until the next start.
+    Daemon {
+        /// Path to the initialized repository root.
+        #[arg(long = "project-dir", value_name = "DIR")]
+        project_dir: PathBuf,
+    },
 }
 
 /// Dispatches the supplied subcommand and writes the result to
 /// stdout. Errors propagate as [`CliError`] so the binary entry
 /// point can render them.
-pub fn run(command: XtraceCommand) -> Result<(), CliError> {
+pub async fn run(command: XtraceCommand) -> Result<(), CliError> {
     match command {
         XtraceCommand::Init { project_dir, display_name, idempotency_key } => {
             init(project_dir, display_name, idempotency_key, &crate::paths::read_env_path)
@@ -69,6 +85,7 @@ pub fn run(command: XtraceCommand) -> Result<(), CliError> {
             open(project_dir, idempotency_key, &crate::paths::read_env_path)
         }
         XtraceCommand::Status { project_dir } => status(project_dir, &crate::paths::read_env_path),
+        XtraceCommand::Daemon { project_dir } => crate::daemon::run(project_dir).await,
     }
 }
 
@@ -82,7 +99,7 @@ pub fn run(command: XtraceCommand) -> Result<(), CliError> {
 /// 2. The pointer's recorded `data_home` when the caller did not
 ///    set an override.
 /// 3. The platform default via [`UserDataPaths::home_with`].
-fn resolve_data_home<F>(
+pub(crate) fn resolve_data_home<F>(
     pointer: Option<&RepositoryPointer>,
     env_reader: &F,
 ) -> Result<PathBuf, CliError>
@@ -317,7 +334,7 @@ where
     Ok(())
 }
 
-fn resolve_repo(project_dir: &Path) -> Result<PathBuf, CliError> {
+pub(crate) fn resolve_repo(project_dir: &Path) -> Result<PathBuf, CliError> {
     if !project_dir.exists() {
         return Err(CliError::ProjectDirectoryMissing(project_dir.display().to_string()));
     }
@@ -360,7 +377,7 @@ fn env_user() -> String {
 }
 
 /// Maps [`xtrace_store::StoreError`] categories into [`CliError`].
-fn map_store_error(err: xtrace_store::StoreError) -> CliError {
+pub(crate) fn map_store_error(err: xtrace_store::StoreError) -> CliError {
     match err.kind() {
         StoreErrorKind::Corruption | StoreErrorKind::SchemaIncompatible => {
             CliError::StoreCorrupted(err.message().to_string())

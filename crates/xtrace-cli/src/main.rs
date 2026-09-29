@@ -7,7 +7,7 @@
 //! machine-readable JSON so downstream automation does not depend on
 //! human-readable output formatting.
 //!
-//! Slice 1A ships exactly three commands:
+//! Slice 1A initially shipped three commands:
 //!
 //! - `xtrace init` — register a new repository and create the local
 //!   store;
@@ -15,6 +15,9 @@
 //!   `last_opened_at`;
 //! - `xtrace status` — emit a truthful machine-readable status report
 //!   for the local store.
+//!
+//! The foreground `xtrace daemon` command is supported on Unix and reports
+//! durable segment ingress separately from language capture support.
 //!
 //! The CLI never claims capture or replay support. The `status`
 //! subcommand sets `capture_supported` and `replay_supported` to
@@ -37,6 +40,9 @@
 )]
 
 mod commands;
+mod daemon;
+#[cfg(unix)]
+mod daemon_lock;
 mod error;
 mod output;
 mod paths;
@@ -60,9 +66,10 @@ pub struct Cli {
     pub command: XtraceCommand,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
-    let exit_code = match commands::run(cli.command) {
+    let exit_code = match commands::run(cli.command).await {
         Ok(()) => 0,
         Err(err) => {
             // Errors go to stderr as one JSON document so scripts can
@@ -75,4 +82,17 @@ fn main() {
         }
     };
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "CLI parser tests use fixed arguments")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_command_accepts_project_path_with_spaces() {
+        let cli = Cli::try_parse_from(["xtrace", "daemon", "--project-dir", "/tmp/my repository"])
+            .expect("daemon command parses");
+        assert!(matches!(cli.command, commands::XtraceCommand::Daemon { .. }));
+    }
 }

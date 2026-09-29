@@ -347,14 +347,87 @@ fn chmod_dir_owner_only(_path: &Path) -> Result<(), CliError> {
 /// `Ok(())`.
 #[cfg(unix)]
 fn chmod_file_owner_only(path: &Path) -> Result<(), CliError> {
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt as _;
-    let metadata = std::fs::metadata(path).map_err(|err| {
-        CliError::StoreUnavailable(format!("stat file {}: {err}", path.display()))
+
+    let path_metadata = std::fs::symlink_metadata(path).map_err(|_| {
+        CliError::StoreUnavailable(format!("inspect file path {} failed", path.display()))
     })?;
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(path, permissions)
-        .map_err(|err| CliError::StoreUnavailable(format!("chmod 0600 {}: {err}", path.display())))
+    validate_database_file_metadata(&path_metadata)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let descriptor = rustix::fs::openat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|_| {
+            CliError::StoreCorrupted("database path is not a safe regular file".to_string())
+        })?;
+        let file = std::fs::File::from(descriptor);
+        let descriptor_metadata = file.metadata().map_err(|_| {
+            CliError::StoreUnavailable(format!("inspect file {} failed", path.display()))
+        })?;
+        validate_database_file_metadata(&descriptor_metadata)?;
+        ensure_same_file(&descriptor_metadata, &path_metadata)?;
+        let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        std::fs::set_permissions(descriptor_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |_| CliError::StoreUnavailable(format!("secure file {} failed", path.display())),
+        )?;
+        let updated_descriptor = file.metadata().map_err(|_| {
+            CliError::StoreUnavailable(format!("inspect file {} failed", path.display()))
+        })?;
+        validate_database_file_metadata(&updated_descriptor)?;
+        ensure_same_file(&updated_descriptor, &path_metadata)?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // On platforms with `fchmodat` no-follow support, this repairs mode-000
+        // files without needing a read-capable open descriptor.
+        rustix::fs::chmodat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| {
+            CliError::StoreUnavailable(format!("secure file {} failed", path.display()))
+        })?;
+        let updated_path = std::fs::symlink_metadata(path).map_err(|_| {
+            CliError::StoreUnavailable(format!("inspect file path {} failed", path.display()))
+        })?;
+        validate_database_file_metadata(&updated_path)?;
+        ensure_same_file(&updated_path, &path_metadata)
+    }
+}
+
+#[cfg(unix)]
+fn validate_database_file_metadata(metadata: &std::fs::Metadata) -> Result<(), CliError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(CliError::StoreCorrupted(
+            "database path must be a single-link regular file".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> Result<(), CliError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if left.dev() != right.dev() || left.ino() != right.ino() {
+        return Err(CliError::StoreCorrupted(
+            "database path changed during validation".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// `chmod 0600` on the supplied file on Unix. Returns `Ok(())` off
@@ -373,39 +446,70 @@ pub fn restrict_project_dir(project_dir: &Path) -> Result<(), CliError> {
     chmod_dir_owner_only(project_dir)
 }
 
-/// Pre-creates the SQLite database file with mode `0600` (using
+/// Creates the SQLite database file with mode `0600` (using
 /// [`std::fs::OpenOptions`] plus
-/// [`std::os::unix::fs::OpenOptionsExt::mode`]) and verifies the
-/// mode before [`xtrace_store::SqliteStore::open`] is called. The
-/// helper is invoked from `init` so the file is born owner-only and
-/// SQLite does not briefly expose it with the directory's default
-/// mode. `truncate(false)` keeps the helper safe to call against a
-/// pre-existing file. Fails closed on Unix; returns `Ok(())` off
-/// Unix (documented no-op).
+/// [`std::os::unix::fs::OpenOptionsExt::mode`]) and repairs an existing
+/// file without truncating it. The mode is verified before
+/// [`xtrace_store::SqliteStore::open`] is called. The helper is invoked
+/// from `init` so the file is born owner-only and SQLite does not briefly
+/// expose it with the directory's default mode. Fails closed on Unix;
+/// returns `Ok(())` off Unix (documented no-op).
 pub fn precreate_database_file(database: &Path) -> Result<(), CliError> {
     #[cfg(unix)]
     {
         use std::fs::OpenOptions;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let _file = OpenOptions::new()
+        let created = OpenOptions::new()
             .create(true)
+            .create_new(true)
             .write(true)
             .truncate(false)
             .mode(0o600)
-            .open(database)
-            .map_err(|err| {
-                CliError::StoreUnavailable(format!(
+            .open(database);
+        match created {
+            Ok(file) => chmod_open_file_owner_only(&file, database)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                chmod_file_owner_only(database)?;
+            }
+            Err(err) => {
+                return Err(CliError::StoreUnavailable(format!(
                     "precreate database {}: {err}",
                     database.display()
-                ))
-            })?;
-        // A restrictive umask could strip the requested mode bits;
-        // verify and force `0600` before SqliteStore opens the file.
-        chmod_file_owner_only(database)?;
+                )));
+            }
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = database;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chmod_open_file_owner_only(file: &std::fs::File, path: &Path) -> Result<(), CliError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let descriptor_metadata = file.metadata().map_err(|_| {
+        CliError::StoreUnavailable(format!("inspect file {} failed", path.display()))
+    })?;
+    validate_database_file_metadata(&descriptor_metadata)?;
+    let path_metadata = std::fs::symlink_metadata(path).map_err(|_| {
+        CliError::StoreUnavailable(format!("inspect file path {} failed", path.display()))
+    })?;
+    validate_database_file_metadata(&path_metadata)?;
+    ensure_same_file(&descriptor_metadata, &path_metadata)?;
+    rustix::fs::fchmod(file, rustix::fs::Mode::from_bits_truncate(0o600)).map_err(|_| {
+        CliError::StoreUnavailable(format!("secure file {} failed", path.display()))
+    })?;
+    let updated = file.metadata().map_err(|_| {
+        CliError::StoreUnavailable(format!("inspect file {} failed", path.display()))
+    })?;
+    validate_database_file_metadata(&updated)?;
+    if updated.dev() != path_metadata.dev() || updated.ino() != path_metadata.ino() {
+        return Err(CliError::StoreCorrupted(
+            "database path changed during permission repair".to_string(),
+        ));
     }
     Ok(())
 }
@@ -426,11 +530,38 @@ pub fn restrict_database_file(database: &Path) -> Result<(), CliError> {
 /// directory left loose by an older binary is repaired on the next
 /// invocation. Fails closed on Unix: a chmod failure on either the
 /// directory or the database file surfaces as
-/// [`CliError::StoreUnavailable`].
+/// [`CliError::StoreUnavailable`]. The database path is checked as a regular,
+/// non-symlink, single-link file before either repair; Unix file-mode repair
+/// uses a no-follow descriptor or chmod operation and verifies file identity.
 pub fn secure_project_dir(project_dir: &Path) -> Result<(), CliError> {
-    chmod_dir_owner_only(project_dir)?;
     let database = project_dir.join(DATABASE_FILENAME);
-    if database.exists() {
+    let database_exists = match std::fs::symlink_metadata(&database) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(CliError::StoreCorrupted(
+                "project database must be a real file".to_string(),
+            ));
+        }
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if metadata.nlink() != 1 {
+                    return Err(CliError::StoreCorrupted(
+                        "project database must have exactly one filesystem link".to_string(),
+                    ));
+                }
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => {
+            return Err(CliError::StoreUnavailable(
+                "inspect project database path failed".to_string(),
+            ));
+        }
+    };
+    chmod_dir_owner_only(project_dir)?;
+    if database_exists {
         chmod_file_owner_only(&database)?;
     }
     Ok(())
@@ -661,7 +792,10 @@ mod tests {
         let dir = tempdir();
         let project_dir = dir.join("project");
         std::fs::create_dir_all(&project_dir).expect("project");
-        std::fs::write(project_dir.join(DATABASE_FILENAME), b"x").expect("database");
+        let database = project_dir.join(DATABASE_FILENAME);
+        std::fs::write(&database, b"x").expect("database");
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o000))
+            .expect("make database unreadable");
         secure_project_dir(&project_dir).expect("chmod");
         let dir_mode =
             std::fs::metadata(&project_dir).expect("dir metadata").permissions().mode() & 0o777;
@@ -672,6 +806,33 @@ mod tests {
             & 0o777;
         assert_eq!(dir_mode, 0o700, "project directory must be owner-only");
         assert_eq!(file_mode, 0o600, "database file must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn precreate_repairs_new_and_existing_mode_zero_database_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir();
+        let project_dir = dir.join("project");
+        std::fs::create_dir_all(&project_dir).expect("project");
+        let database = project_dir.join(DATABASE_FILENAME);
+
+        precreate_database_file(&database).expect("create owner-only database");
+        assert_eq!(
+            std::fs::metadata(&database).expect("new database metadata").permissions().mode()
+                & 0o777,
+            0o600
+        );
+
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o000))
+            .expect("make existing database unreadable");
+        precreate_database_file(&database).expect("repair unreadable existing database");
+        assert_eq!(
+            std::fs::metadata(&database).expect("repaired database metadata").permissions().mode()
+                & 0o777,
+            0o600
+        );
     }
 
     fn tempdir() -> PathBuf {
