@@ -5,10 +5,9 @@
 //! never re-applied. The migration runner is the only component that
 //! writes to `schema_meta`.
 //!
-//! Slice 1A ships exactly one migration: `v0001_initial`. It creates
-//! the `schema_meta` singleton, the `projects` table, and the `runs`
-//! table. Foreign keys are defined on `runs` so a future delete of a
-//! project fails loudly instead of silently leaving orphan rows.
+//! Slice 1A introduced `v0001_initial`; Slice 1C.4 appends
+//! `v0002_recording_segments`. Migrations remain append-only: later
+//! slices must add a new record instead of editing an applied one.
 //!
 //! Migrations deliberately avoid statements that cannot be safely
 //! retried after a crash. The runner wraps every migration in a
@@ -57,7 +56,14 @@ impl Migrations {
     /// Returns every supported migration in version order.
     #[must_use]
     pub fn catalog() -> Vec<MigrationRecord> {
-        vec![MigrationRecord { version: 1, label: "v0001_initial", statements: &[INITIAL_SCHEMA] }]
+        vec![
+            MigrationRecord { version: 1, label: "v0001_initial", statements: &[INITIAL_SCHEMA] },
+            MigrationRecord {
+                version: 2,
+                label: "v0002_recording_segments",
+                statements: &[RECORDING_SEGMENTS_SCHEMA],
+            },
+        ]
     }
 
     /// Returns the maximum version in the catalog.
@@ -189,6 +195,36 @@ CREATE INDEX IF NOT EXISTS runs_project_status
 
 CREATE INDEX IF NOT EXISTS projects_canonical_repo_hash
     ON projects (canonical_repo_hash);
+";
+
+/// Second schema version. Recording rows preserve the current domain lifecycle
+/// vocabulary even though this slice only creates `recording` rows. Sequence
+/// values use fixed-width big-endian blobs so the full `u64` range survives
+/// SQLite's signed integer limit and keeps a future lexical ordering stable.
+const RECORDING_SEGMENTS_SCHEMA: &str = r"
+CREATE TABLE recordings (
+    recording_id        BLOB PRIMARY KEY CHECK(length(recording_id) = 16),
+    project_id          BLOB NOT NULL CHECK(length(project_id) = 16)
+                            REFERENCES projects(project_id),
+    runtime_session_id  BLOB NOT NULL CHECK(length(runtime_session_id) = 16),
+    status              TEXT NOT NULL CHECK(status IN
+                            ('recording', 'finalizing', 'complete', 'partial', 'invalid')),
+    opened_at           TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE recording_segments (
+    recording_id          BLOB NOT NULL CHECK(length(recording_id) = 16)
+                              REFERENCES recordings(recording_id),
+    segment_ordinal       INTEGER NOT NULL CHECK(segment_ordinal >= 0),
+    object_hash           BLOB NOT NULL CHECK(length(object_hash) = 32),
+    first_recording_seq   BLOB NOT NULL CHECK(length(first_recording_seq) = 8),
+    last_recording_seq    BLOB NOT NULL CHECK(length(last_recording_seq) = 8),
+    event_count           INTEGER NOT NULL CHECK(event_count > 0),
+    uncompressed_bytes    INTEGER NOT NULL CHECK(uncompressed_bytes > 0),
+    compressed_bytes      INTEGER NOT NULL CHECK(compressed_bytes > 0),
+    checksum              BLOB NOT NULL CHECK(length(checksum) = 32),
+    PRIMARY KEY(recording_id, segment_ordinal)
+) STRICT;
 ";
 
 /// Applies every pending migration from the compiled-in catalog to
@@ -469,6 +505,7 @@ use rusqlite::OptionalExtension as _;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
     use xtrace_domain::CorrelationId;
 
     fn new_memory() -> Connection {
@@ -486,6 +523,9 @@ mod tests {
         let stored: i64 =
             conn.query_row("SELECT schema_version FROM schema_meta", [], |row| row.get(0)).unwrap();
         assert_eq!(stored as u32, Migrations::latest_version());
+        assert_eq!(list_columns(&conn, "recordings"), RECORDINGS_COLUMNS);
+        assert_eq!(list_columns(&conn, "recording_segments"), RECORDING_SEGMENTS_COLUMNS);
+        assert_recording_schema_contract(&conn);
     }
 
     #[test]
@@ -495,6 +535,29 @@ mod tests {
         let second = apply_pending(&conn, "0.1.0-test", CorrelationId::new())
             .expect("second apply is a no-op");
         assert_eq!(second, Migrations::latest_version());
+    }
+
+    #[test]
+    fn v1_database_upgrades_to_v2_and_reopens_idempotently() {
+        let conn = new_memory();
+        let v1 = v1_catalog();
+        assert_eq!(
+            apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v1).expect("apply v1"),
+            1
+        );
+        assert!(!table_exists(&conn, "recordings"));
+        assert!(!table_exists(&conn, "recording_segments"));
+
+        assert_eq!(
+            apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("upgrade v2"),
+            2
+        );
+        assert_recording_schema_contract(&conn);
+        assert_eq!(
+            apply_pending(&conn, "0.1.0-test", CorrelationId::new())
+                .expect("repeat open is idempotent"),
+            2
+        );
     }
 
     #[test]
@@ -510,8 +573,16 @@ mod tests {
             [],
         )
         .expect("bump version");
+        let checksum_before: String = conn
+            .query_row("SELECT applied_checksum FROM schema_meta", [], |row| row.get(0))
+            .expect("checksum before failed reopen");
         let err = apply_pending(&conn, "0.1.0-test", CorrelationId::new()).unwrap_err();
         assert_eq!(err.kind(), StoreErrorKind::SchemaNewer);
+        let checksum_after: String = conn
+            .query_row("SELECT applied_checksum FROM schema_meta", [], |row| row.get(0))
+            .expect("checksum after failed reopen");
+        assert_eq!(checksum_after, checksum_before);
+        assert_recording_schema_contract(&conn);
     }
 
     #[test]
@@ -528,6 +599,16 @@ mod tests {
     }
 
     #[test]
+    fn v0001_prefix_checksum_is_pinned() {
+        // v0001 is already shipped. Its byte-for-byte migration identity must
+        // remain stable even while later migrations extend the catalog.
+        assert_eq!(
+            Migrations::prefix_checksum(&v1_catalog()),
+            "b3:47f2631947a676aceea0a8e887b32e5ee590cd07c8eb643770583a673bba4787"
+        );
+    }
+
+    #[test]
     fn tampered_applied_checksum_is_rejected_before_pending_runs() {
         // The regression we are guarding against: a future binary
         // that ships a v2 migration could overwrite the on-disk
@@ -536,18 +617,8 @@ mod tests {
         // checksum is verified *before* any pending migration runs,
         // so a tampered value is rejected without v2 mutating state.
         let conn = new_memory();
-        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v1");
-        let v1 = Migrations::catalog();
-        let v1_count = table_count(&conn, "projects");
-
-        // Inject a pending v2 into the catalog (test fixture; not
-        // present in the compiled-in production catalog).
-        const V2_STATEMENT: &str =
-            "ALTER TABLE projects ADD COLUMN test_marker TEXT NOT NULL DEFAULT ''";
-        let catalog = vec![
-            v1[0].clone(),
-            MigrationRecord { version: 2, label: "v0002_marker", statements: &[V2_STATEMENT] },
-        ];
+        let v1 = v1_catalog();
+        apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v1).expect("apply v1");
 
         // Tamper the stored applied checksum.
         conn.execute(
@@ -556,16 +627,27 @@ mod tests {
         )
         .expect("tamper checksum");
 
-        let err = apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &catalog)
+        let err = apply_pending(&conn, "0.1.0-test", CorrelationId::new())
             .expect_err("tampered checksum must be rejected");
         assert_eq!(err.kind(), StoreErrorKind::SchemaIncompatible);
-        // v2 must not have run; the marker column must be absent.
-        assert_eq!(table_count(&conn, "projects"), v1_count);
-        let columns = list_columns(&conn, "projects");
-        assert!(
-            !columns.iter().any(|name| name == "test_marker"),
-            "v2 must not have mutated the schema when checksum was rejected"
-        );
+        assert!(!table_exists(&conn, "recordings"));
+        assert!(!table_exists(&conn, "recording_segments"));
+    }
+
+    #[test]
+    fn tampered_v2_checksum_is_rejected_on_reopen() {
+        let conn = new_memory();
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v2");
+        conn.execute(
+            "UPDATE schema_meta SET applied_checksum = 'b3:0000000000000000000000000000000000000000000000000000000000000000' WHERE singleton = 1",
+            [],
+        )
+        .expect("tamper v2 checksum");
+
+        let err = apply_pending(&conn, "0.1.0-test", CorrelationId::new())
+            .expect_err("tampered v2 checksum must fail closed");
+        assert_eq!(err.kind(), StoreErrorKind::SchemaIncompatible);
+        assert_recording_schema_contract(&conn);
     }
 
     #[test]
@@ -573,7 +655,7 @@ mod tests {
         // A fresh database has no stored checksum. The verification
         // step short-circuits and pending migrations apply as usual.
         let conn = new_memory();
-        let v1 = Migrations::catalog();
+        let v1 = v1_catalog();
         const V2_STATEMENT: &str =
             "ALTER TABLE projects ADD COLUMN another_marker TEXT NOT NULL DEFAULT ''";
         let catalog = vec![
@@ -583,6 +665,188 @@ mod tests {
         let reached =
             apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &catalog).expect("apply");
         assert_eq!(reached, 2);
+    }
+
+    #[test]
+    fn failed_v2_migration_rolls_back_without_partial_tables() {
+        const CREATE_PARTIAL_TABLE: &str =
+            "CREATE TABLE migration_should_rollback (value TEXT) STRICT";
+        const INVALID_STATEMENT: &str = "NOT VALID SQL";
+
+        let conn = new_memory();
+        let v1 = v1_catalog();
+        apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v1).expect("apply v1");
+        let failing_catalog = vec![
+            v1[0].clone(),
+            MigrationRecord {
+                version: 2,
+                label: "v0002_injected_failure",
+                statements: &[CREATE_PARTIAL_TABLE, INVALID_STATEMENT],
+            },
+        ];
+
+        apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &failing_catalog)
+            .expect_err("invalid v2 migration must fail");
+        assert!(!table_exists(&conn, "migration_should_rollback"));
+        assert!(!table_exists(&conn, "recordings"));
+        assert!(!table_exists(&conn, "recording_segments"));
+        assert_eq!(schema_version(&conn), 1);
+    }
+
+    #[test]
+    fn preexisting_malformed_recordings_fails_closed_without_v2_side_effects() {
+        let conn = new_memory();
+        let v1 = v1_catalog();
+        apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v1).expect("apply v1 only");
+        conn.execute_batch("CREATE TABLE recordings (malformed TEXT) STRICT;")
+            .expect("seed malformed recordings table");
+        let recordings_before = table_sql(&conn, "recordings");
+
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new())
+            .expect_err("preexisting recordings table must reject versioned migration");
+        assert_eq!(schema_version(&conn), 1);
+        assert_eq!(applied_checksum(&conn), Migrations::prefix_checksum(&v1));
+        assert_eq!(table_sql(&conn, "recordings"), recordings_before);
+        assert!(!table_exists(&conn, "recording_segments"));
+    }
+
+    #[test]
+    fn preexisting_malformed_segments_roll_back_earlier_v2_table_creation() {
+        let conn = new_memory();
+        let v1 = v1_catalog();
+        apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v1).expect("apply v1 only");
+        conn.execute_batch("CREATE TABLE recording_segments (malformed TEXT) STRICT;")
+            .expect("seed malformed recording_segments table");
+        let segments_before = table_sql(&conn, "recording_segments");
+
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new())
+            .expect_err("preexisting segments table must reject versioned migration");
+        assert_eq!(schema_version(&conn), 1);
+        assert_eq!(applied_checksum(&conn), Migrations::prefix_checksum(&v1));
+        assert!(!table_exists(&conn, "recordings"));
+        assert_eq!(table_sql(&conn, "recording_segments"), segments_before);
+    }
+
+    #[test]
+    fn recordings_constraints_accept_current_states_and_reject_invalid_rows() {
+        let conn = initialized_v2();
+        let project_id = id(0x11);
+        let runtime_session_id = id(0x22);
+        insert_project(&conn, &project_id).expect("insert project");
+
+        for (index, state) in
+            ["recording", "finalizing", "complete", "partial", "invalid"].into_iter().enumerate()
+        {
+            let recording_id = id(0x30 + index as u8);
+            insert_recording(&conn, &recording_id, &project_id, &runtime_session_id, state)
+                .expect("current recording state is accepted");
+        }
+        assert_eq!(table_count(&conn, "recordings"), 5);
+
+        let invalid_state_id = id(0x40);
+        assert!(insert_recording(
+            &conn,
+            &invalid_state_id,
+            &project_id,
+            &runtime_session_id,
+            "unknown",
+        )
+        .is_err());
+        assert!(
+            insert_recording(&conn, &[0x41; 15], &project_id, &runtime_session_id, "recording",)
+                .is_err()
+        );
+        assert!(
+            insert_recording(&conn, &id(0x42), &[0x42; 15], &runtime_session_id, "recording",)
+                .is_err()
+        );
+        assert!(
+            insert_recording(&conn, &id(0x43), &project_id, &[0x43; 15], "recording",).is_err()
+        );
+        assert!(
+            insert_recording(&conn, &id(0x44), &id(0x45), &runtime_session_id, "recording",)
+                .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO recordings \
+                 (recording_id, project_id, runtime_session_id, status, opened_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                // This text has 16 characters, so STRICT typing rather than
+                // the length check must reject it for the BLOB identifier.
+                params!["1234567890abcdef", &project_id, &runtime_session_id, "recording", "now"],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn recording_segments_constraints_accept_u64_max_and_reject_invalid_rows() {
+        let conn = initialized_v2();
+        let project_id = id(0x51);
+        let recording_id = id(0x52);
+        let runtime_session_id = id(0x53);
+        insert_project(&conn, &project_id).expect("insert project");
+        insert_recording(&conn, &recording_id, &project_id, &runtime_session_id, "recording")
+            .expect("insert recording");
+
+        let max_sequence = u64::MAX.to_be_bytes();
+        let mut valid = valid_segment(&recording_id);
+        valid.first_recording_seq = &max_sequence;
+        valid.last_recording_seq = &max_sequence;
+        insert_segment(&conn, valid).expect("valid u64::MAX sequence blob");
+
+        assert!(insert_segment(&conn, valid_segment(&id(0x54))).is_err());
+        let mut negative_ordinal = valid_segment(&recording_id);
+        negative_ordinal.segment_ordinal = -1;
+        assert!(insert_segment(&conn, negative_ordinal).is_err());
+        let short_hash = [0x55; 31];
+        let mut bad_hash = valid_segment(&recording_id);
+        bad_hash.object_hash = &short_hash;
+        assert!(insert_segment(&conn, bad_hash).is_err());
+        let short_checksum = [0x56; 31];
+        let mut bad_checksum = valid_segment(&recording_id);
+        bad_checksum.checksum = &short_checksum;
+        assert!(insert_segment(&conn, bad_checksum).is_err());
+        let short_sequence = [0x57; 7];
+        let mut bad_first_sequence = valid_segment(&recording_id);
+        bad_first_sequence.first_recording_seq = &short_sequence;
+        assert!(insert_segment(&conn, bad_first_sequence).is_err());
+        let mut bad_last_sequence = valid_segment(&recording_id);
+        bad_last_sequence.last_recording_seq = &short_sequence;
+        assert!(insert_segment(&conn, bad_last_sequence).is_err());
+        let mut zero_events = valid_segment(&recording_id);
+        zero_events.event_count = 0;
+        assert!(insert_segment(&conn, zero_events).is_err());
+        let mut zero_uncompressed = valid_segment(&recording_id);
+        zero_uncompressed.uncompressed_bytes = 0;
+        assert!(insert_segment(&conn, zero_uncompressed).is_err());
+        let mut zero_compressed = valid_segment(&recording_id);
+        zero_compressed.compressed_bytes = 0;
+        assert!(insert_segment(&conn, zero_compressed).is_err());
+        assert!(insert_segment(&conn, valid_segment(&recording_id)).is_err());
+        assert!(
+            conn.execute(
+                "INSERT INTO recording_segments \
+                 (recording_id, segment_ordinal, object_hash, first_recording_seq, \
+                  last_recording_seq, event_count, uncompressed_bytes, compressed_bytes, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    &recording_id,
+                    1_i64,
+                    // This text has 32 characters, so STRICT typing rather
+                    // than the length check must reject it for object_hash.
+                    "0123456789abcdef0123456789abcdef",
+                    &max_sequence,
+                    &max_sequence,
+                    1_i64,
+                    1_i64,
+                    1_i64,
+                    &CHECKSUM,
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -603,12 +867,12 @@ mod tests {
         // dedup would silently keep the last record and silently
         // change the on-disk identity.
         let conn = new_memory();
-        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v1");
-        let v1 = Migrations::catalog();
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply latest schema");
+        let compiled_catalog = Migrations::catalog();
         let column_count_before = list_columns(&conn, "projects").len();
 
         let catalog = vec![
-            v1[0].clone(),
+            compiled_catalog[0].clone(),
             MigrationRecord {
                 version: 2,
                 label: "v0002_first",
@@ -639,12 +903,12 @@ mod tests {
         // A catalog that skips v2 must fail closed. The migration
         // runner must not silently insert only v1 and v3.
         let conn = new_memory();
-        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v1");
-        let v1 = Migrations::catalog();
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply latest schema");
+        let compiled_catalog = Migrations::catalog();
         let column_count_before = list_columns(&conn, "projects").len();
 
         let catalog = vec![
-            v1[0].clone(),
+            compiled_catalog[0].clone(),
             MigrationRecord {
                 version: 3,
                 label: "v0003_skip_two",
@@ -668,8 +932,8 @@ mod tests {
         // also happens to be contiguous would otherwise have its
         // checksum computed incorrectly.
         let conn = new_memory();
-        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v1");
-        let v1 = Migrations::catalog();
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply latest schema");
+        let compiled_catalog = Migrations::catalog();
         let column_count_before = list_columns(&conn, "projects").len();
 
         let catalog = vec![
@@ -680,7 +944,7 @@ mod tests {
                     "ALTER TABLE projects ADD COLUMN unsorted_marker TEXT NOT NULL DEFAULT ''",
                 ],
             },
-            v1[0].clone(),
+            compiled_catalog[0].clone(),
         ];
         let err = apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &catalog)
             .expect_err("unsorted catalog must be rejected");
@@ -690,14 +954,189 @@ mod tests {
         assert!(!columns.iter().any(|name| name == "unsorted_marker"));
     }
 
-    fn table_count(conn: &Connection, name: &str) -> i64 {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |row| row.get(0))
-            .expect("count")
+    const OBJECT_HASH: [u8; 32] = [0x61; 32];
+    const CHECKSUM: [u8; 32] = [0x62; 32];
+    const SEQUENCE_TWO: [u8; 8] = 2_u64.to_be_bytes();
+
+    struct SegmentInput<'a> {
+        recording_id: &'a [u8],
+        segment_ordinal: i64,
+        object_hash: &'a [u8],
+        first_recording_seq: &'a [u8],
+        last_recording_seq: &'a [u8],
+        event_count: i64,
+        uncompressed_bytes: i64,
+        compressed_bytes: i64,
+        checksum: &'a [u8],
+    }
+
+    fn initialized_v2() -> Connection {
+        let conn = new_memory();
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v2");
+        conn
+    }
+
+    fn id(byte: u8) -> [u8; 16] {
+        [byte; 16]
+    }
+
+    fn insert_project(conn: &Connection, project_id: &[u8]) -> Result<usize, rusqlite::Error> {
+        conn.execute(
+            "INSERT INTO projects \
+             (project_id, canonical_repo_hash, display_name, created_at, last_opened_at, \
+              config_schema_version, effective_config_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![project_id, "b3:project", "project", "now", "now", 1_i64, "b3:config"],
+        )
+    }
+
+    fn insert_recording(
+        conn: &Connection,
+        recording_id: &[u8],
+        project_id: &[u8],
+        runtime_session_id: &[u8],
+        status: &str,
+    ) -> Result<usize, rusqlite::Error> {
+        conn.execute(
+            "INSERT INTO recordings \
+             (recording_id, project_id, runtime_session_id, status, opened_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![recording_id, project_id, runtime_session_id, status, "now"],
+        )
+    }
+
+    fn valid_segment(recording_id: &[u8]) -> SegmentInput<'_> {
+        SegmentInput {
+            recording_id,
+            segment_ordinal: 0,
+            object_hash: &OBJECT_HASH,
+            first_recording_seq: &SEQUENCE_TWO,
+            last_recording_seq: &SEQUENCE_TWO,
+            event_count: 1,
+            uncompressed_bytes: 1,
+            compressed_bytes: 1,
+            checksum: &CHECKSUM,
+        }
+    }
+
+    fn insert_segment(
+        conn: &Connection,
+        segment: SegmentInput<'_>,
+    ) -> Result<usize, rusqlite::Error> {
+        conn.execute(
+            "INSERT INTO recording_segments \
+             (recording_id, segment_ordinal, object_hash, first_recording_seq, \
+              last_recording_seq, event_count, uncompressed_bytes, compressed_bytes, checksum) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                segment.recording_id,
+                segment.segment_ordinal,
+                segment.object_hash,
+                segment.first_recording_seq,
+                segment.last_recording_seq,
+                segment.event_count,
+                segment.uncompressed_bytes,
+                segment.compressed_bytes,
+                segment.checksum,
+            ],
+        )
     }
 
     fn list_columns(conn: &Connection, table: &str) -> Vec<String> {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).expect("prepare");
         let rows = stmt.query_map([], |row| row.get::<_, String>(1)).expect("rows");
         rows.filter_map(Result::ok).collect()
+    }
+
+    const RECORDINGS_COLUMNS: &[&str] =
+        &["recording_id", "project_id", "runtime_session_id", "status", "opened_at"];
+    const RECORDING_SEGMENTS_COLUMNS: &[&str] = &[
+        "recording_id",
+        "segment_ordinal",
+        "object_hash",
+        "first_recording_seq",
+        "last_recording_seq",
+        "event_count",
+        "uncompressed_bytes",
+        "compressed_bytes",
+        "checksum",
+    ];
+
+    fn v1_catalog() -> Vec<MigrationRecord> {
+        vec![Migrations::catalog()[0].clone()]
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get::<_, i64>(0).map(|_| true),
+        )
+        .optional()
+        .expect("look up table")
+        .unwrap_or(false)
+    }
+
+    fn schema_version(conn: &Connection) -> i64 {
+        conn.query_row("SELECT schema_version FROM schema_meta WHERE singleton = 1", [], |row| {
+            row.get(0)
+        })
+        .expect("schema version")
+    }
+
+    fn applied_checksum(conn: &Connection) -> String {
+        conn.query_row("SELECT applied_checksum FROM schema_meta WHERE singleton = 1", [], |row| {
+            row.get(0)
+        })
+        .expect("applied checksum")
+    }
+
+    fn table_count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .expect("table count")
+    }
+
+    fn table_sql(conn: &Connection, table: &str) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .expect("table schema")
+    }
+
+    fn assert_recording_schema_contract(conn: &Connection) {
+        let recordings_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'recordings'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("recordings schema");
+        assert!(recordings_sql.contains("CHECK(length(recording_id) = 16)"));
+        assert!(recordings_sql.contains("CHECK(length(project_id) = 16)"));
+        assert!(recordings_sql.contains("CHECK(length(runtime_session_id) = 16)"));
+        for state in ["recording", "finalizing", "complete", "partial", "invalid"] {
+            assert!(recordings_sql.contains(state), "recordings status must include {state}");
+        }
+
+        let segments_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'recording_segments'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("recording_segments schema");
+        assert!(segments_sql.contains("CHECK(length(first_recording_seq) = 8)"));
+        assert!(segments_sql.contains("CHECK(length(last_recording_seq) = 8)"));
+        assert!(!segments_sql.contains("UNIQUE"));
+        let secondary_indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'recording_segments' AND sql IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("recording_segments secondary indexes");
+        assert_eq!(secondary_indexes, 0);
     }
 }
