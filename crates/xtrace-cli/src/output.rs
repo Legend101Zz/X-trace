@@ -210,7 +210,12 @@ fn from_app_error(err: &AppError) -> ErrorDocument {
             command_ref: hint.command_ref.clone(),
         })
         .collect();
-    let details = err.details.iter().map(|(k, v)| (k.clone(), scalar_to_json(v))).collect();
+    let mut details: std::collections::BTreeMap<String, serde_json::Value> =
+        err.details.iter().map(|(key, value)| (key.clone(), scalar_to_json(value))).collect();
+    details.insert(
+        "correlation_id".to_string(),
+        serde_json::Value::String(err.correlation_id.to_string()),
+    );
     ErrorDocument {
         kind: "error",
         code: err.code.as_str().to_string(),
@@ -256,6 +261,23 @@ mod tests {
         let document = ErrorDocument::from_error(&error);
         assert_eq!(document.code, "XTR-CLI-DAEMON-UNSUPPORTED");
         assert_eq!(document.category, "compatibility");
+    }
+
+    #[test]
+    fn application_errors_preserve_the_request_correlation_id_in_json_details() {
+        let correlation_id =
+            "018f0000-0000-7000-8000-000000000001".parse().expect("fixed correlation ID");
+        let error = CliError::App(AppError::new(
+            xtrace_domain::ErrorCode::new("XTR-VALIDATION-ENDPOINT-CURSOR"),
+            xtrace_domain::ErrorCategory::Validation,
+            "observed endpoint cursor is malformed or belongs to a different query",
+            xtrace_domain::RetryAdvice::None,
+            correlation_id,
+        ));
+        let document = ErrorDocument::from_error(&error);
+        assert_eq!(document.details.0["correlation_id"], correlation_id.to_string());
+        let rendered = serde_json::to_string(&document).expect("serialized CLI error");
+        assert!(rendered.contains("\"correlation_id\":\"018f0000-0000-7000-8000-000000000001\""));
     }
 
     #[test]

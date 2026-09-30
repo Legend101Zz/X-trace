@@ -12,10 +12,14 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 use serde::Serialize;
 use xtrace_application::{
-    Application, Command, GetProject, GetStoreStatus, InitializeProject, ListRecordings,
+    Application, Command, GetProject, GetStoreStatus, InitializeProject, ListObservedEndpoints,
+    ListOperationRecordings, ListRecordings, ListUnmatchedRecordings, ObservedEndpointQueryService,
     OpenProject, Query, QueryResult, RecordingQueryService, RequestContext, ShowRecording,
 };
-use xtrace_domain::{AppError, ErrorCategory, ErrorCode, RecordingId, RetryAdvice, WallTime};
+use xtrace_domain::{
+    AppError, CorrelationId, ErrorCategory, ErrorCode, OperationId, RecordingId, RetryAdvice,
+    WallTime,
+};
 use xtrace_store::{CURRENT_SCHEMA_VERSION, SqliteIdempotencyStore, SqliteProjectRepository};
 use xtrace_store::{SqliteRecordingReader, SqliteStore, StoreErrorKind};
 
@@ -68,6 +72,11 @@ pub enum XtraceCommand {
         #[command(subcommand)]
         command: RecordingCommand,
     },
+    /// Read observed endpoints and their linked recordings.
+    Endpoint {
+        #[command(subcommand)]
+        command: EndpointCommand,
+    },
     /// Run the Unix-only foreground, project-scoped XTP recording ingress daemon.
     ///
     /// This command durably writes sealed event segments and retains the
@@ -116,11 +125,17 @@ pub enum RecordingCommand {
         #[arg(long = "project-dir", value_name = "DIR")]
         project_dir: PathBuf,
         /// Maximum rows in this page.
-        #[arg(long, default_value_t = xtrace_application::DEFAULT_RECORDING_LIST_LIMIT)]
-        limit: u32,
+        #[arg(long, value_name = "N", allow_hyphen_values = true)]
+        limit: Option<String>,
         /// Exclusive recording ID cursor from the previous page.
-        #[arg(long, value_name = "RECORDING_ID")]
-        after: Option<RecordingId>,
+        #[arg(long, value_name = "RECORDING_ID", allow_hyphen_values = true)]
+        after: Option<String>,
+        /// List only unmatched and legacy recordings.
+        #[arg(long)]
+        unmatched: bool,
+        /// Versioned cursor returned by a previous unmatched page.
+        #[arg(long, value_name = "CURSOR", allow_hyphen_values = true)]
+        cursor: Option<String>,
     },
     /// Show a bounded, ordered Linear event window.
     Show {
@@ -133,7 +148,39 @@ pub enum RecordingCommand {
         #[arg(long, default_value_t = xtrace_application::DEFAULT_RECORDING_EVENT_LIMIT)]
         limit: u32,
         /// Versioned cursor returned by a previous show response.
-        #[arg(long, value_name = "CURSOR")]
+        #[arg(long, value_name = "CURSOR", allow_hyphen_values = true)]
+        cursor: Option<String>,
+    },
+}
+
+/// Read-only observed endpoint query commands.
+#[derive(Clone, Debug, Subcommand)]
+pub enum EndpointCommand {
+    /// List the project's bounded observed endpoint catalog.
+    List {
+        /// Path to the initialized repository root.
+        #[arg(long = "project-dir", value_name = "DIR")]
+        project_dir: PathBuf,
+        /// Maximum number of endpoints in this page.
+        #[arg(long, value_name = "N", allow_hyphen_values = true)]
+        limit: Option<String>,
+        /// Opaque continuation returned by a previous endpoint page.
+        #[arg(long, value_name = "CURSOR", allow_hyphen_values = true)]
+        cursor: Option<String>,
+    },
+    /// List bounded recordings linked to one observed operation.
+    Recordings {
+        /// Canonical UUIDv7 operation ID.
+        #[arg(allow_hyphen_values = true)]
+        operation_id: String,
+        /// Path to the initialized repository root.
+        #[arg(long = "project-dir", value_name = "DIR")]
+        project_dir: PathBuf,
+        /// Maximum number of recordings in this page.
+        #[arg(long, value_name = "N", allow_hyphen_values = true)]
+        limit: Option<String>,
+        /// Opaque continuation returned by a previous recording page.
+        #[arg(long, value_name = "CURSOR", allow_hyphen_values = true)]
         cursor: Option<String>,
     },
 }
@@ -159,6 +206,9 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
         }
         XtraceCommand::Recording { command } => {
             recording(command, &crate::paths::read_env_path).map(|()| 0)
+        }
+        XtraceCommand::Endpoint { command } => {
+            endpoint(command, &crate::paths::read_env_path).map(|()| 0)
         }
         XtraceCommand::Daemon { project_dir } => crate::daemon::run(project_dir).await.map(|()| 0),
         XtraceCommand::Run {
@@ -213,27 +263,137 @@ fn recording<F>(command: RecordingCommand, env_reader: &F) -> Result<(), CliErro
 where
     F: Fn(&str) -> Option<PathBuf>,
 {
-    let (project_dir, list_request, show_request) = match command {
-        RecordingCommand::List { project_dir, limit, after } => {
-            (project_dir, Some((limit, after)), None)
+    match command {
+        RecordingCommand::List { project_dir, limit, after, unmatched, cursor } => {
+            // Reject mixed cursor contracts before resolving the project or opening SQLite.
+            if (unmatched && after.is_some()) || (!unmatched && cursor.is_some()) {
+                return Err(endpoint_query_error(
+                    "XTR-VALIDATION-ENDPOINT-QUERY",
+                    "recording list cursor options are incompatible",
+                    CorrelationId::new(),
+                ));
+            }
+            let correlation_id = CorrelationId::new();
+            let limit = parse_limit(limit.as_deref(), correlation_id)?;
+            let mut stdout = std::io::stdout().lock();
+            if unmatched {
+                let (project_id, queries, correlation_id) =
+                    open_observed_endpoint_queries(&project_dir, env_reader)?;
+                let page = queries.list_unmatched_recordings(
+                    ListUnmatchedRecordings { project_id, limit, cursor },
+                    correlation_id,
+                )?;
+                write_success(&mut stdout, &page)?;
+            } else {
+                let after = after
+                    .as_deref()
+                    .map(|value| parse_recording_cursor(value, correlation_id))
+                    .transpose()?;
+                let (project_id, recording_queries, correlation_id) =
+                    open_recording_queries(&project_dir, env_reader)?;
+                let default_limit = xtrace_application::DEFAULT_RECORDING_LIST_LIMIT;
+                let limit = limit.unwrap_or(default_limit);
+                let page = recording_queries
+                    .list(ListRecordings { project_id, limit, after }, correlation_id)?;
+                write_success(&mut stdout, &page)?;
+            }
+            Ok(())
         }
         RecordingCommand::Show { project_dir, recording_id, limit, cursor } => {
-            (project_dir, None, Some((recording_id, limit, cursor)))
+            let (project_id, recording_queries, correlation_id) =
+                open_recording_queries(&project_dir, env_reader)?;
+            let detail = recording_queries
+                .show(ShowRecording { project_id, recording_id, limit, cursor }, correlation_id)?;
+            let mut stdout = std::io::stdout().lock();
+            write_success(&mut stdout, &detail)?;
+            Ok(())
         }
-    };
-    let (project_id, recording_queries, correlation_id) =
-        open_recording_queries(&project_dir, env_reader)?;
+    }
+}
+
+fn endpoint<F>(command: EndpointCommand, env_reader: &F) -> Result<(), CliError>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
+    let correlation_id = CorrelationId::new();
     let mut stdout = std::io::stdout().lock();
-    if let Some((limit, after)) = list_request {
-        let page =
-            recording_queries.list(ListRecordings { project_id, limit, after }, correlation_id)?;
-        write_success(&mut stdout, &page)?;
-    } else if let Some((recording_id, limit, cursor)) = show_request {
-        let detail = recording_queries
-            .show(ShowRecording { project_id, recording_id, limit, cursor }, correlation_id)?;
-        write_success(&mut stdout, &detail)?;
+    match command {
+        EndpointCommand::List { project_dir, limit, cursor } => {
+            let limit = parse_limit(limit.as_deref(), correlation_id)?;
+            let (project_id, queries, correlation_id) =
+                open_observed_endpoint_queries(&project_dir, env_reader)?;
+            let page = queries.list_observed_endpoints(
+                ListObservedEndpoints { project_id, limit, cursor },
+                correlation_id,
+            )?;
+            write_success(&mut stdout, &page)?;
+        }
+        EndpointCommand::Recordings { operation_id, project_dir, limit, cursor } => {
+            let operation_id = parse_operation_id(&operation_id, correlation_id)?;
+            let limit = parse_limit(limit.as_deref(), correlation_id)?;
+            let (project_id, queries, correlation_id) =
+                open_observed_endpoint_queries(&project_dir, env_reader)?;
+            let page = queries.list_operation_recordings(
+                ListOperationRecordings { project_id, operation_id, limit, cursor },
+                correlation_id,
+            )?;
+            write_success(&mut stdout, &page)?;
+        }
     }
     Ok(())
+}
+
+fn parse_limit(
+    value: Option<&str>,
+    correlation_id: CorrelationId,
+) -> Result<Option<u32>, CliError> {
+    value
+        .map(|value| {
+            value.parse::<u32>().map_err(|_| {
+                endpoint_query_error(
+                    "XTR-VALIDATION-ENDPOINT-QUERY",
+                    "observed endpoint query limit is invalid",
+                    correlation_id,
+                )
+            })
+        })
+        .transpose()
+}
+
+fn parse_recording_cursor(
+    value: &str,
+    correlation_id: CorrelationId,
+) -> Result<RecordingId, CliError> {
+    value.parse::<RecordingId>().map_err(|_| {
+        endpoint_query_error(
+            "XTR-VALIDATION-RECORDING-CURSOR",
+            "recording list cursor is malformed",
+            correlation_id,
+        )
+    })
+}
+
+fn parse_operation_id(value: &str, correlation_id: CorrelationId) -> Result<OperationId, CliError> {
+    let operation_id = value.parse::<OperationId>().map_err(|_| {
+        endpoint_query_error(
+            "XTR-VALIDATION-ENDPOINT-QUERY",
+            "observed endpoint query input is invalid",
+            correlation_id,
+        )
+    })?;
+    if operation_id.to_string() != value {
+        return Err(endpoint_query_error(
+            "XTR-VALIDATION-ENDPOINT-QUERY",
+            "observed endpoint query input is invalid",
+            correlation_id,
+        ));
+    }
+    Ok(operation_id)
+}
+
+fn endpoint_query_error(code: &'static str, message: &'static str, id: CorrelationId) -> CliError {
+    AppError::new(ErrorCode::new(code), ErrorCategory::Validation, message, RetryAdvice::None, id)
+        .into()
 }
 
 pub(crate) fn open_recording_queries<F>(
@@ -247,6 +407,35 @@ pub(crate) fn open_recording_queries<F>(
     ),
     CliError,
 >
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
+    let (project_id, reader, correlation_id) = open_recording_reader(project_dir, env_reader)?;
+    Ok((project_id, RecordingQueryService::new(reader), correlation_id))
+}
+
+fn open_observed_endpoint_queries<F>(
+    project_dir: &Path,
+    env_reader: &F,
+) -> Result<
+    (
+        xtrace_domain::ProjectId,
+        ObservedEndpointQueryService<SqliteRecordingReader>,
+        xtrace_domain::CorrelationId,
+    ),
+    CliError,
+>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
+    let (project_id, reader, correlation_id) = open_recording_reader(project_dir, env_reader)?;
+    Ok((project_id, ObservedEndpointQueryService::new(reader), correlation_id))
+}
+
+fn open_recording_reader<F>(
+    project_dir: &Path,
+    env_reader: &F,
+) -> Result<(xtrace_domain::ProjectId, SqliteRecordingReader, xtrace_domain::CorrelationId), CliError>
 where
     F: Fn(&str) -> Option<PathBuf>,
 {
@@ -287,7 +476,7 @@ where
         )));
     }
     let reader = SqliteRecordingReader::new(store, project_directory);
-    Ok((project.id(), RecordingQueryService::new(reader), context.correlation_id))
+    Ok((project.id(), reader, context.correlation_id))
 }
 
 /// Resolves the user-data home directory for the supplied pointer

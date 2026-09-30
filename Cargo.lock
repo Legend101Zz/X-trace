@@ -1563,6 +1563,7 @@ dependencies = [
 name = "xtrace-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "blake3",
  "clap",
  "fs4",
@@ -1577,6 +1578,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "uuid",
  "xtrace-application",
  "xtrace-daemon",
  "xtrace-domain",

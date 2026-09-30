@@ -49,8 +49,9 @@ mod paths;
 mod run;
 mod viewer;
 
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 use commands::XtraceCommand;
+use xtrace_domain::{AppError, CorrelationId, ErrorCategory, ErrorCode, RetryAdvice};
 
 pub use error::CliError;
 
@@ -70,8 +71,11 @@ pub struct Cli {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
-    let exit_code = match commands::run(cli.command).await {
+    let exit_code = match parse_cli() {
+        Ok(cli) => commands::run(cli.command).await,
+        Err(err) => Err(err),
+    };
+    let exit_code = match exit_code {
         Ok(exit_code) => exit_code,
         Err(err) => {
             // Errors go to stderr as one JSON document so scripts can
@@ -84,6 +88,32 @@ async fn main() {
         }
     };
     std::process::exit(exit_code);
+}
+
+fn parse_cli() -> Result<Cli, CliError> {
+    match Cli::try_parse() {
+        Ok(cli) => Ok(cli),
+        Err(error) => Err(sanitized_parse_error(error)),
+    }
+}
+
+fn sanitized_parse_error(error: clap::Error) -> CliError {
+    if matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            | ErrorKind::DisplayVersion
+    ) {
+        error.exit();
+    }
+    AppError::new(
+        ErrorCode::new("XTR-CLI-ARGUMENT"),
+        ErrorCategory::Validation,
+        "command-line arguments are invalid",
+        RetryAdvice::None,
+        CorrelationId::new(),
+    )
+    .into()
 }
 
 #[cfg(test)]
@@ -189,8 +219,8 @@ mod tests {
         assert!(matches!(
             list.command,
             commands::XtraceCommand::Recording {
-                command: commands::RecordingCommand::List { limit: 200, .. }
-            }
+                command: commands::RecordingCommand::List { limit: Some(ref limit), .. }
+            } if limit == "200"
         ));
 
         let show = Cli::try_parse_from([
@@ -212,5 +242,173 @@ mod tests {
                 }
             } if cursor == "v1.eHh4"
         ));
+    }
+
+    #[test]
+    fn observed_endpoint_and_unmatched_commands_parse_shared_page_options() {
+        let endpoints = Cli::try_parse_from([
+            "xtrace",
+            "endpoint",
+            "list",
+            "--project-dir",
+            "/tmp/project",
+            "--limit",
+            "3",
+            "--cursor",
+            "opaque-token",
+        ])
+        .expect("endpoint list parses");
+        assert!(matches!(
+            endpoints.command,
+            commands::XtraceCommand::Endpoint {
+                command: commands::EndpointCommand::List {
+                    limit: Some(limit), cursor: Some(cursor), ..
+                }
+            } if limit == "3" && cursor == "opaque-token"
+        ));
+
+        let linked = Cli::try_parse_from([
+            "xtrace",
+            "endpoint",
+            "recordings",
+            "018f0000-0000-7000-8000-000000000001",
+            "--project-dir",
+            "/tmp/project",
+        ])
+        .expect("endpoint recordings parses");
+        assert!(matches!(
+            linked.command,
+            commands::XtraceCommand::Endpoint {
+                command: commands::EndpointCommand::Recordings { operation_id, .. }
+            } if operation_id == "018f0000-0000-7000-8000-000000000001"
+        ));
+
+        let unmatched = Cli::try_parse_from([
+            "xtrace",
+            "recording",
+            "list",
+            "--project-dir",
+            "/tmp/project",
+            "--unmatched",
+            "--limit",
+            "3",
+            "--cursor",
+            "opaque-token",
+        ])
+        .expect("unmatched recording list parses");
+        assert!(matches!(
+            unmatched.command,
+            commands::XtraceCommand::Recording {
+                command: commands::RecordingCommand::List {
+                    unmatched: true, limit: Some(limit), cursor: Some(cursor), ..
+                }
+            } if limit == "3" && cursor == "opaque-token"
+        ));
+    }
+
+    #[test]
+    fn hyphen_prefixed_query_values_are_preserved_for_safe_validation() {
+        let endpoint_list = Cli::try_parse_from([
+            "xtrace",
+            "endpoint",
+            "list",
+            "--project-dir",
+            "/tmp/project",
+            "--limit",
+            "-LIMIT_CANARY",
+            "--cursor",
+            "--CURSOR_CANARY",
+        ])
+        .expect("hyphen-prefixed endpoint query values parse");
+        assert!(matches!(
+            endpoint_list.command,
+            commands::XtraceCommand::Endpoint {
+                command: commands::EndpointCommand::List {
+                    limit: Some(limit), cursor: Some(cursor), ..
+                }
+            } if limit == "-LIMIT_CANARY" && cursor == "--CURSOR_CANARY"
+        ));
+
+        let linked = Cli::try_parse_from([
+            "xtrace",
+            "endpoint",
+            "recordings",
+            "--OPERATION_CANARY",
+            "--project-dir",
+            "/tmp/project",
+            "--limit",
+            "--LIMIT_CANARY",
+            "--cursor",
+            "-CURSOR_CANARY",
+        ])
+        .expect("hyphen-prefixed operation query values parse");
+        assert!(matches!(
+            linked.command,
+            commands::XtraceCommand::Endpoint {
+                command: commands::EndpointCommand::Recordings {
+                    operation_id, limit: Some(limit), cursor: Some(cursor), ..
+                }
+            } if operation_id == "--OPERATION_CANARY"
+                && limit == "--LIMIT_CANARY"
+                && cursor == "-CURSOR_CANARY"
+        ));
+
+        let legacy = Cli::try_parse_from([
+            "xtrace",
+            "recording",
+            "list",
+            "--project-dir",
+            "/tmp/project",
+            "--after",
+            "--RECORDING_CURSOR_CANARY",
+        ])
+        .expect("hyphen-prefixed legacy cursor parses");
+        assert!(matches!(
+            legacy.command,
+            commands::XtraceCommand::Recording {
+                command: commands::RecordingCommand::List { after: Some(after), .. }
+            } if after == "--RECORDING_CURSOR_CANARY"
+        ));
+
+        let show = Cli::try_parse_from([
+            "xtrace",
+            "recording",
+            "show",
+            "--project-dir",
+            "/tmp/project",
+            "018f0000-0000-7000-8000-000000000001",
+            "--cursor",
+            "-SHOW_CURSOR_CANARY",
+        ])
+        .expect("hyphen-prefixed show cursor parses");
+        assert!(matches!(
+            show.command,
+            commands::XtraceCommand::Recording {
+                command: commands::RecordingCommand::Show { cursor: Some(cursor), .. }
+            } if cursor == "-SHOW_CURSOR_CANARY"
+        ));
+    }
+
+    #[test]
+    fn ambiguous_cursor_option_orders_render_static_errors_without_echoing_values() {
+        for options in [
+            ["--unmatched", "--after", "--cursor", "AFTER_ORDER_PRIVACY_CANARY"],
+            ["--unmatched", "--cursor", "--after", "CURSOR_ORDER_PRIVACY_CANARY"],
+        ] {
+            let mut args = vec!["xtrace", "recording", "list", "--project-dir", "/missing"];
+            args.extend(options);
+            let parse_error = Cli::try_parse_from(args).expect_err("ambiguous cursor mode");
+            let error = sanitized_parse_error(parse_error);
+            let mut rendered = Vec::new();
+            output::write_error(&mut rendered, &error).expect("render sanitized parse error");
+            let document: serde_json::Value =
+                serde_json::from_slice(&rendered).expect("structured parse error");
+            assert_eq!(document["code"], "XTR-CLI-ARGUMENT");
+            assert_eq!(document["exit_code"], 2);
+            assert!(document["details"]["correlation_id"].as_str().is_some());
+            let rendered = String::from_utf8(rendered).expect("JSON is UTF-8");
+            assert!(!rendered.contains("AFTER_ORDER_PRIVACY_CANARY"));
+            assert!(!rendered.contains("CURSOR_ORDER_PRIVACY_CANARY"));
+        }
     }
 }

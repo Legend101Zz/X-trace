@@ -201,6 +201,33 @@ existing `POST /orders` instrumentation. It is not Gradle/Maven task launch,
 wrapper launch, generic Java/Spring/Servlet compatibility, attach, endpoint
 discovery, browser replay, or a complete capture/replay release journey.
 
+### Observed endpoint CLI projections
+
+The CLI can inspect the fixture-scoped endpoint catalog and recordings that
+carry its stored operation link:
+
+```bash
+cargo run -q -p xtrace-cli --bin xtrace -- endpoint list \
+  --project-dir /tmp/xtrace-run/repo --limit 50
+cargo run -q -p xtrace-cli --bin xtrace -- endpoint recordings \
+  --project-dir /tmp/xtrace-run/repo <operation-id> --limit 25
+cargo run -q -p xtrace-cli --bin xtrace -- endpoint recordings \
+  --project-dir /tmp/xtrace-run/repo <operation-id> --limit 25 --cursor <cursor>
+cargo run -q -p xtrace-cli --bin xtrace -- recording list \
+  --project-dir /tmp/xtrace-run/repo --unmatched --limit 25 --cursor <cursor>
+```
+
+Endpoint pages default to 50 rows and allow at most 100. Linked and unmatched
+recording pages default to 25 rows and allow at most 50. The existing
+`recording list` invocation remains the legacy recording projection: it
+defaults to 50 rows, allows at most 200, accepts `--after <recording-id>`, and
+keeps its legacy JSON fields. `--cursor` is used by the new linked or unmatched
+recording projections; `--after` remains the legacy cursor.
+
+The catalog reflects persisted observations accepted by the current exact
+`spring-orders-v1` fixture policy for `POST /orders`. It does not discover
+general application endpoints or complete the Slice 1E browser journey.
+
 After stopping the run, inspect the persisted request with fresh CLI
 processes:
 
