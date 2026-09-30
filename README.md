@@ -11,11 +11,14 @@ daemon and prove a staged XTP recording reached selected-root XTF storage; it
 does not instrument Node applications or declare Node capture support. See
 `docs/development/setup.md` for the exact acceptance commands and boundary.
 
-The Java 17 workspace under `adapters/java` has the same deliberately narrow
-boundary. Its private synthetic client proves that Conscrypt's TLS exporter,
-the canonical protobuf framing, and staged persistence interoperate with the
-Rust daemon. It is not a Java agent and does not yet instrument Spring,
-Spring Boot, Servlet, or ordinary JVM applications.
+The Java workspace under `adapters/java` preserves that synthetic conformance
+client and adds an experimental launch-only tracer bullet. A JDK-only
+`premain`/bridge JAR loads a private runtime and captures one pinned Spring Boot
+4.1.1 fixture's `POST /orders` path through Spring MVC, three exact application
+methods, and H2 `executeUpdate()`. This is fixture evidence, not general Java,
+Spring, Spring Boot, Servlet, attach, or production capture support. The
+`POST /orders` identity is fixed by the exact fixture handler matcher; it is
+source-derived test metadata, not request-derived dynamic endpoint discovery.
 
 ## Crate layout
 
@@ -99,11 +102,11 @@ npm ci --prefix adapters/node
 npm run generate:check --prefix adapters/node
 npm test --prefix adapters/node
 
-# Verify dependencies, generate Java bindings, test, and install the private
-# Java 17 synthetic client used by the Rust integration suite
+# Verify dependencies, generate Java bindings, test, install the synthetic
+# client, and assemble the experimental premain agent and Spring fixture
 GRADLE_USER_HOME=/path/to/cache/gradle \
   adapters/java/gradlew -p adapters/java --dependency-verification strict \
-  clean test installDist
+  clean test installDist agentDist fixtureBootJar
 
 # Run the Rust suite, including both language-to-daemon persistence tests
 cargo build --workspace --all-features
