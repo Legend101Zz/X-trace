@@ -3,6 +3,10 @@
 use std::path::PathBuf;
 
 use prost::Message as _;
+use xtrace_application::observed_endpoint_queries::{
+    ObservedEndpointKey, ObservedEndpointReadPort, ObservedEndpointRecord, ObservedRecordingKey,
+    ObservedRecordingRecord,
+};
 use xtrace_application::recording::{
     AcceptedRecordingEvent, BeginRecording, BeginRecordingDisposition as PortBeginDisposition,
     BeginRecordingReceipt as PortBeginReceipt, PersistRecordingSegment,
@@ -79,6 +83,43 @@ impl RecordingReadPort for SqliteRecordingReader {
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
         view.read_recording_window(request).map_err(map_recording_error)
+    }
+}
+
+impl ObservedEndpointReadPort for SqliteRecordingReader {
+    fn list_observed_endpoints(
+        &self,
+        project_id: xtrace_domain::ProjectId,
+        after: Option<&ObservedEndpointKey>,
+        limit: u32,
+    ) -> Result<(Vec<ObservedEndpointRecord>, bool), PortError> {
+        let view =
+            self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
+        view.list_observed_endpoints(project_id, after, limit).map_err(map_recording_error)
+    }
+
+    fn list_operation_recordings(
+        &self,
+        project_id: xtrace_domain::ProjectId,
+        operation_id: xtrace_domain::OperationId,
+        after: Option<&ObservedRecordingKey>,
+        limit: u32,
+    ) -> Result<(Vec<ObservedRecordingRecord>, bool), PortError> {
+        let view =
+            self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
+        view.list_operation_recordings(project_id, operation_id, after, limit)
+            .map_err(map_recording_error)
+    }
+
+    fn list_unmatched_recordings(
+        &self,
+        project_id: xtrace_domain::ProjectId,
+        after: Option<&ObservedRecordingKey>,
+        limit: u32,
+    ) -> Result<(Vec<ObservedRecordingRecord>, bool), PortError> {
+        let view =
+            self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
+        view.list_unmatched_recordings(project_id, after, limit).map_err(map_recording_error)
     }
 }
 

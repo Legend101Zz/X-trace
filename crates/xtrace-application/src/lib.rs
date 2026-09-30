@@ -38,6 +38,7 @@
 pub mod application;
 pub mod commands;
 pub mod error;
+pub mod observed_endpoint_queries;
 pub mod ports;
 pub mod queries;
 pub mod recording;
@@ -46,6 +47,13 @@ pub mod recording_queries;
 pub use application::{Application, RequestContext};
 pub use commands::{Command, CommandReceipt, InitializeProject, OpenProject};
 pub use error::{PortError, PortErrorKind};
+pub use observed_endpoint_queries::{
+    DEFAULT_OBSERVED_ENDPOINT_LIMIT, DEFAULT_OBSERVED_RECORDING_LIMIT, ListObservedEndpoints,
+    ListOperationRecordings, ListUnmatchedRecordings, MAX_OBSERVED_ENDPOINT_LIMIT,
+    MAX_OBSERVED_RECORDING_LIMIT, ObservedEndpointDto, ObservedEndpointPage,
+    ObservedEndpointQueryService, ObservedEndpointReadPort, ObservedRecordingDto,
+    ObservedRecordingPage,
+};
 pub use ports::{IdempotencyStore, ProjectRepository, StoredReceipt};
 pub use queries::{
     CapabilityReport, GetProject, GetStoreStatus, ProjectStatus, Query, QueryResult,
