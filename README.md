@@ -125,6 +125,38 @@ cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir /tmp/xtrace-smok
 cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir /tmp/xtrace-smoke
 ```
 
+Persisted recordings can be inspected through the bounded, read-only query
+surface:
+
+```bash
+cargo run -q -p xtrace-cli --bin xtrace -- recording list \
+  --project-dir /tmp/xtrace-smoke --limit 50
+cargo run -q -p xtrace-cli --bin xtrace -- recording show \
+  --project-dir /tmp/xtrace-smoke <recording-id> --limit 200
+```
+
+`list` is metadata-only, ordered by opening time and recording ID, and accepts
+the returned `next_after` recording ID for another page (default 50, maximum
+200). `show` verifies the touched XTF segments and returns an ordered event
+window (default 200, maximum 1,000 events, 256 KiB of compact event JSON, and
+16 MiB of verified compressed-plus-logical XTF input per call). If another
+segment would exceed the input budget, the response stops at the preceding
+event and returns a cursor; one codec-bounded first segment may be processed
+to ensure progress. Pass the versioned `next_cursor` back with `--cursor`; the
+cursor is bound to the selected project and recording. Sequence and monotonic
+values are decimal strings for JavaScript-safe precision. Raw interaction paths
+are omitted because persisted path segments may contain identifiers or tokens.
+Oversized display fields become `[truncated]`; oversized identity/relationship
+fields become `[unavailable]`. `field_truncations` records field names,
+original byte lengths, and replacement kinds without retaining source text.
+These projections contain persisted event metadata only: they do not expose
+captured values, source bodies, or completion semantics, and a `recording`
+status is not a completion claim.
+Opening read-only uses normal SQLite WAL coordination; SQLite may create its
+empty WAL/shared-memory coordination files when none exist, but query paths do
+not migrate or update logical store data, repository pointers, or project
+`last_opened` metadata.
+
 `just test` and `just ci` prepare both language workspaces before Rust tests,
 so their daemon integration tests do not depend on ignored build output from
 another job or checkout.

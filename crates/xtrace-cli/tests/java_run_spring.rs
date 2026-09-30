@@ -109,6 +109,9 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
             "{canary} reached stored XTF"
         );
     }
+    let second_response = post_order(port);
+    assert!(second_response.starts_with(b"HTTP/1.1 201"));
+    wait_for_recording_count(&project_root, 2);
 
     let cli_pid =
         rustix::process::Pid::from_raw(process.child.id() as i32).expect("CLI process ID");
@@ -148,6 +151,68 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
         std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
         "Java fixture remained after signal shutdown"
     );
+
+    let database = project_root.join("metadata.sqlite3");
+    let database_before_queries = fs::read(&database).expect("database snapshot");
+    let pointer = repo.join(".xtrace/config.toml");
+    let pointer_before_queries = file_state(&pointer);
+    let first_page = recording_list_page(&repo, &data_home, None);
+    let first_page_again = recording_list_page(&repo, &data_home, None);
+    assert!(first_page.status.success(), "recording list failed: {}", diagnostic(&first_page));
+    assert!(first_page_again.status.success());
+    assert_eq!(first_page.stdout, first_page_again.stdout, "list output must be stable");
+    let first_json: Value = serde_json::from_slice(&first_page.stdout).expect("list projection");
+    assert_eq!(first_json["schema_version"], 1);
+    let first_recording =
+        first_json["recordings"][0]["recording_id"].as_str().expect("recording ID");
+    let list_cursor = first_json["next_after"].as_str().expect("second page cursor");
+    let second_page = recording_list_page(&repo, &data_home, Some(list_cursor));
+    assert!(second_page.status.success(), "second page failed: {}", diagnostic(&second_page));
+    let second_json: Value = serde_json::from_slice(&second_page.stdout).expect("second page JSON");
+    assert_eq!(second_json["recordings"].as_array().expect("recordings").len(), 1);
+    assert_ne!(
+        first_recording,
+        second_json["recordings"][0]["recording_id"].as_str().expect("second recording ID")
+    );
+    assert_canaries_absent(&first_page.stdout);
+    assert_canaries_absent(&second_page.stdout);
+
+    let detail_page = recording_show_page(&repo, &data_home, first_recording, 1, None);
+    let detail_page_again = recording_show_page(&repo, &data_home, first_recording, 1, None);
+    assert!(detail_page.status.success(), "recording show failed: {}", diagnostic(&detail_page));
+    assert_eq!(detail_page.stdout, detail_page_again.stdout, "show output must be stable");
+    let detail_json: Value = serde_json::from_slice(&detail_page.stdout).expect("show projection");
+    assert_eq!(detail_json["schema_version"], 1);
+    assert_eq!(detail_json["status"], "recording");
+    assert_eq!(detail_json["unavailable"]["completion"], "unavailable");
+    assert_canaries_absent(&detail_page.stdout);
+    let show_cursor = detail_json["next_cursor"].as_str().expect("next show cursor");
+    let next_detail = recording_show_page(&repo, &data_home, first_recording, 1, Some(show_cursor));
+    assert!(next_detail.status.success(), "cursor page failed: {}", diagnostic(&next_detail));
+    let next_json: Value = serde_json::from_slice(&next_detail.stdout).expect("continued show");
+    assert_eq!(next_json["cursor"], show_cursor);
+    let first_sequence = detail_json["events"][0]["sequence"]
+        .as_str()
+        .expect("first event sequence")
+        .parse::<u64>()
+        .expect("decimal sequence");
+    let next_sequence = next_json["events"][0]["sequence"]
+        .as_str()
+        .expect("next event sequence")
+        .parse::<u64>()
+        .expect("decimal sequence");
+    assert!(next_sequence > first_sequence);
+    assert_canaries_absent(&next_detail.stdout);
+
+    let mut unknown_id = first_recording.as_bytes().to_vec();
+    unknown_id[0] = if unknown_id[0] == b'0' { b'1' } else { b'0' };
+    let unknown_id = String::from_utf8(unknown_id).expect("UUID is ASCII");
+    let unknown = recording_show_page(&repo, &data_home, &unknown_id, 1, None);
+    assert!(!unknown.status.success(), "unknown recording should fail");
+    assert_canaries_absent(&unknown.stderr);
+    assert_eq!(fs::read(&database).expect("database after reads"), database_before_queries);
+    assert_eq!(file_state(&pointer), pointer_before_queries);
+
     let reacquired = Command::new(env!("CARGO_BIN_EXE_xtrace"))
         .args(["run", "--project-dir"])
         .arg(&repo)
@@ -424,6 +489,75 @@ fn wait_for_segment(project_root: &Path) -> Vec<u8> {
         assert!(Instant::now() < deadline, "request was not persisted to selected project");
         thread::sleep(Duration::from_millis(30));
     }
+}
+
+fn wait_for_recording_count(project_root: &Path, expected: i64) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let database = Connection::open(project_root.join("metadata.sqlite3")).expect("SQLite");
+        let count: i64 = database
+            .query_row("SELECT COUNT(*) FROM recordings", [], |row| row.get(0))
+            .expect("recording count");
+        if count >= expected {
+            return;
+        }
+        assert!(Instant::now() < deadline, "expected {expected} persisted recordings, got {count}");
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
+fn recording_list_page(repo: &Path, data_home: &Path, after: Option<&str>) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xtrace"));
+    command.args(["recording", "list", "--project-dir"]).arg(repo).args(["--limit", "1"]);
+    if let Some(cursor) = after {
+        command.args(["--after", cursor]);
+    }
+    command.env("XTRACE_DATA_HOME", data_home);
+    command.output().expect("run xtrace recording list")
+}
+
+fn recording_show_page(
+    repo: &Path,
+    data_home: &Path,
+    recording_id: &str,
+    limit: u32,
+    cursor: Option<&str>,
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xtrace"));
+    command
+        .args(["recording", "show", "--project-dir"])
+        .arg(repo)
+        .arg(recording_id)
+        .args(["--limit", &limit.to_string()]);
+    if let Some(cursor) = cursor {
+        command.args(["--cursor", cursor]);
+    }
+    command.env("XTRACE_DATA_HOME", data_home);
+    command.output().expect("run xtrace recording show")
+}
+
+fn assert_canaries_absent(bytes: &[u8]) {
+    for canary in ["BODY_CANARY_1D4", "AUTH_CANARY_1D4", "COOKIE_CANARY_1D4"] {
+        assert!(
+            !bytes.windows(canary.len()).any(|window| window == canary.as_bytes()),
+            "{canary} leaked"
+        );
+    }
+}
+
+fn diagnostic(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[cfg(unix)]
+fn file_state(path: &Path) -> (Vec<u8>, std::time::SystemTime, u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let metadata = fs::metadata(path).expect("file metadata");
+    (
+        fs::read(path).expect("file bytes"),
+        metadata.modified().expect("file mtime"),
+        metadata.permissions().mode(),
+    )
 }
 
 fn drain(mut reader: impl Read) -> Vec<u8> {

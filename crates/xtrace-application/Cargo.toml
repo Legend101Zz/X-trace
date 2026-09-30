@@ -12,6 +12,7 @@ description = "Use cases, commands, queries, and ports for X-trace."
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 xtrace-domain = { path = "../xtrace-domain" }
 thiserror = { workspace = true }
 tracing = { workspace = true }

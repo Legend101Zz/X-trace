@@ -26,6 +26,12 @@ const ZSTD_LEVEL: i32 = 3;
 // zstd back-reference window to the maximum logical-stream budget.
 const ZSTD_WINDOW_LOG_MAX: u32 = 22;
 
+/// Returns the largest logical XTF stream this codec will inspect.
+#[must_use]
+pub const fn max_logical_segment_bytes() -> usize {
+    MAX_LOGICAL_BYTES
+}
+
 /// Typed input used to create one canonical XTF segment.
 ///
 /// Sequence range and count are deliberately absent: they are derived from
@@ -119,8 +125,33 @@ pub struct VerifiedXtfSegment {
     content_hash: ContentHash,
     footer_prefix_digest: ContentHash,
     event_count: u64,
+    logical_bytes: u64,
     first_recording_seq: u64,
     last_recording_seq: u64,
+}
+
+/// Fully verified XTF segment metadata and its bounded decoded event envelopes.
+///
+/// The envelopes are returned by the same pass that verifies all framing,
+/// checksums, identifiers, sequence continuity, and the content address.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedXtfSegment {
+    verified: VerifiedXtfSegment,
+    events: Vec<XtfEventEnvelope>,
+}
+
+impl DecodedXtfSegment {
+    /// Returns metadata proven by complete XTF verification.
+    #[must_use]
+    pub const fn verified(&self) -> &VerifiedXtfSegment {
+        &self.verified
+    }
+
+    /// Returns event envelopes decoded during the verification pass.
+    #[must_use]
+    pub fn events(&self) -> &[XtfEventEnvelope] {
+        &self.events
+    }
 }
 
 impl VerifiedXtfSegment {
@@ -161,6 +192,12 @@ impl VerifiedXtfSegment {
     #[must_use]
     pub const fn event_count(&self) -> u64 {
         self.event_count
+    }
+
+    /// Returns the verified length of the complete uncompressed XTF stream.
+    #[must_use]
+    pub const fn logical_bytes(&self) -> u64 {
+        self.logical_bytes
     }
 
     /// Returns the verified first recording sequence number.
@@ -333,6 +370,20 @@ pub fn verify_compressed_segment(
     compressed_bytes: &[u8],
     expected_content_hash: ContentHash,
 ) -> Result<VerifiedXtfSegment, XtfCodecError> {
+    decode_compressed_segment(compressed_bytes, expected_content_hash)
+        .map(|decoded| decoded.verified)
+}
+
+/// Fully verifies and decodes one bounded checksummed XTF object.
+///
+/// # Errors
+///
+/// Returns XtfCodecError for malformed compression, framing, protobuf
+/// payloads, event sequencing, footer integrity, or address mismatches.
+pub fn decode_compressed_segment(
+    compressed_bytes: &[u8],
+    expected_content_hash: ContentHash,
+) -> Result<DecodedXtfSegment, XtfCodecError> {
     let logical_bytes = decompress_bounded(compressed_bytes)?;
     verify_logical_stream(&logical_bytes, expected_content_hash)
 }
@@ -488,7 +539,7 @@ fn decompress_bounded(compressed_bytes: &[u8]) -> Result<Vec<u8>, XtfCodecError>
 fn verify_logical_stream(
     logical_bytes: &[u8],
     expected_content_hash: ContentHash,
-) -> Result<VerifiedXtfSegment, XtfCodecError> {
+) -> Result<DecodedXtfSegment, XtfCodecError> {
     if logical_bytes.len() > MAX_LOGICAL_BYTES {
         return Err(XtfCodecError::LengthLimitExceeded);
     }
@@ -517,6 +568,9 @@ fn verify_logical_stream(
     }
 
     let mut derived = None;
+    let mut events = Vec::with_capacity(
+        usize::try_from(header.event_count).map_err(|_| XtfCodecError::MetadataMismatch)?,
+    );
     loop {
         if reader.remaining().starts_with(FOOTER_MAGIC) {
             break;
@@ -525,6 +579,7 @@ fn verify_logical_stream(
         let envelope = XtfEventEnvelope::decode(envelope_bytes)
             .map_err(|_| XtfCodecError::MalformedProtobuf)?;
         append_verified_event(&mut derived, &envelope)?;
+        events.push(envelope);
     }
     let derived = derived.ok_or(XtfCodecError::EmptyEvents)?;
     let footer_start = reader.position();
@@ -556,16 +611,19 @@ fn verify_logical_stream(
         return Err(XtfCodecError::ContentAddressMismatch);
     }
 
-    Ok(VerifiedXtfSegment {
+    let verified = VerifiedXtfSegment {
         project_id,
         recording_id,
         segment_ordinal: header.segment_ordinal,
         content_hash,
         footer_prefix_digest,
         event_count: derived.event_count,
+        logical_bytes: u64::try_from(logical_bytes.len())
+            .map_err(|_| XtfCodecError::LengthLimitExceeded)?,
         first_recording_seq: derived.first_recording_seq,
         last_recording_seq: derived.last_recording_seq,
-    })
+    };
+    Ok(DecodedXtfSegment { verified, events })
 }
 
 fn append_verified_event(
@@ -751,6 +809,10 @@ mod tests {
             assert_eq!(verified.recording_id(), recording_id());
             assert_eq!(verified.segment_ordinal(), 7);
             assert_eq!(verified.event_count(), 1);
+            assert_eq!(
+                verified.logical_bytes(),
+                u64::try_from(segment.logical_bytes().len()).expect("logical stream length")
+            );
             assert_eq!(verified.first_recording_seq(), sequence);
             assert_eq!(verified.last_recording_seq(), sequence);
             assert_eq!(verified.footer_prefix_digest(), segment.footer_prefix_digest());
