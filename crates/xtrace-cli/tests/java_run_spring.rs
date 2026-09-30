@@ -92,6 +92,14 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
         .arg(&repo)
         .arg("--java-agent")
         .arg(&agent)
+        .args([
+            "--observed-endpoint-policy",
+            "spring-orders-v1",
+            "--application-component",
+            "spring-fixture",
+            "--binding-key",
+            "default",
+        ])
         .arg("--")
         .arg("java")
         .arg("-jar")
@@ -132,6 +140,19 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     let second_response = post_order(port);
     assert!(second_response.starts_with(b"HTTP/1.1 201"));
     wait_for_recording_count(&project_root, 2);
+    let database = Connection::open(project_root.join("metadata.sqlite3")).expect("SQLite");
+    let operation_count: i64 = database
+        .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+        .expect("operation count");
+    let linked_count: i64 = database
+        .query_row(
+            "SELECT COUNT(*) FROM recording_endpoint_observations WHERE disposition = 'linked' AND observation_policy_id = 'spring-orders-v1' AND application_component = 'spring-fixture' AND binding_key = 'default' AND method = 'POST' AND route_template = '/orders'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("linked observations");
+    assert_eq!(operation_count, 1);
+    assert_eq!(linked_count, 2);
 
     let cli_pid =
         rustix::process::Pid::from_raw(process.child.id() as i32).expect("CLI process ID");

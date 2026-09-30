@@ -38,6 +38,7 @@
 )]
 
 pub mod catalog;
+pub mod endpoint_identity;
 pub mod error;
 pub mod hash;
 pub mod ids;
@@ -49,6 +50,11 @@ pub mod runtime;
 pub mod time;
 pub mod value;
 
+pub use catalog::{HttpMethod, Transport};
+pub use endpoint_identity::{
+    ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointFingerprint, EndpointFingerprintEncodingError,
+    EndpointIdentity,
+};
 pub use error::{AppError, ErrorCategory, ErrorCode, Remediation, RetryAdvice, SafeScalar, codes};
 pub use hash::{ContentHash, HashParseError};
 pub use ids::{

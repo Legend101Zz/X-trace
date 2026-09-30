@@ -95,7 +95,7 @@ impl Default for SegmentPolicy {
 }
 
 /// Immutable identity used to open a durable recording anchor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BeginRecording {
     /// Project that owns the recording.
     pub project_id: ProjectId,
@@ -105,6 +105,24 @@ pub struct BeginRecording {
     pub runtime_session_id: RuntimeSessionId,
     /// Daemon wall time chosen for the first accepted start marker.
     pub opened_at: WallTime,
+    /// CLI-selected run context and untrusted adapter endpoint fields.
+    pub endpoint_observation: EndpointObservationInput,
+}
+
+/// Raw start fields plus invocation-scoped operator opt-in. Rejected strings
+/// are used only for in-transaction classification and are never persisted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EndpointObservationInput {
+    /// Optional operator-selected policy identifier.
+    pub policy_id: Option<String>,
+    /// Optional paired run-scoped application component.
+    pub application_component: Option<String>,
+    /// Optional paired run-scoped binding key.
+    pub binding_key: Option<String>,
+    /// Adapter supplied method, not trusted until classified.
+    pub method: String,
+    /// Adapter supplied matched route template, not trusted until classified.
+    pub route_template: String,
 }
 
 /// Idempotency disposition returned by a recording-anchor port.
@@ -114,6 +132,8 @@ pub enum BeginRecordingDisposition {
     Inserted,
     /// The same immutable anchor already existed.
     ExactReplay,
+    /// Existing recording has no sidecar evidence; retry did not infer or add one.
+    LegacyObservationAbsent,
 }
 
 /// Receipt returned by [`RecordingPersistencePort::begin_recording`].
@@ -453,7 +473,7 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
                         "recording capture retained-ID capacity is exhausted",
                     ));
                 }
-                let recording = Arc::new(Mutex::new(RecordingAssembly::new(request)));
+                let recording = Arc::new(Mutex::new(RecordingAssembly::new(request.clone())));
                 recordings.insert(request.recording_id, Arc::clone(&recording));
                 recording
             }
@@ -472,6 +492,7 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
             recording_id: state.recording_id,
             runtime_session_id: state.runtime_session_id,
             opened_at: state.opened_at,
+            endpoint_observation: request.endpoint_observation,
         };
         let receipt = match self.port.begin_recording(&stable) {
             Ok(receipt) => receipt,
@@ -775,7 +796,7 @@ mod tests {
                     return Err(capture_error(PortErrorKind::Conflict, "fake begin conflict"));
                 }
             };
-            state.begins.push(*request);
+            state.begins.push(request.clone());
             Ok(BeginRecordingReceipt { recording_id: request.recording_id, disposition })
         }
 
@@ -846,7 +867,7 @@ mod tests {
             let call = {
                 let mut attempts = self.attempts.lock().expect("begin attempts");
                 let call = attempts.len();
-                attempts.push(*request);
+                attempts.push(request.clone());
                 call
             };
             if call == self.fail_on_call {
@@ -945,6 +966,7 @@ mod tests {
             recording_id: id(0x22),
             runtime_session_id: id(0x33),
             opened_at,
+            endpoint_observation: EndpointObservationInput::default(),
         }
     }
 
@@ -974,27 +996,27 @@ mod tests {
             NonZeroUsize::new(2).expect("non-zero recording limit"),
         );
         let first = begin(wall(1));
-        let second = BeginRecording { recording_id: id(0x44), ..first };
-        service.begin_recording(first).expect("first recording");
-        service.begin_recording(second).expect("second recording fills limit");
+        let second = BeginRecording { recording_id: id(0x44), ..first.clone() };
+        service.begin_recording(first.clone()).expect("first recording");
+        service.begin_recording(second.clone()).expect("second recording fills limit");
         let at_capacity = port.snapshot();
         assert_eq!(at_capacity.begins.len(), 2);
 
         let replay = service
-            .begin_recording(BeginRecording { opened_at: wall(2), ..first })
+            .begin_recording(BeginRecording { opened_at: wall(2), ..first.clone() })
             .expect("existing ID remains retryable at capacity");
         assert_eq!(replay.disposition, BeginRecordingDisposition::ExactReplay);
         let before_new_id = port.snapshot();
         assert_eq!(before_new_id.begins.len(), 3);
         assert_eq!(before_new_id.begins.last().expect("replay call").opened_at, wall(1));
 
-        let third = BeginRecording { recording_id: id(0x55), ..first };
-        let error = service.begin_recording(third).expect_err("new ID at capacity");
+        let third = BeginRecording { recording_id: id(0x55), ..first.clone() };
+        let error = service.begin_recording(third.clone()).expect_err("new ID at capacity");
         assert_eq!(error.kind(), PortErrorKind::Resource);
         assert_eq!(port.snapshot().begins, before_new_id.begins);
 
         service
-            .begin_recording(BeginRecording { opened_at: wall(2), ..second })
+            .begin_recording(BeginRecording { opened_at: wall(2), ..second.clone() })
             .expect("second existing ID remains present");
         assert_eq!(port.snapshot().begins.len(), 4);
         assert_eq!(
@@ -1020,10 +1042,10 @@ mod tests {
                 NonZeroUsize::new(1).expect("non-zero recording limit"),
             );
             let rejected = begin(wall(1));
-            let error = service.begin_recording(rejected).expect_err("injected failure");
+            let error = service.begin_recording(rejected.clone()).expect_err("injected failure");
             assert_eq!(error.kind(), kind);
 
-            let distinct = BeginRecording { recording_id: id(0x77), ..rejected };
+            let distinct = BeginRecording { recording_id: id(0x77), ..rejected.clone() };
             service.begin_recording(distinct).expect("definitive failure released capacity");
             assert_eq!(port.attempts.lock().expect("attempts").len(), 2);
         }
@@ -1045,11 +1067,13 @@ mod tests {
         ));
         let request = begin(wall(1));
         let first_service = Arc::clone(&service);
-        let first = std::thread::spawn(move || first_service.begin_recording(request));
+        let first_request = request.clone();
+        let first = std::thread::spawn(move || first_service.begin_recording(first_request));
         entered_rx.recv_timeout(Duration::from_secs(5)).expect("first port call entered");
 
         let second_service = Arc::clone(&service);
-        let second = std::thread::spawn(move || second_service.begin_recording(request));
+        let second_request = request.clone();
+        let second = std::thread::spawn(move || second_service.begin_recording(second_request));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let owners = service
@@ -1076,7 +1100,7 @@ mod tests {
             PortErrorKind::Conflict
         );
 
-        let distinct = BeginRecording { recording_id: id(0x77), ..request };
+        let distinct = BeginRecording { recording_id: id(0x77), ..request.clone() };
         service.begin_recording(distinct).expect("last definitive failure released capacity");
         assert_eq!(port.calls.load(Ordering::SeqCst), 3);
     }
@@ -1090,13 +1114,13 @@ mod tests {
             NonZeroUsize::new(1).expect("non-zero recording limit"),
         );
         let begun = begin(wall(1));
-        service.begin_recording(begun).expect("first begin succeeds");
+        service.begin_recording(begun.clone()).expect("first begin succeeds");
         let error = service
-            .begin_recording(BeginRecording { opened_at: wall(2), ..begun })
+            .begin_recording(BeginRecording { opened_at: wall(2), ..begun.clone() })
             .expect_err("later retry fails definitively");
         assert_eq!(error.kind(), PortErrorKind::Conflict);
 
-        let distinct = BeginRecording { recording_id: id(0x77), ..begun };
+        let distinct = BeginRecording { recording_id: id(0x77), ..begun.clone() };
         let capacity_error =
             service.begin_recording(distinct).expect_err("begun reservation remains retained");
         assert_eq!(capacity_error.kind(), PortErrorKind::Resource);
@@ -1112,7 +1136,7 @@ mod tests {
             NonZeroUsize::new(1).expect("non-zero recording limit"),
         );
         let request = begin(wall(1));
-        let assembly = Arc::new(Mutex::new(RecordingAssembly::new(request)));
+        let assembly = Arc::new(Mutex::new(RecordingAssembly::new(request.clone())));
         service
             .recordings
             .lock()
@@ -1144,17 +1168,17 @@ mod tests {
                 NonZeroUsize::new(1).expect("non-zero recording limit"),
             );
             let first = begin(wall(1));
-            let error = service.begin_recording(first).expect_err("injected failure");
+            let error = service.begin_recording(first.clone()).expect_err("injected failure");
             assert_eq!(error.kind(), kind);
 
-            let distinct = BeginRecording { recording_id: id(0x77), ..first };
+            let distinct = BeginRecording { recording_id: id(0x77), ..first.clone() };
             let capacity_error =
                 service.begin_recording(distinct).expect_err("ambiguous reservation is retained");
             assert_eq!(capacity_error.kind(), PortErrorKind::Resource);
             assert_eq!(port.attempts.lock().expect("attempts").len(), 1);
 
             service
-                .begin_recording(BeginRecording { opened_at: wall(2), ..first })
+                .begin_recording(BeginRecording { opened_at: wall(2), ..first.clone() })
                 .expect("same ID can retry");
             let attempts = port.attempts.lock().expect("attempts");
             assert_eq!(attempts.len(), 2);

@@ -92,6 +92,15 @@ pub enum XtraceCommand {
         /// Path to the built X-trace Java agent JAR.
         #[arg(long = "java-agent", value_name = "PATH")]
         java_agent: PathBuf,
+        /// Explicitly opt into the finite observed-endpoint rule.
+        #[arg(long = "observed-endpoint-policy")]
+        observed_endpoint_policy: Option<String>,
+        /// Stable, run-scoped application component (must be paired with --binding-key).
+        #[arg(long = "application-component", requires = "binding_key")]
+        application_component: Option<String>,
+        /// Stable, run-scoped transport binding (must be paired with --application-component).
+        #[arg(long = "binding-key", requires = "application_component")]
+        binding_key: Option<String>,
         /// Java executable followed by its original arguments.
         #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<OsString>,
@@ -152,10 +161,52 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
             recording(command, &crate::paths::read_env_path).map(|()| 0)
         }
         XtraceCommand::Daemon { project_dir } => crate::daemon::run(project_dir).await.map(|()| 0),
-        XtraceCommand::Run { project_dir, java_agent, command } => {
-            crate::run::run(project_dir, java_agent, command).await
+        XtraceCommand::Run {
+            project_dir,
+            java_agent,
+            observed_endpoint_policy,
+            application_component,
+            binding_key,
+            command,
+        } => {
+            validate_safe_run_identity(application_component.as_deref(), binding_key.as_deref())?;
+            crate::run::run(
+                project_dir,
+                java_agent,
+                observed_endpoint_policy,
+                application_component,
+                binding_key,
+                command,
+            )
+            .await
         }
     }
+}
+
+fn validate_safe_run_identity(
+    component: Option<&str>,
+    binding: Option<&str>,
+) -> Result<(), CliError> {
+    fn valid(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 64
+            && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+            && bytes.iter().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+    }
+    if component
+        .zip(binding)
+        .is_some_and(|(component, binding)| !valid(component) || !valid(binding))
+    {
+        return Err(CliError::InvalidArgument(
+            "application component and binding key must be safe IDs".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn recording<F>(command: RecordingCommand, env_reader: &F) -> Result<(), CliError>
@@ -660,6 +711,16 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use xtrace_domain::ProjectId;
+
+    #[test]
+    fn safe_run_identity_uses_ascii_allowlist_and_never_echoes_input() {
+        assert!(validate_safe_run_identity(Some("spring-fixture"), Some("default")).is_ok());
+        assert!(validate_safe_run_identity(Some("A_private"), Some("default")).is_err());
+        assert!(
+            validate_safe_run_identity(Some("spring-fixture\nsecret"), Some("default")).is_err()
+        );
+        assert!(validate_safe_run_identity(Some(&"a".repeat(65)), Some("default")).is_err());
+    }
 
     fn tempdir(label: &str) -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};

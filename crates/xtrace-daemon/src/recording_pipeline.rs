@@ -8,7 +8,8 @@ use tokio::task::JoinError;
 use uuid::Uuid;
 use xtrace_application::PortError;
 use xtrace_application::recording::{
-    AcceptedRecordingEvent, BeginRecording, FinishRecording, RecordEvents, RecordingCapture,
+    AcceptedRecordingEvent, BeginRecording, EndpointObservationInput, FinishRecording,
+    RecordEvents, RecordingCapture,
 };
 use xtrace_domain::{ProjectId, RecordingId, RuntimeSessionId, WallTime};
 use xtrace_protocol::generated::agent::{EventBatch, RecordingFinished, RecordingStarted};
@@ -26,13 +27,18 @@ const RECORDING_SUBMISSION_SLOTS: usize = 64;
 #[derive(Clone)]
 pub(crate) struct RecordingPipeline {
     capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>>,
+    run_observation: EndpointObservationInput,
     lane: Arc<BlockingLane>,
 }
 
 impl RecordingPipeline {
-    pub(crate) fn new(capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>>) -> Self {
+    pub(crate) fn new(
+        capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>>,
+        run_observation: EndpointObservationInput,
+    ) -> Self {
         Self {
             capture,
+            run_observation,
             lane: Arc::new(BlockingLane::new(
                 RECORDING_BLOCKING_CONCURRENCY,
                 RECORDING_SUBMISSION_SLOTS,
@@ -50,7 +56,12 @@ impl RecordingPipeline {
         match incoming {
             IncomingEnvelope::CapabilitySet(_) | IncomingEnvelope::Health(_) => Ok(()),
             IncomingEnvelope::RecordingStarted(started) => {
-                let request = translate_started(&started, project_id, runtime_session_id)?;
+                let request = translate_started(
+                    &started,
+                    project_id,
+                    runtime_session_id,
+                    &self.run_observation,
+                )?;
                 let capture = Arc::clone(&self.capture);
                 self.lane.run(shutdown, move || capture.begin_recording(request).map(|_| ())).await
             }
@@ -132,12 +143,17 @@ fn translate_started(
     started: &RecordingStarted,
     project_id: ProjectId,
     runtime_session_id: RuntimeSessionId,
+    run_observation: &EndpointObservationInput,
 ) -> Result<BeginRecording, RecordingPipelineError> {
+    let mut endpoint_observation = run_observation.clone();
+    endpoint_observation.method = started.method.clone();
+    endpoint_observation.route_template = started.matched_route_template.clone();
     Ok(BeginRecording {
         project_id,
         recording_id: recording_id(&started.recording_id)?,
         runtime_session_id,
         opened_at: WallTime::now(),
+        endpoint_observation,
     })
 }
 
@@ -197,8 +213,8 @@ mod tests {
     use prost::Message as _;
     use tokio::sync::Semaphore;
     use xtrace_application::recording::{
-        BeginRecording, BeginRecordingReceipt, FinishRecordingReceipt, RecordEvents,
-        RecordEventsReceipt,
+        BeginRecording, BeginRecordingReceipt, EndpointObservationInput, FinishRecordingReceipt,
+        RecordEvents, RecordEventsReceipt,
     };
     use xtrace_application::{PortError, PortErrorKind};
     use xtrace_domain::{CorrelationId, ProjectId, RecordingId, RuntimeSessionId, WallTime};
@@ -229,7 +245,7 @@ mod tests {
             &self,
             request: BeginRecording,
         ) -> Result<BeginRecordingReceipt, PortError> {
-            self.operations.lock().expect("operations").push(Operation::Started(request));
+            self.operations.lock().expect("operations").push(Operation::Started(request.clone()));
             Ok(BeginRecordingReceipt {
                 recording_id: request.recording_id,
                 disposition: xtrace_application::recording::BeginRecordingDisposition::Inserted,
@@ -272,7 +288,7 @@ mod tests {
     #[allow(clippy::panic, reason = "operation variant assertions in this test")]
     async fn translates_start_all_events_and_finish_and_passes_duplicate_batches() {
         let capture = std::sync::Arc::new(FakeCapture::default());
-        let pipeline = RecordingPipeline::new(capture.clone());
+        let pipeline = RecordingPipeline::new(capture.clone(), EndpointObservationInput::default());
         let project_id = ProjectId::new();
         let runtime_session_id = RuntimeSessionId::new();
         let recording_id = RecordingId::from_uuid(uuid::Uuid::from_bytes([0x45; 16]));
@@ -361,7 +377,7 @@ mod tests {
 
         let operations = capture.operations.lock().expect("operations");
         assert_eq!(operations.len(), 4);
-        let Operation::Started(start) = operations[0] else {
+        let Operation::Started(ref start) = operations[0] else {
             panic!("first operation must be start");
         };
         assert_eq!(start.project_id, project_id);
@@ -388,6 +404,51 @@ mod tests {
         };
         assert_eq!(finish.recording_id, recording_id);
         assert_eq!(finish.final_recording_seq, 3);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::panic, reason = "operation variant assertion in this test")]
+    async fn passes_run_context_and_only_start_method_and_route_to_begin_recording() {
+        let capture = std::sync::Arc::new(FakeCapture::default());
+        let pipeline = RecordingPipeline::new(
+            capture.clone(),
+            EndpointObservationInput {
+                policy_id: Some("spring-orders-v1".to_owned()),
+                application_component: Some("spring-fixture".to_owned()),
+                binding_key: Some("default".to_owned()),
+                ..EndpointObservationInput::default()
+            },
+        );
+        let project_id = ProjectId::new();
+        let runtime_session_id = RuntimeSessionId::new();
+        let (_shutdown_tx, shutdown) = crate::daemon::shared_shutdown_channel();
+        pipeline
+            .process(
+                IncomingEnvelope::RecordingStarted(RecordingStarted {
+                    recording_id: recording_id_bytes(),
+                    recording_seq: 1,
+                    method: "POST".to_owned(),
+                    matched_route_template: "/orders".to_owned(),
+                    url_shape: "/orders?private=canary".to_owned(),
+                    ..RecordingStarted::default()
+                }),
+                project_id,
+                runtime_session_id,
+                shutdown,
+            )
+            .await
+            .expect("start");
+        let operations = capture.operations.lock().expect("operations");
+        let Operation::Started(start) = &operations[0] else { panic!("start is submitted") };
+        assert_eq!(start.endpoint_observation.policy_id.as_deref(), Some("spring-orders-v1"));
+        assert_eq!(
+            start.endpoint_observation.application_component.as_deref(),
+            Some("spring-fixture")
+        );
+        assert_eq!(start.endpoint_observation.binding_key.as_deref(), Some("default"));
+        assert_eq!(start.endpoint_observation.method, "POST");
+        assert_eq!(start.endpoint_observation.route_template, "/orders");
+        assert!(!format!("{:?}", start.endpoint_observation).contains("canary"));
     }
 
     #[tokio::test]
@@ -464,7 +525,7 @@ mod tests {
         ));
         let capture = std::sync::Arc::new(FakeCapture::default());
         capture.fail_events.store(true, Ordering::SeqCst);
-        let pipeline = RecordingPipeline::new(capture);
+        let pipeline = RecordingPipeline::new(capture, EndpointObservationInput::default());
         let failure = pipeline
             .process(
                 IncomingEnvelope::EventBatch(EventBatch {

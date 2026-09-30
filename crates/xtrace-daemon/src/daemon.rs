@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
-use xtrace_application::recording::RecordingCapture;
+use xtrace_application::recording::{EndpointObservationInput, RecordingCapture};
 use xtrace_domain::ids::Id;
 use xtrace_domain::{ProjectId, RepositoryFingerprint, RuntimeSessionId};
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
@@ -1184,6 +1184,7 @@ pub struct DaemonBuilder {
     expected_repository_fingerprint: Option<RepositoryFingerprint>,
     bootstrap_artifact: Option<PathBuf>,
     recording_capture: Option<Arc<dyn RecordingCapture<Event = XtfEventEnvelope>>>,
+    run_observation: EndpointObservationInput,
 }
 
 impl DaemonBuilder {
@@ -1196,6 +1197,7 @@ impl DaemonBuilder {
             expected_repository_fingerprint: None,
             bootstrap_artifact: None,
             recording_capture: None,
+            run_observation: EndpointObservationInput::default(),
         }
     }
 
@@ -1253,6 +1255,14 @@ impl DaemonBuilder {
         capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>>,
     ) -> Self {
         self.recording_capture = Some(capture);
+        self
+    }
+
+    /// Supplies CLI-owned endpoint observation context for this invocation.
+    /// Ordinary daemon starts use an empty context and remain unmatched.
+    #[must_use = "the daemon is only realized after DaemonBuilder::bind resolves"]
+    pub fn with_endpoint_observation_context(mut self, context: EndpointObservationInput) -> Self {
+        self.run_observation = context;
         self
     }
 
@@ -1318,7 +1328,9 @@ impl DaemonBuilder {
             project_id,
             expected_repository_fingerprint,
             bootstrap,
-            recording_pipeline: self.recording_capture.map(RecordingPipeline::new),
+            recording_pipeline: self
+                .recording_capture
+                .map(|capture| RecordingPipeline::new(capture, self.run_observation)),
         })
     }
 }

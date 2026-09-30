@@ -6,7 +6,8 @@
 //! writes to `schema_meta`.
 //!
 //! Slice 1A introduced `v0001_initial`; Slice 1C.4 appends
-//! `v0002_recording_segments`. Migrations remain append-only: later
+//! `v0002_recording_segments`; Slice 1E.3A appends
+//! `v0003_observed_endpoint_catalog`. Migrations remain append-only: later
 //! slices must add a new record instead of editing an applied one.
 //!
 //! Migrations deliberately avoid statements that cannot be safely
@@ -62,6 +63,11 @@ impl Migrations {
                 version: 2,
                 label: "v0002_recording_segments",
                 statements: &[RECORDING_SEGMENTS_SCHEMA],
+            },
+            MigrationRecord {
+                version: 3,
+                label: "v0003_observed_endpoint_catalog",
+                statements: &[OBSERVED_ENDPOINT_CATALOG_SCHEMA],
             },
         ]
     }
@@ -225,6 +231,76 @@ CREATE TABLE recording_segments (
     checksum              BLOB NOT NULL CHECK(length(checksum) = 32),
     PRIMARY KEY(recording_id, segment_ordinal)
 ) STRICT;
+";
+
+/// Third schema version. Endpoint facts live in a sidecar so legacy recordings
+/// remain unmatched and the existing recording identity stays immutable.
+const OBSERVED_ENDPOINT_CATALOG_SCHEMA: &str = r"
+CREATE UNIQUE INDEX recordings_project_recording
+    ON recordings (project_id, recording_id);
+
+CREATE TABLE operations (
+    operation_id                BLOB PRIMARY KEY CHECK(length(operation_id) = 16
+                                    AND substr(hex(operation_id), 13, 1) = '7'
+                                    AND substr(hex(operation_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    project_id                  BLOB NOT NULL CHECK(length(project_id) = 16)
+                                    REFERENCES projects(project_id),
+    transport                   TEXT NOT NULL CHECK(transport = 'http'),
+    method                      TEXT NOT NULL CHECK(method = 'POST'),
+    route_template              TEXT NOT NULL CHECK(route_template = '/orders'),
+    application_component       TEXT NOT NULL CHECK(application_component = 'spring-fixture'),
+    binding_key                 TEXT NOT NULL CHECK(binding_key = 'default'),
+    fingerprint_format_version INTEGER NOT NULL CHECK(fingerprint_format_version = 1),
+    endpoint_fingerprint        BLOB NOT NULL CHECK(length(endpoint_fingerprint) = 32),
+    created_at                  TEXT NOT NULL,
+    UNIQUE(project_id, operation_id),
+    UNIQUE(project_id, fingerprint_format_version, endpoint_fingerprint),
+    UNIQUE(project_id, application_component, binding_key, transport, method, route_template)
+) STRICT;
+
+CREATE INDEX operations_project_order
+    ON operations(project_id, method, route_template, application_component, binding_key, operation_id);
+
+CREATE TABLE recording_endpoint_observations (
+    recording_id         BLOB PRIMARY KEY CHECK(length(recording_id) = 16),
+    project_id           BLOB NOT NULL CHECK(length(project_id) = 16),
+    disposition          TEXT NOT NULL CHECK(disposition IN ('linked', 'unmatched')),
+    observation_policy_id TEXT CHECK(observation_policy_id IS NULL OR observation_policy_id = 'spring-orders-v1'),
+    operation_id         BLOB CHECK(operation_id IS NULL OR (length(operation_id) = 16
+                              AND substr(hex(operation_id), 13, 1) = '7'
+                              AND substr(hex(operation_id), 17, 1) IN ('8', '9', 'A', 'B'))),
+    application_component TEXT,
+    binding_key          TEXT,
+    method               TEXT,
+    route_template       TEXT,
+    reason_code          TEXT,
+    CHECK((application_component IS NULL AND binding_key IS NULL) OR
+          (application_component = 'spring-fixture' AND binding_key = 'default')),
+    CHECK((disposition = 'linked' AND observation_policy_id = 'spring-orders-v1'
+           AND operation_id IS NOT NULL AND application_component = 'spring-fixture'
+           AND binding_key = 'default' AND method = 'POST' AND route_template = '/orders'
+           AND reason_code IS NULL)
+       OR (disposition = 'unmatched' AND operation_id IS NULL AND method IS NULL
+           AND route_template IS NULL AND reason_code IN
+           ('observation_policy_missing', 'observation_policy_invalid',
+            'identity_context_missing', 'identity_context_invalid',
+            'method_unsupported', 'route_unapproved'))),
+    CHECK(reason_code NOT IN ('observation_policy_missing', 'observation_policy_invalid')
+          OR observation_policy_id IS NULL),
+    CHECK(reason_code NOT IN ('identity_context_missing', 'identity_context_invalid')
+          OR (observation_policy_id = 'spring-orders-v1' AND application_component IS NULL AND binding_key IS NULL)),
+    CHECK(reason_code NOT IN ('method_unsupported', 'route_unapproved')
+          OR (observation_policy_id = 'spring-orders-v1' AND application_component = 'spring-fixture' AND binding_key = 'default')),
+    FOREIGN KEY(recording_id, project_id) REFERENCES recordings(recording_id, project_id),
+    FOREIGN KEY(project_id, operation_id) REFERENCES operations(project_id, operation_id)
+) STRICT;
+
+CREATE INDEX endpoint_observations_operation_recording
+    ON recording_endpoint_observations(project_id, operation_id, recording_id);
+CREATE INDEX endpoint_observations_unmatched_recording
+    ON recording_endpoint_observations(project_id, disposition, recording_id);
+CREATE INDEX recordings_project_opened
+    ON recordings(project_id, opened_at, recording_id);
 ";
 
 /// Applies every pending migration from the compiled-in catalog to
@@ -571,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_upgrades_to_v2_and_reopens_idempotently() {
+    fn v1_database_upgrades_to_v3_and_reopens_idempotently() {
         let conn = new_memory();
         let v1 = v1_catalog();
         assert_eq!(
@@ -583,14 +659,38 @@ mod tests {
 
         assert_eq!(
             apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("upgrade v2"),
-            2
+            3
         );
         assert_recording_schema_contract(&conn);
         assert_eq!(
             apply_pending(&conn, "0.1.0-test", CorrelationId::new())
                 .expect("repeat open is idempotent"),
-            2
+            3
         );
+    }
+
+    #[test]
+    fn v2_database_migrates_forward_without_backfilling_recordings() {
+        let conn = new_memory();
+        let v2 = Migrations::catalog()[..2].to_vec();
+        assert_eq!(apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v2).expect("v2"), 2);
+        let project = id(0x31);
+        let recording = id(0x41);
+        insert_project(&conn, &project).expect("project");
+        insert_recording(&conn, &recording, &project, &id(0x51), "recording").expect("recording");
+
+        assert_eq!(apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("v3"), 3);
+        let sidecars: i64 = conn
+            .query_row("SELECT count(*) FROM recording_endpoint_observations", [], |row| row.get(0))
+            .expect("sidecars");
+        assert_eq!(sidecars, 0);
+        assert_eq!(schema_version(&conn), 3);
+        assert!(table_exists(&conn, "operations"));
+        assert!(table_exists(&conn, "recording_endpoint_observations"));
+        let fk_errors: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0))
+            .expect("foreign keys");
+        assert_eq!(fk_errors, 0);
     }
 
     #[test]
