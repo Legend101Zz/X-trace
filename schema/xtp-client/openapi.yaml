@@ -1,0 +1,261 @@
+openapi: 3.1.0
+info:
+  title: X-trace Experimental Local Viewer API
+  version: 1.0.0
+  description: >-
+    Same-origin, loopback-only read API for persisted recording metadata and
+    bounded verified event windows. Source, captured values, endpoint catalog,
+    durations, and completion claims are not projected by this API. Every
+    request must carry the exact Host authority printed by viewer readiness,
+    Sec-Fetch-Site: same-origin, and X-XTrace-Client: viewer-v1. There is no
+    CORS support. Authentication POST requests require an exact same-origin
+    Origin; API GET requests accept an absent Origin only with the required
+    same-origin Fetch Metadata and client header, and reject any supplied
+    Origin that does not exactly match the viewer origin.
+servers:
+  - url: http://127.0.0.1:{port}
+    variables:
+      port:
+        default: '0'
+paths:
+  /api/v1/auth/exchange:
+    post:
+      operationId: exchangeViewerBootstrap
+      summary: Exchange a one-use fragment bootstrap token for a viewer session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  minLength: 43
+                  maxLength: 43
+                  pattern: '^[A-Za-z0-9_-]{43}$'
+                  description: >-
+                    Unpadded base64url encoding of exactly 32 CSPRNG bytes.
+                    The token is delivered in the URL fragment and consumed
+                    once within 60 seconds.
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/ExchangeOrigin'
+      responses:
+        '200':
+          description: >-
+            Authenticated. Sets a host-only HttpOnly SameSite=Strict browser-session
+            cookie with no persistence attributes. The server enforces a 15-minute
+            session lifetime.
+          headers:
+            Set-Cookie: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+  /api/v1/recordings:
+    get:
+      operationId: listRecordings
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/OptionalApiOrigin'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - in: query
+          name: after
+          description: Exclusive stable recording identity cursor.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Bounded metadata-only page in deterministic order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingList' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+  /api/v1/recordings/{recordingId}:
+    get:
+      operationId: showRecording
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/OptionalApiOrigin'
+        - in: path
+          name: recordingId
+          required: true
+          schema: { type: string, format: uuid }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+        - in: query
+          name: cursor
+          description: Opaque project and recording scoped versioned continuation token.
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200':
+          description: Bounded ordered event projection backed by verified XTF segments.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingDetail' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+components:
+  parameters:
+    ViewerHost:
+      in: header
+      name: Host
+      required: true
+      description: Exact 127.0.0.1 authority, including the viewer's assigned port.
+      schema: { type: string }
+    ViewerFetchSite:
+      in: header
+      name: Sec-Fetch-Site
+      required: true
+      description: Must be exactly same-origin.
+      schema: { type: string, const: same-origin }
+    ViewerClient:
+      in: header
+      name: X-XTrace-Client
+      required: true
+      description: Required browser-client marker; must be exactly viewer-v1.
+      schema: { type: string, const: viewer-v1 }
+    ExchangeOrigin:
+      in: header
+      name: Origin
+      required: true
+      description: Must exactly equal the printed viewer origin, including port.
+      schema: { type: string, format: uri }
+    OptionalApiOrigin:
+      in: header
+      name: Origin
+      required: false
+      description: >-
+        If supplied, must exactly equal the printed viewer origin. It may be
+        absent on browser GET requests only; Host, Sec-Fetch-Site, and
+        X-XTrace-Client remain required.
+      schema: { type: string, format: uri }
+  securitySchemes:
+    viewerCookie:
+      type: apiKey
+      in: cookie
+      name: xtrace_viewer_session
+  responses:
+    Problem:
+      description: Safe RFC 9457-like problem document.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+  schemas:
+    AuthResponse:
+      type: object
+      required: [authenticated, requestId]
+      properties:
+        authenticated: { type: boolean, const: true }
+        requestId: { type: string, format: uuid }
+    RecordingList:
+      type: object
+      required: [schemaVersion, projectId, limit, after, nextAfter, recordings, unavailable, requestId]
+      properties:
+        schemaVersion: { type: integer, const: 1 }
+        projectId: { type: string, format: uuid }
+        limit: { type: integer }
+        after: { type: [string, 'null'], format: uuid }
+        nextAfter: { type: [string, 'null'], format: uuid }
+        recordings:
+          type: array
+          items: { $ref: '#/components/schemas/Recording' }
+        unavailable: { $ref: '#/components/schemas/Unavailable' }
+        requestId: { type: string, format: uuid }
+    Recording:
+      type: object
+      required: [recordingId, status, openedAt, segmentCount, eventCount, incompleteEvidence]
+      properties:
+        recordingId: { type: string, format: uuid }
+        status: { type: string, enum: [recording, finalizing, complete, partial, invalid] }
+        openedAt: { type: string, format: date-time }
+        segmentCount: { type: string, pattern: '^[0-9]+$' }
+        eventCount: { type: string, pattern: '^[0-9]+$' }
+        firstSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
+        lastSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
+        incompleteEvidence: { type: array, items: { type: string } }
+    RecordingDetail:
+      type: object
+      required: [schemaVersion, projectId, recordingId, status, limit, cursor, nextCursor, segmentCount, events, incompleteEvidence, unavailable, requestId]
+      properties:
+        schemaVersion: { type: integer, const: 1 }
+        projectId: { type: string, format: uuid }
+        recordingId: { type: string, format: uuid }
+        status: { type: string, enum: [recording, finalizing, complete, partial, invalid] }
+        limit: { type: integer }
+        cursor: { type: [string, 'null'] }
+        nextCursor: { type: [string, 'null'] }
+        segmentCount: { type: string, pattern: '^[0-9]+$' }
+        events: { type: array, items: { $ref: '#/components/schemas/Event' } }
+        incompleteEvidence: { type: array, items: { type: string } }
+        unavailable: { $ref: '#/components/schemas/Unavailable' }
+        requestId: { type: string, format: uuid }
+    Event:
+      type: object
+      required: [sequence, monotonicNs, kind, fieldTruncations]
+      properties:
+        sequence: { type: string, pattern: '^[0-9]+$' }
+        monotonicNs: { type: string, pattern: '^[0-9]+$' }
+        eventId: { type: [string, 'null'] }
+        parentEventId: { type: [string, 'null'] }
+        asyncParentEventId: { type: [string, 'null'] }
+        kind: { type: string }
+        symbol: { type: [string, 'null'] }
+        interaction:
+          type: [object, 'null']
+          additionalProperties: { type: [string, 'null'] }
+        fieldTruncations:
+          type: array
+          items:
+            type: object
+            required: [field, originalBytes, representation]
+            properties:
+              field: { type: string }
+              originalBytes: { type: string, pattern: '^[0-9]+$' }
+              representation: { type: string, enum: [truncated, unavailable] }
+    Unavailable:
+      type: object
+      required: [source, values, completion]
+      properties:
+        source: { type: string, const: unavailable }
+        values: { type: string, const: unavailable }
+        completion: { type: string, const: unavailable }
+    Problem:
+      type: object
+      required: [type, title, status, detail, code, requestId]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code: { type: string }
+        requestId: { type: string, format: uuid }

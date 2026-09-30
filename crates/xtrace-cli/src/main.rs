@@ -47,6 +47,7 @@ mod error;
 mod output;
 mod paths;
 mod run;
+mod viewer;
 
 use clap::Parser;
 use commands::XtraceCommand;

@@ -16,12 +16,18 @@ env:
 jobs:
   java-client:
     runs-on: ubuntu-latest
+    env:
+      NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
+      PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
     strategy:
       fail-fast: false
       matrix:
         java-version: [17, 21]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -55,6 +61,11 @@ jobs:
         run: cargo test -p xtrace-runtime
       - name: Launch-only premain Spring MVC acceptance
         run: cargo test -p xtrace-cli --test java_premain_spring -- --nocapture
+      - name: Install pinned browser-journey dependency and Chromium
+        run: |
+          npm ci --prefix web/app
+          cd web/app
+          npx playwright install --with-deps chromium
       - name: Supervised direct-Java Spring MVC acceptance
         run: cargo test -p xtrace-cli --test java_run_spring -- --nocapture
 
@@ -62,6 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
+      PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -91,6 +103,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
+      PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -118,6 +131,16 @@ jobs:
           npm ci --prefix adapters/node
           npm run generate:check --prefix adapters/node
           npm test --prefix adapters/node
+      - name: Install and verify embedded browser viewer
+        run: |
+          npm ci --prefix web/app
+          cd web/app
+          npx playwright install --with-deps chromium
+          cd ../..
+          npm run typecheck --prefix web/app
+          npm test --prefix web/app
+          npm run check:api --prefix web/app
+          npm run check:embedded --prefix web/app
       - name: Verify Java protocol, agent, and fixture workspace
         working-directory: adapters/java
         run: ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar

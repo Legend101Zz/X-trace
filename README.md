@@ -31,7 +31,7 @@ Java compatibility.
 | `xtrace-application`| Commands, queries, ports, and the `Application` facade                 |
 | `xtrace-protocol`   | Generated XTP protobuf bindings and domain-DTO translation              |
 | `xtrace-store`      | Bundled SQLite store, migrations, and `ProjectRepository` adapter      |
-| `xtrace-daemon`     | Authenticated loopback XTP ingress and supervised connection draining |
+| `xtrace-daemon`     | Authenticated XTP ingress and experimental isolated loopback viewer     |
 | `xtrace-runtime`    | Runtime launch validation, agent injection, and process supervision    |
 | `xtrace-cli`        | Clap subcommands, project composition, output and path resolution       |
 
@@ -156,6 +156,45 @@ Opening read-only uses normal SQLite WAL coordination; SQLite may create its
 empty WAL/shared-memory coordination files when none exist, but query paths do
 not migrate or update logical store data, repository pointers, or project
 `last_opened` metadata.
+
+For an interactive, explicitly foreground browser session, use:
+
+```bash
+cargo run -q -p xtrace-cli --bin xtrace -- open \
+  --project-dir /tmp/xtrace-smoke --viewer --no-browser
+```
+
+The command prints a JSON readiness document containing a one-use 60-second
+URL, then stays in the foreground until Ctrl+C or SIGTERM. Copy the URL into a
+browser. Omitting `--no-browser` asks the operating system's fixed default
+browser launcher to open it. This mode does not reuse or discover another
+viewer process. It binds only to `127.0.0.1` on an OS-assigned port and uses a
+separate plain-HTTP listener from the XTP mTLS listener. The bootstrap secret
+is in the URL fragment, which browsers do not send to the server; the page
+removes it from history before a one-use exchange and then uses a browser-
+session HttpOnly, host-only, SameSite=Strict cookie backed by an in-memory
+15-minute server-side expiry. The cookie has no `Max-Age` or `Expires`, so the
+browser drops it when its session ends. `Secure` is omitted only
+because this experimental viewer is plain HTTP on loopback; exact Host and
+same-origin checks remain required. Do not share or save the readiness URL.
+This mode does not defend against hostile processes running as the same OS
+user: the readiness document prints the credential URL, and when browser
+launching is enabled the OS opener receives that URL in its argument vector.
+Use `--no-browser` where process-list disclosure matters, and treat readiness
+stdout as sensitive for the token's 60-second lifetime.
+
+The browser is a dense local Linear evidence viewer, not source replay. It
+shows persisted recording facts and ordered event metadata. Source locations,
+captured values, durations, and completion semantics remain explicitly
+unavailable; a persisted `GAP` is a metadata event and does not itself imply
+partiality or completion. Interaction path fields are omitted. Trace text is
+rendered as text, not HTML. The app does not store recordings or tokens in
+localStorage, sessionStorage, or IndexedDB. The browser cookie jar necessarily
+holds the non-persistent session cookie while the browser session is active.
+Static assets are embedded in the Rust daemon;
+`npm run check:embedded --prefix web/app` detects drift from the pinned Vite
+build, and `npm run check:api --prefix web/app` checks generated TypeScript
+against `schema/xtp-client/openapi.yaml`.
 
 `just test` and `just ci` prepare both language workspaces before Rust tests,
 so their daemon integration tests do not depend on ignored build output from
