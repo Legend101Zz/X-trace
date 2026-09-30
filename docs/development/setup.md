@@ -12,7 +12,8 @@ and run the Slice 1A gates from a fresh checkout.
 - No system `protoc`. The build pulls Google's prebuilt `protoc` from
   `protoc-bin-vendored` at compile time.
 - Node.js 22 or newer and npm, for the synthetic XTP conformance client.
-- A Java 17 JDK, for the Java synthetic XTP conformance client. The checked-in
+- A Java 17 or 21 JDK, for the Java synthetic client and experimental Spring
+  premain fixture. CI runs the fixture journey on both versions. The checked-in
   Gradle wrapper supplies Gradle 9.8.0 and verifies its distribution checksum.
 
 ## Caches
@@ -97,8 +98,9 @@ Unix-only.
 ```bash
 export GRADLE_USER_HOME=/path/to/cache/gradle
 adapters/java/gradlew -p adapters/java --dependency-verification strict \
-  clean test installDist
+  clean test installDist agentDist fixtureBootJar
 cargo test -p xtrace-cli --test java_synthetic_adapter
+cargo test -p xtrace-cli --test java_premain_spring
 ```
 
 The private client accepts only `--bootstrap <path>`. It validates the
@@ -107,12 +109,39 @@ XTP data, uses an isolated Conscrypt provider for the TLS exporter, and proves
 four `Staged` acknowledgements plus the selected-root SQLite/XTF artifact. It
 prints one credential-free JSON receipt with `capture_supported: false`.
 
-This is not `-javaagent`, `premain`, attach support, or framework
-instrumentation. Spring Boot, Spring MVC, Servlet, endpoint discovery, request
-capture, and user-application support remain future slices. The exact direct
-pins are recorded in `adapters/java/build.gradle.kts`: Protobuf, Conscrypt,
-Jackson Core, Bouncy Castle, and JUnit. The build uses only their Maven Central
-artifacts and enforces committed SHA-256 dependency metadata.
+### Experimental Spring premain tracer bullet
+
+The `agent-bootstrap`, `agent-runtime`, and `spring-fixture` Gradle projects are
+a deliberately fixture-scoped launch proof. The JDK-only agent entrypoint
+receives only the private bootstrap-file path in `-javaagent` options. It loads
+Byte Buddy 1.18.14, protobuf, Conscrypt, and the XTP writer through a private
+child-first runtime directory; those packages are not placed on the fixture's
+application classpath. This experimental distribution does not yet relocate
+Byte Buddy or protobuf. Conscrypt remains unrelocated for its native/JNI
+resources. Package scans and the live fixture assert that none of these runtime
+packages are visible from the application classloader.
+
+Instrumentation is intentionally exact: Spring Framework 7.0.9's
+`RequestMappingHandlerAdapter.handleInternal`, the fixture controller/service/
+repository methods, and H2 2.4.240's zero-argument `executeUpdate()`. Advice
+uses a fixed, source-derived `POST /orders` identity after the exact handler
+matcher succeeds; it does not inspect a request route or perform dynamic
+endpoint discovery. Advice passes only fixed identifiers and primitive status
+to a bounded nonblocking queue; one writer thread owns XTP. The real-daemon
+test sends a canary-bearing
+`POST /orders`, verifies HTTP 201 and one H2 business row, then validates the
+ordered selected-root XTF events and privacy surfaces. A second request throws
+a canary-bearing fixture exception and proves the exception text is absent from
+the 500 response, complete process streams, and persisted telemetry. The test
+also proves invalid-bootstrap, daemon-unavailable, and forced-disconnect paths
+leave application behavior intact while telemetry fails honestly.
+
+This sub-slice is not a general Java agent release or a support claim. There is
+no `agentmain`/attach, endpoint discovery, static scan, async propagation,
+request values, SQL text/binds, source lines, UI, `xtrace run`, `Committed` ACK,
+or terminal-complete recording. The existing live bootstrap path remains
+Unix-only. The exact direct pins remain in the Gradle build files and strict
+SHA-256 dependency verification/locking applies to every module.
 
 ### Restricted-PATH build
 

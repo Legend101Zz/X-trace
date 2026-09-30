@@ -13,3 +13,5 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "xtrace-java-client"
+
+include("agent-bootstrap", "agent-runtime", "spring-fixture")

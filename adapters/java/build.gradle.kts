@@ -50,6 +50,20 @@ tasks.withType<Test>().configureEach {
     useJUnitPlatform()
 }
 
-dependencyLocking {
-    lockAllConfigurations()
+allprojects {
+    dependencyLocking {
+        lockAllConfigurations()
+    }
+}
+
+tasks.register("agentDist") {
+    group = "distribution"
+    description = "Assembles the experimental launch-only Java agent distribution."
+    dependsOn(":agent-bootstrap:agentDist")
+}
+
+tasks.register("fixtureBootJar") {
+    group = "distribution"
+    description = "Builds the independent Spring MVC fixture executable."
+    dependsOn(":spring-fixture:bootJar")
 }

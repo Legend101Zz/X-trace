@@ -35,10 +35,10 @@ node-check:
     npm run generate:check --prefix adapters/node
     npm test --prefix adapters/node
 
-# Generate Java protobuf bindings, run unit tests, and install the private
-# synthetic client consumed by the Rust daemon acceptance test.
+# Generate Java protobuf bindings, run unit tests, install the private
+# synthetic client, and assemble the launch-only agent and Spring fixture.
 java-check:
-    cd adapters/java && ./gradlew --dependency-verification strict clean test installDist
+    cd adapters/java && ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
 
 # Run both language protocol foundations before the full Rust test suite.
 test: node-check java-check
