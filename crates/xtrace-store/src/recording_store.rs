@@ -698,26 +698,12 @@ impl SqliteRecordingStore<'_> {
                     disposition: BeginRecordingDisposition::LegacyObservationAbsent,
                 });
             };
-            if existing_observation.0 == "linked" {
-                let Some(operation_bytes) = existing_observation.2.as_deref() else {
-                    return Err(endpoint_identity_corrupt(correlation_id));
-                };
-                if existing_observation.1.as_deref() != Some("spring-orders-v1")
-                    || existing_observation.3.as_deref() != Some("spring-fixture")
-                    || existing_observation.4.as_deref() != Some("default")
-                    || existing_observation.5.as_deref() != Some("POST")
-                    || existing_observation.6.as_deref() != Some("/orders")
-                    || existing_observation.7.is_some()
-                {
-                    return Err(endpoint_identity_corrupt(correlation_id));
-                }
-                validate_linked_operation(
-                    &transaction,
-                    request.project_id,
-                    operation_bytes,
-                    correlation_id,
-                )?;
-            }
+            validate_stored_observation(
+                &transaction,
+                request.project_id,
+                &existing_observation,
+                correlation_id,
+            )?;
             if !observation_matches(&existing_observation, &disposition) {
                 return Err(recording_conflict(
                     "recording observation conflicts with an existing recording",
@@ -2318,12 +2304,64 @@ fn observation_matches(stored: &StoredObservation, expected: &SafeObservation) -
     let linked = expected.reason_code.is_none();
     stored.0 == if linked { "linked" } else { "unmatched" }
         && stored.1.as_deref() == expected.policy_id
-        && stored.2.as_ref().is_some_and(|id| id.len() == 16) == linked
         && stored.3.as_deref() == expected.application_component
         && stored.4.as_deref() == expected.binding_key
         && stored.5.as_deref() == expected.method
         && stored.6.as_deref() == expected.route_template
         && stored.7.as_deref() == expected.reason_code
+}
+
+fn validate_stored_observation(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: ProjectId,
+    stored: &StoredObservation,
+    correlation_id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    match stored.0.as_str() {
+        "linked" => {
+            let Some(operation_bytes) = stored.2.as_deref() else {
+                return Err(endpoint_identity_corrupt(correlation_id));
+            };
+            if stored.1.as_deref() != Some("spring-orders-v1")
+                || stored.3.as_deref() != Some("spring-fixture")
+                || stored.4.as_deref() != Some("default")
+                || stored.5.as_deref() != Some("POST")
+                || stored.6.as_deref() != Some("/orders")
+                || stored.7.is_some()
+            {
+                return Err(endpoint_identity_corrupt(correlation_id));
+            }
+            validate_linked_operation(transaction, project_id, operation_bytes, correlation_id)
+        }
+        "unmatched" => {
+            if stored.2.is_some() || stored.5.is_some() || stored.6.is_some() {
+                return Err(endpoint_identity_corrupt(correlation_id));
+            }
+            let valid_shape = match stored.7.as_deref() {
+                Some("observation_policy_missing" | "observation_policy_invalid") => {
+                    stored.1.is_none()
+                        && valid_optional_context(stored.3.as_deref(), stored.4.as_deref())
+                }
+                Some("identity_context_missing" | "identity_context_invalid") => {
+                    stored.1.as_deref() == Some("spring-orders-v1")
+                        && stored.3.is_none()
+                        && stored.4.is_none()
+                }
+                Some("method_unsupported" | "route_unapproved") => {
+                    stored.1.as_deref() == Some("spring-orders-v1")
+                        && stored.3.as_deref() == Some("spring-fixture")
+                        && stored.4.as_deref() == Some("default")
+                }
+                _ => false,
+            };
+            if valid_shape { Ok(()) } else { Err(endpoint_identity_corrupt(correlation_id)) }
+        }
+        _ => Err(endpoint_identity_corrupt(correlation_id)),
+    }
+}
+
+fn valid_optional_context(component: Option<&str>, binding: Option<&str>) -> bool {
+    matches!((component, binding), (None, None) | (Some("spring-fixture"), Some("default")))
 }
 
 fn endpoint_identity_corrupt(correlation_id: CorrelationId) -> RecordingStoreError {
@@ -2939,6 +2977,70 @@ mod tests {
             let error = view
                 .begin_recording(&linked)
                 .expect_err("linked replay fails closed on stored operation corruption");
+            assert_eq!(error.kind(), RecordingStoreErrorKind::Corruption, "{label}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unmatched_replay_rejects_malformed_persisted_sidecar_shapes() {
+        let cases = [
+            (
+                "wrong-width-operation-id",
+                "UPDATE recording_endpoint_observations SET operation_id = x'01' WHERE project_id = ?1",
+            ),
+            (
+                "valid-width-operation-id",
+                "UPDATE recording_endpoint_observations SET operation_id = x'018bcfe5680070008000000000000000' WHERE project_id = ?1",
+            ),
+            (
+                "method-present",
+                "UPDATE recording_endpoint_observations SET method = 'GET' WHERE project_id = ?1",
+            ),
+            (
+                "route-present",
+                "UPDATE recording_endpoint_observations SET route_template = '/corrupt' WHERE project_id = ?1",
+            ),
+            (
+                "invalid-reason",
+                "UPDATE recording_endpoint_observations SET reason_code = 'unlisted_reason' WHERE project_id = ?1",
+            ),
+            (
+                "invalid-policy-context",
+                "UPDATE recording_endpoint_observations SET reason_code = 'identity_context_missing', observation_policy_id = 'spring-orders-v1', application_component = 'spring-fixture', binding_key = 'default' WHERE project_id = ?1",
+            ),
+            (
+                "invalid-policy",
+                "UPDATE recording_endpoint_observations SET observation_policy_id = 'unlisted-policy' WHERE project_id = ?1",
+            ),
+        ];
+        for (label, statement) in cases {
+            let fixture = on_disk_store(&format!("unmatched-sidecar-{label}"));
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let unmatched =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            view.begin_recording(&unmatched).expect("unmatched begin");
+            {
+                let connection = fixture.store.lock().expect("connection");
+                connection
+                    .execute_batch(
+                        "PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;",
+                    )
+                    .expect("bypass schema checks for fixture");
+                connection
+                    .execute(statement, [project_id.as_uuid().as_bytes().to_vec()])
+                    .expect("corrupt stored sidecar fixture");
+                connection
+                    .execute_batch(
+                        "PRAGMA ignore_check_constraints = OFF; PRAGMA foreign_keys = ON;",
+                    )
+                    .expect("restore schema checks");
+            }
+            let error = view
+                .begin_recording(&unmatched)
+                .expect_err("malformed unmatched sidecar fails closed");
             assert_eq!(error.kind(), RecordingStoreErrorKind::Corruption, "{label}");
         }
     }
