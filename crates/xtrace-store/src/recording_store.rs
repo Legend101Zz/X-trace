@@ -13,6 +13,9 @@ use std::str::FromStr as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 
 use rusqlite::OptionalExtension as _;
+use xtrace_application::observed_endpoint_queries::{
+    ObservedEndpointKey, ObservedEndpointRecord, ObservedRecordingKey, ObservedRecordingRecord,
+};
 use xtrace_application::recording::EndpointObservationInput;
 use xtrace_application::recording_queries::{
     MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES, PersistedEvent,
@@ -280,6 +283,276 @@ impl SqliteStore {
 }
 
 impl SqliteRecordingStore<'_> {
+    /// Lists observed endpoints with a project-bound keyset read.
+    pub(crate) fn list_observed_endpoints(
+        &self,
+        project_id: ProjectId,
+        after: Option<&ObservedEndpointKey>,
+        limit: u32,
+    ) -> Result<(Vec<ObservedEndpointRecord>, bool), RecordingStoreError> {
+        let correlation_id = CorrelationId::new();
+        self.binding.revalidate(correlation_id)?;
+        let connection =
+            self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        if !project_exists(&connection, project_id, correlation_id)? {
+            return Err(read_not_found_error(correlation_id));
+        }
+        let query_limit = i64::from(limit)
+            .checked_add(1)
+            .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
+        let mut statement = connection.prepare(
+            "SELECT operation_id, transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint FROM operations WHERE project_id = ?1 AND (?2 IS NULL OR method > ?2 OR (method = ?2 AND route_template > ?3) OR (method = ?2 AND route_template = ?3 AND application_component > ?4) OR (method = ?2 AND route_template = ?3 AND application_component = ?4 AND binding_key > ?5) OR (method = ?2 AND route_template = ?3 AND application_component = ?4 AND binding_key = ?5 AND operation_id > ?6)) ORDER BY method ASC, route_template ASC, application_component ASC, binding_key ASC, operation_id ASC LIMIT ?7"
+        ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+        let mut rows = statement
+            .query(rusqlite::params![
+                project_id.as_uuid().as_bytes().to_vec(),
+                after.map(|key| key.method.as_str()),
+                after.map(|key| key.route_template.as_str()),
+                after.map(|key| key.application_component.as_str()),
+                after.map(|key| key.binding.as_str()),
+                after.map(|key| key.operation_id.as_uuid().as_bytes().to_vec()),
+                query_limit
+            ])
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })? {
+            let operation_bytes: Vec<u8> = row.get(0).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let operation_id = parse_stored_operation_id(&operation_bytes, correlation_id)?;
+            let transport: String = row.get(1).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let method: String = row.get(2).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let route: String = row.get(3).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let component: String = row.get(4).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let binding: String = row.get(5).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let version: i64 = row.get(6).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let fingerprint: Vec<u8> = row.get(7).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let identity = EndpointIdentity {
+                project_id,
+                application_component: "spring-fixture".to_owned(),
+                binding_key: "default".to_owned(),
+                transport: Transport::Http,
+                method: HttpMethod::Post,
+                route_template: "/orders".to_owned(),
+            };
+            let expected =
+                identity.fingerprint().map_err(|_| endpoint_identity_corrupt(correlation_id))?;
+            if transport != "http"
+                || method != "POST"
+                || route != "/orders"
+                || component != "spring-fixture"
+                || binding != "default"
+                || version != i64::from(ENDPOINT_FINGERPRINT_FORMAT_VERSION)
+                || fingerprint.as_slice() != expected.as_bytes()
+            {
+                return Err(endpoint_identity_corrupt(correlation_id));
+            }
+            validate_operation_has_observation(
+                &connection,
+                project_id,
+                &operation_bytes,
+                correlation_id,
+            )?;
+            result.push(ObservedEndpointRecord {
+                operation_id,
+                project_id,
+                application_component: component,
+                binding,
+                method,
+                route_template: route,
+                observation_policy: "spring-orders-v1".to_owned(),
+            });
+        }
+        let has_more = result.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+        if has_more {
+            result.pop();
+        }
+        Ok((result, has_more))
+    }
+
+    /// Lists linked recordings for one project-owned operation.
+    pub(crate) fn list_operation_recordings(
+        &self,
+        project_id: ProjectId,
+        operation_id: xtrace_domain::OperationId,
+        after: Option<&ObservedRecordingKey>,
+        limit: u32,
+    ) -> Result<(Vec<ObservedRecordingRecord>, bool), RecordingStoreError> {
+        let uuid = operation_id.as_uuid();
+        if uuid.get_version_num() != 7 || uuid.get_variant() != uuid::Variant::RFC4122 {
+            return Err(recording_query_validation_error(CorrelationId::new()));
+        }
+        self.list_endpoint_recordings(project_id, Some(operation_id), after, limit)
+    }
+
+    /// Lists sidecar-unmatched and legacy sidecar-absent recordings.
+    pub(crate) fn list_unmatched_recordings(
+        &self,
+        project_id: ProjectId,
+        after: Option<&ObservedRecordingKey>,
+        limit: u32,
+    ) -> Result<(Vec<ObservedRecordingRecord>, bool), RecordingStoreError> {
+        self.list_endpoint_recordings(project_id, None, after, limit)
+    }
+
+    fn list_endpoint_recordings(
+        &self,
+        project_id: ProjectId,
+        operation_id: Option<xtrace_domain::OperationId>,
+        after: Option<&ObservedRecordingKey>,
+        limit: u32,
+    ) -> Result<(Vec<ObservedRecordingRecord>, bool), RecordingStoreError> {
+        let correlation_id = CorrelationId::new();
+        self.binding.revalidate(correlation_id)?;
+        let connection =
+            self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        if !project_exists(&connection, project_id, correlation_id)? {
+            return Err(read_not_found_error(correlation_id));
+        }
+        if let Some(operation_id) = operation_id {
+            let exists: Option<i64> = connection
+                .query_row(
+                    "SELECT 1 FROM operations WHERE project_id = ?1 AND operation_id = ?2",
+                    rusqlite::params![
+                        project_id.as_uuid().as_bytes().to_vec(),
+                        operation_id.as_uuid().as_bytes().to_vec()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
+                })?;
+            if exists.is_none() {
+                return Err(read_not_found_error(correlation_id));
+            }
+            let raw = operation_id.as_uuid().as_bytes().to_vec();
+            validate_operation_has_observation(&connection, project_id, &raw, correlation_id)?;
+        }
+        let query_limit = i64::from(limit)
+            .checked_add(1)
+            .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
+        let sql = if operation_id.is_some() {
+            "SELECT r.recording_id, r.status, r.opened_at, COUNT(s.segment_ordinal), COALESCE(SUM(s.event_count),0), MIN(s.first_recording_seq), MAX(s.last_recording_seq), o.disposition, o.observation_policy_id, o.operation_id, o.application_component, o.binding_key, o.method, o.route_template, o.reason_code, o.project_id FROM recordings r JOIN recording_endpoint_observations o ON o.recording_id=r.recording_id LEFT JOIN recording_segments s ON s.recording_id=r.recording_id WHERE r.project_id=?1 AND o.project_id=?1 AND o.operation_id=?2 AND (?3 IS NULL OR r.opened_at < ?3 OR (r.opened_at = ?3 AND r.recording_id < ?4)) GROUP BY r.recording_id ORDER BY r.opened_at DESC,r.recording_id DESC LIMIT ?5"
+        } else {
+            "SELECT r.recording_id, r.status, r.opened_at, COUNT(s.segment_ordinal), COALESCE(SUM(s.event_count),0), MIN(s.first_recording_seq), MAX(s.last_recording_seq), o.disposition, o.observation_policy_id, o.operation_id, o.application_component, o.binding_key, o.method, o.route_template, o.reason_code, o.project_id FROM recordings r LEFT JOIN recording_endpoint_observations o ON o.recording_id=r.recording_id LEFT JOIN recording_segments s ON s.recording_id=r.recording_id WHERE r.project_id=?1 AND (o.recording_id IS NULL OR o.disposition <> 'linked') AND (?2 IS NULL OR r.opened_at < ?2 OR (r.opened_at = ?2 AND r.recording_id < ?3)) GROUP BY r.recording_id ORDER BY r.opened_at DESC,r.recording_id DESC LIMIT ?4"
+        };
+        let mut statement = connection.prepare(sql).map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+        let mut rows = if let Some(operation_id) = operation_id {
+            statement.query(rusqlite::params![
+                project_id.as_uuid().as_bytes().to_vec(),
+                operation_id.as_uuid().as_bytes().to_vec(),
+                after.map(|key| key.opened_at.as_str()),
+                after.map(|key| key.recording_id.as_uuid().as_bytes().to_vec()),
+                query_limit
+            ])
+        } else {
+            statement.query(rusqlite::params![
+                project_id.as_uuid().as_bytes().to_vec(),
+                after.map(|key| key.opened_at.as_str()),
+                after.map(|key| key.recording_id.as_uuid().as_bytes().to_vec()),
+                query_limit
+            ])
+        }
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })? {
+            let metadata = recording_metadata_from_row(row, correlation_id)?;
+            let disposition: Option<String> = row.get(7).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let policy: Option<String> = row.get(8).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let raw_operation: Option<Vec<u8>> = row.get(9).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let component: Option<String> = row.get(10).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let binding: Option<String> = row.get(11).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let method: Option<String> = row.get(12).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let route: Option<String> = row.get(13).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let reason: Option<String> = row.get(14).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let sidecar_project: Option<Vec<u8>> = row.get(15).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let operation = raw_operation
+                .as_deref()
+                .map(|bytes| parse_stored_operation_id(bytes, correlation_id))
+                .transpose()?;
+            if let Some(disposition) = disposition {
+                let raw_op = raw_operation.clone();
+                let project = sidecar_project.unwrap_or_default();
+                validate_stored_observation(
+                    &connection,
+                    project_id,
+                    &(
+                        disposition,
+                        policy.clone(),
+                        raw_op,
+                        component,
+                        binding,
+                        method,
+                        route,
+                        reason.clone(),
+                        project,
+                    ),
+                    correlation_id,
+                )?;
+            }
+            if operation_id.is_some() && operation != operation_id {
+                return Err(endpoint_identity_corrupt(correlation_id));
+            }
+            result.push(ObservedRecordingRecord {
+                metadata,
+                operation_id: operation,
+                observation_policy: policy,
+                unmatched_reason: reason,
+            });
+        }
+        let has_more = result.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+        if has_more {
+            result.pop();
+        }
+        Ok((result, has_more))
+    }
+
     /// Lists a bounded project-owned page in opening-time/identity order.
     pub(crate) fn list_recording_metadata(
         &self,
@@ -1213,6 +1486,18 @@ fn recording_id_from_bytes(
     let raw: [u8; 16] =
         bytes.try_into().map_err(|_| recording_query_corrupt_error(correlation_id))?;
     Ok(RecordingId::from_uuid(uuid::Uuid::from_bytes(raw)))
+}
+
+fn observed_recording_id_from_bytes(
+    bytes: &[u8],
+    correlation_id: CorrelationId,
+) -> Result<RecordingId, RecordingStoreError> {
+    let recording_id = recording_id_from_bytes(bytes, correlation_id)?;
+    let uuid = recording_id.as_uuid();
+    if uuid.get_version_num() != 7 || uuid.get_variant() != uuid::Variant::RFC4122 {
+        return Err(recording_query_corrupt_error(correlation_id));
+    }
+    Ok(recording_id)
 }
 
 fn project_id_from_bytes(
@@ -2313,7 +2598,7 @@ fn observation_matches(stored: &StoredObservation, expected: &SafeObservation) -
 }
 
 fn validate_stored_observation(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     project_id: ProjectId,
     stored: &StoredObservation,
     correlation_id: CorrelationId,
@@ -2393,7 +2678,7 @@ fn parse_stored_operation_id(
 }
 
 fn validate_linked_operation(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     project_id: ProjectId,
     operation_bytes: &[u8],
     correlation_id: CorrelationId,
@@ -2439,6 +2724,121 @@ fn validate_linked_operation(
         return Err(endpoint_identity_corrupt(correlation_id));
     }
     Ok(())
+}
+
+fn validate_operation_has_observation(
+    connection: &rusqlite::Connection,
+    project_id: ProjectId,
+    operation_bytes: &[u8],
+    correlation_id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    let operation_id = parse_stored_operation_id(operation_bytes, correlation_id)?;
+    validate_linked_operation(connection, project_id, operation_bytes, correlation_id)?;
+    let mut statement = connection.prepare(
+        "SELECT disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code, project_id FROM recording_endpoint_observations WHERE operation_id = ?1",
+    ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+    let mut rows =
+        statement.query([operation_id.as_uuid().as_bytes().to_vec()]).map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let mut found_link = false;
+    while let Some(row) = rows.next().map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })? {
+        let stored: StoredObservation = (
+            row.get(0).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
+            row.get(1).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
+            row.get(2).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
+            row.get(3).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
+            row.get(4).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
+            row.get(5).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
+            row.get(6).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
+            row.get(7).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
+            row.get(8).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
+        );
+        validate_stored_observation(connection, project_id, &stored, correlation_id)?;
+        found_link |= stored.0 == "linked" && stored.2.as_deref() == Some(operation_bytes);
+    }
+    if found_link { Ok(()) } else { Err(endpoint_identity_corrupt(correlation_id)) }
+}
+
+fn recording_metadata_from_row(
+    row: &rusqlite::Row<'_>,
+    correlation_id: CorrelationId,
+) -> Result<RecordingMetadata, RecordingStoreError> {
+    let raw_id: Vec<u8> = row.get(0).map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    let status: String = row.get(1).map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    let opened_at: String = row.get(2).map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    let parsed_opened_at =
+        opened_at.parse::<WallTime>().map_err(|_| recording_query_corrupt_error(correlation_id))?;
+    if parsed_opened_at.to_rfc3339() != opened_at {
+        return Err(recording_query_corrupt_error(correlation_id));
+    }
+    let segment_count: i64 = row.get(3).map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    let event_count: i64 = row.get(4).map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    let first_sequence: Option<Vec<u8>> = row.get(5).map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    let last_sequence: Option<Vec<u8>> = row.get(6).map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    let lifecycle_status = recording_status(&status, correlation_id)?;
+    let incomplete_evidence = match lifecycle_status {
+        RecordingStatus::Partial | RecordingStatus::Invalid => {
+            vec![format!("persisted_status:{status}")]
+        }
+        _ => Vec::new(),
+    };
+    Ok(RecordingMetadata {
+        recording_id: observed_recording_id_from_bytes(&raw_id, correlation_id)?,
+        status: lifecycle_status,
+        opened_at,
+        segment_count: u64::try_from(segment_count)
+            .map_err(|_| recording_query_corrupt_error(correlation_id))?
+            .to_string(),
+        event_count: u64::try_from(event_count)
+            .map_err(|_| recording_query_corrupt_error(correlation_id))?
+            .to_string(),
+        first_sequence: first_sequence
+            .as_deref()
+            .map(|value| decode_stored_sequence(value, correlation_id))
+            .transpose()?
+            .map(|value| value.to_string()),
+        last_sequence: last_sequence
+            .as_deref()
+            .map(|value| decode_stored_sequence(value, correlation_id))
+            .transpose()?
+            .map(|value| value.to_string()),
+        incomplete_evidence,
+    })
 }
 
 fn find_or_insert_operation(
@@ -3998,6 +4398,341 @@ mod tests {
         )
         .expect("final object");
         verify_compressed_segment(&object, receipt.object_hash).expect("final verification");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_catalog_reads_are_bounded_project_scoped_and_include_legacy_unmatched() {
+        let fixture = on_disk_store("observed-query-pages");
+        let project_a = ProjectId::new();
+        let project_b = ProjectId::new();
+        insert_project(&fixture.store, project_a);
+        insert_project(&fixture.store, project_b);
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let mut linked_a =
+            request(project_a, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        linked_a.endpoint_observation = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "POST".to_owned(),
+            route_template: "/orders".to_owned(),
+        };
+        view.begin_recording(&linked_a).expect("linked A");
+        let mut linked_b =
+            request(project_b, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        linked_b.endpoint_observation = linked_a.endpoint_observation.clone();
+        view.begin_recording(&linked_b).expect("linked B");
+        let unmatched =
+            request(project_a, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        view.begin_recording(&unmatched).expect("unmatched");
+        let legacy = request(project_a, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        view.begin_recording(&legacy).expect("legacy anchor");
+        fixture
+            .store
+            .lock()
+            .expect("connection")
+            .execute(
+                "DELETE FROM recording_endpoint_observations WHERE recording_id=?1",
+                [legacy.recording_id.as_uuid().as_bytes().to_vec()],
+            )
+            .expect("remove legacy sidecar");
+
+        let (endpoints_a, more_a) =
+            view.list_observed_endpoints(project_a, None, 1).expect("endpoints A");
+        let (endpoints_b, more_b) =
+            view.list_observed_endpoints(project_b, None, 1).expect("endpoints B");
+        assert_eq!(endpoints_a.len(), 1);
+        assert_eq!(endpoints_b.len(), 1);
+        assert!(!more_a && !more_b);
+        assert_ne!(endpoints_a[0].operation_id, endpoints_b[0].operation_id);
+        let guessed_cross_project = view
+            .list_operation_recordings(project_a, endpoints_b[0].operation_id, None, 1)
+            .expect_err("cross-project operation must be hidden");
+        let unknown = view
+            .list_operation_recordings(project_a, xtrace_domain::OperationId::new(), None, 1)
+            .expect_err("unknown operation");
+        assert_eq!(guessed_cross_project.kind(), RecordingStoreErrorKind::NotFound);
+        assert_eq!(unknown.kind(), RecordingStoreErrorKind::NotFound);
+        assert_eq!(guessed_cross_project.code(), unknown.code());
+
+        let (linked_rows, linked_more) = view
+            .list_operation_recordings(project_a, endpoints_a[0].operation_id, None, 1)
+            .expect("linked recordings");
+        assert_eq!(linked_rows.len(), 1);
+        assert!(!linked_more);
+        assert_eq!(linked_rows[0].metadata.recording_id, linked_a.recording_id);
+        assert_eq!(linked_rows[0].operation_id, Some(endpoints_a[0].operation_id));
+
+        let (first, has_more) =
+            view.list_unmatched_recordings(project_a, None, 1).expect("first unmatched page");
+        assert_eq!(first.len(), 1);
+        assert!(has_more);
+        let after = ObservedRecordingKey {
+            opened_at: first[0].metadata.opened_at.clone(),
+            recording_id: first[0].metadata.recording_id,
+        };
+        let (second, has_more) = view
+            .list_unmatched_recordings(project_a, Some(&after), 1)
+            .expect("second unmatched page");
+        assert_eq!(second.len(), 1);
+        assert!(!has_more);
+        let rows = first.iter().chain(&second).collect::<Vec<_>>();
+        assert!(rows.iter().any(|row| row.metadata.recording_id == unmatched.recording_id));
+        assert!(rows.iter().any(|row| row.metadata.recording_id == legacy.recording_id
+            && row.unmatched_reason.is_none()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operation_recording_query_rejects_orphaned_operation_even_on_empty_page() {
+        let fixture = on_disk_store("observed-query-orphan");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let mut linked =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        linked.endpoint_observation = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "POST".to_owned(),
+            route_template: "/orders".to_owned(),
+        };
+        view.begin_recording(&linked).expect("linked recording");
+        let (endpoints, _) = view.list_observed_endpoints(project_id, None, 1).expect("endpoint");
+        let operation_id = endpoints[0].operation_id;
+        fixture
+            .store
+            .lock()
+            .expect("connection")
+            .execute(
+                "DELETE FROM recording_endpoint_observations WHERE operation_id=?1",
+                [operation_id.as_uuid().as_bytes().to_vec()],
+            )
+            .expect("delete all linked observations");
+
+        let error = view
+            .list_operation_recordings(project_id, operation_id, None, 1)
+            .expect_err("orphaned operation must fail closed rather than return empty page");
+        assert_eq!(error.kind(), RecordingStoreErrorKind::Corruption);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_recording_queries_reject_persisted_uuid_v4_recording_ids() {
+        let fixture = on_disk_store("observed-query-v4-recording-id");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let mut linked =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        linked.endpoint_observation = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "POST".to_owned(),
+            route_template: "/orders".to_owned(),
+        };
+        view.begin_recording(&linked).expect("linked recording");
+        let unmatched =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        view.begin_recording(&unmatched).expect("unmatched recording");
+        let (endpoints, _) = view.list_observed_endpoints(project_id, None, 1).expect("endpoint");
+        let operation_id = endpoints[0].operation_id;
+
+        let uuid_v4_linked =
+            uuid::Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("UUIDv4");
+        let uuid_v4_unmatched =
+            uuid::Uuid::parse_str("d9428888-122b-4d34-9f4a-123456789abc").expect("UUIDv4");
+        let connection = fixture.store.lock().expect("connection");
+        connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .expect("disable foreign keys for corruption fixture");
+        for (recording_id, corrupt_id) in
+            [(linked.recording_id, uuid_v4_linked), (unmatched.recording_id, uuid_v4_unmatched)]
+        {
+            connection
+                .execute(
+                    "UPDATE recordings SET recording_id=?1 WHERE recording_id=?2",
+                    rusqlite::params![
+                        corrupt_id.as_bytes().to_vec(),
+                        recording_id.as_uuid().as_bytes().to_vec()
+                    ],
+                )
+                .expect("corrupt recording identifier");
+            connection
+                .execute(
+                    "UPDATE recording_endpoint_observations SET recording_id=?1 WHERE recording_id=?2",
+                    rusqlite::params![
+                        corrupt_id.as_bytes().to_vec(),
+                        recording_id.as_uuid().as_bytes().to_vec()
+                    ],
+                )
+                .expect("preserve sidecar join for corruption fixture");
+        }
+        connection.execute_batch("PRAGMA foreign_keys=ON;").expect("restore foreign keys");
+        drop(connection);
+
+        let linked_error = view
+            .list_operation_recordings(project_id, operation_id, None, 1)
+            .expect_err("linked query must reject UUIDv4 persisted identity");
+        assert_eq!(linked_error.kind(), RecordingStoreErrorKind::Corruption);
+        assert!(!linked_error.to_string().contains(&uuid_v4_linked.to_string()));
+
+        let unmatched_error = view
+            .list_unmatched_recordings(project_id, None, 1)
+            .expect_err("unmatched query must reject UUIDv4 persisted identity");
+        assert_eq!(unmatched_error.kind(), RecordingStoreErrorKind::Corruption);
+        assert!(!unmatched_error.to_string().contains(&uuid_v4_unmatched.to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_query_validates_sidecars_and_read_only_open_has_no_write_effect() {
+        let fixture = on_disk_store("observed-query-corruption");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let mut linked =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        linked.endpoint_observation = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "POST".to_owned(),
+            route_template: "/orders".to_owned(),
+        };
+        view.begin_recording(&linked).expect("linked recording");
+        let (endpoints, _) =
+            view.list_observed_endpoints(project_id, None, 1).expect("endpoint read");
+        let operation_id = endpoints[0].operation_id;
+        fixture.store.lock().expect("connection").execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE recording_endpoint_observations SET method='GET'; PRAGMA ignore_check_constraints=OFF;").expect("corrupt sidecar");
+        let error = view
+            .list_operation_recordings(project_id, operation_id, None, 1)
+            .expect_err("corrupt sidecar");
+        assert_eq!(error.kind(), RecordingStoreErrorKind::Corruption);
+
+        let read_only = SqliteStore::open(
+            &fixture.database,
+            OpenOptions::default().with_must_exist(true).with_read_only(true),
+        )
+        .expect("read-only store");
+        let before: (i64, i64) = fixture
+            .store
+            .lock()
+            .expect("connection")
+            .query_row(
+                "SELECT (SELECT count(*) FROM recordings),(SELECT count(*) FROM operations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("before counts");
+        let readonly_view = read_only.recording_store(&fixture.root).expect("read-only view");
+        let query_only: i64 = read_only
+            .lock()
+            .expect("read-only connection")
+            .query_row("PRAGMA query_only", [], |row| row.get(0))
+            .expect("query only");
+        assert_eq!(query_only, 1);
+        let _ =
+            readonly_view.list_unmatched_recordings(project_id, None, 1).expect("read-only query");
+        let after: (i64, i64) = fixture
+            .store
+            .lock()
+            .expect("connection")
+            .query_row(
+                "SELECT (SELECT count(*) FROM recordings),(SELECT count(*) FROM operations)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("after counts");
+        assert_eq!(before, after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_endpoint_query_rejects_corrupt_operation_and_link_shapes() {
+        for (label, mutation) in [
+            (
+                "bad-operation-id",
+                "PRAGMA ignore_check_constraints=ON; PRAGMA foreign_keys=OFF; UPDATE operations SET operation_id=zeroblob(16); PRAGMA foreign_keys=ON;",
+            ),
+            (
+                "bad-operation-tuple",
+                "PRAGMA ignore_check_constraints=ON; UPDATE operations SET method='PUT'; PRAGMA ignore_check_constraints=OFF;",
+            ),
+            (
+                "bad-operation-fingerprint",
+                "UPDATE operations SET endpoint_fingerprint=zeroblob(32);",
+            ),
+            (
+                "bad-sidecar-policy",
+                "PRAGMA ignore_check_constraints=ON; UPDATE recording_endpoint_observations SET observation_policy_id='private-policy'; PRAGMA ignore_check_constraints=OFF;",
+            ),
+            (
+                "bad-sidecar-project",
+                "PRAGMA foreign_keys=OFF; UPDATE recording_endpoint_observations SET project_id=zeroblob(16); PRAGMA foreign_keys=ON;",
+            ),
+        ] {
+            let fixture = on_disk_store(label);
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            let mut linked =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            linked.endpoint_observation = EndpointObservationInput {
+                policy_id: Some("spring-orders-v1".to_owned()),
+                application_component: Some("spring-fixture".to_owned()),
+                binding_key: Some("default".to_owned()),
+                method: "POST".to_owned(),
+                route_template: "/orders".to_owned(),
+            };
+            view.begin_recording(&linked).expect("linked recording");
+            fixture
+                .store
+                .lock()
+                .expect("connection")
+                .execute_batch(mutation)
+                .expect("corrupt database fixture");
+            let error = view
+                .list_observed_endpoints(project_id, None, 1)
+                .expect_err("corrupt endpoint identity");
+            assert_eq!(error.kind(), RecordingStoreErrorKind::Corruption, "{label}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unmatched_query_rejects_unknown_reason_and_invalid_policy_context_shape() {
+        for (label, mutation) in [
+            (
+                "bad-unmatched-reason",
+                "PRAGMA ignore_check_constraints=ON; UPDATE recording_endpoint_observations SET reason_code='private-canary'; PRAGMA ignore_check_constraints=OFF;",
+            ),
+            (
+                "bad-unmatched-policy",
+                "PRAGMA ignore_check_constraints=ON; UPDATE recording_endpoint_observations SET observation_policy_id='private-policy'; PRAGMA ignore_check_constraints=OFF;",
+            ),
+        ] {
+            let fixture = on_disk_store(label);
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            let unmatched =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            view.begin_recording(&unmatched).expect("unmatched recording");
+            fixture
+                .store
+                .lock()
+                .expect("connection")
+                .execute_batch(mutation)
+                .expect("corrupt unmatched fixture");
+            let error = view
+                .list_unmatched_recordings(project_id, None, 1)
+                .expect_err("corrupt unmatched sidecar");
+            assert_eq!(error.kind(), RecordingStoreErrorKind::Corruption, "{label}");
+        }
     }
 
     #[cfg(unix)]
