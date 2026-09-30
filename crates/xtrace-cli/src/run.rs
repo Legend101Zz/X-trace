@@ -12,16 +12,34 @@ const DAEMON_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 pub(crate) async fn run(
     project_dir: PathBuf,
     java_agent: PathBuf,
+    observed_endpoint_policy: Option<String>,
+    application_component: Option<String>,
+    binding_key: Option<String>,
     command: Vec<OsString>,
 ) -> Result<i32, CliError> {
     #[cfg(not(unix))]
     {
-        let _ = (project_dir, java_agent, command);
+        let _ = (
+            project_dir,
+            java_agent,
+            observed_endpoint_policy,
+            application_component,
+            binding_key,
+            command,
+        );
         Err(CliError::DaemonUnsupportedPlatform)
     }
     #[cfg(unix)]
     {
-        run_unix(project_dir, java_agent, command).await
+        run_unix(
+            project_dir,
+            java_agent,
+            observed_endpoint_policy,
+            application_component,
+            binding_key,
+            command,
+        )
+        .await
     }
 }
 
@@ -29,6 +47,9 @@ pub(crate) async fn run(
 async fn run_unix(
     project_dir: PathBuf,
     java_agent: PathBuf,
+    observed_endpoint_policy: Option<String>,
+    application_component: Option<String>,
+    binding_key: Option<String>,
     command: Vec<OsString>,
 ) -> Result<i32, CliError> {
     use tokio::sync::oneshot;
@@ -38,7 +59,18 @@ async fn run_unix(
     // direct JDK and private agent distribution have passed runtime preflight.
     let launch = JavaLaunch::validate(&java_agent, &command).map_err(CliError::Run)?;
     let mut signals = JavaSignals::install().map_err(CliError::Run)?;
-    let prepared = crate::daemon::prepare(project_dir, &crate::paths::read_env_path).await?;
+    let run_observation = xtrace_application::recording::EndpointObservationInput {
+        policy_id: observed_endpoint_policy,
+        application_component,
+        binding_key,
+        ..xtrace_application::recording::EndpointObservationInput::default()
+    };
+    let prepared = crate::daemon::prepare_with_observation(
+        project_dir,
+        &crate::paths::read_env_path,
+        run_observation,
+    )
+    .await?;
     let crate::daemon::PreparedDaemon { bound, bootstrap_path, mut runtime_dir, lock } = prepared;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let mut daemon_task = tokio::spawn(async move {

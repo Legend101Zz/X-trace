@@ -98,11 +98,15 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
                 recording_id: request.recording_id,
                 runtime_session_id: request.runtime_session_id,
                 opened_at: request.opened_at,
+                endpoint_observation: request.endpoint_observation.clone(),
             })
             .map_err(map_recording_error)?;
         let disposition = match receipt.disposition {
             BeginRecordingDisposition::Inserted => PortBeginDisposition::Inserted,
             BeginRecordingDisposition::ExactReplay => PortBeginDisposition::ExactReplay,
+            BeginRecordingDisposition::LegacyObservationAbsent => {
+                PortBeginDisposition::LegacyObservationAbsent
+            }
         };
         Ok(PortBeginReceipt { recording_id: receipt.recording_id, disposition })
     }
@@ -258,6 +262,8 @@ mod tests {
             recording_id,
             runtime_session_id: RuntimeSessionId::new(),
             opened_at: WallTime::from_parts(2026, 9, 29, 1, 2, 3, 0).expect("timestamp"),
+            endpoint_observation: xtrace_application::recording::EndpointObservationInput::default(
+            ),
         }
     }
 
@@ -773,7 +779,7 @@ mod tests {
             std::num::NonZeroUsize::new(2).expect("non-zero recording limit"),
         );
         let begin = begin(project.id(), RecordingId::new());
-        capture.begin_recording(begin).expect("begin");
+        capture.begin_recording(begin.clone()).expect("begin");
 
         let first_attempt = event(2, "first-attempt");
         let mut malformed_later = event(3, "malformed-later");
@@ -828,7 +834,7 @@ mod tests {
             std::num::NonZeroUsize::new(2).expect("non-zero recording limit"),
         );
         let begin = begin(project.id(), RecordingId::new());
-        capture.begin_recording(begin).expect("begin");
+        capture.begin_recording(begin.clone()).expect("begin");
 
         let original = event(2, "event-2");
         capture

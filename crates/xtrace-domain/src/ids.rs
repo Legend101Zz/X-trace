@@ -142,8 +142,8 @@ uuid_id! {
     CatalogRevisionId
 }
 uuid_id! {
-    /// Identity of a stable HTTP operation. Computed from a normalized
-    /// method/route/binding/component tuple.
+    /// UUIDv7 identity assigned when a stable HTTP operation is first persisted.
+    /// Endpoint content matching uses a separate versioned fingerprint.
     OperationId
 }
 uuid_id! {

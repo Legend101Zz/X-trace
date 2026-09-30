@@ -13,6 +13,7 @@ use std::str::FromStr as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 
 use rusqlite::OptionalExtension as _;
+use xtrace_application::recording::EndpointObservationInput;
 use xtrace_application::recording_queries::{
     MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES, PersistedEvent,
     PersistedInteraction, RecordingEventWindow, RecordingMetadata, RecordingStatus,
@@ -20,7 +21,8 @@ use xtrace_application::recording_queries::{
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
-    ContentHash, CorrelationId, ProjectId, RecordingId, RuntimeSessionId, WallTime,
+    ContentHash, CorrelationId, ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointIdentity, HttpMethod,
+    ProjectId, RecordingId, RuntimeSessionId, Transport, WallTime,
 };
 
 use crate::connection::SqliteStore;
@@ -31,7 +33,7 @@ use crate::xtf::{
 };
 
 /// Input for the idempotent recording-anchor operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BeginRecordingRequest {
     /// Project that owns the recording.
     pub project_id: ProjectId,
@@ -41,6 +43,8 @@ pub struct BeginRecordingRequest {
     pub runtime_session_id: RuntimeSessionId,
     /// Canonical wall-clock time when the recording opened.
     pub opened_at: WallTime,
+    /// Run-scoped opt-in and adapter fields for safe endpoint classification.
+    pub endpoint_observation: EndpointObservationInput,
 }
 
 /// Successful outcome of [`SqliteRecordingStore::begin_recording`].
@@ -59,6 +63,8 @@ pub enum BeginRecordingDisposition {
     Inserted,
     /// An existing row has the same immutable begin identity.
     ExactReplay,
+    /// Existing legacy recording has no observation sidecar and was not changed.
+    LegacyObservationAbsent,
 }
 
 /// Typed input for one immutable XTF segment commit.
@@ -637,18 +643,19 @@ impl SqliteRecordingStore<'_> {
         })
     }
 
-    /// Inserts a recording anchor or returns an exact immutable replay.
+    /// Classifies one start observation and atomically inserts the recording,
+    /// optional operation, and safe disposition sidecar, or proves a replay.
     ///
     /// The shared writer guard is acquired before root revalidation and all
     /// reads, so every store clone and recording view observes one local
-    /// recording-write order. This pass always inserts `recording`; it never
-    /// transitions lifecycle state.
+    /// recording-write order. Endpoint fields are allowlisted before persistence;
+    /// rejected input and its digest are never retained.
     ///
     /// # Errors
     ///
-    /// Returns [`RecordingStoreErrorKind::NotFound`] before inserting when the
-    /// project does not exist, or `XTR-STORE-RECORDING-CONFLICT` when an
-    /// existing recording has different immutable begin identity.
+    /// Returns [`RecordingStoreErrorKind::NotFound`] when the project is
+    /// unknown, `Conflict` when an immutable identity or retained disposition
+    /// differs, and `Corruption` when operation keys disagree.
     pub fn begin_recording(
         &self,
         request: &BeginRecordingRequest,
@@ -659,10 +666,16 @@ impl SqliteRecordingStore<'_> {
             .lock_recording_writer(correlation_id)
             .map_err(|error| map_store_error(error, correlation_id))?;
         self.binding.revalidate(correlation_id)?;
-        let connection =
+        let mut connection =
             self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
 
-        if !project_exists(&connection, request.project_id, correlation_id)? {
+        let disposition = classify_observation(&request.endpoint_observation);
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        if !project_exists(&transaction, request.project_id, correlation_id)? {
             return Err(RecordingStoreError::new(
                 RecordingStoreErrorKind::NotFound,
                 "XTR-STORE-RECORDING-PROJECT-NOT-FOUND",
@@ -670,39 +683,58 @@ impl SqliteRecordingStore<'_> {
                 correlation_id,
             ));
         }
-
-        if let Some(existing) = load_recording(&connection, request.recording_id, correlation_id)? {
-            return receipt_for_existing(existing, request, correlation_id);
-        }
-
-        let result = connection.execute(
-            "INSERT INTO recordings \
-                 (recording_id, project_id, runtime_session_id, status, opened_at) \
-             VALUES (?1, ?2, ?3, 'recording', ?4)",
-            rusqlite::params![
-                request.recording_id.as_uuid().as_bytes().to_vec(),
-                request.project_id.as_uuid().as_bytes().to_vec(),
-                request.runtime_session_id.as_uuid().as_bytes().to_vec(),
-                request.opened_at.to_rfc3339(),
-            ],
-        );
-        match result {
-            Ok(_) => Ok(BeginRecordingReceipt {
-                recording_id: request.recording_id,
-                disposition: BeginRecordingDisposition::Inserted,
-            }),
-            Err(error) => {
-                let mapped = StoreError::from_rusqlite(error, correlation_id);
-                if matches!(mapped.kind(), StoreErrorKind::AlreadyExists) {
-                    if let Some(existing) =
-                        load_recording(&connection, request.recording_id, correlation_id)?
-                    {
-                        return receipt_for_existing(existing, request, correlation_id);
-                    }
-                }
-                Err(map_store_error(mapped, correlation_id))
+        if let Some(existing) = load_recording(&transaction, request.recording_id, correlation_id)?
+        {
+            verify_existing_identity(&existing, request, correlation_id)?;
+            let existing_observation = transaction.query_row(
+                "SELECT disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code \
+                 FROM recording_endpoint_observations WHERE project_id = ?1 AND recording_id = ?2",
+                rusqlite::params![request.project_id.as_uuid().as_bytes().to_vec(), request.recording_id.as_uuid().as_bytes().to_vec()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<Vec<u8>>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?)),
+            ).optional().map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+            let Some(existing_observation) = existing_observation else {
+                return Ok(BeginRecordingReceipt {
+                    recording_id: request.recording_id,
+                    disposition: BeginRecordingDisposition::LegacyObservationAbsent,
+                });
+            };
+            if !observation_matches(&existing_observation, &disposition) {
+                return Err(recording_conflict(
+                    "recording observation conflicts with an existing recording",
+                    correlation_id,
+                ));
             }
+            return Ok(BeginRecordingReceipt {
+                recording_id: request.recording_id,
+                disposition: BeginRecordingDisposition::ExactReplay,
+            });
         }
+
+        let operation_id = if disposition.reason_code.is_none() {
+            Some(find_or_insert_operation(
+                &transaction,
+                request.project_id,
+                &disposition,
+                correlation_id,
+            )?)
+        } else {
+            None
+        };
+        transaction.execute(
+            "INSERT INTO recordings (recording_id, project_id, runtime_session_id, status, opened_at) VALUES (?1, ?2, ?3, 'recording', ?4)",
+            rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec(), request.project_id.as_uuid().as_bytes().to_vec(), request.runtime_session_id.as_uuid().as_bytes().to_vec(), request.opened_at.to_rfc3339()],
+        ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+        transaction.execute(
+            "INSERT INTO recording_endpoint_observations (recording_id, project_id, disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec(), request.project_id.as_uuid().as_bytes().to_vec(), if operation_id.is_some() { "linked" } else { "unmatched" }, disposition.policy_id, operation_id.map(|id| id.as_uuid().as_bytes().to_vec()), disposition.application_component, disposition.binding_key, disposition.method, disposition.route_template, disposition.reason_code],
+        ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+        transaction.commit().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+        Ok(BeginRecordingReceipt {
+            recording_id: request.recording_id,
+            disposition: BeginRecordingDisposition::Inserted,
+        })
     }
 
     /// Publishes one verified XTF object and its `recording_segments` metadata.
@@ -2145,11 +2177,11 @@ fn load_recording(
         .map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))
 }
 
-fn receipt_for_existing(
-    existing: ExistingRecording,
+fn verify_existing_identity(
+    existing: &ExistingRecording,
     request: &BeginRecordingRequest,
     correlation_id: CorrelationId,
-) -> Result<BeginRecordingReceipt, RecordingStoreError> {
+) -> Result<(), RecordingStoreError> {
     let valid_identity_widths =
         existing.project_id.len() == 16 && existing.runtime_session_id.len() == 16;
     if !valid_identity_widths {
@@ -2164,17 +2196,177 @@ fn receipt_for_existing(
         && existing.runtime_session_id == request.runtime_session_id.as_uuid().as_bytes()
         && existing.opened_at == request.opened_at.to_rfc3339()
     {
-        return Ok(BeginRecordingReceipt {
-            recording_id: request.recording_id,
-            disposition: BeginRecordingDisposition::ExactReplay,
-        });
+        return Ok(());
     }
-    Err(RecordingStoreError::new(
-        RecordingStoreErrorKind::Conflict,
-        "XTR-STORE-RECORDING-CONFLICT",
+    Err(recording_conflict(
         "recording identity conflicts with an existing recording",
         correlation_id,
     ))
+}
+
+fn recording_conflict(message: &'static str, correlation_id: CorrelationId) -> RecordingStoreError {
+    RecordingStoreError::new(
+        RecordingStoreErrorKind::Conflict,
+        "XTR-STORE-RECORDING-CONFLICT",
+        message,
+        correlation_id,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SafeObservation {
+    policy_id: Option<&'static str>,
+    application_component: Option<&'static str>,
+    binding_key: Option<&'static str>,
+    method: Option<&'static str>,
+    route_template: Option<&'static str>,
+    reason_code: Option<&'static str>,
+}
+
+fn classify_observation(input: &EndpointObservationInput) -> SafeObservation {
+    const POLICY: &str = "spring-orders-v1";
+    const COMPONENT: &str = "spring-fixture";
+    const BINDING: &str = "default";
+    let safe_context = if input.application_component.as_deref() == Some(COMPONENT)
+        && input.binding_key.as_deref() == Some(BINDING)
+    {
+        (Some(COMPONENT), Some(BINDING))
+    } else {
+        (None, None)
+    };
+    let Some(policy) = input.policy_id.as_deref() else {
+        return unmatched(None, safe_context.0, safe_context.1, "observation_policy_missing");
+    };
+    if policy != POLICY {
+        return unmatched(None, safe_context.0, safe_context.1, "observation_policy_invalid");
+    }
+    if input.application_component.is_none() && input.binding_key.is_none() {
+        return unmatched(Some(POLICY), None, None, "identity_context_missing");
+    }
+    let valid_pair = input.application_component.as_deref() == Some(COMPONENT)
+        && input.binding_key.as_deref() == Some(BINDING);
+    if !valid_pair {
+        return unmatched(Some(POLICY), None, None, "identity_context_invalid");
+    }
+    let Some(method) = HttpMethod::parse(&input.method) else {
+        return unmatched(Some(POLICY), Some(COMPONENT), Some(BINDING), "method_unsupported");
+    };
+    if method != HttpMethod::Post {
+        return unmatched(Some(POLICY), Some(COMPONENT), Some(BINDING), "method_unsupported");
+    }
+    if input.route_template != "/orders" {
+        return unmatched(Some(POLICY), Some(COMPONENT), Some(BINDING), "route_unapproved");
+    }
+    SafeObservation {
+        policy_id: Some(POLICY),
+        application_component: Some(COMPONENT),
+        binding_key: Some(BINDING),
+        method: Some("POST"),
+        route_template: Some("/orders"),
+        reason_code: None,
+    }
+}
+
+fn unmatched(
+    policy_id: Option<&'static str>,
+    application_component: Option<&'static str>,
+    binding_key: Option<&'static str>,
+    reason_code: &'static str,
+) -> SafeObservation {
+    SafeObservation {
+        policy_id,
+        application_component,
+        binding_key,
+        method: None,
+        route_template: None,
+        reason_code: Some(reason_code),
+    }
+}
+
+type StoredObservation = (
+    String,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn observation_matches(stored: &StoredObservation, expected: &SafeObservation) -> bool {
+    let linked = expected.reason_code.is_none();
+    stored.0 == if linked { "linked" } else { "unmatched" }
+        && stored.1.as_deref() == expected.policy_id
+        && stored.2.as_ref().is_some_and(|id| id.len() == 16) == linked
+        && stored.3.as_deref() == expected.application_component
+        && stored.4.as_deref() == expected.binding_key
+        && stored.5.as_deref() == expected.method
+        && stored.6.as_deref() == expected.route_template
+        && stored.7.as_deref() == expected.reason_code
+}
+
+fn find_or_insert_operation(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: ProjectId,
+    observation: &SafeObservation,
+    correlation_id: CorrelationId,
+) -> Result<xtrace_domain::OperationId, RecordingStoreError> {
+    let identity = EndpointIdentity {
+        project_id,
+        application_component: observation
+            .application_component
+            .unwrap_or("spring-fixture")
+            .to_owned(),
+        binding_key: observation.binding_key.unwrap_or("default").to_owned(),
+        transport: Transport::Http,
+        method: HttpMethod::Post,
+        route_template: "/orders".to_owned(),
+    };
+    let fingerprint = identity.fingerprint().map_err(|_| {
+        RecordingStoreError::new(
+            RecordingStoreErrorKind::Internal,
+            "XTR-STORE-ENDPOINT-FINGERPRINT",
+            "endpoint identity encoding failed",
+            correlation_id,
+        )
+    })?;
+    let project_bytes = project_id.as_uuid().as_bytes().to_vec();
+    let fingerprint_bytes = fingerprint.as_bytes().to_vec();
+    let fingerprint_id: Option<Vec<u8>> = transaction.query_row(
+        "SELECT operation_id FROM operations WHERE project_id = ?1 AND fingerprint_format_version = ?2 AND endpoint_fingerprint = ?3",
+        rusqlite::params![project_bytes, i64::from(ENDPOINT_FINGERPRINT_FORMAT_VERSION), fingerprint_bytes],
+        |row| row.get(0),
+    ).optional().map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+    let tuple_id: Option<Vec<u8>> = transaction.query_row(
+        "SELECT operation_id FROM operations WHERE project_id = ?1 AND application_component = 'spring-fixture' AND binding_key = 'default' AND transport = 'http' AND method = 'POST' AND route_template = '/orders'",
+        rusqlite::params![project_id.as_uuid().as_bytes().to_vec()], |row| row.get(0),
+    ).optional().map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+    if let Some(bytes) = fingerprint_id.as_ref().or(tuple_id.as_ref()) {
+        if fingerprint_id != tuple_id || bytes.len() != 16 {
+            return Err(RecordingStoreError::new(
+                RecordingStoreErrorKind::Corruption,
+                "XTR-STORE-ENDPOINT-IDENTITY-CORRUPT",
+                "stored endpoint identity is inconsistent",
+                correlation_id,
+            ));
+        }
+        let raw: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+            RecordingStoreError::new(
+                RecordingStoreErrorKind::Corruption,
+                "XTR-STORE-ENDPOINT-IDENTITY-CORRUPT",
+                "stored endpoint identity is inconsistent",
+                correlation_id,
+            )
+        })?;
+        return Ok(xtrace_domain::OperationId::from_uuid(uuid::Uuid::from_bytes(raw)));
+    }
+    let operation_id = xtrace_domain::OperationId::new();
+    transaction.execute(
+        "INSERT INTO operations (operation_id, project_id, transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint, created_at) VALUES (?1, ?2, 'http', 'POST', '/orders', 'spring-fixture', 'default', ?3, ?4, ?5)",
+        rusqlite::params![operation_id.as_uuid().as_bytes().to_vec(), project_id.as_uuid().as_bytes().to_vec(), i64::from(ENDPOINT_FINGERPRINT_FORMAT_VERSION), fingerprint.as_bytes().to_vec(), WallTime::now().to_rfc3339()],
+    ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+    Ok(operation_id)
 }
 
 fn map_store_error(error: StoreError, correlation_id: CorrelationId) -> RecordingStoreError {
@@ -2266,6 +2458,71 @@ mod tests {
         let error = store.recording_store(Path::new("/unused")).expect_err("in-memory refusal");
         assert_eq!(error.kind(), RecordingStoreErrorKind::Compatibility);
         assert_eq!(error.code(), "XTR-STORE-RECORDING-ROOT-COMPATIBILITY");
+    }
+
+    #[test]
+    fn observation_classification_uses_stable_reason_precedence() {
+        let cases = [
+            (EndpointObservationInput::default(), "observation_policy_missing"),
+            (
+                EndpointObservationInput {
+                    policy_id: Some("unknown-private-policy".to_owned()),
+                    ..EndpointObservationInput::default()
+                },
+                "observation_policy_invalid",
+            ),
+            (
+                EndpointObservationInput {
+                    policy_id: Some("spring-orders-v1".to_owned()),
+                    ..EndpointObservationInput::default()
+                },
+                "identity_context_missing",
+            ),
+            (
+                EndpointObservationInput {
+                    policy_id: Some("spring-orders-v1".to_owned()),
+                    application_component: Some("other".to_owned()),
+                    binding_key: Some("default".to_owned()),
+                    method: "PRIVATE".to_owned(),
+                    route_template: "/secret".to_owned(),
+                },
+                "identity_context_invalid",
+            ),
+            (
+                EndpointObservationInput {
+                    policy_id: Some("spring-orders-v1".to_owned()),
+                    application_component: Some("spring-fixture".to_owned()),
+                    binding_key: Some("default".to_owned()),
+                    method: "PRIVATE".to_owned(),
+                    route_template: "/secret".to_owned(),
+                },
+                "method_unsupported",
+            ),
+            (
+                EndpointObservationInput {
+                    policy_id: Some("spring-orders-v1".to_owned()),
+                    application_component: Some("spring-fixture".to_owned()),
+                    binding_key: Some("default".to_owned()),
+                    method: "POST".to_owned(),
+                    route_template: "/secret?canary".to_owned(),
+                },
+                "route_unapproved",
+            ),
+        ];
+        for (input, expected) in cases {
+            let result = classify_observation(&input);
+            assert_eq!(result.reason_code, Some(expected));
+            assert_eq!(result.method, None);
+            assert_eq!(result.route_template, None);
+        }
+        let identity_only = classify_observation(&EndpointObservationInput {
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            ..EndpointObservationInput::default()
+        });
+        assert_eq!(identity_only.reason_code, Some("observation_policy_missing"));
+        assert_eq!(identity_only.application_component, Some("spring-fixture"));
+        assert_eq!(identity_only.binding_key, Some("default"));
     }
 
     #[cfg(unix)]
@@ -2365,6 +2622,242 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn observed_begin_links_exact_fixture_and_replays_only_safe_disposition() {
+        let fixture = on_disk_store("observed-start");
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let mut linked =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        linked.endpoint_observation = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "POST".to_owned(),
+            route_template: "/orders".to_owned(),
+        };
+        assert_eq!(
+            view.begin_recording(&linked).expect("linked begin").disposition,
+            BeginRecordingDisposition::Inserted
+        );
+        {
+            let connection = fixture.store.lock().expect("connection");
+            let operation_bytes: Vec<u8> = connection
+                .query_row(
+                    "SELECT operation_id FROM operations WHERE project_id = ?1",
+                    [project_id.as_uuid().as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .expect("operation ID");
+            let operation_uuid = uuid::Uuid::from_slice(&operation_bytes).expect("UUIDv7 width");
+            assert_eq!(operation_uuid.get_version_num(), 7);
+        }
+        let counts = || {
+            let conn = fixture.store.lock().expect("connection");
+            let operations: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM operations WHERE project_id = ?1",
+                    [project_id.as_uuid().as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .expect("operations");
+            let sidecars: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM recording_endpoint_observations WHERE project_id = ?1",
+                    [project_id.as_uuid().as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .expect("sidecars");
+            (operations, sidecars)
+        };
+        assert_eq!(counts(), (1, 1));
+        let mut second =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        second.endpoint_observation = linked.endpoint_observation.clone();
+        view.begin_recording(&second).expect("deduplicated begin");
+        assert_eq!(counts(), (1, 2));
+        assert_eq!(
+            view.begin_recording(&linked).expect("exact replay").disposition,
+            BeginRecordingDisposition::ExactReplay
+        );
+
+        let mut rejected =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        rejected.endpoint_observation = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "BREW_PRIVATE_METHOD".to_owned(),
+            route_template: "/private-canary?token=secret".to_owned(),
+        };
+        view.begin_recording(&rejected).expect("unmatched start is accepted");
+        let mut replay = rejected.clone();
+        replay.endpoint_observation.method = "UNKNOWN_OTHER_METHOD".to_owned();
+        replay.endpoint_observation.route_template = "/different-canary".to_owned();
+        assert_eq!(
+            view.begin_recording(&replay).expect("rejected raw inputs collapse safely").disposition,
+            BeginRecordingDisposition::ExactReplay
+        );
+        let mut rejected_route =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        rejected_route.endpoint_observation = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "POST".to_owned(),
+            route_template: "/route-canary?secret=value".to_owned(),
+        };
+        view.begin_recording(&rejected_route).expect("rejected route is unmatched");
+        let conn = fixture.store.lock().expect("connection");
+        let row: (String, Option<String>, Option<String>, Option<String>, Option<String>) = conn.query_row(
+            "SELECT disposition, observation_policy_id, application_component, binding_key, reason_code FROM recording_endpoint_observations WHERE recording_id = ?1",
+            [rejected.recording_id.as_uuid().as_bytes().to_vec()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).expect("safe unmatched row");
+        assert_eq!(
+            row,
+            (
+                "unmatched".to_owned(),
+                Some("spring-orders-v1".to_owned()),
+                Some("spring-fixture".to_owned()),
+                Some("default".to_owned()),
+                Some("method_unsupported".to_owned())
+            )
+        );
+        let route_reason: String = conn
+            .query_row(
+                "SELECT reason_code FROM recording_endpoint_observations WHERE recording_id = ?1",
+                [rejected_route.recording_id.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("safe route reason");
+        assert_eq!(route_reason, "route_unapproved");
+        let all_text: String = conn.query_row("SELECT group_concat(coalesce(observation_policy_id,'') || coalesce(application_component,'') || coalesce(binding_key,'') || coalesce(method,'') || coalesce(route_template,'') || coalesce(reason_code,'')) FROM recording_endpoint_observations", [], |row| row.get(0)).expect("sidecar text");
+        assert!(!all_text.contains("PRIVATE"));
+        assert!(!all_text.contains("secret"));
+        assert!(!all_text.contains("canary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_replay_stays_absent_and_failed_sidecar_insert_rolls_back_operation() {
+        let fixture = on_disk_store("observed-rollback");
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let mut legacy =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        view.begin_recording(&legacy).expect("legacy-style unmatched row");
+        {
+            let conn = fixture.store.lock().expect("connection");
+            conn.execute(
+                "DELETE FROM recording_endpoint_observations WHERE recording_id = ?1",
+                [legacy.recording_id.as_uuid().as_bytes().to_vec()],
+            )
+            .expect("remove sidecar for legacy fixture");
+        }
+        legacy.endpoint_observation.policy_id = Some("spring-orders-v1".to_owned());
+        legacy.endpoint_observation.application_component = Some("spring-fixture".to_owned());
+        legacy.endpoint_observation.binding_key = Some("default".to_owned());
+        legacy.endpoint_observation.method = "POST".to_owned();
+        legacy.endpoint_observation.route_template = "/orders".to_owned();
+        assert_eq!(
+            view.begin_recording(&legacy).expect("legacy replay").disposition,
+            BeginRecordingDisposition::LegacyObservationAbsent
+        );
+        let failed_id = RecordingId::new();
+        let mut accepted = legacy.clone();
+        accepted.recording_id = failed_id;
+        accepted.runtime_session_id = RuntimeSessionId::new();
+        {
+            let conn = fixture.store.lock().expect("connection");
+            conn.execute_batch("CREATE TRIGGER fail_sidecar BEFORE INSERT ON recording_endpoint_observations BEGIN SELECT RAISE(ABORT, 'injected'); END;").expect("install failpoint");
+        }
+        assert!(view.begin_recording(&accepted).is_err());
+        let conn = fixture.store.lock().expect("connection");
+        let count: i64 = conn.query_row("SELECT (SELECT count(*) FROM operations) + (SELECT count(*) FROM recordings WHERE recording_id = ?1) + (SELECT count(*) FROM recording_endpoint_observations WHERE recording_id = ?1)", [failed_id.as_uuid().as_bytes().to_vec()], |row| row.get(0)).expect("rollback counts");
+        assert_eq!(count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_endpoint_tuples_are_isolated_by_project() {
+        let fixture = on_disk_store("project-isolation");
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let first_project = ProjectId::new();
+        let second_project = ProjectId::new();
+        insert_project(&fixture.store, first_project);
+        insert_project(&fixture.store, second_project);
+        let context = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "POST".to_owned(),
+            route_template: "/orders".to_owned(),
+        };
+        for project_id in [first_project, second_project] {
+            let mut start =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            start.endpoint_observation = context.clone();
+            view.begin_recording(&start).expect("linked observation");
+        }
+        let connection = fixture.store.lock().expect("connection");
+        let first_id: Vec<u8> = connection
+            .query_row(
+                "SELECT operation_id FROM operations WHERE project_id = ?1",
+                [first_project.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("first project operation");
+        let second_id: Vec<u8> = connection
+            .query_row(
+                "SELECT operation_id FROM operations WHERE project_id = ?1",
+                [second_project.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("second project operation");
+        assert_ne!(first_id, second_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_to_tuple_mismatch_fails_closed_before_recording_insert() {
+        let fixture = on_disk_store("fingerprint-tuple-mismatch");
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let context = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "POST".to_owned(),
+            route_template: "/orders".to_owned(),
+        };
+        let mut first =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        first.endpoint_observation = context.clone();
+        view.begin_recording(&first).expect("first operation");
+        {
+            let connection = fixture.store.lock().expect("connection");
+            connection.execute("UPDATE operations SET endpoint_fingerprint = zeroblob(32) WHERE project_id = ?1", [project_id.as_uuid().as_bytes().to_vec()]).expect("corrupt fingerprint fixture");
+        }
+        let mut replay =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        replay.endpoint_observation = context.clone();
+        let error = view.begin_recording(&replay).expect_err("fingerprint mismatch is corruption");
+        assert_eq!(error.kind(), RecordingStoreErrorKind::Corruption);
+        let connection = fixture.store.lock().expect("connection");
+        let present: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM recordings WHERE recording_id = ?1",
+                [replay.recording_id.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("recording count");
+        assert_eq!(present, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn begin_recording_reports_missing_project_and_each_identity_conflict() {
         let fixture = on_disk_store("conflicts");
         let view = fixture.store.recording_store(&fixture.root).expect("view");
@@ -2383,11 +2876,14 @@ mod tests {
         let other_project_id = ProjectId::new();
         insert_project(&fixture.store, other_project_id);
         for changed in [
-            BeginRecordingRequest { project_id: other_project_id, ..request },
-            BeginRecordingRequest { runtime_session_id: RuntimeSessionId::new(), ..request },
+            BeginRecordingRequest { project_id: other_project_id, ..request.clone() },
+            BeginRecordingRequest {
+                runtime_session_id: RuntimeSessionId::new(),
+                ..request.clone()
+            },
             BeginRecordingRequest {
                 opened_at: WallTime::from_parts(2026, 9, 29, 2, 3, 5, 6).expect("time"),
-                ..request
+                ..request.clone()
             },
         ] {
             let error = view.begin_recording(&changed).expect_err("identity conflict");
@@ -3208,7 +3704,13 @@ mod tests {
         runtime_session_id: RuntimeSessionId,
         opened_at: WallTime,
     ) -> BeginRecordingRequest {
-        BeginRecordingRequest { project_id, recording_id, runtime_session_id, opened_at }
+        BeginRecordingRequest {
+            project_id,
+            recording_id,
+            runtime_session_id,
+            opened_at,
+            endpoint_observation: EndpointObservationInput::default(),
+        }
     }
 
     #[cfg(unix)]

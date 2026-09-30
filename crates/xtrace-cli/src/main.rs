@@ -134,6 +134,47 @@ mod tests {
     }
 
     #[test]
+    fn run_command_accepts_the_finite_observation_opt_in_and_paired_context() {
+        let cli = Cli::try_parse_from([
+            "xtrace",
+            "run",
+            "--project-dir",
+            "/tmp/project",
+            "--java-agent",
+            "/tmp/agent.jar",
+            "--observed-endpoint-policy",
+            "spring-orders-v1",
+            "--application-component",
+            "spring-fixture",
+            "--binding-key",
+            "default",
+            "--",
+            "java",
+            "-jar",
+            "app.jar",
+        ])
+        .expect("opt-in parses");
+        assert!(matches!(cli.command, commands::XtraceCommand::Run {
+            observed_endpoint_policy: Some(policy), application_component: Some(component), binding_key: Some(binding), ..
+        } if policy == "spring-orders-v1" && component == "spring-fixture" && binding == "default"));
+        assert!(
+            Cli::try_parse_from([
+                "xtrace",
+                "run",
+                "--project-dir",
+                "/tmp/project",
+                "--java-agent",
+                "/tmp/agent.jar",
+                "--application-component",
+                "spring-fixture",
+                "--",
+                "java",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn recording_commands_accept_project_selection_and_versioned_show_cursor() {
         let list = Cli::try_parse_from([
             "xtrace",

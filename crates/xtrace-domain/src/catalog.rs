@@ -12,7 +12,7 @@ use crate::provenance::{EvidenceRef, ProducerIdentity, ProvenanceKind, SourceRan
 
 /// Transport binding. Slice 1A only models HTTP because the X-trace
 /// v1 framework matrix is HTTP-centric.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     /// Plain HTTP / HTTPS.
@@ -30,7 +30,7 @@ impl Transport {
 }
 
 /// Normalized HTTP method. Stored uppercase.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum HttpMethod {
     /// HTTP GET.
@@ -95,7 +95,8 @@ impl HttpMethod {
 /// foreign key the recordings, exercise plans, and exports hang off.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Operation {
-    /// Stable identifier computed from the normalized key.
+    /// UUIDv7 entity identifier allocated on first persistence; endpoint
+    /// matching uses a separate versioned fingerprint.
     pub id: OperationId,
     /// Owning project.
     pub project_id: ProjectId,

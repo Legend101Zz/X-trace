@@ -110,6 +110,24 @@ pub(crate) async fn prepare<F>(
 where
     F: Fn(&str) -> Option<PathBuf>,
 {
+    prepare_with_observation(
+        project_dir,
+        env_reader,
+        xtrace_application::recording::EndpointObservationInput::default(),
+    )
+    .await
+}
+
+/// Prepares capture with invocation-scoped endpoint observation context.
+#[cfg(unix)]
+pub(crate) async fn prepare_with_observation<F>(
+    project_dir: PathBuf,
+    env_reader: &F,
+    run_observation: xtrace_application::recording::EndpointObservationInput,
+) -> Result<PreparedDaemon, CliError>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
     let preflight = preflight_project(&project_dir, env_reader)?;
     let lock = acquire_project_lock(&preflight.project_data_root)?;
     let selected = open_validated_project(preflight)?;
@@ -123,6 +141,7 @@ where
         .with_expected_repository_fingerprint(selected.repository_fingerprint)
         .with_bootstrap_artifact(bootstrap_path.clone())
         .with_recording_capture(capture)
+        .with_endpoint_observation_context(run_observation)
         .bind()
         .await
         .map_err(map_daemon_error)?;
@@ -584,6 +603,8 @@ mod tests {
                 recording_id,
                 runtime_session_id,
                 opened_at,
+                endpoint_observation:
+                    xtrace_application::recording::EndpointObservationInput::default(),
             })
             .expect("begin anchor");
 
