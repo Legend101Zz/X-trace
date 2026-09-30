@@ -8,7 +8,7 @@ The approved product, architecture, program design, and vertical-slice plan unde
 - Prefer the smallest real end-to-end implementation over broad scaffolding.
 - A slice must exercise a real framework application through the packaged product path. Mocks alone do not complete a slice.
 - Do not change shared domain semantics, Protobuf/OpenAPI schemas, SQLite migrations, XTF format, redaction vocabulary, or replay navigation without explicit orchestrator review.
-- Use GPT-5.6 Terra or Luna agents for implementation and review work when delegation is useful; select Medium or High reasoning for the complexity of the bounded slice. The main orchestrator remains responsible for decomposition, architecture coherence, and independent review and testing.
+- Use GPT-6 Terra or Luna agents for implementation and review work when delegation is useful; select Medium or High reasoning for the complexity of the bounded slice. The main orchestrator remains responsible for decomposition, architecture coherence, and independent review and testing.
 - Commit coherent changes on the assigned branch. Agents must not merge or push `main`; the orchestrator alone reviews, verifies, and may merge or push after the required approval.
 - Never include secrets, credentials, captured private data, or local absolute paths in source, fixtures, logs, snapshots, evidence, or commits.
 
