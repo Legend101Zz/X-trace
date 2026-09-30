@@ -687,10 +687,10 @@ impl SqliteRecordingStore<'_> {
         {
             verify_existing_identity(&existing, request, correlation_id)?;
             let existing_observation = transaction.query_row(
-                "SELECT disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code \
-                 FROM recording_endpoint_observations WHERE project_id = ?1 AND recording_id = ?2",
-                rusqlite::params![request.project_id.as_uuid().as_bytes().to_vec(), request.recording_id.as_uuid().as_bytes().to_vec()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<Vec<u8>>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?)),
+                "SELECT disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code, project_id \
+                 FROM recording_endpoint_observations WHERE recording_id = ?1",
+                rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<Vec<u8>>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Vec<u8>>(8)?)),
             ).optional().map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
             let Some(existing_observation) = existing_observation else {
                 return Ok(BeginRecordingReceipt {
@@ -2298,6 +2298,7 @@ type StoredObservation = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Vec<u8>,
 );
 
 fn observation_matches(stored: &StoredObservation, expected: &SafeObservation) -> bool {
@@ -2317,6 +2318,12 @@ fn validate_stored_observation(
     stored: &StoredObservation,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    let stored_project: [u8; 16] =
+        stored.8.as_slice().try_into().map_err(|_| endpoint_identity_corrupt(correlation_id))?;
+    let stored_project = ProjectId::from_uuid(uuid::Uuid::from_bytes(stored_project));
+    if stored_project != project_id {
+        return Err(endpoint_identity_corrupt(correlation_id));
+    }
     match stored.0.as_str() {
         "linked" => {
             let Some(operation_bytes) = stored.2.as_deref() else {
@@ -3042,6 +3049,59 @@ mod tests {
                 .begin_recording(&unmatched)
                 .expect_err("malformed unmatched sidecar fails closed");
             assert_eq!(error.kind(), RecordingStoreErrorKind::Corruption, "{label}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_rejects_corrupt_sidecar_project_identity_without_mutation() {
+        for label in ["wrong-width", "other-project"] {
+            let fixture = on_disk_store(&format!("sidecar-project-{label}"));
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            let project_id = ProjectId::new();
+            let other_project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            insert_project(&fixture.store, other_project_id);
+            let unmatched =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            view.begin_recording(&unmatched).expect("unmatched begin");
+            let replacement = if label == "wrong-width" {
+                vec![0x01]
+            } else {
+                other_project_id.as_uuid().as_bytes().to_vec()
+            };
+            {
+                let connection = fixture.store.lock().expect("connection");
+                connection
+                    .execute_batch(
+                        "PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;",
+                    )
+                    .expect("bypass schema checks for fixture");
+                connection
+                    .execute(
+                        "UPDATE recording_endpoint_observations SET project_id = ?1 WHERE recording_id = ?2",
+                        rusqlite::params![replacement, unmatched.recording_id.as_uuid().as_bytes().to_vec()],
+                    )
+                    .expect("corrupt sidecar project identity");
+                connection
+                    .execute_batch(
+                        "PRAGMA ignore_check_constraints = OFF; PRAGMA foreign_keys = ON;",
+                    )
+                    .expect("restore schema checks");
+            }
+            let error = view
+                .begin_recording(&unmatched)
+                .expect_err("corrupt sidecar project identity fails closed");
+            assert_eq!(error.kind(), RecordingStoreErrorKind::Corruption, "{label}");
+            let connection = fixture.store.lock().expect("connection");
+            let (recordings, operations): (i64, i64) = connection
+                .query_row(
+                    "SELECT (SELECT count(*) FROM recordings WHERE recording_id = ?1), (SELECT count(*) FROM operations WHERE project_id = ?2)",
+                    rusqlite::params![unmatched.recording_id.as_uuid().as_bytes().to_vec(), project_id.as_uuid().as_bytes().to_vec()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("state counts");
+            assert_eq!((recordings, operations), (1, 0), "{label}");
         }
     }
 
