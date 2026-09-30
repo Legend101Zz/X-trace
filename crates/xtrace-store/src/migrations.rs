@@ -240,7 +240,9 @@ CREATE UNIQUE INDEX recordings_project_recording
     ON recordings (project_id, recording_id);
 
 CREATE TABLE operations (
-    operation_id                BLOB PRIMARY KEY CHECK(length(operation_id) = 16),
+    operation_id                BLOB PRIMARY KEY CHECK(length(operation_id) = 16
+                                    AND substr(hex(operation_id), 13, 1) = '7'
+                                    AND substr(hex(operation_id), 17, 1) IN ('8', '9', 'A', 'B')),
     project_id                  BLOB NOT NULL CHECK(length(project_id) = 16)
                                     REFERENCES projects(project_id),
     transport                   TEXT NOT NULL CHECK(transport = 'http'),
@@ -264,7 +266,9 @@ CREATE TABLE recording_endpoint_observations (
     project_id           BLOB NOT NULL CHECK(length(project_id) = 16),
     disposition          TEXT NOT NULL CHECK(disposition IN ('linked', 'unmatched')),
     observation_policy_id TEXT CHECK(observation_policy_id IS NULL OR observation_policy_id = 'spring-orders-v1'),
-    operation_id         BLOB CHECK(operation_id IS NULL OR length(operation_id) = 16),
+    operation_id         BLOB CHECK(operation_id IS NULL OR (length(operation_id) = 16
+                              AND substr(hex(operation_id), 13, 1) = '7'
+                              AND substr(hex(operation_id), 17, 1) IN ('8', '9', 'A', 'B'))),
     application_component TEXT,
     binding_key          TEXT,
     method               TEXT,

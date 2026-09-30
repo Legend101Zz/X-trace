@@ -698,6 +698,26 @@ impl SqliteRecordingStore<'_> {
                     disposition: BeginRecordingDisposition::LegacyObservationAbsent,
                 });
             };
+            if existing_observation.0 == "linked" {
+                let Some(operation_bytes) = existing_observation.2.as_deref() else {
+                    return Err(endpoint_identity_corrupt(correlation_id));
+                };
+                if existing_observation.1.as_deref() != Some("spring-orders-v1")
+                    || existing_observation.3.as_deref() != Some("spring-fixture")
+                    || existing_observation.4.as_deref() != Some("default")
+                    || existing_observation.5.as_deref() != Some("POST")
+                    || existing_observation.6.as_deref() != Some("/orders")
+                    || existing_observation.7.is_some()
+                {
+                    return Err(endpoint_identity_corrupt(correlation_id));
+                }
+                validate_linked_operation(
+                    &transaction,
+                    request.project_id,
+                    operation_bytes,
+                    correlation_id,
+                )?;
+            }
             if !observation_matches(&existing_observation, &disposition) {
                 return Err(recording_conflict(
                     "recording observation conflicts with an existing recording",
@@ -2306,6 +2326,76 @@ fn observation_matches(stored: &StoredObservation, expected: &SafeObservation) -
         && stored.7.as_deref() == expected.reason_code
 }
 
+fn endpoint_identity_corrupt(correlation_id: CorrelationId) -> RecordingStoreError {
+    RecordingStoreError::new(
+        RecordingStoreErrorKind::Corruption,
+        "XTR-STORE-ENDPOINT-IDENTITY-CORRUPT",
+        "stored endpoint identity is inconsistent",
+        correlation_id,
+    )
+}
+
+fn parse_stored_operation_id(
+    bytes: &[u8],
+    correlation_id: CorrelationId,
+) -> Result<xtrace_domain::OperationId, RecordingStoreError> {
+    let raw: [u8; 16] = bytes.try_into().map_err(|_| endpoint_identity_corrupt(correlation_id))?;
+    let uuid = uuid::Uuid::from_bytes(raw);
+    if uuid.get_version_num() != 7 || uuid.get_variant() != uuid::Variant::RFC4122 {
+        return Err(endpoint_identity_corrupt(correlation_id));
+    }
+    Ok(xtrace_domain::OperationId::from_uuid(uuid))
+}
+
+fn validate_linked_operation(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: ProjectId,
+    operation_bytes: &[u8],
+    correlation_id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    let operation_id = parse_stored_operation_id(operation_bytes, correlation_id)?;
+    type StoredOperation = (String, String, String, String, String, i64, Vec<u8>);
+    let row: Option<StoredOperation> = transaction
+        .query_row(
+            "SELECT transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint FROM operations WHERE project_id = ?1 AND operation_id = ?2",
+            rusqlite::params![project_id.as_uuid().as_bytes().to_vec(), operation_id.as_uuid().as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        )
+        .optional()
+        .map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+    let Some((transport, method, route, component, binding, format_version, fingerprint)) = row
+    else {
+        return Err(endpoint_identity_corrupt(correlation_id));
+    };
+    let identity = EndpointIdentity {
+        project_id,
+        application_component: "spring-fixture".to_owned(),
+        binding_key: "default".to_owned(),
+        transport: Transport::Http,
+        method: HttpMethod::Post,
+        route_template: "/orders".to_owned(),
+    };
+    let expected_fingerprint = identity.fingerprint().map_err(|_| {
+        RecordingStoreError::new(
+            RecordingStoreErrorKind::Internal,
+            "XTR-STORE-ENDPOINT-FINGERPRINT",
+            "endpoint identity encoding failed",
+            correlation_id,
+        )
+    })?;
+    if transport != "http"
+        || method != "POST"
+        || route != "/orders"
+        || component != "spring-fixture"
+        || binding != "default"
+        || format_version != i64::from(ENDPOINT_FINGERPRINT_FORMAT_VERSION)
+        || fingerprint.as_slice() != expected_fingerprint.as_bytes()
+    {
+        return Err(endpoint_identity_corrupt(correlation_id));
+    }
+    Ok(())
+}
+
 fn find_or_insert_operation(
     transaction: &rusqlite::Transaction<'_>,
     project_id: ProjectId,
@@ -2342,24 +2432,19 @@ fn find_or_insert_operation(
         "SELECT operation_id FROM operations WHERE project_id = ?1 AND application_component = 'spring-fixture' AND binding_key = 'default' AND transport = 'http' AND method = 'POST' AND route_template = '/orders'",
         rusqlite::params![project_id.as_uuid().as_bytes().to_vec()], |row| row.get(0),
     ).optional().map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
-    if let Some(bytes) = fingerprint_id.as_ref().or(tuple_id.as_ref()) {
-        if fingerprint_id != tuple_id || bytes.len() != 16 {
-            return Err(RecordingStoreError::new(
-                RecordingStoreErrorKind::Corruption,
-                "XTR-STORE-ENDPOINT-IDENTITY-CORRUPT",
-                "stored endpoint identity is inconsistent",
-                correlation_id,
-            ));
+    if fingerprint_id.is_some() || tuple_id.is_some() {
+        let fingerprint_operation_id = fingerprint_id
+            .as_deref()
+            .map(|id| parse_stored_operation_id(id, correlation_id))
+            .transpose()?;
+        let tuple_operation_id = tuple_id
+            .as_deref()
+            .map(|id| parse_stored_operation_id(id, correlation_id))
+            .transpose()?;
+        if fingerprint_operation_id != tuple_operation_id {
+            return Err(endpoint_identity_corrupt(correlation_id));
         }
-        let raw: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
-            RecordingStoreError::new(
-                RecordingStoreErrorKind::Corruption,
-                "XTR-STORE-ENDPOINT-IDENTITY-CORRUPT",
-                "stored endpoint identity is inconsistent",
-                correlation_id,
-            )
-        })?;
-        return Ok(xtrace_domain::OperationId::from_uuid(uuid::Uuid::from_bytes(raw)));
+        return fingerprint_operation_id.ok_or_else(|| endpoint_identity_corrupt(correlation_id));
     }
     let operation_id = xtrace_domain::OperationId::new();
     transaction.execute(
@@ -2735,6 +2820,127 @@ mod tests {
         assert!(!all_text.contains("PRIVATE"));
         assert!(!all_text.contains("secret"));
         assert!(!all_text.contains("canary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operation_schema_rejects_non_v7_uuid_bytes() {
+        let fixture = on_disk_store("operation-schema-uuid");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let connection = fixture.store.lock().expect("connection");
+        let error = connection.execute(
+            "INSERT INTO operations (operation_id, project_id, transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint, created_at) VALUES (?1, ?2, 'http', 'POST', '/orders', 'spring-fixture', 'default', 1, zeroblob(32), 'now')",
+            rusqlite::params![vec![0_u8; 16], project_id.as_uuid().as_bytes().to_vec()],
+        ).expect_err("schema rejects UUID with no v7/RFC4122 bits");
+        assert!(error.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_non_v7_operation_fails_closed_on_reuse_and_replay() {
+        let fixture = on_disk_store("operation-corrupt-uuid");
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let mut linked =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        linked.endpoint_observation = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "POST".to_owned(),
+            route_template: "/orders".to_owned(),
+        };
+        view.begin_recording(&linked).expect("linked begin");
+        {
+            let connection = fixture.store.lock().expect("connection");
+            connection
+                .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON;")
+                .expect("bypass integrity checks for fixture");
+            connection
+                .execute(
+                    "UPDATE operations SET operation_id = zeroblob(16) WHERE project_id = ?1",
+                    [project_id.as_uuid().as_bytes().to_vec()],
+                )
+                .expect("corrupt operation identifier");
+            connection.execute("UPDATE recording_endpoint_observations SET operation_id = zeroblob(16) WHERE recording_id = ?1", [linked.recording_id.as_uuid().as_bytes().to_vec()]).expect("corrupt sidecar identifier");
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF; PRAGMA foreign_keys = ON;")
+                .expect("restore integrity checks");
+        }
+        let replay =
+            view.begin_recording(&linked).expect_err("linked replay detects corrupt operation");
+        assert_eq!(replay.kind(), RecordingStoreErrorKind::Corruption);
+        let mut another = linked.clone();
+        another.recording_id = RecordingId::new();
+        another.runtime_session_id = RuntimeSessionId::new();
+        let reuse = view.begin_recording(&another).expect_err("operation reuse detects corrupt ID");
+        assert_eq!(reuse.kind(), RecordingStoreErrorKind::Corruption);
+        let connection = fixture.store.lock().expect("connection");
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM recordings WHERE recording_id = ?1",
+                [another.recording_id.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("recording count");
+        assert_eq!(count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_replay_revalidates_stored_operation_fingerprint_and_tuple() {
+        for (label, statement) in [
+            (
+                "fingerprint",
+                "UPDATE operations SET endpoint_fingerprint = zeroblob(32) WHERE project_id = ?1",
+            ),
+            ("method", "UPDATE operations SET method = 'PUT' WHERE project_id = ?1"),
+            ("route", "UPDATE operations SET route_template = '/corrupt' WHERE project_id = ?1"),
+            (
+                "component",
+                "UPDATE operations SET application_component = 'corrupt' WHERE project_id = ?1",
+            ),
+            (
+                "sidecar-method",
+                "UPDATE recording_endpoint_observations SET method = 'PUT' WHERE project_id = ?1",
+            ),
+            (
+                "sidecar-route",
+                "UPDATE recording_endpoint_observations SET route_template = '/corrupt' WHERE project_id = ?1",
+            ),
+        ] {
+            let fixture = on_disk_store(&format!("replay-operation-{label}"));
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let mut linked =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            linked.endpoint_observation = EndpointObservationInput {
+                policy_id: Some("spring-orders-v1".to_owned()),
+                application_component: Some("spring-fixture".to_owned()),
+                binding_key: Some("default".to_owned()),
+                method: "POST".to_owned(),
+                route_template: "/orders".to_owned(),
+            };
+            view.begin_recording(&linked).expect("linked begin");
+            let connection = fixture.store.lock().expect("connection");
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("bypass schema checks for fixture");
+            connection
+                .execute(statement, [project_id.as_uuid().as_bytes().to_vec()])
+                .expect("corrupt stored operation fixture");
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .expect("restore schema checks");
+            drop(connection);
+            let error = view
+                .begin_recording(&linked)
+                .expect_err("linked replay fails closed on stored operation corruption");
+            assert_eq!(error.kind(), RecordingStoreErrorKind::Corruption, "{label}");
+        }
     }
 
     #[cfg(unix)]
