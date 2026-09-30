@@ -1302,6 +1302,7 @@ dependencies = [
  "xtrace-daemon",
  "xtrace-domain",
  "xtrace-protocol",
+ "xtrace-runtime",
  "xtrace-store",
  "zstd",
 ]
@@ -1378,6 +1379,17 @@ dependencies = [
  "thiserror",
  "tracing",
  "xtrace-domain",
+]
+
+[[package]]
+name = "xtrace-runtime"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

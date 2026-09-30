@@ -21,6 +21,7 @@ xtrace-domain = { path = "../xtrace-domain" }
 xtrace-protocol = { path = "../xtrace-protocol" }
 xtrace-store = { path = "../xtrace-store" }
 xtrace-daemon = { path = "../xtrace-daemon" }
+xtrace-runtime = { path = "../xtrace-runtime" }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -28,11 +29,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
 toml = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "signal"] }
 
 [target.'cfg(unix)'.dependencies]
 fs4 = "1.1.0"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 blake3 = { workspace = true }

@@ -51,8 +51,12 @@ jobs:
         run: ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
       - name: Java client to daemon and selected-root XTF acceptance
         run: cargo test -p xtrace-cli --test java_synthetic_adapter -- --nocapture
+      - name: Direct JDK runtime validation
+        run: cargo test -p xtrace-runtime
       - name: Launch-only premain Spring MVC acceptance
         run: cargo test -p xtrace-cli --test java_premain_spring -- --nocapture
+      - name: Supervised direct-Java Spring MVC acceptance
+        run: cargo test -p xtrace-cli --test java_run_spring -- --nocapture
 
   node-client:
     runs-on: ubuntu-latest

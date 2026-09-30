@@ -1,9 +1,8 @@
 # X-trace
 
-X-trace is a local-first capture-and-replay tool for HTTP services. Slice 1A
-ships the minimal Rust foundation: a workspace of five crates, one forward-only
-SQLite migration, the XTP-Agent protobuf bindings, and a small CLI that can
-initialize a project, open it, and report a truthful spine status.
+X-trace is a local-first capture-and-replay tool for HTTP services. The Rust
+workspace provides project storage, authenticated XTP ingestion, and a CLI for
+project setup, the foreground daemon, and an experimental direct-Java launch.
 
 The Node 22 workspace under `adapters/node` is a protocol/conformance
 foundation only. Its private synthetic client can authenticate to the local
@@ -19,6 +18,10 @@ methods, and H2 `executeUpdate()`. This is fixture evidence, not general Java,
 Spring, Spring Boot, Servlet, attach, or production capture support. The
 `POST /orders` identity is fixed by the exact fixture handler matcher; it is
 source-derived test metadata, not request-derived dynamic endpoint discovery.
+`xtrace run` is Unix-only and scoped to this exact fixture tracer bullet. It
+does not launch Gradle/Maven tasks, wrappers, application servers, or arbitrary
+process trees, and it does not add attach, discovery, browser replay, or broad
+Java compatibility.
 
 ## Crate layout
 
@@ -28,12 +31,16 @@ source-derived test metadata, not request-derived dynamic endpoint discovery.
 | `xtrace-application`| Commands, queries, ports, and the `Application` facade                 |
 | `xtrace-protocol`   | Generated XTP protobuf bindings and domain-DTO translation              |
 | `xtrace-store`      | Bundled SQLite store, migrations, and `ProjectRepository` adapter      |
-| `xtrace-cli`        | Clap subcommands, output formatting, user-data path resolution          |
+| `xtrace-daemon`     | Authenticated loopback XTP ingress and supervised connection draining |
+| `xtrace-runtime`    | Runtime launch validation, agent injection, and process supervision    |
+| `xtrace-cli`        | Clap subcommands, project composition, output and path resolution       |
 
 Dependency direction follows `docs/plans/x-trace/02-architecture.md`:
 
 ```text
-xtrace-cli       -> xtrace-application, xtrace-store, xtrace-domain
+xtrace-cli       -> xtrace-application, xtrace-store, xtrace-daemon, xtrace-domain, xtrace-protocol, xtrace-runtime
+xtrace-runtime   -> OS process launch and supervision policy
+xtrace-daemon    -> xtrace-application, xtrace-domain, xtrace-protocol
 xtrace-store     -> xtrace-application, xtrace-domain
 xtrace-protocol  -> xtrace-domain
 xtrace-application -> xtrace-domain

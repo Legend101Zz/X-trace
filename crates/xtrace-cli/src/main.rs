@@ -46,6 +46,7 @@ mod daemon_lock;
 mod error;
 mod output;
 mod paths;
+mod run;
 
 use clap::Parser;
 use commands::XtraceCommand;
@@ -70,7 +71,7 @@ pub struct Cli {
 async fn main() {
     let cli = Cli::parse();
     let exit_code = match commands::run(cli.command).await {
-        Ok(()) => 0,
+        Ok(exit_code) => exit_code,
         Err(err) => {
             // Errors go to stderr as one JSON document so scripts can
             // capture the failure with `2>file.json` without parsing
@@ -94,5 +95,40 @@ mod tests {
         let cli = Cli::try_parse_from(["xtrace", "daemon", "--project-dir", "/tmp/my repository"])
             .expect("daemon command parses");
         assert!(matches!(cli.command, commands::XtraceCommand::Daemon { .. }));
+    }
+
+    #[test]
+    fn run_command_preserves_exact_java_arguments_and_requires_a_launcher() {
+        let cli = Cli::try_parse_from([
+            "xtrace",
+            "run",
+            "--project-dir",
+            "/tmp/project with spaces",
+            "--java-agent",
+            "/tmp/agent with spaces/xtrace-java-agent.jar",
+            "--",
+            "java",
+            "-jar",
+            "app with spaces.jar",
+            "--spring.config.location=file:/tmp/config with spaces/",
+        ])
+        .expect("run command parses");
+        assert!(matches!(
+            cli.command,
+            commands::XtraceCommand::Run { command, .. }
+                if command == ["java", "-jar", "app with spaces.jar", "--spring.config.location=file:/tmp/config with spaces/"]
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "xtrace",
+                "run",
+                "--project-dir",
+                "/tmp/project",
+                "--java-agent",
+                "/tmp/agent.jar",
+                "--",
+            ])
+            .is_err()
+        );
     }
 }

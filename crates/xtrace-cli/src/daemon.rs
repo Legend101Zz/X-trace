@@ -15,7 +15,7 @@ use xtrace_application::recording::{RecordingCapture, RecordingCaptureService, S
 #[cfg(any(unix, test))]
 use xtrace_application::{Application, GetProject, Query, QueryResult, RequestContext};
 #[cfg(unix)]
-use xtrace_daemon::{DaemonBuilder, DaemonConfig, DaemonError};
+use xtrace_daemon::{BoundDaemon, DaemonBuilder, DaemonConfig, DaemonError};
 #[cfg(unix)]
 use xtrace_domain::RuntimeSessionId;
 #[cfg(any(unix, test))]
@@ -61,30 +61,14 @@ async fn run_with_env<F>(project_dir: PathBuf, env_reader: &F) -> Result<(), Cli
 where
     F: Fn(&str) -> Option<PathBuf>,
 {
-    let preflight = preflight_project(&project_dir, env_reader)?;
-    let lock = acquire_project_lock(&preflight.project_data_root)?;
-    let selected = open_validated_project(preflight)?;
-    let runtime_session_id = RuntimeSessionId::new();
-    let mut runtime_dir =
-        RuntimeDirectory::create(&selected.project_data_root, runtime_session_id)?;
-    let bootstrap_path = runtime_dir.path().join("bootstrap.json");
+    let prepared = prepare(project_dir, env_reader).await?;
+    let PreparedDaemon { bound, bootstrap_path, mut runtime_dir, lock } = prepared;
     let signals = ShutdownSignals::install()?;
-
-    let capture = compose_capture(&selected)?;
-    let bound = DaemonBuilder::new(DaemonConfig::default())
-        .with_project_id(selected.project_id)
-        .with_runtime_session_id(runtime_session_id)
-        .with_expected_repository_fingerprint(selected.repository_fingerprint)
-        .with_bootstrap_artifact(bootstrap_path.clone())
-        .with_recording_capture(capture)
-        .bind()
-        .await
-        .map_err(map_daemon_error)?;
 
     let document = DaemonBoundDocument {
         kind: "daemon_bound",
-        project_id: selected.project_id.to_string(),
-        runtime_session_id: runtime_session_id.to_string(),
+        project_id: bound.project_id().to_string(),
+        runtime_session_id: bound.runtime_session_id().to_string(),
         host: bound.local_addr().ip().to_string(),
         port: bound.local_addr().port(),
         certificate_sha256_pin: bound.certificate_pin().to_string(),
@@ -103,6 +87,46 @@ where
     let cleanup_result = runtime_dir.cleanup();
     drop(lock);
     combine_serve_cleanup(serve_result, cleanup_result)
+}
+
+/// Owns all project resources needed to run one already-bound daemon.
+#[cfg(unix)]
+pub(crate) struct PreparedDaemon {
+    pub(crate) bound: BoundDaemon,
+    pub(crate) bootstrap_path: PathBuf,
+    pub(crate) runtime_dir: RuntimeDirectory,
+    pub(crate) lock: crate::daemon_lock::ProjectDaemonLock,
+}
+
+/// Validates and opens an existing project, then binds its private daemon.
+///
+/// The project lock is acquired before SQLite is opened, and the bootstrap
+/// path remains within the owned runtime directory for the bound daemon's life.
+#[cfg(unix)]
+pub(crate) async fn prepare<F>(
+    project_dir: PathBuf,
+    env_reader: &F,
+) -> Result<PreparedDaemon, CliError>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
+    let preflight = preflight_project(&project_dir, env_reader)?;
+    let lock = acquire_project_lock(&preflight.project_data_root)?;
+    let selected = open_validated_project(preflight)?;
+    let runtime_session_id = RuntimeSessionId::new();
+    let runtime_dir = RuntimeDirectory::create(&selected.project_data_root, runtime_session_id)?;
+    let bootstrap_path = runtime_dir.path().join("bootstrap.json");
+    let capture = compose_capture(&selected)?;
+    let bound = DaemonBuilder::new(DaemonConfig::default())
+        .with_project_id(selected.project_id)
+        .with_runtime_session_id(runtime_session_id)
+        .with_expected_repository_fingerprint(selected.repository_fingerprint)
+        .with_bootstrap_artifact(bootstrap_path.clone())
+        .with_recording_capture(capture)
+        .bind()
+        .await
+        .map_err(map_daemon_error)?;
+    Ok(PreparedDaemon { bound, bootstrap_path, runtime_dir, lock })
 }
 
 #[cfg(any(unix, test))]
