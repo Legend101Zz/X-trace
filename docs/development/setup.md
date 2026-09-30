@@ -227,6 +227,57 @@ Read-only SQLite access keeps normal WAL visibility and may create SQLite
 coordination sidecars, but does not apply migrations or update project or
 pointer metadata.
 
+### Experimental foreground browser viewer
+
+The viewer is an explicit, foreground mode of `xtrace open`; plain `open`
+retains its existing non-blocking project-open behavior. Its React app is built
+with pinned Node 22/npm dependencies, then embedded as fixed Rust assets, so a
+fresh Cargo build does not depend on a previously built `web/app/dist`.
+Regenerate/check the assets and OpenAPI-derived TypeScript with:
+
+```bash
+npm ci --prefix web/app
+npm run typecheck --prefix web/app
+npm test --prefix web/app
+npm run check:api --prefix web/app
+npm run check:embedded --prefix web/app
+```
+
+After a real Spring request has been captured and the `xtrace run` process has
+stopped, start the local viewer:
+
+```bash
+cargo run -q -p xtrace-cli --bin xtrace -- open \
+  --project-dir /tmp/xtrace-run/repo --viewer --no-browser
+```
+
+Copy the one-time URL from its JSON readiness line into a browser. Without
+`--no-browser`, the CLI asks the fixed OS browser launcher to open the URL.
+The viewer remains in the foreground until Ctrl+C or SIGTERM and does not
+discover/reuse another viewer process. It listens only on IPv4 loopback at a
+separate OS-assigned port from the XTP mTLS listener. The 256-bit bootstrap
+token expires after 60 seconds and is consumed once; it is carried only in a
+URL fragment, removed from browser history before exchange, and replaced by a
+host-only HttpOnly SameSite=Strict browser-session cookie backed by a
+15-minute server-side expiry. The cookie has no persistence attributes and is
+dropped when the browser session ends. It omits `Secure` because this
+experimental listener is plain loopback HTTP. Exact
+Host, same-origin Origin, and Fetch Metadata checks remain enforced; there is
+no CORS allowance.
+
+This experimental mode does not defend against hostile processes running as
+the same OS user. The readiness document prints the credential URL, and the
+OS opener receives that URL in its argument vector when browser launching is
+enabled. Use `--no-browser` where process-list disclosure matters, and treat
+readiness stdout as sensitive for the token's 60-second lifetime.
+
+The UI shows metadata and ordered persisted event facts, not source replay.
+Source, values, duration, and completion semantics are unavailable. GAP stays
+an ordered metadata event; it is not a completion or partiality claim. Raw
+interaction paths are omitted because segments may contain identifiers or
+tokens. Trace text is React-rendered as text. The app uses no browser storage
+for recordings or tokens and has no service worker or CDN imports.
+
 ### Restricted-PATH build
 
 The build script must not rely on a system `protoc`. CI exercises the

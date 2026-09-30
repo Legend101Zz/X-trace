@@ -1,0 +1,37 @@
+{
+  "name": "@xtrace/local-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "node scripts/copy-fonts.mjs && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run && node scripts/check-contrast.mjs",
+    "generate:api": "openapi-typescript ../../schema/xtp-client/openapi.yaml -o src/api.generated.ts",
+    "check:api": "npm run generate:api && git diff --exit-code -- src/api.generated.ts",
+    "embed": "node scripts/embed-assets.mjs",
+    "check:embedded": "npm run build && node scripts/embed-assets.mjs --check"
+  },
+  "dependencies": {
+    "@fontsource/azeret-mono": "5.2.6",
+    "@fontsource/chivo": "5.2.6",
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/jest-dom": "6.6.3",
+    "@testing-library/react": "16.1.0",
+    "@testing-library/user-event": "14.5.2",
+    "@types/react": "19.0.8",
+    "@types/react-dom": "19.0.3",
+    "@vitejs/plugin-react": "4.3.4",
+    "jsdom": "26.0.0",
+    "openapi-typescript": "7.6.1",
+    "typescript": "5.7.3",
+    "vite": "6.4.3",
+    "vitest": "4.1.11"
+  }
+}

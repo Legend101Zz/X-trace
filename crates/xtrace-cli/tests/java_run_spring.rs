@@ -26,6 +26,24 @@ struct RunProcess {
     stderr: Option<thread::JoinHandle<Vec<u8>>>,
 }
 
+struct ViewerProcess {
+    child: Child,
+    stderr: Option<thread::JoinHandle<Vec<u8>>>,
+}
+
+impl Drop for ViewerProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            if let Ok(pid) = i32::try_from(self.child.id()) {
+                if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+                }
+            }
+            let _ = self.child.wait();
+        }
+    }
+}
+
 impl Drop for RunProcess {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
@@ -103,7 +121,9 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     );
     let logical = wait_for_segment(&project_root);
     assert!(logical.windows(22).any(|bytes| bytes == b"OrderController.create"));
-    for canary in ["BODY_CANARY_1D4", "AUTH_CANARY_1D4", "COOKIE_CANARY_1D4"] {
+    for canary in
+        ["BODY_CANARY_1D4", "AUTH_CANARY_1D4", "COOKIE_CANARY_1D4", "PATH_QUERY_CANARY_1E2"]
+    {
         assert!(
             !logical.windows(canary.len()).any(|window| window == canary.as_bytes()),
             "{canary} reached stored XTF"
@@ -122,7 +142,9 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     let stdout = process.stdout.take().expect("stdout thread").join().expect("join stdout");
     let stderr = process.stderr.take().expect("stderr thread").join().expect("join stderr");
     for surface in [&stdout, &stderr] {
-        for canary in ["BODY_CANARY_1D4", "AUTH_CANARY_1D4", "COOKIE_CANARY_1D4"] {
+        for canary in
+            ["BODY_CANARY_1D4", "AUTH_CANARY_1D4", "COOKIE_CANARY_1D4", "PATH_QUERY_CANARY_1E2"]
+        {
             assert!(
                 !surface.windows(canary.len()).any(|window| window == canary.as_bytes()),
                 "{canary} leaked to process output"
@@ -211,6 +233,65 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     assert!(!unknown.status.success(), "unknown recording should fail");
     assert_canaries_absent(&unknown.stderr);
     assert_eq!(fs::read(&database).expect("database after reads"), database_before_queries);
+    assert_eq!(file_state(&pointer), pointer_before_queries);
+
+    let browser_detail = recording_show_page(&repo, &data_home, first_recording, 200, None);
+    assert!(browser_detail.status.success(), "browser fixture query failed");
+    let browser_detail_json: Value =
+        serde_json::from_slice(&browser_detail.stdout).expect("browser expected projection");
+    let expected_sequences: Vec<String> = browser_detail_json["events"]
+        .as_array()
+        .expect("browser expected events")
+        .iter()
+        .map(|event| event["sequence"].as_str().expect("decimal sequence").to_owned())
+        .collect();
+    let mut viewer = launch_viewer(&repo, &data_home);
+    let readiness = viewer.0;
+    let mut browser = Command::new("node");
+    browser
+        .arg(workspace.join("web/app/scripts/browser-journey.mjs"))
+        .arg(first_recording)
+        .arg(serde_json::to_string(&expected_sequences).expect("expected sequence JSON"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut browser = browser.spawn().expect("start Chromium browser journey");
+    let mut browser_stdin = browser.stdin.take().expect("browser journey stdin");
+    browser_stdin
+        .write_all(serde_json::to_string(&readiness).expect("readiness JSON").as_bytes())
+        .expect("send viewer URL to browser through stdin");
+    drop(browser_stdin);
+    let browser_result = browser.wait_with_output().expect("wait for browser journey");
+    assert!(
+        browser_result.status.success(),
+        "browser journey failed: {}",
+        String::from_utf8_lossy(&browser_result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&browser_result.stdout).contains("browser journey passed"));
+    for canary in
+        ["BODY_CANARY_1D4", "AUTH_CANARY_1D4", "COOKIE_CANARY_1D4", "PATH_QUERY_CANARY_1E2"]
+    {
+        assert!(
+            !browser_result.stdout.windows(canary.len()).any(|bytes| bytes == canary.as_bytes())
+        );
+        assert!(
+            !browser_result.stderr.windows(canary.len()).any(|bytes| bytes == canary.as_bytes())
+        );
+    }
+    let stderr = viewer.1.stderr.take().expect("viewer stderr thread");
+    let viewer_pid =
+        rustix::process::Pid::from_raw(viewer.1.child.id() as i32).expect("viewer process ID");
+    rustix::process::kill_process(viewer_pid, rustix::process::Signal::TERM)
+        .expect("stop foreground viewer");
+    let viewer_status = viewer.1.child.wait().expect("wait for viewer shutdown");
+    assert_eq!(
+        viewer_status.code(),
+        Some(0),
+        "viewer SIGTERM should be a clean foreground shutdown"
+    );
+    let viewer_stderr = stderr.join().expect("join viewer stderr");
+    assert_canaries_absent(&viewer_stderr);
+    assert_eq!(fs::read(&database).expect("database after viewer"), database_before_queries);
     assert_eq!(file_state(&pointer), pointer_before_queries);
 
     let reacquired = Command::new(env!("CARGO_BIN_EXE_xtrace"))
@@ -457,7 +538,7 @@ fn post_order(port: u16) -> Vec<u8> {
     let body = br#"{"description":"BODY_CANARY_1D4","bodyCanary":"safe","errorCanary":""}"#;
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect Spring fixture");
     stream.set_read_timeout(Some(Duration::from_secs(10))).expect("read timeout");
-    write!(stream, "POST /orders HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nAuthorization: Bearer AUTH_CANARY_1D4\r\nCookie: session=COOKIE_CANARY_1D4\r\nContent-Length: {}\r\n\r\n", body.len()).expect("write request");
+    write!(stream, "POST /orders?trace=PATH_QUERY_CANARY_1E2 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nAuthorization: Bearer AUTH_CANARY_1D4\r\nCookie: session=COOKIE_CANARY_1D4\r\nContent-Length: {}\r\n\r\n", body.len()).expect("write request");
     stream.write_all(body).expect("write body");
     let mut response = Vec::new();
     stream.read_to_end(&mut response).expect("read response");
@@ -536,8 +617,31 @@ fn recording_show_page(
     command.output().expect("run xtrace recording show")
 }
 
+fn launch_viewer(repo: &Path, data_home: &Path) -> (Value, ViewerProcess) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["open", "--project-dir"])
+        .arg(repo)
+        .args(["--viewer", "--no-browser"])
+        .env("XTRACE_DATA_HOME", data_home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start foreground viewer");
+    let stdout = child.stdout.take().expect("viewer stdout");
+    let stderr = child.stderr.take().expect("viewer stderr");
+    let stderr = thread::spawn(move || drain(stderr));
+    let mut line = String::new();
+    std::io::BufReader::new(stdout).read_line(&mut line).expect("read viewer readiness");
+    let readiness: Value = serde_json::from_str(&line).expect("structured viewer readiness");
+    assert_eq!(readiness["browserLaunch"], "not_requested");
+    assert!(readiness["url"].as_str().is_some_and(|url| url.starts_with("http://127.0.0.1:")));
+    (readiness, ViewerProcess { child, stderr: Some(stderr) })
+}
+
 fn assert_canaries_absent(bytes: &[u8]) {
-    for canary in ["BODY_CANARY_1D4", "AUTH_CANARY_1D4", "COOKIE_CANARY_1D4"] {
+    for canary in
+        ["BODY_CANARY_1D4", "AUTH_CANARY_1D4", "COOKIE_CANARY_1D4", "PATH_QUERY_CANARY_1E2"]
+    {
         assert!(
             !bytes.windows(canary.len()).any(|window| window == canary.as_bytes()),
             "{canary} leaked"

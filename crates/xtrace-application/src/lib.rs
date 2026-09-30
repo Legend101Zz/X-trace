@@ -65,6 +65,7 @@ pub use recording_queries::{
     MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_LIST_LIMIT,
     MAX_RECORDING_RELATIONSHIP_ID_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES, PersistedEvent,
     PersistedInteraction, RECORDING_READ_SCHEMA_VERSION, RecordingDetail, RecordingEventWindow,
-    RecordingListPage, RecordingMetadata, RecordingReadPort, RecordingStatus, ShowRecording,
-    ShowWindowRequest, UnavailableEvidence, list_recordings, show_recording,
+    RecordingListPage, RecordingMetadata, RecordingQueryService, RecordingReadPort,
+    RecordingStatus, ShowRecording, ShowWindowRequest, UnavailableEvidence, list_recordings,
+    show_recording,
 };

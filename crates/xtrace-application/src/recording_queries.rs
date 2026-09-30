@@ -358,6 +358,51 @@ pub trait RecordingReadPort: Send + Sync {
     ) -> Result<RecordingEventWindow, PortError>;
 }
 
+/// Shared framework-neutral facade for bounded persisted-recording reads.
+///
+/// CLI and local HTTP clients compose the same service with an implementation
+/// of [`RecordingReadPort`]. This type owns application validation and
+/// projection; it has no storage, path, or transport knowledge.
+#[derive(Clone)]
+pub struct RecordingQueryService<P> {
+    port: P,
+}
+
+impl<P: RecordingReadPort> RecordingQueryService<P> {
+    /// Creates a recording query facade over the supplied read port.
+    pub const fn new(port: P) -> Self {
+        Self { port }
+    }
+
+    /// Lists a bounded deterministic page of persisted recordings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed application error for invalid bounds or a sanitized
+    /// read-port failure.
+    pub fn list(
+        &self,
+        request: ListRecordings,
+        correlation_id: CorrelationId,
+    ) -> Result<RecordingListPage, AppError> {
+        list_recordings(&self.port, request, correlation_id)
+    }
+
+    /// Reads one bounded verified event window for the Linear projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed application error for invalid bounds/cursors or a
+    /// sanitized read-port failure.
+    pub fn show(
+        &self,
+        request: ShowRecording,
+        correlation_id: CorrelationId,
+    ) -> Result<RecordingDetail, AppError> {
+        show_recording(&self.port, request, correlation_id)
+    }
+}
+
 /// Lists persisted recordings after validating application-owned bounds.
 ///
 /// # Errors
@@ -585,6 +630,26 @@ mod tests {
             incomplete_evidence: vec!["persisted_status:partial".to_owned()],
         }];
         (project_id, recording_id, ReadFixture { list, window })
+    }
+
+    #[test]
+    fn shared_recording_query_service_uses_the_same_bounded_contract() {
+        let (project_id, recording_id, fixture) = fixture();
+        let service = RecordingQueryService::new(fixture);
+        let list = service
+            .list(ListRecordings { project_id, limit: 1, after: None }, CorrelationId::new())
+            .expect("list through shared service");
+        assert_eq!(list.schema_version, RECORDING_READ_SCHEMA_VERSION);
+        assert_eq!(list.project_id, project_id);
+
+        let detail = service
+            .show(
+                ShowRecording { project_id, recording_id, limit: 1, cursor: None },
+                CorrelationId::new(),
+            )
+            .expect("show through shared service");
+        assert_eq!(detail.recording_id, recording_id);
+        assert_eq!(detail.events.len(), 1);
     }
 
     #[test]

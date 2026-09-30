@@ -99,6 +99,7 @@ pub mod runtime;
 pub mod secret;
 pub mod session;
 pub mod tls;
+pub mod viewer;
 
 pub use bootstrap::{BootstrapArtifact, BootstrapArtifactFields, BootstrapOwner};
 pub use config::{DaemonConfig, LOOPBACK_HOST, LoopbackPolicy, OutboundCapacity};
@@ -113,6 +114,7 @@ pub use runtime::{AdapterHelloAck, IncomingEnvelope, OutgoingCommand, PostHelloA
 pub use secret::SessionSecret;
 pub use session::{HandshakeInputs, HandshakeRole, Session, StagedReleaseError};
 pub use tls::{TlsServerMaterials, build_pinned_client_config};
+pub use viewer::{BoundViewer, ViewerError, ViewerReadiness};
 
 /// Re-export of the XTP-Agent protocol handshake helpers so callers
 /// (the fake adapter in particular) can compute and verify the

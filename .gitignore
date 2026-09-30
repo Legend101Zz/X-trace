@@ -10,6 +10,8 @@ adapters/node/**/dist/
 adapters/node/npm-debug.log*
 adapters/java/.gradle/
 adapters/java/**/build/
+web/app/node_modules/
+web/app/dist/
 
 # Cargo.lock is intentionally committed for an application workspace, but the
 # target directory and build cache must never be tracked.

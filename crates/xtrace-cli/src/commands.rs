@@ -13,7 +13,7 @@ use clap::Subcommand;
 use serde::Serialize;
 use xtrace_application::{
     Application, Command, GetProject, GetStoreStatus, InitializeProject, ListRecordings,
-    OpenProject, Query, QueryResult, RequestContext, ShowRecording,
+    OpenProject, Query, QueryResult, RecordingQueryService, RequestContext, ShowRecording,
 };
 use xtrace_domain::{AppError, ErrorCategory, ErrorCode, RecordingId, RetryAdvice, WallTime};
 use xtrace_store::{CURRENT_SCHEMA_VERSION, SqliteIdempotencyStore, SqliteProjectRepository};
@@ -50,6 +50,12 @@ pub enum XtraceCommand {
         /// Idempotency key.
         #[arg(long = "idempotency-key", value_name = "KEY", default_value = "")]
         idempotency_key: String,
+        /// Start the experimental foreground browser viewer instead of opening the project record.
+        #[arg(long)]
+        viewer: bool,
+        /// Print the viewer URL without launching a browser (requires --viewer).
+        #[arg(long, requires = "viewer")]
+        no_browser: bool,
     },
     /// Emit a machine-readable status report for the local store.
     Status {
@@ -132,8 +138,12 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
             init(project_dir, display_name, idempotency_key, &crate::paths::read_env_path)
                 .map(|()| 0)
         }
-        XtraceCommand::Open { project_dir, idempotency_key } => {
-            open(project_dir, idempotency_key, &crate::paths::read_env_path).map(|()| 0)
+        XtraceCommand::Open { project_dir, idempotency_key, viewer, no_browser } => {
+            if viewer {
+                crate::viewer::run(project_dir, no_browser).await.map(|()| 0)
+            } else {
+                open(project_dir, idempotency_key, &crate::paths::read_env_path).map(|()| 0)
+            }
         }
         XtraceCommand::Status { project_dir } => {
             status(project_dir, &crate::paths::read_env_path).map(|()| 0)
@@ -160,18 +170,47 @@ where
             (project_dir, None, Some((recording_id, limit, cursor)))
         }
     };
-    let repo = resolve_repo(&project_dir)?;
+    let (project_id, recording_queries, correlation_id) =
+        open_recording_queries(&project_dir, env_reader)?;
+    let mut stdout = std::io::stdout().lock();
+    if let Some((limit, after)) = list_request {
+        let page =
+            recording_queries.list(ListRecordings { project_id, limit, after }, correlation_id)?;
+        write_success(&mut stdout, &page)?;
+    } else if let Some((recording_id, limit, cursor)) = show_request {
+        let detail = recording_queries
+            .show(ShowRecording { project_id, recording_id, limit, cursor }, correlation_id)?;
+        write_success(&mut stdout, &detail)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn open_recording_queries<F>(
+    project_dir: &Path,
+    env_reader: &F,
+) -> Result<
+    (
+        xtrace_domain::ProjectId,
+        RecordingQueryService<SqliteRecordingReader>,
+        xtrace_domain::CorrelationId,
+    ),
+    CliError,
+>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
+    let repo = resolve_repo(project_dir)?;
     let pointer = RepositoryPointer::read(&repo)?;
     let data_home = resolve_data_home(Some(&pointer), env_reader)?;
     let project_directory = UserDataPaths::project_dir_with_home(&data_home, pointer.project_id)?;
     let database_path = UserDataPaths::database_path_with_home(&data_home, pointer.project_id)?;
-    let ctx = RequestContext::new(env_user(), WallTime::now());
+    let context = RequestContext::new(env_user(), WallTime::now());
     let store = SqliteStore::open(
         &database_path,
         xtrace_store::OpenOptions::default()
             .with_must_exist(true)
             .with_read_only(true)
-            .with_correlation_id(ctx.correlation_id),
+            .with_correlation_id(context.correlation_id),
     )
     .map_err(map_store_error)?;
     let repository = SqliteProjectRepository::new(&store);
@@ -179,7 +218,7 @@ where
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
     let canonical_repo_path = repo.to_string_lossy().into_owned();
     let project = match app
-        .query(Query::GetProject(GetProject { canonical_repo_path }), &ctx)
+        .query(Query::GetProject(GetProject { canonical_repo_path }), &context)
         .map_err(CliError::from)?
     {
         QueryResult::Project(snapshot) => snapshot.project,
@@ -193,27 +232,11 @@ where
             ErrorCategory::Corruption,
             "repository pointer does not match the registered project",
             RetryAdvice::None,
-            ctx.correlation_id,
+            context.correlation_id,
         )));
     }
     let reader = SqliteRecordingReader::new(store, project_directory);
-    let mut stdout = std::io::stdout().lock();
-    if let Some((limit, after)) = list_request {
-        let page = xtrace_application::list_recordings(
-            &reader,
-            ListRecordings { project_id: pointer.project_id, limit, after },
-            ctx.correlation_id,
-        )?;
-        write_success(&mut stdout, &page)?;
-    } else if let Some((recording_id, limit, cursor)) = show_request {
-        let detail = xtrace_application::show_recording(
-            &reader,
-            ShowRecording { project_id: pointer.project_id, recording_id, limit, cursor },
-            ctx.correlation_id,
-        )?;
-        write_success(&mut stdout, &detail)?;
-    }
-    Ok(())
+    Ok((project.id(), RecordingQueryService::new(reader), context.correlation_id))
 }
 
 /// Resolves the user-data home directory for the supplied pointer
