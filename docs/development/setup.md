@@ -100,7 +100,9 @@ export GRADLE_USER_HOME=/path/to/cache/gradle
 adapters/java/gradlew -p adapters/java --dependency-verification strict \
   clean test installDist agentDist fixtureBootJar
 cargo test -p xtrace-cli --test java_synthetic_adapter
+cargo test -p xtrace-runtime
 cargo test -p xtrace-cli --test java_premain_spring
+cargo test -p xtrace-cli --test java_run_spring
 ```
 
 The private client accepts only `--bootstrap <path>`. It validates the
@@ -142,6 +144,62 @@ request values, SQL text/binds, source lines, UI, `xtrace run`, `Committed` ACK,
 or terminal-complete recording. The existing live bootstrap path remains
 Unix-only. The exact direct pins remain in the Gradle build files and strict
 SHA-256 dependency verification/locking applies to every module.
+
+### Experimental `xtrace run`
+
+On Unix, `xtrace run` supervises a direct Java launcher and injects the built
+agent with the private one-shot bootstrap path:
+
+```bash
+export CARGO_TARGET_DIR="/path/to/cache/cargo-target"
+export XTRACE_DATA_HOME="/tmp/xtrace-run/userdata"
+cargo build -p xtrace-cli --bin xtrace
+cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-run/repo
+cargo run -q -p xtrace-cli --bin xtrace -- run \
+  --project-dir /tmp/xtrace-run/repo \
+  --java-agent adapters/java/agent-bootstrap/build/agent-dist/xtrace-java-agent.jar \
+  -- java -jar adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar
+```
+
+The run command accepts only a direct executable named `java`; it preserves
+the supplied argument vector and does not parse shell syntax or invoke a
+wrapper. The agent JAR must have its `runtime/` sibling directory containing
+regular JAR files. Setup failures happen before the child is launched. The
+command waits for the Java process, forwards SIGINT/SIGTERM to its process
+group, escalates after ten seconds, drains the daemon, cleans the private
+runtime directory, and returns the Java process status. A sanitized
+`capture_incomplete` diagnostic is written if the daemon exits early, fails to
+drain, cleanup fails, or the one-shot bootstrap was never consumed.
+
+Before project side effects, `xtrace-runtime` checks the native executable
+format and probes the resolved launcher with `-version`; the probe has no
+agent, bootstrap, or application arguments, and its output is never displayed.
+Both the probe and launched JVM deliberately clear `JAVA_TOOL_OPTIONS`,
+`JDK_JAVA_OPTIONS`, and `_JAVA_OPTIONS`, so ambient JVM option channels cannot
+inject a second agent or expose bootstrap material. `@argfile` arguments are
+rejected because they can hide additional JVM options. The agent distribution
+must include `manifest.sha256` covering the bootstrap and every runtime JAR;
+membership, SHA-256 digests, owner, hard-link count, symlink status, and write
+permissions are checked before project side effects. This is integrity checking,
+not a signature or trust claim.
+This does not prevent a same-UID actor replacing files after validation;
+same-user TOCTOU is outside this experimental boundary. The CLI owns only
+selected-project daemon composition and result mapping.
+
+After application exit, daemon drain is bounded to five seconds. If capture work
+does not return by then, the CLI reports capture as incomplete and deliberately
+retains the project lock and runtime artifacts through process termination. It
+does not claim cleanup later in the same process: the unfinished daemon task is
+not cancelled, and the lock is retained so another capture cannot overlap it.
+The binary then returns the Java process status and exits; OS process teardown
+releases the lock, and the next locked daemon start removes only recognized
+stale artifacts. A long-lived embedding likewise retains the lock rather than
+allowing overlapping capture work.
+
+This is a supervised launch of the exact Spring Boot 4.1.1 fixture and its
+existing `POST /orders` instrumentation. It is not Gradle/Maven task launch,
+wrapper launch, generic Java/Spring/Servlet compatibility, attach, endpoint
+discovery, browser replay, or a complete capture/replay release journey.
 
 ### Restricted-PATH build
 

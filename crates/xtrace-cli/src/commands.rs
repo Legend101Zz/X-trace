@@ -6,6 +6,7 @@
 //! application facade is the single source of truth for what the
 //! CLI is allowed to do.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
@@ -71,21 +72,39 @@ pub enum XtraceCommand {
         #[arg(long = "project-dir", value_name = "DIR")]
         project_dir: PathBuf,
     },
+    /// Launch a direct Java process with experimental capture enabled.
+    Run {
+        /// Path to the initialized repository root.
+        #[arg(long = "project-dir", value_name = "DIR")]
+        project_dir: PathBuf,
+        /// Path to the built X-trace Java agent JAR.
+        #[arg(long = "java-agent", value_name = "PATH")]
+        java_agent: PathBuf,
+        /// Java executable followed by its original arguments.
+        #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
 }
 
 /// Dispatches the supplied subcommand and writes the result to
 /// stdout. Errors propagate as [`CliError`] so the binary entry
 /// point can render them.
-pub async fn run(command: XtraceCommand) -> Result<(), CliError> {
+pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
     match command {
         XtraceCommand::Init { project_dir, display_name, idempotency_key } => {
             init(project_dir, display_name, idempotency_key, &crate::paths::read_env_path)
+                .map(|()| 0)
         }
         XtraceCommand::Open { project_dir, idempotency_key } => {
-            open(project_dir, idempotency_key, &crate::paths::read_env_path)
+            open(project_dir, idempotency_key, &crate::paths::read_env_path).map(|()| 0)
         }
-        XtraceCommand::Status { project_dir } => status(project_dir, &crate::paths::read_env_path),
-        XtraceCommand::Daemon { project_dir } => crate::daemon::run(project_dir).await,
+        XtraceCommand::Status { project_dir } => {
+            status(project_dir, &crate::paths::read_env_path).map(|()| 0)
+        }
+        XtraceCommand::Daemon { project_dir } => crate::daemon::run(project_dir).await.map(|()| 0),
+        XtraceCommand::Run { project_dir, java_agent, command } => {
+            crate::run::run(project_dir, java_agent, command).await
+        }
     }
 }
 

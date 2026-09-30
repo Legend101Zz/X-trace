@@ -8,6 +8,7 @@ members = [
     "crates/xtrace-store",
     "crates/xtrace-cli",
     "crates/xtrace-daemon",
+    "crates/xtrace-runtime",
 ]
 
 [workspace.package]

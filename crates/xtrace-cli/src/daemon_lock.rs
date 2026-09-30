@@ -26,6 +26,7 @@ pub(crate) struct RuntimeDirectory {
     path: PathBuf,
     sessions_root: PathBuf,
     active: bool,
+    cleanup_on_drop: bool,
 }
 
 impl RuntimeDirectory {
@@ -45,7 +46,7 @@ impl RuntimeDirectory {
         })?;
         set_directory_owner_only(&path)?;
         verify_child_directory(&sessions_root, &path)?;
-        Ok(Self { path, sessions_root, active: true })
+        Ok(Self { path, sessions_root, active: true, cleanup_on_drop: true })
     }
 
     /// Returns the unique session directory.
@@ -62,11 +63,18 @@ impl RuntimeDirectory {
         self.active = false;
         Ok(())
     }
+
+    /// Leaves recognized artifacts for the next locked start after process exit.
+    pub(crate) fn defer_drop_cleanup(&mut self) {
+        self.cleanup_on_drop = false;
+    }
 }
 
 impl Drop for RuntimeDirectory {
     fn drop(&mut self) {
-        if let Err(error) = self.cleanup() {
+        if self.cleanup_on_drop
+            && let Err(error) = self.cleanup()
+        {
             tracing::warn!(
                 code = "XTR-CLI-DAEMON-CLEANUP",
                 kind = ?error.exit_code(),

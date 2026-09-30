@@ -181,6 +181,21 @@ impl ErrorDocument {
                 ),
                 exit_code: error.exit_code(),
             },
+            #[cfg(unix)]
+            CliError::Run(run_error) => Self {
+                kind: "error",
+                code: run_error.code().to_string(),
+                category: match run_error.kind() {
+                    xtrace_runtime::java::LaunchErrorKind::Validation => "validation",
+                    xtrace_runtime::java::LaunchErrorKind::Unsupported => "compatibility",
+                    xtrace_runtime::java::LaunchErrorKind::Process => "process",
+                }
+                .to_string(),
+                message: run_error.to_string(),
+                remediation: Vec::new(),
+                details: BTreeMapString(std::collections::BTreeMap::new()),
+                exit_code: error.exit_code(),
+            },
         }
     }
 }
@@ -241,5 +256,26 @@ mod tests {
         let document = ErrorDocument::from_error(&error);
         assert_eq!(document.code, "XTR-CLI-DAEMON-UNSUPPORTED");
         assert_eq!(document.category, "compatibility");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn runtime_process_failures_are_not_misclassified_as_store_failures() {
+        let error = CliError::Run(xtrace_runtime::java::LaunchError::Process);
+        let document = ErrorDocument::from_error(&error);
+        assert_eq!(document.code, "XTR-RUN-PROCESS");
+        assert_eq!(document.category, "process");
+        assert_eq!(document.exit_code, 9);
+        assert_eq!(error.exit_code(), 9);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn runtime_validation_has_a_stable_launch_category() {
+        let error = CliError::Run(xtrace_runtime::java::LaunchError::Validation("invalid"));
+        let document = ErrorDocument::from_error(&error);
+        assert_eq!(document.code, "XTR-RUN-INVALID-LAUNCH");
+        assert_eq!(document.category, "validation");
+        assert_eq!(document.exit_code, 2);
     }
 }
