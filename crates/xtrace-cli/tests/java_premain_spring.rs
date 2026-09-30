@@ -13,7 +13,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use prost::Message as _;
 use rusqlite::Connection;
@@ -181,6 +181,71 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_error_event_order(&error_events);
     assert_canaries_absent("decoded error XTF", &error_logical);
 
+    let database = project_root.join("metadata.sqlite3");
+    let before_query = database_state(&database);
+    let pointer = repo.join(".xtrace/config.toml");
+    let pointer_before = file_metadata_state(&pointer);
+    let listed = run_cli(&["recording", "list", "--project-dir"], &repo, &data_home);
+    assert!(listed.status.success(), "recording list failed: {}", text(&listed.stderr));
+    let listed_again = run_cli(&["recording", "list", "--project-dir"], &repo, &data_home);
+    assert!(listed_again.status.success(), "repeat list failed: {}", text(&listed_again.stderr));
+    assert_eq!(listed.stdout, listed_again.stdout, "list JSON changes across processes");
+    let list_json: Value = serde_json::from_slice(&listed.stdout).expect("recording list JSON");
+    let rows = list_json["recordings"].as_array().expect("recordings array");
+    assert_eq!(rows.len(), 2, "two completed fixture requests are listed");
+    let ids = rows
+        .iter()
+        .map(|row| row["recording_id"].as_str().expect("recording ID").to_owned())
+        .collect::<Vec<_>>();
+    for recording_id in &ids {
+        let shown = run_recording_show_cli(&repo, &data_home, recording_id);
+        assert!(shown.status.success(), "recording show failed: {}", text(&shown.stderr));
+        let shown_again = run_recording_show_cli(&repo, &data_home, recording_id);
+        assert!(shown_again.status.success(), "repeat show failed: {}", text(&shown_again.stderr));
+        assert_eq!(shown.stdout, shown_again.stdout, "show JSON changes across processes");
+        let detail: Value = serde_json::from_slice(&shown.stdout).expect("recording show JSON");
+        let events = detail["events"].as_array().expect("event window");
+        assert!(!events.is_empty(), "each request has persisted event evidence");
+        assert!(events.windows(2).all(|pair| {
+            pair[0]["sequence"].as_str().expect("sequence").parse::<u64>().unwrap()
+                < pair[1]["sequence"].as_str().expect("sequence").parse::<u64>().unwrap()
+        }));
+        assert_eq!(detail["unavailable"]["source"], "unavailable");
+        assert_eq!(detail["unavailable"]["values"], "unavailable");
+        assert_eq!(detail["unavailable"]["completion"], "unavailable");
+        assert_canaries_absent("recording query output", &shown.stdout);
+    }
+    let mut unknown_id = ids[0].clone().into_bytes();
+    unknown_id[0] = if unknown_id[0] == b'0' { b'1' } else { b'0' };
+    let unknown_id = String::from_utf8(unknown_id).expect("recording ID is ASCII");
+    let missing = run_recording_show_cli(&repo, &data_home, &unknown_id);
+    assert!(!missing.status.success(), "unknown recording ID must fail");
+    assert_canaries_absent("unknown recording error", &missing.stderr);
+    assert_eq!(database_state(&database), before_query, "query commands wrote store state");
+    assert_eq!(file_metadata_state(&pointer), pointer_before, "query rewrote repo pointer");
+
+    let copied_repo = root.path().join("repository with copied pointer");
+    fs::create_dir_all(copied_repo.join(".xtrace")).expect("create copied pointer directory");
+    fs::copy(&pointer, copied_repo.join(".xtrace/config.toml")).expect("copy repository pointer");
+    let copied_pointer = copied_repo.join(".xtrace/config.toml");
+    let copied_pointer_before = file_metadata_state(&copied_pointer);
+    let wrong_repository =
+        run_cli(&["recording", "list", "--project-dir"], &copied_repo, &data_home);
+    assert!(!wrong_repository.status.success(), "copied pointer must not bypass repo binding");
+    assert!(!text(&wrong_repository.stderr).contains(copied_repo.to_string_lossy().as_ref()));
+    assert_eq!(database_state(&database), before_query, "fingerprint failure wrote store state");
+    assert_eq!(file_metadata_state(&pointer), pointer_before, "fingerprint check rewrote pointer");
+    assert_eq!(file_metadata_state(&copied_pointer), copied_pointer_before);
+
+    let wrong_data_home = root.path().join("different XTRACE_DATA_HOME");
+    fs::create_dir_all(&wrong_data_home).expect("create alternate data home");
+    let wrong_home_list = run_cli(&["recording", "list", "--project-dir"], &repo, &wrong_data_home);
+    assert!(!wrong_home_list.status.success(), "mismatched data home must fail closed");
+    assert_canaries_absent("wrong data-home error", &wrong_home_list.stderr);
+    assert!(!wrong_data_home.join("projects").exists(), "query created project directories");
+    assert_eq!(database_state(&database), before_query, "data-home failure wrote store state");
+    assert_eq!(file_metadata_state(&pointer), pointer_before, "data-home failure rewrote pointer");
+
     signal_and_wait(&mut daemon, "-INT");
     let disconnected_response = post_order(port);
     assert_eq!(disconnected_response.status, 201, "daemon disconnect changed app behavior");
@@ -239,6 +304,34 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     readiness_reader.join().expect("join daemon readiness reader");
 }
 
+fn database_state(database: &Path) -> Vec<(PathBuf, Option<Vec<u8>>, Option<SystemTime>)> {
+    [
+        database.to_path_buf(),
+        PathBuf::from(format!("{}-wal", database.display())),
+        PathBuf::from(format!("{}-shm", database.display())),
+        PathBuf::from(format!("{}-journal", database.display())),
+    ]
+    .into_iter()
+    .map(|path| {
+        let metadata = fs::metadata(&path).ok();
+        let content = metadata.as_ref().and_then(|_| fs::read(&path).ok());
+        let modified = metadata.as_ref().and_then(|value| value.modified().ok());
+        (path, content, modified)
+    })
+    .collect()
+}
+
+#[cfg(unix)]
+fn file_metadata_state(path: &Path) -> (Vec<u8>, SystemTime, u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let metadata = fs::metadata(path).expect("read file metadata");
+    (
+        fs::read(path).expect("read file bytes"),
+        metadata.modified().expect("read modification time"),
+        metadata.permissions().mode(),
+    )
+}
+
 #[test]
 fn shared_java_rust_event_digest_golden_matches() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -279,6 +372,20 @@ fn run_cli(args: &[&str], repo: &Path, data_home: &Path) -> std::process::Output
         .env("XTRACE_DATA_HOME", data_home)
         .output()
         .expect("run xtrace CLI")
+}
+
+fn run_recording_show_cli(
+    repo: &Path,
+    data_home: &Path,
+    recording_id: &str,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["recording", "show", "--project-dir"])
+        .arg(repo)
+        .arg(recording_id)
+        .env("XTRACE_DATA_HOME", data_home)
+        .output()
+        .expect("run xtrace recording show")
 }
 
 fn copy_private_bootstrap(root: &Path, source: &Path) -> PathBuf {

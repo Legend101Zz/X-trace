@@ -543,7 +543,10 @@ fn existing_project_error(
 /// slice can correlate the two without
 /// losing the request identity. The mapping is total so port authors
 /// cannot accidentally leak a variant through the boundary.
-fn port_error_to_app_error(err: PortError, request_correlation_id: CorrelationId) -> AppError {
+pub(crate) fn port_error_to_app_error(
+    err: PortError,
+    request_correlation_id: CorrelationId,
+) -> AppError {
     let infra_correlation_id = err.correlation_id();
     let mut builder = AppError::new(
         port_code(err.kind()),

@@ -2,11 +2,13 @@
 //!
 //! [`SqliteStore`] is the public type every other crate interacts
 //! with. It owns a [`rusqlite::Connection`] wrapped with a `Mutex`,
-//! applies the pending migrations at construction time, and exposes
-//! the [`SqliteProjectRepository`] view through
-//! [`SqliteStore::project_repository`].
+//! applies pending migrations for writer handles, and exposes the
+//! [`SqliteProjectRepository`] view through
+//! [`SqliteStore::project_repository`]. Read-only handles use SQLite
+//! `READ_ONLY` plus connection-local `query_only`, validate the exact
+//! supported schema/checksum, and never migrate or alter persistent pragmas.
 //!
-//! The store applies the following pragmas on every open:
+//! Writer opens apply the following pragmas:
 //!
 //! - `foreign_keys = ON` so `STRICT` tables enforce referential
 //!   integrity;
@@ -17,6 +19,9 @@
 //!   slices);
 //! - `busy_timeout = 5000ms` so a brief contention window returns a
 //!   typed [`StoreErrorKind::Busy`] rather than failing immediately.
+//!
+//! Read-only opens set only the connection-local busy timeout and
+//! `query_only = ON`; they leave journal mode and schema untouched.
 //!
 //! [`StoreErrorKind::Busy`]: crate::error::StoreErrorKind::Busy
 
@@ -109,6 +114,7 @@ pub struct OpenOptions {
     /// already exist. Used by callers (`open`, `status`) that must
     /// refuse an absent project rather than create one implicitly.
     must_exist: bool,
+    read_only: bool,
 }
 
 impl Default for OpenOptions {
@@ -118,6 +124,7 @@ impl Default for OpenOptions {
             app_version: STORE_APP_VERSION.to_string(),
             bootstrap_correlation_id: CorrelationId::new(),
             must_exist: false,
+            read_only: false,
         }
     }
 }
@@ -167,6 +174,19 @@ impl OpenOptions {
     #[must_use]
     pub const fn must_exist(&self) -> bool {
         self.must_exist
+    }
+
+    /// Opens without write access, migrations, or persistent pragma changes.
+    #[must_use]
+    pub const fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Returns whether this open is read-only.
+    #[must_use]
+    pub const fn read_only(&self) -> bool {
+        self.read_only
     }
 }
 
@@ -240,13 +260,20 @@ impl SqliteStore {
         // flags only so SQLite refuses to create the file. This closes
         // the `path.exists()`-then-`Connection::open` race in which a
         // missing database could be implicitly created.
-        let flags = if options.must_exist() {
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        let connection = if options.read_only() {
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|err| StoreError::from_rusqlite(err, bootstrap))?
+        } else if options.must_exist() {
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(|err| StoreError::from_rusqlite(err, bootstrap))?
         } else {
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .map_err(|err| StoreError::from_rusqlite(err, bootstrap))?
         };
-        let connection = Connection::open_with_flags(path, flags)
-            .map_err(|err| StoreError::from_rusqlite(err, bootstrap))?;
         Self::from_connection(connection, Some(path.to_path_buf()), options)
     }
 
@@ -263,9 +290,20 @@ impl SqliteStore {
         options: OpenOptions,
     ) -> Result<Self, StoreError> {
         let bootstrap = options.bootstrap_correlation_id;
-        apply_pragmas(&connection, options.busy_timeout, bootstrap)?;
-        let schema_version =
-            migrations::apply_pending(&connection, &options.app_version, bootstrap)?;
+        let schema_version = if options.read_only() {
+            connection
+                .busy_timeout(std::time::Duration::from_millis(u64::from(
+                    options.busy_timeout.as_millis(),
+                )))
+                .map_err(|err| StoreError::from_rusqlite(err, bootstrap))?;
+            connection
+                .execute_batch("PRAGMA query_only = ON")
+                .map_err(|err| StoreError::from_rusqlite(err, bootstrap))?;
+            migrations::validate_read_only(&connection, bootstrap)?
+        } else {
+            apply_pragmas(&connection, options.busy_timeout, bootstrap)?;
+            migrations::apply_pending(&connection, &options.app_version, bootstrap)?
+        };
         let bootstrap_snapshot =
             StoreBootstrap { database_path, schema_version, busy_timeout: options.busy_timeout };
         Ok(Self {
@@ -364,6 +402,7 @@ fn apply_pragmas(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     #[test]
     fn in_memory_store_initializes_schema() {
@@ -421,6 +460,167 @@ mod tests {
             SqliteStore::open(&path, OpenOptions::default().with_must_exist(true)).unwrap_err();
         assert_eq!(err.kind(), StoreErrorKind::Transport);
         assert!(!path.exists(), "must_exist must not create the SQLite file");
+    }
+
+    #[test]
+    fn read_only_open_and_query_leave_database_and_sidecars_unchanged() {
+        let dir = tempdir();
+        let path = dir.join("read-only.sqlite3");
+        let store = SqliteStore::open(&path, OpenOptions::default()).expect("initialize");
+        drop(store);
+        let before = file_snapshot(&path);
+
+        let store = SqliteStore::open(
+            &path,
+            OpenOptions::default().with_must_exist(true).with_read_only(true),
+        )
+        .expect("read-only open");
+        let connection = store.lock().expect("lock read-only store");
+        let version: i64 = connection
+            .query_row("SELECT schema_version FROM schema_meta WHERE singleton = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("read schema metadata");
+        assert_eq!(version, i64::from(CURRENT_SCHEMA_VERSION));
+        drop(connection);
+        drop(store);
+
+        assert_snapshots_equal(&file_snapshot(&path), &before);
+    }
+
+    #[test]
+    fn read_only_connection_observes_committed_concurrent_wal_writes() {
+        let dir = tempdir();
+        let path = dir.join("concurrent.sqlite3");
+        let writer = SqliteStore::open(&path, OpenOptions::default()).expect("initialize");
+        {
+            let connection = writer.lock().expect("lock writer");
+            connection
+                .execute_batch("CREATE TABLE concurrent_probe (value INTEGER NOT NULL);")
+                .expect("create probe");
+            connection.execute("INSERT INTO concurrent_probe VALUES (1)", []).expect("seed");
+        }
+        let reader = SqliteStore::open(
+            &path,
+            OpenOptions::default().with_must_exist(true).with_read_only(true),
+        )
+        .expect("read-only open with active writer");
+
+        writer
+            .lock()
+            .expect("lock writer")
+            .execute("INSERT INTO concurrent_probe VALUES (2)", [])
+            .expect("concurrent committed write");
+        let visible: i64 = reader
+            .lock()
+            .expect("lock reader")
+            .query_row("SELECT SUM(value) FROM concurrent_probe", [], |row| row.get(0))
+            .expect("read concurrent WAL contents");
+        assert_eq!(visible, 3);
+    }
+
+    #[test]
+    fn read_only_option_enforces_query_only_on_injected_writable_connection() {
+        let dir = tempdir();
+        let path = dir.join("injected.sqlite3");
+        drop(SqliteStore::open(&path, OpenOptions::default()).expect("initialize"));
+        let connection = Connection::open(&path).expect("open writable injected connection");
+        let store = SqliteStore::from_connection(
+            connection,
+            Some(path),
+            OpenOptions::default().with_read_only(true),
+        )
+        .expect("wrap read-only store");
+        let connection = store.lock().expect("lock read-only store");
+        let update = connection
+            .execute("UPDATE schema_meta SET app_version = 'mutated' WHERE singleton = 1", []);
+        assert!(update.is_err(), "query_only must reject writes through injected handles");
+        let app_version: String = connection
+            .query_row("SELECT app_version FROM schema_meta WHERE singleton = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("read unchanged metadata");
+        assert_eq!(app_version, STORE_APP_VERSION);
+    }
+
+    #[test]
+    fn read_only_schema_mismatch_fails_without_migration_or_side_effects() {
+        let dir = tempdir();
+        let path = dir.join("older.sqlite3");
+        let connection = Connection::open(&path).expect("create older schema");
+        let v1 = vec![migrations::Migrations::catalog()[0].clone()];
+        migrations::apply_catalog(&connection, "0.1.0-test", CorrelationId::new(), &v1)
+            .expect("apply v1 schema");
+        drop(connection);
+        let before = file_snapshot(&path);
+
+        let error = SqliteStore::open(
+            &path,
+            OpenOptions::default().with_must_exist(true).with_read_only(true),
+        )
+        .expect_err("older schema must fail closed");
+        assert_eq!(error.kind(), StoreErrorKind::SchemaOlder);
+        assert_snapshots_equal(&file_snapshot(&path), &before);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FileSnapshot {
+        entries: Vec<FileEntrySnapshot>,
+    }
+
+    type FileEntrySnapshot = (PathBuf, Option<Vec<u8>>, Option<SystemTime>, Option<u32>);
+
+    fn file_snapshot(database: &Path) -> FileSnapshot {
+        let paths = [
+            database.to_path_buf(),
+            PathBuf::from(format!("{}-wal", database.display())),
+            PathBuf::from(format!("{}-shm", database.display())),
+            PathBuf::from(format!("{}-journal", database.display())),
+        ];
+        let entries = paths
+            .into_iter()
+            .map(|path| {
+                let metadata = std::fs::metadata(&path).ok();
+                let bytes = metadata.as_ref().and_then(|_| std::fs::read(&path).ok());
+                let modified = metadata.as_ref().and_then(|value| value.modified().ok());
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.as_ref().map(|value| value.permissions().mode())
+                };
+                #[cfg(not(unix))]
+                let mode = None;
+                (path, bytes, modified, mode)
+            })
+            .collect();
+        FileSnapshot { entries }
+    }
+
+    fn assert_snapshots_equal(after: &FileSnapshot, before: &FileSnapshot) {
+        assert_eq!(after.entries.len(), before.entries.len());
+        for (index, (after, before)) in after.entries.iter().zip(&before.entries).enumerate() {
+            assert_eq!(after.0, before.0);
+            if index == 0 {
+                assert_eq!(after.1, before.1, "database bytes changed: {}", before.0.display());
+                assert_eq!(after.2, before.2, "database mtime changed: {}", before.0.display());
+                assert_eq!(after.3, before.3, "database mode changed: {}", before.0.display());
+            } else if after.1 != before.1 {
+                // Read-only WAL coordination can create an empty WAL and a
+                // 32 KiB shared-memory index when no writer holds the pair.
+                // No persisted WAL payload or rollback journal is permitted.
+                let permitted_coordination = before.1.is_none()
+                    && (after.1.as_ref().is_some_and(Vec::is_empty)
+                        || (before.0.to_string_lossy().ends_with("-shm")
+                            && after.1.as_ref().is_some_and(|bytes| bytes.len() == 32_768)));
+                assert!(
+                    permitted_coordination,
+                    "SQLite sidecar changed beyond coordination at {} (before bytes: {:?}, after length: {:?})",
+                    before.0.display(),
+                    before.1.as_ref().map(Vec::len),
+                    after.1.as_ref().map(Vec::len),
+                );
+            }
+        }
     }
 
     fn tempdir() -> PathBuf {

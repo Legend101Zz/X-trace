@@ -51,13 +51,14 @@ pub use error::{StoreError, StoreErrorKind};
 pub use idempotency_repository::SqliteIdempotencyStore;
 pub use migrations::{MigrationRecord, Migrations};
 pub use project_repository::SqliteProjectRepository;
-pub use recording_port::SqliteRecordingPersistence;
+pub use recording_port::{SqliteRecordingPersistence, SqliteRecordingReader};
 pub use recording_store::{
     BeginRecordingDisposition, BeginRecordingReceipt, BeginRecordingRequest, RecordingStoreError,
     RecordingStoreErrorCategory, RecordingStoreErrorKind, SegmentCommitDisposition,
     SegmentCommitReceipt, SegmentCommitRequest, SqliteRecordingStore,
 };
 pub use xtf::{
-    EncodedXtfSegment, VerifiedXtfSegment, XtfCodecError, XtfSegmentInput, encode_segment,
-    max_compressed_segment_bytes, verify_compressed_segment,
+    DecodedXtfSegment, EncodedXtfSegment, VerifiedXtfSegment, XtfCodecError, XtfSegmentInput,
+    decode_compressed_segment, encode_segment, max_compressed_segment_bytes,
+    max_logical_segment_bytes, verify_compressed_segment,
 };

@@ -12,11 +12,12 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 use serde::Serialize;
 use xtrace_application::{
-    Application, Command, GetStoreStatus, InitializeProject, OpenProject, Query, RequestContext,
+    Application, Command, GetProject, GetStoreStatus, InitializeProject, ListRecordings,
+    OpenProject, Query, QueryResult, RequestContext, ShowRecording,
 };
-use xtrace_domain::WallTime;
+use xtrace_domain::{AppError, ErrorCategory, ErrorCode, RecordingId, RetryAdvice, WallTime};
 use xtrace_store::{CURRENT_SCHEMA_VERSION, SqliteIdempotencyStore, SqliteProjectRepository};
-use xtrace_store::{SqliteStore, StoreErrorKind};
+use xtrace_store::{SqliteRecordingReader, SqliteStore, StoreErrorKind};
 
 use crate::error::CliError;
 use crate::output::write_success;
@@ -56,6 +57,11 @@ pub enum XtraceCommand {
         #[arg(long = "project-dir", value_name = "DIR")]
         project_dir: PathBuf,
     },
+    /// Read persisted recordings through the verified local store path.
+    Recording {
+        #[command(subcommand)]
+        command: RecordingCommand,
+    },
     /// Run the Unix-only foreground, project-scoped XTP recording ingress daemon.
     ///
     /// This command durably writes sealed event segments and retains the
@@ -86,6 +92,37 @@ pub enum XtraceCommand {
     },
 }
 
+/// Read-only recording query commands.
+#[derive(Clone, Debug, Subcommand)]
+pub enum RecordingCommand {
+    /// List a stable, bounded page of recordings.
+    List {
+        /// Path to the initialized repository root.
+        #[arg(long = "project-dir", value_name = "DIR")]
+        project_dir: PathBuf,
+        /// Maximum rows in this page.
+        #[arg(long, default_value_t = xtrace_application::DEFAULT_RECORDING_LIST_LIMIT)]
+        limit: u32,
+        /// Exclusive recording ID cursor from the previous page.
+        #[arg(long, value_name = "RECORDING_ID")]
+        after: Option<RecordingId>,
+    },
+    /// Show a bounded, ordered Linear event window.
+    Show {
+        /// Path to the initialized repository root.
+        #[arg(long = "project-dir", value_name = "DIR")]
+        project_dir: PathBuf,
+        /// Recording ID to read.
+        recording_id: RecordingId,
+        /// Maximum events in the returned window.
+        #[arg(long, default_value_t = xtrace_application::DEFAULT_RECORDING_EVENT_LIMIT)]
+        limit: u32,
+        /// Versioned cursor returned by a previous show response.
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+    },
+}
+
 /// Dispatches the supplied subcommand and writes the result to
 /// stdout. Errors propagate as [`CliError`] so the binary entry
 /// point can render them.
@@ -101,11 +138,82 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
         XtraceCommand::Status { project_dir } => {
             status(project_dir, &crate::paths::read_env_path).map(|()| 0)
         }
+        XtraceCommand::Recording { command } => {
+            recording(command, &crate::paths::read_env_path).map(|()| 0)
+        }
         XtraceCommand::Daemon { project_dir } => crate::daemon::run(project_dir).await.map(|()| 0),
         XtraceCommand::Run { project_dir, java_agent, command } => {
             crate::run::run(project_dir, java_agent, command).await
         }
     }
+}
+
+fn recording<F>(command: RecordingCommand, env_reader: &F) -> Result<(), CliError>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
+    let (project_dir, list_request, show_request) = match command {
+        RecordingCommand::List { project_dir, limit, after } => {
+            (project_dir, Some((limit, after)), None)
+        }
+        RecordingCommand::Show { project_dir, recording_id, limit, cursor } => {
+            (project_dir, None, Some((recording_id, limit, cursor)))
+        }
+    };
+    let repo = resolve_repo(&project_dir)?;
+    let pointer = RepositoryPointer::read(&repo)?;
+    let data_home = resolve_data_home(Some(&pointer), env_reader)?;
+    let project_directory = UserDataPaths::project_dir_with_home(&data_home, pointer.project_id)?;
+    let database_path = UserDataPaths::database_path_with_home(&data_home, pointer.project_id)?;
+    let ctx = RequestContext::new(env_user(), WallTime::now());
+    let store = SqliteStore::open(
+        &database_path,
+        xtrace_store::OpenOptions::default()
+            .with_must_exist(true)
+            .with_read_only(true)
+            .with_correlation_id(ctx.correlation_id),
+    )
+    .map_err(map_store_error)?;
+    let repository = SqliteProjectRepository::new(&store);
+    let idempotency = SqliteIdempotencyStore::new(&store);
+    let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
+    let canonical_repo_path = repo.to_string_lossy().into_owned();
+    let project = match app
+        .query(Query::GetProject(GetProject { canonical_repo_path }), &ctx)
+        .map_err(CliError::from)?
+    {
+        QueryResult::Project(snapshot) => snapshot.project,
+        QueryResult::StoreStatus(_) => {
+            return Err(CliError::InvalidArgument("unexpected project query result".to_owned()));
+        }
+    };
+    if project.id() != pointer.project_id {
+        return Err(CliError::from(AppError::new(
+            ErrorCode::new("XTR-PROJECT-POINTER-MISMATCH"),
+            ErrorCategory::Corruption,
+            "repository pointer does not match the registered project",
+            RetryAdvice::None,
+            ctx.correlation_id,
+        )));
+    }
+    let reader = SqliteRecordingReader::new(store, project_directory);
+    let mut stdout = std::io::stdout().lock();
+    if let Some((limit, after)) = list_request {
+        let page = xtrace_application::list_recordings(
+            &reader,
+            ListRecordings { project_id: pointer.project_id, limit, after },
+            ctx.correlation_id,
+        )?;
+        write_success(&mut stdout, &page)?;
+    } else if let Some((recording_id, limit, cursor)) = show_request {
+        let detail = xtrace_application::show_recording(
+            &reader,
+            ShowRecording { project_id: pointer.project_id, recording_id, limit, cursor },
+            ctx.correlation_id,
+        )?;
+        write_success(&mut stdout, &detail)?;
+    }
+    Ok(())
 }
 
 /// Resolves the user-data home directory for the supplied pointer

@@ -13,6 +13,11 @@ use std::str::FromStr as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 
 use rusqlite::OptionalExtension as _;
+use xtrace_application::recording_queries::{
+    MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES, PersistedEvent,
+    PersistedInteraction, RecordingEventWindow, RecordingMetadata, RecordingStatus,
+    ShowWindowRequest,
+};
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     ContentHash, CorrelationId, ProjectId, RecordingId, RuntimeSessionId, WallTime,
@@ -269,6 +274,369 @@ impl SqliteStore {
 }
 
 impl SqliteRecordingStore<'_> {
+    /// Lists a bounded project-owned page in opening-time/identity order.
+    pub(crate) fn list_recording_metadata(
+        &self,
+        project_id: ProjectId,
+        after: Option<RecordingId>,
+        limit: u32,
+    ) -> Result<(Vec<RecordingMetadata>, bool), RecordingStoreError> {
+        let correlation_id = CorrelationId::new();
+        self.binding.revalidate(correlation_id)?;
+        let connection =
+            self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        if !project_exists(&connection, project_id, correlation_id)? {
+            return Err(read_not_found_error(correlation_id));
+        }
+
+        let cursor_opened_at = if let Some(recording_id) = after {
+            let row: Option<(Vec<u8>, String)> = connection
+                .query_row(
+                    "SELECT project_id, opened_at FROM recordings WHERE recording_id = ?1",
+                    rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| {
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
+                })?;
+            let Some((cursor_project_id, opened_at)) = row else {
+                return Err(read_not_found_error(correlation_id));
+            };
+            if cursor_project_id.as_slice() != project_id.as_uuid().as_bytes() {
+                return Err(read_not_found_error(correlation_id));
+            }
+            Some(opened_at)
+        } else {
+            None
+        };
+
+        let query_limit = i64::from(limit)
+            .checked_add(1)
+            .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT r.recording_id, r.status, r.opened_at, \
+                 COUNT(s.segment_ordinal), COALESCE(SUM(s.event_count), 0), \
+                 MIN(s.first_recording_seq), MAX(s.last_recording_seq) \
+                 FROM recordings AS r LEFT JOIN recording_segments AS s \
+                 ON s.recording_id = r.recording_id \
+                 WHERE r.project_id = ?1 \
+                 AND (?2 IS NULL OR r.opened_at < ?2 \
+                      OR (r.opened_at = ?2 AND r.recording_id < ?3)) \
+                 GROUP BY r.recording_id \
+                 ORDER BY r.opened_at DESC, r.recording_id DESC LIMIT ?4",
+            )
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        let mut rows = statement
+            .query(rusqlite::params![
+                project_id.as_uuid().as_bytes().to_vec(),
+                cursor_opened_at,
+                after.map(|id| id.as_uuid().as_bytes().to_vec()),
+                query_limit
+            ])
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        let mut recordings = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })? {
+            let raw_id: Vec<u8> = row.get(0).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let status: String = row.get(1).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let opened_at: String = row.get(2).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let segment_count: i64 = row.get(3).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let event_count: i64 = row.get(4).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let first_sequence: Option<Vec<u8>> = row.get(5).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let last_sequence: Option<Vec<u8>> = row.get(6).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let lifecycle_status = recording_status(&status, correlation_id)?;
+            let incomplete_evidence = match lifecycle_status {
+                RecordingStatus::Partial | RecordingStatus::Invalid => {
+                    vec![format!("persisted_status:{status}")]
+                }
+                _ => Vec::new(),
+            };
+            recordings.push(RecordingMetadata {
+                recording_id: recording_id_from_bytes(&raw_id, correlation_id)?,
+                status: lifecycle_status,
+                opened_at,
+                segment_count: u64::try_from(segment_count)
+                    .map_err(|_| recording_query_corrupt_error(correlation_id))?
+                    .to_string(),
+                event_count: u64::try_from(event_count)
+                    .map_err(|_| recording_query_corrupt_error(correlation_id))?
+                    .to_string(),
+                first_sequence: first_sequence
+                    .as_deref()
+                    .map(|value| decode_stored_sequence(value, correlation_id))
+                    .transpose()?
+                    .map(|value| value.to_string()),
+                last_sequence: last_sequence
+                    .as_deref()
+                    .map(|value| decode_stored_sequence(value, correlation_id))
+                    .transpose()?
+                    .map(|value| value.to_string()),
+                incomplete_evidence,
+            });
+        }
+        let has_more = recordings.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+        if has_more {
+            recordings.pop();
+        }
+        Ok((recordings, has_more))
+    }
+
+    /// Reads one bounded event window while fully verifying each decoded XTF object.
+    ///
+    /// Compressed and logical bytes are both counted toward the per-call
+    /// verified-input budget. If the next segment would exceed the budget
+    /// after events have been returned, it is left for the next cursor page.
+    pub(crate) fn read_recording_window(
+        &self,
+        request: &ShowWindowRequest,
+    ) -> Result<RecordingEventWindow, RecordingStoreError> {
+        let correlation_id = CorrelationId::new();
+        self.binding.revalidate(correlation_id)?;
+        let connection =
+            self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        let row: Option<(Vec<u8>, String)> = connection
+            .query_row(
+                "SELECT project_id, status FROM recordings WHERE recording_id = ?1",
+                rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        let Some((raw_project_id, status)) = row else {
+            return Err(read_not_found_error(correlation_id));
+        };
+        let stored_project_id = project_id_from_bytes(&raw_project_id, correlation_id)?;
+        if stored_project_id != request.project_id {
+            return Err(read_not_found_error(correlation_id));
+        }
+        let lifecycle_status = recording_status(&status, correlation_id)?;
+
+        let mut statement = connection
+            .prepare(
+                "SELECT segment_ordinal, object_hash, first_recording_seq, last_recording_seq, \
+                 event_count, uncompressed_bytes, compressed_bytes, checksum \
+                 FROM recording_segments WHERE recording_id = ?1 ORDER BY segment_ordinal ASC",
+            )
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        let mut rows = statement
+            .query(rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()])
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        let mut expected_ordinal = 0_u32;
+        let mut expected_sequence = Some(2_u64);
+        let mut segment_count = 0_u64;
+        let mut events = Vec::new();
+        let event_limit = usize::try_from(request.limit)
+            .map_err(|_| recording_query_validation_error(correlation_id))?;
+        let mut has_more = false;
+        let mut projection_bytes = 2_usize;
+        let mut projection_byte_limit_reached = false;
+        let mut verified_input_bytes = 0_usize;
+        let mut verified_work_limit_reached = false;
+        let mut incomplete_evidence = Vec::new();
+        if status == "partial" || status == "invalid" {
+            incomplete_evidence.push(format!("persisted_status:{status}"));
+        }
+
+        while let Some(row) = rows.next().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })? {
+            if segment_count >= MAX_RECORDING_QUERY_SEGMENTS {
+                return Err(recording_query_resource_error(correlation_id));
+            }
+            let ordinal: i64 = row.get(0).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let object_hash: Vec<u8> = row.get(1).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let first: Vec<u8> = row.get(2).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let last: Vec<u8> = row.get(3).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let count: i64 = row.get(4).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let uncompressed_bytes: i64 = row.get(5).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let compressed_bytes: i64 = row.get(6).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let checksum: Vec<u8> = row.get(7).map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+            let ordinal = u32::try_from(ordinal)
+                .map_err(|_| recording_query_corrupt_error(correlation_id))?;
+            let first_sequence = decode_stored_sequence(&first, correlation_id)?;
+            let last_sequence = decode_stored_sequence(&last, correlation_id)?;
+            let count =
+                u64::try_from(count).map_err(|_| recording_query_corrupt_error(correlation_id))?;
+            let uncompressed_size = usize::try_from(uncompressed_bytes)
+                .map_err(|_| recording_query_corrupt_error(correlation_id))?;
+            if ordinal != expected_ordinal
+                || Some(first_sequence) != expected_sequence
+                || count == 0
+                || uncompressed_size == 0
+                || uncompressed_size > crate::max_logical_segment_bytes()
+                || last_sequence < first_sequence
+                || last_sequence - first_sequence != count - 1
+            {
+                return Err(recording_query_corrupt_error(correlation_id));
+            }
+            expected_ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
+            expected_sequence = last_sequence.checked_add(1);
+            segment_count = segment_count
+                .checked_add(1)
+                .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
+
+            let after_sequence = request.after_sequence.unwrap_or(0);
+            if last_sequence <= after_sequence {
+                continue;
+            }
+            if events.len() >= event_limit {
+                has_more = true;
+                continue;
+            }
+            if projection_byte_limit_reached {
+                continue;
+            }
+            if verified_work_limit_reached {
+                continue;
+            }
+            let segment = SegmentRow {
+                object_hash,
+                first_recording_seq: first,
+                last_recording_seq: last,
+                event_count: i64::try_from(count)
+                    .map_err(|_| recording_query_corrupt_error(correlation_id))?,
+                uncompressed_bytes,
+                compressed_bytes,
+                checksum,
+            };
+            segment.validate(correlation_id)?;
+            let compressed_size = usize::try_from(segment.compressed_bytes)
+                .map_err(|_| recording_query_corrupt_error(correlation_id))?;
+            let segment_work = compressed_size
+                .checked_add(uncompressed_size)
+                .ok_or_else(|| recording_query_resource_error(correlation_id))?;
+            let work_if_added = verified_input_bytes.checked_add(segment_work);
+            if !events.is_empty()
+                && work_if_added.is_none_or(|total| total > MAX_RECORDING_VERIFIED_INPUT_BYTES)
+            {
+                has_more = true;
+                verified_work_limit_reached = true;
+                continue;
+            }
+            let object_path =
+                object_path_from_row(&self.binding.root, &segment.object_hash, correlation_id)?;
+            validate_managed_tree(
+                &self.binding.root,
+                object_path.parent().ok_or_else(|| object_corrupt_error(correlation_id))?,
+                correlation_id,
+            )?;
+            let bytes = read_bounded_regular_file(&object_path, correlation_id, false)?;
+            if i64::try_from(bytes.len()).map_err(|_| object_corrupt_error(correlation_id))?
+                != segment.compressed_bytes
+            {
+                return Err(object_corrupt_error(correlation_id));
+            }
+            let expected_hash = content_hash_from_bytes(&segment.object_hash, correlation_id)?;
+            let decoded = crate::xtf::decode_compressed_segment(&bytes, expected_hash)
+                .map_err(|_| object_corrupt_error(correlation_id))?;
+            let verified = decoded.verified();
+            if verified.project_id() != stored_project_id
+                || verified.recording_id() != request.recording_id
+                || verified.segment_ordinal() != ordinal
+                || verified.event_count() != count
+                || verified.logical_bytes()
+                    != u64::try_from(uncompressed_bytes)
+                        .map_err(|_| recording_query_corrupt_error(correlation_id))?
+                || verified.first_recording_seq() != first_sequence
+                || verified.last_recording_seq() != last_sequence
+                || verified.footer_prefix_digest().as_bytes() != segment.checksum.as_slice()
+                || i64::try_from(bytes.len()).map_err(|_| object_corrupt_error(correlation_id))?
+                    != segment.compressed_bytes
+            {
+                return Err(object_corrupt_error(correlation_id));
+            }
+            verified_input_bytes = work_if_added.unwrap_or(segment_work);
+            for envelope in decoded.events() {
+                let Some(event) = envelope.event.as_ref() else {
+                    return Err(object_corrupt_error(correlation_id));
+                };
+                if event.recording_seq <= after_sequence {
+                    continue;
+                }
+                if events.len() == event_limit {
+                    has_more = true;
+                    break;
+                }
+                if event.kind == 14 {
+                    incomplete_evidence.push(format!("gap_event_sequence:{}", event.recording_seq));
+                }
+                let projected = project_persisted_event(event);
+                let projected_size = projected
+                    .serialized_size_with_separator()
+                    .map_err(|_| recording_query_resource_error(correlation_id))?;
+                if projected_size > MAX_RECORDING_EVENT_PROJECTION_BYTES {
+                    return Err(recording_query_resource_error(correlation_id));
+                }
+                if projection_bytes
+                    .checked_add(projected_size)
+                    .is_none_or(|total| total > MAX_RECORDING_EVENT_PROJECTION_BYTES)
+                {
+                    has_more = true;
+                    projection_byte_limit_reached = true;
+                    break;
+                }
+                projection_bytes += projected_size;
+                events.push(projected);
+            }
+        }
+        Ok(RecordingEventWindow {
+            recording_id: request.recording_id,
+            status: lifecycle_status,
+            segment_count: segment_count.to_string(),
+            events,
+            has_more,
+            incomplete_evidence,
+        })
+    }
+
     /// Inserts a recording anchor or returns an exact immutable replay.
     ///
     /// The shared writer guard is acquired before root revalidation and all
@@ -796,6 +1164,149 @@ fn decode_stored_sequence(
 ) -> Result<u64, RecordingStoreError> {
     let raw: [u8; 8] = bytes.try_into().map_err(|_| object_corrupt_error(correlation_id))?;
     Ok(u64::from_be_bytes(raw))
+}
+
+const MAX_RECORDING_QUERY_SEGMENTS: u64 = 10_000;
+
+fn recording_id_from_bytes(
+    bytes: &[u8],
+    correlation_id: CorrelationId,
+) -> Result<RecordingId, RecordingStoreError> {
+    let raw: [u8; 16] =
+        bytes.try_into().map_err(|_| recording_query_corrupt_error(correlation_id))?;
+    Ok(RecordingId::from_uuid(uuid::Uuid::from_bytes(raw)))
+}
+
+fn project_id_from_bytes(
+    bytes: &[u8],
+    correlation_id: CorrelationId,
+) -> Result<ProjectId, RecordingStoreError> {
+    let raw: [u8; 16] =
+        bytes.try_into().map_err(|_| recording_query_corrupt_error(correlation_id))?;
+    Ok(ProjectId::from_uuid(uuid::Uuid::from_bytes(raw)))
+}
+
+fn content_hash_from_bytes(
+    bytes: &[u8],
+    correlation_id: CorrelationId,
+) -> Result<ContentHash, RecordingStoreError> {
+    let raw: [u8; 32] = bytes.try_into().map_err(|_| object_corrupt_error(correlation_id))?;
+    ContentHash::from_str(&format!("b3:{}", hex::encode(raw)))
+        .map_err(|_| object_corrupt_error(correlation_id))
+}
+
+fn recording_status(
+    status: &str,
+    correlation_id: CorrelationId,
+) -> Result<RecordingStatus, RecordingStoreError> {
+    match status {
+        "recording" => Ok(RecordingStatus::Recording),
+        "finalizing" => Ok(RecordingStatus::Finalizing),
+        "complete" => Ok(RecordingStatus::Complete),
+        "partial" => Ok(RecordingStatus::Partial),
+        "invalid" => Ok(RecordingStatus::Invalid),
+        _ => Err(recording_query_corrupt_error(correlation_id)),
+    }
+}
+
+fn project_persisted_event(
+    event: &xtrace_protocol::generated::agent::RecordingEvent,
+) -> PersistedEvent {
+    let interaction = event.interaction.as_ref().map(|interaction| PersistedInteraction {
+        kind: Some(interaction_kind_label(interaction.kind)),
+        driver: nonempty(&interaction.driver),
+        schema: nonempty(&interaction.schema),
+        table: nonempty(&interaction.table),
+        host: nonempty(&interaction.host),
+        method: nonempty(&interaction.method),
+    });
+    let mut projected = PersistedEvent {
+        sequence: event.recording_seq.to_string(),
+        monotonic_ns: event.monotonic_ns.to_string(),
+        event_id: nonempty(&event.event_id),
+        parent_event_id: nonempty(&event.parent_event_id),
+        async_parent_event_id: nonempty(&event.async_parent_event_id),
+        kind: recording_event_kind_label(event.kind),
+        symbol: nonempty(&event.symbol),
+        interaction,
+        field_truncations: Vec::new(),
+    };
+    projected.bound_display_fields();
+    projected
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn recording_event_kind_label(value: i32) -> String {
+    const NAMES: &[&str] = &[
+        "unspecified",
+        "request_update",
+        "frame_enter",
+        "frame_exit",
+        "frame_throw",
+        "line_cursor",
+        "value_snapshot",
+        "database_start",
+        "database_end",
+        "outbound_http_start",
+        "outbound_http_end",
+        "async_link",
+        "exception",
+        "response",
+        "gap",
+    ];
+    enum_label("recording_event_kind", value, NAMES)
+}
+
+fn interaction_kind_label(value: i32) -> String {
+    const NAMES: &[&str] =
+        &["unspecified", "database", "outbound_http", "messaging", "filesystem", "framework"];
+    enum_label("interaction_kind", value, NAMES)
+}
+
+fn enum_label(prefix: &str, value: i32, names: &[&str]) -> String {
+    usize::try_from(value)
+        .ok()
+        .and_then(|index| names.get(index))
+        .map_or_else(|| format!("unknown:{value}"), |name| format!("{prefix}:{name}"))
+}
+
+fn read_not_found_error(correlation_id: CorrelationId) -> RecordingStoreError {
+    RecordingStoreError::new(
+        RecordingStoreErrorKind::NotFound,
+        "XTR-STORE-RECORDING-NOT-FOUND",
+        "recording was not found in the selected project",
+        correlation_id,
+    )
+}
+
+fn recording_query_validation_error(correlation_id: CorrelationId) -> RecordingStoreError {
+    RecordingStoreError::new(
+        RecordingStoreErrorKind::Validation,
+        "XTR-STORE-RECORDING-QUERY-VALIDATION",
+        "recording query arguments are outside supported bounds",
+        correlation_id,
+    )
+}
+
+fn recording_query_corrupt_error(correlation_id: CorrelationId) -> RecordingStoreError {
+    RecordingStoreError::new(
+        RecordingStoreErrorKind::Corruption,
+        "XTR-STORE-RECORDING-QUERY-CORRUPT",
+        "persisted recording metadata is inconsistent",
+        correlation_id,
+    )
+}
+
+fn recording_query_resource_error(correlation_id: CorrelationId) -> RecordingStoreError {
+    RecordingStoreError::new(
+        RecordingStoreErrorKind::Resource,
+        "XTR-STORE-RECORDING-QUERY-RESOURCE",
+        "recording read exceeds its bounded segment or projection budget",
+        correlation_id,
+    )
 }
 
 fn segment_validation_error(correlation_id: CorrelationId) -> RecordingStoreError {

@@ -131,4 +131,44 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn recording_commands_accept_project_selection_and_versioned_show_cursor() {
+        let list = Cli::try_parse_from([
+            "xtrace",
+            "recording",
+            "list",
+            "--project-dir",
+            "/tmp/project",
+            "--limit",
+            "200",
+        ])
+        .expect("recording list parses");
+        assert!(matches!(
+            list.command,
+            commands::XtraceCommand::Recording {
+                command: commands::RecordingCommand::List { limit: 200, .. }
+            }
+        ));
+
+        let show = Cli::try_parse_from([
+            "xtrace",
+            "recording",
+            "show",
+            "--project-dir",
+            "/tmp/project",
+            "018f0000-0000-7000-8000-000000000001",
+            "--cursor",
+            "v1.eHh4",
+        ])
+        .expect("recording show parses cursor token");
+        assert!(matches!(
+            show.command,
+            commands::XtraceCommand::Recording {
+                command: commands::RecordingCommand::Show {
+                    cursor: Some(cursor), ..
+                }
+            } if cursor == "v1.eHh4"
+        ));
+    }
 }

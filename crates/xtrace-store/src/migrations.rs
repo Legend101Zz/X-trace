@@ -243,6 +243,39 @@ pub fn apply_pending(
     apply_with_catalog(connection, app_version, correlation_id, &Migrations::catalog())
 }
 
+/// Validates an existing database schema without applying migrations or
+/// changing persistent SQLite state.
+///
+/// # Errors
+///
+/// Returns a schema-version or prefix-checksum error when this binary cannot
+/// read the database exactly as it exists.
+pub(crate) fn validate_read_only(
+    connection: &Connection,
+    correlation_id: CorrelationId,
+) -> Result<u32, StoreError> {
+    let catalog = Migrations::catalog();
+    validate_catalog(&catalog, correlation_id)?;
+    let latest = catalog.last().map_or(0, |record| record.version);
+    let current = current_schema_version(connection, correlation_id)?;
+    if current < latest {
+        return Err(StoreError::new(
+            StoreErrorKind::SchemaOlder,
+            "database schema is older than this binary can read without migration",
+            correlation_id,
+        ));
+    }
+    if current > latest {
+        return Err(StoreError::new(
+            StoreErrorKind::SchemaNewer,
+            "database schema is newer than this binary supports",
+            correlation_id,
+        ));
+    }
+    verify_applied_checksum(connection, &catalog, current, correlation_id)?;
+    Ok(current)
+}
+
 /// Applies every migration in the supplied catalog that is not yet
 /// present on disk. Production code uses [`apply_pending`] so the
 /// compiled-in catalog stays the single source of truth; tests use

@@ -9,6 +9,9 @@ use xtrace_application::recording::{
     PersistSegmentDisposition as PortSegmentDisposition,
     PersistSegmentReceipt as PortSegmentReceipt, RecordingPersistencePort,
 };
+use xtrace_application::recording_queries::{
+    RecordingEventWindow, RecordingMetadata, RecordingReadPort, ShowWindowRequest,
+};
 use xtrace_application::{PortError, PortErrorKind};
 use xtrace_domain::CorrelationId;
 use xtrace_protocol::xtf::XtfEventEnvelope;
@@ -36,6 +39,46 @@ impl SqliteRecordingPersistence {
     #[must_use]
     pub fn new(store: SqliteStore, project_data_root: impl Into<PathBuf>) -> Self {
         Self { store, project_data_root: project_data_root.into() }
+    }
+}
+
+/// SQLite/XTF implementation of the framework-neutral recording read port.
+///
+/// Each operation creates a root-bound store view, so object lookup and
+/// verification use the same selected project data root as the SQLite file.
+#[derive(Clone, Debug)]
+pub struct SqliteRecordingReader {
+    store: SqliteStore,
+    project_data_root: PathBuf,
+}
+
+impl SqliteRecordingReader {
+    /// Creates a read adapter bound to one project data directory.
+    #[must_use]
+    pub fn new(store: SqliteStore, project_data_root: impl Into<PathBuf>) -> Self {
+        Self { store, project_data_root: project_data_root.into() }
+    }
+}
+
+impl RecordingReadPort for SqliteRecordingReader {
+    fn list_recordings(
+        &self,
+        project_id: xtrace_domain::ProjectId,
+        after: Option<xtrace_domain::RecordingId>,
+        limit: u32,
+    ) -> Result<(Vec<RecordingMetadata>, bool), PortError> {
+        let view =
+            self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
+        view.list_recording_metadata(project_id, after, limit).map_err(map_recording_error)
+    }
+
+    fn show_recording(
+        &self,
+        request: &ShowWindowRequest,
+    ) -> Result<RecordingEventWindow, PortError> {
+        let view =
+            self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
+        view.read_recording_window(request).map_err(map_recording_error)
     }
 }
 
@@ -162,13 +205,18 @@ mod tests {
         RecordEvents, RecordingCapture, RecordingCaptureService, RecordingPersistencePort,
         SegmentPolicy,
     };
-    use xtrace_domain::{
-        Project, ProjectId, RecordingId, RepositoryFingerprint, RuntimeSessionId, WallTime,
+    use xtrace_application::recording_queries::{
+        ListRecordings, RecordingReadPort, ShowRecording, ShowWindowRequest,
     };
-    use xtrace_protocol::generated::agent::RecordingEvent;
+    use xtrace_domain::ids::Id as _;
+    use xtrace_domain::{
+        CorrelationId, Project, ProjectId, RecordingId, RepositoryFingerprint, RuntimeSessionId,
+        WallTime,
+    };
+    use xtrace_protocol::generated::agent::{ExceptionPayload, Interaction, RecordingEvent};
     use xtrace_protocol::xtf::XtfEventEnvelope;
 
-    use crate::{OpenOptions, SqliteRecordingPersistence, SqliteStore};
+    use crate::{OpenOptions, SqliteRecordingPersistence, SqliteRecordingReader, SqliteStore};
 
     fn fixture() -> (tempfile::TempDir, SqliteStore, Project) {
         let temp_base = std::env::temp_dir().canonicalize().expect("canonical temp base");
@@ -263,6 +311,456 @@ mod tests {
         assert_eq!(error.kind(), PortErrorKind::Conflict);
         assert!(error.message().contains("XTR-STORE-SEGMENT-CONFLICT"));
         assert!(error.source().is_none() || !error.source().unwrap().contains("/"));
+    }
+
+    #[test]
+    fn read_adapter_pages_and_projects_only_verified_persisted_fields() {
+        let (directory, store, project) = fixture();
+        let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
+        let reader = SqliteRecordingReader::new(store.clone(), directory.path());
+        let first = begin(project.id(), RecordingId::new());
+        let second = begin(project.id(), RecordingId::new());
+        persistence.begin_recording(&first).expect("first anchor");
+        persistence.begin_recording(&second).expect("second anchor");
+        let mut sensitive = event(2, "persisted-event");
+        let mut nested = sensitive.payload.event.take().expect("event payload");
+        nested.kind = i32::MAX;
+        nested.async_parent_event_id = "async-parent-event".to_owned();
+        nested.exception = Some(ExceptionPayload {
+            exception_type: "SafeException".to_owned(),
+            sanitized_message: "VALUE_CANARY_RECORDING_READ".to_owned(),
+            stack_frames: vec!["secret/Source.java:1".to_owned()],
+        });
+        nested.interaction = Some(Interaction {
+            kind: 2,
+            method: "GET".to_owned(),
+            path: "/orders/PATH_SEGMENT_CANARY?QUERY_CANARY#FRAGMENT_CANARY".to_owned(),
+            ..Interaction::default()
+        });
+        sensitive.payload = XtfEventEnvelope { recording_seq: 2, event: Some(nested) };
+        sensitive.canonical_bytes = sensitive.payload.encode_to_vec();
+        persistence
+            .persist_segment(&PersistRecordingSegment {
+                project_id: project.id(),
+                recording_id: first.recording_id,
+                segment_ordinal: 0,
+                events: vec![sensitive, event(3, "second-event")],
+            })
+            .expect("persist first segment");
+        persistence
+            .persist_segment(&PersistRecordingSegment {
+                project_id: project.id(),
+                recording_id: second.recording_id,
+                segment_ordinal: 0,
+                events: vec![event(2, "other-event")],
+            })
+            .expect("persist second segment");
+        rusqlite::Connection::open(directory.path().join("metadata.sqlite3"))
+            .expect("open status fixture")
+            .execute(
+                "UPDATE recordings SET status = 'partial' WHERE recording_id = ?1",
+                rusqlite::params![first.recording_id.as_uuid().as_bytes().to_vec()],
+            )
+            .expect("mark persisted partial status");
+
+        let page = xtrace_application::list_recordings(
+            &reader,
+            ListRecordings { project_id: project.id(), limit: 1, after: None },
+            CorrelationId::new(),
+        )
+        .expect("first page");
+        assert_eq!(page.recordings.len(), 1);
+        assert!(page.next_after.is_some());
+        let next = xtrace_application::list_recordings(
+            &reader,
+            ListRecordings { project_id: project.id(), limit: 1, after: page.next_after },
+            CorrelationId::new(),
+        )
+        .expect("next page");
+        assert_eq!(next.recordings.len(), 1);
+        assert_ne!(next.recordings[0].recording_id, page.recordings[0].recording_id);
+
+        let detail = xtrace_application::show_recording(
+            &reader,
+            ShowRecording {
+                project_id: project.id(),
+                recording_id: first.recording_id,
+                limit: 1,
+                cursor: None,
+            },
+            CorrelationId::new(),
+        )
+        .expect("verified event window");
+        assert_eq!(detail.events.len(), 1);
+        assert_eq!(detail.events[0].sequence, "2");
+        assert_eq!(detail.events[0].kind, "unknown:2147483647");
+        assert_eq!(detail.events[0].async_parent_event_id.as_deref(), Some("async-parent-event"));
+        assert!(detail.events[0].field_truncations.is_empty());
+        assert!(detail.events[0].interaction.as_ref().is_some_and(|interaction| {
+            !serde_json::to_value(interaction)
+                .expect("interaction JSON")
+                .as_object()
+                .is_some_and(|fields| fields.contains_key("path"))
+        }));
+        assert_eq!(detail.incomplete_evidence, ["persisted_status:partial"]);
+        let next_cursor = detail.next_cursor.clone().expect("bounded next window cursor");
+        let rendered = serde_json::to_string(&detail).expect("render detail");
+        assert!(!rendered.contains("VALUE_CANARY_RECORDING_READ"));
+        assert!(!rendered.contains("Source.java"));
+        assert!(!rendered.contains("/orders"));
+        assert!(!rendered.contains("PATH_SEGMENT_CANARY"));
+        assert!(!rendered.contains("QUERY_CANARY"));
+        assert!(!rendered.contains("FRAGMENT_CANARY"));
+        assert!(!rendered.contains("\"path\""));
+        assert!(rendered.contains("completion"));
+
+        let next_detail = xtrace_application::show_recording(
+            &reader,
+            ShowRecording {
+                project_id: project.id(),
+                recording_id: first.recording_id,
+                limit: 10,
+                cursor: Some(next_cursor),
+            },
+            CorrelationId::new(),
+        )
+        .expect("cursor continues in sequence order");
+        assert_eq!(next_detail.events[0].sequence, "3");
+        assert!(next_detail.next_cursor.is_none());
+    }
+
+    #[test]
+    fn projection_budget_pages_across_segments_and_oversized_events_remain_reachable() {
+        let (directory, store, project) = fixture();
+        let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
+        let reader = SqliteRecordingReader::new(store.clone(), directory.path());
+        let request = begin(project.id(), RecordingId::new());
+        persistence.begin_recording(&request).expect("recording anchor");
+        for (ordinal, sequence) in [(0, 2), (1, 3)] {
+            let mut event = event(sequence, &format!("wide-{sequence}"));
+            event.payload.event.as_mut().expect("event payload").symbol = "x".repeat(150_000);
+            let payload = event.payload;
+            store
+                .recording_store(directory.path())
+                .expect("bound store")
+                .commit_segment(&crate::SegmentCommitRequest {
+                    project_id: project.id(),
+                    recording_id: request.recording_id,
+                    segment_ordinal: ordinal,
+                    events: vec![payload],
+                })
+                .expect("persist wide segment");
+        }
+
+        let first = xtrace_application::show_recording(
+            &reader,
+            ShowRecording {
+                project_id: project.id(),
+                recording_id: request.recording_id,
+                limit: 1,
+                cursor: None,
+            },
+            CorrelationId::new(),
+        )
+        .expect("first byte-bounded window");
+        assert_eq!(first.events.len(), 1);
+        let cursor = first.next_cursor.expect("next byte-bounded window");
+        let second = xtrace_application::show_recording(
+            &reader,
+            ShowRecording {
+                project_id: project.id(),
+                recording_id: request.recording_id,
+                limit: 1,
+                cursor: Some(cursor),
+            },
+            CorrelationId::new(),
+        )
+        .expect("second segment window");
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].sequence, "3");
+        assert!(second.next_cursor.is_none());
+
+        let oversized_id = RecordingId::new();
+        let oversized_request = begin(project.id(), oversized_id);
+        persistence.begin_recording(&oversized_request).expect("oversized recording anchor");
+        let mut huge = event(2, "too-wide");
+        huge.payload.event.as_mut().expect("event payload").symbol = format!(
+            "OVERSIZED_SYMBOL_CANARY{}",
+            "x".repeat(xtrace_application::MAX_RECORDING_EVENT_PROJECTION_BYTES + 1)
+        );
+        store
+            .recording_store(directory.path())
+            .expect("bound store")
+            .commit_segment(&crate::SegmentCommitRequest {
+                project_id: project.id(),
+                recording_id: oversized_id,
+                segment_ordinal: 0,
+                events: vec![huge.payload, event(3, "later-event").payload],
+            })
+            .expect("persist oversized event");
+        let first = xtrace_application::show_recording(
+            &reader,
+            ShowRecording {
+                project_id: project.id(),
+                recording_id: oversized_id,
+                limit: 1,
+                cursor: None,
+            },
+            CorrelationId::new(),
+        )
+        .expect("large display event is safely represented");
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].sequence, "2");
+        assert_eq!(first.events[0].symbol.as_deref(), Some("[truncated]"));
+        assert!(first.events[0].field_truncations.iter().any(|field| field.field == "symbol"));
+        let rendered = serde_json::to_string(&first).expect("bounded first event");
+        assert!(!rendered.contains("OVERSIZED_SYMBOL_CANARY"));
+        let second = xtrace_application::show_recording(
+            &reader,
+            ShowRecording {
+                project_id: project.id(),
+                recording_id: oversized_id,
+                limit: 1,
+                cursor: first.next_cursor,
+            },
+            CorrelationId::new(),
+        )
+        .expect("later event remains reachable");
+        assert_eq!(second.events[0].sequence, "3");
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn verified_input_budget_pages_large_segments_losslessly() {
+        let (directory, store, project) = fixture();
+        let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
+        let reader = SqliteRecordingReader::new(store.clone(), directory.path());
+        let request = begin(project.id(), RecordingId::new());
+        persistence.begin_recording(&request).expect("recording anchor");
+        let mut next_sequence = 2_u64;
+        for ordinal in 0..7_u32 {
+            let mut events = Vec::new();
+            for _ in 0..10 {
+                let mut item = event(next_sequence, &format!("large-{next_sequence}"));
+                item.payload.event.as_mut().expect("event payload").symbol = "x".repeat(350_000);
+                item.canonical_bytes = item.payload.encode_to_vec();
+                events.push(item);
+                next_sequence += 1;
+            }
+            persistence
+                .persist_segment(&PersistRecordingSegment {
+                    project_id: project.id(),
+                    recording_id: request.recording_id,
+                    segment_ordinal: ordinal,
+                    events,
+                })
+                .expect("persist near-limit logical segment");
+        }
+
+        let first = xtrace_application::show_recording(
+            &reader,
+            ShowRecording {
+                project_id: project.id(),
+                recording_id: request.recording_id,
+                limit: 100,
+                cursor: None,
+            },
+            CorrelationId::new(),
+        )
+        .expect("first verified-input-bounded page");
+        assert_eq!(first.events.len(), 40, "four logical segments fit the work budget");
+        let first_cursor = first.next_cursor.clone().expect("bounded continuation");
+
+        let second = xtrace_application::show_recording(
+            &reader,
+            ShowRecording {
+                project_id: project.id(),
+                recording_id: request.recording_id,
+                limit: 100,
+                cursor: Some(first_cursor),
+            },
+            CorrelationId::new(),
+        )
+        .expect("continued verified-input-bounded page");
+        assert_eq!(second.events.len(), 30);
+        assert!(second.next_cursor.is_none());
+        let sequences = first
+            .events
+            .into_iter()
+            .chain(second.events)
+            .map(|event| event.sequence.parse::<u64>().expect("decimal sequence"))
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, (2_u64..72).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn projection_response_byte_limit_continues_within_a_segment() {
+        let (directory, store, project) = fixture();
+        let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
+        let reader = SqliteRecordingReader::new(store.clone(), directory.path());
+        let request = begin(project.id(), RecordingId::new());
+        persistence.begin_recording(&request).expect("recording anchor");
+        let events = (2_u64..802)
+            .map(|sequence| {
+                let mut item = event(sequence, &format!("event-{sequence}"));
+                item.payload.event.as_mut().expect("event payload").symbol = "s".repeat(220);
+                item.canonical_bytes = item.payload.encode_to_vec();
+                item
+            })
+            .collect();
+        persistence
+            .persist_segment(&PersistRecordingSegment {
+                project_id: project.id(),
+                recording_id: request.recording_id,
+                segment_ordinal: 0,
+                events,
+            })
+            .expect("persist bounded display fields");
+
+        let first = xtrace_application::show_recording(
+            &reader,
+            ShowRecording {
+                project_id: project.id(),
+                recording_id: request.recording_id,
+                limit: 1_000,
+                cursor: None,
+            },
+            CorrelationId::new(),
+        )
+        .expect("first projection-byte-bounded page");
+        assert!(first.events.len() < 800);
+        assert!(!first.events.is_empty());
+        let first_count = first.events.len();
+        let first_cursor = first.next_cursor.clone().expect("projection cursor");
+        let second = xtrace_application::show_recording(
+            &reader,
+            ShowRecording {
+                project_id: project.id(),
+                recording_id: request.recording_id,
+                limit: 1_000,
+                cursor: Some(first_cursor),
+            },
+            CorrelationId::new(),
+        )
+        .expect("second projection-byte-bounded page");
+        assert_eq!(first_count + second.events.len(), 800);
+        assert!(second.next_cursor.is_none());
+        let sequences = first
+            .events
+            .into_iter()
+            .chain(second.events)
+            .map(|event| event.sequence.parse::<u64>().expect("decimal sequence"))
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, (2_u64..802).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn read_adapter_hides_cross_project_ids_and_rejects_missing_or_corrupt_objects() {
+        let (directory, store, project) = fixture();
+        let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
+        let reader = SqliteRecordingReader::new(store.clone(), directory.path());
+        let request = begin(project.id(), RecordingId::new());
+        persistence.begin_recording(&request).expect("anchor");
+        let receipt = store
+            .recording_store(directory.path())
+            .expect("bound store")
+            .commit_segment(&crate::SegmentCommitRequest {
+                project_id: project.id(),
+                recording_id: request.recording_id,
+                segment_ordinal: 0,
+                events: vec![event(2, "verified").payload],
+            })
+            .expect("committed segment");
+        let request_for = |project_id| ShowWindowRequest {
+            project_id,
+            recording_id: request.recording_id,
+            limit: 10,
+            after_sequence: None,
+        };
+        let unknown = reader
+            .show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id: RecordingId::new(),
+                limit: 10,
+                after_sequence: None,
+            })
+            .expect_err("unknown recording is rejected");
+        assert_eq!(unknown.kind(), PortErrorKind::NotFound);
+        let other_project = ProjectId::new();
+        let hidden = reader
+            .show_recording(&request_for(other_project))
+            .expect_err("cross-project identity is hidden");
+        assert_eq!(hidden.kind(), PortErrorKind::NotFound);
+
+        let connection = rusqlite::Connection::open(directory.path().join("metadata.sqlite3"))
+            .expect("open metadata fixture");
+        connection
+            .execute(
+                "UPDATE recording_segments SET first_recording_seq = ?1, last_recording_seq = ?1 \
+                 WHERE recording_id = ?2",
+                rusqlite::params![
+                    3_u64.to_be_bytes().to_vec(),
+                    request.recording_id.as_uuid().as_bytes().to_vec()
+                ],
+            )
+            .expect("damage sequence continuity");
+        let discontinuous = reader
+            .show_recording(&request_for(project.id()))
+            .expect_err("discontinuous stored range rejected");
+        assert_eq!(discontinuous.kind(), PortErrorKind::Corruption);
+        connection
+            .execute(
+                "UPDATE recording_segments SET first_recording_seq = ?1, last_recording_seq = ?2 \
+                 WHERE recording_id = ?3",
+                rusqlite::params![
+                    2_u64.to_be_bytes().to_vec(),
+                    2_u64.to_be_bytes().to_vec(),
+                    request.recording_id.as_uuid().as_bytes().to_vec()
+                ],
+            )
+            .expect("restore sequence metadata");
+        connection
+            .execute(
+                "UPDATE recording_segments SET uncompressed_bytes = uncompressed_bytes + 1 \
+                 WHERE recording_id = ?1",
+                rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
+            )
+            .expect("tamper logical size metadata");
+        let size_mismatch = reader
+            .show_recording(&request_for(project.id()))
+            .expect_err("uncompressed-size metadata must match the verified stream");
+        assert_eq!(size_mismatch.kind(), PortErrorKind::Corruption);
+        connection
+            .execute(
+                "UPDATE recording_segments SET uncompressed_bytes = ?1 \
+                 WHERE recording_id = ?2",
+                rusqlite::params![
+                    i64::try_from(receipt.uncompressed_bytes).expect("uncompressed size"),
+                    request.recording_id.as_uuid().as_bytes().to_vec()
+                ],
+            )
+            .expect("restore logical size metadata");
+
+        let object_path = {
+            let text = receipt.object_hash.to_canonical();
+            let digest = text.strip_prefix("b3:").expect("canonical hash");
+            directory
+                .path()
+                .join("objects/b3")
+                .join(&digest[..2])
+                .join(format!("{}.xtf.zst", &digest[2..]))
+        };
+        let valid = std::fs::read(&object_path).expect("object file");
+        std::fs::write(&object_path, b"malformed XTF").expect("corrupt object");
+        let corrupt = reader
+            .show_recording(&request_for(project.id()))
+            .expect_err("malformed stored XTF rejected");
+        assert_eq!(corrupt.kind(), PortErrorKind::Corruption);
+        std::fs::write(&object_path, valid).expect("restore verified fixture object");
+        std::fs::remove_file(&object_path).expect("remove object");
+        let missing =
+            reader.show_recording(&request_for(project.id())).expect_err("missing object rejected");
+        assert_eq!(missing.kind(), PortErrorKind::Corruption);
     }
 
     #[test]

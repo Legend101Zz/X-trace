@@ -201,6 +201,32 @@ existing `POST /orders` instrumentation. It is not Gradle/Maven task launch,
 wrapper launch, generic Java/Spring/Servlet compatibility, attach, endpoint
 discovery, browser replay, or a complete capture/replay release journey.
 
+After stopping the run, inspect the persisted request with fresh CLI
+processes:
+
+```bash
+cargo run -q -p xtrace-cli --bin xtrace -- recording list \
+  --project-dir /tmp/xtrace-run/repo --limit 50
+cargo run -q -p xtrace-cli --bin xtrace -- recording show \
+  --project-dir /tmp/xtrace-run/repo <recording-id> --limit 200
+```
+
+List pages are metadata-only and bounded to 200 rows. Show windows are bounded
+to 1,000 events, 256 KiB of compact event JSON, and 16 MiB of verified
+compressed-plus-logical XTF input per request. If another segment would exceed
+the input budget, the response stops at the preceding event and returns a
+cursor; one codec-bounded first segment may be processed to ensure progress.
+Use the returned versioned `next_cursor` with `--cursor` to continue. The
+cursor is bound to the selected project and recording. Raw interaction paths
+are omitted because path segments may contain identifiers or tokens. Oversized
+display fields become `[truncated]`; oversized identity/relationship fields
+become `[unavailable]`, with field names and original byte lengths reported
+without source text. These are persisted facts, not debugger-complete replay:
+values, source bodies, and completion semantics remain unavailable.
+Read-only SQLite access keeps normal WAL visibility and may create SQLite
+coordination sidecars, but does not apply migrations or update project or
+pointer metadata.
+
 ### Restricted-PATH build
 
 The build script must not rely on a system `protoc`. CI exercises the

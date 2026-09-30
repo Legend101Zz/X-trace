@@ -41,6 +41,7 @@ pub mod error;
 pub mod ports;
 pub mod queries;
 pub mod recording;
+pub mod recording_queries;
 
 pub use application::{Application, RequestContext};
 pub use commands::{Command, CommandReceipt, InitializeProject, OpenProject};
@@ -57,4 +58,13 @@ pub use recording::{
     MAX_XTF_EVENT_ENVELOPE_BYTES, PersistRecordingSegment, PersistSegmentDisposition,
     PersistSegmentReceipt, RecordEvents, RecordEventsReceipt, RecordingCapture,
     RecordingCaptureService, RecordingPersistencePort, SegmentPolicy,
+};
+pub use recording_queries::{
+    DEFAULT_RECORDING_EVENT_LIMIT, DEFAULT_RECORDING_LIST_LIMIT, FieldRepresentation,
+    FieldTruncation, ListRecordings, MAX_RECORDING_DISPLAY_FIELD_BYTES, MAX_RECORDING_EVENT_LIMIT,
+    MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_LIST_LIMIT,
+    MAX_RECORDING_RELATIONSHIP_ID_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES, PersistedEvent,
+    PersistedInteraction, RECORDING_READ_SCHEMA_VERSION, RecordingDetail, RecordingEventWindow,
+    RecordingListPage, RecordingMetadata, RecordingReadPort, RecordingStatus, ShowRecording,
+    ShowWindowRequest, UnavailableEvidence, list_recordings, show_recording,
 };
