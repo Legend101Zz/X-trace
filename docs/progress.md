@@ -30,6 +30,25 @@ stop for any new material architecture/product decision. Do not use PIO,
 OpenCode, MiniMax, Kimi, or GLM. No failing candidate is accepted by this
 workflow authorization; all required gates still apply.
 
+## Historical B2 stop checkpoint (superseded by accepted ADR 0002)
+
+The initial CLI draft `2e41a3c224e9abe95696af43e67a890a46cf52fe` and
+checkpoint `714b3cca5a3e4b89b397b68ada6b6e92cb5de81d` were local/unmerged
+on baseline `db13dfbf970aa54a6d9152d3fd9ea3e159ead932`. Exact focused tests
+passed 211 with one failure; workspace tests passed 446 with the same failure.
+The real Spring linked-recording continuation exposed UUIDv4 captures rejected
+by B1's v7-only observed reader. Later assertions in that test were unreached.
+Formatting, strict Clippy/rustdoc, restricted-PATH build, and diff checks passed.
+The initial Luna source reviews found no further blocker; no failing draft was
+merged or pushed.
+
+The user accepted historical v4 read/cursor compatibility and future v7 capture,
+requested Sol reviews, and authorized continuation. The separately reviewed
+prerequisite below is merged, tested, pushed, and CI-green. B2 is rebased onto
+it, with a malformed/ambiguous CLI argument privacy repair and stronger genuine-
+capture and historical-v4 pagination evidence. Those amendments require their
+own pinned Sol reviews and full acceptance gate before B2 merge.
+
 | Slice | Goal | Files changed | Verification | Result | Next slice |
 |---|---|---|---|---|---|
 | Baseline | Preserve approved gates and worker rules in the repository | `AGENTS.md`, `docs/plans/x-trace/**`, `docs/progress.md` | File inventory, clean Git baseline, and push of `7eb002a` | Complete | Slice 1A foundation |

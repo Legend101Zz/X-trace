@@ -36,8 +36,10 @@ fs4 = "1.1.0"
 rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
+base64 = { workspace = true }
 blake3 = { workspace = true }
 prost = { workspace = true }
 rusqlite = { workspace = true }
 tempfile = "3.10"
+uuid = { workspace = true }
 zstd = { workspace = true }
