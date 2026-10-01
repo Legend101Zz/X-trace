@@ -3,7 +3,6 @@ package dev.xtrace.agent.bootstrap;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Objects;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -31,7 +30,7 @@ public final class BootstrapBridge {
     if (CONTEXT.get() != null || !"POST".equals(method) || !"/orders".equals(route)) return false;
     BridgeSink sink = SINK.get();
     if (sink == null) return false;
-    String recordingId = UUID.randomUUID().toString();
+    String recordingId = UuidV7.random().toString();
     long started = System.nanoTime();
     RequestContext context = new RequestContext(recordingId, started);
     if (!safeStart(sink, context, method, route)) {

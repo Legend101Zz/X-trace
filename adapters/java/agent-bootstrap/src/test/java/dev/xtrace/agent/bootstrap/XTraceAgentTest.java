@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -23,6 +24,21 @@ class XTraceAgentTest {
     assertThrows(IllegalArgumentException.class, () -> XTraceAgent.parseBootstrapPath(null));
     assertThrows(IllegalArgumentException.class, () -> XTraceAgent.parseBootstrapPath("  "));
     assertThrows(IllegalArgumentException.class, () -> XTraceAgent.parseBootstrapPath("bad\0path"));
+  }
+
+  @Test
+  void uuidV7EncodesUnixMillisecondsRfcBitsAndUniqueValues() {
+    long before = System.currentTimeMillis();
+    HashSet<UUID> identifiers = new HashSet<>();
+    for (int index = 0; index < 10_000; index++) {
+      UUID identifier = UuidV7.random();
+      assertEquals(7, identifier.version());
+      assertEquals(2, identifier.variant());
+      long timestamp = identifier.getMostSignificantBits() >>> 16;
+      assertTrue(timestamp >= before);
+      assertTrue(timestamp <= System.currentTimeMillis());
+      assertTrue(identifiers.add(identifier), "UUIDv7 collision");
+    }
   }
 
   @Test

@@ -153,6 +153,19 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
         .expect("linked observations");
     assert_eq!(operation_count, 1);
     assert_eq!(linked_count, 2);
+    let recording_ids = database
+        .prepare("SELECT recording_id FROM recordings")
+        .expect("prepare recording identity query")
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .expect("query recording identities")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read recording identities");
+    assert_eq!(recording_ids.len(), 2);
+    for bytes in recording_ids {
+        assert_eq!(bytes.len(), 16, "recording UUID width");
+        assert_eq!(bytes[6] >> 4, 7, "future Spring captures use UUIDv7");
+        assert_eq!(bytes[8] >> 6, 2, "recording UUID retains the RFC variant");
+    }
 
     let cli_pid =
         rustix::process::Pid::from_raw(process.child.id() as i32).expect("CLI process ID");

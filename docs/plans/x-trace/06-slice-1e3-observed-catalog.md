@@ -2,7 +2,8 @@
 
 - Status: Proposed bounded design; not implementation authorization.
 - Depends on the merged 1E.1 read/query seam and 1E.2 local viewer.
-- Identity decision: [ADR 0001](../../decisions/0001-operation-id-and-endpoint-fingerprint.md).
+- Identity decisions: [ADR 0001](../../decisions/0001-operation-id-and-endpoint-fingerprint.md)
+  and [ADR 0002](../../decisions/0002-recording-id-read-compatibility.md).
 - Scope: one real `xtrace run` journey against the checked-in Spring fixture.
 
 ## User-visible outcome and truth boundary
