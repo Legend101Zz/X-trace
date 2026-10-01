@@ -6,6 +6,7 @@
 ## 1. Identifier and hash rules
 
 - Public entity IDs are UUIDv7 values encoded as lowercase canonical strings. They are time-sortable without making timestamps authoritative.
+- `RecordingId` read compatibility is the recording-specific exception in [ADR 0002](../../decisions/0002-recording-id-read-compatibility.md): observed reads and continuation cursors accept canonical RFC UUIDv4 or UUIDv7 while future Java captures use UUIDv7.
 - Content identities use BLAKE3-256 encoded as lowercase hexadecimal and tagged with the algorithm, for example `b3:…`.
 - Database rows store UUIDs as 16-byte blobs and hashes as 32-byte blobs. APIs use strings.
 - Wall-clock timestamps use UTC RFC 3339 with microsecond precision. Durations and event ordering use monotonic nanoseconds from the adapter process.

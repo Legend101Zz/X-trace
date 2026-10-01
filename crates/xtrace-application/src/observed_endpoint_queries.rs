@@ -594,7 +594,7 @@ fn decode_recording_cursor(
     }
     let recording_id = canonical_id::<RecordingId>(&value.last.recording_id)?;
     let recording_uuid = recording_id.as_uuid();
-    if recording_uuid.get_version_num() != 7
+    if !matches!(recording_uuid.get_version_num(), 4 | 7)
         || recording_uuid.get_variant() != uuid::Variant::RFC4122
     {
         return Err(());
@@ -695,19 +695,27 @@ mod tests {
             &self,
             _project_id: ProjectId,
             _operation_id: OperationId,
-            _after: Option<&ObservedRecordingKey>,
+            after: Option<&ObservedRecordingKey>,
             limit: u32,
         ) -> Result<(Vec<ObservedRecordingRecord>, bool), PortError> {
-            self.calls.lock().expect("lock").push(("operation".into(), limit, None));
+            self.calls.lock().expect("lock").push((
+                "operation".into(),
+                limit,
+                after.map(|key| key.recording_id.to_string()),
+            ));
             Ok((Vec::new(), false))
         }
         fn list_unmatched_recordings(
             &self,
             _project_id: ProjectId,
-            _after: Option<&ObservedRecordingKey>,
+            after: Option<&ObservedRecordingKey>,
             limit: u32,
         ) -> Result<(Vec<ObservedRecordingRecord>, bool), PortError> {
-            self.calls.lock().expect("lock").push(("unmatched".into(), limit, None));
+            self.calls.lock().expect("lock").push((
+                "unmatched".into(),
+                limit,
+                after.map(|key| key.recording_id.to_string()),
+            ));
             Ok((Vec::new(), false))
         }
     }
@@ -919,10 +927,43 @@ mod tests {
             CorrelationId::new(),
         )
         .expect("canonical JSON cursor with UUIDv4");
-        assert!(
+        let decoded_v4 =
             decode_recording_cursor(&v4_token, QueryKind::Operation, project, Some(operation))
-                .is_err()
-        );
+                .expect("canonical UUIDv4 continuation key remains supported");
+        assert_eq!(decoded_v4.last.recording_id, uuid_v4);
+
+        let decoded_v7 =
+            decode_recording_cursor(&token, QueryKind::Operation, project, Some(operation))
+                .expect("canonical UUIDv7 continuation key remains supported");
+        assert_eq!(decoded_v7.last.recording_id, key.recording_id);
+
+        for recording_id in [uuid_v4, key.recording_id] {
+            let continuation = encode_recording_cursor(
+                QueryKind::Operation,
+                project,
+                Some(operation),
+                ObservedRecordingKey { opened_at: key.opened_at.clone(), recording_id },
+                CorrelationId::new(),
+            )
+            .expect("recording continuation cursor");
+            let fake = Fake::default();
+            let service = ObservedEndpointQueryService::new(fake.clone());
+            service
+                .list_operation_recordings(
+                    ListOperationRecordings {
+                        project_id: project,
+                        operation_id: operation,
+                        limit: Some(1),
+                        cursor: Some(continuation),
+                    },
+                    CorrelationId::new(),
+                )
+                .expect("continue with canonical v4 or v7 recording ID");
+            assert_eq!(
+                fake.calls.lock().expect("calls")[0].2.as_deref(),
+                Some(recording_id.to_string().as_str())
+            );
+        }
 
         let non_rfc4122 = uuid::Uuid::parse_str("01890f3e-7c00-7000-0000-000000000001")
             .expect("UUIDv7 with non-RFC 4122 variant");
@@ -944,6 +985,35 @@ mod tests {
             decode_recording_cursor(&non_rfc_token, QueryKind::Operation, project, Some(operation))
                 .is_err()
         );
+
+        let invalid_versions = [
+            uuid::Uuid::parse_str("f47ac10b-58cc-1372-a567-0e02b2c3d479").expect("UUIDv1"),
+            uuid::Uuid::parse_str("f47ac10b-58cc-5372-a567-0e02b2c3d479").expect("UUIDv5"),
+            uuid::Uuid::nil(),
+        ];
+        for invalid_uuid in invalid_versions {
+            let invalid_key = ObservedRecordingKey {
+                opened_at: key.opened_at.clone(),
+                recording_id: RecordingId::from_uuid(invalid_uuid),
+            };
+            let invalid_token = encode_recording_cursor(
+                QueryKind::Operation,
+                project,
+                Some(operation),
+                invalid_key,
+                CorrelationId::new(),
+            )
+            .expect("canonical cursor with an invalid recording UUID");
+            assert!(
+                decode_recording_cursor(
+                    &invalid_token,
+                    QueryKind::Operation,
+                    project,
+                    Some(operation)
+                )
+                .is_err()
+            );
+        }
 
         let mut invalid = key.clone();
         invalid.opened_at = "not-a-time".into();

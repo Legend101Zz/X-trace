@@ -1494,7 +1494,7 @@ fn observed_recording_id_from_bytes(
 ) -> Result<RecordingId, RecordingStoreError> {
     let recording_id = recording_id_from_bytes(bytes, correlation_id)?;
     let uuid = recording_id.as_uuid();
-    if uuid.get_version_num() != 7 || uuid.get_variant() != uuid::Variant::RFC4122 {
+    if !matches!(uuid.get_version_num(), 4 | 7) || uuid.get_variant() != uuid::Variant::RFC4122 {
         return Err(recording_query_corrupt_error(correlation_id));
     }
     Ok(recording_id)
@@ -4520,12 +4520,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn observed_recording_queries_reject_persisted_uuid_v4_recording_ids() {
+    fn observed_recording_queries_preserve_canonical_v4_and_v7_recording_ids() {
         let fixture = on_disk_store("observed-query-v4-recording-id");
         let project_id = ProjectId::new();
         insert_project(&fixture.store, project_id);
         let view = fixture.store.recording_store(&fixture.root).expect("view");
-        let mut linked =
+        let uuid_v4_linked =
+            uuid::Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("UUIDv4");
+        let uuid_v4_unmatched =
+            uuid::Uuid::parse_str("d9428888-122b-4d34-9f4a-123456789abc").expect("UUIDv4");
+        let uuid_v4_legacy =
+            uuid::Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d47a").expect("UUIDv4");
+        let mut linked = request(
+            project_id,
+            RecordingId::from_uuid(uuid_v4_linked),
+            RuntimeSessionId::new(),
+            opened_at(),
+        );
+        let mut linked_v7 =
             request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
         linked.endpoint_observation = EndpointObservationInput {
             policy_id: Some("spring-orders-v1".to_owned()),
@@ -4534,57 +4546,142 @@ mod tests {
             method: "POST".to_owned(),
             route_template: "/orders".to_owned(),
         };
+        linked_v7.endpoint_observation = linked.endpoint_observation.clone();
         view.begin_recording(&linked).expect("linked recording");
-        let unmatched =
-            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        view.begin_recording(&linked_v7).expect("UUIDv7 linked recording");
+        let unmatched = request(
+            project_id,
+            RecordingId::from_uuid(uuid_v4_unmatched),
+            RuntimeSessionId::new(),
+            opened_at(),
+        );
         view.begin_recording(&unmatched).expect("unmatched recording");
+        let unmatched_v7 =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        view.begin_recording(&unmatched_v7).expect("UUIDv7 unmatched recording");
+        let legacy = request(
+            project_id,
+            RecordingId::from_uuid(uuid_v4_legacy),
+            RuntimeSessionId::new(),
+            opened_at(),
+        );
+        view.begin_recording(&legacy).expect("legacy recording");
+        fixture
+            .store
+            .lock()
+            .expect("connection")
+            .execute(
+                "DELETE FROM recording_endpoint_observations WHERE recording_id=?1",
+                [legacy.recording_id.as_uuid().as_bytes().to_vec()],
+            )
+            .expect("remove sidecar to model historical recording");
         let (endpoints, _) = view.list_observed_endpoints(project_id, None, 1).expect("endpoint");
         let operation_id = endpoints[0].operation_id;
 
-        let uuid_v4_linked =
-            uuid::Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("UUIDv4");
-        let uuid_v4_unmatched =
-            uuid::Uuid::parse_str("d9428888-122b-4d34-9f4a-123456789abc").expect("UUIDv4");
-        let connection = fixture.store.lock().expect("connection");
-        connection
-            .execute_batch("PRAGMA foreign_keys=OFF;")
-            .expect("disable foreign keys for corruption fixture");
-        for (recording_id, corrupt_id) in
-            [(linked.recording_id, uuid_v4_linked), (unmatched.recording_id, uuid_v4_unmatched)]
-        {
-            connection
-                .execute(
-                    "UPDATE recordings SET recording_id=?1 WHERE recording_id=?2",
-                    rusqlite::params![
-                        corrupt_id.as_bytes().to_vec(),
-                        recording_id.as_uuid().as_bytes().to_vec()
-                    ],
-                )
-                .expect("corrupt recording identifier");
-            connection
-                .execute(
-                    "UPDATE recording_endpoint_observations SET recording_id=?1 WHERE recording_id=?2",
-                    rusqlite::params![
-                        corrupt_id.as_bytes().to_vec(),
-                        recording_id.as_uuid().as_bytes().to_vec()
-                    ],
-                )
-                .expect("preserve sidecar join for corruption fixture");
+        let mut linked_ids = Vec::new();
+        let mut after = None;
+        loop {
+            let (page, has_more) = view
+                .list_operation_recordings(project_id, operation_id, after.as_ref(), 1)
+                .expect("linked query accepts canonical UUIDv4 and UUIDv7 IDs");
+            assert_eq!(page.len(), 1);
+            linked_ids.push(page[0].metadata.recording_id);
+            after = page.last().map(|row| ObservedRecordingKey {
+                opened_at: row.metadata.opened_at.clone(),
+                recording_id: row.metadata.recording_id,
+            });
+            if !has_more {
+                break;
+            }
         }
-        connection.execute_batch("PRAGMA foreign_keys=ON;").expect("restore foreign keys");
-        drop(connection);
+        assert_eq!(linked_ids.len(), 2);
+        assert!(linked_ids.contains(&linked.recording_id));
+        assert!(linked_ids.contains(&linked_v7.recording_id));
+        assert!(linked_ids.iter().any(|id| id.as_uuid() == uuid_v4_linked));
 
-        let linked_error = view
-            .list_operation_recordings(project_id, operation_id, None, 1)
-            .expect_err("linked query must reject UUIDv4 persisted identity");
-        assert_eq!(linked_error.kind(), RecordingStoreErrorKind::Corruption);
-        assert!(!linked_error.to_string().contains(&uuid_v4_linked.to_string()));
+        let mut unmatched_ids = Vec::new();
+        after = None;
+        loop {
+            let (page, has_more) = view
+                .list_unmatched_recordings(project_id, after.as_ref(), 1)
+                .expect("unmatched query accepts canonical UUIDv4 and UUIDv7 IDs");
+            assert_eq!(page.len(), 1);
+            unmatched_ids.push(page[0].metadata.recording_id);
+            after = page.last().map(|row| ObservedRecordingKey {
+                opened_at: row.metadata.opened_at.clone(),
+                recording_id: row.metadata.recording_id,
+            });
+            if !has_more {
+                break;
+            }
+        }
+        assert_eq!(unmatched_ids.len(), 3);
+        assert!(unmatched_ids.contains(&unmatched.recording_id));
+        assert!(unmatched_ids.contains(&unmatched_v7.recording_id));
+        assert!(unmatched_ids.iter().any(|id| id.as_uuid() == uuid_v4_unmatched));
+        let legacy_page =
+            view.list_unmatched_recordings(project_id, None, 10).expect("legacy unmatched page").0;
+        assert!(legacy_page.iter().any(|row| {
+            row.metadata.recording_id.as_uuid() == uuid_v4_legacy && row.unmatched_reason.is_none()
+        }));
+        let connection = fixture.store.lock().expect("connection");
+        for identifier in [uuid_v4_linked, uuid_v4_unmatched, uuid_v4_legacy] {
+            let stored_id: Vec<u8> = connection
+                .query_row(
+                    "SELECT recording_id FROM recordings WHERE recording_id=?1",
+                    [identifier.as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .expect("historical recording ID remains unchanged");
+            assert_eq!(stored_id, identifier.as_bytes());
+        }
+    }
 
-        let unmatched_error = view
-            .list_unmatched_recordings(project_id, None, 1)
-            .expect_err("unmatched query must reject UUIDv4 persisted identity");
-        assert_eq!(unmatched_error.kind(), RecordingStoreErrorKind::Corruption);
-        assert!(!unmatched_error.to_string().contains(&uuid_v4_unmatched.to_string()));
+    #[cfg(unix)]
+    #[test]
+    fn observed_recording_queries_reject_invalid_version_and_variant() {
+        let invalid_ids = [
+            uuid::Uuid::parse_str("f47ac10b-58cc-1372-a567-0e02b2c3d479").expect("UUIDv1"),
+            uuid::Uuid::parse_str("f47ac10b-58cc-5372-a567-0e02b2c3d479").expect("UUIDv5"),
+            uuid::Uuid::nil(),
+            uuid::Uuid::parse_str("01890f3e-7c00-7000-0000-000000000001").expect("non-RFC UUIDv7"),
+        ];
+        for (index, invalid_id) in invalid_ids.into_iter().enumerate() {
+            for linked in [false, true] {
+                let fixture =
+                    on_disk_store(&format!("observed-query-invalid-recording-id-{index}-{linked}"));
+                let project_id = ProjectId::new();
+                insert_project(&fixture.store, project_id);
+                let view = fixture.store.recording_store(&fixture.root).expect("view");
+                let mut recording = request(
+                    project_id,
+                    RecordingId::from_uuid(invalid_id),
+                    RuntimeSessionId::new(),
+                    opened_at(),
+                );
+                if linked {
+                    recording.endpoint_observation = EndpointObservationInput {
+                        policy_id: Some("spring-orders-v1".to_owned()),
+                        application_component: Some("spring-fixture".to_owned()),
+                        binding_key: Some("default".to_owned()),
+                        method: "POST".to_owned(),
+                        route_template: "/orders".to_owned(),
+                    };
+                }
+                view.begin_recording(&recording).expect("recording");
+                let error = if linked {
+                    let (endpoints, _) =
+                        view.list_observed_endpoints(project_id, None, 1).expect("endpoint");
+                    view.list_operation_recordings(project_id, endpoints[0].operation_id, None, 10)
+                        .expect_err("invalid linked UUID must fail closed")
+                } else {
+                    view.list_unmatched_recordings(project_id, None, 10)
+                        .expect_err("invalid unmatched UUID must fail closed")
+                };
+                assert_eq!(error.kind(), RecordingStoreErrorKind::Corruption);
+                assert!(!error.to_string().contains(&invalid_id.to_string()));
+            }
+        }
     }
 
     #[cfg(unix)]

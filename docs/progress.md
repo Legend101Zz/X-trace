@@ -17,11 +17,18 @@ the completed work, changes, verification, issues or decisions, remaining
 work, and exact next proposed phase before stopping for approval. No background
 automation may cross that approval boundary.
 
-Active bounded-batch exception: the user explicitly authorized continuing and
-merging individually reviewed phases during the current overnight batch, before
-morning. This authorization is limited to that batch and does not waive any
-per-slice implementation, independent-review, verification, or merge gate. The
-orchestrator will provide a consolidated review afterward.
+Active continuation authorization (2026-10-01): the user explicitly authorized
+reviewed phases to continue autonomously, with individual implementation,
+independent review, exact verification, merge/push, CI, and progress gates.
+The user accepted the recording-ID compatibility proposal: preserve canonical
+RFC UUIDv4/v7 recording identities in observed reads and cursors, retain UUIDv7
+project/operation identities, and generate UUIDv7 for future real captures.
+Implement this as a separately reviewed ADR/prerequisite before completing B2.
+Use GPT-6 Luna for implementation and GPT-6 Sol for reviews because Terra is
+unavailable, as the user instructed. The orchestrator alone merges and pushes;
+stop for any new material architecture/product decision. Do not use PIO,
+OpenCode, MiniMax, Kimi, or GLM. No failing candidate is accepted by this
+workflow authorization; all required gates still apply.
 
 | Slice | Goal | Files changed | Verification | Result | Next slice |
 |---|---|---|---|---|---|
