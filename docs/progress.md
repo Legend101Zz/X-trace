@@ -106,3 +106,51 @@ endpoint-first browser UI and its real journey follow the HTTP contract.
 | Slice | Goal | Files changed | Verification | Result | Next slice |
 |---|---|---|---|---|---|
 | Recording-ID compatibility prerequisite | Preserve historical identities and generate v7 for future Java captures | Feature `8973b248`; store/app recording validation, Java bootstrap/tests, ADR 0002, narrow plan references, real Spring test | Independent Sol architecture/security/build reviews, exact feature and postmerge gates, CI `36817040759` / `36817399287` | Reviewed, merged, pushed; no broader framework or B2 query claim | Slice 1E.3B2 real CLI acceptance and privacy repair |
+
+## Slice 1E.3B2 reviewed and merged (2026-10-01)
+
+Source feature `73b085765818a5ae28460361a52a268afcb59ea6`; feature head
+`084488f55b2bdf6d7f060b8beee28b110d0e0efe`; no-ff merge
+`cbc245b3ccbaa90bd1514be5f4fb9a982fd0c93e`. Feature CI `36818429219`
+and main CI `36819077501` passed all four jobs (aggregate gates, Node,
+Java 17, and Java 21). Luna implemented; Sol independently approved the
+complete pinned architecture/security diff and separately audited build and
+integration evidence. The orchestrator inspected the complete diff and ran
+the exact gates on both feature and merged main.
+
+The bounded `endpoint list`, `endpoint recordings OPERATION_ID`, and explicit
+`recording list --unmatched` JSON commands use the shared observed query service
+and DTOs. Legacy recording-list `--after` behavior remains available. Conflicting
+modes fail before storage opens. Malformed leading-hyphen and ambiguous arguments
+produce static correlated JSON errors without echoing raw input; help/version
+remain available. Shared service limits, canonical scoped cursors, safe NotFound,
+and v4/v7 recording compatibility are preserved.
+
+All eight gates passed on feature and merged main: formatting, strict locked
+workspace/all-target/all-feature Clippy, strict locked all-feature rustdoc,
+focused tests (215 passed), full locked all-feature workspace tests (450 passed
+including doctest), a fresh restricted-PATH locked workspace build with no
+system protoc, and worktree/committed diff checks. Fresh strict Java
+clean/test/installDist/agentDist/fixtureBootJar passed. Seven disposable-project
+parser/help probes passed. The genuine Spring captures are queried and paged
+before supplemental linked/unmatched fixtures; assertions then cover historical
+v4 continuation, stable timestamp ties, malformed/stale/cross-scope cursors,
+unknown/cross-project lookup, privacy canaries, and unchanged SQLite, pointer,
+and XTF bytes and metadata. The previously blocked assertions now all run.
+
+Boundary: the finite policy permits one endpoint per project, so endpoint
+continuation boundaries are tested without fabricating multi-endpoint discovery.
+Supplemental synthetic rows exercise ordering and unmatched compatibility; they
+do not stand in for actual captures. The existing recording-first browser journey
+passes, but B2 adds no HTTP routes or endpoint-first UI and does not complete
+Slice 1E.3 or the broader Slice 1 journey.
+
+Next bounded phase: Slice 1E.3C, the three approved observed-query HTTP routes
+plus OpenAPI/generated client types. Preserve viewer authentication, query-lane
+bounds, legacy response behavior, safe errors, and shared DTOs; verify actual
+authenticated reads of persisted Spring and historical-v4 unmatched recordings.
+The endpoint-first browser and real visual journey follow the stable HTTP seam.
+
+| Slice | Goal | Files changed | Verification | Result | Next slice |
+|---|---|---|---|---|---|
+| Slice 1E.3B2 | Expose bounded endpoint/linked/unmatched CLI JSON through the shared service | CLI commands/parser/output, test-only temp paths, Spring integration, dev dependencies/lock, setup/progress | Sol architecture/security/build approvals; exact feature/postmerge eight gates; 215 focused and 450 workspace tests; CI `36818429219` / `36819077501` | Reviewed, merged, pushed, CI-green; no endpoint-first browser claim | Slice 1E.3C HTTP/OpenAPI |
