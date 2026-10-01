@@ -4,8 +4,10 @@ info:
   version: 1.0.0
   description: >-
     Same-origin, loopback-only read API for persisted recording metadata and
-    bounded verified event windows. Source, captured values, endpoint catalog,
-    durations, and completion claims are not projected by this API. Every
+    bounded verified event windows. It also exposes a finite persisted
+    observed-endpoint projection for the exact Spring fixture policy; it does
+    not claim framework discovery or catalog completeness. Source, captured
+    values, durations, and completion claims are not projected by this API. Every
     request must carry the exact Host authority printed by viewer readiness,
     Sec-Fetch-Site: same-origin, and X-XTrace-Client: viewer-v1. There is no
     CORS support. Authentication POST requests require an exact same-origin
@@ -71,21 +73,129 @@ paths:
         - $ref: '#/components/parameters/OptionalApiOrigin'
         - in: query
           name: limit
-          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: >-
+            Legacy mode (unmatched absent): default 50, maximum 200. Observed
+            unmatched mode (unmatched=true): default 25, maximum 50. Values
+            outside the active mode's bounds are rejected.
+          schema: { type: integer, minimum: 1, maximum: 200 }
         - in: query
           name: after
-          description: Exclusive stable recording identity cursor.
+          description: >-
+            Exclusive stable legacy recording identity cursor. Accepted only
+            when unmatched is absent.
           schema: { type: string, format: uuid }
+        - in: query
+          name: unmatched
+          description: >-
+            When exactly true, selects the observed unmatched-recording projection,
+            including legacy sidecar-absent recordings. When absent, the legacy
+            recordings response and after cursor remain unchanged. Other values are
+            rejected. This is an observed projection, not a complete endpoint catalog.
+          schema: { type: boolean, const: true }
+        - in: query
+          name: cursor
+          description: >-
+            Opaque shared application cursor. Accepted only with unmatched=true;
+            cannot be combined with after.
+          schema: { type: string, maxLength: 2048, pattern: '^[A-Za-z0-9_-]+$' }
       responses:
         '200':
-          description: Bounded metadata-only page in deterministic order.
+          description: >-
+            With unmatched absent, returns the unchanged legacy page. With
+            unmatched=true, returns the shared observed-recording page in stable
+            descending openedAt and recordingId order.
+          headers:
+            X-XTrace-Request-Id:
+              description: Correlation ID shared with safe problem responses.
+              schema: { type: string, format: uuid }
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/RecordingList' }
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/RecordingList'
+                  - $ref: '#/components/schemas/ObservedRecordingPage'
         '400': { $ref: '#/components/responses/Problem' }
         '401': { $ref: '#/components/responses/Problem' }
         '403': { $ref: '#/components/responses/Problem' }
         '413': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+  /api/v1/endpoints:
+    get:
+      operationId: listObservedEndpoints
+      summary: List bounded persisted endpoint observations.
+      description: >-
+        Lists only persisted observations accepted under the finite
+        spring-orders-v1 operator-selected policy. The policy does not attest
+        which adapter or application produced the event, and this endpoint does
+        not claim framework handler discovery or catalog completeness.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/OptionalApiOrigin'
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - in: query
+          name: cursor
+          description: Shared canonical query and project-bound continuation cursor.
+          schema: { type: string, maxLength: 2048, pattern: '^[A-Za-z0-9_-]+$' }
+      responses:
+        '200':
+          description: Direct shared application page with no transport wrapper.
+          headers:
+            X-XTrace-Request-Id:
+              description: Correlation ID shared with safe problem responses.
+              schema: { type: string, format: uuid }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ObservedEndpointPage' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+  /api/v1/endpoints/{operationId}/recordings:
+    get:
+      operationId: listOperationRecordings
+      summary: List recordings explicitly linked to one observed operation.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/OptionalApiOrigin'
+        - in: path
+          name: operationId
+          required: true
+          description: Canonical lowercase RFC UUIDv7 public operation identity.
+          schema: { type: string, format: uuid, pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 50, default: 25 }
+        - in: query
+          name: cursor
+          description: Shared project and operation bound continuation cursor.
+          schema: { type: string, maxLength: 2048, pattern: '^[A-Za-z0-9_-]+$' }
+      responses:
+        '200':
+          description: Direct shared application page of linked recordings.
+          headers:
+            X-XTrace-Request-Id:
+              description: Correlation ID shared with safe problem responses.
+              schema: { type: string, format: uuid }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ObservedRecordingPage' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
         '404': { $ref: '#/components/responses/Problem' }
         '422': { $ref: '#/components/responses/Problem' }
         '500': { $ref: '#/components/responses/Problem' }
@@ -167,6 +277,10 @@ components:
   responses:
     Problem:
       description: Safe RFC 9457-like problem document.
+      headers:
+        X-XTrace-Request-Id:
+          description: Correlation ID included in the problem body.
+          schema: { type: string, format: uuid }
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
@@ -203,6 +317,62 @@ components:
         firstSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
         lastSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
         incompleteEvidence: { type: array, items: { type: string } }
+    ObservedEndpointPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/ObservedEndpoint' }
+        nextCursor: { type: [string, 'null'], maxLength: 2048 }
+    ObservedEndpoint:
+      type: object
+      required: [operationId, projectId, applicationComponent, binding, method, routeTemplate, observation, observationPolicy]
+      properties:
+        operationId:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+        projectId:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+        applicationComponent: { type: string, const: spring-fixture }
+        binding: { type: string, const: default }
+        method: { type: string, const: POST }
+        routeTemplate: { type: string, const: /orders }
+        observation: { type: string, const: observed }
+        observationPolicy:
+          type: string
+          const: spring-orders-v1
+          description: Operator-selected policy; it does not attest the adapter or application.
+    ObservedRecordingPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/ObservedRecording' }
+        nextCursor: { type: [string, 'null'], maxLength: 2048 }
+    ObservedRecording:
+      type: object
+      required: [recordingId, status, openedAt, segmentCount, eventCount, firstSequence, lastSequence, incompleteEvidence, operationId, observationPolicy, unmatchedReason]
+      properties:
+        recordingId: { type: string, format: uuid }
+        status: { type: string, enum: [recording, finalizing, complete, partial, invalid] }
+        openedAt: { type: string, format: date-time }
+        segmentCount: { type: string, pattern: '^[0-9]+$' }
+        eventCount: { type: string, pattern: '^[0-9]+$' }
+        firstSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
+        lastSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
+        incompleteEvidence: { type: array, items: { type: string } }
+        operationId: { type: [string, 'null'], format: uuid }
+        observationPolicy: { type: [string, 'null'], enum: [spring-orders-v1, null] }
+        unmatchedReason:
+          type: [string, 'null']
+          enum: [observation_policy_missing, observation_policy_invalid, identity_context_missing, identity_context_invalid, method_unsupported, route_unapproved, null]
     RecordingDetail:
       type: object
       required: [schemaVersion, projectId, recordingId, status, limit, cursor, nextCursor, segmentCount, events, incompleteEvidence, unavailable, requestId]

@@ -10,6 +10,7 @@
 use std::fs;
 use std::io::BufRead as _;
 use std::io::{Read, Write as _};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -35,6 +36,12 @@ struct RunProcess {
 struct ViewerProcess {
     child: Child,
     stderr: Option<thread::JoinHandle<Vec<u8>>>,
+}
+
+struct ViewerHttpSession {
+    host: String,
+    origin: String,
+    cookie: String,
 }
 
 impl Drop for ViewerProcess {
@@ -324,8 +331,104 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
         "captured Spring continuation has no duplicate recordings"
     );
 
+    let other_repo = root.path().join("other repository");
+    fs::create_dir_all(&other_repo).expect("other repository");
+    let other_data = root.path().join("other data");
+    let other_init = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["init", "--project-dir"])
+        .arg(&other_repo)
+        .env("XTRACE_DATA_HOME", &other_data)
+        .output()
+        .expect("initialize isolated project");
+    assert!(other_init.status.success());
+
+    let mut first_viewer = launch_viewer(&repo, &data_home);
+    let first_session = viewer_http_session(&first_viewer.0);
+    let http_endpoint = viewer_get_json_with_session(&first_session, "/api/v1/endpoints");
+    assert_eq!(http_endpoint.0, 200, "authenticated endpoint HTTP read succeeds");
+    let http_endpoint_page: Value =
+        serde_json::from_str(&http_endpoint.1).expect("HTTP endpoint page");
+    assert_eq!(http_endpoint_page, endpoint_json, "HTTP endpoint DTOs match the CLI shared DTOs");
+    let mut linked_http_ids = Vec::new();
+    let mut linked_cursor = None;
+    for page_index in 0..3 {
+        let linked_cli =
+            endpoint_recordings_page(&repo, &data_home, &operation_id, 1, linked_cursor.as_deref());
+        assert!(linked_cli.status.success());
+        let linked_cli_page: Value =
+            serde_json::from_slice(&linked_cli.stdout).expect("linked CLI page");
+        let mut path = format!("/api/v1/endpoints/{operation_id}/recordings?limit=1");
+        if let Some(cursor) = linked_cursor.as_deref() {
+            path.push_str("&cursor=");
+            path.push_str(cursor);
+        }
+        let http_linked = viewer_get_json_with_session(&first_session, &path);
+        assert_eq!(http_linked.0, 200, "authenticated linked HTTP page succeeds");
+        let http_linked_page: Value =
+            serde_json::from_str(&http_linked.1).expect("HTTP linked page");
+        assert_eq!(http_linked_page, linked_cli_page, "HTTP and CLI linked pages share DTOs");
+        for item in http_linked_page["items"].as_array().expect("linked HTTP items") {
+            linked_http_ids.push(item["recordingId"].as_str().expect("recording ID").to_owned());
+        }
+        linked_cursor = http_linked_page["nextCursor"].as_str().map(str::to_owned);
+        if linked_cursor.is_none() {
+            break;
+        }
+        assert!(page_index < 2, "real linked HTTP continuation terminates");
+    }
+    assert_eq!(linked_http_ids, genuine_linked_ids);
+
+    // Project scoping is enforced by the authenticated HTTP handlers as well as the CLI.
+    let mut unknown_bytes = OperationId::new().as_uuid().into_bytes();
+    unknown_bytes[6] = (unknown_bytes[6] & 0x0f) | 0x70;
+    unknown_bytes[8] = (unknown_bytes[8] & 0x3f) | 0x80;
+    let http_unknown_id = OperationId::from_uuid(uuid::Uuid::from_bytes(unknown_bytes)).to_string();
+    let unknown_http = viewer_get_json_with_session(
+        &first_session,
+        &format!("/api/v1/endpoints/{http_unknown_id}/recordings"),
+    );
+    assert_eq!(unknown_http.0, 404, "canonical unknown operation has safe HTTP 404");
+    let mut other_viewer = launch_viewer(&other_repo, &other_data);
+    let other_session = viewer_http_session(&other_viewer.0);
+    let cross_project_http = viewer_get_json_with_session(
+        &other_session,
+        &format!("/api/v1/endpoints/{operation_id}/recordings"),
+    );
+    assert_eq!(cross_project_http.0, 404, "foreign operation has safe HTTP 404");
+    let mut unknown_problem: Value =
+        serde_json::from_str(&unknown_http.1).expect("unknown HTTP problem JSON");
+    let mut cross_project_problem: Value =
+        serde_json::from_str(&cross_project_http.1).expect("cross-project HTTP problem JSON");
+    unknown_problem.as_object_mut().expect("unknown problem object").remove("requestId");
+    cross_project_problem
+        .as_object_mut()
+        .expect("cross-project problem object")
+        .remove("requestId");
+    assert_eq!(cross_project_problem, unknown_problem);
+    assert!(!cross_project_http.1.contains(&operation_id));
+
+    // A main-project continuation cursor is rejected by the second project's HTTP handler.
+    let cursor_page = viewer_get_json_with_session(
+        &first_session,
+        &format!("/api/v1/endpoints/{operation_id}/recordings?limit=1"),
+    );
+    assert_eq!(cursor_page.0, 200);
+    let cursor_page: Value = serde_json::from_str(&cursor_page.1).expect("HTTP cursor page");
+    let main_project_recording_cursor =
+        cursor_page["nextCursor"].as_str().expect("main project continuation cursor");
+    let cross_project_cursor_http = viewer_get_json_with_session(
+        &other_session,
+        &format!(
+            "/api/v1/endpoints/{operation_id}/recordings?limit=1&cursor={main_project_recording_cursor}"
+        ),
+    );
+    assert_eq!(cross_project_cursor_http.0, 400, "foreign cursor has safe HTTP 400");
+    assert!(!cross_project_cursor_http.1.contains(main_project_recording_cursor));
+    stop_viewer(&mut other_viewer.1);
+    stop_viewer(&mut first_viewer.1);
+
     // Add bounded query fixtures only after selecting the real Spring recording for detail/browser checks.
-    let (tie_ids, _unmatched_id, _legacy_id) =
+    let (tie_ids, _unmatched_id, legacy_v4_id) =
         add_endpoint_cli_fixture_recordings(&project_root, &project_id);
     let database_before_queries = fs::read(&database).expect("database after query fixture setup");
     let pointer_before_query_fixtures = file_state(&pointer);
@@ -487,16 +590,6 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     let unknown_id = OperationId::from_uuid(uuid::Uuid::from_bytes(unknown_bytes)).to_string();
     let unknown = endpoint_recordings_page(&repo, &data_home, &unknown_id, 1, None);
 
-    let other_repo = root.path().join("other repository");
-    fs::create_dir_all(&other_repo).expect("other repository");
-    let other_init = Command::new(env!("CARGO_BIN_EXE_xtrace"))
-        .args(["init", "--project-dir"])
-        .arg(&other_repo)
-        .env("XTRACE_DATA_HOME", root.path().join("other data"))
-        .output()
-        .expect("initialize isolated project");
-    assert!(other_init.status.success());
-    let other_data = root.path().join("other data");
     let empty_endpoints = endpoint_list_page(&other_repo, &other_data, None, None);
     assert!(empty_endpoints.status.success());
     let empty_page: Value =
@@ -665,13 +758,17 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
         .arg(workspace.join("web/app/scripts/browser-journey.mjs"))
         .arg(first_recording)
         .arg(serde_json::to_string(&expected_sequences).expect("expected sequence JSON"))
+        .arg(&operation_id)
+        .arg(&legacy_v4_id)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut browser = browser.spawn().expect("start Chromium browser journey");
     let mut browser_stdin = browser.stdin.take().expect("browser journey stdin");
+    let mut browser_context = readiness.clone();
+    browser_context["expectedUnmatchedIds"] = serde_json::json!(&unmatched_ids);
     browser_stdin
-        .write_all(serde_json::to_string(&readiness).expect("readiness JSON").as_bytes())
+        .write_all(serde_json::to_string(&browser_context).expect("readiness JSON").as_bytes())
         .expect("send viewer URL to browser through stdin");
     drop(browser_stdin);
     let browser_result = browser.wait_with_output().expect("wait for browser journey");
@@ -691,19 +788,7 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
             !browser_result.stderr.windows(canary.len()).any(|bytes| bytes == canary.as_bytes())
         );
     }
-    let stderr = viewer.1.stderr.take().expect("viewer stderr thread");
-    let viewer_pid =
-        rustix::process::Pid::from_raw(viewer.1.child.id() as i32).expect("viewer process ID");
-    rustix::process::kill_process(viewer_pid, rustix::process::Signal::TERM)
-        .expect("stop foreground viewer");
-    let viewer_status = viewer.1.child.wait().expect("wait for viewer shutdown");
-    assert_eq!(
-        viewer_status.code(),
-        Some(0),
-        "viewer SIGTERM should be a clean foreground shutdown"
-    );
-    let viewer_stderr = stderr.join().expect("join viewer stderr");
-    assert_canaries_absent(&viewer_stderr);
+    stop_viewer(&mut viewer.1);
     assert_eq!(fs::read(&database).expect("database after viewer"), database_before_queries);
     assert_eq!(file_state(&pointer), pointer_before_queries);
 
@@ -1292,6 +1377,73 @@ fn launch_viewer(repo: &Path, data_home: &Path) -> (Value, ViewerProcess) {
     assert_eq!(readiness["browserLaunch"], "not_requested");
     assert!(readiness["url"].as_str().is_some_and(|url| url.starts_with("http://127.0.0.1:")));
     (readiness, ViewerProcess { child, stderr: Some(stderr) })
+}
+
+fn viewer_http_session(readiness: &Value) -> ViewerHttpSession {
+    let url = readiness["url"].as_str().expect("viewer URL");
+    let (origin, token) = url.split_once("/#token=").expect("bootstrap token fragment");
+    let host = origin.strip_prefix("http://").expect("loopback HTTP origin").to_owned();
+    let body = serde_json::json!({"token": token}).to_string();
+    let response = viewer_http_request(
+        &host,
+        &format!(
+            "POST /api/v1/auth/exchange HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nSec-Fetch-Site: same-origin\r\nX-XTrace-Client: viewer-v1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "viewer bootstrap exchange failed");
+    let cookie = response
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .and_then(|line| line.split_once(':'))
+        .map(|(_, value)| value.trim().split(';').next().expect("cookie pair").to_owned())
+        .expect("viewer session cookie");
+    ViewerHttpSession { host, origin: origin.to_owned(), cookie }
+}
+
+fn viewer_get_json_with_session(session: &ViewerHttpSession, path: &str) -> (u16, String) {
+    let response = viewer_http_request(
+        &session.host,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\nOrigin: {}\r\nSec-Fetch-Site: same-origin\r\nX-XTrace-Client: viewer-v1\r\nCookie: {}\r\nConnection: close\r\n\r\n",
+            session.host, session.origin, session.cookie
+        ),
+    );
+    let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response headers");
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("HTTP status");
+    assert!(headers.to_ascii_lowercase().contains("x-xtrace-request-id:"));
+    assert!(headers.to_ascii_lowercase().contains("cache-control: no-store"));
+    (status, body.to_owned())
+}
+
+fn viewer_http_request(host: &str, request: &str) -> String {
+    let mut stream = TcpStream::connect(host).expect("connect loopback viewer");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("set viewer response deadline");
+    stream.set_write_timeout(Some(Duration::from_secs(5))).expect("set viewer request deadline");
+    stream.write_all(request.as_bytes()).expect("write viewer request");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read viewer response");
+    response
+}
+
+fn stop_viewer(viewer: &mut ViewerProcess) {
+    let stderr = viewer.stderr.take().expect("viewer stderr thread");
+    let viewer_pid =
+        rustix::process::Pid::from_raw(viewer.child.id() as i32).expect("viewer process ID");
+    rustix::process::kill_process(viewer_pid, rustix::process::Signal::TERM)
+        .expect("stop foreground viewer");
+    let viewer_status = viewer.child.wait().expect("wait for viewer shutdown");
+    assert_eq!(
+        viewer_status.code(),
+        Some(0),
+        "viewer SIGTERM should be a clean foreground shutdown"
+    );
+    assert_canaries_absent(&stderr.join().expect("join viewer stderr"));
 }
 
 fn assert_canaries_absent(bytes: &[u8]) {

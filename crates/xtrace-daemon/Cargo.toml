@@ -52,3 +52,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sy
 # never strands an unwiped bootstrap artifact or secret-bearing file.
 tempfile = "3.10"
 xtrace-store = { path = "../xtrace-store" }
+rusqlite.workspace = true

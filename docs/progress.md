@@ -154,3 +154,31 @@ The endpoint-first browser and real visual journey follow the stable HTTP seam.
 | Slice | Goal | Files changed | Verification | Result | Next slice |
 |---|---|---|---|---|---|
 | Slice 1E.3B2 | Expose bounded endpoint/linked/unmatched CLI JSON through the shared service | CLI commands/parser/output, test-only temp paths, Spring integration, dev dependencies/lock, setup/progress | Sol architecture/security/build approvals; exact feature/postmerge eight gates; 215 focused and 450 workspace tests; CI `36818429219` / `36819077501` | Reviewed, merged, pushed, CI-green; no endpoint-first browser claim | Slice 1E.3C HTTP/OpenAPI |
+
+## User-requested pause / SSD removal checkpoint (2026-10-01)
+
+The user explicitly requested stopping and committing current work before
+disconnecting the SSD. Implementation and both Sol review agents were stopped.
+Main remains clean and pushed at `c1527544922785892d90d8c527235ad530f24b41`;
+B2 merge `cbc245b3ccbaa90bd1514be5f4fb9a982fd0c93e` and checkpoint CI
+`36819456708` are green across all four jobs.
+
+The isolated `slice/1e3c-http-api` branch preserves unfinished HTTP/OpenAPI work:
+shared observed service composition, three observed GET modes, strict bounded
+query parsing, canonical operation validation, safe correlated problems,
+OpenAPI schemas, and partial real Spring HTTP/browser acceptance additions.
+`git diff --check` passes. Luna reported focused daemon tests passing before
+the latest integration additions; that report is not an independent final gate.
+
+This is a WIP preservation commit, not an accepted phase. Complete pinned Sol
+architecture/security reviews, generated OpenAPI TypeScript, HTTP corruption/
+saturation/scoped-cursor coverage, real Spring pagination/restart/privacy checks,
+the exact eight gates, feature CI, and merge/postmerge verification remain
+pending. No HTTP feature was merged or pushed to main; no endpoint-first UI was
+implemented. The browser acceptance script and integration additions were still
+being edited when work stopped and must be verified on resume.
+
+Resume only after the user requests continuation with the SSD mounted. Start
+from this checkpoint and current Git/process truth, finish and amend this same
+bounded feature, then review and verify before publishing/merging. Preserve B2
+and the accepted ADR 0002; do not recreate or re-key completed work.

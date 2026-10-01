@@ -1604,6 +1604,7 @@ dependencies = [
  "prost",
  "rcgen",
  "ring",
+ "rusqlite",
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",

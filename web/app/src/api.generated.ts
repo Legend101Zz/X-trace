@@ -37,6 +37,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/endpoints": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List bounded persisted endpoint observations.
+         * @description Lists only persisted observations accepted under the finite spring-orders-v1 operator-selected policy. The policy does not attest which adapter or application produced the event, and this endpoint does not claim framework handler discovery or catalog completeness.
+         */
+        get: operations["listObservedEndpoints"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/endpoints/{operationId}/recordings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List recordings explicitly linked to one observed operation. */
+        get: operations["listOperationRecordings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/recordings/{recordingId}": {
         parameters: {
             query?: never;
@@ -90,6 +127,54 @@ export interface components {
             firstSequence?: string | null;
             lastSequence?: string | null;
             incompleteEvidence: string[];
+        };
+        ObservedEndpointPage: {
+            items: components["schemas"]["ObservedEndpoint"][];
+            nextCursor: string | null;
+        };
+        ObservedEndpoint: {
+            /** Format: uuid */
+            operationId: string;
+            /** Format: uuid */
+            projectId: string;
+            /** @constant */
+            applicationComponent: "spring-fixture";
+            /** @constant */
+            binding: "default";
+            /** @constant */
+            method: "POST";
+            /** @constant */
+            routeTemplate: "/orders";
+            /** @constant */
+            observation: "observed";
+            /**
+             * @description Operator-selected policy; it does not attest the adapter or application.
+             * @constant
+             */
+            observationPolicy: "spring-orders-v1";
+        };
+        ObservedRecordingPage: {
+            items: components["schemas"]["ObservedRecording"][];
+            nextCursor: string | null;
+        };
+        ObservedRecording: {
+            /** Format: uuid */
+            recordingId: string;
+            /** @enum {string} */
+            status: "recording" | "finalizing" | "complete" | "partial" | "invalid";
+            /** Format: date-time */
+            openedAt: string;
+            segmentCount: string;
+            eventCount: string;
+            firstSequence: string | null;
+            lastSequence: string | null;
+            incompleteEvidence: string[];
+            /** Format: uuid */
+            operationId: string | null;
+            /** @enum {string|null} */
+            observationPolicy: "spring-orders-v1" | null;
+            /** @enum {string|null} */
+            unmatchedReason: "observation_policy_missing" | "observation_policy_invalid" | "identity_context_missing" | "identity_context_invalid" | "method_unsupported" | "route_unapproved" | null;
         };
         RecordingDetail: {
             /** @constant */
@@ -150,6 +235,8 @@ export interface components {
         /** @description Safe RFC 9457-like problem document. */
         Problem: {
             headers: {
+                /** @description Correlation ID included in the problem body. */
+                "X-XTrace-Request-Id"?: string;
                 [name: string]: unknown;
             };
             content: {
@@ -220,9 +307,14 @@ export interface operations {
     listRecordings: {
         parameters: {
             query?: {
+                /** @description Legacy mode (unmatched absent): default 50, maximum 200. Observed unmatched mode (unmatched=true): default 25, maximum 50. Values outside the active mode's bounds are rejected. */
                 limit?: number;
-                /** @description Exclusive stable recording identity cursor. */
+                /** @description Exclusive stable legacy recording identity cursor. Accepted only when unmatched is absent. */
                 after?: string;
+                /** @description When exactly true, selects the observed unmatched-recording projection, including legacy sidecar-absent recordings. When absent, the legacy recordings response and after cursor remain unchanged. Other values are rejected. This is an observed projection, not a complete endpoint catalog. */
+                unmatched?: true;
+                /** @description Opaque shared application cursor. Accepted only with unmatched=true; cannot be combined with after. */
+                cursor?: string;
             };
             header: {
                 /** @description Exact 127.0.0.1 authority, including the viewer's assigned port. */
@@ -239,13 +331,15 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Bounded metadata-only page in deterministic order. */
+            /** @description With unmatched absent, returns the unchanged legacy page. With unmatched=true, returns the shared observed-recording page in stable descending openedAt and recordingId order. */
             200: {
                 headers: {
+                    /** @description Correlation ID shared with safe problem responses. */
+                    "X-XTrace-Request-Id"?: string;
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RecordingList"];
+                    "application/json": components["schemas"]["RecordingList"] | components["schemas"]["ObservedRecordingPage"];
                 };
             };
             400: components["responses"]["Problem"];
@@ -253,6 +347,93 @@ export interface operations {
             403: components["responses"]["Problem"];
             404: components["responses"]["Problem"];
             413: components["responses"]["Problem"];
+            422: components["responses"]["Problem"];
+            500: components["responses"]["Problem"];
+            503: components["responses"]["Problem"];
+        };
+    };
+    listObservedEndpoints: {
+        parameters: {
+            query?: {
+                limit?: number;
+                /** @description Shared canonical query and project-bound continuation cursor. */
+                cursor?: string;
+            };
+            header: {
+                /** @description Exact 127.0.0.1 authority, including the viewer's assigned port. */
+                Host: components["parameters"]["ViewerHost"];
+                /** @description Must be exactly same-origin. */
+                "Sec-Fetch-Site": components["parameters"]["ViewerFetchSite"];
+                /** @description Required browser-client marker; must be exactly viewer-v1. */
+                "X-XTrace-Client": components["parameters"]["ViewerClient"];
+                /** @description If supplied, must exactly equal the printed viewer origin. It may be absent on browser GET requests only; Host, Sec-Fetch-Site, and X-XTrace-Client remain required. */
+                Origin?: components["parameters"]["OptionalApiOrigin"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Direct shared application page with no transport wrapper. */
+            200: {
+                headers: {
+                    /** @description Correlation ID shared with safe problem responses. */
+                    "X-XTrace-Request-Id"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObservedEndpointPage"];
+                };
+            };
+            400: components["responses"]["Problem"];
+            401: components["responses"]["Problem"];
+            403: components["responses"]["Problem"];
+            404: components["responses"]["Problem"];
+            422: components["responses"]["Problem"];
+            500: components["responses"]["Problem"];
+            503: components["responses"]["Problem"];
+        };
+    };
+    listOperationRecordings: {
+        parameters: {
+            query?: {
+                limit?: number;
+                /** @description Shared project and operation bound continuation cursor. */
+                cursor?: string;
+            };
+            header: {
+                /** @description Exact 127.0.0.1 authority, including the viewer's assigned port. */
+                Host: components["parameters"]["ViewerHost"];
+                /** @description Must be exactly same-origin. */
+                "Sec-Fetch-Site": components["parameters"]["ViewerFetchSite"];
+                /** @description Required browser-client marker; must be exactly viewer-v1. */
+                "X-XTrace-Client": components["parameters"]["ViewerClient"];
+                /** @description If supplied, must exactly equal the printed viewer origin. It may be absent on browser GET requests only; Host, Sec-Fetch-Site, and X-XTrace-Client remain required. */
+                Origin?: components["parameters"]["OptionalApiOrigin"];
+            };
+            path: {
+                /** @description Canonical lowercase RFC UUIDv7 public operation identity. */
+                operationId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Direct shared application page of linked recordings. */
+            200: {
+                headers: {
+                    /** @description Correlation ID shared with safe problem responses. */
+                    "X-XTrace-Request-Id"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObservedRecordingPage"];
+                };
+            };
+            400: components["responses"]["Problem"];
+            401: components["responses"]["Problem"];
+            403: components["responses"]["Problem"];
+            404: components["responses"]["Problem"];
             422: components["responses"]["Problem"];
             500: components["responses"]["Problem"];
             503: components["responses"]["Problem"];
