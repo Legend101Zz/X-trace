@@ -14,6 +14,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  release-tool-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux descriptor inspection tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes lsof
+      - name: Require OpenSSL 3 and lsof
+        run: |
+          openssl version | grep -E '^OpenSSL 3\.'
+          command -v lsof
+      - name: Run release tooling tests without skips
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest tools.release.test_release_tools -v 2>&1 | tee /tmp/xtrace-release-tool-tests.log
+          if grep -Eq 'skipped=[1-9]' /tmp/xtrace-release-tool-tests.log; then
+            echo 'Release tooling tests must run without skips.'
+            exit 1
+          fi
+
   java-client:
     runs-on: ubuntu-latest
     env:

@@ -398,16 +398,32 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(process_running(child_pid))
 
     def test_completed_owned_descendant_is_drained_after_parent_exits(self) -> None:
-        script = (
-            "import os,subprocess,sys,time; "
-            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); "
-            "print(child.pid,os.getpgid(child.pid),flush=True); time.sleep(.3)"
-        )
+        tracked = self.cache / "completed-owned-child-tracked"
+        script = "\n".join((
+            "import os, pathlib, subprocess, sys, time",
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)",
+            "print(child.pid, os.getpgid(child.pid), flush=True)",
+            f"marker = pathlib.Path({str(tracked)!r})",
+            "deadline = time.monotonic() + 10",
+            "while not marker.exists() and time.monotonic() < deadline:",
+            "    time.sleep(.01)",
+            "raise SystemExit(0 if marker.exists() else 91)",
+        ))
         gate = run_gates.Gate("completed-owned-child", (sys.executable, "-c", script))
         args = self.args()
         args.label = "P00-completed-owned-child"
         spawned: list[subprocess.Popen[bytes]] = []
         real_popen = subprocess.Popen
+        track_descendants = run_gates._track_descendants
+
+        def track_and_mark(
+            root: tuple[int, str],
+            owned: dict[int, str],
+            snapshot: dict[int, tuple[int, str, str]],
+        ) -> None:
+            track_descendants(root, owned, snapshot)
+            if len(owned) > 1:
+                tracked.write_text("tracked", encoding="utf-8")
 
         def capture_process(*argv: object, **kwargs: object) -> subprocess.Popen[bytes]:
             process = real_popen(*argv, **kwargs)
@@ -417,19 +433,42 @@ class RunnerTests(unittest.TestCase):
                 spawned.append(process)
             return process
 
-        with mock.patch.object(run_gates, "GATES", (gate,)), \
-                mock.patch.object(run_gates.subprocess, "Popen", side_effect=capture_process):
-            self.assertEqual(run_gates.run(args), 1)
-        receipt = json.loads((self.cache / "release-gates" / args.label / "receipt.json").read_text())
-        entry = receipt["gates"][0]
-        log = (self.cache / "release-gates" / args.label / entry["log"]).read_text()
-        child_pid, child_pgid = map(int, log.splitlines()[0].split())
-        self.assertEqual(entry["exitCode"], 125)
-        self.assertIn("Gate left descendant processes running; tree drained", log)
-        self.assertNotEqual(child_pgid, spawned[0].pid)
-        self.assertFalse(process_running(child_pid))
-        self.assertFalse((self.cache / "leases/cargo").exists())
-        self.assertFalse((self.cache / "leases/gradle").exists())
+        child_pid: int | None = None
+        try:
+            with mock.patch.object(run_gates, "GATES", (gate,)), \
+                    mock.patch.object(run_gates, "_track_descendants", side_effect=track_and_mark), \
+                    mock.patch.object(run_gates.subprocess, "Popen", side_effect=capture_process):
+                self.assertEqual(run_gates.run(args), 1)
+            receipt = json.loads((self.cache / "release-gates" / args.label / "receipt.json").read_text())
+            entry = receipt["gates"][0]
+            log = (self.cache / "release-gates" / args.label / entry["log"]).read_text()
+            child_pid, child_pgid = map(int, log.splitlines()[0].split())
+            self.assertTrue(tracked.exists(), "fixture must confirm positive descendant ownership before parent exit")
+            self.assertEqual(entry["exitCode"], 125)
+            self.assertIn("Gate left descendant processes running; tree drained", log)
+            self.assertNotEqual(child_pgid, spawned[0].pid)
+            self.assertFalse(process_running(child_pid))
+            self.assertFalse((self.cache / "leases/cargo").exists())
+            self.assertFalse((self.cache / "leases/gradle").exists())
+        finally:
+            if child_pid is None:
+                try:
+                    log_path = self.cache / "release-gates" / args.label / "logs" / "completed-owned-child.log"
+                    child_pid = int(log_path.read_text().splitlines()[0].split()[0])
+                except (OSError, ValueError, IndexError):
+                    pass
+            if child_pid is not None and process_running(child_pid):
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for process in spawned:
+                if process.poll() is None:
+                    process.kill()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
 
     def test_uncertain_process_tree_retains_both_leases_for_manual_recovery(self) -> None:
         script = "import time; time.sleep(60)"
