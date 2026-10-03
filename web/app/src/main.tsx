@@ -3,13 +3,20 @@ import type { components } from './api.generated';
 import { retainPage } from './retained-page';
 import './style.css';
 
-type Recording = components['schemas']['Recording'];
-type Page = components['schemas']['RecordingList'];
+type Recording = components['schemas']['ObservedRecording'];
+type Endpoint = components['schemas']['ObservedEndpoint'];
 type Detail = components['schemas']['RecordingDetail'];
-type Problem = components['schemas']['Problem'];
+type Pane = 'recordings' | 'events' | 'evidence';
+type CatalogMode = 'endpoints' | 'linked' | 'unmatched';
 
-const MAX_RETAINED_RECORDINGS = 500;
+const MAX_RETAINED_ROWS = 500;
 const MAX_RETAINED_EVENTS = 2_000;
+
+class ApiError extends Error {
+  constructor(readonly status: number) {
+    super(`Request failed (${status})`);
+  }
+}
 
 async function api<T>(path: string): Promise<T> {
   const response = await fetch(path, {
@@ -17,126 +24,209 @@ async function api<T>(path: string): Promise<T> {
     headers: { 'X-XTrace-Client': 'viewer-v1' },
   });
   if (!response.ok) {
-    const problem = (await response.json().catch(() => null)) as Problem | null;
-    const error = new Error(problem?.detail ?? `Request failed (${response.status})`);
-    Object.assign(error, { status: response.status, requestId: problem?.requestId });
-    throw error;
+    throw new ApiError(response.status);
   }
   return (await response.json()) as T;
 }
 
+function failureMessage(error: unknown): string {
+  if (error instanceof ApiError) return `Request failed with status ${error.status}.`;
+  return 'The local viewer could not complete this request. Retry to continue.';
+}
+
+/** Read-only local browser for bounded observed endpoints and persisted recordings. */
 export default function App() {
   const [auth, setAuth] = useState<'checking' | 'ready' | 'expired' | 'error'>('checking');
   const [authError, setAuthError] = useState('');
-  const [recordings, setRecordings] = useState<Recording[]>([]);
+  const [catalogMode, setCatalogMode] = useState<CatalogMode>('endpoints');
+  const [activePane, setActivePane] = useState<Pane>('recordings');
+  const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
+  const [endpointCursor, setEndpointCursor] = useState<string | null>(null);
+  const [selectedOperation, setSelectedOperation] = useState('');
+  const [selectedEndpointSnapshot, setSelectedEndpointSnapshot] = useState<Endpoint | null>(null);
+  const [linked, setLinked] = useState<Recording[]>([]);
+  const [linkedCursor, setLinkedCursor] = useState<string | null>(null);
+  const [unmatched, setUnmatched] = useState<Recording[]>([]);
+  const [unmatchedCursor, setUnmatchedCursor] = useState<string | null>(null);
   const [selectedRecording, setSelectedRecording] = useState('');
   const [detail, setDetail] = useState<Detail | null>(null);
   const [selectedEvent, setSelectedEvent] = useState(0);
-  const [listCursor, setListCursor] = useState<string | null>(null);
-  const [olderRecordingsReleased, setOlderRecordingsReleased] = useState(false);
+  const [olderEndpointsReleased, setOlderEndpointsReleased] = useState(false);
+  const [olderLinkedReleased, setOlderLinkedReleased] = useState(false);
+  const [olderUnmatchedReleased, setOlderUnmatchedReleased] = useState(false);
   const [olderEventsReleased, setOlderEventsReleased] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [activePane, setActivePane] = useState<'recordings' | 'events' | 'evidence'>('events');
+  const [endpointBusy, setEndpointBusy] = useState(false);
+  const [linkedBusy, setLinkedBusy] = useState(false);
+  const [unmatchedBusy, setUnmatchedBusy] = useState(false);
+  const [detailBusy, setDetailBusy] = useState(false);
+  const [endpointError, setEndpointError] = useState('');
+  const [linkedError, setLinkedError] = useState('');
+  const [unmatchedError, setUnmatchedError] = useState('');
+  const [detailError, setDetailError] = useState('');
   const [announcement, setAnnouncement] = useState('');
   const authStarted = useRef(false);
-  const recordingsRef = useRef<Recording[]>([]);
+  const endpointsRef = useRef<Endpoint[]>([]);
+  const linkedRef = useRef<Recording[]>([]);
+  const unmatchedRef = useRef<Recording[]>([]);
   const detailRef = useRef<Detail | null>(null);
   const selectedRecordingRef = useRef('');
-  const listRequestGeneration = useRef(0);
-  const detailRequestGeneration = useRef(0);
-  const listRequestActive = useRef(false);
-  const detailRequestActive = useRef(false);
+  const selectedOperationRef = useRef('');
+  const catalogModeRef = useRef<CatalogMode>('endpoints');
+  const endpointHasLoaded = useRef(false);
+  const endpointGeneration = useRef(0);
+  const linkedGeneration = useRef(0);
+  const unmatchedGeneration = useRef(0);
+  const detailGeneration = useRef(0);
 
-  useEffect(() => { recordingsRef.current = recordings; }, [recordings]);
+  useEffect(() => { endpointsRef.current = endpoints; }, [endpoints]);
+  useEffect(() => { linkedRef.current = linked; }, [linked]);
+  useEffect(() => { unmatchedRef.current = unmatched; }, [unmatched]);
   useEffect(() => { detailRef.current = detail; }, [detail]);
 
-  const loadList = useCallback(async (cursor: string | null = null, append = false) => {
-    const generation = ++listRequestGeneration.current;
-    listRequestActive.current = true;
-    setLoading(true); setError('');
+  const markExpired = (error: unknown) => {
+    if (!(error instanceof ApiError) || error.status !== 401) return;
+    endpointGeneration.current += 1; linkedGeneration.current += 1;
+    unmatchedGeneration.current += 1; detailGeneration.current += 1;
+    setEndpointBusy(false); setLinkedBusy(false); setUnmatchedBusy(false); setDetailBusy(false);
+    setAuth('expired');
+  };
+
+  const loadEndpoints = useCallback(async (cursor: string | null = null, append = false) => {
+    const generation = ++endpointGeneration.current;
+    setEndpointBusy(true);
+    setEndpointError('');
     try {
-      const page = await api<Page>(`/api/v1/recordings?limit=50${cursor ? `&after=${encodeURIComponent(cursor)}` : ''}`);
-      if (generation !== listRequestGeneration.current) return;
-      const { items: retained, released, nextCursor } = retainPage(
-        append ? recordingsRef.current : [],
-        page.recordings,
-        MAX_RETAINED_RECORDINGS,
-        page.nextAfter ?? null,
-      );
-      recordingsRef.current = retained;
-      setRecordings(retained);
-      if (released > 0) setOlderRecordingsReleased(true);
-      else if (!append) setOlderRecordingsReleased(false);
-      if (page.recordings.length && !selectedRecordingRef.current) {
-        selectedRecordingRef.current = page.recordings[0].recordingId;
-        setSelectedRecording(selectedRecordingRef.current);
-      }
-      setListCursor(nextCursor);
-      setAnnouncement(released > 0
-        ? `Earlier recording rows were released. ${retained.length} recordings remain in the current window.`
-        : `${page.recordings.length} recordings loaded`);
-    } catch (cause) {
-      if (generation !== listRequestGeneration.current) return;
-      const status = (cause as Error & { status?: number }).status;
-      if (status === 401) setAuth('expired');
-      else setError(cause instanceof Error ? cause.message : 'Recordings could not be loaded');
+      const query = cursor ? `?limit=100&cursor=${encodeURIComponent(cursor)}` : '?limit=100';
+      const page = await api<components['schemas']['ObservedEndpointPage']>(`/api/v1/endpoints${query}`);
+      if (generation !== endpointGeneration.current) return;
+      const result = retainPage(append ? endpointsRef.current : [], page.items, MAX_RETAINED_ROWS, page.nextCursor);
+      endpointsRef.current = result.items;
+      setEndpoints(result.items);
+      setEndpointCursor(result.nextCursor);
+      setOlderEndpointsReleased(result.released > 0);
+      endpointHasLoaded.current = true;
+      if (catalogModeRef.current === 'endpoints') setAnnouncement(`${page.items.length} observed endpoints loaded`);
+    } catch (error) {
+      if (generation !== endpointGeneration.current) return;
+      markExpired(error);
+      setEndpointError(failureMessage(error));
     } finally {
-      if (generation === listRequestGeneration.current) {
-        listRequestActive.current = false;
-        setLoading(detailRequestActive.current);
+      if (generation === endpointGeneration.current) {
+        setEndpointBusy(false);
+      }
+    }
+  }, []);
+
+  const loadLinked = useCallback(async (operationId: string, cursor: string | null = null, append = false) => {
+    if (!operationId || selectedOperationRef.current !== operationId) return;
+    const generation = ++linkedGeneration.current;
+    setLinkedBusy(true);
+    setLinkedError('');
+    try {
+      const query = cursor ? `?limit=50&cursor=${encodeURIComponent(cursor)}` : '?limit=50';
+      const page = await api<components['schemas']['ObservedRecordingPage']>(`/api/v1/endpoints/${encodeURIComponent(operationId)}/recordings${query}`);
+      if (generation !== linkedGeneration.current || selectedOperationRef.current !== operationId) return;
+      const result = retainPage(append ? linkedRef.current : [], page.items, MAX_RETAINED_ROWS, page.nextCursor);
+      linkedRef.current = result.items;
+      setLinked(result.items);
+      setLinkedCursor(result.nextCursor);
+      setOlderLinkedReleased(result.released > 0);
+      if (catalogModeRef.current === 'linked') setAnnouncement(`${page.items.length} linked recordings loaded`);
+    } catch (error) {
+      if (generation !== linkedGeneration.current || selectedOperationRef.current !== operationId) return;
+      markExpired(error);
+      setLinkedError(failureMessage(error));
+    } finally {
+      if (generation === linkedGeneration.current && selectedOperationRef.current === operationId) {
+        setLinkedBusy(false);
+      }
+    }
+  }, []);
+
+  const loadUnmatched = useCallback(async (cursor: string | null = null, append = false) => {
+    const generation = ++unmatchedGeneration.current;
+    setUnmatchedBusy(true);
+    setUnmatchedError('');
+    try {
+      const query = cursor ? `?unmatched=true&limit=50&cursor=${encodeURIComponent(cursor)}` : '?unmatched=true&limit=50';
+      const page = await api<components['schemas']['ObservedRecordingPage']>(`/api/v1/recordings${query}`);
+      if (generation !== unmatchedGeneration.current) return;
+      const result = retainPage(append ? unmatchedRef.current : [], page.items, MAX_RETAINED_ROWS, page.nextCursor);
+      unmatchedRef.current = result.items;
+      setUnmatched(result.items);
+      setUnmatchedCursor(result.nextCursor);
+      setOlderUnmatchedReleased(result.released > 0);
+      if (catalogModeRef.current === 'unmatched') setAnnouncement(`${page.items.length} unmatched recordings loaded`);
+    } catch (error) {
+      if (generation !== unmatchedGeneration.current) return;
+      markExpired(error);
+      setUnmatchedError(failureMessage(error));
+    } finally {
+      if (generation === unmatchedGeneration.current) {
+        setUnmatchedBusy(false);
       }
     }
   }, []);
 
   const loadDetail = useCallback(async (recordingId: string, cursor: string | null = null, append = false) => {
     if (!recordingId || selectedRecordingRef.current !== recordingId) return;
-    const generation = ++detailRequestGeneration.current;
-    detailRequestActive.current = true;
-    setLoading(true); setError('');
+    const generation = ++detailGeneration.current;
+    setDetailBusy(true);
+    setDetailError('');
     try {
       const query = cursor ? `?limit=200&cursor=${encodeURIComponent(cursor)}` : '?limit=200';
       const next = await api<Detail>(`/api/v1/recordings/${encodeURIComponent(recordingId)}${query}`);
-      if (generation !== detailRequestGeneration.current || selectedRecordingRef.current !== recordingId) return;
+      if (generation !== detailGeneration.current || selectedRecordingRef.current !== recordingId) return;
       const previous = append ? detailRef.current : null;
-      const { items: retained, released, nextCursor } = retainPage(
-        previous?.events ?? [],
-        next.events,
-        MAX_RETAINED_EVENTS,
-        next.nextCursor ?? null,
-      );
-      const updated = { ...next, events: retained, nextCursor };
+      const result = retainPage(previous?.events ?? [], next.events, MAX_RETAINED_EVENTS, next.nextCursor ?? null);
+      const updated = { ...next, events: result.items, nextCursor: result.nextCursor };
       detailRef.current = updated;
       setDetail(updated);
-      if (released > 0) setOlderEventsReleased(true);
-      else if (!append) setOlderEventsReleased(false);
+      setOlderEventsReleased(result.released > 0);
       if (!append) setSelectedEvent(0);
-      else if (released > 0) {
-        setSelectedEvent((current) => Math.max(0, current - released));
-      }
-      setAnnouncement(released > 0
-        ? `Earlier events were released. ${retained.length} events remain in the current window.`
-        : `${next.events.length} events available for selection`);
-    } catch (cause) {
-      if (generation !== detailRequestGeneration.current || selectedRecordingRef.current !== recordingId) return;
-      const status = (cause as Error & { status?: number }).status;
-      if (status === 401) setAuth('expired');
-      else setError(cause instanceof Error ? cause.message : 'Recording could not be loaded');
+      else if (result.released > 0) setSelectedEvent((current) => Math.max(0, current - result.released));
+      setAnnouncement(`${next.events.length} events available for selection`);
+    } catch (error) {
+      if (generation !== detailGeneration.current || selectedRecordingRef.current !== recordingId) return;
+      markExpired(error);
+      setDetailError(failureMessage(error));
     } finally {
-      if (generation === detailRequestGeneration.current) {
-        detailRequestActive.current = false;
-        setLoading(listRequestActive.current);
+      if (generation === detailGeneration.current && selectedRecordingRef.current === recordingId) {
+        setDetailBusy(false);
       }
     }
   }, []);
+
+  function selectRecording(recordingId: string) {
+    const changed = selectedRecordingRef.current !== recordingId;
+    selectedRecordingRef.current = recordingId;
+    setSelectedRecording(recordingId);
+    setActivePane('events');
+    if (changed) {
+      detailGeneration.current += 1;
+      detailRef.current = null;
+      setDetail(null);
+      setDetailError('');
+      setDetailBusy(false);
+      setSelectedEvent(0);
+      setOlderEventsReleased(false);
+      void loadDetail(recordingId);
+    }
+    setAnnouncement(`Recording ${recordingId} selected`);
+  }
 
   useEffect(() => {
     if (authStarted.current) return;
     authStarted.current = true;
     const fragment = new URLSearchParams(window.location.hash.slice(1));
     const token = fragment.get('token');
-    if (!token) { setAuth('error'); setAuthError('The one-time viewer link is missing. Restart xtrace open --viewer.'); return; }
+    // Always discard the one-time fragment before rendering an error or sending a request.
     window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    if (!token) {
+      setAuth('error');
+      setAuthError('The one-time viewer link is missing. Restart xtrace open --viewer.');
+      return;
+    }
     void fetch('/api/v1/auth/exchange', {
       method: 'POST', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json', 'X-XTrace-Client': 'viewer-v1' },
@@ -144,29 +234,21 @@ export default function App() {
     }).then(async (response) => {
       if (!response.ok) throw new Error('Viewer link is invalid or expired. Restart xtrace open --viewer.');
       setAuth('ready');
-      await loadList();
+      catalogModeRef.current = 'endpoints';
+      setCatalogMode('endpoints');
+      await loadEndpoints();
     }).catch((cause: unknown) => {
-      setAuth('error'); setAuthError(cause instanceof Error ? cause.message : 'Viewer authentication failed');
+      setAuth('error');
+      setAuthError(cause instanceof Error ? cause.message : 'Viewer authentication failed');
     });
-  }, [loadList]);
+  }, [loadEndpoints]);
 
-  useEffect(() => {
-    if (auth === 'ready' && selectedRecording) {
-      void loadDetail(selectedRecording);
-    } else {
-      detailRequestGeneration.current += 1;
-      detailRequestActive.current = false;
-      setLoading(listRequestActive.current);
-      detailRef.current = null;
-      setDetail(null);
-    }
-  }, [auth, selectedRecording, loadDetail]);
-
-  const event = detail?.events[selectedEvent];
-  const currentRecording = recordings.find((item) => item.recordingId === selectedRecording);
-  const currentStatus = currentRecording?.status
-    ?? (detail?.recordingId === selectedRecording ? detail.status : 'no selection');
+  const selectedEndpoint = selectedEndpointSnapshot;
+  const currentRows = catalogMode === 'linked' ? linked : unmatched;
+  const currentRecording = currentRows.find((item) => item.recordingId === selectedRecording);
+  const currentStatus = currentRecording?.status ?? (detail?.recordingId === selectedRecording ? detail.status : 'no selection');
   const eventCount = useMemo(() => detail?.events.length ?? 0, [detail]);
+  const event = detail?.events[selectedEvent];
 
   const moveEvent = useCallback((delta: number) => {
     if (eventCount === 0) return;
@@ -179,21 +261,69 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (keyboard: KeyboardEvent) => {
-      if (keyboard.altKey && keyboard.key === 'ArrowDown') { keyboard.preventDefault(); moveEvent(1); }
-      if (keyboard.altKey && keyboard.key === 'ArrowUp') { keyboard.preventDefault(); moveEvent(-1); }
+      if (!keyboard.altKey || (keyboard.key !== 'ArrowDown' && keyboard.key !== 'ArrowUp')) return;
+      keyboard.preventDefault();
+      moveEvent(keyboard.key === 'ArrowDown' ? 1 : -1);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [moveEvent]);
 
-  const nextListPage = () => {
-    if (!listCursor) return;
-    void loadList(listCursor, true);
-  };
-  const nextDetailPage = () => {
-    if (!detail?.nextCursor || !selectedRecording) return;
-    void loadDetail(selectedRecording, detail.nextCursor ?? null, true);
-  };
+  function openEndpoint(endpoint: Endpoint) {
+    endpointGeneration.current += 1; setEndpointBusy(false);
+    unmatchedGeneration.current += 1; setUnmatchedBusy(false); setUnmatchedError('');
+    catalogModeRef.current = 'linked';
+    selectedOperationRef.current = endpoint.operationId;
+    selectedRecordingRef.current = '';
+    setSelectedOperation(endpoint.operationId);
+    setSelectedEndpointSnapshot(endpoint);
+    setSelectedRecording('');
+    setCatalogMode('linked');
+    setLinked([]); linkedRef.current = []; setLinkedCursor(null); setLinkedError('');
+    linkedGeneration.current += 1; setLinkedBusy(false);
+    detailGeneration.current += 1; setDetailBusy(false); setDetailError('');
+    detailRef.current = null; setDetail(null); setSelectedEvent(0);
+    setOlderEventsReleased(false);
+    setOlderLinkedReleased(false);
+    void loadLinked(endpoint.operationId);
+  }
+
+  function openUnmatched() {
+    endpointGeneration.current += 1; setEndpointBusy(false); setEndpointError('');
+    linkedGeneration.current += 1; setLinkedBusy(false); setLinkedError('');
+    catalogModeRef.current = 'unmatched';
+    selectedOperationRef.current = '';
+    selectedRecordingRef.current = '';
+    setSelectedOperation('');
+    setSelectedEndpointSnapshot(null);
+    setSelectedRecording('');
+    setCatalogMode('unmatched');
+    setUnmatched([]); unmatchedRef.current = []; setUnmatchedCursor(null); setUnmatchedError('');
+    unmatchedGeneration.current += 1; setUnmatchedBusy(false);
+    detailGeneration.current += 1; setDetailBusy(false); setDetailError('');
+    detailRef.current = null; setDetail(null); setSelectedEvent(0);
+    setOlderEventsReleased(false);
+    setOlderUnmatchedReleased(false);
+    void loadUnmatched();
+  }
+
+  function backToEndpoints() {
+    linkedGeneration.current += 1; setLinkedBusy(false); setLinkedError('');
+    unmatchedGeneration.current += 1; setUnmatchedBusy(false); setUnmatchedError('');
+    catalogModeRef.current = 'endpoints';
+    selectedOperationRef.current = ''; selectedRecordingRef.current = '';
+    setSelectedOperation(''); setSelectedEndpointSnapshot(null); setSelectedRecording(''); setCatalogMode('endpoints');
+    setLinked([]); linkedRef.current = []; setLinkedCursor(null);
+    detailGeneration.current += 1; setDetailBusy(false); setDetailError('');
+    detailRef.current = null; setDetail(null); setSelectedEvent(0);
+    setOlderEventsReleased(false);
+    if (!endpointHasLoaded.current) void loadEndpoints();
+  }
+
+  const nextEndpoints = () => endpointCursor && void loadEndpoints(endpointCursor, true);
+  const nextLinked = () => linkedCursor && selectedOperation && void loadLinked(selectedOperation, linkedCursor, true);
+  const nextUnmatched = () => unmatchedCursor && void loadUnmatched(unmatchedCursor, true);
+  const nextDetail = () => detail?.nextCursor && selectedRecording && void loadDetail(selectedRecording, detail.nextCursor, true);
 
   return <div className="shell">
     <header className="topbar">
@@ -205,8 +335,7 @@ export default function App() {
       keyboard.preventDefault();
       const panes = ['recordings', 'events', 'evidence'] as const;
       const direction = keyboard.key === 'ArrowRight' ? 1 : -1;
-      const current = panes.indexOf(activePane);
-      const next = panes[(current + direction + panes.length) % panes.length];
+      const next = panes[(panes.indexOf(activePane) + direction + panes.length) % panes.length];
       setActivePane(next);
       document.getElementById(`${next}-tab`)?.focus();
     }}>
@@ -214,40 +343,45 @@ export default function App() {
     </nav>
     <main className="workspace">
       <section className="pane" role="tabpanel" id="recordings-panel" aria-labelledby="recordings-tab" data-active={activePane === 'recordings'} aria-label="Recordings">
-        <div className="pane-head"><div><div className="eyebrow">Project recordings</div><h1>Captured requests</h1></div><button className="button" onClick={() => { recordingsRef.current = []; setRecordings([]); setListCursor(null); setOlderRecordingsReleased(false); void loadList(); }}>Refresh</button></div>
-        {loading && recordings.length === 0 ? <div className="loading">Reading persisted recordings…</div> : null}
-        {error ? <ErrorState message={error} onRetry={() => void loadList()} /> : null}
-        {!loading && !error && recordings.length === 0 ? <div className="empty"><strong>No recordings yet</strong><p>Run a Spring application through X-trace and send a request to create persisted evidence.</p></div> : null}
-        <div className="recording-list">
-          {recordings.map((recording) => <button className="recording" key={recording.recordingId} aria-current={selectedRecording === recording.recordingId} onClick={() => {
-            const changed = selectedRecordingRef.current !== recording.recordingId;
-            selectedRecordingRef.current = recording.recordingId;
-            if (changed) {
-              detailRequestGeneration.current += 1;
-              detailRequestActive.current = false;
-              detailRef.current = null;
-              setDetail(null);
-              setSelectedEvent(0);
-              setLoading(listRequestActive.current);
-              setError('');
-              setSelectedRecording(recording.recordingId);
-            }
-            setActivePane('events');
-            setAnnouncement(`Recording ${recording.recordingId} selected`);
-          }}>
-            <span className={`status-mark status-mark--${recording.status}`} aria-hidden="true" />
-            <span><span className="recording-title">{recording.recordingId}</span><span className="recording-sub">{recording.eventCount} persisted events · {recording.openedAt}</span><span className="recording-status">{recording.status}</span></span>
-          </button>)}
-        </div>
-        {olderRecordingsReleased ? <p className="window-retention" role="status">Earlier recordings were released from memory. Continue from the current page cursor.</p> : null}
-        {listCursor ? <div className="page-controls"><span className="top-meta">More recordings</span><button className="button" onClick={nextListPage} disabled={loading}>Load next page</button></div> : null}
-        <aside className="context-note">Only persisted recording evidence is shown. This view does not infer endpoints or execution results.</aside>
+        <div className="pane-head"><div><div className="eyebrow">Observed catalog</div><h1>{catalogMode === 'endpoints' ? 'Endpoints' : catalogMode === 'linked' ? 'Linked recordings' : 'Unmatched recordings'}</h1></div>
+          <button className="button" onClick={() => catalogMode === 'endpoints' ? void loadEndpoints() : catalogMode === 'linked' ? void loadLinked(selectedOperation) : void loadUnmatched()} disabled={endpointBusy || linkedBusy || unmatchedBusy}>Refresh</button></div>
+        {catalogMode === 'linked' ? <div className="catalog-back"><div className="catalog-actions"><button className="button" onClick={backToEndpoints}>← Observed endpoints</button><button className="button" onClick={openUnmatched}>Unmatched recordings</button></div><span>{selectedEndpoint?.method} {selectedEndpoint?.routeTemplate}</span><small>Component: {selectedEndpoint?.applicationComponent} · Binding: {selectedEndpoint?.binding}</small></div> : null}
+        {catalogMode === 'endpoints' ? <>
+          <div className="catalog-switch"><button className="button" aria-current="page">Observed endpoints</button><button className="button" onClick={openUnmatched}>Unmatched recordings</button></div>
+          <div className="policy-note"><strong>Operator-selected policy</strong><span>{endpoints[0]?.observationPolicy ?? 'spring-orders-v1'} does not attest which adapter or application produced the event.</span></div>
+          {endpointBusy && endpoints.length === 0 ? <div className="loading">Reading observed endpoints…</div> : null}
+          {endpointError ? <ErrorState message={endpointError} onRetry={() => void loadEndpoints()} /> : null}
+          {!endpointBusy && !endpointError && endpoints.length === 0 ? <div className="empty"><strong>No observed endpoints</strong><p>A persisted capture must include the exact operator-selected policy and approved route.</p></div> : null}
+          <div className="recording-list endpoint-list">{endpoints.map((endpoint) => <button className="recording endpoint-card" key={endpoint.operationId} onClick={() => openEndpoint(endpoint)}>
+            <span className="endpoint-method">{endpoint.method}</span><span><span className="recording-title">{endpoint.routeTemplate}</span><span className="recording-sub">Component: {endpoint.applicationComponent}<br />Binding: {endpoint.binding}</span><span className="recording-status">observed</span></span>
+          </button>)}</div>
+          {endpointCursor ? <div className="page-controls"><span className="top-meta">More endpoints</span><button className="button" onClick={nextEndpoints} disabled={endpointBusy}>Load next page</button></div> : null}
+        </> : null}
+        {catalogMode === 'linked' ? <>
+          <div className="policy-note"><strong>Operator-selected policy</strong><span>{selectedEndpoint?.observationPolicy ?? 'spring-orders-v1'} does not attest which adapter or application produced the event.</span></div>
+          {linkedBusy && linked.length === 0 ? <div className="loading">Reading linked recordings…</div> : null}
+          {linkedError ? <ErrorState message={linkedError} onRetry={() => void loadLinked(selectedOperation)} /> : null}
+          {!linkedBusy && !linkedError && linked.length === 0 ? <div className="empty"><strong>No linked recordings</strong><p>This endpoint has no persisted linked recording in the current page.</p></div> : null}
+          <RecordingRows items={linked} selected={selectedRecording} onSelect={selectRecording} />
+          {linkedCursor ? <div className="page-controls"><span className="top-meta">More linked recordings</span><button className="button" onClick={nextLinked} disabled={linkedBusy}>Load next page</button></div> : null}
+        </> : null}
+        {catalogMode === 'unmatched' ? <>
+          <div className="catalog-switch"><button className="button" onClick={backToEndpoints}>Observed endpoints</button><button className="button" aria-current="page">Unmatched recordings</button></div>
+          <div className="context-note unmatched-note">These recordings have no observed endpoint association. A historical recording may have no reason code.</div>
+          {unmatchedBusy && unmatched.length === 0 ? <div className="loading">Reading unmatched recordings…</div> : null}
+          {unmatchedError ? <ErrorState message={unmatchedError} onRetry={() => void loadUnmatched()} /> : null}
+          {!unmatchedBusy && !unmatchedError && unmatched.length === 0 ? <div className="empty"><strong>No unmatched recordings</strong><p>Unlinked and legacy recordings appear here.</p></div> : null}
+          <RecordingRows items={unmatched} selected={selectedRecording} onSelect={selectRecording} />
+          {unmatchedCursor ? <div className="page-controls"><span className="top-meta">More unmatched recordings</span><button className="button" onClick={nextUnmatched} disabled={unmatchedBusy}>Load next page</button></div> : null}
+        </> : null}
+        {(catalogMode === 'endpoints' ? olderEndpointsReleased : catalogMode === 'linked' ? olderLinkedReleased : olderUnmatchedReleased) ? <p className="window-retention" role="status">Earlier rows were released from memory. Continue from the current page cursor.</p> : null}
+        <aside className="context-note">Only persisted endpoint and recording evidence is shown. No handler discovery or application attestation is implied.</aside>
       </section>
       <section className="pane" role="tabpanel" id="events-panel" aria-labelledby="events-tab" data-active={activePane === 'events'} aria-label="Ordered event window">
-        <div className="pane-head center-head"><div className="center-title"><div className="eyebrow">Linear event window</div><h1>{selectedRecording || 'Select a recording'}</h1></div><button className="button" onClick={() => selectedRecording && void loadDetail(selectedRecording)}>Refresh</button></div>
-        {error ? <ErrorState message={error} onRetry={() => selectedRecording && void loadDetail(selectedRecording)} /> : null}
-        {!selectedRecording && !error ? <div className="empty"><strong>No recording selected</strong><p>Choose a persisted recording from the left pane.</p></div> : null}
-        {loading && !detail ? <div className="loading">Verifying persisted event window…</div> : null}
+        <div className="pane-head center-head"><div className="center-title"><div className="eyebrow">Linear event window</div><h1>{selectedRecording || 'Select a recording'}</h1></div><button className="button" onClick={() => selectedRecording && void loadDetail(selectedRecording)} disabled={detailBusy}>Refresh</button></div>
+        {detailError ? <ErrorState message={detailError} onRetry={() => selectedRecording && void loadDetail(selectedRecording)} /> : null}
+        {!selectedRecording && !detailError ? <div className="empty"><strong>No recording selected</strong><p>Choose a linked or unmatched recording from the left pane.</p></div> : null}
+        {detailBusy && !detail ? <div className="loading">Verifying persisted event window…</div> : null}
         {detail && detail.events.length === 0 ? <div className="empty"><strong>No projected events</strong><p>The persisted recording has no event window to display.</p></div> : null}
         {detail && detail.events.length ? <div className="event-rail">
           <div className="window-note"><span>{detail.events.length} ordered events</span><span>ALT + ↑ / ↓ to step</span></div>
@@ -256,7 +390,7 @@ export default function App() {
           </button>)}
         </div> : null}
         {olderEventsReleased ? <p className="window-retention" role="status">Earlier events were released from memory. Continue from the current event cursor.</p> : null}
-        {detail?.nextCursor ? <div className="page-controls"><span className="top-meta">More events in verified window</span><button className="button button-primary" onClick={nextDetailPage} disabled={loading}>Load next window</button></div> : null}
+        {detail?.nextCursor ? <div className="page-controls"><span className="top-meta">More events in verified window</span><button className="button button-primary" onClick={nextDetail} disabled={detailBusy}>Load next window</button></div> : null}
       </section>
       <section className="pane" role="tabpanel" id="evidence-panel" aria-labelledby="evidence-tab" data-active={activePane === 'evidence'} aria-label="Evidence inspector">
         <div className="pane-head"><div><div className="eyebrow">Persisted facts</div><h1>Evidence inspector</h1></div><span className="top-meta">{currentStatus}</span></div>
@@ -279,6 +413,13 @@ export default function App() {
     {auth === 'expired' ? <div role="alert" className="auth-overlay"><div><strong>Viewer session expired</strong><p>Restart the foreground viewer to create a new one-time link.</p></div></div> : null}
     {auth === 'error' ? <div role="alert" className="auth-overlay"><div><strong>Viewer authentication failed</strong><p>{authError}</p></div></div> : null}
   </div>;
+}
+
+function RecordingRows({ items, selected, onSelect }: { items: Recording[]; selected: string; onSelect: (id: string) => void }) {
+  return <div className="recording-list">{items.map((recording) => <button className="recording" key={recording.recordingId} aria-current={selected === recording.recordingId} onClick={() => onSelect(recording.recordingId)}>
+    <span className={`status-mark status-mark--${recording.status}`} aria-hidden="true" />
+    <span><span className="recording-title">{recording.recordingId}</span><span className="recording-sub">{recording.eventCount} persisted events · {recording.openedAt}</span><span className="recording-status">{recording.status}</span>{recording.unmatchedReason ? <span className="recording-reason">{recording.unmatchedReason}</span> : recording.operationId === null ? <span className="recording-reason">No historical reason recorded</span> : null}</span>
+  </button>)}</div>;
 }
 
 function ErrorState({ message, onRetry }: { message: string; onRetry: () => void }) {

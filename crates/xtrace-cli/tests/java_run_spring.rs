@@ -428,7 +428,7 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     stop_viewer(&mut first_viewer.1);
 
     // Add bounded query fixtures only after selecting the real Spring recording for detail/browser checks.
-    let (tie_ids, _unmatched_id, legacy_v4_id) =
+    let (tie_ids, synthetic_unmatched_id, legacy_v4_id) =
         add_endpoint_cli_fixture_recordings(&project_root, &project_id);
     let database_before_queries = fs::read(&database).expect("database after query fixture setup");
     let pointer_before_query_fixtures = file_state(&pointer);
@@ -751,6 +751,9 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
         .iter()
         .map(|event| event["sequence"].as_str().expect("decimal sequence").to_owned())
         .collect();
+    let database_before_browser = file_state(&database);
+    let pointer_before_browser = file_state(&pointer);
+    let objects_before_browser = object_files_state(&project_root.join("objects/b3"));
     let mut viewer = launch_viewer(&repo, &data_home);
     let readiness = viewer.0;
     let mut browser = Command::new("node");
@@ -767,6 +770,9 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     let mut browser_stdin = browser.stdin.take().expect("browser journey stdin");
     let mut browser_context = readiness.clone();
     browser_context["expectedUnmatchedIds"] = serde_json::json!(&unmatched_ids);
+    browser_context["expectedLinkedIds"] = serde_json::json!(&linked_ids);
+    browser_context["expectedGenuineLinkedIds"] = serde_json::json!(&genuine_linked_ids);
+    browser_context["syntheticUnmatchedId"] = serde_json::json!(synthetic_unmatched_id);
     browser_stdin
         .write_all(serde_json::to_string(&browser_context).expect("readiness JSON").as_bytes())
         .expect("send viewer URL to browser through stdin");
@@ -790,6 +796,21 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     }
     stop_viewer(&mut viewer.1);
     assert_eq!(fs::read(&database).expect("database after viewer"), database_before_queries);
+    assert_eq!(
+        file_state(&database),
+        database_before_browser,
+        "browser reads preserve SQLite bytes, mtime, and mode"
+    );
+    assert_eq!(
+        file_state(&pointer),
+        pointer_before_browser,
+        "browser reads preserve pointer bytes, mtime, and mode"
+    );
+    assert_eq!(
+        object_files_state(&project_root.join("objects/b3")),
+        objects_before_browser,
+        "browser reads preserve XTF objects, mtimes, and modes"
+    );
     assert_eq!(file_state(&pointer), pointer_before_queries);
 
     let reacquired = Command::new(env!("CARGO_BIN_EXE_xtrace"))

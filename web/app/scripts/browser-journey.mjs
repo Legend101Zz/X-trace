@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium } from '@playwright/test';
 
@@ -14,8 +14,12 @@ const input = await new Promise((resolve, reject) => {
   process.stdin.on('end', () => resolve(value));
   process.stdin.on('error', reject);
 });
-const { url: startUrl, expectedUnmatchedIds } = JSON.parse(input);
+const { url: startUrl, expectedUnmatchedIds, expectedLinkedIds, expectedGenuineLinkedIds, syntheticUnmatchedId } = JSON.parse(input);
 assert.ok(startUrl, 'viewer URL must be supplied through stdin');
+assert.ok(Array.isArray(expectedUnmatchedIds) && expectedUnmatchedIds.includes(legacyV4Id), 'historical unmatched fixture must be present');
+assert.ok(Array.isArray(expectedLinkedIds) && expectedLinkedIds.includes(recordingId), 'expected linked page must include the selected capture');
+assert.ok(Array.isArray(expectedGenuineLinkedIds) && expectedGenuineLinkedIds.includes(recordingId), 'selected recording must be a genuine pre-enrichment capture');
+assert.ok(syntheticUnmatchedId && expectedUnmatchedIds.includes(syntheticUnmatchedId), 'synthetic unmatched fixture must be present');
 
 const browser = await chromium.launch({ headless: true });
 try {
@@ -23,14 +27,14 @@ try {
   const page = await context.newPage();
   page.setDefaultTimeout(8000);
   page.setDefaultNavigationTimeout(10000);
-  const consoleErrors = [];
-  const unexpectedRequests = [];
+  let consoleErrorCount = 0;
+  let unexpectedRequestCount = 0;
   const bootstrapToken = new URL(startUrl).hash.slice('#token='.length);
-  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
-  page.on('pageerror', (error) => consoleErrors.push(error.message));
+  page.on('console', (message) => { if (message.type() === 'error') consoleErrorCount += 1; });
+  page.on('pageerror', () => { consoleErrorCount += 1; });
   page.on('request', (request) => {
     assert.ok(!request.url().includes(bootstrapToken), 'bootstrap token appeared in a request URL');
-    if (new URL(request.url()).host !== new URL(startUrl).host) unexpectedRequests.push(request.url());
+    if (new URL(request.url()).origin !== new URL(startUrl).origin) unexpectedRequestCount += 1;
     const headers = request.headers();
     assert.ok(!headers.referer?.includes(bootstrapToken), 'bootstrap token appeared in a referrer');
   });
@@ -40,15 +44,52 @@ try {
   } catch {
     throw new Error(`viewer page failed to load at ${new URL(startUrl).origin}`);
   }
+  await page.getByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }).waitFor();
+  await page.getByText('Operator-selected policy').waitFor();
+  await page.getByText('spring-orders-v1 does not attest which adapter or application produced the event.').waitFor();
+  assert.equal(await page.locator('.endpoint-card').count(), 1, 'the finite fixture policy shows its persisted endpoint');
+  const screenshotDirectory = process.env.XTRACE_BROWSER_SCREENSHOT_DIR;
+  const screenshotViews = [];
+  const saveScreenshot = async (name, view, width, height) => {
+    if (!screenshotDirectory) return;
+    await page.screenshot({ path: join(screenshotDirectory, name), fullPage: true });
+    screenshotViews.push({ file: name, viewport: { width, height }, view });
+  };
+  if (screenshotDirectory) {
+    await mkdir(screenshotDirectory, { recursive: true });
+    await saveScreenshot('viewer-desktop-endpoints.png', 'observed-endpoints', 1280, 720);
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
+  const tabHeights = await page.getByRole('tab').evaluateAll((tabs) => tabs.map((tab) => tab.getBoundingClientRect().height));
+  assert.ok(tabHeights.every((height) => height >= 44), `mobile pane tabs must be at least 44px tall: ${tabHeights}`);
+  const wordmarkHeight = await page.locator('.brand > span:nth-child(2)').evaluate((node) => node.getBoundingClientRect().height);
+  assert.ok(wordmarkHeight <= 24, `wordmark must remain on one line: ${wordmarkHeight}px`);
+  assert.equal(await page.getByRole('tab', { name: 'recordings' }).getAttribute('aria-selected'), 'true', 'mobile opens on the endpoint catalog');
+  await saveScreenshot('viewer-mobile-endpoints.png', 'observed-endpoints', 390, 844);
+
+  await page.locator('.endpoint-card').click();
+  const linkedRows = page.locator('.recording-list .recording');
+  await linkedRows.first().waitFor();
+  const linkedIds = await linkedRows.locator('.recording-title').allTextContents();
+  assert.deepEqual([...linkedIds].sort(), [...expectedLinkedIds].sort(), 'browser linked list matches the bounded endpoint query projection');
+  assert.ok(linkedIds.includes(recordingId), 'browser links the selected genuine persisted Spring recording');
+  for (const id of expectedGenuineLinkedIds) assert.ok(linkedIds.includes(id), `genuine capture ${id} remains linked after fixture enrichment`);
+  for (const id of expectedUnmatchedIds) assert.ok(!linkedIds.includes(id), `unmatched recording ${id} is excluded from this endpoint`);
+  assert.ok(!linkedIds.includes(syntheticUnmatchedId));
+  await page.getByText('POST /orders', { exact: false }).waitFor();
+  await page.getByText('Component: spring-fixture · Binding: default').waitFor();
+  await saveScreenshot('viewer-mobile-linked-recordings.png', 'linked-recordings', 390, 844);
   const recordingButton = page.getByRole('button', { name: new RegExp(recordingId) });
   try {
     await recordingButton.click({ timeout: 5000 });
   } catch {
-    throw new Error(JSON.stringify({ ui: await page.locator('body').innerText(), consoleErrors }));
+    throw new Error('Browser could not select the genuine linked recording in the packaged viewer');
   }
   await page.locator('.event-seq').first().waitFor();
   const observed = await page.locator('.event-seq').allTextContents();
   assert.deepEqual(observed, expectedSequences, 'browser event order differs from the product query projection');
+  await page.getByRole('tab', { name: 'evidence' }).click();
+  await page.getByRole('tabpanel', { name: 'evidence' }).waitFor({ state: 'visible' });
   const statusMark = page.locator('.status-mark').first();
   assert.equal(await statusMark.evaluate((node) => node.classList.contains('recording')), false);
   assert.deepEqual(await statusMark.evaluate((node) => {
@@ -59,16 +100,11 @@ try {
   await page.getByText('Source unavailable for this capture').waitFor();
   await page.getByText('Values were not projected').waitFor();
   await page.getByText('Completion semantics unavailable').waitFor();
-  const screenshotDirectory = process.env.XTRACE_BROWSER_SCREENSHOT_DIR;
-  if (screenshotDirectory) {
-    await mkdir(screenshotDirectory, { recursive: true });
-    await page.screenshot({ path: join(screenshotDirectory, 'viewer-desktop.png'), fullPage: true });
-  }
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await saveScreenshot('viewer-desktop-genuine-detail.png', 'genuine-recording-detail', 1280, 720);
   await page.setViewportSize({ width: 390, height: 844 });
-  const tabHeights = await page.getByRole('tab').evaluateAll((tabs) => tabs.map((tab) => tab.getBoundingClientRect().height));
-  assert.ok(tabHeights.every((height) => height >= 44), `mobile pane tabs must be at least 44px tall: ${tabHeights}`);
-  const wordmarkHeight = await page.locator('.brand > span:nth-child(2)').evaluate((node) => node.getBoundingClientRect().height);
-  assert.ok(wordmarkHeight <= 24, `wordmark must remain on one line: ${wordmarkHeight}px`);
+  await saveScreenshot('viewer-mobile-genuine-detail.png', 'genuine-recording-detail', 390, 844);
+  await page.getByRole('tab', { name: 'events' }).click();
   await page.getByRole('tabpanel', { name: 'events' }).waitFor({ state: 'visible' });
   const eventKind = page.locator('.event-kind').first();
   const originalKind = await eventKind.textContent();
@@ -88,9 +124,7 @@ try {
   });
   assert.deepEqual(eventLayout, { kindFits: true, timeFits: true, overlaps: false }, 'mobile event data must wrap without clipping or overlap');
   await eventKind.evaluate((node, text) => { node.textContent = text; }, originalKind);
-  if (screenshotDirectory) {
-    await page.screenshot({ path: join(screenshotDirectory, 'viewer-mobile.png'), fullPage: true });
-  }
+  await saveScreenshot('viewer-mobile-genuine-events.png', 'genuine-event-window', 390, 844);
   await page.getByRole('tab', { name: 'evidence' }).click();
   await page.getByRole('tabpanel', { name: 'evidence' }).waitFor({ state: 'visible' });
   await page.getByRole('tab', { name: 'recordings' }).click();
@@ -106,6 +140,26 @@ try {
   await page.locator('.event').nth(1).click();
   await page.getByRole('tabpanel', { name: 'evidence' }).waitFor({ state: 'visible' });
   await page.getByRole('status').filter({ hasText: /Event .* selected/ }).waitFor();
+  await page.getByRole('tab', { name: 'recordings' }).click();
+  await page.getByRole('tabpanel', { name: 'recordings' }).waitFor({ state: 'visible' });
+  await page.getByRole('button', { name: 'Unmatched recordings' }).click();
+  const historicalRow = page.getByRole('button', { name: new RegExp(legacyV4Id) });
+  await historicalRow.waitFor();
+  await historicalRow.getByText('No historical reason recorded').waitFor();
+  for (const id of expectedUnmatchedIds) await page.getByRole('button', { name: new RegExp(id) }).waitFor();
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await saveScreenshot('viewer-desktop-unmatched.png', 'unmatched-recordings', 1280, 720);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await saveScreenshot('viewer-mobile-unmatched.png', 'unmatched-recordings', 390, 844);
+  await historicalRow.click();
+  await page.getByRole('heading', { name: legacyV4Id }).waitFor();
+  await page.getByText('No projected events').waitFor();
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await saveScreenshot('viewer-desktop-historical-unmatched.png', 'historical-unmatched-detail', 1280, 720);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('tab', { name: 'events' }).click();
+  await page.getByText('No projected events').waitFor();
+  await saveScreenshot('viewer-mobile-historical-unmatched.png', 'historical-unmatched-detail', 390, 844);
   const apiPayloads = await page.evaluate(async ({ id, operationId, legacyV4Id, expectedUnmatchedIds }) => {
     const headers = { 'X-XTrace-Client': 'viewer-v1' };
     const listResponse = await fetch('/api/v1/recordings?limit=50', { headers, credentials: 'same-origin' });
@@ -173,8 +227,11 @@ try {
   assert.deepEqual(await page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length })), { local: 0, session: 0 });
   assert.deepEqual(await page.evaluate(() => indexedDB.databases()), []);
   assert.equal(await page.evaluate(() => document.referrer), '');
-  assert.deepEqual(unexpectedRequests, [], 'browser made a request outside the loopback origin');
-  assert.deepEqual(consoleErrors, [], 'browser console reported an error');
+  assert.equal(unexpectedRequestCount, 0, 'browser made a request outside the loopback origin');
+  assert.equal(consoleErrorCount, 0, 'browser console reported an error');
+  if (screenshotDirectory) {
+    await writeFile(join(screenshotDirectory, 'metadata.json'), `${JSON.stringify({ screenshots: screenshotViews, sanitized: true }, null, 2)}\n`, { mode: 0o600 });
+  }
 } finally {
   await browser.close();
 }
