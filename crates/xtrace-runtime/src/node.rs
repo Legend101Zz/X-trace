@@ -524,11 +524,10 @@ fn resolve_executable(program: &Path, path: Option<&OsStr>) -> Result<PathBuf, L
     Err(LaunchError::Validation("PATH does not contain a Node launcher"))
 }
 fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
     use std::io::Read as _;
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
-    use std::sync::mpsc;
-    use std::thread;
     use std::time::{Duration, Instant};
     let mut file = std::fs::File::open(executable)
         .map_err(|_| LaunchError::Validation("the Node launcher is unavailable"))?;
@@ -568,25 +567,37 @@ fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
         terminate_probe(&mut child, pid)?;
         return Err(LaunchError::Process);
     };
-    let (output_sender, output_receiver) = mpsc::sync_channel(2);
-    let stdout_sender = output_sender.clone();
-    thread::spawn(move || {
-        let output = read_probe_output(stdout);
-        if stdout_sender.send((true, output)).is_err() {
-            // The caller already exhausted the fixed pipe-drain budget.
+    let stdout_flags = fcntl_getfl(&stdout).map_err(|_| LaunchError::Process);
+    let stderr_flags = fcntl_getfl(&stderr).map_err(|_| LaunchError::Process);
+    if let (Ok(stdout_flags), Ok(stderr_flags)) = (stdout_flags, stderr_flags) {
+        let nonblocking = fcntl_setfl(&stdout, stdout_flags | OFlags::NONBLOCK)
+            .and_then(|()| fcntl_setfl(&stderr, stderr_flags | OFlags::NONBLOCK));
+        if nonblocking.is_err() {
+            terminate_probe(&mut child, pid)?;
+            return Err(LaunchError::Process);
         }
-    });
-    thread::spawn(move || {
-        let output = read_probe_output(stderr);
-        if output_sender.send((false, output)).is_err() {
-            // The caller already exhausted the fixed pipe-drain budget.
-        }
-    });
+    } else {
+        terminate_probe(&mut child, pid)?;
+        return Err(LaunchError::Process);
+    }
     let deadline = Instant::now() + Duration::from_secs(2);
+    let drain_deadline = deadline + Duration::from_secs(1);
+    let mut stdout_output = ProbeOutput::default();
+    let mut stderr_output = ProbeOutput::default();
     let status = loop {
+        if let Err(error) = drain_probe_pipes(
+            &stdout,
+            &stderr,
+            &mut stdout_output,
+            &mut stderr_output,
+            Duration::from_millis(10),
+        ) {
+            terminate_probe(&mut child, pid)?;
+            return Err(error);
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) if Instant::now() < deadline => {}
             Ok(None) | Err(_) => {
                 terminate_probe(&mut child, pid)?;
                 return Err(LaunchError::Validation(
@@ -595,27 +606,33 @@ fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
             }
         }
     };
-    let drain_deadline = Instant::now() + Duration::from_secs(1);
-    let mut stdout = None;
-    let mut stderr = None;
-    while stdout.is_none() || stderr.is_none() {
-        let remaining = drain_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
+    while !stdout_output.closed || !stderr_output.closed {
+        if Instant::now() >= drain_deadline {
+            terminate_probe(&mut child, pid)?;
+            return Err(LaunchError::Validation(
+                "the Node version probe output did not close within its time limit",
+            ));
         }
-        match output_receiver.recv_timeout(remaining) {
-            Ok((true, output)) => stdout = Some(output),
-            Ok((false, output)) => stderr = Some(output),
-            Err(_) => break,
+        if drain_probe_pipes(
+            &stdout,
+            &stderr,
+            &mut stdout_output,
+            &mut stderr_output,
+            Duration::from_millis(10),
+        )
+        .is_err()
+        {
+            terminate_probe(&mut child, pid)?;
+            return Err(LaunchError::Process);
         }
     }
-    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+    if stdout_output.exceeded || stderr_output.exceeded {
         terminate_probe(&mut child, pid)?;
         return Err(LaunchError::Validation(
-            "the Node version probe output did not close within its time limit",
+            "the Node version probe output exceeded its size limit",
         ));
-    };
-    let version = [stdout.as_slice(), stderr.as_slice()].concat();
+    }
+    let version = [stdout_output.bytes, stderr_output.bytes].concat();
     let version = String::from_utf8_lossy(&version);
     let major = version
         .trim()
@@ -625,6 +642,73 @@ fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
         .and_then(|part| part.parse::<u32>().ok());
     if !status.success() || !matches!(major, Some(22 | 24)) {
         return Err(LaunchError::Validation("xtrace run supports native Node.js 22 and 24 only"));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ProbeOutput {
+    bytes: Vec<u8>,
+    closed: bool,
+    exceeded: bool,
+}
+
+fn drain_probe_pipes(
+    stdout: &std::process::ChildStdout,
+    stderr: &std::process::ChildStderr,
+    stdout_output: &mut ProbeOutput,
+    stderr_output: &mut ProbeOutput,
+    timeout: std::time::Duration,
+) -> Result<(), LaunchError> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use std::io::Read as _;
+
+    let timeout = Timespec { tv_sec: 0, tv_nsec: timeout.as_nanos().min(999_999_999) as i64 };
+    let mut fds = Vec::with_capacity(2);
+    let mut streams = Vec::with_capacity(2);
+    if !stdout_output.closed {
+        fds.push(PollFd::new(stdout, PollFlags::IN | PollFlags::HUP | PollFlags::ERR));
+        streams.push(true);
+    }
+    if !stderr_output.closed {
+        fds.push(PollFd::new(stderr, PollFlags::IN | PollFlags::HUP | PollFlags::ERR));
+        streams.push(false);
+    }
+    if fds.is_empty() {
+        return Ok(());
+    }
+    poll(&mut fds, Some(&timeout)).map_err(|_| LaunchError::Process)?;
+    for (fd, is_stdout) in fds.iter().zip(streams) {
+        if !fd.revents().intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
+            continue;
+        }
+        let output = if is_stdout { &mut *stdout_output } else { &mut *stderr_output };
+        let mut buffer = [0; 1_024];
+        let mut remaining = 4;
+        while remaining > 0 {
+            remaining -= 1;
+            let read = if is_stdout {
+                let mut reader = stdout;
+                reader.read(&mut buffer)
+            } else {
+                let mut reader = stderr;
+                reader.read(&mut buffer)
+            };
+            match read {
+                Ok(0) => {
+                    output.closed = true;
+                    break;
+                }
+                Ok(count) => {
+                    let available = 4_096usize.saturating_sub(output.bytes.len());
+                    let retained = count.min(available);
+                    output.bytes.extend_from_slice(&buffer[..retained]);
+                    output.exceeded |= retained < count;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => return Err(LaunchError::Process),
+            }
+        }
     }
     Ok(())
 }
@@ -653,23 +737,6 @@ fn terminate_probe(child: &mut std::process::Child, pid: u32) -> Result<(), Laun
     // only when the bounded reap confirms its exit. Group cleanup failures
     // and an unreaped child become sanitized process failures.
     if group_cleanup_failed || !reaped { Err(LaunchError::Process) } else { Ok(()) }
-}
-
-fn read_probe_output(mut reader: impl std::io::Read) -> Vec<u8> {
-    const MAX_PROBE_OUTPUT: usize = 4_096;
-    let mut retained = Vec::new();
-    let mut buffer = [0; 1_024];
-    while retained.len() < MAX_PROBE_OUTPUT {
-        let available = MAX_PROBE_OUTPUT - retained.len();
-        let read_size = available.min(buffer.len());
-        match reader.read(&mut buffer[..read_size]) {
-            Ok(0) | Err(_) => break,
-            Ok(count) => {
-                retained.extend_from_slice(&buffer[..count]);
-            }
-        }
-    }
-    retained
 }
 
 fn validate_distribution(root: &Path) -> Result<(), LaunchError> {
@@ -939,7 +1006,6 @@ mod tests {
 
     #[test]
     fn native_version_probe_bounds_pipe_drain_when_detached_descendant_holds_pipes() {
-        use rustix::process::{Pid, Signal, kill_process_group};
         use std::time::{Duration, Instant};
 
         let directory = tempfile::tempdir().expect("fixture directory");
@@ -947,27 +1013,44 @@ mod tests {
         let helper = compile_native_probe(directory.path(), Some(&pid_file));
         let started = Instant::now();
         let result = verify_node_version(&helper);
-        assert!(
-            matches!(
-                result,
-                Err(LaunchError::Validation(
-                    "the Node version probe output did not close within its time limit"
-                ))
-            ),
-            "a detached inherited pipe must fail with a fixed bounded diagnostic"
+        let exceeded_time_limit = matches!(
+            result,
+            Err(LaunchError::Validation(
+                "the Node version probe output did not close within its time limit"
+            ))
         );
-        assert!(started.elapsed() < Duration::from_secs(3), "version probe exceeded its bound");
-
         let descendant = std::fs::read_to_string(pid_file)
             .expect("helper recorded detached descendant")
             .trim()
             .parse::<i32>()
             .expect("detached descendant PID");
-        if let Some(group) = Pid::from_raw(descendant) {
-            match kill_process_group(group, Signal::KILL) {
-                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-                Err(_) => panic!("could not clean detached probe fixture"),
-            }
+        let cleanup = ProbeFixtureCleanup(descendant);
+        let cleanup_result = cleanup.terminate();
+        assert!(
+            exceeded_time_limit,
+            "a detached inherited pipe must fail with a fixed bounded diagnostic"
+        );
+        assert!(cleanup_result, "could not clean detached probe fixture");
+        assert!(started.elapsed() < Duration::from_secs(3), "version probe exceeded its bound");
+    }
+
+    struct ProbeFixtureCleanup(i32);
+
+    impl ProbeFixtureCleanup {
+        fn terminate(&self) -> bool {
+            use rustix::process::{Pid, Signal, kill_process_group};
+            Pid::from_raw(self.0).is_none_or(|group| {
+                matches!(
+                    kill_process_group(group, Signal::KILL),
+                    Ok(()) | Err(rustix::io::Errno::SRCH)
+                )
+            })
+        }
+    }
+
+    impl Drop for ProbeFixtureCleanup {
+        fn drop(&mut self) {
+            let _cleanup_succeeded = self.terminate();
         }
     }
 
@@ -1064,13 +1147,18 @@ fn main() {{
         let helper_pid = rustix::process::Pid::from_raw(helper).expect("helper PID");
         let gone_by = Instant::now() + Duration::from_secs(2);
         loop {
-            match rustix::process::kill_process(helper_pid, rustix::process::Signal::CONT) {
-                Err(rustix::io::Errno::SRCH) => break,
-                Ok(()) if Instant::now() < gone_by => {
-                    tokio::time::sleep(Duration::from_millis(10)).await
-                }
-                _ => panic!("process-group helper survived supervised termination"),
+            let exists = !matches!(
+                rustix::process::kill_process(helper_pid, rustix::process::Signal::CONT),
+                Err(rustix::io::Errno::SRCH)
+            );
+            assert!(
+                !exists || Instant::now() < gone_by,
+                "process-group helper survived supervised termination"
+            );
+            if !exists {
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
