@@ -872,6 +872,151 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(oversized.error, "output-limit-exceeded")
             self.assertLessEqual(len(oversized.stdout.encode()) + len(oversized.stderr.encode()), run_gates.MAX_LSOF_OUTPUT_BYTES + 65536)
 
+    def test_lsof_parser_never_resolves_untrusted_names_and_rejects_ambiguous_log_alias(self) -> None:
+        ordinary = run_gates.LsofProbe(0, "p123\nf1\nn/Volumes/other/data.db\n", "")
+        with mock.patch.object(run_gates.os.path, "realpath", side_effect=AssertionError("per-name filesystem resolution")):
+            parsed, error = run_gates._parse_lsof_fields(ordinary, {123}, "/private/tmp/private-gate.log")
+        self.assertIsNone(error)
+        self.assertEqual(parsed, ({123}, set()))
+
+        ambiguous = run_gates.LsofProbe(
+            0, "p123\nf1\nn/private/tmp/private-gate.log (deleted)\n", "",
+        )
+        parsed, error = run_gates._parse_lsof_fields(ambiguous, {123}, "/private/tmp/private-gate.log")
+        self.assertEqual(error, "query-returned-malformed-fields")
+        self.assertEqual(parsed, (set(), set()))
+
+    def test_unreaped_lsof_probe_is_bounded_and_preserves_owned_identity(self) -> None:
+        class UnreapableProbe:
+            pid = 987654
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                if timeout is None:
+                    raise AssertionError("probe wait must always be bounded")
+                raise subprocess.TimeoutExpired("lsof", timeout)
+
+        process = UnreapableProbe()
+        with mock.patch.object(run_gates.os, "killpg", side_effect=PermissionError), \
+                mock.patch.object(run_gates, "_lsof_process_group_state", return_value=None):
+            drained, error = run_gates._terminate_lsof_process_group(process, time.monotonic() + 1)  # type: ignore[arg-type]
+        self.assertFalse(drained)
+        self.assertEqual(error, "probe-signal-failed")
+        self.assertIsNone(process.returncode)
+
+    def test_probe_interrupt_and_selector_failure_cleanup_are_bounded_and_report_identity(self) -> None:
+        class ProbeStream:
+            def __init__(self, descriptor: int) -> None:
+                self.descriptor = descriptor
+
+            def fileno(self) -> int:
+                return self.descriptor
+
+            def close(self) -> None:
+                return None
+
+        class UnreapableProbe:
+            pid = 987655
+            returncode = None
+            stdout = ProbeStream(91)
+            stderr = ProbeStream(92)
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                if timeout is None:
+                    raise AssertionError("probe wait must always be bounded")
+                raise subprocess.TimeoutExpired("lsof", timeout)
+
+        class FailingSelector:
+            def __init__(self, failure: BaseException) -> None:
+                self.failure = failure
+
+            def register(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def get_map(self) -> dict[int, int]:
+                return {1: 1}
+
+            def select(self, _timeout: float) -> list[object]:
+                raise self.failure
+
+            def close(self) -> None:
+                return None
+
+        for failure in (KeyboardInterrupt(), OSError("selector failure")):
+            with self.subTest(failure=type(failure).__name__):
+                process = UnreapableProbe()
+                selector = FailingSelector(failure)
+                with mock.patch.object(run_gates, "LSOF_BINARY", sys.executable), \
+                        mock.patch.object(run_gates.subprocess, "Popen", return_value=process), \
+                        mock.patch.object(run_gates, "_process_start_identity", return_value="probe-start"), \
+                        mock.patch.object(run_gates.selectors, "DefaultSelector", return_value=selector), \
+                        mock.patch.object(run_gates.os, "set_blocking"), \
+                        mock.patch.object(run_gates.os, "killpg", side_effect=PermissionError), \
+                        mock.patch.object(run_gates, "_lsof_process_group_state", return_value=None):
+                    if isinstance(failure, KeyboardInterrupt):
+                        with self.assertRaises(run_gates.InterruptedProbeCleanup) as raised:
+                            run_gates._run_lsof_fields([], time.monotonic() + 1)
+                        self.assertEqual(
+                            raised.exception.owned_probe_processes[0]["startedAt"], "probe-start",
+                        )
+                    else:
+                        result = run_gates._run_lsof_fields([], time.monotonic() + 1)
+                        self.assertEqual(result.error, "probe-not-confirmed-drained")
+                        self.assertEqual(result.owned_probe["startedAt"], "probe-start")
+
+    def test_interrupt_during_probe_reap_triggers_bounded_cleanup_with_identity(self) -> None:
+        class ProbeStream:
+            def __init__(self, descriptor: int) -> None:
+                self.descriptor = descriptor
+
+            def fileno(self) -> int:
+                return self.descriptor
+
+            def close(self) -> None:
+                return None
+
+        class InterruptedWaitProbe:
+            pid = 987656
+            returncode = None
+            stdout = ProbeStream(93)
+            stderr = ProbeStream(94)
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                if timeout is None:
+                    raise AssertionError("probe wait must always be bounded")
+                raise KeyboardInterrupt
+
+        class EmptySelector:
+            def register(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def get_map(self) -> dict[int, int]:
+                return {}
+
+            def close(self) -> None:
+                return None
+
+        process = InterruptedWaitProbe()
+        with mock.patch.object(run_gates, "LSOF_BINARY", sys.executable), \
+                mock.patch.object(run_gates.subprocess, "Popen", return_value=process), \
+                mock.patch.object(run_gates, "_process_start_identity", return_value="probe-start"), \
+                mock.patch.object(run_gates.selectors, "DefaultSelector", return_value=EmptySelector()), \
+                mock.patch.object(run_gates.os, "set_blocking"), \
+                mock.patch.object(run_gates.os, "killpg", side_effect=PermissionError), \
+                mock.patch.object(run_gates, "_lsof_process_group_state", return_value=None):
+            with self.assertRaises(run_gates.InterruptedProbeCleanup) as raised:
+                run_gates._run_lsof_fields([], time.monotonic() + 1)
+        self.assertEqual(raised.exception.owned_probe_processes[0]["pid"], process.pid)
+
     def test_interrupted_descriptor_scan_retains_unconfirmed_candidate_in_both_leases(self) -> None:
         args = self.args()
         args.label = "P00-uninspectable-candidate"
@@ -884,8 +1029,10 @@ class RunnerTests(unittest.TestCase):
         )
         gate = run_gates.Gate("uninspectable-candidate", (sys.executable, "-c", script))
         child_pid: int | None = None
-        with mock.patch.object(run_gates, "_process_holds_log", return_value=None), \
-                mock.patch.object(run_gates, "_run_lsof_fields", return_value=run_gates.LsofProbe(0, "", "")), \
+        probe_identity = {"pid": 654321, "startedAt": "Mon Oct  5 12:00:00 2026", "processGroupId": 654321, "reason": "probe-reap-deadline-exceeded"}
+        with mock.patch.object(run_gates, "_track_descendants", return_value=None), \
+                mock.patch.object(run_gates, "_process_holds_log", return_value=None), \
+                mock.patch.object(run_gates, "_run_lsof_fields", side_effect=run_gates.InterruptedProbeCleanup(probe_identity)), \
                 mock.patch.object(run_gates, "GATES", (gate,)):
             try:
                 self.assertEqual(run_gates.run(args), 1)
@@ -894,7 +1041,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(len(logs), 1)
                 child_pid = int(logs[0].read_text().splitlines()[0])
                 receipt = json.loads((run_dir / "receipt.json").read_text())
-                self.assertIn("could not inspect every live candidate", receipt["error"])
+                self.assertIn("InterruptedProbeCleanup", receipt["error"])
                 self.assertTrue(process_running(child_pid), "unconfirmed candidate must not be signaled")
                 for name in ("cargo", "gradle"):
                     owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
@@ -908,6 +1055,7 @@ class RunnerTests(unittest.TestCase):
                         item["pid"] == child_pid and item["descriptorStatus"] == "uninspectable"
                         for item in owner["unconfirmedProcesses"]
                     ))
+                    self.assertEqual(owner["ownedProbeProcesses"], [probe_identity])
             finally:
                 if child_pid is None:
                     try:
