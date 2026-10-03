@@ -103,12 +103,15 @@ message HandlerRef {
 message SourceRange {
     // Repository-relative UTF-8 path.
     string path = 1;
-    // 1-based start line.
+    // 1-based lower bound of the compiled method debug-line extent.
     uint32 start_line = 2;
     // 1-based start column.
     uint32 start_column = 3;
-    // 1-based end line (inclusive).
+    // 1-based inclusive upper bound of the compiled method debug-line extent.
     uint32 end_line = 4;
     // 1-based end column (inclusive).
     uint32 end_column = 5;
+    // BLAKE3-256 of the exact source bytes attested for the loaded class.
+    // Empty means this range has no source identity and cannot be shown as verified source.
+    bytes content_hash = 6;
 }

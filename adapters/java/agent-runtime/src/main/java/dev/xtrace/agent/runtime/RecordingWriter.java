@@ -16,6 +16,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import xtp.agent.v1.CapabilityOuterClass.Capability;
 import xtp.agent.v1.CapabilityOuterClass.CapabilitySet;
+import xtp.agent.v1.CapabilityOuterClass.SourceRange;
 import xtp.agent.v1.Recording.EventBatch;
 import xtp.agent.v1.Recording.Interaction;
 import xtp.agent.v1.Recording.InteractionKind;
@@ -23,6 +24,7 @@ import xtp.agent.v1.Recording.RecordingEvent;
 import xtp.agent.v1.Recording.RecordingEventKind;
 import xtp.agent.v1.Recording.RecordingFinished;
 import xtp.agent.v1.Recording.RecordingStarted;
+import xtp.agent.v1.Recording.SourceBinding;
 import xtp.agent.v1.Transport.Ack;
 
 /** Single owner of XTP session order, protobuf encoding, batching, and staged ACK validation. */
@@ -253,6 +255,17 @@ final class RecordingWriter implements AutoCloseable, Runnable {
             .setPriority(1)
             .setKind(kind)
             .setSymbol(event.symbol());
+    SourceBinding binding = SourceBinding.forNumber(event.sourceBinding());
+    builder.setSourceBinding(
+        binding == null ? SourceBinding.SOURCE_BINDING_ATTESTATION_MISSING : binding);
+    if (event.sourcePath() != null && event.sourceHash() != null) {
+      builder.setSource(
+          SourceRange.newBuilder()
+              .setPath(event.sourcePath())
+              .setStartLine(event.sourceStartLine())
+              .setEndLine(event.sourceEndLine())
+              .setContentHash(ByteString.copyFrom(event.sourceHash())));
+    }
     if (kind == RecordingEventKind.RECORDING_EVENT_KIND_REQUEST_UPDATE) {
       builder.setInteraction(
           Interaction.newBuilder()

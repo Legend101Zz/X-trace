@@ -62,7 +62,9 @@ pub use ids::{
     ProjectId, RecordingId, RunId, RuntimeSessionId, SourceArtifactId, SourceRevisionId,
 };
 pub use project::{FingerprintParseError, Project, RepositoryFingerprint};
-pub use provenance::{EvidenceRef, LimitationCode, ProducerIdentity, ProvenanceKind};
+pub use provenance::{
+    EvidenceRef, LimitationCode, ProducerIdentity, ProvenanceKind, SourceBinding, SourceRange,
+};
 pub use run::{Run, RunKind, RunState};
 pub use time::{MonotonicNs, WallTime};
 pub use value::{CapturedValue, DropReason, SafePreview, UnavailableReason, ValueShape};

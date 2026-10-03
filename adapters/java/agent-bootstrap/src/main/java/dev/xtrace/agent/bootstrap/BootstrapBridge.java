@@ -56,24 +56,40 @@ public final class BootstrapBridge {
 
   /** Emits a fixture method entry and pushes its event identity as the active parent. */
   public static void frameEnter(String symbol) {
+    frameEnter(symbol, null);
+  }
+
+  /** Emits a fixture frame with the method identity used for compile attestation lookup. */
+  public static void frameEnter(String symbol, java.lang.reflect.Method method) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
     if (context == null || sink == null || !isFixtureSymbol(symbol)) return;
     String eventId = context.nextEventId();
     String parent = context.currentParent();
-    boolean accepted =
-        safeEvent(
-        sink,
-        context,
-        eventId,
-        parent,
-        BridgeEventKind.FRAME_ENTER,
-        symbol,
-        0);
+    boolean accepted = safeMethodEvent(
+        sink, context, eventId, parent, BridgeEventKind.FRAME_ENTER, symbol, 0, method);
     if (!accepted) {
       context.dropped++;
     }
     context.frames.push(new Frame(symbol, accepted ? eventId : ""));
+  }
+
+  private static boolean safeMethodEvent(
+      BridgeSink sink,
+      RequestContext context,
+      String eventId,
+      String parentEventId,
+      int kind,
+      String symbol,
+      int detail,
+      java.lang.reflect.Method method) {
+    try {
+      return sink.offerMethodEvent(
+          context.recordingId, eventId, parentEventId, kind, symbol, System.nanoTime(), detail, method);
+    } catch (RuntimeException | LinkageError ignored) {
+      disable(sink);
+      return false;
+    }
   }
 
   /** Emits a fixture method exit or throw and removes the matching frame on every path. */

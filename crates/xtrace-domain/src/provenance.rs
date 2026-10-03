@@ -8,6 +8,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::hash::ContentHash;
 use crate::ids::{RecordingId, RuntimeSessionId, SourceRevisionId};
 
 /// Coarse provenance classification shared by catalog entries, frames,
@@ -136,6 +137,34 @@ pub struct SourceRange {
     /// Repository-relative UTF-8 path. The path is never absolute and
     /// never carries a leading platform separator.
     pub path: String,
+    /// BLAKE3 identity of the exact source bytes attested at compile time.
+    pub content_hash: Option<ContentHash>,
+}
+
+/// Runtime outcome when binding a method frame to source metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceBinding {
+    /// No source binding state was supplied for this event.
+    Unspecified,
+    /// The adapter reports that the exact loaded class bytes matched its build attestation.
+    Verified,
+    /// No compile-time source attestation entry exists.
+    AttestationMissing,
+    /// Loaded class bytes differ from the compile-time attestation.
+    ClassBytesMismatch,
+    /// The class has no usable method line table.
+    DebugMetadataAbsent,
+    /// The source path or range in the build attestation is invalid.
+    SourceMetadataInvalid,
+}
+
+impl SourceBinding {
+    /// Returns `true` only when the event carries compile-attested source.
+    #[must_use]
+    pub const fn is_verified(self) -> bool {
+        matches!(self, Self::Verified)
+    }
 }
 
 /// Reference describing how an evidence item was produced.

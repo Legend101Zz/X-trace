@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     AppError, CorrelationId, ErrorCategory, ErrorCode, ProjectId, RecordingId, RetryAdvice,
+    SourceBinding,
 };
 
 use crate::PortError;
@@ -124,8 +125,42 @@ pub struct PersistedEvent {
     pub symbol: Option<String>,
     /// Persisted interaction projection, if present.
     pub interaction: Option<PersistedInteraction>,
+    /// Compile-attested source location, if the loaded class was verified.
+    pub source: Option<PersistedSource>,
+    /// Runtime source-binding result persisted with the event.
+    pub source_binding: SourceBinding,
     /// Explicit record of unprojected oversized fields without their contents.
     pub field_truncations: Vec<FieldTruncation>,
+}
+
+/// Bounded source projection for one method event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedSource {
+    /// Repository-relative source path; never an absolute local path.
+    pub path: String,
+    /// Lower bound of the compiled method's debug line extent (1-based).
+    pub start_line: u32,
+    /// Inclusive compiled method line extent, when debug metadata supplies it.
+    pub end_line: Option<u32>,
+    /// Current source comparison result.
+    pub status: SourceStatus,
+    /// Bounded source excerpt, present only when the file hash matches.
+    pub excerpt: Option<String>,
+    /// True when the source extent exceeded the excerpt window.
+    pub truncated: bool,
+}
+
+/// Read-time status for matching current project source to the recorded hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStatus {
+    /// Current project source bytes match the recorded compile attestation.
+    Matched,
+    /// Current source exists but its bytes differ from the recorded identity.
+    Mismatch,
+    /// Source could not be read safely or usable metadata is absent.
+    Unavailable,
 }
 
 /// Safe metadata describing a display or relationship field that was bounded.
@@ -614,6 +649,8 @@ mod tests {
                 kind: "unknown:2147483647".to_owned(),
                 symbol: None,
                 interaction: None,
+                source: None,
+                source_binding: SourceBinding::Unspecified,
                 field_truncations: Vec::new(),
             }],
             has_more: true,

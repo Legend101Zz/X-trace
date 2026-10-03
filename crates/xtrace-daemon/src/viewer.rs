@@ -1255,6 +1255,8 @@ struct TransportEvent {
     kind: String,
     symbol: Option<String>,
     interaction: Option<xtrace_application::PersistedInteraction>,
+    source: Option<xtrace_application::PersistedSource>,
+    source_binding: xtrace_domain::SourceBinding,
     field_truncations: Vec<TransportTruncation>,
 }
 
@@ -1288,6 +1290,8 @@ fn to_transport_detail(detail: RecordingDetail, request_id: CorrelationId) -> Tr
                 kind: item.kind,
                 symbol: item.symbol,
                 interaction: item.interaction,
+                source: item.source,
+                source_binding: item.source_binding,
                 field_truncations: item
                     .field_truncations
                     .into_iter()

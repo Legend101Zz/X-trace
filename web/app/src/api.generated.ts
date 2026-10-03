@@ -206,6 +206,17 @@ export interface components {
             interaction?: {
                 [key: string]: string | null;
             } | null;
+            /** @enum {string} */
+            sourceBinding: "unspecified" | "verified" | "attestation_missing" | "class_bytes_mismatch" | "debug_metadata_absent" | "source_metadata_invalid";
+            source?: null | {
+                path: string;
+                startLine: number;
+                endLine: number | null;
+                /** @enum {string} */
+                status: "matched" | "mismatch" | "unavailable";
+                excerpt: string | null;
+                truncated: boolean;
+            };
             fieldTruncations: {
                 field: string;
                 originalBytes: string;

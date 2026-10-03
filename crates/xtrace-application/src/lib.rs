@@ -72,8 +72,8 @@ pub use recording_queries::{
     FieldTruncation, ListRecordings, MAX_RECORDING_DISPLAY_FIELD_BYTES, MAX_RECORDING_EVENT_LIMIT,
     MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_LIST_LIMIT,
     MAX_RECORDING_RELATIONSHIP_ID_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES, PersistedEvent,
-    PersistedInteraction, RECORDING_READ_SCHEMA_VERSION, RecordingDetail, RecordingEventWindow,
-    RecordingListPage, RecordingMetadata, RecordingQueryService, RecordingReadPort,
-    RecordingStatus, ShowRecording, ShowWindowRequest, UnavailableEvidence, list_recordings,
-    show_recording,
+    PersistedInteraction, PersistedSource, RECORDING_READ_SCHEMA_VERSION, RecordingDetail,
+    RecordingEventWindow, RecordingListPage, RecordingMetadata, RecordingQueryService,
+    RecordingReadPort, RecordingStatus, ShowRecording, ShowWindowRequest, SourceStatus,
+    UnavailableEvidence, list_recordings, show_recording,
 };

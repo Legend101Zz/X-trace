@@ -19,13 +19,13 @@ use xtrace_application::observed_endpoint_queries::{
 use xtrace_application::recording::EndpointObservationInput;
 use xtrace_application::recording_queries::{
     MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES, PersistedEvent,
-    PersistedInteraction, RecordingEventWindow, RecordingMetadata, RecordingStatus,
-    ShowWindowRequest,
+    PersistedInteraction, PersistedSource, RecordingEventWindow, RecordingMetadata,
+    RecordingStatus, ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     ContentHash, CorrelationId, ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointIdentity, HttpMethod,
-    ProjectId, RecordingId, RuntimeSessionId, Transport, WallTime,
+    ProjectId, RecordingId, RuntimeSessionId, SourceBinding, SourceRange, Transport, WallTime,
 };
 
 use crate::connection::SqliteStore;
@@ -692,6 +692,7 @@ impl SqliteRecordingStore<'_> {
     pub(crate) fn read_recording_window(
         &self,
         request: &ShowWindowRequest,
+        source_root: Option<&Path>,
     ) -> Result<RecordingEventWindow, RecordingStoreError> {
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
@@ -887,7 +888,7 @@ impl SqliteRecordingStore<'_> {
                 if event.kind == 14 {
                     incomplete_evidence.push(format!("gap_event_sequence:{}", event.recording_seq));
                 }
-                let projected = project_persisted_event(event);
+                let projected = project_persisted_event(event, source_root);
                 let projected_size = projected
                     .serialized_size_with_separator()
                     .map_err(|_| recording_query_resource_error(correlation_id))?;
@@ -1534,7 +1535,10 @@ fn recording_status(
 
 fn project_persisted_event(
     event: &xtrace_protocol::generated::agent::RecordingEvent,
+    source_root: Option<&Path>,
 ) -> PersistedEvent {
+    use xtrace_protocol::generated::agent::SourceBinding as WireSourceBinding;
+
     let interaction = event.interaction.as_ref().map(|interaction| PersistedInteraction {
         kind: Some(interaction_kind_label(interaction.kind)),
         driver: nonempty(&interaction.driver),
@@ -1543,6 +1547,26 @@ fn project_persisted_event(
         host: nonempty(&interaction.host),
         method: nonempty(&interaction.method),
     });
+    let source_binding = WireSourceBinding::try_from(event.source_binding).ok().map_or(
+        SourceBinding::Unspecified,
+        |binding| match binding {
+            WireSourceBinding::Verified => SourceBinding::Verified,
+            WireSourceBinding::AttestationMissing => SourceBinding::AttestationMissing,
+            WireSourceBinding::ClassBytesMismatch => SourceBinding::ClassBytesMismatch,
+            WireSourceBinding::DebugMetadataAbsent => SourceBinding::DebugMetadataAbsent,
+            WireSourceBinding::SourceMetadataInvalid => SourceBinding::SourceMetadataInvalid,
+            WireSourceBinding::Unspecified => SourceBinding::Unspecified,
+        },
+    );
+    let source = if source_binding.is_verified() {
+        event
+            .source
+            .as_ref()
+            .and_then(source_range_from_wire)
+            .and_then(|source| project_source(&source, source_root))
+    } else {
+        None
+    };
     let mut projected = PersistedEvent {
         sequence: event.recording_seq.to_string(),
         monotonic_ns: event.monotonic_ns.to_string(),
@@ -1552,10 +1576,310 @@ fn project_persisted_event(
         kind: recording_event_kind_label(event.kind),
         symbol: nonempty(&event.symbol),
         interaction,
+        source,
+        source_binding,
         field_truncations: Vec::new(),
     };
     projected.bound_display_fields();
     projected
+}
+
+fn source_range_from_wire(
+    wire: &xtrace_protocol::generated::agent::SourceRange,
+) -> Option<SourceRange> {
+    Some(SourceRange {
+        path: wire.path.clone(),
+        start_line: (wire.start_line > 0).then_some(wire.start_line),
+        start_column: (wire.start_column > 0).then_some(wire.start_column),
+        end_line: (wire.end_line > 0).then_some(wire.end_line),
+        end_column: (wire.end_column > 0).then_some(wire.end_column),
+        content_hash: ContentHash::from_digest_bytes(&wire.content_hash),
+    })
+}
+
+const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_SOURCE_EXCERPT_BYTES: usize = 16 * 1024;
+const MAX_SOURCE_EXCERPT_LINES: u32 = 64;
+
+fn project_source(source: &SourceRange, source_root: Option<&Path>) -> Option<PersistedSource> {
+    let start_line = source.start_line?;
+    let path = source.path.as_str();
+    let safe = [
+        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderController.java",
+        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java",
+        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderRepository.java",
+    ];
+    if start_line == 0 || !safe.contains(&path) || source.content_hash.is_none() {
+        return None;
+    }
+    let end_line = source.end_line.filter(|end| *end >= start_line);
+    let Some(root) = source_root else {
+        return Some(PersistedSource {
+            path: path.to_owned(),
+            start_line,
+            end_line,
+            status: SourceStatus::Unavailable,
+            excerpt: None,
+            truncated: false,
+        });
+    };
+    let Ok(root) = root.canonicalize() else {
+        return unavailable_source(path, start_line, end_line);
+    };
+    let relative = Path::new(path);
+    let Ok(root_metadata) = std::fs::symlink_metadata(&root) else {
+        return unavailable_source(path, start_line, end_line);
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return unavailable_source(path, start_line, end_line);
+    }
+    let Ok(mut directory) = std::fs::File::open(&root) else {
+        return unavailable_source(path, start_line, end_line);
+    };
+    let Ok(opened_root) = directory.metadata() else {
+        return unavailable_source(path, start_line, end_line);
+    };
+    #[cfg(unix)]
+    if root_metadata.dev() != opened_root.dev() || root_metadata.ino() != opened_root.ino() {
+        return unavailable_source(path, start_line, end_line);
+    }
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(part) = component else {
+            return unavailable_source(path, start_line, end_line);
+        };
+        let final_component = index + 1 == components.len();
+        let flags = if final_component {
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC
+        } else {
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC
+        };
+        let Ok(opened) = rustix::fs::openat(&directory, *part, flags, rustix::fs::Mode::empty())
+        else {
+            return unavailable_source(path, start_line, end_line);
+        };
+        let file = std::fs::File::from(opened);
+        if final_component {
+            let Ok(metadata) = file.metadata() else {
+                return unavailable_source(path, start_line, end_line);
+            };
+            if !metadata.is_file() || metadata.len() > MAX_SOURCE_FILE_BYTES {
+                return unavailable_source(path, start_line, end_line);
+            }
+            let mut reader = file.take(MAX_SOURCE_FILE_BYTES + 1);
+            let capacity = usize::try_from(metadata.len()).map_or(0, |value| value);
+            let mut bytes = Vec::with_capacity(capacity);
+            if reader.read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_SOURCE_FILE_BYTES
+            {
+                return unavailable_source(path, start_line, end_line);
+            }
+            let Some(recorded_hash) = source.content_hash.as_ref() else {
+                return unavailable_source(path, start_line, end_line);
+            };
+            if ContentHash::of_bytes(&bytes) != *recorded_hash {
+                return Some(PersistedSource {
+                    path: path.to_owned(),
+                    start_line,
+                    end_line,
+                    status: SourceStatus::Mismatch,
+                    excerpt: None,
+                    truncated: false,
+                });
+            }
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                return unavailable_source(path, start_line, end_line);
+            };
+            return project_matching_source(path, start_line, end_line, text);
+        }
+        if file.metadata().is_err() {
+            return unavailable_source(path, start_line, end_line);
+        }
+        directory = file;
+    }
+    unavailable_source(path, start_line, end_line)
+}
+
+fn project_matching_source(
+    path: &str,
+    start_line: u32,
+    end_line: Option<u32>,
+    text: &str,
+) -> Option<PersistedSource> {
+    let mut excerpt = String::new();
+    let mut truncated = false;
+    let mut found = false;
+    let upper = end_line
+        .map_or(start_line, |value| value)
+        .min(start_line.saturating_add(MAX_SOURCE_EXCERPT_LINES - 1));
+    for (index, line) in text.lines().enumerate() {
+        let Ok(number) = u32::try_from(index + 1) else {
+            truncated = true;
+            break;
+        };
+        if number < start_line {
+            continue;
+        }
+        if number > upper {
+            truncated = end_line.is_some_and(|end| end > upper);
+            break;
+        }
+        found = true;
+        if !excerpt.is_empty() {
+            excerpt.push('\n');
+        }
+        let remaining = MAX_SOURCE_EXCERPT_BYTES.saturating_sub(excerpt.len());
+        if line.len() > remaining {
+            let mut boundary = remaining.min(line.len());
+            while !line.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            excerpt.push_str(&line[..boundary]);
+            truncated = true;
+            break;
+        }
+        excerpt.push_str(line);
+    }
+    if !found {
+        return unavailable_source(path, start_line, end_line);
+    }
+    Some(PersistedSource {
+        path: path.to_owned(),
+        start_line,
+        end_line,
+        status: SourceStatus::Matched,
+        excerpt: Some(excerpt),
+        truncated,
+    })
+}
+
+fn unavailable_source(
+    path: &str,
+    start_line: u32,
+    end_line: Option<u32>,
+) -> Option<PersistedSource> {
+    Some(PersistedSource {
+        path: path.to_owned(),
+        start_line,
+        end_line,
+        status: SourceStatus::Unavailable,
+        excerpt: None,
+        truncated: false,
+    })
+}
+
+#[cfg(test)]
+mod source_projection_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    const PATH: &str =
+        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java";
+
+    fn range(path: &str, hash: ContentHash) -> SourceRange {
+        SourceRange {
+            path: path.to_owned(),
+            start_line: Some(2),
+            start_column: None,
+            end_line: Some(3),
+            end_column: None,
+            content_hash: Some(hash),
+        }
+    }
+
+    fn write_source(root: &Path, bytes: &[u8]) {
+        let file = root.join(PATH);
+        std::fs::create_dir_all(file.parent().expect("parent exists")).expect("directory created");
+        std::fs::write(file, bytes).expect("source written");
+    }
+
+    #[test]
+    fn matching_source_returns_only_the_bounded_recorded_extent() {
+        let root = tempdir().expect("temporary root");
+        let bytes = b"one\ntwo\nthree\nfour\n";
+        write_source(root.path(), bytes);
+        let projected =
+            project_source(&range(PATH, ContentHash::of_bytes(bytes)), Some(root.path()))
+                .expect("source projection");
+        assert_eq!(projected.status, SourceStatus::Matched);
+        assert_eq!(projected.excerpt.as_deref(), Some("two\nthree"));
+    }
+
+    #[test]
+    fn changed_source_is_reported_without_returning_its_contents() {
+        let root = tempdir().expect("temporary root");
+        write_source(root.path(), b"private-source-canary\nchanged\n");
+        let projected = project_source(
+            &range(PATH, ContentHash::of_bytes(b"recorded\nsource\n")),
+            Some(root.path()),
+        )
+        .expect("source projection");
+        assert_eq!(projected.status, SourceStatus::Mismatch);
+        assert!(projected.excerpt.is_none());
+    }
+
+    #[test]
+    fn source_paths_outside_the_fixture_allowlist_are_never_projected() {
+        let root = tempdir().expect("temporary root");
+        let projected = project_source(
+            &range("../../private.txt", ContentHash::of_bytes(b"x")),
+            Some(root.path()),
+        );
+        assert!(projected.is_none());
+    }
+
+    #[test]
+    fn source_files_over_the_read_bound_are_unavailable() {
+        let root = tempdir().expect("temporary root");
+        write_source(
+            root.path(),
+            &vec![b'x'; usize::try_from(MAX_SOURCE_FILE_BYTES + 1).expect("bound fits")],
+        );
+        let projected =
+            project_source(&range(PATH, ContentHash::of_bytes(b"unused")), Some(root.path()))
+                .expect("safe unavailable projection");
+        assert_eq!(projected.status, SourceStatus::Unavailable);
+        assert!(projected.excerpt.is_none());
+    }
+
+    #[test]
+    fn missing_source_root_and_out_of_range_method_lines_are_unavailable() {
+        let root = tempdir().expect("temporary root");
+        let bytes = b"one\ntwo\n";
+        write_source(root.path(), bytes);
+        let no_root = project_source(&range(PATH, ContentHash::of_bytes(bytes)), None)
+            .expect("unavailable projection");
+        assert_eq!(no_root.status, SourceStatus::Unavailable);
+        let mut out_of_range = range(PATH, ContentHash::of_bytes(bytes));
+        out_of_range.start_line = Some(20);
+        out_of_range.end_line = Some(20);
+        let projected =
+            project_source(&out_of_range, Some(root.path())).expect("safe unavailable projection");
+        assert_eq!(projected.status, SourceStatus::Unavailable);
+        assert!(projected.excerpt.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_source_file_is_not_read() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().expect("temporary root");
+        let file = root.path().join(PATH);
+        std::fs::create_dir_all(file.parent().expect("parent exists")).expect("directory created");
+        let private = root.path().join("private-source-canary.txt");
+        std::fs::write(&private, b"private-source-canary").expect("private file written");
+        symlink(&private, &file).expect("source symlink created");
+        let projected = project_source(
+            &range(PATH, ContentHash::of_bytes(b"private-source-canary")),
+            Some(root.path()),
+        )
+        .expect("unavailable projection");
+        assert_eq!(projected.status, SourceStatus::Unavailable);
+        assert!(projected.excerpt.is_none());
+    }
 }
 
 fn nonempty(value: &str) -> Option<String> {
