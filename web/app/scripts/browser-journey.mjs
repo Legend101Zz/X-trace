@@ -97,7 +97,10 @@ try {
     return { width: style.width, height: style.height };
   }), { width: '6px', height: '6px' });
   assert.deepEqual(await page.locator('.recording').first().locator('.recording-title, .recording-sub, .recording-status').evaluateAll((labels) => labels.map((label) => getComputedStyle(label).display)), ['block', 'block', 'block']);
-  await page.getByText('Source unavailable for this capture').waitFor();
+  await page.locator('.event').filter({ hasText: 'OrderService.place' }).click();
+  await page.getByText(/Adapter reported a compile-time source binding; current source matches the recorded identity/).waitFor();
+  const sourceExcerpt = await page.locator('.source-excerpt').textContent();
+  assert.ok(sourceExcerpt?.includes('repository.save'), 'browser displays the matched bounded Spring source excerpt');
   await page.getByText('Values were not projected').waitFor();
   await page.getByText('Completion semantics unavailable').waitFor();
   await page.setViewportSize({ width: 1280, height: 720 });
@@ -236,4 +239,4 @@ try {
   await browser.close();
 }
 
-process.stdout.write('browser journey passed: persisted event order and unavailable evidence verified\n');
+process.stdout.write('browser journey passed: persisted event order, matched source evidence, and unavailable evidence verified\n');

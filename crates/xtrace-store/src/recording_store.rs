@@ -1727,10 +1727,16 @@ fn project_matching_source(
             break;
         }
         found = true;
-        if !excerpt.is_empty() {
+        let separator_bytes = usize::from(!excerpt.is_empty());
+        if excerpt.len().saturating_add(separator_bytes) > MAX_SOURCE_EXCERPT_BYTES {
+            truncated = true;
+            break;
+        }
+        let remaining =
+            MAX_SOURCE_EXCERPT_BYTES.saturating_sub(excerpt.len().saturating_add(separator_bytes));
+        if separator_bytes != 0 {
             excerpt.push('\n');
         }
-        let remaining = MAX_SOURCE_EXCERPT_BYTES.saturating_sub(excerpt.len());
         if line.len() > remaining {
             let mut boundary = remaining.min(line.len());
             while !line.is_char_boundary(boundary) {
@@ -1859,6 +1865,22 @@ mod source_projection_tests {
             project_source(&out_of_range, Some(root.path())).expect("safe unavailable projection");
         assert_eq!(projected.status, SourceStatus::Unavailable);
         assert!(projected.excerpt.is_none());
+    }
+
+    #[test]
+    fn excerpt_limit_includes_inter_line_separator_bytes() {
+        let root = tempdir().expect("temporary root");
+        let first = "a".repeat(MAX_SOURCE_EXCERPT_BYTES);
+        let contents = format!("header\n{first}\nnext\n");
+        write_source(root.path(), contents.as_bytes());
+        let projected = project_source(
+            &range(PATH, ContentHash::of_bytes(contents.as_bytes())),
+            Some(root.path()),
+        )
+        .expect("source projection");
+        let excerpt = projected.excerpt.expect("matched excerpt");
+        assert_eq!(excerpt.len(), MAX_SOURCE_EXCERPT_BYTES);
+        assert!(projected.truncated);
     }
 
     #[cfg(unix)]

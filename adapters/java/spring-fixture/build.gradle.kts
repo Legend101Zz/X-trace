@@ -38,7 +38,9 @@ val snapshotFixtureSources = tasks.register("snapshotFixtureSources") {
     doLast {
         val destination = fixtureSourceSnapshot.get().asFile.resolve("dev/xtrace/fixture")
         destination.mkdirs()
-        fixtureSourceNames.forEach { name -> sourceDirectory.file(name).asFile.copyTo(destination.resolve(name), overwrite = true) }
+        fixtureSourceNames.forEach { name ->
+            sourceDirectory.file(name).asFile.copyTo(destination.resolve(name), overwrite = true)
+        }
     }
 }
 
@@ -48,11 +50,18 @@ val generateSourceAttestation = tasks.register<JavaExec>("generateSourceAttestat
     dependsOn(":agent-runtime:jar", tasks.named("compileJava"))
     classpath = sourceAttestation
     mainClass.set("dev.xtrace.agent.runtime.SourceAttestationGenerator")
+    inputs.dir(fixtureSourceSnapshot)
+    inputs.dir(sourceSets.main.get().output.classesDirs.singleFile)
     val attestation = generatedAttestationResources.map { it.file("META-INF/xtrace/source-attestation.tsv") }
     outputs.file(attestation)
     doFirst {
         val classes = sourceSets.main.get().output.classesDirs.singleFile
-        args(rootProject.projectDir.resolve("../..").canonicalPath, classes.absolutePath, attestation.get().asFile.absolutePath, fixtureSourceSnapshot.get().asFile.absolutePath)
+        args(
+            rootProject.projectDir.resolve("../..").canonicalPath,
+            classes.absolutePath,
+            attestation.get().asFile.absolutePath,
+            fixtureSourceSnapshot.get().asFile.absolutePath
+        )
     }
 }
 
