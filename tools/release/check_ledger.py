@@ -27,6 +27,8 @@ from typing import Any
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 BUILD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+PINNED_CONTRACTS_PATH = pathlib.Path(__file__).resolve().parents[2] / "evidence/v0.01/requirements.json"
+PINNED_CONTRACTS_SHA256 = "ee3ab8c2bb1850e14397019aa2f2d1bb6f654d26be08bfbbdf06e19620f6de8a"
 REQUIRED_KIND = {
     "CAMPAIGN-": "campaign",
     "HUMAN-USABILITY": "human_usability",
@@ -60,6 +62,25 @@ def sha256(data: bytes) -> str:
 
 def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def load_pinned_contracts() -> dict[str, dict[str, Any]]:
+    source = _load_json(PINNED_CONTRACTS_PATH.read_bytes(), "approved requirement manifest")
+    rows = source.get("requirements")
+    if not isinstance(rows, list):
+        raise ValidationError("approved requirement manifest has no requirement rows")
+    contracts: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or row["id"] in contracts:
+            raise ValidationError("approved requirement manifest has malformed or duplicate IDs")
+        contract = {field: row.get(field) for field in ("id", "requirement", "approvedSlice", "mandatory")}
+        contracts[row["id"]] = contract
+    canonical = canonical_json(sorted(contracts.values(), key=lambda item: item["id"]))
+    if sha256(canonical) != PINNED_CONTRACTS_SHA256 or set(contracts) != REQUIRED_IDS:
+        raise ValidationError("approved requirement semantics differ from the pinned v0.01 contracts")
+    if any(not isinstance(item["requirement"], str) or not isinstance(item["approvedSlice"], str) or item["mandatory"] is not True for item in contracts.values()):
+        raise ValidationError("approved requirement manifest has invalid mandatory contract fields")
+    return contracts
 
 
 def _safe_relpath(value: Any) -> pathlib.PurePosixPath:
@@ -164,6 +185,7 @@ def _trust_config(root: pathlib.Path, relative_path: str) -> tuple[dict[str, dic
     if config.get("schemaVersion") != 1 or not isinstance(config.get("keys"), list):
         raise ValidationError("trust configuration schema is invalid")
     keys: dict[str, dict[str, Any]] = {}
+    public_key_fingerprints: dict[str, str] = {}
     for item in config["keys"]:
         if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not isinstance(item.get("roles"), list):
             raise ValidationError("trust key entry is malformed")
@@ -172,6 +194,22 @@ def _trust_config(root: pathlib.Path, relative_path: str) -> tuple[dict[str, dic
         pub = read_evidence(root, item.get("publicKey"), item.get("publicKeySha256"))
         if not pub:
             raise ValidationError("trusted public key is empty")
+        with tempfile.TemporaryDirectory(prefix="xtrace-trusted-key-") as temp_dir:
+            key_path = pathlib.Path(temp_dir) / "public-key.pem"
+            key_path.write_bytes(pub)
+            try:
+                normalized = subprocess.run(
+                    ["openssl", "pkey", "-pubin", "-in", str(key_path), "-pubout", "-outform", "DER"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                )
+            except OSError as exc:
+                raise ValidationError("OpenSSL is required to validate trusted public keys") from exc
+        if normalized.returncode or not normalized.stdout:
+            raise ValidationError("trusted public key is not a valid OpenSSL public key")
+        key_fingerprint = sha256(normalized.stdout)
+        if key_fingerprint in public_key_fingerprints:
+            raise ValidationError("trust configuration aliases one public key under multiple signer IDs")
+        public_key_fingerprints[key_fingerprint] = item["id"]
         keys[item["id"]] = {"roles": item["roles"], "path": item["publicKey"], "sha256": item["publicKeySha256"]}
     return keys, sha256(data)
 
@@ -182,6 +220,41 @@ def _ref(root: pathlib.Path, item: Any, label: str) -> None:
     read_evidence(root, item.get("path"), item.get("sha256"))
 
 
+def validate_release_build(root: pathlib.Path, candidate: str, value: Any) -> tuple[dict[str, Any], dict[str, set[str | None]]]:
+    if not isinstance(value, dict) or not isinstance(value.get("id"), str) or not BUILD_RE.fullmatch(value["id"]):
+        raise ValidationError("ledger must identify one accepted logical release build")
+    if value.get("state") != "accepted":
+        raise ValidationError("logical release build is not accepted")
+    if value.get("sourceSha") != candidate:
+        raise ValidationError("accepted release build is stale for this candidate")
+    artifacts = value.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ValidationError("accepted release build has no artifact set")
+    normalized: list[dict[str, str]] = []
+    artifact_hashes: dict[str, set[str | None]] = {}
+    paths: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or not isinstance(artifact.get("sha256"), str):
+            raise ValidationError("accepted release artifact is malformed")
+        _ref(root, artifact, "accepted release artifact")
+        path = artifact["path"]
+        if path in paths:
+            raise ValidationError("accepted release artifact paths must be unique")
+        paths.add(path)
+        record = {"path": path, "sha256": artifact["sha256"]}
+        if "platform" in artifact:
+            if not isinstance(artifact["platform"], str) or not artifact["platform"]:
+                raise ValidationError("accepted release artifact platform is malformed")
+            record["platform"] = artifact["platform"]
+        normalized.append(record)
+        artifact_hashes.setdefault(artifact["sha256"], set()).add(artifact.get("platform"))
+    normalized.sort(key=lambda item: (item.get("platform", ""), item["path"], item["sha256"]))
+    actual_set_sha = sha256(canonical_json(normalized))
+    if not isinstance(value.get("artifactSetSha256"), str) or value["artifactSetSha256"] != actual_set_sha:
+        raise ValidationError("accepted release artifact-set digest does not match its referenced artifacts")
+    return {"id": value["id"], "sourceSha": candidate, "artifactSetSha256": actual_set_sha}, artifact_hashes
+
+
 def _required_kind(requirement_id: str) -> str | None:
     for prefix, kind in REQUIRED_KIND.items():
         if requirement_id == prefix or requirement_id.startswith(prefix):
@@ -189,8 +262,11 @@ def _required_kind(requirement_id: str) -> str | None:
     return None
 
 
-def _validate_special(root: pathlib.Path, requirement_id: str, attestation: dict[str, Any]) -> None:
-    for artifact in attestation.get("artifacts", []):
+def _validate_special(root: pathlib.Path, requirement_id: str, attestation: dict[str, Any], release_artifacts: dict[str, set[str | None]] | None = None) -> None:
+    attested_artifacts = attestation.get("artifacts", [])
+    if not isinstance(attested_artifacts, list):
+        raise ValidationError("attested artifact list is malformed")
+    for artifact in attested_artifacts:
         _ref(root, artifact, "attested artifact")
     if requirement_id.startswith("CAMPAIGN-"):
         upstream = attestation.get("upstream")
@@ -210,7 +286,7 @@ def _validate_special(root: pathlib.Path, requirement_id: str, attestation: dict
         if not isinstance(scenarios, list) or len(scenarios) < 5:
             raise ValidationError("campaign requires at least five scenario receipts")
         for scenario in scenarios:
-            if not isinstance(scenario, dict) or not scenario.get("name"):
+            if not isinstance(scenario, dict) or not isinstance(scenario.get("name"), str) or not scenario["name"].strip():
                 raise ValidationError("campaign scenario receipt is malformed")
             for name in ("baseline", "instrumented", "browser", "privacy", "overhead"):
                 _ref(root, scenario.get(name), f"campaign {name}")
@@ -221,14 +297,16 @@ def _validate_special(root: pathlib.Path, requirement_id: str, attestation: dict
         participants = attestation.get("participants")
         if not isinstance(participants, list) or len(participants) < 2:
             raise ValidationError("usability receipt requires participant records")
-        identities = [item.get("participantId") for item in participants if isinstance(item, dict)]
-        if len(identities) != len(participants) or len(set(identities)) != len(identities):
+        if any(not isinstance(item, dict) for item in participants):
+            raise ValidationError("usability participant records are malformed")
+        identities = [item.get("participantId") for item in participants]
+        if any(not isinstance(value, str) or not value.strip() for value in identities) or len(set(identities)) != len(identities):
             raise ValidationError("usability participant IDs must be present and unique")
         for item in participants:
             elapsed = item.get("elapsedSeconds")
             if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(elapsed) or elapsed < 0 or elapsed > 600:
                 raise ValidationError("usability participant exceeded the ten-minute task bound")
-            if not isinstance(item.get("participantId"), str) or not item["participantId"].strip() or not isinstance(item.get("correct"), bool):
+            if not isinstance(item.get("correct"), bool):
                 raise ValidationError("each usability observation requires an ID and outcome")
             for name in ("journey", "scoring"):
                 _ref(root, item.get(name), f"participant {name}")
@@ -237,14 +315,22 @@ def _validate_special(root: pathlib.Path, requirement_id: str, attestation: dict
             raise ValidationError("usability participant success rate is below 80 percent")
     elif requirement_id == "HUMAN-OWNER":
         required = {"fresh_install", "linear_canvas_tui", "attach_failure", "partial_capture", "exercise", "exports"}
-        if not isinstance(attestation.get("reviewedJourneys"), list) or not required.issubset(set(attestation["reviewedJourneys"])):
+        journeys = attestation.get("reviewedJourneys")
+        if not isinstance(journeys, list) or any(not isinstance(value, str) for value in journeys) or not required.issubset(set(journeys)):
             raise ValidationError("owner review does not cover every required journey")
+        if release_artifacts is not None and (attestation.get("releaseBuildId") is None or attestation.get("artifactSetSha256") is None):
+            raise ValidationError("owner review must bind the accepted logical release build and artifact set")
     elif requirement_id.startswith("PLATFORM-"):
         platform = attestation.get("platform")
-        expected = {"PLATFORM-MAC": ("macOS", "arm64"), "PLATFORM-LINUX": ("Linux", "x86_64")}[requirement_id]
-        if not isinstance(platform, dict) or (platform.get("os"), platform.get("architecture")) != expected:
+        expected = {"PLATFORM-MAC": ("macOS", "arm64", "macos-arm64"), "PLATFORM-LINUX": ("Linux", "x86_64", "linux-x86_64")}[requirement_id]
+        if not isinstance(platform, dict) or (platform.get("os"), platform.get("architecture")) != expected[:2]:
             raise ValidationError("platform receipt does not match its required OS/architecture")
-        if platform.get("freshProfileInstall") is not True or platform.get("packageSha256") not in {a.get("sha256") for a in attestation.get("artifacts", []) if isinstance(a, dict)}:
+        package_sha = platform.get("packageSha256")
+        if not isinstance(package_sha, str) or not HEX64_RE.fullmatch(package_sha):
+            raise ValidationError("platform receipt package SHA-256 is malformed")
+        platform_artifacts = {a.get("sha256") for a in attested_artifacts}
+        if (platform.get("freshProfileInstall") is not True or package_sha not in platform_artifacts
+                or (release_artifacts is not None and expected[2] not in release_artifacts.get(package_sha, set()))):
             raise ValidationError("platform receipt must bind fresh-profile acceptance to a package artifact")
     elif requirement_id == "SUPPLY-CHAIN":
         required = {"sbom", "licenses", "notices", "advisories", "checksums", "provenance"}
@@ -254,7 +340,10 @@ def _validate_special(root: pathlib.Path, requirement_id: str, attestation: dict
         for name in required:
             _ref(root, artifacts[name], f"supply-chain {name}")
     elif requirement_id == "REVIEWS-EXACT":
-        roles = {item.get("role") for item in attestation.get("reviewers", []) if isinstance(item, dict)}
+        reviewers = attestation.get("reviewers", [])
+        if not isinstance(reviewers, list) or any(not isinstance(item, dict) or not isinstance(item.get("role"), str) for item in reviewers):
+            raise ValidationError("exact release reviewer records are malformed")
+        roles = {item["role"] for item in reviewers}
         if not {"architecture", "security_privacy", "build_integration"}.issubset(roles):
             raise ValidationError("exact release reviews require architecture, security/privacy, and build/integration reviewers")
     elif requirement_id == "DISTRIBUTED-RECHECK":
@@ -262,7 +351,15 @@ def _validate_special(root: pathlib.Path, requirement_id: str, attestation: dict
             raise ValidationError("distributed recheck requires fresh-profile Java and Node journeys")
 
 
-def validate_receipt(root: pathlib.Path, ref: Any, requirement_id: str, candidate: str, trust: dict[str, dict[str, Any]]) -> None:
+def validate_receipt(
+    root: pathlib.Path,
+    ref: Any,
+    requirement_id: str,
+    candidate: str,
+    trust: dict[str, dict[str, Any]],
+    release_build: dict[str, Any] | None = None,
+    release_artifacts: dict[str, set[str | None]] | None = None,
+) -> None:
     raw = read_evidence(root, ref.get("path") if isinstance(ref, dict) else None, ref.get("sha256") if isinstance(ref, dict) else None)
     receipt = _load_json(raw, f"{requirement_id} receipt")
     if receipt.get("schemaVersion") != 1 or receipt.get("requirementId") != requirement_id:
@@ -274,6 +371,8 @@ def validate_receipt(root: pathlib.Path, ref: Any, requirement_id: str, candidat
     build = receipt.get("build")
     if not isinstance(build, dict) or build.get("sourceSha") != candidate or not isinstance(build.get("id"), str) or not BUILD_RE.fullmatch(build["id"]):
         raise ValidationError(f"{requirement_id} receipt is not bound to an exact candidate build")
+    if release_build is not None and (build.get("id") != release_build["id"] or build.get("artifactSetSha256") != release_build["artifactSetSha256"]):
+        raise ValidationError(f"{requirement_id} receipt is bound to a different logical release build or artifact set")
     artifacts = receipt.get("artifacts")
     evidence = receipt.get("evidence")
     checks = receipt.get("checks")
@@ -281,6 +380,15 @@ def validate_receipt(root: pathlib.Path, ref: Any, requirement_id: str, candidat
         raise ValidationError(f"{requirement_id} receipt must reference build artifacts and evidence")
     for item in artifacts:
         _ref(root, item, f"{requirement_id} artifact")
+        if release_artifacts is not None and item["sha256"] not in release_artifacts:
+            raise ValidationError(f"{requirement_id} references an artifact outside the accepted release artifact set")
+    if requirement_id.startswith("PLATFORM-") and release_artifacts is not None:
+        attestation = receipt.get("attestation")
+        if not isinstance(attestation, dict) or not isinstance(attestation.get("platform"), dict):
+            raise ValidationError("platform receipt has no typed package identity")
+        package_sha = attestation["platform"].get("packageSha256")
+        if package_sha not in {item.get("sha256") for item in artifacts if isinstance(item, dict)}:
+            raise ValidationError("platform package must be included among the receipt's accepted artifacts")
     for item in evidence:
         _ref(root, item, f"{requirement_id} evidence")
     if not isinstance(checks, list) or not checks:
@@ -295,7 +403,10 @@ def validate_receipt(root: pathlib.Path, ref: Any, requirement_id: str, candidat
     attestation = receipt.get("attestation")
     if not isinstance(attestation, dict):
         raise ValidationError(f"{requirement_id} has no typed attestation")
-    _validate_special(root, requirement_id, attestation)
+    _validate_special(root, requirement_id, attestation, release_artifacts)
+    if requirement_id == "HUMAN-OWNER" and release_build is not None:
+        if attestation.get("releaseBuildId") != release_build["id"] or attestation.get("artifactSetSha256") != release_build["artifactSetSha256"]:
+            raise ValidationError("owner review is not bound to the accepted logical release build and artifact set")
     signatures = receipt.get("signatures")
     if not isinstance(signatures, list) or not signatures:
         raise ValidationError(f"{requirement_id} has no detached trusted signature")
@@ -337,6 +448,8 @@ def check(ledger_path: pathlib.Path, evidence_root: pathlib.Path, candidate: str
     if ledger.get("schemaVersion") != 1 or ledger.get("candidateSha") != candidate:
         raise ValidationError("ledger schema or candidate SHA does not match")
     trust, trust_digest = _trust_config(evidence_root, trust_path)
+    contracts = load_pinned_contracts()
+    release_build, release_artifacts = validate_release_build(evidence_root, candidate, ledger.get("releaseBuild"))
     requirements = ledger.get("requirements")
     if not isinstance(requirements, list) or not requirements:
         raise ValidationError("ledger has no requirements")
@@ -347,6 +460,9 @@ def check(ledger_path: pathlib.Path, evidence_root: pathlib.Path, candidate: str
         ids.add(item["id"])
         if item.get("mandatory") is not True:
             raise ValidationError(f"mandatory requirement {item['id']} was downgraded")
+        contract = {field: item.get(field) for field in ("id", "requirement", "approvedSlice", "mandatory")}
+        if contract != contracts.get(item["id"]):
+            raise ValidationError(f"approved requirement text or slice changed for {item['id']}")
     if ids != REQUIRED_IDS:
         missing = sorted(REQUIRED_IDS - ids)
         extra = sorted(ids - REQUIRED_IDS)
@@ -363,13 +479,16 @@ def check(ledger_path: pathlib.Path, evidence_root: pathlib.Path, candidate: str
         if item.get("state") != "accepted" or not isinstance(receipts, list) or not receipts:
             raise ValidationError(f"mandatory requirement {item['id']} is pending, missing, skipped, or incomplete")
         for ref in receipts:
-            validate_receipt(evidence_root, ref, item["id"], candidate, trust)
+            validate_receipt(evidence_root, ref, item["id"], candidate, trust, release_build, release_artifacts)
         accepted += 1
     return {
         "schemaVersion": 1,
         "candidateSha": candidate,
+        "releaseBuildId": release_build["id"],
+        "artifactSetSha256": release_build["artifactSetSha256"],
         "mandatoryRequirementsAccepted": accepted,
         "mandatoryRequirementsTotal": sum(item.get("mandatory") is True for item in requirements),
+        "approvedRequirementsSha256": PINNED_CONTRACTS_SHA256,
         "decision": "receipts_structurally_valid_for_release_owner_review",
         "trustConfigSha256": trust_digest,
         "substantiveTruthReviewed": False,

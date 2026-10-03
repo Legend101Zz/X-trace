@@ -11,6 +11,7 @@ import pathlib
 import platform
 import re
 import secrets
+import signal
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from typing import Any, Sequence
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CACHE_NAMES = ("cargo", "cargo-target", "gradle", "npm", "playwright", "tmp", "xdg")
+PS_BINARY = next((path for path in ("/bin/ps", "/usr/bin/ps") if pathlib.Path(path).is_file()), None)
 
 
 @dataclass(frozen=True)
@@ -36,7 +38,7 @@ GATES: tuple[Gate, ...] = (
     Gate("rust-format", ("cargo", "fmt", "--all", "--check")),
     Gate("rust-clippy", ("cargo", "clippy", "--locked", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings")),
     Gate("rustdoc", ("cargo", "doc", "--locked", "--workspace", "--all-features", "--no-deps"), env="rustdoc"),
-    Gate("java-strict", ("./gradlew", "--dependency-verification", "strict", "clean", "test", "installDist", "agentDist", "fixtureBootJar"), cwd="adapters/java"),
+    Gate("java-strict", ("./gradlew", "--no-daemon", "--dependency-verification", "strict", "clean", "test", "installDist", "agentDist", "fixtureBootJar"), cwd="adapters/java"),
     Gate("node-install", ("npm", "ci", "--prefix", "adapters/node")),
     Gate("node-generate", ("npm", "run", "generate", "--prefix", "adapters/node")),
     Gate("node-generate-check", ("npm", "run", "generate:check", "--prefix", "adapters/node")),
@@ -59,22 +61,227 @@ GATES: tuple[Gate, ...] = (
 )
 
 
+class UncertainProcessTree(RuntimeError):
+    """A process group may still be writing; shared builders must stay leased."""
+
+    def __init__(self, message: str, process_group_id: int):
+        super().__init__(message)
+        self.process_group_id = process_group_id
+        self.owned_processes: dict[int, str] = {}
+
+
+def _process_snapshot() -> dict[int, tuple[int, str, str]]:
+    """Return pid -> (ppid, start identity, state) using a fixed system ps."""
+    if PS_BINARY is None:
+        raise RuntimeError("cannot inspect process ownership: system ps is unavailable")
+    try:
+        snapshot = subprocess.run(
+            [PS_BINARY, "-axo", "pid=,ppid=,lstart=,stat="],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise RuntimeError("cannot inspect process ownership")
+    if snapshot.returncode:
+        raise RuntimeError("cannot inspect process ownership")
+    records: dict[int, tuple[int, str, str]] = {}
+    for line in snapshot.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 8 and fields[0].isdigit() and fields[1].isdigit():
+            pid, ppid = int(fields[0]), int(fields[1])
+            records[pid] = (ppid, " ".join(fields[2:7]), fields[7][:1])
+    return records
+
+
+def _track_descendants(root: tuple[int, str], owned: dict[int, str], snapshot: dict[int, tuple[int, str, str]]) -> None:
+    """Remember identities still parented under any process we already own."""
+    if root[0] in snapshot and snapshot[root[0]][1] == root[1]:
+        owned[root[0]] = root[1]
+    changed = True
+    while changed:
+        changed = False
+        parents = {pid for pid, started_at in owned.items()
+                   if pid in snapshot and snapshot[pid][1] == started_at and snapshot[pid][2] not in {"Z", "X"}}
+        for pid, (ppid, started_at, state) in snapshot.items():
+            if ppid in parents and pid not in owned and state not in {"Z", "X"}:
+                owned[pid] = started_at
+                changed = True
+
+
+def _owned_processes_alive(owned: dict[int, str], snapshot: dict[int, tuple[int, str, str]]) -> list[int]:
+    return [pid for pid, started_at in owned.items()
+            if pid in snapshot and snapshot[pid][1] == started_at and snapshot[pid][2] not in {"Z", "X"}]
+
+
+def _signal_owned(owned: dict[int, str], sig: int) -> None:
+    snapshot = _process_snapshot()
+    for pid, started_at in list(owned.items()):
+        current = snapshot.get(pid)
+        if current is None or current[1] != started_at or current[2] in {"Z", "X"}:
+            continue
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            raise RuntimeError("could not signal an owned gate descendant") from exc
+
+
+def _stop_owned_process_tree(root: tuple[int, str], owned: dict[int, str], grace: float = 1.0) -> bool:
+    try:
+        snapshot = _process_snapshot()
+        _track_descendants(root, owned, snapshot)
+        _signal_owned(owned, signal.SIGTERM)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            snapshot = _process_snapshot()
+            _track_descendants(root, owned, snapshot)
+            if not _owned_processes_alive(owned, snapshot):
+                return True
+            time.sleep(0.05)
+        snapshot = _process_snapshot()
+        _track_descendants(root, owned, snapshot)
+        _signal_owned(owned, signal.SIGKILL)
+        deadline = time.monotonic() + grace * 3
+        while time.monotonic() < deadline:
+            snapshot = _process_snapshot()
+            _track_descendants(root, owned, snapshot)
+            if not _owned_processes_alive(owned, snapshot):
+                return True
+            time.sleep(0.05)
+        return False
+    except (OSError, RuntimeError, KeyboardInterrupt):
+        return False
+
+
+def _stop_and_reap_owned_tree(process: subprocess.Popen[bytes], root: tuple[int, str], owned: dict[int, str]) -> bool:
+    if not _stop_owned_process_tree(root, owned):
+        return False
+    try:
+        process.wait(timeout=1)
+        return True
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        return False
+
+
 def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout: int, log_path: pathlib.Path) -> tuple[int, float]:
     started = time.monotonic()
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     code = 0
+    uncertain: str | None = None
+    process: subprocess.Popen[bytes] | None = None
+    root_identity: tuple[int, str] | None = None
+    owned: dict[int, str] = {}
+    timed_out = interrupted = False
     with os.fdopen(fd, "wb") as log:
         try:
-            result = subprocess.run(list(argv), cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout, check=False)
-            code = result.returncode
-        except subprocess.TimeoutExpired:
-            log.write(f"\nGate timed out after {timeout} seconds.\n".encode())
-            code = 124
+            process = subprocess.Popen(list(argv), cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            deadline = time.monotonic() + timeout
+            snapshot = _process_snapshot()
+            root_record = snapshot.get(process.pid)
+            if root_record is not None:
+                root_identity = (process.pid, root_record[1])
+                _track_descendants(root_identity, owned, snapshot)
+            while True:
+                snapshot = _process_snapshot()
+                if root_identity is not None:
+                    _track_descendants(root_identity, owned, snapshot)
+                try:
+                    code = process.wait(timeout=0.05)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        break
+            if root_identity is None:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        time.sleep(0.1)
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    try:
+                        process.wait(timeout=2)
+                    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                        pass
+                uncertain = f"cannot identify process {process.pid} or its descendants"
+            elif timed_out or interrupted:
+                if not _stop_and_reap_owned_tree(process, root_identity, owned):
+                    cause = "timed-out" if timed_out else "interrupted"
+                    uncertain = f"{cause} process tree rooted at {process.pid} could not be confirmed drained"
+                elif timed_out:
+                    log.write(f"\nGate timed out after {timeout} seconds; owned process tree drained.\n".encode())
+                    code = 124
+                else:
+                    log.write(b"\nGate interrupted; owned process tree drained.\n")
+                    code = 130
+            else:
+                snapshot = _process_snapshot()
+                _track_descendants(root_identity, owned, snapshot)
+                if _owned_processes_alive(owned, snapshot):
+                    if not _stop_and_reap_owned_tree(process, root_identity, owned):
+                        uncertain = f"completed process tree rooted at {process.pid} could not be confirmed drained"
+                    else:
+                        log.write(b"\nGate left descendant processes running; tree drained and gate failed.\n")
+                        code = 125
+        except KeyboardInterrupt:
+            interrupted = True
+            if process is not None and root_identity is not None and _stop_and_reap_owned_tree(process, root_identity, owned):
+                log.write(b"\nGate interrupted; owned process tree drained.\n")
+                code = 130
+            else:
+                if process is not None and process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        time.sleep(0.1)
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    try:
+                        process.wait(timeout=2)
+                    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                        pass
+                uncertain = f"interrupted process tree rooted at {process.pid if process else 'unknown'} could not be confirmed drained"
+        except RuntimeError as exc:
+            if process is None:
+                log.write(f"Gate could not start ({type(exc).__name__}).\n".encode())
+                code = 127
+            else:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        time.sleep(0.1)
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    try:
+                        process.wait(timeout=2)
+                    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                        pass
+                uncertain = f"process ownership could not be enumerated for gate rooted at {process.pid}: {exc}"
         except OSError as exc:
-            log.write(f"Gate could not start ({type(exc).__name__}).\n".encode())
-            code = 127
+            if process is None:
+                log.write(f"Gate could not start ({type(exc).__name__}).\n".encode())
+                code = 127
+            else:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        time.sleep(0.1)
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    try:
+                        process.wait(timeout=2)
+                    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                        pass
+                uncertain = f"process ownership could not be enumerated for gate rooted at {process.pid}: {type(exc).__name__}"
         log.flush()
         os.fsync(log.fileno())
+    if uncertain is not None:
+        error = UncertainProcessTree(uncertain, process.pid if process else -1)
+        error.owned_processes = dict(owned)
+        raise error
     return code, round(time.monotonic() - started, 6)
 
 
@@ -132,7 +339,7 @@ def _versions(repo: pathlib.Path, env: dict[str, str]) -> dict[str, str]:
         ("java", ("java", "-version"), "."),
         ("node", ("node", "--version"), "."),
         ("npm", ("npm", "--version"), "."),
-        ("gradle-wrapper", ("./gradlew", "--version"), "adapters/java"),
+        ("gradle-wrapper", ("./gradlew", "--no-daemon", "--version"), "adapters/java"),
         ("buf", ("buf", "--version"), "."),
         ("playwright", ("./node_modules/.bin/playwright", "--version"), "web/app"),
         ("python", (sys.executable, "--version"), "."),
@@ -223,8 +430,25 @@ class Lease:
             shutil.rmtree(self.path)
             self.acquired = False
 
+    def retain_for_manual_recovery(self, reason: str, process_group_id: int, owned_processes: dict[int, str]) -> None:
+        if not self.acquired or self.borrowed:
+            return
+        try:
+            owner = json.loads((self.path / "owner.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            owner = {"label": self.label, "token": self.token}
+        owner["requiresManualRecovery"] = True
+        owner["terminationStatus"] = reason
+        owner["processGroupId"] = process_group_id
+        owner["ownedProcesses"] = [{"pid": pid, "startedAt": started_at} for pid, started_at in sorted(owned_processes.items())]
+        _atomic_json(self.path / "owner.json", owner)
+
 
 def run(args: argparse.Namespace) -> int:
+    if os.name != "posix":
+        raise ValueError("release gate process-tree control requires a POSIX host")
+    if args.command_timeout <= 0:
+        raise ValueError("--command-timeout must be a positive number of seconds")
     args.lease_token = getattr(args, "lease_token", "") or secrets.token_hex(16)
     repo = pathlib.Path(args.repo).expanduser().resolve(strict=True)
     cache = pathlib.Path(args.cache_root).expanduser().resolve()
@@ -281,6 +505,7 @@ def run(args: argparse.Namespace) -> int:
         "decision": "running",
     }
     acquired_leases: list[Lease] = []
+    retain_leases = False
     try:
         for lease in leases:
             lease.acquire()
@@ -309,8 +534,11 @@ def run(args: argparse.Namespace) -> int:
         }
         for index, gate in enumerate(GATES):
             head_now = _git(repo, "rev-parse", "HEAD").lower()
-            if head_now != head_start:
-                results.append({"name": gate.name, "status": "unreached", "reason": "HEAD changed during gate run"})
+            tree_before = _tree_state_digest(repo)
+            diff_before = _hash(_phase_diff(repo, base))
+            if head_now != head_start or tree_before != dirty_start or diff_before != _hash(diff_start):
+                results.extend({"name": later.name, "status": "unreached", "reason": "source identity changed before gate"} for later in GATES[index:])
+                manifest["integrityFailure"] = "source identity changed before gate"
                 break
             gate_env = dict(env)
             argv = list(gate.argv)
@@ -347,8 +575,17 @@ def run(args: argparse.Namespace) -> int:
                 "logSha256": _hash_file(log_path),
                 "headBefore": head_now,
                 "headAfter": _git(repo, "rev-parse", "HEAD").lower(),
+                "workingTreeDigestBefore": tree_before,
+                "workingTreeDigestAfter": _tree_state_digest(repo),
+                "phaseDiffSha256Before": diff_before,
+                "phaseDiffSha256After": _hash(_phase_diff(repo, base)),
                 "status": "passed" if code == 0 else "failed",
             }
+            if (entry["headAfter"] != head_start or entry["workingTreeDigestAfter"] != dirty_start
+                    or entry["phaseDiffSha256After"] != _hash(diff_start)):
+                entry["status"] = "failed"
+                entry["integrityFailure"] = "source identity changed during gate"
+                code = code or 1
             results.append(entry)
             if gate.name == "web-browser-install" and code == 0:
                 manifest["toolVersions"]["playwright"] = _versions(repo, env).get("playwright", "unavailable")
@@ -381,6 +618,10 @@ def run(args: argparse.Namespace) -> int:
         print(f"Decision: {manifest['decision']} ({sum(item.get('status') != 'unreached' for item in results)}/{len(GATES)} gates reached)")
         return 0 if manifest["decision"] == "checks_passed_for_review" else 1
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
+        if isinstance(exc, UncertainProcessTree):
+            retain_leases = True
+            for lease in acquired_leases:
+                lease.retain_for_manual_recovery(str(exc), exc.process_group_id, exc.owned_processes)
         manifest["decision"] = "failed"
         manifest["error"] = str(exc)
         try:
@@ -399,8 +640,9 @@ def run(args: argparse.Namespace) -> int:
         print(f"release gates failed: {exc}", file=sys.stderr)
         return 1
     finally:
-        for lease in reversed(acquired_leases):
-            lease.release()
+        if not retain_leases:
+            for lease in reversed(acquired_leases):
+                lease.release()
 
 
 def main() -> int:

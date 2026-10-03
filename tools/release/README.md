@@ -27,6 +27,20 @@ lease is an error and is never broken automatically. An explicitly nested run
 may reuse a lease only by supplying its exact 32-hex lease token. The tool only runs checks.
 It does not accept a phase, merge, push, tag, or publish.
 
+Each gate runs in a fresh POSIX session. The runner tracks descendant PIDs with
+their process start identity, including descendants that create a new session
+or process group. Timeout or interrupt sends TERM, then KILL if needed, and
+confirms every owned process is gone before releasing either builder lease. A
+process tree that cannot be confirmed drained leaves both leases in place with
+`requiresManualRecovery`, `processGroupId`, the tracked PID/start-identity list
+in `ownedProcesses`, and a reason in each `owner.json`.
+Do not remove those lease directories by age or retry automatically: inspect the
+recorded process and descendants, confirm none can write to either builder
+cache, then have the operator remove both lease directories manually. The
+runner never breaks a retained lease itself. Source
+HEAD, worktree, and pinned phase-diff identity are checked immediately before
+and after every gate as well as at the full-run boundary.
+
 `check_ledger.py` reads the ledger path supplied by the caller and resolves
 every referenced receipt, artifact, log, key and signature only beneath the
 explicit evidence root. Receipt paths must be relative, symlink-free, and
@@ -39,8 +53,14 @@ trust configuration stored beneath that evidence root. The trust configuration
 contains key IDs, role names, relative public-key paths and public-key hashes.
 The operator/release owner must independently authenticate and approve that
 trust configuration; the checker does not create signing authority. The tool
-pins the complete mandatory requirement-ID set from the approved v0.01 plan,
-so deleting a row or changing it to optional cannot make the ledger pass. Signed
+pins the canonical `id`, `requirement`, `approvedSlice`, and `mandatory` fields
+for every approved row with a tracked contract digest, so deleting a row,
+changing its wording/slice, or changing it to optional cannot make the ledger
+pass. Trusted signer IDs must resolve to distinct normalized public-key
+material, preventing one key from filling multiple reviewer roles. This checks
+key distinctness only: the owner must authenticate the mapping and verify that
+reviewers were independent actors; signatures do not prove human identity or
+independent review. Signed
 campaign, platform, supply-chain, review, owner and human-study receipt types
 have additional required fields. For usability, each observed participant
 record carries an individual outcome and time plus hashed journey/scoring
@@ -63,9 +83,23 @@ Receipt references use this shape:
 {"path":"receipts/P01-JAVA-LAUNCH.json","sha256":"<64 lowercase hex characters>"}
 ```
 
+The ledger has one accepted `releaseBuild` with a logical build ID, candidate
+source SHA, and an `artifacts` set of hashed files (platform packages use the
+declared `macos-arm64` and `linux-x86_64` platform labels). Its canonical
+`artifactSetSha256` binds that set. Every receipt must
+name the same build ID, source SHA, and artifact-set digest; all receipt
+artifacts must be members of that accepted set. The owner-review receipt also
+signs the logical build and artifact-set identity. This prevents joining
+independently rebuilt receipts or unreviewed package hashes into one candidate.
+
 Each receipt has `schemaVersion`, `requirementId`, `kind`, `result`,
-`candidateSha`, `build: {id, sourceSha}`, non-empty `artifacts`, `evidence`,
-and `checks` arrays. Each check must say `status: "passed"` and `reached: true`.
+`candidateSha`, `build: {id, sourceSha, artifactSetSha256}`, non-empty
+`artifacts`, `evidence`, and `checks` arrays. Each check must say
+`status: "passed"` and `reached: true`.
+For the supply-chain receipt, `attestation.artifacts` remains the ordinary list
+of release artifacts; its separate `attestation.supplyChainArtifacts` object
+maps `sbom`, `licenses`, `notices`, `advisories`, `checksums`, and `provenance`
+to hashed evidence references.
 The canonical receipt excluding `signatures` is the signed payload. Signature
 entries identify a trusted `keyId`, authorized `role`, relative signature
 `path`, and SHA-256. The Petclinic exception records the user's explicit choice
@@ -75,5 +109,5 @@ also records that obsolete `1.5.x` was not used.
 Run the stdlib-only tooling tests with:
 
 ```text
-python3 -m unittest tools.release.test_release_tools
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tools.release.test_release_tools
 ```
