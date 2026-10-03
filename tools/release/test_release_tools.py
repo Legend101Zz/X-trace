@@ -397,6 +397,40 @@ class RunnerTests(unittest.TestCase):
         self.assertNotEqual(child_pgid, spawned[0].pid)
         self.assertFalse(process_running(child_pid))
 
+    def test_completed_owned_descendant_is_drained_after_parent_exits(self) -> None:
+        script = (
+            "import os,subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); "
+            "print(child.pid,os.getpgid(child.pid),flush=True); time.sleep(.3)"
+        )
+        gate = run_gates.Gate("completed-owned-child", (sys.executable, "-c", script))
+        args = self.args()
+        args.label = "P00-completed-owned-child"
+        spawned: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def capture_process(*argv: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            process = real_popen(*argv, **kwargs)
+            command = argv[0] if argv else kwargs.get("args")
+            if (kwargs.get("start_new_session") and isinstance(command, (list, tuple))
+                    and command and command[0] == sys.executable):
+                spawned.append(process)
+            return process
+
+        with mock.patch.object(run_gates, "GATES", (gate,)), \
+                mock.patch.object(run_gates.subprocess, "Popen", side_effect=capture_process):
+            self.assertEqual(run_gates.run(args), 1)
+        receipt = json.loads((self.cache / "release-gates" / args.label / "receipt.json").read_text())
+        entry = receipt["gates"][0]
+        log = (self.cache / "release-gates" / args.label / entry["log"]).read_text()
+        child_pid, child_pgid = map(int, log.splitlines()[0].split())
+        self.assertEqual(entry["exitCode"], 125)
+        self.assertIn("Gate left descendant processes running; tree drained", log)
+        self.assertNotEqual(child_pgid, spawned[0].pid)
+        self.assertFalse(process_running(child_pid))
+        self.assertFalse((self.cache / "leases/cargo").exists())
+        self.assertFalse((self.cache / "leases/gradle").exists())
+
     def test_uncertain_process_tree_retains_both_leases_for_manual_recovery(self) -> None:
         script = "import time; time.sleep(60)"
         gate = run_gates.Gate("uncertain-timeout", (sys.executable, "-c", script))
@@ -627,7 +661,8 @@ class RunnerTests(unittest.TestCase):
         gate = run_gates.Gate("delayed-detached-child", (sys.executable, "-c", script))
         child_pid: int | None = None
         try:
-            with mock.patch.object(run_gates, "GATES", (gate,)):
+            with mock.patch.object(run_gates, "GATES", (gate,)), \
+                    mock.patch.object(run_gates, "_track_descendants", return_value=None):
                 self.assertEqual(run_gates.run(args), 1)
             run_dir = self.cache / "release-gates" / args.label
             receipt = json.loads((run_dir / "receipt.json").read_text())
@@ -684,9 +719,11 @@ class RunnerTests(unittest.TestCase):
 
         child_pid: int | None = None
         try:
-            with mock.patch.object(run_gates, "GATES", (gate,)), mock.patch.object(
-                run_gates, "_untracked_processes_since", side_effect=interrupt_final_scan,
-            ):
+            with mock.patch.object(run_gates, "GATES", (gate,)), \
+                    mock.patch.object(run_gates, "_track_descendants", return_value=None), \
+                    mock.patch.object(
+                        run_gates, "_untracked_processes_since", side_effect=interrupt_final_scan,
+                    ):
                 self.assertEqual(run_gates.run(args), 1)
             run_dir = self.cache / "release-gates" / args.label
             receipt = json.loads((run_dir / "receipt.json").read_text())
@@ -926,6 +963,20 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([item["pid"] for item in result.held], [first_pid])
         self.assertEqual([item["pid"] for item in result.uninspectable], [second_pid])
         self.assertEqual(result.error, "untracked-process descriptor scan could not inspect every live candidate")
+
+    def test_process_fd_inspection_reports_inaccessible_linux_directory(self) -> None:
+        pid = 424242
+        fd_directory = pathlib.Path(f"/proc/{pid}/fd")
+        log_path = self.root / "private-gate.log"
+        log_path.write_text("private\n")
+        real_is_dir = pathlib.Path.is_dir
+        def is_dir(path: pathlib.Path) -> bool:
+            if path == fd_directory:
+                return False
+            return real_is_dir(path)
+
+        with mock.patch.object(pathlib.Path, "is_dir", is_dir):
+            self.assertIsNone(run_gates._process_holds_log(pid, log_path))
 
     def test_probe_interrupt_and_selector_failure_cleanup_are_bounded_and_report_identity(self) -> None:
         class ProbeStream:
@@ -1189,21 +1240,52 @@ class RunnerTests(unittest.TestCase):
         )
         gate = run_gates.Gate("mixed-proc-candidates", (sys.executable, "-c", script))
         child_pids: list[int] = []
+        current_log_path: pathlib.Path | None = None
+        real_scan = run_gates._untracked_processes_since
+        real_is_dir = pathlib.Path.is_dir
+        real_iterdir = pathlib.Path.iterdir
+        real_readlink = os.readlink
 
-        def inspect(pid: int, log_path: pathlib.Path) -> bool | None:
-            if not child_pids and log_path.exists():
-                try:
-                    child_pids.extend(int(value) for value in log_path.read_text().split())
-                except (OSError, ValueError):
-                    child_pids.clear()
-            if pid in child_pids and pid == child_pids[0]:
+        def scan(baseline: dict[int, tuple[int, str, str]], owned: dict[int, str],
+                 snapshot: dict[int, tuple[int, str, str]], log_path: pathlib.Path):
+            nonlocal current_log_path
+            current_log_path = log_path
+            if not child_pids:
+                child_pids.extend(int(value) for value in log_path.read_text().split())
+            return real_scan(baseline, owned, snapshot, log_path)
+
+        def is_dir(path: pathlib.Path) -> bool:
+            if path == pathlib.Path("/proc"):
                 return True
-            return None
+            if path.name == "fd" and path.parent.parent == pathlib.Path("/proc"):
+                try:
+                    candidate_pid = int(path.parent.name)
+                except ValueError:
+                    return real_is_dir(path)
+                if len(child_pids) == 2 and candidate_pid == child_pids[1]:
+                    return False
+                if len(child_pids) == 2 and candidate_pid == child_pids[0]:
+                    return True
+            return real_is_dir(path)
+
+        def iterdir(path: pathlib.Path):
+            if len(child_pids) == 2 and path == pathlib.Path(f"/proc/{child_pids[0]}/fd"):
+                return iter((path / "1",))
+            return real_iterdir(path)
+
+        def readlink(path: pathlib.Path | str) -> str:
+            if len(child_pids) == 2 and pathlib.Path(path) == pathlib.Path(f"/proc/{child_pids[0]}/fd/1"):
+                if current_log_path is not None:
+                    return os.path.realpath(current_log_path)
+            return real_readlink(path)
 
         try:
             with mock.patch.object(run_gates, "GATES", (gate,)), \
-                    mock.patch.object(pathlib.Path, "is_dir", return_value=True), \
-                    mock.patch.object(run_gates, "_process_holds_log", side_effect=inspect):
+                    mock.patch.object(run_gates, "_track_descendants", return_value=None), \
+                    mock.patch.object(run_gates, "_untracked_processes_since", side_effect=scan), \
+                    mock.patch.object(pathlib.Path, "is_dir", is_dir), \
+                    mock.patch.object(pathlib.Path, "iterdir", iterdir), \
+                    mock.patch.object(run_gates.os, "readlink", side_effect=readlink):
                 self.assertEqual(run_gates.run(args), 1)
             run_dir = self.cache / "release-gates" / args.label
             logs = list((run_dir / "logs").glob(".*.tmp"))
