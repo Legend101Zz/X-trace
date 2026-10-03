@@ -6,29 +6,32 @@
   "phase": "P00",
   "workers": {
     "java_evidence": {
-      "branch": "slice/v001-java-evidence",
+      "branch": "slice/v001-java-attach",
       "model": "gpt-6-luna",
       "reasoning": "high",
-      "scope": "Java/source shared increment under central root review",
-      "state": "implementation_authorized"
+      "scope": "Repair JVM attach lifecycle/security, then genuine version-matrix journeys; source preparation unaccepted",
+      "state": "preparation_unaccepted",
+      "sourceBase": "108849c0f410f861d43436fcb6859bb1b5052c4d"
     },
     "node_capture": {
-      "branch": "slice/v001-node-capture",
+      "branch": "slice/v001-shared-replay",
       "model": "gpt-6-luna",
       "reasoning": "high",
-      "scope": "isolated Node HTTP preparation, no Slice4 acceptance",
-      "state": "implementation_authorized"
+      "scope": "Central shared replay/index/terminal evidence; bounded Control runner repairs take precedence",
+      "state": "preparation_unaccepted",
+      "sourceBase": "108849c0f410f861d43436fcb6859bb1b5052c4d",
+      "preservedNodePreparationSha": "09aba20dce9f39b5c46620ddc05efe1eac6b3261"
     },
     "release_audit": {
       "model": "gpt-6-sol",
       "reasoning": "high",
-      "scope": "read-only architecture/security current-source audit",
-      "state": "running"
+      "scope": "Separate exact-source architecture/security and later build/integration reviews",
+      "state": "reviews_in_progress"
     }
   },
   "buildLeases": {
-    "gradle": "java_evidence",
-    "cargo": "root"
+    "policy": "serialize shared Cargo/Gradle; verify live ownership before invoking builders",
+    "liveOwnership": "private task execution checkpoint and cache leases"
   },
   "continuation": {
     "automationId": "x-trace-v0-01-launch-continuation",
@@ -40,10 +43,10 @@
   "externalDependencies": [
     "macOS signing/notarization identity unavailable",
     "real usability participants and owner acceptance pending",
-    "Docker started, Linux aarch64; disposable dependency preparation pending, no x86_64 package acceptance",
-    "Postman credentials unverified"
+    "Docker Linux aarch64 dependencies available; Linux x86_64 packaged acceptance unrun",
+    "Postman connected credentials unavailable; local export fallback remains mandatory"
   ],
-  "next": "Review release control; implement verified source method identity and isolated Node capture; preserve all nine-slice gates.",
+  "next": "Finish reviewed release-control gate tooling, exact local floor and CI; integrate source and Node preparation after their own exact gates; finish attach/shared replay and every mandatory product/release requirement.",
   "decisions": [
     {
       "date": "2026-10-04",
@@ -51,5 +54,11 @@
       "subject": "Petclinic tag exception",
       "decision": "Use current main SHA with explicit tag exception; no obsolete 1.5.x campaign."
     }
-  ]
+  ],
+  "baselinePreparation": {
+    "path": "external-baselines.preparation.json",
+    "projects": 6,
+    "checks": 56,
+    "releaseAcceptance": false
+  }
 }

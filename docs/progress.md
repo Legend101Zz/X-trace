@@ -1,15 +1,21 @@
 # X-trace implementation progress
 
 This file is maintained by the main orchestrator after independent review and
-verification. It is also the execution checkpoint: no phase advances, merges,
-pushes, or continues in background after its status report until the user
-explicitly approves the next proposed phase.
+verification. It is also the execution checkpoint. The active launch mandate
+below supersedes the historical per-phase approval pauses and model assignments
+recorded later in this file; mandatory reviews and verification still apply.
 
 ## Active v0.01 autonomous launch authorization (2026-10-04)
 
 The owner explicitly authorized autonomous implementation through the full v0.01 release gate, feature pushes, independently reviewed no-ff merges and main pushes, and publication only after acceptance. This supersedes older per-phase approval pauses for this launch scope. Use Luna High implementation and separate Sol High architecture/security/build reviews. Root alone merges/releases. Every required gate remains mandatory.
 
-The release specification is `docs/releases/v0.01.md`; machine-readable dependency plan and requirement ledger are in `evidence/v0.01/`. Initial baseline is clean fetched `3e47895`, CI `37140004261` green. No v0.01 release candidate is accepted yet. Source/replay and general Java/Node product journeys remain incomplete. P01 is the genuine Spring verified method-source increment; Node HTTP is isolated preparation, not accepted Slice4. Shared Cargo builder is root-owned; Java worker holds the Gradle lease. Same-chat 30-minute continuation is configured and active; it requires the powered machine, running desktop app and mounted SSD. Signing/notarization identity and real human study/owner acceptance are pending external gates. The historical sections below remain evidence of prior bounded work, not current release acceptance.
+The release specification is `docs/releases/v0.01.md`; machine-readable dependency plan and requirement ledger are in `evidence/v0.01/`. Initial baseline is clean fetched `3e47895`, CI `37140004261` green. No v0.01 release candidate is accepted yet. Source/replay and general Java/Node product journeys remain incomplete. P01 is the genuine Spring verified method-source increment; Node HTTP is isolated preparation, not accepted Slice4. Shared Cargo and Gradle builders are serialized through explicit task leases; the private execution checkpoint records current ownership. Same-chat 30-minute continuation is configured and active; it requires the powered machine, running desktop app and mounted SSD. Signing/notarization identity and real human study/owner acceptance are pending external gates. The historical sections below remain evidence of prior bounded work, not current release acceptance.
+
+## External baseline preparation (2026-10-04)
+
+All six disposable upstream servers now have uninstrumented baseline receipts: Petclinic (6 checks), JHipster (8), Fineract (11), Directus (8), Medusa (10), and Vendure (13). Exact upstream/runtime/database pins and private receipt hashes are recorded in `evidence/v0.01/external-baselines.preparation.json`. Petclinic uses the explicitly approved maintained-main SHA exception. Medusa was repeated from a verified pinned starter checkout; the earlier installer checkout had unknown provenance. Vendure exercised its upstream GraphQL API and direct SQLite effect. Earlier failed attempts remain preserved.
+
+These 56 baseline checks do not prove X-trace instrumentation, packaged installation, response parity under capture, source/line/value/outcome replay, privacy, performance, or release acceptance. Upstream test suites were not run. All mandatory release rows remain pending; no candidate is accepted.
 
 ## Execution workflow checkpoint
 
