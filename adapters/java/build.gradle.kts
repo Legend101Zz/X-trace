@@ -67,3 +67,13 @@ tasks.register("fixtureBootJar") {
     description = "Builds the independent Spring MVC fixture executable."
     dependsOn(":spring-fixture:bootJar")
 }
+
+tasks.register<Sync>("attachHelperDist") {
+    group = "distribution"
+    description = "Assembles the standalone JVM attach helper executable JAR."
+    dependsOn(":attach-helper:jar")
+    into(layout.buildDirectory.dir("attach-helper-dist"))
+    from(project(":attach-helper").tasks.named("jar")) {
+        rename { "xtrace-attach.jar" }
+    }
+}

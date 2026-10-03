@@ -7,6 +7,7 @@ import static net.bytebuddy.matcher.ElementMatchers.not;
 import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
 
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
+import dev.xtrace.adapter.ClientException;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Method;
@@ -17,7 +18,7 @@ import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.utility.JavaModule;
 
-/** Installs the exact fixture-only Spring MVC, application, and H2 transformations. */
+/** Installs exact fixture-only Spring MVC, application, and H2 transformations. */
 final class FixtureInstrumentation {
   static final String SPRING_ADAPTER =
       "org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter";
@@ -26,18 +27,46 @@ final class FixtureInstrumentation {
   static final String SERVICE = "dev.xtrace.fixture.OrderService";
   static final String REPOSITORY = "dev.xtrace.fixture.OrderRepository";
   private static final Set<String> APPLICATION_TYPES = Set.of(CONTROLLER, SERVICE, REPOSITORY);
+  private static final int MAX_ATTACH_RETRANSFORM_CLASSES = 16;
   private static final AtomicBoolean INSTALLED = new AtomicBoolean();
 
   private FixtureInstrumentation() {}
 
-  static void install(Instrumentation instrumentation, Runnable onFailure) {
+  static void validateAttach(Instrumentation instrumentation) throws ClientException {
+    if (!instrumentation.isRetransformClassesSupported()) {
+      throw new ClientException(
+          "XTR-JAVA-ATTACH-UNAVAILABLE", "target JVM does not support class retransformation");
+    }
+    int candidateCount = 0;
+    for (Class<?> candidate : instrumentation.getAllLoadedClasses()) {
+      if (!isExplicitTarget(candidate.getName())) continue;
+      candidateCount++;
+      if (candidateCount > MAX_ATTACH_RETRANSFORM_CLASSES) {
+        throw new ClientException(
+            "XTR-JAVA-ATTACH-UNAVAILABLE", "loaded fixture class count exceeds the attach bound");
+      }
+      if (!instrumentation.isModifiableClass(candidate)) {
+        throw new ClientException(
+            "XTR-JAVA-ATTACH-UNAVAILABLE", "a loaded fixture class cannot be retransformed");
+      }
+    }
+    if (candidateCount == 0) {
+      throw new ClientException(
+          "XTR-JAVA-ATTACH-UNAVAILABLE", "no supported Spring fixture classes are loaded");
+    }
+  }
+
+  static void install(Instrumentation instrumentation, Runnable onFailure, boolean attach) {
     if (!INSTALLED.compareAndSet(false, true)) {
       throw new IllegalStateException("fixture instrumentation is already installed");
     }
     AgentBuilder builder =
         new AgentBuilder.Default()
             .disableClassFormatChanges()
-            .with(AgentBuilder.RedefinitionStrategy.DISABLED)
+            .with(
+                attach
+                    ? AgentBuilder.RedefinitionStrategy.RETRANSFORMATION
+                    : AgentBuilder.RedefinitionStrategy.DISABLED)
             .with(new SafeListener(onFailure))
             .ignore(
                 named("dev.xtrace.agent.bootstrap.XTraceAgent")
@@ -53,11 +82,14 @@ final class FixtureInstrumentation {
           ProtectionDomain protectionDomain,
           byte[] classfileBuffer) {
         if (isApplicationType(className)) {
+          // For retransformation the JVM supplies this transformer's input bytes again. Observe
+          // this callback buffer before Byte Buddy's capable transformer adds instrumentation;
+          // it is not a hash of the final transformed class bytes.
           SourceAttestation.observe(loader, className, classfileBuffer);
         }
         return null;
       }
-    }, false);
+    }, attach);
 
     builder =
         builder

@@ -13,7 +13,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Private launch-only runtime loaded outside the target application's classloader. */
+/** Private fixture runtime loaded outside the target application's classloader. */
 public final class AgentRuntime {
   private static final int MAX_MANIFEST_BYTES = 64 * 1024;
   private static final AtomicReference<RuntimeHandle> ACTIVE = new AtomicReference<>();
@@ -21,7 +21,7 @@ public final class AgentRuntime {
   private AgentRuntime() {}
 
   /** Connects the writer, installs exact fixture transformations, and returns without blocking. */
-  public static void start(String bootstrapPath, Instrumentation instrumentation)
+  public static void start(String bootstrapPath, Instrumentation instrumentation, boolean attach)
       throws ClientException {
     if (ACTIVE.get() != null) {
       throw new ClientException("XTR-JAVA-AGENT", "agent runtime is already active");
@@ -32,13 +32,14 @@ public final class AgentRuntime {
     RecordingWriter writer = null;
     RuntimeBridgeSink sink = null;
     try {
+      if (attach) FixtureInstrumentation.validateAttach(instrumentation);
       bootstrap = BootstrapReader.read(Path.of(bootstrapPath));
       session =
           XtpSession.open(
               bootstrap,
               manifest,
               new XtpSession.ClientIdentity(
-                  "xtrace-java-premain-fixture",
+                  attach ? "xtrace-java-attach-fixture" : "xtrace-java-premain-fixture",
                   "0.1.0",
                   "java",
                   "openjdk",
@@ -50,7 +51,7 @@ public final class AgentRuntime {
       BoundedEventQueue queue = new BoundedEventQueue(1024, 256 * 1024L);
       sink = new RuntimeBridgeSink(queue);
       writer = new RecordingWriter(session, queue, sink);
-      FixtureInstrumentation.install(instrumentation, writer::stopIncomplete);
+      FixtureInstrumentation.install(instrumentation, writer::stopIncomplete, attach);
       if (writer.isStopping()) {
         throw new ClientException("XTR-JAVA-INSTRUMENTATION", "fixture instrumentation failed");
       }

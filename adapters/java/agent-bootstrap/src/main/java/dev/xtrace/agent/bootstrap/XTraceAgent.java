@@ -9,11 +9,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.CodeSource;
 import java.util.Comparator;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.JarFile;
 
-/** Launch-only experimental Java agent entrypoint. */
+/** Fixture-bounded Java premain and explicit attach agent entrypoint. */
 public final class XTraceAgent {
   private static final String RUNTIME_ENTRY = "dev.xtrace.agent.runtime.AgentRuntime";
+  private static final AtomicInteger START_STATE = new AtomicInteger();
 
   private XTraceAgent() {}
 
@@ -23,15 +25,7 @@ public final class XTraceAgent {
    */
   public static void premain(String agentArgument, Instrumentation instrumentation) {
     try {
-      String bootstrapPath = parseBootstrapPath(agentArgument);
-      Path agentJar = ownJar();
-      instrumentation.appendToBootstrapClassLoaderSearch(new JarFile(agentJar.toFile(), false));
-      Class.forName("dev.xtrace.agent.bootstrap.BootstrapBridge", true, null);
-      URL[] runtime = runtimeUrls(agentJar.getParent().resolve("runtime"));
-      PrivateAgentClassLoader loader = new PrivateAgentClassLoader(runtime);
-      Class<?> entry = Class.forName(RUNTIME_ENTRY, true, loader);
-      entry.getMethod("start", String.class, Instrumentation.class)
-          .invoke(null, bootstrapPath, instrumentation);
+      start(agentArgument, instrumentation, false);
     } catch (InvocationTargetException error) {
       Throwable cause = error.getCause();
       if (cause instanceof VirtualMachineError fatal) throw fatal;
@@ -39,6 +33,46 @@ public final class XTraceAgent {
       reportUnavailable();
     } catch (Exception | LinkageError error) {
       reportUnavailable();
+    }
+  }
+
+  /** Starts the bounded fixture attach path after the target JVM has already started. */
+  public static void agentmain(String agentArgument, Instrumentation instrumentation)
+      throws Exception {
+    try {
+      start(agentArgument, instrumentation, true);
+    } catch (InvocationTargetException error) {
+      Throwable cause = error.getCause();
+      if (cause instanceof VirtualMachineError fatal) throw fatal;
+      if (cause instanceof ThreadDeath death) throw death;
+      START_STATE.set(2);
+      throw new Exception("X-trace attach initialization failed");
+    } catch (Exception | LinkageError error) {
+      START_STATE.set(2);
+      throw new Exception("X-trace attach initialization failed");
+    }
+  }
+
+  private static synchronized void start(
+      String agentArgument, Instrumentation instrumentation, boolean attach) throws Exception {
+    if (!START_STATE.compareAndSet(0, 1)) {
+      if (START_STATE.get() == 1) return;
+      throw new IllegalStateException("X-trace agent startup previously failed");
+    }
+    try {
+      String bootstrapPath = parseBootstrapPath(agentArgument);
+      Path agentJar = ownJar();
+      instrumentation.appendToBootstrapClassLoaderSearch(new JarFile(agentJar.toFile(), false));
+      Class.forName("dev.xtrace.agent.bootstrap.BootstrapBridge", true, null);
+      URL[] runtime = runtimeUrls(agentJar.getParent().resolve("runtime"));
+      PrivateAgentClassLoader loader = new PrivateAgentClassLoader(runtime);
+      Class<?> entry = Class.forName(RUNTIME_ENTRY, true, loader);
+      entry
+          .getMethod("start", String.class, Instrumentation.class, boolean.class)
+          .invoke(null, bootstrapPath, instrumentation, attach);
+    } catch (Exception | LinkageError error) {
+      START_STATE.set(2);
+      throw error;
     }
   }
 

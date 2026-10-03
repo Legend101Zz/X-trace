@@ -111,6 +111,36 @@ XTP data, uses an isolated Conscrypt provider for the TLS exporter, and proves
 four `Staged` acknowledgements plus the selected-root SQLite/XTF artifact. It
 prints one credential-free JSON receipt with `capture_supported: false`.
 
+The standalone `:attach-helper` module packages the experimental fixture-only
+JVM attach helper. It exposes `list`, `inspect`, and `attach` JSON commands and
+requires the explicitly selected agent JAR plus the live owner-private daemon
+bootstrap file. The helper rechecks process start time and owner before loading
+`agentmain`; the agent retransforms only the existing Spring fixture matcher
+set. It reports best-effort eligibility and does not promise attachment across
+JDK, permission, dynamic-loading, container, or native-image boundaries. Use
+premain relaunch when dynamic attach is disabled or unsupported.
+
+```bash
+adapters/java/gradlew -p adapters/java --dependency-verification strict \
+  :attach-helper:test :attach-helper:jar :attachHelperDist
+```
+
+The genuine already-running-fixture acceptance task is separate from unit
+checks and uses only disposable repositories and data homes. Provide the
+already-built CLI, selected target JDK, and fixture artifacts as Gradle system
+properties; run it once with JDK 17 and once with JDK 21 where available:
+
+```bash
+adapters/java/gradlew -p adapters/java :attach-helper:acceptanceTest \
+  -Dxtrace.cli=/absolute/path/to/xtrace \
+  -Dxtrace.target.java=/absolute/path/to/jdk/bin/java \
+  -Dxtrace.helper.java=/absolute/path/to/jdk/bin/java \
+  -Dxtrace.agent=/absolute/path/to/xtrace-java-agent.jar \
+  -Dxtrace.fixture=/absolute/path/to/xtrace-spring-fixture.jar \
+  -Dxtrace.helper=/absolute/path/to/xtrace-attach.jar \
+  -Dxtrace.workspace=/absolute/path/to/X-trace
+```
+
 ### Experimental Spring premain tracer bullet
 
 The `agent-bootstrap`, `agent-runtime`, and `spring-fixture` Gradle projects are

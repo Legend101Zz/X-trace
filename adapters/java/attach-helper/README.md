@@ -1,0 +1,17 @@
+# X-trace JVM attach helper
+
+`xtrace-attach.jar` is a standalone JDK command for bounded local JVM discovery and a best-effort attach to the current X-trace Spring fixture. Build it with `./gradlew :attach-helper:jar`; the Java distribution task stages it at `build/attach-helper-dist/xtrace-attach.jar`.
+
+```text
+java -jar xtrace-attach.jar list --json
+java -jar xtrace-attach.jar inspect --pid <pid> --json
+java -jar xtrace-attach.jar attach --pid <pid> --agent <agent-jar> --options-file <private-bootstrap-file> --json
+```
+
+Each command prints one JSON object. `code` is stable; success uses `XTR-ATTACH-OK`. Invalid arguments and artifact paths use exit 2, owner or compatibility limitations use exit 4, missing or unverifiable process state uses exit 5, and an Attach provider or agent failure uses exit 7. Attach-disabled diagnostics use `XTR-ATTACH-DYNAMIC-DISABLED` when the JVM reports that condition and include a relaunch remedy. A limitation the helper cannot probe remains `best_effort` or `not_probed`.
+
+The helper reports PID, operating-system start time and owner, a sanitized executable summary, and a small allowlist of target JVM properties. It does not read or return argv or environment variables. Process listing is bounded to 256 returned rows and at most 4,096 inspected descriptors. Before loading an agent it checks the PID incarnation and owner again after opening the Attach connection. The agent and bootstrap must be explicit paths. The X-trace agent must have its packaged sibling `runtime/` directory and a matching bounded `manifest.sha256` digest inventory; the bootstrap must be an owner-owned, non-symlink, one-link file no larger than 64 KiB inside an owner-private directory. Only its path is passed to `agentmain`; the helper does not print the path or file contents.
+
+The current agentmain implementation connects to the project daemon and retransforms only the existing exact fixture matchers, with a 16-loaded-class bound and modifiability checks. It does not instrument arbitrary Java applications, reconstruct activity before attachment, enable general line probes, or capture values. Retransformation is best effort and requires a compatible full JDK Attach provider, same-user/process-namespace access, and target permission for dynamic agent loading. For disabled attach, native-image, container or permission limitations, use the reported relaunch remedy with premain. No recording is synthesized when attach fails.
+
+The focused genuine acceptance test is tagged separately from unit tests. Root must provide the already-built X-trace CLI and fixture inputs when running `:attach-helper:acceptanceTest`; the test initializes a disposable repository and daemon, starts the fixture without an agent, attaches, sends one HTTP request, then verifies persisted method frames and matched source identity. Example properties are `xtrace.cli`, `xtrace.target.java`, `xtrace.agent`, `xtrace.fixture`, `xtrace.helper`, and `xtrace.workspace`.
