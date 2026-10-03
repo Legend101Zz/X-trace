@@ -1,8 +1,8 @@
 //! Experimental foreground loopback viewer adapter.
 //!
 //! This listener is deliberately separate from XTP's TLS listener. It exposes
-//! only a fixed asset manifest and the bounded recording-query application
-//! service; it has no storage or repository dependency.
+//! only a fixed asset manifest and the bounded recording and observed-query
+//! application services; it has no storage or repository dependency.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -34,16 +34,21 @@ use tokio::time::timeout;
 use tower::ServiceBuilder;
 use tower::limit::ConcurrencyLimitLayer;
 use xtrace_application::{
-    MAX_RECORDING_LIST_LIMIT, RecordingDetail, RecordingListPage, RecordingQueryService,
-    RecordingReadPort, ShowRecording,
+    ListObservedEndpoints, ListOperationRecordings, ListUnmatchedRecordings,
+    MAX_OBSERVED_ENDPOINT_LIMIT, MAX_OBSERVED_RECORDING_LIMIT, MAX_RECORDING_LIST_LIMIT,
+    ObservedEndpointQueryService, ObservedEndpointReadPort, RecordingDetail, RecordingListPage,
+    RecordingQueryService, RecordingReadPort, ShowRecording,
 };
-use xtrace_domain::{CorrelationId, ProjectId, RecordingId};
+use xtrace_domain::ids::Id as _;
+use xtrace_domain::{CorrelationId, OperationId, ProjectId, RecordingId};
 
 const MAX_CONNECTIONS: usize = 32;
 const MAX_HTTP_HEADERS: usize = 32;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_AUTH_BODY_BYTES: usize = 1_024;
 const MAX_QUERY_CONCURRENCY: usize = 2;
+const MAX_OBSERVED_QUERY_BYTES: usize = 2_080;
+const MAX_OBSERVED_CURSOR_BYTES: usize = 2_048;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_TTL_SECONDS: u64 = 15 * 60;
 const BOOTSTRAP_TTL: Duration = Duration::from_secs(60);
@@ -83,7 +88,8 @@ struct BootstrapState {
 }
 
 struct ViewerState<P> {
-    service: RecordingQueryService<P>,
+    recording_service: RecordingQueryService<P>,
+    observed_service: ObservedEndpointQueryService<P>,
     query_lane: QueryLane,
     project_id: ProjectId,
     origin: String,
@@ -170,14 +176,15 @@ pub struct BoundViewer<P> {
     state: Arc<ViewerState<P>>,
 }
 
-impl<P: RecordingReadPort + Clone + 'static> BoundViewer<P> {
+impl<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static> BoundViewer<P> {
     /// Binds an experimental viewer to an OS-assigned IPv4 loopback port.
     ///
     /// # Errors
     ///
     /// Returns an error if the loopback socket or CSPRNG cannot be used.
     pub async fn bind(
-        service: RecordingQueryService<P>,
+        recording_service: RecordingQueryService<P>,
+        observed_service: ObservedEndpointQueryService<P>,
         project_id: ProjectId,
     ) -> Result<Self, ViewerError> {
         let listener =
@@ -189,7 +196,8 @@ impl<P: RecordingReadPort + Clone + 'static> BoundViewer<P> {
         let token = URL_SAFE_NO_PAD.encode(token_bytes);
         let digest = *blake3::hash(&token_bytes).as_bytes();
         let state = Arc::new(ViewerState {
-            service,
+            recording_service,
+            observed_service,
             query_lane: QueryLane::new(MAX_QUERY_CONCURRENCY),
             project_id,
             origin,
@@ -328,7 +336,9 @@ where
     Ok(())
 }
 
-fn router<P: RecordingReadPort + Clone + 'static>(state: Arc<ViewerState<P>>) -> Router {
+fn router<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static>(
+    state: Arc<ViewerState<P>>,
+) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
@@ -339,6 +349,8 @@ fn router<P: RecordingReadPort + Clone + 'static>(state: Arc<ViewerState<P>>) ->
         .route("/api/v1/auth/exchange", post(exchange))
         .route("/api/v1/recordings", get(list_recordings))
         .route("/api/v1/recordings/:recording_id", get(show_recording))
+        .route("/api/v1/endpoints", get(list_observed_endpoints))
+        .route("/api/v1/endpoints/:operation_id/recordings", get(list_operation_recordings))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
         .layer(axum::middleware::from_fn(add_response_security))
         .fallback(not_found)
@@ -353,7 +365,7 @@ async fn add_response_security(request: Request<Body>, next: Next) -> Response {
 
 async fn not_found<P>(State(state): State<Arc<ViewerState<P>>>, headers: HeaderMap) -> Response
 where
-    P: RecordingReadPort,
+    P: RecordingReadPort + ObservedEndpointReadPort,
 {
     if !valid_host(&headers, &state.host) {
         return problem(StatusCode::BAD_REQUEST, "XTR-VIEWER-HOST", "Host is not accepted");
@@ -363,7 +375,7 @@ where
 
 async fn index<P>(State(state): State<Arc<ViewerState<P>>>, headers: HeaderMap) -> Response
 where
-    P: RecordingReadPort,
+    P: RecordingReadPort + ObservedEndpointReadPort,
 {
     if !valid_host(&headers, &state.host) {
         return problem(StatusCode::BAD_REQUEST, "XTR-VIEWER-HOST", "Host is not accepted");
@@ -374,7 +386,7 @@ where
 
 async fn app_js<P>(State(state): State<Arc<ViewerState<P>>>, headers: HeaderMap) -> Response
 where
-    P: RecordingReadPort,
+    P: RecordingReadPort + ObservedEndpointReadPort,
 {
     asset_response(
         &headers,
@@ -386,7 +398,7 @@ where
 
 async fn app_css<P>(State(state): State<Arc<ViewerState<P>>>, headers: HeaderMap) -> Response
 where
-    P: RecordingReadPort,
+    P: RecordingReadPort + ObservedEndpointReadPort,
 {
     asset_response(
         &headers,
@@ -585,13 +597,229 @@ struct ListParams {
     after: Option<RecordingId>,
 }
 
+#[derive(Default)]
+struct ObservedParams {
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+fn has_unmatched_selector(raw: Option<&str>) -> bool {
+    raw.is_some_and(|query| {
+        query.split('&').any(|pair| pair.split_once('=').is_some_and(|(key, _)| key == "unmatched"))
+    })
+}
+
+fn parse_observed_query(
+    raw: Option<&str>,
+    allow_unmatched: bool,
+    require_unmatched: bool,
+) -> Result<ObservedParams, ()> {
+    let Some(raw) = raw else {
+        return if require_unmatched { Err(()) } else { Ok(ObservedParams::default()) };
+    };
+    if raw.is_empty() || raw.len() > MAX_OBSERVED_QUERY_BYTES {
+        return Err(());
+    }
+    let mut params = ObservedParams::default();
+    let mut saw_unmatched = false;
+    for pair in raw.split('&') {
+        let (key, value) = pair.split_once('=').ok_or(())?;
+        if value.is_empty() || value.contains('=') {
+            return Err(());
+        }
+        match key {
+            "limit"
+                if params.limit.is_none() && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                params.limit = Some(value.parse::<u32>().map_err(|_| ())?);
+            }
+            "cursor"
+                if params.cursor.is_none()
+                    && value.len() <= MAX_OBSERVED_CURSOR_BYTES
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+                    }) =>
+            {
+                params.cursor = Some(value.to_owned());
+            }
+            "unmatched" if allow_unmatched && !saw_unmatched && value == "true" => {
+                saw_unmatched = true;
+            }
+            _ => return Err(()),
+        }
+    }
+    if require_unmatched != saw_unmatched {
+        return Err(());
+    }
+    Ok(params)
+}
+
+async fn authorize_api<P>(
+    state: &ViewerState<P>,
+    headers: &HeaderMap,
+    request_id: CorrelationId,
+) -> Result<(), Response> {
+    if !valid_request_origin(headers, &state.host, &state.origin, true) {
+        return Err(problem_with_id(
+            StatusCode::FORBIDDEN,
+            "XTR-VIEWER-ORIGIN",
+            "Request origin is not accepted",
+            request_id,
+        ));
+    }
+    if !one_header_equals(headers, HeaderName::from_static("x-xtrace-client"), "viewer-v1") {
+        return Err(problem_with_id(
+            StatusCode::FORBIDDEN,
+            "XTR-VIEWER-CLIENT",
+            "Viewer request is not accepted",
+            request_id,
+        ));
+    }
+    if !authorized(headers, state).await {
+        return Err(problem_with_id(
+            StatusCode::UNAUTHORIZED,
+            "XTR-VIEWER-SESSION",
+            "Viewer session is missing or expired",
+            request_id,
+        ));
+    }
+    Ok(())
+}
+
+async fn list_observed_endpoints<P>(
+    State(state): State<Arc<ViewerState<P>>>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response
+where
+    P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static,
+{
+    let request_id = CorrelationId::new();
+    if let Err(response) = authorize_api(&state, &headers, request_id).await {
+        return response;
+    }
+    let params = match parse_observed_query(query.as_deref(), false, false) {
+        Ok(params) => params,
+        Err(()) => return observed_query_problem(request_id),
+    };
+    if params.limit.is_some_and(|limit| limit == 0 || limit > MAX_OBSERVED_ENDPOINT_LIMIT) {
+        return observed_query_problem(request_id);
+    }
+    let service = state.observed_service.clone();
+    let request = ListObservedEndpoints {
+        project_id: state.project_id,
+        limit: params.limit,
+        cursor: params.cursor,
+    };
+    let page = match run_observed_query(&state, request_id, move || {
+        service.list_observed_endpoints(request, request_id)
+    })
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    success_json(page, request_id)
+}
+
+async fn list_operation_recordings<P>(
+    State(state): State<Arc<ViewerState<P>>>,
+    headers: HeaderMap,
+    operation_path: Result<Path<String>, axum::extract::rejection::PathRejection>,
+    RawQuery(query): RawQuery,
+) -> Response
+where
+    P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static,
+{
+    let request_id = CorrelationId::new();
+    if let Err(response) = authorize_api(&state, &headers, request_id).await {
+        return response;
+    }
+    let Ok(Path(operation_id)) = operation_path else {
+        return observed_query_problem(request_id);
+    };
+    let params = match parse_observed_query(query.as_deref(), false, false) {
+        Ok(params) => params,
+        Err(()) => return observed_query_problem(request_id),
+    };
+    if params.limit.is_some_and(|limit| limit == 0 || limit > MAX_OBSERVED_RECORDING_LIMIT) {
+        return observed_query_problem(request_id);
+    }
+    let Ok(parsed_id) = operation_id.parse::<OperationId>() else {
+        return observed_query_problem(request_id);
+    };
+    if parsed_id.to_string() != operation_id
+        || parsed_id.as_uuid().get_version_num() != 7
+        || parsed_id.as_uuid().get_variant() != uuid::Variant::RFC4122
+    {
+        return observed_query_problem(request_id);
+    }
+    let service = state.observed_service.clone();
+    let request = ListOperationRecordings {
+        project_id: state.project_id,
+        operation_id: parsed_id,
+        limit: params.limit,
+        cursor: params.cursor,
+    };
+    let page = match run_observed_query(&state, request_id, move || {
+        service.list_operation_recordings(request, request_id)
+    })
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    success_json(page, request_id)
+}
+
+async fn list_unmatched_recordings_authorized<P>(
+    state: &ViewerState<P>,
+    request_id: CorrelationId,
+    query: Option<&str>,
+) -> Response
+where
+    P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static,
+{
+    let params = match parse_observed_query(query, true, true) {
+        Ok(params) => params,
+        Err(()) => return observed_query_problem(request_id),
+    };
+    if params.limit.is_some_and(|limit| limit == 0 || limit > MAX_OBSERVED_RECORDING_LIMIT) {
+        return observed_query_problem(request_id);
+    }
+    let service = state.observed_service.clone();
+    let request = ListUnmatchedRecordings {
+        project_id: state.project_id,
+        limit: params.limit,
+        cursor: params.cursor,
+    };
+    let page = match run_observed_query(state, request_id, move || {
+        service.list_unmatched_recordings(request, request_id)
+    })
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    success_json(page, request_id)
+}
+
+fn observed_query_problem(request_id: CorrelationId) -> Response {
+    problem_with_id(
+        StatusCode::BAD_REQUEST,
+        "XTR-VALIDATION-ENDPOINT-QUERY",
+        "Observed endpoint query is invalid",
+        request_id,
+    )
+}
+
 async fn list_recordings<P>(
     State(state): State<Arc<ViewerState<P>>>,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response
 where
-    P: RecordingReadPort + Clone + 'static,
+    P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static,
 {
     let request_id = CorrelationId::new();
     if !valid_request_origin(&headers, &state.host, &state.origin, true) {
@@ -618,6 +846,9 @@ where
             request_id,
         );
     }
+    if has_unmatched_selector(query.as_deref()) {
+        return list_unmatched_recordings_authorized(&state, request_id, query.as_deref()).await;
+    }
     let params = match parse_query::<ListParams>(query.as_deref(), &["limit", "after"]) {
         Ok(params) => params,
         Err(()) => {
@@ -638,7 +869,7 @@ where
             request_id,
         );
     }
-    let service = state.service.clone();
+    let service = state.recording_service.clone();
     let request = xtrace_application::ListRecordings {
         project_id: state.project_id,
         limit,
@@ -668,7 +899,7 @@ async fn show_recording<P>(
     RawQuery(query): RawQuery,
 ) -> Response
 where
-    P: RecordingReadPort + Clone + 'static,
+    P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static,
 {
     let request_id = CorrelationId::new();
     if !valid_request_origin(&headers, &state.host, &state.origin, true) {
@@ -714,7 +945,7 @@ where
             request_id,
         );
     };
-    let service = state.service.clone();
+    let service = state.recording_service.clone();
     let request = ShowRecording {
         project_id: state.project_id,
         recording_id,
@@ -757,6 +988,61 @@ where
             request_id,
         )),
     }
+}
+
+async fn run_observed_query<T, P, F>(
+    state: &ViewerState<P>,
+    request_id: CorrelationId,
+    query: F,
+) -> Result<T, Response>
+where
+    T: Send + 'static,
+    P: RecordingReadPort + Clone + 'static,
+    F: FnOnce() -> Result<T, xtrace_domain::AppError> + Send + 'static,
+{
+    match state.query_lane.run(query).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(observed_app_problem(error, request_id)),
+        Err(QueryLaneError::Busy | QueryLaneError::Closed) => Err(problem_with_id(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "XTR-VIEWER-QUERY-BUSY",
+            "Viewer query capacity is unavailable",
+            request_id,
+        )),
+        Err(QueryLaneError::Join) => Err(problem_with_id(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "XTR-VIEWER-QUERY-FAILED",
+            "Observed endpoint query could not be completed",
+            request_id,
+        )),
+    }
+}
+
+fn observed_app_problem(error: xtrace_domain::AppError, request_id: CorrelationId) -> Response {
+    let (status, title, detail) = match error.category {
+        xtrace_domain::ErrorCategory::NotFound => {
+            (StatusCode::NOT_FOUND, "Not Found", "Requested endpoint resource was not found")
+        }
+        xtrace_domain::ErrorCategory::Corruption => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Unprocessable Content",
+            "Persisted endpoint query could not be verified",
+        ),
+        xtrace_domain::ErrorCategory::Validation => {
+            (StatusCode::BAD_REQUEST, "Bad Request", "Observed endpoint query is invalid")
+        }
+        xtrace_domain::ErrorCategory::Resource => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable",
+            "Observed endpoint query capacity is unavailable",
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal Server Error",
+            "Observed endpoint query could not be completed",
+        ),
+    };
+    problem_with_dynamic_code(status, title, detail, error.code.as_str(), request_id)
 }
 
 fn parse_query<T: for<'de> Deserialize<'de>>(raw: Option<&str>, allowed: &[&str]) -> Result<T, ()> {
@@ -1127,13 +1413,44 @@ fn add_security_headers(headers: &mut HeaderMap) {
 )]
 mod tests {
     use super::*;
+    use rusqlite::{Connection, params};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use xtrace_application::observed_endpoint_queries::{
+        ObservedEndpointKey, ObservedEndpointRecord, ObservedRecordingKey, ObservedRecordingRecord,
+    };
+    use xtrace_application::recording::{BeginRecording, EndpointObservationInput};
     use xtrace_application::{
-        PortError, PortErrorKind, RecordingEventWindow, RecordingMetadata, ShowWindowRequest,
+        ObservedEndpointReadPort, PortError, PortErrorKind, ProjectRepository,
+        RecordingEventWindow, RecordingMetadata, RecordingPersistencePort, ShowWindowRequest,
+    };
+    use xtrace_domain::{Project, RepositoryFingerprint, RuntimeSessionId, WallTime};
+    use xtrace_store::{
+        OpenOptions, SqliteRecordingPersistence, SqliteRecordingReader, SqliteStore,
     };
 
-    #[derive(Clone)]
-    struct ReadFixture;
+    #[derive(Clone, Default)]
+    struct ReadFixture {
+        observed_calls: Arc<AtomicUsize>,
+        observed_error: Option<PortErrorKind>,
+    }
+
+    impl ReadFixture {
+        fn failing(kind: PortErrorKind) -> Self {
+            Self { observed_error: Some(kind), ..Self::default() }
+        }
+
+        fn observed_result<T>(&self, value: T) -> Result<T, PortError> {
+            self.observed_calls.fetch_add(1, Ordering::AcqRel);
+            match self.observed_error {
+                Some(kind) => {
+                    Err(PortError::new(kind, "PRIVATE_DATABASE_CANARY", CorrelationId::new()))
+                }
+                None => Ok(value),
+            }
+        }
+    }
 
     impl RecordingReadPort for ReadFixture {
         fn list_recordings(
@@ -1157,19 +1474,69 @@ mod tests {
         }
     }
 
+    impl ObservedEndpointReadPort for ReadFixture {
+        fn list_observed_endpoints(
+            &self,
+            _project_id: ProjectId,
+            _after: Option<&ObservedEndpointKey>,
+            _limit: u32,
+        ) -> Result<(Vec<ObservedEndpointRecord>, bool), PortError> {
+            self.observed_result((Vec::new(), false))
+        }
+
+        fn list_operation_recordings(
+            &self,
+            _project_id: ProjectId,
+            _operation_id: OperationId,
+            _after: Option<&ObservedRecordingKey>,
+            _limit: u32,
+        ) -> Result<(Vec<ObservedRecordingRecord>, bool), PortError> {
+            self.observed_calls.fetch_add(1, Ordering::AcqRel);
+            if let Some(kind) = self.observed_error {
+                Err(PortError::new(kind, "PRIVATE_DATABASE_CANARY", CorrelationId::new()))
+            } else {
+                Err(PortError::new(
+                    PortErrorKind::NotFound,
+                    "endpoint was not found",
+                    CorrelationId::new(),
+                ))
+            }
+        }
+
+        fn list_unmatched_recordings(
+            &self,
+            _project_id: ProjectId,
+            _after: Option<&ObservedRecordingKey>,
+            _limit: u32,
+        ) -> Result<(Vec<ObservedRecordingRecord>, bool), PortError> {
+            self.observed_result((Vec::new(), false))
+        }
+    }
+
     struct RunningViewer {
         host: String,
         origin: String,
         token: String,
+        observed_calls: Arc<AtomicUsize>,
+        query_lane: QueryLane,
         shutdown: tokio::sync::oneshot::Sender<()>,
         task: tokio::task::JoinHandle<Result<(), ViewerError>>,
     }
 
     async fn start() -> RunningViewer {
+        start_with(ReadFixture::default()).await
+    }
+
+    async fn start_with(fixture: ReadFixture) -> RunningViewer {
         let project_id = ProjectId::new();
-        let bound = BoundViewer::bind(RecordingQueryService::new(ReadFixture), project_id)
-            .await
-            .expect("bind local viewer");
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(fixture.clone()),
+            ObservedEndpointQueryService::new(fixture.clone()),
+            project_id,
+        )
+        .await
+        .expect("bind local viewer");
+        let query_lane = bound.state.query_lane.clone();
         let ready = bound.readiness();
         let host = ready.origin.strip_prefix("http://").unwrap().to_owned();
         let token = ready.url.rsplit_once("token=").unwrap().1.to_owned();
@@ -1180,7 +1547,15 @@ mod tests {
         let task = tokio::spawn(bound.serve(async move {
             let _ = receiver.await;
         }));
-        RunningViewer { host, origin, token, shutdown, task }
+        RunningViewer {
+            host,
+            origin,
+            token,
+            observed_calls: fixture.observed_calls,
+            query_lane,
+            shutdown,
+            task,
+        }
     }
 
     async fn request(host: &str, text: &str) -> String {
@@ -1266,9 +1641,13 @@ mod tests {
     #[tokio::test]
     async fn expired_bootstrap_is_rejected_without_disclosing_token() {
         let project_id = ProjectId::new();
-        let bound = BoundViewer::bind(RecordingQueryService::new(ReadFixture), project_id)
-            .await
-            .expect("bind local viewer");
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(ReadFixture::default()),
+            ObservedEndpointQueryService::new(ReadFixture::default()),
+            project_id,
+        )
+        .await
+        .expect("bind local viewer");
         if let Some(token) = bound.state.bootstrap.lock().await.as_mut() {
             token.expires_at = Instant::now() - Duration::from_secs(1);
         }
@@ -1276,12 +1655,21 @@ mod tests {
         let host = ready.origin.strip_prefix("http://").unwrap().to_owned();
         let token = ready.url.rsplit_once("token=").unwrap().1.to_owned();
         let origin = ready.origin;
+        let query_lane = bound.state.query_lane.clone();
         let state = bound.state.clone();
         let (shutdown, receiver) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(bound.serve(async move {
             let _ = receiver.await;
         }));
-        let expired = RunningViewer { host, origin, token: token.clone(), shutdown, task };
+        let expired = RunningViewer {
+            host,
+            origin,
+            token: token.clone(),
+            observed_calls: Arc::new(AtomicUsize::new(0)),
+            query_lane,
+            shutdown,
+            task,
+        };
         let response = exchange_response(&expired).await;
         assert!(response.starts_with("HTTP/1.1 401"));
         assert!(!response.contains(&token));
@@ -1399,6 +1787,312 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observed_routes_use_direct_pages_shared_validation_and_viewer_guards() {
+        let viewer = start().await;
+        let unauthenticated = format!(
+            "GET /api/v1/endpoints HTTP/1.1\r\n{}Connection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        assert!(request(&viewer.host, &unauthenticated).await.starts_with("HTTP/1.1 401"));
+        let unauthenticated_linked = format!(
+            "GET /api/v1/endpoints/018f0000-0000-7000-8000-000000000001/recordings HTTP/1.1\r\n{}Connection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        assert!(request(&viewer.host, &unauthenticated_linked).await.starts_with("HTTP/1.1 401"));
+        let unauthenticated_unmatched = format!(
+            "GET /api/v1/recordings?unmatched=true HTTP/1.1\r\n{}Connection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        assert!(
+            request(&viewer.host, &unauthenticated_unmatched).await.starts_with("HTTP/1.1 401")
+        );
+        assert_eq!(viewer.observed_calls.load(Ordering::Acquire), 0);
+        let cookie = authenticate(&viewer).await;
+
+        let endpoints = format!(
+            "GET /api/v1/endpoints?limit=100 HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        let response = request(&viewer.host, &endpoints).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("{\"items\":[],\"nextCursor\":null}"));
+        assert!(response.to_ascii_lowercase().contains("x-xtrace-request-id:"));
+        assert!(
+            response.contains("cache-control: no-store")
+                || response.contains("Cache-Control: no-store")
+        );
+        assert!(!response.contains("requestId\""), "observed page has no wrapper");
+        let calls_after_valid_endpoint = viewer.observed_calls.load(Ordering::Acquire);
+        assert_eq!(calls_after_valid_endpoint, 1);
+
+        for query in [
+            "unmatched=false",
+            "unmatched=maybe",
+            "unmatched=true&unmatched=true",
+            "unmatched=true&after=018f0000-0000-7000-8000-000000000001",
+            "unmatched=true&cursor=bad%2f",
+            "unmatched=true&limit=0",
+            "unmatched=true&unknown=1",
+            "unmatched=true&limit=1&limit=2",
+            "unmatched=true&cursor=",
+            "unmatched=true&limit=+1",
+            "%75nmatched=true",
+        ] {
+            let raw = format!(
+                "GET /api/v1/recordings?{query} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            );
+            let response = request(&viewer.host, &raw).await;
+            assert!(response.starts_with("HTTP/1.1 400"), "observed query validation failed");
+            assert!(response.contains("requestId"));
+            assert!(!response.contains("bad%2f"));
+        }
+
+        for query in
+            ["limit=0", "limit=101", "limit=1&limit=2", "cursor=bad%2f", "cursor=abc&unknown=1"]
+        {
+            let raw = format!(
+                "GET /api/v1/endpoints?{query} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            );
+            assert!(request(&viewer.host, &raw).await.starts_with("HTTP/1.1 400"));
+        }
+
+        let operation_id = OperationId::new().to_string();
+        for path in [
+            format!("/api/v1/endpoints/{operation_id}/recordings?limit=0"),
+            format!("/api/v1/endpoints/{operation_id}/recordings?cursor=bad%2f"),
+            format!("/api/v1/endpoints/{operation_id}/recordings?cursor=abc&cursor=def"),
+        ] {
+            let raw = format!(
+                "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            );
+            assert!(request(&viewer.host, &raw).await.starts_with("HTTP/1.1 400"));
+        }
+        assert_eq!(
+            viewer.observed_calls.load(Ordering::Acquire),
+            calls_after_valid_endpoint,
+            "invalid observed query modes must be rejected before port calls"
+        );
+
+        let valid_unmatched = format!(
+            "GET /api/v1/recordings?unmatched=true&limit=50 HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        let response = request(&viewer.host, &valid_unmatched).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("{\"items\":[],\"nextCursor\":null}"));
+        assert_eq!(viewer.observed_calls.load(Ordering::Acquire), calls_after_valid_endpoint + 1);
+
+        let exact_cursor = format!("cursor={}", "A".repeat(MAX_OBSERVED_CURSOR_BYTES));
+        let raw = format!(
+            "GET /api/v1/endpoints?{exact_cursor} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        let response = request(&viewer.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains("XTR-VALIDATION-ENDPOINT-CURSOR"));
+        assert!(!response.contains(&"A".repeat(MAX_OBSERVED_CURSOR_BYTES)));
+
+        let oversized_cursor = format!("cursor={}", "A".repeat(MAX_OBSERVED_CURSOR_BYTES + 1));
+        let raw = format!(
+            "GET /api/v1/endpoints?{oversized_cursor} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        assert!(request(&viewer.host, &raw).await.starts_with("HTTP/1.1 400"));
+
+        let op_id = OperationId::new().to_string();
+        for (path, status) in [
+            (format!("/api/v1/endpoints/{}/recordings", op_id.to_uppercase()), 400),
+            ("/api/v1/endpoints/not-an-operation/recordings".to_owned(), 400),
+            ("/api/v1/endpoints/%FF/recordings".to_owned(), 400),
+            ("/api/v1/endpoints/SECRET_OPERATION_CANARY/recordings".to_owned(), 400),
+            ("/api/v1/endpoints/018f0000-0000-4000-8000-000000000001/recordings".to_owned(), 400),
+            ("/api/v1/endpoints/018f0000-0000-7000-0000-000000000001/recordings".to_owned(), 400),
+        ] {
+            let raw = format!(
+                "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            );
+            let response = request(&viewer.host, &raw).await;
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{response}");
+            assert!(response.contains("requestId"));
+            assert!(!response.contains("not-an-operation"));
+            assert!(!response.contains("SECRET_OPERATION_CANARY"));
+        }
+
+        let canonical_unknown = format!(
+            "GET /api/v1/endpoints/{op_id}/recordings HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        let unknown_response = request(&viewer.host, &canonical_unknown).await;
+        assert!(unknown_response.starts_with("HTTP/1.1 404"));
+        assert!(!unknown_response.contains(&op_id));
+
+        let client_rejected = format!(
+            "GET /api/v1/endpoints HTTP/1.1\r\nHost: {}\r\nOrigin: {}\r\nSec-Fetch-Site: same-origin\r\nX-XTrace-Client: wrong\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n",
+            viewer.host, viewer.origin
+        );
+        assert!(request(&viewer.host, &client_rejected).await.starts_with("HTTP/1.1 403"));
+        let _ = viewer.shutdown.send(());
+        viewer.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn observed_handlers_map_corruption_and_capacity_failures_safely() {
+        let corrupt = start_with(ReadFixture::failing(PortErrorKind::Corruption)).await;
+        let cookie = authenticate(&corrupt).await;
+        let raw = format!(
+            "GET /api/v1/endpoints HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&corrupt.host, &corrupt.origin)
+        );
+        let response = request(&corrupt.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 422"), "{response}");
+        assert!(response.contains("requestId"));
+        assert!(response.to_ascii_lowercase().contains("x-xtrace-request-id:"));
+        assert!(!response.contains("PRIVATE_DATABASE_CANARY"));
+        let _ = corrupt.shutdown.send(());
+        corrupt.task.await.unwrap().unwrap();
+
+        let unavailable = start_with(ReadFixture::failing(PortErrorKind::Resource)).await;
+        let cookie = authenticate(&unavailable).await;
+        let raw = format!(
+            "GET /api/v1/endpoints HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&unavailable.host, &unavailable.origin)
+        );
+        let response = request(&unavailable.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains("requestId"));
+        assert!(!response.contains("PRIVATE_DATABASE_CANARY"));
+        assert_eq!(unavailable.observed_calls.load(Ordering::Acquire), 1);
+        let _ = unavailable.shutdown.send(());
+        unavailable.task.await.unwrap().unwrap();
+
+        let saturated = start().await;
+        let first_permit = saturated
+            .query_lane
+            .0
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .expect("acquire first shared query permit");
+        let second_permit = saturated
+            .query_lane
+            .0
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .expect("acquire second shared query permit");
+        let cookie = authenticate(&saturated).await;
+        let raw = format!(
+            "GET /api/v1/endpoints HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&saturated.host, &saturated.origin)
+        );
+        let response = request(&saturated.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains("XTR-VIEWER-QUERY-BUSY"));
+        assert!(response.contains("requestId"));
+        assert_eq!(saturated.observed_calls.load(Ordering::Acquire), 0);
+        drop((first_permit, second_permit));
+        let recovered = request(&saturated.host, &raw).await;
+        assert!(recovered.starts_with("HTTP/1.1 200"), "{recovered}");
+        assert_eq!(saturated.observed_calls.load(Ordering::Acquire), 1);
+        let _ = saturated.shutdown.send(());
+        saturated.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_identity_corruption_is_reported_by_the_authenticated_http_handler() {
+        let project_root = tempfile::Builder::new()
+            .prefix("viewer-observed-corruption-")
+            .tempdir()
+            .expect("temporary project root");
+        #[cfg(unix)]
+        std::fs::set_permissions(project_root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("secure temporary project root");
+        let database = project_root.path().join("metadata.sqlite3");
+        let store =
+            SqliteStore::open(&database, OpenOptions::default()).expect("open fixture store");
+        #[cfg(unix)]
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .expect("secure temporary database");
+        let timestamp = WallTime::from_parts(2026, 10, 3, 1, 2, 3, 0).expect("fixture time");
+        let project = Project {
+            id: ProjectId::new(),
+            canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/fixture/repo"),
+            display_name: "fixture".to_owned(),
+            created_at: timestamp,
+            last_opened_at: timestamp,
+            config_schema_version: 1,
+            effective_config_hash: String::new(),
+            active_capture_policy_id: None,
+            active_redaction_policy_id: None,
+        };
+        store.project_repository().insert_project(&project).expect("insert fixture project");
+        let persistence = SqliteRecordingPersistence::new(store.clone(), project_root.path());
+        persistence
+            .begin_recording(&BeginRecording {
+                project_id: project.id(),
+                recording_id: RecordingId::new(),
+                runtime_session_id: RuntimeSessionId::new(),
+                opened_at: timestamp,
+                endpoint_observation: EndpointObservationInput {
+                    policy_id: Some("spring-orders-v1".to_owned()),
+                    application_component: Some("spring-fixture".to_owned()),
+                    binding_key: Some("default".to_owned()),
+                    method: "POST".to_owned(),
+                    route_template: "/orders".to_owned(),
+                },
+            })
+            .expect("persist linked observed recording");
+        Connection::open(&database)
+            .expect("open isolated corruption connection")
+            .execute("UPDATE operations SET endpoint_fingerprint = ?1", params![vec![0xA5_u8; 32]])
+            .expect("corrupt persisted endpoint identity");
+
+        let reader = SqliteRecordingReader::new(store, project_root.path());
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(reader.clone()),
+            ObservedEndpointQueryService::new(reader),
+            project.id(),
+        )
+        .await
+        .expect("bind viewer to SQLite reader");
+        let ready = bound.readiness();
+        let host = ready.origin.strip_prefix("http://").expect("loopback origin").to_owned();
+        let token = ready.url.rsplit_once("token=").expect("bootstrap token").1.to_owned();
+        let origin = ready.origin;
+        let query_lane = bound.state.query_lane.clone();
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(bound.serve(async move {
+            let _ = receiver.await;
+        }));
+        let viewer = RunningViewer {
+            host,
+            origin,
+            token,
+            observed_calls: Arc::new(AtomicUsize::new(0)),
+            query_lane,
+            shutdown,
+            task,
+        };
+        let cookie = authenticate(&viewer).await;
+        let raw = format!(
+            "GET /api/v1/endpoints HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        let response = request(&viewer.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 422"), "{response}");
+        assert!(response.contains("requestId"));
+        assert!(response.to_ascii_lowercase().contains("x-xtrace-request-id:"));
+        assert!(!response.contains("0xA5"));
+        assert!(!response.contains("/fixture/repo"));
+        let _ = viewer.shutdown.send(());
+        viewer.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn query_lane_offloads_bounds_saturation_and_drains_on_shutdown() {
         let lane = QueryLane::new(1);
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1454,7 +2148,8 @@ mod tests {
     #[tokio::test]
     async fn saturated_query_lane_maps_to_safe_service_unavailable_problem() {
         let state = ViewerState {
-            service: RecordingQueryService::new(ReadFixture),
+            recording_service: RecordingQueryService::new(ReadFixture::default()),
+            observed_service: ObservedEndpointQueryService::new(ReadFixture::default()),
             query_lane: QueryLane::new(0),
             project_id: ProjectId::new(),
             origin: "http://127.0.0.1:12345".to_owned(),
@@ -1513,7 +2208,8 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let state = Arc::new(ViewerState {
-            service: RecordingQueryService::new(ReadFixture),
+            recording_service: RecordingQueryService::new(ReadFixture::default()),
+            observed_service: ObservedEndpointQueryService::new(ReadFixture::default()),
             query_lane: QueryLane::new(MAX_QUERY_CONCURRENCY),
             project_id: ProjectId::new(),
             origin: format!("http://{address}"),

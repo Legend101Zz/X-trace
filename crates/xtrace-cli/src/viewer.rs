@@ -8,7 +8,7 @@ use serde::Serialize;
 use xtrace_domain::ProjectId;
 use xtrace_store::SqliteRecordingReader;
 
-use crate::commands::open_recording_queries;
+use crate::commands::open_recording_reader;
 use crate::error::CliError;
 use crate::output::write_success_line;
 use crate::paths::read_env_path;
@@ -24,18 +24,22 @@ struct ViewerReadyDocument {
 /// Composes the read-only project store with the daemon viewer and owns its
 /// foreground lifetime until Ctrl+C or SIGTERM.
 pub async fn run(project_dir: PathBuf, no_browser: bool) -> Result<(), CliError> {
-    let (project_id, queries, _) = open_recording_queries(&project_dir, &read_env_path)?;
-    start_viewer(project_id, queries, no_browser).await
+    let (project_id, reader, _) = open_recording_reader(&project_dir, &read_env_path)?;
+    start_viewer(project_id, reader, no_browser).await
 }
 
 async fn start_viewer(
     project_id: ProjectId,
-    queries: xtrace_application::RecordingQueryService<SqliteRecordingReader>,
+    reader: SqliteRecordingReader,
     no_browser: bool,
 ) -> Result<(), CliError> {
-    let bound = xtrace_daemon::BoundViewer::bind(queries, project_id)
-        .await
-        .map_err(|_| CliError::InvalidArgument("could not bind experimental viewer".to_owned()))?;
+    let bound = xtrace_daemon::BoundViewer::bind(
+        xtrace_application::RecordingQueryService::new(reader.clone()),
+        xtrace_application::ObservedEndpointQueryService::new(reader),
+        project_id,
+    )
+    .await
+    .map_err(|_| CliError::InvalidArgument("could not bind experimental viewer".to_owned()))?;
     let readiness = bound.readiness();
     let browser_launch = if no_browser {
         "not_requested"

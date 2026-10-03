@@ -3,8 +3,8 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium } from '@playwright/test';
 
-const [recordingId, encodedSequences] = process.argv.slice(2);
-assert.ok(recordingId && encodedSequences, 'recording ID and expected event sequences are required');
+const [recordingId, encodedSequences, operationId, legacyV4Id] = process.argv.slice(2);
+assert.ok(recordingId && encodedSequences && operationId && legacyV4Id, 'recording, endpoint, and expected event data are required');
 const expectedSequences = JSON.parse(encodedSequences);
 assert.ok(Array.isArray(expectedSequences) && expectedSequences.length > 0, 'expected events must be a non-empty array');
 const input = await new Promise((resolve, reject) => {
@@ -14,7 +14,7 @@ const input = await new Promise((resolve, reject) => {
   process.stdin.on('end', () => resolve(value));
   process.stdin.on('error', reject);
 });
-const { url: startUrl } = JSON.parse(input);
+const { url: startUrl, expectedUnmatchedIds } = JSON.parse(input);
 assert.ok(startUrl, 'viewer URL must be supplied through stdin');
 
 const browser = await chromium.launch({ headless: true });
@@ -106,20 +106,56 @@ try {
   await page.locator('.event').nth(1).click();
   await page.getByRole('tabpanel', { name: 'evidence' }).waitFor({ state: 'visible' });
   await page.getByRole('status').filter({ hasText: /Event .* selected/ }).waitFor();
-  const apiPayloads = await page.evaluate(async (id) => {
+  const apiPayloads = await page.evaluate(async ({ id, operationId, legacyV4Id, expectedUnmatchedIds }) => {
     const headers = { 'X-XTrace-Client': 'viewer-v1' };
     const listResponse = await fetch('/api/v1/recordings?limit=50', { headers, credentials: 'same-origin' });
     const detailResponse = await fetch(`/api/v1/recordings/${encodeURIComponent(id)}?limit=200`, { headers, credentials: 'same-origin' });
+    const endpointResponse = await fetch('/api/v1/endpoints', { headers, credentials: 'same-origin' });
+    const linkedResponse = await fetch(`/api/v1/endpoints/${encodeURIComponent(operationId)}/recordings?limit=50`, { headers, credentials: 'same-origin' });
+    const unmatchedPages = [];
+    let unmatchedCursor = null;
+    for (let pageIndex = 0; pageIndex < 20; pageIndex += 1) {
+      const suffix = unmatchedCursor ? `&cursor=${encodeURIComponent(unmatchedCursor)}` : '';
+      const response = await fetch(`/api/v1/recordings?unmatched=true&limit=1${suffix}`, { headers, credentials: 'same-origin' });
+      unmatchedPages.push({ status: response.status, body: await response.text() });
+      if (response.status !== 200) break;
+      unmatchedCursor = JSON.parse(unmatchedPages.at(-1).body).nextCursor;
+      if (!unmatchedCursor) break;
+    }
     return {
       listStatus: listResponse.status,
       listBody: await listResponse.text(),
       detailStatus: detailResponse.status,
       detailBody: await detailResponse.text(),
+      endpointStatus: endpointResponse.status,
+      endpointBody: await endpointResponse.text(),
+      linkedStatus: linkedResponse.status,
+      linkedBody: await linkedResponse.text(),
+      unmatchedPages,
+      expectedUnmatchedIds,
+      operationId,
+      legacyV4Id,
     };
-  }, recordingId);
+  }, { id: recordingId, operationId, legacyV4Id, expectedUnmatchedIds });
   assert.equal(apiPayloads.listStatus, 200);
   assert.equal(apiPayloads.detailStatus, 200);
-  const responseBodies = [apiPayloads.listBody, apiPayloads.detailBody];
+  assert.equal(apiPayloads.endpointStatus, 200);
+  assert.equal(apiPayloads.linkedStatus, 200);
+  const endpointPage = JSON.parse(apiPayloads.endpointBody);
+  assert.ok(endpointPage.items.some((item) => item.operationId === operationId));
+  const linkedPage = JSON.parse(apiPayloads.linkedBody);
+  assert.ok(linkedPage.items.some((item) => item.recordingId === recordingId));
+  assert.ok(apiPayloads.unmatchedPages.length < 20, 'unmatched continuation must terminate');
+  assert.ok(apiPayloads.unmatchedPages.every((page) => page.status === 200));
+  const unmatchedPages = apiPayloads.unmatchedPages.map((page) => JSON.parse(page.body));
+  const unmatchedItems = unmatchedPages.flatMap((page) => page.items);
+  assert.deepEqual(unmatchedItems.map((item) => item.recordingId), expectedUnmatchedIds);
+  assert.equal(new Set(unmatchedItems.map((item) => item.recordingId)).size, unmatchedItems.length);
+  const legacyRow = unmatchedItems.find((item) => item.recordingId === legacyV4Id);
+  assert.ok(legacyRow, 'historical sidecar-absent v4 recording remains visible after viewer restart');
+  assert.equal(legacyRow.operationId, null);
+  assert.equal(legacyRow.unmatchedReason, null);
+  const responseBodies = [apiPayloads.listBody, apiPayloads.detailBody, apiPayloads.endpointBody, apiPayloads.linkedBody, ...apiPayloads.unmatchedPages.map((page) => page.body)];
   for (const body of responseBodies) {
     assert.ok(!body.includes(bootstrapToken), 'bootstrap token appeared in an API response');
     for (const canary of ['BODY_CANARY_1D4', 'AUTH_CANARY_1D4', 'COOKIE_CANARY_1D4', 'PATH_QUERY_CANARY_1E2']) {

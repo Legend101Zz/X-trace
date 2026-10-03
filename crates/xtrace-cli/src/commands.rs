@@ -432,7 +432,7 @@ where
     Ok((project_id, ObservedEndpointQueryService::new(reader), correlation_id))
 }
 
-fn open_recording_reader<F>(
+pub(crate) fn open_recording_reader<F>(
     project_dir: &Path,
     env_reader: &F,
 ) -> Result<(xtrace_domain::ProjectId, SqliteRecordingReader, xtrace_domain::CorrelationId), CliError>
