@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "baselineSha": "3e47895f90e6a78e08b1d808d4498e4595f71a5d",
+  "acceptedCandidateSha": null,
+  "launchState": "not_ready",
+  "phase": "P00",
+  "workers": {
+    "java_evidence": {
+      "branch": "slice/v001-java-evidence",
+      "model": "gpt-6-luna",
+      "reasoning": "high",
+      "scope": "Java/source shared increment under central root review",
+      "state": "implementation_authorized"
+    },
+    "node_capture": {
+      "branch": "slice/v001-node-capture",
+      "model": "gpt-6-luna",
+      "reasoning": "high",
+      "scope": "isolated Node HTTP preparation, no Slice4 acceptance",
+      "state": "implementation_authorized"
+    },
+    "release_audit": {
+      "model": "gpt-6-sol",
+      "reasoning": "high",
+      "scope": "read-only architecture/security current-source audit",
+      "state": "running"
+    }
+  },
+  "buildLeases": {
+    "gradle": "java_evidence",
+    "cargo": "root"
+  },
+  "continuation": {
+    "automationId": "x-trace-v0-01-launch-continuation",
+    "status": "ACTIVE",
+    "verified": "created then viewed, persisted target thread checked",
+    "intervalMinutes": 30,
+    "requires": "computer and desktop app running, SSD mounted"
+  },
+  "externalDependencies": [
+    "macOS signing/notarization identity unavailable",
+    "real usability participants and owner acceptance pending",
+    "Docker daemon stopped; disposable dependency infrastructure pending",
+    "Postman credentials unverified"
+  ],
+  "next": "Review release control; implement verified source method identity and isolated Node capture; preserve all nine-slice gates."
+}

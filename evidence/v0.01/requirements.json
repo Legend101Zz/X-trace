@@ -1,0 +1,450 @@
+{
+  "schemaVersion": 1,
+  "releaseName": "v0.01",
+  "machineVersion": "0.0.1",
+  "baselineSha": "3e47895f90e6a78e08b1d808d4498e4595f71a5d",
+  "candidateSha": null,
+  "decision": "not_ready",
+  "requirements": [
+    {
+      "id": "INSTALL-PACK",
+      "requirement": "One package bundles CLI/daemon/TUI, web, Java/Node packs, schemas and migrations",
+      "approvedSlice": "S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "INSTALL-FRESH",
+      "requirement": "Fresh-profile packaged init/capability/launch/record/open/stop/restart/reopen",
+      "approvedSlice": "S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "JAVA-LAUNCH",
+      "requirement": "JAR, Maven, Gradle and explicit supervisor workflows preserve argv/signals/exit/cleanup",
+      "approvedSlice": "S1,S3",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "JAVA-ATTACH",
+      "requirement": "Validated PID/start identity, attach JDK17/21/25 where applicable, precise relaunch remediation",
+      "approvedSlice": "S3",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "NODE-LAUNCH",
+      "requirement": "Native Node, scripts and package managers; CJS/ESM private preloads and child cleanup",
+      "approvedSlice": "S4",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "CATALOG-STATIC",
+      "requirement": "Static endpoints and inferred path hypotheses, explicit confidence/provenance",
+      "approvedSlice": "S2",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "CATALOG-RUNTIME",
+      "requirement": "General runtime registration claims, parameters and handler identity",
+      "approvedSlice": "S2,S5",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "CATALOG-HISTORY",
+      "requirement": "Reconciliation/conflicts, complete/incomplete scans, immutable revisions and run history",
+      "approvedSlice": "S2",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "CATALOG-LINKS",
+      "requirement": "Multiple projects/endpoints/recordings and historical unmatched v4/v7 without backfill/rekey",
+      "approvedSlice": "S2",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "JAVA-MVC",
+      "requirement": "Spring Boot/MVC real controllers, meaningful intermediate calls and outcomes",
+      "approvedSlice": "S1,S5",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "JAVA-WEBFLUX",
+      "requirement": "WebFlux/reactive context, concurrency and error correlation",
+      "approvedSlice": "S5",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "JAVA-SERVLET",
+      "requirement": "javax/jakarta Servlet request/async dispatch and declared container matrix",
+      "approvedSlice": "S5",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "JAVA-INTERACTIONS",
+      "requirement": "JDBC and declared outbound clients, exceptions and bounded sanitized values",
+      "approvedSlice": "S3,S5",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "NODE-HTTP",
+      "requirement": "Built-in HTTP/HTTPS real request roots, concurrency, async context and failures",
+      "approvedSlice": "S4",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "NODE-EXPRESS",
+      "requirement": "Express route/middleware/handler/error discovery and real capture",
+      "approvedSlice": "S4",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "NODE-FASTIFY",
+      "requirement": "Fastify public route/lifecycle hooks with encapsulation identity",
+      "approvedSlice": "S5",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "NODE-NEST",
+      "requirement": "NestJS on Express/Fastify controller/service identity without duplicate roots",
+      "approvedSlice": "S5",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "NODE-SOURCE",
+      "requirement": "CJS/ESM and authored TypeScript maps; safe repository-only transformation",
+      "approvedSlice": "S4",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "NODE-INTERACTIONS",
+      "requirement": "Declared database/outbound interactions, exceptions and safe values",
+      "approvedSlice": "S4,S5",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "PROCESS-LINKAGE",
+      "requirement": "Supported worker/child runtime sessions and explicit correlation gaps",
+      "approvedSlice": "S4,S5",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "REPLAY-SOURCE",
+      "requirement": "Recorded BLAKE3 source identity bound to runtime code, missing/hash-mismatch handling",
+      "approvedSlice": "S1,S2,S6",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "REPLAY-LINE",
+      "requirement": "Observed active file/line distinct from method ranges or inference",
+      "approvedSlice": "S1,S3,S6",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "REPLAY-FRAMES",
+      "requirement": "Persisted parent/async graph, frames/stack, arguments/results/locals/deltas within capabilities",
+      "approvedSlice": "S1,S3,S6",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "REPLAY-OUTCOME",
+      "requirement": "Actual response/exception, duration and complete/partial lifecycle evidence",
+      "approvedSlice": "S1,S3",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "REPLAY-NAV",
+      "requirement": "Shared previous/next/into/over/out and evidence-timed play/pause",
+      "approvedSlice": "S1,S2,S6",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "REPLAY-CANVAS",
+      "requirement": "Real Canvas graph/Linear parity, retained selection/filter/playback",
+      "approvedSlice": "S2,S6",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "REPLAY-TUI",
+      "requirement": "Shared query/navigation, source/values/gaps; resize/reconnect/plain-mode PTY journeys",
+      "approvedSlice": "S2,S6",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "REPLAY-HONESTY",
+      "requirement": "Visible redaction/truncation/drop/gap/incomplete/map/debug absence; never infer missing facts",
+      "approvedSlice": "S1,S3,S4,S6",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "EXPORT-OPENAPI",
+      "requirement": "Deterministic sanitized OpenAPI3.1, parameters, conflicts and provenance",
+      "approvedSlice": "S8",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "EXPORT-POSTMAN",
+      "requirement": "Collection2.1 local fallback; explicit authorized test-workspace delivery/open",
+      "approvedSlice": "S8",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "EXPORT-CURL",
+      "requirement": "Safely quoted recipes and nonexecuting index; mutation labels; no secret content",
+      "approvedSlice": "S8",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "EXPORT-BUNDLE",
+      "requirement": "Sanitized deterministic bundle with policy/catalog hashes and omissions",
+      "approvedSlice": "S8",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "EXERCISE-PLAN",
+      "requirement": "No requests in preview; immutable plan hash/effect/credential refs/scope/expiry",
+      "approvedSlice": "S7",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "EXERCISE-EXEC",
+      "requirement": "Exact approved execution, destination/DNS/redirect revalidation, request/resource limits",
+      "approvedSlice": "S7",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "EXERCISE-PROVENANCE",
+      "requirement": "Explicit ephemeral exercise item/run/recording linkage and failures",
+      "approvedSlice": "S7",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "RECOVERY-UPGRADE",
+      "requirement": "Backup/migration/crash/restart/upgrade retained-data and corrupt-object handling",
+      "approvedSlice": "S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "RETENTION-DOCTOR",
+      "requirement": "Explicit preview/apply retention, local sanitized doctor preview/bundle",
+      "approvedSlice": "S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "SECURITY-LOCAL",
+      "requirement": "TLS pin/auth replay/CSRF/origin/host/permissions/project isolation/local-first offline",
+      "approvedSlice": "S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "PRIVACY-CANARIES",
+      "requirement": "Wire/log/storage/API/client/export/diagnostic canaries for all real journeys",
+      "approvedSlice": "S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "UX-ACCESSIBILITY",
+      "requirement": "Responsive web 320/736/1024+, keyboard/screen reader/reduced motion/stale replies",
+      "approvedSlice": "S6,S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "PERFORMANCE",
+      "requirement": "All approved budgets, 10000-frame/operation bounds and measured instrumentation overhead",
+      "approvedSlice": "S6,S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "PLATFORM-MAC",
+      "requirement": "Exact signed/notarized macOS arm64 artifact fresh-profile acceptance",
+      "approvedSlice": "S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "PLATFORM-LINUX",
+      "requirement": "Exact Linux x86_64 package/signature fresh-profile acceptance",
+      "approvedSlice": "S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "SUPPLY-CHAIN",
+      "requirement": "Deterministic packages/checksums/SBOM/license/notices/advisories/provenance/signatures",
+      "approvedSlice": "S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "MATRIX",
+      "requirement": "Exact JDK17/21 and attach versions; Node22/24; framework/module/driver/OS capability receipts",
+      "approvedSlice": "S5,S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "CAMPAIGN-PETCLINIC",
+      "requirement": "Pinned current stable Petclinic baseline + five meaningful packaged scenarios + browser/privacy/overhead",
+      "approvedSlice": "Campaign",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "CAMPAIGN-JHIPSTER",
+      "requirement": "Pinned current stable JHipster baseline + five meaningful packaged scenarios + browser/privacy/overhead",
+      "approvedSlice": "Campaign",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "CAMPAIGN-FINERACT",
+      "requirement": "Pinned current stable Fineract baseline + five meaningful packaged scenarios + browser/privacy/overhead",
+      "approvedSlice": "Campaign",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "CAMPAIGN-DIRECTUS",
+      "requirement": "Pinned current stable Directus baseline + five meaningful packaged scenarios + browser/privacy/overhead",
+      "approvedSlice": "Campaign",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "CAMPAIGN-MEDUSA",
+      "requirement": "Pinned current stable Medusa + starter if needed, baseline + five packaged scenarios + browser/privacy/overhead",
+      "approvedSlice": "Campaign",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "CAMPAIGN-VENDURE",
+      "requirement": "Pinned current stable Vendure + starter if needed, baseline + five packaged HTTP/Nest scenarios + browser/privacy/overhead",
+      "approvedSlice": "Campaign",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "HUMAN-USABILITY",
+      "requirement": "Real new participants: >=80 percent correct observed entry/intermediate/outcome/interactions in <=10min",
+      "approvedSlice": "S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "HUMAN-OWNER",
+      "requirement": "Real owner reviews install, Linear/Canvas/TUI, attach failure, partial capture, exercise and exports",
+      "approvedSlice": "S9",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "REVIEWS-EXACT",
+      "requirement": "Pinned separate Sol architecture/security and build/integration reviews; root complete actual diff; all exact gates/CI/postmerge",
+      "approvedSlice": "Every phase",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    },
+    {
+      "id": "DISTRIBUTED-RECHECK",
+      "requirement": "Fresh profile install exact public artifacts; second clean Java+Node journey; checksums match release",
+      "approvedSlice": "Release",
+      "mandatory": true,
+      "state": "pending",
+      "receipts": []
+    }
+  ]
+}
