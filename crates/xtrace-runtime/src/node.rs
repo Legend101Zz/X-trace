@@ -390,6 +390,18 @@ fn validate_node_options_arguments(arguments: &[OsString]) -> Result<(), LaunchE
                 "Node preload and loader flags conflict with X-trace injection",
             ));
         }
+        if matches!(option, "--env-file" | "--env-file-if-exists") {
+            // Node parses NODE_OPTIONS from these files after argv validation.
+            return Err(LaunchError::Validation(
+                "Node env-file options are unsupported; pass validated environment values to xtrace run",
+            ));
+        }
+        if matches!(option, "--watch" | "--watch-preserve-output") {
+            // The direct-script supervisor has no tested restarted-child lifecycle.
+            return Err(LaunchError::Validation(
+                "Node watch flags are unsupported by xtrace run; launch the script directly",
+            ));
+        }
         if matches!(option, "-e" | "--eval" | "-p" | "--print") {
             return Err(LaunchError::Validation(
                 "Node eval and print entrypoints are unsupported; use a script file",
@@ -1067,6 +1079,50 @@ mod tests {
         assert!(validate_node_options_arguments(&["--eval=1".into()]).is_err());
         assert!(validate_node_options_arguments(&["-p".into(), "1 + 1".into()]).is_err());
         assert!(validate_node_options_arguments(&["--".into()]).is_err());
+    }
+
+    #[test]
+    fn node_env_files_are_rejected_before_script_but_preserved_as_script_arguments() {
+        for arguments in [
+            vec!["--env-file".into(), "/tmp/app.env".into(), "app.cjs".into()],
+            vec!["--env-file-if-exists".into(), "/tmp/app.env".into(), "app.cjs".into()],
+            vec!["--env-file=/tmp/app.env".into(), "app.cjs".into()],
+            vec!["--env-file-if-exists=/tmp/app.env".into(), "app.cjs".into()],
+        ] {
+            assert_eq!(
+                validate_node_options_arguments(&arguments).unwrap_err().to_string(),
+                "Node env-file options are unsupported; pass validated environment values to xtrace run",
+            );
+        }
+        assert!(
+            validate_node_options_arguments(&[
+                "app.cjs".into(),
+                "--env-file=/ordinary-app-argument".into(),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn node_watch_flags_are_rejected_before_script_but_preserved_as_script_arguments() {
+        for arguments in [
+            vec!["--watch".into(), "app.cjs".into()],
+            vec!["--watch-preserve-output".into(), "app.cjs".into()],
+            vec!["--watch=true".into(), "app.cjs".into()],
+            vec!["--watch-preserve-output=true".into(), "app.cjs".into()],
+        ] {
+            assert_eq!(
+                validate_node_options_arguments(&arguments).unwrap_err().to_string(),
+                "Node watch flags are unsupported by xtrace run; launch the script directly",
+            );
+        }
+        assert!(
+            validate_node_options_arguments(&[
+                "app.cjs".into(),
+                "--watch-preserve-output=ordinary-app-argument".into(),
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
