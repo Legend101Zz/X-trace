@@ -646,6 +646,64 @@ class RunnerTests(unittest.TestCase):
                 if lease_path.exists():
                     shutil.rmtree(lease_path)
 
+    def test_interrupt_during_final_ownership_scan_retains_both_leases_and_candidate_pid(self) -> None:
+        args = self.args()
+        args.label = "P00-final-scan-interrupt"
+        args.command_timeout = 5
+        script = (
+            "import subprocess,sys,time; time.sleep(.35); "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); "
+            "print(child.pid,flush=True)"
+        )
+        gate = run_gates.Gate("final-scan-interrupt", (sys.executable, "-c", script))
+        real_scan = run_gates._untracked_processes_since
+
+        def interrupt_final_scan(baseline: object, owned: object, snapshot: object, log_path: pathlib.Path):
+            if "final-scan-interrupt" in log_path.name:
+                raise KeyboardInterrupt
+            return real_scan(baseline, owned, snapshot, log_path)  # type: ignore[arg-type]
+
+        child_pid: int | None = None
+        try:
+            with mock.patch.object(run_gates, "GATES", (gate,)), mock.patch.object(
+                run_gates, "_untracked_processes_since", side_effect=interrupt_final_scan,
+            ):
+                self.assertEqual(run_gates.run(args), 1)
+            run_dir = self.cache / "release-gates" / args.label
+            receipt = json.loads((run_dir / "receipt.json").read_text())
+            log_files = list((run_dir / "logs").glob(".*.tmp"))
+            self.assertEqual(len(log_files), 1)
+            child_pid = int(log_files[0].read_text().splitlines()[0])
+            self.assertEqual(receipt["decision"], "failed")
+            self.assertIn("post-command ownership scan could not be completed: KeyboardInterrupt", receipt["error"])
+            self.assertTrue(process_running(child_pid), "unconfirmed candidate must not be signaled")
+            for name in ("cargo", "gradle"):
+                owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
+                self.assertTrue(owner["requiresManualRecovery"])
+                self.assertIn(
+                    child_pid,
+                    [item["pid"] for item in owner["unconfirmedProcesses"]],
+                )
+                self.assertNotEqual(owner["processGroupId"], child_pid)
+        finally:
+            if child_pid is None:
+                try:
+                    run_dir = self.cache / "release-gates" / args.label
+                    log_files = list((run_dir / "logs").glob(".*.tmp"))
+                    if log_files:
+                        child_pid = int(log_files[0].read_text().splitlines()[0])
+                except (OSError, ValueError, IndexError):
+                    pass
+            if child_pid is not None and process_running(child_pid):
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for name in ("cargo", "gradle"):
+                lease_path = self.cache / "leases" / name
+                if lease_path.exists():
+                    shutil.rmtree(lease_path)
+
     def test_untracked_scan_budget_exhaustion_retains_leases_without_killing_candidate(self) -> None:
         args = self.args()
         args.label = "P00-scan-budget"

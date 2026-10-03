@@ -116,6 +116,20 @@ def _owned_processes_alive(owned: dict[int, str], snapshot: dict[int, tuple[int,
             if pid in snapshot and snapshot[pid][1] == started_at and snapshot[pid][2] not in {"Z", "X"}]
 
 
+def _unconfirmed_candidates_since(
+    baseline: dict[int, tuple[int, str, str]],
+    owned: dict[int, str],
+    snapshot: dict[int, tuple[int, str, str]],
+) -> list[dict[str, Any]]:
+    """Describe new live processes when descriptor ownership could not be checked."""
+    return [
+        {"pid": pid, "startedAt": started_at, "observedParentPid": ppid}
+        for pid, (ppid, started_at, state) in sorted(snapshot.items())
+        if ((baseline.get(pid) is None or baseline[pid][1] != started_at)
+            and owned.get(pid) != started_at and state not in {"Z", "X"})
+    ]
+
+
 def _untracked_processes_since(
     baseline: dict[int, tuple[int, str, str]],
     owned: dict[int, str],
@@ -294,6 +308,8 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
     baseline_snapshot: dict[int, tuple[int, str, str]] | None = None
     owned: dict[int, str] = {}
     tree_confirmed_drained = True
+    final_ownership_scan_returned = False
+    last_snapshot: dict[int, tuple[int, str, str]] | None = None
     log_io_error: BaseException | None = None
     unconfirmed_processes: list[dict[str, Any]] = []
     timed_out = interrupted = False
@@ -307,12 +323,14 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
             # Keep the direct child unreaped until its first ps snapshot; Popen
             # does not poll or wait implicitly, so short-lived roots remain visible.
             snapshot = _process_snapshot()
+            last_snapshot = snapshot
             root_record = snapshot.get(process.pid)
             if root_record is not None:
                 root_identity = (process.pid, root_record[1])
                 _track_descendants(root_identity, owned, snapshot)
             while True:
                 snapshot = _process_snapshot()
+                last_snapshot = snapshot
                 if root_identity is not None:
                     _track_descendants(root_identity, owned, snapshot)
                 try:
@@ -415,11 +433,13 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
         if process is not None and baseline_snapshot is not None:
             try:
                 final_snapshot = _process_snapshot()
+                last_snapshot = final_snapshot
                 if root_identity is not None:
                     _track_descendants(root_identity, owned, final_snapshot)
                 unconfirmed_processes, scan_error = _untracked_processes_since(
                     baseline_snapshot, owned, final_snapshot, log_path,
                 )
+                final_ownership_scan_returned = True
                 if scan_error:
                     uncertain = uncertain or f"post-command ownership scan incomplete: {scan_error}"
                 if unconfirmed_processes:
@@ -427,8 +447,12 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
                         "completed gate left live processes created during the command that were not "
                         "observed as owned descendants; builder leases require manual review"
                     )
-            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                uncertain = uncertain or f"post-command ownership scan failed: {type(exc).__name__}"
+            except BaseException as exc:
+                uncertain = uncertain or f"post-command ownership scan could not be completed: {type(exc).__name__}"
+                if last_snapshot is not None:
+                    unconfirmed_processes = _unconfirmed_candidates_since(
+                        baseline_snapshot, owned, last_snapshot,
+                    )
         try:
             log.flush()
             _sync_log(log)
@@ -449,6 +473,12 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
             tree_confirmed_drained = True
         else:
             uncertain = uncertain or f"process tree rooted at {process.pid} could not be confirmed drained after log I/O failure"
+    if process is not None and not final_ownership_scan_returned:
+        uncertain = uncertain or f"post-command ownership scan could not be completed: {type(log_io_error).__name__ if log_io_error else 'unknown'}"
+        if baseline_snapshot is not None and last_snapshot is not None and not unconfirmed_processes:
+            unconfirmed_processes = _unconfirmed_candidates_since(
+                baseline_snapshot, owned, last_snapshot,
+            )
     if uncertain is not None:
         error = UncertainProcessTree(uncertain, process.pid if process else -1)
         error.owned_processes = dict(owned)
