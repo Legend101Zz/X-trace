@@ -97,6 +97,7 @@ try {
     return { width: style.width, height: style.height };
   }), { width: '6px', height: '6px' });
   assert.deepEqual(await page.locator('.recording').first().locator('.recording-title, .recording-sub, .recording-status').evaluateAll((labels) => labels.map((label) => getComputedStyle(label).display)), ['block', 'block', 'block']);
+  await page.getByRole('tab', { name: 'events' }).click();
   await page.locator('.event').filter({ hasText: 'OrderService.place' }).click();
   await page.getByText(/Adapter reported a compile-time source binding; current source matches the recorded identity/).waitFor();
   const sourceExcerpt = await page.locator('.source-excerpt').textContent();
