@@ -353,6 +353,14 @@ class AttachCommandsTest {
     assertTrue(BoundedJson.isWorkerResponse(good, "attach", 0));
     assertFalse(BoundedJson.isWorkerResponse(good + " trailing", "attach", 0));
     assertFalse(BoundedJson.isWorkerResponse(
+        good.replace("completed", "\\u" + "\uff26\uff10\uff10\uff10"),
+        "attach",
+        0));
+    assertFalse(BoundedJson.isWorkerResponse(
+        good.replace("\"message\":\"completed\"", "\"message\":\"ok\",\"process\":{\"pid\":1,\"unknown\":{\"field\":true}}"),
+        "attach",
+        0));
+    assertFalse(BoundedJson.isWorkerResponse(
         "{\"schemaVersion\":1,\"schemaVersion\":1,\"ok\":true,"
             + "\"command\":\"attach\",\"code\":\"XTR-ATTACH-OK\",\"message\":\"ok\"}",
         "attach",

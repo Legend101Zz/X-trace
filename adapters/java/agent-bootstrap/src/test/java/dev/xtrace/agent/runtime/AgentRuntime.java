@@ -17,6 +17,7 @@ public final class AgentRuntime {
       boolean attach,
       byte[] expectedIdentity)
       throws StartFailure {
+    if (bootstrapPath.endsWith("identity-mismatch")) return new byte[] {2};
     throw new StartFailure();
   }
 

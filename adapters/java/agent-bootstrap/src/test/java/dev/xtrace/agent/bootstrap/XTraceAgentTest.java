@@ -16,6 +16,7 @@ import java.util.jar.Attributes;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
+import dev.xtrace.agent.runtime.AgentRuntime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -38,14 +39,29 @@ class XTraceAgentTest {
 
   @Test
   void permanentPremainFailurePreventsUnsafeAttachRetry() throws Exception {
+    assertPremainFailureBlocksRetry("permanent-bootstrap.json", true);
+  }
+
+  @Test
+  void postAppendBootstrapLoadFailurePreventsUnsafeAttachRetry() throws Exception {
+    assertPremainFailureBlocksRetry("post-append-bootstrap.json", false);
+  }
+
+  @Test
+  void identityMismatchFailurePreventsUnsafeAttachRetry() throws Exception {
+    assertPremainFailureBlocksRetry("identity-mismatch", true);
+  }
+
+  private void assertPremainFailureBlocksRetry(String bootstrapName, boolean includeBridge)
+      throws Exception {
     Path distribution = Files.createDirectory(temporaryDirectory.resolve("distribution"));
-    Files.createDirectory(distribution.resolve("runtime"));
+    Path runtime = Files.createDirectory(distribution.resolve("runtime"));
     Path agent = distribution.resolve("xtrace-java-agent.jar");
     Path runtimeJar = runtime.resolve("agent-runtime.jar");
-    Path bootstrap = temporaryDirectory.resolve("bootstrap.json");
+    Path bootstrap = temporaryDirectory.resolve(bootstrapName);
     Path output = temporaryDirectory.resolve("child.out");
     Files.writeString(bootstrap, "test bootstrap is consumed only by the fake runtime");
-    writeBootstrapAgentJar(agent);
+    writeBootstrapAgentJar(agent, includeBridge);
     writeFakeRuntimeJar(runtimeJar);
 
     Path testClasses = Path.of(
@@ -73,7 +89,7 @@ class XTraceAgentTest {
     }
   }
 
-  private static void writeBootstrapAgentJar(Path target) throws Exception {
+  private static void writeBootstrapAgentJar(Path target, boolean includeBridge) throws Exception {
     Manifest manifest = new Manifest();
     manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
     manifest.getMainAttributes().putValue("Premain-Class", XTraceAgent.class.getName());
@@ -83,7 +99,10 @@ class XTraceAgentTest {
         var paths = Files.walk(classes)) {
       for (Path file : paths.filter(Files::isRegularFile).sorted().toList()) {
         String name = classes.relativize(file).toString().replace(java.io.File.separatorChar, '/');
-        if (!name.startsWith("dev/xtrace/agent/bootstrap/") || !name.endsWith(".class")) continue;
+        if (!name.startsWith("dev/xtrace/agent/bootstrap/")
+            || !name.endsWith(".class")
+            || (!includeBridge && name.startsWith(
+                "dev/xtrace/agent/bootstrap/BootstrapBridge"))) continue;
         jar.putNextEntry(new JarEntry(name));
         Files.copy(file, jar);
         jar.closeEntry();

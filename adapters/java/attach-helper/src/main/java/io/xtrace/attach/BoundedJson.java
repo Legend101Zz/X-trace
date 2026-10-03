@@ -5,12 +5,21 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** Small strict JSON reader for the bounded worker response; it has no external dependencies. */
 final class BoundedJson {
   private static final int MAX_INPUT_CHARS = 256 * 1024;
   private static final int MAX_DEPTH = 32;
   private static final int MAX_VALUES = 32 * 1024;
+  private static final Set<String> ENVELOPE_FIELDS = Set.of(
+      "schemaVersion", "ok", "command", "code", "message", "remediation",
+      "processes", "truncated", "process", "containerHintStatus", "agentState",
+      "targetAgentState", "targetIdentityStatus", "helperWorkerState", "helperWorkerPid",
+      "helperWorkerStartTime", "helperWorkerFailureKind");
+  private static final Set<String> PROCESS_FIELDS = Set.of(
+      "pid", "startTime", "commandSummary", "owner", "jdkVersion", "jdkVendor", "vmKind",
+      "localAttachApiAvailable", "attachProvider", "attachEligibility");
 
   private BoundedJson() {}
 
@@ -36,7 +45,8 @@ final class BoundedJson {
       Object command = object.get("command");
       Object code = object.get("code");
       Object message = object.get("message");
-      if (!(version instanceof BigDecimal number)
+      if (!ENVELOPE_FIELDS.containsAll(object.keySet())
+          || !(version instanceof BigDecimal number)
           || number.compareTo(BigDecimal.ONE) != 0
           || number.stripTrailingZeros().scale() > 0
           || !(ok instanceof Boolean success)
@@ -49,7 +59,21 @@ final class BoundedJson {
           || (object.containsKey("targetAgentState")
               && !(object.get("targetAgentState") instanceof String))
           || (object.containsKey("targetIdentityStatus")
-              && !(object.get("targetIdentityStatus") instanceof String))) {
+              && !(object.get("targetIdentityStatus") instanceof String))
+          || (object.containsKey("helperWorkerState")
+              && !(object.get("helperWorkerState") instanceof String))
+          || (object.containsKey("helperWorkerPid")
+              && !(object.get("helperWorkerPid") instanceof BigDecimal))
+          || (object.containsKey("helperWorkerStartTime")
+              && !(object.get("helperWorkerStartTime") instanceof BigDecimal))
+          || (object.containsKey("helperWorkerFailureKind")
+              && !(object.get("helperWorkerFailureKind") instanceof String))
+          || (object.containsKey("agentState") && !(object.get("agentState") instanceof String))
+          || (object.containsKey("containerHintStatus")
+              && !(object.get("containerHintStatus") instanceof String))
+          || (object.containsKey("truncated") && !(object.get("truncated") instanceof Boolean))
+          || (object.containsKey("processes") && !validProcesses(object.get("processes")))
+          || (object.containsKey("process") && !validProcess(object.get("process")))) {
         return false;
       }
       if (success) return exitCode == 0 && "XTR-ATTACH-OK".equals(codeText);
@@ -57,6 +81,32 @@ final class BoundedJson {
     } catch (IllegalArgumentException error) {
       return false;
     }
+  }
+
+  private static boolean validProcesses(Object value) {
+    if (!(value instanceof List<?> processes)) return false;
+    for (Object process : processes) {
+      if (!validProcess(process)) return false;
+    }
+    return true;
+  }
+
+  private static boolean validProcess(Object value) {
+    if (!(value instanceof Map<?, ?> process) || !PROCESS_FIELDS.containsAll(process.keySet())) {
+      return false;
+    }
+    return process.get("pid") instanceof BigDecimal
+        && (process.get("startTime") == null || process.get("startTime") instanceof String)
+        && (process.get("commandSummary") == null || process.get("commandSummary") instanceof String)
+        && (process.get("owner") == null || process.get("owner") instanceof String)
+        && (process.get("jdkVersion") == null || process.get("jdkVersion") instanceof String)
+        && (process.get("jdkVendor") == null || process.get("jdkVendor") instanceof String)
+        && (process.get("vmKind") == null || process.get("vmKind") instanceof String)
+        && (process.get("localAttachApiAvailable") == null
+            || process.get("localAttachApiAvailable") instanceof Boolean)
+        && (process.get("attachProvider") == null || process.get("attachProvider") instanceof String)
+        && (process.get("attachEligibility") == null
+            || process.get("attachEligibility") instanceof String);
   }
 
   private static final class Parser {
@@ -160,8 +210,18 @@ final class BoundedJson {
       if (input.length() - offset < 4) fail();
       int value = 0;
       for (int index = 0; index < 4; index++) {
-        int digit = Character.digit(input.charAt(offset++), 16);
-        if (digit < 0) fail();
+        char character = input.charAt(offset++);
+        int digit;
+        if (character >= '0' && character <= '9') {
+          digit = character - '0';
+        } else if (character >= 'a' && character <= 'f') {
+          digit = character - 'a' + 10;
+        } else if (character >= 'A' && character <= 'F') {
+          digit = character - 'A' + 10;
+        } else {
+          fail();
+          return 0;
+        }
         value = (value << 4) | digit;
       }
       return (char) value;

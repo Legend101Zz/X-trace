@@ -62,16 +62,21 @@ public final class XTraceAgent {
     } catch (InvocationTargetException error) {
       Throwable cause = error.getCause();
       rethrowFatal(cause);
-      boolean permanent = failurePermanent(cause);
-      if (START_STATE.get() != 1) START_STATE.set(permanent ? 2 : 0);
+      boolean permanent = START_STATE.get() == 2 || failurePermanent(cause);
+      if (permanent) START_STATE.set(2);
+      else if (START_STATE.get() != 1) START_STATE.set(0);
       throw new Exception(
           permanent
               ? "XTR-JAVA-AGENT-INITIALIZATION-PARTIAL-RELAUNCH-REQUIRED"
               : "XTR-JAVA-AGENT-INITIALIZATION-RETRYABLE");
     } catch (Exception | LinkageError error) {
       rethrowFatal(error);
-      if (START_STATE.get() != 1) START_STATE.set(0);
-      throw new Exception("XTR-JAVA-AGENT-INITIALIZATION-RETRYABLE");
+      boolean permanent = START_STATE.get() == 2;
+      if (!permanent && START_STATE.get() != 1) START_STATE.set(0);
+      throw new Exception(
+          permanent
+              ? "XTR-JAVA-AGENT-INITIALIZATION-PARTIAL-RELAUNCH-REQUIRED"
+              : "XTR-JAVA-AGENT-INITIALIZATION-RETRYABLE");
     }
   }
 
@@ -97,6 +102,7 @@ public final class XTraceAgent {
     byte[] identity = null;
     boolean keepLoader = false;
     boolean permanentFailure = false;
+    boolean irreversibleMutationStarted = false;
     try {
       entry = Class.forName(RUNTIME_ENTRY, true, loader);
       identity = (byte[]) entry
@@ -105,6 +111,8 @@ public final class XTraceAgent {
       if (!START_STATE.compareAndSet(0, -1)) {
         throw new IllegalStateException("XTR-JAVA-AGENT-START-IN-PROGRESS");
       }
+      irreversibleMutationStarted = true;
+      keepLoader = true;
       instrumentation.appendToBootstrapClassLoaderSearch(new JarFile(agentJar.toFile(), false));
       Class.forName("dev.xtrace.agent.bootstrap.BootstrapBridge", true, null);
       byte[] startedIdentity;
@@ -114,7 +122,7 @@ public final class XTraceAgent {
                 "start", String.class, Instrumentation.class, boolean.class, byte[].class)
             .invoke(null, bootstrapPath, instrumentation, attach, identity);
       } catch (InvocationTargetException error) {
-        permanentFailure = failurePermanent(error.getCause());
+        permanentFailure = irreversibleMutationStarted || failurePermanent(error.getCause());
         keepLoader = permanentFailure;
         throw error;
       }
@@ -129,7 +137,7 @@ public final class XTraceAgent {
       START_STATE.set(1);
     } finally {
       if (identity != null) Arrays.fill(identity, (byte) 0);
-      finishFailedStart(permanentFailure);
+      finishFailedStart(permanentFailure || irreversibleMutationStarted);
       if (!keepLoader) {
         try {
           loader.close();

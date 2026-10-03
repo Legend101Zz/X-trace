@@ -2,6 +2,7 @@ package io.xtrace.attach;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -16,7 +17,11 @@ import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -179,14 +184,22 @@ class JavaAttachAcceptanceTest {
       throw error;
     } finally {
       Throwable primaryFailure = failure[0];
-      for (Process process : new Process[] {fixtureProcess, daemon, secondDaemon}) {
+      List<ChildCleanup> cleanupStates = new ArrayList<>();
+      for (NamedProcess child : List.of(
+          new NamedProcess("fixture", fixtureProcess),
+          new NamedProcess("daemon", daemon),
+          new NamedProcess("second-daemon", secondDaemon))) {
+        Process process = child.process();
         if (process == null) continue;
+        boolean wasAlive = process.isAlive();
         try {
           stop(process);
         } catch (InterruptedException | IOException error) {
           if (error instanceof InterruptedException) Thread.currentThread().interrupt();
           if (primaryFailure == null) primaryFailure = error;
           else primaryFailure.addSuppressed(error);
+        } finally {
+          cleanupStates.add(childCleanup(child.name(), process, wasAlive));
         }
       }
       if (primaryFailure == null) {
@@ -194,24 +207,87 @@ class JavaAttachAcceptanceTest {
       } else {
         boolean evidenceSaved = false;
         try {
-          preserveFailureEvidence(evidenceDirectory, root, logs, stage[0], primaryFailure);
+          preserveFailureEvidence(
+              evidenceDirectory, root, logs, stage[0], primaryFailure, cleanupStates);
           evidenceSaved = true;
         } catch (IOException evidenceError) {
           primaryFailure.addSuppressed(
               new IOException("private failure evidence could not be persisted; fixture files were retained"));
           primaryFailure.addSuppressed(evidenceError);
         }
-        if (evidenceSaved) {
+        if (shouldDeleteFixtureRoot(evidenceSaved, cleanupStates)) {
           try {
             deleteTree(root);
           } catch (IOException cleanupError) {
             primaryFailure.addSuppressed(cleanupError);
           }
+        } else if (!allChildrenStopped(cleanupStates)) {
+          primaryFailure.addSuppressed(new IOException(
+              "a disposable child may still be using the fixture; its root was retained"));
         }
         if (failure[0] == null) {
           if (primaryFailure instanceof Exception exception) throw exception;
           if (primaryFailure instanceof Error error) throw error;
         }
+      }
+    }
+  }
+
+  @Test
+  void unconfirmedOwnedChildRetainsFixtureRootAndPrivateRecoveryReceipt() throws Exception {
+    Path root = Files.createTempDirectory("xtrace-java-attach-cleanup-test-");
+    setPrivateDirectory(root);
+    Path logs = Files.createDirectory(root.resolve("logs"));
+    Path evidenceDirectory = Files.createDirectory(root.resolve("evidence"));
+    setPrivateDirectory(evidenceDirectory);
+    Path childOutput = logs.resolve("child.out");
+    Path testClasses = Path.of(
+        UnstoppableChild.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+    Process child = null;
+    try {
+      child = new ProcessBuilder(
+          Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+          "-cp",
+          testClasses.toString(),
+          UnstoppableChild.class.getName())
+          .redirectErrorStream(true)
+          .redirectOutput(childOutput.toFile())
+          .start();
+      assertEquals("READY", waitForFirstLine(childOutput, child, Duration.ofSeconds(10)));
+      long pid = child.pid();
+      Process ownedChild = child;
+      Instant startTime = child.toHandle().info().startInstant()
+          .orElseThrow(() -> new AssertionError("owned child start identity is unavailable"));
+
+      IOException injected = assertThrows(IOException.class, () -> stop(ownedChild, true));
+      assertTrue(injected.getMessage().contains("injected"));
+      assertTrue(child.isAlive(), "the injected path must not signal the child");
+      List<ChildCleanup> cleanup = List.of(childCleanup("fixture", child, true));
+      assertFalse(allChildrenStopped(cleanup));
+      assertFalse(shouldDeleteFixtureRoot(true, cleanup));
+
+      Path bundle = preserveFailureEvidence(
+          evidenceDirectory, root, logs, "injected-stop-failure", injected, cleanup);
+      Map<String, Object> receipt = BoundedJson.parseObject(
+          Files.readString(bundle.resolve("receipt.json")));
+      @SuppressWarnings("unchecked")
+      List<Map<String, Object>> children = (List<Map<String, Object>>) receipt.get("childCleanup");
+      assertEquals(1, children.size());
+      assertEquals(pid, ((java.math.BigDecimal) children.get(0).get("pid")).longValue());
+      assertEquals(startTime.toString(), children.get(0).get("startTime"));
+      assertEquals("termination_unconfirmed", children.get(0).get("state"));
+      assertTrue(Files.isDirectory(root), "the fixture root must remain for the live child");
+    } finally {
+      try {
+        if (child != null) stop(child);
+      } finally {
+        if (child != null && child.isAlive()) {
+          child.destroyForcibly();
+          if (!child.waitFor(5, TimeUnit.SECONDS)) {
+            throw new IOException("the owned cleanup-test child could not be stopped");
+          }
+        }
+        deleteTree(root);
       }
     }
   }
@@ -372,8 +448,13 @@ class JavaAttachAcceptanceTest {
     }
   }
 
-  private static void preserveFailureEvidence(
-      Path evidenceDirectory, Path root, Path logs, String stage, Throwable failure)
+  private static Path preserveFailureEvidence(
+      Path evidenceDirectory,
+      Path root,
+      Path logs,
+      String stage,
+      Throwable failure,
+      List<ChildCleanup> cleanupStates)
       throws IOException {
     if (!Files.isDirectory(evidenceDirectory, java.nio.file.LinkOption.NOFOLLOW_LINKS)
         || Files.isSymbolicLink(evidenceDirectory)
@@ -397,9 +478,22 @@ class JavaAttachAcceptanceTest {
         writePrivateEvidence(bundle.resolve(name), sanitize(text, root));
       }
     }
-    String receipt = "{\"stage\":\"" + stage + "\",\"failureType\":\""
-        + failure.getClass().getSimpleName() + "\",\"jdk\":\""
-        + System.getProperty("java.version") + "\"}\n";
+    Map<String, Object> receiptValues = new LinkedHashMap<>();
+    receiptValues.put("stage", stage);
+    receiptValues.put("failureType", failure.getClass().getSimpleName());
+    receiptValues.put("jdk", System.getProperty("java.version"));
+    List<Map<String, Object>> childValues = new ArrayList<>();
+    for (ChildCleanup child : cleanupStates) {
+      Map<String, Object> value = new LinkedHashMap<>();
+      value.put("name", child.name());
+      value.put("ownedByHarness", true);
+      value.put("pid", child.pid());
+      value.put("startTime", child.startTime() == null ? null : child.startTime().toString());
+      value.put("state", child.state());
+      childValues.add(value);
+    }
+    receiptValues.put("childCleanup", childValues);
+    String receipt = Json.encode(receiptValues) + "\n";
     writePrivateEvidence(bundle.resolve("receipt.json"), receipt);
     if (!Files.isDirectory(bundle, java.nio.file.LinkOption.NOFOLLOW_LINKS)
         || Files.isSymbolicLink(bundle)
@@ -408,7 +502,47 @@ class JavaAttachAcceptanceTest {
     }
     forceDirectory(bundle);
     forceDirectory(evidenceDirectory);
+    return bundle;
   }
+
+  private static ChildCleanup childCleanup(String name, Process process, boolean wasAlive) {
+    boolean alive;
+    try {
+      alive = process.isAlive();
+    } catch (RuntimeException unavailable) {
+      alive = true;
+    }
+    long pid;
+    try {
+      pid = process.pid();
+    } catch (RuntimeException unavailable) {
+      pid = -1;
+    }
+    Instant startTime = null;
+    if (pid > 0) {
+      try {
+        startTime = process.toHandle().info().startInstant().orElse(null);
+      } catch (RuntimeException ignored) {
+        // Keep the PID and explicitly report an unconfirmed state when identity is unavailable.
+      }
+    }
+    return new ChildCleanup(
+        name, pid, startTime, alive ? "termination_unconfirmed" : wasAlive ? "stopped" : "already_exited");
+  }
+
+  private static boolean allChildrenStopped(List<ChildCleanup> children) {
+    return children.stream().allMatch(child ->
+        child.state().equals("stopped") || child.state().equals("already_exited"));
+  }
+
+  private static boolean shouldDeleteFixtureRoot(
+      boolean evidenceSaved, List<ChildCleanup> children) {
+    return evidenceSaved && allChildrenStopped(children);
+  }
+
+  private record NamedProcess(String name, Process process) {}
+
+  private record ChildCleanup(String name, long pid, Instant startTime, String state) {}
 
   private static void writePrivateEvidence(Path path, String text) throws IOException {
     byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
@@ -524,7 +658,13 @@ class JavaAttachAcceptanceTest {
   }
 
   private static void stop(Process process) throws InterruptedException, IOException {
+    stop(process, false);
+  }
+
+  private static void stop(Process process, boolean injectFailureBeforeSignal)
+      throws InterruptedException, IOException {
     if (process == null || !process.isAlive()) return;
+    if (injectFailureBeforeSignal) throw new IOException("injected child-stop failure");
     process.destroy();
     try {
       if (!process.waitFor(5, TimeUnit.SECONDS)) {
