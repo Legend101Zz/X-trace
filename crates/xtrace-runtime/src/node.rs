@@ -389,7 +389,9 @@ fn validate_node_options_arguments(arguments: &[OsString]) -> Result<(), LaunchE
         if matches!(value.as_ref(), "-e" | "--eval" | "-p" | "--print")
             || ["--eval=", "--print="].iter().any(|flag| value.starts_with(flag))
         {
-            break;
+            return Err(LaunchError::Validation(
+                "Node eval and print entrypoints are unsupported; use a script file",
+            ));
         }
         if node_option_takes_value(&value) && !value.contains('=') {
             index = index.saturating_add(1);
@@ -525,6 +527,7 @@ fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
     use std::io::Read as _;
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
     let mut file = std::fs::File::open(executable)
@@ -565,8 +568,20 @@ fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
         terminate_probe(&mut child, pid)?;
         return Err(LaunchError::Process);
     };
-    let stdout_reader = thread::spawn(move || read_probe_output(stdout));
-    let stderr_reader = thread::spawn(move || read_probe_output(stderr));
+    let (output_sender, output_receiver) = mpsc::sync_channel(2);
+    let stdout_sender = output_sender.clone();
+    thread::spawn(move || {
+        let output = read_probe_output(stdout);
+        if stdout_sender.send((true, output)).is_err() {
+            // The caller already exhausted the fixed pipe-drain budget.
+        }
+    });
+    thread::spawn(move || {
+        let output = read_probe_output(stderr);
+        if output_sender.send((false, output)).is_err() {
+            // The caller already exhausted the fixed pipe-drain budget.
+        }
+    });
     let deadline = Instant::now() + Duration::from_secs(2);
     let status = loop {
         match child.try_wait() {
@@ -574,19 +589,32 @@ fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) | Err(_) => {
                 terminate_probe(&mut child, pid)?;
-                let stdout_joined = stdout_reader.join().is_ok();
-                let stderr_joined = stderr_reader.join().is_ok();
-                if !stdout_joined || !stderr_joined {
-                    return Err(LaunchError::Process);
-                }
                 return Err(LaunchError::Validation(
                     "the Node version probe exceeded its time limit",
                 ));
             }
         }
     };
-    let stdout = stdout_reader.join().map_err(|_| LaunchError::Process)?;
-    let stderr = stderr_reader.join().map_err(|_| LaunchError::Process)?;
+    let drain_deadline = Instant::now() + Duration::from_secs(1);
+    let mut stdout = None;
+    let mut stderr = None;
+    while stdout.is_none() || stderr.is_none() {
+        let remaining = drain_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match output_receiver.recv_timeout(remaining) {
+            Ok((true, output)) => stdout = Some(output),
+            Ok((false, output)) => stderr = Some(output),
+            Err(_) => break,
+        }
+    }
+    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        terminate_probe(&mut child, pid)?;
+        return Err(LaunchError::Validation(
+            "the Node version probe output did not close within its time limit",
+        ));
+    };
     let version = [stdout.as_slice(), stderr.as_slice()].concat();
     let version = String::from_utf8_lossy(&version);
     let major = version
@@ -631,12 +659,13 @@ fn read_probe_output(mut reader: impl std::io::Read) -> Vec<u8> {
     const MAX_PROBE_OUTPUT: usize = 4_096;
     let mut retained = Vec::new();
     let mut buffer = [0; 1_024];
-    loop {
-        match reader.read(&mut buffer) {
+    while retained.len() < MAX_PROBE_OUTPUT {
+        let available = MAX_PROBE_OUTPUT - retained.len();
+        let read_size = available.min(buffer.len());
+        match reader.read(&mut buffer[..read_size]) {
             Ok(0) | Err(_) => break,
             Ok(count) => {
-                let retain = count.min(MAX_PROBE_OUTPUT.saturating_sub(retained.len()));
-                retained.extend_from_slice(&buffer[..retain]);
+                retained.extend_from_slice(&buffer[..count]);
             }
         }
     }
@@ -864,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn user_node_preload_flags_are_rejected_only_before_script_delimiter() {
+    fn user_preload_flags_stop_at_script_boundary_and_eval_entrypoints_are_rejected() {
         assert!(
             validate_node_options_arguments(&["--require=other.cjs".into(), "app.cjs".into()])
                 .is_err()
@@ -892,11 +921,94 @@ mod tests {
         assert!(
             validate_node_options_arguments(&[
                 "--eval".into(),
-                "process.exit(0)".into(),
-                "--require=ordinary-app-arg".into()
+                "console.log(JSON.stringify(process.execArgv))".into(),
+                "--require=/xtrace-nonexistent-preload.cjs".into()
             ])
-            .is_ok()
+            .is_err()
         );
+        assert!(validate_node_options_arguments(&["--eval=1".into()]).is_err());
+        assert!(validate_node_options_arguments(&["-p".into(), "1 + 1".into()]).is_err());
+    }
+
+    #[test]
+    fn native_version_probe_accepts_bounded_node_version_output() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let helper = compile_native_probe(directory.path(), None);
+        verify_node_version(&helper).expect("native Node version probe");
+    }
+
+    #[test]
+    fn native_version_probe_bounds_pipe_drain_when_detached_descendant_holds_pipes() {
+        use rustix::process::{Pid, Signal, kill_process_group};
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let pid_file = directory.path().join("detached-descendant.pid");
+        let helper = compile_native_probe(directory.path(), Some(&pid_file));
+        let started = Instant::now();
+        let result = verify_node_version(&helper);
+        assert!(
+            matches!(
+                result,
+                Err(LaunchError::Validation(
+                    "the Node version probe output did not close within its time limit"
+                ))
+            ),
+            "a detached inherited pipe must fail with a fixed bounded diagnostic"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3), "version probe exceeded its bound");
+
+        let descendant = std::fs::read_to_string(pid_file)
+            .expect("helper recorded detached descendant")
+            .trim()
+            .parse::<i32>()
+            .expect("detached descendant PID");
+        if let Some(group) = Pid::from_raw(descendant) {
+            match kill_process_group(group, Signal::KILL) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                Err(_) => panic!("could not clean detached probe fixture"),
+            }
+        }
+    }
+
+    fn compile_native_probe(
+        directory: &std::path::Path,
+        descendant_pid_file: Option<&std::path::Path>,
+    ) -> std::path::PathBuf {
+        use std::process::Command;
+
+        let source = match descendant_pid_file {
+            Some(pid_file) => format!(
+                r#"use std::os::unix::process::CommandExt as _;
+fn main() {{
+    let mut descendant = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .expect("spawn detached pipe holder");
+    std::fs::write({:?}, descendant.id().to_string()).expect("write fixture PID");
+    drop(descendant);
+    println!("v24.21.0");
+}}
+"#,
+                pid_file.to_string_lossy()
+            ),
+            None => "fn main() { println!(\"v24.21.0\"); }\n".to_owned(),
+        };
+        let source_path = directory.join("node_probe.rs");
+        let binary_path = directory.join("node");
+        std::fs::write(&source_path, source).expect("write native Node fixture source");
+        let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let output = Command::new(compiler)
+            .arg("--edition=2024")
+            .arg("--crate-name=xtrace_node_probe")
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&binary_path)
+            .output()
+            .expect("compile native Node fixture");
+        assert!(output.status.success(), "native fixture compilation failed");
+        binary_path
     }
 
     #[test]
