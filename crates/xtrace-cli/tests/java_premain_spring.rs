@@ -305,10 +305,10 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
 
     let mut mismatch_daemon = start_quiet_daemon(&repo, &data_home);
     let mismatch_bootstrap = mismatch_daemon.1.clone();
-    let mismatched_fixture = corrupt_fixture_class_attestation(root.path(), &fixture);
+    let manifest_mismatched_fixture = tamper_fixture_class_attestation(root.path(), &fixture);
     let mismatch_port = free_port();
     let mismatched =
-        launch_fixture(&agent, &mismatched_fixture, &mismatch_bootstrap, mismatch_port);
+        launch_fixture(&agent, &manifest_mismatched_fixture, &mismatch_bootstrap, mismatch_port);
     wait_for_fixture(mismatch_port);
     assert_eq!(post_order(mismatch_port).status, 201);
     let (mismatch_stdout, mismatch_stderr) = mismatched.stop();
@@ -326,6 +326,50 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert!(loaded_mismatch_frame.source.is_none());
     assert_canaries_absent("loaded-class mismatch XTF", &loaded_mismatch_logical);
     signal_and_wait(&mut mismatch_daemon.0, "-INT");
+
+    let mut mutated_class_daemon = start_quiet_daemon(&repo, &data_home);
+    let mutated_class_bootstrap = mutated_class_daemon.1.clone();
+    let mutated_class_fixture = mutate_fixture_classfile(root.path(), &fixture);
+    let mutated_class_port = free_port();
+    let mutated_class = launch_fixture(
+        &agent,
+        &mutated_class_fixture,
+        &mutated_class_bootstrap,
+        mutated_class_port,
+    );
+    wait_for_fixture(mutated_class_port);
+    assert_eq!(post_order(mutated_class_port).status, 201, "mutated class remains loadable");
+    let (mutated_class_stdout, mutated_class_stderr) = mutated_class.stop();
+    assert_scanned_clean("mutated class fixture stdout", &mutated_class_stdout);
+    assert_scanned_clean("mutated class fixture stderr", &mutated_class_stderr);
+    let class_mutation_recordings = wait_for_recordings(&project_root, 4);
+    let class_mutation_recording_id = &class_mutation_recordings[3].0;
+    let class_mutation_logical =
+        zstd::stream::decode_all(class_mutation_recordings[3].1.as_slice())
+            .expect("decompress actual classfile mutation XTF");
+    let class_mutation_events = decode_events(&class_mutation_logical);
+    let class_mutation_frame = class_mutation_events
+        .iter()
+        .find(|event| event.symbol == "OrderController.create")
+        .expect("real controller frame from mutated classfile");
+    assert_eq!(class_mutation_frame.source_binding, 3);
+    assert!(class_mutation_frame.source.is_none());
+    assert_canaries_absent("actual classfile mutation XTF", &class_mutation_logical);
+    let class_mutation_show =
+        run_recording_show_cli(&repo, &data_home, class_mutation_recording_id);
+    assert!(class_mutation_show.status.success(), "class mutation remains queryable");
+    let class_mutation_detail: Value =
+        serde_json::from_slice(&class_mutation_show.stdout).expect("class mismatch CLI JSON");
+    let class_mutation_event = class_mutation_detail["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["symbol"] == "OrderController.create")
+        .expect("controller frame in CLI query");
+    assert_eq!(class_mutation_event["source_binding"], "class_bytes_mismatch");
+    assert!(class_mutation_event["source"].is_null());
+    assert_canaries_absent("actual classfile mutation CLI", &class_mutation_show.stdout);
+    signal_and_wait(&mut mutated_class_daemon.0, "-INT");
 
     let unavailable_port = free_port();
     let unavailable = launch_fixture(&agent, &fixture, &unavailable_bootstrap, unavailable_port);
@@ -405,8 +449,8 @@ fn start_quiet_daemon(repo: &Path, data_home: &Path) -> (ManagedChild, PathBuf) 
     (child, bootstrap)
 }
 
-fn corrupt_fixture_class_attestation(root: &Path, fixture: &Path) -> PathBuf {
-    let working = root.join("class-attestation-mismatch");
+fn tamper_fixture_class_attestation(root: &Path, fixture: &Path) -> PathBuf {
+    let working = root.join("manifest-attestation-mismatch");
     fs::create_dir_all(&working).expect("create class mismatch workspace");
     let jar = working.join("mismatched-fixture.jar");
     fs::copy(fixture, &jar).expect("copy fixture jar");
@@ -432,6 +476,52 @@ fn corrupt_fixture_class_attestation(root: &Path, fixture: &Path) -> PathBuf {
     let update = bounded_output_in(update_command, &staging, "update fixture source attestation");
     assert!(update.status.success(), "manifest update failed: {}", text(&update.stderr));
     jar
+}
+
+fn mutate_fixture_classfile(root: &Path, fixture: &Path) -> PathBuf {
+    const ENTRY: &str = "BOOT-INF/classes/dev/xtrace/fixture/OrderController.class";
+    const ORIGINAL_SOURCE_NAME: &[u8] = b"OrderController.java";
+    const MUTATED_SOURCE_NAME: &[u8] = b"OrderControllor.java";
+
+    assert_eq!(ORIGINAL_SOURCE_NAME.len(), MUTATED_SOURCE_NAME.len());
+    let working = root.join("actual-classfile-mismatch");
+    fs::create_dir_all(&working).expect("create actual classfile mutation workspace");
+    let jar = working.join("mutated-fixture.jar");
+    fs::copy(fixture, &jar).expect("copy fixture jar");
+    let manifest_entry = "META-INF/xtrace/source-attestation.tsv";
+    let original_manifest = extract_jar_entry(&jar, manifest_entry, &working.join("original"));
+    let staging = working.join("staging");
+    let class_path = extract_jar_entry(&jar, ENTRY, &staging);
+    let mut class_bytes = fs::read(&class_path).expect("read controller classfile");
+    let matches = class_bytes
+        .windows(ORIGINAL_SOURCE_NAME.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == ORIGINAL_SOURCE_NAME).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "classfile has one SourceFile name constant");
+    let offset = matches[0];
+    class_bytes[offset..offset + MUTATED_SOURCE_NAME.len()].copy_from_slice(MUTATED_SOURCE_NAME);
+    fs::write(&class_path, class_bytes).expect("write valid classfile with changed debug name");
+    let mut update_command = Command::new("jar");
+    update_command.args(["uf"]).arg(&jar).arg(ENTRY);
+    let update = bounded_output_in(update_command, &staging, "update mutated controller classfile");
+    assert!(update.status.success(), "classfile update failed: {}", text(&update.stderr));
+    let mutated_manifest = extract_jar_entry(&jar, manifest_entry, &working.join("verify"));
+    assert_eq!(
+        fs::read(mutated_manifest).expect("read unchanged class attestation"),
+        fs::read(original_manifest).expect("read original class attestation"),
+        "classfile mutation must preserve the original manifest byte-for-byte"
+    );
+    jar
+}
+
+fn extract_jar_entry(jar: &Path, entry: &str, destination: &Path) -> PathBuf {
+    fs::create_dir_all(destination).expect("create jar extraction directory");
+    let mut command = Command::new("jar");
+    command.args(["xf"]).arg(jar).arg(entry);
+    let extract = bounded_output_in(command, destination, "extract fixture jar entry");
+    assert!(extract.status.success(), "jar entry extraction failed: {}", text(&extract.stderr));
+    destination.join(entry)
 }
 
 fn bounded_output_in(mut command: Command, directory: &Path, label: &str) -> std::process::Output {

@@ -4,6 +4,7 @@
 //! establishes only the root binding, scoped error surface, and idempotent
 //! recording anchor needed before object publication can be added safely.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -743,6 +744,7 @@ impl SqliteRecordingStore<'_> {
         let mut verified_input_bytes = 0_usize;
         let mut verified_work_limit_reached = false;
         let mut incomplete_evidence = Vec::new();
+        let mut source_cache = SourceProjectionCache::default();
         if status == "partial" || status == "invalid" {
             incomplete_evidence.push(format!("persisted_status:{status}"));
         }
@@ -888,7 +890,7 @@ impl SqliteRecordingStore<'_> {
                 if event.kind == 14 {
                     incomplete_evidence.push(format!("gap_event_sequence:{}", event.recording_seq));
                 }
-                let projected = project_persisted_event(event, source_root);
+                let projected = project_persisted_event(event, source_root, &mut source_cache);
                 let projected_size = projected
                     .serialized_size_with_separator()
                     .map_err(|_| recording_query_resource_error(correlation_id))?;
@@ -1536,6 +1538,7 @@ fn recording_status(
 fn project_persisted_event(
     event: &xtrace_protocol::generated::agent::RecordingEvent,
     source_root: Option<&Path>,
+    source_cache: &mut SourceProjectionCache,
 ) -> PersistedEvent {
     use xtrace_protocol::generated::agent::SourceBinding as WireSourceBinding;
 
@@ -1563,7 +1566,7 @@ fn project_persisted_event(
             .source
             .as_ref()
             .and_then(source_range_from_wire)
-            .and_then(|source| project_source(&source, source_root))
+            .and_then(|source| project_source(&source, source_root, source_cache))
     } else {
         None
     };
@@ -1601,7 +1604,22 @@ const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SOURCE_EXCERPT_BYTES: usize = 16 * 1024;
 const MAX_SOURCE_EXCERPT_LINES: u32 = 64;
 
-fn project_source(source: &SourceRange, source_root: Option<&Path>) -> Option<PersistedSource> {
+#[derive(Default)]
+struct SourceProjectionCache {
+    snapshots: HashMap<String, SourceSnapshot>,
+    reads: usize,
+}
+
+enum SourceSnapshot {
+    Unavailable,
+    Loaded { hash: ContentHash, text: Option<String> },
+}
+
+fn project_source(
+    source: &SourceRange,
+    source_root: Option<&Path>,
+    cache: &mut SourceProjectionCache,
+) -> Option<PersistedSource> {
     let start_line = source.start_line?;
     let path = source.path.as_str();
     let safe = [
@@ -1623,30 +1641,56 @@ fn project_source(source: &SourceRange, source_root: Option<&Path>) -> Option<Pe
             truncated: false,
         });
     };
-    let Ok(root) = root.canonicalize() else {
+    if !cache.snapshots.contains_key(path) {
+        cache.reads += 1;
+        cache.snapshots.insert(path.to_owned(), load_source_snapshot(root, path));
+    }
+    let snapshot = cache.snapshots.get(path)?;
+    let SourceSnapshot::Loaded { hash, text } = snapshot else {
         return unavailable_source(path, start_line, end_line);
+    };
+    let recorded_hash = source.content_hash.as_ref()?;
+    if hash != recorded_hash {
+        return Some(PersistedSource {
+            path: path.to_owned(),
+            start_line,
+            end_line,
+            status: SourceStatus::Mismatch,
+            excerpt: None,
+            truncated: false,
+        });
+    }
+    let Some(text) = text.as_deref() else {
+        return unavailable_source(path, start_line, end_line);
+    };
+    project_matching_source(path, start_line, end_line, text)
+}
+
+fn load_source_snapshot(root: &Path, path: &str) -> SourceSnapshot {
+    let Ok(root) = root.canonicalize() else {
+        return SourceSnapshot::Unavailable;
     };
     let relative = Path::new(path);
     let Ok(root_metadata) = std::fs::symlink_metadata(&root) else {
-        return unavailable_source(path, start_line, end_line);
+        return SourceSnapshot::Unavailable;
     };
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return unavailable_source(path, start_line, end_line);
+        return SourceSnapshot::Unavailable;
     }
     let Ok(mut directory) = std::fs::File::open(&root) else {
-        return unavailable_source(path, start_line, end_line);
+        return SourceSnapshot::Unavailable;
     };
     let Ok(opened_root) = directory.metadata() else {
-        return unavailable_source(path, start_line, end_line);
+        return SourceSnapshot::Unavailable;
     };
     #[cfg(unix)]
     if root_metadata.dev() != opened_root.dev() || root_metadata.ino() != opened_root.ino() {
-        return unavailable_source(path, start_line, end_line);
+        return SourceSnapshot::Unavailable;
     }
     let components = relative.components().collect::<Vec<_>>();
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(part) = component else {
-            return unavailable_source(path, start_line, end_line);
+            return SourceSnapshot::Unavailable;
         };
         let final_component = index + 1 == components.len();
         let flags = if final_component {
@@ -1659,47 +1703,34 @@ fn project_source(source: &SourceRange, source_root: Option<&Path>) -> Option<Pe
         };
         let Ok(opened) = rustix::fs::openat(&directory, *part, flags, rustix::fs::Mode::empty())
         else {
-            return unavailable_source(path, start_line, end_line);
+            return SourceSnapshot::Unavailable;
         };
         let file = std::fs::File::from(opened);
         if final_component {
             let Ok(metadata) = file.metadata() else {
-                return unavailable_source(path, start_line, end_line);
+                return SourceSnapshot::Unavailable;
             };
             if !metadata.is_file() || metadata.len() > MAX_SOURCE_FILE_BYTES {
-                return unavailable_source(path, start_line, end_line);
+                return SourceSnapshot::Unavailable;
             }
             let mut reader = file.take(MAX_SOURCE_FILE_BYTES + 1);
             let capacity = usize::try_from(metadata.len()).map_or(0, |value| value);
             let mut bytes = Vec::with_capacity(capacity);
             if reader.read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_SOURCE_FILE_BYTES
             {
-                return unavailable_source(path, start_line, end_line);
+                return SourceSnapshot::Unavailable;
             }
-            let Some(recorded_hash) = source.content_hash.as_ref() else {
-                return unavailable_source(path, start_line, end_line);
+            return SourceSnapshot::Loaded {
+                hash: ContentHash::of_bytes(&bytes),
+                text: std::str::from_utf8(&bytes).ok().map(str::to_owned),
             };
-            if ContentHash::of_bytes(&bytes) != *recorded_hash {
-                return Some(PersistedSource {
-                    path: path.to_owned(),
-                    start_line,
-                    end_line,
-                    status: SourceStatus::Mismatch,
-                    excerpt: None,
-                    truncated: false,
-                });
-            }
-            let Ok(text) = std::str::from_utf8(&bytes) else {
-                return unavailable_source(path, start_line, end_line);
-            };
-            return project_matching_source(path, start_line, end_line, text);
         }
         if file.metadata().is_err() {
-            return unavailable_source(path, start_line, end_line);
+            return SourceSnapshot::Unavailable;
         }
         directory = file;
     }
-    unavailable_source(path, start_line, end_line)
+    SourceSnapshot::Unavailable
 }
 
 fn project_matching_source(
@@ -1801,14 +1832,17 @@ mod source_projection_tests {
         std::fs::write(file, bytes).expect("source written");
     }
 
+    fn project(source: &SourceRange, source_root: Option<&Path>) -> Option<PersistedSource> {
+        project_source(source, source_root, &mut SourceProjectionCache::default())
+    }
+
     #[test]
     fn matching_source_returns_only_the_bounded_recorded_extent() {
         let root = tempdir().expect("temporary root");
         let bytes = b"one\ntwo\nthree\nfour\n";
         write_source(root.path(), bytes);
-        let projected =
-            project_source(&range(PATH, ContentHash::of_bytes(bytes)), Some(root.path()))
-                .expect("source projection");
+        let projected = project(&range(PATH, ContentHash::of_bytes(bytes)), Some(root.path()))
+            .expect("source projection");
         assert_eq!(projected.status, SourceStatus::Matched);
         assert_eq!(projected.excerpt.as_deref(), Some("two\nthree"));
     }
@@ -1817,22 +1851,48 @@ mod source_projection_tests {
     fn changed_source_is_reported_without_returning_its_contents() {
         let root = tempdir().expect("temporary root");
         write_source(root.path(), b"private-source-canary\nchanged\n");
-        let projected = project_source(
-            &range(PATH, ContentHash::of_bytes(b"recorded\nsource\n")),
-            Some(root.path()),
-        )
-        .expect("source projection");
+        let projected =
+            project(&range(PATH, ContentHash::of_bytes(b"recorded\nsource\n")), Some(root.path()))
+                .expect("source projection");
         assert_eq!(projected.status, SourceStatus::Mismatch);
         assert!(projected.excerpt.is_none());
     }
 
     #[test]
+    fn repeated_frames_hash_near_limit_source_once_per_query() {
+        let root = tempdir().expect("temporary root");
+        let max_bytes = usize::try_from(MAX_SOURCE_FILE_BYTES).expect("bound fits");
+        let mut bytes = b"header\nrecorded line\n".to_vec();
+        bytes.resize(max_bytes - 1, b'x');
+        bytes.push(b'\n');
+        write_source(root.path(), &bytes);
+        let mut source = range(PATH, ContentHash::of_bytes(&bytes));
+        source.end_line = Some(2);
+        let mut cache = SourceProjectionCache::default();
+
+        for _ in 0..1_000 {
+            let projected =
+                project_source(&source, Some(root.path()), &mut cache).expect("source projection");
+            assert_eq!(projected.status, SourceStatus::Matched);
+            assert_eq!(projected.excerpt.as_deref(), Some("recorded line"));
+        }
+        assert_eq!(cache.reads, 1, "repeated frames must share one bounded file read/hash");
+
+        let changed = b"private-source-canary\nchanged\n";
+        write_source(root.path(), changed);
+        let mut next_query_cache = SourceProjectionCache::default();
+        let next_query = project_source(&source, Some(root.path()), &mut next_query_cache)
+            .expect("safe mismatch projection");
+        assert_eq!(next_query.status, SourceStatus::Mismatch);
+        assert!(next_query.excerpt.is_none());
+        assert_eq!(next_query_cache.reads, 1, "a new query must observe live source changes");
+    }
+
+    #[test]
     fn source_paths_outside_the_fixture_allowlist_are_never_projected() {
         let root = tempdir().expect("temporary root");
-        let projected = project_source(
-            &range("../../private.txt", ContentHash::of_bytes(b"x")),
-            Some(root.path()),
-        );
+        let projected =
+            project(&range("../../private.txt", ContentHash::of_bytes(b"x")), Some(root.path()));
         assert!(projected.is_none());
     }
 
@@ -1843,9 +1903,8 @@ mod source_projection_tests {
             root.path(),
             &vec![b'x'; usize::try_from(MAX_SOURCE_FILE_BYTES + 1).expect("bound fits")],
         );
-        let projected =
-            project_source(&range(PATH, ContentHash::of_bytes(b"unused")), Some(root.path()))
-                .expect("safe unavailable projection");
+        let projected = project(&range(PATH, ContentHash::of_bytes(b"unused")), Some(root.path()))
+            .expect("safe unavailable projection");
         assert_eq!(projected.status, SourceStatus::Unavailable);
         assert!(projected.excerpt.is_none());
     }
@@ -1855,14 +1914,14 @@ mod source_projection_tests {
         let root = tempdir().expect("temporary root");
         let bytes = b"one\ntwo\n";
         write_source(root.path(), bytes);
-        let no_root = project_source(&range(PATH, ContentHash::of_bytes(bytes)), None)
+        let no_root = project(&range(PATH, ContentHash::of_bytes(bytes)), None)
             .expect("unavailable projection");
         assert_eq!(no_root.status, SourceStatus::Unavailable);
         let mut out_of_range = range(PATH, ContentHash::of_bytes(bytes));
         out_of_range.start_line = Some(20);
         out_of_range.end_line = Some(20);
         let projected =
-            project_source(&out_of_range, Some(root.path())).expect("safe unavailable projection");
+            project(&out_of_range, Some(root.path())).expect("safe unavailable projection");
         assert_eq!(projected.status, SourceStatus::Unavailable);
         assert!(projected.excerpt.is_none());
     }
@@ -1873,11 +1932,9 @@ mod source_projection_tests {
         let first = "a".repeat(MAX_SOURCE_EXCERPT_BYTES);
         let contents = format!("header\n{first}\nnext\n");
         write_source(root.path(), contents.as_bytes());
-        let projected = project_source(
-            &range(PATH, ContentHash::of_bytes(contents.as_bytes())),
-            Some(root.path()),
-        )
-        .expect("source projection");
+        let projected =
+            project(&range(PATH, ContentHash::of_bytes(contents.as_bytes())), Some(root.path()))
+                .expect("source projection");
         let excerpt = projected.excerpt.expect("matched excerpt");
         assert_eq!(excerpt.len(), MAX_SOURCE_EXCERPT_BYTES);
         assert!(projected.truncated);
@@ -1894,7 +1951,7 @@ mod source_projection_tests {
         let private = root.path().join("private-source-canary.txt");
         std::fs::write(&private, b"private-source-canary").expect("private file written");
         symlink(&private, &file).expect("source symlink created");
-        let projected = project_source(
+        let projected = project(
             &range(PATH, ContentHash::of_bytes(b"private-source-canary")),
             Some(root.path()),
         )
