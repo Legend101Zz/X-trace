@@ -103,7 +103,7 @@ try {
   const sourceExcerpt = await page.locator('.source-excerpt').textContent();
   assert.ok(sourceExcerpt?.includes('repository.save'), 'browser displays the matched bounded Spring source excerpt');
   await page.getByText('Values were not projected').waitFor();
-  await page.getByText('Completion semantics unavailable').waitFor();
+  await page.getByText(/completion semantics unavailable/i).waitFor();
   await page.setViewportSize({ width: 1280, height: 720 });
   await saveScreenshot('viewer-desktop-genuine-detail.png', 'genuine-recording-detail', 1280, 720);
   await page.setViewportSize({ width: 390, height: 844 });

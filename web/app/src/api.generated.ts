@@ -206,11 +206,16 @@ export interface components {
             interaction?: {
                 [key: string]: string | null;
             } | null;
-            /** @enum {string} */
+            /**
+             * @description Adapter-reported compile-time class-to-source binding result.
+             * @enum {string}
+             */
             sourceBinding: "unspecified" | "verified" | "attestation_missing" | "class_bytes_mismatch" | "debug_metadata_absent" | "source_metadata_invalid";
             source?: null | {
                 path: string;
+                /** @description Lower bound of the fixture method debug-line extent, not an active execution cursor. */
                 startLine: number;
+                /** @description Inclusive upper bound of the fixture method debug-line extent, when available. */
                 endLine: number | null;
                 /** @enum {string} */
                 status: "matched" | "mismatch" | "unavailable";
