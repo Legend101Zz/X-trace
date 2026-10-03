@@ -40,8 +40,16 @@
   "externalDependencies": [
     "macOS signing/notarization identity unavailable",
     "real usability participants and owner acceptance pending",
-    "Docker daemon stopped; disposable dependency infrastructure pending",
+    "Docker started, Linux aarch64; disposable dependency preparation pending, no x86_64 package acceptance",
     "Postman credentials unverified"
   ],
-  "next": "Review release control; implement verified source method identity and isolated Node capture; preserve all nine-slice gates."
+  "next": "Review release control; implement verified source method identity and isolated Node capture; preserve all nine-slice gates.",
+  "decisions": [
+    {
+      "date": "2026-10-04",
+      "authority": "explicit owner reply in launch chat",
+      "subject": "Petclinic tag exception",
+      "decision": "Use current main SHA with explicit tag exception; no obsolete 1.5.x campaign."
+    }
+  ]
 }

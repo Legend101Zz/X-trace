@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "tool": "Caveman",
+  "canonicalUrl": "https://github.com/JuliusBrussee/caveman",
+  "revision": "aeb45e2f787c0757a8af383a291a280cb6aeb4c1",
+  "reviewed": [
+    "README.md",
+    "skills/caveman/SKILL.md",
+    "INSTALL.md",
+    "SECURITY.md"
+  ],
+  "integration": "Manually read task-scoped pinned local skill; concise routine prose/handoffs only.",
+  "installerExecuted": false,
+  "proxyEnabled": false,
+  "telemetryEnabled": false,
+  "credentialProviderChanges": false,
+  "limits": "No measured token savings claimed. Preserve exact requirements, code, commands, docs, diff/log originals and review evidence."
+}
