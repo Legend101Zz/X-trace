@@ -434,15 +434,21 @@ class RunnerTests(unittest.TestCase):
         probes: list[dict[str, object]] = []
         try:
             with mock.patch.object(run_gates, "VERSION_COMMANDS", (("probe", (sys.executable, "-c", script), "."),)):
-                with self.assertRaisesRegex(RuntimeError, "version probe probe failed with exit 124"):
+                with self.assertRaises((RuntimeError, run_gates.UncertainProcessTree)) as context:
                     REAL_VERSIONS(self.repo, os.environ.copy(), logs, probes, timeout=0.4)
+            if isinstance(context.exception, run_gates.UncertainProcessTree):
+                self.assertRegex(str(context.exception), "timed-out process tree|post-command ownership scan")
+            else:
+                self.assertRegex(str(context.exception), "version probe probe failed with exit 124")
             version_log = logs / "version-probe.log"
             self.assertEqual(version_log.stat().st_mode & 0o777, 0o600)
             child_pid = int(version_log.read_text().splitlines()[0].split()[0])
-            self.assertFalse(process_running(child_pid))
-            self.assertEqual(probes[0]["status"], "failed")
-            self.assertEqual(probes[0]["exitCode"], 124)
-            self.assertEqual(probes[0]["logSha256"], digest(version_log.read_bytes()))
+            if process_running(child_pid):
+                self.assertIsInstance(context.exception, run_gates.UncertainProcessTree)
+            if probes:
+                self.assertEqual(probes[0]["status"], "failed")
+                self.assertEqual(probes[0]["exitCode"], 124)
+                self.assertEqual(probes[0]["logSha256"], digest(version_log.read_bytes()))
         finally:
             if child_pid is None:
                 try:
@@ -606,6 +612,86 @@ class RunnerTests(unittest.TestCase):
                     unrelated.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     pass
+
+    def test_delayed_parent_escape_after_quarter_second_retains_both_leases(self) -> None:
+        args = self.args()
+        args.label = "P00-delayed-child"
+        args.command_timeout = 5
+        script = "import subprocess,sys,time; time.sleep(.35); child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); print(child.pid,flush=True)"
+        gate = run_gates.Gate("delayed-detached-child", (sys.executable, "-c", script))
+        try:
+            with mock.patch.object(run_gates, "GATES", (gate,)):
+                self.assertEqual(run_gates.run(args), 1)
+            run_dir = self.cache / "release-gates" / args.label
+            receipt = json.loads((run_dir / "receipt.json").read_text())
+            log_files = list((run_dir / "logs").glob(".*.tmp"))
+            self.assertEqual(len(log_files), 1)
+            child_pid = int(log_files[0].read_text().splitlines()[0])
+            self.assertRegex(receipt["error"], "not observed as owned descendants|ownership scan incomplete")
+            for name in ("cargo", "gradle"):
+                owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
+                self.assertTrue(owner["requiresManualRecovery"])
+                self.assertIn(
+                    child_pid,
+                    [item["pid"] for item in owner["unconfirmedProcesses"]],
+                )
+        finally:
+            if "child_pid" in locals() and process_running(child_pid):
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for name in ("cargo", "gradle"):
+                lease_path = self.cache / "leases" / name
+                if lease_path.exists():
+                    shutil.rmtree(lease_path)
+
+    def test_untracked_scan_budget_exhaustion_retains_leases_without_killing_candidate(self) -> None:
+        args = self.args()
+        args.label = "P00-scan-budget"
+        args.command_timeout = 5
+        real_snapshot = run_gates._process_snapshot
+        unrelated: subprocess.Popen[bytes] | None = None
+        calls = 0
+
+        def snapshot_with_concurrent_process() -> dict[int, tuple[int, str, str]]:
+            nonlocal calls, unrelated
+            snapshot = real_snapshot()
+            calls += 1
+            if calls == 1:
+                unrelated = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                )
+            return snapshot
+
+        try:
+            with mock.patch.object(run_gates, "GATES", (run_gates.Gate("quick", (sys.executable, "-c", "pass")),)), \
+                    mock.patch.object(run_gates, "_process_snapshot", side_effect=snapshot_with_concurrent_process), \
+                    mock.patch.object(run_gates, "MAX_UNTRACKED_PROCESSES", 0):
+                self.assertEqual(run_gates.run(args), 1)
+            receipt = json.loads((self.cache / "release-gates" / args.label / "receipt.json").read_text())
+            self.assertIn("inspection limit exceeded", receipt["error"])
+            self.assertIsNotNone(unrelated)
+            self.assertIsNone(unrelated.poll())
+            for name in ("cargo", "gradle"):
+                owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
+                self.assertTrue(owner["requiresManualRecovery"])
+                self.assertIn("inspection limit exceeded", owner["terminationStatus"])
+        finally:
+            if unrelated is not None:
+                try:
+                    os.killpg(unrelated.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    unrelated.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+            for name in ("cargo", "gradle"):
+                lease_path = self.cache / "leases" / name
+                if lease_path.exists():
+                    shutil.rmtree(lease_path)
 
     def test_source_change_during_gate_fails_exact_tree_receipt(self) -> None:
         gate = run_gates.Gate("mutating-gate", (sys.executable, "-c", "open('source-drift.txt','w').write('changed')"))

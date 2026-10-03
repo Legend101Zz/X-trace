@@ -25,7 +25,8 @@ LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CACHE_NAMES = ("cargo", "cargo-target", "gradle", "npm", "playwright", "tmp", "xdg")
 PS_BINARY = next((path for path in ("/bin/ps", "/usr/bin/ps") if pathlib.Path(path).is_file()), None)
 LSOF_BINARY = next((path for path in ("/usr/sbin/lsof", "/usr/bin/lsof") if pathlib.Path(path).is_file()), None)
-FAST_EXIT_GUARD_SECONDS = 0.25
+UNTRACKED_SCAN_BUDGET_SECONDS = 2.0
+MAX_UNTRACKED_PROCESSES = 512
 
 
 @dataclass(frozen=True)
@@ -64,7 +65,7 @@ GATES: tuple[Gate, ...] = (
 
 
 class UncertainProcessTree(RuntimeError):
-    """A process group may still be writing; shared builders must stay leased."""
+    """A command-owned or unconfirmed process may still write to shared builders."""
 
     def __init__(self, message: str, process_group_id: int):
         super().__init__(message)
@@ -120,18 +121,76 @@ def _untracked_processes_since(
     owned: dict[int, str],
     snapshot: dict[int, tuple[int, str, str]],
     log_path: pathlib.Path,
-) -> list[dict[str, Any]]:
-    """Find fast-run processes not parent-tracked but retaining the private gate log."""
-    candidates: list[dict[str, Any]] = []
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Find processes born during the run that retain the private gate log."""
+    started = time.monotonic()
+    candidates: list[tuple[int, int, str]] = []
     for pid, (ppid, started_at, state) in sorted(snapshot.items()):
         baseline_record = baseline.get(pid)
         if ((baseline_record is not None and baseline_record[1] == started_at)
                 or owned.get(pid) == started_at or state in {"Z", "X"}):
             continue
-        holds_log = _process_holds_log(pid, log_path)
-        if holds_log is not False:
-            candidates.append({"pid": pid, "startedAt": started_at, "observedParentPid": ppid})
-    return candidates
+        candidates.append((pid, ppid, started_at))
+    if not candidates:
+        return [], None
+    if len(candidates) > MAX_UNTRACKED_PROCESSES:
+        return [], f"untracked-process inspection limit exceeded ({len(candidates)} candidates)"
+
+    held_by: set[int] | None = None
+    unknown: set[int] = set()
+    seen_by: set[int] | None = None
+    proc_fd_root = pathlib.Path("/proc")
+    if (proc_fd_root / str(candidates[0][0]) / "fd").is_dir():
+        held_by = set()
+        for pid, _ppid, _started_at in candidates:
+            if time.monotonic() - started > UNTRACKED_SCAN_BUDGET_SECONDS:
+                return [], "untracked-process descriptor scan exceeded its time budget"
+            holds_log = _process_holds_log(pid, log_path)
+            if holds_log is True:
+                held_by.add(pid)
+            elif holds_log is None:
+                unknown.add(pid)
+    elif LSOF_BINARY is not None:
+        held_by = set()
+        seen_by = set()
+        remaining = UNTRACKED_SCAN_BUDGET_SECONDS - (time.monotonic() - started)
+        if remaining <= 0:
+            return [], "untracked-process descriptor scan exceeded its time budget"
+        try:
+            result = subprocess.run(
+                [LSOF_BINARY, "-Fn", "-a", "-d", "1,2", "-p", ",".join(str(pid) for pid, _ppid, _started_at in candidates)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=remaining, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return [], "untracked-process descriptor scan could not be completed"
+        if result.returncode not in {0, 1}:
+            return [], "untracked-process descriptor scan could not verify candidate processes"
+        current_pid: int | None = None
+        for line in result.stdout.splitlines():
+            if line.startswith("p") and line[1:].isdigit():
+                current_pid = int(line[1:])
+                seen_by.add(current_pid)
+            elif line.startswith("n") and current_pid is not None:
+                if os.path.realpath(line[1:]) == os.path.realpath(log_path):
+                    held_by.add(current_pid)
+    else:
+        return [], "untracked-process descriptor inspection is unavailable"
+
+    still_live = _process_snapshot()
+    candidates_by_pid = {pid: (ppid, started_at) for pid, ppid, started_at in candidates}
+    uninspectable_live = [pid for pid, (_ppid, started_at) in candidates_by_pid.items()
+                          if (pid in unknown or (seen_by is not None and pid not in seen_by)) and pid in still_live
+                          and still_live[pid][1] == started_at
+                          and still_live[pid][2] not in {"Z", "X"}]
+    held_candidates = [
+        {"pid": pid, "startedAt": started_at, "observedParentPid": still_live[pid][0]}
+        for pid, (_ppid, started_at) in candidates_by_pid.items()
+        if pid in (held_by or set()) and pid in still_live
+        and still_live[pid][1] == started_at and still_live[pid][2] not in {"Z", "X"}
+    ]
+    if uninspectable_live:
+        return held_candidates, "untracked-process descriptor scan could not inspect every live candidate"
+    return held_candidates, None
 
 
 def _process_holds_log(pid: int, log_path: pathlib.Path) -> bool | None:
@@ -153,7 +212,7 @@ def _process_holds_log(pid: int, log_path: pathlib.Path) -> bool | None:
         return None
     try:
         result = subprocess.run(
-            [LSOF_BINARY, "-Fn", "-a", "-p", str(pid)],
+            [LSOF_BINARY, "-Fn", "-a", "-d", "1,2", "-p", str(pid)],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2, check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -232,6 +291,7 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
     uncertain: str | None = None
     process: subprocess.Popen[bytes] | None = None
     root_identity: tuple[int, str] | None = None
+    baseline_snapshot: dict[int, tuple[int, str, str]] | None = None
     owned: dict[int, str] = {}
     tree_confirmed_drained = True
     log_io_error: BaseException | None = None
@@ -299,13 +359,6 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
                         code = 125
                 else:
                     tree_confirmed_drained = True
-                    if time.monotonic() - started <= FAST_EXIT_GUARD_SECONDS:
-                        unconfirmed_processes = _untracked_processes_since(baseline_snapshot, owned, snapshot, log_path)
-                        if unconfirmed_processes:
-                            uncertain = (
-                                "fast gate exited with live processes created during the command that were not "
-                                "observed as owned descendants; builder leases require manual review"
-                            )
         except KeyboardInterrupt:
             interrupted = True
             if process is not None and root_identity is not None and _stop_and_reap_owned_tree(process, root_identity, owned):
@@ -359,6 +412,23 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
                     except (subprocess.TimeoutExpired, KeyboardInterrupt):
                         pass
                 uncertain = f"process ownership could not be enumerated for gate rooted at {process.pid}: {type(exc).__name__}"
+        if process is not None and baseline_snapshot is not None:
+            try:
+                final_snapshot = _process_snapshot()
+                if root_identity is not None:
+                    _track_descendants(root_identity, owned, final_snapshot)
+                unconfirmed_processes, scan_error = _untracked_processes_since(
+                    baseline_snapshot, owned, final_snapshot, log_path,
+                )
+                if scan_error:
+                    uncertain = uncertain or f"post-command ownership scan incomplete: {scan_error}"
+                if unconfirmed_processes:
+                    uncertain = uncertain or (
+                        "completed gate left live processes created during the command that were not "
+                        "observed as owned descendants; builder leases require manual review"
+                    )
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                uncertain = uncertain or f"post-command ownership scan failed: {type(exc).__name__}"
         try:
             log.flush()
             _sync_log(log)

@@ -41,13 +41,15 @@ runner never breaks a retained lease itself. Source
 HEAD, worktree, and pinned phase-diff identity are checked immediately before
 and after every gate as well as at the full-run boundary.
 
-For a command that exits almost immediately, the runner also compares the
-process table with its pre-launch snapshot. A new, untracked live process is
-treated as an unconfirmed descendant when it still holds that command's
-private raw-log file open (the usual inherited stdout case). If the host cannot
+After every completed command, the runner compares the process table with its
+pre-launch snapshot. A new, untracked live process is treated as an unconfirmed
+descendant when it still holds that command's private raw-log file open (the
+usual inherited stdout case). The inspection is batched on macOS, capped at 512
+candidate processes and two seconds; exhausting either limit or being unable
+to inspect descriptors retains the leases with a reason. If the host cannot
 inspect open descriptors, a new process is ambiguous and also retains the
 leases. Such candidates are recorded separately as `unconfirmedProcesses`; the
-runner never signals them. This catches a detached child that outlives its fast
+runner never signals them. This catches a detached child that outlives its
 parent without treating unrelated concurrent processes as owned. A child that
 deliberately closes or redirects stdout can evade this marker, so process-table
 polling is not a universal containment boundary; the runner remains intended
