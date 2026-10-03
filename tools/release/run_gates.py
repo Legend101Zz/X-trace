@@ -163,6 +163,14 @@ def _stop_and_reap_owned_tree(process: subprocess.Popen[bytes], root: tuple[int,
         return False
 
 
+def _sync_log(log: Any) -> None:
+    os.fsync(log.fileno())
+
+
+def _close_log(log: Any) -> None:
+    log.close()
+
+
 def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout: int, log_path: pathlib.Path) -> tuple[int, float]:
     started = time.monotonic()
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -171,10 +179,14 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
     process: subprocess.Popen[bytes] | None = None
     root_identity: tuple[int, str] | None = None
     owned: dict[int, str] = {}
+    tree_confirmed_drained = True
+    log_io_error: BaseException | None = None
     timed_out = interrupted = False
-    with os.fdopen(fd, "wb") as log:
+    log = os.fdopen(fd, "wb")
+    try:
         try:
             process = subprocess.Popen(list(argv), cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            tree_confirmed_drained = False
             deadline = time.monotonic() + timeout
             snapshot = _process_snapshot()
             root_record = snapshot.get(process.pid)
@@ -210,9 +222,11 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
                     cause = "timed-out" if timed_out else "interrupted"
                     uncertain = f"{cause} process tree rooted at {process.pid} could not be confirmed drained"
                 elif timed_out:
+                    tree_confirmed_drained = True
                     log.write(f"\nGate timed out after {timeout} seconds; owned process tree drained.\n".encode())
                     code = 124
                 else:
+                    tree_confirmed_drained = True
                     log.write(b"\nGate interrupted; owned process tree drained.\n")
                     code = 130
             else:
@@ -222,11 +236,15 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
                     if not _stop_and_reap_owned_tree(process, root_identity, owned):
                         uncertain = f"completed process tree rooted at {process.pid} could not be confirmed drained"
                     else:
+                        tree_confirmed_drained = True
                         log.write(b"\nGate left descendant processes running; tree drained and gate failed.\n")
                         code = 125
+                else:
+                    tree_confirmed_drained = True
         except KeyboardInterrupt:
             interrupted = True
             if process is not None and root_identity is not None and _stop_and_reap_owned_tree(process, root_identity, owned):
+                tree_confirmed_drained = True
                 log.write(b"\nGate interrupted; owned process tree drained.\n")
                 code = 130
             else:
@@ -276,12 +294,32 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
                     except (subprocess.TimeoutExpired, KeyboardInterrupt):
                         pass
                 uncertain = f"process ownership could not be enumerated for gate rooted at {process.pid}: {type(exc).__name__}"
-        log.flush()
-        os.fsync(log.fileno())
+        try:
+            log.flush()
+            _sync_log(log)
+        except BaseException as exc:
+            log_io_error = exc
+    except BaseException as exc:
+        # This catches write failures too. A spawned process is never released
+        # from its lease until its complete owned tree is known to be drained.
+        log_io_error = exc
+    finally:
+        try:
+            _close_log(log)
+        except BaseException as exc:
+            if log_io_error is None:
+                log_io_error = exc
+    if log_io_error is not None and process is not None and not tree_confirmed_drained:
+        if root_identity is not None and _stop_and_reap_owned_tree(process, root_identity, owned):
+            tree_confirmed_drained = True
+        else:
+            uncertain = uncertain or f"process tree rooted at {process.pid} could not be confirmed drained after log I/O failure"
     if uncertain is not None:
         error = UncertainProcessTree(uncertain, process.pid if process else -1)
         error.owned_processes = dict(owned)
         raise error
+    if log_io_error is not None:
+        raise log_io_error
     return code, round(time.monotonic() - started, 6)
 
 
@@ -330,28 +368,57 @@ def _phase_diff(repo: pathlib.Path, base: str) -> bytes:
     return result.stdout
 
 
-def _versions(repo: pathlib.Path, env: dict[str, str]) -> dict[str, str]:
+VERSION_COMMANDS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("rustc", ("rustc", "--version"), "."),
+    ("cargo", ("cargo", "--version"), "."),
+    ("rustup", ("rustup", "--version"), "."),
+    ("java", ("java", "-version"), "."),
+    ("node", ("node", "--version"), "."),
+    ("npm", ("npm", "--version"), "."),
+    ("gradle-wrapper", ("./gradlew", "--no-daemon", "--version"), "adapters/java"),
+    ("buf", ("./node_modules/.bin/buf", "--version"), "adapters/node"),
+    ("playwright", ("./node_modules/.bin/playwright", "--version"), "web/app"),
+    ("python", (sys.executable, "--version"), "."),
+    ("git", ("git", "--version"), "."),
+)
+
+
+def _versions(
+    repo: pathlib.Path,
+    env: dict[str, str],
+    logs_dir: pathlib.Path,
+    probes: list[dict[str, Any]],
+    *,
+    names: set[str] | None = None,
+    timeout: float = 20,
+) -> dict[str, str]:
     versions: dict[str, str] = {}
-    commands = (
-        ("rustc", ("rustc", "--version"), "."),
-        ("cargo", ("cargo", "--version"), "."),
-        ("rustup", ("rustup", "--version"), "."),
-        ("java", ("java", "-version"), "."),
-        ("node", ("node", "--version"), "."),
-        ("npm", ("npm", "--version"), "."),
-        ("gradle-wrapper", ("./gradlew", "--no-daemon", "--version"), "adapters/java"),
-        ("buf", ("buf", "--version"), "."),
-        ("playwright", ("./node_modules/.bin/playwright", "--version"), "web/app"),
-        ("python", (sys.executable, "--version"), "."),
-        ("git", ("git", "--version"), "."),
-    )
-    for name, argv, cwd in commands:
-        try:
-            result = subprocess.run(argv, cwd=repo / cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20, check=False)
-            lines = result.stdout.decode("utf-8", "replace").splitlines()
-            versions[name] = lines[0][:240] if lines else f"exit:{result.returncode}"
-        except (OSError, subprocess.TimeoutExpired):
+    logs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for name, argv, cwd in VERSION_COMMANDS:
+        if names is not None and name not in names:
+            continue
+        log_name = f"version-{name}.log"
+        log_path = logs_dir / log_name
+        exit_code, duration = _run(argv, cwd=repo / cwd, env=env, timeout=timeout, log_path=log_path)
+        raw = log_path.read_bytes()
+        probe = {
+            "name": name,
+            "argv": list(argv),
+            "cwd": cwd,
+            "exitCode": exit_code,
+            "durationSeconds": duration,
+            "log": f"logs/{log_name}",
+            "logSha256": _hash(raw),
+            "status": "unavailable" if exit_code == 127 else ("passed" if exit_code == 0 else "failed"),
+        }
+        probes.append(probe)
+        lines = raw.decode("utf-8", "replace").splitlines()
+        if exit_code == 127:
             versions[name] = "unavailable"
+        elif exit_code != 0:
+            raise RuntimeError(f"version probe {name} failed with exit {exit_code}")
+        else:
+            versions[name] = lines[0][:240] if lines else "no version output"
     return versions
 
 
@@ -499,6 +566,7 @@ def run(args: argparse.Namespace) -> int:
         "phaseDiffSha256Before": None,
         "phaseDiffSha256After": None,
         "toolVersions": {},
+        "versionProbes": [],
         "cacheKeys": list(CACHE_NAMES),
         "restrictedTargetKey": f"cargo-target-restricted-{args.label}",
         "gates": results,
@@ -526,7 +594,10 @@ def run(args: argparse.Namespace) -> int:
         })
         manifest["workingTreeDigestBefore"] = dirty_start
         manifest["phaseDiffSha256Before"] = _hash(diff_start)
-        manifest["toolVersions"] = _versions(repo, env)
+        manifest["toolVersions"] = _versions(
+            repo, env, logs_dir, manifest["versionProbes"], names={"rustc", "cargo", "rustup", "java", "node", "npm", "gradle-wrapper", "python", "git"},
+        )
+        manifest["toolVersions"].update({"buf": "pending node install", "playwright": "pending web install"})
         manifest["platform"] = {"system": platform.system(), "release": platform.release(), "machine": platform.machine()}
         manifest["dependencyLockSha256"] = {
             name: _hash((repo / name).read_bytes())
@@ -587,8 +658,10 @@ def run(args: argparse.Namespace) -> int:
                 entry["integrityFailure"] = "source identity changed during gate"
                 code = code or 1
             results.append(entry)
-            if gate.name == "web-browser-install" and code == 0:
-                manifest["toolVersions"]["playwright"] = _versions(repo, env).get("playwright", "unavailable")
+            if gate.name == "node-install" and code == 0:
+                manifest["toolVersions"].update(_versions(repo, env, logs_dir, manifest["versionProbes"], names={"buf"}))
+            if gate.name == "web-install" and code == 0:
+                manifest["toolVersions"].update(_versions(repo, env, logs_dir, manifest["versionProbes"], names={"playwright"}))
             manifest["headAfter"] = entry["headAfter"]
             manifest["gates"] = results
             manifest["decision"] = "running" if code == 0 else "failed"

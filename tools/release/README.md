@@ -41,6 +41,12 @@ runner never breaks a retained lease itself. Source
 HEAD, worktree, and pinned phase-diff identity are checked immediately before
 and after every gate as well as at the full-run boundary.
 
+Version probes use that same process-tree control and private per-tool raw logs;
+a timeout or uncertain descendant is a failed run, never an `unavailable`
+version. The local Buf and Playwright executables are probed after their
+respective workspace installs, so the receipt records the actual pinned
+workspace tools.
+
 `check_ledger.py` reads the ledger path supplied by the caller and resolves
 every referenced receipt, artifact, log, key and signature only beneath the
 explicit evidence root. Receipt paths must be relative, symlink-free, and

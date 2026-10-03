@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,8 @@ from argparse import Namespace
 from unittest import mock
 
 from tools.release import check_ledger, run_gates
+
+REAL_VERSIONS = run_gates._versions
 
 
 def digest(data: bytes) -> str:
@@ -292,6 +295,9 @@ class RunnerTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], check=True)
         self.base = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
         self.cache = self.root / "cache"
+        self.versions_patcher = mock.patch.object(run_gates, "_versions", return_value={})
+        self.versions_patcher.start()
+        self.addCleanup(self.versions_patcher.stop)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -420,6 +426,93 @@ class RunnerTests(unittest.TestCase):
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     pass
+
+    def test_version_probe_timeout_drains_detached_child_and_fails_probe(self) -> None:
+        script = "import os,subprocess,sys,time; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); print(child.pid,os.getpgid(child.pid),flush=True); time.sleep(60)"
+        logs = self.cache / "version-probe-logs"
+        child_pid: int | None = None
+        probes: list[dict[str, object]] = []
+        try:
+            with mock.patch.object(run_gates, "VERSION_COMMANDS", (("probe", (sys.executable, "-c", script), "."),)):
+                with self.assertRaisesRegex(RuntimeError, "version probe probe failed with exit 124"):
+                    REAL_VERSIONS(self.repo, os.environ.copy(), logs, probes, timeout=0.4)
+            version_log = logs / "version-probe.log"
+            self.assertEqual(version_log.stat().st_mode & 0o777, 0o600)
+            child_pid = int(version_log.read_text().splitlines()[0].split()[0])
+            self.assertFalse(process_running(child_pid))
+            self.assertEqual(probes[0]["status"], "failed")
+            self.assertEqual(probes[0]["exitCode"], 124)
+            self.assertEqual(probes[0]["logSha256"], digest(version_log.read_bytes()))
+        finally:
+            if child_pid is None:
+                try:
+                    version_log = logs / "version-probe.log"
+                    child_pid = int(version_log.read_text().splitlines()[0].split()[0])
+                except (OSError, ValueError, IndexError):
+                    pass
+            if child_pid is not None and process_running(child_pid):
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_buf_version_probe_uses_workspace_executable(self) -> None:
+        self.assertEqual(
+            next(item for item in run_gates.VERSION_COMMANDS if item[0] == "buf"),
+            ("buf", ("./node_modules/.bin/buf", "--version"), "adapters/node"),
+        )
+
+    def test_log_io_failure_preserves_uncertain_tree_and_both_leases(self) -> None:
+        for failure_point in ("fsync", "close"):
+            with self.subTest(failure_point=failure_point):
+                args = self.args()
+                args.label = f"P00-log-{failure_point}"
+                script = "import os,subprocess,sys,time; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); print(child.pid,flush=True); time.sleep(.35)"
+                gate = run_gates.Gate(f"log-{failure_point}", (sys.executable, "-c", script))
+                args.command_timeout = 5
+                stop = mock.patch.object(run_gates, "_stop_and_reap_owned_tree", return_value=False)
+                if failure_point == "fsync":
+                    inject = mock.patch.object(run_gates, "_sync_log", side_effect=OSError("injected log fsync failure"))
+                else:
+                    real_close = run_gates._close_log
+
+                    def close_then_fail(log: object) -> None:
+                        real_close(log)
+                        raise OSError("injected log close failure")
+
+                    inject = mock.patch.object(run_gates, "_close_log", side_effect=close_then_fail)
+                child_pid: int | None = None
+                try:
+                    with mock.patch.object(run_gates, "GATES", (gate,)), stop, inject:
+                        self.assertEqual(run_gates.run(args), 1)
+                    run_dir = self.cache / "release-gates" / args.label
+                    receipt = json.loads((run_dir / "receipt.json").read_text())
+                    self.assertIn("could not be confirmed drained", receipt["error"])
+                    temporary_logs = list((run_dir / "logs").glob(".*.tmp"))
+                    self.assertEqual(len(temporary_logs), 1)
+                    child_pid = int(temporary_logs[0].read_text().splitlines()[0])
+                    for name in ("cargo", "gradle"):
+                        owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
+                        self.assertTrue(owner["requiresManualRecovery"])
+                        self.assertTrue(owner["ownedProcesses"])
+                finally:
+                    if child_pid is None:
+                        try:
+                            run_dir = self.cache / "release-gates" / args.label
+                            temporary_logs = list((run_dir / "logs").glob(".*.tmp"))
+                            if temporary_logs:
+                                child_pid = int(temporary_logs[0].read_text().splitlines()[0])
+                        except (OSError, ValueError, IndexError):
+                            pass
+                    if child_pid is not None and process_running(child_pid):
+                        try:
+                            os.kill(child_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    for name in ("cargo", "gradle"):
+                        lease_path = self.cache / "leases" / name
+                        if lease_path.exists():
+                            shutil.rmtree(lease_path)
 
     def test_source_change_during_gate_fails_exact_tree_receipt(self) -> None:
         gate = run_gates.Gate("mutating-gate", (sys.executable, "-c", "open('source-drift.txt','w').write('changed')"))
