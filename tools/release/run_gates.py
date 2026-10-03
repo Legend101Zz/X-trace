@@ -10,6 +10,7 @@ import os
 import pathlib
 import platform
 import re
+import selectors
 import secrets
 import signal
 import shutil
@@ -27,6 +28,8 @@ PS_BINARY = next((path for path in ("/bin/ps", "/usr/bin/ps") if pathlib.Path(pa
 LSOF_BINARY = next((path for path in ("/usr/sbin/lsof", "/usr/bin/lsof") if pathlib.Path(path).is_file()), None)
 UNTRACKED_SCAN_BUDGET_SECONDS = 2.0
 MAX_UNTRACKED_PROCESSES = 512
+MAX_UNCONFIRMED_SAMPLE = 64
+MAX_LSOF_OUTPUT_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,26 @@ class Gate:
     argv: tuple[str, ...]
     cwd: str = "."
     env: str = "normal"
+
+
+@dataclass(frozen=True)
+class LsofProbe:
+    returncode: int | None
+    stdout: str
+    stderr: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class UntrackedProcessScan:
+    held: list[dict[str, Any]]
+    uninspectable: list[dict[str, Any]]
+    error: str | None
+    candidate_count: int
+
+    @property
+    def unconfirmed(self) -> list[dict[str, Any]]:
+        return self.held + self.uninspectable
 
 
 GATES: tuple[Gate, ...] = (
@@ -72,6 +95,7 @@ class UncertainProcessTree(RuntimeError):
         self.process_group_id = process_group_id
         self.owned_processes: dict[int, str] = {}
         self.unconfirmed_processes: list[dict[str, Any]] = []
+        self.unconfirmed_process_count = 0
 
 
 def _process_snapshot() -> dict[int, tuple[int, str, str]]:
@@ -123,7 +147,13 @@ def _unconfirmed_candidates_since(
 ) -> list[dict[str, Any]]:
     """Describe new live processes when descriptor ownership could not be checked."""
     return [
-        {"pid": pid, "startedAt": started_at, "observedParentPid": ppid}
+        {
+            "pid": pid,
+            "startedAt": started_at,
+            "observedParentPid": ppid,
+            "descriptorStatus": "uninspectable",
+            "reason": "ownership-scan-did-not-complete",
+        }
         for pid, (ppid, started_at, state) in sorted(snapshot.items())
         if ((baseline.get(pid) is None or baseline[pid][1] != started_at)
             and owned.get(pid) != started_at and state not in {"Z", "X"})
@@ -135,7 +165,7 @@ def _untracked_processes_since(
     owned: dict[int, str],
     snapshot: dict[int, tuple[int, str, str]],
     log_path: pathlib.Path,
-) -> tuple[list[dict[str, Any]], str | None]:
+) -> UntrackedProcessScan:
     """Find processes born during the run that retain the private gate log."""
     started = time.monotonic()
     candidates: list[tuple[int, int, str]] = []
@@ -146,65 +176,234 @@ def _untracked_processes_since(
             continue
         candidates.append((pid, ppid, started_at))
     if not candidates:
-        return [], None
+        return UntrackedProcessScan([], [], None, 0)
+
+    def record(candidate: tuple[int, int, str], status: str, reason: str) -> dict[str, Any]:
+        pid, ppid, started_at = candidate
+        return {
+            "pid": pid,
+            "startedAt": started_at,
+            "observedParentPid": ppid,
+            "descriptorStatus": status,
+            "reason": reason,
+        }
+
+    def finish(
+        held_candidates: set[int],
+        unknown_reasons: dict[int, str],
+        scan_error: str | None,
+    ) -> UntrackedProcessScan:
+        still_live = _process_snapshot()
+        candidates_by_pid = {pid: (ppid, started_at) for pid, ppid, started_at in candidates}
+        held_records = [
+            record((pid, candidates_by_pid[pid][0], started_at), "held", "private-log-descriptor-observed")
+            for pid, (_ppid, started_at) in candidates_by_pid.items()
+            if pid in held_candidates and pid in still_live
+            and still_live[pid][1] == started_at and still_live[pid][2] not in {"Z", "X"}
+        ]
+        unknown_records = [
+            record((pid, candidates_by_pid[pid][0], candidates_by_pid[pid][1]), "uninspectable", reason)
+            for pid, reason in unknown_reasons.items()
+            if pid in candidates_by_pid
+            and pid in still_live
+            and still_live[pid][1] == candidates_by_pid[pid][1]
+            and still_live[pid][2] not in {"Z", "X"}
+        ]
+        total = len(held_records) + len(unknown_records)
+        sample = (held_records + unknown_records)[:MAX_UNCONFIRMED_SAMPLE]
+        if total > MAX_UNCONFIRMED_SAMPLE:
+            scan_error = scan_error or "unconfirmed process sample limit exceeded"
+        return UntrackedProcessScan(
+            [item for item in sample if item["descriptorStatus"] == "held"],
+            [item for item in sample if item["descriptorStatus"] == "uninspectable"],
+            scan_error,
+            total,
+        )
+
     if len(candidates) > MAX_UNTRACKED_PROCESSES:
-        return [], f"untracked-process inspection limit exceeded ({len(candidates)} candidates)"
+        live = _process_snapshot()
+        unknown = {
+            pid: "candidate-limit-exceeded"
+            for pid, _ppid, started_at in candidates
+            if pid in live and live[pid][1] == started_at and live[pid][2] not in {"Z", "X"}
+        }
+        result = finish(set(), unknown, f"untracked-process inspection limit exceeded ({len(candidates)} candidates)")
+        return result
 
     held_by: set[int] | None = None
-    unknown: set[int] = set()
-    seen_by: set[int] | None = None
+    unknown: dict[int, str] = {}
     proc_fd_root = pathlib.Path("/proc")
     if (proc_fd_root / str(candidates[0][0]) / "fd").is_dir():
         held_by = set()
-        for pid, _ppid, _started_at in candidates:
+        for pid, ppid, started_at in candidates:
             if time.monotonic() - started > UNTRACKED_SCAN_BUDGET_SECONDS:
-                return [], "untracked-process descriptor scan exceeded its time budget"
+                unknown.update({
+                    candidate_pid: "descriptor-scan-time-budget-exceeded"
+                    for candidate_pid, _candidate_ppid, _candidate_started_at in candidates
+                    if candidate_pid not in held_by
+                })
+                return finish(held_by, unknown, "untracked-process descriptor scan exceeded its time budget")
             holds_log = _process_holds_log(pid, log_path)
             if holds_log is True:
                 held_by.add(pid)
             elif holds_log is None:
-                unknown.add(pid)
+                unknown[pid] = "descriptor-inspection-unavailable"
     elif LSOF_BINARY is not None:
         held_by = set()
-        seen_by = set()
-        remaining = UNTRACKED_SCAN_BUDGET_SECONDS - (time.monotonic() - started)
-        if remaining <= 0:
-            return [], "untracked-process descriptor scan exceeded its time budget"
-        try:
-            result = subprocess.run(
-                [LSOF_BINARY, "-Fn", "-a", "-d", "1,2", "-p", ",".join(str(pid) for pid, _ppid, _started_at in candidates)],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=remaining, check=False,
+        pids = [pid for pid, _ppid, _started_at in candidates]
+        initial = _run_lsof_fields(
+            ["-Fn", "-a", "-d", "1,2", "-p", ",".join(str(pid) for pid in pids)],
+            started + UNTRACKED_SCAN_BUDGET_SECONDS,
+        )
+        parsed, error = _parse_lsof_fields(initial, set(pids), log_path)
+        if error:
+            unknown.update({pid: error for pid in pids})
+            return finish(held_by, unknown, f"untracked-process descriptor scan {error}")
+        seen_by, initially_held = parsed
+        held_by.update(initially_held)
+        missing = [pid for pid in pids if pid not in seen_by]
+        if missing:
+            fallback = _run_lsof_fields(
+                ["-Fn", "-p", ",".join(str(pid) for pid in missing)],
+                started + UNTRACKED_SCAN_BUDGET_SECONDS,
             )
-        except (OSError, subprocess.SubprocessError):
-            return [], "untracked-process descriptor scan could not be completed"
-        if result.returncode not in {0, 1}:
-            return [], "untracked-process descriptor scan could not verify candidate processes"
-        current_pid: int | None = None
+            fallback_parsed, fallback_error = _parse_lsof_fields(fallback, set(missing), log_path)
+            fallback_seen, fallback_held = fallback_parsed
+            held_by.update(fallback_held)
+            if fallback_error:
+                unknown.update({pid: fallback_error for pid in missing})
+                return finish(held_by, unknown, f"untracked-process descriptor scan {fallback_error}")
+            for pid in missing:
+                if pid not in fallback_seen:
+                    unknown[pid] = "missing-process-record-after-all-fd-fallback"
+    else:
+        unknown.update({pid: "descriptor-inspection-unavailable" for pid, _ppid, _started_at in candidates})
+        return finish(held_by or set(), unknown, "untracked-process descriptor inspection is unavailable")
+
+    result = finish(held_by or set(), unknown, None)
+    if result.uninspectable:
+        return UntrackedProcessScan(
+            result.held,
+            result.uninspectable,
+            "untracked-process descriptor scan could not inspect every live candidate",
+            result.candidate_count,
+        )
+    return result
+
+
+def _run_lsof_fields(arguments: list[str], deadline: float) -> LsofProbe:
+    """Run lsof with bounded wall time and combined stdout/stderr bytes."""
+    if LSOF_BINARY is None:
+        return LsofProbe(None, "", "", "descriptor-inspection-unavailable")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return LsofProbe(None, "", "", "time-budget-exceeded")
+    try:
+        process = subprocess.Popen(
+            [LSOF_BINARY, *arguments], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            close_fds=True, start_new_session=True,
+        )
+    except OSError:
+        return LsofProbe(None, "", "", "query-could-not-start")
+    output = {"stdout": bytearray(), "stderr": bytearray()}
+    selector = selectors.DefaultSelector()
+    exceeded = False
+    timed_out = False
+    try:
+        for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+            if stream is None:
+                return LsofProbe(None, "", "", "query-pipe-unavailable")
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            for key, _events in selector.select(min(remaining, 0.1)):
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output[key.data].extend(chunk)
+                if sum(len(value) for value in output.values()) > MAX_LSOF_OUTPUT_BYTES:
+                    exceeded = True
+                    break
+            if exceeded:
+                break
+        if timed_out or exceeded:
+            _kill_lsof_process_group(process)
+        try:
+            process.wait(timeout=max(0.05, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            _kill_lsof_process_group(process)
+            process.wait()
+        stdout = output["stdout"].decode("utf-8", errors="replace")
+        stderr = output["stderr"].decode("utf-8", errors="replace")
+        if timed_out:
+            return LsofProbe(process.returncode, stdout, stderr, "time-budget-exceeded")
+        if exceeded:
+            return LsofProbe(process.returncode, stdout, stderr, "output-limit-exceeded")
+        return LsofProbe(process.returncode, stdout, stderr)
+    except OSError:
+        _kill_lsof_process_group(process)
+        if process.poll() is None:
+            process.wait()
+        return LsofProbe(process.returncode, "", "", "query-could-not-complete")
+    finally:
+        selector.close()
+        if process.poll() is None:
+            _kill_lsof_process_group(process)
+            process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
+
+def _kill_lsof_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _parse_lsof_fields(
+    result: LsofProbe,
+    expected_pids: set[int],
+    log_path: pathlib.Path,
+) -> tuple[tuple[set[int], set[int]], str | None]:
+    if result.error:
+        return (set(), set()), result.error
+    if result.returncode not in {0, 1}:
+        return (set(), set()), "query-could-not-verify-candidates"
+    if result.stderr:
+        return (set(), set()), "query-reported-incomplete-inspection"
+    seen: set[int] = set()
+    held: set[int] = set()
+    current_pid: int | None = None
+    try:
         for line in result.stdout.splitlines():
-            if line.startswith("p") and line[1:].isdigit():
+            if not line:
+                continue
+            if line.startswith("p"):
+                if not line[1:].isdigit():
+                    raise ValueError
                 current_pid = int(line[1:])
-                seen_by.add(current_pid)
+                if current_pid not in expected_pids:
+                    raise ValueError
+                seen.add(current_pid)
             elif line.startswith("n") and current_pid is not None:
                 if os.path.realpath(line[1:]) == os.path.realpath(log_path):
-                    held_by.add(current_pid)
-    else:
-        return [], "untracked-process descriptor inspection is unavailable"
-
-    still_live = _process_snapshot()
-    candidates_by_pid = {pid: (ppid, started_at) for pid, ppid, started_at in candidates}
-    uninspectable_live = [pid for pid, (_ppid, started_at) in candidates_by_pid.items()
-                          if (pid in unknown or (seen_by is not None and pid not in seen_by)) and pid in still_live
-                          and still_live[pid][1] == started_at
-                          and still_live[pid][2] not in {"Z", "X"}]
-    held_candidates = [
-        {"pid": pid, "startedAt": started_at, "observedParentPid": still_live[pid][0]}
-        for pid, (_ppid, started_at) in candidates_by_pid.items()
-        if pid in (held_by or set()) and pid in still_live
-        and still_live[pid][1] == started_at and still_live[pid][2] not in {"Z", "X"}
-    ]
-    if uninspectable_live:
-        return held_candidates, "untracked-process descriptor scan could not inspect every live candidate"
-    return held_candidates, None
+                    held.add(current_pid)
+            elif not line.startswith("f"):
+                raise ValueError
+    except (OSError, ValueError):
+        return (set(), set()), "query-returned-malformed-fields"
+    return (seen, held), None
 
 
 def _process_holds_log(pid: int, log_path: pathlib.Path) -> bool | None:
@@ -312,6 +511,7 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
     last_snapshot: dict[int, tuple[int, str, str]] | None = None
     log_io_error: BaseException | None = None
     unconfirmed_processes: list[dict[str, Any]] = []
+    unconfirmed_process_count = 0
     timed_out = interrupted = False
     log = os.fdopen(fd, "wb")
     try:
@@ -436,12 +636,14 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
                 last_snapshot = final_snapshot
                 if root_identity is not None:
                     _track_descendants(root_identity, owned, final_snapshot)
-                unconfirmed_processes, scan_error = _untracked_processes_since(
+                scan = _untracked_processes_since(
                     baseline_snapshot, owned, final_snapshot, log_path,
                 )
+                unconfirmed_processes = scan.unconfirmed
+                unconfirmed_process_count = scan.candidate_count
                 final_ownership_scan_returned = True
-                if scan_error:
-                    uncertain = uncertain or f"post-command ownership scan incomplete: {scan_error}"
+                if scan.error:
+                    uncertain = uncertain or f"post-command ownership scan incomplete: {scan.error}"
                 if unconfirmed_processes:
                     uncertain = uncertain or (
                         "completed gate left live processes created during the command that were not "
@@ -453,6 +655,7 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
                     unconfirmed_processes = _unconfirmed_candidates_since(
                         baseline_snapshot, owned, last_snapshot,
                     )
+                    unconfirmed_process_count = len(unconfirmed_processes)
         try:
             log.flush()
             _sync_log(log)
@@ -479,10 +682,12 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
             unconfirmed_processes = _unconfirmed_candidates_since(
                 baseline_snapshot, owned, last_snapshot,
             )
+            unconfirmed_process_count = len(unconfirmed_processes)
     if uncertain is not None:
         error = UncertainProcessTree(uncertain, process.pid if process else -1)
         error.owned_processes = dict(owned)
         error.unconfirmed_processes = unconfirmed_processes
+        error.unconfirmed_process_count = unconfirmed_process_count
         raise error
     if log_io_error is not None:
         raise log_io_error
@@ -669,6 +874,7 @@ class Lease:
         process_group_id: int,
         owned_processes: dict[int, str],
         unconfirmed_processes: list[dict[str, Any]] | None = None,
+        unconfirmed_process_count: int | None = None,
     ) -> None:
         if not self.acquired or self.borrowed:
             return
@@ -682,6 +888,9 @@ class Lease:
         owner["ownedProcesses"] = [{"pid": pid, "startedAt": started_at} for pid, started_at in sorted(owned_processes.items())]
         if unconfirmed_processes:
             owner["unconfirmedProcesses"] = unconfirmed_processes
+        if unconfirmed_process_count is not None:
+            owner["unconfirmedProcessCount"] = unconfirmed_process_count
+            owner["unconfirmedProcessesTruncated"] = unconfirmed_process_count > len(unconfirmed_processes or [])
         _atomic_json(self.path / "owner.json", owner)
 
 
@@ -870,6 +1079,7 @@ def run(args: argparse.Namespace) -> int:
             for lease in acquired_leases:
                 lease.retain_for_manual_recovery(
                     str(exc), exc.process_group_id, exc.owned_processes, exc.unconfirmed_processes,
+                    exc.unconfirmed_process_count,
                 )
         manifest["decision"] = "failed"
         manifest["error"] = str(exc)

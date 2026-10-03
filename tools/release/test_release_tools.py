@@ -342,7 +342,11 @@ class RunnerTests(unittest.TestCase):
             return process
 
         with mock.patch.object(run_gates, "GATES", (gate,)), mock.patch.object(run_gates.subprocess, "Popen", side_effect=capture_process):
-            self.assertEqual(run_gates.run(args), 1)
+            with mock.patch.object(
+                run_gates, "_untracked_processes_since",
+                return_value=run_gates.UntrackedProcessScan([], [], None, 0),
+            ):
+                self.assertEqual(run_gates.run(args), 1)
         receipt = json.loads((self.cache / "release-gates/P00-test/receipt.json").read_text())
         entry = receipt["gates"][0]
         self.assertEqual(entry["exitCode"], 124)
@@ -364,7 +368,9 @@ class RunnerTests(unittest.TestCase):
 
         def launch(*argv: object, **kwargs: object) -> subprocess.Popen[bytes]:
             process = popen(*argv, **kwargs)
-            if kwargs.get("start_new_session"):
+            command = argv[0] if argv else kwargs.get("args")
+            if (kwargs.get("start_new_session") and isinstance(command, (list, tuple))
+                    and command and command[0] == sys.executable):
                 spawned.append(process)
                 wait = process.wait
                 first_wait = True
@@ -619,12 +625,15 @@ class RunnerTests(unittest.TestCase):
         args.command_timeout = 5
         script = "import subprocess,sys,time; time.sleep(.35); child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); print(child.pid,flush=True)"
         gate = run_gates.Gate("delayed-detached-child", (sys.executable, "-c", script))
+        child_pid: int | None = None
         try:
             with mock.patch.object(run_gates, "GATES", (gate,)):
                 self.assertEqual(run_gates.run(args), 1)
             run_dir = self.cache / "release-gates" / args.label
             receipt = json.loads((run_dir / "receipt.json").read_text())
             log_files = list((run_dir / "logs").glob(".*.tmp"))
+            if not log_files:
+                log_files = list((run_dir / "logs").glob("delayed-detached-child.log"))
             self.assertEqual(len(log_files), 1)
             child_pid = int(log_files[0].read_text().splitlines()[0])
             self.assertRegex(receipt["error"], "not observed as owned descendants|ownership scan incomplete")
@@ -636,7 +645,17 @@ class RunnerTests(unittest.TestCase):
                     [item["pid"] for item in owner["unconfirmedProcesses"]],
                 )
         finally:
-            if "child_pid" in locals() and process_running(child_pid):
+            if child_pid is None:
+                try:
+                    run_dir = self.cache / "release-gates" / args.label
+                    log_files = list((run_dir / "logs").glob(".*.tmp"))
+                    if not log_files:
+                        log_files = list((run_dir / "logs").glob("delayed-detached-child.log"))
+                    if log_files:
+                        child_pid = int(log_files[0].read_text().splitlines()[0])
+                except (OSError, ValueError, IndexError):
+                    pass
+            if child_pid is not None and process_running(child_pid):
                 try:
                     os.kill(child_pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -750,6 +769,163 @@ class RunnerTests(unittest.TestCase):
                 lease_path = self.cache / "leases" / name
                 if lease_path.exists():
                     shutil.rmtree(lease_path)
+
+    @unittest.skipUnless(run_gates.LSOF_BINARY is not None, "lsof is required for bounded descriptor-probe tests")
+    def test_lsof_all_fd_fallback_resolves_closed_stdio_and_detects_inherited_log_fd(self) -> None:
+        log_path = self.root / "private-gate.log"
+        log_path.write_text("private\n")
+        baseline: dict[int, tuple[int, str, str]] = {}
+        closed_stdio = subprocess.Popen(
+            [sys.executable, "-c", "import os,time; os.close(1); os.close(2); time.sleep(30)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        log_stream = log_path.open("ab", buffering=0)
+        log_fd_child = subprocess.Popen(
+            [sys.executable, "-c", "import os,time; os.dup2(1,3); os.close(1); os.close(2); time.sleep(30)"],
+            stdin=subprocess.DEVNULL, stdout=log_stream, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            time.sleep(0.1)
+            real_snapshot = run_gates._process_snapshot()
+            snapshot = {
+                pid: real_snapshot[pid]
+                for pid in (closed_stdio.pid, log_fd_child.pid)
+                if pid in real_snapshot
+            }
+            self.assertEqual(set(snapshot), {closed_stdio.pid, log_fd_child.pid})
+            with mock.patch.object(run_gates, "_process_snapshot", return_value=snapshot):
+                result = run_gates._untracked_processes_since(baseline, {}, snapshot, log_path)
+            self.assertIsNone(result.error)
+            self.assertFalse(result.uninspectable)
+            self.assertEqual([item["pid"] for item in result.held], [log_fd_child.pid])
+            self.assertEqual(result.held[0]["descriptorStatus"], "held")
+            # A process with closed stdio is identified by the all-FD fallback
+            # and is conclusively distinct from the log-holding candidate.
+            self.assertNotIn(closed_stdio.pid, [item["pid"] for item in result.held])
+        finally:
+            log_stream.close()
+            for child in (closed_stdio, log_fd_child):
+                if process_running(child.pid):
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+    def test_missing_lsof_pid_record_falls_back_and_preserves_uncertain_metadata(self) -> None:
+        pid = 424242
+        snapshot = {pid: (7, "candidate-start", "S")}
+        log_path = self.root / "private-gate.log"
+        log_path.write_text("private\n")
+        calls: list[list[str]] = []
+
+        def lsof(arguments: list[str], _deadline: float) -> run_gates.LsofProbe:
+            calls.append(arguments)
+            if "-d" in arguments:
+                return run_gates.LsofProbe(0, "", "")
+            return run_gates.LsofProbe(0, "", "")
+
+        with mock.patch.object(pathlib.Path, "is_dir", return_value=False), \
+                mock.patch.object(run_gates, "_run_lsof_fields", side_effect=lsof), \
+                mock.patch.object(run_gates, "_process_snapshot", return_value=snapshot):
+            result = run_gates._untracked_processes_since({}, {}, snapshot, log_path)
+        self.assertEqual(len(calls), 2, "missing stdio record must receive an all-FD fallback")
+        self.assertNotIn("-d", calls[1])
+        self.assertEqual(result.error, "untracked-process descriptor scan could not inspect every live candidate")
+        self.assertEqual(result.held, [])
+        self.assertEqual(result.uninspectable[0]["pid"], pid)
+        self.assertEqual(result.uninspectable[0]["startedAt"], "candidate-start")
+        self.assertEqual(result.uninspectable[0]["observedParentPid"], 7)
+        self.assertEqual(result.uninspectable[0]["descriptorStatus"], "uninspectable")
+
+    def test_unconfirmed_descriptor_candidates_keep_total_count_and_bounded_sample(self) -> None:
+        snapshot = {pid: (1, f"start-{pid}", "S") for pid in range(1000, 1070)}
+        log_path = self.root / "private-gate.log"
+        log_path.write_text("private\n")
+        with mock.patch.object(pathlib.Path, "is_dir", return_value=False), \
+                mock.patch.object(run_gates, "_run_lsof_fields", return_value=run_gates.LsofProbe(0, "", "")), \
+                mock.patch.object(run_gates, "_process_snapshot", return_value=snapshot), \
+                mock.patch.object(run_gates, "MAX_UNCONFIRMED_SAMPLE", 8):
+            result = run_gates._untracked_processes_since({}, {}, snapshot, log_path)
+        self.assertEqual(result.candidate_count, 70)
+        self.assertEqual(len(result.unconfirmed), 8)
+        self.assertEqual([item["pid"] for item in result.unconfirmed], list(range(1000, 1008)))
+        self.assertTrue(result.error)
+
+    def test_lsof_probe_enforces_timeout_and_output_byte_budget(self) -> None:
+        with mock.patch.object(run_gates, "LSOF_BINARY", sys.executable):
+            started = time.monotonic()
+            timed_out = run_gates._run_lsof_fields(
+                ["-c", "import time; time.sleep(30)"], time.monotonic() + 0.15,
+            )
+            self.assertEqual(timed_out.error, "time-budget-exceeded")
+            self.assertLess(time.monotonic() - started, 2)
+            oversized = run_gates._run_lsof_fields(
+                ["-c", "import sys,time; sys.stdout.write('x' * 2000000); sys.stdout.flush(); time.sleep(30)"],
+                time.monotonic() + 2,
+            )
+            self.assertEqual(oversized.error, "output-limit-exceeded")
+            self.assertLessEqual(len(oversized.stdout.encode()) + len(oversized.stderr.encode()), run_gates.MAX_LSOF_OUTPUT_BYTES + 65536)
+
+    def test_interrupted_descriptor_scan_retains_unconfirmed_candidate_in_both_leases(self) -> None:
+        args = self.args()
+        args.label = "P00-uninspectable-candidate"
+        args.command_timeout = 5
+        script = (
+            "import subprocess,sys,time; time.sleep(.35); "
+            "child=subprocess.Popen([sys.executable,'-c','import os,time; os.close(1); os.close(2); time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); "
+            "print(child.pid,flush=True)"
+        )
+        gate = run_gates.Gate("uninspectable-candidate", (sys.executable, "-c", script))
+        child_pid: int | None = None
+        with mock.patch.object(run_gates, "_process_holds_log", return_value=None), \
+                mock.patch.object(run_gates, "_run_lsof_fields", return_value=run_gates.LsofProbe(0, "", "")), \
+                mock.patch.object(run_gates, "GATES", (gate,)):
+            try:
+                self.assertEqual(run_gates.run(args), 1)
+                run_dir = self.cache / "release-gates" / args.label
+                logs = list((run_dir / "logs").glob(".*.tmp"))
+                self.assertEqual(len(logs), 1)
+                child_pid = int(logs[0].read_text().splitlines()[0])
+                receipt = json.loads((run_dir / "receipt.json").read_text())
+                self.assertIn("could not inspect every live candidate", receipt["error"])
+                self.assertTrue(process_running(child_pid), "unconfirmed candidate must not be signaled")
+                for name in ("cargo", "gradle"):
+                    owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
+                    self.assertTrue(owner["requiresManualRecovery"])
+                    self.assertGreaterEqual(owner["unconfirmedProcessCount"], 1)
+                    self.assertEqual(
+                        owner["unconfirmedProcessesTruncated"],
+                        owner["unconfirmedProcessCount"] > len(owner["unconfirmedProcesses"]),
+                    )
+                    self.assertTrue(any(
+                        item["pid"] == child_pid and item["descriptorStatus"] == "uninspectable"
+                        for item in owner["unconfirmedProcesses"]
+                    ))
+            finally:
+                if child_pid is None:
+                    try:
+                        run_dir = self.cache / "release-gates" / args.label
+                        logs = list((run_dir / "logs").glob(".*.tmp"))
+                        if logs:
+                            child_pid = int(logs[0].read_text().splitlines()[0])
+                    except (OSError, ValueError, IndexError):
+                        pass
+                if child_pid is not None and process_running(child_pid):
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                for name in ("cargo", "gradle"):
+                    lease_path = self.cache / "leases" / name
+                    if lease_path.exists():
+                        shutil.rmtree(lease_path)
 
     def test_source_change_during_gate_fails_exact_tree_receipt(self) -> None:
         gate = run_gates.Gate("mutating-gate", (sys.executable, "-c", "open('source-drift.txt','w').write('changed')"))
