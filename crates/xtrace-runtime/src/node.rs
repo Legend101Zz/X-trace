@@ -376,29 +376,48 @@ fn validate_node_options_arguments(arguments: &[OsString]) -> Result<(), LaunchE
     while let Some(argument) = arguments.get(index) {
         let value = argument.to_string_lossy();
         if value == "--" {
+            if arguments.get(index + 1).is_none() {
+                return Err(node_script_required());
+            }
             break;
         }
-        if !value.starts_with('-') || value == "-" {
+        if !value.starts_with('-') {
             break;
         }
-        if is_preload_flag(&value) {
+        let option = value.split_once('=').map_or(value.as_ref(), |(name, _)| name);
+        if is_preload_flag(option) {
             return Err(LaunchError::Validation(
                 "Node preload and loader flags conflict with X-trace injection",
             ));
         }
-        if matches!(value.as_ref(), "-e" | "--eval" | "-p" | "--print")
-            || ["--eval=", "--print="].iter().any(|flag| value.starts_with(flag))
-        {
+        if matches!(option, "-e" | "--eval" | "-p" | "--print") {
             return Err(LaunchError::Validation(
                 "Node eval and print entrypoints are unsupported; use a script file",
             ));
         }
-        if node_option_takes_value(&value) && !value.contains('=') {
+        let has_inline_value = value.contains('=');
+        if node_option_takes_value(option) && !has_inline_value {
+            if arguments.get(index + 1).is_none() {
+                return Err(node_script_required());
+            }
             index = index.saturating_add(1);
+        } else if !node_option_takes_value(option)
+            && !node_option_is_boolean(option)
+            && option != "--"
+        {
+            return Err(LaunchError::Validation(
+                "xtrace run supports a limited set of Node options; use a script file and put app arguments after its path",
+            ));
         }
         index = index.saturating_add(1);
     }
+    if index >= arguments.len() {
+        return Err(node_script_required());
+    }
     Ok(())
+}
+fn node_script_required() -> LaunchError {
+    LaunchError::Validation("a Node script path is required after supported Node options")
 }
 fn node_option_takes_value(value: &str) -> bool {
     [
@@ -410,6 +429,7 @@ fn node_option_takes_value(value: &str) -> bool {
         "--env-file-if-exists",
         "--experimental-policy",
         "--heapsnapshot-near-heap-limit",
+        "--icu-data-dir",
         "--input-type",
         "--inspect-port",
         "--inspect-publish-uid",
@@ -423,7 +443,44 @@ fn node_option_takes_value(value: &str) -> bool {
         "--tls-cipher-list",
         "--trace-event-categories",
         "--trace-event-file-pattern",
+        "--experimental-default-type",
+        "--experimental-specifier-resolution",
+        "--secure-heap",
+        "--secure-heap-min",
         "--unhandled-rejections",
+    ]
+    .contains(&value)
+}
+fn node_option_is_boolean(value: &str) -> bool {
+    [
+        "--abort-on-uncaught-exception",
+        "--completion-bash",
+        "--enable-source-maps",
+        "--experimental-network-inspection",
+        "--experimental-strip-types",
+        "--experimental-transform-types",
+        "--force-fips",
+        "--frozen-intrinsics",
+        "--no-deprecation",
+        "--no-experimental-fetch",
+        "--no-warnings",
+        "--preserve-symlinks",
+        "--preserve-symlinks-main",
+        "--report-compact",
+        "--report-on-fatalerror",
+        "--report-on-signal",
+        "--report-uncaught-exception",
+        "--throw-deprecation",
+        "--trace-deprecation",
+        "--trace-uncaught",
+        "--trace-warnings",
+        "--track-heap-objects",
+        "--zero-fill-buffers",
+        "--watch",
+        "--watch-preserve-output",
+        "--no-addons",
+        "--experimental-wasm-modules",
+        "--experimental-vm-modules",
     ]
     .contains(&value)
 }
@@ -987,6 +1044,20 @@ mod tests {
         );
         assert!(
             validate_node_options_arguments(&[
+                "--icu-data-dir".into(),
+                "/tmp/icu-data".into(),
+                "--require=/xtrace-nonexistent-preload.cjs".into(),
+                "app.cjs".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_node_options_arguments(&["--future-unknown-option".into(), "app.cjs".into()])
+                .is_err()
+        );
+        assert!(validate_node_options_arguments(&["--future-unknown-option".into()]).is_err());
+        assert!(
+            validate_node_options_arguments(&[
                 "--eval".into(),
                 "console.log(JSON.stringify(process.execArgv))".into(),
                 "--require=/xtrace-nonexistent-preload.cjs".into()
@@ -995,6 +1066,7 @@ mod tests {
         );
         assert!(validate_node_options_arguments(&["--eval=1".into()]).is_err());
         assert!(validate_node_options_arguments(&["-p".into(), "1 + 1".into()]).is_err());
+        assert!(validate_node_options_arguments(&["--".into()]).is_err());
     }
 
     #[test]
