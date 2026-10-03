@@ -43,6 +43,9 @@ public final class XTraceAgent {
   /** Starts the bounded fixture attach path after the target JVM has already started. */
   public static void agentmain(String agentArgument, Instrumentation instrumentation)
       throws Exception {
+    if (START_STATE.get() == 2) {
+      throw new Exception("XTR-JAVA-AGENT-RELAUNCH-REQUIRED");
+    }
     AgentOptions options = parseAttachOptions(agentArgument);
     validateSnapshot(options.snapshotRoot());
     String bootstrapPath = options.bootstrapPath();
@@ -93,6 +96,7 @@ public final class XTraceAgent {
     Class<?> entry = null;
     byte[] identity = null;
     boolean keepLoader = false;
+    boolean permanentFailure = false;
     try {
       entry = Class.forName(RUNTIME_ENTRY, true, loader);
       identity = (byte[]) entry
@@ -110,7 +114,8 @@ public final class XTraceAgent {
                 "start", String.class, Instrumentation.class, boolean.class, byte[].class)
             .invoke(null, bootstrapPath, instrumentation, attach, identity);
       } catch (InvocationTargetException error) {
-        keepLoader = failurePermanent(error.getCause());
+        permanentFailure = failurePermanent(error.getCause());
+        keepLoader = permanentFailure;
         throw error;
       }
       keepLoader = true;
@@ -124,7 +129,7 @@ public final class XTraceAgent {
       START_STATE.set(1);
     } finally {
       if (identity != null) Arrays.fill(identity, (byte) 0);
-      if (START_STATE.get() == -1) START_STATE.set(0);
+      finishFailedStart(permanentFailure);
       if (!keepLoader) {
         try {
           loader.close();
@@ -133,6 +138,10 @@ public final class XTraceAgent {
         }
       }
     }
+  }
+
+  static void finishFailedStart(boolean permanentFailure) {
+    if (START_STATE.get() == -1) START_STATE.set(permanentFailure ? 2 : 0);
   }
 
   private static AgentOptions parseAttachOptions(String argument) {

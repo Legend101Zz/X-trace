@@ -199,6 +199,20 @@ class AttachCommandsTest {
       java.util.Arrays.fill(expectedAgent, (byte) 0);
       AgentSnapshot.deleteOwnedSnapshot(snapshot.root(), target.pid(), target.startTime());
     }
+    assertFalse(Files.exists(snapshot.root()), "readonly snapshot directories must be removable");
+  }
+
+  @Test
+  void snapshotEntryBoundCountsZeroByteFiles() throws Exception {
+    Path tree = Files.createDirectory(temporaryDirectory.resolve("many-empty-files"));
+    for (int index = 0; index < 257; index++) {
+      Files.createFile(tree.resolve("entry-" + index));
+    }
+
+    AttachCommands.Failure failure = assertThrows(
+        AttachCommands.Failure.class, () -> AgentSnapshot.treeSize(tree, 1024));
+
+    assertTrue(failure.getMessage().contains("entry or depth bound"));
   }
 
   private static void writeAgentJar(Path path, String payload) throws Exception {
@@ -230,10 +244,7 @@ class AttachCommandsTest {
 
   @Test
   void helperSupervisorKillsOnlyItsTimedOutWorkerAndReportsUncertainty() throws Exception {
-    String classPath = Path.of(
-            SupervisorTestProgram.class.getProtectionDomain().getCodeSource().getLocation().toURI())
-        + java.io.File.pathSeparator
-        + Path.of(Main.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+    String classPath = supervisorTestClassPath();
     Process target = new ProcessBuilder(
         Path.of(System.getProperty("java.home"), "bin", "java").toString(),
         "-cp",
@@ -269,6 +280,101 @@ class AttachCommandsTest {
       target.destroyForcibly();
       target.waitFor(5, TimeUnit.SECONDS);
     }
+  }
+
+  @Test
+  void malformedSingleLineWorkerJsonProducesUncertainAttachResult() throws Exception {
+    ProcessIdentity target = ProcessIdentity.read(ProcessHandle.current().pid(), "attach");
+    HelperSupervisor.Result raw = HelperSupervisor.runWorker(
+        SupervisorTestProgram.class.getName(),
+        new String[] {"attach", "malformed-json"},
+        java.time.Duration.ofSeconds(5),
+        supervisorTestClassPath());
+
+    HelperSupervisor.Result accepted = HelperSupervisor.acceptWorkerResult(
+        "attach", target.pid(), target, raw);
+
+    assertFalse(raw.reliable());
+    assertEquals("{\"schemaVersion\":1,\"ok\":true", raw.json());
+    assertEquals(7, accepted.exitCode());
+    assertTrue(accepted.json().contains("unknown_after_helper_failure"));
+    assertFalse(accepted.json().contains("{\"schemaVersion\":1,\"ok\":true"));
+  }
+
+  @Test
+  void workerSuccessEnvelopeMustAgreeWithExitStatus() throws Exception {
+    ProcessIdentity target = ProcessIdentity.read(ProcessHandle.current().pid(), "attach");
+    HelperSupervisor.Result raw = HelperSupervisor.runWorker(
+        SupervisorTestProgram.class.getName(),
+        new String[] {"attach", "mismatched-exit"},
+        java.time.Duration.ofSeconds(5),
+        supervisorTestClassPath());
+
+    HelperSupervisor.Result accepted = HelperSupervisor.acceptWorkerResult(
+        "attach", target.pid(), target, raw);
+
+    assertFalse(raw.reliable());
+    assertEquals(7, accepted.exitCode());
+    assertTrue(accepted.json().contains("unknown_after_helper_failure"));
+  }
+
+  @Test
+  void survivingOwnedWorkerReportsIdentityAndRetainsPrimaryFailure() throws Exception {
+    UnstoppableProcess worker = new UnstoppableProcess();
+    ProcessIdentity identity = ProcessIdentity.read(worker.pid(), "attach");
+
+    HelperSupervisor.WorkerCleanupException cleanup = assertThrows(
+        HelperSupervisor.WorkerCleanupException.class,
+        () -> HelperSupervisor.ensureWorkerStopped(
+            worker,
+            new HelperSupervisor.TimeoutException(worker.pid()),
+            java.time.Duration.ofMillis(10)));
+    HelperSupervisor.Result result = HelperSupervisor.workerCleanupFailure(
+        "attach", identity.pid(), identity, cleanup);
+
+    assertTrue(worker.destroyRequested());
+    assertTrue(worker.isAlive(), "the double models a still-running owned worker");
+    assertTrue(cleanup.getSuppressed()[0] instanceof HelperSupervisor.TimeoutException);
+    assertEquals(identity.pid(), cleanup.workerPid());
+    assertEquals(identity.startTime(), cleanup.workerStartTime());
+    assertTrue(result.json().contains("XTR-ATTACH-WORKER-UNCONFIRMED"));
+    assertTrue(result.json().contains("unknown_after_helper_cleanup_failure"));
+    assertTrue(result.json().contains("\"helperWorkerPid\":" + identity.pid()));
+    assertTrue(result.json().contains("\"helperWorkerStartTime\":"));
+    assertFalse(result.json().contains("test timeout"));
+    assertTrue(result.json().contains("\"helperWorkerFailureKind\":\"timeout\""));
+  }
+
+  @Test
+  void boundedJsonRequiresCompleteUniqueTypedWorkerEnvelope() {
+    String good = "{\"schemaVersion\":1,\"ok\":true,\"command\":\"attach\","
+        + "\"code\":\"XTR-ATTACH-OK\",\"message\":\"completed\"}";
+
+    assertTrue(BoundedJson.isWorkerResponse(good, "attach", 0));
+    assertFalse(BoundedJson.isWorkerResponse(good + " trailing", "attach", 0));
+    assertFalse(BoundedJson.isWorkerResponse(
+        "{\"schemaVersion\":1,\"schemaVersion\":1,\"ok\":true,"
+            + "\"command\":\"attach\",\"code\":\"XTR-ATTACH-OK\",\"message\":\"ok\"}",
+        "attach",
+        0));
+    assertFalse(BoundedJson.isWorkerResponse(
+        "{\"schemaVersion\":\"1\",\"ok\":true,\"command\":\"attach\","
+            + "\"code\":\"XTR-ATTACH-OK\",\"message\":\"ok\"}",
+        "attach",
+        0));
+    assertFalse(BoundedJson.isWorkerResponse(
+        "{\"schemaVersion\":1,\"ok\":false,\"command\":\"attach\","
+            + "\"code\":\"XTR-ATTACH-FAILED\",\"message\":\"failed\"}",
+        "attach",
+        0));
+    assertFalse(BoundedJson.isWorkerResponse(good, "inspect", 0));
+  }
+
+  private String supervisorTestClassPath() throws Exception {
+    return Path.of(
+            SupervisorTestProgram.class.getProtectionDomain().getCodeSource().getLocation().toURI())
+        + java.io.File.pathSeparator
+        + Path.of(Main.class.getProtectionDomain().getCodeSource().getLocation().toURI());
   }
 
   @Test

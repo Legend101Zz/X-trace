@@ -4,6 +4,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URISyntaxException;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -33,12 +36,9 @@ final class HelperSupervisor {
     }
     try {
       Result result = runWorker(WorkerMain.class.getName(), arguments, ATTACH_TIMEOUT);
-      if (result.reliable()) return result;
-      return command.equals("attach")
-          ? uncertainFailure(command, pid, before)
-          : failure(command, "XTR-ATTACH-HELPER-FAILED", 7,
-              "The bounded JVM helper returned no valid result.",
-              "Retry once; if the helper remains unavailable, relaunch the application through X-trace.");
+      return acceptWorkerResult(command, pid, before, result);
+    } catch (WorkerCleanupException error) {
+      return workerCleanupFailure(command, pid, before, error);
     } catch (TimeoutException error) {
       return timeout(command, pid, before);
     } catch (IOException | InterruptedException | ExecutionException | URISyntaxException error) {
@@ -50,6 +50,38 @@ final class HelperSupervisor {
           "The bounded JVM helper could not complete safely.",
           "Retry once; if the helper remains unavailable, relaunch the application through X-trace.");
     }
+  }
+
+  static Result acceptWorkerResult(
+      String command, long pid, ProcessIdentity before, Result result) {
+    if (result.reliable()) return result;
+    return command.equals("attach")
+        ? uncertainFailure(command, pid, before)
+        : failure(command, "XTR-ATTACH-HELPER-FAILED", 7,
+            "The bounded JVM helper returned no valid result.",
+            "Retry once; if the helper remains unavailable, relaunch the application through X-trace.");
+  }
+
+  static Result workerCleanupFailure(
+      String command, long pid, ProcessIdentity before, WorkerCleanupException error) {
+    Map<String, Object> values = new LinkedHashMap<>();
+    values.put("schemaVersion", 1);
+    values.put("ok", false);
+    values.put("command", command);
+    values.put("code", "XTR-ATTACH-WORKER-UNCONFIRMED");
+    values.put("message", "The helper could not confirm that its owned worker stopped.");
+    values.put("remediation", "Inspect the helper process and target before retrying; relaunch the application through X-trace if attach state is uncertain.");
+    values.put("helperWorkerState", "termination_unconfirmed");
+    values.put("helperWorkerPid", error.workerPid());
+    values.put("helperWorkerFailureKind", error.failureKind());
+    if (error.workerStartTime() != null) {
+      values.put("helperWorkerStartTime", error.workerStartTime().toEpochMilli());
+    }
+    if (command.equals("attach")) {
+      values.put("targetAgentState", "unknown_after_helper_cleanup_failure");
+      values.put("targetIdentityStatus", sameProcess(pid, before) ? "same" : "changed_or_unavailable");
+    }
+    return new Result(Json.encode(values), 7, true);
   }
 
   static Result runWorker(
@@ -87,37 +119,85 @@ final class HelperSupervisor {
     Thread reader = new Thread(output, "xtrace-attach-helper-output");
     reader.setDaemon(true);
     reader.start();
+    Throwable primaryFailure = null;
     try {
       if (!worker.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
-        long workerPid = worker.pid();
-        worker.destroyForcibly();
-        worker.waitFor(5, TimeUnit.SECONDS);
-        reader.interrupt();
-        if (worker.isAlive()) throw new IOException("the bounded helper worker did not stop");
-        throw new TimeoutException(workerPid);
+        throw new TimeoutException(worker.pid());
       }
       byte[] bytes;
       try {
         bytes = output.get(2, TimeUnit.SECONDS);
       } catch (java.util.concurrent.TimeoutException error) {
-        long workerPid = worker.pid();
-        worker.destroyForcibly();
-        worker.waitFor(5, TimeUnit.SECONDS);
-        if (worker.isAlive()) throw new IOException("the bounded helper worker did not stop");
-        throw new TimeoutException(workerPid);
+        throw new TimeoutException(worker.pid());
       }
-    String json = new String(bytes, StandardCharsets.UTF_8).strip();
-    java.util.Arrays.fill(bytes, (byte) 0);
-    if (json.isEmpty() || json.length() > MAX_OUTPUT_BYTES || json.indexOf('\n') >= 0) {
-      return new Result("", 7, false);
-    }
-    return new Result(json, worker.exitValue(), true);
+      String json;
+      try {
+        json = StandardCharsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+            .decode(ByteBuffer.wrap(bytes))
+            .toString()
+            .strip();
+      } catch (CharacterCodingException error) {
+        return new Result("", 7, false);
+      } finally {
+        java.util.Arrays.fill(bytes, (byte) 0);
+      }
+      if (json.isEmpty() || json.length() > MAX_OUTPUT_BYTES || json.indexOf('\n') >= 0) {
+        return new Result("", 7, false);
+      }
+      int exitCode = worker.exitValue();
+      return new Result(
+          json,
+          exitCode,
+          BoundedJson.isWorkerResponse(json, command(arguments), exitCode));
+    } catch (IOException | InterruptedException | ExecutionException
+        | TimeoutException | RuntimeException | Error error) {
+      primaryFailure = error;
+      throw error;
     } finally {
-      if (worker.isAlive()) {
-        worker.destroyForcibly();
-        worker.waitFor(5, TimeUnit.SECONDS);
-      }
+      ensureWorkerStopped(worker, primaryFailure, Duration.ofSeconds(5));
     }
+  }
+
+  static void ensureWorkerStopped(Process worker, Throwable primary, Duration waitBound)
+      throws WorkerCleanupException {
+    if (!worker.isAlive()) return;
+    long pid = worker.pid();
+    ProcessIdentity identity = null;
+    try {
+      identity = ProcessIdentity.read(pid, "attach");
+    } catch (AttachCommands.Failure ignored) {
+      // Keep PID as the minimum recovery fact when start identity is unavailable.
+    }
+    Throwable cleanupFailure = null;
+    try {
+      worker.destroyForcibly();
+      if (worker.waitFor(waitBound.toMillis(), TimeUnit.MILLISECONDS) && !worker.isAlive()) return;
+    } catch (InterruptedException error) {
+      Thread.currentThread().interrupt();
+      cleanupFailure = error;
+    } catch (RuntimeException error) {
+      cleanupFailure = error;
+    }
+    if (!worker.isAlive()) return;
+    WorkerCleanupException failure = new WorkerCleanupException(
+        pid,
+        identity == null ? null : identity.startTime(),
+        failureKind(primary));
+    if (cleanupFailure != null) failure.addSuppressed(cleanupFailure);
+    if (primary != null) failure.addSuppressed(primary);
+    if (primary instanceof InterruptedException) Thread.currentThread().interrupt();
+    throw failure;
+  }
+
+  private static String failureKind(Throwable failure) {
+    if (failure instanceof TimeoutException) return "timeout";
+    if (failure instanceof InterruptedException) return "interrupted";
+    if (failure instanceof ExecutionException) return "worker_output";
+    if (failure instanceof IOException) return "helper_io";
+    if (failure instanceof RuntimeException || failure instanceof Error) return "helper_runtime";
+    return "unknown";
   }
 
   private static byte[] readBounded(InputStream input) throws IOException {
@@ -210,6 +290,31 @@ final class HelperSupervisor {
   record Result(String json, int exitCode, boolean reliable) {
     Result(String json, int exitCode) {
       this(json, exitCode, true);
+    }
+  }
+
+  static final class WorkerCleanupException extends IOException {
+    private final long workerPid;
+    private final java.time.Instant workerStartTime;
+    private final String failureKind;
+
+    WorkerCleanupException(long workerPid, java.time.Instant workerStartTime, String failureKind) {
+      super("the bounded helper worker termination could not be confirmed");
+      this.workerPid = workerPid;
+      this.workerStartTime = workerStartTime;
+      this.failureKind = failureKind;
+    }
+
+    long workerPid() {
+      return workerPid;
+    }
+
+    java.time.Instant workerStartTime() {
+      return workerStartTime;
+    }
+
+    String failureKind() {
+      return failureKind;
     }
   }
 

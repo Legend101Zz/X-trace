@@ -13,8 +13,10 @@ import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.Comparator;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Iterator;
+import java.util.List;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.UUID;
@@ -24,6 +26,8 @@ record AgentSnapshot(Path root, Path agentJar) {
   private static final long MAX_DISTRIBUTION_BYTES = 256L * 1024 * 1024;
   private static final long MAX_CACHED_BYTES = 512L * 1024 * 1024;
   private static final int MAX_SNAPSHOTS = 8;
+  private static final int MAX_SNAPSHOT_ENTRIES = 256;
+  private static final int MAX_SNAPSHOT_DEPTH = 8;
   private static final int CHUNK_BYTES = 8192;
 
   String agentOptions(Path bootstrap) throws AttachCommands.Failure {
@@ -165,8 +169,18 @@ record AgentSnapshot(Path root, Path agentJar) {
     long total = 0;
     int snapshots = 0;
     try (var paths = Files.list(cache)) {
-      for (Path path : paths.toList()) {
-        if (path.getFileName().toString().equals(".lock")) continue;
+      Iterator<Path> entries = paths.iterator();
+      int cacheEntries = 0;
+      while (entries.hasNext()) {
+        Path path = entries.next();
+        if (++cacheEntries > MAX_SNAPSHOTS + 1) {
+          throw invalid("the private attach snapshot cache contains too many entries");
+        }
+        String name = path.getFileName().toString();
+        if (name.equals(".lock")) continue;
+        if (!name.matches("target-[1-9][0-9]{0,9}-[0-9a-f-]{36}")) {
+          throw invalid("the private attach snapshot directory contains an unexpected entry");
+        }
         if (!Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(path)) {
           throw invalid("the private attach snapshot directory contains an unexpected entry");
         }
@@ -185,10 +199,19 @@ record AgentSnapshot(Path root, Path agentJar) {
   static boolean reapExited(Path cache) throws IOException {
     boolean active = false;
     try (var paths = Files.list(cache)) {
-      for (Path path : paths.toList()) {
+      Iterator<Path> entries = paths.iterator();
+      int cacheEntries = 0;
+      while (entries.hasNext()) {
+        Path path = entries.next();
+        if (++cacheEntries > MAX_SNAPSHOTS + 1) {
+          throw new IOException("the attach snapshot cache entry bound was exceeded");
+        }
         if (path.getFileName().toString().equals(".lock")) continue;
-        if (!Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(path)) continue;
-        if (!path.getFileName().toString().matches("target-[1-9][0-9]{0,9}-[0-9a-f-]{36}")) continue;
+        if (!path.getFileName().toString().matches("target-[1-9][0-9]{0,9}-[0-9a-f-]{36}")
+            || !Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)
+            || Files.isSymbolicLink(path)) {
+          throw new IOException("the attach snapshot cache contains an unexpected entry");
+        }
         long[] lease = readLease(path);
         if (lease == null) continue;
         ProcessHandle target = ProcessHandle.of(lease[0]).orElse(null);
@@ -216,14 +239,27 @@ record AgentSnapshot(Path root, Path agentJar) {
   }
 
 
-  private static long treeSize(Path root, long maximum) throws IOException, AttachCommands.Failure {
+  static long treeSize(Path root, long maximum) throws IOException, AttachCommands.Failure {
+    if (maximum < 0) throw invalid("the private attach snapshot cache is full");
     long total = 0;
     try (var paths = Files.walk(root)) {
-      for (Path path : paths.toList()) {
+      Iterator<Path> entries = paths.iterator();
+      int count = 0;
+      while (entries.hasNext()) {
+        Path path = entries.next();
+        if (++count > MAX_SNAPSHOT_ENTRIES
+            || (!path.equals(root) && root.relativize(path).getNameCount() > MAX_SNAPSHOT_DEPTH)) {
+          throw invalid("an attach snapshot exceeds its entry or depth bound");
+        }
         if (Files.isSymbolicLink(path)) throw invalid("an attach snapshot contains a symbolic link");
         if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
-          total += Files.size(path);
-          if (total > maximum) return total;
+          long size = Files.size(path);
+          if (size > maximum - total) {
+            throw invalid("the private attach snapshot cache exceeds its byte bound");
+          }
+          total += size;
+        } else if (!Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
+          throw invalid("an attach snapshot contains an unexpected file type");
         }
       }
     }
@@ -311,14 +347,27 @@ record AgentSnapshot(Path root, Path agentJar) {
   }
 
   private static void delete(Path root) throws IOException {
+    List<Path> entries = new ArrayList<>();
     try (var paths = Files.walk(root)) {
-      for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
-        if (Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
-          Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rwx------"));
+      Iterator<Path> iterator = paths.iterator();
+      while (iterator.hasNext()) {
+        Path path = iterator.next();
+        if (entries.size() >= MAX_SNAPSHOT_ENTRIES
+            || (!path.equals(root) && root.relativize(path).getNameCount() > MAX_SNAPSHOT_DEPTH)
+            || Files.isSymbolicLink(path)
+            || (!Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)
+                && !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))) {
+          throw new IOException("the private attach snapshot structure is not safe to remove");
         }
-        Files.deleteIfExists(path);
+        entries.add(path);
       }
     }
+    for (Path path : entries) {
+      if (Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
+        Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rwx------"));
+      }
+    }
+    for (int index = entries.size() - 1; index >= 0; index--) Files.deleteIfExists(entries.get(index));
   }
 
   private static void deleteQuietly(Path root) {

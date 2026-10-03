@@ -178,14 +178,40 @@ class JavaAttachAcceptanceTest {
       failure[0] = error;
       throw error;
     } finally {
-      stop(fixtureProcess);
-      stop(daemon);
-      stop(secondDaemon);
-      if (failure[0] == null) {
+      Throwable primaryFailure = failure[0];
+      for (Process process : new Process[] {fixtureProcess, daemon, secondDaemon}) {
+        if (process == null) continue;
+        try {
+          stop(process);
+        } catch (InterruptedException | IOException error) {
+          if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+          if (primaryFailure == null) primaryFailure = error;
+          else primaryFailure.addSuppressed(error);
+        }
+      }
+      if (primaryFailure == null) {
         deleteTree(root);
       } else {
-        preserveFailureEvidence(evidenceDirectory, root, logs, stage[0], failure[0]);
-        deleteTree(root);
+        boolean evidenceSaved = false;
+        try {
+          preserveFailureEvidence(evidenceDirectory, root, logs, stage[0], primaryFailure);
+          evidenceSaved = true;
+        } catch (IOException evidenceError) {
+          primaryFailure.addSuppressed(
+              new IOException("private failure evidence could not be persisted; fixture files were retained"));
+          primaryFailure.addSuppressed(evidenceError);
+        }
+        if (evidenceSaved) {
+          try {
+            deleteTree(root);
+          } catch (IOException cleanupError) {
+            primaryFailure.addSuppressed(cleanupError);
+          }
+        }
+        if (failure[0] == null) {
+          if (primaryFailure instanceof Exception exception) throw exception;
+          if (primaryFailure instanceof Error error) throw error;
+        }
       }
     }
   }
@@ -347,31 +373,75 @@ class JavaAttachAcceptanceTest {
   }
 
   private static void preserveFailureEvidence(
-      Path evidenceDirectory, Path root, Path logs, String stage, Throwable failure) {
-    try {
-      Path bundle = Files.createDirectory(
-          evidenceDirectory.resolve("java-attach-failure-" + UUID.randomUUID()),
-          PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")));
-      for (String name : List.of(
-          "daemon.out", "daemon.err", "second-daemon.out", "second-daemon.err",
-          "fixture.out", "fixture.err", "failure-command.out")) {
-        Path source = name.startsWith("daemon") || name.startsWith("second-daemon") || name.startsWith("fixture")
-            ? logs.resolve(name)
-            : root.resolve(name);
-        if (Files.isRegularFile(source)) {
-          String text = readTailText(source);
-          Files.writeString(bundle.resolve(name), sanitize(text, root));
-          Files.setPosixFilePermissions(bundle.resolve(name), PosixFilePermissions.fromString("rw-------"));
-        }
+      Path evidenceDirectory, Path root, Path logs, String stage, Throwable failure)
+      throws IOException {
+    if (!Files.isDirectory(evidenceDirectory, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+        || Files.isSymbolicLink(evidenceDirectory)
+        || ((((Number) Files.getAttribute(
+            evidenceDirectory, "unix:mode", java.nio.file.LinkOption.NOFOLLOW_LINKS)).intValue()) & 0077) != 0
+        || !Files.getOwner(evidenceDirectory, java.nio.file.LinkOption.NOFOLLOW_LINKS).getName()
+            .equals(ProcessHandle.current().info().user().orElse(""))) {
+      throw new IOException("the failure evidence directory is not owner-private");
+    }
+    Path bundle = Files.createDirectory(
+        evidenceDirectory.resolve("java-attach-failure-" + UUID.randomUUID()),
+        PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")));
+    for (String name : List.of(
+        "daemon.out", "daemon.err", "second-daemon.out", "second-daemon.err",
+        "fixture.out", "fixture.err", "failure-command.out")) {
+      Path source = name.startsWith("daemon") || name.startsWith("second-daemon") || name.startsWith("fixture")
+          ? logs.resolve(name)
+          : root.resolve(name);
+      if (Files.isRegularFile(source, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+        String text = readTailText(source);
+        writePrivateEvidence(bundle.resolve(name), sanitize(text, root));
       }
-      Files.writeString(
-          bundle.resolve("receipt.json"),
-          "{\"stage\":\"" + stage + "\",\"failureType\":\""
-              + failure.getClass().getSimpleName() + "\",\"jdk\":\""
-              + System.getProperty("java.version") + "\"}\n");
-      Files.setPosixFilePermissions(bundle.resolve("receipt.json"), PosixFilePermissions.fromString("rw-------"));
-    } catch (Exception ignored) {
-      // Keep the original acceptance failure; evidence storage is best effort and private.
+    }
+    String receipt = "{\"stage\":\"" + stage + "\",\"failureType\":\""
+        + failure.getClass().getSimpleName() + "\",\"jdk\":\""
+        + System.getProperty("java.version") + "\"}\n";
+    writePrivateEvidence(bundle.resolve("receipt.json"), receipt);
+    if (!Files.isDirectory(bundle, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+        || Files.isSymbolicLink(bundle)
+        || !Files.isRegularFile(bundle.resolve("receipt.json"), java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+      throw new IOException("private failure evidence could not be verified");
+    }
+    forceDirectory(bundle);
+    forceDirectory(evidenceDirectory);
+  }
+
+  private static void writePrivateEvidence(Path path, String text) throws IOException {
+    byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+    if (bytes.length > 64 * 1024) {
+      java.util.Arrays.fill(bytes, (byte) 0);
+      throw new IOException("private failure evidence exceeded its file bound");
+    }
+    try {
+      Files.createFile(
+          path, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
+      try (var channel = java.nio.channels.FileChannel.open(
+          path,
+          java.util.Set.of(
+              java.nio.file.StandardOpenOption.WRITE,
+              java.nio.file.LinkOption.NOFOLLOW_LINKS))) {
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(bytes);
+        while (buffer.hasRemaining()) channel.write(buffer);
+        channel.force(true);
+      }
+    } finally {
+      java.util.Arrays.fill(bytes, (byte) 0);
+    }
+    Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rw-------"));
+    if (!Files.isRegularFile(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+        || Files.size(path) > 64 * 1024) {
+      throw new IOException("private failure evidence file could not be verified");
+    }
+  }
+
+  private static void forceDirectory(Path directory) throws IOException {
+    try (var channel = java.nio.channels.FileChannel.open(
+        directory, java.nio.file.StandardOpenOption.READ)) {
+      channel.force(true);
     }
   }
 
@@ -453,12 +523,27 @@ class JavaAttachAcceptanceTest {
     return Path.of(value).toAbsolutePath().normalize();
   }
 
-  private static void stop(Process process) throws InterruptedException {
+  private static void stop(Process process) throws InterruptedException, IOException {
     if (process == null || !process.isAlive()) return;
     process.destroy();
-    if (!process.waitFor(5, TimeUnit.SECONDS)) {
+    try {
+      if (!process.waitFor(5, TimeUnit.SECONDS)) {
+        process.destroyForcibly();
+        if (!process.waitFor(5, TimeUnit.SECONDS)) {
+          throw new IOException("disposable child termination could not be confirmed");
+        }
+      }
+    } catch (InterruptedException interrupted) {
       process.destroyForcibly();
-      process.waitFor(5, TimeUnit.SECONDS);
+      try {
+        if (!process.waitFor(5, TimeUnit.SECONDS)) {
+          interrupted.addSuppressed(new IOException("disposable child termination could not be confirmed"));
+        }
+      } catch (InterruptedException cleanupInterrupted) {
+        interrupted.addSuppressed(cleanupInterrupted);
+      }
+      Thread.currentThread().interrupt();
+      throw interrupted;
     }
   }
 
