@@ -33,11 +33,15 @@ workflow authorization; all required gates still apply.
 Continuation checkpoint (2026-10-03): the user explicitly resumed work after
 the Oct 1 SSD-removal pause and requested a next-session prompt if this chat
 became too long. The approved autonomous scope and Luna High implementation /
-Sol High review assignment remain in force. HTTP is now reviewed, merged,
-pushed, and verified as recorded below; next is the endpoint-first browser.
-This chat ends at that clean handoff because it is long. No background
-implementation or scheduled continuation is running. The historical pause
-section below is superseded by this completion checkpoint.
+Sol High review assignment remain in force. HTTP and the endpoint-first browser
+are now reviewed, merged, pushed, and verified as recorded below. The bounded
+Slice 1E.3 exact-fixture product journey is accepted; broader Slice 1 remains
+incomplete. This chat ends at a clean handoff because it is long. Next session
+reconciles the remaining Slice 1 exit criteria and proposes the smallest bounded
+source/active-line/provenance evidence increment, resolving any material decision
+before implementation. No background implementation or scheduled continuation is
+running. The historical pause section below is superseded by this completion
+checkpoint.
 
 ## Historical B2 stop checkpoint (superseded by accepted ADR 0002)
 
@@ -265,3 +269,73 @@ exact gates, feature CI, no-ff merge, postmerge gates/CI, and progress workflow.
 | Slice | Goal | Files changed | Verification | Result | Next slice |
 |---|---|---|---|---|---|
 | Slice 1E.3C | Bounded authenticated observed endpoint/linked/unmatched HTTP through the shared service | CLI reader/viewer composition, daemon HTTP/tests/dev dependency, Spring/Chromium acceptance, OpenAPI/generated TypeScript, lock and progress | Pinned Sol architecture/security/build approval; exact feature/postmerge eight gates; 215 focused / 453 workspace tests; CI `37123864124` / `37124174180` all four jobs green | Reviewed, merged, pushed, CI-green; UI remains recording-first | Slice 1E.3D endpoint-first browser and real visual journey |
+
+## Slice 1E.3D reviewed and merged (2026-10-03)
+
+Source feature `a1d89cd22f6075c56779fcda41c33177b31439d0`; no-ff merge
+`5c848dd52ebb5d748f616559e1526313d4ef7556`. Feature CI
+`37139481240` and merge CI `37139761333` passed all four jobs (aggregate
+gates, Node, Java 17, Java 21). Luna High implemented. Sol High independently
+approved the pinned complete architecture and security/privacy diff and separately
+audited build/integration evidence. Root reviewed the complete actual eight-file
+diff, visually opened all ten final desktop/mobile screenshots, confirmed the
+restricted build environment, and alone pushed and merged.
+
+The browser starts with observed endpoint method/exact route/component/binding.
+Selecting an endpoint opens only its bounded linked recordings, then the existing
+verified detail. Unmatched recordings remain separate, including historical v4
+with null reason. The UI labels `spring-orders-v1` as operator-selected and
+explicitly non-attesting. Endpoint/linked/unmatched/event windows and cursors are
+independent and bounded, async generations reject obsolete replies, and session
+expiry, keyboard navigation, mobile 390x844 tabs, and the three desktop regions
+are preserved. Shipped assets were rebuilt with exact manifest parity.
+
+All eight exact gates passed on feature and merged main: formatting, strict
+locked workspace/all-target/all-feature Clippy, strict locked all-feature
+rustdoc, focused application/store/CLI tests (215 passed), full locked all-feature
+workspace tests (453 passed including doctest), fresh restricted-PATH locked
+workspace build with no system protoc, and working/full committed diff checks.
+Zero failures or ignored tests. Strict Java clean/test/installDist/agentDist/
+fixtureBootJar passed before feature integration and again on merged main (35
+tasks executed). Web typecheck, 12 tests, 7.32:1 contrast, API/embedded parity,
+Node generation and 11 tests passed on the final feature and merged main.
+The earlier `edf70ad` candidate failed Rust formatting; a small formatting repair
+and stronger negative session assertion were amended before full repeated gates.
+No failed candidate was accepted.
+
+Real checked-in Spring runs through packaged `xtrace run` with all three explicit
+opt-ins. Two genuine `POST /orders` captures are persisted before supplemental
+ordering/compatibility fixtures. After stop/restart, authenticated actual Chromium
+selects endpoint -> genuine linked recording -> verified detail, then separately
+identifies historical unmatched v4/null reason. Verified CLI/API/browser event
+order, truthful unavailable labels, cookie/session/URL/storage/full-origin privacy,
+canaries, and query-only SQLite/pointer/XTF bytes, mtime, and modes pass. Root
+visually accepted all ten candidate desktop1280x720/mobile390x844 screenshots;
+postmerge repeats the real journey with identical shipped assets.
+
+Local evidence: SSD `.cache/xtrace/orchestrator/phases/browser-a1d89cd`,
+`browser-preparation`, `browser-main-5c848dd`, and `browser-reviews`.
+The Oct 3 projectless continuation outputs contain sanitized screenshots,
+independent/root reviews, command/result JSON, status report, and resume prompt.
+
+Bounded Slice 1E.3 observed endpoint catalog/product journey is complete for the
+exact finite operator-selected policy. Whole Slice 1 and the product remain
+incomplete. This is not general endpoint discovery or adapter/application
+attestation; source/line/value/duration/completion/replay expansion is absent.
+The fixture has one endpoint and fewer than a page of linked rows: backend
+continuations and UI state/unit pagination pass, but actual Chromium does not
+click every new list's next-page control. Local Java17 and CI Java17/21 evidence
+remain distinct. No schema, capture, XTP, HTTP, or shared query contract changed.
+
+Next session: reconcile current source against remaining approved Slice 1 exit
+criteria, then propose the smallest bounded source/active-line/provenance evidence
+increment. Preserve the verified endpoint/query/browser seam and accepted ADRs.
+Source mapping, launch support, replay controls, values/outcomes, and
+completion/partial-state semantics still need their own reviewed real evidence.
+Resolve material architecture/product choices before implementation; routine
+reviewed continuation remains authorized. This long chat ends at a clean handoff,
+with no background implementation or scheduled continuation left running.
+
+| Slice | Goal | Files changed | Verification | Result | Next slice |
+|---|---|---|---|---|---|
+| Slice 1E.3D | Endpoint-first observed catalog -> genuine linked recording -> verified detail; separate historical unmatched path | Browser source/tests/CSS, actual Chromium script, Spring integration plumbing, embedded JS/CSS/manifest | Pinned Sol architecture/security/build approvals; root complete diff/ten screenshot review; exact feature/postmerge gates; 215 focused/453 workspace, 12 web/11 Node; CI `37139481240` / `37139761333` all four jobs | Reviewed, merged, pushed, CI-green; bounded Slice 1E.3 exact-fixture journey accepted; broader Slice 1 incomplete | Reconcile remaining Slice 1 criteria and plan smallest source/active-line evidence increment |
