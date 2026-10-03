@@ -30,6 +30,15 @@ stop for any new material architecture/product decision. Do not use PIO,
 OpenCode, MiniMax, Kimi, or GLM. No failing candidate is accepted by this
 workflow authorization; all required gates still apply.
 
+Continuation checkpoint (2026-10-03): the user explicitly resumed work after
+the Oct 1 SSD-removal pause and requested a next-session prompt if this chat
+became too long. The approved autonomous scope and Luna High implementation /
+Sol High review assignment remain in force. HTTP is now reviewed, merged,
+pushed, and verified as recorded below; next is the endpoint-first browser.
+This chat ends at that clean handoff because it is long. No background
+implementation or scheduled continuation is running. The historical pause
+section below is superseded by this completion checkpoint.
+
 ## Historical B2 stop checkpoint (superseded by accepted ADR 0002)
 
 The initial CLI draft `2e41a3c224e9abe95696af43e67a890a46cf52fe` and
@@ -182,3 +191,77 @@ Resume only after the user requests continuation with the SSD mounted. Start
 from this checkpoint and current Git/process truth, finish and amend this same
 bounded feature, then review and verify before publishing/merging. Preserve B2
 and the accepted ADR 0002; do not recreate or re-key completed work.
+
+## Slice 1E.3C reviewed and merged (2026-10-03)
+
+Source feature `4009b61b60fc2b6658f2037f276953e4d81e3141`; no-ff merge
+`9b530b097763c148a0c158b10b62396f9fb0aa34`. Feature CI `37123864124`
+and main CI `37124174180` passed all four jobs (aggregate gates, Node,
+Java 17, Java 21). The Oct 1 WIP `9667649` is historical preservation only;
+it was completed and amended before review, gates, publication, and merge.
+Luna High implemented. Sol High independently approved the complete pinned
+architecture and security/privacy diff, then separately audited local build/
+integration evidence. The orchestrator inspected every actual changed line,
+ran all exact gates, and alone pushed and merged.
+
+Three observed query modes now compose `ObservedEndpointQueryService` through
+the existing read-only reader and two-permit `QueryLane`:
+
+- `GET /api/v1/endpoints?limit&cursor` (default 50, maximum 100).
+- `GET /api/v1/endpoints/{operationId}/recordings?limit&cursor` (25/50).
+- `GET /api/v1/recordings?unmatched=true&limit&cursor` (25/50).
+
+They return the shared lowerCamelCase `{items,nextCursor}` DTOs. Existing
+recording-list response/after behavior remains available when unmatched is
+absent. Strict mode parsing, canonical operation paths (including invalid-UTF8
+path rejection), and bounded cursor transport fail safely without echoing
+input. Authentication precedes queries. Unknown and cross-project operations
+have indistinguishable safe 404 responses. Corruption is 422; observed SQLite
+busy or shared-lane saturation is 503; legacy resource classification remains
+unchanged. Existing Host/Origin/Fetch Metadata/client marker/session/bootstrap,
+response headers, connection/time/header limits, and shutdown bounds remain.
+OpenAPI and generated TypeScript match direct pages, required nullable fields,
+conditional recording modes, limits, and request-ID headers.
+
+All eight exact gates passed on the final feature and merged main: formatting,
+strict locked workspace/all-target/all-feature Clippy, strict locked all-feature
+rustdoc, focused application/store/CLI tests (215 passed), full locked all-feature
+workspace tests (453 passed including doctest), fresh restricted-PATH locked
+workspace build with no system protoc, and worktree/committed diff checks.
+Zero failures or ignored tests. Strict Java clean/test/installDist/agentDist/
+fixtureBootJar passed on feature preparation and again on merged main (35 tasks
+executed). Web typecheck, six unit tests, 7.32:1 contrast, generated API drift,
+embedded assets, Node generation and 11 tests passed in feature preparation;
+those component sources did not change in the final test-only amendment.
+
+The real packaged Spring test pages two genuine persisted linked captures with
+HTTP limit 1 and compares CLI/API DTOs before synthetic supplements. It proves
+cross-project 404 parity and cursor rejection, stops viewers, then restarts
+and runs actual Chromium assertions for tied v4/v7 linked/unmatched and legacy
+sidecar-absent v4 rows, no duplicates, privacy/session/storage/URL constraints,
+unchanged verified detail order, and query-only SQLite/pointer/XTF checks.
+Authenticated actual SQLite identity corruption returns safe HTTP 422. Holding
+both shared-lane permits produces HTTP 503 with zero port calls; releasing them
+restores HTTP 200. Supplemental fixtures test ordering/compatibility and do not
+replace genuine capture evidence. Interrupted browser-script scope errors were
+fixed and all acceptance assertions now execute.
+
+Boundary: UI remains recording-first. The finite operator-selected policy
+permits one endpoint/project, without adapter/application attestation or general
+endpoint discovery. HTTP completes this bounded API phase, not Slice 1E.3's
+endpoint-first product journey or broader Slice 1. No migration, capture/XTP,
+source/line/value, duration, completion, static inference, or replay expansion.
+
+Next bounded phase: Slice 1E.3D endpoint-first browser. Use the stable shared
+HTTP seam to show observed endpoint -> linked genuine recording -> existing
+verified detail, plus a separate unmatched-recordings path. Label policy as
+operator-selected and explicitly non-attesting. Preserve independently bounded
+pages/cursors, stale-response protection, keyboard/mobile behavior, and privacy.
+Rebuild/embed the shipped assets, prove the exact Spring restart browser journey,
+and visually inspect desktop/mobile evidence before acceptance. Follow the
+same Luna implementation, independent Sol architecture/security/build reviews,
+exact gates, feature CI, no-ff merge, postmerge gates/CI, and progress workflow.
+
+| Slice | Goal | Files changed | Verification | Result | Next slice |
+|---|---|---|---|---|---|
+| Slice 1E.3C | Bounded authenticated observed endpoint/linked/unmatched HTTP through the shared service | CLI reader/viewer composition, daemon HTTP/tests/dev dependency, Spring/Chromium acceptance, OpenAPI/generated TypeScript, lock and progress | Pinned Sol architecture/security/build approval; exact feature/postmerge eight gates; 215 focused / 453 workspace tests; CI `37123864124` / `37124174180` all four jobs green | Reviewed, merged, pushed, CI-green; UI remains recording-first | Slice 1E.3D endpoint-first browser and real visual journey |
