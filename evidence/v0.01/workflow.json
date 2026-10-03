@@ -123,13 +123,28 @@
       "acceptanceRequired": true
     },
     {
-      "id": "P08",
-      "outcome": "Six pinned upstream packaged application campaigns",
+      "id": "P07B",
+      "outcome": "Build deterministic complete local release-candidate packages before packaged external-app campaigns",
       "dependencies": [
         "P04",
         "P05",
         "P06",
         "P07"
+      ],
+      "implementationOwner": "Luna High packaging lane",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P08",
+      "outcome": "Six pinned upstream packaged application campaigns",
+      "dependencies": [
+        "P07B"
       ],
       "implementationOwner": "Luna High campaign lanes",
       "state": "pending",
