@@ -18,7 +18,6 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
-import java.util.jar.Attributes;
 import java.util.jar.JarFile;
 import java.util.jar.Manifest;
 
@@ -44,7 +43,7 @@ final class AgentArtifact {
       try (JarFile jar = new JarFile(canonical.toFile(), false)) {
         Manifest manifest = jar.getManifest();
         if (manifest == null) throw invalid("the selected JAR has no agent manifest");
-        String agentClass = manifest.getMainAttributes().getValue(Attributes.Name.AGENT_CLASS);
+        String agentClass = manifest.getMainAttributes().getValue("Agent-Class");
         if (agentClass == null || agentClass.isBlank()) {
           throw invalid("the selected JAR does not declare an Agent-Class");
         }
