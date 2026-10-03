@@ -10,6 +10,7 @@ const DIST_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 /** Starts authenticated transport before an ESM application's entry module executes. */
 export async function startCapture(): Promise<void> {
   const bootstrapPath = process.env.XTRACE_BOOTSTRAP_PATH;
+  restoreLauncherEnvironment();
   if (!bootstrapPath) {
     warnUnavailable("XTR-NODE-BOOTSTRAP");
     return;
@@ -17,6 +18,7 @@ export async function startCapture(): Promise<void> {
   let worker: Worker;
   try {
     worker = new Worker(join(DIST_DIRECTORY, "transport-worker.js"), {
+      execArgv: [],
       workerData: { bootstrapPath, startupBarrier: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT), manifestPath: join(DIST_DIRECTORY, "node-http-manifest.json") },
     });
   } catch {
@@ -37,13 +39,22 @@ export async function startCapture(): Promise<void> {
     warnUnavailable("XTR-NODE-STARTUP");
     return;
   }
-  worker.unref();
   try {
     installHttpCapture(createHttpCaptureTransport(worker));
+    worker.unref();
   } catch {
     void worker.terminate();
     warnUnavailable("XTR-NODE-STARTUP");
   }
+}
+
+function restoreLauncherEnvironment(): void {
+  const original = process.env.XTRACE_NODE_ORIGINAL_OPTIONS;
+  if (process.env.XTRACE_NODE_OPTIONS_WAS_SET === "1") process.env.NODE_OPTIONS = original ?? "";
+  else delete process.env.NODE_OPTIONS;
+  delete process.env.XTRACE_BOOTSTRAP_PATH;
+  delete process.env.XTRACE_NODE_ORIGINAL_OPTIONS;
+  delete process.env.XTRACE_NODE_OPTIONS_WAS_SET;
 }
 
 function warnUnavailable(code: string): void {

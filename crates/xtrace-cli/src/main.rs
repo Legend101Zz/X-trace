@@ -120,6 +120,7 @@ fn sanitized_parse_error(error: clap::Error) -> CliError {
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "CLI parser tests use fixed arguments")]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn daemon_command_accepts_project_path_with_spaces() {
@@ -158,6 +159,63 @@ mod tests {
                 "--java-agent",
                 "/tmp/agent.jar",
                 "--",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn run_command_requires_explicit_node_mode_and_preserves_node_arguments() {
+        let cli = Cli::try_parse_from([
+            "xtrace",
+            "run",
+            "--project-dir",
+            "/tmp/project",
+            "--node-adapter",
+            "/tmp/adapter dist",
+            "--node-mode",
+            "esm",
+            "--",
+            "node",
+            "--no-warnings",
+            "app with spaces.mjs",
+            "--flag",
+            "value with spaces",
+        ])
+        .expect("Node run parses");
+        assert!(matches!(cli.command, commands::XtraceCommand::Run {
+            node_adapter: Some(adapter), node_mode: Some(mode), command, java_agent: None, ..
+        } if adapter == PathBuf::from("/tmp/adapter dist") && mode == "esm"
+            && command == ["node", "--no-warnings", "app with spaces.mjs", "--flag", "value with spaces"]));
+        assert!(
+            Cli::try_parse_from([
+                "xtrace",
+                "run",
+                "--project-dir",
+                "/tmp/project",
+                "--node-adapter",
+                "/tmp/dist",
+                "--",
+                "node",
+                "app.cjs"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "xtrace",
+                "run",
+                "--project-dir",
+                "/tmp/project",
+                "--java-agent",
+                "/tmp/a.jar",
+                "--node-adapter",
+                "/tmp/dist",
+                "--node-mode",
+                "cjs",
+                "--",
+                "node",
+                "app.cjs"
             ])
             .is_err()
         );
