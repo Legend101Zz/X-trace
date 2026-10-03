@@ -15,6 +15,7 @@ import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -52,6 +53,20 @@ class AttachCommandsTest {
     assertFalse(json.contains(SECRET_CANARY));
     assertFalse(json.contains("commandLine"));
     assertFalse(json.contains("environment"));
+  }
+
+  @Test
+  void acceptanceFailureSanitizerRemovesPathsAndCanaries() {
+    String canary = "ATTACH_BODY_CANARY_2A7";
+    String root = temporaryDirectory.toAbsolutePath().toString();
+    String source = "request " + canary + " in " + root + " bootstrap_path=/private/options.json";
+
+    String safe = JavaAttachAcceptanceTest.sanitize(source, Path.of(root));
+
+    assertFalse(safe.contains(canary));
+    assertFalse(safe.contains(root));
+    assertFalse(safe.contains("/private/options.json"));
+    assertTrue(safe.contains("[redacted sensitive log line]"));
   }
 
   @Test
@@ -128,6 +143,132 @@ class AttachCommandsTest {
         assertThrows(AttachCommands.Failure.class, () -> AgentArtifact.validate(agent));
     assertTrue(failure.getMessage().contains("digest does not match"));
     assertFalse(failure.getMessage().contains(distribution.toString()));
+  }
+
+  @Test
+  void compressedOversizedJarManifestIsRejectedBeforeParsing() throws Exception {
+    assumePosix();
+    Path distribution = Files.createDirectory(temporaryDirectory.resolve("oversized-agent"));
+    Path agent = distribution.resolve("xtrace-java-agent.jar");
+    try (JarOutputStream output = new JarOutputStream(Files.newOutputStream(agent))) {
+      output.putNextEntry(new java.util.jar.JarEntry("META-INF/MANIFEST.MF"));
+      output.write(("Manifest-Version: 1.0\nAgent-Class: "
+              + "dev.xtrace.agent.bootstrap.XTraceAgent\nX-Pad: "
+              + "A".repeat(96 * 1024)
+              + "\n\n")
+          .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      output.closeEntry();
+    }
+    Files.setPosixFilePermissions(agent, PosixFilePermissions.fromString("rw-r--r--"));
+
+    AttachCommands.Failure failure =
+        assertThrows(AttachCommands.Failure.class, () -> AgentArtifact.validate(agent));
+
+    assertEquals("XTR-ATTACH-AGENT-INVALID", failure.code());
+    assertTrue(failure.getMessage().contains("manifest exceeds its size limit"));
+    assertFalse(failure.getMessage().contains(distribution.toString()));
+  }
+
+  @Test
+  void verifiedDistributionSnapshotSurvivesSelectedArtifactReplacement() throws Exception {
+    assumePosix();
+    Path distribution = Files.createDirectory(temporaryDirectory.resolve("snapshot-source"));
+    Path runtime = Files.createDirectory(distribution.resolve("runtime"));
+    Path agent = distribution.resolve("xtrace-java-agent.jar");
+    Path runtimeJar = runtime.resolve("agent-runtime.jar");
+    writeAgentJar(agent, "original-agent-payload");
+    Files.write(runtimeJar, "runtime-payload".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    Files.setPosixFilePermissions(runtimeJar, PosixFilePermissions.fromString("rw-r--r--"));
+    writeDistributionManifest(distribution, agent, runtimeJar);
+    Files.setPosixFilePermissions(distribution, PosixFilePermissions.fromString("rwxr-xr-x"));
+    Files.setPosixFilePermissions(runtime, PosixFilePermissions.fromString("rwxr-xr-x"));
+
+    ProcessIdentity target = ProcessIdentity.read(ProcessHandle.current().pid(), "attach");
+    AgentSnapshot snapshot = AgentArtifact.snapshot(agent, target.pid(), target.startTime());
+    byte[] expectedAgent = Files.readAllBytes(snapshot.agentJar());
+    try {
+      writeAgentJar(agent, "replacement-agent-payload");
+
+      assertTrue(java.util.Arrays.equals(expectedAgent, Files.readAllBytes(snapshot.agentJar())));
+      assertTrue(Files.isRegularFile(snapshot.root().resolve("distribution/runtime/agent-runtime.jar")));
+      assertEquals(
+          0,
+          (int) Files.getAttribute(snapshot.root(), "unix:mode") & 0077,
+          "snapshot root permissions must exclude group and other users");
+    } finally {
+      java.util.Arrays.fill(expectedAgent, (byte) 0);
+      AgentSnapshot.deleteOwnedSnapshot(snapshot.root(), target.pid(), target.startTime());
+    }
+  }
+
+  private static void writeAgentJar(Path path, String payload) throws Exception {
+    Manifest manifest = new Manifest();
+    manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
+    manifest.getMainAttributes().putValue(
+        "Agent-Class", "dev.xtrace.agent.bootstrap.XTraceAgent");
+    try (JarOutputStream output = new JarOutputStream(Files.newOutputStream(path), manifest)) {
+      output.putNextEntry(new java.util.jar.JarEntry("payload.txt"));
+      output.write(payload.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      output.closeEntry();
+    }
+    Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rw-r--r--"));
+  }
+
+  private static void writeDistributionManifest(Path root, Path agent, Path runtime)
+      throws Exception {
+    String agentHash = java.util.HexFormat.of().formatHex(
+        java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(agent)));
+    String runtimeHash = java.util.HexFormat.of().formatHex(
+        java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(runtime)));
+    Path manifest = root.resolve("manifest.sha256");
+    Files.writeString(
+        manifest,
+        agentHash + "  xtrace-java-agent.jar\n"
+            + runtimeHash + "  runtime/agent-runtime.jar\n");
+    Files.setPosixFilePermissions(manifest, PosixFilePermissions.fromString("rw-r--r--"));
+  }
+
+  @Test
+  void helperSupervisorKillsOnlyItsTimedOutWorkerAndReportsUncertainty() throws Exception {
+    String classPath = Path.of(
+            SupervisorTestProgram.class.getProtectionDomain().getCodeSource().getLocation().toURI())
+        + java.io.File.pathSeparator
+        + Path.of(Main.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+    Process target = new ProcessBuilder(
+        Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+        "-cp",
+        classPath,
+        SupervisorTestProgram.class.getName(),
+        "target")
+        .redirectError(ProcessBuilder.Redirect.DISCARD)
+        .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+        .start();
+    try {
+      ProcessIdentity identity = ProcessIdentity.read(target.pid(), "attach");
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (target.isAlive() && System.nanoTime() < deadline) Thread.sleep(10);
+      assertTrue(target.isAlive());
+
+      HelperSupervisor.TimeoutException timedOut =
+          assertThrows(
+              HelperSupervisor.TimeoutException.class,
+              () ->
+                  HelperSupervisor.runWorker(
+                      SupervisorTestProgram.class.getName(),
+                      new String[] {"hang"},
+                      java.time.Duration.ofMillis(400),
+                      classPath));
+
+      assertTrue(target.isAlive(), "timeout must not kill or signal the target JVM");
+      assertFalse(ProcessHandle.of(timedOut.workerPid()).map(ProcessHandle::isAlive).orElse(false));
+      String result = HelperSupervisor.timeout("attach", target.pid(), identity).json();
+      assertTrue(result.contains("XTR-ATTACH-TIMEOUT"));
+      assertTrue(result.contains("unknown_after_timeout"));
+      assertTrue(result.contains("\"targetIdentityStatus\":\"same\""));
+    } finally {
+      target.destroyForcibly();
+      target.waitFor(5, TimeUnit.SECONDS);
+    }
   }
 
   @Test

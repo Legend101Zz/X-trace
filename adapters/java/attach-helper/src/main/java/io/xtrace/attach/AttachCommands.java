@@ -27,7 +27,8 @@ final class AttachCommands {
           failure.code,
           failure.exitCode,
           failure.getMessage(),
-          failure.remediation);
+          failure.remediation,
+          failure.data);
     } catch (SecurityException error) {
       return Result.failure(
           commandName(arguments),
@@ -124,24 +125,45 @@ final class AttachCommands {
   private static Result attach(String[] arguments) throws IOException, Failure {
     Map<String, String> options = parseOptions(arguments, 1, SetOf.ATTACH);
     long pid = parsePid(options.get("--pid"), "attach");
-    Path agent = AgentArtifact.validate(Path.of(options.get("--agent")));
     Path bootstrap = PrivateBootstrap.validate(Path.of(options.get("--options-file")));
     ProcessIdentity before = ProcessIdentity.read(pid, "attach");
     before.requireCurrentOwner("attach");
     VirtualMachineDescriptor descriptor = findDescriptor(pid);
     if (descriptor == null) throw unavailableTarget(before, "attach");
+    AgentSnapshot snapshot = AgentArtifact.snapshot(
+        Path.of(options.get("--agent")), pid, before.startTime());
 
     Properties properties;
+    boolean loadAttempted = false;
     try (AttachedVm attached = AttachedVm.connect(descriptor)) {
       properties = attached.machine().getSystemProperties();
       // Keep this identity check adjacent to loadAgent: PIDs can be reused while artifacts are
       // validated or while the Attach handshake runs.
-      before.requireUnchanged(ProcessIdentity.read(pid, "attach"), "attach");
-      attached.machine().loadAgent(agent.toString(), bootstrap.toString());
-    } catch (AttachNotSupportedException | AgentLoadException | AgentInitializationException error) {
+      try {
+        before.requireUnchanged(ProcessIdentity.read(pid, "attach"), "attach");
+      } catch (Failure changed) {
+        AgentSnapshot.deleteOwnedSnapshot(snapshot.root(), pid, before.startTime());
+        throw changed;
+      }
+      loadAttempted = true;
+      attached.machine().loadAgent(snapshot.agentJar().toString(), snapshot.agentOptions(bootstrap));
+    } catch (AttachNotSupportedException | AgentLoadException error) {
+      AgentSnapshot.deleteOwnedSnapshot(snapshot.root(), pid, before.startTime());
       throw mapAttachFailure("attach", error);
+    } catch (AgentInitializationException error) {
+      throw mapAttachFailure("attach", error);
+    } catch (IOException | RuntimeException error) {
+      if (loadAttempted) {
+        throw uncertainAttach("the helper lost a reliable result after requesting agent loading");
+      }
+      if (error instanceof IOException io) throw io;
+      throw error;
     }
-    before.requireUnchanged(ProcessIdentity.read(pid, "attach"), "attach");
+    try {
+      before.requireUnchanged(ProcessIdentity.read(pid, "attach"), "attach");
+    } catch (Failure changed) {
+      throw uncertainAttach("the target identity changed after agent loading was requested");
+    }
     return Result.success(
         "attach",
         Map.of(
@@ -233,6 +255,15 @@ final class AttachCommands {
           "The target JVM does not expose a usable Attach provider.",
           "Run the helper beside the target JVM in the same user and process namespace, or relaunch through X-trace.");
     }
+    if (error instanceof AgentInitializationException) {
+      return new Failure(
+          command,
+          "XTR-ATTACH-AGENT-REJECTED",
+          7,
+          "The target JVM rejected agent initialization; an X-trace session may already be active.",
+          "Inspect the target's existing X-trace recording. To select another project, relaunch the JVM through X-trace.",
+          Map.of("targetAgentState", "unknown_after_agent_rejection"));
+    }
     return new Failure(
         command,
         "XTR-ATTACH-FAILED",
@@ -248,6 +279,16 @@ final class AttachCommands {
         2,
         message,
         "Use `xtrace-attach list --json`, `inspect --pid <pid> --json`, or `attach --pid <pid> --agent <jar> --options-file <path> --json`.");
+  }
+
+  private static Failure uncertainAttach(String message) {
+    return new Failure(
+        "attach",
+        "XTR-ATTACH-RESULT-UNCERTAIN",
+        7,
+        message,
+        "Inspect the target before retrying; if its attach state is uncertain, relaunch through X-trace.",
+        Map.of("targetAgentState", "unknown_after_load_attempt"));
   }
 
   private static String commandName(String[] arguments) {
@@ -327,7 +368,17 @@ final class AttachCommands {
 
     static Result failure(
         String command, String code, int exitCode, String message, String remediation) {
-      return new Result(command, false, code, exitCode, message, remediation, Map.of());
+      return failure(command, code, exitCode, message, remediation, Map.of());
+    }
+
+    static Result failure(
+        String command,
+        String code,
+        int exitCode,
+        String message,
+        String remediation,
+        Map<String, Object> data) {
+      return new Result(command, false, code, exitCode, message, remediation, data);
     }
 
     int exitCode() {
@@ -352,13 +403,29 @@ final class AttachCommands {
     private final String code;
     private final int exitCode;
     private final String remediation;
+    private final Map<String, Object> data;
 
     Failure(String command, String code, int exitCode, String message, String remediation) {
+      this(command, code, exitCode, message, remediation, Map.of());
+    }
+
+    Failure(
+        String command,
+        String code,
+        int exitCode,
+        String message,
+        String remediation,
+        Map<String, Object> data) {
       super(message);
       this.command = command;
       this.code = code;
       this.exitCode = exitCode;
       this.remediation = remediation;
+      this.data = data;
+    }
+
+    String code() {
+      return code;
     }
   }
 }

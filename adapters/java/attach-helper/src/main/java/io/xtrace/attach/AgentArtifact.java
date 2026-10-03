@@ -23,14 +23,27 @@ import java.util.jar.Manifest;
 
 /** Validates the explicitly selected regular agent JAR without echoing its path. */
 final class AgentArtifact {
-  private static final long MAX_AGENT_BYTES = 128L * 1024 * 1024;
+  static final long MAX_AGENT_BYTES = 32L * 1024 * 1024;
+  private static final long MAX_DISTRIBUTION_BYTES = 256L * 1024 * 1024;
   private static final int MAX_MANIFEST_BYTES = 1024 * 1024;
+  private static final int MAX_JAR_MANIFEST_BYTES = 64 * 1024;
   private static final int MAX_RUNTIME_JARS = 128;
+  private static final int MAX_ARCHIVE_ENTRIES = 8192;
   private static final String XTRACE_AGENT = "dev.xtrace.agent.bootstrap.XTraceAgent";
 
   private AgentArtifact() {}
 
   static Path validate(Path input) throws AttachCommands.Failure {
+    return inspectDistribution(input).agent();
+  }
+
+  static AgentSnapshot snapshot(Path input, long pid, java.time.Instant startTime)
+      throws AttachCommands.Failure {
+    return AgentSnapshot.create(inspectDistribution(input), pid, startTime);
+  }
+
+  private static VerifiedDistribution inspectDistribution(Path input)
+      throws AttachCommands.Failure {
     if (input == null || !input.isAbsolute()) {
       throw invalid("the selected agent must use an absolute path");
     }
@@ -41,7 +54,7 @@ final class AgentArtifact {
       Path canonical = input.toRealPath();
       selectedIdentity.requireSame(FileIdentity.file(canonical, MAX_AGENT_BYTES, currentOwner));
       try (JarFile jar = new JarFile(canonical.toFile(), false)) {
-        Manifest manifest = jar.getManifest();
+        Manifest manifest = readJarManifest(jar);
         if (manifest == null) throw invalid("the selected JAR has no agent manifest");
         String agentClass = manifest.getMainAttributes().getValue("Agent-Class");
         if (agentClass == null || agentClass.isBlank()) {
@@ -50,9 +63,10 @@ final class AgentArtifact {
         if (!XTRACE_AGENT.equals(agentClass)) {
           throw invalid("the selected JAR is not the supported X-trace agent");
         }
-        validateXtraceDistribution(canonical, selectedIdentity);
+        VerifiedDistribution verified =
+            validateXtraceDistribution(canonical, selectedIdentity);
+        return verified;
       }
-      return canonical;
     } catch (AttachCommands.Failure failure) {
       throw failure;
     } catch (IOException | RuntimeException error) {
@@ -60,7 +74,38 @@ final class AgentArtifact {
     }
   }
 
-  private static void validateXtraceDistribution(Path agent, FileIdentity agentBefore)
+  private static Manifest readJarManifest(JarFile jar)
+      throws IOException, AttachCommands.Failure {
+    var entry = jar.getJarEntry(JarFile.MANIFEST_NAME);
+    if (entry == null || entry.isDirectory()) {
+      throw invalid("the selected JAR has no agent manifest");
+    }
+    if (entry.getSize() > MAX_JAR_MANIFEST_BYTES) {
+      throw invalid("the selected JAR manifest exceeds its size limit");
+    }
+    ByteBuffer buffer = ByteBuffer.allocate(MAX_JAR_MANIFEST_BYTES + 1);
+    try (var input = jar.getInputStream(entry)) {
+      byte[] chunk = new byte[4096];
+      int count;
+      while ((count = input.read(chunk)) != -1) {
+        if (count > MAX_JAR_MANIFEST_BYTES - buffer.position()) {
+          throw invalid("the selected JAR manifest exceeds its size limit");
+        }
+        buffer.put(chunk, 0, count);
+      }
+      byte[] bytes = Arrays.copyOf(buffer.array(), buffer.position());
+      try {
+        return new Manifest(new java.io.ByteArrayInputStream(bytes));
+      } finally {
+        Arrays.fill(bytes, (byte) 0);
+      }
+    } finally {
+      Arrays.fill(buffer.array(), (byte) 0);
+    }
+  }
+
+  private static VerifiedDistribution validateXtraceDistribution(
+      Path agent, FileIdentity agentBefore)
       throws IOException, AttachCommands.Failure {
     Path root = agent.getParent();
     if (root == null || !"xtrace-java-agent.jar".equals(agent.getFileName().toString())) {
@@ -84,6 +129,7 @@ final class AgentArtifact {
         if (!expected.contains(name)) throw invalid("the X-trace distribution has unexpected files");
       }
     }
+    long totalBytes = agentBefore.size();
     try (DirectoryStream<Path> entries = Files.newDirectoryStream(runtime)) {
       int count = 0;
       for (Path entry : entries) {
@@ -92,7 +138,11 @@ final class AgentArtifact {
         if (!name.matches("[A-Za-z0-9_.+-]{1,128}\\.jar")) {
           throw invalid("the X-trace runtime contains an unexpected file");
         }
-        FileIdentity.file(entry, MAX_AGENT_BYTES, currentOwner);
+        FileIdentity runtimeFile = FileIdentity.file(entry, MAX_AGENT_BYTES, currentOwner);
+        totalBytes += runtimeFile.size();
+        if (totalBytes > MAX_DISTRIBUTION_BYTES) {
+          throw invalid("the X-trace runtime distribution exceeds its total size limit");
+        }
         artifacts.put("runtime/" + name, entry);
       }
     }
@@ -125,6 +175,7 @@ final class AgentArtifact {
       throw invalid("the X-trace distribution manifest membership does not match");
     }
     Map<Path, FileIdentity> before = new LinkedHashMap<>();
+    Map<String, String> digests = new LinkedHashMap<>();
     for (Map.Entry<String, Path> artifact : artifacts.entrySet()) {
       FileIdentity identity = FileIdentity.file(artifact.getValue(), MAX_AGENT_BYTES, currentOwner);
       before.put(artifact.getValue(), identity);
@@ -132,9 +183,20 @@ final class AgentArtifact {
       if (!digest.equals(declared.get(artifact.getKey()))) {
         throw invalid("the X-trace distribution digest does not match");
       }
+      digests.put(artifact.getKey(), digest);
     }
     for (Map.Entry<Path, FileIdentity> entry : before.entrySet()) {
       entry.getValue().requireSame(FileIdentity.file(entry.getKey(), MAX_AGENT_BYTES, currentOwner));
+    }
+    try (JarFile jar = new JarFile(agent.toFile(), false)) {
+      int entries = 0;
+      var enumeration = jar.entries();
+      while (enumeration.hasMoreElements()) {
+        enumeration.nextElement();
+        if (++entries > MAX_ARCHIVE_ENTRIES) {
+          throw invalid("the selected agent archive has too many entries");
+        }
+      }
     }
     agentBefore.requireSame(FileIdentity.file(agent, MAX_AGENT_BYTES, currentOwner));
     manifestBefore.requireSame(FileIdentity.file(manifest, MAX_MANIFEST_BYTES, currentOwner));
@@ -148,7 +210,17 @@ final class AgentArtifact {
     } finally {
       Arrays.fill(manifestAfter, (byte) 0);
     }
+    return new VerifiedDistribution(
+        agent, manifest, artifacts, digests, currentOwner, manifestText);
   }
+
+  record VerifiedDistribution(
+      Path agent,
+      Path manifest,
+      Map<String, Path> artifacts,
+      Map<String, String> digests,
+      String owner,
+      String manifestContents) {}
 
   private static byte[] readBounded(Path path, FileIdentity identity, int maximum)
       throws IOException, AttachCommands.Failure {

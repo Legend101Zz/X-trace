@@ -49,6 +49,7 @@ tasks.register<Test>("acceptanceTest") {
         "xtrace.fixture",
         "xtrace.helper",
         "xtrace.workspace",
+        "xtrace.attach.evidence.dir",
     ).forEach { property ->
         System.getProperty(property)?.let { systemProperty(property, it) }
     }

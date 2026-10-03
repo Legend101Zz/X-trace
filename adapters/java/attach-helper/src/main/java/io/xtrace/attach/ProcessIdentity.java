@@ -109,6 +109,18 @@ final class ProcessIdentity {
     return executableName != null;
   }
 
+  Instant startTime() {
+    return startTime;
+  }
+
+  long pid() {
+    return pid;
+  }
+
+  String owner() {
+    return owner;
+  }
+
   Map<String, Object> toJson(Properties properties, boolean attachApiProbed, String providerType) {
     Map<String, Object> values = new LinkedHashMap<>();
     values.put("pid", pid);

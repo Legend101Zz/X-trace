@@ -13,11 +13,14 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.nio.file.attribute.PosixFileAttributeView;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.UUID;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
@@ -41,17 +44,27 @@ class JavaAttachAcceptanceTest {
     Path fixture = requiredPath("xtrace.fixture");
     Path helper = requiredPath("xtrace.helper");
     Path workspace = requiredPath("xtrace.workspace");
+    Path evidenceDirectory = requiredPath("xtrace.attach.evidence.dir");
 
     Path root = Files.createTempDirectory("xtrace-java-attach-");
+    setPrivateDirectory(root);
     Path repository = Files.createDirectory(root.resolve("repository"));
     Path dataHome = Files.createDirectory(root.resolve("data"));
+    Path secondRepository = Files.createDirectory(root.resolve("second-repository"));
+    Path secondDataHome = Files.createDirectory(root.resolve("second-data"));
     Path logs = Files.createDirectory(root.resolve("logs"));
     Process daemon = null;
+    Process secondDaemon = null;
     Process fixtureProcess = null;
+    String[] stage = {"initialize"};
+    Throwable[] failure = {null};
     try {
       runCli(cli, List.of("init", "--project-dir", repository.toString()), dataHome, root);
+      runCli(cli, List.of("init", "--project-dir", secondRepository.toString()), secondDataHome, root);
       copyAllowedApplicationSources(workspace, repository);
+      copyAllowedApplicationSources(workspace, secondRepository);
 
+      stage[0] = "start-first-daemon";
       Path daemonOutput = logs.resolve("daemon.out");
       daemon = startDaemon(cli, repository, dataHome, daemonOutput, logs.resolve("daemon.err"));
       String ready = waitForFirstLine(daemonOutput, daemon, Duration.ofSeconds(15));
@@ -59,12 +72,21 @@ class JavaAttachAcceptanceTest {
       assertFalse(bootstrapValue.isBlank());
       Path bootstrap = Path.of(bootstrapValue);
 
+      stage[0] = "start-second-daemon";
+      Path secondDaemonOutput = logs.resolve("second-daemon.out");
+      secondDaemon = startDaemon(
+          cli, secondRepository, secondDataHome, secondDaemonOutput, logs.resolve("second-daemon.err"));
+      String secondReady = waitForFirstLine(secondDaemonOutput, secondDaemon, Duration.ofSeconds(15));
+      Path secondBootstrap = Path.of(stringField(secondReady, "bootstrap_path"));
+
       int port = freePort();
+      stage[0] = "start-spring-fixture";
       fixtureProcess =
           new ProcessBuilder(
                   targetJava.toString(),
                   "-jar",
                   fixture.toString(),
+                  "--server.address=127.0.0.1",
                   "--server.port=" + port,
                   "--spring.main.banner-mode=off")
               .redirectOutput(logs.resolve("fixture.out").toFile())
@@ -84,29 +106,49 @@ class JavaAttachAcceptanceTest {
       assertTrue(inspected.contains("\"jdkVersion\":"));
       assertFalse(inspected.contains(bootstrap.toString()));
 
+      stage[0] = "reject-malformed-bootstrap-without-poisoning-target";
+      Path malformedDirectory = Files.createDirectory(logs.resolve("bad-options"));
+      setPrivateDirectory(malformedDirectory);
+      Path malformedBootstrap = malformedDirectory.resolve("malformed.json");
+      Files.writeString(malformedBootstrap, Files.readString(bootstrap) + " trailing-junk");
+      Files.setPosixFilePermissions(malformedBootstrap, PosixFilePermissions.fromString("rw-------"));
+      HelperResult malformed = runHelperResult(
+          helperJava, helper, attachArguments(fixtureProcess.pid(), agent, malformedBootstrap), root);
+      assertTrue(malformed.exitCode() != 0);
+      assertTrue(malformed.json().contains("XTR-ATTACH"));
+      assertFalse(malformed.json().contains("trailing-junk"));
+      Files.deleteIfExists(malformedBootstrap);
+
+      stage[0] = "attach-first-session";
       String attached =
           runHelper(
               helperJava,
               helper,
-              List.of(
-                  "attach",
-                  "--pid",
-                  Long.toString(fixtureProcess.pid()),
-                  "--agent",
-                  agent.toString(),
-                  "--options-file",
-                  bootstrap.toString(),
-                  "--json"),
+              attachArguments(fixtureProcess.pid(), agent, bootstrap),
               root);
       assertTrue(attached.contains("XTR-ATTACH-OK"));
       assertTrue(attached.contains("active_or_already_active"));
       assertFalse(attached.contains(bootstrap.toString()));
       assertFalse(attached.contains(BODY_CANARY));
 
+      stage[0] = "same-session-idempotent-attach";
+      String duplicate = runHelper(
+          helperJava, helper, attachArguments(fixtureProcess.pid(), agent, bootstrap), root);
+      assertTrue(duplicate.contains("XTR-ATTACH-OK"));
+
+      stage[0] = "reject-different-daemon-session";
+      HelperResult otherSession = runHelperResult(
+          helperJava, helper, attachArguments(fixtureProcess.pid(), agent, secondBootstrap), root);
+      assertTrue(otherSession.exitCode() != 0);
+      assertFalse(otherSession.json().contains("XTR-ATTACH-OK"));
+      assertFalse(otherSession.json().contains(secondBootstrap.toString()));
+
+      stage[0] = "exercise-spring-request";
       HttpResponse<String> response = postOrder(port);
       assertEquals(201, response.statusCode());
       assertEquals("{\"status\":\"created\"}", response.body());
 
+      stage[0] = "verify-first-session-recording";
       String recordingId = waitForRecording(cli, repository, dataHome, Duration.ofSeconds(20));
       String showing =
           runCli(
@@ -125,11 +167,33 @@ class JavaAttachAcceptanceTest {
       assertFalse(showing.contains(repository.toString()));
       assertFalse(showing.contains(BODY_CANARY));
       assertFalse(showing.contains(bootstrap.toString()));
+      String secondListings = runCli(
+          cli,
+          List.of("recording", "list", "--project-dir", secondRepository.toString(), "--limit", "50"),
+          secondDataHome,
+          root);
+      assertFalse(RECORDING_ID.matcher(secondListings).find());
+      assertFalse(secondListings.contains("OrderController.create"));
+    } catch (Exception | AssertionError error) {
+      failure[0] = error;
+      throw error;
     } finally {
       stop(fixtureProcess);
       stop(daemon);
-      deleteTree(root);
+      stop(secondDaemon);
+      if (failure[0] == null) {
+        deleteTree(root);
+      } else {
+        preserveFailureEvidence(evidenceDirectory, root, logs, stage[0], failure[0]);
+        deleteTree(root);
+      }
     }
+  }
+
+  private static List<String> attachArguments(long pid, Path agent, Path bootstrap) {
+    return List.of(
+        "attach", "--pid", Long.toString(pid), "--agent", agent.toString(),
+        "--options-file", bootstrap.toString(), "--json");
   }
 
   private static Process startDaemon(
@@ -225,6 +289,16 @@ class JavaAttachAcceptanceTest {
     return run(command, root, null);
   }
 
+  private static HelperResult runHelperResult(
+      Path helperJava, Path helper, List<String> arguments, Path root) throws Exception {
+    List<String> command = new java.util.ArrayList<>();
+    command.add(helperJava.toString());
+    command.add("-jar");
+    command.add(helper.toString());
+    command.addAll(arguments);
+    return runResult(command, root, null);
+  }
+
   private static String runCli(Path cli, List<String> arguments, Path dataHome, Path root)
       throws Exception {
     List<String> command = new java.util.ArrayList<>();
@@ -234,6 +308,15 @@ class JavaAttachAcceptanceTest {
   }
 
   private static String run(List<String> command, Path root, Path dataHome) throws Exception {
+    HelperResult result = runResult(command, root, dataHome);
+    if (result.exitCode() != 0) {
+      throw new AssertionError("a local X-trace command failed with exit code " + result.exitCode());
+    }
+    return result.json();
+  }
+
+  private static HelperResult runResult(List<String> command, Path root, Path dataHome)
+      throws Exception {
     ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
     if (dataHome != null) builder.environment().put("XTRACE_DATA_HOME", dataHome.toString());
     Path captured = root.resolve("command-output-" + java.util.UUID.randomUUID());
@@ -241,20 +324,97 @@ class JavaAttachAcceptanceTest {
     try {
       if (!process.waitFor(20, TimeUnit.SECONDS)) {
         process.destroyForcibly();
+        process.waitFor(5, TimeUnit.SECONDS);
+        storeCommandTail(captured, root);
         throw new AssertionError("a bounded local X-trace command timed out");
       }
       long size = Files.size(captured);
       if (size > 256 * 1024) {
+        storeCommandTail(captured, root);
         throw new AssertionError("a local X-trace command exceeded the output bound");
       }
       String text = Files.readString(captured, StandardCharsets.UTF_8);
       if (process.exitValue() != 0) {
-        throw new AssertionError(
-            "a local X-trace command failed with exit code " + process.exitValue());
+        Files.copy(
+            captured,
+            root.resolve("failure-command.out"),
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
       }
-      return text;
+      return new HelperResult(text, process.exitValue());
     } finally {
       Files.deleteIfExists(captured);
+    }
+  }
+
+  private static void preserveFailureEvidence(
+      Path evidenceDirectory, Path root, Path logs, String stage, Throwable failure) {
+    try {
+      Path bundle = Files.createDirectory(
+          evidenceDirectory.resolve("java-attach-failure-" + UUID.randomUUID()),
+          PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")));
+      for (String name : List.of(
+          "daemon.out", "daemon.err", "second-daemon.out", "second-daemon.err",
+          "fixture.out", "fixture.err", "failure-command.out")) {
+        Path source = name.startsWith("daemon") || name.startsWith("second-daemon") || name.startsWith("fixture")
+            ? logs.resolve(name)
+            : root.resolve(name);
+        if (Files.isRegularFile(source)) {
+          String text = readTailText(source);
+          Files.writeString(bundle.resolve(name), sanitize(text, root));
+          Files.setPosixFilePermissions(bundle.resolve(name), PosixFilePermissions.fromString("rw-------"));
+        }
+      }
+      Files.writeString(
+          bundle.resolve("receipt.json"),
+          "{\"stage\":\"" + stage + "\",\"failureType\":\""
+              + failure.getClass().getSimpleName() + "\",\"jdk\":\""
+              + System.getProperty("java.version") + "\"}\n");
+      Files.setPosixFilePermissions(bundle.resolve("receipt.json"), PosixFilePermissions.fromString("rw-------"));
+    } catch (Exception ignored) {
+      // Keep the original acceptance failure; evidence storage is best effort and private.
+    }
+  }
+
+  static String sanitize(String text, Path root) {
+    String[] lines = text.split("\\R", -1);
+    StringBuilder safe = new StringBuilder(Math.min(text.length(), 64 * 1024));
+    for (String line : lines) {
+      String lower = line.toLowerCase(java.util.Locale.ROOT);
+      if (lower.contains("secret") || lower.contains("authorization") || lower.contains("token")
+          || lower.contains("bootstrap_path")) {
+        safe.append("[redacted sensitive log line]\n");
+        continue;
+      }
+      safe.append(line.replace(root.toString(), "[private-fixture-root]")
+              .replace(BODY_CANARY, "[request-body-redacted]")
+              .replace("ATTACH_BODY_CANARY_2A7", "[request-body-redacted]")
+              .replaceAll("(?<![A-Za-z0-9])/(?:Users|Volumes)/[^\\s\\\"']+", "[private-path]"))
+          .append('\n');
+    }
+    return safe.toString();
+  }
+
+  private static void storeCommandTail(Path captured, Path root) throws IOException {
+    if (!Files.isRegularFile(captured)) return;
+    Files.writeString(root.resolve("failure-command.out"), readTailText(captured));
+  }
+
+  private static String readTailText(Path path) throws IOException {
+    try (var channel = Files.newByteChannel(
+        path, java.util.Set.of(java.nio.file.StandardOpenOption.READ, java.nio.file.LinkOption.NOFOLLOW_LINKS))) {
+      long size = channel.size();
+      int length = (int) Math.min(size, 64 * 1024);
+      channel.position(Math.max(0, size - length));
+      java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(length);
+      while (buffer.hasRemaining() && channel.read(buffer) != -1) {}
+      return StandardCharsets.UTF_8.decode(
+          java.nio.ByteBuffer.wrap(buffer.array(), 0, buffer.position())).toString();
+    }
+  }
+
+  private static void setPrivateDirectory(Path directory) throws IOException {
+    if (Files.getFileStore(directory).supportsFileAttributeView(PosixFileAttributeView.class)) {
+      Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString("rwx------"));
     }
   }
 
@@ -310,4 +470,6 @@ class JavaAttachAcceptanceTest {
       }
     }
   }
+
+  private record HelperResult(String json, int exitCode) {}
 }
