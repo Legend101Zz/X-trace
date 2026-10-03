@@ -376,8 +376,16 @@ fn validate_node_options_arguments(arguments: &[OsString]) -> Result<(), LaunchE
     while let Some(argument) = arguments.get(index) {
         let value = argument.to_string_lossy();
         if value == "--" {
-            if arguments.get(index + 1).is_none() {
+            let Some(script) = arguments.get(index + 1) else {
                 return Err(node_script_required());
+            };
+            if script.is_empty() {
+                return Err(node_script_required());
+            }
+            if script == OsStr::new("-") {
+                return Err(LaunchError::Validation(
+                    "Node stdin script entrypoints are unsupported; use a script file",
+                ));
             }
             break;
         }
@@ -424,6 +432,10 @@ fn validate_node_options_arguments(arguments: &[OsString]) -> Result<(), LaunchE
         index = index.saturating_add(1);
     }
     if index >= arguments.len() {
+        return Err(node_script_required());
+    }
+    let script_index = if arguments[index] == OsStr::new("--") { index + 1 } else { index };
+    if arguments.get(script_index).is_none_or(|script| script.is_empty()) {
         return Err(node_script_required());
     }
     Ok(())
@@ -1123,6 +1135,19 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn stdin_script_entrypoint_is_rejected_but_dash_after_script_is_an_app_argument() {
+        assert_eq!(
+            validate_node_options_arguments(&["--".into(), "-".into()]).unwrap_err().to_string(),
+            "Node stdin script entrypoints are unsupported; use a script file",
+        );
+        assert!(
+            validate_node_options_arguments(&["--".into(), "app.cjs".into(), "-".into(),]).is_ok()
+        );
+        assert!(validate_node_options_arguments(&["--".into(), "".into()]).is_err());
+        assert!(validate_node_options_arguments(&["".into()]).is_err());
     }
 
     #[test]
