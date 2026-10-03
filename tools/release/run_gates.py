@@ -24,6 +24,8 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CACHE_NAMES = ("cargo", "cargo-target", "gradle", "npm", "playwright", "tmp", "xdg")
 PS_BINARY = next((path for path in ("/bin/ps", "/usr/bin/ps") if pathlib.Path(path).is_file()), None)
+LSOF_BINARY = next((path for path in ("/usr/sbin/lsof", "/usr/bin/lsof") if pathlib.Path(path).is_file()), None)
+FAST_EXIT_GUARD_SECONDS = 0.25
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,7 @@ class UncertainProcessTree(RuntimeError):
         super().__init__(message)
         self.process_group_id = process_group_id
         self.owned_processes: dict[int, str] = {}
+        self.unconfirmed_processes: list[dict[str, Any]] = []
 
 
 def _process_snapshot() -> dict[int, tuple[int, str, str]]:
@@ -110,6 +113,57 @@ def _track_descendants(root: tuple[int, str], owned: dict[int, str], snapshot: d
 def _owned_processes_alive(owned: dict[int, str], snapshot: dict[int, tuple[int, str, str]]) -> list[int]:
     return [pid for pid, started_at in owned.items()
             if pid in snapshot and snapshot[pid][1] == started_at and snapshot[pid][2] not in {"Z", "X"}]
+
+
+def _untracked_processes_since(
+    baseline: dict[int, tuple[int, str, str]],
+    owned: dict[int, str],
+    snapshot: dict[int, tuple[int, str, str]],
+    log_path: pathlib.Path,
+) -> list[dict[str, Any]]:
+    """Find fast-run processes not parent-tracked but retaining the private gate log."""
+    candidates: list[dict[str, Any]] = []
+    for pid, (ppid, started_at, state) in sorted(snapshot.items()):
+        baseline_record = baseline.get(pid)
+        if ((baseline_record is not None and baseline_record[1] == started_at)
+                or owned.get(pid) == started_at or state in {"Z", "X"}):
+            continue
+        holds_log = _process_holds_log(pid, log_path)
+        if holds_log is not False:
+            candidates.append({"pid": pid, "startedAt": started_at, "observedParentPid": ppid})
+    return candidates
+
+
+def _process_holds_log(pid: int, log_path: pathlib.Path) -> bool | None:
+    """Use inherited stdout as a practical ownership marker for escaped children."""
+    expected = os.path.realpath(log_path)
+    proc_fds = pathlib.Path(f"/proc/{pid}/fd")
+    if proc_fds.is_dir():
+        try:
+            for descriptor in proc_fds.iterdir():
+                try:
+                    if os.path.realpath(descriptor) == expected:
+                        return True
+                except OSError:
+                    continue
+            return False
+        except OSError:
+            return None
+    if LSOF_BINARY is None:
+        return None
+    try:
+        result = subprocess.run(
+            [LSOF_BINARY, "-Fn", "-a", "-p", str(pid)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode not in {0, 1}:
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("n") and os.path.realpath(line[1:]) == expected:
+            return True
+    return False
 
 
 def _signal_owned(owned: dict[int, str], sig: int) -> None:
@@ -181,13 +235,17 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
     owned: dict[int, str] = {}
     tree_confirmed_drained = True
     log_io_error: BaseException | None = None
+    unconfirmed_processes: list[dict[str, Any]] = []
     timed_out = interrupted = False
     log = os.fdopen(fd, "wb")
     try:
         try:
+            baseline_snapshot = _process_snapshot()
             process = subprocess.Popen(list(argv), cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             tree_confirmed_drained = False
             deadline = time.monotonic() + timeout
+            # Keep the direct child unreaped until its first ps snapshot; Popen
+            # does not poll or wait implicitly, so short-lived roots remain visible.
             snapshot = _process_snapshot()
             root_record = snapshot.get(process.pid)
             if root_record is not None:
@@ -241,6 +299,13 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
                         code = 125
                 else:
                     tree_confirmed_drained = True
+                    if time.monotonic() - started <= FAST_EXIT_GUARD_SECONDS:
+                        unconfirmed_processes = _untracked_processes_since(baseline_snapshot, owned, snapshot, log_path)
+                        if unconfirmed_processes:
+                            uncertain = (
+                                "fast gate exited with live processes created during the command that were not "
+                                "observed as owned descendants; builder leases require manual review"
+                            )
         except KeyboardInterrupt:
             interrupted = True
             if process is not None and root_identity is not None and _stop_and_reap_owned_tree(process, root_identity, owned):
@@ -317,6 +382,7 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
     if uncertain is not None:
         error = UncertainProcessTree(uncertain, process.pid if process else -1)
         error.owned_processes = dict(owned)
+        error.unconfirmed_processes = unconfirmed_processes
         raise error
     if log_io_error is not None:
         raise log_io_error
@@ -497,7 +563,13 @@ class Lease:
             shutil.rmtree(self.path)
             self.acquired = False
 
-    def retain_for_manual_recovery(self, reason: str, process_group_id: int, owned_processes: dict[int, str]) -> None:
+    def retain_for_manual_recovery(
+        self,
+        reason: str,
+        process_group_id: int,
+        owned_processes: dict[int, str],
+        unconfirmed_processes: list[dict[str, Any]] | None = None,
+    ) -> None:
         if not self.acquired or self.borrowed:
             return
         try:
@@ -508,6 +580,8 @@ class Lease:
         owner["terminationStatus"] = reason
         owner["processGroupId"] = process_group_id
         owner["ownedProcesses"] = [{"pid": pid, "startedAt": started_at} for pid, started_at in sorted(owned_processes.items())]
+        if unconfirmed_processes:
+            owner["unconfirmedProcesses"] = unconfirmed_processes
         _atomic_json(self.path / "owner.json", owner)
 
 
@@ -694,7 +768,9 @@ def run(args: argparse.Namespace) -> int:
         if isinstance(exc, UncertainProcessTree):
             retain_leases = True
             for lease in acquired_leases:
-                lease.retain_for_manual_recovery(str(exc), exc.process_group_id, exc.owned_processes)
+                lease.retain_for_manual_recovery(
+                    str(exc), exc.process_group_id, exc.owned_processes, exc.unconfirmed_processes,
+                )
         manifest["decision"] = "failed"
         manifest["error"] = str(exc)
         try:

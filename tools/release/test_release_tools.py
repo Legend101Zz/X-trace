@@ -456,6 +456,22 @@ class RunnerTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
+    def test_repeated_real_fast_version_probes_do_not_misclassify_exited_roots(self) -> None:
+        commands = []
+        for tool in ("git", "node", "rustc"):
+            binary = shutil.which(tool)
+            if binary:
+                commands.extend((f"{tool}-{index}", (binary, "--version"), ".") for index in range(5))
+        self.assertTrue(commands, "at least git should be available for fast version probes")
+        logs = self.cache / "fast-version-logs"
+        probes: list[dict[str, object]] = []
+        with mock.patch.object(run_gates, "VERSION_COMMANDS", tuple(commands)):
+            versions = REAL_VERSIONS(self.repo, os.environ.copy(), logs, probes)
+        self.assertEqual(len(probes), len(commands))
+        self.assertTrue(all(probe["status"] == "passed" and probe["exitCode"] == 0 for probe in probes))
+        self.assertEqual(set(versions), {command[0] for command in commands})
+        self.assertTrue(all((logs / f"version-{command[0]}.log").is_file() for command in commands))
+
     def test_buf_version_probe_uses_workspace_executable(self) -> None:
         self.assertEqual(
             next(item for item in run_gates.VERSION_COMMANDS if item[0] == "buf"),
@@ -513,6 +529,83 @@ class RunnerTests(unittest.TestCase):
                         lease_path = self.cache / "leases" / name
                         if lease_path.exists():
                             shutil.rmtree(lease_path)
+
+    def test_fast_parent_cannot_leave_an_unobserved_detached_child(self) -> None:
+        for index in range(5):
+            with self.subTest(index=index):
+                args = self.args()
+                args.label = f"P00-fast-child-{index}"
+                script = "import subprocess,sys; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); print(child.pid,flush=True)"
+                gate = run_gates.Gate("fast-detached-child", (sys.executable, "-c", script))
+                with mock.patch.object(run_gates, "GATES", (gate,)):
+                    self.assertEqual(run_gates.run(args), 1)
+                run_dir = self.cache / "release-gates" / args.label
+                receipt = json.loads((run_dir / "receipt.json").read_text())
+                candidates = list((run_dir / "logs").glob(".*.tmp"))
+                if not candidates:
+                    candidates = list((run_dir / "logs").glob("fast-detached-child.log"))
+                self.assertEqual(len(candidates), 1)
+                child_pid = int(candidates[0].read_text().splitlines()[0])
+                try:
+                    if process_running(child_pid):
+                        self.assertIn("unconfirmedProcesses", json.loads(
+                            (self.cache / "leases/cargo/owner.json").read_text(),
+                        ))
+                        self.assertIn(str(child_pid), json.dumps(receipt.get("error", "")) + json.dumps(
+                            json.loads((self.cache / "leases/cargo/owner.json").read_text()).get("unconfirmedProcesses", []),
+                        ))
+                    else:
+                        self.assertEqual(receipt.get("decision"), "failed")
+                    self.assertNotEqual(receipt.get("decision"), "checks_passed_for_review")
+                finally:
+                    if process_running(child_pid):
+                        try:
+                            os.kill(child_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    for name in ("cargo", "gradle"):
+                        lease_path = self.cache / "leases" / name
+                        if lease_path.exists():
+                            shutil.rmtree(lease_path)
+
+    def test_unrelated_concurrent_process_does_not_look_like_an_owned_descendant(self) -> None:
+        log_path = self.cache / "unrelated-process.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        unrelated: subprocess.Popen[bytes] | None = None
+        real_snapshot = run_gates._process_snapshot
+        calls = 0
+
+        def snapshot_with_concurrent_process() -> dict[int, tuple[int, str, str]]:
+            nonlocal calls, unrelated
+            snapshot = real_snapshot()
+            calls += 1
+            if calls == 1:
+                unrelated = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                )
+            return snapshot
+
+        try:
+            with mock.patch.object(run_gates, "_process_snapshot", side_effect=snapshot_with_concurrent_process):
+                code, _ = run_gates._run(
+                    (sys.executable, "-c", "print('fast gate passed')"), cwd=self.repo,
+                    env=os.environ.copy(), timeout=5, log_path=log_path,
+                )
+            self.assertEqual(code, 0)
+            self.assertTrue(log_path.exists())
+            self.assertIsNotNone(unrelated)
+            self.assertIsNone(unrelated.poll())
+        finally:
+            if unrelated is not None:
+                try:
+                    os.killpg(unrelated.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    unrelated.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
 
     def test_source_change_during_gate_fails_exact_tree_receipt(self) -> None:
         gate = run_gates.Gate("mutating-gate", (sys.executable, "-c", "open('source-drift.txt','w').write('changed')"))
