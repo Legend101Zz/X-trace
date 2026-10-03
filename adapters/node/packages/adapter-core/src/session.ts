@@ -93,7 +93,7 @@ export async function openXtpSession(
       runtimeSessionId,
       sessionSeq: 0n,
       sentMonotonicNs: process.hrtime.bigint(),
-      messageId: "node-synthetic-hello",
+      messageId: `${identity.adapterName}-hello`,
       correlationToken: "",
       payload: {
         case: "adapterHello",
