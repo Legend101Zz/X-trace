@@ -257,7 +257,7 @@ def _untracked_processes_since(
     held_by: set[int] | None = None
     unknown: dict[int, str] = {}
     proc_fd_root = pathlib.Path("/proc")
-    if (proc_fd_root / str(candidates[0][0]) / "fd").is_dir():
+    if proc_fd_root.is_dir():
         held_by = set()
         for pid, ppid, started_at in candidates:
             if time.monotonic() - started > UNTRACKED_SCAN_BUDGET_SECONDS:
@@ -341,8 +341,8 @@ def _run_lsof_fields(arguments: list[str], deadline: float) -> LsofProbe:
         raise
     probe_identity: dict[str, Any] = {"pid": process.pid, "startedAt": None, "processGroupId": process.pid}
     output = {"stdout": bytearray(), "stderr": bytearray()}
-    exceeded = False
-    timed_out = False
+    result: LsofProbe | None = None
+    pending_error: BaseException | None = None
     try:
         probe_identity["startedAt"] = _process_start_identity(
             process.pid, min(deadline, time.monotonic() + 0.15),
@@ -352,6 +352,8 @@ def _run_lsof_fields(arguments: list[str], deadline: float) -> LsofProbe:
                 raise OSError("probe output pipe unavailable")
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, name)
+        exceeded = False
+        timed_out = False
         query_deadline = max(time.monotonic(), deadline - LSOF_CLEANUP_RESERVE_SECONDS)
         while selector.get_map():
             remaining = query_deadline - time.monotonic()
@@ -382,38 +384,79 @@ def _run_lsof_fields(arguments: list[str], deadline: float) -> LsofProbe:
             probe_identity["reason"] = cleanup_error or "probe-not-confirmed-drained"
             stdout = output["stdout"].decode("utf-8", errors="replace")
             stderr = output["stderr"].decode("utf-8", errors="replace")
-            return LsofProbe(
+            result = LsofProbe(
                 process.returncode, stdout, stderr, "probe-not-confirmed-drained", probe_identity,
             )
-        stdout = output["stdout"].decode("utf-8", errors="replace")
-        stderr = output["stderr"].decode("utf-8", errors="replace")
-        if timed_out:
-            return LsofProbe(process.returncode, stdout, stderr, "time-budget-exceeded")
-        if exceeded:
-            return LsofProbe(process.returncode, stdout, stderr, "output-limit-exceeded")
-        return LsofProbe(process.returncode, stdout, stderr)
+        else:
+            stdout = output["stdout"].decode("utf-8", errors="replace")
+            stderr = output["stderr"].decode("utf-8", errors="replace")
+            if timed_out:
+                result = LsofProbe(process.returncode, stdout, stderr, "time-budget-exceeded")
+            elif exceeded:
+                result = LsofProbe(process.returncode, stdout, stderr, "output-limit-exceeded")
+            else:
+                result = LsofProbe(process.returncode, stdout, stderr)
     except OSError:
         drained, cleanup_error = _terminate_lsof_process_group(process, deadline)
         if not drained:
             probe_identity["reason"] = cleanup_error or "probe-not-confirmed-drained"
-            return LsofProbe(
+            result = LsofProbe(
                 process.returncode, "", "", "probe-not-confirmed-drained", probe_identity,
             )
-        return LsofProbe(process.returncode, "", "", "query-could-not-complete")
+        else:
+            result = LsofProbe(process.returncode, "", "", "query-could-not-complete")
     except BaseException as exc:
         drained, cleanup_error = _terminate_lsof_process_group(process, deadline)
         if not drained:
             probe_identity["reason"] = cleanup_error or "probe-not-confirmed-drained"
             if isinstance(exc, KeyboardInterrupt):
-                raise InterruptedProbeCleanup(probe_identity) from exc
-            raise UncertainProbeCleanup(probe_identity) from exc
-        raise
-    finally:
-        selector.close()
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()
+                pending_error = InterruptedProbeCleanup(probe_identity)
+                pending_error.__cause__ = exc
+            else:
+                pending_error = UncertainProbeCleanup(probe_identity)
+                pending_error.__cause__ = exc
+        else:
+            pending_error = exc
+
+    close_error: BaseException | None = None
+    for close in (
+        selector.close,
+        process.stdout.close if process.stdout is not None else None,
+        process.stderr.close if process.stderr is not None else None,
+    ):
+        if close is None:
+            continue
+        try:
+            close()
+        except BaseException as exc:
+            close_error = close_error or exc
+    if close_error is not None:
+        if isinstance(pending_error, (InterruptedProbeCleanup, UncertainProbeCleanup)):
+            pass
+        elif pending_error is not None:
+            probe_identity["reason"] = "probe-resource-cleanup-failed"
+            cleanup_type = (
+                InterruptedProbeCleanup
+                if isinstance(pending_error, KeyboardInterrupt)
+                else UncertainProbeCleanup
+            )
+            wrapped = cleanup_type(probe_identity)
+            wrapped.__cause__ = pending_error
+            pending_error = wrapped
+        elif result is not None and result.owned_probe is not None:
+            # Keep the earlier uncertainty and its cause when cleanup also fails.
+            pass
+        else:
+            probe_identity["reason"] = "probe-resource-cleanup-failed"
+            result = LsofProbe(
+                process.returncode, "", "", "probe-not-confirmed-drained", probe_identity,
+            )
+    if pending_error is not None:
+        raise pending_error
+    if result is None:
+        probe_identity["reason"] = "probe-result-unavailable"
+        return LsofProbe(process.returncode, "", "", "probe-not-confirmed-drained", probe_identity)
+    return result
 
 
 def _process_start_identity(pid: int, deadline: float) -> str | None:
@@ -463,7 +506,7 @@ def _terminate_lsof_process_group(
             os.killpg(process.pid, signum)
         except ProcessLookupError:
             pass
-        except OSError:
+        except BaseException:
             signal_errors = True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -472,13 +515,21 @@ def _terminate_lsof_process_group(
             process.wait(timeout=min(grace, remaining))
         except subprocess.TimeoutExpired:
             continue
-        except KeyboardInterrupt:
+        except BaseException:
+            signal_errors = True
             continue
         if process.returncode is not None and signum == signal.SIGTERM:
             # Still signal the dedicated group to close descendant-held pipes.
             continue
-    process_reaped = process.poll() is not None
-    group_state = _lsof_process_group_state(process.pid)
+    try:
+        process_reaped = process.poll() is not None
+    except BaseException:
+        process_reaped = False
+        signal_errors = True
+    try:
+        group_state = _lsof_process_group_state(process.pid)
+    except BaseException:
+        group_state = None
     if process_reaped and group_state is False:
         return True, None
     if signal_errors or group_state is None:
@@ -533,7 +584,6 @@ def _parse_lsof_fields(
                         held.add(current_pid)
                 elif "/" in name or name in {".", ".."}:
                     raise ValueError
-                    held.add(current_pid)
             elif not line.startswith("f"):
                 raise ValueError
     except (OSError, ValueError):
@@ -545,27 +595,27 @@ def _process_holds_log(pid: int, log_path: pathlib.Path) -> bool | None:
     """Use inherited stdout as a practical ownership marker for escaped children."""
     expected = os.path.realpath(log_path)
     proc_fds = pathlib.Path(f"/proc/{pid}/fd")
-    if proc_fds.is_dir():
-        try:
-            for descriptor in proc_fds.iterdir():
-                try:
-                    target = os.readlink(descriptor)
-                    if any(ord(character) < 32 or ord(character) == 127 for character in target):
-                        return None
-                    if target.endswith(" (deleted)"):
-                        if os.path.normpath(target[:-10]) == expected:
-                            return None
-                        continue
-                    if target.startswith("/") and os.path.normpath(target) == expected:
-                        return True
-                except OSError as exc:
-                    if exc.errno == errno.ENOENT:
-                        continue
-                    return None
-            return False
-        except OSError:
+    try:
+        if not proc_fds.is_dir():
             return None
-    return False
+        for descriptor in proc_fds.iterdir():
+            try:
+                target = os.readlink(descriptor)
+                if any(ord(character) < 32 or ord(character) == 127 for character in target):
+                    return None
+                if target.endswith(" (deleted)"):
+                    if os.path.normpath(target[:-10]) == expected:
+                        return None
+                    continue
+                if target.startswith("/") and os.path.normpath(target) == expected:
+                    return True
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    continue
+                return None
+        return False
+    except OSError:
+        return None
 
 
 def _signal_owned(owned: dict[int, str], sig: int) -> None:

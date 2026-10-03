@@ -907,6 +907,26 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(error, "probe-signal-failed")
         self.assertIsNone(process.returncode)
 
+    def test_linux_mixed_proc_candidates_keep_inaccessible_live_process_uncertain(self) -> None:
+        first_pid, second_pid = 424240, 424241
+        snapshot = {
+            first_pid: (7, "first-start", "S"),
+            second_pid: (8, "second-start", "S"),
+        }
+        log_path = self.root / "private-gate.log"
+        log_path.write_text("private\n")
+
+        def inspect(pid: int, _log_path: pathlib.Path) -> bool | None:
+            return True if pid == first_pid else None
+
+        with mock.patch.object(pathlib.Path, "is_dir", return_value=True), \
+                mock.patch.object(run_gates, "_process_holds_log", side_effect=inspect), \
+                mock.patch.object(run_gates, "_process_snapshot", return_value=snapshot):
+            result = run_gates._untracked_processes_since({}, {}, snapshot, log_path)
+        self.assertEqual([item["pid"] for item in result.held], [first_pid])
+        self.assertEqual([item["pid"] for item in result.uninspectable], [second_pid])
+        self.assertEqual(result.error, "untracked-process descriptor scan could not inspect every live candidate")
+
     def test_probe_interrupt_and_selector_failure_cleanup_are_bounded_and_report_identity(self) -> None:
         class ProbeStream:
             def __init__(self, descriptor: int) -> None:
@@ -969,6 +989,86 @@ class RunnerTests(unittest.TestCase):
                         result = run_gates._run_lsof_fields([], time.monotonic() + 1)
                         self.assertEqual(result.error, "probe-not-confirmed-drained")
                         self.assertEqual(result.owned_probe["startedAt"], "probe-start")
+
+    def test_probe_wait_poll_and_stream_close_errors_keep_owned_identity(self) -> None:
+        class ProbeStream:
+            def __init__(self, descriptor: int, fail_close: bool = False) -> None:
+                self.descriptor = descriptor
+                self.fail_close = fail_close
+
+            def fileno(self) -> int:
+                return self.descriptor
+
+            def close(self) -> None:
+                if self.fail_close:
+                    raise OSError("injected close failure")
+
+        class ProbeProcess:
+            pid = 987657
+            returncode = None
+
+            def __init__(self, failure: str, fail_close: bool = False) -> None:
+                self.failure = failure
+                self.stdout = ProbeStream(95, fail_close)
+                self.stderr = ProbeStream(96, fail_close)
+
+            def poll(self) -> int | None:
+                if self.failure == "poll":
+                    raise OSError("injected poll failure")
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                if timeout is None:
+                    raise AssertionError("probe wait must always be bounded")
+                if self.failure in {"wait", "poll"}:
+                    raise OSError("injected wait failure")
+                return 0
+
+        class FailingSelector:
+            def __init__(self, fail_select: bool) -> None:
+                self.fail_select = fail_select
+
+            def register(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def get_map(self) -> dict[int, int]:
+                return {1: 1} if self.fail_select else {}
+
+            def select(self, _timeout: float) -> list[object]:
+                raise OSError("injected selector failure")
+
+            def close(self) -> None:
+                return None
+
+        for failure in ("wait", "poll"):
+            with self.subTest(failure=failure):
+                process = ProbeProcess(failure, fail_close=True)
+                selector = FailingSelector(True)
+                with mock.patch.object(run_gates, "LSOF_BINARY", sys.executable), \
+                        mock.patch.object(run_gates.subprocess, "Popen", return_value=process), \
+                        mock.patch.object(run_gates, "_process_start_identity", return_value="probe-start"), \
+                        mock.patch.object(run_gates.selectors, "DefaultSelector", return_value=selector), \
+                        mock.patch.object(run_gates.os, "set_blocking"), \
+                        mock.patch.object(run_gates.os, "killpg", side_effect=PermissionError), \
+                        mock.patch.object(run_gates, "_lsof_process_group_state", return_value=None):
+                    result = run_gates._run_lsof_fields([], time.monotonic() + 1)
+                self.assertEqual(result.error, "probe-not-confirmed-drained")
+                self.assertEqual(result.owned_probe["pid"], process.pid)
+                self.assertEqual(result.owned_probe["startedAt"], "probe-start")
+
+        process = ProbeProcess("none", fail_close=True)
+        process.returncode = 0
+        selector = FailingSelector(False)
+        with mock.patch.object(run_gates, "LSOF_BINARY", sys.executable), \
+                mock.patch.object(run_gates.subprocess, "Popen", return_value=process), \
+                mock.patch.object(run_gates, "_process_start_identity", return_value="probe-start"), \
+                mock.patch.object(run_gates.selectors, "DefaultSelector", return_value=selector), \
+                mock.patch.object(run_gates.os, "set_blocking"), \
+                mock.patch.object(run_gates, "_lsof_process_group_state", return_value=False):
+            result = run_gates._run_lsof_fields([], time.monotonic() + 1)
+        self.assertEqual(result.error, "probe-not-confirmed-drained")
+        self.assertEqual(result.owned_probe["pid"], process.pid)
+        self.assertEqual(result.owned_probe["reason"], "probe-resource-cleanup-failed")
 
     def test_interrupt_during_probe_reap_triggers_bounded_cleanup_with_identity(self) -> None:
         class ProbeStream:
@@ -1074,6 +1174,67 @@ class RunnerTests(unittest.TestCase):
                     lease_path = self.cache / "leases" / name
                     if lease_path.exists():
                         shutil.rmtree(lease_path)
+
+    def test_mixed_linux_descriptor_scan_retains_both_leases_without_signaling_candidate(self) -> None:
+        args = self.args()
+        args.label = "P00-mixed-proc-candidates"
+        args.command_timeout = 5
+        script = (
+            "import subprocess,sys,time; time.sleep(.35); "
+            "a=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); "
+            "b=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); "
+            "print(a.pid,b.pid,flush=True)"
+        )
+        gate = run_gates.Gate("mixed-proc-candidates", (sys.executable, "-c", script))
+        child_pids: list[int] = []
+
+        def inspect(pid: int, log_path: pathlib.Path) -> bool | None:
+            if not child_pids and log_path.exists():
+                try:
+                    child_pids.extend(int(value) for value in log_path.read_text().split())
+                except (OSError, ValueError):
+                    child_pids.clear()
+            if pid in child_pids and pid == child_pids[0]:
+                return True
+            return None
+
+        try:
+            with mock.patch.object(run_gates, "GATES", (gate,)), \
+                    mock.patch.object(pathlib.Path, "is_dir", return_value=True), \
+                    mock.patch.object(run_gates, "_process_holds_log", side_effect=inspect):
+                self.assertEqual(run_gates.run(args), 1)
+            run_dir = self.cache / "release-gates" / args.label
+            logs = list((run_dir / "logs").glob(".*.tmp"))
+            if not logs:
+                logs = list((run_dir / "logs").glob("mixed-proc-candidates.log"))
+            self.assertEqual(len(logs), 1)
+            child_pids = [int(value) for value in logs[0].read_text().split()]
+            self.assertEqual(len(child_pids), 2)
+            self.assertTrue(all(process_running(pid) for pid in child_pids), "unowned candidates must not be signaled")
+            receipt = json.loads((run_dir / "receipt.json").read_text())
+            self.assertEqual(receipt["decision"], "failed")
+            self.assertIn("descriptor scan could not inspect every live candidate", receipt["error"])
+            for name in ("cargo", "gradle"):
+                owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
+                self.assertTrue(owner["requiresManualRecovery"])
+                self.assertGreaterEqual(owner["unconfirmedProcessCount"], 2)
+                recorded = {item["pid"]: item for item in owner["unconfirmedProcesses"]}
+                self.assertTrue(set(child_pids).issubset(recorded))
+                self.assertEqual(recorded[child_pids[0]]["descriptorStatus"], "held")
+                self.assertEqual(recorded[child_pids[1]]["descriptorStatus"], "uninspectable")
+        finally:
+            for pid in child_pids:
+                if process_running(pid):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            for name in ("cargo", "gradle"):
+                lease_path = self.cache / "leases" / name
+                if lease_path.exists():
+                    shutil.rmtree(lease_path)
 
     def test_source_change_during_gate_fails_exact_tree_receipt(self) -> None:
         gate = run_gates.Gate("mutating-gate", (sys.executable, "-c", "open('source-drift.txt','w').write('changed')"))
