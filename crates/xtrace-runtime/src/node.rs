@@ -581,7 +581,6 @@ fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
         return Err(LaunchError::Process);
     }
     let deadline = Instant::now() + Duration::from_secs(2);
-    let drain_deadline = deadline + Duration::from_secs(1);
     let mut stdout_output = ProbeOutput::default();
     let mut stderr_output = ProbeOutput::default();
     let status = loop {
@@ -606,6 +605,7 @@ fn verify_node_version(executable: &Path) -> Result<(), LaunchError> {
             }
         }
     };
+    let drain_deadline = Instant::now() + Duration::from_secs(1);
     while !stdout_output.closed || !stderr_output.closed {
         if Instant::now() >= drain_deadline {
             terminate_probe(&mut child, pid)?;
@@ -661,9 +661,10 @@ fn drain_probe_pipes(
     timeout: std::time::Duration,
 ) -> Result<(), LaunchError> {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
-    use std::io::Read as _;
 
-    let timeout = Timespec { tv_sec: 0, tv_nsec: timeout.as_nanos().min(999_999_999) as i64 };
+    let timeout_duration = timeout;
+    let timeout =
+        Timespec { tv_sec: 0, tv_nsec: timeout_duration.as_nanos().min(999_999_999) as i64 };
     let mut fds = Vec::with_capacity(2);
     let mut streams = Vec::with_capacity(2);
     if !stdout_output.closed {
@@ -675,6 +676,7 @@ fn drain_probe_pipes(
         streams.push(false);
     }
     if fds.is_empty() {
+        std::thread::sleep(timeout_duration);
         return Ok(());
     }
     poll(&mut fds, Some(&timeout)).map_err(|_| LaunchError::Process)?;
@@ -688,11 +690,9 @@ fn drain_probe_pipes(
         while remaining > 0 {
             remaining -= 1;
             let read = if is_stdout {
-                let mut reader = stdout;
-                reader.read(&mut buffer)
+                rustix::io::read(stdout, &mut buffer)
             } else {
-                let mut reader = stderr;
-                reader.read(&mut buffer)
+                rustix::io::read(stderr, &mut buffer)
             };
             match read {
                 Ok(0) => {
@@ -705,7 +705,7 @@ fn drain_probe_pipes(
                     output.bytes.extend_from_slice(&buffer[..retained]);
                     output.exceeded |= retained < count;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(rustix::io::Errno::AGAIN) => break,
                 Err(_) => return Err(LaunchError::Process),
             }
         }
