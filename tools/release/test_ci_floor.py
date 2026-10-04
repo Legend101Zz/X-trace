@@ -937,12 +937,27 @@ class CiFloorEvidenceTests(unittest.TestCase):
             old_path = os.environ.get("PATH", "/usr/bin:/bin")
             started = time.monotonic()
             original_snapshot = ci_floor._utility_process_snapshot
+            original_popen = ci_floor.subprocess.Popen
             snapshot_trace: list[dict[str, object]] = []
             signal_trace: list[dict[str, object]] = []
             exact_signal_identities: list[tuple[int, int, str, int]] = []
+            probe_processes: list[tuple[object, float]] = []
+            probe_snapshot_trace: list[dict[str, object]] = []
             snapshot_trace_omitted = 0
             signal_trace_omitted = 0
             exact_signal_identities_omitted = 0
+            probe_snapshot_trace_omitted = 0
+            probe_popen_attempted = False
+            probe_popen_launch_failed = False
+            probe_snapshot_diagnostic_failed = False
+            probe_any_unreaped_boundary = False
+            probe_any_unavailable_boundary = False
+            probe_snapshot_trace_overflow = False
+            probe_rescue_attempted = False
+            probe_rescue_reaped = False
+            probe_rescue_failed = False
+            probe_rescue_deadline_expired = False
+            probe_rescue_kill_failed = False
             exact_term_identity_seen = False
             active_signal_signum: int | None = None
 
@@ -994,6 +1009,104 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     exact_signal_identities.append(item)
                 else:
                     exact_signal_identities_omitted += 1
+
+            def probe_returncode_summary() -> dict[str, object]:
+                total_handles = len(probe_processes)
+                omitted = max(0, total_handles - 64)
+                summary: dict[str, object] = {
+                    "probeCount": min(total_handles, 64),
+                    "omittedProbeHandles": min(omitted, 64),
+                    "probeHandleOmissionOverflow": omitted > 64,
+                    "returncodeKnownCount": 0,
+                    "returncodeUnknownCount": 0,
+                    "statusUnavailableCount": 0,
+                    "ageBuckets": {"lt50ms": 0, "50to99ms": 0, "100to249ms": 0,
+                                   "250to499ms": 0, "ge500ms": 0, "unavailable": 0},
+                }
+                try:
+                    now = time.monotonic()
+                    age_buckets = summary["ageBuckets"]
+                    assert isinstance(age_buckets, dict)
+                    for process, launched_at in probe_processes[:64]:
+                        try:
+                            known = process.returncode is not None  # Deliberately do not poll here.
+                            key = "returncodeKnownCount" if known else "returncodeUnknownCount"
+                            summary[key] = int(summary[key]) + 1
+                        except Exception:
+                            summary["statusUnavailableCount"] = int(summary["statusUnavailableCount"]) + 1
+                        try:
+                            age = max(0.0, now - launched_at)
+                            bucket = (
+                                "lt50ms" if age < 0.05 else "50to99ms" if age < 0.1
+                                else "100to249ms" if age < 0.25 else "250to499ms" if age < 0.5
+                                else "ge500ms"
+                            )
+                            age_buckets[bucket] = int(age_buckets[bucket]) + 1
+                        except Exception:
+                            age_buckets["unavailable"] = int(age_buckets["unavailable"]) + 1
+                    summary["omittedProbeStatuses"] = min(omitted, 64)
+                    summary["omittedProbeAgeBuckets"] = min(omitted, 64)
+                    summary["probeStatusOmissionOverflow"] = omitted > 64
+                except Exception:
+                    probe_snapshot_diagnostic_failure()
+                    return {
+                        "probeCount": min(total_handles, 64),
+                        "status": "unavailable",
+                    }
+                return summary
+
+            def probe_snapshot_diagnostic_failure() -> None:
+                nonlocal probe_snapshot_diagnostic_failed
+                probe_snapshot_diagnostic_failed = True
+
+            def append_probe_snapshot_boundary(context: str, outcome: str) -> None:
+                nonlocal probe_snapshot_trace_omitted, probe_snapshot_trace_overflow
+                nonlocal probe_any_unreaped_boundary, probe_any_unavailable_boundary
+                try:
+                    summary = probe_returncode_summary()
+                    if (summary.get("status") == "unavailable"
+                            or int(summary.get("statusUnavailableCount", 0)) > 0
+                            or int(summary.get("omittedProbeStatuses", 0)) > 0
+                            or bool(summary.get("probeStatusOmissionOverflow", False))):
+                        probe_any_unavailable_boundary = True
+                    if int(summary.get("returncodeUnknownCount", 0)) > 0:
+                        probe_any_unreaped_boundary = True
+                    item = {
+                        "callContext": context,
+                        "outcome": outcome,
+                        **summary,
+                    }
+                    if len(probe_snapshot_trace) < 64:
+                        probe_snapshot_trace.append(item)
+                    else:
+                        if probe_snapshot_trace_omitted < 64:
+                            probe_snapshot_trace_omitted += 1
+                        else:
+                            probe_snapshot_trace_overflow = True
+                except Exception:
+                    probe_any_unavailable_boundary = True
+                    probe_snapshot_diagnostic_failure()
+
+            def record_probe_popen(*args: object, **kwargs: object) -> object:
+                nonlocal probe_popen_attempted, probe_popen_launch_failed
+                command = args[0] if args else kwargs.get("args")
+                try:
+                    executable = command[0] if isinstance(command, (list, tuple)) and command else None
+                    selected_fixture = executable is not None and os.fspath(executable) == os.fspath(fake_ps)
+                except (TypeError, ValueError, OSError):
+                    selected_fixture = False
+                if not selected_fixture:
+                    return original_popen(*args, **kwargs)
+                probe_popen_attempted = True
+                launched_at = time.monotonic()
+                try:
+                    process = original_popen(*args, **kwargs)
+                except BaseException:
+                    probe_popen_launch_failed = True
+                    raise
+                # Retain the exact owned Popen handle for later observation and rescue.
+                probe_processes.append((process, launched_at))
+                return process
 
             def safe_count_file() -> dict[str, object]:
                 descriptor: int | None = None
@@ -1108,6 +1221,27 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     "omittedSignalCalls": signal_trace_omitted,
                     "exactSignalIdentityCount": len(exact_signal_identities),
                     "omittedExactSignalIdentities": exact_signal_identities_omitted,
+                    "nestedFakePsPopen": {
+                        "launchAttempted": probe_popen_attempted,
+                        "launchFailed": probe_popen_launch_failed,
+                        "capturedHandles": min(len(probe_processes), 64),
+                        "omittedHandles": min(max(0, len(probe_processes) - 64), 64),
+                        "handleOverflow": len(probe_processes) > 128,
+                        "snapshotBoundaries": probe_snapshot_trace,
+                        "omittedSnapshotBoundaries": probe_snapshot_trace_omitted,
+                        "snapshotBoundaryOverflow": probe_snapshot_trace_overflow,
+                        "diagnosticFailure": probe_snapshot_diagnostic_failed,
+                        "anyUnreapedBoundary": probe_any_unreaped_boundary,
+                        "anyUnavailableBoundary": probe_any_unavailable_boundary,
+                        "finalReturncodeState": probe_returncode_summary(),
+                        "rescue": {
+                            "attempted": probe_rescue_attempted,
+                            "reaped": probe_rescue_reaped,
+                            "failed": probe_rescue_failed,
+                            "deadlineExpired": probe_rescue_deadline_expired,
+                            "killFailed": probe_rescue_kill_failed,
+                        },
+                    },
                 }, sort_keys=True)
 
             def record_snapshot(*args: object, **kwargs: object) -> dict[int, tuple[int, int, str, str]]:
@@ -1140,6 +1274,11 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 try:
                     result = original_snapshot(*args, **kwargs)
                 except BaseException as exc:
+                    append_probe_snapshot_boundary(
+                        call_context,
+                        "exception_floor_input" if isinstance(exc, ci_floor.FloorInputError)
+                        else "exception_other",
+                    )
                     ps_count_after = safe_count_value()
                     stall_stage_after = safe_marker_file(
                         stall_invocation_stage_file, {"stalling", "delegating"},
@@ -1165,6 +1304,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     })
                     append_snapshot_trace(item)
                     raise
+                append_probe_snapshot_boundary(call_context, "returned")
                 ps_count_after = safe_count_value()
                 stall_stage_after = safe_marker_file(
                     stall_invocation_stage_file, {"stalling", "delegating"},
@@ -1190,6 +1330,51 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 })
                 append_snapshot_trace(item)
                 return result
+
+            def rescue_probe_processes() -> None:
+                nonlocal probe_rescue_attempted, probe_rescue_reaped
+                nonlocal probe_rescue_failed, probe_rescue_deadline_expired
+                nonlocal probe_rescue_kill_failed
+                deadline = time.monotonic() + 0.25
+                for process, _launched_at in probe_processes:
+                    try:
+                        if process.returncode is not None:
+                            continue
+                    except Exception:
+                        probe_rescue_failed = True
+                        continue
+                    probe_rescue_attempted = True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        probe_rescue_deadline_expired = True
+                        probe_rescue_failed = True
+                        continue
+                    try:
+                        process.kill()
+                    except Exception:
+                        probe_rescue_kill_failed = True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        probe_rescue_deadline_expired = True
+                        probe_rescue_failed = True
+                        continue
+                    try:
+                        process.wait(timeout=remaining)
+                        if process.returncode is not None:
+                            probe_rescue_reaped = True
+                        else:
+                            probe_rescue_failed = True
+                    except Exception:
+                        probe_rescue_failed = True
+
+            def any_unreaped_probe_handle() -> bool:
+                for process, _launched_at in probe_processes:
+                    try:
+                        if process.returncode is None:
+                            return True
+                    except Exception:
+                        return True
+                return False
 
             original_signal = ci_floor._signal_utility_group_members
 
@@ -1276,7 +1461,8 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         mock.patch.object(ci_floor, "UTILITY_LEADER_REAP_RESERVE_SECONDS", 0.15), \
                         mock.patch.object(ci_floor, "UTILITY_FINAL_SCAN_RESERVE_SECONDS", 0.1), \
                         mock.patch.object(ci_floor, "_utility_process_snapshot", side_effect=record_snapshot), \
-                        mock.patch.object(ci_floor, "_signal_utility_group_members", side_effect=record_signal):
+                        mock.patch.object(ci_floor, "_signal_utility_group_members", side_effect=record_signal), \
+                        mock.patch.object(ci_floor.subprocess, "Popen", side_effect=record_probe_popen):
                     try:
                         ci_floor._run(
                             [sys.executable, "-c", program, str(child_pid_file), str(term_file), str(handler_ready_file)],
@@ -1297,6 +1483,25 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     "the armed one-shot stall must occur in a main snapshot after the real child identity is observed: "
                     + diagnostic(),
                 )
+                self.assertTrue(probe_popen_attempted, "the real fake-ps helper must be captured: " + diagnostic())
+                self.assertFalse(probe_popen_launch_failed, "fake-ps Popen must launch cleanly: " + diagnostic())
+                self.assertTrue(probe_processes, "each successful fixture helper launch must retain its exact Popen handle")
+                self.assertFalse(probe_snapshot_diagnostic_failed, "helper lifecycle diagnostics must remain available: " + diagnostic())
+                self.assertFalse(
+                    probe_any_unreaped_boundary,
+                    "every wrapped snapshot boundary must observe only already-recorded helper return codes: "
+                    + diagnostic(),
+                )
+                self.assertFalse(
+                    probe_any_unavailable_boundary,
+                    "every wrapped snapshot boundary must include lifecycle status for every captured helper: "
+                    + diagnostic(),
+                )
+                self.assertFalse(
+                    any_unreaped_probe_handle(),
+                    "every nested fake-ps Popen must already have a recorded return code before fixture success: "
+                    + diagnostic(),
+                )
                 self.assertGreaterEqual(int(safe_count_file().get("value", 0)), 3, diagnostic())
                 self.assertLess(time.monotonic() - started, 1.8, diagnostic())
                 self.assertTrue(term_file.is_file(), "the owned term-ignorer must receive TERM before KILL: " + diagnostic())
@@ -1311,6 +1516,13 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 )
                 self.assertFalse(child_is_live, "the outer supervisor left its utility child alive: " + diagnostic())
             finally:
+                rescue_probe_processes()
+                if probe_rescue_failed:
+                    self.addCleanup(
+                        self.fail,
+                        "owned nested fake-ps helper cleanup was not confirmed within the shared rescue deadline: "
+                        + diagnostic(),
+                    )
                 if child_pid_file.is_file():
                     child_pid, child_group, child_start = json.loads(child_pid_file.read_text(encoding="utf-8"))
                     snapshot = ci_floor._utility_process_snapshot()
