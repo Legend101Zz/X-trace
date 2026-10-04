@@ -9,7 +9,7 @@
 //! `v0002_recording_segments`; Slice 1E.3A appends
 //! `v0003_observed_endpoint_catalog`; P02A appends
 //! `v0004_recording_terminal_evidence`; P03A appends
-//! `v0005_catalog_discovery`. Migrations remain append-only: later
+//! `v0005_catalog_discovery` and `v0006_catalog_retry_namespace_expiry`. Migrations remain append-only: later
 //! slices must add a new record instead of editing an applied one.
 //!
 //! Migrations deliberately avoid statements that cannot be safely
@@ -80,6 +80,11 @@ impl Migrations {
                 version: 5,
                 label: "v0005_catalog_discovery",
                 statements: &[CATALOG_DISCOVERY_SCHEMA],
+            },
+            MigrationRecord {
+                version: 6,
+                label: "v0006_catalog_retry_namespace_expiry",
+                statements: &[CATALOG_RETRY_NAMESPACE_EXPIRY_SCHEMA],
             },
         ]
     }
@@ -564,6 +569,34 @@ CREATE TABLE catalog_revision_claims (
 ) STRICT;
 ";
 
+/// Additive P03A persistence for namespaced retry identity and bounded open
+/// run lifetime. Existing v0005 runs are deliberately not adopted into a
+/// namespace: their retry identity remains legacy-only and is refused by the
+/// application until an explicit migration policy is approved.
+const CATALOG_RETRY_NAMESPACE_EXPIRY_SCHEMA: &str = r#"
+CREATE TABLE catalog_discovery_retry_keys (
+    project_id             BLOB NOT NULL,
+    runtime_session_id     BLOB NOT NULL,
+    verified_pack_digest   BLOB NOT NULL CHECK (length(verified_pack_digest) = 32),
+    retry_namespace        TEXT NOT NULL CHECK (retry_namespace IN ('runtime_producer', 'local_static_scanner')),
+    request_run_hint       TEXT NOT NULL CHECK (length(CAST(request_run_hint AS BLOB)) BETWEEN 1 AND 128),
+    stored_run_hint        TEXT NOT NULL CHECK (length(CAST(stored_run_hint AS BLOB)) BETWEEN 1 AND 128),
+    run_id                 BLOB NOT NULL CHECK (length(run_id) = 16),
+    PRIMARY KEY (project_id, runtime_session_id, verified_pack_digest, retry_namespace, request_run_hint),
+    UNIQUE (run_id),
+    FOREIGN KEY (run_id, project_id) REFERENCES catalog_discovery_runs(run_id, project_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE catalog_discovery_run_deadlines (
+    run_id                 BLOB PRIMARY KEY CHECK (length(run_id) = 16),
+    project_id             BLOB NOT NULL,
+    started_at             TEXT NOT NULL CHECK (length(CAST(started_at AS BLOB)) BETWEEN 1 AND 64),
+    expires_at             TEXT NOT NULL CHECK (length(CAST(expires_at AS BLOB)) BETWEEN 1 AND 64),
+    expired_at             TEXT CHECK (expired_at IS NULL OR length(CAST(expired_at AS BLOB)) BETWEEN 1 AND 64),
+    FOREIGN KEY (run_id, project_id) REFERENCES catalog_discovery_runs(run_id, project_id) ON DELETE RESTRICT
+) STRICT;
+"#;
+
 /// Applies every pending migration from the compiled-in catalog to
 /// the supplied connection.
 ///
@@ -908,6 +941,58 @@ mod tests {
     }
 
     #[test]
+    fn v6_adds_retry_and_deadline_tables_without_adopting_v5_history_and_rolls_back_atomically() {
+        let conn = new_memory();
+        let v5 = Migrations::catalog()[..5].to_vec();
+        assert_eq!(apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v5).expect("apply exact v5"), 5);
+        let project = [0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 1];
+        let selection = [0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 2];
+        let session = [0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 3];
+        let open_run = [0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 4];
+        let terminal_run = [0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 5];
+        let digest = [0x22; 32];
+        insert_project(&conn, &project).expect("seed project");
+        conn.execute(
+            "INSERT INTO catalog_owner_selections (owner_selection_id, project_id, selection_epoch, current_for_scope, verified_pack_digest, scope_digest, scope_json, revoked) VALUES (?1, ?2, 1, 1, ?3, ?3, '{}', 0)",
+            params![selection.as_slice(), project.as_slice(), digest.as_slice()],
+        ).expect("seed owner selection");
+        for (run_id, status, completed) in [
+            (&open_run, "open", false),
+            (&terminal_run, "complete", true),
+        ] {
+            conn.execute(
+                "INSERT INTO catalog_discovery_runs (run_id, project_id, runtime_session_id, protocol_minor, verified_pack_digest, owner_selection_id, selection_epoch, run_hint, request_bytes, request_digest, scope_digest, scope_json, status, accepted_claim_count, accepted_claim_bytes, final_digest) VALUES (?1, ?2, ?3, 1, ?4, ?5, 1, ?6, X'01', ?4, ?4, '{}', ?7, ?8, ?9, ?10)",
+                params![run_id.as_slice(), project.as_slice(), session.as_slice(), digest.as_slice(), selection.as_slice(), if completed {"terminal"} else {"open"}, status, if completed {1_i64} else {0_i64}, if completed {1_i64} else {0_i64}, if completed {Some(digest.as_slice())} else {None}],
+            ).expect("seed v5 run");
+        }
+        conn.execute(
+            "INSERT INTO catalog_discovery_chunks (run_id, project_id, chunk_index, chunk_digest, claim_count, payload_bytes) VALUES (?1, ?2, 0, ?3, 1, 1)",
+            params![terminal_run.as_slice(), project.as_slice(), digest.as_slice()],
+        ).expect("seed terminal chunk");
+        conn.execute(
+            "INSERT INTO catalog_discovery_claims (run_id, project_id, chunk_index, claim_ordinal, claim_hint, claim_digest, canonical_bytes, canonical_json) VALUES (?1, ?2, 0, 0, 'claim', ?3, X'01', '{}')",
+            params![terminal_run.as_slice(), project.as_slice(), digest.as_slice()],
+        ).expect("seed terminal claim");
+        let v5_checksum: String = conn.query_row("SELECT applied_checksum FROM schema_meta", [], |row| row.get(0)).expect("v5 checksum");
+        conn.execute_batch("CREATE TABLE catalog_discovery_retry_keys (placeholder INTEGER)").expect("force migration conflict");
+        assert!(apply_pending(&conn, "0.1.0-test", CorrelationId::new()).is_err());
+        assert_eq!(schema_version(&conn), 5);
+        assert_eq!(conn.query_row("SELECT applied_checksum FROM schema_meta", [], |row| row.get::<_, String>(0)).expect("checksum after rollback"), v5_checksum);
+        assert!(!table_exists(&conn, "catalog_discovery_run_deadlines"));
+        conn.execute_batch("DROP TABLE catalog_discovery_retry_keys").expect("clear injected collision");
+
+        assert_eq!(apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v6"), 6);
+        let history: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM catalog_discovery_runs), (SELECT COUNT(*) FROM catalog_discovery_chunks), (SELECT COUNT(*) FROM catalog_discovery_claims), (SELECT COUNT(*) FROM catalog_discovery_retry_keys)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).expect("read preserved history");
+        assert_eq!(history, (2, 1, 1, 0));
+        let fk_errors: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0)).expect("foreign key check");
+        assert_eq!(fk_errors, 0);
+    }
+
+    #[test]
     fn v1_database_upgrades_to_v4_and_reopens_idempotently() {
         let conn = new_memory();
         let v1 = v1_catalog();
@@ -918,13 +1003,11 @@ mod tests {
         assert!(!table_exists(&conn, "recordings"));
         assert!(!table_exists(&conn, "recording_segments"));
 
-        assert_eq!(
-            apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("upgrade v4"),
-            4
-        );
+        let v4 = Migrations::catalog()[..4].to_vec();
+        assert_eq!(apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v4).expect("upgrade v4"), 4);
         assert_recording_schema_contract(&conn);
         assert_eq!(
-            apply_pending(&conn, "0.1.0-test", CorrelationId::new())
+            apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v4)
                 .expect("repeat open is idempotent"),
             4
         );
@@ -940,7 +1023,8 @@ mod tests {
         insert_project(&conn, &project).expect("project");
         insert_recording(&conn, &recording, &project, &id(0x51), "recording").expect("recording");
 
-        assert_eq!(apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("v4"), 4);
+        let v4 = Migrations::catalog()[..4].to_vec();
+        assert_eq!(apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v4).expect("v4"), 4);
         let sidecars: i64 = conn
             .query_row("SELECT count(*) FROM recording_endpoint_observations", [], |row| row.get(0))
             .expect("sidecars");

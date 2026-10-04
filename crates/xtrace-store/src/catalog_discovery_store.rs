@@ -6,23 +6,27 @@
 //! are wired into that boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{OptionalExtension as _, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use xtrace_application::{
     AdmittedCatalogSelection, CatalogChangeKind, CatalogDiscoveryWritePort, CatalogOperationFilter,
     CatalogOperationRecord, CatalogReadPort, CatalogRevisionSummary, CatalogSourceAvailability,
-    PortError, PortErrorKind,
+    CatalogRunNamespace, PortError, PortErrorKind,
 };
 use xtrace_domain::catalog_discovery::{
     ClaimProvenance, ClaimSourceEvidence, DiscoveryChunk, DiscoveryCompletion, DiscoveryProofError,
     DiscoveryRunFinish, DiscoveryRunGrant, DiscoveryRunStartRequest, DiscoveryScope,
+    DiscoveryScopeKind,
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     CatalogRevisionId, ClaimId, ContentHash, CorrelationId, EndpointIdentity, HttpMethod,
     OperationId, OperationVersionId, ProjectId, RunId, SourceRevisionId, Transport,
 };
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::connection::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
@@ -31,13 +35,83 @@ use crate::error::{StoreError, StoreErrorKind};
 #[derive(Clone, Debug)]
 pub struct SqliteCatalogDiscoveryStore {
     store: SqliteStore,
+    #[cfg(test)]
+    test_now: Arc<Mutex<Option<String>>>,
+}
+
+/// Private transaction input copied from the application's opaque admission
+/// token. Store tests can construct this view; production callers cannot pass
+/// one through the public port or create an application authority token.
+#[derive(Clone, Debug)]
+struct SelectionView {
+    project_id: ProjectId,
+    runtime_session_id: xtrace_domain::RuntimeSessionId,
+    verified_pack_digest: ContentHash,
+    protocol_minor: u32,
+    namespace: CatalogRunNamespace,
+    owner_selection_id: [u8; 16],
+    owner_selection_epoch: u64,
+    scope: DiscoveryScope,
+    source_revision_id: Option<SourceRevisionId>,
+    pinned_source_digest: Option<ContentHash>,
+}
+
+impl From<&AdmittedCatalogSelection> for SelectionView {
+    fn from(selection: &AdmittedCatalogSelection) -> Self {
+        Self {
+            project_id: selection.project_id(),
+            runtime_session_id: selection.runtime_session_id(),
+            verified_pack_digest: selection.verified_pack_digest(),
+            protocol_minor: selection.protocol_minor(),
+            namespace: selection.namespace(),
+            owner_selection_id: *selection.owner_selection_id(),
+            owner_selection_epoch: selection.owner_selection_epoch(),
+            scope: selection.scope().clone(),
+            source_revision_id: selection.source_revision_id(),
+            pinned_source_digest: selection.pinned_source_digest(),
+        }
+    }
+}
+
+impl SelectionView {
+    const fn project_id(&self) -> ProjectId { self.project_id }
+    const fn runtime_session_id(&self) -> xtrace_domain::RuntimeSessionId { self.runtime_session_id }
+    const fn verified_pack_digest(&self) -> ContentHash { self.verified_pack_digest }
+    const fn protocol_minor(&self) -> u32 { self.protocol_minor }
+    const fn namespace(&self) -> CatalogRunNamespace { self.namespace }
+    const fn owner_selection_id(&self) -> &[u8; 16] { &self.owner_selection_id }
+    const fn owner_selection_epoch(&self) -> u64 { self.owner_selection_epoch }
+    fn scope(&self) -> &DiscoveryScope { &self.scope }
+    const fn source_revision_id(&self) -> Option<SourceRevisionId> { self.source_revision_id }
+    const fn pinned_source_digest(&self) -> Option<ContentHash> { self.pinned_source_digest }
 }
 
 impl SqliteCatalogDiscoveryStore {
     /// Creates a catalog view over the shared SQLite handle.
     #[must_use]
-    pub const fn new(store: SqliteStore) -> Self {
-        Self { store }
+    pub fn new(store: SqliteStore) -> Self {
+        Self {
+            store,
+            #[cfg(test)]
+            test_now: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn now(&self) -> String {
+        #[cfg(test)]
+        if let Ok(value) = self.test_now.lock()
+            && let Some(value) = value.as_ref()
+        {
+            return value.clone();
+        }
+        xtrace_domain::WallTime::now().to_rfc3339()
+    }
+
+    #[cfg(test)]
+    fn set_test_now(&self, value: &str) {
+        if let Ok(mut current) = self.test_now.lock() {
+            *current = Some(value.to_owned());
+        }
     }
 }
 
@@ -104,6 +178,10 @@ struct RunRow {
     protocol_minor: u32,
     owner_selection_id: [u8; 16],
     selection_epoch: u64,
+    namespace: String,
+    started_at: Option<String>,
+    expires_at: Option<String>,
+    expired_at: Option<String>,
     scope_digest: ContentHash,
     scope: DiscoveryScope,
     source_revision_id: Option<SourceRevisionId>,
@@ -119,6 +197,32 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
         selection: &AdmittedCatalogSelection,
         request: &DiscoveryRunStartRequest,
     ) -> Result<DiscoveryRunGrant, PortError> {
+        self.start_run_with_view(&SelectionView::from(selection), request)
+    }
+
+    fn submit_chunk(
+        &self,
+        selection: &AdmittedCatalogSelection,
+        chunk: &DiscoveryChunk,
+    ) -> Result<(), PortError> {
+        self.submit_chunk_with_view(&SelectionView::from(selection), chunk)
+    }
+
+    fn finish_run(
+        &self,
+        selection: &AdmittedCatalogSelection,
+        finish: &DiscoveryRunFinish,
+    ) -> Result<(), PortError> {
+        self.finish_run_with_view(&SelectionView::from(selection), finish)
+    }
+}
+
+impl SqliteCatalogDiscoveryStore {
+    fn start_run_with_view(
+        &self,
+        selection: &SelectionView,
+        request: &DiscoveryRunStartRequest,
+    ) -> Result<DiscoveryRunGrant, PortError> {
         request.validate().map_err(|_| validation_error())?;
         if request.requested_scope.canonical_bytes().map_err(|_| validation_error())?
             != selection.scope().canonical_bytes().map_err(|_| validation_error())?
@@ -130,6 +234,7 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| map_rusqlite(error, correlation_id))?;
+        let started_at = self.now();
         // Exact retries are checked against their original immutable
         // selection even if a newer selection now covers the same scope.
         verify_selection(&transaction, selection, false)?;
@@ -137,14 +242,14 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
         let request_digest = ContentHash::of_bytes(&request_bytes);
         if let Some(existing) = transaction
             .query_row(
-                "SELECT run_id, request_bytes, request_digest, scope_digest, source_revision_id, protocol_minor, pinned_source_digest FROM catalog_discovery_runs \
-                 WHERE project_id = ?1 AND runtime_session_id = ?2 AND verified_pack_digest = ?3 \
-                   AND owner_selection_id = ?4 AND run_hint = ?5",
+                "SELECT r.run_id, r.request_bytes, r.request_digest, r.scope_digest, r.source_revision_id, r.protocol_minor, r.pinned_source_digest, r.status, d.expires_at, d.started_at, d.expired_at, r.run_hint, k.stored_run_hint FROM catalog_discovery_retry_keys k JOIN catalog_discovery_runs r ON r.run_id = k.run_id LEFT JOIN catalog_discovery_run_deadlines d ON d.run_id = r.run_id \
+                 WHERE k.project_id = ?1 AND k.runtime_session_id = ?2 AND k.verified_pack_digest = ?3 \
+                   AND k.retry_namespace = ?4 AND k.request_run_hint = ?5",
                 params![
                     selection.project_id().as_uuid().as_bytes().to_vec(),
                     selection.runtime_session_id().as_uuid().as_bytes().to_vec(),
                     selection.verified_pack_digest().as_bytes().to_vec(),
-                    selection.owner_selection_id().to_vec(),
+                    selection.namespace().storage_key(),
                     request.run_hint,
                 ],
                 |row| {
@@ -156,13 +261,37 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
                         row.get::<_, Option<Vec<u8>>>(4)?,
                         row.get::<_, i64>(5)?,
                         row.get::<_, Option<Vec<u8>>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| map_rusqlite(error, correlation_id))?
         {
+            let expected_stored_hint = stored_run_hint(selection.namespace(), &request.run_hint);
+            if existing.11 != expected_stored_hint || existing.12 != expected_stored_hint {
+                return Err(corruption_error());
+            }
             if existing.1 != request_bytes {
+                return Err(conflict_error());
+            }
+            if existing.7 == "open"
+                && (existing.10.is_some() || is_expired(
+                    existing.9.as_deref().ok_or_else(corruption_error)?,
+                    existing.8.as_deref().ok_or_else(corruption_error)?,
+                    &started_at,
+                )?)
+            {
+                mark_expired(&transaction, &existing.0, &started_at, correlation_id)?;
+                transaction.commit().map_err(|error| map_rusqlite(error, correlation_id))?;
+                return Err(conflict_error());
+            }
+            if !matches!(existing.7.as_str(), "open" | "complete" | "incomplete" | "failed" | "superseded") {
                 return Err(conflict_error());
             }
             let expected_revision =
@@ -192,8 +321,34 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
             return Ok(DiscoveryRunGrant::Admitted { run_id, scope_digest, source_revision_id });
         }
 
+        // v0005 rows have no retry-namespace record. Never silently adopt an
+        // old hint into a new namespace or replay authority across versions.
+        let legacy_retry: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM catalog_discovery_runs WHERE project_id = ?1 AND runtime_session_id = ?2 AND verified_pack_digest = ?3 AND owner_selection_id = ?4 AND run_hint = ?5)",
+                params![selection.project_id().as_uuid().as_bytes().to_vec(), selection.runtime_session_id().as_uuid().as_bytes().to_vec(), selection.verified_pack_digest().as_bytes().to_vec(), selection.owner_selection_id().to_vec(), request.run_hint],
+                |row| row.get(0),
+            )
+            .map_err(|error| map_rusqlite(error, correlation_id))?;
+        if legacy_retry {
+            return Err(conflict_error());
+        }
+        let orphaned_retry: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM catalog_discovery_runs WHERE project_id = ?1 AND runtime_session_id = ?2 AND verified_pack_digest = ?3 AND owner_selection_id = ?4 AND run_hint = ?5)",
+                params![selection.project_id().as_uuid().as_bytes().to_vec(), selection.runtime_session_id().as_uuid().as_bytes().to_vec(), selection.verified_pack_digest().as_bytes().to_vec(), selection.owner_selection_id().to_vec(), stored_run_hint(selection.namespace(), &request.run_hint)],
+                |row| row.get(0),
+            )
+            .map_err(|error| map_rusqlite(error, correlation_id))?;
+        if orphaned_retry {
+            return Err(corruption_error());
+        }
+
         verify_selection(&transaction, selection, true)?;
         let run_id = RunId::new();
+        let expires_at = expiry_from(&started_at)?;
+        let request_hint = request.run_hint.clone();
+        let stored_run_hint = stored_run_hint(selection.namespace(), &request_hint);
         let scope_digest = selection.scope().digest().map_err(|_| validation_error())?;
         let scope_json =
             serde_json::to_string(selection.scope()).map_err(|_| validation_error())?;
@@ -213,7 +368,7 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
                     i64::from(selection.protocol_minor()),
                     selection.owner_selection_id().to_vec(),
                     i64::try_from(selection.owner_selection_epoch()).map_err(|_| validation_error())?,
-                    request.run_hint,
+                    stored_run_hint,
                     request_bytes,
                     request_digest.as_bytes().to_vec(),
                     scope_digest.as_bytes().to_vec(),
@@ -223,13 +378,26 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
                 ],
             )
             .map_err(|error| map_rusqlite(error, correlation_id))?;
+        transaction
+            .execute(
+                "INSERT INTO catalog_discovery_retry_keys (project_id, runtime_session_id, verified_pack_digest, retry_namespace, request_run_hint, stored_run_hint, run_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![selection.project_id().as_uuid().as_bytes().to_vec(), selection.runtime_session_id().as_uuid().as_bytes().to_vec(), selection.verified_pack_digest().as_bytes().to_vec(), selection.namespace().storage_key(), request_hint, stored_run_hint, run_id.as_uuid().as_bytes().to_vec()],
+            )
+            .map_err(|error| map_rusqlite(error, correlation_id))?;
+        transaction
+            .execute(
+                "INSERT INTO catalog_discovery_run_deadlines (run_id, project_id, started_at, expires_at, expired_at) VALUES (?1, ?2, ?3, ?4, NULL)",
+                params![run_id.as_uuid().as_bytes().to_vec(), selection.project_id().as_uuid().as_bytes().to_vec(), started_at, expires_at],
+            )
+            .map_err(|error| map_rusqlite(error, correlation_id))?;
         transaction.commit().map_err(|error| map_rusqlite(error, correlation_id))?;
         Ok(DiscoveryRunGrant::Admitted { run_id, scope_digest, source_revision_id })
+
     }
 
-    fn submit_chunk(
+    fn submit_chunk_with_view(
         &self,
-        selection: &AdmittedCatalogSelection,
+        selection: &SelectionView,
         chunk: &DiscoveryChunk,
     ) -> Result<(), PortError> {
         let canonical_chunk = chunk.canonical_bytes().map_err(|_| validation_error())?;
@@ -249,7 +417,13 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
                 CorrelationId::new(),
             ));
         }
-        if chunk.claims.iter().any(|claim| claim.operation().project_id != selection.project_id()) {
+        if chunk.claims.iter().any(|claim| {
+            claim.operation().project_id != selection.project_id()
+                || claim.operation().application_component
+                    != selection.scope().application_component
+                || claim.operation().binding_key != selection.scope().binding_key
+                || !provenance_matches_scope(claim.provenance(), selection.scope())
+        }) {
             return Err(validation_error());
         }
         let claims = chunk
@@ -277,6 +451,21 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
         let run = load_run(&transaction, chunk.run_id)?;
         verify_run_selection(&transaction, selection, &run, true)?;
         if run.status != "open" {
+            return Err(conflict_error());
+        }
+        let now = self.now();
+        if run.expired_at.is_some() || is_expired(
+            run.started_at.as_deref().ok_or_else(corruption_error)?,
+            run.expires_at.as_deref().ok_or_else(corruption_error)?,
+            &now,
+        )? {
+            mark_expired(
+                &transaction,
+                chunk.run_id.as_uuid().as_bytes(),
+                &now,
+                correlation_id,
+            )?;
+            transaction.commit().map_err(|error| map_rusqlite(error, correlation_id))?;
             return Err(conflict_error());
         }
         let existing = transaction
@@ -401,11 +590,12 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
             )
             .map_err(|error| map_rusqlite(error, correlation_id))?;
         transaction.commit().map_err(|error| map_rusqlite(error, correlation_id))
+
     }
 
-    fn finish_run(
+    fn finish_run_with_view(
         &self,
-        selection: &AdmittedCatalogSelection,
+        selection: &SelectionView,
         finish: &DiscoveryRunFinish,
     ) -> Result<(), PortError> {
         let correlation_id = CorrelationId::new();
@@ -422,7 +612,29 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
         };
         let limitation_json =
             serde_json::to_string(&finish.limitation_codes).map_err(|_| validation_error())?;
-        let chunks = load_and_verify_chunks(&transaction, finish.run_id, selection.project_id())?;
+        if run.status == "open"
+            && (run.expired_at.is_some() || is_expired(
+                run.started_at.as_deref().ok_or_else(corruption_error)?,
+                run.expires_at.as_deref().ok_or_else(corruption_error)?,
+                &self.now(),
+            )?)
+        {
+            let now = self.now();
+            mark_expired(
+                &transaction,
+                finish.run_id.as_uuid().as_bytes(),
+                &now,
+                correlation_id,
+            )?;
+            transaction.commit().map_err(|error| map_rusqlite(error, correlation_id))?;
+            return Err(conflict_error());
+        }
+        let chunks = load_and_verify_chunks(
+            &transaction,
+            finish.run_id,
+            selection.project_id(),
+            &run.scope,
+        )?;
         let actual_claim_count = chunks.iter().map(|chunk| chunk.claims.len()).sum::<usize>();
         let actual_claim_bytes = chunks
             .iter()
@@ -444,7 +656,7 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
                 params![finish.run_id.as_uuid().as_bytes().to_vec()],
                 |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<Vec<u8>>>(3)?, row.get::<_, Option<String>>(4)?)),
             ).map_err(|error| map_rusqlite(error, correlation_id))?;
-            if run.status == status
+            if (run.status == status || (run.status == "superseded" && status == "complete"))
                 && existing.0 == Some(i64::from(finish.expected_chunk_count))
                 && existing.1 == i64::from(finish.accepted_claim_count)
                 && existing.2 == i64::from(finish.rejected_claim_count)
@@ -496,7 +708,7 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
                 )
                 .map_err(|error| map_rusqlite(error, correlation_id))?;
             transaction.commit().map_err(|error| map_rusqlite(error, correlation_id))?;
-            return Err(conflict_error());
+            return Ok(());
         }
         publish_revision(
             &transaction,
@@ -508,7 +720,9 @@ impl CatalogDiscoveryWritePort for SqliteCatalogDiscoveryStore {
             correlation_id,
         )?;
         transaction.commit().map_err(|error| map_rusqlite(error, correlation_id))
+
     }
+
 }
 
 impl CatalogReadPort for SqliteCatalogDiscoveryStore {
@@ -541,6 +755,12 @@ impl CatalogReadPort for SqliteCatalogDiscoveryStore {
             .ok_or_else(|| PortError::new(PortErrorKind::NotFound, "catalog revision was not found", correlation_id))?;
         let scope_digest =
             ContentHash::from_digest_bytes(&summary.0).ok_or_else(corruption_error)?;
+        let completion = match summary.4.as_str() {
+            "complete" => DiscoveryCompletion::Complete,
+            "incomplete" => DiscoveryCompletion::Incomplete,
+            "failed" => DiscoveryCompletion::Failed,
+            _ => return Err(corruption_error()),
+        };
         if summary.4 != "complete"
             || summary.5.as_deref() != Some(revision_id.as_uuid().as_bytes())
             || summary.6.as_deref() != Some(summary.2.as_slice())
@@ -557,7 +777,7 @@ impl CatalogReadPort for SqliteCatalogDiscoveryStore {
             revision_id,
             scope_digest,
             source_revision_id,
-            completion: DiscoveryCompletion::Complete,
+            completion,
             operation_count: u32::try_from(summary.1).map_err(|_| corruption_error())?,
         })
     }
@@ -748,7 +968,7 @@ impl CatalogReadPort for SqliteCatalogDiscoveryStore {
 
 fn verify_selection(
     transaction: &Transaction<'_>,
-    selection: &AdmittedCatalogSelection,
+    selection: &SelectionView,
     require_current: bool,
 ) -> Result<(), PortError> {
     let row = transaction
@@ -781,7 +1001,7 @@ fn verify_selection(
 
 fn verify_run_selection(
     transaction: &Transaction<'_>,
-    selection: &AdmittedCatalogSelection,
+    selection: &SelectionView,
     run: &RunRow,
     require_current: bool,
 ) -> Result<(), PortError> {
@@ -791,6 +1011,7 @@ fn verify_run_selection(
         || run.protocol_minor != selection.protocol_minor()
         || run.owner_selection_id != *selection.owner_selection_id()
         || run.selection_epoch != selection.owner_selection_epoch()
+        || run.namespace != selection.namespace().storage_key()
         || run.source_revision_id != selection.source_revision_id()
         || run.pinned_source_digest != selection.pinned_source_digest()
         || run.scope.canonical_bytes().ok() != selection.scope().canonical_bytes().ok()
@@ -800,13 +1021,76 @@ fn verify_run_selection(
     verify_selection(transaction, selection, require_current)
 }
 
+const DISCOVERY_RUN_TTL_SECONDS: i64 = 120;
+
+fn expiry_from(started_at: &str) -> Result<String, PortError> {
+    let started = OffsetDateTime::parse(started_at, &Rfc3339).map_err(|_| validation_error())?;
+    started
+        .checked_add(Duration::seconds(DISCOVERY_RUN_TTL_SECONDS))
+        .ok_or_else(validation_error)?
+        .format(&Rfc3339)
+        .map_err(|_| validation_error())
+}
+
+fn stored_run_hint(namespace: CatalogRunNamespace, request_hint: &str) -> String {
+    let digest = blake3::hash(request_hint.as_bytes());
+    format!("{}:{}", namespace.storage_key(), digest.to_hex())
+}
+
+fn mark_expired(
+    transaction: &Transaction<'_>,
+    run_id: &[u8],
+    now: &str,
+    correlation_id: CorrelationId,
+) -> Result<(), PortError> {
+    transaction
+        .execute(
+            "UPDATE catalog_discovery_run_deadlines SET expired_at = ?2 WHERE run_id = ?1 AND expired_at IS NULL",
+            params![run_id, now],
+        )
+        .map_err(|error| map_rusqlite(error, correlation_id))?;
+    Ok(())
+}
+
+fn is_expired(started_at: &str, expires_at: &str, now: &str) -> Result<bool, PortError> {
+    let started = OffsetDateTime::parse(started_at, &Rfc3339).map_err(|_| corruption_error())?;
+    let expires = OffsetDateTime::parse(expires_at, &Rfc3339).map_err(|_| corruption_error())?;
+    let current = OffsetDateTime::parse(now, &Rfc3339).map_err(|_| corruption_error())?;
+    let expected_expiry = started
+        .checked_add(Duration::seconds(DISCOVERY_RUN_TTL_SECONDS))
+        .ok_or_else(corruption_error)?;
+    if expires != expected_expiry {
+        return Err(corruption_error());
+    }
+    if current < started {
+        // A wall-clock rollback must never extend a persisted admission.
+        return Err(conflict_error());
+    }
+    Ok(current >= expires)
+}
+
+fn provenance_matches_scope(
+    provenance: ClaimProvenance,
+    scope: &DiscoveryScope,
+) -> bool {
+    match scope.kind {
+        DiscoveryScopeKind::StaticRepository => matches!(
+            provenance,
+            ClaimProvenance::StaticInferred | ClaimProvenance::ImportedSpec
+        ),
+        DiscoveryScopeKind::RuntimeRegistration => {
+            provenance == ClaimProvenance::RuntimeDiscovered
+        }
+    }
+}
+
 fn load_run(transaction: &Transaction<'_>, run_id: RunId) -> Result<RunRow, PortError> {
     let row = transaction
         .query_row(
-            "SELECT project_id, runtime_session_id, verified_pack_digest, protocol_minor, owner_selection_id, selection_epoch, scope_digest, scope_json, source_revision_id, pinned_source_digest, accepted_claim_count, accepted_claim_bytes, status \
-             FROM catalog_discovery_runs WHERE run_id = ?1",
+            "SELECT r.project_id, r.runtime_session_id, r.verified_pack_digest, r.protocol_minor, r.owner_selection_id, r.selection_epoch, r.scope_digest, r.scope_json, r.source_revision_id, r.pinned_source_digest, r.accepted_claim_count, r.accepted_claim_bytes, r.status, k.retry_namespace, d.started_at, d.expires_at, d.expired_at \
+             FROM catalog_discovery_runs r LEFT JOIN catalog_discovery_retry_keys k ON k.run_id = r.run_id LEFT JOIN catalog_discovery_run_deadlines d ON d.run_id = r.run_id WHERE r.run_id = ?1",
             params![run_id.as_uuid().as_bytes().to_vec()],
-            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, i64>(5)?, row.get::<_, Vec<u8>>(6)?, row.get::<_, String>(7)?, row.get::<_, Option<Vec<u8>>>(8)?, row.get::<_, Option<Vec<u8>>>(9)?, row.get::<_, i64>(10)?, row.get::<_, i64>(11)?, row.get::<_, String>(12)?)),
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?, row.get::<_, Vec<u8>>(4)?, row.get::<_, i64>(5)?, row.get::<_, Vec<u8>>(6)?, row.get::<_, String>(7)?, row.get::<_, Option<Vec<u8>>>(8)?, row.get::<_, Option<Vec<u8>>>(9)?, row.get::<_, i64>(10)?, row.get::<_, i64>(11)?, row.get::<_, String>(12)?, row.get::<_, Option<String>>(13)?, row.get::<_, Option<String>>(14)?, row.get::<_, Option<String>>(15)?, row.get::<_, Option<String>>(16)?)),
         )
         .optional()
         .map_err(|error| map_rusqlite(error, CorrelationId::new()))?
@@ -837,6 +1121,10 @@ fn load_run(transaction: &Transaction<'_>, run_id: RunId) -> Result<RunRow, Port
         protocol_minor,
         owner_selection_id,
         selection_epoch: u64::try_from(row.5).map_err(|_| corruption_error())?,
+        namespace: row.13.unwrap_or_else(|| "legacy_unscoped".to_owned()),
+        started_at: row.14,
+        expires_at: row.15,
+        expired_at: row.16,
         scope_digest,
         scope,
         source_revision_id,
@@ -851,6 +1139,7 @@ fn load_and_verify_chunks(
     transaction: &Transaction<'_>,
     run_id: RunId,
     project_id: ProjectId,
+    scope: &DiscoveryScope,
 ) -> Result<Vec<DiscoveryChunk>, PortError> {
     let mut chunk_statement = transaction
         .prepare("SELECT chunk_index, chunk_digest, claim_count FROM catalog_discovery_chunks WHERE run_id = ?1 AND project_id = ?2 ORDER BY chunk_index")
@@ -935,6 +1224,9 @@ fn load_and_verify_chunks(
             let claim = stored.rebuild().map_err(|_| corruption_error())?;
             if claim.canonical_bytes() != canonical
                 || claim.digest().map(|hash| hash.as_bytes().to_vec()) != Some(digest_bytes)
+                || claim.operation().application_component != scope.application_component
+                || claim.operation().binding_key != scope.binding_key
+                || !provenance_matches_scope(claim.provenance(), scope)
             {
                 return Err(corruption_error());
             }
@@ -955,7 +1247,7 @@ fn load_and_verify_chunks(
 
 fn publish_revision(
     transaction: &Transaction<'_>,
-    selection: &AdmittedCatalogSelection,
+    selection: &SelectionView,
     run: &RunRow,
     finish: &DiscoveryRunFinish,
     chunks: &[DiscoveryChunk],
@@ -1143,6 +1435,7 @@ fn find_or_create_operation(
         params![identity.project_id.as_uuid().as_bytes().to_vec(), fingerprint],
         |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?)),
     ).optional().map_err(|error| map_rusqlite(error, correlation_id))?;
+    let legacy_existed = legacy.is_some();
     let (operation_id, component, binding, transport, method, route) = match legacy {
         Some(row) => row,
         None => (
@@ -1163,7 +1456,9 @@ fn find_or_create_operation(
         "INSERT INTO catalog_operations (operation_id, project_id, fingerprint_format, endpoint_fingerprint, transport, application_component, binding_key, method, route_template, created_at) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         params![operation_id, identity.project_id.as_uuid().as_bytes().to_vec(), fingerprint, tuple.2, tuple.0, tuple.1, tuple.3, tuple.4],
     ).map_err(|error| map_rusqlite(error, correlation_id))?;
-    if tuple == ("spring-fixture", "default", "http", "POST", "/orders") {
+    if !legacy_existed
+        && tuple == ("spring-fixture", "default", "http", "POST", "/orders")
+    {
         transaction.execute(
             "INSERT INTO operations (operation_id, project_id, transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint, created_at) \
              VALUES (?1, ?2, 'http', 'POST', '/orders', 'spring-fixture', 'default', 1, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
@@ -1319,6 +1614,313 @@ mod tests {
     use super::*;
 
     use crate::connection::{OpenOptions, SqliteStore};
+    use std::{env, fs, path::PathBuf};
+
+    #[test]
+    fn test_clock_and_persisted_deadline_enforce_exact_ttl_and_clock_rollback() {
+        let shared = SqliteStore::open_in_memory(OpenOptions::default()).expect("store");
+        let store = SqliteCatalogDiscoveryStore::new(shared);
+        store.set_test_now("2026-10-04T00:00:00Z");
+        assert_eq!(store.now(), "2026-10-04T00:00:00Z");
+        let started = store.now();
+        let expires = expiry_from(&started).expect("checked deadline");
+        let expected = OffsetDateTime::parse("2026-10-04T00:02:00Z", &Rfc3339).expect("time");
+        assert_eq!(OffsetDateTime::parse(&expires, &Rfc3339).expect("expiry"), expected);
+        assert!(!is_expired(&started, &expires, "2026-10-04T00:01:59Z").expect("before deadline"));
+        assert!(is_expired(&started, &expires, &expires).expect("at deadline"));
+        assert!(is_expired(&started, &expires, "2026-10-03T23:59:59Z").is_err());
+        assert!(is_expired(&started, "2026-10-04T00:02:01Z", "2026-10-04T00:01:00Z").is_err());
+        assert!(expiry_from("9999-12-31T23:59:59Z").is_err());
+    }
+
+    fn test_scope(component: &str) -> DiscoveryScope {
+        DiscoveryScope {
+            kind: DiscoveryScopeKind::RuntimeRegistration,
+            source_root_key: None,
+            module_selector: "test-module".to_owned(),
+            application_component: component.to_owned(),
+            binding_key: "default".to_owned(),
+            framework_family: "fixture".to_owned(),
+            producer_family: "fixture".to_owned(),
+            ruleset_digest: ContentHash::of_bytes(b"test-rules"),
+        }
+    }
+
+    fn test_selection(scope: DiscoveryScope, namespace: CatalogRunNamespace) -> SelectionView {
+        SelectionView {
+            project_id: ProjectId::new(),
+            runtime_session_id: xtrace_domain::RuntimeSessionId::new(),
+            verified_pack_digest: ContentHash::of_bytes(b"test-pack"),
+            protocol_minor: 1,
+            namespace,
+            owner_selection_id: *uuid::Uuid::now_v7().as_bytes(),
+            owner_selection_epoch: 1,
+            scope,
+            source_revision_id: None,
+            pinned_source_digest: None,
+        }
+    }
+
+    fn seed_authority(store: &SqliteStore, selection: &SelectionView) {
+        let connection = store.lock().expect("database connection");
+        connection.execute(
+            "INSERT INTO projects (project_id, canonical_repo_hash, display_name, created_at, last_opened_at, config_schema_version, effective_config_hash) VALUES (?1, ?2, 'fixture', '2026-10-04T00:00:00Z', '2026-10-04T00:00:00Z', 1, ?3)",
+            params![selection.project_id().as_uuid().as_bytes().to_vec(), format!("b3:{}", "0".repeat(64)), "0".repeat(64)],
+        ).expect("seed project");
+        connection.execute(
+            "INSERT INTO catalog_owner_selections (owner_selection_id, project_id, selection_epoch, current_for_scope, verified_pack_digest, scope_digest, scope_json, revoked) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, 0)",
+            params![selection.owner_selection_id().to_vec(), selection.project_id().as_uuid().as_bytes().to_vec(), i64::try_from(selection.owner_selection_epoch()).expect("epoch"), selection.verified_pack_digest().as_bytes().to_vec(), selection.scope().digest().expect("scope digest").as_bytes().to_vec(), serde_json::to_string(selection.scope()).expect("scope JSON")],
+        ).expect("seed owner selection");
+    }
+
+    fn private_database(label: &str) -> (PathBuf, PathBuf) {
+        let scratch = env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+            .map(PathBuf::from)
+            .expect("XTRACE_TEST_PRIVATE_SCRATCH must point to private test storage");
+        fs::create_dir_all(&scratch).expect("create private test scratch");
+        let root = scratch.join(format!("catalog-store-{label}-{}", uuid::Uuid::now_v7().simple()));
+        fs::create_dir(&root).expect("create isolated catalog test directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("restrict test directory");
+        }
+        let database = root.join("catalog.sqlite3");
+        (root, database)
+    }
+
+    fn start_request(scope: &DiscoveryScope, hint: &str) -> DiscoveryRunStartRequest {
+        DiscoveryRunStartRequest {
+            schema_version: 1,
+            run_hint: hint.to_owned(),
+            requested_scope: scope.clone(),
+            owner_selection_ref: Some("test-owner".to_owned()),
+        }
+    }
+
+    fn run_id(grant: DiscoveryRunGrant) -> RunId {
+        match grant {
+            DiscoveryRunGrant::Admitted { run_id, .. } => run_id,
+            DiscoveryRunGrant::Refused { .. } => panic!("test run unexpectedly refused"),
+        }
+    }
+
+    fn test_claim(project_id: ProjectId, component: &str, hint: &str) -> xtrace_domain::catalog_discovery::ValidatedEndpointClaim {
+        let identity = EndpointIdentity {
+            project_id,
+            application_component: component.to_owned(),
+            transport: Transport::Http,
+            binding_key: "default".to_owned(),
+            method: HttpMethod::Post,
+            route_template: "/orders".to_owned(),
+        };
+        xtrace_domain::catalog_discovery::ValidatedEndpointClaim::new(
+            hint.to_owned(), identity, ClaimProvenance::RuntimeDiscovered, None, -1.0,
+            Vec::new(), Vec::new(),
+        ).expect("valid scoped claim")
+    }
+
+    fn test_finish(run_id: RunId, scope: &DiscoveryScope, chunks: &[DiscoveryChunk]) -> DiscoveryRunFinish {
+        let accepted_claim_count = chunks.iter().map(|chunk| chunk.claims.len() as u32).sum();
+        DiscoveryRunFinish {
+            run_id,
+            expected_chunk_count: chunks.len() as u32,
+            accepted_claim_count,
+            rejected_claim_count: 0,
+            final_digest: xtrace_domain::catalog_discovery::final_digest(
+                run_id, scope, None, chunks, 0, DiscoveryCompletion::Complete,
+            ).expect("final digest"),
+            completion: DiscoveryCompletion::Complete,
+            limitation_codes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn shared_sql_transactions_preserve_legacy_orders_and_replay_after_restart_and_supersession() {
+        let (root, database) = private_database("restart");
+        let shared = SqliteStore::open(&database, OpenOptions::default()).expect("open database");
+        let scope = test_scope("spring-fixture");
+        let selection = test_selection(scope.clone(), CatalogRunNamespace::RuntimeProducer);
+        seed_authority(&shared, &selection);
+        let identity = EndpointIdentity {
+            project_id: selection.project_id(),
+            application_component: "spring-fixture".to_owned(),
+            transport: Transport::Http,
+            binding_key: "default".to_owned(),
+            method: HttpMethod::Post,
+            route_template: "/orders".to_owned(),
+        };
+        let legacy_operation = OperationId::new();
+        {
+            let connection = shared.lock().expect("seed legacy operation");
+            connection.execute(
+                "INSERT INTO operations (operation_id, project_id, transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint, created_at) VALUES (?1, ?2, 'http', 'POST', '/orders', 'spring-fixture', 'default', 1, ?3, '2026-10-04T00:00:00Z')",
+                params![legacy_operation.as_uuid().as_bytes().to_vec(), selection.project_id().as_uuid().as_bytes().to_vec(), identity.fingerprint().expect("fingerprint").as_bytes().to_vec()],
+            ).expect("seed finite legacy row");
+        }
+
+        let adapter = SqliteCatalogDiscoveryStore::new(shared.clone());
+        let request = start_request(&scope, "stable-retry");
+        let run = run_id(adapter.start_run_with_view(&selection, &request).expect("start"));
+        let exact_retry = run_id(adapter.start_run_with_view(&selection, &request).expect("lost-grant retry"));
+        assert_eq!(exact_retry, run);
+        let mut local_selection = selection.clone();
+        local_selection.namespace = CatalogRunNamespace::LocalStaticScanner;
+        let local_run = run_id(adapter.start_run_with_view(&local_selection, &request).expect("separate namespace"));
+        assert_ne!(local_run, run);
+
+        let claim = test_claim(selection.project_id(), "spring-fixture", "claim-1");
+        let chunk = DiscoveryChunk { run_id: run, chunk_index: 0, claims: vec![claim] };
+        adapter.submit_chunk_with_view(&selection, &chunk).expect("persist chunk");
+        let finish = test_finish(run, &scope, std::slice::from_ref(&chunk));
+        adapter.finish_run_with_view(&selection, &finish).expect("publish revision");
+        let revision: CatalogRevisionId = {
+            let connection = shared.lock().expect("read revision id");
+            let bytes: Vec<u8> = connection.query_row(
+                "SELECT revision_id FROM catalog_discovery_runs WHERE run_id = ?1",
+                [run.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            ).expect("revision id");
+            decode_id::<CatalogRevisionId>(&bytes).expect("revision UUID")
+        };
+        let summary = adapter.read_revision_summary(selection.project_id(), revision).expect("persisted summary");
+        assert_eq!(summary.completion, DiscoveryCompletion::Complete);
+        {
+            let connection = shared.lock().expect("supersede selection");
+            connection.execute(
+                "UPDATE catalog_owner_selections SET current_for_scope = 0 WHERE owner_selection_id = ?1",
+                [selection.owner_selection_id().to_vec()],
+            ).expect("supersede owner selection");
+        }
+        adapter.finish_run_with_view(&selection, &finish).expect("exact terminal replay after supersession");
+
+        let mut latest = selection.clone();
+        latest.owner_selection_id = *uuid::Uuid::now_v7().as_bytes();
+        latest.owner_selection_epoch = 2;
+        {
+            let connection = shared.lock().expect("insert successor selection");
+            connection.execute(
+                "INSERT INTO catalog_owner_selections (owner_selection_id, project_id, selection_epoch, current_for_scope, verified_pack_digest, scope_digest, scope_json, revoked) VALUES (?1, ?2, 2, 1, ?3, ?4, ?5, 0)",
+                params![latest.owner_selection_id.to_vec(), latest.project_id().as_uuid().as_bytes().to_vec(), latest.verified_pack_digest().as_bytes().to_vec(), latest.scope().digest().expect("scope digest").as_bytes().to_vec(), serde_json::to_string(latest.scope()).expect("scope JSON")],
+            ).expect("insert successor selection");
+        }
+        let superseded_run = run_id(adapter.start_run_with_view(&latest, &start_request(&scope, "superseded")).expect("start successor run"));
+        let superseded_finish = test_finish(superseded_run, &scope, &[]);
+        {
+            let connection = shared.lock().expect("supersede successor");
+            connection.execute(
+                "UPDATE catalog_owner_selections SET current_for_scope = 0 WHERE owner_selection_id = ?1",
+                [latest.owner_selection_id.to_vec()],
+            ).expect("supersede successor selection");
+        }
+        adapter.finish_run_with_view(&latest, &superseded_finish).expect("persist superseded terminal receipt");
+        let superseded_status: String = shared.lock().expect("inspect superseded").query_row(
+            "SELECT status FROM catalog_discovery_runs WHERE run_id = ?1",
+            [superseded_run.as_uuid().as_bytes().to_vec()],
+            |row| row.get(0),
+        ).expect("superseded run status");
+        assert_eq!(superseded_status, "superseded");
+        adapter.finish_run_with_view(&latest, &superseded_finish).expect("replay superseded receipt");
+        drop(adapter);
+        drop(shared);
+
+        let reopened = SqliteStore::open(&database, OpenOptions::default()).expect("reopen database");
+        let replay = SqliteCatalogDiscoveryStore::new(reopened.clone());
+        replay.finish_run_with_view(&selection, &finish).expect("terminal replay after restart");
+        replay.finish_run_with_view(&latest, &superseded_finish).expect("superseded replay after restart");
+        let connection = reopened.lock().expect("inspect restarted history");
+        let (legacy_count, legacy_id, catalog_id): (i64, Vec<u8>, Vec<u8>) = connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM operations WHERE project_id = ?1), (SELECT operation_id FROM operations WHERE project_id = ?1), (SELECT operation_id FROM catalog_operations WHERE project_id = ?1)",
+            [selection.project_id().as_uuid().as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).expect("read legacy bridge");
+        assert_eq!(legacy_count, 1);
+        assert_eq!(legacy_id, legacy_operation.as_uuid().as_bytes());
+        assert_eq!(catalog_id, legacy_id);
+        drop(connection);
+        drop(replay);
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove private fixture");
+    }
+
+    #[test]
+    fn shared_sql_transactions_expire_refuse_revoked_corrupt_and_rollback_partial_chunk() {
+        let shared = SqliteStore::open_in_memory(OpenOptions::default()).expect("store");
+        let scope = test_scope("orders");
+        let selection = test_selection(scope.clone(), CatalogRunNamespace::RuntimeProducer);
+        seed_authority(&shared, &selection);
+        let adapter = SqliteCatalogDiscoveryStore::new(shared.clone());
+        adapter.set_test_now("2026-10-04T00:00:00Z");
+
+        let expired_run = run_id(adapter.start_run_with_view(&selection, &start_request(&scope, "expired")).expect("start expiring run"));
+        {
+            let connection = shared.lock().expect("set expired deadline");
+            connection.execute(
+                "UPDATE catalog_discovery_run_deadlines SET started_at = '2000-01-01T00:00:00Z', expires_at = '2000-01-01T00:02:00Z' WHERE run_id = ?1",
+                [expired_run.as_uuid().as_bytes().to_vec()],
+            ).expect("set expired timestamp");
+        }
+        let expired_chunk = DiscoveryChunk {
+            run_id: expired_run,
+            chunk_index: 0,
+            claims: vec![test_claim(selection.project_id(), "orders", "expired-claim")],
+        };
+        assert!(adapter.submit_chunk_with_view(&selection, &expired_chunk).is_err());
+        let persisted_expiry: Option<String> = shared.lock().expect("read expiry marker").query_row(
+            "SELECT expired_at FROM catalog_discovery_run_deadlines WHERE run_id = ?1",
+            [expired_run.as_uuid().as_bytes().to_vec()],
+            |row| row.get(0),
+        ).expect("expiry marker");
+        assert!(persisted_expiry.is_some());
+        adapter.set_test_now("1999-12-31T00:00:00Z");
+        assert!(adapter.submit_chunk_with_view(&selection, &expired_chunk).is_err());
+
+        adapter.set_test_now("2026-10-04T00:00:00Z");
+        let rollback_run = run_id(adapter.start_run_with_view(&selection, &start_request(&scope, "rollback")).expect("start rollback run"));
+        shared.lock().expect("install SQL failure trigger").execute_batch(
+            "CREATE TRIGGER reject_test_claim BEFORE INSERT ON catalog_discovery_claims BEGIN SELECT RAISE(ABORT, 'injected rollback'); END;",
+        ).expect("install trigger");
+        let rollback_chunk = DiscoveryChunk {
+            run_id: rollback_run,
+            chunk_index: 0,
+            claims: vec![test_claim(selection.project_id(), "orders", "rollback-claim")],
+        };
+        assert!(adapter.submit_chunk_with_view(&selection, &rollback_chunk).is_err());
+        let rollback_state: (i64, i64, String) = shared.lock().expect("inspect rollback").query_row(
+            "SELECT (SELECT COUNT(*) FROM catalog_discovery_chunks WHERE run_id = ?1), (SELECT COUNT(*) FROM catalog_discovery_claims WHERE run_id = ?1), status FROM catalog_discovery_runs WHERE run_id = ?1",
+            [rollback_run.as_uuid().as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).expect("rollback state");
+        assert_eq!((rollback_state.0, rollback_state.1, rollback_state.2.as_str()), (0, 0, "open"));
+
+        let corrupt_run = run_id(adapter.start_run_with_view(&selection, &start_request(&scope, "corrupt")).expect("start corrupt run"));
+        let corrupt_chunk = DiscoveryChunk {
+            run_id: corrupt_run,
+            chunk_index: 0,
+            claims: vec![test_claim(selection.project_id(), "orders", "corrupt-claim")],
+        };
+        shared.lock().expect("remove injected trigger").execute_batch("DROP TRIGGER reject_test_claim").expect("drop trigger");
+        adapter.submit_chunk_with_view(&selection, &corrupt_chunk).expect("stage valid chunk");
+        shared.lock().expect("corrupt canonical row").execute(
+            "UPDATE catalog_discovery_claims SET canonical_json = '{broken' WHERE run_id = ?1",
+            [corrupt_run.as_uuid().as_bytes().to_vec()],
+        ).expect("inject canonical corruption");
+        let corrupt_finish = test_finish(corrupt_run, &scope, std::slice::from_ref(&corrupt_chunk));
+        assert!(adapter.finish_run_with_view(&selection, &corrupt_finish).is_err());
+
+        let revoked_run = run_id(adapter.start_run_with_view(&selection, &start_request(&scope, "revoked")).expect("start revoked run"));
+        shared.lock().expect("revoke owner").execute(
+            "UPDATE catalog_owner_selections SET revoked = 1 WHERE owner_selection_id = ?1",
+            [selection.owner_selection_id().to_vec()],
+        ).expect("revoke persisted selection");
+        assert!(adapter.finish_run_with_view(&selection, &test_finish(revoked_run, &scope, &[])).is_err());
+        let revisions: i64 = shared.lock().expect("count revisions").query_row(
+            "SELECT COUNT(*) FROM catalog_revisions WHERE project_id = ?1",
+            [selection.project_id().as_uuid().as_bytes().to_vec()],
+            |row| row.get(0),
+        ).expect("revision count");
+        assert_eq!(revisions, 0);
+    }
 
     #[test]
     fn catalog_first_orders_identity_is_shared_with_legacy_endpoint_table() {

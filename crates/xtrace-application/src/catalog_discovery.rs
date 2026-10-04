@@ -36,6 +36,29 @@ pub struct CatalogProducerContext {
     pub protocol_minor: u32,
     /// Whether the daemon negotiated the scoped catalog capability.
     pub scoped_discovery_negotiated: bool,
+    /// Trusted origin namespace for retry identity. Local static scans and
+    /// adapter requests must never alias the same producer hint.
+    pub namespace: CatalogRunNamespace,
+}
+
+/// Distinct idempotency namespaces for local scans and runtime producers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogRunNamespace {
+    /// A user-requested local static scanner run.
+    LocalStaticScanner,
+    /// A discovery request from an authenticated runtime adapter.
+    RuntimeProducer,
+}
+
+impl CatalogRunNamespace {
+    /// Stable value used only for durable retry identity.
+    #[must_use]
+    pub const fn storage_key(self) -> &'static str {
+        match self {
+            Self::LocalStaticScanner => "local_static_scanner",
+            Self::RuntimeProducer => "runtime_producer",
+        }
+    }
 }
 
 /// Opaque result of owner selection and pack/scope admission.
@@ -49,6 +72,7 @@ pub struct AdmittedCatalogSelection {
     runtime_session_id: RuntimeSessionId,
     verified_pack_digest: ContentHash,
     protocol_minor: u32,
+    namespace: CatalogRunNamespace,
     owner_selection_id: [u8; 16],
     owner_selection_epoch: u64,
     scope: DiscoveryScope,
@@ -80,6 +104,12 @@ impl AdmittedCatalogSelection {
     #[must_use]
     pub const fn protocol_minor(&self) -> u32 {
         self.protocol_minor
+    }
+
+    /// Retry namespace resolved by trusted admission.
+    #[must_use]
+    pub const fn namespace(&self) -> CatalogRunNamespace {
+        self.namespace
     }
 
     /// Stable owner-selection row identity.
@@ -119,6 +149,14 @@ impl AdmittedCatalogSelection {
 /// producer's owner-selection reference is a lookup key only; all returned
 /// identities and epochs must come from trusted persisted policy.
 pub trait CatalogAdmissionPort: Send + Sync {
+    /// Resolves an exact Start retry against its original persisted owner
+    /// selection before a fresh selection can be chosen.
+    fn resolve_start_retry(
+        &self,
+        context: CatalogProducerContext,
+        request: &DiscoveryRunStartRequest,
+    ) -> Result<Option<AdmittedCatalogSelection>, DiscoveryRefusal>;
+
     /// Resolves a requested scope or returns a stable refusal.
     fn admit(
         &self,
@@ -142,6 +180,17 @@ pub trait CatalogAdmissionPort: Send + Sync {
 pub struct RefuseCatalogAdmission;
 
 impl CatalogAdmissionPort for RefuseCatalogAdmission {
+    fn resolve_start_retry(
+        &self,
+        context: CatalogProducerContext,
+        _request: &DiscoveryRunStartRequest,
+    ) -> Result<Option<AdmittedCatalogSelection>, DiscoveryRefusal> {
+        if !context.scoped_discovery_negotiated {
+            return Err(DiscoveryRefusal::CapabilityNotNegotiated);
+        }
+        Ok(None)
+    }
+
     fn admit(
         &self,
         context: CatalogProducerContext,
@@ -250,8 +299,14 @@ impl CatalogDiscoveryService {
         request: &DiscoveryRunStartRequest,
     ) -> Result<DiscoveryRunGrant, CatalogDiscoveryError> {
         request.validate()?;
-        let selection =
-            self.admission.admit(context, request).map_err(CatalogDiscoveryError::Refused)?;
+        let selection = match self
+            .admission
+            .resolve_start_retry(context, request)
+            .map_err(CatalogDiscoveryError::Refused)?
+        {
+            Some(selection) => selection,
+            None => self.admission.admit(context, request).map_err(CatalogDiscoveryError::Refused)?,
+        };
         if !selection_matches_context(&selection, context)
             || selection.scope.canonical_bytes()? != request.requested_scope.canonical_bytes()?
         {
@@ -327,6 +382,7 @@ fn selection_matches_context(
         && selection.runtime_session_id == context.runtime_session_id
         && selection.verified_pack_digest == context.verified_pack_digest
         && selection.protocol_minor == context.protocol_minor
+        && selection.namespace == context.namespace
 }
 
 /// Safe application failure for catalog discovery.
@@ -509,6 +565,13 @@ impl<P: CatalogReadPort> CatalogQueryService<P> {
         }) {
             return Err(catalog_query_error(correlation_id, true));
         }
+        let summary = self
+            .port
+            .read_revision_summary(request.project_id, request.revision_id)
+            .map_err(|error| crate::application::port_error_to_app_error(error, correlation_id))?;
+        if summary.project_id != request.project_id || summary.revision_id != request.revision_id {
+            return Err(catalog_query_error(correlation_id, false));
+        }
         let (items, has_more) = self
             .port
             .list_revision_operations(
@@ -530,7 +593,7 @@ impl<P: CatalogReadPort> CatalogQueryService<P> {
         Ok(CatalogOperationsPage {
             items,
             next_cursor,
-            completion: xtrace_domain::catalog_discovery::DiscoveryCompletion::Complete,
+            completion: summary.completion,
         })
     }
 }
@@ -633,7 +696,9 @@ mod tests {
     use super::*;
     use crate::error::PortErrorKind;
     use uuid::Uuid;
-    use xtrace_domain::catalog_discovery::{DiscoveryRunGrant, DiscoveryScopeKind};
+    use xtrace_domain::catalog_discovery::{
+        DiscoveryRunGrant, DiscoveryRunStartRequest, DiscoveryScopeKind,
+    };
     use xtrace_domain::{ProjectId, RuntimeSessionId};
 
     #[derive(Default)]
@@ -709,6 +774,7 @@ mod tests {
             verified_pack_digest: ContentHash::of_bytes(b"untrusted-for-this-build"),
             protocol_minor: if negotiated { 1 } else { 0 },
             scoped_discovery_negotiated: negotiated,
+            namespace: CatalogRunNamespace::RuntimeProducer,
         }
     }
 
@@ -765,4 +831,182 @@ mod tests {
         };
         assert_ne!(decoded.filter, changed_filter.filter);
     }
+
+    #[derive(Clone)]
+    struct RetryAdmission {
+        original: AdmittedCatalogSelection,
+        latest: AdmittedCatalogSelection,
+        resolved_starts: Arc<AtomicUsize>,
+        fresh_admissions: Arc<AtomicUsize>,
+    }
+
+    impl CatalogAdmissionPort for RetryAdmission {
+        fn resolve_start_retry(
+            &self,
+            context: CatalogProducerContext,
+            request: &DiscoveryRunStartRequest,
+        ) -> Result<Option<AdmittedCatalogSelection>, DiscoveryRefusal> {
+            if !context.scoped_discovery_negotiated {
+                return Err(DiscoveryRefusal::CapabilityNotNegotiated);
+            }
+            self.resolved_starts.fetch_add(1, Ordering::SeqCst);
+            if request.run_hint == "retry-me" {
+                Ok(Some(self.original.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn admit(
+            &self,
+            _context: CatalogProducerContext,
+            _request: &DiscoveryRunStartRequest,
+        ) -> Result<AdmittedCatalogSelection, DiscoveryRefusal> {
+            self.fresh_admissions.fetch_add(1, Ordering::SeqCst);
+            Ok(self.latest.clone())
+        }
+
+        fn resolve_run(
+            &self,
+            context: CatalogProducerContext,
+            _run_id: RunId,
+        ) -> Result<AdmittedCatalogSelection, DiscoveryRefusal> {
+            if !context.scoped_discovery_negotiated {
+                return Err(DiscoveryRefusal::CapabilityNotNegotiated);
+            }
+            Ok(self.original.clone())
+        }
+    }
+
+    struct GrantWriter {
+        run_id: RunId,
+    }
+
+    impl CatalogDiscoveryWritePort for GrantWriter {
+        fn start_run(
+            &self,
+            selection: &AdmittedCatalogSelection,
+            _request: &DiscoveryRunStartRequest,
+        ) -> Result<DiscoveryRunGrant, PortError> {
+            Ok(DiscoveryRunGrant::Admitted {
+                run_id: self.run_id,
+                scope_digest: selection.scope().digest().expect("scope digest"),
+                source_revision_id: selection.source_revision_id(),
+            })
+        }
+
+        fn submit_chunk(
+            &self,
+            _selection: &AdmittedCatalogSelection,
+            _chunk: &DiscoveryChunk,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        fn finish_run(
+            &self,
+            _selection: &AdmittedCatalogSelection,
+            _finish: &DiscoveryRunFinish,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    fn admitted_selection(
+        ctx: CatalogProducerContext,
+        selection_id: Uuid,
+        epoch: u64,
+    ) -> AdmittedCatalogSelection {
+        AdmittedCatalogSelection {
+            project_id: ctx.project_id,
+            runtime_session_id: ctx.runtime_session_id,
+            verified_pack_digest: ctx.verified_pack_digest,
+            protocol_minor: ctx.protocol_minor,
+            namespace: ctx.namespace,
+            owner_selection_id: *selection_id.as_bytes(),
+            owner_selection_epoch: epoch,
+            scope: request().requested_scope,
+            source_revision_id: None,
+            pinned_source_digest: None,
+        }
+    }
+
+    #[test]
+    fn start_retry_resolves_original_selection_before_fresh_owner_selection() {
+        let ctx = context(true);
+        let original = admitted_selection(ctx, Uuid::now_v7(), 1);
+        let latest = admitted_selection(ctx, Uuid::now_v7(), 2);
+        let resolved = Arc::new(AtomicUsize::new(0));
+        let fresh = Arc::new(AtomicUsize::new(0));
+        let service = CatalogDiscoveryService::with_test_ports(
+            Arc::new(RetryAdmission {
+                original,
+                latest,
+                resolved_starts: resolved.clone(),
+                fresh_admissions: fresh.clone(),
+            }),
+            Arc::new(RefuseUnboundSourceEvidence),
+            Arc::new(GrantWriter { run_id: RunId::new() }),
+        );
+        let mut retry = request();
+        retry.run_hint = "retry-me".to_owned();
+        service.start_run(ctx, &retry).expect("original request");
+        service.start_run(ctx, &retry).expect("exact retry");
+        assert_eq!(resolved.load(Ordering::SeqCst), 2);
+        assert_eq!(fresh.load(Ordering::SeqCst), 1);
+    }
+
+    struct SummaryReader {
+        summary: CatalogRevisionSummary,
+    }
+
+    impl CatalogReadPort for SummaryReader {
+        fn read_revision_summary(
+            &self,
+            _project_id: ProjectId,
+            _revision_id: xtrace_domain::CatalogRevisionId,
+        ) -> Result<CatalogRevisionSummary, PortError> {
+            Ok(self.summary.clone())
+        }
+
+        fn list_revision_operations(
+            &self,
+            _project_id: ProjectId,
+            _revision_id: xtrace_domain::CatalogRevisionId,
+            _filter: CatalogOperationFilter,
+            _after: Option<OperationId>,
+            _limit: u32,
+        ) -> Result<(Vec<CatalogOperationRecord>, bool), PortError> {
+            Ok((Vec::new(), false))
+        }
+    }
+
+    #[test]
+    fn operation_page_completion_comes_from_the_persisted_revision_summary() {
+        let project_id = ProjectId::new();
+        let revision_id = xtrace_domain::CatalogRevisionId::new();
+        let completion = xtrace_domain::catalog_discovery::DiscoveryCompletion::Incomplete;
+        let service = CatalogQueryService::new(SummaryReader {
+            summary: CatalogRevisionSummary {
+                project_id,
+                revision_id,
+                scope_digest: ContentHash::of_bytes(b"summary-scope"),
+                source_revision_id: None,
+                completion,
+                operation_count: 0,
+            },
+        });
+        let page = service.list_operations(
+            ListCatalogOperations {
+                project_id,
+                revision_id,
+                filter: CatalogOperationFilter::default(),
+                limit: Some(10),
+                cursor: None,
+            },
+            CorrelationId::new(),
+        ).expect("query page");
+        assert_eq!(page.completion, completion);
+    }
+
 }
