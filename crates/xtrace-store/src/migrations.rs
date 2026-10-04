@@ -8,7 +8,8 @@
 //! Slice 1A introduced `v0001_initial`; Slice 1C.4 appends
 //! `v0002_recording_segments`; Slice 1E.3A appends
 //! `v0003_observed_endpoint_catalog`; P02A appends
-//! `v0004_recording_terminal_evidence`. Migrations remain append-only: later
+//! `v0004_recording_terminal_evidence`; P03A appends
+//! `v0005_catalog_discovery`. Migrations remain append-only: later
 //! slices must add a new record instead of editing an applied one.
 //!
 //! Migrations deliberately avoid statements that cannot be safely
@@ -74,6 +75,11 @@ impl Migrations {
                 version: 4,
                 label: "v0004_recording_terminal_evidence",
                 statements: &[RECORDING_TERMINAL_EVIDENCE_SCHEMA],
+            },
+            MigrationRecord {
+                version: 5,
+                label: "v0005_catalog_discovery",
+                statements: &[CATALOG_DISCOVERY_SCHEMA],
             },
         ]
     }
@@ -346,6 +352,216 @@ CREATE TABLE recording_terminal_evidence (
 
 CREATE INDEX recording_terminal_completion
     ON recording_terminal_evidence(completion, recording_id);
+";
+
+/// Durable owner-scoped discovery ledger and immutable catalog history.
+/// Existing v1-v4 tables and their checksums remain untouched.
+const CATALOG_DISCOVERY_SCHEMA: &str = r"
+CREATE TABLE catalog_owner_selections (
+    owner_selection_id       BLOB PRIMARY KEY CHECK (length(owner_selection_id) = 16
+                                 AND substr(hex(owner_selection_id), 13, 1) = '7'
+                                 AND substr(hex(owner_selection_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    project_id               BLOB NOT NULL,
+    selection_epoch          INTEGER NOT NULL CHECK (selection_epoch > 0),
+    current_for_scope        INTEGER NOT NULL CHECK (current_for_scope IN (0, 1)),
+    verified_pack_digest     BLOB NOT NULL CHECK (length(verified_pack_digest) = 32),
+    scope_digest             BLOB NOT NULL CHECK (length(scope_digest) = 32),
+    scope_json               TEXT NOT NULL CHECK (length(CAST(scope_json AS BLOB)) <= 8192),
+    source_revision_id       BLOB CHECK (source_revision_id IS NULL OR (length(source_revision_id) = 16
+                                 AND substr(hex(source_revision_id), 13, 1) = '7'
+                                 AND substr(hex(source_revision_id), 17, 1) IN ('8', '9', 'A', 'B'))),
+    pinned_source_digest     BLOB CHECK (pinned_source_digest IS NULL OR length(pinned_source_digest) = 32),
+    revoked                  INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1)),
+    UNIQUE (owner_selection_id, project_id),
+    UNIQUE (owner_selection_id, project_id, selection_epoch),
+    FOREIGN KEY (project_id) REFERENCES projects(project_id) ON DELETE RESTRICT,
+    CHECK ((source_revision_id IS NULL) = (pinned_source_digest IS NULL))
+) STRICT;
+
+CREATE INDEX catalog_owner_selections_current_scope
+    ON catalog_owner_selections(project_id, scope_digest, current_for_scope, revoked);
+
+CREATE UNIQUE INDEX catalog_owner_selections_one_current
+    ON catalog_owner_selections(project_id, scope_digest)
+    WHERE current_for_scope = 1 AND revoked = 0;
+
+CREATE TABLE catalog_discovery_runs (
+    run_id                   BLOB PRIMARY KEY CHECK (length(run_id) = 16
+                                 AND substr(hex(run_id), 13, 1) = '7'
+                                 AND substr(hex(run_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    project_id               BLOB NOT NULL,
+    runtime_session_id       BLOB NOT NULL CHECK (length(runtime_session_id) = 16
+                                 AND substr(hex(runtime_session_id), 13, 1) = '7'
+                                 AND substr(hex(runtime_session_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    protocol_minor           INTEGER NOT NULL CHECK (protocol_minor BETWEEN 0 AND 65535),
+    verified_pack_digest     BLOB NOT NULL CHECK (length(verified_pack_digest) = 32),
+    owner_selection_id       BLOB NOT NULL CHECK (length(owner_selection_id) = 16),
+    selection_epoch          INTEGER NOT NULL CHECK (selection_epoch > 0),
+    run_hint                 TEXT NOT NULL CHECK (length(CAST(run_hint AS BLOB)) BETWEEN 1 AND 128),
+    request_bytes            BLOB NOT NULL CHECK (length(request_bytes) BETWEEN 1 AND 16384),
+    request_digest           BLOB NOT NULL CHECK (length(request_digest) = 32),
+    scope_digest             BLOB NOT NULL CHECK (length(scope_digest) = 32),
+    scope_json               TEXT NOT NULL CHECK (length(CAST(scope_json AS BLOB)) <= 8192),
+    source_revision_id       BLOB CHECK (source_revision_id IS NULL OR (length(source_revision_id) = 16
+                                 AND substr(hex(source_revision_id), 13, 1) = '7'
+                                 AND substr(hex(source_revision_id), 17, 1) IN ('8', '9', 'A', 'B'))),
+    pinned_source_digest     BLOB CHECK (pinned_source_digest IS NULL OR length(pinned_source_digest) = 32),
+    status                   TEXT NOT NULL CHECK (status IN ('open', 'complete', 'incomplete', 'failed', 'invalid', 'superseded')),
+    expected_chunk_count     INTEGER CHECK (expected_chunk_count IS NULL OR expected_chunk_count BETWEEN 0 AND 64),
+    accepted_claim_count     INTEGER NOT NULL DEFAULT 0 CHECK (accepted_claim_count BETWEEN 0 AND 4096),
+    rejected_claim_count     INTEGER NOT NULL DEFAULT 0 CHECK (rejected_claim_count BETWEEN 0 AND 4096),
+    accepted_claim_bytes     INTEGER NOT NULL DEFAULT 0 CHECK (accepted_claim_bytes BETWEEN 0 AND 4194304),
+    final_digest             BLOB CHECK (final_digest IS NULL OR length(final_digest) = 32),
+    limitation_codes_json    TEXT CHECK (limitation_codes_json IS NULL OR length(CAST(limitation_codes_json AS BLOB)) <= 16384),
+    revision_id              BLOB CHECK (revision_id IS NULL OR length(revision_id) = 16),
+    UNIQUE (run_id, project_id),
+    UNIQUE (project_id, runtime_session_id, verified_pack_digest, owner_selection_id, run_hint),
+    FOREIGN KEY (project_id) REFERENCES projects(project_id) ON DELETE RESTRICT,
+    FOREIGN KEY (owner_selection_id, project_id, selection_epoch)
+        REFERENCES catalog_owner_selections(owner_selection_id, project_id, selection_epoch)
+        ON DELETE RESTRICT,
+    CHECK ((source_revision_id IS NULL) = (pinned_source_digest IS NULL)),
+    CHECK ((status IN ('complete', 'incomplete', 'failed', 'superseded')) = (final_digest IS NOT NULL))
+) STRICT;
+
+CREATE INDEX catalog_discovery_runs_scope
+    ON catalog_discovery_runs(project_id, scope_digest, status, run_id);
+
+CREATE TABLE catalog_discovery_chunks (
+    run_id                   BLOB NOT NULL,
+    project_id               BLOB NOT NULL,
+    chunk_index              INTEGER NOT NULL CHECK (chunk_index BETWEEN 0 AND 63),
+    chunk_digest             BLOB NOT NULL CHECK (length(chunk_digest) = 32),
+    claim_count              INTEGER NOT NULL CHECK (claim_count BETWEEN 1 AND 64),
+    payload_bytes            INTEGER NOT NULL CHECK (payload_bytes BETWEEN 1 AND 262144),
+    PRIMARY KEY (run_id, chunk_index),
+    UNIQUE (run_id, project_id, chunk_index),
+    FOREIGN KEY (run_id, project_id) REFERENCES catalog_discovery_runs(run_id, project_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE catalog_discovery_claims (
+    run_id                   BLOB NOT NULL,
+    project_id               BLOB NOT NULL,
+    chunk_index              INTEGER NOT NULL,
+    claim_ordinal            INTEGER NOT NULL CHECK (claim_ordinal BETWEEN 0 AND 63),
+    claim_hint               TEXT NOT NULL CHECK (length(CAST(claim_hint AS BLOB)) BETWEEN 1 AND 128),
+    claim_digest             BLOB NOT NULL CHECK (length(claim_digest) = 32),
+    canonical_bytes          BLOB NOT NULL CHECK (length(canonical_bytes) BETWEEN 1 AND 8192),
+    canonical_json           TEXT NOT NULL CHECK (length(CAST(canonical_json AS BLOB)) BETWEEN 1 AND 16384),
+    PRIMARY KEY (run_id, chunk_index, claim_ordinal),
+    UNIQUE (run_id, claim_hint),
+    UNIQUE (run_id, claim_digest),
+    FOREIGN KEY (run_id, project_id, chunk_index)
+        REFERENCES catalog_discovery_chunks(run_id, project_id, chunk_index) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE catalog_operations (
+    operation_id             BLOB PRIMARY KEY CHECK (length(operation_id) = 16
+                                 AND substr(hex(operation_id), 13, 1) = '7'
+                                 AND substr(hex(operation_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    project_id               BLOB NOT NULL,
+    fingerprint_format       INTEGER NOT NULL CHECK (fingerprint_format = 1),
+    endpoint_fingerprint     BLOB NOT NULL CHECK (length(endpoint_fingerprint) = 32),
+    transport                TEXT NOT NULL CHECK (transport = 'http'),
+    application_component    TEXT NOT NULL CHECK (length(CAST(application_component AS BLOB)) BETWEEN 1 AND 128),
+    binding_key              TEXT NOT NULL CHECK (length(CAST(binding_key AS BLOB)) BETWEEN 1 AND 128),
+    method                   TEXT NOT NULL CHECK (length(CAST(method AS BLOB)) BETWEEN 1 AND 16),
+    route_template           TEXT NOT NULL CHECK (length(CAST(route_template AS BLOB)) BETWEEN 1 AND 1024),
+    created_at               TEXT NOT NULL,
+    UNIQUE (project_id, operation_id),
+    UNIQUE (project_id, fingerprint_format, endpoint_fingerprint),
+    UNIQUE (project_id, application_component, binding_key, transport, method, route_template),
+    FOREIGN KEY (project_id) REFERENCES projects(project_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE catalog_claims (
+    claim_id                 BLOB PRIMARY KEY CHECK (length(claim_id) = 16
+                                 AND substr(hex(claim_id), 13, 1) = '7'
+                                 AND substr(hex(claim_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    project_id               BLOB NOT NULL,
+    operation_id             BLOB NOT NULL CHECK (length(operation_id) = 16),
+    claim_digest             BLOB NOT NULL CHECK (length(claim_digest) = 32),
+    canonical_bytes          BLOB NOT NULL CHECK (length(canonical_bytes) BETWEEN 1 AND 8192),
+    canonical_json           TEXT NOT NULL CHECK (length(CAST(canonical_json AS BLOB)) BETWEEN 1 AND 16384),
+    first_revision_id        BLOB NOT NULL CHECK (length(first_revision_id) = 16),
+    last_revision_id         BLOB NOT NULL CHECK (length(last_revision_id) = 16),
+    UNIQUE (project_id, claim_id),
+    UNIQUE (project_id, operation_id, claim_id),
+    UNIQUE (project_id, claim_digest),
+    FOREIGN KEY (project_id, operation_id) REFERENCES catalog_operations(project_id, operation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (project_id, first_revision_id) REFERENCES catalog_revisions(project_id, revision_id) ON DELETE RESTRICT,
+    FOREIGN KEY (project_id, last_revision_id) REFERENCES catalog_revisions(project_id, revision_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE catalog_operation_versions (
+    operation_version_id    BLOB PRIMARY KEY CHECK (length(operation_version_id) = 16
+                                 AND substr(hex(operation_version_id), 13, 1) = '7'
+                                 AND substr(hex(operation_version_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    project_id               BLOB NOT NULL,
+    operation_id             BLOB NOT NULL CHECK (length(operation_id) = 16),
+    version_digest           BLOB NOT NULL CHECK (length(version_digest) = 32),
+    lifecycle                TEXT NOT NULL CHECK (lifecycle IN ('inferred', 'registered', 'removed')),
+    created_at               TEXT NOT NULL,
+    UNIQUE (project_id, operation_version_id),
+    UNIQUE (project_id, operation_id, version_digest),
+    UNIQUE (project_id, operation_id, operation_version_id),
+    FOREIGN KEY (project_id, operation_id) REFERENCES catalog_operations(project_id, operation_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE catalog_revisions (
+    revision_id              BLOB PRIMARY KEY CHECK (length(revision_id) = 16
+                                 AND substr(hex(revision_id), 13, 1) = '7'
+                                 AND substr(hex(revision_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    project_id               BLOB NOT NULL,
+    owner_selection_id       BLOB NOT NULL CHECK (length(owner_selection_id) = 16),
+    run_id                   BLOB NOT NULL CHECK (length(run_id) = 16),
+    scope_digest             BLOB NOT NULL CHECK (length(scope_digest) = 32),
+    source_revision_id       BLOB CHECK (source_revision_id IS NULL OR (length(source_revision_id) = 16
+                                 AND substr(hex(source_revision_id), 13, 1) = '7'
+                                 AND substr(hex(source_revision_id), 17, 1) IN ('8', '9', 'A', 'B'))),
+    ordinal                  INTEGER NOT NULL CHECK (ordinal > 0),
+    parent_revision_id       BLOB CHECK (parent_revision_id IS NULL OR length(parent_revision_id) = 16),
+    content_digest           BLOB NOT NULL CHECK (length(content_digest) = 32),
+    final_digest             BLOB NOT NULL CHECK (length(final_digest) = 32),
+    operation_count          INTEGER NOT NULL CHECK (operation_count BETWEEN 0 AND 4096),
+    created_at               TEXT NOT NULL,
+    UNIQUE (project_id, revision_id),
+    UNIQUE (project_id, scope_digest, ordinal),
+    UNIQUE (project_id, run_id),
+    FOREIGN KEY (project_id) REFERENCES projects(project_id) ON DELETE RESTRICT,
+    FOREIGN KEY (run_id, project_id) REFERENCES catalog_discovery_runs(run_id, project_id) ON DELETE RESTRICT,
+    FOREIGN KEY (owner_selection_id, project_id) REFERENCES catalog_owner_selections(owner_selection_id, project_id) ON DELETE RESTRICT,
+    FOREIGN KEY (project_id, parent_revision_id) REFERENCES catalog_revisions(project_id, revision_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX catalog_revisions_scope_latest
+    ON catalog_revisions(project_id, scope_digest, ordinal DESC);
+
+CREATE TABLE catalog_revision_entries (
+    project_id               BLOB NOT NULL,
+    revision_id              BLOB NOT NULL CHECK (length(revision_id) = 16),
+    operation_id             BLOB NOT NULL CHECK (length(operation_id) = 16),
+    operation_version_id     BLOB NOT NULL CHECK (length(operation_version_id) = 16),
+    change_kind              TEXT NOT NULL CHECK (change_kind IN ('added', 'unchanged', 'changed', 'removed', 'unknown')),
+    source_availability      TEXT NOT NULL CHECK (source_availability IN ('unverified', 'unavailable')),
+    PRIMARY KEY (revision_id, operation_id),
+    UNIQUE (project_id, revision_id, operation_id),
+    FOREIGN KEY (project_id, revision_id) REFERENCES catalog_revisions(project_id, revision_id) ON DELETE RESTRICT,
+    FOREIGN KEY (project_id, operation_id) REFERENCES catalog_operations(project_id, operation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (project_id, operation_id, operation_version_id) REFERENCES catalog_operation_versions(project_id, operation_id, operation_version_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE catalog_revision_claims (
+    project_id               BLOB NOT NULL,
+    revision_id              BLOB NOT NULL CHECK (length(revision_id) = 16),
+    operation_id             BLOB NOT NULL CHECK (length(operation_id) = 16),
+    claim_id                 BLOB NOT NULL CHECK (length(claim_id) = 16),
+    PRIMARY KEY (revision_id, operation_id, claim_id),
+    FOREIGN KEY (project_id, revision_id, operation_id)
+        REFERENCES catalog_revision_entries(project_id, revision_id, operation_id) ON DELETE RESTRICT,
+    FOREIGN KEY (project_id, operation_id, claim_id)
+        REFERENCES catalog_claims(project_id, operation_id, claim_id) ON DELETE RESTRICT
+) STRICT;
 ";
 
 /// Applies every pending migration from the compiled-in catalog to

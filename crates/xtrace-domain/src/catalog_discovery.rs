@@ -427,6 +427,35 @@ impl ValidatedEndpointClaim {
         })
     }
 
+    /// Rebuilds a persisted typed claim through the same validator used for
+    /// inbound data. Stored rows are not trusted merely because their JSON
+    /// deserializes; the canonical bytes and digest are regenerated.
+    pub fn from_persisted(
+        claim_hint: String,
+        operation: EndpointIdentity,
+        provenance: ClaimProvenance,
+        handler_symbol: Option<String>,
+        confidence_basis_points: Option<u16>,
+        limitation_codes: Vec<String>,
+        source_evidence: Vec<ClaimSourceEvidence>,
+    ) -> Result<Self, DiscoveryProofError> {
+        let confidence =
+            confidence_basis_points.map_or(-1.0, |basis_points| f32::from(basis_points) / 10_000.0);
+        let claim = Self::new(
+            claim_hint,
+            operation,
+            provenance,
+            handler_symbol,
+            confidence,
+            limitation_codes,
+            source_evidence,
+        )?;
+        if claim.confidence_basis_points != confidence_basis_points {
+            return Err(DiscoveryProofError::InvalidClaim);
+        }
+        Ok(claim)
+    }
+
     /// Canonical v1 claim bytes used by the store and transcript hashes.
     #[must_use]
     pub fn canonical_bytes(&self) -> &[u8] {
@@ -749,6 +778,26 @@ impl DiscoveryRunStartRequest {
             validate_ascii_identifier(owner_ref, 128)?;
         }
         Ok(())
+    }
+
+    /// Encodes the exact bounded request tuple used for retry identity.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, DiscoveryProofError> {
+        self.validate()?;
+        let scope = self.requested_scope.canonical_bytes()?;
+        let mut bytes = Vec::with_capacity(64 + scope.len());
+        let mut enc = Encoder::new(&mut bytes);
+        enc.array(5)
+            .map_err(|_| DiscoveryProofError::Encoding)?
+            .str("xtrace.discovery-start")
+            .map_err(|_| DiscoveryProofError::Encoding)?
+            .u32(self.schema_version)
+            .map_err(|_| DiscoveryProofError::Encoding)?
+            .str(&self.run_hint)
+            .map_err(|_| DiscoveryProofError::Encoding)?
+            .bytes(&scope)
+            .map_err(|_| DiscoveryProofError::Encoding)?;
+        encode_optional_text(&mut enc, self.owner_selection_ref.as_deref())?;
+        Ok(bytes)
     }
 }
 
@@ -1337,6 +1386,77 @@ mod tests {
                 .unwrap()
             ),
             "89767874726163652e646973636f766572792d66696e616c0150018f00000000700080000000000000025820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa50018f000000007000800000000000000380000001"
+        );
+    }
+
+    #[test]
+    fn public_independent_blake3_catalog_vectors_match_claim_chunk_and_final() {
+        // These literals were checked against the separately implemented
+        // public CBOR reference at reference revision 3fde72e and the official
+        // BLAKE3 vectors. They are fixed bytes/digests, not producer receipts.
+        let scope_value = scope();
+        assert_eq!(
+            hex::encode(scope_value.digest().unwrap().as_bytes()),
+            "f24011314fa70910aab9defaf5f578075c080a894b8b0249ac21eb60425feae5"
+        );
+        let claim_value = fixture_claim(-1.0);
+        assert_eq!(
+            hex::encode(claim_value.digest().unwrap().as_bytes()),
+            "07fc9ac933a4384462049bbe1d34f22d952eb7bca220c9d88b11521e1fbfed0a"
+        );
+        assert_eq!(
+            hex::encode(claim_value.canonical_bytes()),
+            "89767874726163652e646973636f766572792d636c61696d016b706f73742d6f7264657273585988781b7874726163652e656e64706f696e742d66696e6765727072696e740150018f00000000700080000000000000016e737072696e672d6669787475726564687474706764656661756c7464504f5354672f6f726465727301774f7264657273436f6e74726f6c6c657223637265617465f68081886f7374617469632d736e617073686f7450018f00000000700080000000000000036f7372632f4f72646572732e6a6176615820222222222222222222222222222222222222222222222222222222222222222201010201"
+        );
+        let chunk_value =
+            DiscoveryChunk { run_id: run_id(), chunk_index: 0, claims: vec![claim_value] };
+        assert_eq!(
+            hex::encode(chunk_value.digest().unwrap().as_bytes()),
+            "12eba3b438d34f5bff5b7425b58d4c63c60b99b9615f40247365869d0b3f989c"
+        );
+        assert_eq!(
+            hex::encode(
+                final_digest(
+                    run_id(),
+                    &scope_value,
+                    Some(source_revision()),
+                    &[chunk_value],
+                    0,
+                    DiscoveryCompletion::Complete,
+                )
+                .unwrap()
+                .as_bytes()
+            ),
+            "63b86229ff62e4c31f1f6ce38fa40ba4e46480d0b3220d18b2e80f89475ccf69"
+        );
+    }
+
+    #[test]
+    fn persisted_claim_rebuild_rechecks_canonical_digest() {
+        let original = fixture_claim(0.5);
+        let rebuilt = ValidatedEndpointClaim::from_persisted(
+            original.claim_hint().to_owned(),
+            original.operation().clone(),
+            original.provenance(),
+            original.handler_symbol().map(str::to_owned),
+            original.confidence_basis_points(),
+            original.limitation_codes().to_vec(),
+            original.source_evidence().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.canonical_bytes(), original.canonical_bytes());
+        assert_eq!(rebuilt.digest(), original.digest());
+        assert_eq!(
+            ValidatedEndpointClaim::from_persisted(
+                original.claim_hint().to_owned(),
+                original.operation().clone(),
+                original.provenance(),
+                original.handler_symbol().map(str::to_owned),
+                Some(10_001),
+                original.limitation_codes().to_vec(),
+                original.source_evidence().to_vec(),
+            ),
+            Err(DiscoveryProofError::InvalidClaim)
         );
     }
 
