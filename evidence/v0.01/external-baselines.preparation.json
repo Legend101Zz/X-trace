@@ -1,0 +1,112 @@
+{
+  "schemaVersion": 1,
+  "kind": "uninstrumented_external_baseline_preparation",
+  "acceptedCandidateSha": null,
+  "releaseAcceptance": false,
+  "platform": "macOS arm64",
+  "projects": [
+    {
+      "project": "petclinic",
+      "canonicalUrl": "https://github.com/spring-projects/spring-petclinic",
+      "tag": null,
+      "upstreamSha": "500158f732419217507c7656904b8e6aa1bcc0d6",
+      "runtime": "Java 17.0.10",
+      "database": "H2",
+      "baselineStatus": "passed_baseline_only",
+      "checkCount": 6,
+      "upstreamTests": "not_run",
+      "packagedCapture": "not_run",
+      "receiptSha256": "fd00cd470ff1449020c60bfadc16baae1c288d1a1bbe66ec6f492b175efa18eb",
+      "tagException": "Owner explicitly approved maintained main at an immutable SHA; obsolete 1.5.x excluded."
+    },
+    {
+      "project": "jhipster",
+      "canonicalUrl": "https://github.com/jhipster/jhipster-sample-app",
+      "tag": "v9.4.0",
+      "upstreamSha": "6b000b5d23a36c45e01472471b84a44fa2464044",
+      "runtime": "Java 21.0.12.1",
+      "database": "H2",
+      "baselineStatus": "passed_baseline_only",
+      "checkCount": 8,
+      "upstreamTests": "not_run",
+      "packagedCapture": "not_run",
+      "receiptSha256": "0a9e6ec137e12b7e7743a0aede9a62ebc6a6f6bdf07dade21cdd0847cbf7c935"
+    },
+    {
+      "project": "directus",
+      "canonicalUrl": "https://github.com/directus/directus",
+      "tag": "v12.4.1",
+      "upstreamSha": "d52fd4b29ecdd4d260aa47ca8cee58d9d62bf486",
+      "runtime": "Node 22.23.0",
+      "database": "PostgreSQL 18.3",
+      "baselineStatus": "passed_baseline_only",
+      "checkCount": 8,
+      "upstreamTests": "not_run",
+      "packagedCapture": "not_run",
+      "receiptSha256": "67059528afe5f91a3101eef62720a6014d18ddc14d14d12fd9379475b7bea250"
+    },
+    {
+      "project": "fineract",
+      "canonicalUrl": "https://github.com/apache/fineract",
+      "tag": "1.15.0",
+      "upstreamSha": "d5636847ac556c30b437254c353f05526d172b97",
+      "runtime": "Java 21.0.12.1",
+      "database": "PostgreSQL 18.3",
+      "baselineStatus": "passed_baseline_only",
+      "checkCount": 11,
+      "upstreamTests": "not_run",
+      "packagedCapture": "not_run",
+      "receiptSha256": "6c17db54dfc202eddc57fc060a3b90514617dadd98b31919d5538547fc02d834"
+    },
+    {
+      "project": "medusa",
+      "canonicalUrl": "https://github.com/medusajs/medusa",
+      "tag": "v2.21.2",
+      "upstreamSha": "020565398e436a2bc65777a3b1ad347b4735d6df",
+      "runtime": "Node 24.21.0",
+      "database": "PostgreSQL 18.3",
+      "baselineStatus": "passed_baseline_only",
+      "checkCount": 10,
+      "upstreamTests": "not_run",
+      "packagedCapture": "not_run",
+      "receiptSha256": "979c87bd15f58a09bc1fc0940090df01c3a2eaa8a37943c3f11913e59892a06e",
+      "starter": {
+        "url": "https://github.com/medusajs/dtc-starter",
+        "sha": "15ef93da7d155ad990d8cc6db0296446fecbdfe6",
+        "selectedCheckout": "verified pinned repeat baseline05; original installer clone SHA unknown"
+      }
+    },
+    {
+      "project": "vendure",
+      "canonicalUrl": "https://github.com/vendurehq/vendure",
+      "tag": "v3.7.3",
+      "upstreamSha": "2cc309deb5394af176314552ac7320a7b26a0104",
+      "runtime": "Node 24.21.0",
+      "database": "SQLite",
+      "baselineStatus": "passed_baseline_only",
+      "checkCount": 13,
+      "upstreamTests": "not_run",
+      "packagedCapture": "not_run",
+      "receiptSha256": "c2de9d0dcbae8e9fec99544919100e656369a4228475ee571313bce62387c52a",
+      "starter": {
+        "url": "https://github.com/vendurehq/vendure/tree/v3.7.3/packages/create",
+        "sha": "2cc309deb5394af176314552ac7320a7b26a0104",
+        "package": "@vendure/create@3.7.3",
+        "templateComparison": "all four examined published templates identical to pinned source"
+      }
+    }
+  ],
+  "unrunMandatoryAssertions": [
+    "packaged instrumentation",
+    "baseline/capture response and database-effect comparison",
+    "application intermediate call and source/line/outcome",
+    "persisted reopened browser Linear/Canvas parity and TUI",
+    "privacy canary surfaces",
+    "repeatable instrumentation overhead"
+  ],
+  "notes": [
+    "Upstream test suites were not run. Baseline requests are not adapter acceptance.",
+    "Only task-owned synthetic data; no upstream business logic patches.",
+    "Earlier failed or unproven attempts retained separately."
+  ]
+}

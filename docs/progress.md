@@ -1,9 +1,21 @@
 # X-trace implementation progress
 
 This file is maintained by the main orchestrator after independent review and
-verification. It is also the execution checkpoint: no phase advances, merges,
-pushes, or continues in background after its status report until the user
-explicitly approves the next proposed phase.
+verification. It is also the execution checkpoint. The active launch mandate
+below supersedes the historical per-phase approval pauses and model assignments
+recorded later in this file; mandatory reviews and verification still apply.
+
+## Active v0.01 autonomous launch authorization (2026-10-04)
+
+The owner explicitly authorized autonomous implementation through the full v0.01 release gate, feature pushes, independently reviewed no-ff merges and main pushes, and publication only after acceptance. This supersedes older per-phase approval pauses for this launch scope. Use Luna High implementation and separate Sol High architecture/security/build reviews. Root alone merges/releases. Every required gate remains mandatory.
+
+The release specification is `docs/releases/v0.01.md`; machine-readable dependency plan and requirement ledger are in `evidence/v0.01/`. Initial baseline is clean fetched `3e47895`, CI `37140004261` green. No v0.01 release candidate is accepted yet. Source/replay and general Java/Node product journeys remain incomplete. P01 is the genuine Spring verified method-source increment; Node HTTP is isolated preparation, not accepted Slice4. Shared Cargo and Gradle builders are serialized through explicit task leases; the private execution checkpoint records current ownership. Same-chat 30-minute continuation is configured and active; it requires the powered machine, running desktop app and mounted SSD. Signing/notarization identity and real human study/owner acceptance are pending external gates. The historical sections below remain evidence of prior bounded work, not current release acceptance.
+
+## External baseline preparation (2026-10-04)
+
+All six disposable upstream servers now have uninstrumented baseline receipts: Petclinic (6 checks), JHipster (8), Fineract (11), Directus (8), Medusa (10), and Vendure (13). Exact upstream/runtime/database pins and private receipt hashes are recorded in `evidence/v0.01/external-baselines.preparation.json`. Petclinic uses the explicitly approved maintained-main SHA exception. Medusa was repeated from a verified pinned starter checkout; the earlier installer checkout had unknown provenance. Vendure exercised its upstream GraphQL API and direct SQLite effect. Earlier failed attempts remain preserved.
+
+These 56 baseline checks do not prove X-trace instrumentation, packaged installation, response parity under capture, source/line/value/outcome replay, privacy, performance, or release acceptance. Upstream test suites were not run. All mandatory release rows remain pending; no candidate is accepted.
 
 ## Execution workflow checkpoint
 
@@ -339,3 +351,10 @@ with no background implementation or scheduled continuation left running.
 | Slice | Goal | Files changed | Verification | Result | Next slice |
 |---|---|---|---|---|---|
 | Slice 1E.3D | Endpoint-first observed catalog -> genuine linked recording -> verified detail; separate historical unmatched path | Browser source/tests/CSS, actual Chromium script, Spring integration plumbing, embedded JS/CSS/manifest | Pinned Sol architecture/security/build approvals; root complete diff/ten screenshot review; exact feature/postmerge gates; 215 focused/453 workspace, 12 web/11 Node; CI `37139481240` / `37139761333` all four jobs | Reviewed, merged, pushed, CI-green; bounded Slice 1E.3 exact-fixture journey accepted; broader Slice 1 incomplete | Reconcile remaining Slice 1 criteria and plan smallest source/active-line evidence increment |
+
+
+## v0.01 owner-requested WIP preservation and orchestrator handoff (2026-10-04)
+
+The owner requested committing/pushing all current preparation and handing the remaining launch to Opus 5.5 with Sonnet 5.5 agents, using batched routine checks. This supersedes the next-session model assignment; it does not accept unfinished phases. Main remains `3e47895f`; all 55 mandatory release rows remain pending. Focused control tooling passed 85 tests, but the subsequent 23-gate floor failed before every gate. Both exact leases were manually recovered under fresh proof; original failures remain unchanged. All active agents are frozen/completed, and the continuation heartbeat is paused for handoff.
+
+Twelve feature branches preserve current WIP. The pack admission commit `e48d6d2` is unbuilt/untested; the global-quiescence source patch is unapplied and requires changes. See [the sanitized source pins, failures, review findings and remaining launch scope](../evidence/v0.01/handoff-2026-10-04.md). No new phase was accepted, merged into main, tagged or released. Next root must refresh live state, finish the runner and full floor, then complete dependency-aware implementation, exact accepted-phase gates, six real packaged campaigns, platform/supply-chain verification and genuine human/owner acceptance before publication.

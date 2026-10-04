@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "baselineSha": "3e47895f90e6a78e08b1d808d4498e4595f71a5d",
+  "acceptedCandidateSha": null,
+  "launchState": "not_ready",
+  "phase": "P00",
+  "workers": {
+    "catalog-core": {
+      "branch": "slice/v001-catalog-core",
+      "head": "93e72fcd9eea191ace750389059744e77bf1969b",
+      "state": "frozen_unaccepted_wip"
+    },
+    "ci-floor": {
+      "branch": "slice/v001-ci-floor",
+      "head": "a0efe4aed296aa3821839074a45a15398ba5a72e",
+      "state": "frozen_unaccepted_wip"
+    },
+    "control-admission": {
+      "branch": "slice/v001-control-admission",
+      "head": "c8e549d5349bd4965b8f03adca72ebb332791ccb",
+      "state": "frozen_unaccepted_wip"
+    },
+    "java-attach": {
+      "branch": "slice/v001-java-attach",
+      "head": "e62a991f8d334c34bf088a40555e6385b0b1bdbb",
+      "state": "frozen_unaccepted_wip"
+    },
+    "java-cli-attach": {
+      "branch": "slice/v001-java-cli-attach",
+      "head": "e711099b73bbbc8153908896645062d2e8614b05",
+      "state": "frozen_unaccepted_wip"
+    },
+    "java-evidence": {
+      "branch": "slice/v001-java-evidence",
+      "head": "108849c0f410f861d43436fcb6859bb1b5052c4d",
+      "state": "frozen_unaccepted_wip"
+    },
+    "node-capture": {
+      "branch": "slice/v001-node-capture",
+      "head": "09aba20dce9f39b5c46620ddc05efe1eac6b3261",
+      "state": "frozen_unaccepted_wip"
+    },
+    "pack-verifier": {
+      "branch": "slice/v001-pack-verifier",
+      "head": "e48d6d20545eb161c153861d18f9a1acb14b73ab",
+      "state": "frozen_unaccepted_wip"
+    },
+    "pointer-init": {
+      "branch": "slice/v001-pointer-init",
+      "head": "665b9afc7812aba740c0209f7d8961f140c99633",
+      "state": "frozen_unaccepted_wip"
+    },
+    "private-storage": {
+      "branch": "slice/v001-private-storage",
+      "head": "8333ebdd495996ddccf1dc2dcaf2722b2f3199d6",
+      "state": "frozen_unaccepted_wip"
+    },
+    "release-control": {
+      "branch": "slice/v001-release-control",
+      "head": "b9d6632835296237febb2f1a0985c4c067d26de4",
+      "state": "frozen_unaccepted_wip"
+    },
+    "shared-replay": {
+      "branch": "slice/v001-shared-replay",
+      "head": "ba9e88bb7f3d44e295b39400768bf49b078ec515",
+      "state": "frozen_unaccepted_wip"
+    }
+  },
+  "buildLeases": {
+    "policy": "serialize shared Cargo/Gradle; verify live ownership before invoking builders",
+    "liveOwnership": "private task execution checkpoint and cache leases"
+  },
+  "continuation": {
+    "automationId": "x-trace-v0-01-launch-continuation",
+    "status": "PAUSED",
+    "verified": "scheduler update confirmed PAUSED for owner-requested handoff",
+    "intervalMinutes": 30,
+    "requires": "computer and desktop app running, SSD mounted"
+  },
+  "externalDependencies": [
+    "macOS signing/notarization identity unavailable",
+    "real usability participants and owner acceptance pending",
+    "Docker Linux aarch64 dependencies available; Linux x86_64 packaged acceptance unrun",
+    "Postman connected credentials unavailable; local export fallback remains mandatory"
+  ],
+  "next": "Finish reviewed release-control gate tooling, exact local floor and CI; integrate source and Node preparation after their own exact gates; finish attach/shared replay and every mandatory product/release requirement.",
+  "decisions": [
+    {
+      "date": "2026-10-04",
+      "authority": "explicit owner reply in launch chat",
+      "subject": "Petclinic tag exception",
+      "decision": "Use current main SHA with explicit tag exception; no obsolete 1.5.x campaign."
+    }
+  ],
+  "baselinePreparation": {
+    "path": "external-baselines.preparation.json",
+    "projects": 6,
+    "checks": 56,
+    "releaseAcceptance": false
+  },
+  "handoff": {
+    "date": "2026-10-04",
+    "ownerRequestedWipCommitPush": true,
+    "nextOrchestrator": "Opus 5.5",
+    "nextWorkers": "Sonnet 5.5",
+    "routineChecks": "batched at coherent integration/acceptance checkpoints",
+    "mandatoryFinalGatesUnchanged": true,
+    "details": "handoff-2026-10-04.md",
+    "releaseControlPinMeaning": "listed head is this checkpoint parent; use containing commit as final pin"
+  }
+}
