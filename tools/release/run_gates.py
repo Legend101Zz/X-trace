@@ -1543,6 +1543,15 @@ def _hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _first_nonempty_version_line(raw: bytes) -> str:
+    """Use the same bounded normalization for recorded version probes and review."""
+    for line in raw.decode("utf-8", "replace").splitlines():
+        normalized = line.strip()
+        if normalized:
+            return normalized[:240]
+    return "no version output"
+
+
 def _tree_state_digest(repo: pathlib.Path) -> str:
     status = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     work = subprocess.run(["git", "diff", "--binary", "HEAD"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
@@ -1663,13 +1672,12 @@ def _versions(
         if settle_report:
             probe["naturalExitSettle"] = settle_report
         probes.append(probe)
-        lines = raw.decode("utf-8", "replace").splitlines()
         if exit_code == 127:
             versions[name] = "unavailable"
         elif exit_code != 0:
             raise RuntimeError(f"version probe {name} failed with exit {exit_code}")
         else:
-            versions[name] = lines[0][:240] if lines else "no version output"
+            versions[name] = _first_nonempty_version_line(raw)
     return versions
 
 

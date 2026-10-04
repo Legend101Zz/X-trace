@@ -179,6 +179,53 @@ class PrivateRootAdmissionTests(unittest.TestCase):
                 except OSError:
                     pass
 
+    def test_private_log_reader_reads_a_regular_fixture_through_validated_fd(self) -> None:
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
+            root = pathlib.Path(temporary)
+            path = root / "private.log"
+            expected = b"public synthetic version fixture\n"
+            path.write_bytes(expected)
+            os.chmod(path, 0o600)
+            identity = (root.stat().st_dev, root.stat().st_ino)
+
+            def opened_parent(candidate: pathlib.Path, **_kwargs: object) -> tuple[int, tuple[int, int]]:
+                self.assertEqual(candidate, root)
+                return os.open(candidate, os.O_RDONLY | os.O_DIRECTORY), identity
+
+            with mock.patch.object(private_roots, "_open_validated_directory", side_effect=opened_parent), \
+                    mock.patch.object(private_roots, "admit_directory", return_value=identity), \
+                    mock.patch.object(private_roots, "_acl_check"):
+                fd = private_roots.open_private_file_read(path)
+            try:
+                self.assertEqual(os.read(fd, len(expected) + 1), expected)
+            finally:
+                os.close(fd)
+
+    def test_private_log_reader_opens_fifo_nonblocking_then_rejects_type(self) -> None:
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
+            root = pathlib.Path(temporary)
+            fifo = root / "private.log"
+            os.mkfifo(fifo, 0o600)
+            root_identity = (root.stat().st_dev, root.stat().st_ino)
+            real_open = os.open
+            observed_nonblocking: list[bool] = []
+
+            def opened_parent(path: pathlib.Path, **_kwargs: object) -> tuple[int, tuple[int, int]]:
+                self.assertEqual(path, root)
+                return real_open(path, os.O_RDONLY | os.O_DIRECTORY), root_identity
+
+            def checked_open(candidate: object, flags: int, *args: object, **kwargs: object) -> int:
+                if candidate == fifo.name:
+                    observed_nonblocking.append(bool(flags & getattr(os, "O_NONBLOCK", 0)))
+                return real_open(candidate, flags, *args, **kwargs)
+
+            with mock.patch.object(private_roots, "_open_validated_directory", side_effect=opened_parent), \
+                    mock.patch.object(private_roots, "admit_directory", return_value=root_identity), \
+                    mock.patch.object(private_roots.os, "open", side_effect=checked_open):
+                with self.assertRaises(private_roots.AdmissionError):
+                    private_roots.open_private_file_read(fifo)
+            self.assertEqual(observed_nonblocking, [True])
+
     def test_actual_macos_ls_headers_allow_deny_only_acl_and_paths_with_spaces(self) -> None:
         workspace = pathlib.Path("/Users/example/Documents/Codex/2026-10-04/workspace with spaces")
         cache = pathlib.Path("/Volumes/Example SSD/.cache/xtrace")

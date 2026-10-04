@@ -27,6 +27,8 @@ UTILITY_TIMEOUT_SECONDS = 5.0
 UTILITY_CLEANUP_SECONDS = 1.0
 UTILITY_OUTPUT_LIMIT = 65536
 MOUNTINFO_LIMIT = 1024 * 1024
+PRIVATE_JSON_BUDGET_LIMIT = 8192
+PRIVATE_JSON_BYTE_LIMIT = 65536
 LINUX_LOCAL_FILESYSTEMS = frozenset({"ext4", "xfs", "btrfs"})
 _MAC_DF_LINE = re.compile(r"^(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+%)\s+(.+)$")
 _MAC_MODE = re.compile(r"^d[rwxstST-]{9}(?:\+@|@\+|[+@.])?$")
@@ -323,7 +325,10 @@ def _directory_entry_signature(info: os.stat_result) -> tuple[int, int]:
     return info.st_nlink, info.st_size
 
 
-def _bounded_json_shape(fd: int, maximum_bytes: int) -> None:
+def _bounded_json_shape(fd: int, maximum_bytes: int, *, maximum_commas: int = 512) -> None:
+    if (not isinstance(maximum_commas, int) or isinstance(maximum_commas, bool)
+            or maximum_commas < 0 or maximum_commas > PRIVATE_JSON_BUDGET_LIMIT):
+        raise _fail()
     try:
         os.lseek(fd, 0, os.SEEK_SET)
         raw = bytearray()
@@ -335,10 +340,10 @@ def _bounded_json_shape(fd: int, maximum_bytes: int) -> None:
         os.lseek(fd, 0, os.SEEK_SET)
     except OSError:
         raise _fail() from None
-    _check_json_shape_bytes(bytes(raw), maximum_bytes)
+    _check_json_shape_bytes(bytes(raw), maximum_bytes, maximum_commas=maximum_commas)
 
 
-def _check_json_shape_bytes(raw: bytes, maximum_bytes: int) -> None:
+def _check_json_shape_bytes(raw: bytes, maximum_bytes: int, *, maximum_commas: int = 512) -> None:
     if len(raw) > maximum_bytes:
         raise _fail()
     depth = 0
@@ -366,7 +371,7 @@ def _check_json_shape_bytes(raw: bytes, maximum_bytes: int) -> None:
                 raise _fail()
         elif byte == ord(","):
             commas += 1
-            if commas > 512:
+            if commas > maximum_commas:
                 raise _fail()
     if quoted or depth != 0:
         raise _fail()
@@ -383,8 +388,11 @@ def _bounded_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _bounded_json_value(value: Any) -> bool:
-    remaining = [512]
+def _bounded_json_value(value: Any, *, maximum_nodes: int = 512) -> bool:
+    if (not isinstance(maximum_nodes, int) or isinstance(maximum_nodes, bool)
+            or maximum_nodes < 1 or maximum_nodes > PRIVATE_JSON_BUDGET_LIMIT):
+        return False
+    remaining = [maximum_nodes]
 
     def inspect(item: Any, depth: int) -> bool:
         remaining[0] -= 1
@@ -408,7 +416,7 @@ def _bounded_json_value(value: Any) -> bool:
     return inspect(value, 0)
 
 
-def _loads_bounded_private_json(data: bytes) -> dict[str, Any]:
+def _loads_bounded_private_json(data: bytes, *, maximum_nodes: int = 512) -> dict[str, Any]:
     def reject_constant(_value: str) -> Any:
         raise _fail()
 
@@ -419,7 +427,7 @@ def _loads_bounded_private_json(data: bytes) -> dict[str, Any]:
         )
     except (ValueError, TypeError):
         raise _fail() from None
-    if not isinstance(value, dict) or not _bounded_json_value(value):
+    if not isinstance(value, dict) or not _bounded_json_value(value, maximum_nodes=maximum_nodes):
         raise _fail()
     return value
 
@@ -630,7 +638,11 @@ def open_private_file_read(path: os.PathLike[str] | str) -> int:
     parent_fd, parent_identity = _open_validated_directory(candidate.parent, private_leaf=True)
     fd: int | None = None
     try:
-        fd = os.open(candidate.name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
+        fd = os.open(
+            candidate.name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
         info = os.fstat(fd)
         named = os.stat(candidate.name, dir_fd=parent_fd, follow_symlinks=False)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
@@ -822,8 +834,21 @@ def private_json_fits_read_limits(data: bytes, *, maximum_bytes: int = 65536) ->
     return True
 
 
-def read_private_json(path: os.PathLike[str] | str, *, maximum_bytes: int = 65536) -> dict[str, Any]:
+def read_private_json(
+    path: os.PathLike[str] | str,
+    *,
+    maximum_bytes: int = 65536,
+    maximum_nodes: int = 512,
+    maximum_commas: int = 512,
+) -> dict[str, Any]:
     """Read an existing small private JSON file without following a link."""
+    if (not isinstance(maximum_bytes, int) or isinstance(maximum_bytes, bool)
+            or maximum_bytes < 1 or maximum_bytes > PRIVATE_JSON_BYTE_LIMIT
+            or not isinstance(maximum_nodes, int) or isinstance(maximum_nodes, bool)
+            or maximum_nodes < 1 or maximum_nodes > PRIVATE_JSON_BUDGET_LIMIT
+            or not isinstance(maximum_commas, int) or isinstance(maximum_commas, bool)
+            or maximum_commas < 0 or maximum_commas > PRIVATE_JSON_BUDGET_LIMIT):
+        raise _fail()
     candidate = _absolute_path(path)
     parent_fd, parent_identity = _open_validated_directory(candidate.parent, private_leaf=False)
     file_fd: int | None = None
@@ -840,7 +865,7 @@ def read_private_json(path: os.PathLike[str] | str, *, maximum_bytes: int = 6553
             _parse_macos_acl(output, candidate, directory=False)
         elif sys.platform.startswith("linux"):
             _linux_acl_check(file_fd)
-        _bounded_json_shape(file_fd, maximum_bytes)
+        _bounded_json_shape(file_fd, maximum_bytes, maximum_commas=maximum_commas)
         data = bytearray()
         while len(data) <= maximum_bytes:
             chunk = os.read(file_fd, min(4096, maximum_bytes + 1 - len(data)))
@@ -883,7 +908,7 @@ def read_private_json(path: os.PathLike[str] | str, *, maximum_bytes: int = 6553
                 raise _fail()
         finally:
             os.close(final_parent_fd)
-        return _loads_bounded_private_json(bytes(data))
+        return _loads_bounded_private_json(bytes(data), maximum_nodes=maximum_nodes)
     except AdmissionError:
         raise
     except (OSError, ValueError, TypeError):
