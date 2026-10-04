@@ -151,10 +151,12 @@ def _process_snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, str, str]
     """Return pid -> (ppid, start identity, state) using a fixed system ps."""
     if PS_BINARY is None:
         raise RuntimeError("cannot inspect process ownership: system ps is unavailable")
+    if timeout <= 0:
+        raise RuntimeError("process ownership scan deadline expired")
     try:
         snapshot = subprocess.run(
             [PS_BINARY, "-axo", "pid=,ppid=,lstart=,stat="],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=max(0.01, timeout), check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=timeout, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError("cannot inspect process ownership")
@@ -218,7 +220,11 @@ def _settle_uninspectable_candidates(
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> NaturalExitSettle:
-    """Wait boundedly for exact initially-uninspectable identities to exit."""
+    """Wait boundedly for exact initially-uninspectable identities to exit.
+
+    The callback receives the absolute monotonic deadline so all scanner work
+    in one poll shares the same remaining budget.
+    """
     started = monotonic()
     deadline = started + max(0.0, duration)
     identities = {
@@ -246,7 +252,7 @@ def _settle_uninspectable_candidates(
                     False, max(0.0, monotonic() - started), poll_count, latest,
                     "initial uninspectable process identity survived settling deadline", deadline,
                 )
-            snapshot, scan = snapshot_and_scan(remaining)
+            snapshot, scan = snapshot_and_scan(deadline)
             poll_count += 1
         except BaseException as exc:
             return NaturalExitSettle(
@@ -285,7 +291,10 @@ def _final_global_quiescence_scan(
     sleep: Callable[[float], None] = time.sleep,
     quiescent_seconds: float = NATURAL_EXIT_QUIESCENT_SECONDS,
 ) -> tuple[bool, list[dict[str, Any]], str | None, int]:
-    """Require two clean global scans separated by a bounded quiet interval."""
+    """Require two clean global scans separated by a bounded quiet interval.
+
+    The callback receives the absolute monotonic deadline for the full scan.
+    """
     latest: list[dict[str, Any]] = []
     for scan_index in range(2):
         remaining = deadline - monotonic()
@@ -302,7 +311,7 @@ def _final_global_quiescence_scan(
             if remaining <= 0:
                 return False, latest, "settling deadline expired during quiescent interval", scan_index
         try:
-            snapshot, scan = snapshot_and_scan(remaining)
+            snapshot, scan = snapshot_and_scan(deadline)
         except BaseException as exc:
             return False, latest, f"global ownership rescan failed: {type(exc).__name__}", scan_index
         latest = scan.unconfirmed
@@ -321,6 +330,36 @@ def _final_global_quiescence_scan(
     return True, latest, None, 2
 
 
+def _bounded_ownership_scan(
+    deadline: float,
+    *,
+    snapshot: Callable[..., dict[int, tuple[int, str, str]]],
+    descriptor_scan: Callable[..., UntrackedProcessScan],
+    after_snapshot: Callable[[dict[int, tuple[int, str, str]]], None] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[dict[int, tuple[int, str, str]], UntrackedProcessScan]:
+    """Run process and descriptor scans within one absolute deadline."""
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise RuntimeError("settling deadline expired before process snapshot")
+    processes = snapshot(timeout=min(2.0, remaining))
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise RuntimeError("settling deadline expired before descriptor scan")
+    if after_snapshot is not None:
+        after_snapshot(processes)
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise RuntimeError("settling deadline expired before descriptor scan")
+    scan = descriptor_scan(
+        processes,
+        budget_seconds=min(UNTRACKED_SCAN_BUDGET_SECONDS, remaining),
+    )
+    if monotonic() > deadline:
+        raise RuntimeError("settling deadline exceeded during ownership scan")
+    return processes, scan
+
+
 def _merge_process_identities(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: dict[tuple[Any, Any], dict[str, Any]] = {}
     for group in groups:
@@ -331,10 +370,12 @@ def _merge_process_identities(*groups: list[dict[str, Any]]) -> list[dict[str, A
 
 def _natural_exit_settle_eligible(
     scan: UntrackedProcessScan, *, tree_confirmed_drained: bool, log_io_failed: bool,
+    prior_uncertainty: bool = False,
 ) -> bool:
     return (
         tree_confirmed_drained
         and not log_io_failed
+        and not prior_uncertainty
         and not scan.held
         and not scan.owned_probes
         and bool(scan.uninspectable)
@@ -875,6 +916,15 @@ def _run(
     owned_probe_processes: list[dict[str, Any]] = []
     timed_out = interrupted = False
     log = os.fdopen(fd, "wb")
+
+    def write_diagnostic(payload: bytes) -> None:
+        nonlocal log_io_error
+        try:
+            log.write(payload)
+        except OSError as exc:
+            if log_io_error is None:
+                log_io_error = exc
+
     try:
         try:
             baseline_snapshot = _process_snapshot()
@@ -920,12 +970,14 @@ def _run(
                     uncertain = f"{cause} process tree rooted at {process.pid} could not be confirmed drained"
                 elif timed_out:
                     tree_confirmed_drained = True
-                    log.write(f"\nGate timed out after {timeout} seconds; owned process tree drained.\n".encode())
                     code = 124
+                    write_diagnostic(
+                        f"\nGate timed out after {timeout} seconds; owned process tree drained.\n".encode()
+                    )
                 else:
                     tree_confirmed_drained = True
-                    log.write(b"\nGate interrupted; owned process tree drained.\n")
                     code = 130
+                    write_diagnostic(b"\nGate interrupted; owned process tree drained.\n")
             else:
                 snapshot = _process_snapshot()
                 _track_descendants(root_identity, owned, snapshot)
@@ -934,16 +986,18 @@ def _run(
                         uncertain = f"completed process tree rooted at {process.pid} could not be confirmed drained"
                     else:
                         tree_confirmed_drained = True
-                        log.write(b"\nGate left descendant processes running; tree drained and gate failed.\n")
                         code = 125
+                        write_diagnostic(
+                            b"\nGate left descendant processes running; tree drained and gate failed.\n"
+                        )
                 else:
                     tree_confirmed_drained = True
         except KeyboardInterrupt:
             interrupted = True
             if process is not None and root_identity is not None and _stop_and_reap_owned_tree(process, root_identity, owned):
                 tree_confirmed_drained = True
-                log.write(b"\nGate interrupted; owned process tree drained.\n")
                 code = 130
+                write_diagnostic(b"\nGate interrupted; owned process tree drained.\n")
             else:
                 if process is not None and process.poll() is None:
                     try:
@@ -959,8 +1013,8 @@ def _run(
                 uncertain = f"interrupted process tree rooted at {process.pid if process else 'unknown'} could not be confirmed drained"
         except RuntimeError as exc:
             if process is None:
-                log.write(f"Gate could not start ({type(exc).__name__}).\n".encode())
                 code = 127
+                write_diagnostic(f"Gate could not start ({type(exc).__name__}).\n".encode())
             else:
                 if process.poll() is None:
                     try:
@@ -976,8 +1030,8 @@ def _run(
                 uncertain = f"process ownership could not be enumerated for gate rooted at {process.pid}: {exc}"
         except OSError as exc:
             if process is None:
-                log.write(f"Gate could not start ({type(exc).__name__}).\n".encode())
                 code = 127
+                write_diagnostic(f"Gate could not start ({type(exc).__name__}).\n".encode())
             else:
                 if process.poll() is None:
                     try:
@@ -1007,21 +1061,26 @@ def _run(
                 settle_eligible = _natural_exit_settle_eligible(
                     scan, tree_confirmed_drained=tree_confirmed_drained,
                     log_io_failed=log_io_error is not None,
+                    prior_uncertainty=uncertain is not None,
                 )
                 if settle_eligible and root_identity is not None:
                     initial_uninspectable = [dict(item) for item in scan.uninspectable]
 
-                    def scan_again(remaining: float) -> tuple[dict[int, tuple[int, str, str]], UntrackedProcessScan]:
-                        snapshot = _process_snapshot(timeout=min(2.0, remaining))
-                        _track_descendants(root_identity, owned, snapshot)
-                        current_scan = _untracked_processes_since(
-                            baseline_snapshot, owned, snapshot, log_path,
-                            budget_seconds=min(UNTRACKED_SCAN_BUDGET_SECONDS, remaining),
+                    def scan_to_deadline(deadline: float) -> tuple[dict[int, tuple[int, str, str]], UntrackedProcessScan]:
+                        snapshot, current_scan = _bounded_ownership_scan(
+                            deadline,
+                            snapshot=lambda **kwargs: _process_snapshot(**kwargs),
+                            descriptor_scan=lambda snapshot, **kwargs: _untracked_processes_since(
+                                baseline_snapshot, owned, snapshot, log_path, **kwargs,
+                            ),
+                            after_snapshot=lambda snapshot: _track_descendants(
+                                root_identity, owned, snapshot,
+                            ),
                         )
                         return snapshot, current_scan
 
                     settling_started = time.monotonic()
-                    settled = _settle_uninspectable_candidates(initial_uninspectable, scan_again)
+                    settled = _settle_uninspectable_candidates(initial_uninspectable, scan_to_deadline)
                     report = {
                         "eligible": True,
                         "settled": False,
@@ -1039,7 +1098,7 @@ def _run(
                         clean_scans, latest_identities, final_scan_error, global_scan_count = (
                             _final_global_quiescence_scan(
                                 settled.deadline,
-                                scan_again,
+                                scan_to_deadline,
                                 lambda snapshot: _owned_processes_alive(owned, snapshot),
                             )
                         )
@@ -1235,7 +1294,27 @@ def _versions(
                 probe["naturalExitSettle"] = settle_report
             probes.append(probe)
             raise
-        raw = log_path.read_bytes()
+        try:
+            raw = log_path.read_bytes()
+        except OSError as exc:
+            probe = {
+                "name": name,
+                "argv": list(argv),
+                "cwd": cwd,
+                "exitCode": exit_code,
+                "durationSeconds": duration,
+                "log": f"logs/{log_name}",
+                "status": "failed",
+                "sourceIdentityAfter": "unavailable because version probe log finalization failed",
+            }
+            try:
+                probe["logSha256"] = _hash_file(log_path)
+            except OSError:
+                probe["logHash"] = "unavailable"
+            if settle_report:
+                probe["naturalExitSettle"] = settle_report
+            probes.append(probe)
+            raise RuntimeError("version probe log could not be read") from exc
         probe = {
             "name": name,
             "argv": list(argv),
@@ -1426,6 +1505,7 @@ def run(args: argparse.Namespace) -> int:
     }
     acquired_leases: list[Lease] = []
     retain_leases = False
+    active_attempt: dict[str, Any] | None = None
     try:
         for lease in leases:
             lease.acquire()
@@ -1462,6 +1542,7 @@ def run(args: argparse.Namespace) -> int:
             temp_log_path: pathlib.Path, log_path: pathlib.Path, gate: Gate,
             head_before: str, tree_before: str, diff_before: str,
         ) -> tuple[int, float]:
+            nonlocal active_attempt
             natural_exit_settle: dict[str, Any] = {}
             try:
                 result = _run(
@@ -1469,59 +1550,47 @@ def run(args: argparse.Namespace) -> int:
                     log_path=temp_log_path,
                     settle_report=natural_exit_settle,
                 )
-                if natural_exit_settle:
-                    # Normal gate receipts include settling evidence after the
-                    # command result and final global scan have completed.
-                    gate_settle_reports[gate.name] = natural_exit_settle
-                return result
             except (UncertainProcessTree, AttemptedGateFailure) as exc:
                 if not exc.command_started:
                     raise
-                # The command did start. Preserve that fact before the outer
-                # failure handler appends later gates as unreached.
-                attempted_log: pathlib.Path | None = None
-                try:
-                    if temp_log_path.is_file():
-                        os.replace(temp_log_path, log_path)
-                        attempted_log = log_path
-                except OSError:
-                    if temp_log_path.is_file():
-                        attempted_log = temp_log_path
-                entry: dict[str, Any] = {
-                    "name": gate.name,
-                    "argv": argv,
-                    "cwd": gate.cwd,
+                active_attempt = {
+                    "gate": gate,
+                    "argv": list(argv),
+                    "headBefore": head_before,
+                    "treeBefore": tree_before,
+                    "diffBefore": diff_before,
+                    "tempLogPath": temp_log_path,
+                    "logPath": log_path,
                     "exitCode": exc.raw_exit_code,
                     "durationSeconds": exc.duration_seconds,
-                    "headBefore": head_before,
-                    "headAfter": None,
-                    "workingTreeDigestBefore": tree_before,
-                    "workingTreeDigestAfter": None,
-                    "phaseDiffSha256Before": diff_before,
-                    "phaseDiffSha256After": None,
-                    "status": "failed",
                     "cleanupUncertain": isinstance(exc, UncertainProcessTree),
-                    "sourceIdentityAfter": "unavailable because gate command finalization failed",
+                    "naturalExitSettle": natural_exit_settle,
+                    "headAfter": None,
+                    "treeAfter": None,
+                    "diffAfter": None,
                 }
-                if attempted_log is not None:
-                    entry["log"] = f"logs/{attempted_log.name}"
-                    try:
-                        entry["logSha256"] = _hash_file(attempted_log)
-                    except OSError:
-                        entry["logHash"] = "unavailable"
-                if natural_exit_settle:
-                    entry["naturalExitSettle"] = natural_exit_settle
-                results.append(entry)
-                manifest["headAfter"] = None
-                manifest["workingTreeDigestAfter"] = None
-                manifest["phaseDiffSha256After"] = None
-                manifest["gates"] = results
-                manifest["decision"] = "failed"
-                try:
-                    _atomic_json(run_dir / "receipt.json", manifest)
-                except OSError:
-                    pass
                 raise
+            if natural_exit_settle:
+                # Normal gate receipts include settling evidence after the
+                # command result and final global scan have completed.
+                gate_settle_reports[gate.name] = natural_exit_settle
+            active_attempt = {
+                "gate": gate,
+                "argv": list(argv),
+                "headBefore": head_before,
+                "treeBefore": tree_before,
+                "diffBefore": diff_before,
+                "tempLogPath": temp_log_path,
+                "logPath": log_path,
+                "exitCode": result[0],
+                "durationSeconds": result[1],
+                "cleanupUncertain": False,
+                "naturalExitSettle": natural_exit_settle,
+                "headAfter": None,
+                "treeAfter": None,
+                "diffAfter": None,
+            }
+            return result
 
         for index, gate in enumerate(GATES):
             head_now = _git(repo, "rev-parse", "HEAD").lower()
@@ -1568,6 +1637,12 @@ def run(args: argparse.Namespace) -> int:
                 )
             if temp_log_path.exists():
                 os.replace(temp_log_path, log_path)
+            head_after = _git(repo, "rev-parse", "HEAD").lower()
+            active_attempt["headAfter"] = head_after
+            tree_after = _tree_state_digest(repo)
+            active_attempt["treeAfter"] = tree_after
+            diff_after = _hash(_phase_diff(repo, base))
+            active_attempt["diffAfter"] = diff_after
             entry = {
                 "name": gate.name,
                 "argv": argv,
@@ -1577,11 +1652,11 @@ def run(args: argparse.Namespace) -> int:
                 "log": f"logs/{log_name}",
                 "logSha256": _hash_file(log_path),
                 "headBefore": head_now,
-                "headAfter": _git(repo, "rev-parse", "HEAD").lower(),
+                "headAfter": head_after,
                 "workingTreeDigestBefore": tree_before,
-                "workingTreeDigestAfter": _tree_state_digest(repo),
+                "workingTreeDigestAfter": tree_after,
                 "phaseDiffSha256Before": diff_before,
-                "phaseDiffSha256After": _hash(_phase_diff(repo, base)),
+                "phaseDiffSha256After": diff_after,
                 "status": "passed" if code == 0 else "failed",
             }
             if gate.name in gate_settle_reports:
@@ -1592,6 +1667,7 @@ def run(args: argparse.Namespace) -> int:
                 entry["integrityFailure"] = "source identity changed during gate"
                 code = code or 1
             results.append(entry)
+            active_attempt = None
             if gate.name == "node-install" and code == 0:
                 manifest["toolVersions"].update(_versions(repo, env, logs_dir, manifest["versionProbes"], names={"buf"}))
             if gate.name == "web-install" and code == 0:
@@ -1625,6 +1701,52 @@ def run(args: argparse.Namespace) -> int:
         print(f"Decision: {manifest['decision']} ({sum(item.get('status') != 'unreached' for item in results)}/{len(GATES)} gates reached)")
         return 0 if manifest["decision"] == "checks_passed_for_review" else 1
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
+        if active_attempt is not None:
+            attempt = active_attempt
+            gate = attempt["gate"]
+            temp_log_path: pathlib.Path = attempt["tempLogPath"]
+            log_path: pathlib.Path = attempt["logPath"]
+            actual_log: pathlib.Path | None = None
+            if temp_log_path.is_file():
+                try:
+                    os.replace(temp_log_path, log_path)
+                    actual_log = log_path
+                except OSError:
+                    if temp_log_path.is_file():
+                        actual_log = temp_log_path
+                    elif log_path.is_file():
+                        actual_log = log_path
+            elif log_path.is_file():
+                actual_log = log_path
+            entry: dict[str, Any] = {
+                "name": gate.name,
+                "argv": attempt["argv"],
+                "cwd": gate.cwd,
+                "exitCode": attempt["exitCode"],
+                "durationSeconds": attempt["durationSeconds"],
+                "headBefore": attempt["headBefore"],
+                "headAfter": attempt["headAfter"],
+                "workingTreeDigestBefore": attempt["treeBefore"],
+                "workingTreeDigestAfter": attempt["treeAfter"],
+                "phaseDiffSha256Before": attempt["diffBefore"],
+                "phaseDiffSha256After": attempt["diffAfter"],
+                "status": "failed",
+                "cleanupUncertain": attempt["cleanupUncertain"],
+                "sourceIdentityAfter": "unavailable because gate command finalization failed",
+            }
+            if actual_log is not None:
+                entry["log"] = f"logs/{actual_log.name}"
+                try:
+                    entry["logSha256"] = _hash_file(actual_log)
+                except OSError:
+                    entry["logHash"] = "unavailable"
+            if attempt["naturalExitSettle"]:
+                entry["naturalExitSettle"] = attempt["naturalExitSettle"]
+            results.append(entry)
+            active_attempt = None
+            manifest["headAfter"] = None
+            manifest["workingTreeDigestAfter"] = None
+            manifest["phaseDiffSha256After"] = None
         if isinstance(exc, UncertainProcessTree) and exc.command_started:
             retain_leases = True
             for lease in acquired_leases:

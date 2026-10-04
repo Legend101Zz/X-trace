@@ -331,6 +331,56 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.poll_count, 2)
         self.assertFalse(result.latest_candidates)
 
+    def test_settle_process_and_descriptor_scans_share_one_absolute_deadline(self) -> None:
+        clock = [10.0]
+        budgets: list[float] = []
+
+        def process_scan(*, timeout: float) -> dict[int, tuple[int, str, str]]:
+            budgets.append(timeout)
+            clock[0] += 0.75
+            return {}
+
+        def descriptor_scan(
+            _snapshot: dict[int, tuple[int, str, str]], *, budget_seconds: float,
+        ) -> run_gates.UntrackedProcessScan:
+            budgets.append(budget_seconds)
+            return run_gates.UntrackedProcessScan([], [], None, 0)
+
+        processes, scan = run_gates._bounded_ownership_scan(
+            12.0,
+            snapshot=process_scan,
+            descriptor_scan=descriptor_scan,
+            monotonic=lambda: clock[0],
+        )
+        self.assertEqual(processes, {})
+        self.assertIsNone(scan.error)
+        self.assertEqual(budgets, [2.0, 1.25])
+
+        clock[0] = 20.0
+        descriptor_called = False
+
+        def late_process_scan(*, timeout: float) -> dict[int, tuple[int, str, str]]:
+            del timeout
+            clock[0] = 21.0
+            return {}
+
+        def late_descriptor_scan(
+            _snapshot: dict[int, tuple[int, str, str]], *, budget_seconds: float,
+        ) -> run_gates.UntrackedProcessScan:
+            nonlocal descriptor_called
+            del budget_seconds
+            descriptor_called = True
+            return run_gates.UntrackedProcessScan([], [], None, 0)
+
+        with self.assertRaisesRegex(RuntimeError, "expired before descriptor scan"):
+            run_gates._bounded_ownership_scan(
+                21.0,
+                snapshot=late_process_scan,
+                descriptor_scan=late_descriptor_scan,
+                monotonic=lambda: clock[0],
+            )
+        self.assertFalse(descriptor_called, "exhausted poll must not start another scan")
+
     def test_natural_exit_settle_fails_closed_for_survivors_and_new_holders(self) -> None:
         clock = [0.0]
         identity = (4242, "candidate-start")
@@ -382,6 +432,10 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(run_gates._natural_exit_settle_eligible(
             eligible, tree_confirmed_drained=True, log_io_failed=True,
         ))
+        self.assertFalse(run_gates._natural_exit_settle_eligible(
+            eligible, tree_confirmed_drained=True, log_io_failed=False,
+            prior_uncertainty=True,
+        ))
         held = run_gates.UntrackedProcessScan(
             [{"pid": 9, "startedAt": "held", "descriptorStatus": "held"}],
             [unknown], run_gates.EXPECTED_UNINSPECTABLE_SCAN, 2,
@@ -393,6 +447,64 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(run_gates._natural_exit_settle_eligible(
             owned_probe, tree_confirmed_drained=True, log_io_failed=False,
         ))
+
+    def test_diagnostic_log_failure_cannot_be_cleared_by_transient_uninspectable_candidate(self) -> None:
+        gate = run_gates.Gate("diagnostic-write", (sys.executable, "-c", "pass"))
+        root_snapshot = {4321: (1, "root-start", "S")}
+        candidate = {
+            "pid": 9876,
+            "startedAt": "transient-start",
+            "descriptorStatus": "uninspectable",
+            "reason": "missing-process-record-after-all-fd-fallback",
+        }
+        process = mock.Mock(pid=4321, returncode=0)
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        real_fdopen = os.fdopen
+
+        class FailingDiagnosticLog:
+            def __init__(self, fd: int, mode: str) -> None:
+                self.stream = real_fdopen(fd, mode)
+
+            def write(self, _payload: bytes) -> int:
+                raise OSError("injected diagnostic write failure")
+
+            def flush(self) -> None:
+                self.stream.flush()
+
+            def fileno(self) -> int:
+                return self.stream.fileno()
+
+            def close(self) -> None:
+                self.stream.close()
+
+        settle = run_gates.NaturalExitSettle(
+            True, 1.0, 1, [], None, time.monotonic() + 120,
+        )
+        with mock.patch.object(run_gates, "GATES", (gate,)), \
+                mock.patch.object(run_gates.subprocess, "Popen", return_value=process), \
+                mock.patch.object(run_gates, "_process_snapshot", side_effect=[{}, root_snapshot, root_snapshot, root_snapshot, root_snapshot]), \
+                mock.patch.object(run_gates, "_owned_processes_alive", return_value=[4321]), \
+                mock.patch.object(run_gates, "_stop_and_reap_owned_tree", return_value=True), \
+                mock.patch.object(run_gates, "_untracked_processes_since", return_value=run_gates.UntrackedProcessScan(
+                    [], [candidate], run_gates.EXPECTED_UNINSPECTABLE_SCAN, 1,
+                )), \
+                mock.patch.object(run_gates, "_settle_uninspectable_candidates", return_value=settle) as settle_candidates, \
+                mock.patch.object(run_gates, "_final_global_quiescence_scan", return_value=(True, [], None, 2)) as global_scan, \
+                mock.patch.object(run_gates.os, "fdopen", side_effect=FailingDiagnosticLog):
+            self.assertEqual(run_gates.run(self.args()), 1)
+
+        settle_candidates.assert_not_called()
+        global_scan.assert_not_called()
+        receipt = json.loads((self.cache / "release-gates/P00-test/receipt.json").read_text())
+        entry = receipt["gates"][0]
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["exitCode"], 0, "receipt retains raw child exit without treating it as pass")
+        self.assertTrue(entry["cleanupUncertain"])
+        self.assertNotIn("naturalExitSettle", entry, "log failure disqualifies the settle path")
+        for name in ("cargo", "gradle"):
+            owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
+            self.assertTrue(owner["requiresManualRecovery"])
 
     def test_natural_exit_settle_fails_closed_on_scan_error_and_interrupt(self) -> None:
         candidate = {"pid": 4242, "startedAt": "candidate-start", "descriptorStatus": "uninspectable", "reason": "missing-process-record-after-all-fd-fallback"}
@@ -550,6 +662,103 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(receipt["gates"][1]["status"], "unreached")
         for name in ("cargo", "gradle"):
             self.assertTrue((self.cache / "leases" / name / "owner.json").is_file())
+
+    def test_normal_return_finalization_failures_remain_attempted_gate_receipts(self) -> None:
+        real_replace = os.replace
+        real_hash_file = run_gates._hash_file
+        real_tree_digest = run_gates._tree_state_digest
+
+        for failure_stage in ("rename", "hash", "source"):
+            with self.subTest(stage=failure_stage):
+                args = self.args()
+                args.label = f"P00-{failure_stage}"
+                gate = run_gates.Gate("finalize", (sys.executable, "-c", "pass"))
+
+                def normal_run(
+                    _argv: object, *, log_path: pathlib.Path, **_kwargs: object,
+                ) -> tuple[int, float]:
+                    log_path.write_bytes(b"command completed before finalization\n")
+                    return 0, 0.75
+
+                def replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+                    if failure_stage == "rename" and pathlib.Path(destination).name == "finalize.log":
+                        raise OSError("injected final log rename failure")
+                    real_replace(source, destination)
+
+                def hash_file(path: pathlib.Path) -> str:
+                    if failure_stage == "hash" and path.name == "finalize.log":
+                        raise OSError("injected final log hash failure")
+                    return real_hash_file(path)
+
+                tree_calls = [0]
+
+                def tree_digest(repo: pathlib.Path) -> str:
+                    tree_calls[0] += 1
+                    if failure_stage == "source" and tree_calls[0] == 2:
+                        raise RuntimeError("injected post-command source read failure")
+                    return real_tree_digest(repo)
+
+                with mock.patch.object(run_gates, "GATES", (gate,)), \
+                        mock.patch.object(run_gates, "_run", side_effect=normal_run), \
+                        mock.patch.object(run_gates.os, "replace", side_effect=replace), \
+                        mock.patch.object(run_gates, "_hash_file", side_effect=hash_file), \
+                        mock.patch.object(run_gates, "_tree_state_digest", side_effect=tree_digest):
+                    self.assertEqual(run_gates.run(args), 1)
+
+                receipt = json.loads((self.cache / "release-gates" / args.label / "receipt.json").read_text())
+                entry = receipt["gates"][0]
+                self.assertEqual(entry["name"], "finalize")
+                self.assertEqual(entry["status"], "failed")
+                self.assertEqual(entry["exitCode"], 0, "raw command result remains visible")
+                self.assertEqual(entry["durationSeconds"], 0.75)
+                if failure_stage == "source":
+                    self.assertEqual(entry["headAfter"], receipt["headBefore"])
+                    self.assertIsNone(entry["workingTreeDigestAfter"])
+                    self.assertIsNone(entry["phaseDiffSha256After"])
+                elif failure_stage == "rename":
+                    self.assertIsNone(entry["headAfter"])
+                    self.assertIsNone(entry["workingTreeDigestAfter"])
+                    self.assertIsNone(entry["phaseDiffSha256After"])
+                else:
+                    self.assertEqual(entry["headAfter"], receipt["headBefore"])
+                    self.assertEqual(entry["workingTreeDigestAfter"], receipt["workingTreeDigestBefore"])
+                    self.assertEqual(entry["phaseDiffSha256After"], receipt["phaseDiffSha256Before"])
+                self.assertTrue(entry["log"].startswith("logs/"))
+                self.assertEqual(receipt["decision"], "failed")
+
+    def test_normal_return_version_log_read_failure_keeps_attempted_probe(self) -> None:
+        logs = self.cache / "version-read-failure"
+        logs.mkdir(parents=True)
+        log_path = logs / "version-probe.log"
+        real_read_bytes = pathlib.Path.read_bytes
+
+        def normal_probe(
+            _argv: object, *, log_path: pathlib.Path, **_kwargs: object,
+        ) -> tuple[int, float]:
+            log_path.write_bytes(b"tool 1.2.3\n")
+            return 0, 0.5
+
+        def read_bytes(path: pathlib.Path) -> bytes:
+            if path == log_path:
+                raise OSError("injected version log read failure")
+            return real_read_bytes(path)
+
+        probes: list[dict[str, object]] = []
+        with mock.patch.object(run_gates, "VERSION_COMMANDS", (("probe", (sys.executable, "--version"), "."),)), \
+                mock.patch.object(run_gates, "_run", side_effect=normal_probe), \
+                mock.patch.object(pathlib.Path, "read_bytes", read_bytes):
+            with self.assertRaisesRegex(RuntimeError, "version probe log could not be read"):
+                REAL_VERSIONS(
+                    self.repo, os.environ.copy(), logs, probes, names={"probe"},
+                )
+
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(probes[0]["name"], "probe")
+        self.assertEqual(probes[0]["exitCode"], 0)
+        self.assertEqual(probes[0]["durationSeconds"], 0.5)
+        self.assertEqual(probes[0]["status"], "failed")
+        self.assertEqual(probes[0]["logSha256"], digest(b"tool 1.2.3\n"))
+        self.assertIn("unavailable", probes[0]["sourceIdentityAfter"])
 
     def test_pre_spawn_uncertainty_remains_unreached_not_attempted(self) -> None:
         attempted = run_gates.Gate("not-started", ("java", "-version"))
