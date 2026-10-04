@@ -151,7 +151,7 @@ final class HelperSupervisor {
           json,
           exitCode,
           BoundedJson.isWorkerResponse(json, command(arguments), exitCode));
-    } catch (IOException | InterruptedException | ExecutionException
+    } catch (InterruptedException | ExecutionException
         | TimeoutException | RuntimeException | Error error) {
       primaryFailure = error;
       throw error;
