@@ -1110,6 +1110,8 @@ def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
     """
     names: list[str] = []
     sites: list[str] = []
+    messages: list[str] = []
+    expect_message = False
     compile_error = False
     try:
         fd = private_roots.open_private_file_read(log_path)
@@ -1127,10 +1129,19 @@ def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
             *lines, pending = pending.split(b"\n")
             pending = pending[-4096:]
             for line in lines:
+                if expect_message and line.strip():
+                    # The assertion/expect text of our own test code, scrubbed and bounded.
+                    if len(messages) < 10:
+                        text = _scrub_text(line.decode("utf-8", "replace"), 120)
+                        if text and text not in messages:
+                            messages.append(text)
+                    expect_message = False
                 match = _FAILED_TEST_LINE.match(line)
                 if match and len(names) < MAX_FAILURE_HINTS and match.group(1).decode() not in names:
                     names.append(match.group(1).decode())
                 site = _PANIC_SITE.search(line)
+                if site:
+                    expect_message = True
                 if site and len(sites) < MAX_FAILURE_HINTS:
                     text = f"{site.group(1).decode()}:{site.group(2).decode()}"
                     if text not in sites:
@@ -1146,6 +1157,8 @@ def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
         hints["failingTests"] = names
     if sites:
         hints["panicSites"] = sites
+    if messages:
+        hints["panicMessages"] = messages
     if compile_error:
         hints["compileError"] = True
     return hints

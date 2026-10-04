@@ -117,6 +117,15 @@ jobs:
         run: |
           set -euo pipefail
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor prepare-private-root --root "$XTRACE_CI_PRIVATE_ROOT"
+      - name: Report private root ancestry (modes, owners and filesystem types only)
+        run: |
+          set -euo pipefail
+          path="$XTRACE_CI_PRIVATE_ROOT"
+          while [ "$path" != "/" ]; do
+            printf '%s %s %s\n' "$(ls -ld "$path" | cut -d' ' -f1,3)" "$(stat -f -c %T "$path")" "$(basename "$path" | sed 's/[0-9]\{6,\}/N/g')"
+            path="$(dirname "$path")"
+          done
+          printf '%s\n' "umask $(umask) uid $(id -u)"
       - name: Verify full release tooling suite on the exact source
         run: |
           set +e

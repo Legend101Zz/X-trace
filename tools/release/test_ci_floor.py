@@ -402,6 +402,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
             b"test evil name with spaces GITHUB_TOKEN=abc ... FAILED\n"
             b"test crate::mod_x::second_failure ... FAILED\n"
             b"thread 'x' panicked at crates/xtrace-cli/tests/java_run_spring.rs:781:5:\n"
+            b"init: StoreUnavailable(\"secure file /home/runner/work/x/y failed\")\n"
             b"thread 'y' panicked at /home/runner/secret/path.rs:5:1:\n"
             b"error: could not compile `xtrace-cli` (test \"x\") due to 1 previous error\n"
         )
@@ -414,6 +415,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
         self.assertEqual(hints["panicSites"], ["crates/xtrace-cli/tests/java_run_spring.rs:781"])
         self.assertIs(hints["compileError"], True)
         self.assertNotIn("GITHUB_TOKEN", json.dumps(hints))
+        self.assertEqual(hints["panicMessages"][0], 'init: StoreUnavailable("secure file <path> failed")')
         self.assertNotIn("/home/runner", json.dumps(hints))
         with mock.patch.object(ci_floor.private_roots, "open_private_file_read", side_effect=private_roots.AdmissionError("x")):
             self.assertEqual(ci_floor._gate_failure_hints(pathlib.Path("/synthetic/log")), {})
