@@ -689,7 +689,10 @@ fn catalog_query_error(correlation_id: CorrelationId, cursor: bool) -> AppError 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
     use crate::error::PortErrorKind;
@@ -860,8 +863,8 @@ mod tests {
             _context: CatalogProducerContext,
             _request: &DiscoveryRunStartRequest,
         ) -> Result<AdmittedCatalogSelection, DiscoveryRefusal> {
-            self.fresh_admissions.fetch_add(1, Ordering::SeqCst);
-            Ok(self.latest.clone())
+            let prior_admissions = self.fresh_admissions.fetch_add(1, Ordering::SeqCst);
+            if prior_admissions == 0 { Ok(self.original.clone()) } else { Ok(self.latest.clone()) }
         }
 
         fn resolve_run(
@@ -878,6 +881,7 @@ mod tests {
 
     struct GrantWriter {
         run_id: RunId,
+        selections: Arc<Mutex<Vec<([u8; 16], u64)>>>,
     }
 
     impl CatalogDiscoveryWritePort for GrantWriter {
@@ -886,6 +890,10 @@ mod tests {
             selection: &AdmittedCatalogSelection,
             _request: &DiscoveryRunStartRequest,
         ) -> Result<DiscoveryRunGrant, PortError> {
+            self.selections
+                .lock()
+                .expect("record selected owner")
+                .push((*selection.owner_selection_id(), selection.owner_selection_epoch()));
             Ok(DiscoveryRunGrant::Admitted {
                 run_id: self.run_id,
                 scope_digest: selection.scope().digest().expect("scope digest"),
@@ -936,6 +944,8 @@ mod tests {
         let latest = admitted_selection(ctx, Uuid::now_v7(), 2);
         let resolved = Arc::new(AtomicUsize::new(0));
         let fresh = Arc::new(AtomicUsize::new(0));
+        let selections = Arc::new(Mutex::new(Vec::new()));
+        let expected_original = (*original.owner_selection_id(), original.owner_selection_epoch());
         let service = CatalogDiscoveryService::with_test_ports(
             Arc::new(RetryAdmission {
                 original,
@@ -944,7 +954,7 @@ mod tests {
                 fresh_admissions: fresh.clone(),
             }),
             Arc::new(RefuseUnboundSourceEvidence),
-            Arc::new(GrantWriter { run_id: RunId::new() }),
+            Arc::new(GrantWriter { run_id: RunId::new(), selections: selections.clone() }),
         );
         let mut retry = request();
         retry.run_hint = "retry-me".to_owned();
@@ -952,6 +962,10 @@ mod tests {
         service.start_run(ctx, &retry).expect("exact retry");
         assert_eq!(resolved.load(Ordering::SeqCst), 2);
         assert_eq!(fresh.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *selections.lock().expect("read selected owners"),
+            [expected_original, expected_original]
+        );
     }
 
     struct SummaryReader {
