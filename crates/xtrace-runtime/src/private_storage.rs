@@ -1532,7 +1532,7 @@ fn parse_macos_acl_listing_kind(text: &str, expected_path: &str, kind: u8) -> bo
         }
         if words[1..effect_index].iter().any(|word| {
             !matches!(
-                **word,
+                *word,
                 "inherited"
                     | "file_inherit"
                     | "directory_inherit"

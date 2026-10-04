@@ -819,7 +819,10 @@ fn valid_package_marker(value: &str) -> bool {
         })
 }
 
-fn parse_semver_range(value: &str) -> Result<((u32, u32, u32), (u32, u32, u32)), SignedPackError> {
+/// A `(major, minor, patch)` semantic version triple.
+type SemverTriple = (u32, u32, u32);
+
+fn parse_semver_range(value: &str) -> Result<(SemverTriple, SemverTriple), SignedPackError> {
     let Some((lower, upper)) = value.split_once(' ') else {
         return Err(SignedPackError::UnsupportedManifest);
     };
@@ -1339,7 +1342,7 @@ fn valid_artifact_path(path: &str) -> bool {
     if path.is_empty()
         || path.len() > 255
         || !path.is_ascii()
-        || path.to_ascii_lowercase() == "xtrace-pack.json"
+        || path.eq_ignore_ascii_case("xtrace-pack.json")
     {
         return false;
     }

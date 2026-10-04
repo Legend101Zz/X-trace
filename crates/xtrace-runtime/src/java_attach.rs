@@ -250,7 +250,7 @@ impl JavaAttachPack {
         .map_err(|_| {
             AttachError::PrivateStorage("the private Java pack snapshot could not be written")
         })?;
-        (&mut manifest_file).write_all(&manifest).map_err(|_| {
+        manifest_file.write_all(&manifest).map_err(|_| {
             AttachError::PrivateStorage("the private Java pack snapshot could not be written")
         })?;
         drop(manifest_file);
@@ -406,7 +406,7 @@ fn open_or_create_private_child(
 
 fn create_private_directory(root: &std::fs::File, relative: &str) -> Result<(), AttachError> {
     use rustix::fs::{Mode, OFlags, openat};
-    let (parent, name) = relative.rsplit_once('/').map_or(("", relative), |pair| pair);
+    let (parent, name) = relative.rsplit_once('/').unwrap_or(("", relative));
     let directory = if parent.is_empty() {
         root.try_clone().map_err(|_| {
             AttachError::PrivateStorage("the private Java pack snapshot is unavailable")
@@ -588,15 +588,19 @@ struct PackInventory {
 }
 
 fn walk_pack(root: &Path, owner: u32) -> Result<PackInventory, AttachError> {
+    /// Running totals and collected entries for one bounded pack walk.
+    struct WalkState {
+        total: u64,
+        count: usize,
+        inventory: PackInventory,
+    }
+
     fn visit(
         root: &Path,
         directory: &Path,
         owner: u32,
         depth: usize,
-        total: &mut u64,
-        count: &mut usize,
-        files: &mut std::collections::BTreeMap<String, FileIdentity>,
-        directories: &mut std::collections::BTreeSet<String>,
+        state: &mut WalkState,
     ) -> Result<(), AttachError> {
         use std::os::unix::fs::MetadataExt as _;
         if depth > 5 {
@@ -618,8 +622,8 @@ fn walk_pack(root: &Path, owner: u32) -> Result<PackInventory, AttachError> {
         }
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
-            *count += 1;
-            if *count > MAX_PACK_ENTRIES {
+            state.count += 1;
+            if state.count > MAX_PACK_ENTRIES {
                 return Err(AttachError::Validation("the Java attach pack has too many files"));
             }
             let path = entry.path();
@@ -642,12 +646,12 @@ fn walk_pack(root: &Path, owner: u32) -> Result<PackInventory, AttachError> {
                     .to_str()
                     .ok_or(AttachError::Validation("the Java attach pack has a non-UTF-8 path"))?
                     .replace(std::path::MAIN_SEPARATOR, "/");
-                if !safe_relative_path(&relative) || !directories.insert(relative) {
+                if !safe_relative_path(&relative) || !state.inventory.directories.insert(relative) {
                     return Err(AttachError::Validation(
                         "the Java attach pack contains an invalid directory",
                     ));
                 }
-                visit(root, &path, owner, depth + 1, total, count, files, directories)?;
+                visit(root, &path, owner, depth + 1, state)?;
             } else if metadata.is_file() {
                 let identity = FileIdentity::from_metadata(&metadata);
                 if identity.owner != owner
@@ -659,10 +663,10 @@ fn walk_pack(root: &Path, owner: u32) -> Result<PackInventory, AttachError> {
                         "Java pack files must be bounded owned unlinked regular files",
                     ));
                 }
-                *total = (*total).checked_add(identity.size).ok_or(AttachError::Validation(
-                    "the Java attach pack exceeds its size limit",
-                ))?;
-                if *total > MAX_PACK_BYTES {
+                state.total = state.total.checked_add(identity.size).ok_or(
+                    AttachError::Validation("the Java attach pack exceeds its size limit"),
+                )?;
+                if state.total > MAX_PACK_BYTES {
                     return Err(AttachError::Validation(
                         "the Java attach pack exceeds its size limit",
                     ));
@@ -674,7 +678,9 @@ fn walk_pack(root: &Path, owner: u32) -> Result<PackInventory, AttachError> {
                     .to_str()
                     .ok_or(AttachError::Validation("the Java attach pack has a non-UTF-8 path"))?
                     .replace(std::path::MAIN_SEPARATOR, "/");
-                if !safe_relative_path(&relative) || files.insert(relative, identity).is_some() {
+                if !safe_relative_path(&relative)
+                    || state.inventory.files.insert(relative, identity).is_some()
+                {
                     return Err(AttachError::Validation(
                         "the Java attach pack contains an invalid path",
                     ));
@@ -691,12 +697,16 @@ fn walk_pack(root: &Path, owner: u32) -> Result<PackInventory, AttachError> {
         Ok(())
     }
 
-    let mut files = std::collections::BTreeMap::new();
-    let mut directories = std::collections::BTreeSet::new();
-    let mut total = 0;
-    let mut count = 0;
-    visit(root, root, owner, 0, &mut total, &mut count, &mut files, &mut directories)?;
-    Ok(PackInventory { files, directories })
+    let mut state = WalkState {
+        total: 0,
+        count: 0,
+        inventory: PackInventory {
+            files: std::collections::BTreeMap::new(),
+            directories: std::collections::BTreeSet::new(),
+        },
+    };
+    visit(root, root, owner, 0, &mut state)?;
+    Ok(state.inventory)
 }
 
 fn check_directory(path: &Path, owner: u32) -> Result<FileIdentity, AttachError> {
@@ -1091,7 +1101,7 @@ fn parse_macos_acl_listing(text: &str, expected_path: &str) -> bool {
         }
         if words[1..effect_index].iter().any(|word| {
             !matches!(
-                **word,
+                *word,
                 "inherited"
                     | "file_inherit"
                     | "directory_inherit"

@@ -1576,7 +1576,9 @@ fn map_store_kind(kind: StoreErrorKind, message: &str, correlation_id: Correlati
         StoreErrorKind::SchemaOlder
         | StoreErrorKind::SchemaNewer
         | StoreErrorKind::SchemaIncompatible => PortErrorKind::Compatibility,
-        StoreErrorKind::Busy | StoreErrorKind::Resource => PortErrorKind::Resource,
+        StoreErrorKind::Busy | StoreErrorKind::Resource | StoreErrorKind::Permission => {
+            PortErrorKind::Resource
+        }
         StoreErrorKind::Corruption => PortErrorKind::Corruption,
         StoreErrorKind::Transport => PortErrorKind::Transport,
         StoreErrorKind::Internal => PortErrorKind::Internal,
