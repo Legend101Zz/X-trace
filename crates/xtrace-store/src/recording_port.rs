@@ -316,7 +316,12 @@ mod tests {
     use crate::{OpenOptions, SqliteRecordingPersistence, SqliteRecordingReader, SqliteStore};
 
     fn fixture() -> (tempfile::TempDir, SqliteStore, Project) {
-        let temp_base = std::env::temp_dir().canonicalize().expect("canonical temp base");
+        let temp_base = std::path::PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        xtrace_runtime::private_storage::AdmittedPrivateRoot::open(&temp_base)
+            .expect("admitted private test scratch");
         let directory = tempfile::Builder::new()
             .prefix("recording-port-")
             .tempdir_in(temp_base)

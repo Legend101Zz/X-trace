@@ -482,84 +482,37 @@ fn write_snapshot_file(
 /// are rejected. This remains a point-in-time admission check, not a defense from
 /// privileged remounts or hostile same-user processes.
 pub fn admit_private_directory(path: &Path) -> Result<(), AttachError> {
-    let directory = open_directory_without_symlinks(path)
-        .map_err(|_| AttachError::PrivateStorage("private storage cannot be opened"))?;
-    admit_directory_descriptor(path, &directory, true)
+    super::private_storage::AdmittedPrivateRoot::open(path)
+        .map(|_| ())
+        .map_err(|_| AttachError::PrivateStorage("private storage cannot be admitted"))
 }
 
 /// Admits a user-data container that may be traversable but is not writable by other users.
 pub fn admit_private_container_directory(path: &Path) -> Result<(), AttachError> {
-    let directory = open_directory_without_symlinks(path)
-        .map_err(|_| AttachError::PrivateStorage("private storage cannot be opened"))?;
-    admit_directory_descriptor(path, &directory, false)
+    super::private_storage::AdmittedPrivateRoot::open_container(path)
+        .map(|_| ())
+        .map_err(|_| AttachError::PrivateStorage("private storage cannot be admitted"))
 }
 
-fn admit_directory_descriptor(
+pub(super) fn admit_directory_descriptor(
     path: &Path,
     directory: &std::fs::File,
     owner_only: bool,
 ) -> Result<(), AttachError> {
-    let named = std::fs::symlink_metadata(path)
-        .map_err(|_| AttachError::PrivateStorage("private storage is unavailable"))?;
-    if named.file_type().is_symlink() || !named.is_dir() {
-        return Err(AttachError::PrivateStorage("private storage must be a real directory"));
-    }
-    let descriptor = directory
-        .metadata()
-        .map_err(|_| AttachError::PrivateStorage("private storage cannot be inspected"))?;
-    if !descriptor.is_dir()
-        || FileIdentity::from_metadata(&named) != FileIdentity::from_metadata(&descriptor)
-    {
-        return Err(AttachError::PrivateStorage("private storage changed during inspection"));
-    }
-    verify_metadata_owner_mode(&descriptor, owner_only).map_err(|_| {
-        AttachError::PrivateStorage("private storage ownership or permissions are unsafe")
-    })?;
-    let filesystem = rustix::fs::fstatfs(&directory)
-        .map_err(|_| AttachError::PrivateStorage("private filesystem admission is unavailable"))?;
-    if !owner_enforcing_local_filesystem(&filesystem)
-        || !acl_admits_directory(path, directory, FileIdentity::from_metadata(&descriptor))
-    {
-        return Err(AttachError::PrivateStorage(
-            "private storage requires an owner-enforced local filesystem",
-        ));
-    }
-    let named_after = std::fs::symlink_metadata(path)
-        .map_err(|_| AttachError::PrivateStorage("private storage changed during inspection"))?;
-    let descriptor_after = directory
-        .metadata()
-        .map_err(|_| AttachError::PrivateStorage("private storage changed during inspection"))?;
-    let initial = FileIdentity::from_metadata(&descriptor);
-    if FileIdentity::from_metadata(&named_after) != initial
-        || FileIdentity::from_metadata(&descriptor_after) != initial
-    {
-        return Err(AttachError::PrivateStorage("private storage changed during inspection"));
-    }
-    Ok(())
+    super::private_storage::AdmittedPrivateRoot::validate_open_directory(
+        path, directory, owner_only,
+    )
+    .map_err(|_| AttachError::PrivateStorage("private storage cannot be admitted"))
 }
 
 /// Creates a private, durable helper cache below an already-admitted user data home.
 pub fn prepare_helper_cache(data_home: &Path) -> Result<PathBuf, AttachError> {
-    admit_private_container_directory(data_home)?;
-    let cache = data_home.join(".xtrace-java-attach-cache");
-    let parent = open_directory_without_symlinks(data_home)
-        .map_err(|_| AttachError::PrivateStorage("the user data home changed during inspection"))?;
-    admit_directory_descriptor(data_home, &parent, false)?;
-    let name = ".xtrace-java-attach-cache";
-    let cache_descriptor = match open_child_directory(&parent, name) {
-        Ok(directory) => directory,
-        Err(error) if error == rustix::io::Errno::NOENT => {
-            rustix::fs::mkdirat(&parent, name, rustix::fs::Mode::from_raw_mode(0o700)).map_err(
-                |_| AttachError::PrivateStorage("the Java helper cache cannot be created"),
-            )?;
-            open_child_directory(&parent, name).map_err(|_| {
-                AttachError::PrivateStorage("the Java helper cache cannot be opened")
-            })?
-        }
-        Err(_) => return Err(AttachError::PrivateStorage("the Java helper cache is unavailable")),
-    };
-    admit_directory_descriptor(&cache, &cache_descriptor, true)?;
-    Ok(cache)
+    let parent = super::private_storage::AdmittedPrivateRoot::open_container(data_home)
+        .map_err(|_| AttachError::PrivateStorage("the user data home cannot be admitted"))?;
+    let cache = parent
+        .open_or_create_private_child(".xtrace-java-attach-cache")
+        .map_err(|_| AttachError::PrivateStorage("the Java helper cache is unavailable"))?;
+    Ok(cache.path().to_path_buf())
 }
 
 fn parse_manifest(bytes: &[u8]) -> Result<std::collections::BTreeMap<String, String>, AttachError> {
@@ -606,7 +559,7 @@ fn safe_relative_path(path: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
+pub(super) struct FileIdentity {
     device: u64,
     inode: u64,
     size: u64,
@@ -616,7 +569,7 @@ struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+    pub(super) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
         Self {
             device: metadata.dev(),
@@ -626,6 +579,14 @@ impl FileIdentity {
             mode: metadata.mode() & 0o7777,
             links: metadata.nlink(),
         }
+    }
+
+    pub(super) fn same_directory(self, other: &Self) -> bool {
+        self.device == other.device
+            && self.inode == other.inode
+            && self.owner == other.owner
+            && self.mode == other.mode
+            && self.links == other.links
     }
 }
 
@@ -818,7 +779,7 @@ fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn open_directory_without_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
+pub(super) fn open_directory_without_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags, open, openat};
     if !path.is_absolute() {
         return Err(std::io::Error::new(
@@ -860,7 +821,10 @@ fn open_directory_without_symlinks(path: &Path) -> std::io::Result<std::fs::File
     Ok(descriptor)
 }
 
-fn verify_ancestor_metadata(path: &Path, descriptor: &std::fs::File) -> std::io::Result<()> {
+pub(super) fn verify_ancestor_metadata(
+    path: &Path,
+    descriptor: &std::fs::File,
+) -> std::io::Result<()> {
     let metadata = descriptor.metadata()?;
     let uid = rustix::process::getuid().as_raw();
     let identity = FileIdentity::from_metadata(&metadata);

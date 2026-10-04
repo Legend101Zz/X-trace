@@ -34,6 +34,7 @@ use xtrace_domain::CorrelationId;
 use crate::error::{StoreError, StoreErrorKind};
 use crate::migrations;
 use crate::project_repository::SqliteProjectRepository;
+use xtrace_runtime::private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
 /// Application binary identifier stored in `schema_meta.app_version`.
 pub const STORE_APP_VERSION: &str = concat!("xtrace ", env!("CARGO_PKG_VERSION"));
@@ -214,6 +215,7 @@ pub struct SqliteStore {
 #[derive(Debug)]
 struct StoreInner {
     connection: Mutex<Connection>,
+    private_root: Option<AdmittedPrivateRoot>,
     // This lock owns recording-wide ordering across every clone and every
     // borrowed recording-store view. It intentionally remains separate from
     // the connection lock because later commits hold it across filesystem and
@@ -247,15 +249,63 @@ impl SqliteStore {
     /// the parent directory does not exist, or migrations fail.
     pub fn open(path: &Path, options: OpenOptions) -> Result<Self, StoreError> {
         let bootstrap = options.bootstrap_correlation_id;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                return Err(StoreError::new(
+        let parent =
+            path.parent().filter(|value| !value.as_os_str().is_empty()).ok_or_else(|| {
+                StoreError::new(
                     StoreErrorKind::Validation,
-                    "parent directory of database file does not exist",
+                    "database path has no parent directory",
                     bootstrap,
-                ));
-            }
+                )
+            })?;
+        if !parent.is_dir() {
+            return Err(StoreError::new(
+                StoreErrorKind::Validation,
+                "parent directory of database file does not exist",
+                bootstrap,
+            ));
         }
+        let private_root = AdmittedPrivateRoot::open(parent).map_err(|_| {
+            StoreError::new(
+                StoreErrorKind::Permission,
+                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
+                bootstrap,
+            )
+        })?;
+        let database_name = path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+            StoreError::new(StoreErrorKind::Validation, "database file name is invalid", bootstrap)
+        })?;
+        let prepared_file = if options.read_only() || options.must_exist() {
+            private_root.open_regular_file(database_name)
+        } else {
+            private_root.open_or_create_private_file(database_name)
+        };
+        let prepared_file = prepared_file.map_err(|error| match error {
+            PrivateStorageError::Operation if options.must_exist() || options.read_only() => {
+                StoreError::new(
+                    StoreErrorKind::Transport,
+                    "SQLite database file could not be opened",
+                    bootstrap,
+                )
+            }
+            PrivateStorageError::InvalidName => StoreError::new(
+                StoreErrorKind::Validation,
+                "database file name is invalid",
+                bootstrap,
+            ),
+            _ => StoreError::new(
+                StoreErrorKind::Permission,
+                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
+                bootstrap,
+            ),
+        })?;
+        drop(prepared_file);
+        private_root.revalidate().map_err(|_| {
+            StoreError::new(
+                StoreErrorKind::Permission,
+                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
+                bootstrap,
+            )
+        })?;
         // When `must_exist` is set we open the file with read-write
         // flags only so SQLite refuses to create the file. This closes
         // the `path.exists()`-then-`Connection::open` race in which a
@@ -274,7 +324,27 @@ impl SqliteStore {
             )
             .map_err(|err| StoreError::from_rusqlite(err, bootstrap))?
         };
-        Self::from_connection(connection, Some(path.to_path_buf()), options)
+        let post_open = private_root.open_regular_file(database_name).map_err(|_| {
+            StoreError::new(
+                StoreErrorKind::Permission,
+                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
+                bootstrap,
+            )
+        })?;
+        drop(post_open);
+        private_root.revalidate().map_err(|_| {
+            StoreError::new(
+                StoreErrorKind::Permission,
+                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
+                bootstrap,
+            )
+        })?;
+        Self::from_connection_with_private_root(
+            connection,
+            Some(path.to_path_buf()),
+            options,
+            Some(private_root),
+        )
     }
 
     /// Wraps a pre-built connection. Exposed for tests that want to
@@ -284,10 +354,58 @@ impl SqliteStore {
     ///
     /// Returns [`StoreError`] when the pragmas cannot be applied or
     /// migrations fail.
-    pub fn from_connection(
+    pub(crate) fn from_connection(
         connection: Connection,
         database_path: Option<PathBuf>,
         options: OpenOptions,
+    ) -> Result<Self, StoreError> {
+        let bootstrap = options.bootstrap_correlation_id;
+        let private_root = database_path
+            .as_deref()
+            .map(|path| {
+                let parent = path
+                    .parent()
+                    .filter(|value| !value.as_os_str().is_empty())
+                    .ok_or_else(|| {
+                        StoreError::new(
+                            StoreErrorKind::Validation,
+                            "database path has no parent directory",
+                            bootstrap,
+                        )
+                    })?;
+                let root = AdmittedPrivateRoot::open(parent).map_err(|_| {
+                    StoreError::new(
+                        StoreErrorKind::Permission,
+                        "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
+                        bootstrap,
+                    )
+                })?;
+                let name = path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+                    StoreError::new(
+                        StoreErrorKind::Validation,
+                        "database file name is invalid",
+                        bootstrap,
+                    )
+                })?;
+                let file = root.open_regular_file(name).map_err(|_| {
+                    StoreError::new(
+                        StoreErrorKind::Permission,
+                        "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
+                        bootstrap,
+                    )
+                })?;
+                drop(file);
+                Ok::<_, StoreError>(root)
+            })
+            .transpose()?;
+        Self::from_connection_with_private_root(connection, database_path, options, private_root)
+    }
+
+    fn from_connection_with_private_root(
+        connection: Connection,
+        database_path: Option<PathBuf>,
+        options: OpenOptions,
+        private_root: Option<AdmittedPrivateRoot>,
     ) -> Result<Self, StoreError> {
         let bootstrap = options.bootstrap_correlation_id;
         let schema_version = if options.read_only() {
@@ -309,6 +427,7 @@ impl SqliteStore {
         Ok(Self {
             inner: Arc::new(StoreInner {
                 connection: Mutex::new(connection),
+                private_root,
                 recording_writer: Mutex::new(()),
             }),
             bootstrap: bootstrap_snapshot,
@@ -334,6 +453,13 @@ impl SqliteStore {
     /// repositories (added in later slices) that share the same
     /// connection mutex.
     pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        if self.inner.private_root.as_ref().is_some_and(|root| root.revalidate().is_err()) {
+            return Err(StoreError::new(
+                StoreErrorKind::Permission,
+                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
+                CorrelationId::new(),
+            ));
+        }
         // Locking a `Mutex` only fails when poisoned. Poisoning
         // means a previous holder panicked; treat it as corruption
         // because the database may be in an inconsistent state.
@@ -568,6 +694,33 @@ mod tests {
         entries: Vec<FileEntrySnapshot>,
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_parent_is_rejected_before_sqlite_creates_or_mutates_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempdir().join("unsafe-parent");
+        std::fs::create_dir(&parent).expect("create fixture parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+            .expect("make fixture parent deliberately traversable");
+        let database = parent.join("metadata.sqlite3");
+
+        let error = SqliteStore::open(&database, OpenOptions::default())
+            .expect_err("unsafe parent must fail before opening SQLite");
+        assert_eq!(error.kind(), StoreErrorKind::Permission);
+        assert!(!database.exists(), "admission failure must not create the database");
+        assert_eq!(
+            std::fs::metadata(&parent).expect("parent metadata").permissions().mode() & 0o777,
+            0o755,
+            "admission must not chmod-repair the existing parent",
+        );
+        assert_eq!(
+            std::fs::read_dir(&parent).expect("parent entries").count(),
+            0,
+            "SQLite sidecars must not be created before admission",
+        );
+    }
+
     type FileEntrySnapshot = (PathBuf, Option<Vec<u8>>, Option<SystemTime>, Option<u32>);
 
     fn file_snapshot(database: &Path) -> FileSnapshot {
@@ -626,8 +779,14 @@ mod tests {
     fn tempdir() -> PathBuf {
         let nanos =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("xtrace-store-{nanos}"));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        root.create_private_child(&format!("xtrace-store-{nanos}"))
+            .expect("private store test directory")
+            .path()
+            .to_path_buf()
     }
 }

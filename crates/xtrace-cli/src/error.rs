@@ -27,6 +27,8 @@ pub enum CliError {
     StoreCorrupted(String),
     /// The local store cannot be reached (I/O error).
     StoreUnavailable(String),
+    /// Private local storage could not be admitted before a read or write.
+    PrivateStorageUnavailable,
     /// Another daemon currently holds this project's advisory lock.
     DaemonAlreadyRunning,
     /// Durable recording daemon support is unavailable on this platform.
@@ -63,6 +65,7 @@ impl CliError {
             Self::StoreSchemaOlder(_) => 6,
             Self::StoreCorrupted(_) => 4,
             Self::StoreUnavailable(_) => 5,
+            Self::PrivateStorageUnavailable => 7,
             Self::DaemonAlreadyRunning => 5,
             Self::DaemonUnsupportedPlatform => 6,
             Self::DaemonFailure(_) => 5,
@@ -103,6 +106,9 @@ impl std::fmt::Display for CliError {
             Self::StoreSchemaOlder(message) => write!(f, "store schema older: {message}"),
             Self::StoreCorrupted(message) => write!(f, "store corrupted: {message}"),
             Self::StoreUnavailable(message) => write!(f, "store unavailable: {message}"),
+            Self::PrivateStorageUnavailable => {
+                f.write_str("private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)")
+            }
             Self::DaemonAlreadyRunning => {
                 f.write_str("a daemon is already running for this project")
             }

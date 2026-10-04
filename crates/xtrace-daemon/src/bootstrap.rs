@@ -70,6 +70,7 @@
 //! begun on a value, no later caller can retry through that same
 //! instance; a subsequent launch writes a fresh artifact.
 
+#[cfg(test)]
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -77,6 +78,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use xtrace_domain::{ProjectId, RepositoryFingerprint, RuntimeSessionId};
+use xtrace_runtime::private_storage::AdmittedPrivateRoot;
 use zeroize::Zeroize;
 
 use crate::error::DaemonError;
@@ -248,6 +250,7 @@ enum ReleaseState {
 pub struct BootstrapArtifact {
     fields: BootstrapArtifactFields,
     path: PathBuf,
+    private_parent: AdmittedPrivateRoot,
     owner: BootstrapOwner,
     /// Serialises the released flag and the unlink syscall so the
     /// flag is observed exactly when the file has actually been
@@ -293,23 +296,32 @@ impl BootstrapArtifact {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).ok_or_else(|| {
             DaemonError::Bootstrap("bootstrap path has no parent directory".to_string())
         })?;
-        refuse_symlink_path(path, "target")?;
-        let parent_probe = refuse_symlink_path(parent, "parent directory")?;
-        if matches!(parent_probe, PathProbe::Missing) {
-            fs::create_dir_all(parent).map_err(|err| {
-                DaemonError::Bootstrap(format!(
-                    "create bootstrap parent {}: {err}",
-                    parent.display()
-                ))
+        let private_parent = AdmittedPrivateRoot::open(parent)
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+        private_parent
+            .revalidate()
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+        let target_name = path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+            DaemonError::Bootstrap("bootstrap target name is invalid".to_string())
+        })?;
+        if private_parent
+            .bounded_child_names(64)
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?
+            .iter()
+            .any(|name| name == target_name)
+        {
+            let existing = private_parent.open_regular_file(target_name).map_err(|_| {
+                DaemonError::Bootstrap("private storage is unavailable".to_string())
             })?;
+            drop(existing);
         }
-        chmod_dir_owner_only(parent)?;
         let body = serde_json::to_string_pretty(&fields)
             .map_err(|err| DaemonError::Bootstrap(format!("serialize bootstrap: {err}")))?;
-        write_atomic(path, parent, body.as_bytes())?;
+        write_atomic_admitted(&private_parent, target_name, body.as_bytes())?;
         Ok(Self {
             fields,
             path: path.to_path_buf(),
+            private_parent,
             owner,
             release_lock: Mutex::new(ReleaseState::Pending),
         })
@@ -324,25 +336,21 @@ impl BootstrapArtifact {
     /// session secret because the [`BootstrapArtifactFields`] fields
     /// are validated before the function returns.
     pub fn read(path: &Path) -> Result<Self, DaemonError> {
-        let probe = refuse_symlink_path(path, "target")?;
-        let meta = match probe {
-            PathProbe::Present(meta) => meta,
-            PathProbe::Missing => {
-                return Err(DaemonError::Bootstrap(format!(
-                    "bootstrap target {} does not exist",
-                    path.display()
-                )));
-            }
-        };
-        enforce_owner_only_file(path, &meta)?;
-        let text = fs::read_to_string(path)
-            .map_err(|err| DaemonError::Bootstrap(format!("read bootstrap: {err}")))?;
-        let fields: BootstrapArtifactFields = serde_json::from_str(&text)
+        let (private_parent, basename) = admit_bootstrap_path(path)?;
+        let name = basename.to_str().ok_or_else(|| {
+            DaemonError::Bootstrap("bootstrap target name is invalid".to_string())
+        })?;
+        const MAX_BOOTSTRAP_BYTES: usize = 16 * 1024;
+        let bytes = private_parent
+            .read_bounded_file(name, MAX_BOOTSTRAP_BYTES)
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+        let fields: BootstrapArtifactFields = serde_json::from_slice(&bytes)
             .map_err(|err| DaemonError::Bootstrap(format!("parse bootstrap: {err}")))?;
         validate_fields(&fields)?;
         Ok(Self {
             fields,
             path: path.to_path_buf(),
+            private_parent,
             owner: BootstrapOwner::Persistent,
             release_lock: Mutex::new(ReleaseState::Pending),
         })
@@ -398,21 +406,29 @@ impl BootstrapArtifact {
         if matches!(*state, ReleaseState::Released) {
             return Ok(ReleaseOutcome::AlreadyReleased);
         }
-        match fs::remove_file(&self.path) {
+        let target_name =
+            self.path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+                DaemonError::Bootstrap("bootstrap target name is invalid".to_string())
+            })?;
+        match self.private_parent.remove_private_file(target_name) {
             Ok(()) => {
                 *state = ReleaseState::Released;
                 Ok(ReleaseOutcome::Released)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(_)
+                if self
+                    .private_parent
+                    .bounded_child_names(64)
+                    .is_ok_and(|names| !names.iter().any(|name| name == target_name)) =>
+            {
                 // The file is already gone; mark the artifact as
                 // released so subsequent callers see a stable view.
                 *state = ReleaseState::Released;
                 Ok(ReleaseOutcome::Released)
             }
-            Err(err) => Err(DaemonError::Bootstrap(format!(
-                "remove bootstrap {}: {err}",
-                self.path.display()
-            ))),
+            Err(_) => {
+                Err(DaemonError::Bootstrap("private bootstrap cleanup is unavailable".to_string()))
+            }
         }
     }
 
@@ -424,20 +440,15 @@ impl BootstrapArtifact {
     /// Returns [`DaemonError::Bootstrap`] for any I/O or parse
     /// failure.
     pub fn reload(&mut self) -> Result<(), DaemonError> {
-        let probe = refuse_symlink_path(&self.path, "target")?;
-        let meta = match probe {
-            PathProbe::Present(meta) => meta,
-            PathProbe::Missing => {
-                return Err(DaemonError::Bootstrap(format!(
-                    "bootstrap target {} does not exist",
-                    self.path.display()
-                )));
-            }
-        };
-        enforce_owner_only_file(&self.path, &meta)?;
-        let text = fs::read_to_string(&self.path)
-            .map_err(|err| DaemonError::Bootstrap(format!("read bootstrap: {err}")))?;
-        let fields: BootstrapArtifactFields = serde_json::from_str(&text)
+        let name = self.path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+            DaemonError::Bootstrap("bootstrap target name is invalid".to_string())
+        })?;
+        const MAX_BOOTSTRAP_BYTES: usize = 16 * 1024;
+        let bytes = self
+            .private_parent
+            .read_bounded_file(name, MAX_BOOTSTRAP_BYTES)
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+        let fields: BootstrapArtifactFields = serde_json::from_slice(&bytes)
             .map_err(|err| DaemonError::Bootstrap(format!("parse bootstrap: {err}")))?;
         validate_fields(&fields)?;
         self.fields = fields;
@@ -540,16 +551,19 @@ impl BootstrapArtifactFields {
 
 /// RAII guard that removes a freshly-created bootstrap candidate if
 /// the writer returns before the rename publishes the file.
+#[cfg(test)]
 struct CandidateGuard {
     path: PathBuf,
 }
 
+#[cfg(test)]
 impl CandidateGuard {
     fn new(path: PathBuf) -> Self {
         Self { path }
     }
 }
 
+#[cfg(test)]
 impl Drop for CandidateGuard {
     fn drop(&mut self) {
         match fs::remove_file(&self.path) {
@@ -626,6 +640,7 @@ fn is_canonical_lowercase_hex_pin(value: &str) -> bool {
 /// file are astronomically unlikely. The fill closure is supplied by
 /// the caller so production code can delegate to the OS CSPRNG and
 /// regression tests can pin a deterministic suffix.
+#[cfg(test)]
 fn unique_temp_path<F>(target: &Path, fill_suffix: &mut F) -> Result<PathBuf, DaemonError>
 where
     F: FnMut(&mut [u8]) -> Result<(), ring::error::Unspecified>,
@@ -647,6 +662,7 @@ where
 
 /// Outcome of a path-stat probe used by the writer and the reader.
 #[derive(Debug)]
+#[cfg(test)]
 enum PathProbe {
     /// Path does not exist; no metadata is available.
     Missing,
@@ -657,6 +673,7 @@ enum PathProbe {
 /// Probe a path for symlink and file-type violations. Returns the
 /// metadata when the path exists so the caller can apply the
 /// owner-only permission check without re-stat'ing.
+#[cfg(test)]
 fn refuse_symlink_path(path: &Path, label: &str) -> Result<PathProbe, DaemonError> {
     #[cfg(unix)]
     {
@@ -710,7 +727,7 @@ fn refuse_symlink_path(path: &Path, label: &str) -> Result<PathProbe, DaemonErro
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn enforce_owner_only_file(path: &Path, meta: &std::fs::Metadata) -> Result<(), DaemonError> {
     use std::os::unix::fs::MetadataExt as _;
     if !meta.is_file() {
@@ -729,13 +746,91 @@ fn enforce_owner_only_file(path: &Path, meta: &std::fs::Metadata) -> Result<(), 
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn enforce_owner_only_file(_path: &Path, _meta: &std::fs::Metadata) -> Result<(), DaemonError> {
     Ok(())
 }
 
 use ring::rand::{SecureRandom, SystemRandom};
 
+fn admit_bootstrap_path(
+    path: &Path,
+) -> Result<(AdmittedPrivateRoot, std::ffi::OsString), DaemonError> {
+    let parent = path.parent().filter(|value| !value.as_os_str().is_empty()).ok_or_else(|| {
+        DaemonError::Bootstrap("bootstrap path has no parent directory".to_string())
+    })?;
+    let basename = path
+        .file_name()
+        .ok_or_else(|| DaemonError::Bootstrap("bootstrap target name is invalid".to_string()))?
+        .to_os_string();
+    let root = AdmittedPrivateRoot::open(parent)
+        .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+    Ok((root, basename))
+}
+
+fn write_atomic_admitted(
+    root: &AdmittedPrivateRoot,
+    target: &str,
+    body: &[u8],
+) -> Result<(), DaemonError> {
+    const ATTEMPTS: usize = 8;
+    root.revalidate()
+        .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+    let rng = SystemRandom::new();
+    let mut selected: Option<(String, std::fs::File)> = None;
+    for _ in 0..ATTEMPTS {
+        let mut suffix = [0_u8; 16];
+        rng.fill(&mut suffix).map_err(|_| {
+            DaemonError::Bootstrap("bootstrap randomness is unavailable".to_string())
+        })?;
+        let name = format!("{TEMP_BOOTSTRAP_PREFIX}{}", hex::encode(suffix));
+        match root.create_private_file(&name) {
+            Ok(file) => {
+                selected = Some((name, file));
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    let (temporary, mut file) = selected.ok_or_else(|| {
+        DaemonError::Bootstrap("bootstrap temporary file is unavailable".to_string())
+    })?;
+    let write_result = (|| {
+        file.write_all(body)
+            .map_err(|_| DaemonError::Bootstrap("bootstrap write failed".to_string()))?;
+        file.flush().map_err(|_| DaemonError::Bootstrap("bootstrap flush failed".to_string()))?;
+        file.sync_all().map_err(|_| DaemonError::Bootstrap("bootstrap sync failed".to_string()))?;
+        root.validate_file_binding(&temporary, &file, true)
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+        drop(file);
+        root.rename_replace(&temporary, target)
+            .map_err(|_| DaemonError::Bootstrap("bootstrap publish failed".to_string()))?;
+        root.sync().map_err(|_| DaemonError::Bootstrap("private storage sync failed".to_string()))
+    })();
+    if write_result.is_err() {
+        let names = root.bounded_child_names(64).map_err(|_| {
+            DaemonError::Bootstrap(
+                "bootstrap write failed and private cleanup is unavailable".to_string(),
+            )
+        })?;
+        if names.iter().any(|name| name == &temporary) {
+            root.remove_private_file(&temporary).map_err(|_| {
+                DaemonError::Bootstrap(
+                    "bootstrap write failed and private cleanup is unavailable".to_string(),
+                )
+            })?;
+        } else if names.iter().any(|name| name == target) {
+            root.remove_private_file(target).map_err(|_| {
+                DaemonError::Bootstrap(
+                    "bootstrap write failed and private cleanup is unavailable".to_string(),
+                )
+            })?;
+        }
+    }
+    write_result
+}
+
+#[cfg(test)]
 fn write_atomic(target: &Path, parent: &Path, body: &[u8]) -> Result<(), DaemonError> {
     let rng = SystemRandom::new();
     write_atomic_with_rng(target, parent, body, &rng)
@@ -747,6 +842,7 @@ fn write_atomic(target: &Path, parent: &Path, body: &[u8]) -> Result<(), DaemonE
 /// production path delegates here with the OS CSPRNG; the test path
 /// pins the suffix sequence so the `AlreadyExists` retry branch is
 /// exercised as designed rather than opportunistically.
+#[cfg(test)]
 fn write_atomic_with_rng(
     target: &Path,
     parent: &Path,
@@ -760,6 +856,7 @@ fn write_atomic_with_rng(
 /// candidate suffix buffer. The production path delegates here with
 /// the OS CSPRNG; the regression test path pins the suffix so the
 /// retry branch is exercised deterministically.
+#[cfg(test)]
 fn write_atomic_with_suffixed_rng<F>(
     target: &Path,
     parent: &Path,
@@ -836,18 +933,18 @@ where
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn open_create_new(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new().create_new(true).read(true).write(true).mode(0o600).open(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn open_create_new(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(path)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn chmod_dir_owner_only(path: &Path) -> Result<(), DaemonError> {
     use std::os::unix::fs::PermissionsExt as _;
     let metadata = fs::metadata(path)
@@ -858,12 +955,12 @@ fn chmod_dir_owner_only(path: &Path) -> Result<(), DaemonError> {
         .map_err(|err| DaemonError::Bootstrap(format!("chmod 0700 {}: {err}", path.display())))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn chmod_dir_owner_only(_path: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn chmod_file_owner_only(path: &Path) -> Result<(), DaemonError> {
     use std::os::unix::fs::PermissionsExt as _;
     let metadata = fs::metadata(path)
@@ -874,18 +971,18 @@ fn chmod_file_owner_only(path: &Path) -> Result<(), DaemonError> {
         .map_err(|err| DaemonError::Bootstrap(format!("chmod 0600 {}: {err}", path.display())))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn chmod_file_owner_only(_path: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
     let file = std::fs::File::open(path)?;
     file.sync_all()
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn fsync_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -904,12 +1001,17 @@ mod tests {
         let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
         let nanos =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "xtrace-daemon-bootstrap-{label}-{}-{counter}-{nanos}",
-            std::process::id(),
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
+        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+            .map(PathBuf::from)
+            .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required");
+        AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        let name =
+            format!("xtrace-daemon-bootstrap-{label}-{}-{counter}-{nanos}", std::process::id(),);
+        let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        root.create_private_child(&name)
+            .expect("private bootstrap test directory")
+            .path()
+            .to_path_buf()
     }
 
     fn sample_fingerprint() -> RepositoryFingerprint {

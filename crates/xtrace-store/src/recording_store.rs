@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr as _;
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::MetadataExt as _;
 
 use rusqlite::OptionalExtension as _;
 use xtrace_application::observed_endpoint_queries::{
@@ -28,6 +28,7 @@ use xtrace_domain::{
     ContentHash, CorrelationId, ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointIdentity, HttpMethod,
     ProjectId, RecordingId, RuntimeSessionId, SourceBinding, SourceRange, Transport, WallTime,
 };
+use xtrace_runtime::private_storage::AdmittedPrivateRoot;
 
 use crate::connection::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
@@ -274,10 +275,7 @@ impl SqliteStore {
                 correlation_id,
             )
         })?;
-        let binding = ProjectRootBinding {
-            root: project_root.to_path_buf(),
-            database_path: database_path.clone(),
-        };
+        let binding = ProjectRootBinding::new(project_root, database_path.clone(), correlation_id)?;
         binding.revalidate(correlation_id)?;
         Ok(SqliteRecordingStore { store: self, binding })
     }
@@ -1810,7 +1808,18 @@ fn unavailable_source(
 #[cfg(test)]
 mod source_projection_tests {
     use super::*;
-    use tempfile::tempdir;
+
+    fn tempdir() -> tempfile::TempDir {
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        tempfile::Builder::new()
+            .prefix("xtrace-source-projection-")
+            .tempdir_in(scratch)
+            .expect("private source projection test directory")
+    }
 
     const PATH: &str =
         "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java";
@@ -2091,18 +2100,27 @@ fn create_staging_files(
     correlation_id: CorrelationId,
 ) -> Result<StagingFiles, RecordingStoreError> {
     binding.revalidate(correlation_id)?;
-    let staging_root = binding.root.join("staging");
-    ensure_owner_only_directory(&binding.root, &staging_root, correlation_id)?;
-    let recording_directory = staging_root.join(recording_id.as_uuid().to_string());
-    ensure_owner_only_directory(&binding.root, &recording_directory, correlation_id)?;
+    let root =
+        AdmittedPrivateRoot::open(&binding.root).map_err(|_| object_io_error(correlation_id))?;
+    let staging_root = root
+        .open_or_create_private_child("staging")
+        .map_err(|_| object_io_error(correlation_id))?;
+    let recording_directory = staging_root
+        .open_or_create_private_child(&recording_id.as_uuid().to_string())
+        .map_err(|_| object_io_error(correlation_id))?;
     // UUIDv7 supplies entropy for collision resistance while preserving no caller
     // material in the staging path.
     let directory = recording_directory.join(uuid::Uuid::now_v7().to_string());
-    let mut builder = std::fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder.create(&directory).map_err(|_| object_io_error(correlation_id))?;
-    set_owner_mode(&directory, 0o700, correlation_id)?;
-    sync_directory(&recording_directory, correlation_id, "XTR-STORE-OBJECT-IO")?;
+    let staging = recording_directory
+        .create_private_child(
+            directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| object_io_error(correlation_id))?,
+        )
+        .map_err(|_| object_io_error(correlation_id))?;
+    recording_directory.sync().map_err(|_| object_io_error(correlation_id))?;
+    drop(staging);
     Ok(StagingFiles {
         logical: directory.join("logical.xtf"),
         compressed: directory.join("object.xtf.zst"),
@@ -2155,48 +2173,25 @@ fn ensure_owner_only_directory(
     directory: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    if !directory.starts_with(root) {
-        return Err(atomic_install_error(correlation_id));
-    }
-    match std::fs::symlink_metadata(directory) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                return Err(atomic_install_error(correlation_id));
-            }
-            if metadata.mode() & 0o077 != 0 {
-                return Err(RecordingStoreError::new(
-                    RecordingStoreErrorKind::Permission,
-                    "XTR-STORE-OBJECT-IO",
-                    "object storage directory must be owner-only",
-                    correlation_id,
-                ));
-            }
+    let relative =
+        directory.strip_prefix(root).map_err(|_| atomic_install_error(correlation_id))?;
+    let root_cap = AdmittedPrivateRoot::open(root).map_err(|_| object_io_error(correlation_id))?;
+    let mut current = root_cap;
+    let mut traversed = 0_usize;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(atomic_install_error(correlation_id));
+        };
+        traversed += 1;
+        if traversed > 16 {
+            return Err(atomic_install_error(correlation_id));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.mode(0o700);
-            builder.create(directory).map_err(|_| object_io_error(correlation_id))?;
-            set_owner_mode(directory, 0o700, correlation_id)?;
-            let parent = directory.parent().ok_or_else(|| object_io_error(correlation_id))?;
-            sync_directory(parent, correlation_id, "XTR-STORE-OBJECT-IO")?;
-        }
-        Err(_) => return Err(atomic_install_error(correlation_id)),
+        let name = name.to_str().ok_or_else(|| atomic_install_error(correlation_id))?;
+        current = current
+            .open_or_create_private_child(name)
+            .map_err(|_| object_io_error(correlation_id))?;
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_owner_mode(
-    path: &Path,
-    mode: u32,
-    correlation_id: CorrelationId,
-) -> Result<(), RecordingStoreError> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .map_err(|_| object_io_error(correlation_id))
+    current.revalidate().map_err(|_| object_io_error(correlation_id))
 }
 
 fn write_synced_file(
@@ -2204,19 +2199,19 @@ fn write_synced_file(
     bytes: &[u8],
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
-    use std::fs::OpenOptions;
-
     note_staging_write();
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path).map_err(|_| object_io_error(correlation_id))?;
-    #[cfg(unix)]
-    set_owner_mode(path, 0o600, correlation_id)?;
+    let parent = path.parent().ok_or_else(|| object_io_error(correlation_id))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| object_io_error(correlation_id))?;
+    let root = AdmittedPrivateRoot::open(parent).map_err(|_| object_io_error(correlation_id))?;
+    let mut file = root.create_private_file(name).map_err(|_| object_io_error(correlation_id))?;
     file.write_all(bytes).map_err(|_| object_io_error(correlation_id))?;
     file.flush().map_err(|_| object_io_error(correlation_id))?;
-    file.sync_all().map_err(|_| object_io_error(correlation_id))
+    file.sync_all().map_err(|_| object_io_error(correlation_id))?;
+    root.validate_file_binding(name, &file, true).map_err(|_| object_io_error(correlation_id))?;
+    root.sync().map_err(|_| object_io_error(correlation_id))
 }
 
 #[cfg(unix)]
@@ -2224,15 +2219,9 @@ fn validate_managed_directory(
     directory: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
-    let metadata =
-        std::fs::symlink_metadata(directory).map_err(|_| atomic_install_error(correlation_id))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_dir()
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(atomic_install_error(correlation_id));
-    }
-    Ok(())
+    AdmittedPrivateRoot::open(directory)
+        .and_then(|root| root.revalidate())
+        .map_err(|_| atomic_install_error(correlation_id))
 }
 
 #[cfg(unix)]
@@ -2243,16 +2232,22 @@ fn validate_managed_tree(
 ) -> Result<(), RecordingStoreError> {
     let relative =
         directory.strip_prefix(root).map_err(|_| atomic_install_error(correlation_id))?;
-    validate_managed_directory(root, correlation_id)?;
-    let mut current = root.to_path_buf();
+    let mut current =
+        AdmittedPrivateRoot::open(root).map_err(|_| atomic_install_error(correlation_id))?;
+    let mut traversed = 0_usize;
     for component in relative.components() {
         let std::path::Component::Normal(part) = component else {
             return Err(atomic_install_error(correlation_id));
         };
-        current.push(part);
-        validate_managed_directory(&current, correlation_id)?;
+        traversed += 1;
+        if traversed > 16 {
+            return Err(atomic_install_error(correlation_id));
+        }
+        current = current
+            .open_private_child(part.to_str().ok_or_else(|| atomic_install_error(correlation_id))?)
+            .map_err(|_| atomic_install_error(correlation_id))?;
     }
-    Ok(())
+    current.revalidate().map_err(|_| atomic_install_error(correlation_id))
 }
 
 #[cfg(not(unix))]
@@ -2277,22 +2272,21 @@ fn validate_managed_file(
     correlation_id: CorrelationId,
     absent_is_valid: bool,
 ) -> Result<(), RecordingStoreError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            #[cfg(unix)]
-            if metadata.file_type().is_symlink()
-                || !metadata.file_type().is_file()
-                || metadata.mode() & 0o077 != 0
-            {
-                return Err(atomic_install_error(correlation_id));
-            }
-            #[cfg(not(unix))]
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err(atomic_install_error(correlation_id));
-            }
-            Ok(())
-        }
-        Err(error) if absent_is_valid && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    let parent = path.parent().ok_or_else(|| atomic_install_error(correlation_id))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| atomic_install_error(correlation_id))?;
+    let root =
+        AdmittedPrivateRoot::open(parent).map_err(|_| atomic_install_error(correlation_id))?;
+    match root.open_managed_file(name) {
+        Ok(file) => root
+            .validate_managed_file_binding(name, &file, false)
+            .map_err(|_| atomic_install_error(correlation_id)),
+        Err(_) if absent_is_valid => match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(atomic_install_error(correlation_id)),
+        },
         Err(_) => Err(atomic_install_error(correlation_id)),
     }
 }
@@ -2310,8 +2304,8 @@ fn sync_directory(
             object_io_error(correlation_id)
         }
     };
-    let handle = std::fs::File::open(directory).map_err(|_| failure())?;
-    handle.sync_all().map_err(|_| failure())
+    let handle = AdmittedPrivateRoot::open(directory).map_err(|_| failure())?;
+    handle.sync().map_err(|_| failure())
 }
 
 #[cfg(not(unix))]
@@ -2351,33 +2345,15 @@ fn read_bounded_regular_file(
             object_corrupt_error(correlation_id)
         }
     };
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| failure())?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return Err(failure());
-    }
     let limit = max_compressed_segment_bytes();
-    if metadata.len() > u64::try_from(limit).map_err(|_| failure())? {
-        return Err(failure());
+    let parent = path.parent().ok_or_else(failure)?;
+    let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(failure)?;
+    let root = AdmittedPrivateRoot::open(parent).map_err(|_| failure())?;
+    if staging {
+        root.read_bounded_file(name, limit).map_err(|_| failure())
+    } else {
+        root.read_bounded_managed_file(name, limit).map_err(|_| failure())
     }
-    let file = std::fs::File::open(path).map_err(|_| failure())?;
-    #[cfg(unix)]
-    {
-        let opened = file.metadata().map_err(|_| failure())?;
-        if opened.dev() != metadata.dev()
-            || opened.ino() != metadata.ino()
-            || !opened.file_type().is_file()
-            || opened.mode() & 0o077 != 0
-        {
-            return Err(failure());
-        }
-    }
-    let mut reader = file.take(u64::try_from(limit + 1).map_err(|_| failure())?);
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).map_err(|_| failure())?);
-    reader.read_to_end(&mut bytes).map_err(|_| failure())?;
-    if bytes.len() > limit {
-        return Err(failure());
-    }
-    Ok(bytes)
 }
 
 fn verify_staged_object(
@@ -2442,6 +2418,29 @@ fn publish_no_replace<F>(
 where
     F: FnOnce(),
 {
+    let staging_parent = staging.parent().ok_or_else(|| atomic_install_error(correlation_id))?;
+    let staging_name = staging
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| atomic_install_error(correlation_id))?;
+    let destination_parent =
+        destination.parent().ok_or_else(|| atomic_install_error(correlation_id))?;
+    let destination_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| atomic_install_error(correlation_id))?;
+    let staging_root = AdmittedPrivateRoot::open(staging_parent)
+        .map_err(|_| atomic_install_error(correlation_id))?;
+    let staged_file = staging_root
+        .open_regular_file(staging_name)
+        .map_err(|_| atomic_install_error(correlation_id))?;
+    staging_root
+        .validate_file_binding(staging_name, &staged_file, false)
+        .map_err(|_| atomic_install_error(correlation_id))?;
+    let destination_root = AdmittedPrivateRoot::open(destination_parent)
+        .map_err(|_| atomic_install_error(correlation_id))?;
+    staging_root.revalidate().map_err(|_| atomic_install_error(correlation_id))?;
+    destination_root.revalidate().map_err(|_| atomic_install_error(correlation_id))?;
     commit_failpoint("hard-link-syscall", correlation_id, true)?;
     match std::fs::hard_link(staging, destination) {
         Ok(()) => {
@@ -2450,12 +2449,24 @@ where
             // fallible readback can observe the new destination.
             defer_cleanup_after_new_link();
             commit_failpoint("after-hard-link-before-readback", correlation_id, true)?;
+            let persisted_file = destination_root
+                .open_managed_file(destination_name)
+                .map_err(|_| atomic_install_error(correlation_id))?;
+            destination_root
+                .validate_managed_file_binding(destination_name, &persisted_file, false)
+                .map_err(|_| atomic_install_error(correlation_id))?;
             let persisted = read_bounded_regular_file(destination, correlation_id, false)?;
             verify_staged_object(&persisted, candidate, correlation_id)
                 .map_err(|_| object_corrupt_error(correlation_id))?;
             i64::try_from(persisted.len()).map_err(|_| object_corrupt_error(correlation_id))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing_file = destination_root
+                .open_managed_file(destination_name)
+                .map_err(|_| object_corrupt_error(correlation_id))?;
+            destination_root
+                .validate_managed_file_binding(destination_name, &existing_file, false)
+                .map_err(|_| object_corrupt_error(correlation_id))?;
             let existing = read_bounded_regular_file(destination, correlation_id, false)?;
             verify_staged_object(&existing, candidate, correlation_id)
                 .map_err(|_| object_corrupt_error(correlation_id))?;
@@ -2466,20 +2477,45 @@ where
 }
 
 fn cleanup_owned_staging_paths(staging: &StagingFiles, correlation_id: CorrelationId) {
-    let cleanup = std::fs::remove_file(&staging.logical)
-        .and_then(|_| std::fs::remove_file(&staging.compressed))
-        .and_then(|_| std::fs::remove_dir(&staging.directory));
+    let Some(parent) = staging.directory.parent() else {
+        tracing::warn!("recording segment staging cleanup could not bind its parent");
+        return;
+    };
+    let Some(directory_name) = staging.directory.file_name().and_then(|name| name.to_str()) else {
+        tracing::warn!("recording segment staging cleanup had an invalid directory name");
+        return;
+    };
+    let cleanup = (|| {
+        let parent_cap =
+            AdmittedPrivateRoot::open(parent).map_err(|_| PrivateStorageError::Unavailable)?;
+        let staging_cap = parent_cap.open_private_child(directory_name)?;
+        for (path, managed) in [(&staging.logical, false), (&staging.compressed, true)] {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(PrivateStorageError::InvalidName)?;
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(_) => {}
+                Err(_) => return Err(PrivateStorageError::Unavailable),
+            }
+            if managed {
+                staging_cap.remove_managed_file(name)?;
+            } else {
+                staging_cap.remove_private_file(name)?;
+            }
+        }
+        parent_cap.remove_private_child(directory_name)?;
+        Ok::<(), PrivateStorageError>(())
+    })();
     if cleanup.is_err() {
         tracing::warn!("recording segment staging cleanup left safe residue");
         return;
     }
-    #[cfg(unix)]
-    if let Some(parent) = staging.directory.parent() {
-        if commit_failpoint("cleanup-staging-directory-fsync", correlation_id, false).is_err()
-            || sync_directory(parent, correlation_id, "XTR-STORE-OBJECT-IO").is_err()
-        {
-            tracing::warn!("recording segment staging directory synchronization left safe residue");
-        }
+    if commit_failpoint("cleanup-staging-directory-fsync", correlation_id, false).is_err()
+        || sync_directory(parent, correlation_id, "XTR-STORE-OBJECT-IO").is_err()
+    {
+        tracing::warn!("recording segment staging directory synchronization left safe residue");
     }
 }
 
@@ -2660,9 +2696,36 @@ fn commit_failpoint(
 struct ProjectRootBinding {
     root: PathBuf,
     database_path: PathBuf,
+    private_root: AdmittedPrivateRoot,
 }
 
 impl ProjectRootBinding {
+    fn new(
+        root: &Path,
+        database_path: PathBuf,
+        correlation_id: CorrelationId,
+    ) -> Result<Self, RecordingStoreError> {
+        let private_root = AdmittedPrivateRoot::open(root).map_err(|_| {
+            RecordingStoreError::new(
+                RecordingStoreErrorKind::Permission,
+                "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+                "private storage is unavailable",
+                correlation_id,
+            )
+        })?;
+        if private_root.path() != root {
+            return Err(RecordingStoreError::new(
+                RecordingStoreErrorKind::Validation,
+                "XTR-STORE-RECORDING-ROOT-INVALID",
+                "project root identity does not match its requested path",
+                correlation_id,
+            ));
+        }
+        let binding = Self { root: root.to_path_buf(), database_path, private_root };
+        binding.revalidate(correlation_id)?;
+        Ok(binding)
+    }
+
     /// Re-checks the durable root/database identity without canonicalizing.
     ///
     /// Construction-time checks cannot eliminate filesystem TOCTOU. Later
@@ -2680,7 +2743,14 @@ impl ProjectRootBinding {
 
         #[cfg(unix)]
         {
-            validate_absolute_symlink_free_directory(&self.root, correlation_id)?;
+            self.private_root.revalidate().map_err(|_| {
+                RecordingStoreError::new(
+                    RecordingStoreErrorKind::Permission,
+                    "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+                    "private storage is unavailable",
+                    correlation_id,
+                )
+            })?;
             let parent = self.database_path.parent().ok_or_else(|| {
                 RecordingStoreError::new(
                     RecordingStoreErrorKind::Validation,
@@ -2697,97 +2767,35 @@ impl ProjectRootBinding {
                     correlation_id,
                 ));
             }
-            validate_regular_owner_only_file(&self.database_path, correlation_id)
+            validate_regular_owner_only_file(&self.database_path, correlation_id)?;
+            let file_name =
+                self.database_path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+                    RecordingStoreError::new(
+                        RecordingStoreErrorKind::Validation,
+                        "XTR-STORE-RECORDING-ROOT-INVALID",
+                        "SQLite database file name is invalid",
+                        correlation_id,
+                    )
+                })?;
+            let file = self.private_root.open_regular_file(file_name).map_err(|_| {
+                RecordingStoreError::new(
+                    RecordingStoreErrorKind::Permission,
+                    "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+                    "private storage is unavailable",
+                    correlation_id,
+                )
+            })?;
+            drop(file);
+            self.private_root.revalidate().map_err(|_| {
+                RecordingStoreError::new(
+                    RecordingStoreErrorKind::Permission,
+                    "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+                    "private storage is unavailable",
+                    correlation_id,
+                )
+            })
         }
     }
-}
-
-#[cfg(unix)]
-fn validate_absolute_symlink_free_directory(
-    root: &Path,
-    correlation_id: CorrelationId,
-) -> Result<(), RecordingStoreError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    if !root.is_absolute()
-        || root
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
-        return Err(RecordingStoreError::new(
-            RecordingStoreErrorKind::Validation,
-            "XTR-STORE-RECORDING-ROOT-INVALID",
-            "project root must be an absolute lexical path without dot components",
-            correlation_id,
-        ));
-    }
-    let mut component_path = PathBuf::from("/");
-    let root_metadata = std::fs::symlink_metadata(&component_path).map_err(|_| {
-        RecordingStoreError::new(
-            RecordingStoreErrorKind::Transport,
-            "XTR-STORE-RECORDING-ROOT-IO",
-            "project root metadata could not be read",
-            correlation_id,
-        )
-        .with_source("filesystem metadata failure")
-    })?;
-    if root_metadata.file_type().is_symlink() {
-        return Err(RecordingStoreError::new(
-            RecordingStoreErrorKind::Validation,
-            "XTR-STORE-RECORDING-ROOT-INVALID",
-            "project root path must not contain symbolic links",
-            correlation_id,
-        ));
-    }
-    for component in root.components() {
-        let Component::Normal(segment) = component else {
-            continue;
-        };
-        component_path.push(segment);
-        let metadata = std::fs::symlink_metadata(&component_path).map_err(|_| {
-            RecordingStoreError::new(
-                RecordingStoreErrorKind::Transport,
-                "XTR-STORE-RECORDING-ROOT-IO",
-                "project root metadata could not be read",
-                correlation_id,
-            )
-            .with_source("filesystem metadata failure")
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(RecordingStoreError::new(
-                RecordingStoreErrorKind::Validation,
-                "XTR-STORE-RECORDING-ROOT-INVALID",
-                "project root path must not contain symbolic links",
-                correlation_id,
-            ));
-        }
-    }
-    let metadata = std::fs::symlink_metadata(root).map_err(|_| {
-        RecordingStoreError::new(
-            RecordingStoreErrorKind::Transport,
-            "XTR-STORE-RECORDING-ROOT-IO",
-            "project root metadata could not be read",
-            correlation_id,
-        )
-        .with_source("filesystem metadata failure")
-    })?;
-    if !metadata.file_type().is_dir() {
-        return Err(RecordingStoreError::new(
-            RecordingStoreErrorKind::Validation,
-            "XTR-STORE-RECORDING-ROOT-INVALID",
-            "project root must be a directory",
-            correlation_id,
-        ));
-    }
-    if metadata.mode() & 0o077 != 0 {
-        return Err(RecordingStoreError::new(
-            RecordingStoreErrorKind::Permission,
-            "XTR-STORE-RECORDING-ROOT-PERMISSION",
-            "project root must be owner-only",
-            correlation_id,
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -4348,10 +4356,8 @@ mod tests {
         assert_ne!(default.len(), alternate.len());
         let destination = object_path(&fixture.root, logical.content_hash());
         ensure_object_parent(
-            &ProjectRootBinding {
-                root: fixture.root.clone(),
-                database_path: fixture.database.clone(),
-            },
+            &ProjectRootBinding::new(&fixture.root, fixture.database.clone(), CorrelationId::new())
+                .expect("admitted project root"),
             &destination,
             CorrelationId::new(),
         )
@@ -4443,10 +4449,8 @@ mod tests {
         .expect("max object");
         let destination = object_path(&fixture.root, encoded.content_hash());
         ensure_object_parent(
-            &ProjectRootBinding {
-                root: fixture.root.clone(),
-                database_path: fixture.database.clone(),
-            },
+            &ProjectRootBinding::new(&fixture.root, fixture.database.clone(), CorrelationId::new())
+                .expect("admitted project root"),
             &destination,
             CorrelationId::new(),
         )
@@ -5258,15 +5262,18 @@ mod tests {
     #[cfg(unix)]
     fn tempdir(label: &str) -> PathBuf {
         let index = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        // Fixture setup may resolve macOS's `/var` alias. Production root
-        // validation intentionally never canonicalizes, because that would
-        // accept a symlinked user-supplied path.
-        let symlink_free_base = std::env::temp_dir().canonicalize().expect("canonical test base");
-        let path = symlink_free_base
-            .join(format!("xtrace-recording-store-{label}-{}-{index}", std::process::id()));
-        std::fs::create_dir(&path).expect("deterministic test directory");
-        set_mode(&path, 0o700);
-        path
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        root.create_private_child(&format!(
+            "xtrace-recording-store-{label}-{}-{index}",
+            std::process::id()
+        ))
+        .expect("private recording store test directory")
+        .path()
+        .to_path_buf()
     }
 
     #[cfg(unix)]

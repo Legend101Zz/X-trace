@@ -242,6 +242,20 @@ fn write_capture_incomplete() {
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "exit mapping uses fixed test values")]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn private_tempdir() -> tempfile::TempDir {
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        xtrace_runtime::private_storage::AdmittedPrivateRoot::open(&scratch)
+            .expect("admitted private test scratch");
+        tempfile::Builder::new()
+            .prefix("xtrace-run-test-")
+            .tempdir_in(scratch)
+            .expect("private run test directory")
+    }
 
     #[test]
     fn signaled_java_status_maps_to_shell_conventional_exit_code() {
@@ -289,7 +303,7 @@ mod tests {
         use std::time::{Duration, Instant};
         use xtrace_domain::RuntimeSessionId;
 
-        let root = tempfile::tempdir().expect("project data root");
+        let root = private_tempdir();
         let lock = crate::daemon_lock::acquire_project_lock(root.path()).expect("project lock");
         let runtime_dir =
             crate::daemon_lock::RuntimeDirectory::create(root.path(), RuntimeSessionId::new())

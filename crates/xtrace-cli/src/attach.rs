@@ -1274,6 +1274,19 @@ mod tests {
     use std::cell::RefCell;
     use xtrace_domain::RuntimeSessionId;
 
+    fn private_tempdir() -> tempfile::TempDir {
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        xtrace_runtime::private_storage::AdmittedPrivateRoot::open(&scratch)
+            .expect("admitted private test scratch");
+        tempfile::Builder::new()
+            .prefix("xtrace-attach-test-")
+            .tempdir_in(scratch)
+            .expect("private attach test directory")
+    }
+
     #[test]
     fn non_tty_attach_requires_explicit_pid_even_for_one_listed_process() {
         let rows = vec![serde_json::json!({
@@ -1404,7 +1417,7 @@ mod tests {
 
     #[tokio::test]
     async fn unconfirmed_blocking_server_work_retains_lock_and_runtime_artifacts() {
-        let project = tempfile::tempdir().expect("disposable project data root");
+        let project = private_tempdir();
         let lock = crate::daemon_lock::acquire_project_lock(project.path()).expect("project lock");
         let runtime =
             crate::daemon_lock::RuntimeDirectory::create(project.path(), RuntimeSessionId::new())
@@ -1445,7 +1458,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_server_with_started_blocking_work_retains_lock_and_artifacts() {
-        let project = tempfile::tempdir().expect("disposable project data root");
+        let project = private_tempdir();
         let lock = crate::daemon_lock::acquire_project_lock(project.path()).expect("project lock");
         let runtime =
             crate::daemon_lock::RuntimeDirectory::create(project.path(), RuntimeSessionId::new())

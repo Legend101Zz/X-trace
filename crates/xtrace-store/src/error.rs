@@ -33,6 +33,8 @@ pub enum StoreErrorKind {
     Corruption,
     /// I/O on the underlying file failed.
     Transport,
+    /// Private filesystem ownership, ACL, mode, or mount admission failed.
+    Permission,
     /// SQLite was busy and the busy timeout elapsed.
     Busy,
     /// Underlying resource exhaustion (memory, file descriptors).

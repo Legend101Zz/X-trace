@@ -20,15 +20,13 @@ use xtrace_domain::{
     AppError, CorrelationId, ErrorCategory, ErrorCode, OperationId, RecordingId, RetryAdvice,
     WallTime,
 };
+use xtrace_runtime::private_storage::AdmittedPrivateRoot;
 use xtrace_store::{CURRENT_SCHEMA_VERSION, SqliteIdempotencyStore, SqliteProjectRepository};
 use xtrace_store::{SqliteRecordingReader, SqliteStore, StoreErrorKind};
 
 use crate::error::CliError;
 use crate::output::write_success;
-use crate::paths::{
-    RepositoryPointer, UserDataPaths, precreate_database_file, restrict_database_file,
-    restrict_project_dir, secure_project_dir,
-};
+use crate::paths::{RepositoryPointer, UserDataPaths};
 
 /// Top-level subcommand surface parsed by [`clap`].
 #[derive(Clone, Debug, Subcommand)]
@@ -464,6 +462,13 @@ where
     let data_home = resolve_data_home(Some(&pointer), env_reader)?;
     let project_directory = UserDataPaths::project_dir_with_home(&data_home, pointer.project_id)?;
     let database_path = UserDataPaths::database_path_with_home(&data_home, pointer.project_id)?;
+    let private_root = AdmittedPrivateRoot::open(&project_directory)
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
+    let database = private_root
+        .open_regular_file("metadata.sqlite3")
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    drop(database);
     let context = RequestContext::new(env_user(), WallTime::now());
     let store = SqliteStore::open(
         &database_path,
@@ -473,6 +478,11 @@ where
             .with_correlation_id(context.correlation_id),
     )
     .map_err(map_store_error)?;
+    let database = private_root
+        .open_regular_file("metadata.sqlite3")
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    drop(database);
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -555,20 +565,19 @@ where
         existing_pointer.as_ref().map(|pointer| pointer.project_id).unwrap_or_default();
     let project_directory = UserDataPaths::project_dir_with_home(&user_data_home, project_id)?;
     let database_path = UserDataPaths::database_path_with_home(&user_data_home, project_id)?;
-    // Create the project directory and tighten its permissions to
-    // owner-only *before* SQLite creates the database file. The
-    // directory's `0700` mode prevents another user on the host
-    // from traversing into the project before the database file is
-    // born; the file's `0600` mode below closes the same window on
-    // the file itself.
-    std::fs::create_dir_all(&project_directory)
-        .map_err(|err| CliError::StoreUnavailable(format!("create project dir: {err}")))?;
-    restrict_project_dir(&project_directory)?;
-    // Pre-create the database file with mode `0600` before SQLite
-    // opens it so the file is never readable by another user, even
-    // for a single instant. The helper verifies the mode after
-    // creation so a restrictive umask cannot strip the bits.
-    precreate_database_file(&database_path)?;
+    // Admit or create the project directory with the shared private-storage
+    // capability before SQLite is allowed to inspect or mutate project state.
+    // Existing directories are validated and never permission-repaired.
+    let private_root = AdmittedPrivateRoot::open_or_create(&project_directory)
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
+    // Exclusively create or validate the database file through the admitted
+    // directory descriptor. Existing unsafe files fail closed without chmod.
+    let database = private_root
+        .open_or_create_private_file("metadata.sqlite3")
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    drop(database);
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
 
@@ -577,10 +586,11 @@ where
         xtrace_store::OpenOptions::default().with_correlation_id(ctx.correlation_id),
     )
     .map_err(map_store_error)?;
-    // Defensive re-tightening: the precreate step already set
-    // `0600`, but a future change to the open path must not be
-    // able to widen the file's permissions silently.
-    restrict_database_file(&database_path)?;
+    let database = private_root
+        .open_regular_file("metadata.sqlite3")
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    drop(database);
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -641,16 +651,12 @@ where
     let data_home = resolve_data_home(Some(&pointer), env_reader)?;
     let project_directory = UserDataPaths::project_dir_with_home(&data_home, pointer.project_id)?;
     let database_path = UserDataPaths::database_path_with_home(&data_home, pointer.project_id)?;
+    let private_root = AdmittedPrivateRoot::open(&project_directory)
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     let requested_at = WallTime::now();
     let ctx = RequestContext::new(env_user(), requested_at);
 
-    // Repair the project directory and database file modes before
-    // SQLite touches the file. An older binary could have left the
-    // directory or database world-readable; tightening here ensures
-    // SQLite reads (and the migration runner) never see loose
-    // permissions, and a chmod failure surfaces before any data is
-    // read or migrated.
-    secure_project_dir(&project_directory)?;
     let store = SqliteStore::open(
         &database_path,
         xtrace_store::OpenOptions::default()
@@ -658,6 +664,7 @@ where
             .with_correlation_id(ctx.correlation_id),
     )
     .map_err(map_store_error)?;
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -704,11 +711,9 @@ where
                 UserDataPaths::project_dir_with_home(&data_home, pointer.project_id)?;
             let database_path =
                 UserDataPaths::database_path_with_home(&data_home, pointer.project_id)?;
-            // Repair the project directory and database file modes
-            // before SQLite touches the file so an older binary that
-            // left them world-readable is tightened (or rejected)
-            // before the migration runner reads the schema.
-            secure_project_dir(&project_directory)?;
+            let private_root = AdmittedPrivateRoot::open(&project_directory)
+                .map_err(|_| CliError::PrivateStorageUnavailable)?;
+            private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
             let store = SqliteStore::open(
                 &database_path,
                 xtrace_store::OpenOptions::default()
@@ -716,6 +721,7 @@ where
                     .with_correlation_id(ctx.correlation_id),
             )
             .map_err(map_store_error)?;
+            private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
             let repository = SqliteProjectRepository::new(&store);
             let idempotency = SqliteIdempotencyStore::new(&store);
             let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
@@ -795,6 +801,7 @@ pub(crate) fn map_store_error(err: xtrace_store::StoreError) -> CliError {
         StoreErrorKind::SchemaNewer => CliError::StoreSchemaNewer(err.message().to_string()),
         StoreErrorKind::SchemaOlder => CliError::StoreSchemaOlder(err.message().to_string()),
         StoreErrorKind::Transport => CliError::StoreUnavailable(err.message().to_string()),
+        StoreErrorKind::Permission => CliError::PrivateStorageUnavailable,
         StoreErrorKind::Busy => CliError::StoreUnavailable(err.message().to_string()),
         StoreErrorKind::Validation => CliError::StoreUnavailable(err.message().to_string()),
         _ => CliError::StoreUnavailable(err.message().to_string()),
@@ -934,9 +941,15 @@ mod tests {
     fn tempdir(label: &str) -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("xtrace-cli-commands-{label}-{nanos}"));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        root.create_private_child(&format!("xtrace-cli-commands-{label}-{nanos}"))
+            .expect("private CLI test directory")
+            .path()
+            .to_path_buf()
     }
 
     /// Maps a variable name to its configured value. Used to inject

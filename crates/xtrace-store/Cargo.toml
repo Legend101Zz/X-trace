@@ -15,6 +15,7 @@ workspace = true
 xtrace-domain = { path = "../xtrace-domain" }
 xtrace-application = { path = "../xtrace-application" }
 xtrace-protocol = { path = "../xtrace-protocol" }
+xtrace-runtime = { path = "../xtrace-runtime" }
 rusqlite = { workspace = true }
 prost = { workspace = true }
 thiserror = { workspace = true }

@@ -46,6 +46,7 @@ impl<'store> SqliteIdempotencyStore<'store> {
             StoreErrorKind::Conflict => PortErrorKind::Conflict,
             StoreErrorKind::Corruption => PortErrorKind::Corruption,
             StoreErrorKind::Transport => PortErrorKind::Transport,
+            StoreErrorKind::Permission => PortErrorKind::Resource,
             StoreErrorKind::Busy => PortErrorKind::Resource,
             StoreErrorKind::Resource => PortErrorKind::Resource,
             StoreErrorKind::Internal => PortErrorKind::Internal,
