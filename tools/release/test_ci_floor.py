@@ -671,6 +671,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
             old_path = os.environ.get("PATH", "/usr/bin:/bin")
             started = time.monotonic()
             try:
+                run_started = time.monotonic()
                 with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{old_path}"}), \
                         mock.patch.object(ci_floor, "UTILITY_CLEANUP_SECONDS", 0.8), \
                         mock.patch.object(ci_floor, "UTILITY_TERM_GRACE_SECONDS", 0.2), \
@@ -698,6 +699,118 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 if child_pid_file.is_file():
                     child_pid, child_group, child_start = json.loads(child_pid_file.read_text(encoding="utf-8"))
                     snapshot = ci_floor._utility_process_snapshot()
+                    child = snapshot.get(child_pid)
+                    if (child is not None and child[1] == child_group and child[2] == child_start
+                            and child[3] not in {"Z", "X"}):
+                        ci_floor._signal_utility_group_members(
+                            child_group, {child_pid: child_start}, signal.SIGKILL,
+                            deadline=time.monotonic() + 1.0,
+                        )
+
+    def test_stalled_cleanup_discovery_preserves_reserved_phases_and_stops_owned_child(self) -> None:
+        with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
+            root = pathlib.Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            count_file = fake_bin / "ps-count"
+            stall_file = fake_bin / "discovery-stall"
+            identity_file = root / "utility-identity"
+            fake_ps = fake_bin / "ps"
+            fake_ps.write_text(
+                f"#!{sys.executable}\n"
+                "import os, pathlib, sys, time\n"
+                "counter = pathlib.Path(__file__).with_name('ps-count')\n"
+                "count = int(counter.read_text() or '0') + 1 if counter.exists() else 1\n"
+                "counter.write_text(str(count))\n"
+                "if count == 2:\n"
+                " pathlib.Path(__file__).with_name('discovery-stall').write_text('entered')\n"
+                " time.sleep(2)\n"
+                "os.execv('/bin/ps', ['/bin/ps', *sys.argv[1:]])\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_ps, 0o700)
+            program = (
+                "import json,os,pathlib,subprocess,sys,time; pid=os.getpid(); "
+                "start=' '.join(subprocess.check_output(['/bin/ps','-o','lstart=','-p',str(pid)],text=True).split()); "
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps([pid,os.getpgid(pid),start])); time.sleep(30)"
+            )
+            old_path = os.environ.get("PATH", "/usr/bin:/bin")
+            original_snapshot = ci_floor._utility_process_snapshot
+            snapshot_calls = 0
+            discovery_calls: list[tuple[float, float, float]] = []
+
+            def fail_main_probe_then_stall_discovery(
+                *, timeout: float = 2.0, deadline: float | None = None,
+            ) -> dict[int, tuple[int, int, str, str]]:
+                nonlocal snapshot_calls
+                snapshot_calls += 1
+                if snapshot_calls == 2:
+                    raise ci_floor.FloorInputError
+                if snapshot_calls == 3:
+                    entered = time.monotonic()
+                    if deadline is None:
+                        raise ci_floor.FloorInputError
+                    discovery_calls.append((entered, timeout, deadline))
+                return original_snapshot(timeout=timeout, deadline=deadline)
+
+            real_signal = ci_floor._signal_utility_group_members
+            observed_signals: list[tuple[int, int]] = []
+
+            def record_signal(
+                group_id: int, identities: dict[int, str], signum: int, *, deadline: float,
+            ) -> bool:
+                observed_signals.extend((pid, signum) for pid in identities)
+                return real_signal(group_id, identities, signum, deadline=deadline)
+
+            try:
+                with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{old_path}"}), \
+                        mock.patch.object(ci_floor, "_utility_process_snapshot", side_effect=fail_main_probe_then_stall_discovery), \
+                        mock.patch.object(ci_floor, "_signal_utility_group_members", side_effect=record_signal):
+                    with self.assertRaises(ci_floor.FloorInputError):
+                        ci_floor._run([sys.executable, "-c", program, str(identity_file)], timeout=2.0)
+                run_elapsed = time.monotonic() - run_started
+
+                self.assertEqual(snapshot_calls, 3, "the injected main and discovery stages must be reached")
+                self.assertLessEqual(
+                    run_elapsed,
+                    ci_floor.UTILITY_CLEANUP_SECONDS + 0.25,
+                    "stalled cleanup discovery must fit inside the composed cleanup deadline",
+                )
+                self.assertTrue(stall_file.is_file(), "the cleanup-discovery ps fixture must stall")
+                self.assertEqual(observed_signals, [], "unconfirmed process identities must never be signaled")
+                self.assertEqual(len(discovery_calls), 1)
+                entered, timeout, discovery_deadline = discovery_calls[0]
+                remaining = discovery_deadline - entered
+                reserved_after_discovery = (
+                    ci_floor.UTILITY_TERM_GRACE_SECONDS
+                    + ci_floor.UTILITY_KILL_SIGNAL_RESERVE_SECONDS
+                    + ci_floor.UTILITY_LEADER_REAP_RESERVE_SECONDS
+                    + ci_floor.UTILITY_FINAL_SCAN_RESERVE_SECONDS
+                )
+                self.assertGreater(remaining, 0)
+                self.assertLessEqual(timeout, 0.5)
+                self.assertLessEqual(
+                    discovery_deadline,
+                    entered + timeout + 0.02,
+                    "the nested ps cleanup must use the bounded discovery subdeadline",
+                )
+                self.assertLessEqual(
+                    remaining + reserved_after_discovery,
+                    ci_floor.UTILITY_CLEANUP_SECONDS,
+                    "the nested discovery deadline must preserve later cleanup phases",
+                )
+                self.assertTrue(identity_file.is_file(), "utility child must publish its identity")
+                child_pid, child_group, child_start = json.loads(identity_file.read_text(encoding="utf-8"))
+                snapshot = original_snapshot()
+                child = snapshot.get(child_pid)
+                self.assertFalse(
+                    child is not None and child[1] == child_group and child[2] == child_start,
+                    "the direct Popen child must be reaped before the fixture fallback",
+                )
+            finally:
+                if identity_file.is_file():
+                    child_pid, child_group, child_start = json.loads(identity_file.read_text(encoding="utf-8"))
+                    snapshot = original_snapshot()
                     child = snapshot.get(child_pid)
                     if (child is not None and child[1] == child_group and child[2] == child_start
                             and child[3] not in {"Z", "X"}):

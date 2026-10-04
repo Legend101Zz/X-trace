@@ -329,7 +329,7 @@ def _run(
             if process is not None:
                 if group_id is None or not root_identity_observed:
                     try:
-                        discovery_deadline = (
+                        discovery_phase_deadline = (
                             cleanup_deadline - UTILITY_TERM_GRACE_SECONDS
                             - UTILITY_KILL_SIGNAL_RESERVE_SECONDS
                             - UTILITY_LEADER_REAP_RESERVE_SECONDS
@@ -337,12 +337,17 @@ def _run(
                         )
                         discovery_budget = min(
                             0.5,
-                            discovery_deadline - time.monotonic(),
+                            discovery_phase_deadline - time.monotonic(),
                         )
                         if discovery_budget <= 0:
                             raise FloorInputError
+                        discovery_started = time.monotonic()
+                        discovery_probe_deadline = min(
+                            discovery_phase_deadline,
+                            discovery_started + discovery_budget,
+                        )
                         snapshot = _utility_process_snapshot(
-                            timeout=discovery_budget, deadline=discovery_deadline,
+                            timeout=discovery_budget, deadline=discovery_probe_deadline,
                         )
                         for pid, (_parent, pgid, started_at, _state) in snapshot.items():
                             prior = baseline.get(pid)
