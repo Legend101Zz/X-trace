@@ -1,18 +1,8 @@
-//! User-data path resolution and repository pointer file.
+//! User-data path resolution and public repository locator files.
 //!
-//! Slice 1A keeps durable project state under the user-data home
-//! directory rather than inside the repository. The CLI resolves the
-//! home directory at the command level in this order:
-//!
-//! 1. `XTRACE_DATA_HOME` when it points at an absolute path (the
-//!    explicit override is used directly as the application root);
-//! 2. the [`data_home`](RepositoryPointer::data_home) recorded in an
-//!    existing repository pointer, when no override is set;
-//! 3. the platform default, via [`UserDataPaths::home_with`].
-//!
-//! [`UserDataPaths::home_with`] itself only handles the override
-//! followed by the platform default; the pointer is consulted by the
-//! command-level resolver before that helper is called.
+//! Durable project state stays under the user-data home. The repository contains
+//! a bounded pointer and recovery locator; neither replaces private storage
+//! admission or the project and receipt proof in SQLite.
 //!
 //! Platform defaults:
 //!
@@ -20,25 +10,18 @@
 //! - Linux: `${XDG_DATA_HOME:-~/.local/share}/xtrace`
 //! - Windows: `%APPDATA%\xtrace`
 //!
-//! Database path:
-//!
-//! ```text
-//! <user_data_home>/projects/<project-id>/metadata.sqlite3
-//! ```
-//!
-//! Repository pointer:
-//!
-//! ```text
-//! <repo>/.xtrace/config.toml
-//! ```
+//! Database path: `<user_data_home>/projects/<project-id>/metadata.sqlite3`.
+//! Repository pointer: `<repo>/.xtrace/config.toml`.
 
 use std::path::{Path, PathBuf};
 
 use xtrace_domain::ProjectId;
+use xtrace_domain::ids::Id as _;
 
 use crate::error::CliError;
 
 /// Basename of the repository pointer file written by `xtrace init`.
+#[cfg(test)]
 const POINTER_BASENAME: &str = ".xtrace";
 /// File name of the pointer file inside `.xtrace`.
 const POINTER_FILENAME: &str = "config.toml";
@@ -52,6 +35,12 @@ const XTRACE_FOLDER: &str = "xtrace";
 const PROJECTS_FOLDER: &str = "projects";
 /// Pointer file format version the binary understands.
 const POINTER_SCHEMA_VERSION: u32 = 1;
+const PENDING_SCHEMA_VERSION: u32 = 2;
+
+fn valid_project_id(project_id: ProjectId) -> bool {
+    let uuid = project_id.as_uuid();
+    uuid.get_version_num() == 7 && uuid.get_variant() == uuid::Variant::RFC4122
+}
 
 /// Pointer file written into the repository root by `xtrace init`.
 ///
@@ -77,6 +66,7 @@ pub struct RepositoryPointer {
 /// pointer cannot silently move a project to a different storage
 /// location.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct RepositoryPointerToml {
     /// Pointer file format version. Bumped together with schema
     /// changes that older binaries cannot read.
@@ -86,6 +76,171 @@ struct RepositoryPointerToml {
     /// Absolute path of the user-data home directory the project
     /// lives under.
     data_home: PathBuf,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingInit {
+    schema_version: u32,
+    repository_fingerprint: String,
+    project_id: ProjectId,
+    data_home: PathBuf,
+    display_name_digest: String,
+    idempotency_key_digest: String,
+    canonical_input_digest: String,
+}
+
+impl PendingInit {
+    pub(crate) fn new(
+        repository_fingerprint: String,
+        project_id: ProjectId,
+        data_home: PathBuf,
+        display_name: &str,
+        idempotency_key: &str,
+        canonical_repo_path: &str,
+    ) -> Result<Self, CliError> {
+        if !valid_project_id(project_id) {
+            return Err(CliError::InvalidArgument("project identifier is invalid".into()));
+        }
+        if !data_home.is_absolute()
+            || data_home.as_os_str().as_encoded_bytes().len() > crate::pointer_io::MAX_PATH_BYTES
+        {
+            return Err(CliError::InvalidArgument(
+                "resolved data home is invalid or exceeds its path limit".into(),
+            ));
+        }
+        let display_name_digest = digest(display_name);
+        let idempotency_key_digest = digest(idempotency_key);
+        let canonical_input_digest = canonical_input_digest(canonical_repo_path, display_name);
+        Ok(Self {
+            schema_version: PENDING_SCHEMA_VERSION,
+            repository_fingerprint,
+            project_id,
+            data_home: normalize_absolute_path(&data_home)?,
+            display_name_digest,
+            idempotency_key_digest,
+            canonical_input_digest,
+        })
+    }
+
+    pub(crate) fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+    pub(crate) fn data_home(&self) -> &Path {
+        &self.data_home
+    }
+
+    pub(crate) fn serialized(&self) -> Result<Vec<u8>, CliError> {
+        let body = toml::to_string_pretty(self).map_err(|_| {
+            CliError::StoreCorrupted("could not serialize init recovery metadata".into())
+        })?;
+        if body.len() > crate::pointer_io::PENDING_MAX_BYTES {
+            return Err(CliError::StoreCorrupted(
+                "init recovery metadata exceeds its size limit".into(),
+            ));
+        }
+        Ok(body.into_bytes())
+    }
+
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, CliError> {
+        if bytes.len() > crate::pointer_io::PENDING_MAX_BYTES {
+            return Err(CliError::StoreCorrupted(
+                "init recovery metadata exceeds its size limit".into(),
+            ));
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| CliError::StoreCorrupted("init recovery metadata is not UTF-8".into()))?;
+        let marker: Self = toml::from_str(text)
+            .map_err(|_| CliError::StoreCorrupted("init recovery metadata is invalid".into()))?;
+        if !matches!(marker.schema_version, 1 | PENDING_SCHEMA_VERSION)
+            || !valid_project_id(marker.project_id)
+            || !marker.data_home.is_absolute()
+            || marker.data_home.as_os_str().as_encoded_bytes().len()
+                > crate::pointer_io::MAX_PATH_BYTES
+            || normalize_absolute_path(&marker.data_home)
+                .map_or(true, |path| path != marker.data_home)
+            || !valid_digest(&marker.repository_fingerprint)
+            || !valid_digest(&marker.display_name_digest)
+            || !valid_digest(&marker.idempotency_key_digest)
+            || !valid_digest(&marker.canonical_input_digest)
+        {
+            return Err(CliError::StoreCorrupted(
+                "init recovery metadata has unsupported identity".into(),
+            ));
+        }
+        Ok(marker)
+    }
+
+    pub(crate) fn matches_request(
+        &self,
+        repository_fingerprint: &str,
+        data_home: &Path,
+        display_name: &str,
+        idempotency_key: &str,
+        canonical_repo_path: &str,
+    ) -> bool {
+        let expected_input_digest = match self.schema_version {
+            1 => legacy_canonical_input_digest(canonical_repo_path, display_name, idempotency_key),
+            PENDING_SCHEMA_VERSION => canonical_input_digest(canonical_repo_path, display_name),
+            _ => return false,
+        };
+        self.repository_fingerprint == repository_fingerprint
+            && self.data_home == data_home
+            && self.display_name_digest == digest(display_name)
+            && self.idempotency_key_digest == digest(idempotency_key)
+            && self.canonical_input_digest == expected_input_digest
+    }
+}
+
+pub(crate) fn normalize_absolute_path(path: &Path) -> Result<PathBuf, CliError> {
+    if !path.is_absolute()
+        || path.as_os_str().as_encoded_bytes().len() > crate::pointer_io::MAX_PATH_BYTES
+    {
+        return Err(CliError::InvalidArgument(
+            "data home must be an absolute path within the supported limit".into(),
+        ));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized.push(component.as_os_str())
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Ok(normalized)
+}
+
+fn digest(value: &str) -> String {
+    format!("b3:{}", blake3::hash(value.as_bytes()).to_hex())
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 67
+        && value.starts_with("b3:")
+        && value[3..].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn legacy_canonical_input_digest(
+    canonical_repo_path: &str,
+    display_name: &str,
+    idempotency_key: &str,
+) -> String {
+    digest(&format!("{canonical_repo_path}\n{display_name}\n{idempotency_key}"))
+}
+
+fn canonical_input_digest(canonical_repo_path: &str, display_name: &str) -> String {
+    let mut input = b"xtrace.init-input\0\x02".to_vec();
+    for value in [canonical_repo_path.as_bytes(), display_name.as_bytes()] {
+        input.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        input.extend_from_slice(value);
+    }
+    format!("b3:{}", blake3::hash(&input).to_hex())
 }
 
 impl From<RepositoryPointer> for RepositoryPointerToml {
@@ -107,11 +262,20 @@ impl TryFrom<RepositoryPointerToml> for RepositoryPointer {
                 value.schema_version, POINTER_SCHEMA_VERSION
             )));
         }
+        if !valid_project_id(value.project_id) {
+            return Err(CliError::StoreCorrupted("pointer project identifier is invalid".into()));
+        }
         if !value.data_home.is_absolute() {
-            return Err(CliError::StoreCorrupted(format!(
-                "pointer data_home is not absolute: {}",
-                value.data_home.display()
-            )));
+            return Err(CliError::StoreCorrupted("pointer data home is not absolute".into()));
+        }
+        if value.data_home.as_os_str().as_encoded_bytes().len() > crate::pointer_io::MAX_PATH_BYTES
+        {
+            return Err(CliError::StoreCorrupted(
+                "pointer data home exceeds its path limit".into(),
+            ));
+        }
+        if normalize_absolute_path(&value.data_home).map_or(true, |path| path != value.data_home) {
+            return Err(CliError::StoreCorrupted("pointer data home is not normalized".into()));
         }
         Ok(Self {
             schema_version: value.schema_version,
@@ -122,100 +286,98 @@ impl TryFrom<RepositoryPointerToml> for RepositoryPointer {
 }
 
 impl RepositoryPointer {
-    /// Writes the pointer file to the supplied repository root.
-    /// The file is written atomically: the body first lands in a
-    /// sibling `.tmp` file, then `rename` swaps it into place. The
-    /// parent `.xtrace` directory is created with owner-only
-    /// permissions on Unix so the file cannot be read by other users.
-    ///
-    /// The helper fails closed on Unix: every chmod step returns
-    /// [`CliError::StoreUnavailable`] on failure. If the write fails
-    /// after the local database has been initialized, Slice 1A is
-    /// left in a state it cannot recover from automatically: the
-    /// database at `<data_home>/projects/<project_id>/` contains a
-    /// project row but the repository has no `.xtrace/config.toml`
-    /// pointer, and the CLI generated the project ID locally so it
-    /// cannot discover the orphaned directory from a missing pointer.
-    /// A subsequent `init` cannot replay the original receipt
-    /// through the public path because the CLI assigns a fresh
-    /// project ID on retry and the resulting pointer would resolve
-    /// to a different database. Slice 1A does not redesign recovery;
-    /// the bounded risk is that the orphaned
-    /// `<data_home>/projects/<project_id>/` directory must be
-    /// cleaned up manually.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CliError::StoreUnavailable`] when the filesystem
-    /// refuses the write or any chmod step fails; the file is never
-    /// partially written.
+    /// Writes the pointer without replacing a pointer already present.
     pub fn write(&self, repo: &Path) -> Result<(), CliError> {
-        use std::fs;
-        use std::io::Write as _;
+        if !valid_project_id(self.project_id) {
+            return Err(CliError::StoreCorrupted(
+                "refusing pointer with an invalid project identifier".into(),
+            ));
+        }
         if !self.data_home.is_absolute() {
-            return Err(CliError::StoreCorrupted(format!(
-                "refusing to write pointer with non-absolute data_home: {}",
-                self.data_home.display()
-            )));
+            return Err(CliError::StoreCorrupted(
+                "refusing pointer with non-absolute data home".into(),
+            ));
         }
-        let pointer_dir = repo.join(POINTER_BASENAME);
-        let pointer_path = pointer_dir.join(POINTER_FILENAME);
-        fs::create_dir_all(&pointer_dir)
-            .map_err(|err| CliError::StoreUnavailable(format!("create .xtrace: {err}")))?;
-        // `0700` on the pointer directory prevents other users from
-        // enumerating or reading the file before the rename commits.
-        chmod_dir_owner_only(&pointer_dir)?;
-        // Serialise the typed pointer through `toml` so a path
-        // containing quotes, backslashes, or other TOML-significant
-        // characters round-trips verbatim instead of corrupting the
-        // file.
-        let toml_value = RepositoryPointerToml::from(self.clone());
-        let body = toml::to_string_pretty(&toml_value)
-            .map_err(|err| CliError::StoreCorrupted(format!("serialize pointer: {err}")))?;
-        let tmp = pointer_dir.join(format!("{POINTER_FILENAME}.tmp"));
-        {
-            let mut file = fs::File::create(&tmp)
-                .map_err(|err| CliError::StoreUnavailable(format!("create tmp pointer: {err}")))?;
-            file.write_all(body.as_bytes())
-                .map_err(|err| CliError::StoreUnavailable(format!("write tmp pointer: {err}")))?;
-            file.sync_all()
-                .map_err(|err| CliError::StoreUnavailable(format!("sync tmp pointer: {err}")))?;
+        if normalize_absolute_path(&self.data_home).map_or(true, |path| path != self.data_home) {
+            return Err(CliError::StoreCorrupted(
+                "refusing pointer with non-normalized data home".into(),
+            ));
         }
-        fs::rename(&tmp, &pointer_path)
-            .map_err(|err| CliError::StoreUnavailable(format!("rename pointer: {err}")))?;
-        chmod_file_owner_only(&pointer_path)?;
-        Ok(())
+        let body = self.serialized()?;
+        let lock = crate::pointer_io::RepositoryInitLock::acquire(repo)?;
+        self.write_locked(&lock, &body)
     }
 
-    /// Reads the pointer file from the supplied repository root.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CliError::ProjectDirectoryMissing`] when the file is
-    /// absent, [`CliError::StoreCorrupted`] when the schema version
-    /// is unsupported, the data home is relative, or the body is
-    /// unparseable, [`CliError::StoreUnavailable`] when the
-    /// filesystem refuses the read. The CLI surfaces a missing
-    /// pointer as a separate "uninitialized" error so callers can
-    /// report the state truthfully.
-    pub fn read(repo: &Path) -> Result<Self, CliError> {
-        let pointer_path = repo.join(POINTER_BASENAME).join(POINTER_FILENAME);
-        let text = std::fs::read_to_string(&pointer_path).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                CliError::ProjectDirectoryMissing(format!(
-                    "repository pointer not found: {}",
-                    pointer_path.display()
-                ))
+    pub(crate) fn write_locked(
+        &self,
+        lock: &crate::pointer_io::RepositoryInitLock,
+        body: &[u8],
+    ) -> Result<(), CliError> {
+        if body.len() > crate::pointer_io::POINTER_MAX_BYTES {
+            return Err(CliError::StoreCorrupted(
+                "repository pointer exceeds its size limit".into(),
+            ));
+        }
+        if let Some(existing) = lock.read(POINTER_FILENAME, crate::pointer_io::POINTER_MAX_BYTES)? {
+            let existing = Self::parse(&existing)?;
+            return if existing == *self {
+                Ok(())
             } else {
-                CliError::StoreUnavailable(format!("read pointer: {err}"))
-            }
-        })?;
-        let parsed: RepositoryPointerToml = toml::from_str(&text).map_err(|err| {
-            CliError::StoreCorrupted(format!(
-                "invalid pointer file {}: {err}",
-                pointer_path.display()
-            ))
-        })?;
+                Err(CliError::StoreCorrupted(
+                    "repository pointer conflicts with existing metadata".into(),
+                ))
+            };
+        }
+        lock.publish(POINTER_FILENAME, body, crate::pointer_io::POINTER_MAX_BYTES)
+    }
+
+    pub(crate) fn read_locked(
+        lock: &crate::pointer_io::RepositoryInitLock,
+    ) -> Result<Option<Self>, CliError> {
+        lock.read(POINTER_FILENAME, crate::pointer_io::POINTER_MAX_BYTES)?
+            .map(|bytes| Self::parse(&bytes))
+            .transpose()
+    }
+
+    pub(crate) fn serialized(&self) -> Result<Vec<u8>, CliError> {
+        if !valid_project_id(self.project_id) {
+            return Err(CliError::StoreCorrupted(
+                "repository pointer project identifier is invalid".into(),
+            ));
+        }
+        if self.data_home.as_os_str().as_encoded_bytes().len() > crate::pointer_io::MAX_PATH_BYTES {
+            return Err(CliError::StoreCorrupted(
+                "repository data home exceeds its path limit".into(),
+            ));
+        }
+        let body =
+            toml::to_string_pretty(&RepositoryPointerToml::from(self.clone())).map_err(|_| {
+                CliError::StoreCorrupted("could not serialize repository pointer".into())
+            })?;
+        if body.len() > crate::pointer_io::POINTER_MAX_BYTES {
+            return Err(CliError::StoreCorrupted(
+                "repository pointer exceeds its size limit".into(),
+            ));
+        }
+        Ok(body.into_bytes())
+    }
+
+    /// Reads the bounded pointer file without following links.
+    pub fn read(repo: &Path) -> Result<Self, CliError> {
+        let bytes = crate::pointer_io::read_unlocked(
+            repo,
+            POINTER_FILENAME,
+            crate::pointer_io::POINTER_MAX_BYTES,
+        )?
+        .ok_or_else(|| CliError::ProjectDirectoryMissing("repository pointer not found".into()))?;
+        Self::parse(&bytes)
+    }
+
+    fn parse(bytes: &[u8]) -> Result<Self, CliError> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| CliError::StoreCorrupted("repository pointer is not UTF-8".into()))?;
+        let parsed: RepositoryPointerToml = toml::from_str(text)
+            .map_err(|_| CliError::StoreCorrupted("repository pointer is invalid".into()))?;
         parsed.try_into()
     }
 }
@@ -315,126 +477,6 @@ where
         let _ = env_reader;
         None
     }
-}
-
-/// `chmod 0700` on the supplied directory on Unix. Fails closed:
-/// every metadata or chmod failure surfaces as
-/// [`CliError::StoreUnavailable`]. Off Unix, the helper returns
-/// `Ok(())` because Windows ACLs are managed through other APIs
-/// and no portable `chmod` equivalent exists.
-#[cfg(unix)]
-fn chmod_dir_owner_only(path: &Path) -> Result<(), CliError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let metadata = std::fs::metadata(path).map_err(|err| {
-        CliError::StoreUnavailable(format!("stat directory {}: {err}", path.display()))
-    })?;
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(path, permissions)
-        .map_err(|err| CliError::StoreUnavailable(format!("chmod 0700 {}: {err}", path.display())))
-}
-
-/// `chmod 0700` on the supplied directory on Unix. Returns `Ok(())`
-/// off Unix (documented no-op).
-#[cfg(not(unix))]
-fn chmod_dir_owner_only(_path: &Path) -> Result<(), CliError> {
-    Ok(())
-}
-
-/// `chmod 0600` on the supplied file on Unix. Fails closed: every
-/// metadata or chmod failure (including a missing file) surfaces as
-/// [`CliError::StoreUnavailable`]. Off Unix, the helper returns
-/// `Ok(())`.
-#[cfg(unix)]
-fn chmod_file_owner_only(path: &Path) -> Result<(), CliError> {
-    #[cfg(target_os = "linux")]
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let path_metadata = std::fs::symlink_metadata(path).map_err(|_| {
-        CliError::StoreUnavailable(format!("inspect file path {} failed", path.display()))
-    })?;
-    validate_database_file_metadata(&path_metadata)?;
-
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd as _;
-        let descriptor = rustix::fs::openat(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
-            rustix::fs::Mode::empty(),
-        )
-        .map_err(|_| {
-            CliError::StoreCorrupted("database path is not a safe regular file".to_string())
-        })?;
-        let file = std::fs::File::from(descriptor);
-        let descriptor_metadata = file.metadata().map_err(|_| {
-            CliError::StoreUnavailable(format!("inspect file {} failed", path.display()))
-        })?;
-        validate_database_file_metadata(&descriptor_metadata)?;
-        ensure_same_file(&descriptor_metadata, &path_metadata)?;
-        let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-        std::fs::set_permissions(descriptor_path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |_| CliError::StoreUnavailable(format!("secure file {} failed", path.display())),
-        )?;
-        let updated_descriptor = file.metadata().map_err(|_| {
-            CliError::StoreUnavailable(format!("inspect file {} failed", path.display()))
-        })?;
-        validate_database_file_metadata(&updated_descriptor)?;
-        ensure_same_file(&updated_descriptor, &path_metadata)?;
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        // On platforms with `fchmodat` no-follow support, this repairs mode-000
-        // files without needing a read-capable open descriptor.
-        rustix::fs::chmodat(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::Mode::from_bits_truncate(0o600),
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|_| {
-            CliError::StoreUnavailable(format!("secure file {} failed", path.display()))
-        })?;
-        let updated_path = std::fs::symlink_metadata(path).map_err(|_| {
-            CliError::StoreUnavailable(format!("inspect file path {} failed", path.display()))
-        })?;
-        validate_database_file_metadata(&updated_path)?;
-        ensure_same_file(&updated_path, &path_metadata)
-    }
-}
-
-#[cfg(unix)]
-fn validate_database_file_metadata(metadata: &std::fs::Metadata) -> Result<(), CliError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    if !metadata.is_file() || metadata.nlink() != 1 {
-        return Err(CliError::StoreCorrupted(
-            "database path must be a single-link regular file".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn ensure_same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> Result<(), CliError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    if left.dev() != right.dev() || left.ino() != right.ino() {
-        return Err(CliError::StoreCorrupted(
-            "database path changed during validation".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// `chmod 0600` on the supplied file on Unix. Returns `Ok(())` off
-/// Unix (documented no-op).
-#[cfg(not(unix))]
-fn chmod_file_owner_only(_path: &Path) -> Result<(), CliError> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -653,6 +695,104 @@ mod tests {
         let metadata = std::fs::metadata(repo.join(POINTER_BASENAME).join(POINTER_FILENAME))
             .expect("metadata");
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn pointer_write_preserves_an_existing_different_pointer() {
+        let dir = tempdir();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let first = RepositoryPointer {
+            schema_version: 1,
+            project_id: ProjectId::new(),
+            data_home: dir.join("data-one"),
+        };
+        first.write(&repo).expect("first pointer");
+        let pointer_path = repo.join(POINTER_BASENAME).join(POINTER_FILENAME);
+        let original = std::fs::read(&pointer_path).expect("original pointer");
+        let second = RepositoryPointer {
+            schema_version: 1,
+            project_id: ProjectId::new(),
+            data_home: dir.join("data-two"),
+        };
+        assert!(second.write(&repo).is_err());
+        assert_eq!(std::fs::read(pointer_path).expect("preserved pointer"), original);
+    }
+
+    #[test]
+    fn pointer_and_pending_serialization_enforce_utf8_byte_caps() {
+        let long_escaped_path =
+            PathBuf::from(format!("/{}", "\"".repeat(crate::pointer_io::MAX_PATH_BYTES - 1)));
+        let pointer = RepositoryPointer {
+            schema_version: 1,
+            project_id: ProjectId::new(),
+            data_home: long_escaped_path.clone(),
+        };
+        assert!(pointer.serialized().is_err());
+        let pending = PendingInit::new(
+            digest("/repo"),
+            ProjectId::new(),
+            long_escaped_path,
+            "name",
+            "key",
+            "/repo",
+        )
+        .expect("bounded path");
+        assert!(pending.serialized().is_err());
+    }
+
+    #[test]
+    fn pending_input_digest_uses_unambiguous_versioned_framing() {
+        let left = canonical_input_digest("/repo\nname", "X");
+        let right = canonical_input_digest("/repo", "name\nX");
+        assert_ne!(left, right);
+        assert_eq!(left, canonical_input_digest("/repo\nname", "X"));
+    }
+
+    #[test]
+    fn pointer_and_pending_reject_non_v7_project_ids() {
+        let v4 = ProjectId::from_uuid(
+            uuid::Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("UUIDv4"),
+        );
+        let pointer = RepositoryPointer {
+            schema_version: POINTER_SCHEMA_VERSION,
+            project_id: v4,
+            data_home: PathBuf::from("/tmp/xtrace-data"),
+        };
+        assert!(pointer.serialized().is_err());
+        assert!(
+            PendingInit::new(
+                digest("/repo"),
+                v4,
+                PathBuf::from("/tmp/xtrace-data"),
+                "name",
+                "key",
+                "/repo",
+            )
+            .is_err()
+        );
+        let pointer_text = format!(
+            "schema_version = 1\nproject_id = \"{v4}\"\ndata_home = \"/tmp/xtrace-data\"\n"
+        );
+        assert!(RepositoryPointer::parse(pointer_text.as_bytes()).is_err());
+
+        let mut valid_marker = PendingInit::new(
+            digest("/repo"),
+            ProjectId::new(),
+            PathBuf::from("/tmp/xtrace-data"),
+            "name",
+            "key",
+            "/repo",
+        )
+        .expect("valid marker")
+        .serialized()
+        .expect("serialize marker");
+        let valid_id = PendingInit::parse(&valid_marker).expect("parse valid marker").project_id;
+        let changed = String::from_utf8(valid_marker.clone())
+            .expect("marker UTF-8")
+            .replace(&valid_id.to_string(), &v4.to_string());
+        valid_marker = changed.into_bytes();
+        assert!(PendingInit::parse(&valid_marker).is_err());
     }
 
     fn tempdir() -> PathBuf {

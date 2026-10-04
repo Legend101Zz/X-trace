@@ -48,6 +48,55 @@ mod daemon_lock;
 mod error;
 mod output;
 mod paths;
+#[cfg(unix)]
+mod pointer_io;
+#[cfg(not(unix))]
+mod pointer_io {
+    use crate::error::CliError;
+    use std::fs::File;
+    use std::path::Path;
+    pub(crate) const POINTER_MAX_BYTES: usize = 8192;
+    pub(crate) const PENDING_MAX_BYTES: usize = 8192;
+    pub(crate) const MAX_PATH_BYTES: usize = 4096;
+    pub(crate) struct RepositoryInitLock;
+    impl RepositoryInitLock {
+        pub(crate) fn acquire(_: &Path) -> Result<Self, CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+        pub(crate) fn read(&self, _: &str, _: usize) -> Result<Option<Vec<u8>>, CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+        pub(crate) fn publish(&self, _: &str, _: &[u8], _: usize) -> Result<(), CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+        pub(crate) fn remove_owned(&self, _: &str, _: &File) -> Result<(), CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+        pub(crate) fn open_owned(&self, _: &str) -> Result<File, CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+        pub(crate) fn revalidate(&self) -> Result<(), CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+    }
+    pub(crate) fn read_unlocked(_: &Path, _: &str, _: usize) -> Result<Option<Vec<u8>>, CliError> {
+        Err(CliError::StoreUnavailable(
+            "safe repository metadata I/O is unsupported on this platform".into(),
+        ))
+    }
+}
 mod run;
 mod viewer;
 
