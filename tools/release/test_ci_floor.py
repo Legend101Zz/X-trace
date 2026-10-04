@@ -601,10 +601,14 @@ class CiFloorEvidenceTests(unittest.TestCase):
             fake_git = fake_bin / "git"
             fake_git.write_text(
                 f"#!{sys.executable}\n"
-                "import os, pathlib, subprocess, sys, time\n"
+                "import json, os, pathlib, subprocess, sys, time\n"
                 "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
-                "pathlib.Path(os.environ['XTRACE_FAKE_GIT_PID_FILE']).write_text(str(child.pid))\n"
-                "time.sleep(.15)\n",
+                "try:\n"
+                " start = ' '.join(subprocess.check_output(['/bin/ps','-o','lstart=','-p',str(child.pid)],text=True).split())\n"
+                " pathlib.Path(os.environ['XTRACE_FAKE_GIT_PID_FILE']).write_text(json.dumps([child.pid,os.getpgid(child.pid),start]))\n"
+                " time.sleep(.15)\n"
+                "except BaseException:\n"
+                " child.kill(); child.wait(); raise\n",
                 encoding="utf-8",
             )
             os.chmod(fake_git, 0o700)
@@ -616,26 +620,24 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 }), mock.patch.object(ci_floor, "SOURCE_COMMAND_TIMEOUT_SECONDS", 0.5):
                     with self.assertRaises(ci_floor.FloorInputError):
                         ci_floor._bounded_git_output(root, "rev-parse", "--verify", "HEAD")
-                if pid_file.exists():
-                    child_pid = int(pid_file.read_text(encoding="utf-8"))
-                    snapshot = ci_floor._utility_process_snapshot()
-                    child = snapshot.get(child_pid)
-                    if child is not None and child[3] not in {"Z", "X"}:
-                        ci_floor._signal_utility_group_members(
-                            child[1], {child_pid: child[2]}, signal.SIGKILL,
-                            deadline=time.monotonic() + 1.0,
-                        )
-                        snapshot = ci_floor._utility_process_snapshot()
-                        child = snapshot.get(child_pid)
-                    self.assertFalse(child is not None and child[3] not in {"Z", "X"})
+                self.assertTrue(pid_file.is_file(), "fake Git child must publish its process identity")
+                child_pid, child_group, child_start = json.loads(pid_file.read_text(encoding="utf-8"))
+                snapshot = ci_floor._utility_process_snapshot()
+                child = snapshot.get(child_pid)
+                child_is_live = (
+                    child is not None and child[1] == child_group and child[2] == child_start
+                    and child[3] not in {"Z", "X"}
+                )
+                self.assertFalse(child_is_live, "the Git supervisor left its pipe-holding child alive")
             finally:
-                if pid_file.exists():
-                    child_pid = int(pid_file.read_text(encoding="utf-8"))
+                if pid_file.is_file():
+                    child_pid, child_group, child_start = json.loads(pid_file.read_text(encoding="utf-8"))
                     snapshot = ci_floor._utility_process_snapshot()
                     child = snapshot.get(child_pid)
-                    if child is not None and child[3] not in {"Z", "X"}:
+                    if (child is not None and child[1] == child_group and child[2] == child_start
+                            and child[3] not in {"Z", "X"}):
                         ci_floor._signal_utility_group_members(
-                            child[1], {child_pid: child[2]}, signal.SIGKILL,
+                            child_group, {child_pid: child_start}, signal.SIGKILL,
                             deadline=time.monotonic() + 1.0,
                         )
 
@@ -659,7 +661,9 @@ class CiFloorEvidenceTests(unittest.TestCase):
             )
             os.chmod(fake_ps, 0o700)
             program = (
-                "import os,pathlib,time; pathlib.Path(__import__('sys').argv[1]).write_text(str(os.getpid())); time.sleep(30)"
+                "import json,os,pathlib,subprocess,sys,time; pid=os.getpid(); "
+                "start=' '.join(subprocess.check_output(['/bin/ps','-o','lstart=','-p',str(pid)],text=True).split()); "
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps([pid,os.getpgid(pid),start])); time.sleep(30)"
             )
             old_path = os.environ.get("PATH", "/usr/bin:/bin")
             started = time.monotonic()
@@ -672,26 +676,24 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         ci_floor._run([sys.executable, "-c", program, str(child_pid_file)], timeout=0.2)
                 self.assertGreaterEqual(int(count_file.read_text(encoding="utf-8")), 3)
                 self.assertLess(time.monotonic() - started, 1.8)
-                if child_pid_file.exists():
-                    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
-                    snapshot = ci_floor._utility_process_snapshot()
-                    child = snapshot.get(child_pid)
-                    if child is not None and child[3] not in {"Z", "X"}:
-                        ci_floor._signal_utility_group_members(
-                            child[1], {child_pid: child[2]}, signal.SIGKILL,
-                            deadline=time.monotonic() + 1.0,
-                        )
-                        snapshot = ci_floor._utility_process_snapshot()
-                        child = snapshot.get(child_pid)
-                    self.assertFalse(child is not None and child[3] not in {"Z", "X"})
+                self.assertTrue(child_pid_file.is_file(), "utility child must publish its process identity")
+                child_pid, child_group, child_start = json.loads(child_pid_file.read_text(encoding="utf-8"))
+                snapshot = ci_floor._utility_process_snapshot()
+                child = snapshot.get(child_pid)
+                child_is_live = (
+                    child is not None and child[1] == child_group and child[2] == child_start
+                    and child[3] not in {"Z", "X"}
+                )
+                self.assertFalse(child_is_live, "the outer supervisor left its utility child alive")
             finally:
-                if child_pid_file.exists():
-                    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+                if child_pid_file.is_file():
+                    child_pid, child_group, child_start = json.loads(child_pid_file.read_text(encoding="utf-8"))
                     snapshot = ci_floor._utility_process_snapshot()
                     child = snapshot.get(child_pid)
-                    if child is not None and child[3] not in {"Z", "X"}:
+                    if (child is not None and child[1] == child_group and child[2] == child_start
+                            and child[3] not in {"Z", "X"}):
                         ci_floor._signal_utility_group_members(
-                            child[1], {child_pid: child[2]}, signal.SIGKILL,
+                            child_group, {child_pid: child_start}, signal.SIGKILL,
                             deadline=time.monotonic() + 1.0,
                         )
 

@@ -327,14 +327,19 @@ def _run(
             if process is not None:
                 if group_id is None or not root_identity_observed:
                     try:
+                        discovery_deadline = (
+                            cleanup_deadline - UTILITY_TERM_GRACE_SECONDS
+                            - UTILITY_FINAL_SCAN_RESERVE_SECONDS
+                        )
                         discovery_budget = min(
                             0.5,
-                            cleanup_deadline - time.monotonic()
-                            - UTILITY_TERM_GRACE_SECONDS - UTILITY_FINAL_SCAN_RESERVE_SECONDS,
+                            discovery_deadline - time.monotonic(),
                         )
                         if discovery_budget <= 0:
                             raise FloorInputError
-                        snapshot = _utility_process_snapshot(timeout=discovery_budget, deadline=cleanup_deadline)
+                        snapshot = _utility_process_snapshot(
+                            timeout=discovery_budget, deadline=discovery_deadline,
+                        )
                         for pid, (_parent, pgid, started_at, _state) in snapshot.items():
                             prior = baseline.get(pid)
                             if pgid == group_id and (prior is None or prior[2] != started_at):
