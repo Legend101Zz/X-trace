@@ -641,8 +641,87 @@ class CiFloorEvidenceTests(unittest.TestCase):
             os.chmod(fake_git, 0o700)
             old_path = os.environ.get("PATH", "/usr/bin:/bin")
             original_snapshot = ci_floor._utility_process_snapshot
+            original_popen = ci_floor.subprocess.Popen
+            original_os_read = os.read
             snapshot_trace: list[dict[str, object]] = []
             snapshot_trace_omitted = 0
+            git_launch: dict[str, object] = {
+                "attempted": False,
+                "selectedPathEqualsFixture": False,
+                "pathCheckExceptionType": None,
+                "launched": False,
+                "popenExceptionType": None,
+                "process": None,
+                "stderrFd": None,
+            }
+            stderr_bytes_observed = 0
+            stderr_observation_truncated = False
+            stderr_prefix = bytearray()
+
+            def record_popen(*args: object, **kwargs: object) -> object:
+                command = args[0] if args else kwargs.get("args")
+                is_git = (
+                    isinstance(command, (list, tuple)) and bool(command) and command[0] == "git"
+                ) or command == "git"
+                if is_git:
+                    git_launch["attempted"] = True
+                    try:
+                        selected = ci_floor.shutil.which("git")
+                        git_launch["selectedPathEqualsFixture"] = bool(
+                            selected is not None and pathlib.Path(selected).resolve() == fake_git.resolve()
+                        )
+                    except Exception as exc:
+                        git_launch["pathCheckExceptionType"] = type(exc).__name__
+                try:
+                    process = original_popen(*args, **kwargs)
+                except BaseException as exc:
+                    if is_git:
+                        git_launch["popenExceptionType"] = type(exc).__name__
+                    raise
+                if is_git:
+                    git_launch["launched"] = True
+                    git_launch["process"] = process
+                    stream = getattr(process, "stderr", None)
+                    if stream is not None:
+                        try:
+                            git_launch["stderrFd"] = stream.fileno()
+                        except (OSError, ValueError):
+                            git_launch["stderrFd"] = None
+                return process
+
+            def record_read(descriptor: int, size: int) -> bytes:
+                nonlocal stderr_bytes_observed, stderr_observation_truncated
+                chunk = original_os_read(descriptor, size)
+                if descriptor == git_launch["stderrFd"]:
+                    remaining = 65536 - stderr_bytes_observed
+                    stderr_bytes_observed += min(len(chunk), max(0, remaining))
+                    if len(chunk) > max(0, remaining):
+                        stderr_observation_truncated = True
+                    if len(stderr_prefix) < 512:
+                        stderr_prefix.extend(chunk[:512 - len(stderr_prefix)])
+                return chunk
+
+            def stderr_category() -> str:
+                sample = bytes(stderr_prefix).lower()
+                if not sample:
+                    return "empty_or_unobserved"
+                if b"bad interpreter" in sample or b"not found" in sample or b"no such file" in sample:
+                    return "interpreter_startup"
+                if b"permission denied" in sample:
+                    return "permission_denied"
+                if b"syntaxerror" in sample:
+                    return "python_startup_syntax"
+                return "other_nonempty"
+
+            def post_cleanup_return_code() -> int | str:
+                process = git_launch["process"]
+                if process is None:
+                    return "not_launched"
+                try:
+                    code = process.poll()
+                except Exception:
+                    return "unavailable"
+                return code if isinstance(code, int) else "still_running"
 
             def append_snapshot_trace(item: dict[str, object]) -> None:
                 nonlocal snapshot_trace_omitted
@@ -666,6 +745,15 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     "fixtureStages": {
                         "scriptEntered": entered_file.is_file(),
                         "childIdentityPublished": pid_file.is_file(),
+                        "fakeGitLaunchAttempted": git_launch["attempted"],
+                        "fakeGitSelectedPathEqualsFixture": git_launch["selectedPathEqualsFixture"],
+                        "fakeGitPathCheckExceptionType": git_launch["pathCheckExceptionType"],
+                        "fakeGitPopenLaunched": git_launch["launched"],
+                        "fakeGitPopenExceptionType": git_launch["popenExceptionType"],
+                        "fakeGitLeaderReturnCode": post_cleanup_return_code(),
+                        "fakeGitStderrBytesObservedCapped": stderr_bytes_observed,
+                        "fakeGitStderrObservationTruncated": stderr_observation_truncated,
+                        "fakeGitStderrCategory": stderr_category(),
                     },
                     "snapshotCalls": snapshot_trace,
                     "omittedSnapshotCalls": snapshot_trace_omitted,
@@ -707,7 +795,9 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     "XTRACE_FAKE_GIT_PID_FILE": str(pid_file),
                     "XTRACE_FAKE_GIT_ENTERED_FILE": str(entered_file),
                 }), mock.patch.object(ci_floor, "SOURCE_COMMAND_TIMEOUT_SECONDS", 0.5), \
-                        mock.patch.object(ci_floor, "_utility_process_snapshot", side_effect=record_snapshot):
+                        mock.patch.object(ci_floor, "_utility_process_snapshot", side_effect=record_snapshot), \
+                        mock.patch.object(ci_floor.subprocess, "Popen", side_effect=record_popen), \
+                        mock.patch.object(ci_floor.os, "read", side_effect=record_read):
                     try:
                         ci_floor._bounded_git_output(root, "rev-parse", "--verify", "HEAD")
                     except ci_floor.FloorInputError:
@@ -747,6 +837,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
             fake_bin.mkdir()
             count_file = fake_bin / "ps-count"
             stall_file = fake_bin / "ps-stall-entered"
+            third_invocation_stage_file = fake_bin / "ps-third-stage"
             child_pid_file = root / "utility-pid"
             handler_ready_file = root / "term-handler-ready"
             term_file = root / "term-observed"
@@ -763,8 +854,12 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 "count = int(counter.read_text() or '0') + 1 if counter.exists() else 1\n"
                 "publish(counter, str(count))\n"
                 "if count == 3:\n"
+                " publish(str(pathlib.Path(__file__).with_name('ps-third-stage')), 'entered')\n"
                 " publish(str(pathlib.Path(__file__).with_name('ps-stall-entered')), 'entered')\n"
+                " publish(str(pathlib.Path(__file__).with_name('ps-third-stage')), 'stalling')\n"
                 " time.sleep(2)\n"
+                "if count == 3:\n"
+                " publish(str(pathlib.Path(__file__).with_name('ps-third-stage')), 'delegating')\n"
                 "os.execv('/bin/ps', ['/bin/ps', *sys.argv[1:]])\n",
                 encoding="utf-8",
             )
@@ -792,6 +887,35 @@ class CiFloorEvidenceTests(unittest.TestCase):
             signal_trace_omitted = 0
             exact_signal_identities_omitted = 0
             exact_term_identity_seen = False
+            active_signal_signum: int | None = None
+
+            def safe_marker_file(path: pathlib.Path, allowed: set[str]) -> dict[str, object]:
+                descriptor: int | None = None
+                try:
+                    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+                    descriptor = os.open(path, flags)
+                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        return {"status": "not_regular"}
+                    raw = os.read(descriptor, 33)
+                except FileNotFoundError:
+                    return {"status": "missing"}
+                except (OSError, ValueError) as exc:
+                    return {"status": "unavailable", "errorType": type(exc).__name__}
+                finally:
+                    if descriptor is not None:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+                if len(raw) > 32:
+                    return {"status": "too_long"}
+                try:
+                    value = raw.decode("ascii")
+                except UnicodeError:
+                    return {"status": "invalid"}
+                if value not in allowed:
+                    return {"status": "invalid"}
+                return {"status": "read", "value": value}
 
             def append_snapshot_trace(item: dict[str, object]) -> None:
                 nonlocal snapshot_trace_omitted
@@ -838,6 +962,10 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     return {"status": "invalid"}
                 return {"status": "read", "value": int(raw)}
 
+            def safe_count_value() -> int | None:
+                value = safe_count_file().get("value")
+                return value if isinstance(value, int) else None
+
             def fixture_identity_seen(records: dict[int, tuple[int, int, str, str]]) -> bool:
                 if not child_pid_file.is_file():
                     return False
@@ -855,6 +983,9 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         "identityPublished": child_pid_file.is_file(),
                         "nestedPsStallEntered": stall_file.is_file(),
                         "psInvocationCount": safe_count_file(),
+                        "thirdPsInvocationStage": safe_marker_file(
+                            third_invocation_stage_file, {"entered", "stalling", "delegating"},
+                        ),
                     },
                     "snapshotCalls": snapshot_trace,
                     "omittedSnapshotCalls": snapshot_trace_omitted,
@@ -866,28 +997,66 @@ class CiFloorEvidenceTests(unittest.TestCase):
 
             def record_snapshot(*args: object, **kwargs: object) -> dict[int, tuple[int, int, str, str]]:
                 entered = time.monotonic()
+                ps_count_before = safe_count_value()
+                third_stage_before = safe_marker_file(
+                    third_invocation_stage_file, {"entered", "stalling", "delegating"},
+                )
                 timeout = kwargs.get("timeout", 2.0)
                 deadline = kwargs.get("deadline")
+                if active_signal_signum == signal.SIGTERM:
+                    call_context = "term_inner_snapshot"
+                elif active_signal_signum == signal.SIGKILL:
+                    call_context = "kill_inner_snapshot"
+                elif active_signal_signum is not None:
+                    call_context = "signal_inner_snapshot"
+                elif entered - started < 0.6:
+                    call_context = "main_deadline_window"
+                else:
+                    call_context = "cleanup_window"
                 item: dict[str, object] = {
+                    "callContext": call_context,
                     "enteredOffsetSeconds": round(entered - started, 6),
                     "timeoutSeconds": timeout if isinstance(timeout, (int, float)) else "invalid",
                     "deadlineRemainingSeconds": round(deadline - entered, 6)
                     if isinstance(deadline, (int, float)) else None,
+                    "fakePsInvocationCountBefore": ps_count_before,
+                    "fakePsThirdInvocationStageBefore": third_stage_before,
                 }
                 try:
                     result = original_snapshot(*args, **kwargs)
                 except BaseException as exc:
+                    ps_count_after = safe_count_value()
+                    third_stage_after = safe_marker_file(
+                        third_invocation_stage_file, {"entered", "stalling", "delegating"},
+                    )
                     item.update({
                         "exitedOffsetSeconds": round(time.monotonic() - started, 6),
                         "outcome": "exception",
                         "exceptionType": type(exc).__name__,
+                        "failureCategory": (
+                            "snapshot_failed_during_fake_ps_stall"
+                            if isinstance(exc, ci_floor.FloorInputError)
+                            and (ps_count_before or 0) < 3 and (ps_count_after or 0) >= 3
+                            and third_stage_after.get("value") == "stalling"
+                            else "floor_input_error" if isinstance(exc, ci_floor.FloorInputError)
+                            else "other_exception"
+                        ),
+                        "fakePsInvocationCountAfter": ps_count_after,
+                        "fakePsThirdInvocationStageAfter": third_stage_after,
                         "fixtureIdentitySeen": False,
                     })
                     append_snapshot_trace(item)
                     raise
+                ps_count_after = safe_count_value()
+                third_stage_after = safe_marker_file(
+                    third_invocation_stage_file, {"entered", "stalling", "delegating"},
+                )
                 item.update({
                     "exitedOffsetSeconds": round(time.monotonic() - started, 6),
                     "outcome": "returned",
+                    "failureCategory": "none",
+                    "fakePsInvocationCountAfter": ps_count_after,
+                    "fakePsThirdInvocationStageAfter": third_stage_after,
                     "fixtureIdentitySeen": fixture_identity_seen(result),
                 })
                 append_snapshot_trace(item)
@@ -898,7 +1067,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
             def record_signal(
                 group_id: int, identities: dict[int, str], signum: int, *, deadline: float,
             ) -> bool:
-                nonlocal exact_term_identity_seen
+                nonlocal exact_term_identity_seen, active_signal_signum
                 entered = time.monotonic()
                 expected: tuple[int, int, str] | None = None
                 if child_pid_file.is_file():
@@ -918,9 +1087,24 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         and started_at == expected[2]
                         for pid, started_at in identities.items()
                     ) or exact_term_identity_seen
+                prior_signal = active_signal_signum
+                active_signal_signum = signum
                 try:
-                    result = original_signal(group_id, identities, signum, deadline=deadline)
-                except BaseException as exc:
+                    try:
+                        result = original_signal(group_id, identities, signum, deadline=deadline)
+                    except BaseException as exc:
+                        append_signal_trace({
+                            "enteredOffsetSeconds": round(entered - started, 6),
+                            "exitedOffsetSeconds": round(time.monotonic() - started, 6),
+                            "signum": signum,
+                            "identityCount": len(identities),
+                            "fixtureIdentityMatched": matched,
+                            "deadlineRemainingSeconds": round(deadline - entered, 6),
+                            "outcome": "exception",
+                            "exceptionType": type(exc).__name__,
+                            "failureCategory": "signal_helper_exception",
+                        })
+                        raise
                     append_signal_trace({
                         "enteredOffsetSeconds": round(entered - started, 6),
                         "exitedOffsetSeconds": round(time.monotonic() - started, 6),
@@ -928,21 +1112,17 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         "identityCount": len(identities),
                         "fixtureIdentityMatched": matched,
                         "deadlineRemainingSeconds": round(deadline - entered, 6),
-                        "outcome": "exception",
-                        "exceptionType": type(exc).__name__,
+                        "outcome": "returned",
+                        "result": result,
+                        "failureCategory": (
+                            "matched_identity_signal_not_confirmed"
+                            if matched and not result else "fixture_identity_not_matched"
+                            if not matched else "none"
+                        ),
                     })
-                    raise
-                append_signal_trace({
-                    "enteredOffsetSeconds": round(entered - started, 6),
-                    "exitedOffsetSeconds": round(time.monotonic() - started, 6),
-                    "signum": signum,
-                    "identityCount": len(identities),
-                    "fixtureIdentityMatched": matched,
-                    "deadlineRemainingSeconds": round(deadline - entered, 6),
-                    "outcome": "returned",
-                    "result": result,
-                })
-                return result
+                    return result
+                finally:
+                    active_signal_signum = prior_signal
 
             try:
                 with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{old_path}"}), \
