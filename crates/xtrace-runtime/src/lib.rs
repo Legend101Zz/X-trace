@@ -21,3 +21,10 @@ pub mod private_storage;
 #[cfg(not(unix))]
 #[path = "private_storage_unsupported.rs"]
 pub mod private_storage;
+
+/// Strict signed language-pack manifest parsing and cryptographic primitives.
+pub mod signed_pack;
+
+/// Descriptor-relative inspection of untrusted public pack directories.
+#[cfg(unix)]
+pub mod pack_inventory;

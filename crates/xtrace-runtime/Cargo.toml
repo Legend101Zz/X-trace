@@ -12,10 +12,14 @@ description = "Application-owned runtime launch and supervision policy for X-tra
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
+blake3 = { workspace = true }
+ring = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process", "signal", "time"] }
 sha2 = { workspace = true }
 tracing = { workspace = true }
+xtrace-protocol = { path = "../xtrace-protocol" }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process"] }
