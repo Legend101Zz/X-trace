@@ -527,7 +527,7 @@ fn populate_private_snapshot(context: SnapshotPopulation<'_>) -> Result<(), Sign
             destination,
             total_bytes: &mut total_bytes,
             deadline,
-            hooks,
+            hooks: &mut *hooks,
         })?;
     }
     Ok(())
