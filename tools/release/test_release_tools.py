@@ -1203,13 +1203,20 @@ class RunnerTests(unittest.TestCase):
                     os.chmod(log_path, 0o600)
                     return 0, 0.75
 
-                def replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+                failure_reached = [False]
+
+                def replace(
+                    source: str | os.PathLike[str], destination: str | os.PathLike[str],
+                    *args: object, **kwargs: object,
+                ) -> None:
                     if failure_stage == "rename" and pathlib.Path(destination).name == "finalize.log":
+                        failure_reached[0] = True
                         raise OSError("injected final log rename failure")
-                    real_replace(source, destination)
+                    real_replace(source, destination, *args, **kwargs)
 
                 def hash_file(path: pathlib.Path) -> str:
                     if failure_stage == "hash" and path.name == "finalize.log":
+                        failure_reached[0] = True
                         raise OSError("injected final log hash failure")
                     return real_hash_file(path)
 
@@ -1219,6 +1226,7 @@ class RunnerTests(unittest.TestCase):
                 def tree_digest(repo: pathlib.Path) -> str:
                     tree_calls[0] += 1
                     if failure_stage == "source" and normal_returned[0]:
+                        failure_reached[0] = True
                         raise RuntimeError("injected post-command source read failure")
                     return real_tree_digest(repo)
 
@@ -1229,6 +1237,8 @@ class RunnerTests(unittest.TestCase):
                         mock.patch.object(run_gates, "_tree_state_digest", side_effect=tree_digest):
                     self.assertEqual(run_gates.run(args), 1)
 
+                self.assertTrue(normal_returned[0], "normal command result must be reached")
+                self.assertTrue(failure_reached[0], f"{failure_stage} injection must be reached")
                 receipt = json.loads((self.cache / "release-gates" / args.label / "receipt.json").read_text())
                 entry = receipt["gates"][0]
                 self.assertEqual(entry["name"], "finalize")
