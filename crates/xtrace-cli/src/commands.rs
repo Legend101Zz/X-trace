@@ -626,15 +626,13 @@ where
                     "pending init identity conflicts with repository pointer".into(),
                 ));
             }
-            let expected = crate::paths::PendingInit::new(
-                fingerprint.as_str().to_string(),
-                pointer.project_id,
-                user_data_home.clone(),
+            if !marker.matches_request(
+                fingerprint.as_str(),
+                &user_data_home,
                 &display_name,
                 &idempotency_key,
                 &canonical,
-            )?;
-            if marker != expected {
+            ) {
                 return Err(CliError::StoreCorrupted(
                     "pending init input conflicts with repository state".into(),
                 ));
@@ -652,15 +650,15 @@ where
         (None, Some(marker)) => {
             let expected_home =
                 crate::paths::normalize_absolute_path(&UserDataPaths::home_with(env_reader)?)?;
-            let expected = crate::paths::PendingInit::new(
-                fingerprint.as_str().to_string(),
-                marker.project_id(),
-                expected_home.clone(),
-                &display_name,
-                &idempotency_key,
-                &canonical,
-            )?;
-            if marker.data_home() != expected_home || marker != expected {
+            if marker.data_home() != expected_home
+                || !marker.matches_request(
+                    fingerprint.as_str(),
+                    &expected_home,
+                    &display_name,
+                    &idempotency_key,
+                    &canonical,
+                )
+            {
                 return Err(CliError::StoreCorrupted(
                     "pending init input or data home does not match this retry".into(),
                 ));
@@ -669,7 +667,6 @@ where
         }
         (None, None) => candidate,
     };
-    let marker_bytes = marker.serialized()?;
     let project_id =
         existing_pointer.as_ref().map_or_else(|| marker.project_id(), |pointer| pointer.project_id);
     let pointer =
@@ -677,6 +674,7 @@ where
     let pointer_bytes = pointer.serialized()?;
     let publish_pending = existing_pointer.is_none() && pending_bytes.is_none();
     if publish_pending {
+        let marker_bytes = marker.serialized()?;
         lock.publish("init.pending", &marker_bytes, crate::pointer_io::PENDING_MAX_BYTES)?;
     }
     lock.revalidate()?;
@@ -739,7 +737,12 @@ where
 }
 
 fn default_init_idempotency_key(canonical_repo_path: &str) -> String {
-    format!("xtrace-init-v1-{}", blake3::hash(canonical_repo_path.as_bytes()).to_hex())
+    let legacy = format!("xtrace-init-{canonical_repo_path}");
+    if legacy.len() <= 128 && !legacy.contains(['\0', '\n', '\r']) {
+        legacy
+    } else {
+        format!("xtrace-init-v1-{}", blake3::hash(canonical_repo_path.as_bytes()).to_hex())
+    }
 }
 
 fn open<F>(project_dir: PathBuf, idempotency_key: String, env_reader: &F) -> Result<(), CliError>
@@ -1035,6 +1038,58 @@ mod tests {
         assert!(key.len() <= 128);
         assert_eq!(key, default_init_idempotency_key(&long_path));
         assert_ne!(key, default_init_idempotency_key("/different"));
+        assert_eq!(
+            default_init_idempotency_key("/short/repository"),
+            "xtrace-init-/short/repository"
+        );
+        assert!(key.starts_with("xtrace-init-v1-"));
+    }
+
+    #[test]
+    fn init_replays_historical_implicit_key_receipt_without_rewriting_it() {
+        use xtrace_application::IdempotencyStore as _;
+
+        let repo = tempdir("legacy-default-key-retry");
+        let home = tempdir("legacy-default-key-home");
+        let env_reader = move |name: &str| (name == USER_DATA_HOME_ENV).then(|| home.clone());
+        init(repo.clone(), "Legacy".into(), String::new(), &env_reader)
+            .expect("initial project and receipt");
+        let pointer = RepositoryPointer::read(&repo).expect("pointer");
+        let database_path =
+            UserDataPaths::database_path_with_home(&pointer.data_home, pointer.project_id)
+                .expect("database path");
+        let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
+            .expect("open initialized store");
+        let idempotency = SqliteIdempotencyStore::new(&store);
+        let canonical = resolve_repo(&repo).expect("canonical repository");
+        let canonical = canonical.to_str().expect("UTF-8 repository");
+        let legacy_key = format!("xtrace-init-{canonical}");
+        let original = idempotency
+            .lookup_receipt("initialize_project", &legacy_key)
+            .expect("lookup legacy receipt")
+            .expect("legacy receipt exists");
+        drop(idempotency);
+        drop(store);
+
+        init(repo.clone(), "Legacy".into(), String::new(), &env_reader)
+            .expect("exact historical default-key retry");
+        let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
+            .expect("reopen initialized store");
+        let idempotency = SqliteIdempotencyStore::new(&store);
+        let replayed = idempotency
+            .lookup_receipt("initialize_project", &legacy_key)
+            .expect("lookup replayed receipt")
+            .expect("replayed receipt exists");
+        assert_eq!(replayed.receipt_json, original.receipt_json);
+        assert_eq!(replayed.input_digest, original.input_digest);
+        assert_eq!(replayed.project_id, original.project_id);
+        assert_eq!(replayed.idempotency_key, original.idempotency_key);
+        assert_eq!(
+            std::fs::read_dir(pointer.data_home.join("projects"))
+                .expect("project directories")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1110,6 +1165,167 @@ mod tests {
 
     fn reader_with_none() -> impl Fn(&str) -> Option<PathBuf> {
         reader(HashMap::new())
+    }
+
+    fn legacy_pending_marker(
+        repository_fingerprint: &str,
+        project_id: xtrace_domain::ProjectId,
+        data_home: &Path,
+        display_name: &str,
+        idempotency_key: &str,
+        canonical_repo_path: &str,
+    ) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct LegacyPending<'a> {
+            schema_version: u32,
+            repository_fingerprint: &'a str,
+            project_id: xtrace_domain::ProjectId,
+            data_home: &'a Path,
+            display_name_digest: String,
+            idempotency_key_digest: String,
+            canonical_input_digest: String,
+        }
+        fn digest(value: &str) -> String {
+            format!("b3:{}", blake3::hash(value.as_bytes()).to_hex())
+        }
+        toml::to_string_pretty(&LegacyPending {
+            schema_version: 1,
+            repository_fingerprint,
+            project_id,
+            data_home,
+            display_name_digest: digest(display_name),
+            idempotency_key_digest: digest(idempotency_key),
+            canonical_input_digest: digest(&format!(
+                "{canonical_repo_path}\n{display_name}\n{idempotency_key}"
+            )),
+        })
+        .expect("historical v1 marker")
+        .into_bytes()
+    }
+
+    fn publish_pending_marker(repo: &Path, bytes: &[u8]) {
+        let lock = crate::pointer_io::RepositoryInitLock::acquire(repo).expect("init lock");
+        lock.publish("init.pending", bytes, crate::pointer_io::PENDING_MAX_BYTES)
+            .expect("publish fixture marker");
+    }
+
+    #[test]
+    fn v1_pending_marker_recovers_same_identity_before_database_commit() {
+        let repo = tempdir("v1-pending-precommit-repo");
+        let blocked_home = tempdir("v1-pending-precommit-home").join("blocked-home");
+        std::fs::write(&blocked_home, b"injected private-root blocker").expect("block home");
+        let configured_home = blocked_home.clone();
+        let env_reader =
+            move |name: &str| (name == USER_DATA_HOME_ENV).then(|| configured_home.clone());
+        let canonical = resolve_repo(&repo).expect("canonical repo");
+        let canonical = canonical.to_str().expect("UTF-8 repo");
+        let fingerprint = xtrace_domain::RepositoryFingerprint::from_canonical_path(canonical);
+        let display_name = "V1 recovery";
+        let key = default_init_idempotency_key(canonical);
+        let project_id = xtrace_domain::ProjectId::new();
+        let original_marker = legacy_pending_marker(
+            fingerprint.as_str(),
+            project_id,
+            &blocked_home,
+            display_name,
+            &key,
+            canonical,
+        );
+        publish_pending_marker(&repo, &original_marker);
+
+        assert!(init(repo.clone(), display_name.into(), String::new(), &env_reader).is_err());
+        let after_failure = crate::pointer_io::read_unlocked(
+            &repo,
+            "init.pending",
+            crate::pointer_io::PENDING_MAX_BYTES,
+        )
+        .expect("read preserved marker")
+        .expect("marker remains");
+        assert_eq!(after_failure, original_marker);
+        assert!(RepositoryPointer::read(&repo).is_err());
+
+        std::fs::remove_file(&blocked_home).expect("remove blocker");
+        std::fs::create_dir(&blocked_home).expect("allow private root");
+        init(repo.clone(), display_name.into(), String::new(), &env_reader)
+            .expect("retry historical marker");
+        let pointer = RepositoryPointer::read(&repo).expect("published pointer");
+        assert_eq!(pointer.project_id, project_id);
+        assert!(
+            crate::pointer_io::read_unlocked(
+                &repo,
+                "init.pending",
+                crate::pointer_io::PENDING_MAX_BYTES,
+            )
+            .expect("check marker cleanup")
+            .is_none()
+        );
+        assert_eq!(
+            std::fs::read_dir(blocked_home.join("projects")).expect("project directories").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn v1_pending_marker_replays_committed_receipt_without_duplicate_project() {
+        use xtrace_application::IdempotencyStore as _;
+
+        let repo = tempdir("v1-pending-postcommit-repo");
+        let home = tempdir("v1-pending-postcommit-home");
+        let configured_home = home.clone();
+        let env_reader =
+            move |name: &str| (name == USER_DATA_HOME_ENV).then(|| configured_home.clone());
+        let display_name = "V1 committed";
+        init(repo.clone(), display_name.into(), String::new(), &env_reader)
+            .expect("commit initial project and receipt");
+        let original_pointer = RepositoryPointer::read(&repo).expect("initial pointer");
+        let database_path = UserDataPaths::database_path_with_home(
+            &original_pointer.data_home,
+            original_pointer.project_id,
+        )
+        .expect("database path");
+        let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
+            .expect("open store");
+        let idempotency = SqliteIdempotencyStore::new(&store);
+        let canonical = resolve_repo(&repo).expect("canonical repo");
+        let canonical = canonical.to_str().expect("UTF-8 repo");
+        let key = default_init_idempotency_key(canonical);
+        let original_receipt = idempotency
+            .lookup_receipt("initialize_project", &key)
+            .expect("lookup committed receipt")
+            .expect("receipt exists");
+        drop(idempotency);
+        drop(store);
+
+        let pointer_path = repo.join(".xtrace").join("config.toml");
+        std::fs::remove_file(pointer_path).expect("simulate crash before pointer publish");
+        let fingerprint = xtrace_domain::RepositoryFingerprint::from_canonical_path(canonical);
+        let marker = legacy_pending_marker(
+            fingerprint.as_str(),
+            original_pointer.project_id,
+            &original_pointer.data_home,
+            display_name,
+            &key,
+            canonical,
+        );
+        publish_pending_marker(&repo, &marker);
+
+        init(repo.clone(), display_name.into(), String::new(), &env_reader)
+            .expect("v1 post-commit exact receipt retry");
+        let pointer = RepositoryPointer::read(&repo).expect("recovered pointer");
+        assert_eq!(pointer.project_id, original_pointer.project_id);
+        let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
+            .expect("reopen recovered store");
+        let idempotency = SqliteIdempotencyStore::new(&store);
+        let replayed_receipt = idempotency
+            .lookup_receipt("initialize_project", &key)
+            .expect("lookup replayed receipt")
+            .expect("replayed receipt exists");
+        assert_eq!(replayed_receipt.receipt_json, original_receipt.receipt_json);
+        assert_eq!(replayed_receipt.input_digest, original_receipt.input_digest);
+        assert_eq!(
+            std::fs::read_dir(home.join("projects")).expect("project directories").count(),
+            1
+        );
     }
 
     #[test]

@@ -152,19 +152,43 @@ impl PendingInit {
             .map_err(|_| CliError::StoreCorrupted("init recovery metadata is not UTF-8".into()))?;
         let marker: Self = toml::from_str(text)
             .map_err(|_| CliError::StoreCorrupted("init recovery metadata is invalid".into()))?;
-        if marker.schema_version != PENDING_SCHEMA_VERSION
+        if !matches!(marker.schema_version, 1 | PENDING_SCHEMA_VERSION)
             || !valid_project_id(marker.project_id)
             || !marker.data_home.is_absolute()
             || marker.data_home.as_os_str().as_encoded_bytes().len()
                 > crate::pointer_io::MAX_PATH_BYTES
             || normalize_absolute_path(&marker.data_home)
                 .map_or(true, |path| path != marker.data_home)
+            || !valid_digest(&marker.repository_fingerprint)
+            || !valid_digest(&marker.display_name_digest)
+            || !valid_digest(&marker.idempotency_key_digest)
+            || !valid_digest(&marker.canonical_input_digest)
         {
             return Err(CliError::StoreCorrupted(
                 "init recovery metadata has unsupported identity".into(),
             ));
         }
         Ok(marker)
+    }
+
+    pub(crate) fn matches_request(
+        &self,
+        repository_fingerprint: &str,
+        data_home: &Path,
+        display_name: &str,
+        idempotency_key: &str,
+        canonical_repo_path: &str,
+    ) -> bool {
+        let expected_input_digest = match self.schema_version {
+            1 => legacy_canonical_input_digest(canonical_repo_path, display_name, idempotency_key),
+            PENDING_SCHEMA_VERSION => canonical_input_digest(canonical_repo_path, display_name),
+            _ => return false,
+        };
+        self.repository_fingerprint == repository_fingerprint
+            && self.data_home == data_home
+            && self.display_name_digest == digest(display_name)
+            && self.idempotency_key_digest == digest(idempotency_key)
+            && self.canonical_input_digest == expected_input_digest
     }
 }
 
@@ -194,6 +218,20 @@ pub(crate) fn normalize_absolute_path(path: &Path) -> Result<PathBuf, CliError> 
 
 fn digest(value: &str) -> String {
     format!("b3:{}", blake3::hash(value.as_bytes()).to_hex())
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 67
+        && value.starts_with("b3:")
+        && value[3..].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn legacy_canonical_input_digest(
+    canonical_repo_path: &str,
+    display_name: &str,
+    idempotency_key: &str,
+) -> String {
+    digest(&format!("{canonical_repo_path}\n{display_name}\n{idempotency_key}"))
 }
 
 fn canonical_input_digest(canonical_repo_path: &str, display_name: &str) -> String {
@@ -692,7 +730,7 @@ mod tests {
         };
         assert!(pointer.serialized().is_err());
         let pending = PendingInit::new(
-            "fingerprint".into(),
+            digest("/repo"),
             ProjectId::new(),
             long_escaped_path,
             "name",
@@ -724,7 +762,7 @@ mod tests {
         assert!(pointer.serialized().is_err());
         assert!(
             PendingInit::new(
-                "fingerprint".into(),
+                digest("/repo"),
                 v4,
                 PathBuf::from("/tmp/xtrace-data"),
                 "name",
@@ -739,7 +777,7 @@ mod tests {
         assert!(RepositoryPointer::parse(pointer_text.as_bytes()).is_err());
 
         let mut valid_marker = PendingInit::new(
-            "fingerprint".into(),
+            digest("/repo"),
             ProjectId::new(),
             PathBuf::from("/tmp/xtrace-data"),
             "name",
