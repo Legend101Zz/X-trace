@@ -140,8 +140,12 @@ entries identify a trusted `keyId`, authorized `role`, relative signature
 to test a pinned maintained `main` SHA because no current stable tag exists; it
 also records that obsolete `1.5.x` was not used.
 
-Run the stdlib-only tooling tests with:
+Run the stdlib-only tooling tests with an explicit existing scratch directory
+that has already passed the private-cache admission policy. The runner supplies
+its admitted `cache/tmp` as `XTRACE_TEST_SCRATCH_ROOT` to child test commands;
+direct test invocations must set that variable themselves. The tests do not
+fall back to writing beneath the user's home directory.
 
 ```text
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tools.release.test_release_tools
+XTRACE_TEST_SCRATCH_ROOT=/absolute/path/to/admitted/test-scratch PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tools.release.test_release_tools
 ```

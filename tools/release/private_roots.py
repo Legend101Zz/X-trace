@@ -31,7 +31,7 @@ LINUX_LOCAL_FILESYSTEMS = frozenset({"ext4", "xfs", "btrfs"})
 _MAC_DF_LINE = re.compile(r"^(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+%)\s+(.+)$")
 _MAC_MODE = re.compile(r"^d[rwxstST-]{9}(?:\+@|@\+|[+@.])?$")
 _MAC_FILE_MODE = re.compile(r"^-[rwxstST-]{9}(?:\+@|@\+|[+@.])?$")
-_MAC_ACE = re.compile(r"^(\d{1,2}): (user|group):([A-Za-z0-9_.$-]{1,128}) (allow|deny) ([a-z_,]+)(?: \(inherited\))?$")
+_MAC_ACE = re.compile(r"^(?: {1,2})?(\d{1,2}): (user|group):([A-Za-z0-9_.$-]{1,128}) (allow|deny) ([a-z_,]+)(?: \(inherited\))?$")
 _MOUNT_ESCAPE = re.compile(r"\\(040|011|012|134)")
 _MAC_RIGHTS = frozenset({
     "read", "write", "execute", "append", "delete", "list", "search",
@@ -422,10 +422,20 @@ def _mount_check(path: pathlib.Path, fd: int, info: os.stat_result) -> None:
 def _acl_check(path: pathlib.Path, fd: int) -> None:
     if sys.platform == "darwin":
         try:
+            info = os.fstat(fd)
+        except OSError:
+            raise _fail() from None
+        if stat.S_ISDIR(info.st_mode):
+            is_directory = True
+        elif stat.S_ISREG(info.st_mode):
+            is_directory = False
+        else:
+            raise _fail()
+        try:
             output, _ = _bounded_utility(["/bin/ls", "-ldeO", os.fspath(path)])
         except AdmissionError:
             raise _fail() from None
-        _parse_macos_acl(output, path)
+        _parse_macos_acl(output, path, directory=is_directory)
     elif sys.platform.startswith("linux"):
         _linux_acl_check(fd)
     else:
@@ -437,10 +447,12 @@ def _open_validated_directory(
     *,
     private_leaf: bool,
     current_uid: int | None = None,
-    acl_check: Callable[[pathlib.Path, int], None] = _acl_check,
-    mount_check: Callable[[pathlib.Path, int, os.stat_result], None] = _mount_check,
+    acl_check: Callable[[pathlib.Path, int], None] | None = None,
+    mount_check: Callable[[pathlib.Path, int, os.stat_result], None] | None = None,
 ) -> tuple[int, tuple[int, int]]:
     """Open every directory component with no-follow and bind checks to fds."""
+    acl_check = _acl_check if acl_check is None else acl_check
+    mount_check = _mount_check if mount_check is None else mount_check
     candidate = _absolute_path(path)
     uid = os.getuid() if current_uid is None else current_uid
     if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
@@ -683,13 +695,29 @@ def atomic_write_private(path: os.PathLike[str] | str, data: bytes) -> None:
         )
         created = True
         temp_path = candidate.with_name(temp_name)
-        _acl_check(temp_path, fd)
         file_info = os.fstat(fd)
+        if (not stat.S_ISREG(file_info.st_mode) or file_info.st_uid != os.getuid()
+                or stat.S_IMODE(file_info.st_mode) != 0o600 or file_info.st_nlink != 1):
+            raise _fail()
         named_info = os.stat(temp_name, dir_fd=parent_fd, follow_symlinks=False)
         if _object_signature(file_info) != _object_signature(named_info):
             raise _fail()
-        stream = os.fdopen(fd, "wb")
+        _acl_check(temp_path, fd)
+        checked_info = os.fstat(fd)
+        checked_name = os.stat(temp_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (_object_signature(file_info) != _object_signature(checked_info)
+                or _object_signature(file_info) != _object_signature(checked_name)):
+            raise _fail()
+        raw_fd = fd
         fd = None
+        try:
+            stream = os.fdopen(raw_fd, "wb")
+        except BaseException:
+            try:
+                os.close(raw_fd)
+            except OSError:
+                pass
+            raise
         with stream:
             stream.write(data)
             stream.flush()
@@ -697,6 +725,7 @@ def atomic_write_private(path: os.PathLike[str] | str, data: bytes) -> None:
         if admit_directory(candidate.parent, private_leaf=True) != parent_identity:
             raise _fail()
         os.replace(temp_name, candidate.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
     except BaseException:
         if fd is not None:
             try:

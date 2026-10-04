@@ -1203,7 +1203,15 @@ def _run(
 def _hash_file(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
     fd = private_roots.open_private_file_read(path)
-    with os.fdopen(fd, "rb") as stream:
+    try:
+        stream = os.fdopen(fd, "rb")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    with stream:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
@@ -1563,6 +1571,8 @@ def run(args: argparse.Namespace) -> int:
             "PLAYWRIGHT_BROWSERS_PATH": str(cache / "playwright"),
             "TMPDIR": str(cache / "tmp"),
             "XDG_CACHE_HOME": str(cache / "xdg"),
+            "XTRACE_TEST_SCRATCH_ROOT": str(cache / "tmp"),
+            "XTRACE_TEST_PRIVATE_SCRATCH": str(cache / "tmp"),
         })
         manifest["workingTreeDigestBefore"] = dirty_start
         manifest["phaseDiffSha256Before"] = _hash(diff_start)
@@ -1746,17 +1756,25 @@ def run(args: argparse.Namespace) -> int:
         print(f"Decision: {manifest['decision']} ({sum(item.get('status') != 'unreached' for item in results)}/{len(GATES)} gates reached)")
         return 0 if manifest["decision"] == "checks_passed_for_review" else 1
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
+        uncertain_command = isinstance(exc, UncertainProcessTree) and exc.command_started
+        # Lease retention is a consequence of the primary process-tree result,
+        # not of whether its diagnostic artifacts can still be admitted.
+        if uncertain_command:
+            retain_leases = True
+        lease_retention_errors: list[str] = []
         if active_attempt is not None:
             attempt = active_attempt
             gate = attempt["gate"]
             temp_log_path: pathlib.Path = attempt["tempLogPath"]
             log_path: pathlib.Path = attempt["logPath"]
             actual_log: pathlib.Path | None = None
+            artifact_finalization_failed = False
             if temp_log_path.is_file():
                 try:
                     private_roots.replace_private_file(temp_log_path, log_path, logs_identity)
                     actual_log = log_path
-                except OSError:
+                except (OSError, RuntimeError, ValueError):
+                    artifact_finalization_failed = True
                     if temp_log_path.is_file():
                         actual_log = temp_log_path
                     elif log_path.is_file():
@@ -1779,12 +1797,15 @@ def run(args: argparse.Namespace) -> int:
                 "cleanupUncertain": attempt["cleanupUncertain"],
                 "sourceIdentityAfter": "unavailable because gate command finalization failed",
             }
+            if artifact_finalization_failed:
+                entry["artifactFinalization"] = "unavailable after private admission or filesystem error"
             if actual_log is not None:
                 entry["log"] = f"logs/{actual_log.name}"
                 try:
                     entry["logSha256"] = _hash_file(actual_log)
-                except OSError:
+                except (OSError, RuntimeError, ValueError):
                     entry["logHash"] = "unavailable"
+                    entry["artifactFinalization"] = "log hash unavailable after private admission or filesystem error"
             if attempt["naturalExitSettle"]:
                 entry["naturalExitSettle"] = attempt["naturalExitSettle"]
             results.append(entry)
@@ -1792,15 +1813,22 @@ def run(args: argparse.Namespace) -> int:
             manifest["headAfter"] = None
             manifest["workingTreeDigestAfter"] = None
             manifest["phaseDiffSha256After"] = None
-        if isinstance(exc, UncertainProcessTree) and exc.command_started:
-            retain_leases = True
+        if uncertain_command:
             for lease in acquired_leases:
-                lease.retain_for_manual_recovery(
-                    str(exc), exc.process_group_id, exc.owned_processes, exc.unconfirmed_processes,
-                    exc.unconfirmed_process_count, exc.owned_probe_processes,
-                )
+                try:
+                    lease.retain_for_manual_recovery(
+                        str(exc), exc.process_group_id, exc.owned_processes, exc.unconfirmed_processes,
+                        exc.unconfirmed_process_count, exc.owned_probe_processes,
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    lease_retention_errors.append(lease.label)
         manifest["decision"] = "failed"
         manifest["error"] = str(exc)
+        if lease_retention_errors:
+            manifest["leaseRetention"] = {
+                "status": "owner records unavailable; leases retained without modification",
+                "leaseNames": lease_retention_errors,
+            }
         try:
             manifest["headAfter"] = _git(repo, "rev-parse", "HEAD").lower()
         except RuntimeError:
@@ -1812,7 +1840,7 @@ def run(args: argparse.Namespace) -> int:
         ]
         try:
             _atomic_json(run_dir / "receipt.json", manifest)
-        except OSError:
+        except (OSError, RuntimeError, ValueError):
             pass
         print(f"release gates failed: {exc}", file=sys.stderr)
         return 1

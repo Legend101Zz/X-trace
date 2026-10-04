@@ -13,12 +13,25 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from argparse import Namespace
 from unittest import mock
 
 from tools.release import check_ledger, private_roots, run_gates
 
 REAL_VERSIONS = run_gates._versions
+
+
+def test_scratch_root() -> pathlib.Path:
+    value = os.environ.get("XTRACE_TEST_SCRATCH_ROOT")
+    if not value:
+        raise RuntimeError("XTRACE_TEST_SCRATCH_ROOT must name an admitted test scratch directory")
+    path = pathlib.Path(value)
+    if not path.is_absolute() or path.is_symlink() or not path.is_dir():
+        raise RuntimeError("XTRACE_TEST_SCRATCH_ROOT must be an existing real directory")
+    if path.resolve(strict=True) != path:
+        raise RuntimeError("XTRACE_TEST_SCRATCH_ROOT must use its canonical path")
+    return path
 
 
 class PrivateRootAdmissionTests(unittest.TestCase):
@@ -39,13 +52,18 @@ class PrivateRootAdmissionTests(unittest.TestCase):
         )
         private_roots._parse_macos_acl(
             (f"drwx------@ 88 example staff - 2816 Oct 4 03:00 {cache}\n"
-             "0: group:everyone deny delete\n").encode(),
+             " 0: group:everyone deny delete\n").encode(),
             cache,
         )
         documents = pathlib.Path("/Users/example/Documents")
         private_roots._parse_macos_acl(
             (f"drwx------@ 9 example staff - 288 Oct 4 00:23 {documents}\n"
-             "0: group:everyone deny delete\n").encode(),
+             " 0: group:everyone deny delete\n").encode(),
+            documents,
+        )
+        private_roots._parse_macos_acl(
+            (f"drwx------@ 9 example staff - 288 Oct 4 00:23 {documents}\n"
+             "  0: group:everyone deny delete\n").encode(),
             documents,
         )
 
@@ -53,9 +71,11 @@ class PrivateRootAdmissionTests(unittest.TestCase):
         path = pathlib.Path("/Users/test/parent with spaces")
         good_header = f"drwx------+ 2 test staff - 64 Oct 4 00:23 {path}\n"
         for payload in (
-            (good_header + "0: group:everyone allow read\n").encode(),
+            (good_header + " 0: group:everyone allow read\n").encode(),
+            (good_header + " 0: group:everyone allow read (inherited)\n").encode(),
             (good_header + "0: group:everyone allow read (inherited)\n").encode(),
-            (good_header + "1: group:everyone deny delete\n").encode(),
+            (good_header + " 1: group:everyone deny delete\n").encode(),
+            (good_header + "\t0: group:everyone deny delete\n").encode(),
             f"drwx------ 2 test staff - 64 Oct 4 00:23 {path}\n0: malformed\n".encode(),
             f"drwx------ 2 test staff - 64 Oct 4 00:23 /wrong/path\n".encode(),
             f"drwx------ 2 test staff - 64 Oct 4 00:23 {path}\nextra header field\n".encode(),
@@ -64,8 +84,96 @@ class PrivateRootAdmissionTests(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(private_roots.AdmissionError):
                 private_roots._parse_macos_acl(payload, path)
 
+    def test_macos_acl_check_uses_the_validated_regular_file_kind(self) -> None:
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
+            path = pathlib.Path(temporary) / "owner file.log"
+            path.write_bytes(b"synthetic public fixture\n")
+            os.chmod(path, 0o600)
+            output = f"-rw------- 1 example staff - 24 Oct 4 00:23 {path}\n".encode()
+            with path.open("rb") as stream, \
+                    mock.patch.object(private_roots.sys, "platform", "darwin"), \
+                    mock.patch.object(private_roots, "_bounded_utility", return_value=(output, b"")):
+                private_roots._acl_check(path, stream.fileno())
+                mismatched_directory_header = output.replace(b"-rw-------", b"drwx------")
+                with mock.patch.object(
+                    private_roots, "_bounded_utility",
+                    return_value=(mismatched_directory_header, b""),
+                ), self.assertRaises(private_roots.AdmissionError):
+                    private_roots._acl_check(path, stream.fileno())
+
+    def test_atomic_private_write_checks_created_metadata_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
+            root = pathlib.Path(temporary)
+            destination = root / "receipt.json"
+            real_fstat = os.fstat
+            identity = (root.stat().st_dev, root.stat().st_ino)
+
+            def opened_parent(path: pathlib.Path, **_kwargs: object) -> tuple[int, tuple[int, int]]:
+                self.assertEqual(path, root)
+                return os.open(path, os.O_RDONLY | os.O_DIRECTORY), identity
+
+            def wrong_owner(fd: int) -> object:
+                info = real_fstat(fd)
+                return SimpleNamespace(
+                    st_dev=info.st_dev, st_ino=info.st_ino, st_uid=os.getuid() + 1,
+                    st_mode=info.st_mode, st_nlink=info.st_nlink, st_size=info.st_size,
+                )
+
+            with mock.patch.object(private_roots, "_open_validated_directory", side_effect=opened_parent), \
+                    mock.patch.object(private_roots, "admit_directory", return_value=identity), \
+                    mock.patch.object(private_roots, "_acl_check"), \
+                    mock.patch.object(private_roots.os, "fstat", side_effect=wrong_owner):
+                with self.assertRaises(private_roots.AdmissionError):
+                    private_roots.atomic_write_private(destination, b"must not be written")
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_atomic_private_write_fails_if_parent_fsync_fails(self) -> None:
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
+            root = pathlib.Path(temporary)
+            destination = root / "receipt.json"
+            identity = (root.stat().st_dev, root.stat().st_ino)
+            real_fsync = os.fsync
+            real_fstat = os.fstat
+            observed_directory_sync: list[bool] = []
+            calls = 0
+
+            def opened_parent(path: pathlib.Path, **_kwargs: object) -> tuple[int, tuple[int, int]]:
+                self.assertEqual(path, root)
+                return os.open(path, os.O_RDONLY | os.O_DIRECTORY), identity
+
+            def fail_parent_fsync(fd: int) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    observed_directory_sync.append(stat.S_ISDIR(real_fstat(fd).st_mode))
+                    raise OSError("injected parent fsync failure")
+                real_fsync(fd)
+
+            with mock.patch.object(private_roots, "_open_validated_directory", side_effect=opened_parent), \
+                    mock.patch.object(private_roots, "admit_directory", return_value=identity), \
+                    mock.patch.object(private_roots, "_acl_check"), \
+                    mock.patch.object(private_roots.os, "fsync", side_effect=fail_parent_fsync):
+                with self.assertRaises(OSError):
+                    private_roots.atomic_write_private(destination, b"metadata")
+            self.assertEqual(calls, 2)
+            self.assertEqual(observed_directory_sync, [True])
+            self.assertEqual(destination.read_bytes(), b"metadata")
+
+    def test_hash_file_closes_descriptor_when_fdopen_conversion_fails(self) -> None:
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
+            path = pathlib.Path(temporary) / "public fixture.log"
+            path.write_bytes(b"public fixture")
+            fd = os.open(path, os.O_RDONLY)
+            with mock.patch.object(private_roots, "open_private_file_read", return_value=fd), \
+                    mock.patch.object(run_gates.os, "fdopen", side_effect=OSError("injected conversion failure")):
+                with self.assertRaises(OSError):
+                    run_gates._hash_file(path)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
     def test_directory_admission_uses_injected_acl_and_mount_facts(self) -> None:
-        with tempfile.TemporaryDirectory(dir=pathlib.Path.home()) as temporary:
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
             child = pathlib.Path(temporary) / "private child"
             child.mkdir(mode=0o700)
             acl_paths: list[pathlib.Path] = []
@@ -86,7 +194,7 @@ class PrivateRootAdmissionTests(unittest.TestCase):
             self.assertIn(child, mount_paths)
 
     def test_directory_admission_rejects_writable_parent_and_same_inode_mode_change(self) -> None:
-        with tempfile.TemporaryDirectory(dir=pathlib.Path.home()) as temporary:
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
             parent = pathlib.Path(temporary)
             child = parent / "private child"
             child.mkdir(mode=0o700)
@@ -114,7 +222,7 @@ class PrivateRootAdmissionTests(unittest.TestCase):
             os.chmod(child, 0o700)
 
     def test_directory_admission_rejects_rename_during_mount_check(self) -> None:
-        with tempfile.TemporaryDirectory(dir=pathlib.Path.home()) as temporary:
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
             child = pathlib.Path(temporary) / "private child"
             moved = pathlib.Path(temporary) / "moved child"
             child.mkdir(mode=0o700)
@@ -138,8 +246,7 @@ class PrivateRootAdmissionTests(unittest.TestCase):
             self.assertIsNone(private_roots._bounded_json_shape(stream.fileno(), 64))
             with self.assertRaises(private_roots.AdmissionError):
                 private_roots._loads_bounded_private_json(b'{"owner":NaN}')
-            with self.assertRaises(private_roots.AdmissionError):
-                private_roots._bounded_json_value({"owner": float("inf")})
+            self.assertFalse(private_roots._bounded_json_value({"owner": float("inf")}))
             stream.seek(0)
             stream.truncate()
             stream.write((b"[" * 10) + (b"]" * 10))
@@ -613,7 +720,17 @@ class LedgerTests(unittest.TestCase):
 
 class RunnerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(dir=pathlib.Path.home())
+        self.temp = tempfile.TemporaryDirectory(dir=test_scratch_root())
+        self.addCleanup(self.temp.cleanup)
+        # Runner tests exercise orchestration against public synthetic trees.
+        # Host ACL and mount observations are covered by explicit component
+        # fixtures, not by treating this scratch tree as private storage.
+        self.acl_patcher = mock.patch.object(private_roots, "_acl_check", lambda _path, _fd: None)
+        self.mount_patcher = mock.patch.object(private_roots, "_mount_check", lambda _path, _fd, _info: None)
+        self.acl_patcher.start()
+        self.mount_patcher.start()
+        self.addCleanup(self.mount_patcher.stop)
+        self.addCleanup(self.acl_patcher.stop)
         self.root = pathlib.Path(self.temp.name)
         self.repo = self.root / "repo"
         self.repo.mkdir()
@@ -630,9 +747,6 @@ class RunnerTests(unittest.TestCase):
         self.versions_patcher = mock.patch.object(run_gates, "_versions", return_value={})
         self.versions_patcher.start()
         self.addCleanup(self.versions_patcher.stop)
-
-    def tearDown(self) -> None:
-        self.temp.cleanup()
 
     def args(self) -> Namespace:
         return Namespace(repo=str(self.repo), base=self.base, label="P00-test", cache_root=str(self.cache), command_timeout=30)
@@ -995,6 +1109,43 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(receipt["gates"][1]["status"], "unreached")
         for name in ("cargo", "gradle"):
             self.assertTrue((self.cache / "leases" / name / "owner.json").is_file())
+
+    def test_admission_error_finalizing_uncertain_log_does_not_release_leases(self) -> None:
+        attempted = run_gates.Gate("uncertain-log", ("java", "-version"))
+
+        def uncertain_run(
+            _argv: object, *, log_path: pathlib.Path, **_kwargs: object,
+        ) -> tuple[int, float]:
+            log_path.write_bytes(b"partial public synthetic log\n")
+            os.chmod(log_path, 0o600)
+            error = run_gates.UncertainProcessTree("owned tree did not drain", 777)
+            error.command_started = True
+            error.raw_exit_code = 0
+            error.duration_seconds = 1.25
+            error.owned_processes = {777: "started"}
+            error.unconfirmed_processes = []
+            raise error
+
+        with mock.patch.object(run_gates, "GATES", (attempted,)), \
+                mock.patch.object(run_gates, "_run", side_effect=uncertain_run), \
+                mock.patch.object(
+                    private_roots, "replace_private_file",
+                    side_effect=private_roots.AdmissionError("synthetic admission failure"),
+                ):
+            self.assertEqual(run_gates.run(self.args()), 1)
+
+        for name in ("cargo", "gradle"):
+            lease = self.cache / "leases" / name
+            self.assertTrue(lease.is_dir(), f"uncertain {name} lease was removed")
+            owner = json.loads((lease / "owner.json").read_text())
+            self.assertTrue(owner["requiresManualRecovery"])
+            self.assertEqual(owner["processGroupId"], 777)
+        receipt = json.loads(
+            (self.cache / "release-gates" / "P00-test" / "receipt.json").read_text()
+        )
+        self.assertEqual(receipt["gates"][0]["exitCode"], 0)
+        self.assertTrue(receipt["gates"][0]["cleanupUncertain"])
+        self.assertIn("unavailable", receipt["gates"][0]["artifactFinalization"])
 
     def test_normal_return_finalization_failures_remain_attempted_gate_receipts(self) -> None:
         real_replace = os.replace
