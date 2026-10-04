@@ -170,7 +170,7 @@ impl JavaAttachPack {
         let packs_name = "java-packs";
         let packs = open_or_create_private_child(&parent, packs_name)?;
         admit_directory_descriptor(&cache.join(packs_name), &packs, true)?;
-        let snapshot_path = cache.join(packs_name).join(snapshot_name);
+        let snapshot_path = cache.join(packs_name).join(&snapshot_name);
         match std::fs::symlink_metadata(&snapshot_path) {
             Ok(_) => {
                 // An existing snapshot must be complete and identical. Never repair
@@ -1152,7 +1152,8 @@ fn acl_admits_directory(_path: &Path, directory: &std::fs::File, _expected: File
         error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NODATA
     }
     for name in ["system.posix_acl_access", "system.posix_acl_default"] {
-        match rustix::fs::fgetxattr(directory, name, vec![0_u8; 16 * 1024]) {
+        let mut value = [0_u8; 16 * 1024];
+        match rustix::fs::fgetxattr(directory, name, value.as_mut_slice()) {
             Ok(_) => return false,
             Err(error) if absent(error) => {}
             Err(_) => return false,
