@@ -143,11 +143,15 @@ because a live or identity-uncertain target may still load classes lazily; a
 full cache fails closed instead of deleting files still needed by a target.
 
 ```bash
-xtrace attach --project-dir /path/to/initialized/repository --pid 12345 --json
+xtrace attach --project-dir /path/to/initialized/repository --pid 12345 \
+  --java-pack /path/to/adapters/java/build/java-pack-dist --json
 ```
 
 For an unpackaged development build, add
 `--java-pack /path/to/adapters/java/build/java-pack-dist`.
+Java attach snapshot tests require `XTRACE_TEST_PRIVATE_SCRATCH` to point at a
+pre-created owner-enforced private scratch directory. They fail when it is
+unset and never fall back to the home directory or system temporary directory.
 
 ```bash
 adapters/java/gradlew -p adapters/java --dependency-verification strict \

@@ -299,6 +299,8 @@ final class HelperSupervisor {
   }
 
   static final class WorkerCleanupException extends IOException {
+    private static final long serialVersionUID = 1L;
+
     private final long workerPid;
     private final java.time.Instant workerStartTime;
     private final String failureKind;
@@ -324,6 +326,8 @@ final class HelperSupervisor {
   }
 
   static final class TimeoutException extends Exception {
+    private static final long serialVersionUID = 1L;
+
     private final long workerPid;
 
     private TimeoutException(long workerPid) {

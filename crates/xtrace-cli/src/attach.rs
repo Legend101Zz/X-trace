@@ -1,6 +1,6 @@
 //! Foreground composition for one explicitly selected, already-running JVM.
 
-use std::io::{BufRead as _, IsTerminal as _, Write as _};
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -10,7 +10,8 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 use xtrace_runtime::java_attach::{
-    AttachError, JavaAttachPack, admit_private_directory, prepare_helper_cache,
+    AttachError, JavaAttachPack, admit_private_container_directory, admit_private_directory,
+    prepare_helper_cache,
 };
 
 use crate::commands::{resolve_data_home, resolve_repo};
@@ -146,7 +147,7 @@ pub(crate) async fn run(
             error
         }
     })?;
-    let crate::daemon::PreparedDaemon { bound, bootstrap_path, mut runtime_dir, lock } = prepared;
+    let crate::daemon::PreparedDaemon { bound, bootstrap_path, runtime_dir, lock } = prepared;
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let mut server = tokio::spawn(async move {
         bound
@@ -164,7 +165,7 @@ pub(crate) async fn run(
     let mut shutdown_signals = match ShutdownSignals::install() {
         Ok(signals) => signals,
         Err(error) => {
-            return cleanup_after_primary(shutdown, server, &mut runtime_dir, lock, error).await;
+            return cleanup_after_primary(shutdown, server, runtime_dir, lock, error).await;
         }
     };
 
@@ -176,7 +177,7 @@ pub(crate) async fn run(
             "Use an owner-enforced local data directory and retry.",
             2,
         );
-        return cleanup_after_primary(shutdown, server, &mut runtime_dir, lock, error).await;
+        return cleanup_after_primary(shutdown, server, runtime_dir, lock, error).await;
     };
     // Daemon preparation can take time. Revalidate immediately before the
     // helper invocation; the helper independently checks again before loadAgent.
@@ -184,10 +185,10 @@ pub(crate) async fn run(
     let identity_check =
         final_inspection.and_then(|observed| verify_identity(&selected, &observed));
     if let Err(error) = identity_check {
-        return cleanup_after_primary(shutdown, server, &mut runtime_dir, lock, error).await;
+        return cleanup_after_primary(shutdown, server, runtime_dir, lock, error).await;
     }
     if let Err(error) = verify_os_identity(&selected).await {
-        return cleanup_after_primary(shutdown, server, &mut runtime_dir, lock, error).await;
+        return cleanup_after_primary(shutdown, server, runtime_dir, lock, error).await;
     }
     let attach_result = helper_command(
         &helper_java,
@@ -209,12 +210,12 @@ pub(crate) async fn run(
     let attach_result = match attach_result {
         Ok(result) => result,
         Err(error) => {
-            return cleanup_after_primary(shutdown, server, &mut runtime_dir, lock, error).await;
+            return cleanup_after_primary(shutdown, server, runtime_dir, lock, error).await;
         }
     };
     if !attach_result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         let error = helper_failure(&attach_result, "attach");
-        return cleanup_after_primary(shutdown, server, &mut runtime_dir, lock, error).await;
+        return cleanup_after_primary(shutdown, server, runtime_dir, lock, error).await;
     }
     let attached_identity = process_document(attach_result.get("process").unwrap_or(&Value::Null));
     let Some(process) = attached_identity else {
@@ -225,7 +226,7 @@ pub(crate) async fn run(
             "Inspect the target before retrying; if its attach state is uncertain, relaunch through X-trace.",
             7,
         );
-        return cleanup_after_primary(shutdown, server, &mut runtime_dir, lock, error).await;
+        return cleanup_after_primary(shutdown, server, runtime_dir, lock, error).await;
     };
 
     let document = AttachResultDocument {
@@ -254,7 +255,6 @@ pub(crate) async fn run(
             document.pid,
             document.process.owner
         )
-        .map_err(|_| CliError::StoreUnavailable("write attach result failed".to_string()))
     }
     .and_then(|()| output.flush());
     if output_result.is_err() {
@@ -266,7 +266,7 @@ pub(crate) async fn run(
             "Inspect the target before retrying; if attach state is uncertain, relaunch through X-trace.",
             7,
         );
-        return cleanup_after_primary(shutdown, server, &mut runtime_dir, lock, error).await;
+        return cleanup_after_primary(shutdown, server, runtime_dir, lock, error).await;
     }
     drop(output);
 
@@ -293,7 +293,7 @@ pub(crate) async fn run(
             await_owned_server(&mut server).await
         }
         ForegroundEnd::SignalSetupFailed(error) => {
-            return cleanup_after_primary(shutdown, server, &mut runtime_dir, lock, error).await;
+            return cleanup_after_primary(shutdown, server, runtime_dir, lock, error).await;
         }
         ForegroundEnd::ServerFinished(result) => {
             if shutdown.send(()).is_err() {
@@ -306,12 +306,20 @@ pub(crate) async fn run(
         }
     };
     let cleanup_result = match &server_result {
-        OwnedServerResult::Finished(_) => runtime_dir.cleanup(),
+        OwnedServerResult::Finished(_) => {
+            finish_confirmed_runtime(runtime_dir, lock, |runtime| runtime.cleanup())
+        }
         OwnedServerResult::Unconfirmed => {
-            Err(std::io::Error::other("owned server shutdown is unconfirmed"))
+            retain_unconfirmed_runtime(runtime_dir, lock);
+            return Err(attach_error(
+                "XTR-ATTACH-DAEMON-FAILED",
+                "process",
+                "The owned recording session could not be confirmed stopped.",
+                "Leave this project closed until the X-trace process exits; the selected JVM remains running.",
+                7,
+            ));
         }
     };
-    drop(lock);
     if !matches!(&server_result, OwnedServerResult::Finished(Ok(Ok(())))) {
         if cleanup_result.is_err() {
             tracing::warn!(
@@ -333,7 +341,7 @@ pub(crate) async fn run(
 async fn cleanup_after_primary(
     shutdown: tokio::sync::oneshot::Sender<()>,
     server: tokio::task::JoinHandle<Result<(), xtrace_daemon::DaemonError>>,
-    runtime_dir: &mut crate::daemon_lock::RuntimeDirectory,
+    runtime_dir: crate::daemon_lock::RuntimeDirectory,
     lock: crate::daemon_lock::ProjectDaemonLock,
     primary: CliError,
 ) -> Result<(), CliError> {
@@ -345,19 +353,54 @@ async fn cleanup_after_primary(
         );
     }
     let server_result = await_owned_server(&mut server).await;
-    let cleanup_result = if matches!(server_result, OwnedServerResult::Unconfirmed) {
-        Err(std::io::Error::other("owned server shutdown is unconfirmed"))
-    } else {
-        runtime_dir.cleanup()
+    let cleanup_result = match &server_result {
+        OwnedServerResult::Finished(_) => {
+            finish_confirmed_runtime(runtime_dir, lock, |runtime| runtime.cleanup())
+        }
+        OwnedServerResult::Unconfirmed => {
+            retain_unconfirmed_runtime(runtime_dir, lock);
+            Err(attach_error(
+                "XTR-ATTACH-DAEMON-FAILED",
+                "process",
+                "The owned recording session could not be confirmed stopped.",
+                "Leave this project closed until the X-trace process exits; the selected JVM remains running.",
+                7,
+            ))
+        }
     };
-    drop(lock);
-    if !matches!(server_result, Ok(Ok(()))) || cleanup_result.is_err() {
+    if cleanup_result.is_err() || !matches!(&server_result, OwnedServerResult::Finished(Ok(Ok(()))))
+    {
         tracing::warn!(
             code = "XTR-ATTACH-CLEANUP-UNCONFIRMED",
             "owned attach cleanup did not complete"
         );
     }
     Err(primary)
+}
+
+fn finish_confirmed_runtime<R, L, C>(runtime_dir: R, lock: L, cleanup: C) -> Result<(), CliError>
+where
+    C: FnOnce(&mut R) -> Result<(), CliError>,
+{
+    let mut runtime_dir = runtime_dir;
+    let cleanup_result = cleanup(&mut runtime_dir);
+    // RuntimeDirectory::drop may retry cleanup, so it must finish while the
+    // project lock still prevents a new owner from entering this directory.
+    drop(runtime_dir);
+    drop(lock);
+    cleanup_result
+}
+
+fn retain_unconfirmed_runtime(
+    mut runtime_dir: crate::daemon_lock::RuntimeDirectory,
+    lock: crate::daemon_lock::ProjectDaemonLock,
+) {
+    // No in-process custodian can prove a timed-out task has drained. Keep its
+    // artifacts and lock until this CLI process exits; never let Drop clean
+    // them while the daemon may still be using the session directory.
+    runtime_dir.defer_drop_cleanup();
+    std::mem::forget(runtime_dir);
+    std::mem::forget(lock);
 }
 
 enum OwnedServerResult {
@@ -368,15 +411,18 @@ enum OwnedServerResult {
 async fn await_owned_server(
     server: &mut tokio::task::JoinHandle<Result<(), xtrace_daemon::DaemonError>>,
 ) -> OwnedServerResult {
-    match tokio::time::timeout(Duration::from_secs(5), &mut *server).await {
+    await_owned_server_with_timeout(server, Duration::from_secs(5)).await
+}
+
+async fn await_owned_server_with_timeout(
+    server: &mut tokio::task::JoinHandle<Result<(), xtrace_daemon::DaemonError>>,
+    timeout: Duration,
+) -> OwnedServerResult {
+    match tokio::time::timeout(timeout, &mut *server).await {
         Ok(result) => OwnedServerResult::Finished(result),
-        Err(_) => {
-            server.abort();
-            match tokio::time::timeout(Duration::from_secs(1), &mut *server).await {
-                Ok(result) => OwnedServerResult::Finished(result),
-                Err(_) => OwnedServerResult::Unconfirmed,
-            }
-        }
+        // Cancellation cannot preempt work already running in spawn_blocking.
+        // Do not abort and mistake a cancelled serve future for drained storage.
+        Err(_) => OwnedServerResult::Unconfirmed,
     }
 }
 
@@ -415,7 +461,7 @@ fn validate_project_private_roots(
     data_home: &Path,
     project_data_root: &Path,
 ) -> Result<(), CliError> {
-    admit_private_directory(data_home).map_err(map_runtime_error)?;
+    admit_private_container_directory(data_home).map_err(map_runtime_error)?;
     admit_private_directory(project_data_root).map_err(map_runtime_error)?;
     Ok(())
 }
@@ -663,7 +709,7 @@ async fn stop_helper_group(child: &mut tokio::process::Child, raw_pid: u32) {
         return;
     }
     let Ok(raw_pid) = i32::try_from(raw_pid) else { return };
-    let group = Pid::from_raw(raw_pid);
+    let Some(group) = Pid::from_raw(raw_pid) else { return };
     if let Err(error) = kill_process_group(group, Signal::TERM) {
         tracing::warn!(code = "XTR-ATTACH-WORKER-UNCONFIRMED", errno = %error, "owned helper group termination was not confirmed");
     }
@@ -898,7 +944,7 @@ fn require_interactive_terminal(is_tty: bool) -> Result<(), CliError> {
         "XTR-ATTACH-PID-REQUIRED",
         "validation",
         "A PID is required when no interactive terminal is available.",
-        "Run xtrace attach --pid <PID> --project-dir <DIR>.",
+        "Run xtrace attach --pid <PID> --project-dir <DIR> --java-pack <DIR>.",
         2,
     ))
 }
@@ -1220,6 +1266,8 @@ impl ShutdownSignals {
 mod tests {
     use super::*;
     use clap::Parser as _;
+    use std::cell::RefCell;
+    use xtrace_domain::RuntimeSessionId;
 
     #[test]
     fn non_tty_attach_requires_explicit_pid_even_for_one_listed_process() {
@@ -1230,7 +1278,10 @@ mod tests {
         })];
         assert_eq!(rows.len(), 1);
         let error = require_interactive_terminal(false).expect_err("PID must be explicit");
-        assert!(matches!(error, CliError::Attach { code: "XTR-ATTACH-PID-REQUIRED", .. }));
+        assert!(matches!(&error, CliError::Attach { code: "XTR-ATTACH-PID-REQUIRED", .. }));
+        if let CliError::Attach { remediation, .. } = error {
+            assert!(remediation.contains("--java-pack <DIR>"));
+        }
     }
 
     #[test]
@@ -1344,5 +1395,77 @@ mod tests {
             .status()
             .expect("stop test-owned worker by its reported PID");
         assert!(terminated.success());
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_blocking_server_work_retains_lock_and_runtime_artifacts() {
+        let project = tempfile::tempdir().expect("disposable project data root");
+        let lock = crate::daemon_lock::acquire_project_lock(project.path()).expect("project lock");
+        let runtime =
+            crate::daemon_lock::RuntimeDirectory::create(project.path(), RuntimeSessionId::new())
+                .expect("session directory");
+        let session_path = runtime.path().to_path_buf();
+        let marker_path = session_path.join(".in-flight-marker");
+        std::fs::write(&marker_path, b"still in use").expect("marker");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).expect("signal work started");
+            release_rx.recv().expect("release blocking storage work");
+        });
+        let mut server = tokio::spawn(async move {
+            let _ = blocking.await;
+            Ok::<(), xtrace_daemon::DaemonError>(())
+        });
+        started_rx.await.expect("blocking work started");
+
+        let drain = await_owned_server_with_timeout(&mut server, Duration::from_millis(10)).await;
+        assert!(matches!(drain, OwnedServerResult::Unconfirmed));
+        retain_unconfirmed_runtime(runtime, lock);
+        assert!(marker_path.exists(), "unconfirmed work must retain its session artifacts");
+        assert!(matches!(
+            crate::daemon_lock::acquire_project_lock(project.path()),
+            Err(CliError::DaemonAlreadyRunning)
+        ));
+
+        release_tx.send(()).expect("release work after retention assertion");
+        server.await.expect("server completes when blocking work is released").expect("server ok");
+        assert!(marker_path.exists(), "retained artifacts are left for process-exit cleanup");
+        assert!(matches!(
+            crate::daemon_lock::acquire_project_lock(project.path()),
+            Err(CliError::DaemonAlreadyRunning)
+        ));
+    }
+
+    #[test]
+    fn confirmed_cleanup_failure_drops_runtime_before_releasing_lock() {
+        struct DropEvent<'a> {
+            name: &'static str,
+            events: &'a RefCell<Vec<&'static str>>,
+        }
+
+        impl Drop for DropEvent<'_> {
+            fn drop(&mut self) {
+                self.events.borrow_mut().push(self.name);
+            }
+        }
+
+        let events = RefCell::new(Vec::new());
+        let runtime = DropEvent { name: "runtime-drop", events: &events };
+        let lock = DropEvent { name: "lock-drop", events: &events };
+        let result = finish_confirmed_runtime(runtime, lock, |_| {
+            events.borrow_mut().push("cleanup");
+            Err(attach_error(
+                "XTR-ATTACH-CLEANUP-FAILED",
+                "process",
+                "cleanup failed",
+                "retry cleanup",
+                7,
+            ))
+        });
+
+        assert!(result.is_err(), "cleanup failure must remain observable");
+        assert_eq!(events.borrow().as_slice(), &["cleanup", "runtime-drop", "lock-drop"]);
     }
 }

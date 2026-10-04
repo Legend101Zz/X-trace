@@ -404,6 +404,8 @@ final class AttachCommands {
   }
 
   static final class Failure extends Exception {
+    private static final long serialVersionUID = 1L;
+
     private final String command;
     private final String code;
     private final int exitCode;

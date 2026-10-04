@@ -246,6 +246,7 @@ impl JavaAttachPack {
                 | rustix::fs::OFlags::NOFOLLOW,
             rustix::fs::Mode::from_raw_mode(0o400),
         )
+        .map(std::fs::File::from)
         .map_err(|_| {
             AttachError::PrivateStorage("the private Java pack snapshot could not be written")
         })?;
@@ -483,6 +484,13 @@ fn write_snapshot_file(
 pub fn admit_private_directory(path: &Path) -> Result<(), AttachError> {
     let directory = open_directory_without_symlinks(path)
         .map_err(|_| AttachError::PrivateStorage("private storage cannot be opened"))?;
+    admit_directory_descriptor(path, &directory, true)
+}
+
+/// Admits a user-data container that may be traversable but is not writable by other users.
+pub fn admit_private_container_directory(path: &Path) -> Result<(), AttachError> {
+    let directory = open_directory_without_symlinks(path)
+        .map_err(|_| AttachError::PrivateStorage("private storage cannot be opened"))?;
     admit_directory_descriptor(path, &directory, false)
 }
 
@@ -532,7 +540,7 @@ fn admit_directory_descriptor(
 
 /// Creates a private, durable helper cache below an already-admitted user data home.
 pub fn prepare_helper_cache(data_home: &Path) -> Result<PathBuf, AttachError> {
-    admit_private_directory(data_home)?;
+    admit_private_container_directory(data_home)?;
     let cache = data_home.join(".xtrace-java-attach-cache");
     let parent = open_directory_without_symlinks(data_home)
         .map_err(|_| AttachError::PrivateStorage("the user data home changed during inspection"))?;
@@ -761,12 +769,15 @@ fn verify_metadata_owner_mode(
 ) -> Result<(), AttachError> {
     use std::os::unix::fs::MetadataExt as _;
     if metadata.uid() != rustix::process::getuid().as_raw()
-        || metadata.mode() & (if owner_only { 0o077 } else { 0o022 }) != 0
-        || (owner_only && metadata.mode() & 0o7777 != 0o700)
+        || !directory_mode_allowed(metadata.mode(), owner_only)
     {
         return Err(AttachError::Validation("private storage ownership or permissions are unsafe"));
     }
     Ok(())
+}
+
+fn directory_mode_allowed(mode: u32, owner_only: bool) -> bool {
+    if owner_only { mode & 0o7777 == 0o700 } else { mode & 0o022 == 0 }
 }
 
 fn read_bounded_file(
@@ -775,11 +786,10 @@ fn read_bounded_file(
     bound: u64,
 ) -> Result<Vec<u8>, AttachError> {
     use std::io::Read as _;
-    use std::os::unix::fs::MetadataExt as _;
     if expected.size > bound {
         return Err(AttachError::Validation("a Java attach pack file exceeds its size limit"));
     }
-    let mut file = std::fs::File::open(path)
+    let file = std::fs::File::open(path)
         .map_err(|_| AttachError::Validation("a Java attach pack file cannot be read"))?;
     let before = file
         .metadata()
@@ -817,23 +827,26 @@ fn open_directory_without_symlinks(path: &Path) -> std::io::Result<std::fs::File
             "directory path is not absolute",
         ));
     }
-    let mut descriptor = open(
+    let mut descriptor = std::fs::File::from(open(
         "/",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-    )?;
-    verify_ancestor_metadata(&descriptor)?;
+    )?);
+    let mut traversed = PathBuf::from("/");
+    verify_ancestor_metadata(&traversed, &descriptor)?;
     for component in path.components() {
         match component {
             std::path::Component::RootDir => {}
             std::path::Component::Normal(name) => {
-                descriptor = openat(
+                let opened = openat(
                     &descriptor,
                     name,
                     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                     Mode::empty(),
                 )?;
-                verify_ancestor_metadata(&descriptor)?;
+                traversed.push(name);
+                descriptor = std::fs::File::from(opened);
+                verify_ancestor_metadata(&traversed, &descriptor)?;
             }
             std::path::Component::CurDir
             | std::path::Component::ParentDir
@@ -845,25 +858,29 @@ fn open_directory_without_symlinks(path: &Path) -> std::io::Result<std::fs::File
             }
         }
     }
-    Ok(std::fs::File::from(descriptor))
+    Ok(descriptor)
 }
 
-fn verify_ancestor_metadata(descriptor: &impl std::os::fd::AsFd) -> std::io::Result<()> {
-    let metadata = rustix::fs::fstat(descriptor)?;
+fn verify_ancestor_metadata(path: &Path, descriptor: &std::fs::File) -> std::io::Result<()> {
+    let metadata = descriptor.metadata()?;
     let uid = rustix::process::getuid().as_raw();
-    if metadata.st_uid != uid && metadata.st_uid != 0 {
+    let identity = FileIdentity::from_metadata(&metadata);
+    if !ancestor_metadata_allowed(
+        identity.owner,
+        identity.mode,
+        uid,
+        acl_admits_directory(path, descriptor, identity),
+    ) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "directory ancestor has an untrusted owner",
-        ));
-    }
-    if metadata.st_mode & 0o022 != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "directory ancestor is writable by another user",
+            "directory ancestor has unsafe ownership, permissions, or ACL",
         ));
     }
     Ok(())
+}
+
+fn ancestor_metadata_allowed(owner: u32, mode: u32, current_uid: u32, acl_admitted: bool) -> bool {
+    (owner == current_uid || owner == 0) && mode & 0o022 == 0 && acl_admitted
 }
 
 fn open_child_directory(
@@ -1011,6 +1028,7 @@ fn acl_admits_directory(path: &Path, directory: &std::fs::File, expected: FileId
         && FileIdentity::from_metadata(&descriptor_after) == expected
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_macos_acl_listing(text: &str, expected_path: &str) -> bool {
     if text.contains('\r') || !text.is_ascii() || !text.ends_with('\n') {
         return false;
@@ -1047,7 +1065,7 @@ fn parse_macos_acl_listing(text: &str, expected_path: &str) -> bool {
         || !(fields[3]
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')))
-        || fields[4] != "-"
+        || !valid_macos_flags(fields[4])
         || fields[5].parse::<u64>().is_err()
         || !matches!(
             fields[6],
@@ -1073,7 +1091,7 @@ fn parse_macos_acl_listing(text: &str, expected_path: &str) -> bool {
     {
         return false;
     }
-    let acl_marker = mode_suffix.contains(&b'+');
+    let acl_required = mode_suffix.contains(&b'+');
     let mut expected_index = 0_u32;
     let mut saw_acl = false;
     for raw in lines {
@@ -1153,9 +1171,19 @@ fn parse_macos_acl_listing(text: &str, expected_path: &str) -> bool {
         }
         saw_acl = true;
     }
-    acl_marker == saw_acl
+    (!acl_required || saw_acl) && (!saw_acl || mode_suffix.contains(&b'@') || acl_required)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn valid_macos_flags(flags: &str) -> bool {
+    if flags == "-" {
+        return true;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    flags.split(',').all(|flag| matches!(flag, "sunlnk" | "restricted") && seen.insert(flag))
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn valid_posix_mode(mode: &[u8]) -> bool {
     const PERMISSIONS: [&[u8]; 9] =
         [b"r-", b"w-", b"xSs-", b"r-", b"w-", b"xSs-", b"r-", b"w-", b"xTt-"];
@@ -1256,8 +1284,11 @@ mod tests {
     fn snapshots_verified_pack_and_keeps_executed_bytes_after_source_changes() {
         let source = tempfile::tempdir().expect("temporary source pack");
         make_pack(source.path());
-        let home = std::env::var_os("HOME").expect("test home directory");
-        let cache = tempfile::tempdir_in(home).expect("temporary private cache under home");
+        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+            .map(PathBuf::from)
+            .expect("the gate must provide an owner-enforced private scratch root");
+        admit_private_directory(&scratch).expect("gate-provided scratch admission");
+        let cache = tempfile::tempdir_in(scratch).expect("temporary private cache under scratch");
         let cache_path = cache.path().join("cache");
         std::fs::create_dir(&cache_path).expect("cache directory");
         std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o700))
@@ -1375,6 +1406,25 @@ mod tests {
             "drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 /private/root extra\n",
             "/private/root"
         ));
+        for (listing, path) in [
+            ("drwxr-xr-x 22 root wheel sunlnk 704 Feb 25 2026 /\n", "/"),
+            ("drwxr-xr-x 5 root wheel restricted 160 Oct 4 00:23 /System\n", "/System"),
+            ("drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 /Users\n", "/Users"),
+            (
+                "drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 /Users/example/Documents\n 0: group:everyone deny delete\n",
+                "/Users/example/Documents",
+            ),
+        ] {
+            assert!(parse_macos_acl_listing(listing, path), "{listing}");
+        }
+        assert!(!parse_macos_acl_listing(
+            "drwxr-xr-x 5 root wheel unknown 160 Oct 4 00:23 /System\n",
+            "/System"
+        ));
+        assert!(!parse_macos_acl_listing(
+            "drwxr-xr-x+ 5 root wheel - 160 Oct 4 00:23 /System\n",
+            "/System"
+        ));
     }
 
     #[cfg(unix)]
@@ -1414,5 +1464,57 @@ mod tests {
         let link = root.path().join("link");
         std::os::unix::fs::symlink(root.path(), &link).expect("directory symlink");
         assert!(admit_private_directory(&link).is_err());
+    }
+
+    #[test]
+    fn private_leaf_and_ancestor_policy_rejects_loose_modes_and_acl_grants() {
+        assert!(directory_mode_allowed(0o700, true));
+        assert!(!directory_mode_allowed(0o755, true));
+        assert!(!directory_mode_allowed(0o2700, true));
+        assert!(directory_mode_allowed(0o755, false));
+        assert!(!directory_mode_allowed(0o757, false));
+
+        assert!(ancestor_metadata_allowed(0, 0o755, 501, true));
+        assert!(ancestor_metadata_allowed(501, 0o755, 501, true));
+        assert!(!ancestor_metadata_allowed(501, 0o755, 501, false));
+        assert!(!ancestor_metadata_allowed(501, 0o777, 501, true));
+        assert!(!ancestor_metadata_allowed(502, 0o755, 501, true));
+
+        let root = tempfile::tempdir().expect("policy fixture directory");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("loosen policy fixture mode");
+        let metadata = std::fs::metadata(root.path()).expect("fixture metadata");
+        assert!(verify_metadata_owner_mode(&metadata, true).is_err());
+        assert!(verify_metadata_owner_mode(&metadata, false).is_ok());
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore private fixture mode");
+        let metadata = std::fs::metadata(root.path()).expect("private fixture metadata");
+        assert!(verify_metadata_owner_mode(&metadata, true).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_acl_parser_accepts_known_system_flags_and_deny_only_extended_acl() {
+        for header in [
+            "drwxr-xr-x 22 root wheel sunlnk 704 Feb 25 2026 /\n",
+            "drwxr-xr-x 5 root wheel restricted 160 Oct 4 00:23 /System\n",
+            "drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 /Users\n",
+            "drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 /Users/example/Documents\n 0: group:everyone deny delete\n",
+        ] {
+            let path = header
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().last())
+                .expect("fixture path");
+            assert!(parse_macos_acl_listing(header, path), "{header}");
+        }
+        assert!(!parse_macos_acl_listing(
+            "drwxr-xr-x 5 root wheel unexpected 160 Oct 4 00:23 /System\n",
+            "/System"
+        ));
+        assert!(!parse_macos_acl_listing(
+            "drwxr-xr-x+ 5 root wheel - 160 Oct 4 00:23 /System\n",
+            "/System"
+        ));
     }
 }
