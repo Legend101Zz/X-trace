@@ -1,0 +1,172 @@
+{
+  "schemaVersion": 1,
+  "kind": "campaign_definition",
+  "project": "directus",
+  "requirementId": "CAMPAIGN-DIRECTUS",
+  "releaseAcceptance": false,
+  "status": "preparation_baseline_only",
+  "upstream": {
+    "canonicalUrl": "https://github.com/directus/directus",
+    "stableTag": "v12.4.1",
+    "sha": "d52fd4b29ecdd4d260aa47ca8cee58d9d62bf486",
+    "tagKind": "lightweight (git ls-remote --tags shows no peeled ^{} entry)",
+    "defaultBranchHeadAtPinTime": "f5be756db0d01c435ab683663c1c896c4d30db67 (main; not used)",
+    "verifiedAt": "2026-10-04"
+  },
+  "starter": null,
+  "license": {
+    "spdx": "LicenseRef-MSCL-1.0-GPL",
+    "spdxNote": "The file's own abbreviation is MSCL-1.0-GPL (Monospace Sustainable Core License 1.0 with a GPL-3.0 grant of future license on the 4th anniversary of each version's release); it is not an SPDX-listed id. package.json says \"SEE LICENSE IN license\". Directus 11.x and earlier used BSL-1.1; 12.4.1 does not.",
+    "file": "license",
+    "sha256": "f209dfa60e56b29f6e8e5cefde91dec4ce86f12289209ede63520556385d555d",
+    "testingConditions": "Permitted Purpose = any purpose other than a Competing Use (making the Software available to a party that competes with the Licensor's paid offerings of the Software itself). Local, disposable, internal testing is a Permitted Purpose. Limitation: do not move/change/disable/circumvent license-key functionality or modify license-key-protected portions; this campaign does not (no license key configured, no source modified). Redistribution (e.g. packaging Directus inside X-trace artifacts) must carry the license text and impose no extra restrictions; X-trace does not redistribute Directus."
+  },
+  "runtime": {
+    "nodeMajor": 22,
+    "nodeEngines": "22 (root package.json engines.node)",
+    "nodeImageVersion": "22.23.0",
+    "database": "PostgreSQL 18.3 (docker image postgres:18.3, tmpfs data, reset per run)",
+    "httpStack": "Express 4.22.3 (pnpm catalog) over node:http createServer (api/src/server.ts createServer -> createApp)",
+    "dbDriver": "knex 3.1.0 over pg 8.16.3",
+    "otherInterfaces": "GraphQL (graphql-compose) and WebSocket (ws/graphql-ws) mounted on the same server; not exercised",
+    "moduleSystem": "ESM (TypeScript compiled by tsdown to api/dist)",
+    "nativeModules": "isolated-vm 5.0.3 (prebuild-install on linux-arm64), argon2, sharp"
+  },
+  "packageManager": {
+    "name": "pnpm",
+    "version": "10.27.0",
+    "lockfile": "pnpm-lock.yaml",
+    "lockfileSha256": "45fe80c8c4c45b51b11e655993bc66486ec5dc13fbb2596e5fead56960958de6",
+    "install": "pnpm install --frozen-lockfile --filter @directus/api... --filter directus...",
+    "build": "pnpm --filter @directus/api... build"
+  },
+  "buildAdaptations": [
+    "Install limited with pnpm --filter to @directus/api and directus (no app/ SPA build); runs in the ephemeral Docker image with pnpm store and corepack home on the bind-mounted checkout (.xtrace-* dirs, git-excluded). No upstream source file is modified."
+  ],
+  "configAdaptations": [
+    "SERVE_APP=false (the Vue admin app is not built); all /server, /auth, /items, /collections API routes are unaffected.",
+    "TELEMETRY=false, AI_TELEMETRY_ENABLED=false, DO_NOT_TRACK=1."
+  ],
+  "run": {
+    "entrypointDocker": "node api/dist/cli/run.js bootstrap && node api/dist/cli/run.js start (cwd = checkout root; same as `directus bootstrap` / `directus start`)",
+    "readiness": "GET /server/ping == 200 (/server/health requires an admin token in v12.4.1) (necessary, never sufficient)",
+    "port": 8055,
+    "harness": "harness/run.mjs (prepare | baseline <n> | compare <n> <m>...)"
+  },
+  "scenarios": [
+    {
+      "id": "auth-anonymous-denied",
+      "kind": "auth",
+      "expectedSeams": [
+        "express root GET /users/me",
+        "express root GET /items/{collection}",
+        "outcome 401/403 via Directus error handler"
+      ]
+    },
+    {
+      "id": "auth-invalid-login",
+      "kind": "validation-error",
+      "expectedSeams": [
+        "express root POST /auth/login",
+        "AuthenticationService.login (services/authentication.ts)",
+        "DB select on directus_users via knex/pg",
+        "outcome 401"
+      ]
+    },
+    {
+      "id": "auth-admin-login",
+      "kind": "auth",
+      "expectedSeams": [
+        "POST /auth/login",
+        "AuthenticationService.login",
+        "pg insert directus_sessions",
+        "GET /users/me"
+      ]
+    },
+    {
+      "id": "item-create-read-db",
+      "kind": "business-db-write-read",
+      "expectedSeams": [
+        "POST /collections",
+        "CollectionsService.createOne (DDL via knex/pg)",
+        "POST /items/{collection} -> ItemsService.createOne",
+        "GET /items/{collection}/{id} -> ItemsService.readOne",
+        "pg INSERT + SELECT",
+        "outcome 200"
+      ]
+    },
+    {
+      "id": "item-validation-null-required",
+      "kind": "validation-error",
+      "expectedSeams": [
+        "POST /items/{collection}",
+        "ItemsService.createOne -> payload validation error",
+        "outcome 400, no INSERT"
+      ]
+    },
+    {
+      "id": "item-update-persists",
+      "kind": "business-db-write-read",
+      "expectedSeams": [
+        "PATCH /items/{collection}/{id} -> ItemsService.updateOne",
+        "pg UPDATE",
+        "GET readOne"
+      ]
+    },
+    {
+      "id": "concurrent-writes-and-reads",
+      "kind": "concurrent",
+      "expectedSeams": [
+        "6 concurrent POST + 18 concurrent GET; each recording must contain only its own request/route/item and its own pg statements (no cross association)"
+      ]
+    },
+    {
+      "id": "item-delete-then-gone",
+      "kind": "business-db-write-read",
+      "expectedSeams": [
+        "DELETE /items/{collection}/{id} -> ItemsService.deleteOne",
+        "pg DELETE",
+        "subsequent GET outcome 403/404"
+      ]
+    },
+    {
+      "id": "error-unknown-route",
+      "kind": "error-path",
+      "expectedSeams": [
+        "express root with no matched route (not-found handler)",
+        "body-parser error path on malformed JSON",
+        "outcome 404 / 4xx"
+      ]
+    }
+  ],
+  "knownLimits": [
+    "No outbound/failure scenario yet: Directus Flows 'Webhook / Request URL' operation to a deterministic local dependency server is present upstream but not exercised in this preparation (requires IMPORT_IP_DENY_LIST relaxation; see report).",
+    "GraphQL, websockets, file uploads, extensions are not exercised.",
+    "Upstream test suites were not run (baseline harness only)."
+  ],
+  "instrumented": {
+    "status": "NOT RUN (preparation only). Documented for the later packaged-candidate run.",
+    "xtraceVersionAtPreparation": "slice/v001-node-capture 09aba20 provides only the node:http server request root (adapters/node/packages/adapter-core/src/http-capture.cts); Express/Nest/Fastify framework modules and DB-driver seams required by ADR 0005 are not present on that branch, so only the HTTP-root assertions below are currently satisfiable; the framework/DB rows become required as those modules land.",
+    "procedure": [
+      "1. node harness/run.mjs prepare|create+build (once) -> immutable pinned workspace.",
+      "2. Start PostgreSQL (or seed SQLite) fresh exactly as in the baseline (harness reset), then launch the app with the packaged `xtrace` as the process launcher inside the same linux/arm64 Docker image (or on the host with the same Node major) instead of plain `node`.",
+      "3. Run the same scenarios (same harness code, same request bodies); compare each scenario's semanticEffectFingerprint with baseline-<n>/scenarios.json; any difference fails the scenario.",
+      "4. Query X-trace (CLI/API/browser) for the recording of each request and assert handler/intermediate/DB/outcome rows listed in `scenarios[].expectedSeams`, with wrong-association checks for `concurrent-writes-and-reads` (every recording holds only its own route params, response and DB statements).",
+      "5. Stop/restart X-trace, reopen persisted captures in the packaged browser; privacy canaries (synthetic secrets in request bodies, headers, cookies, DB values) must not appear in wire/logs/storage/API/exports/diagnostics; measure overhead (baseline vs instrumented p50/p95 and throughput over repeated runs)."
+    ],
+    "launcher": "xtrace run -- node api/dist/cli/run.js start   (cwd = checkout root, after an uninstrumented `node api/dist/cli/run.js bootstrap`; `pnpm --filter directus start`/`npx directus start` are launcher-propagation variants; ESM entry => registerHooks/--import path of the Node adapter must handle ESM + the isolated-vm worker threads).",
+    "seamsByLayer": {
+      "httpRoot": "node:http server in api/src/server.ts createServer() (required)",
+      "express": "Express 4.22.3 app from createApp(): route templates (/items/:collection/:pk, /auth/login, /collections, /users/me), middleware order (authenticate, sanitize query, validate, respond), error handler (required)",
+      "nest": "none (Directus does not use NestJS)",
+      "intermediateApplicationCall": "ItemsService.createOne/readOne/updateOne/deleteOne (api/dist/services/items.js), AuthenticationService.login, CollectionsService.createOne",
+      "db": "knex 3.1.0 -> pg Client.query (SQL text sanitized, binds excluded; DDL for collection creation included)",
+      "outcome": "HTTP status + Directus error code (FORBIDDEN, INVALID_CREDENTIALS, FAILED_VALIDATION, ROUTE_NOT_FOUND)"
+    }
+  },
+  "ledger": {
+    "requirementId": "CAMPAIGN-DIRECTUS",
+    "receiptShape": "tools/release/check_ledger.py (slice/v001-control-admission) validate_receipt/_validate_special: schemaVersion 1; requirementId; result 'passed'; candidateSha == exact candidate; build{id,sourceSha,artifactSetSha256} bound to the accepted logical release build; artifacts[] {path,sha256} (packaged xtrace artifacts in the accepted set); evidence[] {path,sha256}; checks[] each {status:'passed', reached:true}; kind 'campaign'; attestation{upstream{canonicalUrl (https), sha (40-hex), stableTag}, scenarios[>=5]{name, baseline{path,sha256}, instrumented{path,sha256}, browser{path,sha256}, privacy{path,sha256}, overhead{path,sha256}, semanticEffectFingerprint (64-hex) == instrumentedSemanticEffectFingerprint}, artifacts[]}; signatures[] containing a trusted 'campaign-runner' role signature.",
+    "fromThisPreparation": "baseline-<n>/scenario-index.json (written by lib/export-scenarios.mjs) supplies, per scenario, name, baseline{path,sha256} and the 64-hex semanticEffectFingerprint; the instrumented run must reproduce each fingerprint exactly and write instrumentedSemanticEffectFingerprint, instrumented/browser/privacy/overhead evidence files. Skipped, unreached or synthetic assertions never count."
+  }
+}

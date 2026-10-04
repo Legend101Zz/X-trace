@@ -1,0 +1,190 @@
+{
+  "schemaVersion": 1,
+  "kind": "campaign_definition",
+  "project": "medusa",
+  "requirementId": "CAMPAIGN-MEDUSA",
+  "releaseAcceptance": false,
+  "status": "preparation_baseline_only",
+  "upstream": {
+    "canonicalUrl": "https://github.com/medusajs/medusa",
+    "stableTag": "v2.21.2",
+    "sha": "020565398e436a2bc65777a3b1ad347b4735d6df",
+    "tagKind": "lightweight",
+    "defaultBranchHeadAtPinTime": "44a0d1165a28d80fa44aae45544f67d71e2b2f64 (master; not used)",
+    "verifiedAt": "2026-10-04"
+  },
+  "starter": {
+    "canonicalUrl": "https://github.com/medusajs/dtc-starter",
+    "sha": "15ef93da7d155ad990d8cc6db0296446fecbdfe6",
+    "ref": "main (head at pin time; no tags)",
+    "role": "runnable Medusa v2 app: apps/backend depends on @medusajs/medusa, @medusajs/framework, @medusajs/cli, ... all exactly 2.21.2 from the registry (the same version as the pinned upstream tag; lockfile integrity recorded below). The upstream monorepo checkout is the source reference for the pinned SHA and licenses; the backend code that executes is the registry build of that exact version.",
+    "upstreamBackendCodeProof": "pnpm-lock.yaml pins @medusajs/medusa@2.21.2 (sha512-kzotmmmdv8hou319iRiYuDDqqNzxPWf9d7HHidRhagmHDGU+b863ecLaeLyfAvyc2UniFxb/UpnwjvKDvZ0cuA==), @medusajs/framework@2.21.2 (sha512-AwX3Plxm1t4wJ8dqhwDpa2/5EuKJHdwsBxDb26E6lc3HKIJAzUFLJiF37wp5pZWicb7ETJtUe36jy/dUZw5fkg==), @medusajs/cli@2.21.2 (sha512-rMWPcj+35aPEfHFPvyn3CQ4qYeNsfnVhlYG2mZ8oScwVC9v0k2A3d3C5o9uDgchTo34SH/tIggOo+EhWTBRQYg==); packages/medusa/package.json and packages/core/framework/package.json at the pinned SHA report version 2.21.2. Runtime proof: baseline app.log shows the Medusa module migrations (stock_location, inventory, ...) loaded from node_modules/.pnpm/@medusajs+*@2.21.2 and the `medusa start` process serving /admin/products etc. The harness-visible effects (product rows in PostgreSQL, store API visibility via publishable key) can only come from that code. A byte-for-byte build-vs-registry comparison of dist/ was NOT done.",
+    "lockfile": "pnpm-lock.yaml",
+    "lockfileSha256": "e9cb0f260fc1484472ef3b8d3c34ef9b4e5d3e6b0ed11d3c08a2b65a7945fd93",
+    "licenseSha256": "770a61c897d73cdeb53ff2a367d537a80eccf57b31f81e4a5fe951fecc40c632",
+    "licenseSpdx": "MIT"
+  },
+  "license": {
+    "spdx": "MIT AND LicenseRef-Medusa-Enterprise-Edition",
+    "spdxNote": "Root LICENSE: MIT for everything except the Enterprise Edition materials named in ENTERPRISE-LICENSE.md (commercial; not MIT). The starter and the @medusajs/* packages used by apps/backend are MIT; none of the enterprise-edition materials are part of the executed backend path in this campaign (not verified file by file; ENTERPRISE-LICENSE.md sha256 recorded).",
+    "file": "LICENSE",
+    "sha256": "cf67cc556c17e0b00dc0c74a3d71db8dec9aae98af747a2503803a640fba9bb5",
+    "enterpriseLicenseSha256": "2e0b6e1a06fc2fbc9d4f6bb57cf61ea707bb470711f8c068acc42b85fd30b5d4",
+    "testingConditions": "MIT permits running and testing; no conditions beyond keeping the copyright notice if redistributed. X-trace does not redistribute Medusa."
+  },
+  "runtime": {
+    "nodeMajor": 24,
+    "nodeEngines": "^20.19.0 || >=22.12.0 (packages), >=22.22.0 (starter)",
+    "nodeImageVersion": "24.21.0",
+    "database": "PostgreSQL 18.3 (docker image postgres:18.3, tmpfs data, reset per run)",
+    "httpStack": "Express 4.22.2 inside a node:http server created by `medusa start` (packages/medusa/src/commands/start.ts: express() + http.createServer); file-system API routes under apps/backend/src/api; NO NestJS present (verified: no @nestjs/* in the resolved dependency set)",
+    "dbDriver": "MikroORM 6.6.14 (@mikro-orm/postgresql/knex) over knex 3.2.10 over pg 8.20.0/8.23.0",
+    "eventBusCache": "in-memory/fake redis (REDIS_URL unset)",
+    "moduleSystem": "CommonJS output + TypeScript sources transformed at start (esbuild present)"
+  },
+  "packageManager": {
+    "name": "pnpm",
+    "version": "10.11.1",
+    "lockfile": "pnpm-lock.yaml",
+    "lockfileSha256": "e9cb0f260fc1484472ef3b8d3c34ef9b4e5d3e6b0ed11d3c08a2b65a7945fd93",
+    "install": "pnpm install --frozen-lockfile --filter @dtc/backend..."
+  },
+  "buildAdaptations": [
+    "Install limited to @dtc/backend (storefront not installed); pnpm store and corepack home on the bind-mounted checkout (.xtrace-*, git-excluded). No source file modified; `medusa build` is not used (admin UI not built)."
+  ],
+  "configAdaptations": [
+    "Run with `medusa start` in NODE_ENV=development straight from the starter's TypeScript sources; env only: DATABASE_URL (private PostgreSQL container), HOST=0.0.0.0, PORT=9000, JWT_SECRET/COOKIE_SECRET (random per run), CORS vars from .env.template, MEDUSA_DISABLE_TELEMETRY=1, DO_NOT_TRACK=1. apps/backend/medusa-config.ts and instrumentation.ts are unmodified."
+  ],
+  "run": {
+    "entrypointDocker": "cd apps/backend && node ./node_modules/@medusajs/cli/cli.js db:migrate && cli.js user -e $ADMIN_EMAIL -p $ADMIN_PASSWORD && exec node ./node_modules/@medusajs/cli/cli.js start",
+    "readiness": "GET /health == 200 (necessary, never sufficient)",
+    "port": 9000,
+    "harness": "harness/run.mjs (prepare | baseline <n> | compare <n> <m>...)",
+    "note": "`medusa develop` forks `medusa start` as a child process (develop.ts fork()); the instrumented run should launch `start` directly so the traced process is the server."
+  },
+  "scenarios": [
+    {
+      "id": "auth-unauthorized-admin",
+      "kind": "auth",
+      "expectedSeams": [
+        "express root GET /admin/products and /admin/users/me",
+        "Medusa auth middleware (authenticate) short-circuit",
+        "outcome 401, no DB statement for the resource"
+      ]
+    },
+    {
+      "id": "auth-invalid-login",
+      "kind": "validation-error",
+      "expectedSeams": [
+        "express root POST /auth/user/emailpass",
+        "auth module provider (emailpass) authenticate",
+        "pg SELECT on auth_identity/provider_identity",
+        "outcome 401"
+      ]
+    },
+    {
+      "id": "auth-admin-login",
+      "kind": "auth",
+      "expectedSeams": [
+        "POST /auth/user/emailpass -> token",
+        "GET /admin/users/me (route handler src/.. in @medusajs/medusa dist/api/admin/users/me/route)",
+        "pg SELECT user"
+      ]
+    },
+    {
+      "id": "product-validation-strict",
+      "kind": "validation-error",
+      "expectedSeams": [
+        "POST /admin/products",
+        "validateAndTransformBody middleware (zod strict) rejects before the workflow",
+        "outcome 400 invalid_data; zero INSERT"
+      ]
+    },
+    {
+      "id": "product-create-read-db",
+      "kind": "business-db-write-read",
+      "expectedSeams": [
+        "POST /admin/products route handler -> createProductsWorkflow",
+        "Product module service createProducts",
+        "pg INSERT product/product_option/... in a transaction",
+        "GET /admin/products/{id} and list -> query graph -> pg SELECT"
+      ]
+    },
+    {
+      "id": "product-update-persists",
+      "kind": "business-db-write-read",
+      "expectedSeams": [
+        "POST /admin/products/{id} -> updateProductsWorkflow -> Product module update",
+        "pg UPDATE",
+        "GET reflects"
+      ]
+    },
+    {
+      "id": "storefront-publishable-key-flow",
+      "kind": "business-multi-module",
+      "expectedSeams": [
+        "POST /admin/sales-channels, POST /admin/api-keys, POST /admin/api-keys/{id}/sales-channels (Sales Channel + API Key modules + link)",
+        "POST /admin/products with sales_channels",
+        "GET /store/products with x-publishable-api-key (publishable-key middleware + sales channel filtering) -> pg SELECT with joins",
+        "GET /store/products without key -> 400"
+      ]
+    },
+    {
+      "id": "concurrent-writes-and-reads",
+      "kind": "concurrent",
+      "expectedSeams": [
+        "6 concurrent POST /admin/products + 18 concurrent GET /admin/products/{id}; each recording contains only its own product id/handle and its own pg INSERT/SELECT (no cross association between interleaved workflows/transactions)"
+      ]
+    },
+    {
+      "id": "product-delete-then-gone",
+      "kind": "business-db-write-read",
+      "expectedSeams": [
+        "DELETE /admin/products/{id} -> deleteProductsWorkflow -> soft delete (pg UPDATE deleted_at)",
+        "GET -> 404 not_found"
+      ]
+    },
+    {
+      "id": "error-unknown-route",
+      "kind": "error-path",
+      "expectedSeams": [
+        "express root with no matching route (Medusa not-found handler)",
+        "body-parser failure on malformed JSON -> 4xx via Medusa error handler"
+      ]
+    }
+  ],
+  "knownLimits": [
+    "No outbound/failure scenario: Medusa 2.21.2 core flows in this app have no external HTTP dependency (event bus and cache are in-memory); the notification/payment/fulfillment providers are not configured. A deterministic local webhook dependency can only be added via a custom subscriber/module, which would be new application code and is not done.",
+    "Admin dashboard, storefront, workers (`--workers`/`--servers` cluster modes) not exercised; `medusa develop` mode not exercised.",
+    "Starter commit is an immutable SHA but its dependencies resolve from the registry via pnpm-lock.yaml integrity hashes.",
+    "Upstream test suites were not run."
+  ],
+  "instrumented": {
+    "status": "NOT RUN (preparation only). Documented for the later packaged-candidate run.",
+    "xtraceVersionAtPreparation": "slice/v001-node-capture 09aba20 provides only the node:http server request root (adapters/node/packages/adapter-core/src/http-capture.cts); Express/Nest/Fastify framework modules and DB-driver seams required by ADR 0005 are not present on that branch, so only the HTTP-root assertions below are currently satisfiable; the framework/DB rows become required as those modules land.",
+    "procedure": [
+      "1. node harness/run.mjs prepare|create+build (once) -> immutable pinned workspace.",
+      "2. Start PostgreSQL (or seed SQLite) fresh exactly as in the baseline (harness reset), then launch the app with the packaged `xtrace` as the process launcher inside the same linux/arm64 Docker image (or on the host with the same Node major) instead of plain `node`.",
+      "3. Run the same scenarios (same harness code, same request bodies); compare each scenario's semanticEffectFingerprint with baseline-<n>/scenarios.json; any difference fails the scenario.",
+      "4. Query X-trace (CLI/API/browser) for the recording of each request and assert handler/intermediate/DB/outcome rows listed in `scenarios[].expectedSeams`, with wrong-association checks for `concurrent-writes-and-reads` (every recording holds only its own route params, response and DB statements).",
+      "5. Stop/restart X-trace, reopen persisted captures in the packaged browser; privacy canaries (synthetic secrets in request bodies, headers, cookies, DB values) must not appear in wire/logs/storage/API/exports/diagnostics; measure overhead (baseline vs instrumented p50/p95 and throughput over repeated runs)."
+    ],
+    "launcher": "xtrace run -- node ./node_modules/@medusajs/cli/cli.js start   (cwd apps/backend; direct node entry preferred over `pnpm exec medusa`/npm scripts so xtrace supervises the server process; if a package-manager script launcher is used, `xtrace run -- pnpm start` must propagate the instrumentation env to the node child). `medusa develop` re-forks `start` with IPC, so it is a launcher-propagation test, not the primary path. Admin-user and migration commands (`cli.js db:migrate`, `cli.js user`) run uninstrumented before the traced server starts.",
+    "seamsByLayer": {
+      "httpRoot": "node:http server created in packages/medusa/src/commands/start.ts (required)",
+      "express": "Express 4.22.2 route templates from file-based routes (e.g. /admin/products/:id), middleware order (authenticate, validateAndTransformBody/Query, publishable-key), error handler (required by ADR 0005 'Express/Node HTTP')",
+      "nest": "none (no NestJS in Medusa 2.21.2); claims limited to observed seams",
+      "intermediateApplicationCall": "route handler + workflow step functions / module service methods in @medusajs/medusa and core modules (dist/api/**/route.js, product/api-key/sales-channel module services)",
+      "db": "MikroORM -> knex -> pg Client.query (SQL text sanitized, binds excluded by default)",
+      "outcome": "HTTP status + error type from Medusa error handler"
+    },
+    "notes": [
+      "The starter ships apps/backend/instrumentation.ts; Medusa's start command imports it via registerInstrumentation(). X-trace must coexist with (or be unaffected by) that hook: it is unmodified here."
+    ]
+  },
+  "ledger": {
+    "requirementId": "CAMPAIGN-MEDUSA",
+    "receiptShape": "tools/release/check_ledger.py (slice/v001-control-admission) validate_receipt/_validate_special: schemaVersion 1; requirementId; result 'passed'; candidateSha == exact candidate; build{id,sourceSha,artifactSetSha256} bound to the accepted logical release build; artifacts[] {path,sha256} (packaged xtrace artifacts in the accepted set); evidence[] {path,sha256}; checks[] each {status:'passed', reached:true}; kind 'campaign'; attestation{upstream{canonicalUrl (https), sha (40-hex), stableTag}, scenarios[>=5]{name, baseline{path,sha256}, instrumented{path,sha256}, browser{path,sha256}, privacy{path,sha256}, overhead{path,sha256}, semanticEffectFingerprint (64-hex) == instrumentedSemanticEffectFingerprint}, artifacts[]}; signatures[] containing a trusted 'campaign-runner' role signature.",
+    "fromThisPreparation": "baseline-<n>/scenario-index.json (written by lib/export-scenarios.mjs) supplies, per scenario, name, baseline{path,sha256} and the 64-hex semanticEffectFingerprint; the instrumented run must reproduce each fingerprint exactly and write instrumentedSemanticEffectFingerprint, instrumented/browser/privacy/overhead evidence files. Skipped, unreached or synthetic assertions never count."
+  }
+}
