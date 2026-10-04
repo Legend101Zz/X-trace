@@ -32,12 +32,10 @@
 //! with `O_CREAT | O_EXCL` and `0600` mode so the secret never first
 //! appears world-readable. The candidate path uses a CSPRNG-derived
 //! suffix; on `AlreadyExists` the writer retries with a fresh suffix
-//! up to a bounded budget. A drop guard removes the candidate if any
-//! pre-rename step fails so a partial write cannot leak the secret on
-//! a later daemon launch. After the rename succeeds the published
-//! file is the only artifact on disk; if the post-rename directory
-//! fsync fails, the daemon removes the published target best-effort
-//! before returning.
+//! up to a bounded budget. On failure, cleanup removes a temporary or
+//! published name only when it still identifies the exact open file
+//! created by this writer. If ownership cannot be proved, cleanup
+//! preserves the name rather than deleting a replacement.
 //!
 //! Symlinks in the parent directory or the target path are refused
 //! before any write occurs, both during the initial write and on
@@ -70,6 +68,7 @@
 //! begun on a value, no later caller can retry through that same
 //! instance; a subsequent launch writes a fresh artifact.
 
+#[cfg(test)]
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -77,6 +76,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use xtrace_domain::{ProjectId, RepositoryFingerprint, RuntimeSessionId};
+use xtrace_runtime::private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 use zeroize::Zeroize;
 
 use crate::error::DaemonError;
@@ -248,6 +248,7 @@ enum ReleaseState {
 pub struct BootstrapArtifact {
     fields: BootstrapArtifactFields,
     path: PathBuf,
+    private_parent: AdmittedPrivateRoot,
     owner: BootstrapOwner,
     /// Serialises the released flag and the unlink syscall so the
     /// flag is observed exactly when the file has actually been
@@ -280,10 +281,9 @@ impl BootstrapArtifact {
     /// # Errors
     ///
     /// Returns [`DaemonError::Bootstrap`] when the file cannot be
-    /// created, written, chmod-ed, renamed, or its parent directory
-    /// already holds a non-owner-only pointer file. On every error
-    /// path any temporary file is removed before the function
-    /// returns.
+    /// created, written, renamed, or its parent directory fails the
+    /// admitted private-storage policy. Any temporary file is removed
+    /// only when its descriptor still proves ownership.
     pub fn write(
         path: &Path,
         fields: BootstrapArtifactFields,
@@ -293,23 +293,32 @@ impl BootstrapArtifact {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).ok_or_else(|| {
             DaemonError::Bootstrap("bootstrap path has no parent directory".to_string())
         })?;
-        refuse_symlink_path(path, "target")?;
-        let parent_probe = refuse_symlink_path(parent, "parent directory")?;
-        if matches!(parent_probe, PathProbe::Missing) {
-            fs::create_dir_all(parent).map_err(|err| {
-                DaemonError::Bootstrap(format!(
-                    "create bootstrap parent {}: {err}",
-                    parent.display()
-                ))
+        let private_parent = AdmittedPrivateRoot::open(parent)
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+        private_parent
+            .revalidate()
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+        let target_name = path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+            DaemonError::Bootstrap("bootstrap target name is invalid".to_string())
+        })?;
+        if private_parent
+            .bounded_child_names(64)
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?
+            .iter()
+            .any(|name| name == target_name)
+        {
+            let existing = private_parent.open_regular_file(target_name).map_err(|_| {
+                DaemonError::Bootstrap("private storage is unavailable".to_string())
             })?;
+            drop(existing);
         }
-        chmod_dir_owner_only(parent)?;
         let body = serde_json::to_string_pretty(&fields)
             .map_err(|err| DaemonError::Bootstrap(format!("serialize bootstrap: {err}")))?;
-        write_atomic(path, parent, body.as_bytes())?;
+        write_atomic_admitted(&private_parent, target_name, body.as_bytes())?;
         Ok(Self {
             fields,
             path: path.to_path_buf(),
+            private_parent,
             owner,
             release_lock: Mutex::new(ReleaseState::Pending),
         })
@@ -324,25 +333,21 @@ impl BootstrapArtifact {
     /// session secret because the [`BootstrapArtifactFields`] fields
     /// are validated before the function returns.
     pub fn read(path: &Path) -> Result<Self, DaemonError> {
-        let probe = refuse_symlink_path(path, "target")?;
-        let meta = match probe {
-            PathProbe::Present(meta) => meta,
-            PathProbe::Missing => {
-                return Err(DaemonError::Bootstrap(format!(
-                    "bootstrap target {} does not exist",
-                    path.display()
-                )));
-            }
-        };
-        enforce_owner_only_file(path, &meta)?;
-        let text = fs::read_to_string(path)
-            .map_err(|err| DaemonError::Bootstrap(format!("read bootstrap: {err}")))?;
-        let fields: BootstrapArtifactFields = serde_json::from_str(&text)
+        let (private_parent, basename) = admit_bootstrap_path(path)?;
+        let name = basename.to_str().ok_or_else(|| {
+            DaemonError::Bootstrap("bootstrap target name is invalid".to_string())
+        })?;
+        const MAX_BOOTSTRAP_BYTES: usize = 16 * 1024;
+        let bytes = private_parent
+            .read_bounded_file(name, MAX_BOOTSTRAP_BYTES)
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+        let fields: BootstrapArtifactFields = serde_json::from_slice(&bytes)
             .map_err(|err| DaemonError::Bootstrap(format!("parse bootstrap: {err}")))?;
         validate_fields(&fields)?;
         Ok(Self {
             fields,
             path: path.to_path_buf(),
+            private_parent,
             owner: BootstrapOwner::Persistent,
             release_lock: Mutex::new(ReleaseState::Pending),
         })
@@ -398,21 +403,29 @@ impl BootstrapArtifact {
         if matches!(*state, ReleaseState::Released) {
             return Ok(ReleaseOutcome::AlreadyReleased);
         }
-        match fs::remove_file(&self.path) {
+        let target_name =
+            self.path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+                DaemonError::Bootstrap("bootstrap target name is invalid".to_string())
+            })?;
+        match self.private_parent.remove_private_file(target_name) {
             Ok(()) => {
                 *state = ReleaseState::Released;
                 Ok(ReleaseOutcome::Released)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(_)
+                if self
+                    .private_parent
+                    .bounded_child_names(64)
+                    .is_ok_and(|names| !names.iter().any(|name| name == target_name)) =>
+            {
                 // The file is already gone; mark the artifact as
                 // released so subsequent callers see a stable view.
                 *state = ReleaseState::Released;
                 Ok(ReleaseOutcome::Released)
             }
-            Err(err) => Err(DaemonError::Bootstrap(format!(
-                "remove bootstrap {}: {err}",
-                self.path.display()
-            ))),
+            Err(_) => {
+                Err(DaemonError::Bootstrap("private bootstrap cleanup is unavailable".to_string()))
+            }
         }
     }
 
@@ -424,20 +437,15 @@ impl BootstrapArtifact {
     /// Returns [`DaemonError::Bootstrap`] for any I/O or parse
     /// failure.
     pub fn reload(&mut self) -> Result<(), DaemonError> {
-        let probe = refuse_symlink_path(&self.path, "target")?;
-        let meta = match probe {
-            PathProbe::Present(meta) => meta,
-            PathProbe::Missing => {
-                return Err(DaemonError::Bootstrap(format!(
-                    "bootstrap target {} does not exist",
-                    self.path.display()
-                )));
-            }
-        };
-        enforce_owner_only_file(&self.path, &meta)?;
-        let text = fs::read_to_string(&self.path)
-            .map_err(|err| DaemonError::Bootstrap(format!("read bootstrap: {err}")))?;
-        let fields: BootstrapArtifactFields = serde_json::from_str(&text)
+        let name = self.path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+            DaemonError::Bootstrap("bootstrap target name is invalid".to_string())
+        })?;
+        const MAX_BOOTSTRAP_BYTES: usize = 16 * 1024;
+        let bytes = self
+            .private_parent
+            .read_bounded_file(name, MAX_BOOTSTRAP_BYTES)
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+        let fields: BootstrapArtifactFields = serde_json::from_slice(&bytes)
             .map_err(|err| DaemonError::Bootstrap(format!("parse bootstrap: {err}")))?;
         validate_fields(&fields)?;
         self.fields = fields;
@@ -538,34 +546,6 @@ impl BootstrapArtifactFields {
     }
 }
 
-/// RAII guard that removes a freshly-created bootstrap candidate if
-/// the writer returns before the rename publishes the file.
-struct CandidateGuard {
-    path: PathBuf,
-}
-
-impl CandidateGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for CandidateGuard {
-    fn drop(&mut self) {
-        match fs::remove_file(&self.path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                tracing::warn!(
-                    candidate = %self.path.display(),
-                    error = %err,
-                    "failed to remove bootstrap candidate on error path",
-                );
-            }
-        }
-    }
-}
-
 fn validate_fields(fields: &BootstrapArtifactFields) -> Result<(), DaemonError> {
     if fields.schema_version != SCHEMA_VERSION {
         return Err(DaemonError::Bootstrap(format!(
@@ -620,274 +600,130 @@ fn is_canonical_lowercase_hex_pin(value: &str) -> bool {
     value.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
-/// Returns a per-attempt unique candidate path in the same directory
-/// as the target. The suffix is a 128-bit value rendered as
-/// lowercase hex so collisions with a pre-existing attacker-controlled
-/// file are astronomically unlikely. The fill closure is supplied by
-/// the caller so production code can delegate to the OS CSPRNG and
-/// regression tests can pin a deterministic suffix.
-fn unique_temp_path<F>(target: &Path, fill_suffix: &mut F) -> Result<PathBuf, DaemonError>
-where
-    F: FnMut(&mut [u8]) -> Result<(), ring::error::Unspecified>,
-{
-    let parent = target.parent().ok_or_else(|| {
-        DaemonError::Bootstrap("bootstrap target has no parent directory".to_string())
-    })?;
-    let stem = target.file_name().and_then(|name| name.to_str()).unwrap_or("bootstrap.json");
-    let mut bytes = [0u8; 16];
-    fill_suffix(&mut bytes)
-        .map_err(|err| DaemonError::Bootstrap(format!("csprng refused to fill suffix: {err}")))?;
-    let suffix = bytes.iter().fold(String::with_capacity(32), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(&mut acc, "{b:02x}");
-        acc
-    });
-    Ok(parent.join(format!(".{stem}.tmp-{suffix}")))
-}
-
-/// Outcome of a path-stat probe used by the writer and the reader.
-#[derive(Debug)]
-enum PathProbe {
-    /// Path does not exist; no metadata is available.
-    Missing,
-    /// Path exists; metadata follows.
-    Present(std::fs::Metadata),
-}
-
-/// Probe a path for symlink and file-type violations. Returns the
-/// metadata when the path exists so the caller can apply the
-/// owner-only permission check without re-stat'ing.
-fn refuse_symlink_path(path: &Path, label: &str) -> Result<PathProbe, DaemonError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        match fs::symlink_metadata(path) {
-            Ok(meta) => {
-                let ft = meta.file_type();
-                if ft.is_symlink() {
-                    return Err(DaemonError::Bootstrap(format!(
-                        "{label} {} must not be a symbolic link",
-                        path.display()
-                    )));
-                }
-                // The parent directory must be a real directory; the
-                // target slot must be a regular file (or absent).
-                // Anything else (device node, fifo, socket, ...) is
-                // rejected.
-                if label == "parent directory" && !ft.is_dir() {
-                    return Err(DaemonError::Bootstrap(format!(
-                        "{label} {} must be a directory",
-                        path.display()
-                    )));
-                }
-                if label == "target" && !ft.is_file() {
-                    return Err(DaemonError::Bootstrap(format!(
-                        "{label} {} must be a regular file",
-                        path.display()
-                    )));
-                }
-                // Touch the MetadataExt trait so the import is not
-                // removed by dead-code analysis on builds that never
-                // touch the inner methods.
-                let _ = meta.mode();
-                Ok(PathProbe::Present(meta))
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(PathProbe::Missing),
-            Err(err) => {
-                Err(DaemonError::Bootstrap(format!("stat {label} {}: {err}", path.display())))
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        match fs::metadata(path) {
-            Ok(meta) => Ok(PathProbe::Present(meta)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(PathProbe::Missing),
-            Err(err) => {
-                Err(DaemonError::Bootstrap(format!("stat {label} {}: {err}", path.display())))
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn enforce_owner_only_file(path: &Path, meta: &std::fs::Metadata) -> Result<(), DaemonError> {
-    use std::os::unix::fs::MetadataExt as _;
-    if !meta.is_file() {
-        return Err(DaemonError::Bootstrap(format!(
-            "bootstrap target {} must be a regular file",
-            path.display()
-        )));
-    }
-    let mode = meta.mode() & 0o777;
-    if mode != 0o600 {
-        return Err(DaemonError::Bootstrap(format!(
-            "bootstrap target {} must be owner-only, found mode {mode:o}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn enforce_owner_only_file(_path: &Path, _meta: &std::fs::Metadata) -> Result<(), DaemonError> {
-    Ok(())
-}
-
 use ring::rand::{SecureRandom, SystemRandom};
 
-fn write_atomic(target: &Path, parent: &Path, body: &[u8]) -> Result<(), DaemonError> {
-    let rng = SystemRandom::new();
-    write_atomic_with_rng(target, parent, body, &rng)
+fn admit_bootstrap_path(
+    path: &Path,
+) -> Result<(AdmittedPrivateRoot, std::ffi::OsString), DaemonError> {
+    let parent = path.parent().filter(|value| !value.as_os_str().is_empty()).ok_or_else(|| {
+        DaemonError::Bootstrap("bootstrap path has no parent directory".to_string())
+    })?;
+    let basename = path
+        .file_name()
+        .ok_or_else(|| DaemonError::Bootstrap("bootstrap target name is invalid".to_string()))?
+        .to_os_string();
+    let root = AdmittedPrivateRoot::open(parent)
+        .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+    Ok((root, basename))
 }
 
-/// Atomic write helper parameterised over a CSPRNG so a regression
-/// test can force a deterministic collision against the candidate
-/// path the writer would otherwise choose on its first attempt. The
-/// production path delegates here with the OS CSPRNG; the test path
-/// pins the suffix sequence so the `AlreadyExists` retry branch is
-/// exercised as designed rather than opportunistically.
-fn write_atomic_with_rng(
-    target: &Path,
-    parent: &Path,
+fn write_atomic_admitted(
+    root: &AdmittedPrivateRoot,
+    target: &str,
     body: &[u8],
-    rng: &dyn SecureRandom,
 ) -> Result<(), DaemonError> {
-    write_atomic_with_suffixed_rng(target, parent, body, |dest| rng.fill(dest))
+    let rng = SystemRandom::new();
+    write_atomic_admitted_with_hooks(
+        root,
+        target,
+        body,
+        |destination| rng.fill(destination),
+        |_, _, _| Ok(()),
+        |root| root.sync(),
+    )
 }
 
-/// Atomic write helper parameterised over a closure that fills the
-/// candidate suffix buffer. The production path delegates here with
-/// the OS CSPRNG; the regression test path pins the suffix so the
-/// retry branch is exercised deterministically.
-fn write_atomic_with_suffixed_rng<F>(
-    target: &Path,
-    parent: &Path,
+#[cfg(test)]
+fn write_atomic_admitted_with_suffix<F>(
+    root: &AdmittedPrivateRoot,
+    target: &str,
     body: &[u8],
-    mut fill_suffix: F,
+    fill_suffix: F,
 ) -> Result<(), DaemonError>
 where
     F: FnMut(&mut [u8]) -> Result<(), ring::error::Unspecified>,
 {
-    // Bounded retry on `AlreadyExists`. CSPRNG-derived suffixes make a
-    // collision astronomically unlikely; the bounded budget keeps the
-    // loop finite even in the worst case.
-    let mut attempts = 0;
-    let (mut file, candidate_path) = loop {
-        attempts += 1;
-        if attempts > 8 {
-            return Err(DaemonError::Bootstrap(
-                "bootstrap temp suffix budget exhausted".to_string(),
-            ));
-        }
-        let tmp = unique_temp_path(target, &mut fill_suffix)?;
-        // `create_new` opens with `O_CREAT | O_EXCL` so a pre-existing
-        // path cannot be clobbered. The OS rejects the open if the
-        // path already exists, removing the small window in which a
-        // partial secret could leak through a follow-up write.
-        match open_create_new(&tmp) {
-            Ok(file) => break (file, tmp),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(DaemonError::Bootstrap(format!(
-                    "create bootstrap tmp {tmp}: {err}",
-                    tmp = tmp.display()
-                )));
+    write_atomic_admitted_with_hooks(
+        root,
+        target,
+        body,
+        fill_suffix,
+        |_, _, _| Ok(()),
+        |root| root.sync(),
+    )
+}
+
+fn write_atomic_admitted_with_hooks<F, H, S>(
+    root: &AdmittedPrivateRoot,
+    target: &str,
+    body: &[u8],
+    mut fill_suffix: F,
+    mut after_publish: H,
+    mut sync_directory: S,
+) -> Result<(), DaemonError>
+where
+    F: FnMut(&mut [u8]) -> Result<(), ring::error::Unspecified>,
+    H: FnMut(&AdmittedPrivateRoot, &str, &std::fs::File) -> Result<(), PrivateStorageError>,
+    S: FnMut(&AdmittedPrivateRoot) -> Result<(), PrivateStorageError>,
+{
+    const ATTEMPTS: usize = 8;
+    root.revalidate()
+        .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+    let mut selected: Option<(String, std::fs::File)> = None;
+    for _ in 0..ATTEMPTS {
+        let mut suffix = [0_u8; 16];
+        fill_suffix(&mut suffix).map_err(|_| {
+            DaemonError::Bootstrap("bootstrap randomness is unavailable".to_string())
+        })?;
+        let name = format!("{TEMP_BOOTSTRAP_PREFIX}{}", hex::encode(suffix));
+        match root.create_private_file(&name) {
+            Ok(file) => {
+                selected = Some((name, file));
+                break;
+            }
+            Err(PrivateStorageError::AlreadyExists) => continue,
+            Err(_) => {
+                return Err(DaemonError::Bootstrap(
+                    "bootstrap temporary file is unavailable".to_string(),
+                ));
             }
         }
-    };
-    let _guard = CandidateGuard::new(candidate_path.clone());
-
-    if let Err(err) = file.write_all(body) {
-        return Err(DaemonError::Bootstrap(format!("write bootstrap tmp: {err}")));
     }
-    if let Err(err) = file.flush() {
-        return Err(DaemonError::Bootstrap(format!("flush bootstrap tmp: {err}")));
+    let (temporary, mut file) = selected.ok_or_else(|| {
+        DaemonError::Bootstrap("bootstrap temporary-file collision budget exhausted".to_string())
+    })?;
+    let write_result = (|| {
+        file.write_all(body)
+            .map_err(|_| DaemonError::Bootstrap("bootstrap write failed".to_string()))?;
+        file.flush().map_err(|_| DaemonError::Bootstrap("bootstrap flush failed".to_string()))?;
+        file.sync_all().map_err(|_| DaemonError::Bootstrap("bootstrap sync failed".to_string()))?;
+        root.validate_file_binding(&temporary, &file, true)
+            .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
+        root.rename_replace(&temporary, target)
+            .map_err(|_| DaemonError::Bootstrap("bootstrap publish failed".to_string()))?;
+        after_publish(root, target, &file)
+            .map_err(|_| DaemonError::Bootstrap("bootstrap publish failed".to_string()))?;
+        root.validate_file_binding(target, &file, true)
+            .map_err(|_| DaemonError::Bootstrap("bootstrap publish failed".to_string()))?;
+        sync_directory(root)
+            .map_err(|_| DaemonError::Bootstrap("private storage sync failed".to_string()))
+    })();
+    if write_result.is_err() {
+        let temporary_cleanup = root.remove_private_file_if_matches(&temporary, &file);
+        let cleanup = match temporary_cleanup {
+            Ok(()) => Ok(()),
+            Err(PrivateStorageError::Operation) => {
+                root.remove_private_file_if_matches(target, &file)
+            }
+            Err(error) => Err(error),
+        };
+        if cleanup.is_err() {
+            tracing::warn!(
+                "bootstrap cleanup could not prove temporary or published file ownership"
+            );
+        }
     }
-    if let Err(err) = file.sync_all() {
-        return Err(DaemonError::Bootstrap(format!("fsync bootstrap tmp: {err}")));
-    }
-    drop(file);
-    // `rename` is atomic on the same filesystem and overwrites an
-    // existing regular file; the target is guaranteed regular because
-    // `refuse_symlink_path` rejected any other file type above.
-    if let Err(err) = fs::rename(&candidate_path, target) {
-        return Err(DaemonError::Bootstrap(format!("rename bootstrap: {err}")));
-    }
-    if let Err(err) = chmod_file_owner_only(target) {
-        // The rename has already published the file; clean up the
-        // best-effort before returning the chmod error so the
-        // post-rename failure mode does not leave a secret-bearing
-        // artifact on disk.
-        let _ = fs::remove_file(target);
-        return Err(err);
-    }
-    // Fsync the parent directory so the rename is durable across a
-    // crash; the parent is a directory and never a symlink because
-    // `refuse_symlink_path` was called above.
-    if let Err(err) = fsync_dir(parent) {
-        // Same recovery as the chmod branch above.
-        let _ = fs::remove_file(target);
-        return Err(DaemonError::Bootstrap(format!(
-            "fsync bootstrap parent {}: {err}",
-            parent.display()
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_create_new(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new().create_new(true).read(true).write(true).mode(0o600).open(path)
-}
-
-#[cfg(not(unix))]
-fn open_create_new(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(path)
-}
-
-#[cfg(unix)]
-fn chmod_dir_owner_only(path: &Path) -> Result<(), DaemonError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let metadata = fs::metadata(path)
-        .map_err(|err| DaemonError::Bootstrap(format!("stat dir {}: {err}", path.display())))?;
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(path, permissions)
-        .map_err(|err| DaemonError::Bootstrap(format!("chmod 0700 {}: {err}", path.display())))
-}
-
-#[cfg(not(unix))]
-fn chmod_dir_owner_only(_path: &Path) -> Result<(), DaemonError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn chmod_file_owner_only(path: &Path) -> Result<(), DaemonError> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let metadata = fs::metadata(path)
-        .map_err(|err| DaemonError::Bootstrap(format!("stat file {}: {err}", path.display())))?;
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(0o600);
-    fs::set_permissions(path, permissions)
-        .map_err(|err| DaemonError::Bootstrap(format!("chmod 0600 {}: {err}", path.display())))
-}
-
-#[cfg(not(unix))]
-fn chmod_file_owner_only(_path: &Path) -> Result<(), DaemonError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn fsync_dir(path: &Path) -> std::io::Result<()> {
-    let file = std::fs::File::open(path)?;
-    file.sync_all()
-}
-
-#[cfg(not(unix))]
-fn fsync_dir(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+    write_result
 }
 
 #[cfg(test)]
@@ -904,12 +740,17 @@ mod tests {
         let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
         let nanos =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "xtrace-daemon-bootstrap-{label}-{}-{counter}-{nanos}",
-            std::process::id(),
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
+        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+            .map(PathBuf::from)
+            .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required");
+        AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        let name =
+            format!("xtrace-daemon-bootstrap-{label}-{}-{counter}-{nanos}", std::process::id(),);
+        let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        root.create_private_child(&name)
+            .expect("private bootstrap test directory")
+            .path()
+            .to_path_buf()
     }
 
     fn sample_fingerprint() -> RepositoryFingerprint {
@@ -1139,42 +980,26 @@ mod tests {
     }
 
     #[test]
-    fn unique_temp_path_resides_in_target_parent() {
-        let dir = unique_dir("unique-temp");
-        let path = dir.join("bootstrap.json");
-        let rng = SystemRandom::new();
-        let tmp = unique_temp_path(&path, &mut |dest| rng.fill(dest)).expect("temp");
-        assert_eq!(tmp.parent().unwrap(), path.parent().unwrap());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn unique_temp_path_uses_csprng_suffix() {
-        // Two draws of the CSPRNG must produce distinct suffixes.
-        let dir = unique_dir("csprng");
-        let path = dir.join("bootstrap.json");
-        let rng = SystemRandom::new();
-        let a = unique_temp_path(&path, &mut |dest| rng.fill(dest)).expect("temp a");
-        let b = unique_temp_path(&path, &mut |dest| rng.fill(dest)).expect("temp b");
-        assert_ne!(a, b);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn write_retries_after_forced_temp_collision() {
-        // Pre-create the candidate path the writer would have chosen
-        // and confirm the bounded retry still succeeds. The CSPRNG
-        // is fresh on each attempt so the second attempt lands on a
-        // different suffix and `create_new` succeeds.
         let dir = unique_dir("retry-collision");
+        let root = AdmittedPrivateRoot::open(&dir).expect("admitted parent");
         let path = dir.join("bootstrap.json");
-        let rng = SystemRandom::new();
-        let first = unique_temp_path(&path, &mut |dest| rng.fill(dest)).expect("first");
-        fs::write(&first, b"stale").unwrap();
-        let artifact = BootstrapArtifact::write(&path, sample_fields(), BootstrapOwner::Persistent)
-            .expect("write");
-        assert!(path.exists());
-        drop(artifact);
+        let first = [0x21; 16];
+        let second = [0x22; 16];
+        let blocked = format!("{TEMP_BOOTSTRAP_PREFIX}{}", hex::encode(first));
+        let mut stale = root.create_private_file(&blocked).expect("blocked candidate");
+        stale.write_all(b"stale").expect("write blocker");
+        stale.sync_all().expect("sync blocker");
+        write_atomic_admitted_with_suffix(
+            &root,
+            "bootstrap.json",
+            b"body",
+            two_step_suffix(&first, &second),
+        )
+        .expect("production admitted writer retries collision");
+        assert_eq!(fs::read(&path).expect("published bytes"), b"body");
+        assert_eq!(root.read_bounded_file(&blocked, 16).expect("stale bytes"), b"stale");
+        root.remove_private_file(&blocked).expect("remove blocker");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1233,24 +1058,19 @@ mod tests {
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
             0x1e, 0x1f,
         ];
-        let first_candidate = {
-            let parent = path.parent().unwrap();
-            let stem = path.file_name().and_then(|n| n.to_str()).unwrap();
-            let suffix = first.iter().fold(String::with_capacity(32), |mut acc, b| {
-                use std::fmt::Write as _;
-                let _ = write!(&mut acc, "{b:02x}");
-                acc
-            });
-            parent.join(format!(".{stem}.tmp-{suffix}"))
-        };
-        fs::write(&first_candidate, b"stale-attacker").unwrap();
-        write_atomic_with_suffixed_rng(
-            &path,
-            path.parent().unwrap(),
+        let root = AdmittedPrivateRoot::open(&dir).expect("admitted parent");
+        let first_name = format!("{TEMP_BOOTSTRAP_PREFIX}{}", hex::encode(first));
+        let mut stale_file = root.create_private_file(&first_name).expect("block first candidate");
+        stale_file.write_all(b"stale-attacker").expect("write blocker");
+        stale_file.sync_all().expect("sync blocker");
+        let first_candidate = dir.join(&first_name);
+        write_atomic_admitted_with_suffix(
+            &root,
+            "bootstrap.json",
             b"body",
             two_step_suffix(&first, &second),
         )
-        .expect("write");
+        .expect("write via production admitted path");
         let published = fs::read(&path).expect("read published");
         assert_eq!(published, b"body", "published target must carry the bootstrap body");
         // The writer never touches the attacker-preplaced file; the
@@ -1259,9 +1079,10 @@ mod tests {
         // the daemon has not been tricked into publishing it as the
         // authoritative bootstrap artifact.
         assert!(first_candidate.exists(), "attacker-preplaced candidate must remain untouched");
-        let stale_contents = fs::read(&first_candidate).expect("read stale");
+        let stale_contents = root.read_bounded_file(&first_name, 64).expect("read stale");
         assert_eq!(stale_contents, b"stale-attacker");
         assert_ne!(first_candidate, path, "published path must differ from the stale candidate");
+        root.remove_private_file(&first_name).expect("remove blocker");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1271,29 +1092,139 @@ mod tests {
         // path; the bounded retry budget must surface as a typed
         // error rather than an infinite loop.
         let dir = unique_dir("retry-budget");
-        let path = dir.join("bootstrap.json");
         let pinned: [u8; 16] = [0xff; 16];
-        let candidate = {
-            let parent = path.parent().unwrap();
-            let stem = path.file_name().and_then(|n| n.to_str()).unwrap();
-            let suffix = pinned.iter().fold(String::with_capacity(32), |mut acc, b| {
-                use std::fmt::Write as _;
-                let _ = write!(&mut acc, "{b:02x}");
-                acc
-            });
-            parent.join(format!(".{stem}.tmp-{suffix}"))
-        };
-        fs::write(&candidate, b"blocker").unwrap();
-        let err = write_atomic_with_suffixed_rng(
-            &path,
-            path.parent().unwrap(),
+        let root = AdmittedPrivateRoot::open(&dir).expect("admitted parent");
+        let candidate_name = format!("{TEMP_BOOTSTRAP_PREFIX}{}", hex::encode(pinned));
+        let mut blocker = root.create_private_file(&candidate_name).expect("block candidate");
+        blocker.write_all(b"blocker").expect("write blocker");
+        blocker.sync_all().expect("sync blocker");
+        let err = write_atomic_admitted_with_suffix(
+            &root,
+            "bootstrap.json",
             b"body",
             deterministic_suffix(&pinned),
         )
         .unwrap_err();
         let rendered = format!("{err}");
-        assert!(rendered.contains("budget exhausted"), "got {rendered}");
-        assert!(candidate.exists(), "blocker must remain until the bound is hit");
+        assert!(rendered.contains("collision budget exhausted"), "got {rendered}");
+        assert_eq!(
+            root.read_bounded_file(&candidate_name, 16).expect("blocker remains"),
+            b"blocker"
+        );
+        root.remove_private_file(&candidate_name).expect("remove blocker");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_publish_cleans_only_the_writer_owned_temporary_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_dir("publish-failure");
+        let root = AdmittedPrivateRoot::open(&dir).expect("admitted parent");
+        let mut canary = root.create_private_file("canary").expect("private canary");
+        canary.write_all(b"unchanged").expect("write canary");
+        canary.sync_all().expect("sync canary");
+        let target = dir.join("bootstrap.json");
+        symlink("canary", &target).expect("preplace unsafe target symlink");
+        let suffix = [0x44; 16];
+
+        let result = write_atomic_admitted_with_suffix(
+            &root,
+            "bootstrap.json",
+            b"secret",
+            deterministic_suffix(&suffix),
+        );
+        assert!(result.is_err(), "writer must reject a symlink target");
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .expect("target symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(root.read_bounded_file("canary", 32).expect("canary remains"), b"unchanged");
+        assert!(
+            root.bounded_child_names(64)
+                .expect("bounded directory listing")
+                .iter()
+                .all(|name| !name.starts_with(TEMP_BOOTSTRAP_PREFIX))
+        );
+        fs::remove_file(target).expect("remove test symlink");
+        root.remove_private_file("canary").expect("remove canary");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_publish_sync_failure_removes_only_the_writer_owned_target() {
+        let dir = unique_dir("sync-failure");
+        let root = AdmittedPrivateRoot::open(&dir).expect("admitted parent");
+        let suffix = [0x55; 16];
+
+        let result = write_atomic_admitted_with_hooks(
+            &root,
+            "bootstrap.json",
+            b"candidate-secret",
+            deterministic_suffix(&suffix),
+            |_, _, _| Ok(()),
+            |_| Err(PrivateStorageError::Operation),
+        );
+        assert!(result.is_err(), "injected directory sync failure must be surfaced");
+        assert!(
+            !dir.join("bootstrap.json").exists(),
+            "failed publication is removed only while its original descriptor still owns it"
+        );
+        assert!(
+            root.bounded_child_names(64)
+                .expect("bounded fixture listing")
+                .iter()
+                .all(|name| !name.starts_with(TEMP_BOOTSTRAP_PREFIX))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_publish_replacement_is_preserved_during_failure_cleanup() {
+        let dir = unique_dir("publish-replacement");
+        let root = AdmittedPrivateRoot::open(&dir).expect("admitted parent");
+        let suffix = [0x56; 16];
+        let sync_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sync_observation = Arc::clone(&sync_called);
+
+        let result = write_atomic_admitted_with_hooks(
+            &root,
+            "bootstrap.json",
+            b"candidate-secret",
+            deterministic_suffix(&suffix),
+            |root, target, _| {
+                root.remove_private_file(target)?;
+                let mut replacement = root.create_private_file(target)?;
+                replacement
+                    .write_all(b"replacement-canary")
+                    .map_err(|_| PrivateStorageError::Operation)?;
+                replacement.sync_all().map_err(|_| PrivateStorageError::Operation)?;
+                Ok(())
+            },
+            |_| {
+                sync_observation.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "post-publish replacement fault must be surfaced");
+        assert!(
+            !sync_called.load(Ordering::SeqCst),
+            "replaced target must fail identity check first"
+        );
+        assert_eq!(
+            root.read_bounded_file("bootstrap.json", 64).expect("replacement remains"),
+            b"replacement-canary",
+        );
+        assert!(
+            root.bounded_child_names(64)
+                .expect("bounded fixture listing")
+                .iter()
+                .all(|name| !name.starts_with(TEMP_BOOTSTRAP_PREFIX))
+        );
+        root.remove_private_file("bootstrap.json").expect("remove replacement fixture");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1310,13 +1241,6 @@ mod tests {
         let second_secret = fs::read_to_string(&path).unwrap();
         assert_ne!(first_secret, second_secret);
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn empty_target_path_rejected() {
-        let rng = SystemRandom::new();
-        let err = unique_temp_path(Path::new("/"), &mut |dest| rng.fill(dest)).unwrap_err();
-        assert!(matches!(err, DaemonError::Bootstrap(_)));
     }
 
     #[test]
@@ -1348,21 +1272,6 @@ mod tests {
         assert!(!is_canonical_lowercase_hex_pin(&"a".repeat(63)));
         assert!(is_canonical_lowercase_hex_pin(&"a".repeat(64)));
         assert!(is_canonical_lowercase_hex_pin(&"0123456789abcdef".repeat(4)));
-    }
-
-    #[test]
-    fn csprng_loop_eventually_yields_unique_path() {
-        // The CSPRNG-backed helper must produce distinct suffixes on
-        // repeated calls; this guards against a regression where a
-        // future change accidentally falls back to a single shared
-        // buffer.
-        let dir = unique_dir("budget");
-        let path = dir.join("bootstrap.json");
-        let rng = SystemRandom::new();
-        let a = unique_temp_path(&path, &mut |dest| rng.fill(dest)).expect("temp a");
-        let b = unique_temp_path(&path, &mut |dest| rng.fill(dest)).expect("temp b");
-        assert_ne!(a, b);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

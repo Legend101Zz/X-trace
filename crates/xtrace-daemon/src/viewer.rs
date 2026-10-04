@@ -2022,9 +2022,15 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_identity_corruption_is_reported_by_the_authenticated_http_handler() {
+        let scratch = std::path::PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        xtrace_runtime::private_storage::AdmittedPrivateRoot::open(&scratch)
+            .expect("admitted private test scratch");
         let project_root = tempfile::Builder::new()
             .prefix("viewer-observed-corruption-")
-            .tempdir()
+            .tempdir_in(scratch)
             .expect("temporary project root");
         #[cfg(unix)]
         std::fs::set_permissions(project_root.path(), std::fs::Permissions::from_mode(0o700))

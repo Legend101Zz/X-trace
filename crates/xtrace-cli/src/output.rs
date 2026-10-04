@@ -148,6 +148,19 @@ impl ErrorDocument {
                 details: BTreeMapString(std::collections::BTreeMap::new()),
                 exit_code: error.exit_code(),
             },
+            CliError::PrivateStorageUnavailable => Self {
+                kind: "error",
+                code: "XTR-PRIVATE-STORAGE-UNAVAILABLE".to_string(),
+                category: "permission".to_string(),
+                message: "private storage could not be admitted on this filesystem".to_string(),
+                remediation: vec![RemediationDocument {
+                    kind: "next_step".to_string(),
+                    label: "Choose an owner-enforced local data directory and retry".to_string(),
+                    command_ref: None,
+                }],
+                details: BTreeMapString(std::collections::BTreeMap::new()),
+                exit_code: error.exit_code(),
+            },
             CliError::DaemonAlreadyRunning => Self {
                 kind: "error",
                 code: "XTR-CLI-DAEMON-LOCKED".to_string(),

@@ -1622,6 +1622,7 @@ dependencies = [
  "xtrace-domain",
  "xtrace-ingest",
  "xtrace-protocol",
+ "xtrace-runtime",
  "xtrace-store",
  "zeroize",
 ]
@@ -1700,6 +1701,7 @@ dependencies = [
  "xtrace-application",
  "xtrace-domain",
  "xtrace-protocol",
+ "xtrace-runtime",
  "zstd",
 ]
 

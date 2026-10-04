@@ -1274,6 +1274,19 @@ mod tests {
     use std::cell::RefCell;
     use xtrace_domain::RuntimeSessionId;
 
+    fn private_tempdir() -> tempfile::TempDir {
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        xtrace_runtime::private_storage::AdmittedPrivateRoot::open(&scratch)
+            .expect("admitted private test scratch");
+        tempfile::Builder::new()
+            .prefix("xtrace-attach-test-")
+            .tempdir_in(scratch)
+            .expect("private attach test directory")
+    }
+
     #[test]
     fn non_tty_attach_requires_explicit_pid_even_for_one_listed_process() {
         let rows = vec![serde_json::json!({
@@ -1404,10 +1417,12 @@ mod tests {
 
     #[tokio::test]
     async fn unconfirmed_blocking_server_work_retains_lock_and_runtime_artifacts() {
-        let project = tempfile::tempdir().expect("disposable project data root");
-        let lock = crate::daemon_lock::acquire_project_lock(project.path()).expect("project lock");
+        let project = private_tempdir();
+        let admitted = xtrace_runtime::private_storage::AdmittedPrivateRoot::open(project.path())
+            .expect("admitted project root");
+        let lock = crate::daemon_lock::acquire_project_lock(&admitted).expect("project lock");
         let runtime =
-            crate::daemon_lock::RuntimeDirectory::create(project.path(), RuntimeSessionId::new())
+            crate::daemon_lock::RuntimeDirectory::create(&admitted, RuntimeSessionId::new())
                 .expect("session directory");
         let session_path = runtime.path().to_path_buf();
         let marker_path = session_path.join(".in-flight-marker");
@@ -1430,7 +1445,7 @@ mod tests {
         retain_unconfirmed_runtime(runtime, lock);
         assert!(marker_path.exists(), "unconfirmed work must retain its session artifacts");
         assert!(matches!(
-            crate::daemon_lock::acquire_project_lock(project.path()),
+            crate::daemon_lock::acquire_project_lock(&admitted),
             Err(CliError::DaemonAlreadyRunning)
         ));
 
@@ -1438,17 +1453,19 @@ mod tests {
         server.await.expect("server completes when blocking work is released").expect("server ok");
         assert!(marker_path.exists(), "retained artifacts are left for process-exit cleanup");
         assert!(matches!(
-            crate::daemon_lock::acquire_project_lock(project.path()),
+            crate::daemon_lock::acquire_project_lock(&admitted),
             Err(CliError::DaemonAlreadyRunning)
         ));
     }
 
     #[tokio::test]
     async fn cancelled_server_with_started_blocking_work_retains_lock_and_artifacts() {
-        let project = tempfile::tempdir().expect("disposable project data root");
-        let lock = crate::daemon_lock::acquire_project_lock(project.path()).expect("project lock");
+        let project = private_tempdir();
+        let admitted = xtrace_runtime::private_storage::AdmittedPrivateRoot::open(project.path())
+            .expect("admitted project root");
+        let lock = crate::daemon_lock::acquire_project_lock(&admitted).expect("project lock");
         let runtime =
-            crate::daemon_lock::RuntimeDirectory::create(project.path(), RuntimeSessionId::new())
+            crate::daemon_lock::RuntimeDirectory::create(&admitted, RuntimeSessionId::new())
                 .expect("session directory");
         let marker_path = runtime.path().join(".blocking-work-marker");
         std::fs::write(&marker_path, b"storage closure is active").expect("marker");
@@ -1473,7 +1490,7 @@ mod tests {
         retain_unconfirmed_runtime(runtime, lock);
         assert!(marker_path.exists(), "cancelled wrapper must not clean live-work artifacts");
         assert!(matches!(
-            crate::daemon_lock::acquire_project_lock(project.path()),
+            crate::daemon_lock::acquire_project_lock(&admitted),
             Err(CliError::DaemonAlreadyRunning)
         ));
 
@@ -1481,7 +1498,7 @@ mod tests {
         finished_rx.await.expect("blocking closure completed");
         assert!(marker_path.exists(), "artifacts remain until process exit");
         assert!(matches!(
-            crate::daemon_lock::acquire_project_lock(project.path()),
+            crate::daemon_lock::acquire_project_lock(&admitted),
             Err(CliError::DaemonAlreadyRunning)
         ));
     }

@@ -437,136 +437,6 @@ fn chmod_file_owner_only(_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Sets owner-only permissions on the project directory. Callers
-/// must invoke this helper *before* the SQLite database file is
-/// created so the directory's `0700` mode prevents another user on
-/// the host from enumerating or traversing into the project before
-/// the database file is born. Fails closed on Unix.
-pub fn restrict_project_dir(project_dir: &Path) -> Result<(), CliError> {
-    chmod_dir_owner_only(project_dir)
-}
-
-/// Creates the SQLite database file with mode `0600` (using
-/// [`std::fs::OpenOptions`] plus
-/// [`std::os::unix::fs::OpenOptionsExt::mode`]) and repairs an existing
-/// file without truncating it. The mode is verified before
-/// [`xtrace_store::SqliteStore::open`] is called. The helper is invoked
-/// from `init` so the file is born owner-only and SQLite does not briefly
-/// expose it with the directory's default mode. Fails closed on Unix;
-/// returns `Ok(())` off Unix (documented no-op).
-pub fn precreate_database_file(database: &Path) -> Result<(), CliError> {
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let created = OpenOptions::new()
-            .create(true)
-            .create_new(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(database);
-        match created {
-            Ok(file) => chmod_open_file_owner_only(&file, database)?,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                chmod_file_owner_only(database)?;
-            }
-            Err(err) => {
-                return Err(CliError::StoreUnavailable(format!(
-                    "precreate database {}: {err}",
-                    database.display()
-                )));
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = database;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn chmod_open_file_owner_only(file: &std::fs::File, path: &Path) -> Result<(), CliError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let descriptor_metadata = file.metadata().map_err(|_| {
-        CliError::StoreUnavailable(format!("inspect file {} failed", path.display()))
-    })?;
-    validate_database_file_metadata(&descriptor_metadata)?;
-    let path_metadata = std::fs::symlink_metadata(path).map_err(|_| {
-        CliError::StoreUnavailable(format!("inspect file path {} failed", path.display()))
-    })?;
-    validate_database_file_metadata(&path_metadata)?;
-    ensure_same_file(&descriptor_metadata, &path_metadata)?;
-    rustix::fs::fchmod(file, rustix::fs::Mode::from_bits_truncate(0o600)).map_err(|_| {
-        CliError::StoreUnavailable(format!("secure file {} failed", path.display()))
-    })?;
-    let updated = file.metadata().map_err(|_| {
-        CliError::StoreUnavailable(format!("inspect file {} failed", path.display()))
-    })?;
-    validate_database_file_metadata(&updated)?;
-    if updated.dev() != path_metadata.dev() || updated.ino() != path_metadata.ino() {
-        return Err(CliError::StoreCorrupted(
-            "database path changed during permission repair".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Sets owner-only permissions on the SQLite database file. Callers
-/// invoke this helper immediately after
-/// [`xtrace_store::SqliteStore::open`] returns so the file is never
-/// readable by another user even when it was just created. Fails
-/// closed on Unix.
-pub fn restrict_database_file(database: &Path) -> Result<(), CliError> {
-    chmod_file_owner_only(database)
-}
-
-/// Sets owner-only permissions on a project directory and the SQLite
-/// file it contains when the platform supports it. The helper is
-/// idempotent and is used by every CLI entry point that touches a
-/// previously-created project directory (`status`, `open`) so a
-/// directory left loose by an older binary is repaired on the next
-/// invocation. Fails closed on Unix: a chmod failure on either the
-/// directory or the database file surfaces as
-/// [`CliError::StoreUnavailable`]. The database path is checked as a regular,
-/// non-symlink, single-link file before either repair; Unix file-mode repair
-/// uses a no-follow descriptor or chmod operation and verifies file identity.
-pub fn secure_project_dir(project_dir: &Path) -> Result<(), CliError> {
-    let database = project_dir.join(DATABASE_FILENAME);
-    let database_exists = match std::fs::symlink_metadata(&database) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(CliError::StoreCorrupted(
-                "project database must be a real file".to_string(),
-            ));
-        }
-        Ok(metadata) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt as _;
-                if metadata.nlink() != 1 {
-                    return Err(CliError::StoreCorrupted(
-                        "project database must have exactly one filesystem link".to_string(),
-                    ));
-                }
-            }
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => {
-            return Err(CliError::StoreUnavailable(
-                "inspect project database path failed".to_string(),
-            ));
-        }
-    };
-    chmod_dir_owner_only(project_dir)?;
-    if database_exists {
-        chmod_file_owner_only(&database)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 // Tests intentionally panic on invariant violations because the
 // failure mode is "test failed", not "library panicked".
@@ -785,60 +655,15 @@ mod tests {
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn project_directory_is_owner_only_on_unix() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempdir();
-        let project_dir = dir.join("project");
-        std::fs::create_dir_all(&project_dir).expect("project");
-        let database = project_dir.join(DATABASE_FILENAME);
-        std::fs::write(&database, b"x").expect("database");
-        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o000))
-            .expect("make database unreadable");
-        secure_project_dir(&project_dir).expect("chmod");
-        let dir_mode =
-            std::fs::metadata(&project_dir).expect("dir metadata").permissions().mode() & 0o777;
-        let file_mode = std::fs::metadata(project_dir.join(DATABASE_FILENAME))
-            .expect("file metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(dir_mode, 0o700, "project directory must be owner-only");
-        assert_eq!(file_mode, 0o600, "database file must be owner-only");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn precreate_repairs_new_and_existing_mode_zero_database_files() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempdir();
-        let project_dir = dir.join("project");
-        std::fs::create_dir_all(&project_dir).expect("project");
-        let database = project_dir.join(DATABASE_FILENAME);
-
-        precreate_database_file(&database).expect("create owner-only database");
-        assert_eq!(
-            std::fs::metadata(&database).expect("new database metadata").permissions().mode()
-                & 0o777,
-            0o600
-        );
-
-        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o000))
-            .expect("make existing database unreadable");
-        precreate_database_file(&database).expect("repair unreadable existing database");
-        assert_eq!(
-            std::fs::metadata(&database).expect("repaired database metadata").permissions().mode()
-                & 0o777,
-            0o600
-        );
-    }
-
     fn tempdir() -> PathBuf {
+        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+            .map(PathBuf::from)
+            .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required");
+        xtrace_runtime::private_storage::AdmittedPrivateRoot::open(&scratch)
+            .expect("admitted private test scratch");
         tempfile::Builder::new()
             .prefix("xtrace-cli-paths-")
-            .tempdir()
+            .tempdir_in(scratch)
             .expect("create unique test directory")
             .keep()
     }
