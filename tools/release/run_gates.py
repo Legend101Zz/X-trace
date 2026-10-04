@@ -21,6 +21,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
+if __package__:
+    from . import private_roots
+else:
+    import private_roots
+
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -900,7 +905,9 @@ def _run(
     log_path: pathlib.Path, settle_report: dict[str, Any] | None = None,
 ) -> tuple[int, float]:
     started = time.monotonic()
-    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = private_roots.create_private_file(
+        log_path, flags=os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode=0o600,
+    )
     code = 0
     uncertain: str | None = None
     process: subprocess.Popen[bytes] | None = None
@@ -915,7 +922,11 @@ def _run(
     unconfirmed_process_count = 0
     owned_probe_processes: list[dict[str, Any]] = []
     timed_out = interrupted = False
-    log = os.fdopen(fd, "wb")
+    try:
+        log = os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)
+        raise
 
     def write_diagnostic(payload: bytes) -> None:
         nonlocal log_io_error
@@ -1191,7 +1202,8 @@ def _run(
 
 def _hash_file(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    fd = private_roots.open_private_file_read(path)
+    with os.fdopen(fd, "rb") as stream:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
@@ -1259,7 +1271,7 @@ def _versions(
     timeout: float = 20,
 ) -> dict[str, str]:
     versions: dict[str, str] = {}
-    logs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    private_roots.ensure_private_directory(logs_dir)
     for name, argv, cwd in VERSION_COMMANDS:
         if names is not None and name not in names:
             continue
@@ -1358,20 +1370,7 @@ def _restricted_env(base_env: dict[str, str], cache: pathlib.Path, label: str) -
 
 
 def _atomic_write(path: pathlib.Path, data: bytes) -> None:
-    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, path)
-    except BaseException:
-        try:
-            temp.unlink()
-        except OSError:
-            pass
-        raise
+    private_roots.atomic_write_private(path, data)
 
 
 def _atomic_json(path: pathlib.Path, value: Any) -> None:
@@ -1387,29 +1386,44 @@ class Lease:
         self.borrowed = False
 
     def acquire(self) -> None:
+        created = False
         try:
-            self.path.mkdir(mode=0o700)
+            private_roots.ensure_private_directory(self.path, must_create=True)
+            created = True
         except FileExistsError as exc:
+            private_roots.admit_directory(self.path, private_leaf=True)
             owner = "unknown owner"
             try:
-                data = json.loads((self.path / "owner.json").read_text())
-                owner = f"pid {data.get('pid', '?')} label {data.get('label', '?')}"
+                data = private_roots.read_private_json(self.path / "owner.json")
+                owner_pid = data.get("pid")
+                owner_label = data.get("label")
+                if (isinstance(owner_pid, int) and not isinstance(owner_pid, bool)
+                        and 0 < owner_pid <= 2**31 - 1
+                        and isinstance(owner_label, str) and LABEL_RE.fullmatch(owner_label)):
+                    owner = f"pid {owner_pid} label {owner_label}"
                 if data.get("token") == self.token:
                     self.borrowed = True
                     return
-            except (OSError, json.JSONDecodeError):
+            except (OSError, RuntimeError, ValueError):
                 pass
             raise RuntimeError(f"release builder lease is already owned ({owner}); share the exact lease token only with a nested gate invocation") from exc
+        if not created:
+            raise RuntimeError("release builder lease is already owned (unknown owner)")
         self.acquired = True
         try:
             _atomic_json(self.path / "owner.json", {"pid": os.getpid(), "label": self.label, "token": self.token, "startedAtEpoch": int(time.time())})
         except BaseException:
-            shutil.rmtree(self.path, ignore_errors=True)
+            try:
+                private_roots.admit_directory(self.path, private_leaf=True)
+                shutil.rmtree(self.path)
+            except (OSError, RuntimeError, ValueError):
+                pass
             self.acquired = False
             raise
 
     def release(self) -> None:
         if self.acquired and not self.borrowed:
+            private_roots.admit_directory(self.path, private_leaf=True)
             shutil.rmtree(self.path)
             self.acquired = False
 
@@ -1425,9 +1439,10 @@ class Lease:
         if not self.acquired or self.borrowed:
             return
         try:
-            owner = json.loads((self.path / "owner.json").read_text())
-        except (OSError, json.JSONDecodeError):
-            owner = {"label": self.label, "token": self.token}
+            private_roots.admit_directory(self.path, private_leaf=True)
+            owner = private_roots.read_private_json(self.path / "owner.json")
+        except (OSError, RuntimeError, ValueError):
+            raise RuntimeError("release lease owner record failed private admission; lease retained without modification") from None
         owner["requiresManualRecovery"] = True
         owner["terminationStatus"] = reason
         owner["processGroupId"] = process_group_id
@@ -1449,7 +1464,7 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("--command-timeout must be a positive number of seconds")
     args.lease_token = getattr(args, "lease_token", "") or secrets.token_hex(16)
     repo = pathlib.Path(args.repo).expanduser().resolve(strict=True)
-    cache = pathlib.Path(args.cache_root).expanduser().resolve()
+    cache = private_roots.normalize_directory_path(args.cache_root)
     if not (repo / ".git").exists():
         raise ValueError("--repo must be a Git checkout")
     if not LABEL_RE.fullmatch(args.label):
@@ -1466,24 +1481,48 @@ def run(args: argparse.Namespace) -> int:
     if not re.fullmatch(r"[0-9a-f]{32}", args.lease_token):
         raise ValueError("--lease-token must be 32 lowercase hexadecimal characters")
 
-    cache.mkdir(parents=True, exist_ok=True)
-    os.chmod(cache, 0o700)
-    for name in CACHE_NAMES:
-        (cache / name).mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(cache / name, 0o700)
+    restricted_target = cache / f"cargo-target-restricted-{args.label}"
     release_root = cache / "release-gates"
-    release_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(release_root, 0o700)
     run_dir = release_root / args.label
-    try:
-        run_dir.mkdir(mode=0o700)
-    except FileExistsError as exc:
-        raise RuntimeError("run label already exists; choose a unique --label") from exc
     logs_dir = run_dir / "logs"
-    logs_dir.mkdir(mode=0o700)
     lease_root = cache / "leases"
-    lease_root.mkdir(mode=0o700, exist_ok=True)
     leases = [Lease(lease_root / name, args.lease_token, args.label) for name in ("cargo", "gradle")]
+    # Inspect every existing named root before the first cache mutation. Missing
+    # descendants are admitted through their nearest existing no-follow parent.
+    private_roots.preflight_directory(cache, private_leaf=True)
+    for name in CACHE_NAMES:
+        private_roots.preflight_directory(cache / name, private_leaf=True)
+    private_roots.preflight_directory(restricted_target, must_be_absent=True)
+    private_roots.preflight_directory(release_root, private_leaf=True)
+    private_roots.preflight_directory(run_dir, must_be_absent=True)
+    private_roots.preflight_directory(logs_dir, must_be_absent=True)
+    private_roots.preflight_directory(lease_root, private_leaf=True)
+    for lease in leases:
+        private_roots.preflight_directory(lease.path, private_leaf=True)
+
+    private_roots.ensure_private_directory(cache)
+    for name in CACHE_NAMES:
+        private_roots.ensure_private_directory(cache / name)
+    restricted_target_identity = private_roots.ensure_private_directory(restricted_target, must_create=True)
+    private_roots.ensure_private_directory(release_root)
+    private_roots.ensure_private_directory(run_dir, must_create=True)
+    private_roots.ensure_private_directory(logs_dir, must_create=True)
+    private_roots.ensure_private_directory(lease_root)
+    logs_identity = private_roots.admit_directory(logs_dir, private_leaf=True)
+
+    private_roots_to_recheck = [
+        cache,
+        *(cache / name for name in CACHE_NAMES),
+        restricted_target,
+        release_root,
+        run_dir,
+        logs_dir,
+        lease_root,
+    ]
+
+    def recheck_private_roots() -> None:
+        for private_root in private_roots_to_recheck:
+            private_roots.admit_directory(private_root, private_leaf=True)
 
     results: list[dict[str, Any]] = []
     manifest: dict[str, Any] = {
@@ -1507,6 +1546,7 @@ def run(args: argparse.Namespace) -> int:
     retain_leases = False
     active_attempt: dict[str, Any] | None = None
     try:
+        recheck_private_roots()
         for lease in leases:
             lease.acquire()
             acquired_leases.append(lease)
@@ -1526,6 +1566,7 @@ def run(args: argparse.Namespace) -> int:
         })
         manifest["workingTreeDigestBefore"] = dirty_start
         manifest["phaseDiffSha256Before"] = _hash(diff_start)
+        recheck_private_roots()
         manifest["toolVersions"] = _versions(
             repo, env, logs_dir, manifest["versionProbes"], names={"rustc", "cargo", "rustup", "java", "node", "npm", "gradle-wrapper", "python", "git"},
         )
@@ -1593,6 +1634,7 @@ def run(args: argparse.Namespace) -> int:
             return result
 
         for index, gate in enumerate(GATES):
+            recheck_private_roots()
             head_now = _git(repo, "rev-parse", "HEAD").lower()
             tree_before = _tree_state_digest(repo)
             diff_before = _hash(_phase_diff(repo, base))
@@ -1615,7 +1657,7 @@ def run(args: argparse.Namespace) -> int:
                     argv = ["protoc absence check", *gate.argv]
                 else:
                     target = pathlib.Path(gate_env["CARGO_TARGET_DIR"])
-                    target.mkdir(mode=0o700)
+                    private_roots.admit_empty_directory(target, restricted_target_identity)
                     argv = [cargo_path, *gate.argv[1:]]
                     code, duration = run_gate_command(
                         argv, cwd=repo, env=gate_env, temp_log_path=temp_log_path,
@@ -1636,7 +1678,7 @@ def run(args: argparse.Namespace) -> int:
                     tree_before=tree_before, diff_before=diff_before,
                 )
             if temp_log_path.exists():
-                os.replace(temp_log_path, log_path)
+                private_roots.replace_private_file(temp_log_path, log_path, logs_identity)
             head_after = _git(repo, "rev-parse", "HEAD").lower()
             active_attempt["headAfter"] = head_after
             tree_after = _tree_state_digest(repo)
@@ -1669,12 +1711,15 @@ def run(args: argparse.Namespace) -> int:
             results.append(entry)
             active_attempt = None
             if gate.name == "node-install" and code == 0:
+                recheck_private_roots()
                 manifest["toolVersions"].update(_versions(repo, env, logs_dir, manifest["versionProbes"], names={"buf"}))
             if gate.name == "web-install" and code == 0:
+                recheck_private_roots()
                 manifest["toolVersions"].update(_versions(repo, env, logs_dir, manifest["versionProbes"], names={"playwright"}))
             manifest["headAfter"] = entry["headAfter"]
             manifest["gates"] = results
             manifest["decision"] = "running" if code == 0 else "failed"
+            recheck_private_roots()
             _atomic_json(run_dir / "receipt.json", manifest)
             print(f"{'PASS' if code == 0 else 'FAIL'} {gate.name} (exit {code}; log {log_name})", flush=True)
             if code != 0:
@@ -1709,7 +1754,7 @@ def run(args: argparse.Namespace) -> int:
             actual_log: pathlib.Path | None = None
             if temp_log_path.is_file():
                 try:
-                    os.replace(temp_log_path, log_path)
+                    private_roots.replace_private_file(temp_log_path, log_path, logs_identity)
                     actual_log = log_path
                 except OSError:
                     if temp_log_path.is_file():

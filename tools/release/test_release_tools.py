@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import pathlib
+import plistlib
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,9 +16,338 @@ import unittest
 from argparse import Namespace
 from unittest import mock
 
-from tools.release import check_ledger, run_gates
+from tools.release import check_ledger, private_roots, run_gates
 
 REAL_VERSIONS = run_gates._versions
+
+
+class PrivateRootAdmissionTests(unittest.TestCase):
+    def test_actual_macos_ls_headers_allow_deny_only_acl_and_paths_with_spaces(self) -> None:
+        workspace = pathlib.Path("/Users/example/Documents/Codex/2026-10-04/workspace with spaces")
+        cache = pathlib.Path("/Volumes/Example SSD/.cache/xtrace")
+        for mode, nlink, owner, group, flags, size, month, day, year, path in (
+            ("drwxr-xr-x", "22", "root", "wheel", "sunlnk", "704", "Feb", "25", "2026", pathlib.Path("/")),
+            ("drwxr-xr-x", "64", "root", "wheel", "restricted", "2048", "Feb", "25", "2026", pathlib.Path("/System")),
+            ("drwxr-xr-x", "8", "root", "wheel", "restricted", "256", "Feb", "25", "2026", pathlib.Path("/System/Volumes")),
+            ("drwxr-xr-x", "4", "root", "wheel", "sunlnk", "128", "Feb", "25", "2026", pathlib.Path("/Users")),
+        ):
+            header = f"{mode} {nlink} {owner} {group} {flags} {size} {month} {day} {year} {path}\n"
+            private_roots._parse_macos_acl(header.encode(), path)
+        private_roots._parse_macos_acl(
+            f"drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 {workspace}\n".encode(),
+            workspace,
+        )
+        private_roots._parse_macos_acl(
+            (f"drwx------@ 88 example staff - 2816 Oct 4 03:00 {cache}\n"
+             "0: group:everyone deny delete\n").encode(),
+            cache,
+        )
+        documents = pathlib.Path("/Users/example/Documents")
+        private_roots._parse_macos_acl(
+            (f"drwx------@ 9 example staff - 288 Oct 4 00:23 {documents}\n"
+             "0: group:everyone deny delete\n").encode(),
+            documents,
+        )
+
+    def test_macos_acl_rejects_allow_malformed_header_and_wrong_path(self) -> None:
+        path = pathlib.Path("/Users/test/parent with spaces")
+        good_header = f"drwx------+ 2 test staff - 64 Oct 4 00:23 {path}\n"
+        for payload in (
+            (good_header + "0: group:everyone allow read\n").encode(),
+            (good_header + "0: group:everyone allow read (inherited)\n").encode(),
+            (good_header + "1: group:everyone deny delete\n").encode(),
+            f"drwx------ 2 test staff - 64 Oct 4 00:23 {path}\n0: malformed\n".encode(),
+            f"drwx------ 2 test staff - 64 Oct 4 00:23 /wrong/path\n".encode(),
+            f"drwx------ 2 test staff - 64 Oct 4 00:23 {path}\nextra header field\n".encode(),
+            f"drwx------ 2 test staff unknown 64 Oct 4 00:23 {path}\n".encode(),
+        ):
+            with self.subTest(payload=payload), self.assertRaises(private_roots.AdmissionError):
+                private_roots._parse_macos_acl(payload, path)
+
+    def test_directory_admission_uses_injected_acl_and_mount_facts(self) -> None:
+        with tempfile.TemporaryDirectory(dir=pathlib.Path.home()) as temporary:
+            child = pathlib.Path(temporary) / "private child"
+            child.mkdir(mode=0o700)
+            acl_paths: list[pathlib.Path] = []
+            mount_paths: list[pathlib.Path] = []
+
+            def acl(path: pathlib.Path, _fd: int) -> None:
+                acl_paths.append(path)
+
+            def mount(path: pathlib.Path, _fd: int, _info: os.stat_result) -> None:
+                mount_paths.append(path)
+
+            fd, identity = private_roots._open_validated_directory(
+                child, private_leaf=True, acl_check=acl, mount_check=mount,
+            )
+            os.close(fd)
+            self.assertEqual(identity, (os.stat(child).st_dev, os.stat(child).st_ino))
+            self.assertIn(child, acl_paths)
+            self.assertIn(child, mount_paths)
+
+    def test_directory_admission_rejects_writable_parent_and_same_inode_mode_change(self) -> None:
+        with tempfile.TemporaryDirectory(dir=pathlib.Path.home()) as temporary:
+            parent = pathlib.Path(temporary)
+            child = parent / "private child"
+            child.mkdir(mode=0o700)
+            os.chmod(parent, 0o777)
+            try:
+                with self.assertRaises(private_roots.AdmissionError):
+                    private_roots._open_validated_directory(
+                        child, private_leaf=True,
+                        acl_check=lambda _path, _fd: None,
+                        mount_check=lambda _path, _fd, _info: None,
+                    )
+            finally:
+                os.chmod(parent, 0o700)
+
+            def change_mode(path: pathlib.Path, _fd: int, _info: os.stat_result) -> None:
+                if path == child:
+                    os.chmod(child, 0o750)
+
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._open_validated_directory(
+                    child, private_leaf=True,
+                    acl_check=lambda _path, _fd: None,
+                    mount_check=change_mode,
+                )
+            os.chmod(child, 0o700)
+
+    def test_directory_admission_rejects_rename_during_mount_check(self) -> None:
+        with tempfile.TemporaryDirectory(dir=pathlib.Path.home()) as temporary:
+            child = pathlib.Path(temporary) / "private child"
+            moved = pathlib.Path(temporary) / "moved child"
+            child.mkdir(mode=0o700)
+
+            def rename(path: pathlib.Path, _fd: int, _info: os.stat_result) -> None:
+                if path == child and child.exists():
+                    child.rename(moved)
+                    child.mkdir(mode=0o700)
+
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._open_validated_directory(
+                    child, private_leaf=True,
+                    acl_check=lambda _path, _fd: None,
+                    mount_check=rename,
+                )
+
+    def test_private_json_shape_rejects_nonfinite_and_deep_values(self) -> None:
+        with tempfile.TemporaryFile() as stream:
+            stream.write(b'{"owner":NaN}')
+            stream.flush()
+            self.assertIsNone(private_roots._bounded_json_shape(stream.fileno(), 64))
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._loads_bounded_private_json(b'{"owner":NaN}')
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._bounded_json_value({"owner": float("inf")})
+            stream.seek(0)
+            stream.truncate()
+            stream.write((b"[" * 10) + (b"]" * 10))
+            stream.flush()
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._bounded_json_shape(stream.fileno(), 64)
+
+    def test_mac_mount_uses_reported_firmlink_mount_and_rejects_noowners_or_device_change(self) -> None:
+        path = pathlib.Path("/Users/example/cache with spaces")
+        mount = pathlib.Path("/System/Volumes/Data/Users/example")
+        candidate_stat = os.stat_result((stat.S_IFDIR | 0o700, 11, 77, 1, os.getuid(), 0, 0, 0, 0, 0))
+        mount_stat = os.stat_result((stat.S_IFDIR | 0o755, 12, 77, 1, 0, 0, 0, 0, 0, 0))
+        real_path_stat = pathlib.Path.stat
+
+        def path_stat(target: pathlib.Path, *args: object, **kwargs: object) -> os.stat_result:
+            del args, kwargs
+            if target == path:
+                return candidate_stat
+            if target == mount:
+                return mount_stat
+            return real_path_stat(target)
+
+        def run_util(argv: list[str]) -> tuple[bytes, bytes]:
+            if argv[:2] == ["/bin/df", "-P"]:
+                return (b"Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk3s1 100 10 90 10% /System/Volumes/Data/Users/example\n", b"")
+            return plistlib.dumps({
+                "MountPoint": str(mount), "DeviceNode": "/dev/disk3s1",
+                "FilesystemType": "apfs", "GlobalPermissionsEnabled": True,
+            }), b""
+
+        with mock.patch.object(pathlib.Path, "stat", path_stat), \
+                mock.patch.object(os, "fstat", return_value=candidate_stat), \
+                mock.patch.object(private_roots, "_bounded_utility", side_effect=run_util) as utility:
+            private_roots._macos_mount(path, 7, candidate_stat)
+        self.assertEqual(utility.call_args_list[0].args[0], ["/bin/df", "-P", str(path)])
+        self.assertEqual(utility.call_args_list[1].args[0], ["/usr/sbin/diskutil", "info", "-plist", str(mount)])
+
+        def run_noowners(argv: list[str]) -> tuple[bytes, bytes]:
+            stdout, stderr = run_util(argv)
+            if argv[0] == "/usr/sbin/diskutil":
+                return plistlib.dumps({
+                    "MountPoint": str(mount), "DeviceNode": "/dev/disk3s1",
+                    "FilesystemType": "apfs", "GlobalPermissionsEnabled": False,
+                }), b""
+            return stdout, stderr
+
+        with mock.patch.object(pathlib.Path, "stat", path_stat), \
+                mock.patch.object(os, "fstat", return_value=candidate_stat), \
+                mock.patch.object(private_roots, "_bounded_utility", side_effect=run_noowners):
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._macos_mount(path, 7, candidate_stat)
+
+    def test_mac_mount_rejects_candidate_rename_after_utility_probe(self) -> None:
+        path = pathlib.Path("/Users/example/cache")
+        mount = pathlib.Path("/Volumes/Example")
+        initial = os.stat_result((stat.S_IFDIR | 0o700, 11, 77, 1, os.getuid(), 0, 0, 0, 0, 0))
+        changed = os.stat_result((stat.S_IFDIR | 0o700, 99, 77, 1, os.getuid(), 0, 0, 0, 0, 0))
+        mount_stat = os.stat_result((stat.S_IFDIR | 0o755, 12, 77, 1, 0, 0, 0, 0, 0, 0))
+        real_path_stat = pathlib.Path.stat
+        path_reads = 0
+
+        def path_stat(target: pathlib.Path, *args: object, **kwargs: object) -> os.stat_result:
+            nonlocal path_reads
+            del args, kwargs
+            if target == path:
+                path_reads += 1
+                return initial if path_reads == 1 else changed
+            if target == mount:
+                return mount_stat
+            return real_path_stat(target)
+
+        def run_util(argv: list[str]) -> tuple[bytes, bytes]:
+            if argv[0] == "/bin/df":
+                return (b"Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk3s1 100 10 90 10% /Volumes/Example\n", b"")
+            return plistlib.dumps({
+                "MountPoint": str(mount), "DeviceNode": "/dev/disk3s1",
+                "FilesystemType": "apfs", "GlobalPermissionsEnabled": True,
+            }), b""
+
+        with mock.patch.object(pathlib.Path, "stat", path_stat), \
+                mock.patch.object(os, "fstat", return_value=initial), \
+                mock.patch.object(private_roots, "_bounded_utility", side_effect=run_util):
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._macos_mount(path, 7, initial)
+
+        def run_mismatched_device(argv: list[str]) -> tuple[bytes, bytes]:
+            stdout, stderr = run_util(argv)
+            if argv[0] == "/usr/sbin/diskutil":
+                return plistlib.dumps({
+                    "MountPoint": str(mount), "DeviceNode": "/dev/disk9",
+                    "FilesystemType": "apfs", "GlobalPermissionsEnabled": True,
+            }), b""
+            return stdout, stderr
+
+        path_reads = 0
+        with mock.patch.object(pathlib.Path, "stat", path_stat), \
+                mock.patch.object(os, "fstat", return_value=initial), \
+                mock.patch.object(private_roots, "_bounded_utility", side_effect=run_mismatched_device):
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._macos_mount(path, 7, initial)
+
+    def test_linux_mountinfo_accepts_only_known_local_filesystems_and_decodes_spaces(self) -> None:
+        info = os.stat_result((stat.S_IFDIR | 0o700, 1, os.makedev(8, 1), 1, os.getuid(), 0, 0, 0, 0, 0))
+        escaped_mount = "/Volumes/Local\\040SSD"
+        record = f"36 25 8:1 / {escaped_mount} rw,relatime - ext4 /dev/sda1 rw\n".encode()
+        self.assertEqual(
+            private_roots._linux_filesystem_from_mountinfo(record, pathlib.Path("/Volumes/Local SSD/cache"), info),
+            "ext4",
+        )
+        overlay = record.replace(b"ext4", b"overlay")
+        with self.assertRaises(private_roots.AdmissionError):
+            private_roots._linux_filesystem_from_mountinfo(overlay, pathlib.Path("/Volumes/Local SSD/cache"), info)
+
+    def test_linux_acl_presence_or_probe_error_fails_closed(self) -> None:
+        with mock.patch.object(private_roots.os, "listxattr", return_value=[]):
+            private_roots._linux_acl_check(17)
+        with mock.patch.object(private_roots.os, "listxattr", return_value=["system.posix_acl_access"]):
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._linux_acl_check(17)
+        with mock.patch.object(private_roots.os, "listxattr", side_effect=OSError("xattr unavailable")):
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._linux_acl_check(17)
+
+    def test_admit_empty_directory_rejects_preexisting_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            child = root / "restricted-target"
+            child.mkdir(mode=0o700)
+            identity = (os.stat(child).st_dev, os.stat(child).st_ino)
+            fd = os.open(child, os.O_RDONLY | os.O_DIRECTORY)
+            with mock.patch.object(private_roots, "_open_validated_directory", return_value=(fd, identity)):
+                private_roots.admit_empty_directory(child, identity)
+            child.joinpath("unexpected").write_text("cached")
+            fd = os.open(child, os.O_RDONLY | os.O_DIRECTORY)
+            with mock.patch.object(private_roots, "_open_validated_directory", return_value=(fd, identity)):
+                with self.assertRaises(private_roots.AdmissionError):
+                    private_roots.admit_empty_directory(child, identity)
+
+    def test_utility_probe_error_fails_closed(self) -> None:
+        with mock.patch.object(private_roots.subprocess, "Popen", side_effect=OSError("probe unavailable")):
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._bounded_utility(["/usr/sbin/diskutil", "info", "-plist", "/Volumes/test"])
+
+    def test_utility_timeout_and_output_limit_fail_closed(self) -> None:
+        with mock.patch.object(private_roots, "UTILITY_TIMEOUT_SECONDS", 0.05):
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._bounded_utility(["/bin/sleep", "2"])
+        with mock.patch.object(private_roots, "UTILITY_OUTPUT_LIMIT", 128):
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._bounded_utility(["/usr/bin/yes"])
+
+    def test_preflight_rejects_symlink_and_preexisting_restricted_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            real = root / "real"
+            real.mkdir(mode=0o700)
+            link = root / "link"
+            link.symlink_to(real, target_is_directory=True)
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots.preflight_directory(link / "child", must_be_absent=True)
+            with self.assertRaises(FileExistsError):
+                private_roots.preflight_directory(real, must_be_absent=True)
+
+    def test_run_admission_rejection_precedes_all_cache_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base"], check=True)
+            base = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            cache = root / "cache-must-not-be-created"
+            args = Namespace(repo=str(repo), base=base, label="P00-admission-test", cache_root=str(cache), command_timeout=1)
+            reject = private_roots.AdmissionError("private cache admission failed")
+            with mock.patch.object(private_roots, "preflight_directory", side_effect=reject), \
+                    mock.patch.object(pathlib.Path, "mkdir", side_effect=AssertionError("mkdir called")), \
+                    mock.patch.object(os, "mkdir", side_effect=AssertionError("os.mkdir called")), \
+                    mock.patch.object(os, "chmod", side_effect=AssertionError("chmod called")), \
+                    mock.patch.object(run_gates, "_atomic_write", side_effect=AssertionError("private write called")):
+                with self.assertRaises(private_roots.AdmissionError):
+                    run_gates.run(args)
+            self.assertFalse(cache.exists())
+
+    def test_preexisting_restricted_target_stops_before_cache_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base"], check=True)
+            base = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            cache = root / "cache-must-not-be-created"
+            args = Namespace(repo=str(repo), base=base, label="P00-fresh-target", cache_root=str(cache), command_timeout=1)
+            target = cache / f"cargo-target-restricted-{args.label}"
+
+            def reject_existing_target(path: pathlib.Path, **kwargs: object) -> None:
+                del kwargs
+                if pathlib.Path(path) == target:
+                    raise FileExistsError("private run directory already exists")
+
+            with mock.patch.object(private_roots, "preflight_directory", side_effect=reject_existing_target), \
+                    mock.patch.object(pathlib.Path, "mkdir", side_effect=AssertionError("mkdir called")), \
+                    mock.patch.object(os, "mkdir", side_effect=AssertionError("os.mkdir called")), \
+                    mock.patch.object(os, "chmod", side_effect=AssertionError("chmod called")), \
+                    mock.patch.object(run_gates, "_atomic_write", side_effect=AssertionError("private write called")):
+                with self.assertRaises(FileExistsError):
+                    run_gates.run(args)
+            self.assertFalse(cache.exists())
 
 
 def digest(data: bytes) -> str:
@@ -282,7 +613,7 @@ class LedgerTests(unittest.TestCase):
 
 class RunnerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir=pathlib.Path.home())
         self.root = pathlib.Path(self.temp.name)
         self.repo = self.root / "repo"
         self.repo.mkdir()
@@ -295,6 +626,7 @@ class RunnerTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], check=True)
         self.base = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
         self.cache = self.root / "cache"
+        self.cache.mkdir(mode=0o700)
         self.versions_patcher = mock.patch.object(run_gates, "_versions", return_value={})
         self.versions_patcher.start()
         self.addCleanup(self.versions_patcher.stop)
@@ -626,6 +958,7 @@ class RunnerTests(unittest.TestCase):
             **_kwargs: object,
         ) -> tuple[int, float]:
             log_path.write_bytes(b"partial private command log\n")
+            os.chmod(log_path, 0o600)
             error = run_gates.UncertainProcessTree("owned tree did not drain", 777)
             error.command_started = True
             error.raw_exit_code = 0
@@ -678,6 +1011,7 @@ class RunnerTests(unittest.TestCase):
                     _argv: object, *, log_path: pathlib.Path, **_kwargs: object,
                 ) -> tuple[int, float]:
                     log_path.write_bytes(b"command completed before finalization\n")
+                    os.chmod(log_path, 0o600)
                     return 0, 0.75
 
                 def replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
@@ -728,7 +1062,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_normal_return_version_log_read_failure_keeps_attempted_probe(self) -> None:
         logs = self.cache / "version-read-failure"
-        logs.mkdir(parents=True)
+        logs.mkdir(mode=0o700, parents=True)
         log_path = logs / "version-probe.log"
         real_read_bytes = pathlib.Path.read_bytes
 
@@ -736,6 +1070,7 @@ class RunnerTests(unittest.TestCase):
             _argv: object, *, log_path: pathlib.Path, **_kwargs: object,
         ) -> tuple[int, float]:
             log_path.write_bytes(b"tool 1.2.3\n")
+            os.chmod(log_path, 0o600)
             return 0, 0.5
 
         def read_bytes(path: pathlib.Path) -> bytes:
@@ -788,6 +1123,7 @@ class RunnerTests(unittest.TestCase):
             _argv: object, *, log_path: pathlib.Path, **_kwargs: object,
         ) -> tuple[int, float]:
             log_path.write_bytes(b"flushed command output\n")
+            os.chmod(log_path, 0o600)
             raise run_gates.AttemptedGateFailure(OSError("injected fsync error"), 7, 2.0)
 
         with mock.patch.object(run_gates, "GATES", (attempted,)), \

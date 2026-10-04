@@ -4,6 +4,20 @@
 phase-diff gates. It accepts a checkout, a full immutable base commit SHA, a
 safe run label, and a cache root explicitly:
 
+Before creating cache directories, logs, leases, or receipts, the runner admits
+the configured cache root and every existing named cache location. It follows
+no symlinks, requires owner-controlled non-group/other-writable directories,
+and rejects filesystems or ACL states it cannot prove suitable for private
+local storage. On macOS it requires APFS with global permissions enabled; on
+Linux it accepts only the explicitly checked local filesystem set and rejects
+POSIX ACLs. Initial admission completes before the runner's first cache write;
+later admission failures stop subsequent writes without repairing or relocating
+the selected cache.
+The per-run restricted Cargo target must be new and empty before its build.
+Choose an owner-controlled cache location on a supported filesystem whose
+immediate parent already exists; the runner does not move cache data or change
+host ACLs.
+
 ```text
 python3 tools/release/run_gates.py \
   --repo /path/to/X-trace \
