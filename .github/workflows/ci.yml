@@ -26,6 +26,23 @@ jobs:
         run: |
           openssl version | grep -E '^OpenSSL 3\.'
           command -v lsof
+      - name: Create private test scratch directory
+        # The runner tests require an existing, canonical, owner-only scratch
+        # directory. It is created here, per job, with a shell-level runner
+        # variable; the runner context is not available in job-level `env`.
+        run: |
+          set -euo pipefail
+          umask 077
+          scratch="$(mktemp -d "${RUNNER_TEMP:?}/xtrace-test-scratch.XXXXXXXX")"
+          chmod 700 "$scratch"
+          scratch="$(realpath "$scratch")"
+          test -d "$scratch" && test ! -L "$scratch"
+          test "$(stat -c '%a' "$scratch")" = 700
+          test "$(stat -c '%u' "$scratch")" = "$(id -u)"
+          {
+            echo "XTRACE_TEST_SCRATCH_ROOT=$scratch"
+            echo "XTRACE_TEST_PRIVATE_SCRATCH=$scratch"
+          } >> "$GITHUB_ENV"
       - name: Run release tooling tests without skips
         run: |
           set -euo pipefail
