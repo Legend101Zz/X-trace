@@ -41,6 +41,15 @@ NATURAL_EXIT_SETTLE_SECONDS = 120.0
 NATURAL_EXIT_POLL_SECONDS = 1.0
 NATURAL_EXIT_QUIESCENT_SECONDS = 1.0
 EXPECTED_UNINSPECTABLE_SCAN = "untracked-process descriptor scan could not inspect every live candidate"
+MAX_UNION_INPUT_RECORDS = MAX_UNTRACKED_PROCESSES
+MAX_UNION_KEYS = MAX_UNTRACKED_PROCESSES
+MAX_SETTLE_ITERATIONS = 1024
+MAX_PID = 2**31 - 1
+MAX_STARTED_AT_CHARS = 64
+MAX_REASON_CHARS = 96
+MAX_PROBE_RECORDS = 64
+MAX_CLEANUP_EXCEPTION_RECORDS = 64
+OWNER_RECORD_SOFT_LIMIT_BYTES = 60 * 1024
 
 
 @dataclass(frozen=True)
@@ -67,6 +76,9 @@ class UntrackedProcessScan:
     error: str | None
     candidate_count: int
     owned_probes: list[dict[str, Any]] = field(default_factory=list)
+    # Exact (pid, startedAt) identities of candidates the scanner positively
+    # inspected and found neither held nor unknown. Empty on any scan error.
+    clean_identities: frozenset[tuple[int, str]] = frozenset()
 
     @property
     def unconfirmed(self) -> list[dict[str, Any]]:
@@ -81,6 +93,177 @@ class NaturalExitSettle:
     latest_candidates: list[dict[str, Any]]
     last_error: str | None
     deadline: float
+    identity_union: list[dict[str, Any]] = field(default_factory=list)
+    identity_union_count: int = 0
+    identity_union_truncated: bool = False
+
+
+def _identity_record(record: Any) -> tuple[dict[str, Any], tuple[int, str] | None, bool]:
+    """Return a bounded sanitized copy, its (pid, startedAt) key and validity.
+
+    Never serializes or copies unbounded input: only known fields with length
+    and type limits survive; anything else is reduced to a fixed marker.
+    """
+    if not isinstance(record, dict):
+        return {"descriptorStatus": "malformed", "reason": "non-record-identity"}, None, False
+    pid = record.get("pid")
+    started_at = record.get("startedAt")
+    valid_identity = (
+        isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid <= MAX_PID
+        and isinstance(started_at, str) and 0 < len(started_at.strip())
+        and len(started_at) <= MAX_STARTED_AT_CHARS
+    )
+    status = record.get("descriptorStatus")
+    status_ok = status in {"held", "uninspectable"}
+    clean: dict[str, Any] = {}
+    if valid_identity:
+        clean["pid"] = pid
+        clean["startedAt"] = started_at
+    parent = record.get("observedParentPid")
+    if isinstance(parent, int) and not isinstance(parent, bool) and 0 <= parent <= MAX_PID:
+        clean["observedParentPid"] = parent
+    clean["descriptorStatus"] = status if status_ok else "malformed"
+    reason = record.get("reason")
+    clean["reason"] = reason[:MAX_REASON_CHARS] if isinstance(reason, str) else "reason-unavailable"
+    key = (pid, started_at) if valid_identity else None
+    return clean, key, valid_identity and status_ok
+
+
+@dataclass
+class UnconfirmedIdentityUnion:
+    """Bounded identity evidence accumulated across one natural-exit settle.
+
+    Input size, record shape, field lengths, dedup keys, iteration and the
+    retained sample are all capped before anything is stored. `count` is the
+    number of distinct identities processed plus any input records that were
+    refused for size (an upper bound, never an under-count). `truncated` is
+    true whenever the sample does not carry every observed identity.
+    """
+
+    sample: list[dict[str, Any]] = field(default_factory=list)
+    count: int = 0
+    truncated: bool = False
+    _keys: set[Any] = field(default_factory=set)
+
+    def add(self, candidates: Any) -> str | None:
+        error: str | None = None
+        if not isinstance(candidates, (list, tuple)):
+            return self._admit(("malformed", "non-list"), {
+                "descriptorStatus": "malformed", "reason": "non-list-identity-input",
+            }) or "malformed or incomplete uninspectable process identity"
+        taken = candidates[:MAX_UNION_INPUT_RECORDS]
+        if len(candidates) > len(taken):
+            self.count += len(candidates) - len(taken)
+            self.truncated = True
+            error = "settling identity input exceeded its record limit"
+        for item in taken:
+            clean, key, valid = _identity_record(item)
+            if not valid:
+                error = error or "malformed or incomplete uninspectable process identity"
+                if key is None:
+                    key = ("malformed", clean.get("reason"), clean["descriptorStatus"])
+                else:
+                    key = ("malformed-status", key)
+            overflow = self._admit(key, clean)
+            error = error or overflow
+        if self.count > MAX_UNCONFIRMED_SAMPLE:
+            self.truncated = True
+        if self.truncated:
+            error = error or f"settling identity union exceeded {MAX_UNCONFIRMED_SAMPLE} identities"
+        return error
+
+    def _admit(self, key: Any, clean: dict[str, Any]) -> str | None:
+        if key in self._keys:
+            return None
+        if len(self._keys) >= MAX_UNION_KEYS:
+            self.count += 1
+            self.truncated = True
+            return "settling identity union exceeded its dedup limit"
+        self._keys.add(key)
+        self.count += 1
+        if len(self.sample) < MAX_UNCONFIRMED_SAMPLE:
+            self.sample.append(clean)
+        else:
+            self.truncated = True
+        return None
+
+    def mark_incomplete(self, observed_count: int) -> None:
+        self.truncated = True
+        if isinstance(observed_count, int) and observed_count > self.count:
+            self.count = observed_count
+
+
+@dataclass
+class ProbeEvidence:
+    """Bounded owned descriptor-probe identities and cleanup-exception records."""
+
+    probes: list[dict[str, Any]] = field(default_factory=list)
+    probe_count: int = 0
+    exceptions: list[dict[str, Any]] = field(default_factory=list)
+    exception_count: int = 0
+    truncated: bool = False
+    _probe_keys: set[Any] = field(default_factory=set)
+
+    def add_probes(self, records: Any) -> None:
+        if not isinstance(records, (list, tuple)):
+            records = [None]
+        if len(records) > MAX_PROBE_RECORDS:
+            self.truncated = True
+            self.probe_count += len(records) - MAX_PROBE_RECORDS
+            records = records[:MAX_PROBE_RECORDS]
+        for record in records:
+            clean: dict[str, Any] = {}
+            if isinstance(record, dict):
+                for name in ("pid", "processGroupId"):
+                    value = record.get(name)
+                    if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= MAX_PID:
+                        clean[name] = value
+                started_at = record.get("startedAt")
+                if isinstance(started_at, str) and len(started_at) <= MAX_STARTED_AT_CHARS:
+                    clean["startedAt"] = started_at
+                reason = record.get("reason")
+                if isinstance(reason, str):
+                    clean["reason"] = reason[:MAX_REASON_CHARS]
+            if "pid" not in clean:
+                clean["reason"] = clean.get("reason", "probe-record-malformed")
+            key = (clean.get("pid"), clean.get("startedAt"), clean.get("processGroupId"), clean.get("reason"))
+            if key in self._probe_keys:
+                continue
+            self._probe_keys.add(key)
+            self.probe_count += 1
+            if len(self.probes) < MAX_PROBE_RECORDS:
+                self.probes.append(clean)
+            else:
+                self.truncated = True
+
+    def add_exception(self, exc: BaseException) -> None:
+        """Capture probe identities and the cleanup-exception type before absorption."""
+        self.add_probes(getattr(exc, "owned_probe_processes", []) or [])
+        if isinstance(exc, (UncertainProbeCleanup, InterruptedProbeCleanup)):
+            self.exception_count += 1
+            if len(self.exceptions) < MAX_CLEANUP_EXCEPTION_RECORDS:
+                self.exceptions.append({"type": type(exc).__name__})
+            else:
+                self.truncated = True
+
+    @property
+    def empty(self) -> bool:
+        return not (self.probe_count or self.exception_count)
+
+    def report_fields(self) -> dict[str, Any]:
+        return {
+            "ownedProbeProcesses": list(self.probes),
+            "ownedProbeProcessCount": self.probe_count,
+            "cleanupExceptions": list(self.exceptions),
+            "cleanupExceptionCount": self.exception_count,
+            "probeEvidenceTruncated": self.truncated or self.probe_count > len(self.probes),
+        }
+
+
+def _bounded_unconfirmed(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, bool]:
+    """Bound a candidate list to the sample limit with a truthful total."""
+    sample = [_identity_record(item)[0] for item in records[:MAX_UNCONFIRMED_SAMPLE]]
+    return sample, len(records), len(records) > MAX_UNCONFIRMED_SAMPLE
 
 
 GATES: tuple[Gate, ...] = (
@@ -119,7 +302,12 @@ class UncertainProcessTree(RuntimeError):
         self.owned_processes: dict[int, str] = {}
         self.unconfirmed_processes: list[dict[str, Any]] = []
         self.unconfirmed_process_count = 0
+        self.unconfirmed_processes_truncated = False
         self.owned_probe_processes: list[dict[str, Any]] = []
+        self.owned_probe_process_count = 0
+        self.cleanup_exceptions: list[dict[str, Any]] = []
+        self.cleanup_exception_count = 0
+        self.probe_evidence_truncated = False
         self.raw_exit_code: int | None = None
         self.duration_seconds: float | None = None
         self.command_started = False
@@ -216,6 +404,44 @@ def _unconfirmed_candidates_since(
     ]
 
 
+def _classify_settle_scan(
+    scan: UntrackedProcessScan, union: UnconfirmedIdentityUnion, *, global_phase: bool,
+) -> str | None:
+    """Return a fail-closed reason, or None when the scan is acceptable.
+
+    Acceptable means: only the expected scanner classification, complete
+    candidate coverage, no held descriptor, no owned probe, bounded and
+    well-formed identities. Union evidence is accumulated first so every
+    failure path keeps what was observed.
+    """
+    union_error = union.add(scan.unconfirmed)
+    incomplete = scan.candidate_count != len(scan.unconfirmed)
+    if incomplete:
+        union.mark_incomplete(scan.candidate_count)
+    if scan.error not in {None, EXPECTED_UNINSPECTABLE_SCAN}:
+        return scan.error
+    if scan.held or scan.owned_probes:
+        return (
+            "global ownership rescan found a live unconfirmed candidate" if global_phase
+            else "held descriptor or owned probe appeared during settling"
+        )
+    if union_error:
+        return union_error
+    if incomplete:
+        return "settling scan candidate coverage is incomplete"
+    if bool(scan.uninspectable) != (scan.error == EXPECTED_UNINSPECTABLE_SCAN):
+        return "uninspectable scan classification is inconsistent with its candidate identities"
+    return None
+
+
+def _live_identities(snapshot: dict[int, tuple[int, str, str]]) -> set[tuple[int, str]]:
+    return {
+        (pid, started_at)
+        for pid, (_ppid, started_at, state) in snapshot.items()
+        if state not in {"Z", "X"}
+    }
+
+
 def _settle_uninspectable_candidates(
     initial: list[dict[str, Any]],
     snapshot_and_scan: Callable[[float], tuple[dict[int, tuple[int, str, str]], UntrackedProcessScan]],
@@ -224,67 +450,74 @@ def _settle_uninspectable_candidates(
     interval: float = NATURAL_EXIT_POLL_SECONDS,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    identity_union: UnconfirmedIdentityUnion | None = None,
+    owned_alive: Callable[[dict[int, tuple[int, str, str]]], list[int]] | None = None,
 ) -> NaturalExitSettle:
-    """Wait boundedly for exact initially-uninspectable identities to exit.
+    """Wait boundedly until every initial PID+start identity has exited or been
+    positively classified by the scanner.
+
+    A later scan that merely lacks the identity in its unknown list never
+    clears it: the identity must be absent from the live snapshot (natural
+    exit) or be listed among the scanner's positively inspected identities.
+    Other, later unknown identities do not block this stage; the global
+    quiescence scan owns them under the same absolute deadline.
 
     The callback receives the absolute monotonic deadline so all scanner work
     in one poll shares the same remaining budget.
     """
     started = monotonic()
     deadline = started + max(0.0, duration)
+    union = identity_union if identity_union is not None else UnconfirmedIdentityUnion()
+    initial_error = union.add(initial)
     identities = {
-        (candidate.get("pid"), candidate.get("startedAt"))
+        (candidate["pid"], candidate["startedAt"])
         for candidate in initial
-        if isinstance(candidate.get("pid"), int) and isinstance(candidate.get("startedAt"), str)
+        if isinstance(candidate, dict) and _identity_record(candidate)[1] is not None
     }
-    latest = list(initial)
-    last_error: str | None = None
+    latest = list(initial) if isinstance(initial, list) else []
+
+    def result(cleared: bool, polls: int, error: str | None) -> NaturalExitSettle:
+        return NaturalExitSettle(
+            cleared, max(0.0, monotonic() - started), polls, latest, error, deadline,
+            list(union.sample), union.count, union.truncated,
+        )
+
+    if initial_error or not identities or len(identities) != len(initial):
+        return NaturalExitSettle(
+            False, 0.0, 0, latest, initial_error or "initial process identity unavailable", deadline,
+            list(union.sample), union.count, union.truncated,
+        )
     poll_count = 0
-    if not identities:
-        return NaturalExitSettle(False, 0.0, 0, latest, "initial process identity unavailable", deadline)
     while True:
         remaining = deadline - monotonic()
-        if remaining <= 0:
-            return NaturalExitSettle(
-                False, max(0.0, monotonic() - started), poll_count, latest,
-                "initial uninspectable process identity survived settling deadline", deadline,
-            )
+        if remaining <= 0 or poll_count >= MAX_SETTLE_ITERATIONS:
+            return result(False, poll_count, "initial uninspectable process identity survived settling deadline")
         try:
             sleep(min(max(0.01, interval), remaining))
             remaining = deadline - monotonic()
             if remaining <= 0:
-                return NaturalExitSettle(
-                    False, max(0.0, monotonic() - started), poll_count, latest,
-                    "initial uninspectable process identity survived settling deadline", deadline,
-                )
+                return result(False, poll_count, "initial uninspectable process identity survived settling deadline")
             snapshot, scan = snapshot_and_scan(deadline)
             poll_count += 1
         except BaseException as exc:
-            return NaturalExitSettle(
-                False, max(0.0, monotonic() - started), poll_count, latest,
-                f"settling poll failed: {type(exc).__name__}", deadline,
-            )
+            return result(False, poll_count, f"settling poll failed: {type(exc).__name__}")
         latest = scan.unconfirmed
-        if scan.error and scan.error != EXPECTED_UNINSPECTABLE_SCAN:
-            last_error = scan.error
-            return NaturalExitSettle(
-                False, max(0.0, monotonic() - started), poll_count, latest,
-                last_error, deadline,
-            )
-        if scan.held or scan.owned_probes:
-            return NaturalExitSettle(
-                False, max(0.0, monotonic() - started), poll_count, latest,
-                "held descriptor or owned probe appeared during settling", deadline,
-            )
-        live_initial = {
-            (pid, started_at)
-            for pid, (_ppid, started_at, state) in snapshot.items()
-            if state not in {"Z", "X"} and (pid, started_at) in identities
+        reason = _classify_settle_scan(scan, union, global_phase=False)
+        if reason is not None:
+            return result(False, poll_count, reason)
+        if owned_alive is not None:
+            try:
+                owned_now = owned_alive(snapshot)
+            except BaseException as exc:
+                return result(False, poll_count, f"owned process check failed: {type(exc).__name__}")
+            if owned_now:
+                return result(False, poll_count, "owned process appeared during settling")
+        unresolved = {
+            identity for identity in _live_identities(snapshot) & identities
+            if identity not in scan.clean_identities
         }
-        if not live_initial:
-            return NaturalExitSettle(
-                True, max(0.0, monotonic() - started), poll_count, latest, None, deadline,
-            )
+        if not unresolved:
+            return result(True, poll_count, None)
 
 
 def _final_global_quiescence_scan(
@@ -295,44 +528,80 @@ def _final_global_quiescence_scan(
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     quiescent_seconds: float = NATURAL_EXIT_QUIESCENT_SECONDS,
+    identity_union: UnconfirmedIdentityUnion | None = None,
+    pending_identities: set[tuple[int, str]] | None = None,
 ) -> tuple[bool, list[dict[str, Any]], str | None, int]:
-    """Require two clean global scans separated by a bounded quiet interval.
+    """Require two quiet global scans after the latest uncertainty.
+
+    A scan is quiet only when it has no error, held descriptor, owned probe,
+    unknown identity or owned live process, covers every candidate, and every
+    identity ever seen unknown (plus `pending_identities`) has exited or been
+    positively classified. An unknown identity that appears resets the quiet
+    count; it must exit (or be classified) and then two further quiet scans
+    must follow, all before the same absolute deadline. Anything still
+    unresolved at the deadline fails closed.
 
     The callback receives the absolute monotonic deadline for the full scan.
     """
     latest: list[dict[str, Any]] = []
-    for scan_index in range(2):
+    union = identity_union if identity_union is not None else UnconfirmedIdentityUnion()
+    pending: set[tuple[int, str]] = set(pending_identities or ())
+    quiet = 0
+    scan_count = 0
+    churn_seen = False
+    while quiet < 2:
         remaining = deadline - monotonic()
+        if scan_count >= MAX_SETTLE_ITERATIONS:
+            return False, latest, "global rescan iteration limit exceeded", scan_count
         if remaining <= 0:
-            return False, latest, "settling deadline expired before global rescan", scan_index
-        if scan_index:
+            if churn_seen and not quiet:
+                return False, latest, "settling deadline expired while an uninspectable identity remained unresolved", scan_count
+            return False, latest, "settling deadline expired before global rescan", scan_count
+        if quiet:
             if remaining < quiescent_seconds:
-                return False, latest, "settling deadline expired before quiescent rescan", scan_index
+                return False, latest, "settling deadline expired before quiescent rescan", scan_count
             try:
                 sleep(quiescent_seconds)
             except BaseException as exc:
-                return False, latest, f"quiescent wait failed: {type(exc).__name__}", scan_index
+                return False, latest, f"quiescent wait failed: {type(exc).__name__}", scan_count
             remaining = deadline - monotonic()
             if remaining <= 0:
-                return False, latest, "settling deadline expired during quiescent interval", scan_index
+                return False, latest, "settling deadline expired during quiescent interval", scan_count
         try:
             snapshot, scan = snapshot_and_scan(deadline)
         except BaseException as exc:
-            return False, latest, f"global ownership rescan failed: {type(exc).__name__}", scan_index
-        latest = scan.unconfirmed
+            return False, latest, f"global ownership rescan failed: {type(exc).__name__}", scan_count
+        scan_count += 1
+        latest = list(scan.unconfirmed[:MAX_UNCONFIRMED_SAMPLE])
+        reason = _classify_settle_scan(scan, union, global_phase=True)
         if monotonic() > deadline:
-            return False, latest, "settling deadline exceeded during global ownership rescan", scan_index + 1
-        if scan.error:
-            return False, latest, scan.error, scan_index + 1
-        if latest or scan.owned_probes:
-            return False, latest, "global ownership rescan found a live unconfirmed candidate", scan_index + 1
+            return False, latest, "settling deadline exceeded during global ownership rescan", scan_count
+        if reason is not None:
+            return False, latest, reason, scan_count
         try:
             owned = owned_alive(snapshot)
         except BaseException as exc:
-            return False, latest, f"owned process check failed: {type(exc).__name__}", scan_index + 1
+            return False, latest, f"owned process check failed: {type(exc).__name__}", scan_count
         if owned:
-            return False, latest, "global ownership rescan found a live owned process", scan_index + 1
-    return True, latest, None, 2
+            return False, latest, "global ownership rescan found a live owned process", scan_count
+        pending.update((item["pid"], item["startedAt"]) for item in scan.uninspectable)
+        unresolved = {
+            identity for identity in _live_identities(snapshot) & pending
+            if identity not in scan.clean_identities
+        }
+        if scan.uninspectable or unresolved:
+            churn_seen = True
+            quiet = 0
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False, latest, "settling deadline expired while an uninspectable identity remained unresolved", scan_count
+            try:
+                sleep(min(max(0.01, NATURAL_EXIT_POLL_SECONDS), remaining))
+            except BaseException as exc:
+                return False, latest, f"uninspectable wait failed: {type(exc).__name__}", scan_count
+            continue
+        quiet += 1
+    return True, latest, None, scan_count
 
 
 def _bounded_ownership_scan(
@@ -365,14 +634,6 @@ def _bounded_ownership_scan(
     return processes, scan
 
 
-def _merge_process_identities(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: dict[tuple[Any, Any], dict[str, Any]] = {}
-    for group in groups:
-        for candidate in group:
-            merged[(candidate.get("pid"), candidate.get("startedAt"))] = dict(candidate)
-    return [merged[key] for key in sorted(merged, key=lambda item: (str(item[0]), str(item[1])))]
-
-
 def _natural_exit_settle_eligible(
     scan: UntrackedProcessScan, *, tree_confirmed_drained: bool, log_io_failed: bool,
     prior_uncertainty: bool = False,
@@ -385,7 +646,13 @@ def _natural_exit_settle_eligible(
         and not scan.owned_probes
         and bool(scan.uninspectable)
         and scan.error == EXPECTED_UNINSPECTABLE_SCAN
-        and all(item.get("descriptorStatus") == "uninspectable" for item in scan.uninspectable)
+        and scan.candidate_count == len(scan.unconfirmed)
+        and len(scan.uninspectable) <= MAX_UNCONFIRMED_SAMPLE
+        and all(
+            isinstance(item, dict)
+            and item.get("descriptorStatus") == "uninspectable" and _identity_record(item)[2]
+            for item in scan.uninspectable
+        )
     )
 
 
@@ -456,6 +723,14 @@ def _untracked_processes_since(
             and still_live[pid][2] not in {"Z", "X"}
         ]
         total = len(held_records) + len(unknown_records)
+        clean_identities: frozenset[tuple[int, str]] = frozenset()
+        if scan_error is None:
+            clean_identities = frozenset(
+                (pid, started_at) for pid, _ppid, started_at in candidates
+                if pid in still_live and still_live[pid][1] == started_at
+                and still_live[pid][2] not in {"Z", "X"}
+                and pid not in held_candidates and pid not in unknown_reasons
+            )
         sample = (held_records + unknown_records)[:MAX_UNCONFIRMED_SAMPLE]
         if total > MAX_UNCONFIRMED_SAMPLE:
             scan_error = scan_error or "unconfirmed process sample limit exceeded"
@@ -465,6 +740,7 @@ def _untracked_processes_since(
             scan_error,
             total,
             owned_probes,
+            clean_identities,
         )
 
     if len(candidates) > MAX_UNTRACKED_PROCESSES:
@@ -539,6 +815,7 @@ def _untracked_processes_since(
             "untracked-process descriptor scan could not inspect every live candidate",
             result.candidate_count,
             owned_probes,
+            result.clean_identities,
         )
     return result
 
@@ -920,7 +1197,8 @@ def _run(
     log_io_error: BaseException | None = None
     unconfirmed_processes: list[dict[str, Any]] = []
     unconfirmed_process_count = 0
-    owned_probe_processes: list[dict[str, Any]] = []
+    unconfirmed_processes_truncated = False
+    probe_evidence = ProbeEvidence()
     timed_out = interrupted = False
     try:
         log = os.fdopen(fd, "wb")
@@ -1067,7 +1345,8 @@ def _run(
                 )
                 unconfirmed_processes = scan.unconfirmed
                 unconfirmed_process_count = scan.candidate_count
-                owned_probe_processes = scan.owned_probes
+                unconfirmed_processes_truncated = scan.candidate_count > len(scan.unconfirmed)
+                probe_evidence.add_probes(scan.owned_probes)
                 final_ownership_scan_returned = True
                 settle_eligible = _natural_exit_settle_eligible(
                     scan, tree_confirmed_drained=tree_confirmed_drained,
@@ -1076,33 +1355,51 @@ def _run(
                 )
                 if settle_eligible and root_identity is not None:
                     initial_uninspectable = [dict(item) for item in scan.uninspectable]
+                    initial_identities = {
+                        (item["pid"], item["startedAt"]) for item in initial_uninspectable
+                    }
+                    identity_union = UnconfirmedIdentityUnion()
 
                     def scan_to_deadline(deadline: float) -> tuple[dict[int, tuple[int, str, str]], UntrackedProcessScan]:
-                        snapshot, current_scan = _bounded_ownership_scan(
-                            deadline,
-                            snapshot=lambda **kwargs: _process_snapshot(**kwargs),
-                            descriptor_scan=lambda snapshot, **kwargs: _untracked_processes_since(
-                                baseline_snapshot, owned, snapshot, log_path, **kwargs,
-                            ),
-                            after_snapshot=lambda snapshot: _track_descendants(
-                                root_identity, owned, snapshot,
-                            ),
-                        )
+                        # Evidence is captured here, before the settle and
+                        # global helpers can absorb a cleanup exception into a
+                        # string or treat returned probes as a plain failure.
+                        try:
+                            snapshot, current_scan = _bounded_ownership_scan(
+                                deadline,
+                                snapshot=lambda **kwargs: _process_snapshot(**kwargs),
+                                descriptor_scan=lambda snapshot, **kwargs: _untracked_processes_since(
+                                    baseline_snapshot, owned, snapshot, log_path, **kwargs,
+                                ),
+                                after_snapshot=lambda snapshot: _track_descendants(
+                                    root_identity, owned, snapshot,
+                                ),
+                            )
+                        except BaseException as scan_exc:
+                            probe_evidence.add_exception(scan_exc)
+                            raise
+                        probe_evidence.add_probes(current_scan.owned_probes)
                         return snapshot, current_scan
 
                     settling_started = time.monotonic()
-                    settled = _settle_uninspectable_candidates(initial_uninspectable, scan_to_deadline)
+                    settled = _settle_uninspectable_candidates(
+                        initial_uninspectable, scan_to_deadline,
+                        identity_union=identity_union,
+                        owned_alive=lambda snapshot: _owned_processes_alive(owned, snapshot),
+                    )
                     report = {
                         "eligible": True,
                         "settled": False,
                         "initialIdentities": initial_uninspectable,
                         "initialCandidateCount": scan.candidate_count,
-                        "latestIdentities": settled.latest_candidates,
+                        "latestIdentities": settled.latest_candidates[:MAX_UNCONFIRMED_SAMPLE],
                         "latestCandidateCount": len(settled.latest_candidates),
+                        "initialSettleSeconds": round(settled.elapsed_seconds, 6),
                         "waitSeconds": round(settled.elapsed_seconds, 6),
                         "settleWindowSeconds": NATURAL_EXIT_SETTLE_SECONDS,
                         "deadlineRemainingSeconds": round(max(0.0, settled.deadline - time.monotonic()), 6),
                         "pollCount": settled.poll_count,
+                        "globalRescanCount": 0,
                         "error": settled.last_error,
                     }
                     if settled.cleared:
@@ -1111,31 +1408,40 @@ def _run(
                                 settled.deadline,
                                 scan_to_deadline,
                                 lambda snapshot: _owned_processes_alive(owned, snapshot),
+                                identity_union=identity_union,
+                                pending_identities=initial_identities,
                             )
                         )
                         report["globalRescanCount"] = global_scan_count
                         report["latestIdentities"] = latest_identities
                         report["latestCandidateCount"] = len(latest_identities)
                         report["error"] = final_scan_error
+                        # Complete elapsed time (initial + global settling) against
+                        # the one original absolute deadline; never reset it.
+                        report["waitSeconds"] = round(time.monotonic() - settling_started, 6)
                         report["deadlineRemainingSeconds"] = round(max(0.0, settled.deadline - time.monotonic()), 6)
                         if clean_scans:
                             report["settled"] = True
-                            report["waitSeconds"] = round(time.monotonic() - settling_started, 6)
                             unconfirmed_processes = []
                             unconfirmed_process_count = 0
+                            unconfirmed_processes_truncated = False
                             uncertain = None
                         else:
                             uncertain = "natural-exit settling did not establish a clean global ownership rescan"
-                            unconfirmed_processes = _merge_process_identities(
-                                initial_uninspectable, latest_identities,
-                            )
-                            unconfirmed_process_count = len(unconfirmed_processes)
+                            unconfirmed_processes = list(identity_union.sample)
+                            unconfirmed_process_count = identity_union.count
+                            unconfirmed_processes_truncated = identity_union.truncated
                     else:
                         uncertain = "initial uninspectable process identity could not be cleared within the settling window"
-                        unconfirmed_processes = _merge_process_identities(
-                            initial_uninspectable, settled.latest_candidates,
+                        unconfirmed_processes = list(identity_union.sample)
+                        unconfirmed_process_count = max(scan.candidate_count, identity_union.count)
+                        unconfirmed_processes_truncated = (
+                            identity_union.truncated or unconfirmed_process_count > len(unconfirmed_processes)
                         )
-                        unconfirmed_process_count = max(scan.candidate_count, len(unconfirmed_processes))
+                    report["identityUnion"] = list(identity_union.sample)
+                    report["identityUnionCount"] = identity_union.count
+                    report["identityUnionTruncated"] = identity_union.truncated
+                    report.update(probe_evidence.report_fields())
                     if settle_report is not None:
                         settle_report.update(report)
                 else:
@@ -1147,13 +1453,15 @@ def _run(
                             "observed as owned descendants; builder leases require manual review"
                         )
             except BaseException as exc:
-                owned_probe_processes.extend(getattr(exc, "owned_probe_processes", []))
+                probe_evidence.add_exception(exc)
+                if settle_report is not None and not probe_evidence.empty:
+                    settle_report.update(probe_evidence.report_fields())
                 uncertain = uncertain or f"post-command ownership scan could not be completed: {type(exc).__name__}"
                 if last_snapshot is not None:
-                    unconfirmed_processes = _unconfirmed_candidates_since(
-                        baseline_snapshot, owned, last_snapshot,
+                    (unconfirmed_processes, unconfirmed_process_count,
+                     unconfirmed_processes_truncated) = _bounded_unconfirmed(
+                        _unconfirmed_candidates_since(baseline_snapshot, owned, last_snapshot),
                     )
-                    unconfirmed_process_count = len(unconfirmed_processes)
         try:
             log.flush()
             _sync_log(log)
@@ -1177,16 +1485,23 @@ def _run(
     if process is not None and not final_ownership_scan_returned:
         uncertain = uncertain or f"post-command ownership scan could not be completed: {type(log_io_error).__name__ if log_io_error else 'unknown'}"
         if baseline_snapshot is not None and last_snapshot is not None and not unconfirmed_processes:
-            unconfirmed_processes = _unconfirmed_candidates_since(
-                baseline_snapshot, owned, last_snapshot,
+            (unconfirmed_processes, unconfirmed_process_count,
+             unconfirmed_processes_truncated) = _bounded_unconfirmed(
+                _unconfirmed_candidates_since(baseline_snapshot, owned, last_snapshot),
             )
-            unconfirmed_process_count = len(unconfirmed_processes)
     if uncertain is not None:
         error = UncertainProcessTree(uncertain, process.pid if process else -1)
         error.owned_processes = dict(owned)
         error.unconfirmed_processes = unconfirmed_processes
         error.unconfirmed_process_count = unconfirmed_process_count
-        error.owned_probe_processes = owned_probe_processes
+        error.unconfirmed_processes_truncated = (
+            unconfirmed_processes_truncated or unconfirmed_process_count > len(unconfirmed_processes)
+        )
+        error.owned_probe_processes = list(probe_evidence.probes)
+        error.owned_probe_process_count = probe_evidence.probe_count
+        error.cleanup_exceptions = list(probe_evidence.exceptions)
+        error.cleanup_exception_count = probe_evidence.exception_count
+        error.probe_evidence_truncated = probe_evidence.truncated or probe_evidence.probe_count > len(probe_evidence.probes)
         error.raw_exit_code = process.returncode if process is not None else None
         error.duration_seconds = round(time.monotonic() - started, 6)
         error.command_started = process is not None
@@ -1443,7 +1758,17 @@ class Lease:
         unconfirmed_processes: list[dict[str, Any]] | None = None,
         unconfirmed_process_count: int | None = None,
         owned_probe_processes: list[dict[str, Any]] | None = None,
+        unconfirmed_processes_truncated: bool | None = None,
+        cleanup_exceptions: list[dict[str, Any]] | None = None,
+        cleanup_exception_count: int | None = None,
+        owned_probe_process_count: int | None = None,
+        probe_evidence_truncated: bool | None = None,
     ) -> None:
+        """Retain the lease with bounded evidence.
+
+        `unconfirmed_processes_truncated` is the explicit caller-supplied flag;
+        when omitted (older callers) it is inferred from count > sample length.
+        """
         if not self.acquired or self.borrowed:
             return
         try:
@@ -1459,10 +1784,93 @@ class Lease:
             owner["unconfirmedProcesses"] = unconfirmed_processes
         if unconfirmed_process_count is not None:
             owner["unconfirmedProcessCount"] = unconfirmed_process_count
-            owner["unconfirmedProcessesTruncated"] = unconfirmed_process_count > len(unconfirmed_processes or [])
+            owner["unconfirmedProcessesTruncated"] = bool(
+                unconfirmed_processes_truncated
+                or unconfirmed_process_count > len(unconfirmed_processes or [])
+            )
         if owned_probe_processes:
             owner["ownedProbeProcesses"] = owned_probe_processes
+        if owned_probe_process_count is not None:
+            owner["ownedProbeProcessCount"] = owned_probe_process_count
+        if cleanup_exceptions:
+            counts: dict[str, int] = {}
+            for item in cleanup_exceptions[:MAX_CLEANUP_EXCEPTION_RECORDS]:
+                name = item.get("type") if isinstance(item, dict) else None
+                name = name[:MAX_REASON_CHARS] if isinstance(name, str) else "unknown"
+                counts[name] = counts.get(name, 0) + 1
+            owner["cleanupExceptions"] = counts
+        if cleanup_exception_count is not None:
+            owner["cleanupExceptionCount"] = cleanup_exception_count
+        if probe_evidence_truncated is not None:
+            owner["probeEvidenceTruncated"] = bool(
+                probe_evidence_truncated
+                or (owned_probe_process_count or 0) > len(owned_probe_processes or [])
+            )
+        _fit_owner_record(owner)
         _atomic_json(self.path / "owner.json", owner)
+
+
+def _fit_owner_record(owner: dict[str, Any]) -> None:
+    """Trim evidence lists until the owner record stays readable.
+
+    The record must pass the same byte/node/comma/list limits that
+    `private_roots.read_private_json` enforces, otherwise a retained lease would
+    become unreadable. The largest evidence list is halved first and a truthful
+    truncation flag is set for whatever is cut; lease identity fields are never
+    trimmed.
+    """
+    flags = {
+        "unconfirmedProcesses": "unconfirmedProcessesTruncated",
+        "ownedProbeProcesses": "probeEvidenceTruncated",
+        "ownedProcesses": "ownedProcessesTruncated",
+    }
+
+    def fits() -> bool:
+        data = (json.dumps(owner, indent=2, sort_keys=True) + "\n").encode()
+        return private_roots.private_json_fits_read_limits(data)
+
+    for _ in range(64):
+        if fits():
+            return
+        candidates = [
+            (len(owner[name]), name) for name in flags
+            if isinstance(owner.get(name), list) and len(owner[name]) > 1
+        ]
+        if not candidates:
+            break
+        _size, name = max(candidates, key=lambda item: (item[0], item[1] != "unconfirmedProcesses"))
+        owner[name] = owner[name][: len(owner[name]) // 2]
+        owner[flags[name]] = True
+    if not fits():
+        for name, flag in flags.items():
+            if isinstance(owner.get(name), list):
+                owner[name] = []
+                owner[flag] = True
+        if not fits():
+            raise RuntimeError("release lease owner record cannot be bounded; lease retained without modification")
+
+
+def _retain_uncertain_leases(leases: Sequence[Lease], exc: UncertainProcessTree) -> list[str]:
+    """Retain every acquired lease with the complete bounded evidence.
+
+    Forwards the explicit unconfirmed-process truncation flag and all probe and
+    cleanup-exception evidence. Returns labels whose owner record was unavailable.
+    """
+    failed: list[str] = []
+    for lease in leases:
+        try:
+            lease.retain_for_manual_recovery(
+                str(exc), exc.process_group_id, exc.owned_processes, exc.unconfirmed_processes,
+                exc.unconfirmed_process_count, exc.owned_probe_processes,
+                unconfirmed_processes_truncated=exc.unconfirmed_processes_truncated,
+                cleanup_exceptions=exc.cleanup_exceptions,
+                cleanup_exception_count=exc.cleanup_exception_count,
+                owned_probe_process_count=exc.owned_probe_process_count,
+                probe_evidence_truncated=exc.probe_evidence_truncated,
+            )
+        except (OSError, RuntimeError, ValueError):
+            failed.append(lease.label)
+    return failed
 
 
 def run(args: argparse.Namespace) -> int:
@@ -1814,14 +2222,7 @@ def run(args: argparse.Namespace) -> int:
             manifest["workingTreeDigestAfter"] = None
             manifest["phaseDiffSha256After"] = None
         if uncertain_command:
-            for lease in acquired_leases:
-                try:
-                    lease.retain_for_manual_recovery(
-                        str(exc), exc.process_group_id, exc.owned_processes, exc.unconfirmed_processes,
-                        exc.unconfirmed_process_count, exc.owned_probe_processes,
-                    )
-                except (OSError, RuntimeError, ValueError):
-                    lease_retention_errors.append(lease.label)
+            lease_retention_errors.extend(_retain_uncertain_leases(acquired_leases, exc))
         manifest["decision"] = "failed"
         manifest["error"] = str(exc)
         if lease_retention_errors:
