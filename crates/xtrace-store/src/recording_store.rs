@@ -1215,8 +1215,10 @@ impl SqliteRecordingStore<'_> {
             )? {
                 Some(existing)
             } else {
-                validate_frame_identities(&connection, request, correlation_id)?;
+                // Sequence and ordinal continuity is the primary structural contract, so it
+                // is reported before the per-frame identity checks.
                 validate_new_continuity(&connection, request, &candidate, correlation_id)?;
+                validate_frame_identities(&connection, request, correlation_id)?;
                 None
             }
         };
@@ -4445,7 +4447,10 @@ mod tests {
         let fixture = on_disk_store("bindings");
         let relative =
             fixture.store.recording_store(Path::new("relative-root")).expect_err("relative root");
-        assert_eq!(relative.kind(), RecordingStoreErrorKind::Validation);
+        // Any path that cannot be admitted as a private root fails closed with the single
+        // sanitized private-storage error rather than distinguishing why.
+        assert_eq!(relative.kind(), RecordingStoreErrorKind::Permission);
+        assert_eq!(relative.code(), "XTR-PRIVATE-STORAGE-UNAVAILABLE");
 
         let mismatch_root = fixture.base.join("other");
         std::fs::create_dir(&mismatch_root).expect("mismatch root");
@@ -4461,7 +4466,7 @@ mod tests {
         let root_link = fixture.base.join("root-link");
         symlink(&fixture.root, &root_link).expect("root link");
         let linked_root = fixture.store.recording_store(&root_link).expect_err("linked root");
-        assert_eq!(linked_root.kind(), RecordingStoreErrorKind::Validation);
+        assert_eq!(linked_root.kind(), RecordingStoreErrorKind::Permission);
 
         let ancestor = fixture.base.join("ancestor");
         std::fs::create_dir(&ancestor).expect("ancestor");
@@ -4473,7 +4478,7 @@ mod tests {
         set_mode(fixture.base.join("ancestor").join("child"), 0o700);
         let ancestor_failure =
             fixture.store.recording_store(&descendant).expect_err("ancestor link");
-        assert_eq!(ancestor_failure.kind(), RecordingStoreErrorKind::Validation);
+        assert_eq!(ancestor_failure.kind(), RecordingStoreErrorKind::Permission);
     }
 
     #[cfg(unix)]
@@ -5392,6 +5397,9 @@ mod tests {
             .commit_segment(&segment_request(project_id, anchor.recording_id, 0, &[2]))
             .expect_err("unsafe root");
         assert_eq!(error.kind(), RecordingStoreErrorKind::Permission);
+        // A store whose root is unsafe refuses to hand out its connection, so restore the
+        // owner-only mode before asserting that nothing was published.
+        set_mode(&fixture.root, 0o700);
         assert_eq!(segment_count(&fixture.store), 0);
     }
 
@@ -5712,8 +5720,10 @@ mod tests {
                 verify_compressed_segment(&object, logical.content_hash()).expect("orphan valid");
                 let staged = staging_compressed_paths(&fixture.root, anchor.recording_id);
                 assert_eq!(staged.len(), 1, "{point} must retain its published staging link");
+                // The staging path is intentionally hard-linked to the published orphan, so it
+                // must be read through the managed (link-tolerant) policy.
                 let staged_bytes =
-                    read_bounded_regular_file(&staged[0], CorrelationId::new(), true)
+                    read_bounded_regular_file(&staged[0], CorrelationId::new(), false)
                         .expect("staging link");
                 verify_compressed_segment(&staged_bytes, logical.content_hash())
                     .expect("staging link valid");
@@ -6389,6 +6399,12 @@ mod tests {
     #[cfg(unix)]
     fn delete_segment_row(store: &SqliteStore, recording_id: RecordingId, ordinal: u32) {
         let connection = store.lock().expect("connection");
+        connection
+            .execute(
+                "DELETE FROM recording_frame_index WHERE recording_id = ?1 AND segment_ordinal = ?2",
+                rusqlite::params![recording_id.as_uuid().as_bytes().to_vec(), i64::from(ordinal)],
+            )
+            .expect("delete dependent frame index rows");
         connection
             .execute(
                 "DELETE FROM recording_segments WHERE recording_id = ?1 AND segment_ordinal = ?2",

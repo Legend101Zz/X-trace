@@ -1354,8 +1354,11 @@ mod tests {
         let error = adapter
             .begin_recording(&begin(project.id(), RecordingId::new()))
             .expect_err("absent root");
-        assert_eq!(error.kind(), PortErrorKind::Transport);
-        assert_eq!(error.source(), Some("filesystem metadata failure"));
+        // An absent root cannot be admitted as private storage; the failure is the sanitized
+        // private-storage error and exposes neither the path nor an OS error.
+        assert_eq!(error.kind(), PortErrorKind::Validation);
+        assert!(error.message().starts_with("XTR-PRIVATE-STORAGE-UNAVAILABLE"));
+        assert_eq!(error.source(), None);
         assert!(!error.message().contains(directory.path().to_string_lossy().as_ref()));
 
         let adapter = SqliteRecordingPersistence::new(store, directory.path());

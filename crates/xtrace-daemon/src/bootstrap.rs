@@ -1548,8 +1548,8 @@ mod tests {
         let first = artifact.try_release().expect_err("unlink must fail under read-only parent");
         let rendered = format!("{first}");
         assert!(
-            rendered.contains("remove bootstrap"),
-            "error must report the unlink failure, got: {rendered}",
+            rendered.contains("private bootstrap cleanup is unavailable"),
+            "error must report the sanitized cleanup failure, got: {rendered}",
         );
         assert!(path.exists(), "file must still exist after a failed release");
         let debug = format!("{artifact:?}");
@@ -1611,8 +1611,8 @@ mod tests {
             "explicit attempt must surface a Bootstrap error so the Drop fallback is reached, got {first_err:?}",
         );
         assert!(
-            rendered.contains("remove bootstrap"),
-            "error must report the unlink failure, got: {rendered}",
+            rendered.contains("private bootstrap cleanup is unavailable"),
+            "error must report the sanitized cleanup failure, got: {rendered}",
         );
         assert!(path.exists(), "file must still exist after a failed explicit release");
 

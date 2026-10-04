@@ -1618,7 +1618,7 @@ mod tests {
     fn manifest_with_module_capture(capability: &str) -> Vec<u8> {
         let module = format!(
             concat!(
-                "[{{\"after\":[],\"captureCapabilities\":[\"{capability}\"],",
+                "\"frameworkModules\":[{{\"after\":[],\"captureCapabilities\":[\"{capability}\"],",
                 "\"conflicts\":[],\"discoveryCapabilities\":[],\"fixtureIds\":[],",
                 "\"framework\":{{\"artifact\":\"spring-web\",\"ecosystem\":\"maven\",",
                 "\"group\":\"org.springframework\"}},\"id\":\"spring.web\",",
