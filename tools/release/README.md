@@ -149,3 +149,28 @@ fall back to writing beneath the user's home directory.
 ```text
 XTRACE_TEST_SCRATCH_ROOT=/absolute/path/to/admitted/test-scratch PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tools.release.test_release_tools
 ```
+
+## Leased runner for builds and tests
+
+`tools/release/leased_run.py` runs one Cargo, Gradle or npm command under both
+real builder leases in the private cache root, with the same task-scoped
+environment and process-tree supervision as the 23-gate floor:
+
+```
+python3.14 -B -m tools.release.leased_run --repo <worktree> --label <new unique label> \
+    --cache-root <private root> --timeout <seconds> [--wait <seconds>] \
+    [--jdk-home <path>] [--expect-unittest <N>] -- <argv...>
+```
+
+- The label must be new. Both leases are acquired with a fresh random token that
+  is never printed. A held lease is never borrowed or broken: the runner polls
+  every 15 s for at most `--wait` seconds, then exits with code 75.
+- Uncommitted edits are allowed; HEAD and working-tree digests are recorded in
+  `release-gates/<label>/receipt.json` (no tokens, paths or environment).
+- Exit codes: 0 passed, 1 command or expectation failed, 2 invalid input or
+  admission failure, 3 uncertain process tree (leases retained for manual
+  recovery) or lease release failure, 75 leases busy past `--wait`.
+- `--expect-unittest N` passes only on exit 0, `Ran N tests`, a plain `OK` and
+  no skip or expected-failure marker.
+- One JSON summary line is printed: label, decision, exit code, duration, log
+  SHA-256 and lease cleanup.

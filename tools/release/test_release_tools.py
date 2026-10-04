@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from argparse import Namespace
 from unittest import mock
 
-from tools.release import check_ledger, private_roots, run_gates
+from tools.release import check_ledger, leased_run, private_roots, run_gates
 
 REAL_VERSIONS = run_gates._versions
 
@@ -3345,6 +3345,399 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(run_gates, "GATES", ()):
             with self.assertRaisesRegex(ValueError, "ancestor"):
                 run_gates.run(self.args())
+
+
+class LeasedRunTests(unittest.TestCase):
+    """Behavior of tools.release.leased_run.
+
+    The filesystem admission layer is replaced by plain-directory equivalents so
+    these tests exercise the runner's own logic (lease polling, env, receipt,
+    retention, exit codes) deterministically; real private-root admission is
+    covered by the admission and RunnerTests suites. `run_gates._run` is faked
+    with callables that write the log and return or raise like the real one.
+    """
+
+    TOKEN = "ab" * 16
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(dir=test_scratch_root())
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        (self.repo / "tracked.txt").write_text("one\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], check=True)
+        self.cache = self.root / "cache"
+        self.cache.mkdir(mode=0o700)
+        self.clock = FakeClock()
+        self.lines: list[str] = []
+
+        def identity(path: object) -> tuple[int, int]:
+            info = os.stat(path)
+            return info.st_dev, info.st_ino
+
+        def preflight(path: object, *, private_leaf: bool = True, must_be_absent: bool = False) -> None:
+            if must_be_absent and os.path.lexists(path):
+                raise FileExistsError("exists")
+
+        def admit(path: object, *, private_leaf: bool = False) -> tuple[int, int]:
+            if not os.path.isdir(path):
+                raise private_roots.AdmissionError("private cache admission failed")
+            return identity(path)
+
+        def ensure(path: object, *, must_create: bool = False) -> tuple[int, int]:
+            if must_create and os.path.lexists(path):
+                raise FileExistsError("exists")
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            return identity(path)
+
+        def atomic_write(path: object, data: bytes) -> None:
+            pathlib.Path(os.fspath(path)).write_bytes(data)
+            os.chmod(path, 0o600)
+
+        def read_json(path: object, **_kwargs: object) -> dict:
+            return json.loads(pathlib.Path(os.fspath(path)).read_text())
+
+        patches = [
+            mock.patch.object(private_roots, "preflight_directory", side_effect=preflight),
+            mock.patch.object(private_roots, "admit_directory", side_effect=admit),
+            mock.patch.object(private_roots, "ensure_private_directory", side_effect=ensure),
+            mock.patch.object(private_roots, "atomic_write_private", side_effect=atomic_write),
+            mock.patch.object(private_roots, "read_private_json", side_effect=read_json),
+            mock.patch.object(private_roots, "open_private_file_read", side_effect=lambda path: os.open(path, os.O_RDONLY)),
+            mock.patch.object(private_roots, "replace_private_file", side_effect=lambda src, dst, _identity: os.replace(src, dst)),
+            mock.patch.object(private_roots, "normalize_directory_path", side_effect=lambda value: pathlib.Path(value)),
+            mock.patch.object(leased_run.secrets, "token_hex", return_value=self.TOKEN),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def args(self, label: str = "leased-test-1", **overrides: object) -> Namespace:
+        values = dict(
+            repo=str(self.repo), label=label, cache_root=str(self.cache), timeout=30.0, wait=0.0,
+            jdk_home=None, expect_unittest=None, argv=["cargo", "build"],
+        )
+        values.update(overrides)
+        return Namespace(**values)
+
+    def fake_run(self, log: bytes = b"", code: int = 0, raise_exc: BaseException | None = None,
+                 mutate: object = None) -> mock._patch:
+        captured: dict[str, object] = {}
+        self.captured = captured
+
+        def fake(argv: list[str], *, cwd: pathlib.Path, env: dict[str, str], timeout: float,
+                 log_path: pathlib.Path, settle_report: dict | None = None) -> tuple[int, float]:
+            captured.update(
+                argv=list(argv), cwd=cwd, env=dict(env), timeout=timeout,
+                held=sorted(path.name for path in (self.cache / "leases").iterdir()),
+                log_name=pathlib.Path(log_path).name,
+            )
+            pathlib.Path(log_path).write_bytes(log)
+            if callable(mutate):
+                mutate()
+            if raise_exc is not None:
+                raise raise_exc
+            return code, 0.5
+
+        return mock.patch.object(run_gates, "_run", side_effect=fake)
+
+    def go(self, args: Namespace | None = None) -> int:
+        return leased_run.run(
+            args or self.args(), monotonic=self.clock.monotonic, sleep=self.clock.sleep, out=self.lines.append,
+        )
+
+    def receipt(self, label: str = "leased-test-1") -> dict:
+        return json.loads((self.cache / "release-gates" / label / "receipt.json").read_text())
+
+    def leases_present(self) -> list[str]:
+        directory = self.cache / "leases"
+        return sorted(path.name for path in directory.iterdir()) if directory.is_dir() else []
+
+    def uncertain(self) -> run_gates.UncertainProcessTree:
+        error = run_gates.UncertainProcessTree("process tree could not be confirmed drained", 4242)
+        error.command_started = True
+        error.raw_exit_code = 0
+        error.duration_seconds = 2.0
+        error.owned_processes = {4243: "owned-start"}
+        return error
+
+    def test_passing_run_uses_task_scoped_env_holds_both_leases_and_releases_them(self) -> None:
+        jdk = self.root / "jdk"
+        (jdk / "bin").mkdir(parents=True)
+        (jdk / "bin" / "java").write_text("")
+        with self.fake_run(log=b"Ran 3 tests in 0.010s\n\nOK\n"):
+            code = self.go(self.args(expect_unittest=3, jdk_home=str(jdk)))
+        self.assertEqual(code, leased_run.EXIT_PASSED)
+        self.assertEqual(self.captured["held"], ["cargo", "gradle"], "both leases are held while the command runs")
+        self.assertEqual(self.leases_present(), [], "leases released after success")
+        env = self.captured["env"]
+        scratch = self.cache / "tmp" / "leased-test-1-scratch"
+        self.assertTrue(scratch.is_dir())
+        expected = {
+            "CARGO_HOME": self.cache / "cargo", "CARGO_TARGET_DIR": self.cache / "cargo-target",
+            "GRADLE_USER_HOME": self.cache / "gradle", "NPM_CONFIG_CACHE": self.cache / "npm",
+            "PLAYWRIGHT_BROWSERS_PATH": self.cache / "playwright", "XDG_CACHE_HOME": self.cache / "xdg",
+            "TMPDIR": scratch, "TMP": scratch, "TEMP": scratch,
+            "XTRACE_TEST_SCRATCH_ROOT": scratch, "XTRACE_TEST_PRIVATE_SCRATCH": scratch,
+        }
+        for name, value in expected.items():
+            self.assertEqual(env[name], str(value), name)  # type: ignore[index]
+        self.assertEqual(env["JAVA_HOME"], str(jdk))  # type: ignore[index]
+        self.assertTrue(env["PATH"].startswith(str(jdk / "bin") + os.pathsep))  # type: ignore[index]
+        self.assertEqual(self.captured["cwd"], self.repo.resolve())
+        self.assertEqual(self.captured["timeout"], 30.0)
+        receipt = self.receipt()
+        self.assertEqual(receipt["decision"], "passed")
+        self.assertEqual(receipt["leaseCleanup"], ["released", "released"])
+        self.assertEqual(receipt["unittest"], {"ran": 3, "ok": True, "skipOrExpectedFailureMarker": False})
+        summary = json.loads(self.lines[-1])
+        self.assertEqual(
+            sorted(summary),
+            ["decision", "durationSeconds", "exitCode", "label", "leaseCleanup", "logSha256"],
+        )
+        self.assertEqual(summary["decision"], "passed")
+        self.assertEqual(summary["exitCode"], 0)
+        self.assertEqual(summary["logSha256"], hashlib.sha256(b"Ran 3 tests in 0.010s\n\nOK\n").hexdigest())
+        self.assertEqual(len(self.lines), 1, "exactly one summary line")
+        # Sanitized: no token, owner path, repo path or environment in the receipt or summary.
+        rendered = json.dumps(receipt) + self.lines[-1]
+        for secret in (self.TOKEN, str(self.root), "CARGO_HOME", "TMPDIR"):
+            self.assertNotIn(secret, rendered)
+
+    def test_unittest_expectation_requires_exact_count_plain_ok_and_zero_skips(self) -> None:
+        cases = {
+            "wrong count": (b"Ran 4 tests in 0.1s\n\nOK\n", 0),
+            "skips": (b"Ran 3 tests in 0.1s\n\nOK (skipped=1)\n", 0),
+            "expected failures": (b"Ran 3 tests in 0.1s\n\nOK (expected failures=1)\n", 0),
+            "failed": (b"Ran 3 tests in 0.1s\n\nFAILED (failures=1)\n", 0),
+            "no summary": (b"compiled fine\n", 0),
+            "nonzero exit": (b"Ran 3 tests in 0.1s\n\nOK\n", 2),
+        }
+        for index, (name, (log, exit_code)) in enumerate(cases.items()):
+            with self.subTest(name):
+                label = f"leased-expect-{index}"
+                with self.fake_run(log=log, code=exit_code):
+                    code = self.go(self.args(label, expect_unittest=3))
+                self.assertEqual(code, leased_run.EXIT_FAILED)
+                self.assertEqual(self.receipt(label)["decision"], "failed")
+                self.assertEqual(self.leases_present(), [])
+        label = "leased-expect-ok"
+        with self.fake_run(log=b"noise\nRan 3 tests in 0.1s\n\nOK\n"):
+            self.assertEqual(self.go(self.args(label, expect_unittest=3)), leased_run.EXIT_PASSED)
+
+    def test_parse_unittest_summary(self) -> None:
+        parse = leased_run.parse_unittest_summary
+        self.assertEqual(parse(b"Ran 1 test in 0.001s\n\nOK\n"), (1, True, False))
+        self.assertEqual(parse(b"Ran 2 tests in 1.0s\n\nOK (skipped=2)\n"), (2, False, True))
+        self.assertEqual(parse(b"Ran 2 tests in 1.0s\n\nFAILED (errors=1)\n"), (2, False, False))
+        self.assertEqual(parse(b"\xff\xfe garbage"), (None, False, False))
+        self.assertEqual(parse(b"Ran 9 tests in 1s\nOK\nRan 5 tests in 1.0s\n\nOK\n"), (5, True, False), "last summary wins")
+
+    def test_dirty_tree_is_allowed_and_recorded_not_refused(self) -> None:
+        (self.repo / "tracked.txt").write_text("edited\n")
+        (self.repo / "new.txt").write_text("new\n")
+        head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+
+        def edit_during_run() -> None:
+            (self.repo / "new.txt").write_text("changed again\n")
+
+        with self.fake_run(mutate=edit_during_run):
+            self.assertEqual(self.go(), leased_run.EXIT_PASSED)
+        receipt = self.receipt()
+        self.assertEqual(receipt["sourceBefore"]["head"], head)
+        self.assertEqual(receipt["sourceBefore"]["dirtyEntries"], 2)
+        self.assertEqual(receipt["sourceAfter"]["head"], head)
+        self.assertRegex(receipt["sourceBefore"]["statusSha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(receipt["sourceBefore"]["workingTreeDigest"], r"^[0-9a-f]{64}$")
+        self.assertTrue(receipt["sourceChangedDuringRun"])
+        self.assertEqual(receipt["decision"], "passed", "source edits are recorded, not a failure")
+
+    def test_uncertain_process_tree_retains_both_leases_and_blocks_the_next_run(self) -> None:
+        with self.fake_run(raise_exc=self.uncertain()):
+            code = self.go()
+        self.assertEqual(code, leased_run.EXIT_UNCERTAIN)
+        self.assertEqual(self.leases_present(), ["cargo", "gradle"], "leases retained for manual recovery")
+        for name in LEASE_DIRS:
+            owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
+            self.assertIs(owner["requiresManualRecovery"], True)
+        receipt = self.receipt()
+        self.assertEqual(receipt["decision"], "uncertain_process_tree")
+        self.assertEqual(receipt["leaseCleanup"], ["retained", "retained"])
+        self.assertEqual(json.loads(self.lines[-1])["leaseCleanup"], ["retained", "retained"])
+        before = {name: (self.cache / "leases" / name / "owner.json").read_bytes() for name in LEASE_DIRS}
+        # The next run never borrows or breaks them: it reports the busy code.
+        with self.fake_run() as fake:
+            code = self.go(self.args("leased-test-2"))
+        self.assertEqual(code, leased_run.EXIT_LEASE_WAIT_EXPIRED)
+        fake.assert_not_called()
+        self.assertEqual(before, {name: (self.cache / "leases" / name / "owner.json").read_bytes() for name in LEASE_DIRS})
+        self.assertEqual(json.loads(self.lines[-1])["decision"], "lease_wait_expired")
+        self.assertFalse((self.cache / "release-gates" / "leased-test-2").exists(), "label stays unused")
+
+    def test_attempted_gate_failure_is_a_failed_run_that_releases_leases(self) -> None:
+        failure = run_gates.AttemptedGateFailure(OSError("log"), 0, 1.5)
+        with self.fake_run(raise_exc=failure):
+            self.assertEqual(self.go(), leased_run.EXIT_FAILED)
+        self.assertEqual(self.leases_present(), [])
+        receipt = self.receipt()
+        self.assertEqual(receipt["decision"], "failed")
+        self.assertEqual(receipt["exitCode"], 0)
+
+    def test_leases_release_in_reverse_order(self) -> None:
+        order: list[str] = []
+        real_release = run_gates.Lease.release
+
+        def record(lease: run_gates.Lease) -> None:
+            order.append(lease.path.name)
+            real_release(lease)
+
+        with self.fake_run(), mock.patch.object(run_gates.Lease, "release", record):
+            self.assertEqual(self.go(), leased_run.EXIT_PASSED)
+        self.assertEqual(order, ["gradle", "cargo"])
+
+    def test_busy_lease_is_polled_never_borrowed_and_taken_once_free(self) -> None:
+        busy = self.cache / "leases" / "gradle"
+        busy.mkdir(parents=True)
+        (busy / "owner.json").write_text(json.dumps({"pid": 1, "label": "other", "token": "cd" * 16}))
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            self.clock.now += seconds
+            if len(sleeps) == 2:
+                shutil.rmtree(busy)
+
+        with self.fake_run():
+            code = leased_run.run(self.args(wait=100.0), monotonic=self.clock.monotonic, sleep=sleep, out=self.lines.append)
+        self.assertEqual(code, leased_run.EXIT_PASSED)
+        self.assertEqual(sleeps, [leased_run.LEASE_POLL_SECONDS] * 2)
+        self.assertEqual(leased_run.LEASE_POLL_SECONDS, 15.0)
+        self.assertGreaterEqual(self.receipt()["waitSeconds"], 30.0)
+        self.assertEqual(self.leases_present(), [])
+
+    def test_wait_expiry_returns_the_distinct_code_without_touching_the_foreign_lease(self) -> None:
+        busy = self.cache / "leases" / "cargo"
+        busy.mkdir(parents=True)
+        owner = json.dumps({"pid": 1, "label": "other", "token": "cd" * 16}).encode()
+        (busy / "owner.json").write_bytes(owner)
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            self.clock.now += seconds
+
+        with self.fake_run() as fake:
+            code = leased_run.run(self.args(wait=20.0), monotonic=self.clock.monotonic, sleep=sleep, out=self.lines.append)
+        self.assertEqual(code, leased_run.EXIT_LEASE_WAIT_EXPIRED)
+        self.assertNotIn(code, (leased_run.EXIT_PASSED, leased_run.EXIT_FAILED, leased_run.EXIT_INVALID, leased_run.EXIT_UNCERTAIN))
+        self.assertEqual(sleeps, [15.0, 5.0])
+        fake.assert_not_called()
+        self.assertEqual((busy / "owner.json").read_bytes(), owner)
+        self.assertEqual(self.leases_present(), ["cargo"], "no lease of ours was left behind")
+        self.assertEqual(json.loads(self.lines[-1])["leaseCleanup"], ["not-acquired"])
+
+    def test_no_wait_means_a_single_attempt(self) -> None:
+        (self.cache / "leases" / "gradle").mkdir(parents=True)
+        sleeps: list[float] = []
+        with self.fake_run():
+            code = leased_run.run(self.args(wait=0.0), monotonic=self.clock.monotonic, sleep=sleeps.append, out=self.lines.append)
+        self.assertEqual(code, leased_run.EXIT_LEASE_WAIT_EXPIRED)
+        self.assertEqual(sleeps, [])
+
+    def test_partial_acquisition_is_rolled_back_on_a_non_busy_error(self) -> None:
+        leases = [run_gates.Lease(self.cache / "leases" / name, self.TOKEN, "label") for name in ("cargo", "gradle")]
+        with mock.patch.object(leases[1], "acquire", side_effect=private_roots.AdmissionError("private cache admission failed")):
+            with self.assertRaises(private_roots.AdmissionError):
+                leased_run.acquire_leases(leases, 0.0, monotonic=self.clock.monotonic, sleep=self.clock.sleep)
+        self.assertEqual(self.leases_present(), [], "the first lease was released")
+
+    def test_race_on_second_lease_releases_the_first_and_waits(self) -> None:
+        leases = [run_gates.Lease(self.cache / "leases" / name, self.TOKEN, "label") for name in ("cargo", "gradle")]
+        real_acquire = leases[1].acquire
+        attempts = [0]
+
+        def racing_acquire() -> None:
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise RuntimeError("release builder lease is already owned (pid 1 label other); share the exact lease token only with a nested gate invocation")
+            real_acquire()
+
+        with mock.patch.object(leases[1], "acquire", side_effect=racing_acquire):
+            acquired = leased_run.acquire_leases(leases, 60.0, monotonic=self.clock.monotonic, sleep=self.clock.sleep)
+        self.assertEqual(len(acquired), 2)
+        self.assertEqual(attempts[0], 2)
+        self.assertEqual(self.clock.now, 15.0)
+
+    def test_new_label_is_required_and_inputs_are_validated(self) -> None:
+        with self.fake_run():
+            self.assertEqual(self.go(), leased_run.EXIT_PASSED)
+            with self.assertRaises(FileExistsError):
+                self.go()
+        invalid = {
+            "label": dict(label="bad label!"),
+            "timeout": dict(timeout=0.0),
+            "nan timeout": dict(timeout=float("nan")),
+            "negative wait": dict(wait=-1.0),
+            "no command": dict(argv=[]),
+            "expect zero": dict(expect_unittest=0),
+            "relative jdk": dict(jdk_home="relative/jdk"),
+            "missing jdk": dict(jdk_home=str(self.root / "nojdk")),
+        }
+        for name, overrides in invalid.items():
+            with self.subTest(name):
+                with self.fake_run() as fake:
+                    with self.assertRaises(ValueError):
+                        self.go(self.args(**{"label": "leased-invalid", **overrides}))
+                fake.assert_not_called()
+                self.assertFalse((self.cache / "release-gates" / "leased-invalid").exists())
+                self.assertEqual(self.leases_present(), [])
+
+    def test_cli_parses_arguments_and_maps_errors_to_the_invalid_code(self) -> None:
+        captured: list[Namespace] = []
+        with mock.patch.object(leased_run, "run", side_effect=lambda args: captured.append(args) or 0):
+            code = leased_run.main([
+                "--repo", "/r", "--label", "L1", "--cache-root", "/c", "--timeout", "90", "--wait", "30",
+                "--jdk-home", "/j", "--expect-unittest", "7", "--", "cargo", "test", "--", "--nocapture",
+            ])
+        self.assertEqual(code, 0)
+        args = captured[0]
+        self.assertEqual((args.repo, args.label, args.cache_root, args.timeout, args.wait, args.jdk_home, args.expect_unittest),
+                         ("/r", "L1", "/c", 90.0, 30.0, "/j", 7))
+        self.assertEqual(args.argv, ["cargo", "test", "--", "--nocapture"])
+        with mock.patch.object(leased_run, "run", side_effect=ValueError("bad input")):
+            self.assertEqual(leased_run.main(["--repo", "/r", "--label", "L", "--cache-root", "/c", "--timeout", "1", "--", "x"]), leased_run.EXIT_INVALID)
+        with mock.patch.object(leased_run, "run", side_effect=private_roots.AdmissionError("private cache admission failed")):
+            self.assertEqual(leased_run.main(["--repo", "/r", "--label", "L", "--cache-root", "/c", "--timeout", "1", "--", "x"]), leased_run.EXIT_INVALID)
+        with mock.patch.object(leased_run, "run", side_effect=FileExistsError("x")):
+            self.assertEqual(leased_run.main(["--repo", "/r", "--label", "L", "--cache-root", "/c", "--timeout", "1", "--", "x"]), leased_run.EXIT_INVALID)
+
+    def test_admission_failure_is_invalid_and_releases_leases(self) -> None:
+        with self.fake_run() as fake, mock.patch.object(
+            private_roots, "ensure_private_directory",
+            side_effect=lambda path, must_create=False: (_ for _ in ()).throw(private_roots.AdmissionError("private cache admission failed"))
+            if str(path).endswith("-scratch") else (os.makedirs(path, mode=0o700, exist_ok=True), (os.stat(path).st_dev, os.stat(path).st_ino))[1],
+        ):
+            code = self.go()
+        self.assertEqual(code, leased_run.EXIT_INVALID)
+        fake.assert_not_called()
+        self.assertEqual(self.leases_present(), [])
+        self.assertEqual(self.receipt()["decision"], "failed")
+
+    def test_oversized_log_fails_the_run(self) -> None:
+        with self.fake_run(log=b"x" * 100), mock.patch.object(leased_run, "MAX_LOG_BYTES", 10):
+            self.assertEqual(self.go(), leased_run.EXIT_FAILED)
+        self.assertEqual(self.receipt()["failureReason"], "log-exceeded-bound")
+
+    def test_timeout_is_passed_through_unchanged(self) -> None:
+        with self.fake_run():
+            self.go(self.args(timeout=1234.5))
+        self.assertEqual(self.captured["timeout"], 1234.5)
+
+
+LEASE_DIRS = ("cargo", "gradle")
 
 
 if __name__ == "__main__":
