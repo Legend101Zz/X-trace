@@ -927,6 +927,7 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         "releaseAcceptance": False,
     }
     gate_rows: list[dict[str, Any]] = []
+    receipt_was_read = False
     try:
         if (not tuple_is_supported or not _valid_sha(args.expected_head)
                 or not _valid_sha(args.phase_base)):
@@ -983,6 +984,7 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
             maximum_nodes=CI_RECEIPT_JSON_BUDGET,
             maximum_commas=CI_RECEIPT_JSON_BUDGET,
         )
+        receipt_was_read = True
         if not isinstance(receipt, dict):
             raise FloorInputError
         names = [gate.name for gate in run_gates.GATES]
@@ -1149,7 +1151,7 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         if _source_proofs(repo, args.expected_head, args.phase_base) != source_proofs:
             raise FloorInputError
     except (FloorInputError, OSError, RuntimeError, ValueError, TypeError):
-        summary["floorStatus"] = "invalid" if receipt_path.exists() else "unreached"
+        summary["floorStatus"] = "invalid" if receipt_was_read or receipt_path.exists() else "unreached"
         summary["gates"] = []
         summary["gateCount"] = 0
     private_roots.atomic_write_private(
