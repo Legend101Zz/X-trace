@@ -1714,7 +1714,7 @@ fn load_source_snapshot(root: &Path, path: &str) -> SourceSnapshot {
                 return SourceSnapshot::Unavailable;
             }
             let mut reader = file.take(MAX_SOURCE_FILE_BYTES + 1);
-            let capacity = usize::try_from(metadata.len()).map_or(0, |value| value);
+            let capacity = usize::try_from(metadata.len()).unwrap_or(0);
             let mut bytes = Vec::with_capacity(capacity);
             if reader.read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_SOURCE_FILE_BYTES
             {
@@ -1742,9 +1742,8 @@ fn project_matching_source(
     let mut excerpt = String::new();
     let mut truncated = false;
     let mut found = false;
-    let upper = end_line
-        .map_or(start_line, |value| value)
-        .min(start_line.saturating_add(MAX_SOURCE_EXCERPT_LINES - 1));
+    let upper =
+        end_line.unwrap_or(start_line).min(start_line.saturating_add(MAX_SOURCE_EXCERPT_LINES - 1));
     for (index, line) in text.lines().enumerate() {
         let Ok(number) = u32::try_from(index + 1) else {
             truncated = true;
