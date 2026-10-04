@@ -813,7 +813,6 @@ def _summarize_tests(args: argparse.Namespace) -> int:
         "sourceIdentityVerified": source_clean_before and source_clean_after,
         "testScratchAdmissionVerified": True,
         "suiteModules": list(RELEASE_TEST_MODULES),
-        "discoveredTestIds": discovered,
         "status": "passed" if complete and failed == 0 and skipped == 0 else "failed",
         "discoveredCount": len(discovered),
         "testCount": len(tests),
@@ -821,16 +820,48 @@ def _summarize_tests(args: argparse.Namespace) -> int:
         "skippedCount": skipped,
         "tests": tests,
     }
-    private_roots.atomic_write_private(
-        root / "release-tool-tests-summary.json",
-        (json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n").encode(),
-    )
+    data = _bounded_test_summary(result, discovered)
+    private_roots.atomic_write_private(root / "release-tool-tests-summary.json", data)
     print(json.dumps({
         "releaseToolTests": result["status"], "testCount": len(tests),
         "failedCount": failed, "skippedCount": result["skippedCount"],
         "sourceSha": args.source_sha,
     }, sort_keys=True))
     return 0 if result["status"] == "passed" else 1
+
+
+TEST_SUMMARY_ROW_BYTES_BUDGET = 40 * 1024
+MAX_TEST_SUMMARY_ROWS = 120
+MAX_NON_PASSING_ROWS = 64
+
+
+def _ids_sha256(ids: Sequence[str]) -> str:
+    return hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()
+
+
+def _bounded_test_summary(result: dict[str, Any], discovered: Sequence[str]) -> bytes:
+    """Serialize the test summary so its own reader can always read it back.
+
+    The reader (`read_private_json`) caps a record at 64 KiB. Every test used to be listed twice
+    (ids and rows), which overflowed it at 252 tests (size and the 128-element list cap). Now each test appears once in `tests` while the
+    rows fit a fixed budget; beyond it the per-test rows are replaced by an id hash, status counts and
+    the (bounded) non-passing rows, all flagged `testsOmitted`, and the reader verifies the hash.
+    """
+    result = dict(result)
+    counts: dict[str, int] = {}
+    for row in result["tests"]:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    result["statusCounts"] = counts
+    result["discoveredTestIdsSha256"] = _ids_sha256(list(discovered))
+    encoded = json.dumps(result["tests"], separators=(",", ":")).encode()
+    # `read_private_json` also caps every list at 128 elements, so rows are only kept for small suites.
+    if len(encoded) > TEST_SUMMARY_ROW_BYTES_BUDGET or len(result["tests"]) > MAX_TEST_SUMMARY_ROWS:
+        non_passing = [row for row in result["tests"] if row["status"] != "passed"]
+        result["testsOmitted"] = True
+        result["nonPassingTests"] = non_passing[:MAX_NON_PASSING_ROWS]
+        result["nonPassingTruncated"] = len(non_passing) > MAX_NON_PASSING_ROWS
+        result["tests"] = []
+    return (json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
 def _source_is_clean(repo: pathlib.Path, expected_head: str) -> bool:
@@ -1147,7 +1178,9 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         if (not tuple_is_supported or not _valid_sha(args.expected_head)
                 or not _valid_sha(args.phase_base)):
             raise FloorInputError
-        test_result = private_roots.read_private_json(test_summary_path)
+        test_result = private_roots.read_private_json(
+            test_summary_path, maximum_nodes=CI_RECEIPT_JSON_BUDGET, maximum_commas=CI_RECEIPT_JSON_BUDGET,
+        )
         if not isinstance(test_result, dict):
             raise FloorInputError
         repo = pathlib.Path(args.repo)
@@ -1160,8 +1193,8 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         if _source_proofs(repo, args.expected_head, args.phase_base) != source_proofs:
             raise FloorInputError
         test_rows = test_result.get("tests")
-        discovered_names = test_result.get("discoveredTestIds")
-        if not isinstance(test_rows, list) or not test_rows or not isinstance(discovered_names, list):
+        omitted = test_result.get("testsOmitted") is True
+        if not isinstance(test_rows, list) or (not omitted and not test_rows):
             raise FloorInputError
         test_names = [item.get("name") for item in test_rows if isinstance(item, dict)]
         test_statuses = [item.get("status") for item in test_rows if isinstance(item, dict)]
@@ -1169,20 +1202,33 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         discovered_count = test_result.get("discoveredCount")
         failed_count = test_result.get("failedCount")
         skipped_count = test_result.get("skippedCount")
+        if omitted:
+            # Large suites: the per-test rows were replaced by a hash and counts; verify them.
+            rows_match = (
+                test_rows == [] and test_result.get("nonPassingTests") == []
+                and test_result.get("nonPassingTruncated") is False
+                and test_result.get("discoveredTestIdsSha256") == _ids_sha256(discovered_now)
+                and test_result.get("statusCounts") == {"passed": len(discovered_now)}
+                and test_count == len(discovered_now)
+            )
+        else:
+            rows_match = (
+                len(test_rows) == len(test_names) == test_count
+                and len(set(test_names)) == test_count
+                and test_names == discovered_now
+                and test_statuses == ["passed"] * test_count
+            )
         tests_match = (
             type(test_result.get("schemaVersion")) is int and test_result.get("schemaVersion") == 1
             and test_result.get("suiteModules") == list(RELEASE_TEST_MODULES)
             and test_result.get("sourceSha") == args.expected_head
             and test_result.get("sourceIdentityVerified") is True
             and test_result.get("testScratchAdmissionVerified") is True
-            and discovered_names == discovered_now
-            and len(discovered_names) == len(set(discovered_names))
+            and len(discovered_now) == len(set(discovered_now))
             and isinstance(test_count, int) and not isinstance(test_count, bool)
             and isinstance(discovered_count, int) and not isinstance(discovered_count, bool)
-            and test_count == discovered_count == len(test_rows) == len(test_names)
-            and len(set(test_names)) == test_count
-            and test_names == discovered_names
-            and test_statuses == ["passed"] * test_count
+            and test_count == discovered_count == len(discovered_now)
+            and rows_match
             and type(failed_count) is int and failed_count == 0
             and type(skipped_count) is int and skipped_count == 0
             and test_result.get("status") == "passed"

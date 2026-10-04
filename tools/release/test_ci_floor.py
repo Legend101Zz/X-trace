@@ -329,7 +329,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
             self.assertEqual(ci_floor._sanitize_floor(args), 1)
         self.assertNotEqual(json.loads(output[0])["floorStatus"], "checks_passed_for_review")
 
-    def sanitize_with_provenance(self, mutate: object) -> dict:
+    def sanitize_with_provenance(self, mutate: object, tests_mutate: object = None, discovered_ids: list[str] | None = None) -> dict:
         label = "floor-123456-1-jdk17-node22"
         names = sorted(["tools.release.test_release_tools.Public.test_ok", "tools.release.test_ci_floor.Public.test_ok"])
         tests = {
@@ -338,6 +338,8 @@ class CiFloorEvidenceTests(unittest.TestCase):
             "status": "passed", "discoveredCount": 2, "discoveredTestIds": names, "testCount": 2,
             "failedCount": 0, "skippedCount": 0, "tests": [{"name": name, "status": "passed"} for name in names],
         }
+        if tests_mutate is not None:
+            tests_mutate(tests)  # type: ignore[operator]
         receipt = self._passing_receipt(label)
         private_cargo = "/private/runner/cache/toolchain-cargo-argv/cargo"
         next(row for row in receipt["gates"] if row["name"] == "restricted-build")["argv"][0] = private_cargo
@@ -359,7 +361,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 mock.patch.object(ci_floor.private_roots, "read_private_json", side_effect=read), \
                 mock.patch.object(ci_floor, "_source_is_clean", return_value=True), \
                 mock.patch.object(ci_floor, "_source_proofs", return_value=self._source_proofs()), \
-                mock.patch.object(ci_floor, "_discover_release_test_ids", return_value=tests["discoveredTestIds"]), \
+                mock.patch.object(ci_floor, "_discover_release_test_ids", return_value=discovered_ids if discovered_ids is not None else tests["discoveredTestIds"]), \
                 mock.patch.object(ci_floor, "_private_file_sha256", return_value=self.digest), \
                 mock.patch.object(ci_floor, "_private_log_digest_and_first_line", side_effect=version_log), \
                 mock.patch.object(ci_floor.shutil, "which", side_effect=which), \
@@ -413,6 +415,68 @@ class CiFloorEvidenceTests(unittest.TestCase):
         self.assertEqual(info["stage"], "no-receipt")
         self.assertIn("release gates failed: checkout failed at <path>", info["runnerError"])
         self.assertNotIn("GITHUB_TOKEN", json.dumps(info))
+
+    def synthetic_summary(self, ids: list[str], status: str = "passed") -> dict:
+        tests = [{"name": name, "status": status} for name in ids]
+        base = {
+            "schemaVersion": 1, "sourceSha": self.source_sha, "sourceIdentityVerified": True,
+            "testScratchAdmissionVerified": True, "suiteModules": list(ci_floor.RELEASE_TEST_MODULES),
+            "status": "passed", "discoveredCount": len(ids), "testCount": len(ids), "failedCount": 0,
+            "skippedCount": 0, "tests": tests,
+        }
+        return json.loads(ci_floor._bounded_test_summary(base, ids))
+
+    def test_test_summary_always_fits_the_limits_of_its_own_reader(self) -> None:
+        old_format_bytes = 66158  # the pre-fix record for the 252-test suite: over the 65536-byte read cap
+        self.assertGreater(old_format_bytes, private_roots.PRIVATE_JSON_BYTE_LIMIT)
+        real_ids = ci_floor._discover_release_test_ids()
+        for ids in (real_ids, [f"tools.release.test_release_tools.Class{n // 20}.test_{n:05d}_" + "x" * 60 for n in range(5000)]):
+            doc = self.synthetic_summary(ids)
+            data = (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            self.assertLess(len(data), 64 * 1024, len(ids))
+            self.assertTrue(private_roots.private_json_fits_read_limits(
+                data, maximum_nodes=ci_floor.CI_RECEIPT_JSON_BUDGET, maximum_commas=ci_floor.CI_RECEIPT_JSON_BUDGET,
+            ), len(ids))
+            self.assertEqual(doc["statusCounts"], {"passed": len(ids)})
+            self.assertEqual(doc["discoveredTestIdsSha256"], ci_floor._ids_sha256(ids))
+        large = self.synthetic_summary([f"tools.release.test_x.C.test_{n:05d}_" + "y" * 80 for n in range(3000)])
+        self.assertIs(large["testsOmitted"], True)
+        self.assertEqual((large["tests"], large["nonPassingTests"], large["nonPassingTruncated"]), ([], [], False))
+        mid = self.synthetic_summary([f"m.C.test_{n}" for n in range(200)])
+        self.assertIs(mid["testsOmitted"], True, "over the 128-element list cap: rows are not kept")
+        small = self.synthetic_summary(["a.b.c", "a.b.d"])
+        self.assertNotIn("testsOmitted", small)
+        self.assertEqual(len(small["tests"]), 2)
+
+    def test_non_passing_rows_are_bounded_with_a_truthful_flag(self) -> None:
+        ids = [f"tools.release.test_x.C.test_{n:05d}_" + "z" * 80 for n in range(3000)]
+        doc = self.synthetic_summary(ids, status="failed")
+        self.assertEqual(len(doc["nonPassingTests"]), ci_floor.MAX_NON_PASSING_ROWS)
+        self.assertIs(doc["nonPassingTruncated"], True)
+        self.assertEqual(doc["statusCounts"], {"failed": 3000})
+
+    def test_sanitizer_accepts_a_hash_only_summary_for_a_large_suite_and_rejects_tampering(self) -> None:
+        ids = [f"tools.release.test_x.C.test_{n:05d}_" + "w" * 80 for n in range(3000)]
+
+        def large(tests: dict) -> None:
+            tests.update(self.synthetic_summary(ids))
+
+        public = self.sanitize_with_provenance(lambda receipt: None, large, ids)
+        self.assertEqual(public["floorStatus"], "checks_passed_for_review")
+        self.assertEqual(public["fullReleaseToolTests"], {"status": "passed", "testCount": 3000, "skippedCount": 0})
+
+        def tampered(tests: dict) -> None:
+            tests.update(self.synthetic_summary(ids))
+            tests["discoveredTestIdsSha256"] = "0" * 64
+
+        tampered_public = self.sanitize_with_provenance(lambda receipt: None, tampered, ids)
+        self.assertIn(tampered_public["floorStatus"], ("invalid", "unreached"))
+        self.assertEqual(tampered_public["fullReleaseToolTests"]["status"], "failed")
+
+        def different_suite(tests: dict) -> None:
+            tests.update(self.synthetic_summary(ids))
+
+        self.assertIn(self.sanitize_with_provenance(lambda receipt: None, different_suite, ids[:-1] + ["tools.release.test_x.C.other"])["floorStatus"], ("invalid", "unreached"))
 
     def test_sanitizer_surfaces_provenance_counts_and_rejects_an_unavailable_mechanism(self) -> None:
         report = {"mode": "subreaper", "available": True, "overflowed": False, "classifiedCount": 4}
