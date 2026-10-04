@@ -59,7 +59,7 @@ pub const BUSY_TIMEOUT_PRAGMA: &str = "PRAGMA busy_timeout = 5000";
 
 /// Maximum schema version this binary can read. Bumped together with
 /// new migrations.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Stable ABI version of the store crate. Bumped when the on-disk
 /// representation changes in a way that requires all linked code to
@@ -403,6 +403,11 @@ fn apply_pragmas(
 mod tests {
     use super::*;
     use std::time::SystemTime;
+
+    #[test]
+    fn exported_schema_version_matches_latest_migration() {
+        assert_eq!(crate::CURRENT_SCHEMA_VERSION, migrations::Migrations::latest_version());
+    }
 
     #[test]
     fn in_memory_store_initializes_schema() {
