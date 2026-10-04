@@ -471,6 +471,7 @@ impl AdmittedPrivateRoot {
         expected: &File,
         operation_deadline: std::time::Instant,
     ) -> Result<(), PrivateStorageError> {
+        use std::os::unix::fs::MetadataExt as _;
         let deadline = operation_deadline.min(new_admission_deadline());
         let actual = self.open_file_with_link_policy_until(name, false, deadline)?;
         self.validate_file_binding_with_link_policy_until(name, &actual, false, false, deadline)?;

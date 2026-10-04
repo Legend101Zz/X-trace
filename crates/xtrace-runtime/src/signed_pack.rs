@@ -368,7 +368,7 @@ fn validate_schema(value: &JsonValue) -> Result<PackManifest, SignedPackError> {
         framework_modules: validated_json(framework_modules)?,
         capabilities: validated_json(capabilities)?,
         known_limitations: validated_json(known_limitations)?,
-        key_id,
+        key_id: key_id.to_owned(),
         signature: signature_value,
     })
 }
