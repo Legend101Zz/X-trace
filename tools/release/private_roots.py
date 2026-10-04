@@ -39,9 +39,9 @@ _MAC_RIGHTS = frozenset({
     "readextattr", "writeextattr", "readsecurity", "writesecurity", "chown",
     "read_data", "write_data", "append_data",
 })
-# `ls -O` reports the BSD `hidden` flag as a visibility hint for GUI clients.
-# It does not alter file access, so it is safe to accept during owner-boundary
-# admission alongside the other non-access-changing metadata flags here.
+# `chflags(1)` documents BSD `hidden` as hiding an item from GUI clients. This
+# visibility flag does not change access-control rules, so admission can accept
+# it while continuing to enforce the deny-only ACL checks below.
 _MAC_SAFE_FLAGS = frozenset({"sunlnk", "restricted", "hidden"})
 
 

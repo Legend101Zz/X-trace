@@ -74,11 +74,19 @@ class PrivateRootAdmissionTests(unittest.TestCase):
             " 0: group:everyone deny delete\n"
         )
         private_roots._parse_macos_acl(header.encode(), library)
+        private_roots._parse_macos_acl(
+            header.replace(" staff hidden ", " staff hidden,restricted ").encode(),
+            library,
+        )
 
-        for flag in ("uchg", "dataless", "hidden,hidden"):
-            rejected = header.replace(" hidden ", f" {flag} ")
-            with self.subTest(flag=flag), self.assertRaises(private_roots.AdmissionError):
-                private_roots._parse_macos_acl(rejected.encode(), library)
+        rejected_payloads = (
+            header.replace(" hidden ", " hidden,dataless "),
+            header.replace(" hidden ", " hidden,hidden "),
+            header.replace(" 0: group:everyone deny delete", " 0: group:everyone allow read"),
+        )
+        for payload in rejected_payloads:
+            with self.subTest(payload=payload), self.assertRaises(private_roots.AdmissionError):
+                private_roots._parse_macos_acl(payload.encode(), library)
 
     def test_macos_acl_rejects_allow_malformed_header_and_wrong_path(self) -> None:
         path = pathlib.Path("/Users/test/parent with spaces")
