@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -32,6 +32,10 @@ MAX_UNTRACKED_PROCESSES = 512
 MAX_UNCONFIRMED_SAMPLE = 64
 MAX_LSOF_OUTPUT_BYTES = 1024 * 1024
 LSOF_CLEANUP_RESERVE_SECONDS = 0.3
+NATURAL_EXIT_SETTLE_SECONDS = 120.0
+NATURAL_EXIT_POLL_SECONDS = 1.0
+NATURAL_EXIT_QUIESCENT_SECONDS = 1.0
+EXPECTED_UNINSPECTABLE_SCAN = "untracked-process descriptor scan could not inspect every live candidate"
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,16 @@ class UntrackedProcessScan:
     @property
     def unconfirmed(self) -> list[dict[str, Any]]:
         return self.held + self.uninspectable
+
+
+@dataclass(frozen=True)
+class NaturalExitSettle:
+    cleared: bool
+    elapsed_seconds: float
+    poll_count: int
+    latest_candidates: list[dict[str, Any]]
+    last_error: str | None
+    deadline: float
 
 
 GATES: tuple[Gate, ...] = (
@@ -101,6 +115,20 @@ class UncertainProcessTree(RuntimeError):
         self.unconfirmed_processes: list[dict[str, Any]] = []
         self.unconfirmed_process_count = 0
         self.owned_probe_processes: list[dict[str, Any]] = []
+        self.raw_exit_code: int | None = None
+        self.duration_seconds: float | None = None
+        self.command_started = False
+
+
+class AttemptedGateFailure(RuntimeError):
+    """A command ran but failed during its final log or result handling."""
+
+    def __init__(self, cause: BaseException, raw_exit_code: int | None, duration_seconds: float):
+        super().__init__(f"gate command result could not be finalized ({type(cause).__name__})")
+        self.raw_exit_code = raw_exit_code
+        self.duration_seconds = duration_seconds
+        self.command_started = True
+        self.cleanup_uncertain = False
 
 
 class UncertainProbeCleanup(RuntimeError):
@@ -119,14 +147,14 @@ class InterruptedProbeCleanup(KeyboardInterrupt):
         self.owned_probe_processes = [owned_probe]
 
 
-def _process_snapshot() -> dict[int, tuple[int, str, str]]:
+def _process_snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, str, str]]:
     """Return pid -> (ppid, start identity, state) using a fixed system ps."""
     if PS_BINARY is None:
         raise RuntimeError("cannot inspect process ownership: system ps is unavailable")
     try:
         snapshot = subprocess.run(
             [PS_BINARY, "-axo", "pid=,ppid=,lstart=,stat="],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=2, check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=max(0.01, timeout), check=False,
         )
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError("cannot inspect process ownership")
@@ -181,11 +209,147 @@ def _unconfirmed_candidates_since(
     ]
 
 
+def _settle_uninspectable_candidates(
+    initial: list[dict[str, Any]],
+    snapshot_and_scan: Callable[[float], tuple[dict[int, tuple[int, str, str]], UntrackedProcessScan]],
+    *,
+    duration: float = NATURAL_EXIT_SETTLE_SECONDS,
+    interval: float = NATURAL_EXIT_POLL_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> NaturalExitSettle:
+    """Wait boundedly for exact initially-uninspectable identities to exit."""
+    started = monotonic()
+    deadline = started + max(0.0, duration)
+    identities = {
+        (candidate.get("pid"), candidate.get("startedAt"))
+        for candidate in initial
+        if isinstance(candidate.get("pid"), int) and isinstance(candidate.get("startedAt"), str)
+    }
+    latest = list(initial)
+    last_error: str | None = None
+    poll_count = 0
+    if not identities:
+        return NaturalExitSettle(False, 0.0, 0, latest, "initial process identity unavailable", deadline)
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return NaturalExitSettle(
+                False, max(0.0, monotonic() - started), poll_count, latest,
+                "initial uninspectable process identity survived settling deadline", deadline,
+            )
+        try:
+            sleep(min(max(0.01, interval), remaining))
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return NaturalExitSettle(
+                    False, max(0.0, monotonic() - started), poll_count, latest,
+                    "initial uninspectable process identity survived settling deadline", deadline,
+                )
+            snapshot, scan = snapshot_and_scan(remaining)
+            poll_count += 1
+        except BaseException as exc:
+            return NaturalExitSettle(
+                False, max(0.0, monotonic() - started), poll_count, latest,
+                f"settling poll failed: {type(exc).__name__}", deadline,
+            )
+        latest = scan.unconfirmed
+        if scan.error and scan.error != EXPECTED_UNINSPECTABLE_SCAN:
+            last_error = scan.error
+            return NaturalExitSettle(
+                False, max(0.0, monotonic() - started), poll_count, latest,
+                last_error, deadline,
+            )
+        if scan.held or scan.owned_probes:
+            return NaturalExitSettle(
+                False, max(0.0, monotonic() - started), poll_count, latest,
+                "held descriptor or owned probe appeared during settling", deadline,
+            )
+        live_initial = {
+            (pid, started_at)
+            for pid, (_ppid, started_at, state) in snapshot.items()
+            if state not in {"Z", "X"} and (pid, started_at) in identities
+        }
+        if not live_initial:
+            return NaturalExitSettle(
+                True, max(0.0, monotonic() - started), poll_count, latest, None, deadline,
+            )
+
+
+def _final_global_quiescence_scan(
+    deadline: float,
+    snapshot_and_scan: Callable[[float], tuple[dict[int, tuple[int, str, str]], UntrackedProcessScan]],
+    owned_alive: Callable[[dict[int, tuple[int, str, str]]], list[int]],
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    quiescent_seconds: float = NATURAL_EXIT_QUIESCENT_SECONDS,
+) -> tuple[bool, list[dict[str, Any]], str | None, int]:
+    """Require two clean global scans separated by a bounded quiet interval."""
+    latest: list[dict[str, Any]] = []
+    for scan_index in range(2):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, latest, "settling deadline expired before global rescan", scan_index
+        if scan_index:
+            if remaining < quiescent_seconds:
+                return False, latest, "settling deadline expired before quiescent rescan", scan_index
+            try:
+                sleep(quiescent_seconds)
+            except BaseException as exc:
+                return False, latest, f"quiescent wait failed: {type(exc).__name__}", scan_index
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False, latest, "settling deadline expired during quiescent interval", scan_index
+        try:
+            snapshot, scan = snapshot_and_scan(remaining)
+        except BaseException as exc:
+            return False, latest, f"global ownership rescan failed: {type(exc).__name__}", scan_index
+        latest = scan.unconfirmed
+        if monotonic() > deadline:
+            return False, latest, "settling deadline exceeded during global ownership rescan", scan_index + 1
+        if scan.error:
+            return False, latest, scan.error, scan_index + 1
+        if latest or scan.owned_probes:
+            return False, latest, "global ownership rescan found a live unconfirmed candidate", scan_index + 1
+        try:
+            owned = owned_alive(snapshot)
+        except BaseException as exc:
+            return False, latest, f"owned process check failed: {type(exc).__name__}", scan_index + 1
+        if owned:
+            return False, latest, "global ownership rescan found a live owned process", scan_index + 1
+    return True, latest, None, 2
+
+
+def _merge_process_identities(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for group in groups:
+        for candidate in group:
+            merged[(candidate.get("pid"), candidate.get("startedAt"))] = dict(candidate)
+    return [merged[key] for key in sorted(merged, key=lambda item: (str(item[0]), str(item[1])))]
+
+
+def _natural_exit_settle_eligible(
+    scan: UntrackedProcessScan, *, tree_confirmed_drained: bool, log_io_failed: bool,
+) -> bool:
+    return (
+        tree_confirmed_drained
+        and not log_io_failed
+        and not scan.held
+        and not scan.owned_probes
+        and bool(scan.uninspectable)
+        and scan.error == EXPECTED_UNINSPECTABLE_SCAN
+        and all(item.get("descriptorStatus") == "uninspectable" for item in scan.uninspectable)
+    )
+
+
 def _untracked_processes_since(
     baseline: dict[int, tuple[int, str, str]],
     owned: dict[int, str],
     snapshot: dict[int, tuple[int, str, str]],
     log_path: pathlib.Path,
+    *,
+    budget_seconds: float = UNTRACKED_SCAN_BUDGET_SECONDS,
 ) -> UntrackedProcessScan:
     """Find processes born during the run that retain the private gate log."""
     started = time.monotonic()
@@ -216,7 +380,20 @@ def _untracked_processes_since(
         unknown_reasons: dict[int, str],
         scan_error: str | None,
     ) -> UntrackedProcessScan:
-        still_live = _process_snapshot()
+        remaining = budget_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            scan_error = scan_error or "untracked-process descriptor scan exceeded its time budget"
+            still_live: dict[int, tuple[int, str, str]] = {
+                pid: (ppid, started_at, "R") for pid, ppid, started_at in candidates
+            }
+        else:
+            try:
+                still_live = _process_snapshot(timeout=min(2.0, remaining))
+            except RuntimeError:
+                still_live = {
+                    pid: (ppid, started_at, "R") for pid, ppid, started_at in candidates
+                }
+                scan_error = scan_error or "process identities could not be rechecked within the scan budget"
         candidates_by_pid = {pid: (ppid, started_at) for pid, ppid, started_at in candidates}
         held_records = [
             record((pid, candidates_by_pid[pid][0], started_at), "held", "private-log-descriptor-observed")
@@ -260,7 +437,7 @@ def _untracked_processes_since(
     if proc_fd_root.is_dir():
         held_by = set()
         for pid, ppid, started_at in candidates:
-            if time.monotonic() - started > UNTRACKED_SCAN_BUDGET_SECONDS:
+            if time.monotonic() - started > budget_seconds:
                 unknown.update({
                     candidate_pid: "descriptor-scan-time-budget-exceeded"
                     for candidate_pid, _candidate_ppid, _candidate_started_at in candidates
@@ -277,7 +454,7 @@ def _untracked_processes_since(
         pids = [pid for pid, _ppid, _started_at in candidates]
         initial = _run_lsof_fields(
             ["-Fn", "-a", "-d", "1,2", "-p", ",".join(str(pid) for pid in pids)],
-            started + UNTRACKED_SCAN_BUDGET_SECONDS,
+            started + budget_seconds,
         )
         if initial.owned_probe is not None:
             owned_probes.append(initial.owned_probe)
@@ -291,7 +468,7 @@ def _untracked_processes_since(
         if missing:
             fallback = _run_lsof_fields(
                 ["-Fn", "-p", ",".join(str(pid) for pid in missing)],
-                started + UNTRACKED_SCAN_BUDGET_SECONDS,
+                started + budget_seconds,
             )
             if fallback.owned_probe is not None:
                 owned_probes.append(fallback.owned_probe)
@@ -677,7 +854,10 @@ def _close_log(log: Any) -> None:
     log.close()
 
 
-def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout: int, log_path: pathlib.Path) -> tuple[int, float]:
+def _run(
+    argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout: int,
+    log_path: pathlib.Path, settle_report: dict[str, Any] | None = None,
+) -> tuple[int, float]:
     started = time.monotonic()
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     code = 0
@@ -824,13 +1004,78 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
                 unconfirmed_process_count = scan.candidate_count
                 owned_probe_processes = scan.owned_probes
                 final_ownership_scan_returned = True
-                if scan.error:
-                    uncertain = uncertain or f"post-command ownership scan incomplete: {scan.error}"
-                if unconfirmed_processes:
-                    uncertain = uncertain or (
-                        "completed gate left live processes created during the command that were not "
-                        "observed as owned descendants; builder leases require manual review"
-                    )
+                settle_eligible = _natural_exit_settle_eligible(
+                    scan, tree_confirmed_drained=tree_confirmed_drained,
+                    log_io_failed=log_io_error is not None,
+                )
+                if settle_eligible and root_identity is not None:
+                    initial_uninspectable = [dict(item) for item in scan.uninspectable]
+
+                    def scan_again(remaining: float) -> tuple[dict[int, tuple[int, str, str]], UntrackedProcessScan]:
+                        snapshot = _process_snapshot(timeout=min(2.0, remaining))
+                        _track_descendants(root_identity, owned, snapshot)
+                        current_scan = _untracked_processes_since(
+                            baseline_snapshot, owned, snapshot, log_path,
+                            budget_seconds=min(UNTRACKED_SCAN_BUDGET_SECONDS, remaining),
+                        )
+                        return snapshot, current_scan
+
+                    settling_started = time.monotonic()
+                    settled = _settle_uninspectable_candidates(initial_uninspectable, scan_again)
+                    report = {
+                        "eligible": True,
+                        "settled": False,
+                        "initialIdentities": initial_uninspectable,
+                        "initialCandidateCount": scan.candidate_count,
+                        "latestIdentities": settled.latest_candidates,
+                        "latestCandidateCount": len(settled.latest_candidates),
+                        "waitSeconds": round(settled.elapsed_seconds, 6),
+                        "settleWindowSeconds": NATURAL_EXIT_SETTLE_SECONDS,
+                        "deadlineRemainingSeconds": round(max(0.0, settled.deadline - time.monotonic()), 6),
+                        "pollCount": settled.poll_count,
+                        "error": settled.last_error,
+                    }
+                    if settled.cleared:
+                        clean_scans, latest_identities, final_scan_error, global_scan_count = (
+                            _final_global_quiescence_scan(
+                                settled.deadline,
+                                scan_again,
+                                lambda snapshot: _owned_processes_alive(owned, snapshot),
+                            )
+                        )
+                        report["globalRescanCount"] = global_scan_count
+                        report["latestIdentities"] = latest_identities
+                        report["latestCandidateCount"] = len(latest_identities)
+                        report["error"] = final_scan_error
+                        report["deadlineRemainingSeconds"] = round(max(0.0, settled.deadline - time.monotonic()), 6)
+                        if clean_scans:
+                            report["settled"] = True
+                            report["waitSeconds"] = round(time.monotonic() - settling_started, 6)
+                            unconfirmed_processes = []
+                            unconfirmed_process_count = 0
+                            uncertain = None
+                        else:
+                            uncertain = "natural-exit settling did not establish a clean global ownership rescan"
+                            unconfirmed_processes = _merge_process_identities(
+                                initial_uninspectable, latest_identities,
+                            )
+                            unconfirmed_process_count = len(unconfirmed_processes)
+                    else:
+                        uncertain = "initial uninspectable process identity could not be cleared within the settling window"
+                        unconfirmed_processes = _merge_process_identities(
+                            initial_uninspectable, settled.latest_candidates,
+                        )
+                        unconfirmed_process_count = max(scan.candidate_count, len(unconfirmed_processes))
+                    if settle_report is not None:
+                        settle_report.update(report)
+                else:
+                    if scan.error:
+                        uncertain = uncertain or f"post-command ownership scan incomplete: {scan.error}"
+                    if unconfirmed_processes:
+                        uncertain = uncertain or (
+                            "completed gate left live processes created during the command that were not "
+                            "observed as owned descendants; builder leases require manual review"
+                        )
             except BaseException as exc:
                 owned_probe_processes.extend(getattr(exc, "owned_probe_processes", []))
                 uncertain = uncertain or f"post-command ownership scan could not be completed: {type(exc).__name__}"
@@ -872,8 +1117,15 @@ def _run(argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout
         error.unconfirmed_processes = unconfirmed_processes
         error.unconfirmed_process_count = unconfirmed_process_count
         error.owned_probe_processes = owned_probe_processes
+        error.raw_exit_code = process.returncode if process is not None else None
+        error.duration_seconds = round(time.monotonic() - started, 6)
+        error.command_started = process is not None
         raise error
     if log_io_error is not None:
+        if process is not None:
+            raise AttemptedGateFailure(
+                log_io_error, process.returncode, round(time.monotonic() - started, 6),
+            ) from log_io_error
         raise log_io_error
     return code, round(time.monotonic() - started, 6)
 
@@ -954,7 +1206,35 @@ def _versions(
             continue
         log_name = f"version-{name}.log"
         log_path = logs_dir / log_name
-        exit_code, duration = _run(argv, cwd=repo / cwd, env=env, timeout=timeout, log_path=log_path)
+        settle_report: dict[str, Any] = {}
+        try:
+            exit_code, duration = _run(
+                argv, cwd=repo / cwd, env=env, timeout=timeout, log_path=log_path,
+                settle_report=settle_report,
+            )
+        except (UncertainProcessTree, AttemptedGateFailure) as exc:
+            if not exc.command_started:
+                raise
+            probe: dict[str, Any] = {
+                "name": name,
+                "argv": list(argv),
+                "cwd": cwd,
+                "exitCode": exc.raw_exit_code,
+                "durationSeconds": exc.duration_seconds,
+                "status": "failed",
+                "cleanupUncertain": isinstance(exc, UncertainProcessTree),
+                "sourceIdentityAfter": "unavailable because version probe finalization failed",
+            }
+            if log_path.is_file():
+                try:
+                    probe["logSha256"] = _hash_file(log_path)
+                except OSError:
+                    probe["logHash"] = "unavailable"
+                probe["log"] = f"logs/{log_name}"
+            if settle_report:
+                probe["naturalExitSettle"] = settle_report
+            probes.append(probe)
+            raise
         raw = log_path.read_bytes()
         probe = {
             "name": name,
@@ -966,6 +1246,8 @@ def _versions(
             "logSha256": _hash(raw),
             "status": "unavailable" if exit_code == 127 else ("passed" if exit_code == 0 else "failed"),
         }
+        if settle_report:
+            probe["naturalExitSettle"] = settle_report
         probes.append(probe)
         lines = raw.decode("utf-8", "replace").splitlines()
         if exit_code == 127:
@@ -1173,6 +1455,74 @@ def run(args: argparse.Namespace) -> int:
             name: _hash((repo / name).read_bytes())
             for name in ("Cargo.lock", "adapters/java/gradle.lockfile", "adapters/node/package-lock.json", "web/app/package-lock.json")
         }
+        gate_settle_reports: dict[str, dict[str, Any]] = {}
+
+        def run_gate_command(
+            argv: list[str], *, cwd: pathlib.Path, env: dict[str, str],
+            temp_log_path: pathlib.Path, log_path: pathlib.Path, gate: Gate,
+            head_before: str, tree_before: str, diff_before: str,
+        ) -> tuple[int, float]:
+            natural_exit_settle: dict[str, Any] = {}
+            try:
+                result = _run(
+                    argv, cwd=cwd, env=env, timeout=args.command_timeout,
+                    log_path=temp_log_path,
+                    settle_report=natural_exit_settle,
+                )
+                if natural_exit_settle:
+                    # Normal gate receipts include settling evidence after the
+                    # command result and final global scan have completed.
+                    gate_settle_reports[gate.name] = natural_exit_settle
+                return result
+            except (UncertainProcessTree, AttemptedGateFailure) as exc:
+                if not exc.command_started:
+                    raise
+                # The command did start. Preserve that fact before the outer
+                # failure handler appends later gates as unreached.
+                attempted_log: pathlib.Path | None = None
+                try:
+                    if temp_log_path.is_file():
+                        os.replace(temp_log_path, log_path)
+                        attempted_log = log_path
+                except OSError:
+                    if temp_log_path.is_file():
+                        attempted_log = temp_log_path
+                entry: dict[str, Any] = {
+                    "name": gate.name,
+                    "argv": argv,
+                    "cwd": gate.cwd,
+                    "exitCode": exc.raw_exit_code,
+                    "durationSeconds": exc.duration_seconds,
+                    "headBefore": head_before,
+                    "headAfter": None,
+                    "workingTreeDigestBefore": tree_before,
+                    "workingTreeDigestAfter": None,
+                    "phaseDiffSha256Before": diff_before,
+                    "phaseDiffSha256After": None,
+                    "status": "failed",
+                    "cleanupUncertain": isinstance(exc, UncertainProcessTree),
+                    "sourceIdentityAfter": "unavailable because gate command finalization failed",
+                }
+                if attempted_log is not None:
+                    entry["log"] = f"logs/{attempted_log.name}"
+                    try:
+                        entry["logSha256"] = _hash_file(attempted_log)
+                    except OSError:
+                        entry["logHash"] = "unavailable"
+                if natural_exit_settle:
+                    entry["naturalExitSettle"] = natural_exit_settle
+                results.append(entry)
+                manifest["headAfter"] = None
+                manifest["workingTreeDigestAfter"] = None
+                manifest["phaseDiffSha256After"] = None
+                manifest["gates"] = results
+                manifest["decision"] = "failed"
+                try:
+                    _atomic_json(run_dir / "receipt.json", manifest)
+                except OSError:
+                    pass
+                raise
+
         for index, gate in enumerate(GATES):
             head_now = _git(repo, "rev-parse", "HEAD").lower()
             tree_before = _tree_state_digest(repo)
@@ -1198,12 +1548,24 @@ def run(args: argparse.Namespace) -> int:
                     target = pathlib.Path(gate_env["CARGO_TARGET_DIR"])
                     target.mkdir(mode=0o700)
                     argv = [cargo_path, *gate.argv[1:]]
-                    code, duration = _run(argv, cwd=repo, env=gate_env, timeout=args.command_timeout, log_path=temp_log_path)
+                    code, duration = run_gate_command(
+                        argv, cwd=repo, env=gate_env, temp_log_path=temp_log_path,
+                        log_path=log_path, gate=gate, head_before=head_now,
+                        tree_before=tree_before, diff_before=diff_before,
+                    )
             elif gate.env == "phase-diff":
                 argv = ["git", "diff", "--check", f"{base}...HEAD"]
-                code, duration = _run(argv, cwd=repo, env=gate_env, timeout=args.command_timeout, log_path=temp_log_path)
+                code, duration = run_gate_command(
+                    argv, cwd=repo, env=gate_env, temp_log_path=temp_log_path,
+                    log_path=log_path, gate=gate, head_before=head_now,
+                    tree_before=tree_before, diff_before=diff_before,
+                )
             else:
-                code, duration = _run(argv, cwd=repo / gate.cwd, env=gate_env, timeout=args.command_timeout, log_path=temp_log_path)
+                code, duration = run_gate_command(
+                    argv, cwd=repo / gate.cwd, env=gate_env, temp_log_path=temp_log_path,
+                    log_path=log_path, gate=gate, head_before=head_now,
+                    tree_before=tree_before, diff_before=diff_before,
+                )
             if temp_log_path.exists():
                 os.replace(temp_log_path, log_path)
             entry = {
@@ -1222,6 +1584,8 @@ def run(args: argparse.Namespace) -> int:
                 "phaseDiffSha256After": _hash(_phase_diff(repo, base)),
                 "status": "passed" if code == 0 else "failed",
             }
+            if gate.name in gate_settle_reports:
+                entry["naturalExitSettle"] = gate_settle_reports[gate.name]
             if (entry["headAfter"] != head_start or entry["workingTreeDigestAfter"] != dirty_start
                     or entry["phaseDiffSha256After"] != _hash(diff_start)):
                 entry["status"] = "failed"
@@ -1261,7 +1625,7 @@ def run(args: argparse.Namespace) -> int:
         print(f"Decision: {manifest['decision']} ({sum(item.get('status') != 'unreached' for item in results)}/{len(GATES)} gates reached)")
         return 0 if manifest["decision"] == "checks_passed_for_review" else 1
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
-        if isinstance(exc, UncertainProcessTree):
+        if isinstance(exc, UncertainProcessTree) and exc.command_started:
             retain_leases = True
             for lease in acquired_leases:
                 lease.retain_for_manual_recovery(

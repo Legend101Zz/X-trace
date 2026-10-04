@@ -305,6 +305,192 @@ class RunnerTests(unittest.TestCase):
     def args(self) -> Namespace:
         return Namespace(repo=str(self.repo), base=self.base, label="P00-test", cache_root=str(self.cache), command_timeout=30)
 
+    def test_natural_exit_settle_clears_only_after_initial_identity_exits(self) -> None:
+        clock = [0.0]
+        identity = (4242, "candidate-start")
+        candidate = {"pid": identity[0], "startedAt": identity[1], "descriptorStatus": "uninspectable", "reason": "missing-process-record-after-all-fd-fallback"}
+
+        def sleep(seconds: float) -> None:
+            clock[0] += seconds
+
+        def poll(_remaining: float) -> tuple[dict[int, tuple[int, str, str]], run_gates.UntrackedProcessScan]:
+            if clock[0] < 1.5:
+                snapshot = {identity[0]: (1, identity[1], "S")}
+                scan = run_gates.UntrackedProcessScan([], [candidate], run_gates.EXPECTED_UNINSPECTABLE_SCAN, 1)
+            else:
+                snapshot = {}
+                scan = run_gates.UntrackedProcessScan([], [], None, 0)
+            return snapshot, scan
+
+        result = run_gates._settle_uninspectable_candidates(
+            [candidate], poll, duration=4, interval=1,
+            monotonic=lambda: clock[0], sleep=sleep,
+        )
+        self.assertTrue(result.cleared)
+        self.assertEqual(result.elapsed_seconds, 2)
+        self.assertEqual(result.poll_count, 2)
+        self.assertFalse(result.latest_candidates)
+
+    def test_natural_exit_settle_fails_closed_for_survivors_and_new_holders(self) -> None:
+        clock = [0.0]
+        identity = (4242, "candidate-start")
+        candidate = {"pid": identity[0], "startedAt": identity[1], "descriptorStatus": "uninspectable", "reason": "missing-process-record-after-all-fd-fallback"}
+
+        def sleep(seconds: float) -> None:
+            clock[0] += seconds
+
+        def survivor(_remaining: float) -> tuple[dict[int, tuple[int, str, str]], run_gates.UntrackedProcessScan]:
+            return (
+                {identity[0]: (1, identity[1], "S")},
+                run_gates.UntrackedProcessScan([], [candidate], run_gates.EXPECTED_UNINSPECTABLE_SCAN, 1),
+            )
+
+        result = run_gates._settle_uninspectable_candidates(
+            [candidate], survivor, duration=2, interval=1,
+            monotonic=lambda: clock[0], sleep=sleep,
+        )
+        self.assertFalse(result.cleared)
+        self.assertEqual(result.last_error, "initial uninspectable process identity survived settling deadline")
+        self.assertEqual(result.latest_candidates, [candidate])
+
+        clock[0] = 0.0
+        holder = {"pid": 5151, "startedAt": "late-start", "descriptorStatus": "held", "reason": "private-log-descriptor-observed"}
+
+        def new_holder(_remaining: float) -> tuple[dict[int, tuple[int, str, str]], run_gates.UntrackedProcessScan]:
+            return (
+                {identity[0]: (1, identity[1], "S"), 5151: (1, "late-start", "S")},
+                run_gates.UntrackedProcessScan([holder], [], None, 1),
+            )
+
+        result = run_gates._settle_uninspectable_candidates(
+            [candidate], new_holder, duration=4, interval=1,
+            monotonic=lambda: clock[0], sleep=sleep,
+        )
+        self.assertFalse(result.cleared)
+        self.assertEqual(result.latest_candidates, [holder])
+        self.assertIn("held descriptor", result.last_error or "")
+
+    def test_natural_exit_settle_admission_excludes_held_owned_and_log_failures(self) -> None:
+        unknown = {"pid": 4242, "startedAt": "candidate-start", "descriptorStatus": "uninspectable", "reason": "missing-process-record-after-all-fd-fallback"}
+        eligible = run_gates.UntrackedProcessScan([], [unknown], run_gates.EXPECTED_UNINSPECTABLE_SCAN, 1)
+        self.assertTrue(run_gates._natural_exit_settle_eligible(
+            eligible, tree_confirmed_drained=True, log_io_failed=False,
+        ))
+        self.assertFalse(run_gates._natural_exit_settle_eligible(
+            eligible, tree_confirmed_drained=False, log_io_failed=False,
+        ))
+        self.assertFalse(run_gates._natural_exit_settle_eligible(
+            eligible, tree_confirmed_drained=True, log_io_failed=True,
+        ))
+        held = run_gates.UntrackedProcessScan(
+            [{"pid": 9, "startedAt": "held", "descriptorStatus": "held"}],
+            [unknown], run_gates.EXPECTED_UNINSPECTABLE_SCAN, 2,
+        )
+        self.assertFalse(run_gates._natural_exit_settle_eligible(
+            held, tree_confirmed_drained=True, log_io_failed=False,
+        ))
+        owned_probe = run_gates.UntrackedProcessScan([], [unknown], run_gates.EXPECTED_UNINSPECTABLE_SCAN, 1, [{"pid": 8}])
+        self.assertFalse(run_gates._natural_exit_settle_eligible(
+            owned_probe, tree_confirmed_drained=True, log_io_failed=False,
+        ))
+
+    def test_natural_exit_settle_fails_closed_on_scan_error_and_interrupt(self) -> None:
+        candidate = {"pid": 4242, "startedAt": "candidate-start", "descriptorStatus": "uninspectable", "reason": "missing-process-record-after-all-fd-fallback"}
+        clock = [0.0]
+
+        def sleep(seconds: float) -> None:
+            clock[0] += seconds
+
+        scan_error = run_gates.UntrackedProcessScan([], [], "scanner unavailable", 0)
+        result = run_gates._settle_uninspectable_candidates(
+            [candidate], lambda _remaining: ({}, scan_error), duration=4,
+            interval=1, monotonic=lambda: clock[0], sleep=sleep,
+        )
+        self.assertFalse(result.cleared)
+        self.assertEqual(result.last_error, "scanner unavailable")
+
+        def interrupt(_seconds: float) -> None:
+            raise KeyboardInterrupt()
+
+        result = run_gates._settle_uninspectable_candidates(
+            [candidate], lambda _remaining: ({}, scan_error), duration=4,
+            monotonic=lambda: clock[0], sleep=interrupt,
+        )
+        self.assertFalse(result.cleared)
+        self.assertEqual(result.last_error, "settling poll failed: KeyboardInterrupt")
+
+    def test_natural_exit_settle_requires_clean_global_rescan_and_quiescence(self) -> None:
+        clock = [0.0]
+        scans = [0]
+
+        def sleep(seconds: float) -> None:
+            clock[0] += seconds
+
+        def clean_scan(_remaining: float) -> tuple[dict[int, tuple[int, str, str]], run_gates.UntrackedProcessScan]:
+            scans[0] += 1
+            return {}, run_gates.UntrackedProcessScan([], [], None, 0)
+
+        cleared, latest, error, count = run_gates._final_global_quiescence_scan(
+            5, clean_scan, lambda _snapshot: [], monotonic=lambda: clock[0], sleep=sleep,
+        )
+        self.assertTrue(cleared)
+        self.assertFalse(latest)
+        self.assertIsNone(error)
+        self.assertEqual(count, 2)
+        self.assertEqual(scans[0], 2)
+        self.assertEqual(clock[0], run_gates.NATURAL_EXIT_QUIESCENT_SECONDS)
+
+        late_unknown = {"pid": 9001, "startedAt": "late-start", "descriptorStatus": "uninspectable", "reason": "late-child"}
+        failed, latest, error, count = run_gates._final_global_quiescence_scan(
+            5,
+            lambda _remaining: ({9001: (1, "late-start", "S")}, run_gates.UntrackedProcessScan([], [late_unknown], run_gates.EXPECTED_UNINSPECTABLE_SCAN, 1)),
+            lambda _snapshot: [], monotonic=lambda: clock[0], sleep=sleep,
+        )
+        self.assertFalse(failed)
+        self.assertEqual(latest, [late_unknown])
+        self.assertEqual(count, 1)
+
+        failed, _latest, error, _count = run_gates._final_global_quiescence_scan(
+            5, clean_scan, lambda _snapshot: [733], monotonic=lambda: clock[0], sleep=sleep,
+        )
+        self.assertFalse(failed)
+        self.assertIn("owned process", error or "")
+
+    def test_natural_exit_final_quiescence_fails_on_scan_error_timeout_or_interrupt(self) -> None:
+        clock = [0.0]
+        clean = run_gates.UntrackedProcessScan([], [], None, 0)
+        no_sleep = lambda _seconds: None
+
+        failed, _latest, error, _count = run_gates._final_global_quiescence_scan(
+            5,
+            lambda _remaining: ({}, run_gates.UntrackedProcessScan([], [], "late scanner error", 0)),
+            lambda _snapshot: [], monotonic=lambda: clock[0], sleep=no_sleep,
+        )
+        self.assertFalse(failed)
+        self.assertEqual(error, "late scanner error")
+
+        def late_scan(_remaining: float) -> tuple[dict[int, tuple[int, str, str]], run_gates.UntrackedProcessScan]:
+            clock[0] = 6
+            return {}, clean
+
+        failed, _latest, error, _count = run_gates._final_global_quiescence_scan(
+            5, late_scan, lambda _snapshot: [], monotonic=lambda: clock[0], sleep=no_sleep,
+        )
+        self.assertFalse(failed)
+        self.assertIn("deadline exceeded", error or "")
+
+        clock[0] = 0
+
+        def interrupt(_seconds: float) -> None:
+            raise KeyboardInterrupt()
+
+        failed, _latest, error, _count = run_gates._final_global_quiescence_scan(
+            5, lambda _remaining: ({}, clean), lambda _snapshot: [],
+            monotonic=lambda: clock[0], sleep=interrupt,
+        )
+        self.assertFalse(failed)
+        self.assertEqual(error, "quiescent wait failed: KeyboardInterrupt")
+
     def test_failed_gate_stops_and_never_claims_all_passed(self) -> None:
         failure = run_gates.Gate("failure", (sys.executable, "-c", "print('gate failed'); raise SystemExit(9)"))
         later = run_gates.Gate("unreached", (sys.executable, "-c", "raise SystemExit(0)"))
@@ -317,6 +503,94 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(receipt["gates"][0]["exitCode"], 9)
         self.assertEqual(receipt["gates"][0]["status"], "failed")
         self.assertNotIn("ALL GATES PASSED", (self.cache / "release-gates/P00-test/receipt.json").read_text())
+
+    def test_attempted_cleanup_failure_is_failed_receipt_with_raw_exit_and_partial_log(self) -> None:
+        attempted = run_gates.Gate("attempted-java", ("java", "-version"))
+        later = run_gates.Gate("later", (sys.executable, "-c", "raise SystemExit(0)"))
+        real_replace = os.replace
+
+        def uncertain_run(
+            _argv: object, *, log_path: pathlib.Path, settle_report: dict[str, object] | None = None,
+            **_kwargs: object,
+        ) -> tuple[int, float]:
+            log_path.write_bytes(b"partial private command log\n")
+            error = run_gates.UncertainProcessTree("owned tree did not drain", 777)
+            error.command_started = True
+            error.raw_exit_code = 0
+            error.duration_seconds = 1.25
+            error.owned_processes = {777: "started"}
+            error.unconfirmed_processes = [{"pid": 888, "startedAt": "unknown-start", "descriptorStatus": "uninspectable", "reason": "fixture"}]
+            if settle_report is not None:
+                settle_report.update({"eligible": False, "error": "test uncertainty"})
+            raise error
+
+        def fail_log_rename(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            if pathlib.Path(destination).name == "attempted-java.log":
+                raise OSError("injected log rename failure")
+            real_replace(source, destination)
+
+        with mock.patch.object(run_gates, "GATES", (attempted, later)), \
+                mock.patch.object(run_gates, "_run", side_effect=uncertain_run), \
+                mock.patch.object(run_gates.os, "replace", side_effect=fail_log_rename):
+            self.assertEqual(run_gates.run(self.args()), 1)
+
+        run_dir = self.cache / "release-gates/P00-test"
+        receipt = json.loads((run_dir / "receipt.json").read_text())
+        entry = receipt["gates"][0]
+        self.assertEqual(entry["name"], "attempted-java")
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["exitCode"], 0, "raw zero must not promote an unclean command")
+        self.assertEqual(entry["durationSeconds"], 1.25)
+        self.assertTrue(entry["cleanupUncertain"])
+        self.assertIsNone(entry["headAfter"])
+        self.assertIsNone(entry["workingTreeDigestAfter"])
+        self.assertTrue(entry["log"].startswith("logs/.attempted-java.log."))
+        self.assertEqual(entry["logSha256"], digest(b"partial private command log\n"))
+        self.assertEqual(entry["naturalExitSettle"]["error"], "test uncertainty")
+        self.assertEqual(receipt["gates"][1]["status"], "unreached")
+        for name in ("cargo", "gradle"):
+            self.assertTrue((self.cache / "leases" / name / "owner.json").is_file())
+
+    def test_pre_spawn_uncertainty_remains_unreached_not_attempted(self) -> None:
+        attempted = run_gates.Gate("not-started", ("java", "-version"))
+
+        def pre_spawn(_argv: object, **_kwargs: object) -> tuple[int, float]:
+            error = run_gates.UncertainProcessTree("interrupted before spawn", -1)
+            error.command_started = False
+            raise error
+
+        with mock.patch.object(run_gates, "GATES", (attempted,)), \
+                mock.patch.object(run_gates, "_run", side_effect=pre_spawn):
+            self.assertEqual(run_gates.run(self.args()), 1)
+
+        receipt = json.loads((self.cache / "release-gates/P00-test/receipt.json").read_text())
+        self.assertEqual(receipt["gates"], [{
+            "name": "not-started",
+            "status": "unreached",
+            "reason": "precondition or gate runner error",
+        }])
+        self.assertFalse((self.cache / "leases/cargo").exists())
+        self.assertFalse((self.cache / "leases/gradle").exists())
+
+    def test_attempted_log_io_failure_is_not_reported_as_unreached(self) -> None:
+        attempted = run_gates.Gate("log-io", ("java", "-version"))
+
+        def log_io_failure(
+            _argv: object, *, log_path: pathlib.Path, **_kwargs: object,
+        ) -> tuple[int, float]:
+            log_path.write_bytes(b"flushed command output\n")
+            raise run_gates.AttemptedGateFailure(OSError("injected fsync error"), 7, 2.0)
+
+        with mock.patch.object(run_gates, "GATES", (attempted,)), \
+                mock.patch.object(run_gates, "_run", side_effect=log_io_failure):
+            self.assertEqual(run_gates.run(self.args()), 1)
+
+        receipt = json.loads((self.cache / "release-gates/P00-test/receipt.json").read_text())
+        entry = receipt["gates"][0]
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["exitCode"], 7)
+        self.assertFalse(entry["cleanupUncertain"])
+        self.assertEqual(entry["logSha256"], digest(b"flushed command output\n"))
 
     def test_owned_atomic_lease_fails_before_any_gate(self) -> None:
         lease = self.cache / "leases/cargo"
@@ -489,6 +763,12 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(run_gates.run(args), 1)
             receipt = json.loads((self.cache / "release-gates/P00-test/receipt.json").read_text())
             self.assertEqual(receipt["decision"], "failed")
+            self.assertEqual(receipt["gates"][0]["name"], "uncertain-timeout")
+            self.assertEqual(receipt["gates"][0]["status"], "failed")
+            self.assertTrue(receipt["gates"][0]["cleanupUncertain"])
+            self.assertIsNone(receipt["gates"][0]["exitCode"])
+            self.assertTrue(receipt["gates"][0]["logSha256"])
+            self.assertEqual(receipt["gates"][1]["status"], "unreached")
             for name in ("cargo", "gradle"):
                 owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
                 self.assertTrue(owner["requiresManualRecovery"])
