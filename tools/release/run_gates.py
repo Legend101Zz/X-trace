@@ -30,6 +30,9 @@ else:
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 CACHE_NAMES = ("cargo", "cargo-target", "gradle", "npm", "playwright", "tmp", "xdg")
+LEASE_NAMES = ("cargo", "gradle")
+RECEIPT_JSON_BUDGET = 4096
+LOG_LIMIT_EXIT_CODE = 126
 PS_BINARY = next((path for path in ("/bin/ps", "/usr/bin/ps") if pathlib.Path(path).is_file()), None)
 LSOF_BINARY = next((path for path in ("/usr/sbin/lsof", "/usr/bin/lsof") if pathlib.Path(path).is_file()), None)
 UNTRACKED_SCAN_BUDGET_SECONDS = 2.0
@@ -322,6 +325,18 @@ class AttemptedGateFailure(RuntimeError):
         self.duration_seconds = duration_seconds
         self.command_started = True
         self.cleanup_uncertain = False
+
+
+class LeaseBusy(RuntimeError):
+    """A builder lease directory already exists and is not ours.
+
+    `requires_manual_recovery` is True when its owner record says a failed run
+    retained it, False when the record does not, and None when it is unreadable.
+    """
+
+    def __init__(self, message: str, requires_manual_recovery: bool | None = None):
+        super().__init__(message)
+        self.requires_manual_recovery = requires_manual_recovery
 
 
 class UncertainProbeCleanup(RuntimeError):
@@ -1180,7 +1195,15 @@ def _close_log(log: Any) -> None:
 def _run(
     argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout: int,
     log_path: pathlib.Path, settle_report: dict[str, Any] | None = None,
+    max_log_bytes: int | None = None,
 ) -> tuple[int, float]:
+    """Run one supervised command, optionally enforcing a live log-size cap.
+
+    With `max_log_bytes`, the poll loop checks the log's size; on overflow it
+    stops only this run's owned process tree through the same path as a
+    timeout, returns LOG_LIMIT_EXIT_CODE, and any tree that cannot be confirmed
+    drained fails closed as an uncertain process tree.
+    """
     started = time.monotonic()
     fd = private_roots.create_private_file(
         log_path, flags=os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode=0o600,
@@ -1199,7 +1222,7 @@ def _run(
     unconfirmed_process_count = 0
     unconfirmed_processes_truncated = False
     probe_evidence = ProbeEvidence()
-    timed_out = interrupted = False
+    timed_out = interrupted = log_overflow = False
     try:
         log = os.fdopen(fd, "wb")
     except BaseException:
@@ -1240,6 +1263,14 @@ def _run(
                     if time.monotonic() >= deadline:
                         timed_out = True
                         break
+                    if max_log_bytes is not None:
+                        try:
+                            log_size = os.fstat(log.fileno()).st_size
+                        except (OSError, ValueError):
+                            log_size = max_log_bytes + 1  # unreadable size fails closed
+                        if log_size > max_log_bytes:
+                            log_overflow = True
+                            break
             if root_identity is None:
                 if process.poll() is None:
                     try:
@@ -1253,10 +1284,14 @@ def _run(
                     except (subprocess.TimeoutExpired, KeyboardInterrupt):
                         pass
                 uncertain = f"cannot identify process {process.pid} or its descendants"
-            elif timed_out or interrupted:
+            elif timed_out or interrupted or log_overflow:
                 if not _stop_and_reap_owned_tree(process, root_identity, owned):
-                    cause = "timed-out" if timed_out else "interrupted"
+                    cause = "timed-out" if timed_out else ("log-limit-exceeded" if log_overflow else "interrupted")
                     uncertain = f"{cause} process tree rooted at {process.pid} could not be confirmed drained"
+                elif log_overflow:
+                    tree_confirmed_drained = True
+                    code = LOG_LIMIT_EXIT_CODE
+                    write_diagnostic(b"\nGate log exceeded its size limit; owned process tree drained.\n")
                 elif timed_out:
                     tree_confirmed_drained = True
                     code = 124
@@ -1438,7 +1473,9 @@ def _run(
                         unconfirmed_processes_truncated = (
                             identity_union.truncated or unconfirmed_process_count > len(unconfirmed_processes)
                         )
-                    report["identityUnion"] = list(identity_union.sample)
+                    # On success the union only repeats the initial identities plus
+                    # churn that already exited; keep counts, not the list.
+                    report["identityUnion"] = [] if report.get("settled") else list(identity_union.sample)
                     report["identityUnionCount"] = identity_union.count
                     report["identityUnionTruncated"] = identity_union.truncated
                     report.update(probe_evidence.report_fields())
@@ -1452,6 +1489,8 @@ def _run(
                             "completed gate left live processes created during the command that were not "
                             "observed as owned descendants; builder leases require manual review"
                         )
+                    if settle_report is not None and not probe_evidence.empty:
+                        settle_report.update(probe_evidence.report_fields())
             except BaseException as exc:
                 probe_evidence.add_exception(exc)
                 if settle_report is not None and not probe_evidence.empty:
@@ -1708,6 +1747,48 @@ def _atomic_json(path: pathlib.Path, value: Any) -> None:
     _atomic_write(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode())
 
 
+_SETTLE_LIST_FIELDS = ("initialIdentities", "latestIdentities", "identityUnion", "ownedProbeProcesses", "cleanupExceptions")
+
+
+def _settle_reports(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    for group in ("gates", "versionProbes"):
+        for item in manifest.get(group) or []:
+            report = item.get("naturalExitSettle") if isinstance(item, dict) else None
+            if isinstance(report, dict):
+                reports.append(report)
+    return reports
+
+
+def _receipt_fits(manifest: dict[str, Any]) -> bool:
+    data = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+    return private_roots.private_json_fits_read_limits(
+        data, maximum_nodes=RECEIPT_JSON_BUDGET, maximum_commas=RECEIPT_JSON_BUDGET,
+    )
+
+
+def _write_receipt(path: pathlib.Path, manifest: dict[str, Any]) -> None:
+    """Write the receipt, guaranteeing it stays readable under the CI read limits.
+
+    Oversized settle reports are compacted in stages (identity lists first cut,
+    then dropped) while keeping every count and truncation flag; a receipt that
+    still cannot fit is an error rather than an unreadable file.
+    """
+    if not _receipt_fits(manifest):
+        for keep in (8, 0):
+            for report in _settle_reports(manifest):
+                for name in _SETTLE_LIST_FIELDS:
+                    items = report.get(name)
+                    if isinstance(items, list) and len(items) > keep:
+                        report[name] = items[:keep]
+                        report["evidenceListsCompacted"] = True
+            if _receipt_fits(manifest):
+                break
+        else:
+            raise RuntimeError("release receipt cannot be bounded to the readable limits")
+    _atomic_json(path, manifest)
+
+
 class Lease:
     def __init__(self, path: pathlib.Path, token: str, label: str):
         self.path = path
@@ -1724,8 +1805,10 @@ class Lease:
         except FileExistsError as exc:
             private_roots.admit_directory(self.path, private_leaf=True)
             owner = "unknown owner"
+            recovery: bool | None = None
             try:
                 data = private_roots.read_private_json(self.path / "owner.json")
+                recovery = data.get("requiresManualRecovery") is True
                 owner_pid = data.get("pid")
                 owner_label = data.get("label")
                 if (isinstance(owner_pid, int) and not isinstance(owner_pid, bool)
@@ -1737,9 +1820,12 @@ class Lease:
                     return
             except (OSError, RuntimeError, ValueError):
                 pass
-            raise RuntimeError(f"release builder lease is already owned ({owner}); share the exact lease token only with a nested gate invocation") from exc
+            raise LeaseBusy(
+                f"release builder lease is already owned ({owner}); share the exact lease token only with a nested gate invocation",
+                recovery,
+            ) from exc
         if not created:
-            raise RuntimeError("release builder lease is already owned (unknown owner)")
+            raise LeaseBusy("release builder lease is already owned (unknown owner)")
         self.acquired = True
         try:
             _atomic_json(self.path / "owner.json", {"pid": os.getpid(), "label": self.label, "token": self.token, "startedAtEpoch": int(time.time())})
@@ -1829,9 +1915,11 @@ def _fit_owner_record(owner: dict[str, Any]) -> None:
     """
     flags = {
         "unconfirmedProcesses": "unconfirmedProcessesTruncated",
-        "ownedProbeProcesses": "probeEvidenceTruncated",
         "ownedProcesses": "ownedProcessesTruncated",
+        "ownedProbeProcesses": "probeEvidenceTruncated",
     }
+    # Run-owned probe identities are the last evidence to be trimmed.
+    tiers = (("unconfirmedProcesses", "ownedProcesses"), ("ownedProbeProcesses",))
 
     def fits() -> bool:
         data = (json.dumps(owner, indent=2, sort_keys=True) + "\n").encode()
@@ -1840,15 +1928,18 @@ def _fit_owner_record(owner: dict[str, Any]) -> None:
     for _ in range(64):
         if fits():
             return
-        candidates = [
-            (len(owner[name]), name) for name in flags
-            if isinstance(owner.get(name), list) and len(owner[name]) > 1
-        ]
-        if not candidates:
+        for tier in tiers:
+            candidates = [
+                (len(owner[name]), name == "unconfirmedProcesses", name) for name in tier
+                if isinstance(owner.get(name), list) and len(owner[name]) > 1
+            ]
+            if candidates:
+                _size, _first, name = max(candidates)
+                owner[name] = owner[name][: len(owner[name]) // 2]
+                owner[flags[name]] = True
+                break
+        else:
             break
-        _size, name = max(candidates, key=lambda item: (item[0], item[1] != "unconfirmedProcesses"))
-        owner[name] = owner[name][: len(owner[name]) // 2]
-        owner[flags[name]] = True
     if not fits():
         for name, flag in flags.items():
             if isinstance(owner.get(name), list):
@@ -1910,7 +2001,7 @@ def run(args: argparse.Namespace) -> int:
     run_dir = release_root / args.label
     logs_dir = run_dir / "logs"
     lease_root = cache / "leases"
-    leases = [Lease(lease_root / name, args.lease_token, args.label) for name in ("cargo", "gradle")]
+    leases = [Lease(lease_root / name, args.lease_token, args.label) for name in LEASE_NAMES]
     # Inspect every existing named root before the first cache mutation. Missing
     # descendants are admitted through their nearest existing no-follow parent.
     private_roots.preflight_directory(cache, private_leaf=True)
@@ -2146,7 +2237,7 @@ def run(args: argparse.Namespace) -> int:
             manifest["gates"] = results
             manifest["decision"] = "running" if code == 0 else "failed"
             recheck_private_roots()
-            _atomic_json(run_dir / "receipt.json", manifest)
+            _write_receipt(run_dir / "receipt.json", manifest)
             print(f"{'PASS' if code == 0 else 'FAIL'} {gate.name} (exit {code}; log {log_name})", flush=True)
             if code != 0:
                 for later in GATES[index + 1:]:
@@ -2168,7 +2259,7 @@ def run(args: argparse.Namespace) -> int:
             manifest["decision"] = "checks_passed_for_review"
         else:
             manifest["decision"] = "failed"
-        _atomic_json(run_dir / "receipt.json", manifest)
+        _write_receipt(run_dir / "receipt.json", manifest)
         print(f"Decision: {manifest['decision']} ({sum(item.get('status') != 'unreached' for item in results)}/{len(GATES)} gates reached)")
         return 0 if manifest["decision"] == "checks_passed_for_review" else 1
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
@@ -2248,7 +2339,7 @@ def run(args: argparse.Namespace) -> int:
             for gate in GATES if gate.name not in completed
         ]
         try:
-            _atomic_json(run_dir / "receipt.json", manifest)
+            _write_receipt(run_dir / "receipt.json", manifest)
         except (OSError, RuntimeError, ValueError):
             pass
         print(f"release gates failed: {exc}", file=sys.stderr)

@@ -820,15 +820,17 @@ def preflight_directory(
     admit_directory(candidate, private_leaf=private_leaf)
 
 
-def private_json_fits_read_limits(data: bytes, *, maximum_bytes: int = 65536) -> bool:
+def private_json_fits_read_limits(
+    data: bytes, *, maximum_bytes: int = 65536, maximum_nodes: int = 512, maximum_commas: int = 512,
+) -> bool:
     """Return whether `data` would pass `read_private_json`'s content bounds.
 
     Applies the same byte, depth, comma, node, key, list and string limits so a
     writer can prove its record stays readable before atomically replacing it.
     """
     try:
-        _check_json_shape_bytes(data, maximum_bytes)
-        _loads_bounded_private_json(data)
+        _check_json_shape_bytes(data, maximum_bytes, maximum_commas=maximum_commas)
+        _loads_bounded_private_json(data, maximum_nodes=maximum_nodes)
     except AdmissionError:
         return False
     return True
