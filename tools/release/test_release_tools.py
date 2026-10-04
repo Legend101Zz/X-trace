@@ -916,6 +916,12 @@ class RunnerTests(unittest.TestCase):
         process.wait.return_value = 0
         process.poll.return_value = 0
         real_fdopen = os.fdopen
+        real_popen = subprocess.Popen
+
+        def selective_popen(argv: object, *args: object, **kwargs: object) -> object:
+            if isinstance(argv, (list, tuple)) and list(argv) == list(gate.argv):
+                return process
+            return real_popen(argv, *args, **kwargs)
 
         class FailingDiagnosticLog:
             def __init__(self, fd: int, mode: str) -> None:
@@ -937,7 +943,7 @@ class RunnerTests(unittest.TestCase):
             True, 1.0, 1, [], None, time.monotonic() + 120,
         )
         with mock.patch.object(run_gates, "GATES", (gate,)), \
-                mock.patch.object(run_gates.subprocess, "Popen", return_value=process), \
+                mock.patch.object(run_gates.subprocess, "Popen", side_effect=selective_popen), \
                 mock.patch.object(run_gates, "_process_snapshot", side_effect=[{}, root_snapshot, root_snapshot, root_snapshot, root_snapshot]), \
                 mock.patch.object(run_gates, "_owned_processes_alive", return_value=[4321]), \
                 mock.patch.object(run_gates, "_stop_and_reap_owned_tree", return_value=True), \
@@ -1170,6 +1176,7 @@ class RunnerTests(unittest.TestCase):
                 def normal_run(
                     _argv: object, *, log_path: pathlib.Path, **_kwargs: object,
                 ) -> tuple[int, float]:
+                    normal_returned[0] = True
                     log_path.write_bytes(b"command completed before finalization\n")
                     os.chmod(log_path, 0o600)
                     return 0, 0.75
@@ -1185,10 +1192,11 @@ class RunnerTests(unittest.TestCase):
                     return real_hash_file(path)
 
                 tree_calls = [0]
+                normal_returned = [False]
 
                 def tree_digest(repo: pathlib.Path) -> str:
                     tree_calls[0] += 1
-                    if failure_stage == "source" and tree_calls[0] == 2:
+                    if failure_stage == "source" and normal_returned[0]:
                         raise RuntimeError("injected post-command source read failure")
                     return real_tree_digest(repo)
 
