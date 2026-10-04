@@ -16,24 +16,136 @@ env:
 jobs:
   release-tool-tests:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      XTRACE_CI_PRIVATE_ROOT: ${{ runner.temp }}/xtrace-release-tool-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Install Linux descriptor inspection tool
         run: |
           sudo apt-get update
           sudo apt-get install --yes lsof
-      - name: Require OpenSSL 3 and lsof
+      - name: Verify exact source and phase base
         run: |
-          openssl version | grep -E '^OpenSSL 3\.'
-          command -v lsof
-      - name: Run release tooling tests without skips
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor preflight-source \
+            --repo "$GITHUB_WORKSPACE" \
+            --phase-metadata evidence/v0.01/workflow.json \
+            --expected-head "$GITHUB_SHA"
+      - name: Admit private scratch before test output
         run: |
           set -euo pipefail
-          PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest tools.release.test_release_tools -v 2>&1 | tee /tmp/xtrace-release-tool-tests.log
-          if grep -Eq 'skipped=[1-9]' /tmp/xtrace-release-tool-tests.log; then
-            echo 'Release tooling tests must run without skips.'
-            exit 1
-          fi
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor prepare-private-root --root "$XTRACE_CI_PRIVATE_ROOT"
+      - name: Run the complete release tooling suite without skips
+        run: |
+          set +e
+          umask 077
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor summarize-tests \
+            --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
+            > "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log" 2>&1
+          result=$?
+          set -e
+          exit "$result"
+
+  release-floor-linux-x86_64:
+    needs: release-tool-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tuple: jdk17-node22
+            java-version: 17
+            node-version: 22
+          - tuple: jdk21-node24
+            java-version: 21
+            node-version: 24
+    env:
+      XTRACE_CI_PRIVATE_ROOT: ${{ runner.temp }}/xtrace-release-floor-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.tuple }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install release-floor system prerequisite
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes lsof
+      - name: Verify source, architecture, toolchain tuple, and browser prerequisites
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor preflight \
+            --repo "$GITHUB_WORKSPACE" \
+            --phase-metadata evidence/v0.01/workflow.json \
+            --expected-head "$GITHUB_SHA" \
+            --java-major "${{ matrix.java-version }}" \
+            --node-major "${{ matrix.node-version }}" \
+            --tuple "${{ matrix.tuple }}"
+      - name: Admit private logs, leases, caches, and test scratch before writes
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor prepare-private-root --root "$XTRACE_CI_PRIVATE_ROOT"
+      - name: Verify full release tooling suite on the exact source
+        run: |
+          set +e
+          umask 077
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor summarize-tests \
+            --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
+            > "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log" 2>&1
+          result=$?
+          set -e
+          exit "$result"
+      - name: Run all 23 pinned release gates
+        run: |
+          set +e
+          umask 077
+          python3 -B -m tools.release.run_gates \
+            --repo "$GITHUB_WORKSPACE" \
+            --base "$XTRACE_PHASE_BASE_SHA" \
+            --label "floor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.tuple }}" \
+            --cache-root "$XTRACE_CI_PRIVATE_ROOT" \
+            > "$XTRACE_CI_PRIVATE_ROOT/gate-runner.log" 2>&1
+          result=$?
+          set -e
+          exit "$result"
+      - name: Write a strict sanitized result summary
+        if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
+        run: |
+          set +e
+          python3 -B -m tools.release.ci_floor sanitize-floor \
+            --root "$XTRACE_CI_PRIVATE_ROOT" \
+            --label "floor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.tuple }}" \
+            --expected-head "$GITHUB_SHA" \
+            --phase-base "${XTRACE_PHASE_BASE_SHA:-}" \
+            --tuple "${{ matrix.tuple }}"
+          result=$?
+          set -e
+          exit "$result"
+      - name: Upload sanitized floor summary only
+        if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xtrace-v001-floor-${{ matrix.tuple }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json
+          if-no-files-found: ignore
+          retention-days: 14
 
   java-client:
     runs-on: ubuntu-latest
