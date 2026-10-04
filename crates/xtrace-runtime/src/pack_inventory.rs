@@ -182,7 +182,7 @@ impl InspectedPack {
             .create_private_child_for_operation(&snapshot_name, deadline)
             .map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
 
-        let mut directories = BTreeMap::new();
+        let mut directories: BTreeMap<String, AdmittedPrivateRoot> = BTreeMap::new();
         let mut created_files = Vec::new();
         for path in expected_directories(&self.manifest) {
             let parent_path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
@@ -446,6 +446,55 @@ fn populate_private_snapshot(
     created_files: &mut Vec<(String, File)>,
     deadline: std::time::Instant,
 ) -> Result<(), SignedPackError> {
+    populate_private_snapshot_with_hooks(
+        manifest,
+        outer_bytes,
+        outer_digest,
+        sources,
+        snapshot,
+        directories,
+        created_files,
+        deadline,
+        &mut NoopSnapshotHooks,
+    )
+}
+
+trait SnapshotHooks {
+    fn after_copy_chunk(
+        &mut self,
+        _parent: &AdmittedPrivateRoot,
+        _name: &str,
+        _destination: &File,
+        _copied: u64,
+    ) -> Result<(), SignedPackError> {
+        Ok(())
+    }
+
+    fn before_destination_rehash(
+        &mut self,
+        _parent: &AdmittedPrivateRoot,
+        _name: &str,
+        _destination: &File,
+    ) -> Result<(), SignedPackError> {
+        Ok(())
+    }
+}
+
+struct NoopSnapshotHooks;
+
+impl SnapshotHooks for NoopSnapshotHooks {}
+
+fn populate_private_snapshot_with_hooks(
+    manifest: &PackManifest,
+    outer_bytes: &[u8],
+    outer_digest: &[u8; 32],
+    sources: &BTreeMap<String, (File, Identity, [u8; 32])>,
+    snapshot: &AdmittedPrivateRoot,
+    directories: &BTreeMap<String, AdmittedPrivateRoot>,
+    created_files: &mut Vec<(String, File)>,
+    deadline: std::time::Instant,
+    hooks: &mut dyn SnapshotHooks,
+) -> Result<(), SignedPackError> {
     let mut expected = manifest
         .artifact_digests()
         .iter()
@@ -486,6 +535,7 @@ fn populate_private_snapshot(
             destination,
             &mut total_bytes,
             deadline,
+            hooks,
         )?;
     }
     Ok(())
@@ -503,6 +553,7 @@ fn copy_and_verify_source(
     destination: &File,
     total_bytes: &mut u64,
     deadline: std::time::Instant,
+    hooks: &mut dyn SnapshotHooks,
 ) -> Result<(), SignedPackError> {
     let source_before = source.metadata().map_err(|_| SignedPackError::InventoryMismatch)?;
     if Identity::from_metadata(&source_before) != source_identity
@@ -512,9 +563,8 @@ fn copy_and_verify_source(
         return Err(SignedPackError::InventoryMismatch);
     }
     let limit = if outer_manifest { MAX_MANIFEST_BYTES } else { MAX_ARTIFACT_BYTES };
-    let remaining = (MAX_TOTAL_BYTES + MAX_MANIFEST_BYTES)
-        .checked_sub(*total_bytes)
-        .ok_or(SignedPackError::ResourceLimit)?;
+    let remaining =
+        MAX_TOTAL_BYTES.checked_sub(*total_bytes).ok_or(SignedPackError::ResourceLimit)?;
     if source_identity.size > limit || source_identity.size > remaining {
         return Err(SignedPackError::ResourceLimit);
     }
@@ -542,6 +592,7 @@ fn copy_and_verify_source(
             .write_all(&buffer[..count])
             .map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
         hasher.update(&buffer[..count]);
+        hooks.after_copy_chunk(parent, name, destination, copied)?;
     }
     *total_bytes = total_bytes.checked_add(copied).ok_or(SignedPackError::ResourceLimit)?;
     let source_after = source.metadata().map_err(|_| SignedPackError::InventoryMismatch)?;
@@ -556,7 +607,18 @@ fn copy_and_verify_source(
     parent
         .validate_file_binding_for_operation(name, destination, true, deadline)
         .map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
-    verify_private_file(parent, name, expected_digest, limit, deadline)?;
+    hooks.before_destination_rehash(parent, name, destination)?;
+    let expected_identity =
+        destination.metadata().map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
+    verify_private_file(
+        parent,
+        name,
+        expected_digest,
+        limit,
+        MAX_TOTAL_BYTES,
+        Some(Identity::from_metadata(&expected_identity)),
+        deadline,
+    )?;
     parent.sync_for_operation(deadline).map_err(|_| SignedPackError::PrivateSnapshotUnavailable)
 }
 
@@ -569,13 +631,23 @@ fn verify_private_file(
     name: &str,
     expected_digest: [u8; 32],
     maximum_bytes: u64,
+    maximum_total_remaining: u64,
+    expected_identity: Option<Identity>,
     deadline: std::time::Instant,
-) -> Result<(), SignedPackError> {
+) -> Result<u64, SignedPackError> {
     let file = parent
         .open_regular_file_for_operation(name, deadline)
         .map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
     let before = file.metadata().map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
-    if !before.is_file() || before.len() > maximum_bytes || before.nlink() != 1 {
+    let before_identity = Identity::from_metadata(&before);
+    if before.len() > maximum_total_remaining {
+        return Err(SignedPackError::ResourceLimit);
+    }
+    if !before.is_file()
+        || before.len() > maximum_bytes
+        || before.nlink() != 1
+        || expected_identity.is_some_and(|expected| expected != before_identity)
+    {
         return Err(SignedPackError::SnapshotIncomplete);
     }
     let mut reader = &file;
@@ -591,13 +663,14 @@ fn verify_private_file(
             break;
         }
         consumed = consumed.checked_add(count as u64).ok_or(SignedPackError::ResourceLimit)?;
-        if consumed > maximum_bytes {
+        if consumed > maximum_bytes || consumed > maximum_total_remaining {
             return Err(SignedPackError::ResourceLimit);
         }
         hasher.update(&buffer[..count]);
     }
     let after = file.metadata().map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
-    if Identity::from_metadata(&before) != Identity::from_metadata(&after)
+    if before_identity != Identity::from_metadata(&after)
+        || expected_identity.is_some_and(|expected| expected != Identity::from_metadata(&after))
         || consumed != after.len()
         || *hasher.finalize().as_bytes() != expected_digest
     {
@@ -605,13 +678,30 @@ fn verify_private_file(
     }
     parent
         .validate_file_binding_for_operation(name, &file, false, deadline)
-        .map_err(|_| SignedPackError::PrivateSnapshotUnavailable)
+        .map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
+    Ok(consumed)
 }
 
 fn verify_private_snapshot(
     snapshot: &AdmittedPrivateRoot,
     manifest: &PackManifest,
     outer_digest: &[u8; 32],
+    deadline: std::time::Instant,
+) -> Result<(), SignedPackError> {
+    verify_private_snapshot_with_total_limit(
+        snapshot,
+        manifest,
+        outer_digest,
+        MAX_TOTAL_BYTES,
+        deadline,
+    )
+}
+
+fn verify_private_snapshot_with_total_limit(
+    snapshot: &AdmittedPrivateRoot,
+    manifest: &PackManifest,
+    outer_digest: &[u8; 32],
+    maximum_total_bytes: u64,
     deadline: std::time::Instant,
 ) -> Result<(), SignedPackError> {
     snapshot
@@ -670,6 +760,7 @@ fn verify_private_snapshot(
             return Err(SignedPackError::SnapshotIncomplete);
         }
     }
+    let mut total_bytes = 0_u64;
     for (path, digest) in expected_files {
         let parent_path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
         let name = path.rsplit('/').next().ok_or(SignedPackError::SnapshotIncomplete)?;
@@ -679,7 +770,10 @@ fn verify_private_snapshot(
             directory_caps.get(parent_path).ok_or(SignedPackError::SnapshotIncomplete)?
         };
         let maximum = if path == OUTER_MANIFEST { MAX_MANIFEST_BYTES } else { MAX_ARTIFACT_BYTES };
-        verify_private_file(parent, name, digest, maximum, deadline)?;
+        let remaining =
+            maximum_total_bytes.checked_sub(total_bytes).ok_or(SignedPackError::ResourceLimit)?;
+        let read = verify_private_file(parent, name, digest, maximum, remaining, None, deadline)?;
+        total_bytes = total_bytes.checked_add(read).ok_or(SignedPackError::ResourceLimit)?;
     }
     snapshot
         .revalidate_for_operation(deadline)
@@ -803,11 +897,15 @@ fn parse_sha256_manifest(bytes: &[u8]) -> Result<BTreeMap<String, [u8; 32]>, Sig
         return Err(SignedPackError::InventoryMismatch);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| SignedPackError::InventoryMismatch)?;
+    let body = text.strip_suffix('\n').ok_or(SignedPackError::InventoryMismatch)?;
     let mut rows = BTreeMap::new();
     let mut previous: Option<String> = None;
-    for (index, line) in text.lines().enumerate() {
+    for (index, line) in body.split('\n').enumerate() {
         if index >= MAX_INNER_MANIFEST_ENTRIES {
             return Err(SignedPackError::ResourceLimit);
+        }
+        if line.is_empty() || line.contains('\r') {
+            return Err(SignedPackError::InventoryMismatch);
         }
         let (hex, path) = line.split_once("  ").ok_or(SignedPackError::InventoryMismatch)?;
         if hex.len() != 64
@@ -972,15 +1070,20 @@ fn scan_directory(
                     .ok_or(SignedPackError::ResourceLimit)?;
                 let scanned = scan_regular_file(
                     &file,
-                    directory,
-                    name_c.as_c_str(),
-                    named.st_dev,
-                    named.st_ino,
-                    relative == OUTER_MANIFEST,
-                    matches!(relative.as_str(), "pack.manifest" | "agent/manifest.sha256"),
+                    ScanFileContext {
+                        parent: directory,
+                        name: name_c.as_c_str(),
+                        named_device: named.st_dev,
+                        named_inode: named.st_ino,
+                        outer_manifest: relative == OUTER_MANIFEST,
+                        capture_small: matches!(
+                            relative.as_str(),
+                            "pack.manifest" | "agent/manifest.sha256"
+                        ),
+                        maximum_total_remaining: remaining_total,
+                        deadline,
+                    },
                     total_bytes,
-                    remaining_total,
-                    deadline,
                 )?;
                 if tree.files.insert(relative, scanned).is_some() {
                     return Err(SignedPackError::InventoryMismatch);
@@ -992,44 +1095,53 @@ fn scan_directory(
     Ok(())
 }
 
-fn scan_regular_file(
-    file: &File,
-    parent: &File,
-    name: &std::ffi::CStr,
+struct ScanFileContext<'a> {
+    parent: &'a File,
+    name: &'a std::ffi::CStr,
     named_device: u64,
     named_inode: u64,
     outer_manifest: bool,
     capture_small: bool,
-    total_bytes: &mut u64,
     maximum_total_remaining: u64,
     deadline: std::time::Instant,
+}
+
+fn scan_regular_file(
+    file: &File,
+    context: ScanFileContext<'_>,
+    total_bytes: &mut u64,
 ) -> Result<ScannedFile, SignedPackError> {
     let before = file.metadata().map_err(|_| SignedPackError::InventoryMismatch)?;
     let identity = Identity::from_metadata(&before);
-    let limit = if outer_manifest { MAX_MANIFEST_BYTES } else { MAX_ARTIFACT_BYTES };
+    let limit = if context.outer_manifest { MAX_MANIFEST_BYTES } else { MAX_ARTIFACT_BYTES };
+    if context.capture_small && identity.size > MAX_MANIFEST_BYTES {
+        return Err(SignedPackError::ResourceLimit);
+    }
     if !before.is_file()
-        || identity.device != named_device
-        || identity.inode != named_inode
+        || identity.device != context.named_device
+        || identity.inode != context.named_inode
         || identity.links != 1
         || identity.size > limit
     {
         return Err(SignedPackError::InventoryMismatch);
     }
-    if !outer_manifest {
-        *total_bytes =
-            total_bytes.checked_add(identity.size).ok_or(SignedPackError::ResourceLimit)?;
-        if *total_bytes > MAX_TOTAL_BYTES {
-            return Err(SignedPackError::ResourceLimit);
-        }
+    *total_bytes = total_bytes.checked_add(identity.size).ok_or(SignedPackError::ResourceLimit)?;
+    if *total_bytes > MAX_TOTAL_BYTES {
+        return Err(SignedPackError::ResourceLimit);
     }
     let mut reader = file;
     let mut hasher = blake3::Hasher::new();
     let mut sha256 = Sha256::new();
-    let mut small_contents = capture_small.then(|| Vec::with_capacity(before.len() as usize));
+    let capture_capacity = if context.capture_small {
+        Some(usize::try_from(identity.size).map_err(|_| SignedPackError::ResourceLimit)?)
+    } else {
+        None
+    };
+    let mut small_contents = capture_capacity.map(Vec::with_capacity);
     let mut consumed = 0_u64;
     let mut buffer = [0_u8; 32 * 1024];
     loop {
-        if std::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= context.deadline {
             return Err(SignedPackError::ResourceLimit);
         }
         let count = reader.read(&mut buffer).map_err(|_| SignedPackError::InventoryMismatch)?;
@@ -1037,7 +1149,7 @@ fn scan_regular_file(
             break;
         }
         consumed = consumed.checked_add(count as u64).ok_or(SignedPackError::ResourceLimit)?;
-        if consumed > limit || (!outer_manifest && consumed > maximum_total_remaining) {
+        if consumed > limit || consumed > context.maximum_total_remaining {
             return Err(SignedPackError::ResourceLimit);
         }
         hasher.update(&buffer[..count]);
@@ -1051,8 +1163,9 @@ fn scan_regular_file(
     }
     let after = file.metadata().map_err(|_| SignedPackError::InventoryMismatch)?;
     let after_identity = Identity::from_metadata(&after);
-    let named_after = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(|_| SignedPackError::InventoryMismatch)?;
+    let named_after =
+        rustix::fs::statat(context.parent, context.name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| SignedPackError::InventoryMismatch)?;
     reader.seek(SeekFrom::Start(0)).map_err(|_| SignedPackError::InventoryMismatch)?;
     if !after_identity.stable_file(identity)
         || after_identity.size != consumed
@@ -1158,6 +1271,113 @@ fn encode_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::signed_pack::{ArtifactDigest, build_hash};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn private_scratch() -> AdmittedPrivateRoot {
+        let path = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+            .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required");
+        AdmittedPrivateRoot::open(Path::new(&path)).expect("admitted private test scratch")
+    }
+
+    fn unique_name(stem: &str) -> String {
+        let ticks = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        format!("{stem}-{}-{ticks}", std::process::id())
+    }
+
+    fn public_fixture(payload: &[u8]) -> (tempfile::TempDir, InspectedPack) {
+        let source = tempfile::tempdir().expect("public pack fixture directory");
+        let payload_path = source.path().join("payload.bin");
+        std::fs::write(&payload_path, payload).expect("public artifact fixture");
+        let artifacts = [ArtifactDigest {
+            path: "payload.bin".to_owned(),
+            digest: *blake3::hash(payload).as_bytes(),
+        }];
+        std::fs::write(source.path().join(OUTER_MANIFEST), make_manifest(&artifacts))
+            .expect("public manifest fixture");
+        let inspected = inspect_pack(source.path()).expect("closed public pack fixture");
+        (source, inspected)
+    }
+
+    fn private_snapshot(
+        cache: &AdmittedPrivateRoot,
+        manifest: &PackManifest,
+    ) -> (String, AdmittedPrivateRoot, BTreeMap<String, AdmittedPrivateRoot>) {
+        let name = unique_name("pack-snapshot-test");
+        let snapshot = cache.create_private_child(&name).expect("private snapshot fixture");
+        let mut directories: BTreeMap<String, AdmittedPrivateRoot> = BTreeMap::new();
+        for path in expected_directories(manifest) {
+            let parent_path = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            let basename = path.rsplit('/').next().expect("directory basename");
+            let parent = if parent_path.is_empty() {
+                &snapshot
+            } else {
+                directories.get(parent_path).expect("previous parent capability")
+            };
+            let child = parent.create_private_child(basename).expect("nested directory fixture");
+            directories.insert(path, child);
+        }
+        (name, snapshot, directories)
+    }
+
+    fn populate_fixture(
+        inspected: &InspectedPack,
+        snapshot: &AdmittedPrivateRoot,
+        directories: &BTreeMap<String, AdmittedPrivateRoot>,
+        created_files: &mut Vec<(String, File)>,
+        hooks: &mut dyn SnapshotHooks,
+    ) -> Result<(), SignedPackError> {
+        populate_private_snapshot_with_hooks(
+            &inspected.manifest,
+            &inspected.manifest_bytes,
+            &inspected.outer_digest,
+            &inspected.source_files,
+            snapshot,
+            directories,
+            created_files,
+            std::time::Instant::now() + MAX_INSPECTION_TIME,
+            hooks,
+        )
+    }
+
+    type ChunkFault =
+        Box<dyn FnMut(&AdmittedPrivateRoot, &str, &File, u64) -> Result<(), SignedPackError>>;
+    type RehashFault =
+        Box<dyn FnMut(&AdmittedPrivateRoot, &str, &File) -> Result<(), SignedPackError>>;
+
+    struct TestSnapshotHooks {
+        after_chunk: Option<ChunkFault>,
+        before_rehash: Option<RehashFault>,
+    }
+
+    impl SnapshotHooks for TestSnapshotHooks {
+        fn after_copy_chunk(
+            &mut self,
+            parent: &AdmittedPrivateRoot,
+            name: &str,
+            destination: &File,
+            copied: u64,
+        ) -> Result<(), SignedPackError> {
+            if let Some(fault) = &mut self.after_chunk {
+                fault(parent, name, destination, copied)?;
+            }
+            Ok(())
+        }
+
+        fn before_destination_rehash(
+            &mut self,
+            parent: &AdmittedPrivateRoot,
+            name: &str,
+            destination: &File,
+        ) -> Result<(), SignedPackError> {
+            if let Some(fault) = &mut self.before_rehash {
+                fault(parent, name, destination)?;
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn public_input_tree_rejects_links_special_files_and_unlisted_entries() {
@@ -1242,6 +1462,36 @@ mod tests {
     }
 
     #[test]
+    fn small_manifest_limit_is_checked_before_capture_allocation() {
+        let directory = tempfile::tempdir().expect("public manifest fixture directory");
+        let path = directory.path().join("manifest.bin");
+        let contents = vec![b'x'; MAX_MANIFEST_BYTES as usize + 1];
+        std::fs::write(&path, &contents).expect("oversized bounded fixture");
+        let file = File::open(&path).expect("open public fixture");
+        let metadata = file.metadata().expect("fixture metadata");
+        let parent = File::open(directory.path()).expect("fixture parent directory");
+        let name = std::ffi::CString::new("manifest.bin").expect("fixed fixture name");
+        let mut total = 0;
+        assert_eq!(
+            scan_regular_file(
+                &file,
+                ScanFileContext {
+                    parent: &parent,
+                    name: name.as_c_str(),
+                    named_device: metadata.dev(),
+                    named_inode: metadata.ino(),
+                    outer_manifest: false,
+                    capture_small: true,
+                    maximum_total_remaining: MAX_TOTAL_BYTES,
+                    deadline: std::time::Instant::now() + MAX_INSPECTION_TIME,
+                },
+                &mut total,
+            ),
+            Err(SignedPackError::ResourceLimit)
+        );
+    }
+
+    #[test]
     fn java_distribution_manifest_rows_are_bounded_sorted_and_path_closed() {
         let valid = format!("{}  agent/a.jar\n", "ab".repeat(32));
         assert_eq!(parse_sha256_manifest(valid.as_bytes()).map(|rows| rows.len()), Ok(1));
@@ -1260,6 +1510,170 @@ mod tests {
             .map(|index| format!("{}  agent/{index:03}.jar\n", "ab".repeat(32)))
             .collect::<String>();
         assert_eq!(parse_sha256_manifest(too_many.as_bytes()), Err(SignedPackError::ResourceLimit));
+    }
+
+    #[test]
+    fn sha256_distribution_rows_require_literal_lf_and_no_empty_records() {
+        let row = format!("{}  agent/a.jar", "ab".repeat(32));
+        assert!(parse_sha256_manifest(format!("{row}\n").as_bytes()).is_ok());
+        for malformed in [format!("{row}\r\n"), format!("{row}\n\n"), format!("{row}\r\n{row}\r\n")]
+        {
+            assert_eq!(
+                parse_sha256_manifest(malformed.as_bytes()),
+                Err(SignedPackError::InventoryMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn copied_snapshot_reopens_same_descriptor_and_enforces_aggregate_budget_and_deadline() {
+        let cache = private_scratch();
+        let payload = b"authenticated snapshot fixture";
+        let (_source, inspected) = public_fixture(payload);
+        let (snapshot_name, snapshot, directories) = private_snapshot(&cache, &inspected.manifest);
+        let mut created_files = Vec::new();
+        let mut hooks = NoopSnapshotHooks;
+        assert_eq!(
+            populate_fixture(&inspected, &snapshot, &directories, &mut created_files, &mut hooks),
+            Ok(())
+        );
+        let deadline = std::time::Instant::now() + MAX_INSPECTION_TIME;
+        assert_eq!(
+            verify_private_snapshot(
+                &snapshot,
+                &inspected.manifest,
+                &inspected.outer_digest,
+                deadline
+            ),
+            Ok(())
+        );
+        let exact_total = payload.len() as u64 + inspected.manifest_bytes.len() as u64;
+        assert_eq!(
+            verify_private_snapshot_with_total_limit(
+                &snapshot,
+                &inspected.manifest,
+                &inspected.outer_digest,
+                exact_total - 1,
+                deadline,
+            ),
+            Err(SignedPackError::ResourceLimit)
+        );
+        assert!(
+            verify_private_snapshot(
+                &snapshot,
+                &inspected.manifest,
+                &inspected.outer_digest,
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            )
+            .is_err()
+        );
+        cleanup_private_snapshot(
+            &cache,
+            &snapshot_name,
+            &snapshot,
+            &directories,
+            &created_files,
+            deadline,
+        )
+        .expect("exact snapshot fixture cleanup");
+    }
+
+    #[test]
+    fn partial_snapshot_copy_uses_production_cleanup_and_reports_uncertain_replacement() {
+        let cache = private_scratch();
+        let payload = vec![0x5a; 70 * 1024];
+        let (_source, inspected) = public_fixture(&payload);
+
+        let (snapshot_name, snapshot, directories) = private_snapshot(&cache, &inspected.manifest);
+        let mut created_files = Vec::new();
+        let mut fail_after_chunk = TestSnapshotHooks {
+            after_chunk: Some(Box::new(
+                |_: &AdmittedPrivateRoot, _: &str, _: &File, copied: u64| {
+                    if copied > 0 { Err(SignedPackError::SnapshotIncomplete) } else { Ok(()) }
+                },
+            )),
+            before_rehash: None,
+        };
+        assert_eq!(
+            populate_fixture(
+                &inspected,
+                &snapshot,
+                &directories,
+                &mut created_files,
+                &mut fail_after_chunk,
+            ),
+            Err(SignedPackError::SnapshotIncomplete)
+        );
+        let deadline = std::time::Instant::now() + MAX_INSPECTION_TIME;
+        cleanup_private_snapshot(
+            &cache,
+            &snapshot_name,
+            &snapshot,
+            &directories,
+            &created_files,
+            deadline,
+        )
+        .expect("partial copy cleanup");
+        assert!(
+            !cache
+                .bounded_child_names_for_operation(MAX_TREE_ENTRIES, deadline)
+                .expect("private cache listing")
+                .contains(&snapshot_name)
+        );
+
+        let (snapshot_name, snapshot, directories) = private_snapshot(&cache, &inspected.manifest);
+        let mut created_files = Vec::new();
+        let replacement = vec![0x5a; payload.len()];
+        let mut hooks = TestSnapshotHooks {
+            after_chunk: None,
+            before_rehash: Some(Box::new(
+                move |parent: &AdmittedPrivateRoot, name: &str, _destination: &File| {
+                    let path = parent.path().join(name);
+                    let parked = parent.path().join("fixture-original-held");
+                    std::fs::rename(&path, &parked)
+                        .map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
+                    std::fs::write(&path, &replacement)
+                        .map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
+                    let replacement_file = File::open(&path)
+                        .map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
+                    replacement_file
+                        .set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .map_err(|_| SignedPackError::PrivateSnapshotUnavailable)?;
+                    Ok(())
+                },
+            )),
+        };
+        assert_eq!(
+            populate_fixture(&inspected, &snapshot, &directories, &mut created_files, &mut hooks),
+            Err(SignedPackError::SnapshotIncomplete)
+        );
+        assert_eq!(
+            cleanup_private_snapshot(
+                &cache,
+                &snapshot_name,
+                &snapshot,
+                &directories,
+                &created_files,
+                std::time::Instant::now() + MAX_INSPECTION_TIME,
+            ),
+            Err(SignedPackError::SnapshotCleanupUncertain)
+        );
+        let parked = snapshot.path().join("fixture-original-held");
+        assert_eq!(
+            std::fs::read(snapshot.path().join("payload.bin"))
+                .expect("replacement remains visible after refused cleanup"),
+            payload
+        );
+        std::fs::remove_file(snapshot.path().join("payload.bin"))
+            .expect("remove replacement fixture");
+        std::fs::remove_file(&parked).expect("remove displaced fixture");
+        cache
+            .remove_private_child_for_operation(
+                &snapshot_name,
+                &snapshot,
+                std::time::Instant::now() + MAX_INSPECTION_TIME,
+            )
+            .expect("remove manually emptied uncertain fixture");
     }
 
     #[test]

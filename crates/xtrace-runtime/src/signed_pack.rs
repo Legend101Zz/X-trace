@@ -592,8 +592,6 @@ fn validate_framework_modules(value: &JsonValue, language: &str) -> Result<(), S
         "native_http",
     ];
     const CAPABILITIES: &[&str] = &[
-        "launch",
-        "attach",
         "method_frames",
         "line_cursor",
         "locals",
@@ -601,7 +599,6 @@ fn validate_framework_modules(value: &JsonValue, language: &str) -> Result<(), S
         "database_interaction",
         "outbound_http",
         "source_maps",
-        "retransmit",
     ];
     let mut previous_id: Option<String> = None;
     for module in modules {
@@ -650,9 +647,7 @@ fn validate_framework_modules(value: &JsonValue, language: &str) -> Result<(), S
         })?;
         let capture = string_array(required(fields, "captureCapabilities")?, 0, 16)?;
         if capture.windows(2).any(|pair| pair[0] >= pair[1])
-            || capture
-                .iter()
-                .any(|item| !CAPABILITIES.contains(&item.as_str()) || *item == "endpoint_discovery")
+            || capture.iter().any(|item| !CAPABILITIES.contains(&item.as_str()))
         {
             return Err(SignedPackError::UnsupportedManifest);
         }
@@ -782,9 +777,15 @@ fn valid_npm_name(value: &str) -> bool {
         None => return false,
     };
     let valid_segment = |segment: &str| {
-        segment.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
-        })
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && !segment.contains("..")
+            && segment.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
     };
     scope.is_none_or(valid_segment) && valid_segment(name)
 }
@@ -1474,6 +1475,41 @@ mod tests {
     }
 
     #[test]
+    fn framework_module_capture_capability_registry_is_exact() {
+        for allowed in [
+            "method_frames",
+            "line_cursor",
+            "locals",
+            "async_correlation",
+            "database_interaction",
+            "outbound_http",
+            "source_maps",
+        ] {
+            assert!(parse_canonical_manifest(&manifest_with_module_capture(allowed)).is_ok());
+        }
+        for forbidden in ["launch", "attach", "retransmit", "endpoint_discovery"] {
+            assert_eq!(
+                parse_canonical_manifest(&manifest_with_module_capture(forbidden)),
+                Err(SignedPackError::UnsupportedManifest),
+                "module capture must reject pack-level capability {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_coordinates_reject_dot_and_traversal_segments() {
+        for accepted in ["react", "@scope/package", "pkg_name-1", "@scope/pkg.name"] {
+            assert!(valid_npm_name(accepted), "expected valid npm coordinate {accepted}");
+        }
+        for rejected in [".", "..", "foo..bar", "@../..", "@scope/..", "@../package", "@scope/."] {
+            assert!(
+                !valid_npm_name(rejected),
+                "expected traversal-like coordinate {rejected} to fail"
+            );
+        }
+    }
+
+    #[test]
     fn signed_message_omits_only_signature_value() {
         let expected = concat!(
             "XTRACE-PACK-v1\0",
@@ -1559,6 +1595,25 @@ mod tests {
         output.extend_from_slice(to);
         output.extend_from_slice(&source[position + from.len()..]);
         output
+    }
+
+    fn manifest_with_module_capture(capability: &str) -> Vec<u8> {
+        let module = format!(
+            concat!(
+                "[{{\"after\":[],\"captureCapabilities\":[\"{capability}\"],",
+                "\"conflicts\":[],\"discoveryCapabilities\":[],\"fixtureIds\":[],",
+                "\"framework\":{{\"artifact\":\"spring-web\",\"ecosystem\":\"maven\",",
+                "\"group\":\"org.springframework\"}},\"id\":\"spring.web\",",
+                "\"matcherIds\":[],\"packageMarkers\":[\"org.springframework\"],",
+                "\"posture\":\"public_hook\",\"requiredRuntimeFeatures\":[],",
+                "\"status\":\"experimental\",\"testedVersions\":[\"6.0.0\"],",
+                "\"versionRange\":\">=6.0.0 <7.0.0\"}}]"
+            ),
+            capability = capability
+        );
+        let changed = replace_once(MANIFEST, b"\"frameworkModules\":[]", module.as_bytes());
+        assert_ne!(changed, MANIFEST, "fixture placeholder must be present");
+        changed
     }
 
     fn decode_hex(value: &str) -> Vec<u8> {
