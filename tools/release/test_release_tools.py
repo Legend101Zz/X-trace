@@ -51,6 +51,134 @@ def attempt_log_from_receipt(run_dir: pathlib.Path) -> pathlib.Path | None:
 
 
 class PrivateRootAdmissionTests(unittest.TestCase):
+    def test_object_signature_ignores_directory_entries_only(self) -> None:
+        directory = os.stat_result((stat.S_IFDIR | 0o700, 11, 77, 2, os.getuid(), 0, 64, 0, 0, 0))
+        directory_with_churn = os.stat_result(
+            (stat.S_IFDIR | 0o700, 11, 77, 5, os.getuid(), 0, 4096, 0, 0, 0),
+        )
+        self.assertEqual(
+            private_roots._object_signature(directory),
+            private_roots._object_signature(directory_with_churn),
+        )
+        for changed in (
+            os.stat_result((stat.S_IFDIR | 0o700, 12, 77, 2, os.getuid(), 0, 64, 0, 0, 0)),
+            os.stat_result((stat.S_IFDIR | 0o700, 11, 78, 2, os.getuid(), 0, 64, 0, 0, 0)),
+            os.stat_result((stat.S_IFDIR | 0o750, 11, 77, 2, os.getuid(), 0, 64, 0, 0, 0)),
+            os.stat_result((stat.S_IFDIR | 0o700, 11, 77, 2, os.getuid() + 1, 0, 64, 0, 0, 0)),
+        ):
+            with self.subTest(changed=changed):
+                self.assertNotEqual(
+                    private_roots._object_signature(directory),
+                    private_roots._object_signature(changed),
+                )
+        regular = os.stat_result((stat.S_IFREG | 0o600, 11, 77, 1, os.getuid(), 0, 12, 0, 0, 0))
+        changed_regular_links = os.stat_result(
+            (stat.S_IFREG | 0o600, 11, 77, 2, os.getuid(), 0, 12, 0, 0, 0),
+        )
+        changed_regular_size = os.stat_result(
+            (stat.S_IFREG | 0o600, 11, 77, 1, os.getuid(), 0, 13, 0, 0, 0),
+        )
+        self.assertNotEqual(
+            private_roots._object_signature(regular),
+            private_roots._object_signature(changed_regular_links),
+        )
+        self.assertNotEqual(
+            private_roots._object_signature(regular),
+            private_roots._object_signature(changed_regular_size),
+        )
+
+    def test_mac_mount_tolerates_synthetic_directory_entry_stat_drift(self) -> None:
+        """Synthetic stat drift at os.fstat; real child creation and fd, not admission proof."""
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
+            mount = pathlib.Path(temporary)
+            path = mount / "cache"
+            path.mkdir(mode=0o700)
+            child = path / "concurrent-child"
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            before = os.fstat(fd)
+            real_fstat = os.fstat
+            candidate_fstat_calls = 0
+
+            def run_util(argv: list[str]) -> tuple[bytes, bytes]:
+                if argv[0] == "/bin/df":
+                    child.mkdir(mode=0o700)
+                    return (
+                        f"Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                        f"/dev/disk3s1 100 10 90 10% {mount}\n".encode(),
+                        b"",
+                    )
+                return plistlib.dumps({
+                    "MountPoint": str(mount), "DeviceNode": "/dev/disk3s1",
+                    "FilesystemType": "apfs", "GlobalPermissionsEnabled": True,
+                }), b""
+
+            def fstat_with_synthetic_entry_drift(target_fd: int) -> os.stat_result:
+                nonlocal candidate_fstat_calls
+                info = real_fstat(target_fd)
+                if target_fd == fd:
+                    candidate_fstat_calls += 1
+                    if candidate_fstat_calls == 2:
+                        self.assertTrue(child.is_dir())
+                        fields = list(info)
+                        fields[3] += 1
+                        fields[6] += 256
+                        return os.stat_result(fields)
+                return info
+
+            try:
+                with mock.patch.object(private_roots, "_bounded_utility", side_effect=run_util), \
+                        mock.patch.object(private_roots.os, "fstat", side_effect=fstat_with_synthetic_entry_drift):
+                    private_roots._macos_mount(path, fd, before)
+                after = real_fstat(fd)
+                self.assertTrue(child.is_dir())
+                self.assertEqual(candidate_fstat_calls, 2)
+                self.assertEqual((before.st_dev, before.st_ino, before.st_uid, before.st_mode),
+                                 (after.st_dev, after.st_ino, after.st_uid, after.st_mode))
+            finally:
+                os.close(fd)
+
+    def test_admit_empty_directory_rejects_entry_inserted_after_empty_scan(self) -> None:
+        """Insert a real entry at the final-fstat seam; this is not admission evidence."""
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
+            root = pathlib.Path(temporary)
+            child = root / "appears-after-scan"
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            admission_fd = os.dup(fd)
+            identity_info = os.fstat(fd)
+            identity = (identity_info.st_dev, identity_info.st_ino)
+            before_entries = (identity_info.st_nlink, identity_info.st_size)
+            real_fstat = os.fstat
+            candidate_fstat_calls = 0
+
+            def fstat_with_postscan_child(target_fd: int) -> os.stat_result:
+                nonlocal candidate_fstat_calls
+                if target_fd == admission_fd:
+                    candidate_fstat_calls += 1
+                    if candidate_fstat_calls == 2:
+                        child.mkdir(mode=0o700)
+                        info = real_fstat(target_fd)
+                        fields = list(info)
+                        fields[3] = max(fields[3], before_entries[0] + 1)
+                        fields[6] = max(fields[6], before_entries[1] + 256)
+                        return os.stat_result(fields)
+                return real_fstat(target_fd)
+
+            try:
+                with mock.patch.object(private_roots, "_open_validated_directory", return_value=(admission_fd, identity)), \
+                        mock.patch.object(private_roots.os, "fstat", side_effect=fstat_with_postscan_child):
+                    with self.assertRaises(private_roots.AdmissionError):
+                        private_roots.admit_empty_directory(root, identity)
+                self.assertTrue(child.is_dir())
+                self.assertEqual(candidate_fstat_calls, 2)
+                with self.assertRaises(OSError):
+                    real_fstat(admission_fd)
+            finally:
+                os.close(fd)
+                try:
+                    os.close(admission_fd)
+                except OSError:
+                    pass
+
     def test_actual_macos_ls_headers_allow_deny_only_acl_and_paths_with_spaces(self) -> None:
         workspace = pathlib.Path("/Users/example/Documents/Codex/2026-10-04/workspace with spaces")
         cache = pathlib.Path("/Volumes/Example SSD/.cache/xtrace")

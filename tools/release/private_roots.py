@@ -309,8 +309,18 @@ def _macos_mount(path: pathlib.Path, fd: int, info: os.stat_result) -> None:
         raise _fail()
 
 
-def _object_signature(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
-    return (info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_nlink, info.st_size)
+def _object_signature(info: os.stat_result) -> tuple[int, ...]:
+    identity = (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
+    if stat.S_ISDIR(info.st_mode):
+        # Directory contents can change during bounded metadata probes. Keep
+        # identity, ownership, and the complete mode bound; entry counts and
+        # encoded size remain checked by operations whose contract is emptiness.
+        return identity
+    return (*identity, info.st_nlink, info.st_size)
+
+
+def _directory_entry_signature(info: os.stat_result) -> tuple[int, int]:
+    return info.st_nlink, info.st_size
 
 
 def _bounded_json_shape(fd: int, maximum_bytes: int) -> None:
@@ -940,6 +950,7 @@ def admit_empty_directory(path: os.PathLike[str] | str, expected_identity: tuple
                 raise _fail()
         after = os.fstat(fd)
         if (_object_signature(after) != _object_signature(before)
+                or _directory_entry_signature(after) != _directory_entry_signature(before)
                 or (after.st_dev, after.st_ino) != expected_identity):
             raise _fail()
     except OSError:
