@@ -539,8 +539,10 @@ pub fn list_recordings<P: RecordingReadPort>(
         .map_err(|error| crate::application::port_error_to_app_error(error, correlation_id))?;
     let next_after =
         has_more.then(|| recordings.last().map(|recording| recording.recording_id)).flatten();
-    let mut unavailable = UnavailableEvidence::default();
-    unavailable.completion = "per_recording".to_owned();
+    let unavailable = UnavailableEvidence {
+        completion: "per_recording".to_owned(),
+        ..UnavailableEvidence::default()
+    };
     Ok(RecordingListPage {
         schema_version: RECORDING_READ_SCHEMA_VERSION,
         project_id: request.project_id,
