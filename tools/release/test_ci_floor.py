@@ -381,16 +381,42 @@ class CiFloorEvidenceTests(unittest.TestCase):
             receipt["gates"][0].pop("exitCode", None)
 
         public = self.sanitize_with_provenance(stop_at_gradle_probe)
-        self.assertEqual(public["floorStatus"], "invalid")
-        self.assertEqual(public["gateCount"], 0)
+        self.assertEqual(public["floorStatus"], "failed", "a well-formed failed receipt is a failed floor, not invalid")
+        self.assertEqual((public["gateCount"], public["passedGateCount"]), (23, 0))
+        self.assertTrue(all(row["status"] == "unreached" for row in public["gates"]))
         failure = public["failure"]
         self.assertEqual((failure["stage"], failure["step"], failure["exitCode"]), ("version-probe", "gradle-wrapper", 124))
         self.assertEqual(failure["decision"], "failed")
-        self.assertIn("gradle-wrapper failed with exit 124", failure["runnerError"])
-        self.assertTrue(public["invalidReason"].startswith("FloorInputError/"), public["invalidReason"])
+        self.assertEqual(failure["runnerReason"], "version-probe-failed")
+        self.assertNotIn("runnerError", failure)
+        self.assertNotIn("invalidReason", public)
         rendered = json.dumps(public)
         for secret in ("/home/runner", "GITHUB_TOKEN", "abc"):
             self.assertNotIn(secret, rendered)
+
+    def test_gate_failure_hints_publish_only_fixed_identifiers(self) -> None:
+        raw = (
+            b"running 3 tests\n"
+            b"test premain::tests::captures_real_request ... FAILED\n"
+            b"test ok::fine ... ok\n"
+            b"test evil name with spaces GITHUB_TOKEN=abc ... FAILED\n"
+            b"test crate::mod_x::second_failure ... FAILED\n"
+            b"thread 'x' panicked at crates/xtrace-cli/tests/java_run_spring.rs:781:5:\n"
+            b"thread 'y' panicked at /home/runner/secret/path.rs:5:1:\n"
+            b"error: could not compile `xtrace-cli` (test \"x\") due to 1 previous error\n"
+        )
+        r, w = os.pipe()
+        os.write(w, raw)
+        os.close(w)
+        with mock.patch.object(ci_floor.private_roots, "open_private_file_read", return_value=r):
+            hints = ci_floor._gate_failure_hints(pathlib.Path("/synthetic/log"))
+        self.assertEqual(hints["failingTests"], ["premain::tests::captures_real_request", "crate::mod_x::second_failure"])
+        self.assertEqual(hints["panicSites"], ["crates/xtrace-cli/tests/java_run_spring.rs:781"])
+        self.assertIs(hints["compileError"], True)
+        self.assertNotIn("GITHUB_TOKEN", json.dumps(hints))
+        self.assertNotIn("/home/runner", json.dumps(hints))
+        with mock.patch.object(ci_floor.private_roots, "open_private_file_read", side_effect=private_roots.AdmissionError("x")):
+            self.assertEqual(ci_floor._gate_failure_hints(pathlib.Path("/synthetic/log")), {})
 
     def test_describe_runner_failure_for_gates_missing_receipts_and_unknown_names(self) -> None:
         root = pathlib.Path("/synthetic/private-root")
@@ -413,8 +439,19 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 mock.patch.object(ci_floor.private_roots, "open_private_file_read", return_value=r):
             info = ci_floor._describe_runner_failure(root, "floor-1-1-jdk17-node22")
         self.assertEqual(info["stage"], "no-receipt")
-        self.assertIn("release gates failed: checkout failed at <path>", info["runnerError"])
+        self.assertEqual(info["runnerReason"], "unclassified", "unknown text is never echoed")
+        self.assertNotIn("runnerError", info)
         self.assertNotIn("GITHUB_TOKEN", json.dumps(info))
+        self.assertNotIn("checkout failed", json.dumps(info))
+        for text, code in {
+            "release gates failed: checkout must be clean so the receipt identifies exactly HEAD": "checkout-not-clean",
+            "release gates failed: gradle distribution prewarm failed after 3 attempts (last exit 1)": "gradle-prewarm-failed",
+            "release gates failed: natural-exit settling did not establish a clean global ownership rescan": "settling-uncertain",
+            "version probe node failed with exit 3 password hunter2": "version-probe-failed",
+            "something else with password hunter2": "unclassified",
+        }.items():
+            self.assertEqual(ci_floor._runner_reason_code(text), code)
+            self.assertNotIn("hunter2", code)
 
     def synthetic_summary(self, ids: list[str], status: str = "passed") -> dict:
         tests = [{"name": name, "status": status} for name in ids]
@@ -477,6 +514,90 @@ class CiFloorEvidenceTests(unittest.TestCase):
             tests.update(self.synthetic_summary(ids))
 
         self.assertIn(self.sanitize_with_provenance(lambda receipt: None, different_suite, ids[:-1] + ["tools.release.test_x.C.other"])["floorStatus"], ("invalid", "unreached"))
+
+    def test_a_failed_floor_is_summarized_honestly_with_per_gate_results(self) -> None:
+        names = [gate.name for gate in run_gates.GATES]
+
+        def fail17(receipt: dict) -> None:
+            receipt["decision"] = "failed"
+            receipt["gates"][16].update(status="failed", exitCode=101)
+            for index in range(17, 23):
+                receipt["gates"][index] = {"name": names[index], "status": "unreached", "reason": "stopped after rust-focused failed"}
+
+        public = self.sanitize_with_provenance(fail17)
+        self.assertEqual(public["floorStatus"], "failed")
+        self.assertEqual((public["gateCount"], public["passedGateCount"]), (23, 16))
+        self.assertEqual([row["name"] for row in public["gates"]], names)
+        statuses = [row["status"] for row in public["gates"]]
+        self.assertEqual(statuses, ["passed"] * 16 + ["failed"] + ["unreached"] * 6)
+        failing = public["gates"][16]
+        self.assertEqual((failing["name"], failing["exitCode"]), ("rust-focused", 101))
+        self.assertTrue(all("sourceProof" in row for row in public["gates"][:16]), "passed rows stay fully verified")
+        self.assertEqual(public["failure"]["stage"], "gate")
+        self.assertEqual((public["failure"]["step"], public["failure"]["exitCode"]), ("rust-focused", 101))
+
+        def integrity(receipt: dict) -> None:
+            receipt["decision"] = "failed"
+            receipt["gates"][5].update(status="failed", exitCode=0, integrityFailure="source identity changed during gate")
+            for index in range(6, 23):
+                receipt["gates"][index] = {"name": names[index], "status": "unreached", "reason": "stopped"}
+
+        public = self.sanitize_with_provenance(integrity)
+        self.assertEqual(public["floorStatus"], "failed")
+        self.assertEqual(public["gates"][5], {"name": "node-generate", "status": "failed", "exitCode": 0, "integrityFailure": True})
+
+    def test_only_malformed_receipts_are_invalid(self) -> None:
+        names = [gate.name for gate in run_gates.GATES]
+
+        def unreached_row(index: int) -> dict:
+            return {"name": names[index], "status": "unreached", "reason": "x"}
+
+        def passed_then_failed_after_unreached(receipt: dict) -> None:
+            receipt["decision"] = "failed"
+            receipt["gates"][3] = unreached_row(3)
+            receipt["gates"][4].update(status="failed", exitCode=1)
+
+        def decision_passed_with_failed_row(receipt: dict) -> None:
+            receipt["gates"][2].update(status="failed", exitCode=1)
+
+        def wrong_label(receipt: dict) -> None:
+            receipt["decision"] = "failed"
+            receipt["label"] = "floor-9-9-jdk17-node22"
+            receipt["gates"][2].update(status="failed", exitCode=1)
+            for index in range(3, 23):
+                receipt["gates"][index] = unreached_row(index)
+
+        def wrong_head(receipt: dict) -> None:
+            receipt["decision"] = "failed"
+            receipt["headBefore"] = "e" * 40
+            receipt["gates"][2].update(status="failed", exitCode=1)
+            for index in range(3, 23):
+                receipt["gates"][index] = unreached_row(index)
+
+        def two_failed(receipt: dict) -> None:
+            receipt["decision"] = "failed"
+            receipt["gates"][2].update(status="failed", exitCode=1)
+            receipt["gates"][3].update(status="failed", exitCode=1)
+            for index in range(4, 23):
+                receipt["gates"][index] = unreached_row(index)
+
+        def failed_without_a_failed_gate(receipt: dict) -> None:
+            receipt["decision"] = "failed"
+
+        def unknown_gate_status(receipt: dict) -> None:
+            receipt["decision"] = "failed"
+            receipt["gates"][2]["status"] = "weird"
+
+        for name, mutate in {
+            "unreached before failed": passed_then_failed_after_unreached,
+            "decision claims passed": decision_passed_with_failed_row, "label": wrong_label, "head": wrong_head,
+            "two failed rows": two_failed, "failed decision with all rows passed": failed_without_a_failed_gate,
+            "unknown status": unknown_gate_status,
+        }.items():
+            with self.subTest(name):
+                public = self.sanitize_with_provenance(mutate)
+                self.assertIn(public["floorStatus"], ("invalid", "unreached"), name)
+                self.assertNotEqual(public["floorStatus"], "failed", name)
 
     def test_sanitizer_surfaces_provenance_counts_and_rejects_an_unavailable_mechanism(self) -> None:
         report = {"mode": "subreaper", "available": True, "overflowed": False, "classifiedCount": 4}

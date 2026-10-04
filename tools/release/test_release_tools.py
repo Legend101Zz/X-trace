@@ -2268,9 +2268,46 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((self.cache / "tmp" / "P00-test-home").is_dir())
         self.assertEqual(env["CARGO_HOME"], str(self.cache / "cargo"))  # type: ignore[index]
 
+    def test_node_generate_normalizer_is_shared_canonical_and_symlink_safe(self) -> None:
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "node is required for the generated-bindings normalizer test")
+        scripts = pathlib.Path(__file__).resolve().parents[2] / "adapters" / "node" / "scripts"
+        root = self.root / "gen"
+        (root / "sub").mkdir(parents=True)
+        (root / "a.ts").write_text("export {};\n\n\n")
+        (root / "sub" / "b.ts").write_text("export {};")  # missing trailing newline
+        (root / "c.ts").write_text("export {};\n")  # already canonical
+        (root / "d.js").write_text("keep\n\n")  # not TypeScript
+        outside = self.root / "outside.ts"
+        outside.write_text("x;\n\n\n")
+        os.symlink(outside, root / "link.ts")
+        driver = self.root / "run.mjs"
+        driver.write_text(f'import {{ normalizeTree }} from "{(scripts / "generated-normalize.mjs").as_posix()}"; await normalizeTree(process.argv[2]);')
+        for _ in range(2):  # idempotent
+            subprocess.run([node, str(driver), str(root)], check=True)
+            self.assertEqual((root / "a.ts").read_text(), "export {};\n")
+            self.assertEqual((root / "sub" / "b.ts").read_text(), "export {};\n", "a missing trailing newline is added")
+            self.assertEqual((root / "c.ts").read_text(), "export {};\n")
+            self.assertEqual((root / "d.js").read_text(), "keep\n\n")
+            self.assertEqual(outside.read_text(), "x;\n\n\n", "symlinks are not followed or rewritten")
+        # One shared implementation and template: generate and generate:check cannot diverge.
+        generate = (scripts / "generate.mjs").read_text()
+        check = (scripts / "check-generated.mjs").read_text()
+        for text in (generate, check):
+            self.assertIn('from "./generated-normalize.mjs"', text)
+            self.assertIn('from "./generated-template.mjs"', text)
+        self.assertNotIn("normalizeTree(directory", check, "the checker has no private copy")
+        package = json.loads((scripts.parent / "package.json").read_text())
+        self.assertEqual(package["scripts"]["generate"], "node scripts/generate.mjs")
+        self.assertEqual(package["scripts"]["generate:check"], "node scripts/check-generated.mjs")
+        self.assertFalse((scripts.parent / "buf.gen.yaml").exists(), "no second template to drift")
+
     def test_prewarm_gradle_retries_logs_each_attempt_and_fails_explicitly(self) -> None:
         logs = self.root / "prewarm-logs"
         logs.mkdir()
+        props = self.repo / "adapters" / "java" / "gradle" / "wrapper"
+        props.mkdir(parents=True)
+        (props / "gradle-wrapper.properties").write_text("distributionUrl=x\ndistributionSha256Sum=" + "a" * 64 + "\n")
         calls: list[tuple[list[str], dict]] = []
 
         def flaky(argv: list[str], **kwargs: object) -> tuple[int, float]:
@@ -2286,6 +2323,32 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(run_gates.prewarm_gradle(self.repo, {}, logs, run=lambda *a, **k: (0, 0.1)), {"gradle": {"attempts": 1, "exitCode": 0}})
         with self.assertRaisesRegex(RuntimeError, "prewarm failed after 3 attempts \\(last exit 7\\)"):
             run_gates.prewarm_gradle(self.repo, {}, logs, run=lambda *a, **k: (7, 0.1))
+        # Not retried: a missing executable (127), a timeout (124) or a log overflow.
+        for code in (127, 124, run_gates.LOG_LIMIT_EXIT_CODE):
+            attempts: list[int] = []
+            with self.assertRaisesRegex(RuntimeError, f"after 1 attempts \\(last exit {code}\\)"):
+                run_gates.prewarm_gradle(self.repo, {}, logs, run=lambda *a, **k: (attempts.append(1), (code, 0.1))[1])
+            self.assertEqual(len(attempts), 1)
+        # Supervised with a log cap, and with provenance when asked (the floor's setting).
+        seen: list[dict] = []
+        run_gates.prewarm_gradle(self.repo, {}, logs, run=lambda argv, **k: (seen.append(k), (0, 0.1))[1], provenance=True, provenance_report={})
+        self.assertEqual(seen[0]["max_log_bytes"], run_gates.GRADLE_PREWARM_MAX_LOG_BYTES)
+        self.assertIs(seen[0]["provenance"], True)
+        seen.clear()
+        run_gates.prewarm_gradle(self.repo, {}, logs, run=lambda argv, **k: (seen.append(k), (0, 0.1))[1])
+        self.assertNotIn("provenance", seen[0])
+        # The wrapper must pin a checksum, otherwise nothing is run.
+        (props / "gradle-wrapper.properties").write_text("distributionUrl=x\n")
+        called: list[int] = []
+        with self.assertRaisesRegex(RuntimeError, "does not pin distributionSha256Sum"):
+            run_gates.prewarm_gradle(self.repo, {}, logs, run=lambda *a, **k: (called.append(1), (0, 0.1))[1])
+        self.assertEqual(called, [])
+        (props / "gradle-wrapper.properties").write_text("distributionSha256Sum=" + "z" * 64 + "\n")
+        with self.assertRaises(RuntimeError):
+            run_gates.prewarm_gradle(self.repo, {}, logs, run=lambda *a, **k: (0, 0.1))
+        (props / "gradle-wrapper.properties").unlink()
+        with self.assertRaisesRegex(RuntimeError, "unreadable"):
+            run_gates.prewarm_gradle(self.repo, {}, logs, run=lambda *a, **k: (0, 0.1))
         import inspect
         self.assertEqual(inspect.signature(REAL_VERSIONS).parameters["timeout"].default, 20, "the 20 s probe budget is unchanged")
 
@@ -3828,9 +3891,10 @@ class LeasedRunTests(unittest.TestCase):
                  log_path: pathlib.Path, settle_report: dict | None = None,
                  max_log_bytes: int | None = None, provenance: bool = False,
                  provenance_report: dict | None = None) -> tuple[int, float]:
-            captured.update(provenance=provenance, 
+            captured.update(
+                provenance=provenance,
                 scratch_existed=pathlib.Path(env["XTRACE_TEST_SCRATCH_ROOT"]).is_dir(), max_log_bytes=max_log_bytes,
-                home_existed=pathlib.Path(env.get("HOME", "/nonexistent")).is_dir(), 
+                home_existed=pathlib.Path(env.get("HOME", "/nonexistent")).is_dir(),
                 argv=list(argv), cwd=cwd, env=dict(env), timeout=timeout,
                 held=sorted(path.name for path in (self.cache / "leases").iterdir()),
                 log_name=pathlib.Path(log_path).name,
@@ -4375,6 +4439,8 @@ class LeasedRunTests(unittest.TestCase):
             self.assertEqual(env["CARGO_HOME"], str(cache / "cargo"))
             self.assertEqual(env["CARGO_TARGET_DIR"], str(cache / "cargo-target"))
             self.assertEqual(env["GRADLE_USER_HOME"], str(cache / "gradle"))
+        for env in (floor_style, leased_style):
+            self.assertEqual(env["RUSTUP_AUTO_INSTALL"], "0", "a missing toolchain must fail, not install into the host rustup")
         self.assertEqual(floor_style["HOME"], str(cache / "tmp" / "floor-home"))
         self.assertEqual(floor_style["TMPDIR"], str(cache / "tmp"))
         self.assertEqual(leased_style["TMPDIR"], str(scratch))
@@ -4812,6 +4878,20 @@ class ProvenanceTests(unittest.TestCase):
         self.assertFalse(result.cleared)
         self.assertGreaterEqual(clock.now, 5.0)
 
+    def test_more_than_sixty_four_classified_identities_still_resolve_a_pending_one(self) -> None:
+        start = "Sun Oct  4 21:00:00 2026"
+        supplied = {pid: (1, start, "S") for pid in range(7001, 7001 + 100)}
+        real_is_dir = pathlib.Path.is_dir
+        with mock.patch.object(run_gates, "LSOF_BINARY", "/test/lsof"), \
+                mock.patch.object(run_gates, "_run_lsof_fields", return_value=run_gates.LsofProbe(0, "", "")), \
+                mock.patch.object(pathlib.Path, "is_dir", lambda path: False if str(path) == "/proc" else real_is_dir(path)), \
+                mock.patch.object(run_gates, "_process_snapshot", return_value=supplied):
+            scan = run_gates._untracked_processes_since({}, {}, supplied, pathlib.Path("/nonexistent/gate.log"), provenance=_AlwaysClassify())
+        self.assertEqual(len(scan.classified), run_gates.MAX_UNCONFIRMED_SAMPLE, "only a sample is reported")
+        self.assertEqual(len(scan.classified_identities), 100)
+        self.assertIn((7100, start), scan.resolved_identities, "an identity beyond the first 64 still resolves")
+        self.assertEqual(scan.uninspectable, [])
+
     def test_provenance_facts_are_durable_in_owner_records_and_receipts(self) -> None:
         item = provenance.Provenance(
             platform="darwin", runner_pid=self.RUNNER, coalition_reader={self.RUNNER: 100, 4321: 55}.get, facts_reader=self.facts,
@@ -5015,6 +5095,7 @@ class RecoverLeasesTests(unittest.TestCase):
             "processGroupId": 70001, "ownedProcesses": [{"pid": 4101, "startedAt": self.identities[0][1]}],
             "unconfirmedProcesses": [{"pid": pid, "startedAt": start, "descriptorStatus": "uninspectable"} for pid, start in self.identities],
             "unconfirmedProcessCount": 2, "unconfirmedProcessesTruncated": False,
+            "provenance": {"mode": "coalition", "available": True, "runCoalitionIds": [100], "subreaper": False},
         }
         record.update(overrides)
         return record
@@ -5060,7 +5141,7 @@ class RecoverLeasesTests(unittest.TestCase):
 
     def args(self, **overrides: object) -> Namespace:
         values = dict(cache_root=str(self.cache), label=self.LABEL, receipt=str(self.run_dir / "receipt.json"),
-                      run_coalition_id=[100], execute=False, dry_run=True, confirm_label=None)
+                      execute=False, dry_run=True, confirm_label=None)
         values.update(overrides)
         return Namespace(**values)
 
@@ -5093,7 +5174,7 @@ class RecoverLeasesTests(unittest.TestCase):
         self.assertEqual(plan["protocol"]["observations"], 3)
         self.assertEqual(len(plan["observations"]), 3)
         self.assertEqual(len(plan["globalScans"]), 2)
-        self.assertEqual(plan["runCoalitionSources"], ["operator:tool-session"])
+        self.assertEqual(plan["runCoalitionSources"], ["persisted"])
         self.assertEqual(plan["toolSessionCoalitionId"], 100)
         self.assertIn("not that nothing can write the caches", plan["notice"])
         # The three observations and two scans are at least two seconds apart.
@@ -5289,8 +5370,7 @@ class RecoverLeasesTests(unittest.TestCase):
         self.assertIn((4101, self.identities[0][1]), found)
         self.assertEqual(sum(1 for key in found if 5000 <= key[0] < 5064), 64)
         self.assertIn("identityUnionTruncated", truncated)
-        ids, sources = recover_leases.run_coalition_ids(self.context(), records, [100], found)
-        self.assertEqual((ids, sources), ([55, 100], ["operator:tool-session", "persisted"]))
+        self.assertEqual(recover_leases.persisted_coalition_ids(records), [55, 100])
         huge = {"label": self.LABEL, "decision": "failed",
                 "a": {"naturalExitSettle": {"identityUnion": [{"pid": 10000 + n, "startedAt": "s"} for n in range(64)]}}}
         for index in range(10):
@@ -5391,43 +5471,44 @@ class RecoverLeasesTests(unittest.TestCase):
                 mock.patch.object(os, "setuid", side_effect=AssertionError("no privilege"), create=True):
             self.assertEqual(self.go(), recover_leases.EXIT_OK)
 
-    def test_operator_coalition_ids_are_validated_and_must_be_corroborated(self) -> None:
-        for bad in ([0], [-5], list(range(1, 10)), [2**63]):
-            with self.subTest(bad=bad), self.assertRaises(recover_leases.InvalidInput):
-                self.go(run_coalition_id=bad)
+    def test_recovery_is_refused_without_persisted_provenance_and_there_is_no_operator_override(self) -> None:
         self.quiet_world()
-        # Uncorroborated id: not the tool session's, not persisted, no live identity carries it.
-        self.coalitions[self.SELF_PID] = 55
-        self.assertEqual(self.go(run_coalition_id=[100]), recover_leases.EXIT_REFUSED)
-        self.assertEqual(self.summary()["refusalReasons"], ["run-coalition-uncorroborated"])
-        # Corroborated by the tool's own session coalition.
-        self.coalitions[self.SELF_PID] = 100
-        self.assertEqual(self.go(run_coalition_id=[100]), recover_leases.EXIT_OK)
-        # Corroborated by a still-live recorded identity that carries it.
-        self.coalitions[self.SELF_PID] = 55
-        pid, start = self.identities[1]
-        self.processes[pid] = (1, start, "S")
-        self.coalitions[pid] = 100
-        self.assertEqual(self.go(run_coalition_id=[100]), recover_leases.EXIT_REFUSED)
-        self.assertNotIn("run-coalition-uncorroborated", self.summary()["refusalReasons"], "corroborated, then judged on its own merits")
-        self.assertIn("identity-uncertain", self.summary()["refusalReasons"], "the live identity shares the run coalition")
-
-    def test_persisted_coalition_ids_are_authoritative_and_operator_ids_additive_only(self) -> None:
-        self.write_records(owner=self.owner_record(provenance={"mode": "coalition", "available": True, "runCoalitionIds": [100], "subreaper": False}))
-        self.quiet_world()
-        # No operator id needed: the run's own record names its coalition.
-        self.assertEqual(self.go(run_coalition_id=[]), recover_leases.EXIT_OK, self.lines)
+        for name, owner in {
+            "no provenance field": {k: v for k, v in self.owner_record().items() if k != "provenance"},
+            "provenance unavailable": self.owner_record(provenance={"mode": "coalition", "available": False, "runCoalitionIds": [100], "subreaper": False}),
+            "no ids and no subreaper": self.owner_record(provenance={"mode": "coalition", "available": True, "runCoalitionIds": [], "subreaper": False}),
+            "hostile ids only": self.owner_record(provenance={"mode": "coalition", "available": True, "runCoalitionIds": [0, -3, "x"], "subreaper": False}),
+        }.items():
+            with self.subTest(name):
+                self.write_records(owner=owner)
+                self.lines.clear()
+                self.assertEqual(self.go(), recover_leases.EXIT_REFUSED, self.lines)
+                self.assertEqual(self.summary()["refusalReasons"], ["no-persisted-provenance"])
+                self.assertEqual(self.go(execute=True, dry_run=False, confirm_label=self.LABEL), recover_leases.EXIT_REFUSED)
+                self.assertTrue((self.cache / "leases" / "cargo" / "owner.json").exists())
+        self.assertNotIn("--run-coalition-id", recover_leases.build_parser().format_help())
+        with self.assertRaises(SystemExit):
+            recover_leases.build_parser().parse_args(["--cache-root", "/c", "--label", "L", "--receipt", "/r", "--run-coalition-id", "100"])
+        self.assertFalse(hasattr(recover_leases, "validate_operator_coalitions"))
+        # A subreaper-only record (Linux) is accepted: no coalition rule, only exit/predates.
+        self.write_records(owner=self.owner_record(provenance={"mode": "subreaper", "available": True, "runCoalitionIds": [], "subreaper": True}))
+        self.world((1, 0, -86400, "S"), (500, 1, -3000, "S"))  # nothing new: no coalition rule exists to classify daemons
+        self.lines.clear()
+        self.assertEqual(self.go(), recover_leases.EXIT_OK, self.lines)
         plan = json.loads((self.run_dir / self.summary()["planFile"]).read_text())
-        self.assertEqual((plan["runCoalitionIds"], plan["runCoalitionSources"]), ([100], ["persisted"]))
-        # A wrong operator id can neither replace nor remove the persisted id.
-        self.setUp()
-        self.write_records(owner=self.owner_record(provenance={"mode": "coalition", "available": True, "runCoalitionIds": [100], "subreaper": False}))
+        self.assertEqual((plan["runCoalitionIds"], plan["runCoalitionSources"]), ([], ["persisted-subreaper-only"]))
+
+    def test_persisted_coalition_ids_are_authoritative(self) -> None:
         self.quiet_world()
-        self.coalitions[self.SELF_PID] = 55
         self.coalitions[800] = 100
         self.processes[800] = (1, self.lstart(self.RUN_EPOCH + 900), "S")
-        self.assertEqual(self.go(run_coalition_id=[55]), recover_leases.EXIT_REFUSED)
-        self.assertIn("scan-uncertain", self.summary()["refusalReasons"], "a daemon in the persisted run coalition still blocks")
+        self.assertEqual(self.go(), recover_leases.EXIT_REFUSED)
+        self.assertIn("scan-uncertain", self.summary()["refusalReasons"], "a daemon in the persisted run coalition blocks recovery")
+        self.setUp()
+        self.quiet_world()
+        self.assertEqual(self.go(), recover_leases.EXIT_OK, self.lines)
+        plan = json.loads((self.run_dir / self.summary()["planFile"]).read_text())
+        self.assertEqual((plan["runCoalitionIds"], plan["runCoalitionSources"]), ([100], ["persisted"]))
 
     def test_recorded_owned_identities_are_cleared_only_by_verified_exit(self) -> None:
         self.quiet_world()
@@ -5524,9 +5605,8 @@ class RecoverLeasesTests(unittest.TestCase):
 
     def test_cli_parser(self) -> None:
         parsed = recover_leases.build_parser().parse_args(
-            ["--cache-root", "/c", "--label", "L", "--receipt", "/r", "--run-coalition-id", "7", "--run-coalition-id", "9",
-             "--execute", "--confirm-label", "L"])
-        self.assertEqual((parsed.run_coalition_id, parsed.execute, parsed.confirm_label), ([7, 9], True, "L"))
+            ["--cache-root", "/c", "--label", "L", "--receipt", "/r", "--execute", "--confirm-label", "L"])
+        self.assertEqual((parsed.execute, parsed.confirm_label), (True, "L"))
         with self.assertRaises(SystemExit):
             recover_leases.build_parser().parse_args(["--cache-root", "/c", "--label", "L", "--receipt", "/r", "--dry-run", "--execute"])
 

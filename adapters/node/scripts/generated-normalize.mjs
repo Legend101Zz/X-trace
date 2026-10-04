@@ -1,9 +1,9 @@
 // The single canonical form of generated TypeScript bindings: every .ts file ends with exactly one
-// newline. Shared by `npm run generate` (which writes the checked-in tree) and `generate:check`
-// (which normalizes a fresh generation before comparing), so the two cannot diverge.
+// newline (a missing trailing newline is added, extra blank lines are removed). Shared by
+// `npm run generate` (which writes the checked-in tree) and `generate:check` (which normalizes a fresh
+// generation before comparing), so the two cannot diverge. Symlinks are never followed or rewritten.
 import { readdir, readFile, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
 async function files(directory) {
   const result = [];
@@ -20,16 +20,7 @@ export async function normalizeTree(directory) {
   for (const path of await files(directory)) {
     if (!path.endsWith(".ts")) continue;
     const text = (await readFile(path)).toString("utf8");
-    const canonical = text.replace(/\n+$/, "\n");
+    const canonical = text.replace(/\n*$/, "\n");
     if (canonical !== text) await writeFile(path, canonical);
   }
-}
-
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const target = process.argv[2];
-  if (!target) {
-    process.stderr.write("usage: node scripts/generated-normalize.mjs <directory>\n");
-    process.exit(2);
-  }
-  await normalizeTree(resolve(target));
 }

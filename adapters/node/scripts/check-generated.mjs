@@ -1,9 +1,9 @@
-import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizeTree } from "./generated-normalize.mjs";
+import { generate } from "./generated-template.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const workspace = resolve(dirname(scriptPath), "..");
@@ -26,24 +26,6 @@ function sameTree(left, right) {
     const candidate = right[index];
     return candidate?.[0] === path && bytes.equals(candidate[1]);
   });
-}
-
-async function generatorOutput(directory) {
-  const template = JSON.stringify({
-    version: "v2",
-    plugins: [{
-      local: "protoc-gen-es",
-      out: directory,
-      opt: "target=ts,import_extension=js",
-    }],
-  });
-  const result = spawnSync(
-    "npm",
-    ["exec", "--", "buf", "generate", schema, "--template", template],
-    { cwd: workspace, stdio: "inherit" },
-  );
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`Buf generation failed with status ${result.status}`);
 }
 
 async function verifyComparatorDetectsStaleFiles() {
@@ -73,7 +55,7 @@ const temporaryRoot = await mkdtemp(join(tmpdir(), "xtrace-proto-gen "));
 try {
   const generated = join(temporaryRoot, "bindings");
   await mkdir(generated);
-  await generatorOutput(generated);
+  generate(workspace, schema, generated);
   await normalizeTree(generated);
   if (!sameTree(await tree(checkedIn), await tree(generated))) {
     process.stderr.write("generated protobuf bindings differ from canonical schemas\n");

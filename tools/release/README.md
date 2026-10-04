@@ -222,7 +222,7 @@ receipt is never modified.
 
 ```
 python3.14 -B -m tools.release.recover_leases --cache-root <root> --label <label> \
-    --receipt <root>/release-gates/<label>/receipt.json [--run-coalition-id <id>]  # additive only; must be corroborated
+    --receipt <root>/release-gates/<label>/receipt.json
 ```
 
 Recovery is allowed only if both owner records carry the label and `requiresManualRecovery`, their
@@ -234,11 +234,12 @@ began) leave nothing unproven, and nothing holds the cache directories open. Ide
 times at least 2 s apart. An empty `lsof` result is supporting evidence only. Exit codes: 0 allowed or
 recovered, 1 refused, 2 invalid input or admission, 3 recovery started but incomplete.
 
-Since the final fix round new runs persist their coalition ids and subreaper fact in the owner record
-(`provenance`) and the receipt, and recovery treats those as authoritative. `--run-coalition-id` is
-additive evidence and is refused unless it is in the persisted record, equals the recovery tool's own session
-coalition, or is carried by a still-live recorded identity (0, negative and more than 8 ids are rejected).
-Identities the run recorded as owned are cleared only by a verified exit. "Predates the run" uses the
+Recovery requires the run's own persisted provenance facts: both owner records must carry `provenance`
+(`available`, and either a subreaper fact or at least one run coalition id), written by every run since
+the final fix round. A retained lease without them is refused (`no-persisted-provenance`); there is no
+operator-supplied coalition id any more (the earlier `--run-coalition-id` option was removed because a
+wrong or uncorroborated id could classify the run's real descendants as foreign). No such legacy retained
+lease exists. Identities the run recorded as owned are cleared only by a verified exit. "Predates the run" uses the
 kernel start time (proc_pidinfo or /proc), must agree with `ps` within 2 s, and needs a 300 s margin;
 DST-ambiguous times fail closed. The owner record is re-read and unlinked through the lease directory
 descriptor, archived owner records have the token replaced by its sha256, and `manual-recovery.json`
@@ -250,8 +251,9 @@ The floor job passes `--prewarm-gradle` (see below).
 
 A cold `./gradlew --version` downloads the pinned Gradle distribution and cannot finish inside the fixed 20 s
 `gradle-wrapper` version-probe budget (exit 124; the budget is never raised). `run_gates --prewarm-gradle`
-runs the same wrapper through the supervised runner, under the floor's leases and environment, with its
-own timeout (at most 900 s) and 3 attempts, into the private `GRADLE_USER_HOME` before the version probes;
+runs the same wrapper through the supervised runner, under the floor's leases, environment and provenance
+classification, with its own timeout (at most 900 s), a 16 MiB log cap and 3 attempts (not retried on exit
+127, a timeout or a log overflow; the wrapper must pin `distributionSha256Sum`), into the private `GRADLE_USER_HOME` before the version probes;
 CI uses it, and a local cold-cache floor should too:
 
 ```

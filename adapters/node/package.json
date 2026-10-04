@@ -5,7 +5,7 @@
   "engines": { "node": ">=22" },
   "workspaces": ["packages/*", "examples/*"],
   "scripts": {
-    "generate": "buf generate ../../schema/proto --template buf.gen.yaml && node scripts/generated-normalize.mjs packages/protocol/src/gen",
+    "generate": "node scripts/generate.mjs",
     "generate:check": "node scripts/check-generated.mjs",
     "build:protocol": "npm run build --workspace @xtrace/protocol",
     "build:core": "npm run build --workspace @xtrace/adapter-core",

@@ -11,7 +11,7 @@ never uses privilege, and never exempts anything by UID or name. The failed rece
 read, never modified.
 
     python3.14 -B -m tools.release.recover_leases --cache-root <root> --label <label> \
-        --receipt <root>/release-gates/<label>/receipt.json [--run-coalition-id N ...]
+        --receipt <root>/release-gates/<label>/receipt.json
         [--execute --confirm-label <label>]
 
 Default is a dry run that writes a sanitized `recovery-plan-<utc>.json` and prints a summary.
@@ -27,7 +27,8 @@ observation):
   before the run. macOS has no subreaper, so a descendant of the run only ever reparents to
   launchd; every other ancestor of a descendant is itself a descendant and younger than the run.
 - non-descendant-coalition (macOS): ADR 0007's resource-coalition rule against the run's
-  coalition ids (from the receipt's provenance evidence or --run-coalition-id).
+  coalition ids persisted by the run itself (owner records and receipt); recovery is refused
+  when they are absent (`no-persisted-provenance`).
 Everything else stays uncertain and blocks recovery.
 """
 
@@ -317,17 +318,6 @@ def collect_identities(records: dict[str, Any]) -> tuple[dict[tuple[int, str], s
     return found, sorted(set(truncated))
 
 
-def validate_operator_coalitions(values: Sequence[int]) -> list[int]:
-    """Operator-supplied coalition ids: positive, bounded in count, never silently truncated."""
-    ids = sorted(set(values))
-    if len(ids) > MAX_RUN_COALITION_IDS:
-        raise InvalidInput("too-many-run-coalition-ids")
-    for value in ids:
-        if type(value) is not int or value <= 0 or value >= 2**63:
-            raise InvalidInput("run-coalition-id-invalid")
-    return ids
-
-
 def persisted_coalition_ids(records: dict[str, Any]) -> list[int]:
     """Coalition ids the run itself recorded (owner records and receipt provenance), authoritative."""
     found: set[int] = set()
@@ -356,41 +346,23 @@ def persisted_coalition_ids(records: dict[str, Any]) -> list[int]:
     return sorted(found)
 
 
-def run_coalition_ids(ctx: Context, records: dict[str, Any], operator: Sequence[int],
-                      identities: dict[tuple[int, str], set[str]]) -> tuple[list[int], list[str]]:
-    """The coalition ids the run is judged against: persisted ids, plus corroborated operator ids.
+def require_persisted_provenance(records: dict[str, Any]) -> list[int]:
+    """Recovery needs the run's own provenance facts; there is no operator-supplied substitute.
 
-    An operator id is only additive and only accepted when something independent supports it: it
-    is in the persisted record, it equals this tool's own session coalition, or a still-live recorded
-    identity currently carries it. Anything else refuses (a wrong id would misclassify the run's
-    real descendants as foreign).
+    Both owner records must carry `provenance` with `available` true and either a subreaper fact
+    (Linux) or at least one persisted run coalition id (macOS). A retained lease without them (a run
+    from before these facts were recorded, or one where provenance was unavailable) is refused: the
+    run's coalition cannot be established independently, so nothing may be cleared by it.
     """
-    persisted = persisted_coalition_ids(records)
-    sources = ["persisted"] if persisted else []
-    ids = set(persisted)
-    if operator:
-        own = ctx.coalition_reader(ctx.self_pid) if ctx.platform == "darwin" else None
-        snapshot = ctx.snapshot()
-        live_ids: set[int] = set()
-        for pid, start in identities:
-            record = snapshot.get(pid)
-            if record and record[1] == start and record[2] not in {"Z", "X"}:
-                value = ctx.coalition_reader(pid)
-                if value is not None:
-                    live_ids.add(value)
-        for value in operator:
-            if value in persisted:
-                continue
-            if value == own:
-                sources.append("operator:tool-session")
-            elif value in live_ids:
-                sources.append("operator:live-identity")
-            else:
-                raise Refused(["run-coalition-uncorroborated"])
-            ids.add(value)
-    if len(ids) > MAX_RUN_COALITION_IDS:
-        raise Refused(["evidence-overflow"])
-    return sorted(ids), sorted(set(sources))
+    for owner in records["owners"].values():
+        facts = owner.get("provenance")
+        if not isinstance(facts, dict) or facts.get("available") is not True:
+            raise Refused(["no-persisted-provenance"])
+        ids = [value for value in (facts.get("runCoalitionIds") or []) if type(value) is int and 0 < value < 2**63]
+        if not ids and facts.get("subreaper") is not True:
+            raise Refused(["no-persisted-provenance"])
+    ids = persisted_coalition_ids(records)
+    return ids
 
 
 class Classifier:
@@ -599,13 +571,14 @@ def lsof_check(ctx: Context, layout: Layout) -> dict[str, Any]:
             "note": "supporting evidence only: an empty result is not negative proof"}
 
 
-def evaluate(ctx: Context, layout: Layout, operator_coalitions: Sequence[int]) -> dict[str, Any]:
+def evaluate(ctx: Context, layout: Layout) -> dict[str, Any]:
     """Run every check once and return the evaluation (never mutates anything)."""
     admissions = admit_all(layout)
     records = read_records(layout)
     shared = check_records(layout, records)
     identities, truncated = collect_identities(records)
-    coalitions, coalition_sources = run_coalition_ids(ctx, records, operator_coalitions, identities)
+    coalitions = require_persisted_provenance(records)
+    coalition_sources = ["persisted"] if coalitions else ["persisted-subreaper-only"]
     classifier = Classifier(ctx, shared["runStartEpoch"], coalitions)
     observed = observe(ctx, classifier, sorted(identities), identities, shared["ownerPid"], shared["runStartEpoch"])
     scans = global_scans(ctx, classifier)
@@ -795,11 +768,10 @@ def run(args: argparse.Namespace, ctx: Context | None = None, out: Callable[[str
         raise InvalidInput("confirm-label-mismatch")
     if not execute_mode and args.confirm_label:
         raise InvalidInput("confirm-label-needs-execute")
-    operator_ids = validate_operator_coalitions(args.run_coalition_id or [])
     mode = "execute" if execute_mode else "dry-run"
     own_coalition = ctx.coalition_reader(ctx.self_pid) if ctx.platform == "darwin" else None
     try:
-        evaluation = evaluate(ctx, layout, operator_ids)
+        evaluation = evaluate(ctx, layout)
     except Refused as exc:
         out(json.dumps({"label": args.label, "mode": mode, "decision": "recovery-refused", "refusalReasons": exc.reasons}, sort_keys=True))
         return EXIT_REFUSED
@@ -839,8 +811,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-root", required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--receipt", required=True, help="the failed run's receipt.json (read only)")
-    parser.add_argument("--run-coalition-id", type=int, action="append", default=[],
-                        help="macOS resource coalition id of the original run's session (operator-supplied evidence)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="default: evaluate and write a plan only")
     mode.add_argument("--execute", action="store_true", help="remove the leases if every check holds")

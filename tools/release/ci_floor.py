@@ -64,6 +64,10 @@ CHROMIUM_LIBRARIES = (
 )
 
 
+class _HonestFailure(Exception):
+    """Internal control flow: the receipt is a well-formed FAILED floor; summarize it as such."""
+
+
 class FloorInputError(RuntimeError):
     """Sanitized failure; the optional reason is a fixed, non-secret code."""
 
@@ -1068,11 +1072,90 @@ def _successful_settle_report(value: Any) -> bool:
     )
 
 
+_RUNNER_REASON_CODES = (
+    (re.compile(r"^version probe \S+ failed with exit \d+"), "version-probe-failed"),
+    (re.compile(r"^gradle distribution prewarm failed"), "gradle-prewarm-failed"),
+    (re.compile(r"^gradle wrapper does not pin"), "gradle-wrapper-unpinned"),
+    (re.compile(r"^checkout must be clean"), "checkout-not-clean"),
+    (re.compile(r"^natural-exit settling did not establish"), "settling-uncertain"),
+    (re.compile(r"^initial uninspectable process identity"), "settling-uncertain"),
+    (re.compile(r"^post-command ownership scan"), "ownership-scan-incomplete"),
+    (re.compile(r"^completed gate left live processes"), "leftover-processes"),
+    (re.compile(r"^release lease owner record"), "lease-record-unavailable"),
+    (re.compile(r"^release builder lease is already owned"), "lease-busy"),
+    (re.compile(r"^private cache admission failed"), "admission-failed"),
+    (re.compile(r"^release receipt cannot be bounded"), "receipt-too-large"),
+)
+
+
+def _runner_reason_code(text: Any) -> str:
+    """Map a runner error line to a fixed reason code; the raw text is never published."""
+    line = str(text).strip().splitlines()[0] if str(text).strip() else ""
+    for pattern, code in _RUNNER_REASON_CODES:
+        if pattern.match(line) or pattern.match(line.removeprefix("release gates failed: ")):
+            return code
+    return "unclassified"
+
+
+_FAILED_TEST_LINE = re.compile(rb"^test ([A-Za-z0-9_:]{1,120}) \.\.\. FAILED\s*$")
+_PANIC_SITE = re.compile(rb"panicked at ((?:crates|adapters|web)/[A-Za-z0-9_./-]{1,100}\.rs):(\d{1,6}):\d{1,4}")
+MAX_FAILURE_HINTS = 20
+
+
+def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
+    """Failing test names and panic sites from a private cargo gate log, as fixed identifiers only.
+
+    Names must be plain Rust test paths and sites repository-relative `.rs:line` locations; anything
+    else in the log is ignored, never echoed. Reads at most 16 MiB.
+    """
+    names: list[str] = []
+    sites: list[str] = []
+    compile_error = False
+    try:
+        fd = private_roots.open_private_file_read(log_path)
+    except (private_roots.AdmissionError, OSError, ValueError, RuntimeError):
+        return {}
+    try:
+        total = 0
+        pending = b""
+        while total < 16 * 1024 * 1024:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            pending += chunk
+            *lines, pending = pending.split(b"\n")
+            pending = pending[-4096:]
+            for line in lines:
+                match = _FAILED_TEST_LINE.match(line)
+                if match and len(names) < MAX_FAILURE_HINTS and match.group(1).decode() not in names:
+                    names.append(match.group(1).decode())
+                site = _PANIC_SITE.search(line)
+                if site and len(sites) < MAX_FAILURE_HINTS:
+                    text = f"{site.group(1).decode()}:{site.group(2).decode()}"
+                    if text not in sites:
+                        sites.append(text)
+                if line.startswith(b"error: could not compile"):
+                    compile_error = True
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    hints: dict[str, Any] = {}
+    if names:
+        hints["failingTests"] = names
+    if sites:
+        hints["panicSites"] = sites
+    if compile_error:
+        hints["compileError"] = True
+    return hints
+
+
 def _describe_runner_failure(root: pathlib.Path, label: str) -> dict[str, Any]:
     """Sanitized description of where a floor run stopped: stage, fixed step name, exit code.
 
-    Only fixed names (gate and version-probe names), integers and a scrubbed first line are
-    emitted; no paths, environment, raw logs or process records.
+    Only fixed names (gate and version-probe names), small integers and a fixed reason code are
+    emitted; no log text, paths, environment or process records.
     """
     info: dict[str, Any] = {"stage": "unknown"}
     probe_names = {name for name, _argv, _cwd in run_gates.VERSION_COMMANDS}
@@ -1094,7 +1177,7 @@ def _describe_runner_failure(root: pathlib.Path, label: str) -> dict[str, Any]:
         if isinstance(receipt.get("decision"), str):
             info["decision"] = _scrub_text(receipt["decision"], 40)
         if isinstance(receipt.get("error"), str):
-            info["runnerError"] = _scrub_text(receipt["error"])
+            info["runnerReason"] = _runner_reason_code(receipt["error"])
         for probe in receipt.get("versionProbes") or []:
             if isinstance(probe, dict) and probe.get("status") not in {"passed", "unavailable"}:
                 name = probe.get("name")
@@ -1107,6 +1190,8 @@ def _describe_runner_failure(root: pathlib.Path, label: str) -> dict[str, Any]:
                     name = gate.get("name")
                     info.update({"stage": "gate", "step": name if name in gate_names else "unknown",
                                  "exitCode": small_int(gate.get("exitCode"))})
+                    if name in gate_names:
+                        info.update(_gate_failure_hints(root / "release-gates" / label / "logs" / f"{name}.log"))
                     break
         return info
     info["stage"] = "no-receipt"
@@ -1126,7 +1211,7 @@ def _describe_runner_failure(root: pathlib.Path, label: str) -> dict[str, Any]:
             os.close(fd)
         lines = [line for line in tail.splitlines() if line.strip()]
         if lines:
-            info["runnerError"] = _scrub_text(lines[-1])
+            info["runnerReason"] = _runner_reason_code(lines[-1])
     except (private_roots.AdmissionError, OSError, ValueError, RuntimeError):
         pass
     return info
@@ -1257,12 +1342,23 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         if [item.get("name") for item in gates if isinstance(item, dict)] != list(EXPECTED_GATE_NAMES):
             raise FloorInputError
         expected_gate_by_name = {gate.name: gate for gate in run_gates.GATES}
+        not_passed: list[dict[str, Any]] = []
         for item in gates:
             if not isinstance(item, dict):
                 raise FloorInputError
             name = item.get("name")
             gate = expected_gate_by_name.get(name)
             exit_code = item.get("exitCode")
+            if gate is not None and item.get("status") in {"failed", "unreached"}:
+                # A gate that did not pass: summarized by name, status and (small) exit code only.
+                row: dict[str, Any] = {"name": name, "status": item["status"]}
+                if item["status"] == "failed":
+                    row["exitCode"] = exit_code if type(exit_code) is int and -1000 <= exit_code <= 1000 else None
+                    if "integrityFailure" in item:
+                        row["integrityFailure"] = True
+                not_passed.append(row)
+                gate_rows.append(row)
+                continue
             if (gate is None or item.get("status") != "passed"
                     or type(exit_code) is not int or exit_code != 0):
                 raise FloorInputError
@@ -1320,6 +1416,30 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
                     "phaseDiffSha256After": row_diff_after,
                 },
             })
+        if not_passed or receipt.get("decision") == "failed":
+            # Honest failed floor: passed rows were fully verified above; the rest is ordered
+            # passed*, at most one failed, then unreached. Only a malformed receipt is "invalid".
+            statuses = [row["status"] for row in gate_rows]
+            first_other = next((i for i, status in enumerate(statuses) if status != "passed"), len(statuses))
+            tail = statuses[first_other:]
+            ordered = (
+                tail[:1] in (["failed"], ["unreached"], []) and all(status == "unreached" for status in tail[1:])
+                and "failed" not in tail[1:]
+            )
+            core = (
+                type(receipt.get("schemaVersion")) is int and receipt.get("schemaVersion") == 1
+                and receipt.get("label") == args.label and receipt.get("decision") == "failed"
+                and receipt.get("headBefore") == args.expected_head and receipt.get("phaseBase") == args.phase_base
+                and bool(not_passed) and ordered
+            )
+            if not core:
+                raise FloorInputError("failed-receipt-malformed")
+            summary.update({
+                "sourceSha": args.expected_head, "phaseBaseSha": args.phase_base, "floorStatus": "failed",
+                "gateCount": len(gate_rows), "passedGateCount": statuses.count("passed"), "gates": gate_rows,
+                "toolVersionNamesRecordedPrivately": False,
+            })
+            raise _HonestFailure()
         head = receipt.get("headBefore")
         base = receipt.get("phaseBase")
         diff_before = receipt.get("phaseDiffSha256Before")
@@ -1417,6 +1537,8 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         })
         if _source_proofs(repo, args.expected_head, args.phase_base) != source_proofs:
             raise FloorInputError
+    except _HonestFailure:
+        pass
     except (FloorInputError, OSError, RuntimeError, ValueError, TypeError) as floor_error:
         summary["invalidReason"] = _failure_reason(floor_error)
         summary["floorStatus"] = "invalid" if receipt_was_read or receipt_path.exists() else "unreached"

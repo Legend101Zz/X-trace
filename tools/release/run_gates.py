@@ -86,6 +86,9 @@ class UntrackedProcessScan:
     # Uninspectable identities positively classified as non-descendants by
     # provenance; they carry their evidence and no longer block settling.
     classified: list[dict[str, Any]] = field(default_factory=list)
+    # Every classified identity (not truncated to the reported sample), so a pending identity among
+    # more than 64 classified ones still resolves.
+    classified_identities: frozenset[tuple[int, str]] = frozenset()
 
     @property
     def unconfirmed(self) -> list[dict[str, Any]]:
@@ -98,7 +101,7 @@ class UntrackedProcessScan:
             (item["pid"], item["startedAt"]) for item in self.classified
             if isinstance(item, dict) and isinstance(item.get("pid"), int) and isinstance(item.get("startedAt"), str)
         }
-        return self.clean_identities | frozenset(classified)
+        return self.clean_identities | self.classified_identities | frozenset(classified)
 
 
 @dataclass(frozen=True)
@@ -783,6 +786,7 @@ def _untracked_processes_since(
             owned_probes,
             clean_identities,
             classified_records[:MAX_UNCONFIRMED_SAMPLE],
+            frozenset((item["pid"], item["startedAt"]) for item in classified_records),
         )
 
     if len(candidates) > MAX_UNTRACKED_PROCESSES:
@@ -859,6 +863,7 @@ def _untracked_processes_since(
             owned_probes,
             result.clean_identities,
             result.classified,
+            result.classified_identities,
         )
     return result
 
@@ -1841,6 +1846,8 @@ def build_task_env(
         "XDG_CACHE_HOME": str(cache / "xdg"),
         "TMPDIR": str(scratch), "TMP": str(scratch), "TEMP": str(scratch),
         "XTRACE_TEST_SCRATCH_ROOT": str(scratch), "XTRACE_TEST_PRIVATE_SCRATCH": str(scratch),
+        # A missing toolchain must fail the build, not make rustup install into the host RUSTUP_HOME.
+        "RUSTUP_AUTO_INSTALL": "0",
     })
     if jdk_home:
         env["JAVA_HOME"] = jdk_home
@@ -1850,31 +1857,51 @@ def build_task_env(
 
 GRADLE_PREWARM_ATTEMPTS = 3
 GRADLE_PREWARM_TIMEOUT_SECONDS = 900
+GRADLE_PREWARM_MAX_LOG_BYTES = 16 * 1024 * 1024
+
+
+def _require_pinned_gradle_distribution(repo: pathlib.Path) -> None:
+    """The wrapper must pin a distribution checksum, or the download would be unverified."""
+    properties = repo / "adapters" / "java" / "gradle" / "wrapper" / "gradle-wrapper.properties"
+    try:
+        text = properties.read_text(encoding="utf-8")
+    except OSError:
+        raise RuntimeError("gradle wrapper properties are unreadable") from None
+    if not re.search(r"(?m)^distributionSha256Sum=[0-9a-f]{64}\s*$", text):
+        raise RuntimeError("gradle wrapper does not pin distributionSha256Sum; refusing an unverified download")
 
 
 def prewarm_gradle(
     repo: pathlib.Path, env: dict[str, str], logs_dir: pathlib.Path, *, timeout: float = GRADLE_PREWARM_TIMEOUT_SECONDS,
     attempts: int = GRADLE_PREWARM_ATTEMPTS, run: Callable[..., tuple[int, float]] | None = None,
+    provenance: bool = False, provenance_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fill the private GRADLE_USER_HOME with the pinned wrapper distribution before the version probes.
 
     The `gradle-wrapper` version probe has a fixed 20 s budget (never changed) that a cold download of
     the pinned distribution cannot meet. This runs the same wrapper through the supervised `_run`, under
-    the same leases and the same environment, with its own generous timeout and a few attempts (the
-    wrapper verifies the distribution checksum), so the budgeted probe later finds it warm. Failure is an
-    explicit error, not a probe timeout.
+    the same leases, environment and provenance classification, with its own timeout, a log cap and a few
+    attempts, so the budgeted probe later finds it warm. The pinned checksum must exist in the wrapper
+    properties. Exit 127 (no such executable) and a timeout are not retried. Failure is an explicit error,
+    not a probe timeout.
     """
+    _require_pinned_gradle_distribution(repo)
     runner = run or _run
     last = -1
     for attempt in range(1, attempts + 1):
+        extra: dict[str, Any] = {"max_log_bytes": GRADLE_PREWARM_MAX_LOG_BYTES}
+        if provenance:
+            extra.update(provenance=True, provenance_report=provenance_report)
         code, _duration = runner(
             ["./gradlew", "--no-daemon", "--version"], cwd=repo / "adapters" / "java", env=env, timeout=timeout,
-            log_path=logs_dir / f"prewarm-gradle-{attempt}.log",
+            log_path=logs_dir / f"prewarm-gradle-{attempt}.log", **extra,
         )
         last = code
         if code == 0:
             return {"gradle": {"attempts": attempt, "exitCode": 0}}
-    raise RuntimeError(f"gradle distribution prewarm failed after {attempts} attempts (last exit {last})")
+        if code in (124, 127, LOG_LIMIT_EXIT_CODE):
+            break
+    raise RuntimeError(f"gradle distribution prewarm failed after {attempt} attempts (last exit {last})")
 
 
 def _restricted_env(base_env: dict[str, str], cache: pathlib.Path, label: str) -> tuple[dict[str, str], str]:
@@ -2245,9 +2272,18 @@ def run(args: argparse.Namespace) -> int:
         manifest["phaseDiffSha256Before"] = _hash(diff_start)
         recheck_private_roots()
         if getattr(args, "prewarm_gradle", False):
-            manifest["prewarm"] = prewarm_gradle(
-                repo, env, logs_dir, timeout=min(float(args.command_timeout), GRADLE_PREWARM_TIMEOUT_SECONDS),
-            )
+            prewarm_provenance: dict[str, Any] = {}
+            try:
+                manifest["prewarm"] = prewarm_gradle(
+                    repo, env, logs_dir, timeout=min(float(args.command_timeout), GRADLE_PREWARM_TIMEOUT_SECONDS),
+                    provenance=use_provenance, provenance_report=prewarm_provenance,
+                )
+            except RuntimeError:
+                manifest["prewarm"] = {"gradle": {"failed": True}}
+                raise
+            finally:
+                if prewarm_provenance:
+                    manifest.setdefault("prewarm", {})["provenance"] = prewarm_provenance
             recheck_private_roots()
         manifest["toolVersions"] = _versions(
             repo, env, logs_dir, manifest["versionProbes"], names={"rustc", "cargo", "rustup", "java", "node", "npm", "gradle-wrapper", "python", "git"},
