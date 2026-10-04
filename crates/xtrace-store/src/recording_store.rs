@@ -765,7 +765,7 @@ impl SqliteRecordingStore<'_> {
         let mut expected_ordinal = 0_u32;
         let mut expected_sequence = Some(2_u64);
         let mut segment_count = 0_u64;
-        let mut events = Vec::new();
+        let mut events: Vec<PersistedEvent> = Vec::new();
         let mut verified_frame_ids = HashMap::new();
         let event_limit = usize::try_from(request.limit)
             .map_err(|_| recording_query_validation_error(correlation_id))?;
@@ -1524,6 +1524,9 @@ impl SqliteRecordingStore<'_> {
                 })?
                 .ok_or_else(|| read_not_found_error(correlation_id))?;
             let project_id = project_id_from_bytes(&project_bytes, correlation_id)?;
+            /// Row shape of `recording_segments`: ordinal, object hash, first and last
+            /// sequence, event count, uncompressed bytes, compressed bytes, checksum.
+            type SegmentRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64, Vec<u8>);
             let mut statement = connection
                 .prepare(
                     "SELECT segment_ordinal, object_hash, first_recording_seq, last_recording_seq, \
@@ -1539,7 +1542,7 @@ impl SqliteRecordingStore<'_> {
             let rows = statement
                 .query_map(
                     rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
-                    |row| {
+                    |row| -> rusqlite::Result<SegmentRow> {
                         Ok((
                             row.get(0)?,
                             row.get(1)?,
