@@ -461,6 +461,20 @@ class RunnerTests(unittest.TestCase):
         process.wait.return_value = 0
         process.poll.return_value = 0
         real_fdopen = os.fdopen
+        real_open = os.open
+        diagnostic_fds: set[int] = set()
+
+        def tracking_open(path: object, *args: object, **kwargs: object) -> int:
+            fd = real_open(path, *args, **kwargs)
+            name = pathlib.Path(os.fsdecode(path)).name
+            if name.startswith(".diagnostic-write.log."):
+                diagnostic_fds.add(fd)
+            return fd
+
+        def selective_fdopen(fd: int, mode: str, *args: object, **kwargs: object) -> object:
+            if fd in diagnostic_fds:
+                return FailingDiagnosticLog(fd, mode)
+            return real_fdopen(fd, mode, *args, **kwargs)
         real_popen = subprocess.Popen
 
         def selective_popen(argv: object, *args: object, **kwargs: object) -> object:
@@ -497,7 +511,8 @@ class RunnerTests(unittest.TestCase):
                 )), \
                 mock.patch.object(run_gates, "_settle_uninspectable_candidates", return_value=settle) as settle_candidates, \
                 mock.patch.object(run_gates, "_final_global_quiescence_scan", return_value=(True, [], None, 2)) as global_scan, \
-                mock.patch.object(run_gates.os, "fdopen", side_effect=FailingDiagnosticLog):
+                mock.patch.object(run_gates.os, "open", side_effect=tracking_open), \
+                mock.patch.object(run_gates.os, "fdopen", side_effect=selective_fdopen):
             self.assertEqual(run_gates.run(self.args()), 1)
 
         settle_candidates.assert_not_called()
