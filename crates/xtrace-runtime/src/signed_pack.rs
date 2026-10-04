@@ -178,6 +178,20 @@ impl PackManifest {
         &self.platforms
     }
 
+    /// Returns whether the signed platform list contains this validated host tuple.
+    #[must_use]
+    pub fn supports_platform(&self, os: &str, arch: &str) -> bool {
+        let Ok(JsonValue::Array(platforms)) = parse_canonical_value(self.platforms.as_canonical_json())
+        else {
+            return false;
+        };
+        platforms.iter().any(|platform| {
+            let JsonValue::Object(fields) = platform else { return false };
+            matches!(fields.get("os"), Some(JsonValue::String(value)) if value == os)
+                && matches!(fields.get("arch"), Some(JsonValue::String(value)) if value == arch)
+        })
+    }
+
     /// Signed entrypoint declarations, retained after inventory-reference validation.
     #[must_use]
     pub const fn entrypoints(&self) -> &ValidatedJson {

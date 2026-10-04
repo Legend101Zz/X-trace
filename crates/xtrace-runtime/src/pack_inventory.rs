@@ -26,6 +26,7 @@ const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 4096;
 const MAX_PATH_COMPONENTS: usize = 128;
 const MAX_INSPECTION_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+const CORE_RELEASE_VERSION: &str = "0.0.1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Identity {
@@ -278,6 +279,93 @@ pub struct AuthenticatedArtifactSnapshot {
     root: AdmittedPrivateRoot,
 }
 
+/// A runtime major selected by X-trace's compatibility policy after runtime detection.
+///
+/// The closed variants prevent a producer manifest from introducing a new runtime
+/// version. The selected variant must still match the pack's signed declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeMajor {
+    /// Java 17.
+    Java17,
+    /// Java 21.
+    Java21,
+    /// Node.js 22.
+    Node22,
+    /// Node.js 24.
+    Node24,
+}
+
+impl RuntimeMajor {
+    const fn language(self) -> &'static str {
+        match self {
+            Self::Java17 | Self::Java21 => "java",
+            Self::Node22 | Self::Node24 => "node",
+        }
+    }
+
+    const fn number(self) -> u32 {
+        match self {
+            Self::Java17 => 17,
+            Self::Java21 => 21,
+            Self::Node22 => 22,
+            Self::Node24 => 24,
+        }
+    }
+}
+
+/// Publisher-authenticated pack bytes admitted for one core-selected runtime target.
+///
+/// This type is nonconstructible outside this module and retains the private
+/// artifact snapshot whose full signed inventory was revalidated during admission.
+/// It records compatibility facts only; it does not imply daemon readiness or
+/// authorize process launch by itself.
+pub struct VerifiedSignedPack {
+    snapshot: AuthenticatedArtifactSnapshot,
+    runtime_major: RuntimeMajor,
+    inner_manifest_digest: [u8; 32],
+}
+
+impl std::fmt::Debug for VerifiedSignedPack {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedSignedPack")
+            .field("compatibility_verified", &true)
+            .field("runtime_major", &self.runtime_major)
+            .field("inner_manifest_bound", &true)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedSignedPack {
+    /// Signed pack declarations whose complete private inventory remains retained.
+    #[must_use]
+    pub fn manifest(&self) -> &PackManifest {
+        self.snapshot.manifest()
+    }
+
+    /// Selected runtime major checked against core policy and signed pack bounds.
+    #[must_use]
+    pub const fn runtime_major(&self) -> RuntimeMajor {
+        self.runtime_major
+    }
+
+    /// BLAKE3 digest of the core-selected inner producer manifest artifact.
+    #[must_use]
+    pub const fn inner_manifest_digest(&self) -> &[u8; 32] {
+        &self.inner_manifest_digest
+    }
+
+    /// Revalidates all retained signed artifact bytes before a later consumer uses them.
+    pub fn revalidate(&self) -> Result<(), SignedPackError> {
+        self.snapshot.revalidate()?;
+        let expected = known_inner_manifest_digest(self.snapshot.manifest())?;
+        if expected != self.inner_manifest_digest {
+            return Err(SignedPackError::SnapshotIncomplete);
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for AuthenticatedArtifactSnapshot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -318,6 +406,85 @@ impl AuthenticatedArtifactSnapshot {
             std::time::Instant::now() + MAX_INSPECTION_TIME,
         )
     }
+
+    /// Revalidates this authenticated snapshot and admits its declarations for one
+    /// core-selected runtime major and the current supported host platform.
+    ///
+    /// The caller must select `runtime_major` from X-trace's runtime detection and
+    /// compatibility policy. Producer declarations can only accept or reject that
+    /// selection; they cannot choose a runtime or add a supported major. The
+    /// installed trust table remains the only publisher-authentication authority.
+    pub fn verify_for_runtime(
+        self,
+        runtime_major: RuntimeMajor,
+    ) -> Result<VerifiedSignedPack, SignedPackError> {
+        self.revalidate()?;
+        let (os, arch) = current_platform().ok_or(SignedPackError::UnsupportedManifest)?;
+        verify_compatibility_declarations(&self.manifest, runtime_major, os, arch)?;
+        let inner_manifest_digest = known_inner_manifest_digest(&self.manifest)?;
+        Ok(VerifiedSignedPack { snapshot: self, runtime_major, inner_manifest_digest })
+    }
+}
+
+fn current_platform() -> Option<(&'static str, &'static str)> {
+    let os = match std::env::consts::OS {
+        "macos" => "macos",
+        "linux" => "linux",
+        _ => return None,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "aarch64",
+        "x86_64" => "x86_64",
+        _ => return None,
+    };
+    Some((os, arch))
+}
+
+fn verify_compatibility_declarations(
+    manifest: &PackManifest,
+    runtime_major: RuntimeMajor,
+    os: &str,
+    arch: &str,
+) -> Result<(), SignedPackError> {
+    if manifest.pack_version() != CORE_RELEASE_VERSION
+        || manifest.release_range() != (CORE_RELEASE_VERSION, CORE_RELEASE_VERSION)
+        || manifest.pack_name() != runtime_major.language()
+        || manifest.runtime_language() != runtime_major.language()
+        || !manifest.supports_platform(os, arch)
+    {
+        return Err(SignedPackError::UnsupportedManifest);
+    }
+
+    let protocol = (xtrace_protocol::envelope::PROTOCOL_MAJOR, xtrace_protocol::envelope::PROTOCOL_MINOR);
+    let (protocol_minimum, protocol_maximum) = manifest.protocol_range();
+    if protocol < protocol_minimum || protocol > protocol_maximum {
+        return Err(SignedPackError::UnsupportedManifest);
+    }
+
+    let major = runtime_major.number();
+    let (minimum, maximum) = manifest.runtime_range();
+    if major < minimum || major >= maximum
+        || !manifest.tested_runtime_majors().contains(&major)
+    {
+        return Err(SignedPackError::UnsupportedManifest);
+    }
+    Ok(())
+}
+
+fn known_inner_manifest_digest(manifest: &PackManifest) -> Result<[u8; 32], SignedPackError> {
+    // Java's nested manifest is verified against the exact runtime JAR inventory
+    // during public inspection, then carried by the outer signed artifact list.
+    // Node's installed-pack producer manifest contract has not been defined yet.
+    let path = match manifest.pack_name() {
+        "java" => "agent/manifest.sha256",
+        _ => return Err(SignedPackError::UnsupportedManifest),
+    };
+    manifest
+        .artifact_digests()
+        .iter()
+        .find(|artifact| artifact.path == path)
+        .map(|artifact| artifact.digest)
+        .ok_or(SignedPackError::UnsupportedManifest)
 }
 
 /// Opens a pack root without following its final path component and verifies
@@ -1734,6 +1901,102 @@ mod tests {
         assert_eq!(
             verify_inner_manifests(&manifest, &tree),
             Err(SignedPackError::InventoryMismatch)
+        );
+    }
+
+    #[test]
+    fn executable_admission_facts_require_core_selected_release_protocol_runtime_and_host() {
+        let artifact = ArtifactDigest {
+            path: "agent/manifest.sha256".to_owned(),
+            digest: [7; 32],
+        };
+        let manifest = crate::signed_pack::parse_canonical_manifest(&make_manifest_for_pack(
+            std::slice::from_ref(&artifact),
+            "java",
+        ))
+        .expect("supported Java admission fixture");
+
+        assert_eq!(
+            verify_compatibility_declarations(&manifest, RuntimeMajor::Java17, "macos", "aarch64"),
+            Ok(())
+        );
+        assert_eq!(
+            verify_compatibility_declarations(&manifest, RuntimeMajor::Java21, "macos", "aarch64"),
+            Ok(())
+        );
+        assert_eq!(
+            verify_compatibility_declarations(&manifest, RuntimeMajor::Node22, "macos", "aarch64"),
+            Err(SignedPackError::UnsupportedManifest)
+        );
+        assert_eq!(
+            verify_compatibility_declarations(&manifest, RuntimeMajor::Java17, "linux", "aarch64"),
+            Err(SignedPackError::UnsupportedManifest)
+        );
+        assert_eq!(
+            verify_compatibility_declarations(&manifest, RuntimeMajor::Java17, "macos", "x86_64"),
+            Err(SignedPackError::UnsupportedManifest)
+        );
+
+        let mut incompatible_protocol =
+            make_manifest_for_pack(std::slice::from_ref(&artifact), "java");
+        let old = b"\"protocol\":{\"max\":\"1.2\",\"min\":\"1.0\"}";
+        let position = incompatible_protocol
+            .windows(old.len())
+            .position(|window| window == old)
+            .expect("protocol fixture field");
+        incompatible_protocol.splice(
+            position..position + old.len(),
+            b"\"protocol\":{\"max\":\"2.0\",\"min\":\"2.0\"}".iter().copied(),
+        );
+        let incompatible_protocol =
+            crate::signed_pack::parse_canonical_manifest(&incompatible_protocol)
+                .expect("closed but incompatible protocol fixture");
+        assert_eq!(
+            verify_compatibility_declarations(
+                &incompatible_protocol,
+                RuntimeMajor::Java17,
+                "macos",
+                "aarch64",
+            ),
+            Err(SignedPackError::UnsupportedManifest)
+        );
+    }
+
+    #[test]
+    fn executable_admission_binds_only_the_known_inner_manifest_inventory_entry() {
+        let expected_digest = [9; 32];
+        let known = ArtifactDigest {
+            path: "agent/manifest.sha256".to_owned(),
+            digest: expected_digest,
+        };
+        let manifest = crate::signed_pack::parse_canonical_manifest(&make_manifest_for_pack(
+            std::slice::from_ref(&known),
+            "java",
+        ))
+        .expect("known producer manifest fixture");
+        assert_eq!(known_inner_manifest_digest(&manifest), Ok(expected_digest));
+
+        let swapped = ArtifactDigest {
+            path: "agent/other-manifest.sha256".to_owned(),
+            digest: expected_digest,
+        };
+        let swapped_manifest = crate::signed_pack::parse_canonical_manifest(
+            &make_manifest_for_pack(std::slice::from_ref(&swapped), "java"),
+        )
+        .expect("swapped producer manifest fixture");
+        assert_eq!(
+            known_inner_manifest_digest(&swapped_manifest),
+            Err(SignedPackError::UnsupportedManifest)
+        );
+
+        let node_manifest = crate::signed_pack::parse_canonical_manifest(&make_manifest_for_pack(
+            &[ArtifactDigest { path: "index.js".to_owned(), digest: expected_digest }],
+            "node",
+        ))
+        .expect("Node compatibility fixture");
+        assert_eq!(
+            known_inner_manifest_digest(&node_manifest),
+            Err(SignedPackError::UnsupportedManifest)
         );
     }
 
