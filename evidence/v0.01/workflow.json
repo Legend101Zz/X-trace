@@ -1,0 +1,268 @@
+{
+  "schemaVersion": 1,
+  "releaseName": "v0.01",
+  "baselineSha": "3e47895f90e6a78e08b1d808d4498e4595f71a5d",
+  "phases": [
+    {
+      "id": "P00",
+      "outcome": "Release control and exact current-source audit",
+      "dependencies": [],
+      "implementationOwner": "root",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P01",
+      "outcome": "Genuine Spring method/source identity and safe persisted source projection",
+      "dependencies": [
+        "P00"
+      ],
+      "implementationOwner": "Luna High Java/shared lane",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P02",
+      "outcome": "Actual active-line/value/outcome and shared replay navigation, terminal/partial evidence",
+      "dependencies": [
+        "P01"
+      ],
+      "implementationOwner": "Luna High shared lane",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P03",
+      "outcome": "General static/runtime catalog, reconciliation/history, basic Canvas/TUI",
+      "dependencies": [
+        "P02"
+      ],
+      "implementationOwner": "Luna High shared/catalog lane",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P04",
+      "outcome": "Java supervision/build tools, attach/focused capture and framework breadth",
+      "dependencies": [
+        "P03"
+      ],
+      "implementationOwner": "Luna High Java lane",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P05",
+      "outcome": "Real Node packaged capture, Express/TypeScript and framework breadth",
+      "dependencies": [
+        "P03"
+      ],
+      "implementationOwner": "Luna High Node lane",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P06",
+      "outcome": "Production replay UX, accessibility/performance/large-window acceptance",
+      "dependencies": [
+        "P04",
+        "P05"
+      ],
+      "implementationOwner": "Luna High experience lane",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P07",
+      "outcome": "Reviewed exercise and deterministic export/Postman workflows",
+      "dependencies": [
+        "P06"
+      ],
+      "implementationOwner": "Luna High workflow lane",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P07B",
+      "outcome": "Build deterministic complete local release-candidate packages before packaged external-app campaigns",
+      "dependencies": [
+        "P04",
+        "P05",
+        "P06",
+        "P07"
+      ],
+      "implementationOwner": "Luna High packaging lane",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P08",
+      "outcome": "Six pinned upstream packaged application campaigns",
+      "dependencies": [
+        "P07B"
+      ],
+      "implementationOwner": "Luna High campaign lanes",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P09",
+      "outcome": "Recovery/security/packages/supply-chain/fresh-platform acceptance",
+      "dependencies": [
+        "P08"
+      ],
+      "implementationOwner": "Luna High release lane",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    },
+    {
+      "id": "P10",
+      "outcome": "Exact final independent reviews, real humans, distributed artifact acceptance and launch",
+      "dependencies": [
+        "P09"
+      ],
+      "implementationOwner": "root",
+      "state": "pending",
+      "reviewers": [
+        "GPT-6 Sol High architecture",
+        "GPT-6 Sol High security/privacy",
+        "GPT-6 Sol High build/integration"
+      ],
+      "acceptanceRequired": true
+    }
+  ],
+  "requiredCommandArgv": [
+    [
+      "cargo",
+      "fmt",
+      "--all",
+      "--check"
+    ],
+    [
+      "cargo",
+      "clippy",
+      "--locked",
+      "--workspace",
+      "--all-targets",
+      "--all-features",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    [
+      "cargo",
+      "doc",
+      "--locked",
+      "--workspace",
+      "--all-features",
+      "--no-deps"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "xtrace-application",
+      "-p",
+      "xtrace-store",
+      "-p",
+      "xtrace-cli",
+      "--all-features",
+      "--no-fail-fast"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "--workspace",
+      "--all-features",
+      "--no-fail-fast"
+    ],
+    [
+      "cargo",
+      "build",
+      "--locked",
+      "--workspace",
+      "--all-features"
+    ],
+    [
+      "git",
+      "diff",
+      "--check"
+    ],
+    [
+      "./gradlew",
+      "--dependency-verification",
+      "strict",
+      "clean",
+      "test",
+      "installDist",
+      "agentDist",
+      "fixtureBootJar"
+    ]
+  ],
+  "notes": [
+    "Cargo/Gradle shared builders serialized by explicit root lease.",
+    "Rustdoc requires RUSTDOCFLAGS=-D warnings.",
+    "Restricted build requires fresh target, restricted PATH and verified absent system protoc.",
+    "Gradle working directory is adapters/java.",
+    "Entire committed diff is checked against pinned phase base, never floating origin/main after merge.",
+    "Each phase adds applicable exact web/Node/schema/conformance/real journey/privacy/failure gates.",
+    "Preparation may proceed in isolated language ownership; acceptance respects dependencies."
+  ]
+}

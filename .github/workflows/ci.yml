@@ -10,10 +10,169 @@ on:
       - main
       - "slice/**"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  release-tool-tests:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Linux descriptor inspection tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes lsof
+      - name: Select private root path
+        # The runner context is not available in job-level `env`; derive the
+        # path from the shell-level runner variable and export it here.
+        run: |
+          echo "XTRACE_CI_PRIVATE_ROOT=${RUNNER_TEMP:?}/xtrace-release-tool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+      - name: Verify exact source and phase base
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor preflight-source \
+            --repo "$GITHUB_WORKSPACE" \
+            --phase-metadata evidence/v0.01/workflow.json \
+            --expected-head "$GITHUB_SHA"
+      - name: Admit private scratch before test output
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor prepare-private-root --root "$XTRACE_CI_PRIVATE_ROOT"
+      - name: Run the complete release tooling suite without skips
+        run: |
+          set +e
+          umask 077
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor summarize-tests \
+            --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
+            --log-file "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log"
+          result=$?
+          set -e
+          exit "$result"
+
+  release-floor-linux-x86_64:
+    needs: release-tool-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tuple: jdk17-node22
+            java-version: 17
+            node-version: 22
+          - tuple: jdk21-node24
+            java-version: 21
+            node-version: 24
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Install release-floor system prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            lsof \
+            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
+            libcairo2 libcups2t64 libdrm2 libgbm1 libglib2.0-0t64 \
+            libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 \
+            libxext6 libxfixes3 libxrandr2 libxkbcommon0 libxshmfence1 libgtk-3-0t64
+      - name: Select private root path
+        # The runner context is not available in job-level `env`; derive the
+        # path from the shell-level runner variable and export it here.
+        run: |
+          echo "XTRACE_CI_PRIVATE_ROOT=${RUNNER_TEMP:?}/xtrace-release-floor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.tuple }}" >> "$GITHUB_ENV"
+      - name: Verify source, architecture, toolchain tuple, and browser prerequisites
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor preflight \
+            --repo "$GITHUB_WORKSPACE" \
+            --phase-metadata evidence/v0.01/workflow.json \
+            --expected-head "$GITHUB_SHA" \
+            --java-major "${{ matrix.java-version }}" \
+            --node-major "${{ matrix.node-version }}" \
+            --tuple "${{ matrix.tuple }}"
+      - name: Admit private logs, leases, caches, and test scratch before writes
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor prepare-private-root --root "$XTRACE_CI_PRIVATE_ROOT"
+      - name: Report private root ancestry (modes, owners and filesystem types only)
+        run: |
+          set -euo pipefail
+          path="$XTRACE_CI_PRIVATE_ROOT"
+          while [ "$path" != "/" ]; do
+            printf '%s %s %s\n' "$(ls -ld "$path" | cut -d' ' -f1,3)" "$(stat -f -c %T "$path")" "$(basename "$path" | sed 's/[0-9]\{6,\}/N/g')"
+            path="$(dirname "$path")"
+          done
+          printf '%s\n' "umask $(umask) uid $(id -u)"
+      - name: Verify full release tooling suite on the exact source
+        run: |
+          set +e
+          umask 077
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor summarize-tests \
+            --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
+            --log-file "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log"
+          result=$?
+          set -e
+          exit "$result"
+      - name: Run all 23 pinned release gates
+        run: |
+          set +e
+          umask 077
+          python3 -B -m tools.release.run_gates \
+            --repo "$GITHUB_WORKSPACE" \
+            --base "$XTRACE_PHASE_BASE_SHA" \
+            --label "floor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.tuple }}" \
+            --cache-root "$XTRACE_CI_PRIVATE_ROOT" \
+            --prewarm-gradle \
+            > "$XTRACE_CI_PRIVATE_ROOT/gate-runner.log" 2>&1
+          result=$?
+          set -e
+          exit "$result"
+      - name: Write a strict sanitized result summary
+        if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
+        run: |
+          set +e
+          python3 -B -m tools.release.ci_floor sanitize-floor \
+            --root "$XTRACE_CI_PRIVATE_ROOT" \
+            --repo "$GITHUB_WORKSPACE" \
+            --label "floor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.tuple }}" \
+            --expected-head "$GITHUB_SHA" \
+            --phase-base "${XTRACE_PHASE_BASE_SHA:-}" \
+            --tuple "${{ matrix.tuple }}"
+          result=$?
+          set -e
+          exit "$result"
+      - name: Upload sanitized floor summary only
+        if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: xtrace-v001-floor-${{ matrix.tuple }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json
+          if-no-files-found: error
+          retention-days: 14
+
   java-client:
     runs-on: ubuntu-latest
     env:
@@ -24,11 +183,11 @@ jobs:
       matrix:
         java-version: [17, 21]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: ${{ matrix.java-version }}
@@ -41,9 +200,11 @@ jobs:
             adapters/java/*/gradle.lockfile
             adapters/java/gradle/verification-metadata.xml
             adapters/java/gradle/wrapper/gradle-wrapper.properties
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -75,13 +236,15 @@ jobs:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -105,11 +268,11 @@ jobs:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: 17
@@ -123,8 +286,9 @@ jobs:
             adapters/java/gradle/verification-metadata.xml
             adapters/java/gradle/wrapper/gradle-wrapper.properties
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - name: Install and validate Node protocol workspace
         run: |
@@ -145,7 +309,7 @@ jobs:
         working-directory: adapters/java
         run: ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
