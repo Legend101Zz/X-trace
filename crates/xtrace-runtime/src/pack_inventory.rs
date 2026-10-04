@@ -213,16 +213,18 @@ impl InspectedPack {
             directories.insert(path, child);
         }
 
-        let result = populate_private_snapshot(
-            &self.manifest,
-            &self.manifest_bytes,
-            &self.outer_digest,
-            &self.source_files,
-            &snapshot,
-            &directories,
-            &mut created_files,
+        let mut hooks = NoopSnapshotHooks;
+        let result = populate_private_snapshot(SnapshotPopulation {
+            manifest: &self.manifest,
+            outer_bytes: &self.manifest_bytes,
+            outer_digest: &self.outer_digest,
+            sources: &self.source_files,
+            snapshot: &snapshot,
+            directories: &directories,
+            created_files: &mut created_files,
             deadline,
-        );
+            hooks: &mut hooks,
+        });
         if let Err(primary) = result {
             let clean = cleanup_private_snapshot(
                 cache,
@@ -436,29 +438,6 @@ fn expected_directories(manifest: &PackManifest) -> BTreeSet<String> {
         .collect()
 }
 
-fn populate_private_snapshot(
-    manifest: &PackManifest,
-    outer_bytes: &[u8],
-    outer_digest: &[u8; 32],
-    sources: &BTreeMap<String, (File, Identity, [u8; 32])>,
-    snapshot: &AdmittedPrivateRoot,
-    directories: &BTreeMap<String, AdmittedPrivateRoot>,
-    created_files: &mut Vec<(String, File)>,
-    deadline: std::time::Instant,
-) -> Result<(), SignedPackError> {
-    populate_private_snapshot_with_hooks(
-        manifest,
-        outer_bytes,
-        outer_digest,
-        sources,
-        snapshot,
-        directories,
-        created_files,
-        deadline,
-        &mut NoopSnapshotHooks,
-    )
-}
-
 trait SnapshotHooks {
     fn after_copy_chunk(
         &mut self,
@@ -484,17 +463,30 @@ struct NoopSnapshotHooks;
 
 impl SnapshotHooks for NoopSnapshotHooks {}
 
-fn populate_private_snapshot_with_hooks(
-    manifest: &PackManifest,
-    outer_bytes: &[u8],
-    outer_digest: &[u8; 32],
-    sources: &BTreeMap<String, (File, Identity, [u8; 32])>,
-    snapshot: &AdmittedPrivateRoot,
-    directories: &BTreeMap<String, AdmittedPrivateRoot>,
-    created_files: &mut Vec<(String, File)>,
+struct SnapshotPopulation<'a> {
+    manifest: &'a PackManifest,
+    outer_bytes: &'a [u8],
+    outer_digest: &'a [u8; 32],
+    sources: &'a BTreeMap<String, (File, Identity, [u8; 32])>,
+    snapshot: &'a AdmittedPrivateRoot,
+    directories: &'a BTreeMap<String, AdmittedPrivateRoot>,
+    created_files: &'a mut Vec<(String, File)>,
     deadline: std::time::Instant,
-    hooks: &mut dyn SnapshotHooks,
-) -> Result<(), SignedPackError> {
+    hooks: &'a mut dyn SnapshotHooks,
+}
+
+fn populate_private_snapshot(context: SnapshotPopulation<'_>) -> Result<(), SignedPackError> {
+    let SnapshotPopulation {
+        manifest,
+        outer_bytes,
+        outer_digest,
+        sources,
+        snapshot,
+        directories,
+        created_files,
+        deadline,
+        hooks,
+    } = context;
     let mut expected = manifest
         .artifact_digests()
         .iter()
@@ -524,37 +516,51 @@ fn populate_private_snapshot_with_hooks(
         created_files.push((relative.clone(), destination));
         let destination =
             &created_files.last().ok_or(SignedPackError::PrivateSnapshotUnavailable)?.1;
-        copy_and_verify_source(
+        copy_and_verify_source(SnapshotCopy {
             source,
-            *source_identity,
+            source_identity: *source_identity,
             expected_digest,
             outer_bytes,
-            relative == OUTER_MANIFEST,
+            outer_manifest: relative == OUTER_MANIFEST,
             parent,
             name,
             destination,
-            &mut total_bytes,
+            total_bytes: &mut total_bytes,
             deadline,
             hooks,
-        )?;
+        })?;
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn copy_and_verify_source(
-    source: &File,
+struct SnapshotCopy<'a> {
+    source: &'a File,
     source_identity: Identity,
     expected_digest: [u8; 32],
-    outer_bytes: &[u8],
+    outer_bytes: &'a [u8],
     outer_manifest: bool,
-    parent: &AdmittedPrivateRoot,
-    name: &str,
-    destination: &File,
-    total_bytes: &mut u64,
+    parent: &'a AdmittedPrivateRoot,
+    name: &'a str,
+    destination: &'a File,
+    total_bytes: &'a mut u64,
     deadline: std::time::Instant,
-    hooks: &mut dyn SnapshotHooks,
-) -> Result<(), SignedPackError> {
+    hooks: &'a mut dyn SnapshotHooks,
+}
+
+fn copy_and_verify_source(context: SnapshotCopy<'_>) -> Result<(), SignedPackError> {
+    let SnapshotCopy {
+        source,
+        source_identity,
+        expected_digest,
+        outer_bytes,
+        outer_manifest,
+        parent,
+        name,
+        destination,
+        total_bytes,
+        deadline,
+        hooks,
+    } = context;
     let source_before = source.metadata().map_err(|_| SignedPackError::InventoryMismatch)?;
     if Identity::from_metadata(&source_before) != source_identity
         || !source_before.is_file()
@@ -1329,17 +1335,17 @@ mod tests {
         created_files: &mut Vec<(String, File)>,
         hooks: &mut dyn SnapshotHooks,
     ) -> Result<(), SignedPackError> {
-        populate_private_snapshot_with_hooks(
-            &inspected.manifest,
-            &inspected.manifest_bytes,
-            &inspected.outer_digest,
-            &inspected.source_files,
+        populate_private_snapshot(SnapshotPopulation {
+            manifest: &inspected.manifest,
+            outer_bytes: &inspected.manifest_bytes,
+            outer_digest: &inspected.outer_digest,
+            sources: &inspected.source_files,
             snapshot,
             directories,
             created_files,
-            std::time::Instant::now() + MAX_INSPECTION_TIME,
+            deadline: std::time::Instant::now() + MAX_INSPECTION_TIME,
             hooks,
-        )
+        })
     }
 
     type ChunkFault =
@@ -1472,7 +1478,7 @@ mod tests {
         let parent = File::open(directory.path()).expect("fixture parent directory");
         let name = std::ffi::CString::new("manifest.bin").expect("fixed fixture name");
         let mut total = 0;
-        assert_eq!(
+        assert!(matches!(
             scan_regular_file(
                 &file,
                 ScanFileContext {
@@ -1488,7 +1494,7 @@ mod tests {
                 &mut total,
             ),
             Err(SignedPackError::ResourceLimit)
-        );
+        ));
     }
 
     #[test]
