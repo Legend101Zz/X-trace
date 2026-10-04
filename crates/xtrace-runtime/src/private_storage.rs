@@ -456,17 +456,16 @@ impl AdmittedPrivateRoot {
 
     /// Admits an optional private regular file without treating absence as an error.
     pub fn validate_optional_private_file(&self, name: &str) -> Result<bool, PrivateStorageError> {
+        if !self.private_leaf {
+            return Err(PrivateStorageError::Unavailable);
+        }
         let deadline = new_admission_deadline();
         validate_child_name(name)?;
-        self.revalidate_until(deadline)?;
-        let opened = rustix::fs::openat(
-            &self.directory,
-            name,
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
-            rustix::fs::Mode::empty(),
-        );
-        let file = match opened {
-            Ok(opened) => File::from(opened),
+        if !self.named_regular_file_exists_until(name, deadline)? {
+            return Ok(false);
+        }
+        let file = match self.open_nonblocking_read_descriptor(name) {
+            Ok(file) => file,
             Err(error) if error == rustix::io::Errno::NOENT => {
                 self.revalidate_until(deadline)?;
                 return Ok(false);
@@ -505,15 +504,12 @@ impl AdmittedPrivateRoot {
             return Err(PrivateStorageError::Unavailable);
         }
         validate_child_name(name)?;
-        self.revalidate_until(deadline)?;
-        let file = rustix::fs::openat(
-            &self.directory,
-            name,
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
-            rustix::fs::Mode::empty(),
-        )
-        .map(File::from)
-        .map_err(|_| PrivateStorageError::Operation)?;
+        if !self.named_regular_file_exists_until(name, deadline)? {
+            return Err(PrivateStorageError::Operation);
+        }
+        let file = self
+            .open_nonblocking_read_descriptor(name)
+            .map_err(|_| PrivateStorageError::Operation)?;
         self.validate_file_binding_with_link_policy_until(
             name,
             &file,
@@ -523,6 +519,36 @@ impl AdmittedPrivateRoot {
         )?;
         self.revalidate_until(deadline)?;
         Ok(file)
+    }
+
+    fn open_nonblocking_read_descriptor(&self, name: &str) -> Result<File, rustix::io::Errno> {
+        rustix::fs::openat(
+            &self.directory,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map(File::from)
+    }
+
+    fn named_regular_file_exists_until(
+        &self,
+        name: &str,
+        deadline: std::time::Instant,
+    ) -> Result<bool, PrivateStorageError> {
+        self.revalidate_until(deadline)?;
+        match std::fs::symlink_metadata(self.path.join(name)) {
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(PrivateStorageError::Unavailable),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.revalidate_until(deadline)?;
+                Ok(false)
+            }
+            Err(_) => Err(PrivateStorageError::Unavailable),
+        }
     }
 
     /// Exclusively creates a no-follow owner-only regular file relative to this directory.
@@ -537,6 +563,7 @@ impl AdmittedPrivateRoot {
             &self.directory,
             name,
             rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::NONBLOCK
                 | rustix::fs::OFlags::CREATE
                 | rustix::fs::OFlags::EXCL
                 | rustix::fs::OFlags::CLOEXEC
@@ -567,11 +594,14 @@ impl AdmittedPrivateRoot {
         }
         validate_child_name(name)?;
         let deadline = new_admission_deadline();
-        self.revalidate_until(deadline)?;
+        self.named_regular_file_exists_until(name, deadline)?;
         let opened = rustix::fs::openat(
             &self.directory,
             name,
-            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
             rustix::fs::Mode::empty(),
         );
         let (file, created) = match opened {
@@ -581,6 +611,7 @@ impl AdmittedPrivateRoot {
                     &self.directory,
                     name,
                     rustix::fs::OFlags::RDWR
+                        | rustix::fs::OFlags::NONBLOCK
                         | rustix::fs::OFlags::CREATE
                         | rustix::fs::OFlags::EXCL
                         | rustix::fs::OFlags::CLOEXEC
@@ -1555,5 +1586,64 @@ mod tests {
             "unsafe metadata must not be chmod-repaired"
         );
         std::fs::remove_file(&path).expect("remove deliberately unsafe canary");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn file_openers_reject_fifo_without_waiting_for_a_peer() {
+        use std::os::unix::fs::FileTypeExt as _;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = private_scratch();
+        let name = unique_name("private-storage-fifo");
+        #[cfg(target_os = "linux")]
+        rustix::fs::mkfifoat(&root.directory, &name, rustix::fs::Mode::from_raw_mode(0o600))
+            .expect("create FIFO fixture in admitted scratch");
+        #[cfg(target_os = "macos")]
+        {
+            let fifo_path = root.path().join(&name);
+            let status = std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&fifo_path)
+                .status()
+                .expect("create FIFO fixture with the macOS system utility");
+            assert!(status.success(), "create FIFO fixture in admitted scratch");
+        }
+
+        let worker_root_path = root.path().to_path_buf();
+        let worker_name = name.clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let root = AdmittedPrivateRoot::open(&worker_root_path)
+                .expect("reopen admitted scratch in fixture worker");
+            let raced_descriptor = root
+                .open_nonblocking_read_descriptor(&worker_name)
+                .expect("opening a raced FIFO must return without a peer");
+            let descriptor_is_fifo = raced_descriptor
+                .metadata()
+                .expect("FIFO descriptor metadata")
+                .file_type()
+                .is_fifo();
+            drop(raced_descriptor);
+            let outcomes = [
+                root.open_regular_file(&worker_name).is_err(),
+                root.open_managed_file(&worker_name).is_err(),
+                root.read_bounded_file(&worker_name, 8).is_err(),
+                root.read_bounded_managed_file(&worker_name, 8).is_err(),
+                root.validate_optional_private_file(&worker_name).is_err(),
+                root.open_or_create_private_file(&worker_name).is_err(),
+            ];
+            sender.send((descriptor_is_fifo, outcomes)).expect("deliver FIFO fixture outcomes");
+        });
+        let (descriptor_is_fifo, outcomes) = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("FIFO validation must not block waiting for a reader or writer");
+        assert!(descriptor_is_fifo, "the race fixture must reach the descriptor-level opener");
+        assert!(outcomes.into_iter().all(|opened| opened));
+        #[cfg(target_os = "linux")]
+        rustix::fs::unlinkat(&root.directory, &name, rustix::fs::AtFlags::empty())
+            .expect("remove FIFO fixture");
+        #[cfg(target_os = "macos")]
+        std::fs::remove_file(root.path().join(&name)).expect("remove FIFO fixture");
     }
 }

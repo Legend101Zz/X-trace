@@ -600,32 +600,6 @@ fn is_canonical_lowercase_hex_pin(value: &str) -> bool {
     value.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
-/// Returns a per-attempt unique candidate path in the same directory
-/// as the target. The suffix is a 128-bit value rendered as
-/// lowercase hex so collisions with a pre-existing attacker-controlled
-/// file are astronomically unlikely. The fill closure is supplied by
-/// the caller so production code can delegate to the OS CSPRNG and
-/// regression tests can pin a deterministic suffix.
-#[cfg(test)]
-fn unique_temp_path<F>(target: &Path, fill_suffix: &mut F) -> Result<PathBuf, DaemonError>
-where
-    F: FnMut(&mut [u8]) -> Result<(), ring::error::Unspecified>,
-{
-    let parent = target.parent().ok_or_else(|| {
-        DaemonError::Bootstrap("bootstrap target has no parent directory".to_string())
-    })?;
-    let stem = target.file_name().and_then(|name| name.to_str()).unwrap_or("bootstrap.json");
-    let mut bytes = [0u8; 16];
-    fill_suffix(&mut bytes)
-        .map_err(|err| DaemonError::Bootstrap(format!("csprng refused to fill suffix: {err}")))?;
-    let suffix = bytes.iter().fold(String::with_capacity(32), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(&mut acc, "{b:02x}");
-        acc
-    });
-    Ok(parent.join(format!(".{stem}.tmp-{suffix}")))
-}
-
 use ring::rand::{SecureRandom, SystemRandom};
 
 fn admit_bootstrap_path(
@@ -649,7 +623,14 @@ fn write_atomic_admitted(
     body: &[u8],
 ) -> Result<(), DaemonError> {
     let rng = SystemRandom::new();
-    write_atomic_admitted_with_suffix(root, target, body, |destination| rng.fill(destination))
+    write_atomic_admitted_with_hooks(
+        root,
+        target,
+        body,
+        |destination| rng.fill(destination),
+        |_, _, _| Ok(()),
+        |root| root.sync(),
+    )
 }
 
 fn write_atomic_admitted_with_suffix<F>(
@@ -660,6 +641,29 @@ fn write_atomic_admitted_with_suffix<F>(
 ) -> Result<(), DaemonError>
 where
     F: FnMut(&mut [u8]) -> Result<(), ring::error::Unspecified>,
+{
+    write_atomic_admitted_with_hooks(
+        root,
+        target,
+        body,
+        fill_suffix,
+        |_, _, _| Ok(()),
+        |root| root.sync(),
+    )
+}
+
+fn write_atomic_admitted_with_hooks<F, H, S>(
+    root: &AdmittedPrivateRoot,
+    target: &str,
+    body: &[u8],
+    mut fill_suffix: F,
+    mut after_publish: H,
+    mut sync_directory: S,
+) -> Result<(), DaemonError>
+where
+    F: FnMut(&mut [u8]) -> Result<(), ring::error::Unspecified>,
+    H: FnMut(&AdmittedPrivateRoot, &str, &std::fs::File) -> Result<(), PrivateStorageError>,
+    S: FnMut(&AdmittedPrivateRoot) -> Result<(), PrivateStorageError>,
 {
     const ATTEMPTS: usize = 8;
     root.revalidate()
@@ -685,7 +689,7 @@ where
         }
     }
     let (temporary, mut file) = selected.ok_or_else(|| {
-        DaemonError::Bootstrap("bootstrap temporary file is unavailable".to_string())
+        DaemonError::Bootstrap("bootstrap temporary-file collision budget exhausted".to_string())
     })?;
     let write_result = (|| {
         file.write_all(body)
@@ -696,9 +700,12 @@ where
             .map_err(|_| DaemonError::Bootstrap("private storage is unavailable".to_string()))?;
         root.rename_replace(&temporary, target)
             .map_err(|_| DaemonError::Bootstrap("bootstrap publish failed".to_string()))?;
+        after_publish(root, target, &file)
+            .map_err(|_| DaemonError::Bootstrap("bootstrap publish failed".to_string()))?;
         root.validate_file_binding(target, &file, true)
             .map_err(|_| DaemonError::Bootstrap("bootstrap publish failed".to_string()))?;
-        root.sync().map_err(|_| DaemonError::Bootstrap("private storage sync failed".to_string()))
+        sync_directory(root)
+            .map_err(|_| DaemonError::Bootstrap("private storage sync failed".to_string()))
     })();
     if write_result.is_err() {
         let temporary_cleanup = root.remove_private_file_if_matches(&temporary, &file);
@@ -972,28 +979,6 @@ mod tests {
     }
 
     #[test]
-    fn unique_temp_path_resides_in_target_parent() {
-        let dir = unique_dir("unique-temp");
-        let path = dir.join("bootstrap.json");
-        let rng = SystemRandom::new();
-        let tmp = unique_temp_path(&path, &mut |dest| rng.fill(dest)).expect("temp");
-        assert_eq!(tmp.parent().unwrap(), path.parent().unwrap());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn unique_temp_path_uses_csprng_suffix() {
-        // Two draws of the CSPRNG must produce distinct suffixes.
-        let dir = unique_dir("csprng");
-        let path = dir.join("bootstrap.json");
-        let rng = SystemRandom::new();
-        let a = unique_temp_path(&path, &mut |dest| rng.fill(dest)).expect("temp a");
-        let b = unique_temp_path(&path, &mut |dest| rng.fill(dest)).expect("temp b");
-        assert_ne!(a, b);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn write_retries_after_forced_temp_collision() {
         let dir = unique_dir("retry-collision");
         let root = AdmittedPrivateRoot::open(&dir).expect("admitted parent");
@@ -1110,7 +1095,6 @@ mod tests {
         let pinned: [u8; 16] = [0xff; 16];
         let root = AdmittedPrivateRoot::open(&dir).expect("admitted parent");
         let candidate_name = format!("{TEMP_BOOTSTRAP_PREFIX}{}", hex::encode(pinned));
-        let candidate = dir.join(&candidate_name);
         let mut blocker = root.create_private_file(&candidate_name).expect("block candidate");
         blocker.write_all(b"blocker").expect("write blocker");
         blocker.sync_all().expect("sync blocker");
@@ -1122,7 +1106,7 @@ mod tests {
         )
         .unwrap_err();
         let rendered = format!("{err}");
-        assert!(rendered.contains("budget exhausted"), "got {rendered}");
+        assert!(rendered.contains("collision budget exhausted"), "got {rendered}");
         assert_eq!(
             root.read_bounded_file(&candidate_name, 16).expect("blocker remains"),
             b"blocker"
@@ -1171,6 +1155,80 @@ mod tests {
     }
 
     #[test]
+    fn post_publish_sync_failure_removes_only_the_writer_owned_target() {
+        let dir = unique_dir("sync-failure");
+        let root = AdmittedPrivateRoot::open(&dir).expect("admitted parent");
+        let suffix = [0x55; 16];
+
+        let result = write_atomic_admitted_with_hooks(
+            &root,
+            "bootstrap.json",
+            b"candidate-secret",
+            deterministic_suffix(&suffix),
+            |_, _, _| Ok(()),
+            |_| Err(PrivateStorageError::Operation),
+        );
+        assert!(result.is_err(), "injected directory sync failure must be surfaced");
+        assert!(
+            !dir.join("bootstrap.json").exists(),
+            "failed publication is removed only while its original descriptor still owns it"
+        );
+        assert!(
+            root.bounded_child_names(64)
+                .expect("bounded fixture listing")
+                .iter()
+                .all(|name| !name.starts_with(TEMP_BOOTSTRAP_PREFIX))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn post_publish_replacement_is_preserved_during_failure_cleanup() {
+        let dir = unique_dir("publish-replacement");
+        let root = AdmittedPrivateRoot::open(&dir).expect("admitted parent");
+        let suffix = [0x56; 16];
+        let sync_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sync_observation = Arc::clone(&sync_called);
+
+        let result = write_atomic_admitted_with_hooks(
+            &root,
+            "bootstrap.json",
+            b"candidate-secret",
+            deterministic_suffix(&suffix),
+            |root, target, _| {
+                root.remove_private_file(target)?;
+                let mut replacement = root.create_private_file(target)?;
+                replacement
+                    .write_all(b"replacement-canary")
+                    .map_err(|_| PrivateStorageError::Operation)?;
+                replacement.sync_all().map_err(|_| PrivateStorageError::Operation)?;
+                Err(PrivateStorageError::Operation)
+            },
+            |_| {
+                sync_observation.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "post-publish replacement fault must be surfaced");
+        assert!(
+            !sync_called.load(Ordering::SeqCst),
+            "replaced target must fail identity check first"
+        );
+        assert_eq!(
+            root.read_bounded_file("bootstrap.json", 64).expect("replacement remains"),
+            b"replacement-canary",
+        );
+        assert!(
+            root.bounded_child_names(64)
+                .expect("bounded fixture listing")
+                .iter()
+                .all(|name| !name.starts_with(TEMP_BOOTSTRAP_PREFIX))
+        );
+        root.remove_private_file("bootstrap.json").expect("remove replacement fixture");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn write_succeeds_when_already_exists_target_is_preplaced() {
         // Re-running the writer on a path that already holds a valid
         // bootstrap artifact must overwrite it; the published file
@@ -1183,13 +1241,6 @@ mod tests {
         let second_secret = fs::read_to_string(&path).unwrap();
         assert_ne!(first_secret, second_secret);
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn empty_target_path_rejected() {
-        let rng = SystemRandom::new();
-        let err = unique_temp_path(Path::new("/"), &mut |dest| rng.fill(dest)).unwrap_err();
-        assert!(matches!(err, DaemonError::Bootstrap(_)));
     }
 
     #[test]
@@ -1221,21 +1272,6 @@ mod tests {
         assert!(!is_canonical_lowercase_hex_pin(&"a".repeat(63)));
         assert!(is_canonical_lowercase_hex_pin(&"a".repeat(64)));
         assert!(is_canonical_lowercase_hex_pin(&"0123456789abcdef".repeat(4)));
-    }
-
-    #[test]
-    fn csprng_loop_eventually_yields_unique_path() {
-        // The CSPRNG-backed helper must produce distinct suffixes on
-        // repeated calls; this guards against a regression where a
-        // future change accidentally falls back to a single shared
-        // buffer.
-        let dir = unique_dir("budget");
-        let path = dir.join("bootstrap.json");
-        let rng = SystemRandom::new();
-        let a = unique_temp_path(&path, &mut |dest| rng.fill(dest)).expect("temp a");
-        let b = unique_temp_path(&path, &mut |dest| rng.fill(dest)).expect("temp b");
-        assert_ne!(a, b);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
