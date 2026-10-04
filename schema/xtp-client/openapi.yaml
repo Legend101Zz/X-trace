@@ -4,10 +4,14 @@ info:
   version: 1.0.0
   description: >-
     Same-origin, loopback-only read API for persisted recording metadata and
-    bounded verified event windows. It also exposes a finite persisted
+    bounded verified event windows with typed source and frame-navigation
+    availability. Recording details include producer-declared duration and
+    persisted terminal capture-completion evidence, including unavailable
+    states. Captured values, an active execution line, and independently
+    verified application or HTTP outcomes remain unavailable; a producer
+    summary is not outcome proof. It also exposes a finite persisted
     observed-endpoint projection for the exact Spring fixture policy; it does
-    not claim framework discovery or catalog completeness. Source, captured
-    values, durations, and completion claims are not projected by this API. Every
+    not claim framework discovery or catalog completeness. Every
     request must carry the exact Host authority printed by viewer readiness,
     Sec-Fetch-Site: same-origin, and X-XTrace-Client: viewer-v1. There is no
     CORS support. Authentication POST requests require an exact same-origin
