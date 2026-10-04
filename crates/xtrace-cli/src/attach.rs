@@ -1206,7 +1206,7 @@ fn safe_short(input: &str) -> &str {
     if input.len() <= 64
         && input
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | '-' | '@'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'@'))
     {
         input
     } else {

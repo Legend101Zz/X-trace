@@ -182,6 +182,11 @@ mod tests {
     use std::fs;
     use xtrace_domain::RuntimeSessionId;
 
+    #[test]
+    fn temp_bootstrap_prefix_matches_daemon_definition() {
+        assert_eq!(TEMP_BOOTSTRAP_PREFIX, xtrace_daemon::bootstrap::TEMP_BOOTSTRAP_PREFIX);
+    }
+
     fn temp_root() -> tempfile::TempDir {
         let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
             .map(PathBuf::from)

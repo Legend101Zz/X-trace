@@ -330,7 +330,7 @@ final class HelperSupervisor {
 
     private final long workerPid;
 
-    private TimeoutException(long workerPid) {
+    TimeoutException(long workerPid) {
       this.workerPid = workerPid;
     }
 

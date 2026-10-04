@@ -29,6 +29,7 @@ use xtrace_domain::{
 
 use crate::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
+use crate::idempotency_repository::map_receipt_row;
 
 const MAX_INIT_RECEIPT_JSON_BYTES: i64 = 8192;
 

@@ -948,17 +948,17 @@ mod tests {
             apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v5).expect("apply exact v5"),
             5
         );
-        let project =
+        let project: [u8; 16] =
             [0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 1];
-        let selection =
+        let selection: [u8; 16] =
             [0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 2];
-        let session =
+        let session: [u8; 16] =
             [0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 3];
-        let open_run =
+        let open_run: [u8; 16] =
             [0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 4];
-        let terminal_run =
+        let terminal_run: [u8; 16] =
             [0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 5];
-        let digest = [0x22; 32];
+        let digest = [0x22_u8; 32];
         insert_project(&conn, &project).expect("seed project");
         conn.execute(
             "INSERT INTO catalog_owner_selections (owner_selection_id, project_id, selection_epoch, current_for_scope, verified_pack_digest, scope_digest, scope_json, revoked) VALUES (?1, ?2, 1, 1, ?3, ?3, '{}', 0)",

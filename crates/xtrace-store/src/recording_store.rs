@@ -1503,7 +1503,6 @@ impl SqliteRecordingStore<'_> {
         request: &FinishRecording,
         correlation_id: CorrelationId,
     ) -> Result<(RecordingCompletion, u64), RecordingStoreError> {
-        type Segment = (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64, Vec<u8>);
         let (project_id, segments, declared_event_count, declared_input_bytes) = {
             let connection =
                 self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
@@ -2299,6 +2298,10 @@ fn frame_navigation(
     ))
 }
 
+/// Row shape of `recording_frame_index`: frame id, segment ordinal, event
+/// offset, event id digest, monotonic nanoseconds.
+type FrameIndexRow = (Vec<u8>, i64, i64, Vec<u8>, Vec<u8>);
+
 fn index_verified_segment_frames(
     connection: &rusqlite::Connection,
     recording_id: RecordingId,
@@ -2311,7 +2314,7 @@ fn index_verified_segment_frames(
         let Some(event) = envelope.event.as_ref() else {
             return Err(object_corrupt_error(correlation_id));
         };
-        let indexed: Option<(Vec<u8>, i64, i64, Vec<u8>, Vec<u8>)> = connection
+        let indexed: Option<FrameIndexRow> = connection
             .query_row(
                 "SELECT frame_id, segment_ordinal, event_offset, event_id_digest, monotonic_ns \
                  FROM recording_frame_index WHERE recording_id = ?1 AND recording_seq = ?2",

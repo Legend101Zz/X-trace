@@ -308,8 +308,8 @@ mod tests {
     use xtrace_application::ProjectRepository;
     use xtrace_application::recording::{
         AcceptedRecordingEvent, BeginRecording, FinishRecording, PersistRecordingSegment,
-        RecordEvents, RecordingCapture, RecordingCaptureService, RecordingPersistencePort,
-        SegmentPolicy,
+        RecordEvents, RecordingCapture, RecordingCaptureService, RecordingCompletion,
+        RecordingPersistencePort, SegmentPolicy,
     };
     use xtrace_application::recording_queries::{
         ListRecordings, RecordingReadPort, ShowRecording, ShowWindowRequest,

@@ -879,9 +879,12 @@ mod tests {
         }
     }
 
+    /// Log of `(owner selection id, epoch)` pairs observed by the grant writer.
+    type SelectionLog = Arc<Mutex<Vec<([u8; 16], u64)>>>;
+
     struct GrantWriter {
         run_id: RunId,
-        selections: Arc<Mutex<Vec<([u8; 16], u64)>>>,
+        selections: SelectionLog,
     }
 
     impl CatalogDiscoveryWritePort for GrantWriter {

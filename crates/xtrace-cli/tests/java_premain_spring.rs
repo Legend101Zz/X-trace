@@ -217,7 +217,8 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
         }));
         assert_eq!(detail["unavailable"]["source"], "unavailable");
         assert_eq!(detail["unavailable"]["values"], "unavailable");
-        assert_eq!(detail["unavailable"]["completion"], "unavailable");
+        assert_eq!(detail["completion"], "complete");
+        assert_eq!(detail["unavailable"]["completion"], "available");
         if *recording_id == ids[1] {
             for (index, file) in
                 ["OrderController.java", "OrderService.java", "OrderRepository.java"]

@@ -88,6 +88,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// Marker written by the redacted `Debug` implementation so tests and
 /// log scrapers can assert the session secret is never serialized.
+/// Prefix of in-flight bootstrap temp files; must equal the identical literal
+/// in `xtrace-cli` `daemon_lock.rs` (asserted by a test there).
+pub const TEMP_BOOTSTRAP_PREFIX: &str = ".bootstrap.json.tmp-";
 const SESSION_SECRET_REDACTED: &str = "<redacted>";
 
 /// Owner of the bootstrap artifact. The owner marker controls whether

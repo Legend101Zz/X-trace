@@ -882,7 +882,7 @@ impl CatalogReadPort for SqliteCatalogDiscoveryStore {
                 method: HttpMethod::parse(&method).ok_or_else(corruption_error)?,
                 route_template: route.clone(),
             };
-            if identity.fingerprint().map(|hash| hash.as_bytes().to_vec())
+            if identity.fingerprint().ok().map(|hash| hash.as_bytes().to_vec())
                 != Some(stored_fingerprint)
             {
                 return Err(corruption_error());
@@ -1242,7 +1242,7 @@ fn load_and_verify_chunks(
             chunk_index: u32::try_from(index).map_err(|_| corruption_error())?,
             claims,
         };
-        if chunk.digest().map(|hash| hash.as_bytes().to_vec()) != Some(stored_digest) {
+        if chunk.digest().ok().map(|hash| hash.as_bytes().to_vec()) != Some(stored_digest) {
             return Err(corruption_error());
         }
         chunks.push(chunk);
