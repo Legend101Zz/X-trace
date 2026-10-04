@@ -188,10 +188,12 @@ export interface components {
             /** @enum {string} */
             status: "recording" | "finalizing" | "complete" | "partial" | "invalid";
             completion: components["schemas"]["Completion"];
-            /** Producer-declared privacy-safe summary, not outcome proof. */
-            adapterSummary: components["schemas"]["AdapterSummary"] | null;
+            /** @description Producer-declared privacy-safe summary; it is not independently correlated to a RESPONSE event and is not outcome proof. */
+            adapterSummary: null | components["schemas"]["AdapterSummary"];
             durationNs: string | null;
-            dropCountsByPriority: { [key: string]: string };
+            dropCountsByPriority: {
+                [key: string]: string;
+            };
             limit: number;
             cursor: string | null;
             nextCursor: string | null;
@@ -239,6 +241,7 @@ export interface components {
                 representation: "truncated" | "unavailable";
             }[];
         };
+        /** @enum {string} */
         Completion: "complete" | "partial" | "invalid" | "unavailable";
         FrameNavigation: {
             previous: components["schemas"]["NavigationResult"];
@@ -247,13 +250,33 @@ export interface components {
             over: components["schemas"]["NavigationResult"];
             out: components["schemas"]["NavigationResult"];
         };
-        NavigationResult:
-            | { state: "target"; frameId: string }
-            | { state: "boundary" | "unavailable" };
-        AdapterSummary:
-            | { Redacted: { rule_id: "unverified-producer-redaction"; shape_hint: unknown } }
-            | { Unavailable: { reason: "capability_unsupported" | "debug_metadata_absent" | "capture_budget_exhausted" | "source_artifact_missing" | "recorder_disconnected" | "privacy_policy_unavailable" } }
-            | { Dropped: { reason: "backpressure_shed" | "queue_full" | "sequence_gap" | "adapter_dropped" } };
+        NavigationResult: {
+            /** @constant */
+            state: "target";
+            /** Format: uuid */
+            frameId: string;
+        } | {
+            /** @enum {string} */
+            state: "boundary" | "unavailable";
+        };
+        /** @description No preview text or producer-supplied rule identifier is exposed until a verified policy registry exists. */
+        AdapterSummary: {
+            Redacted: {
+                /** @constant */
+                rule_id: "unverified-producer-redaction";
+                shape_hint: unknown;
+            };
+        } | {
+            Unavailable: {
+                /** @enum {string} */
+                reason: "capability_unsupported" | "debug_metadata_absent" | "capture_budget_exhausted" | "source_artifact_missing" | "recorder_disconnected" | "privacy_policy_unavailable";
+            };
+        } | {
+            Dropped: {
+                /** @enum {string} */
+                reason: "backpressure_shed" | "queue_full" | "sequence_gap" | "adapter_dropped";
+            };
+        };
         Unavailable: {
             /** @constant */
             source: "unavailable";
