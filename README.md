@@ -206,4 +206,4 @@ the filesystem.
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0 at the user's option.
+Licensed under the MIT license (see `LICENSE`).
