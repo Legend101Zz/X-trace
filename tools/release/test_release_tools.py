@@ -2268,6 +2268,60 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((self.cache / "tmp" / "P00-test-home").is_dir())
         self.assertEqual(env["CARGO_HOME"], str(self.cache / "cargo"))  # type: ignore[index]
 
+    def test_prewarm_gradle_retries_logs_each_attempt_and_fails_explicitly(self) -> None:
+        logs = self.root / "prewarm-logs"
+        logs.mkdir()
+        calls: list[tuple[list[str], dict]] = []
+
+        def flaky(argv: list[str], **kwargs: object) -> tuple[int, float]:
+            calls.append((argv, kwargs))
+            return (0 if len(calls) == 3 else 1), 0.1
+
+        result = run_gates.prewarm_gradle(self.repo, {"GRADLE_USER_HOME": "g"}, logs, run=flaky)
+        self.assertEqual(result, {"gradle": {"attempts": 3, "exitCode": 0}})
+        self.assertEqual([call[0] for call in calls], [["./gradlew", "--no-daemon", "--version"]] * 3)
+        self.assertEqual(calls[0][1]["cwd"], self.repo / "adapters" / "java")
+        self.assertEqual(calls[0][1]["env"], {"GRADLE_USER_HOME": "g"})
+        self.assertEqual(len({call[1]["log_path"] for call in calls}), 3, "a new log per attempt")
+        self.assertEqual(run_gates.prewarm_gradle(self.repo, {}, logs, run=lambda *a, **k: (0, 0.1)), {"gradle": {"attempts": 1, "exitCode": 0}})
+        with self.assertRaisesRegex(RuntimeError, "prewarm failed after 3 attempts \\(last exit 7\\)"):
+            run_gates.prewarm_gradle(self.repo, {}, logs, run=lambda *a, **k: (7, 0.1))
+        import inspect
+        self.assertEqual(inspect.signature(REAL_VERSIONS).parameters["timeout"].default, 20, "the 20 s probe budget is unchanged")
+
+    def test_floor_prewarms_under_its_leases_before_the_version_probes_only_when_asked(self) -> None:
+        order: list[str] = []
+        held: list[bool] = []
+        gate = run_gates.Gate("noop", ("true",))
+
+        def fake_prewarm(*args: object, **kwargs: object) -> dict:
+            order.append("prewarm")
+            held.append((self.cache / "leases" / "cargo").exists() and (self.cache / "leases" / "gradle").exists())
+            return {"gradle": {"attempts": 1, "exitCode": 0}}
+
+        def fake_versions(*args: object, **kwargs: object) -> dict:
+            order.append("versions")
+            return {}
+
+        def fake_run(argv: list[str], *, log_path: pathlib.Path, **_k: object) -> tuple[int, float]:
+            os.close(private_roots.create_private_file(log_path, flags=os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode=0o600))
+            return 0, 0.1
+
+        for flag, expected in ((True, ["prewarm", "versions"]), (False, ["versions"])):
+            order.clear()
+            args = self.args()
+            args.label = f"P00-prewarm-{flag}"
+            args.prewarm_gradle = flag
+            with mock.patch.object(run_gates, "GATES", (gate,)), mock.patch.object(run_gates, "prewarm_gradle", side_effect=fake_prewarm), \
+                    mock.patch.object(run_gates, "_versions", side_effect=fake_versions), mock.patch.object(run_gates, "_run", side_effect=fake_run):
+                run_gates.run(args)
+            self.assertEqual(order[:len(expected)], expected)
+        self.assertEqual(held, [True], "the distribution is warmed while both leases are held")
+        receipt = json.loads((self.cache / "release-gates" / "P00-prewarm-True" / "receipt.json").read_text())
+        self.assertEqual(receipt["prewarm"], {"gradle": {"attempts": 1, "exitCode": 0}})
+        help_text = subprocess.run([sys.executable, '-B', '-m', 'tools.release.run_gates', '--help'], capture_output=True, text=True, cwd=pathlib.Path(__file__).resolve().parents[2]).stdout
+        self.assertIn('--prewarm-gradle', help_text)
+
     def test_failed_gate_stops_and_never_claims_all_passed(self) -> None:
         failure = run_gates.Gate("failure", (sys.executable, "-c", "print('gate failed'); raise SystemExit(9)"))
         later = run_gates.Gate("unreached", (sys.executable, "-c", "raise SystemExit(0)"))

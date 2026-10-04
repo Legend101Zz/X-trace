@@ -1848,6 +1848,35 @@ def build_task_env(
     return env
 
 
+GRADLE_PREWARM_ATTEMPTS = 3
+GRADLE_PREWARM_TIMEOUT_SECONDS = 900
+
+
+def prewarm_gradle(
+    repo: pathlib.Path, env: dict[str, str], logs_dir: pathlib.Path, *, timeout: float = GRADLE_PREWARM_TIMEOUT_SECONDS,
+    attempts: int = GRADLE_PREWARM_ATTEMPTS, run: Callable[..., tuple[int, float]] | None = None,
+) -> dict[str, Any]:
+    """Fill the private GRADLE_USER_HOME with the pinned wrapper distribution before the version probes.
+
+    The `gradle-wrapper` version probe has a fixed 20 s budget (never changed) that a cold download of
+    the pinned distribution cannot meet. This runs the same wrapper through the supervised `_run`, under
+    the same leases and the same environment, with its own generous timeout and a few attempts (the
+    wrapper verifies the distribution checksum), so the budgeted probe later finds it warm. Failure is an
+    explicit error, not a probe timeout.
+    """
+    runner = run or _run
+    last = -1
+    for attempt in range(1, attempts + 1):
+        code, _duration = runner(
+            ["./gradlew", "--no-daemon", "--version"], cwd=repo / "adapters" / "java", env=env, timeout=timeout,
+            log_path=logs_dir / f"prewarm-gradle-{attempt}.log",
+        )
+        last = code
+        if code == 0:
+            return {"gradle": {"attempts": attempt, "exitCode": 0}}
+    raise RuntimeError(f"gradle distribution prewarm failed after {attempts} attempts (last exit {last})")
+
+
 def _restricted_env(base_env: dict[str, str], cache: pathlib.Path, label: str) -> tuple[dict[str, str], str]:
     cargo = shutil.which("cargo", path=base_env.get("PATH"))
     rustc = shutil.which("rustc", path=base_env.get("PATH"))
@@ -2215,6 +2244,11 @@ def run(args: argparse.Namespace) -> int:
         manifest["workingTreeDigestBefore"] = dirty_start
         manifest["phaseDiffSha256Before"] = _hash(diff_start)
         recheck_private_roots()
+        if getattr(args, "prewarm_gradle", False):
+            manifest["prewarm"] = prewarm_gradle(
+                repo, env, logs_dir, timeout=min(float(args.command_timeout), GRADLE_PREWARM_TIMEOUT_SECONDS),
+            )
+            recheck_private_roots()
         manifest["toolVersions"] = _versions(
             repo, env, logs_dir, manifest["versionProbes"], names={"rustc", "cargo", "rustup", "java", "node", "npm", "gradle-wrapper", "python", "git"},
             provenance=use_provenance,
@@ -2499,6 +2533,9 @@ def main() -> int:
     parser.add_argument("--cache-root", required=True, help="explicit local cache and raw-log root")
     parser.add_argument("--lease-token", default="", help="shared 32-hex token for an explicitly nested invocation")
     parser.add_argument("--command-timeout", type=int, default=7200, help="per-command timeout in seconds")
+    parser.add_argument("--prewarm-gradle", action="store_true",
+                        help="warm the pinned Gradle distribution into the private GRADLE_USER_HOME, supervised under the "
+                             "leases, before the 20 s version probes (a cold download cannot meet that budget)")
     parser.add_argument("--no-provenance", dest="provenance", action="store_false", default=True,
                         help="disable process-provenance classification of uninspectable processes")
     args = parser.parse_args()

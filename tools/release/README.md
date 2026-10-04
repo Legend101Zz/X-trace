@@ -244,4 +244,21 @@ DST-ambiguous times fail closed. The owner record is re-read and unlinked throug
 descriptor, archived owner records have the token replaced by its sha256, and `manual-recovery.json`
 is written with an honest `status` even if a step after removal fails. Recovery proves non-descent in the
 fork tree only; it cannot prove that a pre-existing daemon or delegated work cannot write the caches.
-The floor job warms the pinned Gradle distribution before the 20 s version-probe budget.
+The floor job passes `--prewarm-gradle` (see below).
+
+## Warming the pinned Gradle distribution
+
+A cold `./gradlew --version` downloads the pinned Gradle distribution and cannot finish inside the fixed 20 s
+`gradle-wrapper` version-probe budget (exit 124; the budget is never raised). `run_gates --prewarm-gradle`
+runs the same wrapper through the supervised runner, under the floor's leases and environment, with its
+own timeout (at most 900 s) and 3 attempts, into the private `GRADLE_USER_HOME` before the version probes;
+CI uses it, and a local cold-cache floor should too:
+
+```
+python3.14 -B -m tools.release.run_gates --repo <worktree> --base <phase-base> --label <new label> \
+    --cache-root <private root> --prewarm-gradle
+```
+
+To warm without running the floor, use the leased runner (same cache and leases):
+`python3.14 -B -m tools.release.leased_run --repo <worktree> --label <new label> --cache-root <private root>
+--timeout 900 -- ./adapters/java/gradlew --no-daemon --version`.

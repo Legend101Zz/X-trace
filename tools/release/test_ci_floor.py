@@ -2399,9 +2399,8 @@ class CiFloorProvenanceAndWorkflowTests(unittest.TestCase):
             if line.strip().startswith("permissions:") and not line.startswith("permissions:"):
                 continue
         self.assertNotIn("contents: write", text)
-        warm = text.index("Warm the pinned Gradle distribution")
-        self.assertLess(warm, text.index("Run all 23 pinned release gates"), "the distribution is warmed before the budgeted probe")
-        self.assertIn('GRADLE_USER_HOME="$XTRACE_CI_PRIVATE_ROOT/gradle"', text)
+        self.assertIn("--prewarm-gradle", text, "the floor warms the pinned Gradle distribution under its leases")
+        self.assertLess(text.index("--prewarm-gradle"), text.index("gate-runner.log\" 2>&1"))
         import inspect
         self.assertEqual(inspect.signature(run_gates._versions).parameters["timeout"].default, 20, "the 20 s probe budget is unchanged")
         self.assertNotIn("runner.temp", text)

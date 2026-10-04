@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { normalizeTree } from "./generated-normalize.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const workspace = resolve(dirname(scriptPath), "..");
@@ -25,14 +26,6 @@ function sameTree(left, right) {
     const candidate = right[index];
     return candidate?.[0] === path && bytes.equals(candidate[1]);
   });
-}
-
-async function normalizeTree(directory) {
-  for (const [path, bytes] of await tree(directory)) {
-    if (path.endsWith(".ts")) {
-      await writeFile(join(directory, path), bytes.toString("utf8").replace(/\n+$/, "\n"));
-    }
-  }
 }
 
 async function generatorOutput(directory) {
