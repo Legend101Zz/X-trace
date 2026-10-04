@@ -34,6 +34,22 @@ def test_scratch_root() -> pathlib.Path:
     return path
 
 
+def attempt_log_from_receipt(run_dir: pathlib.Path) -> pathlib.Path | None:
+    """Locate an attempted gate's finalized private log for assertions/cleanup."""
+    try:
+        receipt = json.loads((run_dir / "receipt.json").read_text())
+        gates = receipt.get("gates")
+        log_ref = gates[0].get("log") if isinstance(gates, list) and gates else None
+        if not isinstance(log_ref, str):
+            return None
+        log_path = run_dir / log_ref
+        if log_path.parent != run_dir / "logs" or not log_path.is_file():
+            return None
+        return log_path
+    except (OSError, ValueError, TypeError, IndexError, AttributeError):
+        return None
+
+
 class PrivateRootAdmissionTests(unittest.TestCase):
     def test_actual_macos_ls_headers_allow_deny_only_acl_and_paths_with_spaces(self) -> None:
         workspace = pathlib.Path("/Users/example/Documents/Codex/2026-10-04/workspace with spaces")
@@ -1373,9 +1389,13 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(entry["logSha256"], digest(b"flushed command output\n"))
 
     def test_owned_atomic_lease_fails_before_any_gate(self) -> None:
+        lease_root = self.cache / "leases"
+        lease_root.mkdir(mode=0o700)
         lease = self.cache / "leases/cargo"
-        lease.mkdir(parents=True)
-        (lease / "owner.json").write_text('{"pid":123,"label":"owner","token":"' + "f" * 32 + '"}')
+        lease.mkdir(mode=0o700)
+        owner = lease / "owner.json"
+        owner.write_text('{"pid":123,"label":"owner","token":"' + "f" * 32 + '"}')
+        owner.chmod(0o600)
         with mock.patch.object(run_gates, "GATES", ()):
             self.assertEqual(run_gates.run(self.args()), 1)
         receipt = json.loads((self.cache / "release-gates/P00-test/receipt.json").read_text())
@@ -1527,6 +1547,7 @@ class RunnerTests(unittest.TestCase):
     def test_uncertain_process_tree_retains_both_leases_for_manual_recovery(self) -> None:
         script = "import time; time.sleep(60)"
         gate = run_gates.Gate("uncertain-timeout", (sys.executable, "-c", script))
+        later = run_gates.Gate("unreached", (sys.executable, "-c", "pass"))
         args = self.args()
         args.command_timeout = 0.2
         spawned: list[subprocess.Popen[bytes]] = []
@@ -1539,7 +1560,7 @@ class RunnerTests(unittest.TestCase):
             return process
 
         try:
-            with mock.patch.object(run_gates, "GATES", (gate,)), mock.patch.object(run_gates.subprocess, "Popen", side_effect=capture_process), mock.patch.object(run_gates, "_stop_owned_process_tree", return_value=False):
+            with mock.patch.object(run_gates, "GATES", (gate, later)), mock.patch.object(run_gates.subprocess, "Popen", side_effect=capture_process), mock.patch.object(run_gates, "_stop_owned_process_tree", return_value=False):
                 self.assertEqual(run_gates.run(args), 1)
             receipt = json.loads((self.cache / "release-gates/P00-test/receipt.json").read_text())
             self.assertEqual(receipt["decision"], "failed")
@@ -1649,9 +1670,12 @@ class RunnerTests(unittest.TestCase):
                     run_dir = self.cache / "release-gates" / args.label
                     receipt = json.loads((run_dir / "receipt.json").read_text())
                     self.assertIn("could not be confirmed drained", receipt["error"])
-                    temporary_logs = list((run_dir / "logs").glob(".*.tmp"))
-                    self.assertEqual(len(temporary_logs), 1)
-                    child_pid = int(temporary_logs[0].read_text().splitlines()[0])
+                    log_path = attempt_log_from_receipt(run_dir)
+                    self.assertIsNotNone(log_path)
+                    assert log_path is not None
+                    entry = receipt["gates"][0]
+                    self.assertEqual(entry["logSha256"], digest(log_path.read_bytes()))
+                    child_pid = int(log_path.read_text().splitlines()[0])
                     for name in ("cargo", "gradle"):
                         owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
                         self.assertTrue(owner["requiresManualRecovery"])
@@ -1660,9 +1684,9 @@ class RunnerTests(unittest.TestCase):
                     if child_pid is None:
                         try:
                             run_dir = self.cache / "release-gates" / args.label
-                            temporary_logs = list((run_dir / "logs").glob(".*.tmp"))
-                            if temporary_logs:
-                                child_pid = int(temporary_logs[0].read_text().splitlines()[0])
+                            log_path = attempt_log_from_receipt(run_dir)
+                            if log_path is not None:
+                                child_pid = int(log_path.read_text().splitlines()[0])
                         except (OSError, ValueError, IndexError):
                             pass
                     if child_pid is not None and process_running(child_pid):
@@ -1720,9 +1744,9 @@ class RunnerTests(unittest.TestCase):
         real_snapshot = run_gates._process_snapshot
         calls = 0
 
-        def snapshot_with_concurrent_process() -> dict[int, tuple[int, str, str]]:
+        def snapshot_with_concurrent_process(*, timeout: float = 2.0) -> dict[int, tuple[int, str, str]]:
             nonlocal calls, unrelated
-            snapshot = real_snapshot()
+            snapshot = real_snapshot(timeout=timeout)
             calls += 1
             if calls == 1:
                 unrelated = subprocess.Popen(
@@ -1811,10 +1835,13 @@ class RunnerTests(unittest.TestCase):
         gate = run_gates.Gate("final-scan-interrupt", (sys.executable, "-c", script))
         real_scan = run_gates._untracked_processes_since
 
-        def interrupt_final_scan(baseline: object, owned: object, snapshot: object, log_path: pathlib.Path):
+        def interrupt_final_scan(
+            baseline: object, owned: object, snapshot: object, log_path: pathlib.Path,
+            **kwargs: object,
+        ):
             if "final-scan-interrupt" in log_path.name:
                 raise KeyboardInterrupt
-            return real_scan(baseline, owned, snapshot, log_path)  # type: ignore[arg-type]
+            return real_scan(baseline, owned, snapshot, log_path, **kwargs)  # type: ignore[arg-type]
 
         child_pid: int | None = None
         try:
@@ -1826,9 +1853,11 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(run_gates.run(args), 1)
             run_dir = self.cache / "release-gates" / args.label
             receipt = json.loads((run_dir / "receipt.json").read_text())
-            log_files = list((run_dir / "logs").glob(".*.tmp"))
-            self.assertEqual(len(log_files), 1)
-            child_pid = int(log_files[0].read_text().splitlines()[0])
+            log_path = attempt_log_from_receipt(run_dir)
+            self.assertIsNotNone(log_path)
+            assert log_path is not None
+            child_pid = int(log_path.read_text().splitlines()[0])
+            self.assertEqual(receipt["gates"][0]["logSha256"], digest(log_path.read_bytes()))
             self.assertEqual(receipt["decision"], "failed")
             self.assertIn("post-command ownership scan could not be completed: KeyboardInterrupt", receipt["error"])
             self.assertTrue(process_running(child_pid), "unconfirmed candidate must not be signaled")
@@ -1844,9 +1873,9 @@ class RunnerTests(unittest.TestCase):
             if child_pid is None:
                 try:
                     run_dir = self.cache / "release-gates" / args.label
-                    log_files = list((run_dir / "logs").glob(".*.tmp"))
-                    if log_files:
-                        child_pid = int(log_files[0].read_text().splitlines()[0])
+                    log_path = attempt_log_from_receipt(run_dir)
+                    if log_path is not None:
+                        child_pid = int(log_path.read_text().splitlines()[0])
                 except (OSError, ValueError, IndexError):
                     pass
             if child_pid is not None and process_running(child_pid):
@@ -1867,9 +1896,9 @@ class RunnerTests(unittest.TestCase):
         unrelated: subprocess.Popen[bytes] | None = None
         calls = 0
 
-        def snapshot_with_concurrent_process() -> dict[int, tuple[int, str, str]]:
+        def snapshot_with_concurrent_process(*, timeout: float = 2.0) -> dict[int, tuple[int, str, str]]:
             nonlocal calls, unrelated
-            snapshot = real_snapshot()
+            snapshot = real_snapshot(timeout=timeout)
             calls += 1
             if calls == 1:
                 unrelated = subprocess.Popen(
@@ -2287,10 +2316,12 @@ class RunnerTests(unittest.TestCase):
             try:
                 self.assertEqual(run_gates.run(args), 1)
                 run_dir = self.cache / "release-gates" / args.label
-                logs = list((run_dir / "logs").glob(".*.tmp"))
-                self.assertEqual(len(logs), 1)
-                child_pid = int(logs[0].read_text().splitlines()[0])
                 receipt = json.loads((run_dir / "receipt.json").read_text())
+                log_path = attempt_log_from_receipt(run_dir)
+                self.assertIsNotNone(log_path)
+                assert log_path is not None
+                child_pid = int(log_path.read_text().splitlines()[0])
+                self.assertEqual(receipt["gates"][0]["logSha256"], digest(log_path.read_bytes()))
                 self.assertIn("InterruptedProbeCleanup", receipt["error"])
                 self.assertTrue(process_running(child_pid), "unconfirmed candidate must not be signaled")
                 for name in ("cargo", "gradle"):
@@ -2310,9 +2341,9 @@ class RunnerTests(unittest.TestCase):
                 if child_pid is None:
                     try:
                         run_dir = self.cache / "release-gates" / args.label
-                        logs = list((run_dir / "logs").glob(".*.tmp"))
-                        if logs:
-                            child_pid = int(logs[0].read_text().splitlines()[0])
+                        log_path = attempt_log_from_receipt(run_dir)
+                        if log_path is not None:
+                            child_pid = int(log_path.read_text().splitlines()[0])
                     except (OSError, ValueError, IndexError):
                         pass
                 if child_pid is not None and process_running(child_pid):
