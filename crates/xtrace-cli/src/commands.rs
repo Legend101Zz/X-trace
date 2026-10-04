@@ -731,7 +731,7 @@ where
 
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    let document = InitDocument::from_receipt(&receipt, &pointer, &database_path);
+    let document = InitDocument::from_receipt(&receipt, &pointer, &repo, &database_path);
     write_success(&mut handle, &document)?;
     Ok(())
 }
@@ -790,7 +790,7 @@ where
 
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    let document = OpenDocument::from_receipt(&receipt, &pointer, &database_path);
+    let document = OpenDocument::from_receipt(&receipt, &repo, &database_path);
     write_success(&mut handle, &document)?;
     Ok(())
 }
@@ -834,7 +834,7 @@ where
                     StatusDocument::from_report(
                         report,
                         store.bootstrap().schema_version,
-                        &pointer,
+                        &repo,
                         &database_path,
                     )
                 }
@@ -928,6 +928,7 @@ impl InitDocument {
     fn from_receipt(
         receipt: &xtrace_application::CommandReceipt,
         pointer: &RepositoryPointer,
+        repo: &Path,
         database_path: &Path,
     ) -> Self {
         match receipt {
@@ -940,7 +941,7 @@ impl InitDocument {
                 project_id: project_id.to_string(),
                 fingerprint: fingerprint.as_str().to_string(),
                 idempotency_key: idempotency_key.clone(),
-                project_dir: pointer.data_home.display().to_string(),
+                project_dir: repo.display().to_string(),
                 database_path: database_path.display().to_string(),
                 data_home: pointer.data_home.display().to_string(),
                 schema_version: CURRENT_SCHEMA_VERSION,
@@ -963,7 +964,7 @@ pub struct OpenDocument {
 impl OpenDocument {
     fn from_receipt(
         receipt: &xtrace_application::CommandReceipt,
-        pointer: &RepositoryPointer,
+        repo: &Path,
         database_path: &Path,
     ) -> Self {
         match receipt {
@@ -972,7 +973,7 @@ impl OpenDocument {
                     kind: "project_opened",
                     project_id: project_id.to_string(),
                     idempotency_key: idempotency_key.clone(),
-                    project_dir: pointer.data_home.display().to_string(),
+                    project_dir: repo.display().to_string(),
                     database_path: database_path.display().to_string(),
                 }
             }
@@ -999,13 +1000,13 @@ impl StatusDocument {
     fn from_report(
         report: xtrace_application::StoreStatusReport,
         schema_version: u32,
-        pointer: &RepositoryPointer,
+        repo: &Path,
         database_path: &Path,
     ) -> Self {
         Self {
             kind: "store_status",
             initialized: true,
-            project_dir: pointer.data_home.display().to_string(),
+            project_dir: repo.display().to_string(),
             database_path: database_path.display().to_string(),
             store_schema_version: schema_version,
             capabilities: report.capabilities,
@@ -1030,6 +1031,79 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use xtrace_domain::ProjectId;
+
+    fn dto_fixture_pointer() -> (RepositoryPointer, PathBuf, PathBuf) {
+        let repo = PathBuf::from("/canonical/checkout/repository");
+        let data_home = PathBuf::from("/owner-private/xtrace-data");
+        let pointer = RepositoryPointer {
+            schema_version: 1,
+            project_id: ProjectId::new(),
+            data_home: data_home.clone(),
+        };
+        (pointer, repo, data_home)
+    }
+
+    #[test]
+    fn init_document_reports_canonical_repository_and_separate_data_home() {
+        let (pointer, repo, data_home) = dto_fixture_pointer();
+        let receipt = xtrace_application::CommandReceipt::ProjectInitialized {
+            project_id: pointer.project_id,
+            fingerprint: xtrace_domain::RepositoryFingerprint::from_canonical_path(
+                repo.to_str().expect("UTF-8 fixture repo"),
+            ),
+            idempotency_key: "owner-local-key".into(),
+        };
+        let database_path = data_home.join("projects").join("metadata.sqlite3");
+        let document = InitDocument::from_receipt(&receipt, &pointer, &repo, &database_path);
+        assert_eq!(document.project_dir, repo.display().to_string());
+        assert_eq!(document.data_home, data_home.display().to_string());
+        assert_eq!(document.idempotency_key, "owner-local-key");
+    }
+
+    #[test]
+    fn open_document_reports_canonical_repository() {
+        let (pointer, repo, data_home) = dto_fixture_pointer();
+        let receipt = xtrace_application::CommandReceipt::ProjectOpened {
+            project_id: pointer.project_id,
+            idempotency_key: "owner-local-open-key".into(),
+        };
+        let database_path = data_home.join("projects").join("metadata.sqlite3");
+        let document = OpenDocument::from_receipt(&receipt, &repo, &database_path);
+        assert_eq!(document.project_dir, repo.display().to_string());
+        assert_eq!(document.database_path, database_path.display().to_string());
+    }
+
+    #[test]
+    fn initialized_status_reports_canonical_repository() {
+        let (_pointer, repo, data_home) = dto_fixture_pointer();
+        let report = xtrace_application::StoreStatusReport {
+            capabilities: xtrace_application::CapabilityReport {
+                store_schema_version: CURRENT_SCHEMA_VERSION,
+                protocol_major: 1,
+                protocol_minor: 0,
+                capture_supported: false,
+                replay_supported: false,
+            },
+            current_schema_version: CURRENT_SCHEMA_VERSION,
+            target_schema_version: CURRENT_SCHEMA_VERSION,
+            projects: Vec::new(),
+            diagnostics: std::collections::BTreeMap::new(),
+        };
+        let database_path = data_home.join("projects").join("metadata.sqlite3");
+        let document =
+            StatusDocument::from_report(report, CURRENT_SCHEMA_VERSION, &repo, &database_path);
+        assert!(document.initialized);
+        assert_eq!(document.project_dir, repo.display().to_string());
+        assert_eq!(document.database_path, database_path.display().to_string());
+    }
+
+    #[test]
+    fn absent_pointer_status_keeps_the_canonical_repository_path() {
+        let repo = Path::new("/canonical/checkout/uninitialized-repository");
+        let document = empty_status_document(repo);
+        assert!(!document.initialized);
+        assert_eq!(document.project_dir, repo.display().to_string());
+    }
 
     #[test]
     fn default_init_key_is_bounded_and_path_specific() {
