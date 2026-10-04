@@ -3478,12 +3478,12 @@ class RunnerTests(unittest.TestCase):
         real_readlink = os.readlink
 
         def scan(baseline: dict[int, tuple[int, str, str]], owned: dict[int, str],
-                 snapshot: dict[int, tuple[int, str, str]], log_path: pathlib.Path):
+                 snapshot: dict[int, tuple[int, str, str]], log_path: pathlib.Path, **kwargs: object):
             nonlocal current_log_path
             current_log_path = log_path
             if not child_pids:
                 child_pids.extend(int(value) for value in log_path.read_text().split())
-            return real_scan(baseline, owned, snapshot, log_path)
+            return real_scan(baseline, owned, snapshot, log_path, **kwargs)  # type: ignore[arg-type]
 
         def is_dir(path: pathlib.Path) -> bool:
             if path == pathlib.Path("/proc"):
@@ -3548,6 +3548,84 @@ class RunnerTests(unittest.TestCase):
                 lease_path = self.cache / "leases" / name
                 if lease_path.exists():
                     shutil.rmtree(lease_path)
+
+    def test_provenance_classified_non_descendant_is_recorded_and_does_not_block_a_run(self) -> None:
+        """Companion to the mixed-candidates test, which keeps provenance OFF (unclassifiable
+        candidates must still retain both leases). Here an uninspectable detached process is
+        positively classified, so the run passes with evidence and nothing is signaled."""
+        args = self.args()
+        args.label = "P00-classified-candidate"
+        args.command_timeout = 5
+        args.provenance = True
+        script = (
+            "import subprocess,sys,time; time.sleep(.35); "
+            "c=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); "
+            "print(c.pid,flush=True)"
+        )
+        gate = run_gates.Gate("classified-candidate", (sys.executable, "-c", script))
+        child_pids: list[int] = []
+        real_is_dir = pathlib.Path.is_dir
+
+        class StubProvenance:
+            def __init__(self, **_ignored: object) -> None:
+                self.recorded: list[dict[str, object]] = []
+
+            def start(self) -> bool:
+                return True
+
+            def note_root(self, pid: int) -> None:
+                pass
+
+            def observe(self, snapshot: object, baseline: object, owned: object) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+            def classify(self, unknowns: list, scan: object, fresh: object, owned: object, deadline: float) -> dict:
+                found = {pid: {"pid": pid, "startedAt": started, "classification": provenance.CLASS_SUBREAPER,
+                               "uidClass": "other"} for pid, started in unknowns}
+                self.recorded.extend(found.values())
+                return found
+
+            def report(self) -> dict[str, object]:
+                return {"mode": "subreaper", "available": True, "classifiedCount": len(self.recorded),
+                        "classifiedIdentities": list(self.recorded)}
+
+        def is_dir(path: pathlib.Path) -> bool:
+            # Every candidate's descriptor table is unreadable, like another user's process.
+            if path.name == "fd" and path.parent.parent == pathlib.Path("/proc"):
+                return False
+            return True if path == pathlib.Path("/proc") else real_is_dir(path)
+
+        try:
+            with mock.patch.object(run_gates, "GATES", (gate,)), \
+                    mock.patch.object(run_gates, "_track_descendants", return_value=None), \
+                    mock.patch.object(run_gates.provenance_module, "Provenance", StubProvenance), \
+                    mock.patch.object(pathlib.Path, "is_dir", is_dir):
+                code = run_gates.run(args)
+            run_dir = self.cache / "release-gates" / args.label
+            receipt = json.loads((run_dir / "receipt.json").read_text())
+            logs = list((run_dir / "logs").glob("classified-candidate.log"))
+            self.assertEqual(len(logs), 1)
+            child_pids = [int(value) for value in logs[0].read_text().split()]
+            self.assertEqual(code, 0, receipt.get("error"))
+            self.assertEqual(receipt["decision"], "checks_passed_for_review")
+            evidence = receipt["gates"][0]["provenance"]
+            self.assertEqual(evidence["classifiedCount"], 1)
+            self.assertEqual(evidence["classifiedIdentities"][0]["pid"], child_pids[0])
+            self.assertEqual(evidence["classifiedIdentities"][0]["classification"], provenance.CLASS_SUBREAPER)
+            self.assertTrue(process_running(child_pids[0]), "a classified non-descendant is never signaled")
+            self.assertFalse((self.cache / "leases/cargo").exists())
+            self.assertFalse((self.cache / "leases/gradle").exists())
+        finally:
+            for pid in child_pids:
+                if process_running(pid):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_source_change_during_gate_fails_exact_tree_receipt(self) -> None:
         gate = run_gates.Gate("mutating-gate", (sys.executable, "-c", "open('source-drift.txt','w').write('changed')"))
