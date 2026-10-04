@@ -30,6 +30,8 @@ MAX_METADATA_BYTES = 64 * 1024
 UTILITY_OUTPUT_LIMIT = 1024 * 1024
 UTILITY_CLEANUP_SECONDS = 3.0
 UTILITY_TERM_GRACE_SECONDS = 0.75
+UTILITY_KILL_SIGNAL_RESERVE_SECONDS = 0.5
+UTILITY_LEADER_REAP_RESERVE_SECONDS = 0.3
 UTILITY_FINAL_SCAN_RESERVE_SECONDS = 0.35
 CI_RECEIPT_JSON_BUDGET = 4096
 SOURCE_COMMAND_OUTPUT_LIMIT = 64 * 1024 * 1024
@@ -329,6 +331,8 @@ def _run(
                     try:
                         discovery_deadline = (
                             cleanup_deadline - UTILITY_TERM_GRACE_SECONDS
+                            - UTILITY_KILL_SIGNAL_RESERVE_SECONDS
+                            - UTILITY_LEADER_REAP_RESERVE_SECONDS
                             - UTILITY_FINAL_SCAN_RESERVE_SECONDS
                         )
                         discovery_budget = min(
@@ -352,7 +356,9 @@ def _run(
                         cleanup_ok = False
                 if group_id is not None and group_identities:
                     term_deadline = min(
-                        cleanup_deadline - UTILITY_FINAL_SCAN_RESERVE_SECONDS,
+                        cleanup_deadline - UTILITY_KILL_SIGNAL_RESERVE_SECONDS
+                        - UTILITY_LEADER_REAP_RESERVE_SECONDS
+                        - UTILITY_FINAL_SCAN_RESERVE_SECONDS,
                         time.monotonic() + UTILITY_TERM_GRACE_SECONDS,
                     )
                     term_signal_ok = _signal_utility_group_members(
@@ -373,12 +379,23 @@ def _run(
                         if not live:
                             break
                         time.sleep(min(0.025, max(0.0, term_deadline - time.monotonic())))
-                    kill_deadline = cleanup_deadline - UTILITY_FINAL_SCAN_RESERVE_SECONDS
+                    kill_deadline = (
+                        cleanup_deadline - UTILITY_LEADER_REAP_RESERVE_SECONDS
+                        - UTILITY_FINAL_SCAN_RESERVE_SECONDS
+                    )
                     if live and time.monotonic() < kill_deadline:
                         kill_ok = _signal_utility_group_members(
                             group_id, group_identities, signal.SIGKILL, deadline=kill_deadline,
                         )
                         cleanup_ok = kill_ok and cleanup_ok
+                    # Popen proves ownership of this exact direct child even
+                    # when a process-table probe cannot confirm group members.
+                    # Stop it directly, but keep descendant uncertainty fatal.
+                    try:
+                        if process.poll() is None:
+                            process.kill()
+                    except OSError:
+                        cleanup_ok = False
                     wait_deadline = cleanup_deadline - UTILITY_FINAL_SCAN_RESERVE_SECONDS
                     remaining = wait_deadline - time.monotonic()
                     if remaining <= 0:
@@ -408,7 +425,8 @@ def _run(
                     try:
                         if process.poll() is None:
                             process.kill()
-                        remaining = cleanup_deadline - time.monotonic()
+                        leader_reap_deadline = cleanup_deadline - UTILITY_FINAL_SCAN_RESERVE_SECONDS
+                        remaining = leader_reap_deadline - time.monotonic()
                         if remaining <= 0:
                             cleanup_ok = False
                         else:

@@ -641,13 +641,14 @@ class CiFloorEvidenceTests(unittest.TestCase):
                             deadline=time.monotonic() + 1.0,
                         )
 
-    def test_stalled_nested_ps_keeps_outer_utility_cleanup_deadline(self) -> None:
+    def test_stalled_nested_ps_escalates_term_ignorer_within_outer_cleanup_deadline(self) -> None:
         with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
             root = pathlib.Path(temporary)
             fake_bin = root / "bin"
             fake_bin.mkdir()
             count_file = fake_bin / "ps-count"
             child_pid_file = root / "utility-pid"
+            term_file = root / "term-observed"
             fake_ps = fake_bin / "ps"
             fake_ps.write_text(
                 f"#!{sys.executable}\n"
@@ -661,7 +662,9 @@ class CiFloorEvidenceTests(unittest.TestCase):
             )
             os.chmod(fake_ps, 0o700)
             program = (
-                "import json,os,pathlib,subprocess,sys,time; pid=os.getpid(); "
+                "import json,os,pathlib,signal,subprocess,sys,time; pid=os.getpid(); "
+                "term_file=pathlib.Path(sys.argv[2]); "
+                "signal.signal(signal.SIGTERM,lambda *_: term_file.write_text('term')); "
                 "start=' '.join(subprocess.check_output(['/bin/ps','-o','lstart=','-p',str(pid)],text=True).split()); "
                 "pathlib.Path(sys.argv[1]).write_text(json.dumps([pid,os.getpgid(pid),start])); time.sleep(30)"
             )
@@ -671,11 +674,17 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{old_path}"}), \
                         mock.patch.object(ci_floor, "UTILITY_CLEANUP_SECONDS", 0.8), \
                         mock.patch.object(ci_floor, "UTILITY_TERM_GRACE_SECONDS", 0.2), \
+                        mock.patch.object(ci_floor, "UTILITY_KILL_SIGNAL_RESERVE_SECONDS", 0.15), \
+                        mock.patch.object(ci_floor, "UTILITY_LEADER_REAP_RESERVE_SECONDS", 0.15), \
                         mock.patch.object(ci_floor, "UTILITY_FINAL_SCAN_RESERVE_SECONDS", 0.1):
                     with self.assertRaises(ci_floor.FloorInputError):
-                        ci_floor._run([sys.executable, "-c", program, str(child_pid_file)], timeout=0.2)
+                        ci_floor._run(
+                            [sys.executable, "-c", program, str(child_pid_file), str(term_file)],
+                            timeout=0.6,
+                        )
                 self.assertGreaterEqual(int(count_file.read_text(encoding="utf-8")), 3)
                 self.assertLess(time.monotonic() - started, 1.8)
+                self.assertTrue(term_file.is_file(), "the owned term-ignorer must receive TERM before KILL")
                 self.assertTrue(child_pid_file.is_file(), "utility child must publish its process identity")
                 child_pid, child_group, child_start = json.loads(child_pid_file.read_text(encoding="utf-8"))
                 snapshot = ci_floor._utility_process_snapshot()
