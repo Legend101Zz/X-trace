@@ -892,6 +892,706 @@ class LedgerTests(unittest.TestCase):
             check_ledger._verify_signature(self.root, trust, {"keyId": "reviewer", "role": "reviewer", "path": "signatures/attestation.sig", "sha256": digest(signature_bytes)}, payload + b"tampered")
 
 
+EXPECTED_UNKNOWN = run_gates.EXPECTED_UNINSPECTABLE_SCAN
+
+
+def _unknown(pid: int, start: str | None = None, reason: str = "missing-process-record-after-all-fd-fallback") -> dict[str, object]:
+    return {
+        "pid": pid, "startedAt": start or f"start-{pid}", "observedParentPid": 1,
+        "descriptorStatus": "uninspectable", "reason": reason,
+    }
+
+
+def _ident(record: dict[str, object]) -> tuple[int, str]:
+    return (record["pid"], record["startedAt"])  # type: ignore[return-value]
+
+
+def _unknown_scan(*items: dict[str, object], clean: tuple[tuple[int, str], ...] = ()) -> run_gates.UntrackedProcessScan:
+    return run_gates.UntrackedProcessScan([], list(items), EXPECTED_UNKNOWN, len(items), [], frozenset(clean))
+
+
+def _quiet_scan(clean: tuple[tuple[int, str], ...] = ()) -> run_gates.UntrackedProcessScan:
+    return run_gates.UntrackedProcessScan([], [], None, 0, [], frozenset(clean))
+
+
+def _live(*items: dict[str, object]) -> dict[int, tuple[int, str, str]]:
+    return {item["pid"]: (1, item["startedAt"], "S") for item in items}  # type: ignore[misc]
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class Script:
+    """Scripted (snapshot, scan) results; the last step repeats. Each call
+    advances the fake clock a little so nothing can spin without time passing."""
+
+    def __init__(self, clock: FakeClock, steps: list[tuple[dict[int, tuple[int, str, str]], run_gates.UntrackedProcessScan]]) -> None:
+        self.clock = clock
+        self.steps = steps
+        self.calls = 0
+
+    def __call__(self, _deadline: float) -> tuple[dict[int, tuple[int, str, str]], run_gates.UntrackedProcessScan]:
+        step = self.steps[min(self.calls, len(self.steps) - 1)]
+        self.calls += 1
+        self.clock.now += 0.01
+        return step
+
+
+class SettleAndGlobalQuiescenceTests(unittest.TestCase):
+    """Pure-logic coverage of settling, global quiescence and bounded evidence."""
+
+    def settle(self, initial, script, clock, **kwargs):  # type: ignore[no-untyped-def]
+        return run_gates._settle_uninspectable_candidates(
+            initial, script, duration=kwargs.pop("duration", 4), interval=1,
+            monotonic=clock.monotonic, sleep=clock.sleep, **kwargs,
+        )
+
+    def global_scan(self, script, clock, *, deadline=10.0, owned=lambda _s: [], **kwargs):  # type: ignore[no-untyped-def]
+        return run_gates._final_global_quiescence_scan(
+            deadline, script, owned, monotonic=clock.monotonic, sleep=clock.sleep, **kwargs,
+        )
+
+    # Rule 1: initial PID+start identity must exit or be positively classified.
+    def test_later_clean_scan_alone_never_clears_live_initial_identity(self) -> None:
+        clock = FakeClock()
+        initial = _unknown(4242)
+        script = Script(clock, [(_live(initial), _quiet_scan())])
+        result = self.settle([initial], script, clock, duration=3)
+        self.assertFalse(result.cleared)
+        self.assertEqual(result.last_error, "initial uninspectable process identity survived settling deadline")
+
+    def test_positive_classification_clears_live_initial_identity(self) -> None:
+        clock = FakeClock()
+        initial = _unknown(4242)
+        script = Script(clock, [(_live(initial), _quiet_scan(clean=(_ident(initial),)))])
+        result = self.settle([initial], script, clock)
+        self.assertTrue(result.cleared)
+        self.assertEqual(result.poll_count, 1)
+
+    def test_positive_classification_of_a_different_identity_does_not_clear_initial(self) -> None:
+        clock = FakeClock()
+        initial = _unknown(4242)
+        other = _unknown(4243)
+        script = Script(clock, [(_live(initial, other), _quiet_scan(clean=(_ident(other),)))])
+        self.assertFalse(self.settle([initial], script, clock, duration=3).cleared)
+
+    def test_pid_reuse_with_new_start_does_not_keep_initial_identity_alive(self) -> None:
+        clock = FakeClock()
+        initial = _unknown(4242, "old-start")
+        reused = _unknown(4242, "new-start")
+        script = Script(clock, [(_live(reused), _unknown_scan(reused))])
+        result = self.settle([initial], script, clock)
+        self.assertTrue(result.cleared, "the exact initial identity exited; the reuse is later churn")
+        self.assertEqual({_ident(item) for item in result.identity_union}, {_ident(initial), _ident(reused)})
+
+    def test_settle_clears_on_initial_exit_and_keeps_later_unknown_in_union(self) -> None:
+        clock = FakeClock()
+        initial, late = _unknown(4242), _unknown(9001)
+        script = Script(clock, [(_live(late), _unknown_scan(late))])
+        result = self.settle([initial], script, clock)
+        self.assertTrue(result.cleared)
+        self.assertEqual(result.identity_union_count, 2)
+        self.assertFalse(result.identity_union_truncated)
+
+    def test_settle_fails_closed_for_every_unsafe_scan_shape(self) -> None:
+        initial = _unknown(4242)
+        held = {"pid": 9, "startedAt": "held-start", "descriptorStatus": "held", "reason": "private-log-descriptor-observed"}
+        cases = {
+            "coverage is incomplete": (_live(initial), run_gates.UntrackedProcessScan([], [initial], EXPECTED_UNKNOWN, 2), None),
+            "held descriptor": (_live(initial), run_gates.UntrackedProcessScan([held], [initial], EXPECTED_UNKNOWN, 2), None),
+            "owned probe": (_live(initial), run_gates.UntrackedProcessScan([], [initial], EXPECTED_UNKNOWN, 1, [{"pid": 8}]), None),
+            "inconsistent": (_live(initial), run_gates.UntrackedProcessScan([], [initial], None, 1), None),
+            "inconsistent ": (_live(initial), run_gates.UntrackedProcessScan([], [], EXPECTED_UNKNOWN, 0), None),
+            "malformed": (_live(initial), run_gates.UntrackedProcessScan([], [{"pid": "x", "startedAt": "s", "descriptorStatus": "uninspectable"}], EXPECTED_UNKNOWN, 1), None),
+            "scanner unavailable": ({}, run_gates.UntrackedProcessScan([], [], "scanner unavailable", 0), None),
+            "owned process appeared": ({}, _quiet_scan(), lambda _snapshot: [77]),
+        }
+        for expected, (snapshot, scan, owned) in cases.items():
+            with self.subTest(expected):
+                clock = FakeClock()
+                result = self.settle([initial], Script(clock, [(snapshot, scan)]), clock, owned_alive=owned)
+                self.assertFalse(result.cleared)
+                self.assertIn(expected.strip(), result.last_error or "")
+
+    def test_settle_rejects_missing_or_malformed_initial_identity(self) -> None:
+        for initial in ([], [{"pid": True, "startedAt": "s", "descriptorStatus": "uninspectable"}],
+                        [{"pid": 5, "startedAt": "", "descriptorStatus": "uninspectable"}], [_unknown(5), _unknown(5)]):
+            with self.subTest(initial=initial):
+                clock = FakeClock()
+                result = self.settle(initial, Script(clock, [({}, _quiet_scan())]), clock)
+                self.assertFalse(result.cleared)
+                self.assertEqual(result.poll_count, 0)
+
+    # Rule 2: production candidates originate in the supplied snapshot only.
+    def test_untracked_scan_candidates_originate_only_in_supplied_snapshot(self) -> None:
+        start = "Sun Oct  4 21:00:00 2026"
+        supplied = {7001: (1, start, "S")}
+        clean_pids: set[int] = set()
+
+        def fake_lsof(arguments: list[str], _deadline: float) -> run_gates.LsofProbe:
+            pids = [int(item) for item in arguments[-1].split(",")]
+            body = "".join(f"p{pid}\nf1\nn/dev/null\n" for pid in pids if pid in clean_pids)
+            return run_gates.LsofProbe(0, body, "")
+
+        real_is_dir = pathlib.Path.is_dir
+
+        def fake_is_dir(path: pathlib.Path) -> bool:
+            return False if str(path) == "/proc" else real_is_dir(path)
+
+        def scan(baseline: dict, snapshot: dict, recheck: dict, owned: dict | None = None) -> run_gates.UntrackedProcessScan:
+            with mock.patch.object(run_gates, "LSOF_BINARY", "/test/lsof"), \
+                    mock.patch.object(run_gates, "_run_lsof_fields", side_effect=fake_lsof) as lsof, \
+                    mock.patch.object(pathlib.Path, "is_dir", fake_is_dir), \
+                    mock.patch.object(run_gates, "_process_snapshot", return_value=recheck):
+                result = run_gates._untracked_processes_since(baseline, owned or {}, snapshot, pathlib.Path("/nonexistent/gate.log"))
+                del lsof
+                return result
+
+        # An identity that exists only in a re-snapshot is never invented.
+        result = scan({}, {}, {7001: (1, start, "S")})
+        self.assertEqual((result.candidate_count, result.uninspectable, result.error), (0, [], None))
+        # A supplied-snapshot candidate with no descriptor record is the exact unknown identity.
+        result = scan({}, supplied, supplied)
+        self.assertEqual([_ident(item) for item in result.uninspectable], [(7001, start)])
+        self.assertEqual(result.error, EXPECTED_UNKNOWN)
+        self.assertEqual(result.clean_identities, frozenset())
+        # The re-check may remove a candidate (natural exit) but never adds one.
+        result = scan({}, supplied, {})
+        self.assertEqual((result.candidate_count, result.uninspectable), (0, []))
+        result = scan({}, supplied, {7001: (1, "reused-start", "S"), 7002: (1, start, "S")})
+        self.assertEqual((result.candidate_count, result.uninspectable), (0, []))
+        # Zombie or exited states are not live candidates.
+        result = scan({}, {7001: (1, start, "Z")}, {})
+        self.assertEqual(result.candidate_count, 0)
+        # A candidate with a positive descriptor record is positively classified.
+        clean_pids.add(7001)
+        result = scan({}, supplied, supplied)
+        self.assertEqual((result.uninspectable, result.error), ([], None))
+        self.assertEqual(result.clean_identities, frozenset({(7001, start)}))
+        # Baseline and owned identities are not candidates.
+        result = scan({7001: (1, start, "S")}, supplied, supplied)
+        self.assertEqual(result.candidate_count, 0)
+        result = scan({}, supplied, supplied, {7001: start})
+        self.assertEqual(result.candidate_count, 0)
+
+    # Rule 4: bounded union.
+    def test_union_bounds_hostile_input_before_processing(self) -> None:
+        touched = [0]
+
+        class Counting(dict):
+            def get(self, *args: object) -> object:
+                touched[0] += 1
+                return super().get(*args)
+
+        records = [
+            Counting(pid=index + 1, startedAt=f"s{index}", descriptorStatus="uninspectable", reason="r" * 10_000)
+            for index in range(100_000)
+        ]
+        union = run_gates.UnconfirmedIdentityUnion()
+        error = union.add(records)
+        self.assertIsNotNone(error)
+        self.assertLessEqual(touched[0], run_gates.MAX_UNION_INPUT_RECORDS * 6, "input is bounded before processing")
+        self.assertEqual(len(union.sample), run_gates.MAX_UNCONFIRMED_SAMPLE)
+        self.assertEqual(union.count, 100_000, "total stays truthful even when input is refused")
+        self.assertTrue(union.truncated)
+        self.assertTrue(all(len(item["reason"]) <= run_gates.MAX_REASON_CHARS for item in union.sample))
+        self.assertLess(len(json.dumps(union.sample)), 64 * 1024)
+
+    def test_union_malformed_records_never_serialize_or_store_raw_values(self) -> None:
+        union = run_gates.UnconfirmedIdentityUnion()
+        huge = "x" * 5_000_000
+        junk = [
+            "not-a-record", 7, None, {"pid": True, "startedAt": "s", "descriptorStatus": "uninspectable"},
+            {"pid": -1, "startedAt": "s", "descriptorStatus": "uninspectable"},
+            {"pid": 5, "startedAt": huge, "descriptorStatus": "uninspectable", "reason": huge},
+            {"pid": 6, "startedAt": "s", "descriptorStatus": "weird", "reason": 12},
+        ]
+        error = union.add(junk)
+        self.assertIn("malformed", error or "")
+        self.assertLess(len(json.dumps(union.sample)), 4096)
+        self.assertTrue(all(
+            len(value) <= run_gates.MAX_REASON_CHARS for item in union.sample for value in item.values() if isinstance(value, str)
+        ))
+        self.assertLessEqual(union.count, len(junk))
+        self.assertIsNotNone(run_gates.UnconfirmedIdentityUnion().add("not-a-list"))
+
+    def test_union_dedups_exact_identity_and_flags_dedup_overflow(self) -> None:
+        union = run_gates.UnconfirmedIdentityUnion()
+        self.assertIsNone(union.add([_unknown(5), _unknown(5)]))
+        self.assertIsNone(union.add([_unknown(5)]))
+        self.assertEqual((union.count, len(union.sample), union.truncated), (1, 1, False))
+        self.assertIsNone(union.add([_unknown(5, "other-start")]))
+        self.assertEqual(union.count, 2)
+        full = run_gates.UnconfirmedIdentityUnion()
+        for chunk in range(0, run_gates.MAX_UNION_KEYS + 10, 50):
+            error = full.add([_unknown(pid) for pid in range(chunk + 1, chunk + 51)])
+        self.assertIn("exceeded", error or "")
+        self.assertTrue(full.truncated)
+        self.assertGreaterEqual(full.count, run_gates.MAX_UNION_KEYS)
+
+    def test_bounded_unconfirmed_reports_truthful_total_and_truncation(self) -> None:
+        sample, count, truncated = run_gates._bounded_unconfirmed([_unknown(pid) for pid in range(1, 71)])
+        self.assertEqual((len(sample), count, truncated), (64, 70, True))
+        sample, count, truncated = run_gates._bounded_unconfirmed([_unknown(1)])
+        self.assertEqual((len(sample), count, truncated), (1, 1, False))
+
+    # Global quiescence: the c8e549d churn scenario and its fail-closed variants.
+    def test_new_unknown_in_first_global_rescan_then_natural_exit_needs_two_quiet_scans(self) -> None:
+        clock = FakeClock()
+        new = _unknown(9002)
+        script = Script(clock, [(_live(new), _unknown_scan(new)), ({}, _quiet_scan()), ({}, _quiet_scan())])
+        union = run_gates.UnconfirmedIdentityUnion()
+        cleared, latest, error, count = self.global_scan(script, clock, identity_union=union)
+        self.assertTrue(cleared, error)
+        self.assertEqual(count, 3, "one churn scan plus two subsequent full quiet scans")
+        self.assertEqual(latest, [])
+        self.assertEqual([_ident(item) for item in union.sample], [_ident(new)])
+        self.assertLess(clock.now, 10.0, "same absolute budget")
+
+    def test_new_unknown_after_first_quiet_scan_restarts_the_quiet_count(self) -> None:
+        clock = FakeClock()
+        first, second = _unknown(9002), _unknown(9003)
+        script = Script(clock, [
+            (_live(first), _unknown_scan(first)), ({}, _quiet_scan()),
+            (_live(second), _unknown_scan(second)), ({}, _quiet_scan()), ({}, _quiet_scan()),
+        ])
+        cleared, _latest, error, count = self.global_scan(script, clock)
+        self.assertTrue(cleared, error)
+        self.assertEqual(count, 5)
+
+    def test_unknown_that_stays_live_fails_closed_at_the_original_deadline(self) -> None:
+        clock = FakeClock()
+        stuck = _unknown(9002)
+        script = Script(clock, [(_live(stuck), _unknown_scan(stuck))])
+        union = run_gates.UnconfirmedIdentityUnion()
+        cleared, latest, error, count = self.global_scan(script, clock, deadline=5.0, identity_union=union)
+        self.assertFalse(cleared)
+        self.assertIn("unresolved", error or "")
+        self.assertEqual(latest, [stuck])
+        self.assertGreater(count, 2)
+        self.assertEqual(union.count, 1, "the same identity is deduplicated")
+        self.assertGreaterEqual(clock.now, 4.9)
+        self.assertLessEqual(clock.now, 5.1, "the deadline is not extended")
+
+    def test_global_pending_identity_must_exit_or_be_positively_classified(self) -> None:
+        stuck = _unknown(9002)
+        # Live and merely absent from the unknown list is not enough.
+        clock = FakeClock()
+        script = Script(clock, [(_live(stuck), _quiet_scan())])
+        cleared, _l, error, _c = self.global_scan(script, clock, deadline=4.0, pending_identities={_ident(stuck)})
+        self.assertFalse(cleared)
+        self.assertIn("unresolved", error or "")
+        # Positive classification resolves it.
+        clock = FakeClock()
+        script = Script(clock, [(_live(stuck), _quiet_scan(clean=(_ident(stuck),)))])
+        cleared, _l, error, count = self.global_scan(script, clock, pending_identities={_ident(stuck)})
+        self.assertTrue(cleared, error)
+        self.assertEqual(count, 2)
+        # An unknown that becomes positively classified later also resolves.
+        clock = FakeClock()
+        script = Script(clock, [(_live(stuck), _unknown_scan(stuck)), (_live(stuck), _quiet_scan(clean=(_ident(stuck),)))])
+        cleared, _l, error, count = self.global_scan(script, clock)
+        self.assertTrue(cleared, error)
+        self.assertEqual(count, 3)
+
+    def test_global_fails_closed_for_every_unsafe_scan_shape(self) -> None:
+        stuck = _unknown(9002)
+        held = {"pid": 9, "startedAt": "held-start", "descriptorStatus": "held", "reason": "private-log-descriptor-observed"}
+        cases = {
+            "live unconfirmed candidate": run_gates.UntrackedProcessScan([held], [], None, 1),
+            "live unconfirmed candidate ": run_gates.UntrackedProcessScan([], [], None, 0, [{"pid": 8}]),
+            "coverage is incomplete": run_gates.UntrackedProcessScan([], [stuck], EXPECTED_UNKNOWN, 3),
+            "late scanner error": run_gates.UntrackedProcessScan([], [], "late scanner error", 0),
+            "inconsistent": run_gates.UntrackedProcessScan([], [stuck], None, 1),
+            "malformed": run_gates.UntrackedProcessScan([], [{"pid": 0, "startedAt": "s", "descriptorStatus": "uninspectable"}], EXPECTED_UNKNOWN, 1),
+        }
+        for expected, scan in cases.items():
+            with self.subTest(expected):
+                clock = FakeClock()
+                cleared, _latest, error, count = self.global_scan(Script(clock, [(_live(stuck), scan)]), clock)
+                self.assertFalse(cleared)
+                self.assertIn(expected.strip(), error or "")
+                self.assertEqual(count, 1)
+        clock = FakeClock()
+        cleared, _latest, error, _count = self.global_scan(
+            Script(clock, [({}, _quiet_scan())]), clock, owned=lambda _snapshot: [733],
+        )
+        self.assertFalse(cleared)
+        self.assertIn("owned process", error or "")
+
+    def test_global_union_overflow_across_churn_fails_closed(self) -> None:
+        clock = FakeClock()
+        steps = []
+        for pid in range(1, 80):
+            item = _unknown(pid)
+            steps.append((_live(item), _unknown_scan(item)))
+        union = run_gates.UnconfirmedIdentityUnion()
+        cleared, _latest, error, _count = self.global_scan(Script(clock, steps), clock, deadline=1000.0, identity_union=union)
+        self.assertFalse(cleared)
+        self.assertIn("exceeded", error or "")
+        self.assertTrue(union.truncated)
+        self.assertEqual(len(union.sample), run_gates.MAX_UNCONFIRMED_SAMPLE)
+
+    def test_global_and_settle_iteration_are_bounded_even_without_time_passing(self) -> None:
+        stuck = _unknown(9002)
+        calls = [0]
+
+        def frozen(_deadline: float) -> tuple[dict[int, tuple[int, str, str]], run_gates.UntrackedProcessScan]:
+            calls[0] += 1
+            return _live(stuck), _unknown_scan(stuck)
+
+        with mock.patch.object(run_gates, "MAX_SETTLE_ITERATIONS", 5):
+            cleared, _l, error, count = run_gates._final_global_quiescence_scan(
+                100.0, frozen, lambda _s: [], monotonic=lambda: 0.0, sleep=lambda _s: None,
+            )
+            self.assertFalse(cleared)
+            self.assertIn("iteration limit", error or "")
+            self.assertEqual(count, 5)
+            result = run_gates._settle_uninspectable_candidates(
+                [stuck], frozen, duration=100, monotonic=lambda: 0.0, sleep=lambda _s: None,
+            )
+            self.assertFalse(result.cleared)
+            self.assertEqual(result.poll_count, 5)
+
+    def test_eligibility_requires_complete_well_formed_expected_unknowns(self) -> None:
+        good = _unknown(5)
+        self.assertTrue(run_gates._natural_exit_settle_eligible(
+            _unknown_scan(good), tree_confirmed_drained=True, log_io_failed=False,
+        ))
+        for scan in (
+            run_gates.UntrackedProcessScan([], [good], EXPECTED_UNKNOWN, 2),
+            _unknown_scan({"pid": "5", "startedAt": "s", "descriptorStatus": "uninspectable"}),
+            _unknown_scan({"pid": 5, "startedAt": "s" * 500, "descriptorStatus": "uninspectable"}),
+            _unknown_scan("not-a-dict"),  # type: ignore[arg-type]
+        ):
+            self.assertFalse(run_gates._natural_exit_settle_eligible(
+                scan, tree_confirmed_drained=True, log_io_failed=False,
+            ))
+
+    # Rule 3: probe and cleanup-exception evidence.
+    def test_probe_evidence_records_exceptions_and_probes_before_absorption(self) -> None:
+        evidence = run_gates.ProbeEvidence()
+        evidence.add_exception(run_gates.UncertainProbeCleanup({"pid": 11, "startedAt": "p-start", "processGroupId": 11}))
+        evidence.add_exception(run_gates.InterruptedProbeCleanup({"pid": 12, "startedAt": None, "processGroupId": 12}))
+        evidence.add_exception(RuntimeError("unrelated"))
+        evidence.add_probes([{"pid": 11, "startedAt": "p-start", "processGroupId": 11}])
+        fields = evidence.report_fields()
+        self.assertEqual([item["pid"] for item in fields["ownedProbeProcesses"]], [11, 12])
+        self.assertEqual(fields["ownedProbeProcessCount"], 2, "duplicate probe identity is deduplicated")
+        self.assertEqual([item["type"] for item in fields["cleanupExceptions"]], ["UncertainProbeCleanup", "InterruptedProbeCleanup"])
+        self.assertEqual(fields["cleanupExceptionCount"], 2)
+        self.assertFalse(fields["probeEvidenceTruncated"])
+        self.assertFalse(evidence.empty)
+
+    def test_probe_evidence_is_bounded_for_hostile_records(self) -> None:
+        evidence = run_gates.ProbeEvidence()
+        evidence.add_probes([{"pid": index + 1, "startedAt": "s", "reason": "r" * 100_000} for index in range(5000)])
+        evidence.add_probes("garbage")
+        for _ in range(500):
+            evidence.add_exception(run_gates.UncertainProbeCleanup({"pid": 1}))
+        fields = evidence.report_fields()
+        self.assertLessEqual(len(fields["ownedProbeProcesses"]), run_gates.MAX_PROBE_RECORDS)
+        self.assertLessEqual(len(fields["cleanupExceptions"]), run_gates.MAX_CLEANUP_EXCEPTION_RECORDS)
+        self.assertEqual(fields["cleanupExceptionCount"], 500)
+        self.assertGreater(fields["ownedProbeProcessCount"], run_gates.MAX_PROBE_RECORDS)
+        self.assertTrue(fields["probeEvidenceTruncated"])
+        self.assertLess(len(json.dumps(fields)), 64 * 1024)
+
+    # Rule 6 and the owner record limit.
+    def retain(self, **kwargs: object) -> dict[str, object]:
+        lease = run_gates.Lease(pathlib.Path("/nonexistent/lease"), "test-token-value", "label")
+        lease.acquired = True
+        written: dict[str, object] = {}
+        base = {"pid": 1, "label": "label", "token": "test-token-value", "startedAtEpoch": 1}
+        with mock.patch.object(private_roots, "admit_directory"), \
+                mock.patch.object(private_roots, "read_private_json", return_value=dict(base)), \
+                mock.patch.object(run_gates, "_atomic_json", side_effect=lambda _path, value: written.update(value)):
+            lease.retain_for_manual_recovery("reason", 5, kwargs.pop("owned", {}), **kwargs)  # type: ignore[arg-type]
+        return written
+
+    def test_retention_uses_the_explicit_truncation_flag(self) -> None:
+        sample = [_unknown(pid) for pid in range(1, 5)]
+        owner = self.retain(unconfirmed_processes=sample, unconfirmed_process_count=4, unconfirmed_processes_truncated=True)
+        self.assertIs(owner["unconfirmedProcessesTruncated"], True, "explicit flag wins over count == len(sample)")
+        owner = self.retain(unconfirmed_processes=sample, unconfirmed_process_count=4, unconfirmed_processes_truncated=False)
+        self.assertIs(owner["unconfirmedProcessesTruncated"], False)
+        owner = self.retain(unconfirmed_processes=sample, unconfirmed_process_count=70, unconfirmed_processes_truncated=False)
+        self.assertIs(owner["unconfirmedProcessesTruncated"], True, "a count above the sample is always truncation")
+        # Older positional callers keep working and infer the flag.
+        lease = run_gates.Lease(pathlib.Path("/nonexistent/lease"), "t", "label")
+        lease.acquired = True
+        written: dict[str, object] = {}
+        with mock.patch.object(private_roots, "admit_directory"), \
+                mock.patch.object(private_roots, "read_private_json", return_value={}), \
+                mock.patch.object(run_gates, "_atomic_json", side_effect=lambda _path, value: written.update(value)):
+            lease.retain_for_manual_recovery("reason", 5, {}, sample, 4, [])
+        self.assertIs(written["unconfirmedProcessesTruncated"], False)
+
+    def test_retention_keeps_probe_and_cleanup_evidence_and_fits_owner_limits(self) -> None:
+        owner = self.retain(
+            unconfirmed_processes=[_unknown(pid) for pid in range(1, 65)], unconfirmed_process_count=64,
+            owned_probe_processes=[{"pid": 11, "startedAt": "p", "processGroupId": 11, "reason": "probe"}],
+            owned_probe_process_count=1,
+            cleanup_exceptions=[{"type": "UncertainProbeCleanup"}, {"type": "UncertainProbeCleanup"}, {"type": "InterruptedProbeCleanup"}],
+            cleanup_exception_count=3, probe_evidence_truncated=False,
+        )
+        self.assertEqual(owner["ownedProbeProcesses"][0]["pid"], 11)  # type: ignore[index]
+        self.assertEqual(owner["cleanupExceptions"], {"UncertainProbeCleanup": 2, "InterruptedProbeCleanup": 1})
+        self.assertEqual(owner["cleanupExceptionCount"], 3)
+        self.assertEqual(len(owner["unconfirmedProcesses"]), 64)  # type: ignore[arg-type]
+        self.assertIs(owner["unconfirmedProcessesTruncated"], False)
+        data = (json.dumps(owner, indent=2, sort_keys=True) + "\n").encode()
+        self.assertTrue(private_roots.private_json_fits_read_limits(data))
+
+    def test_retention_trims_oversized_evidence_with_truthful_flags(self) -> None:
+        owner = self.retain(
+            owned={pid: f"start-{pid}" for pid in range(1, 400)},
+            unconfirmed_processes=[_unknown(pid) for pid in range(1, 65)], unconfirmed_process_count=64,
+            owned_probe_processes=[{"pid": pid, "startedAt": "p", "processGroupId": pid, "reason": "probe"} for pid in range(1, 65)],
+            owned_probe_process_count=64,
+        )
+        data = (json.dumps(owner, indent=2, sort_keys=True) + "\n").encode()
+        self.assertTrue(private_roots.private_json_fits_read_limits(data))
+        self.assertIs(owner["probeEvidenceTruncated"], True)
+        self.assertIs(owner["ownedProcessesTruncated"], True)
+        self.assertEqual(owner["ownedProbeProcessCount"], 64, "the truthful total is preserved")
+        self.assertTrue(owner["token"] == "test-token-value" and owner["requiresManualRecovery"])
+
+    def test_private_json_limits_reject_what_read_private_json_rejects(self) -> None:
+        self.assertTrue(private_roots.private_json_fits_read_limits(b'{"a": [1, 2, 3]}'))
+        self.assertFalse(private_roots.private_json_fits_read_limits(json.dumps({"a": list(range(300))}).encode()))
+        self.assertFalse(private_roots.private_json_fits_read_limits(b"x" * 70_000))
+        self.assertFalse(private_roots.private_json_fits_read_limits(b'{"a": NaN}'))
+
+    def test_retain_uncertain_leases_forwards_every_evidence_field(self) -> None:
+        error = run_gates.UncertainProcessTree("uncertain", 77)
+        error.owned_processes = {5: "s"}
+        error.unconfirmed_processes = [_unknown(5)]
+        error.unconfirmed_process_count = 70
+        error.unconfirmed_processes_truncated = True
+        error.owned_probe_processes = [{"pid": 11}]
+        error.owned_probe_process_count = 1
+        error.cleanup_exceptions = [{"type": "UncertainProbeCleanup"}]
+        error.cleanup_exception_count = 1
+        error.probe_evidence_truncated = False
+        seen: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        class SpyLease:
+            def __init__(self, label: str, fail: bool = False) -> None:
+                self.label = label
+                self.fail = fail
+
+            def retain_for_manual_recovery(self, *args: object, **kwargs: object) -> None:
+                seen.append((args, kwargs))
+                if self.fail:
+                    raise RuntimeError("owner record unavailable")
+
+        failed = run_gates._retain_uncertain_leases([SpyLease("cargo"), SpyLease("gradle", fail=True)], error)  # type: ignore[arg-type]
+        self.assertEqual(failed, ["gradle"])
+        self.assertEqual(len(seen), 2)
+        for args, kwargs in seen:
+            self.assertEqual(args[:3], ("uncertain", 77, {5: "s"}))
+            self.assertEqual(args[4], 70)
+            self.assertIs(kwargs["unconfirmed_processes_truncated"], True)
+            self.assertEqual(kwargs["cleanup_exception_count"], 1)
+            self.assertEqual(kwargs["owned_probe_process_count"], 1)
+            self.assertEqual(kwargs["cleanup_exceptions"], [{"type": "UncertainProbeCleanup"}])
+            self.assertIs(kwargs["probe_evidence_truncated"], False)
+
+
+class RunOwnershipWorldTests(unittest.TestCase):
+    """Drive `_run` end to end against a scripted process world.
+
+    Everything the scanner sees is synthetic and uses the real production
+    scanner: candidates come from the supplied snapshot, descriptor lookups come
+    from a scripted lsof, and every scan step reads the next world.
+    """
+
+    ROOT = 4321
+    ROOT_START = "root-start"
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(dir=test_scratch_root())
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+
+    def world(self, *unknown: dict[str, object], clean: tuple[dict[str, object], ...] = (), raise_exc: BaseException | None = None,
+              owned_probe: dict[str, object] | None = None) -> tuple[dict[int, tuple[int, str, str]], set[int], BaseException | None, dict[str, object] | None]:
+        snapshot = {self.ROOT: (1, self.ROOT_START, "Z")}
+        snapshot.update(_live(*unknown, *clean))
+        return snapshot, {item["pid"] for item in clean}, raise_exc, owned_probe  # type: ignore[arg-type, misc]
+
+    def drive(self, worlds: list, *, settle_seconds: float | None = None) -> tuple[dict[str, object], run_gates.UncertainProcessTree | None, tuple[int, float] | None]:
+        state = {"calls": 0, "scan": 0, "world": worlds[0]}
+
+        def fake_snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, str, str]]:
+            del timeout
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return {}
+            if state["calls"] <= 3:
+                return {self.ROOT: (1, self.ROOT_START, "S")}
+            return dict(state["world"][0])  # type: ignore[index]
+
+        real_bounded = run_gates._bounded_ownership_scan
+
+        def counting_bounded(*args: object, **kwargs: object) -> object:
+            state["scan"] += 1
+            state["world"] = worlds[min(state["scan"], len(worlds) - 1)]
+            return real_bounded(*args, **kwargs)  # type: ignore[arg-type]
+
+        def fake_lsof(arguments: list[str], _deadline: float) -> run_gates.LsofProbe:
+            _snapshot, clean, raise_exc, owned_probe = state["world"]  # type: ignore[misc]
+            if raise_exc is not None:
+                raise raise_exc
+            pids = [int(item) for item in arguments[-1].split(",")]
+            body = "".join(f"p{pid}\nf1\nn/dev/null\n" for pid in pids if pid in clean)
+            return run_gates.LsofProbe(0, body, "", None, owned_probe)
+
+        real_is_dir = pathlib.Path.is_dir
+        real_settle = run_gates._settle_uninspectable_candidates
+        process = mock.Mock(pid=self.ROOT, returncode=0)
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+
+        def settle(*args: object, **kwargs: object) -> object:
+            if settle_seconds is not None:
+                kwargs["duration"] = settle_seconds
+            return real_settle(*args, **kwargs)  # type: ignore[arg-type]
+
+        report: dict[str, object] = {}
+        result: tuple[int, float] | None = None
+        failure: run_gates.UncertainProcessTree | None = None
+        with mock.patch.object(run_gates, "_process_snapshot", side_effect=fake_snapshot), \
+                mock.patch.object(run_gates.subprocess, "Popen", return_value=process), \
+                mock.patch.object(run_gates, "_bounded_ownership_scan", side_effect=counting_bounded), \
+                mock.patch.object(run_gates, "_run_lsof_fields", side_effect=fake_lsof), \
+                mock.patch.object(run_gates, "LSOF_BINARY", "/test/lsof"), \
+                mock.patch.object(pathlib.Path, "is_dir", lambda path: False if str(path) == "/proc" else real_is_dir(path)), \
+                mock.patch.object(run_gates, "_settle_uninspectable_candidates", side_effect=settle), \
+                mock.patch.object(private_roots, "create_private_file", side_effect=lambda path, flags, mode: os.open(path, flags, mode)):
+            try:
+                result = run_gates._run(
+                    ["gate"], cwd=self.root, env={}, timeout=30,
+                    log_path=self.root / f"gate-{id(worlds)}.log", settle_report=report,
+                )
+            except run_gates.UncertainProcessTree as exc:
+                failure = exc
+        return report, failure, result
+
+    def test_new_unknown_in_first_global_rescan_then_natural_exit_succeeds_with_complete_elapsed_time(self) -> None:
+        initial, new = _unknown(9001), _unknown(9002)
+        report, failure, result = self.drive([
+            self.world(initial),   # post-command scan: initial identity unknown
+            self.world(),          # settle poll: initial identity exited
+            self.world(new),       # first global rescan: a NEW unknown identity appears
+            self.world(),          # it exited naturally
+            self.world(),          # quiet scan 1
+            self.world(),          # quiet scan 2 (repeats)
+        ])
+        self.assertIsNone(failure, str(failure))
+        self.assertIsNotNone(result)
+        self.assertIs(report["settled"], True)
+        self.assertEqual(report["pollCount"], 1)
+        self.assertEqual(report["globalRescanCount"], 3, "one churn scan then two full quiet scans")
+        self.assertEqual(report["identityUnionCount"], 2)
+        self.assertIs(report["identityUnionTruncated"], False)
+        self.assertIsNone(report["error"])
+        self.assertGreaterEqual(report["waitSeconds"], 3.0, "elapsed time includes global settling")  # type: ignore[operator]
+        self.assertGreater(report["waitSeconds"], report["initialSettleSeconds"])  # type: ignore[operator]
+        self.assertLessEqual(report["waitSeconds"] + report["deadlineRemainingSeconds"], run_gates.NATURAL_EXIT_SETTLE_SECONDS + 0.5)  # type: ignore[operator]
+        self.assertEqual(report["ownedProbeProcessCount"], 0)
+
+    def test_new_unknown_that_stays_live_fails_closed_without_resetting_the_deadline(self) -> None:
+        initial, stuck = _unknown(9001), _unknown(9002)
+        report, failure, result = self.drive([
+            self.world(initial), self.world(), self.world(stuck),
+        ], settle_seconds=4.0)
+        self.assertIsNone(result)
+        self.assertIsNotNone(failure)
+        self.assertIn("clean global ownership rescan", str(failure))
+        self.assertIs(report["settled"], False)
+        self.assertIn("unresolved", str(report["error"]))
+        self.assertLessEqual(report["deadlineRemainingSeconds"], 0.01)  # type: ignore[operator]
+        self.assertGreaterEqual(report["waitSeconds"], 3.9)  # type: ignore[operator]
+        self.assertLessEqual(report["waitSeconds"], 5.0)  # type: ignore[operator]
+        self.assertGreater(report["waitSeconds"], report["initialSettleSeconds"] + 1.0)  # type: ignore[operator]
+        assert failure is not None
+        self.assertEqual({_ident(item) for item in failure.unconfirmed_processes}, {_ident(initial), _ident(stuck)})
+        self.assertEqual(failure.unconfirmed_process_count, 2)
+        self.assertFalse(failure.unconfirmed_processes_truncated)
+
+    def test_initial_identity_that_stays_live_is_never_cleared_by_a_later_scan(self) -> None:
+        initial = _unknown(9001)
+        report, failure, _result = self.drive([self.world(initial), self.world(initial)], settle_seconds=3.0)
+        self.assertIsNotNone(failure)
+        self.assertIn("could not be cleared", str(failure))
+        self.assertEqual(report["globalRescanCount"], 0)
+        assert failure is not None
+        self.assertEqual([_ident(item) for item in failure.unconfirmed_processes], [_ident(initial)])
+
+    def test_initial_identity_positively_classified_by_the_scanner_is_cleared(self) -> None:
+        initial = _unknown(9001)
+        report, failure, result = self.drive([
+            self.world(initial), self.world(clean=(initial,)), self.world(),
+        ])
+        self.assertIsNone(failure, str(failure))
+        self.assertIsNotNone(result)
+        self.assertIs(report["settled"], True)
+
+    def test_cleanup_exceptions_and_probe_identities_reach_receipt_and_owner_error(self) -> None:
+        initial = _unknown(9001)
+        for exc, kind in (
+            (run_gates.UncertainProbeCleanup({"pid": 7001, "startedAt": "probe-start", "processGroupId": 7001}), "UncertainProbeCleanup"),
+            (run_gates.InterruptedProbeCleanup({"pid": 7002, "startedAt": None, "processGroupId": 7002}), "InterruptedProbeCleanup"),
+        ):
+            with self.subTest(kind):
+                report, failure, _result = self.drive([self.world(initial), self.world(initial, raise_exc=exc)])
+                assert failure is not None
+                self.assertIn("settling poll failed", str(report["error"]))
+                self.assertEqual([item["pid"] for item in failure.owned_probe_processes], [exc.owned_probe_processes[0]["pid"]])
+                self.assertEqual(failure.cleanup_exceptions, [{"type": kind}])
+                self.assertEqual(report["cleanupExceptions"], [{"type": kind}])
+                self.assertEqual([item["pid"] for item in report["ownedProbeProcesses"]], [exc.owned_probe_processes[0]["pid"]])  # type: ignore[index]
+                self.assertEqual(report["ownedProbeProcessCount"], 1)
+
+    def test_probe_returned_by_a_poll_scan_is_retained_before_the_helper_fails_closed(self) -> None:
+        initial = _unknown(9001)
+        probe = {"pid": 7003, "startedAt": "probe-start", "processGroupId": 7003}
+        report, failure, _result = self.drive([self.world(initial), self.world(initial, owned_probe=probe)])
+        assert failure is not None
+        self.assertIn("owned probe", str(report["error"]))
+        self.assertEqual([item["pid"] for item in failure.owned_probe_processes], [7003])
+        self.assertEqual(failure.owned_probe_process_count, 1)
+        self.assertEqual([item["pid"] for item in report["ownedProbeProcesses"]], [7003])  # type: ignore[index]
+
+    def test_global_phase_probe_exception_is_retained(self) -> None:
+        initial = _unknown(9001)
+        exc = run_gates.UncertainProbeCleanup({"pid": 7004, "startedAt": "probe-start", "processGroupId": 7004})
+        report, failure, _result = self.drive([self.world(initial), self.world(), self.world(_unknown(9005), raise_exc=exc)])
+        assert failure is not None
+        self.assertIn("global ownership rescan failed", str(report["error"]))
+        self.assertEqual(failure.cleanup_exceptions, [{"type": "UncertainProbeCleanup"}])
+        self.assertEqual([item["pid"] for item in failure.owned_probe_processes], [7004])
+
+    def test_truncated_initial_unknown_set_reports_truncation_and_stays_uncertain(self) -> None:
+        many = [_unknown(pid) for pid in range(9001, 9071)]
+        _report, failure, result = self.drive([self.world(*many)])
+        self.assertIsNone(result)
+        assert failure is not None
+        self.assertEqual(failure.unconfirmed_process_count, 70)
+        self.assertEqual(len(failure.unconfirmed_processes), run_gates.MAX_UNCONFIRMED_SAMPLE)
+        self.assertTrue(failure.unconfirmed_processes_truncated)
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(dir=test_scratch_root())
@@ -1206,7 +1906,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(scans[0], 2)
         self.assertEqual(clock[0], run_gates.NATURAL_EXIT_QUIESCENT_SECONDS)
 
+        # A new unknown identity that stays live is churn that never resolves:
+        # it is waited on and fails closed at the one absolute deadline.
         late_unknown = {"pid": 9001, "startedAt": "late-start", "descriptorStatus": "uninspectable", "reason": "late-child"}
+        clock[0] = 0.0
         failed, latest, error, count = run_gates._final_global_quiescence_scan(
             5,
             lambda _remaining: ({9001: (1, "late-start", "S")}, run_gates.UntrackedProcessScan([], [late_unknown], run_gates.EXPECTED_UNINSPECTABLE_SCAN, 1)),
@@ -1214,8 +1917,11 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertFalse(failed)
         self.assertEqual(latest, [late_unknown])
-        self.assertEqual(count, 1)
+        self.assertGreater(count, 1)
+        self.assertIn("unresolved", error or "")
+        self.assertEqual(clock[0], 5)
 
+        clock[0] = 0.0
         failed, _latest, error, _count = run_gates._final_global_quiescence_scan(
             5, clean_scan, lambda _snapshot: [733], monotonic=lambda: clock[0], sleep=sleep,
         )
