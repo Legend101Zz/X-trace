@@ -1049,9 +1049,12 @@ mod tests {
     fn init_replays_historical_implicit_key_receipt_without_rewriting_it() {
         use xtrace_application::IdempotencyStore as _;
 
-        let repo = tempdir("legacy-default-key-retry");
+        let repo = legacy_key_repo_dir();
         let home = tempdir("legacy-default-key-home");
         let env_reader = move |name: &str| (name == USER_DATA_HOME_ENV).then(|| home.clone());
+        let canonical = resolve_repo(&repo).expect("canonical repository");
+        let canonical = canonical.to_str().expect("UTF-8 repository");
+        let legacy_key = require_parent_legacy_key(canonical);
         init(repo.clone(), "Legacy".into(), String::new(), &env_reader)
             .expect("initial project and receipt");
         let pointer = RepositoryPointer::read(&repo).expect("pointer");
@@ -1061,9 +1064,6 @@ mod tests {
         let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
             .expect("open initialized store");
         let idempotency = SqliteIdempotencyStore::new(&store);
-        let canonical = resolve_repo(&repo).expect("canonical repository");
-        let canonical = canonical.to_str().expect("UTF-8 repository");
-        let legacy_key = format!("xtrace-init-{canonical}");
         let original = idempotency
             .lookup_receipt("initialize_project", &legacy_key)
             .expect("lookup legacy receipt")
@@ -1203,6 +1203,42 @@ mod tests {
         .into_bytes()
     }
 
+    fn legacy_key_repo_dir() -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after UNIX epoch")
+            .as_nanos();
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        root.create_private_child(&format!("r{nanos:x}"))
+            .expect("short legacy-key repository fixture under admitted scratch")
+            .path()
+            .to_path_buf()
+    }
+
+    fn require_parent_legacy_key(canonical_repo_path: &str) -> String {
+        let key = format!("xtrace-init-{canonical_repo_path}");
+        assert!(
+            canonical_repo_path.as_bytes().len() <= 116,
+            "legacy-key fixture repository path must be <=116 bytes; shorten XTRACE_TEST_PRIVATE_SCRATCH"
+        );
+        assert!(
+            key.len() <= 128 && !key.contains(['\0', '\n', '\r']),
+            "historical implicit key must pass the parent's exact 128-byte/control admission; shorten XTRACE_TEST_PRIVATE_SCRATCH"
+        );
+        assert_eq!(
+            default_init_idempotency_key(canonical_repo_path),
+            key,
+            "fixture must exercise the historical implicit key, not the bounded fallback"
+        );
+        key
+    }
+
     fn publish_pending_marker(repo: &Path, bytes: &[u8]) {
         let lock = crate::pointer_io::RepositoryInitLock::acquire(repo).expect("init lock");
         lock.publish("init.pending", bytes, crate::pointer_io::PENDING_MAX_BYTES)
@@ -1211,7 +1247,7 @@ mod tests {
 
     #[test]
     fn v1_pending_marker_recovers_same_identity_before_database_commit() {
-        let repo = tempdir("v1-pending-precommit-repo");
+        let repo = legacy_key_repo_dir();
         let blocked_home = tempdir("v1-pending-precommit-home").join("blocked-home");
         std::fs::write(&blocked_home, b"injected private-root blocker").expect("block home");
         let configured_home = blocked_home.clone();
@@ -1221,7 +1257,7 @@ mod tests {
         let canonical = canonical.to_str().expect("UTF-8 repo");
         let fingerprint = xtrace_domain::RepositoryFingerprint::from_canonical_path(canonical);
         let display_name = "V1 recovery";
-        let key = default_init_idempotency_key(canonical);
+        let key = require_parent_legacy_key(canonical);
         let project_id = xtrace_domain::ProjectId::new();
         let original_marker = legacy_pending_marker(
             fingerprint.as_str(),
@@ -1269,11 +1305,14 @@ mod tests {
     fn v1_pending_marker_replays_committed_receipt_without_duplicate_project() {
         use xtrace_application::IdempotencyStore as _;
 
-        let repo = tempdir("v1-pending-postcommit-repo");
+        let repo = legacy_key_repo_dir();
         let home = tempdir("v1-pending-postcommit-home");
         let configured_home = home.clone();
         let env_reader =
             move |name: &str| (name == USER_DATA_HOME_ENV).then(|| configured_home.clone());
+        let canonical = resolve_repo(&repo).expect("canonical repo");
+        let canonical = canonical.to_str().expect("UTF-8 repo");
+        let key = require_parent_legacy_key(canonical);
         let display_name = "V1 committed";
         init(repo.clone(), display_name.into(), String::new(), &env_reader)
             .expect("commit initial project and receipt");
@@ -1286,9 +1325,6 @@ mod tests {
         let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
             .expect("open store");
         let idempotency = SqliteIdempotencyStore::new(&store);
-        let canonical = resolve_repo(&repo).expect("canonical repo");
-        let canonical = canonical.to_str().expect("UTF-8 repo");
-        let key = default_init_idempotency_key(canonical);
         let original_receipt = idempotency
             .lookup_receipt("initialize_project", &key)
             .expect("lookup committed receipt")
