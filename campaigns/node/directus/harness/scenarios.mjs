@@ -6,7 +6,9 @@ const COLLECTION = "xtrace_campaign_items";
 
 const errCodes = (j) => ({ errorCodes: (j?.errors || []).map((e) => e?.extensions?.code) });
 
-export function directusScenarios({ db, admin }) {
+export function directusScenarios({ db, admin, dep }) {
+  const depLog = async () => (await (await fetch(`${dep.hostUrl}/__requests`)).json());
+  const fileRows = () => psqlRows(db.container, db.database, `select filename_download, type, filesize, title from directus_files order by filename_download`, db.user);
   const rows = () => psqlRows(db.container, db.database, `select name, quantity from ${COLLECTION} order by name, quantity`, db.user);
   const tableCount = () => Number(psqlRows(db.container, db.database, `select count(*) from ${COLLECTION}`, db.user)[0][0]);
   const state = { token: null };
@@ -191,6 +193,75 @@ export function directusScenarios({ db, admin }) {
           project: errCodes,
         });
         return { assertions: { deleted: del.status === 204, gone: read.status === 403 || read.status === 404 }, db: { rows: rows() } };
+      },
+    },
+    {
+      id: "outbound-file-import-success",
+      name: "URL file import fetches from the local dependency server and persists the file",
+      kind: "outbound",
+      async run({ http }) {
+        const t = state.token;
+        const imp = await http.call("import file from dependency", "POST", "/files/import", {
+          route: "/files/import",
+          token: t,
+          body: { url: `${dep.internalUrl}/fixtures/synthetic.png`, data: { title: "Synthetic import" } },
+          project: (j) => ({ filename: j?.data?.filename_download, type: j?.data?.type, title: j?.data?.title, filesize: j?.data?.filesize, width: j?.data?.width, height: j?.data?.height, ...errCodes(j) }),
+        });
+        const id = imp.json?.data?.id;
+        const got = await http.call("read imported file", "GET", `/files/${id}?fields=filename_download,type,title,filesize`, {
+          route: "/files/{id}",
+          token: t,
+          project: (j) => ({ filename: j?.data?.filename_download, type: j?.data?.type, title: j?.data?.title, filesize: j?.data?.filesize }),
+        });
+        const hits = (await depLog()).filter((r) => r.path === "/fixtures/synthetic.png");
+        return {
+          assertions: {
+            imported: imp.status === 200 && !!id && imp.json?.data?.filename_download === "synthetic.png" && imp.json?.data?.type === "image/png",
+            readBack: got.status === 200 && got.json?.data?.title === "Synthetic import",
+            dependencyCalledOnceWithGet: hits.length === 1 && hits[0].method === "GET",
+          },
+          db: { files: fileRows(), dependencyRequests: hits },
+        };
+      },
+    },
+    {
+      id: "outbound-file-import-dependency-5xx",
+      name: "dependency 503 surfaces as Directus 503 SERVICE_UNAVAILABLE with no partial DB effect",
+      kind: "outbound-failure",
+      async run({ http }) {
+        const before = fileRows();
+        const imp = await http.call("import file from failing dependency", "POST", "/files/import", {
+          route: "/files/import",
+          token: state.token,
+          body: { url: `${dep.internalUrl}/fixtures/unavailable.png`, data: { title: "Should not persist" } },
+          project: (j) => ({ ...errCodes(j), reason: j?.errors?.[0]?.extensions?.service }),
+        });
+        const hits = (await depLog()).filter((r) => r.path === "/fixtures/unavailable.png");
+        const after = fileRows();
+        return {
+          assertions: {
+            status503: imp.status === 503,
+            serviceUnavailable: imp.json?.errors?.[0]?.extensions?.code === "SERVICE_UNAVAILABLE",
+            dependencyReached: hits.length === 1,
+            noPartialDbEffect: JSON.stringify(before) === JSON.stringify(after),
+          },
+          db: { files: after, dependencyRequests: hits },
+        };
+      },
+    },
+    {
+      id: "outbound-file-import-denied-address",
+      name: "import of the cloud-metadata address is refused by the default deny list; nothing fetched or stored",
+      kind: "outbound-failure",
+      async run({ http }) {
+        const before = fileRows();
+        const imp = await http.call("import from denied address", "POST", "/files/import", {
+          route: "/files/import",
+          token: state.token,
+          body: { url: "http://169.254.169.254/latest/meta-data/", data: { title: "denied" } },
+          project: (j) => errCodes(j),
+        });
+        return { assertions: { refused: imp.status >= 400, noFileRow: JSON.stringify(before) === JSON.stringify(fileRows()) }, db: { files: fileRows() } };
       },
     },
     {

@@ -36,7 +36,7 @@
     "nodeMajor": 24,
     "nodeEngines": "^20.19.0 || >=22.12.0 (packages), >=22.22.0 (starter)",
     "nodeImageVersion": "24.21.0",
-    "database": "PostgreSQL 18.3 (docker image postgres:18.3, tmpfs data, reset per run)",
+    "database": "PostgreSQL 18.3 (postgres@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db, tmpfs data, reset per run)",
     "httpStack": "Express 4.22.2 inside a node:http server created by `medusa start` (packages/medusa/src/commands/start.ts: express() + http.createServer); file-system API routes under apps/backend/src/api; NO NestJS present (verified: no @nestjs/* in the resolved dependency set)",
     "dbDriver": "MikroORM 6.6.14 (@mikro-orm/postgresql/knex) over knex 3.2.10 over pg 8.20.0/8.23.0",
     "eventBusCache": "in-memory/fake redis (REDIS_URL unset)",
@@ -120,6 +120,14 @@
       ]
     },
     {
+      "id": "product-duplicate-handle-conflict",
+      "kind": "constraint-violation",
+      "expectedSeams": [
+        "POST /admin/products route -> createProductsWorkflow -> Product module detects existing handle (unique constraint) -> error mapped by Medusa error handler (HTTP 400)",
+        "pg lookup/INSERT attempt rolled back; no new row"
+      ]
+    },
+    {
       "id": "storefront-publishable-key-flow",
       "kind": "business-multi-module",
       "expectedSeams": [
@@ -154,7 +162,6 @@
     }
   ],
   "knownLimits": [
-    "No outbound/failure scenario: Medusa 2.21.2 core flows in this app have no external HTTP dependency (event bus and cache are in-memory); the notification/payment/fulfillment providers are not configured. A deterministic local webhook dependency can only be added via a custom subscriber/module, which would be new application code and is not done.",
     "Admin dashboard, storefront, workers (`--workers`/`--servers` cluster modes) not exercised; `medusa develop` mode not exercised.",
     "Starter commit is an immutable SHA but its dependencies resolve from the registry via pnpm-lock.yaml integrity hashes.",
     "Upstream test suites were not run."
@@ -186,5 +193,22 @@
     "requirementId": "CAMPAIGN-MEDUSA",
     "receiptShape": "tools/release/check_ledger.py (slice/v001-control-admission) validate_receipt/_validate_special: schemaVersion 1; requirementId; result 'passed'; candidateSha == exact candidate; build{id,sourceSha,artifactSetSha256} bound to the accepted logical release build; artifacts[] {path,sha256} (packaged xtrace artifacts in the accepted set); evidence[] {path,sha256}; checks[] each {status:'passed', reached:true}; kind 'campaign'; attestation{upstream{canonicalUrl (https), sha (40-hex), stableTag}, scenarios[>=5]{name, baseline{path,sha256}, instrumented{path,sha256}, browser{path,sha256}, privacy{path,sha256}, overhead{path,sha256}, semanticEffectFingerprint (64-hex) == instrumentedSemanticEffectFingerprint}, artifacts[]}; signatures[] containing a trusted 'campaign-runner' role signature.",
     "fromThisPreparation": "baseline-<n>/scenario-index.json (written by lib/export-scenarios.mjs) supplies, per scenario, name, baseline{path,sha256} and the 64-hex semanticEffectFingerprint; the instrumented run must reproduce each fingerprint exactly and write instrumentedSemanticEffectFingerprint, instrumented/browser/privacy/overhead evidence files. Skipped, unreached or synthetic assertions never count."
+  },
+  "outbound": {
+    "present": false,
+    "statement": "not present in the pinned stack without custom code",
+    "evidence": [
+      "packages/core/utils/src/common/define-config.ts @020565398e: default providers are local/manual only: fulfillment '@medusajs/medusa/fulfillment-manual' (L329), notification '@medusajs/medusa/notification-local' (L340, logs only), file '@medusajs/medusa/file-local' (L384, disk), search '@medusajs/medusa/search-postgres' (L360), auth emailpass; the s3 file provider (L400) is only added when S3 env is set.",
+      "Event bus, cache and locking default to in-memory modules unless REDIS_URL is set (L374-377, redisUrl not found -> fake redis in app.log).",
+      "The Payment module is registered without any provider in the starter's medusa-config.ts (no stripe); packages/modules/providers/{payment-stripe,notification-sendgrid,analytics-posthog,file-s3,auth-github|google|oidc} exist but are opt-in and need external services/credentials.",
+      "Telemetry (@medusajs/telemetry) is the only default network egress and is disabled with MEDUSA_DISABLE_TELEMETRY=1."
+    ],
+    "errorPathScenarios": [
+      "auth-unauthorized-admin",
+      "auth-invalid-login",
+      "product-validation-strict",
+      "product-duplicate-handle-conflict",
+      "error-unknown-route"
+    ]
   }
 }

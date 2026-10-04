@@ -25,7 +25,7 @@
     "nodeMajor": 22,
     "nodeEngines": "22 (root package.json engines.node)",
     "nodeImageVersion": "22.23.0",
-    "database": "PostgreSQL 18.3 (docker image postgres:18.3, tmpfs data, reset per run)",
+    "database": "PostgreSQL 18.3 (postgres@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db, tmpfs data, reset per run)",
     "httpStack": "Express 4.22.3 (pnpm catalog) over node:http createServer (api/src/server.ts createServer -> createApp)",
     "dbDriver": "knex 3.1.0 over pg 8.16.3",
     "otherInterfaces": "GraphQL (graphql-compose) and WebSocket (ws/graphql-ws) mounted on the same server; not exercised",
@@ -45,13 +45,15 @@
   ],
   "configAdaptations": [
     "SERVE_APP=false (the Vue admin app is not built); all /server, /auth, /items, /collections API routes are unaffected.",
-    "TELEMETRY=false, AI_TELEMETRY_ENABLED=false, DO_NOT_TRACK=1."
+    "TELEMETRY=false, AI_TELEMETRY_ENABLED=false, DO_NOT_TRACK=1.",
+    "Outbound scenarios: IMPORT_IP_DENY_LIST is left at the upstream default (0.0.0.0 + local interfaces, 169.254.169.254). No relaxation was needed: api/src/request/is-denied-ip.ts only denies the listed addresses/local interfaces, and the dependency container's private address on the harness network is neither (verified by the successful import). The metadata address stays denied and is asserted as such."
   ],
   "run": {
     "entrypointDocker": "node api/dist/cli/run.js bootstrap && node api/dist/cli/run.js start (cwd = checkout root; same as `directus bootstrap` / `directus start`)",
     "readiness": "GET /server/ping == 200 (/server/health requires an admin token in v12.4.1) (necessary, never sufficient)",
     "port": 8055,
-    "harness": "harness/run.mjs (prepare | baseline <n> | compare <n> <m>...)"
+    "harness": "harness/run.mjs (prepare | baseline <n> | compare <n> <m>...)",
+    "dependencyServer": "harness/dependency-server.mjs run in a container (same node image) with alias `dep` on the harness network: serves fixed PNG bytes at /fixtures/synthetic.png, a fixed 503 at /fixtures/unavailable.png, records every request (/__requests)."
   },
   "scenarios": [
     {
@@ -130,6 +132,31 @@
       ]
     },
     {
+      "id": "outbound-file-import-success",
+      "kind": "outbound",
+      "expectedSeams": [
+        "POST /files/import root + FilesService.importOne (api/dist/services/files.js)",
+        "outbound HTTP GET to the local dependency (axios -> node:http client; destination http://dep:8080/fixtures/synthetic.png) as a child of the inbound request",
+        "pg INSERT directus_files, file written to local storage, GET /files/{id}",
+        "dependency /__requests proves exactly one GET"
+      ]
+    },
+    {
+      "id": "outbound-file-import-dependency-5xx",
+      "kind": "outbound-failure",
+      "expectedSeams": [
+        "POST /files/import -> importOne -> outbound GET returns 503 -> ServiceUnavailableError (extensions.service=external-file)",
+        "outcome 503 SERVICE_UNAVAILABLE; NO INSERT into directus_files (no partial DB effect)"
+      ]
+    },
+    {
+      "id": "outbound-file-import-denied-address",
+      "kind": "outbound-failure",
+      "expectedSeams": [
+        "POST /files/import to 169.254.169.254 refused by the request interceptor (isDeniedIp) before any connection; outcome 503; no dependency request, no INSERT"
+      ]
+    },
+    {
       "id": "error-unknown-route",
       "kind": "error-path",
       "expectedSeams": [
@@ -140,9 +167,10 @@
     }
   ],
   "knownLimits": [
-    "No outbound/failure scenario yet: Directus Flows 'Webhook / Request URL' operation to a deterministic local dependency server is present upstream but not exercised in this preparation (requires IMPORT_IP_DENY_LIST relaxation; see report).",
     "GraphQL, websockets, file uploads, extensions are not exercised.",
-    "Upstream test suites were not run (baseline harness only)."
+    "Upstream test suites were not run (baseline harness only).",
+    "Outbound timeout/hang is not exercised: Directus's file-import axios call has no request timeout in this code path (IMPORT_TIMEOUT governs the import-export feature), so a hanging dependency would block until the client gives up; the 5xx and denied-address failure paths are covered instead.",
+    "Other Directus outbound features (Flows webhook/request operation, webhooks, mail) not exercised."
   ],
   "instrumented": {
     "status": "NOT RUN (preparation only). Documented for the later packaged-candidate run.",
@@ -161,12 +189,17 @@
       "nest": "none (Directus does not use NestJS)",
       "intermediateApplicationCall": "ItemsService.createOne/readOne/updateOne/deleteOne (api/dist/services/items.js), AuthenticationService.login, CollectionsService.createOne",
       "db": "knex 3.1.0 -> pg Client.query (SQL text sanitized, binds excluded; DDL for collection creation included)",
-      "outcome": "HTTP status + Directus error code (FORBIDDEN, INVALID_CREDENTIALS, FAILED_VALIDATION, ROUTE_NOT_FOUND)"
+      "outcome": "HTTP status + Directus error code (FORBIDDEN, INVALID_CREDENTIALS, FAILED_VALIDATION, ROUTE_NOT_FOUND)",
+      "outbound": "node:http client request (via axios) from FilesService.importOne with destination host/port/path template and status 200/503; must be linked to the inbound POST /files/import recording; denied-address case must show no outbound attempt"
     }
   },
   "ledger": {
     "requirementId": "CAMPAIGN-DIRECTUS",
     "receiptShape": "tools/release/check_ledger.py (slice/v001-control-admission) validate_receipt/_validate_special: schemaVersion 1; requirementId; result 'passed'; candidateSha == exact candidate; build{id,sourceSha,artifactSetSha256} bound to the accepted logical release build; artifacts[] {path,sha256} (packaged xtrace artifacts in the accepted set); evidence[] {path,sha256}; checks[] each {status:'passed', reached:true}; kind 'campaign'; attestation{upstream{canonicalUrl (https), sha (40-hex), stableTag}, scenarios[>=5]{name, baseline{path,sha256}, instrumented{path,sha256}, browser{path,sha256}, privacy{path,sha256}, overhead{path,sha256}, semanticEffectFingerprint (64-hex) == instrumentedSemanticEffectFingerprint}, artifacts[]}; signatures[] containing a trusted 'campaign-runner' role signature.",
     "fromThisPreparation": "baseline-<n>/scenario-index.json (written by lib/export-scenarios.mjs) supplies, per scenario, name, baseline{path,sha256} and the 64-hex semanticEffectFingerprint; the instrumented run must reproduce each fingerprint exactly and write instrumentedSemanticEffectFingerprint, instrumented/browser/privacy/overhead evidence files. Skipped, unreached or synthetic assertions never count."
+  },
+  "outbound": {
+    "present": true,
+    "evidence": "api/src/services/files.ts FilesService.importOne issues an outbound axios GET for POST /files/import {url}; scenarios outbound-file-import-*."
   }
 }

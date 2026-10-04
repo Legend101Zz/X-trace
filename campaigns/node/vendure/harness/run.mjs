@@ -1,16 +1,17 @@
 #!/usr/bin/env node
 // Vendure v3.7.3 campaign harness (preparation lane; baseline only).
 //   node run.mjs create             official `@vendure/create@3.7.3 --ci --db sqlite` in Docker (Node 24)
-//   node run.mjs build              compile server + worker (vendure build server|worker), snapshot seed.sqlite
-//   node run.mjs baseline <n>       reset SQLite from seed, start server + worker containers, run scenarios
+//   node run.mjs build              adapt config to PostgreSQL (DB_* env), install pg, compile server + worker
+//   node run.mjs seed               populate sample data into a throwaway PostgreSQL and dump seed.sql
+//   node run.mjs baseline <n>       fresh PostgreSQL restored from seed.sql, stock server + separate stock worker, run scenarios
 //   node run.mjs compare <n> <m>..  compare semantic fingerprints
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { dockerLogged, container, docker } from "../../lib/docker.mjs";
+import { dockerLogged, container, docker, net, PREFIX } from "../../lib/docker.mjs";
 import { projectRoot, IMAGE } from "../../lib/paths.mjs";
-import { runBaseline, imageId } from "../../lib/baseline.mjs";
-import { waitHttp, sleep } from "../../lib/stack.mjs";
+import { runBaseline, imageId, randomSecret } from "../../lib/baseline.mjs";
+import { waitHttp, sleep, startPostgres } from "../../lib/stack.mjs";
 import { compareRuns } from "../../lib/harness.mjs";
 import { sha256Hex } from "../../lib/canonical.mjs";
 import { vendureScenarios } from "./scenarios.mjs";
@@ -40,17 +41,70 @@ async function create() {
   process.exitCode = code;
 }
 
+const PG_DB = "vendure";
+const PG_USER = "xtrace";
+
+// Config-only adaptation SQLite -> PostgreSQL: the exact dbConnectionOptions the pinned create
+// template (templates/vendure-config.hbs) renders for `--db postgres`, driven by DB_* env.
+function patchConfigForPostgres() {
+  const file = path.join(appDir, "src", "vendure-config.ts");
+  let src = fs.readFileSync(file, "utf8");
+  if (src.includes("process.env.DB_HOST")) return "config already adapted";
+  fs.mkdirSync(path.join(root, "config-original"), { recursive: true });
+  fs.writeFileSync(path.join(root, "config-original", "vendure-config.sqlite.ts"), src);
+  const before = sha256Hex(src);
+  src = src
+    .replace("type: 'better-sqlite3',", "type: 'postgres',")
+    .replace("database: path.join(__dirname, '../vendure.sqlite'),",
+      "database: process.env.DB_NAME,\n        schema: process.env.DB_SCHEMA,\n        host: process.env.DB_HOST,\n        port: +process.env.DB_PORT,\n        username: process.env.DB_USERNAME,\n        password: process.env.DB_PASSWORD,");
+  if (!src.includes("process.env.DB_HOST") || !src.includes("type: 'postgres'")) throw new Error("config patch did not apply");
+  fs.writeFileSync(file, src);
+  // environment.d.ts: add the DB_* declarations the postgres template renders
+  const envd = path.join(appDir, "src", "environment.d.ts");
+  let e = fs.readFileSync(envd, "utf8");
+  if (!e.includes("DB_HOST")) {
+    e = e.replace("CORS_ORIGINS?: string;\n", "CORS_ORIGINS?: string;\n            DB_HOST: string;\n            DB_PORT: number;\n            DB_NAME: string;\n            DB_USERNAME: string;\n            DB_PASSWORD: string;\n            DB_SCHEMA: string;\n");
+    fs.writeFileSync(envd, e);
+  }
+  return `${before} -> ${sha256Hex(src)}`;
+}
+
 async function build() {
   const log = path.join(root, "build.log");
+  console.log("config:", patchConfigForPostgres());
   const code = await dockerLogged(
     ["run", "--rm", "--name", "xtrace-camp-node-vendure-build", "--platform", "linux/arm64", "-v", `${root}:/work`, "-w", "/work/app",
      "-e", "npm_config_cache=/work/.xtrace-npm-cache", "-e", "CI=true", "-e", "DO_NOT_TRACK=1", image,
-     "sh", "-c", "npm run build:server && npm run build:worker && cp -n vendure.sqlite seed.sqlite && ls -l dist seed.sqlite"],
+     "sh", "-c", "(npm ls pg >/dev/null 2>&1 || (npm uninstall better-sqlite3 && npm install --save-exact pg)) && npm run build:server && npm run build:worker && ls -l dist"],
     log,
   );
-  if (code === 0) fs.copyFileSync(path.join(here, "xtrace-index-inprocess.cjs"), path.join(appDir, "dist", "xtrace-index-inprocess.cjs"));
   console.log("build exit", code, "log", log);
   process.exitCode = code;
+}
+
+// Populate sample data into a throwaway PostgreSQL once and dump it as the reset seed (seed.sql).
+async function seed() {
+  const tag = "seed";
+  const names = { net: `${PREFIX}vendure-${tag}-net`, db: `${PREFIX}vendure-${tag}-db` };
+  fs.copyFileSync(path.join(here, "seed-populate.cjs"), path.join(appDir, "dist", "xtrace-seed-populate.cjs"));
+  const password = randomSecret();
+  try {
+    net.create(names.net);
+    await startPostgres({ netName: names.net, dbName: names.db, database: PG_DB, user: PG_USER, password });
+    const code = await dockerLogged(
+      ["run", "--rm", "--name", "xtrace-camp-node-vendure-seed", "--platform", "linux/arm64", "--network", names.net, "-v", `${root}:/work`, "-w", "/work/app",
+       "-e", "DB_HOST=db", "-e", "DB_PORT=5432", "-e", `DB_NAME=${PG_DB}`, "-e", `DB_USERNAME=${PG_USER}`, "-e", `DB_PASSWORD=${password}`, "-e", "DB_SCHEMA=public",
+       "-e", "APP_ENV=dev", "-e", "PORT=3000", "-e", "CREATE_ASSETS_DIR=/work/create-assets", "-e", "DO_NOT_TRACK=1", image, "node", "./dist/xtrace-seed-populate.cjs"],
+      path.join(root, "seed.log"),
+    );
+    if (code !== 0) throw new Error("populate failed; see seed.log");
+    const dump = docker(["exec", names.db, "pg_dump", "-U", PG_USER, "-d", PG_DB, "--no-owner", "--no-acl"]).stdout;
+    fs.writeFileSync(path.join(appDir, "seed.sql"), dump);
+    console.log("seed.sql bytes", dump.length, "sha256", sha256Hex(dump));
+  } finally {
+    container.rm(names.db);
+    net.rm(names.net);
+  }
 }
 
 function readEnvFile() {
@@ -65,36 +119,36 @@ function readEnvFile() {
 async function buildStack({ names }) {
   const env = readEnvFile();
   const admin = { identifier: env.SUPERADMIN_USERNAME, password: env.SUPERADMIN_PASSWORD };
+  const dbPassword = randomSecret();
+  await startPostgres({ netName: names.net, dbName: names.db, database: PG_DB, user: PG_USER, password: dbPassword });
+  // reset = restore the pristine seed into the fresh (tmpfs) database
+  docker(["exec", "-i", names.db, "psql", "-U", PG_USER, "-d", PG_DB, "-q", "-v", "ON_ERROR_STOP=1"], { input: fs.readFileSync(path.join(appDir, "seed.sql"), "utf8") });
   const common = [
-    "--network", names.net,
-    "-v", `${root}:/work`,
-    "-w", "/work/app",
+    "--network", names.net, "-v", `${root}:/work`, "-w", "/work/app",
+    "-e", "DB_HOST=db", "-e", "DB_PORT=5432", "-e", `DB_NAME=${PG_DB}`, "-e", `DB_USERNAME=${PG_USER}`, "-e", `DB_PASSWORD=${dbPassword}`, "-e", "DB_SCHEMA=public",
     "-e", "PORT=3000", "-e", "APP_ENV=dev", "-e", "DO_NOT_TRACK=1", "-e", "VENDURE_DISABLE_TELEMETRY=1",
-    image,
   ];
-  // Reset: pristine seed copied to container-local storage (fast local locking for SQLite). Single process: server + in-process job queue (see xtrace-index-inprocess.cjs).
-  // /work/app/vendure.sqlite becomes a symlink to it, so vendure-config.ts is used unmodified.
-  const script =
-    "set -e; mkdir -p /tmp/xtrace-data && cp /work/app/seed.sqlite /tmp/xtrace-data/vendure.sqlite && " +
-    "ln -sfn /tmp/xtrace-data/vendure.sqlite /work/app/vendure.sqlite && rm -rf /work/app/static/email/test-emails; " +
-    "exec node ./dist/xtrace-index-inprocess.cjs";
-  container.runDetached(names.app, ["-p", "127.0.0.1::3000", ...common.slice(0, -1), image, "sh", "-c", script]);
+  // The upstream topology: stock server entry and, as a separate process/container, the stock worker entry.
+  container.runDetached(names.worker, [...common, image, "node", "./dist/index-worker.js"]);
+  container.runDetached(names.app, ["-p", "127.0.0.1::3000", ...common, image, "node", "./dist/index.js"]);
   const port = container.hostPort(names.app, 3000);
   const baseUrl = `http://127.0.0.1:${port}`;
-  // Readiness: shop-api responds to a trivial typename query (necessary, never sufficient).
+  // Readiness (necessary, never sufficient): shop-api answers and the worker logged "ready".
   const deadline = Date.now() + 300000;
   for (;;) {
     if (!container.running(names.app)) throw new Error("app container exited before readiness");
+    if (!container.running(names.worker)) throw new Error("worker container exited before readiness");
     try {
       const r = await fetch(baseUrl + "/shop-api", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ query: "{__typename}" }), signal: AbortSignal.timeout(3000) });
-      if (r.status === 200) break;
+      const w = container.logs(names.worker);
+      if (r.status === 200 && /Vendure Worker is ready/.test((w.stdout || "") + (w.stderr || ""))) break;
     } catch {}
     if (Date.now() > deadline) throw new Error("readiness deadline exceeded");
     await sleep(500);
   }
+  // rows as objects, via PostgreSQL json_agg
   const sql = (q) => {
-    const script = "const D=require('better-sqlite3');const db=new D('/tmp/xtrace-data/vendure.sqlite',{readonly:true});console.log(JSON.stringify(db.prepare(process.argv[1]).all()))";
-    const out = docker(["exec", "-w", "/work/app", names.app, "node", "-e", script, q]).stdout.trim();
+    const out = container.exec(names.db, ["psql", "-U", PG_USER, "-d", PG_DB, "-At", "-c", `select coalesce(json_agg(t),'[]'::json) from (${q}) t`]).stdout.trim();
     return JSON.parse(out);
   };
   return { baseUrl, admin, sql, extra: { sql, admin } };
@@ -103,6 +157,7 @@ async function buildStack({ names }) {
 const cmd = process.argv[2];
 if (cmd === "create") await create();
 else if (cmd === "build") await build();
+else if (cmd === "seed") await seed();
 else if (cmd === "baseline") {
   const n = Number(process.argv[3]);
   await runBaseline({
@@ -122,7 +177,7 @@ else if (cmd === "baseline") {
       platform: "linux/arm64 (Docker Desktop)",
       database: campaign.runtime.database,
       lockfileSha256: sha256Hex(fs.readFileSync(path.join(appDir, "package-lock.json"))),
-      seedSha256: sha256Hex(fs.readFileSync(path.join(appDir, "seed.sqlite"))),
+      seedSha256: sha256Hex(fs.readFileSync(path.join(appDir, "seed.sql"))),
       scenarioHarnessSha256: sha256Hex(fs.readFileSync(path.join(here, "scenarios.mjs"))),
     },
   });
@@ -131,6 +186,6 @@ else if (cmd === "baseline") {
   console.log(JSON.stringify(r, null, 2));
   process.exitCode = r.stable ? 0 : 1;
 } else {
-  console.error("usage: run.mjs create | build | baseline <n> [--keep] | compare <n> <m> ...");
+  console.error("usage: run.mjs create | build | seed | baseline <n> [--keep] | compare <n> <m> ...");
   process.exitCode = 2;
 }

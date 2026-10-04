@@ -17,7 +17,7 @@ export async function runBaseline({ project, n, root, buildStack, scenarios, met
   if (fs.existsSync(outDir)) throw new Error(`${outDir} exists; baselines are write-once (pick a new number)`);
   fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
   const tag = `b${n}`;
-  const names = { net: `${PREFIX}${project}-${tag}-net`, db: `${PREFIX}${project}-${tag}-db`, app: `${PREFIX}${project}-${tag}-app`, worker: `${PREFIX}${project}-${tag}-worker` };
+  const names = { net: `${PREFIX}${project}-${tag}-net`, db: `${PREFIX}${project}-${tag}-db`, app: `${PREFIX}${project}-${tag}-app`, worker: `${PREFIX}${project}-${tag}-worker`, dep: `${PREFIX}${project}-${tag}-dep` };
   const startedAt = Date.now();
   let ctx;
   let summary;
@@ -36,9 +36,14 @@ export async function runBaseline({ project, n, root, buildStack, scenarios, met
   } finally {
     const logs = container.logs(names.app);
     fs.writeFileSync(path.join(outDir, "app.log"), (logs.stdout || "") + (logs.stderr || ""), { mode: 0o600 });
+    for (const extra of ["worker", "dep"]) {
+      const l = container.logs(names[extra]);
+      if ((l.stdout || l.stderr)) fs.writeFileSync(path.join(outDir, `${extra}.log`), (l.stdout || "") + (l.stderr || ""), { mode: 0o600 });
+    }
     const exit = docker(["inspect", "-f", "{{.State.ExitCode}}", names.app], { allowFail: true }).stdout.trim();
     if (!keep) {
       container.rm(names.worker);
+      container.rm(names.dep);
       container.rm(names.app);
       container.rm(names.db);
       net.rm(names.net);

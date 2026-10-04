@@ -69,6 +69,15 @@ async function buildStack({ names, outDir }) {
     STORAGE_LOCAL_ROOT: "/tmp/xtrace-uploads",
     DO_NOT_TRACK: "1",
   };
+  // Deterministic local dependency for the outbound scenarios (alias `dep` on the harness network).
+  container.runDetached(names.dep, [
+    "--network", names.net, "--network-alias", "dep",
+    "-p", "127.0.0.1::8080",
+    "-v", `${here}:/dep:ro`,
+    image, "node", "/dep/dependency-server.mjs",
+  ]);
+  const depPort = container.hostPort(names.dep, 8080);
+  await waitHttp(`http://127.0.0.1:${depPort}/__requests`, { isAlive: () => container.running(names.dep), timeoutMs: 60000 });
   const envArgs = Object.entries(env).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
   // Pre-start command = the upstream CLI exactly as shipped: `bootstrap` (migrations + admin) then `start`.
   container.runDetached(names.app, [
@@ -83,7 +92,8 @@ async function buildStack({ names, outDir }) {
   const port = container.hostPort(names.app, 8055);
   const baseUrl = `http://127.0.0.1:${port}`;
   await waitHttp(`${baseUrl}/server/ping`, { isAlive: () => container.running(names.app), timeoutMs: 900000 });
-  return { baseUrl, admin, db: { container: names.db, database, user: dbUser }, extra: {} };
+  const dep = { internalUrl: "http://dep:8080", hostUrl: `http://127.0.0.1:${depPort}` };
+  return { baseUrl, admin, dep, db: { container: names.db, database, user: dbUser }, extra: {} };
 }
 
 const cmd = process.argv[2];

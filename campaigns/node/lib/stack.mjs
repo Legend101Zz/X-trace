@@ -1,7 +1,7 @@
 // Docker stack helpers: PostgreSQL (tmpfs, ephemeral) + app container on a private network.
 import { container, net, docker, PREFIX } from "./docker.mjs";
 
-export const POSTGRES_IMAGE = process.env.XTRACE_CAMP_POSTGRES_IMAGE || "postgres:18.3";
+export const POSTGRES_IMAGE = process.env.XTRACE_CAMP_POSTGRES_IMAGE || "postgres@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db";  // == postgres:18.3 (image index digest)
 
 export function names(project, tag) {
   const t = `${PREFIX}${project}-${tag}`;

@@ -122,9 +122,9 @@ export function vendureScenarios({ sql, admin }) {
       },
     },
     {
-      id: "async-search-index-job",
-      name: "created product becomes searchable only after the job queue runs its search-index job",
-      kind: "async-job-queue",
+      id: "worker-search-index-job",
+      name: "created product becomes searchable only after the separate worker process completes its search-index jobs",
+      kind: "async-worker",
       async run({ http }) {
         const c = await gql(http, "create searchable product", ADMIN, CREATE, { i: product("Xtrace Indexed Widget", "xtrace-indexed-widget") }, { token: state.token, project: (j) => ({ name: j?.data?.createProduct?.name }) });
         // The search index holds one entry per enabled variant, so the product needs a variant.
@@ -146,7 +146,16 @@ export function vendureScenarios({ sql, admin }) {
         const calls = http.calls;
         const kept = calls.filter((x, i) => i === 0 || i >= calls.length - 1);
         http.calls.splice(0, http.calls.length, ...kept);
-        return { assertions: { created: c.status === 200 && !!c.json?.data?.createProduct?.id, variantCreated: v.json?.data?.createProductVariants?.[0]?.sku === "xtrace-indexed-widget-1", searchableViaJobQueue: found }, facts: { attempts }, db: { products: dbProducts() } };
+        // The stock server process does not run the job queue; only the separate worker does. Wait for the
+        // worker to drain the update-search-index queue and assert every such job COMPLETED.
+        let states = [];
+        for (let i = 0; i < 60; i++) {
+          states = sql(`select "state" as state, count(*)::int as n from job_record where "queueName"='update-search-index' group by "state" order by "state"`);
+          if (states.length && states.every((r) => r.state === "COMPLETED")) break;
+          await sleep(500);
+        }
+        const jobsDone = states.length > 0 && states.every((r) => r.state === "COMPLETED");
+        return { assertions: { workerCompletedIndexJobs: jobsDone, created: c.status === 200 && !!c.json?.data?.createProduct?.id, variantCreated: v.json?.data?.createProductVariants?.[0]?.sku === "xtrace-indexed-widget-1", searchableViaJobQueue: found }, facts: { attempts }, db: { products: dbProducts(), indexJobStates: [...new Set(states.map((r) => r.state))] } };
       },
     },
     {

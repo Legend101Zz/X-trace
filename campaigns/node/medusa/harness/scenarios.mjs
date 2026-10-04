@@ -117,6 +117,20 @@ export function medusaScenarios({ db, admin }) {
       },
     },
     {
+      id: "product-duplicate-handle-conflict",
+      name: "duplicate product handle is rejected (unique constraint) and nothing extra is written",
+      kind: "constraint-violation",
+      async run({ http }) {
+        const before = dbRows();
+        const dup = await createProduct(http, state.token, "create product with an existing handle", "Persisted");
+        const after = dbRows();
+        return {
+          assertions: { rejected: dup.status >= 400, noExtraRow: JSON.stringify(before) === JSON.stringify(after), errorShapePresent: typeof dup.json?.type === "string" },
+          db: { rows: after },
+        };
+      },
+    },
+    {
       id: "storefront-publishable-key-flow",
       name: "sales channel + publishable key + published product visible through the Store API",
       kind: "business-multi-module",
