@@ -524,24 +524,33 @@ class CiFloorEvidenceTests(unittest.TestCase):
             parent_code = (
                 "import json,os,subprocess,sys,time; "
                 "child=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
-                "open(sys.argv[1],'w').write(json.dumps([os.getpid(),child.pid])); time.sleep(.2)"
+                "start=' '.join(subprocess.check_output(['/bin/ps','-o','lstart=','-p',str(child.pid)],text=True).split()); "
+                "open(sys.argv[1],'w').write(json.dumps([child.pid,os.getpgid(child.pid),start])); time.sleep(.2)"
             )
             try:
                 with self.assertRaises(ci_floor.FloorInputError):
                     ci_floor._run([sys.executable, "-c", parent_code, str(pid_file), child_code], timeout=0.6)
-                if pid_file.exists():
-                    parent_pid, child_pid = json.loads(pid_file.read_text(encoding="utf-8"))
-                    snapshot = ci_floor._utility_process_snapshot()
-                    child = snapshot.get(child_pid)
-                    self.assertFalse(child is not None and child[1] == parent_pid and child[2] != "" and child[3] not in {"Z", "X"})
+                self.assertTrue(pid_file.is_file(), "the pipe-holding child must publish its process identity")
+                child_pid, child_group, child_start = json.loads(pid_file.read_text(encoding="utf-8"))
+                self.assertGreater(child_pid, 0)
+                self.assertGreater(child_group, 0)
+                self.assertTrue(child_start, "the child start identity must be captured before supervision")
+                snapshot = ci_floor._utility_process_snapshot()
+                child = snapshot.get(child_pid)
+                child_is_live = (
+                    child is not None and child[1] == child_group and child[2] == child_start
+                    and child[3] not in {"Z", "X"}
+                )
+                self.assertFalse(child_is_live, "the utility supervisor left its pipe-holding child alive")
             finally:
                 if pid_file.exists():
-                    parent_pid, child_pid = json.loads(pid_file.read_text(encoding="utf-8"))
+                    child_pid, child_group, child_start = json.loads(pid_file.read_text(encoding="utf-8"))
                     snapshot = ci_floor._utility_process_snapshot()
                     child = snapshot.get(child_pid)
-                    if child is not None and child[1] == parent_pid and child[3] not in {"Z", "X"}:
+                    if (child is not None and child[1] == child_group and child[2] == child_start
+                            and child[3] not in {"Z", "X"}):
                         ci_floor._signal_utility_group_members(
-                            parent_pid, {child_pid: child[2]}, signal.SIGKILL,
+                            child_group, {child_pid: child_start}, signal.SIGKILL,
                             deadline=time.monotonic() + 1.0,
                         )
 
@@ -562,7 +571,8 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 "ready=pathlib.Path(sys.argv[2]); deadline=time.monotonic()+3\n"
                 "while not ready.exists() and time.monotonic()<deadline:\n"
                 " time.sleep(.01)\n"
-                "open(sys.argv[1],'w').write(json.dumps([os.getpid(),child.pid]))\n"
+                "start=' '.join(subprocess.check_output(['/bin/ps','-o','lstart=','-p',str(child.pid)],text=True).split())\n"
+                "open(sys.argv[1],'w').write(json.dumps([child.pid,os.getpgid(child.pid),start]))\n"
                 "time.sleep(.2)\n"
             )
             started = time.monotonic()
@@ -572,23 +582,32 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         [sys.executable, "-c", parent_code, str(pid_file), str(ready_file), child_code, str(term_file)],
                         timeout=0.6,
                     )
-                self.assertLess(time.monotonic() - started, 5.0)
-                self.assertTrue(term_file.is_file(), "TERM was delivered before the forced KILL")
-                parent_pid, child_pid = json.loads(pid_file.read_text(encoding="utf-8"))
+                self.assertTrue(pid_file.is_file(), "the TERM-ignoring child must publish its process identity")
+                child_pid, child_group, child_start = json.loads(pid_file.read_text(encoding="utf-8"))
+                self.assertGreater(child_pid, 0)
+                self.assertGreater(child_group, 0)
+                self.assertTrue(child_start, "the child start identity must be captured before supervision")
                 snapshot = ci_floor._utility_process_snapshot()
                 child = snapshot.get(child_pid)
-                self.assertFalse(
-                    child is not None and child[1] == parent_pid and child[3] not in {"Z", "X"},
-                    "TERM-ignoring owned child remains live in utility process group",
+                child_is_live = (
+                    child is not None and child[1] == child_group and child[2] == child_start
+                    and child[3] not in {"Z", "X"}
                 )
+                self.assertFalse(
+                    child_is_live,
+                    "TERM-ignoring owned child remains live in its original utility process group",
+                )
+                self.assertLess(time.monotonic() - started, 5.0)
+                self.assertTrue(term_file.is_file(), "TERM was delivered before the forced KILL")
             finally:
                 if pid_file.exists():
-                    parent_pid, child_pid = json.loads(pid_file.read_text(encoding="utf-8"))
+                    child_pid, child_group, child_start = json.loads(pid_file.read_text(encoding="utf-8"))
                     snapshot = ci_floor._utility_process_snapshot()
                     child = snapshot.get(child_pid)
-                    if child is not None and child[1] == parent_pid and child[3] not in {"Z", "X"}:
+                    if (child is not None and child[1] == child_group and child[2] == child_start
+                            and child[3] not in {"Z", "X"}):
                         ci_floor._signal_utility_group_members(
-                            parent_pid, {child_pid: child[2]}, signal.SIGKILL,
+                            child_group, {child_pid: child_start}, signal.SIGKILL,
                             deadline=time.monotonic() + 1.0,
                         )
 
@@ -736,6 +755,9 @@ class CiFloorEvidenceTests(unittest.TestCase):
             old_path = os.environ.get("PATH", "/usr/bin:/bin")
             original_snapshot = ci_floor._utility_process_snapshot
             snapshot_calls = 0
+            identity_handshakes: list[float] = []
+            cleanup_started: list[float] = []
+            cleanup_finished: list[float] = []
             discovery_calls: list[tuple[float, float, float]] = []
 
             def fail_main_probe_then_stall_discovery(
@@ -744,12 +766,26 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 nonlocal snapshot_calls
                 snapshot_calls += 1
                 if snapshot_calls == 2:
+                    handshake_deadline = time.monotonic() + 0.5
+                    while not identity_file.is_file() and time.monotonic() < handshake_deadline:
+                        time.sleep(0.01)
+                    if not identity_file.is_file():
+                        raise ci_floor.FloorInputError
+                    child_pid, child_group, child_start = json.loads(identity_file.read_text(encoding="utf-8"))
+                    if child_pid <= 0 or child_group <= 0 or not child_start:
+                        raise ci_floor.FloorInputError
+                    identity_handshakes.append(time.monotonic())
                     raise ci_floor.FloorInputError
                 if snapshot_calls == 3:
                     entered = time.monotonic()
+                    cleanup_started.append(entered)
                     if deadline is None:
                         raise ci_floor.FloorInputError
                     discovery_calls.append((entered, timeout, deadline))
+                    try:
+                        return original_snapshot(timeout=timeout, deadline=deadline)
+                    finally:
+                        cleanup_finished.append(time.monotonic())
                 return original_snapshot(timeout=timeout, deadline=deadline)
 
             real_signal = ci_floor._signal_utility_group_members
@@ -771,10 +807,19 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 run_elapsed = time.monotonic() - run_started
 
                 self.assertEqual(snapshot_calls, 3, "the injected main and discovery stages must be reached")
+                self.assertEqual(len(identity_handshakes), 1, "main-probe failure must follow the child identity handshake")
+                self.assertEqual(len(cleanup_started), 1)
+                self.assertEqual(len(cleanup_finished), 1)
+                cleanup_elapsed = cleanup_finished[0] - cleanup_started[0]
                 self.assertLessEqual(
-                    run_elapsed,
+                    cleanup_elapsed,
                     ci_floor.UTILITY_CLEANUP_SECONDS + 0.25,
                     "stalled cleanup discovery must fit inside the composed cleanup deadline",
+                )
+                self.assertLessEqual(
+                    run_elapsed,
+                    cleanup_started[0] - run_started + ci_floor.UTILITY_CLEANUP_SECONDS + 0.25,
+                    "the bounded identity handshake must be accounted for before cleanup starts",
                 )
                 self.assertTrue(stall_file.is_file(), "the cleanup-discovery ps fixture must stall")
                 self.assertEqual(observed_signals, [], "unconfirmed process identities must never be signaled")
@@ -803,10 +848,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 child_pid, child_group, child_start = json.loads(identity_file.read_text(encoding="utf-8"))
                 snapshot = original_snapshot()
                 child = snapshot.get(child_pid)
-                self.assertFalse(
-                    child is not None and child[1] == child_group and child[2] == child_start,
-                    "the direct Popen child must be reaped before the fixture fallback",
-                )
+                self.assertIsNone(child, "the direct Popen child must be reaped before the fixture fallback")
             finally:
                 if identity_file.is_file():
                     child_pid, child_group, child_start = json.loads(identity_file.read_text(encoding="utf-8"))
