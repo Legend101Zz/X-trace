@@ -5,28 +5,65 @@
   "launchState": "not_ready",
   "phase": "P00",
   "workers": {
-    "java_evidence": {
+    "catalog-core": {
+      "branch": "slice/v001-catalog-core",
+      "head": "93e72fcd9eea191ace750389059744e77bf1969b",
+      "state": "frozen_unaccepted_wip"
+    },
+    "ci-floor": {
+      "branch": "slice/v001-ci-floor",
+      "head": "a0efe4aed296aa3821839074a45a15398ba5a72e",
+      "state": "frozen_unaccepted_wip"
+    },
+    "control-admission": {
+      "branch": "slice/v001-control-admission",
+      "head": "c8e549d5349bd4965b8f03adca72ebb332791ccb",
+      "state": "frozen_unaccepted_wip"
+    },
+    "java-attach": {
       "branch": "slice/v001-java-attach",
-      "model": "gpt-6-luna",
-      "reasoning": "high",
-      "scope": "Repair JVM attach lifecycle/security, then genuine version-matrix journeys; source preparation unaccepted",
-      "state": "preparation_unaccepted",
-      "sourceBase": "108849c0f410f861d43436fcb6859bb1b5052c4d"
+      "head": "e62a991f8d334c34bf088a40555e6385b0b1bdbb",
+      "state": "frozen_unaccepted_wip"
     },
-    "node_capture": {
+    "java-cli-attach": {
+      "branch": "slice/v001-java-cli-attach",
+      "head": "e711099b73bbbc8153908896645062d2e8614b05",
+      "state": "frozen_unaccepted_wip"
+    },
+    "java-evidence": {
+      "branch": "slice/v001-java-evidence",
+      "head": "108849c0f410f861d43436fcb6859bb1b5052c4d",
+      "state": "frozen_unaccepted_wip"
+    },
+    "node-capture": {
+      "branch": "slice/v001-node-capture",
+      "head": "09aba20dce9f39b5c46620ddc05efe1eac6b3261",
+      "state": "frozen_unaccepted_wip"
+    },
+    "pack-verifier": {
+      "branch": "slice/v001-pack-verifier",
+      "head": "e48d6d20545eb161c153861d18f9a1acb14b73ab",
+      "state": "frozen_unaccepted_wip"
+    },
+    "pointer-init": {
+      "branch": "slice/v001-pointer-init",
+      "head": "665b9afc7812aba740c0209f7d8961f140c99633",
+      "state": "frozen_unaccepted_wip"
+    },
+    "private-storage": {
+      "branch": "slice/v001-private-storage",
+      "head": "8333ebdd495996ddccf1dc2dcaf2722b2f3199d6",
+      "state": "frozen_unaccepted_wip"
+    },
+    "release-control": {
+      "branch": "slice/v001-release-control",
+      "head": "b9d6632835296237febb2f1a0985c4c067d26de4",
+      "state": "frozen_unaccepted_wip"
+    },
+    "shared-replay": {
       "branch": "slice/v001-shared-replay",
-      "model": "gpt-6-luna",
-      "reasoning": "high",
-      "scope": "Central shared replay/index/terminal evidence; bounded Control runner repairs take precedence",
-      "state": "preparation_unaccepted",
-      "sourceBase": "108849c0f410f861d43436fcb6859bb1b5052c4d",
-      "preservedNodePreparationSha": "09aba20dce9f39b5c46620ddc05efe1eac6b3261"
-    },
-    "release_audit": {
-      "model": "gpt-6-sol",
-      "reasoning": "high",
-      "scope": "Separate exact-source architecture/security and later build/integration reviews",
-      "state": "reviews_in_progress"
+      "head": "ba9e88bb7f3d44e295b39400768bf49b078ec515",
+      "state": "frozen_unaccepted_wip"
     }
   },
   "buildLeases": {
@@ -35,8 +72,8 @@
   },
   "continuation": {
     "automationId": "x-trace-v0-01-launch-continuation",
-    "status": "ACTIVE",
-    "verified": "created then viewed, persisted target thread checked",
+    "status": "PAUSED",
+    "verified": "scheduler update confirmed PAUSED for owner-requested handoff",
     "intervalMinutes": 30,
     "requires": "computer and desktop app running, SSD mounted"
   },
@@ -60,5 +97,15 @@
     "projects": 6,
     "checks": 56,
     "releaseAcceptance": false
+  },
+  "handoff": {
+    "date": "2026-10-04",
+    "ownerRequestedWipCommitPush": true,
+    "nextOrchestrator": "Opus 5.5",
+    "nextWorkers": "Sonnet 5.5",
+    "routineChecks": "batched at coherent integration/acceptance checkpoints",
+    "mandatoryFinalGatesUnchanged": true,
+    "details": "handoff-2026-10-04.md",
+    "releaseControlPinMeaning": "listed head is this checkpoint parent; use containing commit as final pin"
   }
 }
