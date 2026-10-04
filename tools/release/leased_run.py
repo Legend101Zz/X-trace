@@ -67,18 +67,13 @@ ALLOWED_COMMANDS = frozenset({"cargo", "gradlew", "npm", "npx", "node", "python3
 PYTHON_COMMANDS = frozenset({"python3", "python3.14"})
 PROVENANCE_RESIDUAL = (
     "Provenance proves a process is not a fork-tree descendant of this run, not that it cannot "
-    "write the builder caches. Work delegated through LaunchServices/XPC/launchctl, systemd/docker, "
-    "cron/at or a persistent build daemon is outside the threat model only because the command "
-    "allowlist excludes launchers and builders run with --no-daemon."
+    "write the builder caches. The command allowlist is hygiene, not a barrier: npx, node, java, git "
+    "and python can run arbitrary code, including launchers (LaunchServices/XPC/launchctl, "
+    "systemd/docker, cron/at) and persistent build daemons, whose work provenance cannot see. "
+    "Builders run with --no-daemon by convention; callers and reviewers own that."
 )
-# Parent environment names that reach the command. Everything else (including
-# ambient credentials) is dropped; task variables are added by build_env.
-ENV_ALLOWLIST = frozenset({
-    "PATH", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ",
-    "SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET",
-    "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "JAVA_HOME",
-})
-ENV_ALLOWED_PREFIXES = ("LC_",)
+ENV_ALLOWLIST = run_gates.ENV_ALLOWLIST
+ENV_ALLOWED_PREFIXES = run_gates.ENV_ALLOWED_PREFIXES
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _SECRET_WORDS = ("TOKEN", "SECRET", "KEY", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH")
 # Names --pass-env refuses, each because it can load or run code of the caller's choosing inside
@@ -93,7 +88,20 @@ DENIED_ENV_NAMES = frozenset({
     "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",  # trust anchors
     "TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "PATH",  # task-scoped by the runner
 })
+DENIED_ENV_NAMES = DENIED_ENV_NAMES | frozenset({
+    # compilers, linkers and their flags: choose or run the tool, or change codegen/linking
+    "CC", "CXX", "CPP", "LD", "AR", "AS", "NM", "RANLIB", "STRIP", "OBJCOPY", "LDFLAGS", "CFLAGS", "CXXFLAGS", "CPPFLAGS",
+    "GCC_EXEC_PREFIX", "COMPILER_PATH", "LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH",
+    "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR", "SDKROOT_OVERRIDE",
+    # other runtimes' option and module injection
+    "GOFLAGS", "GOROOT", "GOPATH", "GOPROXY", "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB", "CLASSPATH", "ANT_OPTS",
+    "MAVEN_ARGS", "MAKEFLAGS", "MFLAGS", "OPENSSL_CONF", "OPENSSL_MODULES", "OPENSSL_ENGINES",
+    # programs that git, npm and shells launch on the caller's behalf
+    "EDITOR", "VISUAL", "PAGER", "BROWSER", "LESSOPEN", "SSH_AUTH_SOCK", "SSH_ASKPASS", "ASKPASS", "TERMINFO",
+})
 DENIED_ENV_PREFIXES = (
+    # whole families that configure runtimes, toolchains, credentials or sockets
+    "JAVA_", "_JAVA", "MAVEN_", "ANT_", "PERL", "RUBY", "OPENSSL_", "PKG_CONFIG_", "SSH_", "DOCKER_", "KUBE", "AWS_", "BUILDKIT", "GO",
     "DYLD_",  # macOS dynamic-loader injection
     "CARGO_",  # build.rustc-wrapper, linkers, registries via env
     "GIT_",  # exec path, ssh command, config injection
@@ -180,49 +188,39 @@ def build_env(
     cache: pathlib.Path, scratch: pathlib.Path, base_env: dict[str, str], jdk_home: str | None,
     pass_env: Sequence[str] = (), home: pathlib.Path | None = None,
 ) -> dict[str, str]:
-    """Allowlisted parent environment plus the floor's task-scoped variables.
-
-    HOME is a private directory inside the admitted scratch, so ~/.npmrc, ~/.netrc, ~/.ssh and
-    friends are not reachable and tools cannot write outside the private cache. The host HOME
-    is passed only when `--pass-env HOME` asks for it explicitly.
-    """
-    extra = set(pass_env)
-    env = {
-        name: value for name, value in base_env.items()
-        if (name in ENV_ALLOWLIST or name in extra or name.startswith(ENV_ALLOWED_PREFIXES)) and name != "HOME"
-    }
-    if "HOME" in extra and "HOME" in base_env:
-        env["HOME"] = base_env["HOME"]
-    elif home is not None:
-        env["HOME"] = str(home)
-    env.update({
-        "CARGO_HOME": str(cache / "cargo"),
-        "CARGO_TARGET_DIR": str(cache / "cargo-target"),
-        "GRADLE_USER_HOME": str(cache / "gradle"),
-        "NPM_CONFIG_CACHE": str(cache / "npm"),
-        "PLAYWRIGHT_BROWSERS_PATH": str(cache / "playwright"),
-        "XDG_CACHE_HOME": str(cache / "xdg"),
-        "TMPDIR": str(scratch),
-        "TMP": str(scratch),
-        "TEMP": str(scratch),
-        "XTRACE_TEST_SCRATCH_ROOT": str(scratch),
-        "XTRACE_TEST_PRIVATE_SCRATCH": str(scratch),
-    })
-    if jdk_home:
-        env["JAVA_HOME"] = jdk_home
-        env["PATH"] = os.pathsep.join(filter(None, [str(pathlib.Path(jdk_home) / "bin"), env.get("PATH", "")]))
-    return env
+    """The shared builder environment policy (`run_gates.build_task_env`) with per-run scratch."""
+    return run_gates.build_task_env(
+        cache, base_env, scratch=scratch, home=home if home is not None else scratch / "home",
+        jdk_home=jdk_home, pass_env=pass_env,
+    )
 
 
 class CommandRefused(RuntimeError):
     """The command is not on the leased-run allowlist."""
 
 
-def check_command_allowed(argv: Sequence[str]) -> None:
-    """Allow only the build tools a lane needs; refuse shells and launchers."""
+def check_command_allowed(argv: Sequence[str], repo: pathlib.Path | None = None) -> None:
+    """Allow only the build tools a lane needs; refuse shells and launchers by name.
+
+    This is hygiene against accidents, not a security barrier (see PROVENANCE_RESIDUAL). A path
+    form of argv[0] must resolve inside the repository or inside a directory on PATH.
+    """
     name = os.path.basename(argv[0])
     if name not in ALLOWED_COMMANDS:
         raise CommandRefused("command is not on the leased-run allowlist")
+    if os.sep in argv[0]:
+        candidate = argv[0] if os.path.isabs(argv[0]) else os.path.join(str(repo or "."), argv[0])
+        # A tool on PATH may itself be a symlink (npm, java): judge its path as written. Inside the
+        # repository the real path must stay inside it, so a symlink cannot point elsewhere.
+        written = os.path.normpath(candidate)
+        in_path = any(
+            written.startswith(os.path.normpath(entry) + os.sep)
+            for entry in os.environ.get("PATH", "").split(os.pathsep) if entry and os.path.isabs(entry)
+        )
+        resolved = os.path.realpath(candidate)
+        in_repo = repo is not None and resolved.startswith(os.path.realpath(repo) + os.sep)
+        if not (in_path or in_repo):
+            raise CommandRefused("command path is outside the repository and PATH")
     if name in PYTHON_COMMANDS:
         head = list(argv[1:4])
         ok = len(head) >= 3 and head[0] == "-B" and head[1] == "-m" and (
@@ -345,13 +343,13 @@ def run(
     if expect is not None and (not isinstance(expect, int) or isinstance(expect, bool) or expect < 1):
         raise ValueError("--expect-unittest must be a positive integer")
     pass_env = _validate_pass_env(getattr(args, "pass_env", None) or [])
-    try:
-        check_command_allowed(argv)
-    except CommandRefused as exc:
-        return _not_started(out, args.label, "command_refused", str(exc), EXIT_COMMAND_REFUSED)
     repo = pathlib.Path(args.repo).expanduser().resolve(strict=True)
     if not (repo / ".git").exists():
         raise ValueError("--repo must be a Git checkout")
+    try:
+        check_command_allowed(argv, repo)
+    except CommandRefused as exc:
+        return _not_started(out, args.label, "command_refused", str(exc), EXIT_COMMAND_REFUSED)
     jdk_home = None
     if args.jdk_home:
         jdk_path = pathlib.Path(args.jdk_home)

@@ -176,7 +176,9 @@ python3.14 -B -m tools.release.leased_run --repo <worktree> --label <new unique 
   (reported at once; waiting cannot help).
 - Only these commands run: cargo, gradlew, npm, npx, node, git, java, and python3/python3.14 as
   `-B -m unittest` or `-B -m tools.release.*`; anything else (shells, open, launchctl, osascript,
-  docker, systemd-run, at) is refused with exit code 77 before any lease is taken.
+  docker, systemd-run, at) is refused with exit code 77 before any lease is taken. This is hygiene,
+  not a launcher barrier: npx/node/java/git/python can run anything. The residual is recorded in each
+  receipt (`provenanceResidual`) and in ADR 0007.
 - HOME is a private directory inside the run's scratch (`~/.npmrc`, `~/.netrc`, `~/.ssh` are not
   reachable); `--pass-env HOME` passes the host HOME explicitly and is recorded as
   `hostHomePassed`. Export `RUSTUP_HOME` when rustup toolchains live outside the host HOME.
@@ -220,7 +222,7 @@ receipt is never modified.
 
 ```
 python3.14 -B -m tools.release.recover_leases --cache-root <root> --label <label> \
-    --receipt <root>/release-gates/<label>/receipt.json [--run-coalition-id <macOS coalition id of the original run's session>]
+    --receipt <root>/release-gates/<label>/receipt.json [--run-coalition-id <id>]  # additive only; must be corroborated
 ```
 
 Recovery is allowed only if both owner records carry the label and `requiresManualRecovery`, their
@@ -231,3 +233,15 @@ owner process is gone, two complete global scans at least 2 s apart (every live 
 began) leave nothing unproven, and nothing holds the cache directories open. Identities are observed three
 times at least 2 s apart. An empty `lsof` result is supporting evidence only. Exit codes: 0 allowed or
 recovered, 1 refused, 2 invalid input or admission, 3 recovery started but incomplete.
+
+Since the final fix round new runs persist their coalition ids and subreaper fact in the owner record
+(`provenance`) and the receipt, and recovery treats those as authoritative. `--run-coalition-id` is
+additive evidence and is refused unless it is in the persisted record, equals the recovery tool's own session
+coalition, or is carried by a still-live recorded identity (0, negative and more than 8 ids are rejected).
+Identities the run recorded as owned are cleared only by a verified exit. "Predates the run" uses the
+kernel start time (proc_pidinfo or /proc), must agree with `ps` within 2 s, and needs a 300 s margin;
+DST-ambiguous times fail closed. The owner record is re-read and unlinked through the lease directory
+descriptor, archived owner records have the token replaced by its sha256, and `manual-recovery.json`
+is written with an honest `status` even if a step after removal fails. Recovery proves non-descent in the
+fork tree only; it cannot prove that a pre-existing daemon or delegated work cannot write the caches.
+The floor job warms the pinned Gradle distribution before the 20 s version-probe budget.

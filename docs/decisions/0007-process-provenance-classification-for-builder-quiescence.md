@@ -1,6 +1,6 @@
 # ADR 0007: Process provenance classification for builder quiescence
 
-- Status: Accepted (root decision 2026-10-04, pending reviews)
+- Status: Accepted (root decision 2026-10-04, pending reviews; the allowlist and recovery text amended in the final fix round)
 - Context: The release runner proves that nothing it started can still write the
   shared builder caches before it releases the builder leases. After a command
   it scans every process born during the run. On both supported hosts an
@@ -85,15 +85,19 @@ run behaves exactly as before.
   sccache, Bazel servers), ptrace injection into a non-descendant, and setuid exec, which
   keeps ancestry but defeats descriptor inspection (such a process stays uncertain because it
   is a descendant).
-- These routes are out of the threat model only because the callers are constrained, not
-  because provenance covers them: `leased_run` enforces an argv[0] basename allowlist (cargo,
-  gradlew, npm, npx, node, git, java, and python only as `-B -m unittest` or
-  `-B -m tools.release.*`) and refuses shells and launchers (open, launchctl, osascript,
-  docker, systemd-run, at, sh) with exit code 77; builders run with `--no-daemon`; the 23
-  gates contain no launcher. A pre-existing daemon is outside the baseline. Receipts record
-  this residual as `provenanceResidual`. Adding a command or a gate that delegates work
-  needs its own review.
-- A leased run gets a private HOME inside its admitted scratch and an allowlisted environment;
+- The `leased_run` argv[0] allowlist (cargo, gradlew, npm, npx, node, git, java, python only as
+  `-B -m unittest` or `-B -m tools.release.*`; shells and launchers refused by name with exit 77; a
+  path form must resolve inside the repository or a PATH directory) is hygiene against accidents, not
+  a launcher barrier. `npx`, `node`, `java`, `git` and `python` can run arbitrary code, including
+  `launchctl`, `open`, `docker`, `systemd-run`, cron and persistent build daemons, and provenance
+  cannot see work delegated that way. The residual is therefore accepted by the owner for the
+  reviewed lanes and gates, not removed: builders are run with `--no-daemon` by convention, the 23 gates
+  contain no launcher, and a pre-existing daemon is outside the baseline. Receipts record the residual
+  as `provenanceResidual`. Adding a gate or lane that delegates work needs its own review.
+- The floor and `leased_run` share one environment policy (`run_gates.build_task_env`): an explicit
+  allowlist, task-scoped caches, and a private HOME (the floor's under `tmp/<label>-home`). Toolchains
+  keep working: PATH, JAVA_HOME and RUSTUP_HOME pass through, and RUSTUP_HOME is derived from the host
+  HOME when unset. A leased run gets a private HOME inside its admitted scratch and an allowlisted environment;
   `--pass-env` refuses names that load code or redirect the build (LD_*, DYLD_*, NODE_OPTIONS,
   PYTHONPATH, JAVA_TOOL_OPTIONS, BASH_ENV, RUSTC_WRAPPER, RUSTFLAGS, CARGO_*, GIT_*, *_PROXY and
   similar); the host HOME is passed only by an explicit `--pass-env HOME`, recorded in the receipt.

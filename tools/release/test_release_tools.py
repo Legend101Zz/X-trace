@@ -2244,6 +2244,30 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(failed)
         self.assertEqual(error, "quiescent wait failed: KeyboardInterrupt")
 
+    def test_floor_builds_its_environment_with_the_shared_allowlist_and_private_home(self) -> None:
+        gate = run_gates.Gate("env-probe", ("true",))
+        captured: dict[str, object] = {}
+
+        def fake_run(argv: list[str], *, cwd: pathlib.Path, env: dict[str, str], timeout: float, log_path: pathlib.Path,
+                     settle_report: dict | None = None, **_kwargs: object) -> tuple[int, float]:
+            captured.setdefault("env", dict(env))
+            os.close(private_roots.create_private_file(log_path, flags=os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode=0o600))
+            return 0, 0.1
+
+        ambient = {"PATH": os.environ.get("PATH", "/usr/bin"), "HOME": "/host/home", "JAVA_HOME": "/opt/jdk", "CI": "true",
+                   "GITHUB_TOKEN": "canary-token", "LD_PRELOAD": "/x.so"}
+        with mock.patch.dict(os.environ, ambient, clear=True), \
+                mock.patch.object(run_gates, "GATES", (gate,)), mock.patch.object(run_gates, "_run", side_effect=fake_run):
+            run_gates.run(self.args())
+        env = captured["env"]
+        self.assertEqual(env["JAVA_HOME"], "/opt/jdk")  # type: ignore[index]
+        self.assertEqual(env["CI"], "true")  # type: ignore[index]
+        self.assertNotIn("GITHUB_TOKEN", env)  # type: ignore[operator]
+        self.assertNotIn("LD_PRELOAD", env)  # type: ignore[operator]
+        self.assertEqual(env["HOME"], str(self.cache / "tmp" / "P00-test-home"))  # type: ignore[index]
+        self.assertTrue((self.cache / "tmp" / "P00-test-home").is_dir())
+        self.assertEqual(env["CARGO_HOME"], str(self.cache / "cargo"))  # type: ignore[index]
+
     def test_failed_gate_stops_and_never_claims_all_passed(self) -> None:
         failure = run_gates.Gate("failure", (sys.executable, "-c", "print('gate failed'); raise SystemExit(9)"))
         later = run_gates.Gate("unreached", (sys.executable, "-c", "raise SystemExit(0)"))
@@ -4222,7 +4246,10 @@ class LeasedRunTests(unittest.TestCase):
             "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER", "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "GRADLE_OPTS", "NPM_CONFIG_REGISTRY",
             "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE", "TMPDIR", "PATH", "XDG_CONFIG_HOME", "XTRACE_TEST_SCRATCH_ROOT",
         )
-        for name in refused:
+        for name in refused + (
+            "CC", "CXX", "LD", "AR", "LDFLAGS", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "GOFLAGS", "GOPATH", "PERL5OPT", "RUBYOPT", "CLASSPATH",
+            "OPENSSL_CONF", "MAKEFLAGS", "MAVEN_ARGS", "EDITOR", "SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID_X", "DOCKER_HOST", "PKG_CONFIG_PATH", "LIBRARY_PATH",
+        ):
             with self.subTest(name), self.fake_run() as fake:
                 with self.assertRaises(ValueError):
                     self.go(self.args("leased-deny", pass_env=[name]))
@@ -4258,6 +4285,57 @@ class LeasedRunTests(unittest.TestCase):
                 self.assertEqual(self.leases_present(), [], "refused before any lease was taken")
                 self.assertFalse((self.cache / "release-gates" / f"leased-refused-{index}").exists())
         self.assertNotIn(leased_run.EXIT_COMMAND_REFUSED, (0, 1, 2, 3, 4, 75, 76))
+
+    def test_argv0_path_forms_must_resolve_inside_the_repo_or_a_path_directory(self) -> None:
+        (self.repo / "gradlew").write_text("#!/bin/sh\n")
+        outside = self.root / "elsewhere"
+        outside.mkdir()
+        (outside / "cargo").write_text("#!/bin/sh\n")
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            leased_run.check_command_allowed(["./gradlew", "test"], self.repo)
+            leased_run.check_command_allowed([str(self.repo / "gradlew")], self.repo)
+            leased_run.check_command_allowed(["cargo", "build"], self.repo)
+            for argv in ([str(outside / "cargo")], ["../elsewhere/cargo"], ["/tmp/definitely-not-a-build-tool/node"]):
+                with self.subTest(argv=argv), self.assertRaises(leased_run.CommandRefused):
+                    leased_run.check_command_allowed(argv, self.repo)
+            link = self.repo / "node"
+            os.symlink(outside / "cargo", link)
+            with self.assertRaises(leased_run.CommandRefused):
+                leased_run.check_command_allowed(["./node"], self.repo)
+        self.assertIn("hygiene, not a barrier", leased_run.PROVENANCE_RESIDUAL)
+        self.assertIn("arbitrary code", leased_run.PROVENANCE_RESIDUAL)
+
+    def test_env_is_built_by_the_one_shared_policy(self) -> None:
+        cache = self.cache
+        scratch = self.cache / "tmp" / "x-scratch"
+        host = {"PATH": "/opt/tool/bin:/usr/bin", "HOME": "/host/home", "JAVA_HOME": "/opt/jdk", "RUSTUP_HOME": "/opt/rustup",
+                "CI": "true", "LC_ALL": "C", "GITHUB_TOKEN": "t", "AWS_SECRET_ACCESS_KEY": "s", "LD_PRELOAD": "/x.so", "HTTPS_PROXY": "http://p"}
+        floor_style = run_gates.build_task_env(cache, host, scratch=cache / "tmp", home=cache / "tmp" / "floor-home")
+        leased_style = leased_run.build_env(cache, scratch, host, None, (), scratch / "home")
+        for env in (floor_style, leased_style):
+            for name in ("PATH", "JAVA_HOME", "RUSTUP_HOME", "CI", "LC_ALL"):
+                self.assertEqual(env[name], host[name], f"builders keep {name}")
+            for name in ("GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "LD_PRELOAD", "HTTPS_PROXY"):
+                self.assertNotIn(name, env)
+            self.assertNotEqual(env["HOME"], "/host/home")
+            self.assertEqual(env["CARGO_HOME"], str(cache / "cargo"))
+            self.assertEqual(env["CARGO_TARGET_DIR"], str(cache / "cargo-target"))
+            self.assertEqual(env["GRADLE_USER_HOME"], str(cache / "gradle"))
+        self.assertEqual(floor_style["HOME"], str(cache / "tmp" / "floor-home"))
+        self.assertEqual(floor_style["TMPDIR"], str(cache / "tmp"))
+        self.assertEqual(leased_style["TMPDIR"], str(scratch))
+        # RUSTUP_HOME is derived from the host HOME when absent, so rustup still finds toolchains.
+        (self.root / "hosthome" / ".rustup").mkdir(parents=True)
+        derived = run_gates.build_task_env(cache, {"PATH": "/usr/bin", "HOME": str(self.root / "hosthome")}, scratch=scratch, home=scratch / "home")
+        self.assertEqual(derived["RUSTUP_HOME"], str(self.root / "hosthome" / ".rustup"))
+        self.assertEqual(derived["HOME"], str(scratch / "home"))
+        none = run_gates.build_task_env(cache, {"PATH": "/usr/bin", "HOME": str(self.root / "nohome")}, scratch=scratch, home=scratch / "home")
+        self.assertNotIn("RUSTUP_HOME", none)
+        # --jdk-home wins and prefixes PATH; HOME comes from the host only when explicitly passed.
+        jdk = run_gates.build_task_env(cache, host, scratch=scratch, home=scratch / "home", jdk_home="/opt/jdk17")
+        self.assertEqual((jdk["JAVA_HOME"], jdk["PATH"].split(os.pathsep)[0]), ("/opt/jdk17", "/opt/jdk17/bin"))
+        explicit = run_gates.build_task_env(cache, host, scratch=scratch, home=scratch / "home", pass_env=("HOME",))
+        self.assertEqual(explicit["HOME"], "/host/home")
 
     def test_receipt_records_the_provenance_residual_and_scrubs_errors(self) -> None:
         failure = run_gates.AttemptedGateFailure(OSError("/home/test/secret/path failed"), 0, 1.0)
@@ -4336,6 +4414,17 @@ class LeasedRunTests(unittest.TestCase):
                 env=dict(os.environ), timeout=30, log_path=self.root / "uncapped.log",
             )
         self.assertEqual(code, 0)
+
+class _AlwaysClassify:
+    def classify(self, unknowns, scan, fresh, owned, deadline):  # type: ignore[no-untyped-def]
+        return {pid: {"pid": pid, "startedAt": started, "classification": provenance.CLASS_SUBREAPER}
+                for pid, started in unknowns}
+
+
+class _NeverClassify:
+    def classify(self, *args):  # type: ignore[no-untyped-def]
+        return {}
+
 
 class ProvenanceTests(unittest.TestCase):
     """Provenance classification with fakes for every syscall, plus real-host observers."""
@@ -4629,6 +4718,130 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(blocked.classified, [])
         self.assertEqual(self.scan_with(None).classified, [])
 
+    def test_classified_identities_count_as_resolved_so_settling_does_not_stall(self) -> None:
+        """The realistic case: a process stays uninspectable but provenance classifies it on every
+        scan. It must resolve at once in both loops, not wait out the 120 s deadline for an exit."""
+        start = "Sun Oct  4 21:00:00 2026"
+        supplied = {7001: (1, start, "S")}
+        initial = [{"pid": 7001, "startedAt": start, "observedParentPid": 1,
+                    "descriptorStatus": "uninspectable", "reason": "missing-process-record-after-all-fd-fallback"}]
+        clock = FakeClock()
+
+        def poll_with(classifier: object) -> object:
+            def poll(_deadline: float) -> tuple[dict, run_gates.UntrackedProcessScan]:
+                clock.now += 0.01
+                return supplied, self.scan_with(classifier)
+            return poll
+
+        scan = self.scan_with(_AlwaysClassify())
+        self.assertEqual(scan.resolved_identities, frozenset({(7001, start)}), "classified identities are resolved")
+        self.assertEqual(scan.uninspectable, [])
+        result = run_gates._settle_uninspectable_candidates(
+            initial, poll_with(_AlwaysClassify()), duration=120, interval=1, monotonic=clock.monotonic, sleep=clock.sleep,
+        )
+        self.assertTrue(result.cleared)
+        self.assertEqual(result.poll_count, 1)
+        self.assertLess(clock.now, 5.0, "no 120 s stall")
+        clock.now = 0.0
+        cleared, _latest, error, count = run_gates._final_global_quiescence_scan(
+            120, poll_with(_AlwaysClassify()), lambda _s: [], monotonic=clock.monotonic, sleep=clock.sleep,
+            pending_identities={(7001, start)},
+        )
+        self.assertTrue(cleared, error)
+        self.assertEqual(count, 2)
+        self.assertLess(clock.now, 5.0)
+        # Without classification the same identity is still unresolved and fails closed at the deadline.
+        clock.now = 0.0
+        result = run_gates._settle_uninspectable_candidates(
+            initial, poll_with(_NeverClassify()), duration=5, interval=1, monotonic=clock.monotonic, sleep=clock.sleep,
+        )
+        self.assertFalse(result.cleared)
+        self.assertGreaterEqual(clock.now, 5.0)
+
+    def test_provenance_facts_are_durable_in_owner_records_and_receipts(self) -> None:
+        item = provenance.Provenance(
+            platform="darwin", runner_pid=self.RUNNER, coalition_reader={self.RUNNER: 100, 4321: 55}.get, facts_reader=self.facts,
+        )
+        item.start()
+        item.note_root(4321)
+        self.assertEqual(item.facts(), {"mode": "coalition", "available": True, "runCoalitionIds": [55, 100], "subreaper": False})
+        self.assertEqual(item.report()["runCoalitionIds"], [55, 100])
+        linux = self.subreaper()
+        linux.start()
+        linux.stop()
+        self.assertTrue(linux.facts()["subreaper"], "the subreaper fact survives stop()")
+        self.assertTrue(linux.report()["subreaper"])
+        lease_tests = SettleAndGlobalQuiescenceTests()
+        owner = lease_tests.retain(provenance_facts=item.facts())
+        self.assertEqual(owner["provenance"], {"mode": "coalition", "available": True, "runCoalitionIds": [55, 100], "subreaper": False})
+        hostile = lease_tests.retain(provenance_facts={"mode": "x", "available": 1, "runCoalitionIds": [0, -1, "a", 5] + list(range(9, 40)), "subreaper": "yes"})
+        self.assertEqual(hostile["provenance"]["runCoalitionIds"][0], 5)
+        self.assertLessEqual(len(hostile["provenance"]["runCoalitionIds"]), 8)
+        self.assertIs(hostile["provenance"]["subreaper"], False)
+        error = run_gates.UncertainProcessTree("x", 1)
+        error.provenance_facts = item.facts()
+        seen: list[dict] = []
+
+        class Spy:
+            label = "spy"
+
+            def retain_for_manual_recovery(self, *args: object, **kwargs: object) -> None:
+                seen.append(kwargs)
+
+        run_gates._retain_uncertain_leases([Spy()], error)  # type: ignore[list-item]
+        self.assertEqual(seen[0]["provenance_facts"]["runCoalitionIds"], [55, 100])
+
+    def test_a_failed_run_carries_the_run_coalition_ids_for_recovery(self) -> None:
+        world = RunOwnershipWorldTests()
+        world.setUp()
+        self.addCleanup(world.temp.cleanup)
+        real_class = provenance.Provenance
+        factory = lambda **_ignored: real_class(  # noqa: E731
+            platform="darwin", runner_pid=self.RUNNER, coalition_reader={self.RUNNER: 100, 9001: 100}.get,
+            facts_reader=lambda pids, _d: {pid: (0, f"start-{pid}") for pid in pids})
+        _report, failure, _result = world.drive([world.world(_unknown(9001))], provenance_factory=factory, settle_seconds=2.0)
+        self.assertIsNotNone(failure)
+        assert failure is not None
+        self.assertEqual(failure.provenance_facts["runCoalitionIds"], [100])
+
+    def test_provenance_start_failure_does_not_leak_the_log_descriptor(self) -> None:
+        opened: list[int] = []
+        temp = tempfile.TemporaryDirectory(dir=test_scratch_root())
+        self.addCleanup(temp.cleanup)
+
+        class Broken:
+            def __init__(self, **_ignored: object) -> None:
+                pass
+
+            def start(self) -> bool:
+                raise OSError("prctl exploded")
+
+            def stop(self) -> None:
+                pass
+
+            def report(self) -> dict:
+                return {}
+
+        def create(path: object, flags: int, mode: int) -> int:
+            fd = os.open(path, flags, mode)
+            opened.append(fd)
+            return fd
+
+        report: dict = {}
+        with mock.patch.object(private_roots, "create_private_file", side_effect=create), \
+                mock.patch.object(run_gates.provenance_module, "Provenance", Broken):
+            try:
+                run_gates._run(
+                    [sys.executable, "-c", "pass"], cwd=pathlib.Path(temp.name), env=dict(os.environ), timeout=5,
+                    log_path=pathlib.Path(temp.name) / "leak.log", provenance=True, provenance_report=report,
+                )
+            except (OSError, run_gates.UncertainProcessTree):
+                pass
+        self.assertTrue(opened)
+        for fd in opened:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
     def test_run_with_provenance_passes_when_foreign_daemons_are_classified_and_fails_closed_without_it(self) -> None:
         world = RunOwnershipWorldTests()
         world.setUp()
@@ -4711,6 +4924,7 @@ class RecoverLeasesTests(unittest.TestCase):
         self.snapshot_calls = 0
         self.on_snapshot: object = None
         self.identities = [(4101, self.lstart(self.RUN_EPOCH + 30)), (4102, self.lstart(self.RUN_EPOCH + 31))]
+        self.coalitions[self.SELF_PID] = 100
         self.write_records()
 
         def identity(path: object) -> tuple[int, int]:
@@ -4783,6 +4997,7 @@ class RecoverLeasesTests(unittest.TestCase):
             platform="darwin", uid=501, self_pid=self.SELF_PID, sleep=sleep, monotonic=self.clock.monotonic,
             now=lambda: datetime.datetime(2026, 10, 4, 18, 30, 0, tzinfo=datetime.timezone.utc),
             snapshot=snapshot, coalition_reader=lambda pid: self.coalitions.get(pid), facts_reader=facts,
+            start_reader=lambda pid: recover_leases.parse_start(self.processes[pid][1]) if pid in self.processes else None,
             inventory=lambda: [(1, "launchd"), (self.SELF_PID, "python3.14")],
             lsof=lambda paths: [{"path": path, "pids": list(self.holders), "error": None} for path in paths],
         )
@@ -4824,7 +5039,9 @@ class RecoverLeasesTests(unittest.TestCase):
         self.assertEqual(plan["protocol"]["observations"], 3)
         self.assertEqual(len(plan["observations"]), 3)
         self.assertEqual(len(plan["globalScans"]), 2)
-        self.assertEqual(plan["runCoalitionSources"], ["operator"])
+        self.assertEqual(plan["runCoalitionSources"], ["operator:tool-session"])
+        self.assertEqual(plan["toolSessionCoalitionId"], 100)
+        self.assertIn("not that nothing can write the caches", plan["notice"])
         # The three observations and two scans are at least two seconds apart.
         self.assertTrue(all(gap >= 2.0 for gap in self.sleeps), self.sleeps)
         self.assertGreaterEqual(self.clock.now, 2 * 2.0 + 2.0)
@@ -4953,12 +5170,12 @@ class RecoverLeasesTests(unittest.TestCase):
         start = self.lstart(self.RUN_EPOCH + 50)
         old = self.lstart(self.RUN_EPOCH - 3600)
         self.world((1, 0, -86400, "S"), (500, 1, -3000, "S"), (610, 500, 100, "S"), (620, 1, 100, "S"), (630, 1, 100, "S"),
-                   (640, 1, 100, "Z"), (650, 1, -100, "S"))
+                   (640, 1, 100, "Z"), (650, 1, -400, "S"))
         self.coalitions.update({620: 7, 630: 100, 610: 100})
         classifier = recover_leases.Classifier(self.context(), self.RUN_EPOCH, [100])
         outcomes = classifier.classify_many([
             (610, self.lstart(self.RUN_EPOCH + 100)), (620, self.lstart(self.RUN_EPOCH + 100)), (630, self.lstart(self.RUN_EPOCH + 100)),
-            (640, self.lstart(self.RUN_EPOCH + 100)), (650, self.lstart(self.RUN_EPOCH - 100)), (999, start),
+            (640, self.lstart(self.RUN_EPOCH + 100)), (650, self.lstart(self.RUN_EPOCH - 400)), (999, start),
             (620, "Mon Jan  1 00:00:00 2001"),
         ], self.processes)
         classes = {key: cls for key, (cls, _e) in outcomes.items()}
@@ -4967,7 +5184,10 @@ class RecoverLeasesTests(unittest.TestCase):
         self.assertEqual(classes[(620, self.lstart(self.RUN_EPOCH + 100))], "non-descendant-coalition")
         self.assertEqual(classes[(630, self.lstart(self.RUN_EPOCH + 100))], "uncertain", "equal coalition, ppid 1: could be a daemonized descendant")
         self.assertEqual(classes[(640, self.lstart(self.RUN_EPOCH + 100))], "exited", "zombie")
-        self.assertEqual(classes[(650, self.lstart(self.RUN_EPOCH - 100))], "non-descendant-predates-run")
+        self.assertEqual(classes[(650, self.lstart(self.RUN_EPOCH - 400))], "non-descendant-predates-run")
+        # Inside the 300 s margin a process is NOT treated as predating the run.
+        self.processes[651] = (1, self.lstart(self.RUN_EPOCH - 100), "S")
+        self.assertFalse(classifier.predates(self.processes[651][1], 651))
         self.assertEqual(classes[(999, start)], "exited")
         self.assertEqual(classes[(620, "Mon Jan  1 00:00:00 2001")], "exited", "start time differs: PID reuse")
         # Without run coalition ids nothing can be classified by coalition; Linux has no ancestor rule.
@@ -4979,7 +5199,7 @@ class RecoverLeasesTests(unittest.TestCase):
 
     def test_observation_requires_every_live_sighting_to_be_classified(self) -> None:
         self.quiet_world()
-        pid, start = self.identities[0]
+        pid, start = self.identities[1]  # unconfirmed (not recorded as owned)
         flips = {"count": 0}
 
         def flicker(call: int) -> None:
@@ -5015,8 +5235,8 @@ class RecoverLeasesTests(unittest.TestCase):
         self.assertIn((4101, self.identities[0][1]), found)
         self.assertEqual(sum(1 for key in found if 5000 <= key[0] < 5064), 64)
         self.assertIn("identityUnionTruncated", truncated)
-        ids, sources = recover_leases.run_coalition_ids(records, [100])
-        self.assertEqual((ids, sources), ([55, 100], ["operator", "receipt"]))
+        ids, sources = recover_leases.run_coalition_ids(self.context(), records, [100], found)
+        self.assertEqual((ids, sources), ([55, 100], ["operator:tool-session", "persisted"]))
         huge = {"label": self.LABEL, "decision": "failed",
                 "a": {"naturalExitSettle": {"identityUnion": [{"pid": 10000 + n, "startedAt": "s"} for n in range(64)]}}}
         for index in range(10):
@@ -5045,7 +5265,11 @@ class RecoverLeasesTests(unittest.TestCase):
         archive = next(self.run_dir.glob("manual-recovery-*"))
         self.assertEqual(archive.name, "manual-recovery-20261004T183000Z")
         for name in ("cargo", "gradle"):
-            self.assertEqual((archive / f"original-owner-{name}.json").read_bytes(), original_bytes[name])
+            archived = (archive / f"owner-{name}-token-redacted.json").read_text()
+            self.assertNotIn(self.TOKEN, archived, "raw lease tokens are never archived")
+            redacted = json.loads(archived)
+            self.assertEqual(redacted["token"], "sha256:" + hashlib.sha256(self.TOKEN.encode()).hexdigest())
+            self.assertEqual(redacted["label"], self.LABEL)
         self.assertEqual((archive / "failed-receipt.json").read_bytes(), receipt_bytes)
         data = (archive / "manual-recovery.json").read_bytes()
         self.assertEqual(hashlib.sha256(data).hexdigest(), summary["manualRecoverySha256"])
@@ -5088,7 +5312,8 @@ class RecoverLeasesTests(unittest.TestCase):
         archive = next(self.run_dir.glob("manual-recovery-*"))
         result = json.loads((archive / "manual-recovery.json").read_text())
         self.assertEqual(result["failure"], "OSError")
-        self.assertTrue((archive / "original-owner-gradle.json").exists(), "originals were archived before anything was removed")
+        self.assertTrue((archive / "owner-gradle-token-redacted.json").exists(), "originals were archived before anything was removed")
+        self.assertEqual(result["status"], "partial")
 
     def test_execute_refuses_to_remove_a_lease_whose_record_changed_at_the_last_moment(self) -> None:
         self.quiet_world()
@@ -5111,6 +5336,137 @@ class RecoverLeasesTests(unittest.TestCase):
         with mock.patch.object(subprocess, "run", side_effect=AssertionError("no helper processes in this test")), \
                 mock.patch.object(os, "setuid", side_effect=AssertionError("no privilege"), create=True):
             self.assertEqual(self.go(), recover_leases.EXIT_OK)
+
+    def test_operator_coalition_ids_are_validated_and_must_be_corroborated(self) -> None:
+        for bad in ([0], [-5], list(range(1, 10)), [2**63]):
+            with self.subTest(bad=bad), self.assertRaises(recover_leases.InvalidInput):
+                self.go(run_coalition_id=bad)
+        self.quiet_world()
+        # Uncorroborated id: not the tool session's, not persisted, no live identity carries it.
+        self.coalitions[self.SELF_PID] = 55
+        self.assertEqual(self.go(run_coalition_id=[100]), recover_leases.EXIT_REFUSED)
+        self.assertEqual(self.summary()["refusalReasons"], ["run-coalition-uncorroborated"])
+        # Corroborated by the tool's own session coalition.
+        self.coalitions[self.SELF_PID] = 100
+        self.assertEqual(self.go(run_coalition_id=[100]), recover_leases.EXIT_OK)
+        # Corroborated by a still-live recorded identity that carries it.
+        self.coalitions[self.SELF_PID] = 55
+        pid, start = self.identities[1]
+        self.processes[pid] = (1, start, "S")
+        self.coalitions[pid] = 100
+        self.assertEqual(self.go(run_coalition_id=[100]), recover_leases.EXIT_REFUSED)
+        self.assertNotIn("run-coalition-uncorroborated", self.summary()["refusalReasons"], "corroborated, then judged on its own merits")
+        self.assertIn("identity-uncertain", self.summary()["refusalReasons"], "the live identity shares the run coalition")
+
+    def test_persisted_coalition_ids_are_authoritative_and_operator_ids_additive_only(self) -> None:
+        self.write_records(owner=self.owner_record(provenance={"mode": "coalition", "available": True, "runCoalitionIds": [100], "subreaper": False}))
+        self.quiet_world()
+        # No operator id needed: the run's own record names its coalition.
+        self.assertEqual(self.go(run_coalition_id=[]), recover_leases.EXIT_OK, self.lines)
+        plan = json.loads((self.run_dir / self.summary()["planFile"]).read_text())
+        self.assertEqual((plan["runCoalitionIds"], plan["runCoalitionSources"]), ([100], ["persisted"]))
+        # A wrong operator id can neither replace nor remove the persisted id.
+        self.setUp()
+        self.write_records(owner=self.owner_record(provenance={"mode": "coalition", "available": True, "runCoalitionIds": [100], "subreaper": False}))
+        self.quiet_world()
+        self.coalitions[self.SELF_PID] = 55
+        self.coalitions[800] = 100
+        self.processes[800] = (1, self.lstart(self.RUN_EPOCH + 900), "S")
+        self.assertEqual(self.go(run_coalition_id=[55]), recover_leases.EXIT_REFUSED)
+        self.assertIn("scan-uncertain", self.summary()["refusalReasons"], "a daemon in the persisted run coalition still blocks")
+
+    def test_recorded_owned_identities_are_cleared_only_by_verified_exit(self) -> None:
+        self.quiet_world()
+        pid, start = self.identities[0]  # recorded in ownedProcesses
+        self.processes[pid] = (1, start, "S")
+        self.coalitions[pid] = 7  # foreign coalition: would classify as non-descendant if it were not owned
+        self.assertEqual(self.go(), recover_leases.EXIT_REFUSED)
+        self.assertIn("identity-uncertain", self.summary()["refusalReasons"])
+        self.setUp()
+        self.quiet_world()
+        self.processes[pid] = (1, start, "S")
+        self.processes[500] = (1, self.lstart(self.RUN_EPOCH - 3000), "S")
+        self.processes[pid] = (500, start, "S")  # also has a pre-run ancestor
+        self.assertEqual(self.go(), recover_leases.EXIT_REFUSED, "heuristics never clear an owned identity")
+
+    def test_parse_start_refuses_dst_ambiguity_and_start_sources_must_agree(self) -> None:
+        old_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "America/New_York"
+            time.tzset()
+            self.assertIsNone(recover_leases.parse_start("Sun Nov  1 01:30:00 2026"), "repeated fall-back hour is ambiguous")
+            self.assertIsNotNone(recover_leases.parse_start("Sun Nov  1 03:30:00 2026"))
+            self.assertIsNotNone(recover_leases.parse_start("Sun Jul  5 01:30:00 2026"))
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
+        start = self.lstart(self.RUN_EPOCH - 4000)
+        self.processes = {900: (1, start, "S")}
+        agree = recover_leases.Classifier(self.context(), self.RUN_EPOCH, [100])
+        self.assertTrue(agree.predates(start, 900))
+        disagree = recover_leases.Classifier(self.context(start_reader=lambda pid: recover_leases.parse_start(start) + 3600), self.RUN_EPOCH, [100])
+        self.assertFalse(disagree.predates(start, 900), "a skew between the kernel and ps start times fails closed")
+        unreadable = recover_leases.Classifier(self.context(start_reader=lambda pid: None), self.RUN_EPOCH, [100])
+        self.assertFalse(unreadable.predates(start, 900))
+
+    def test_kernel_start_reader_agrees_with_ps_for_this_process(self) -> None:
+        epoch = provenance.read_process_start_epoch(os.getpid())
+        if epoch is None:
+            return  # unsupported host: nothing to compare
+        ps = subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())], capture_output=True, text=True).stdout.strip()
+        parsed = recover_leases.parse_start(ps)
+        self.assertTrue(parsed is None or abs(parsed - epoch) <= 2.0, (parsed, epoch))
+        self.assertLess(epoch, time.time() + 1)
+        self.assertIsNone(provenance.read_process_start_epoch(2**22 + 12345))
+
+    def test_removal_reads_the_record_through_the_lease_descriptor_and_refuses_links(self) -> None:
+        self.quiet_world()
+        layout = recover_leases.Layout(self.cache, self.LABEL)
+        records = recover_leases.read_records(layout)
+        admissions = recover_leases.admit_all(layout)
+        expected = recover_leases._public_facts(records["ownerFacts"]["cargo"])
+        owner_path = self.cache / "leases" / "cargo" / "owner.json"
+        os.link(owner_path, self.root / "second-link")  # a second hard link
+        with self.assertRaises(recover_leases.Refused):
+            recover_leases._remove_lease(layout, "cargo", expected, admissions["leases/cargo"])
+        self.assertTrue(owner_path.exists())
+        os.unlink(self.root / "second-link")
+        data = owner_path.read_bytes()
+        owner_path.unlink()
+        (self.cache / "leases" / "cargo" / "target.json").write_bytes(data)
+        os.symlink("target.json", owner_path)  # a symlink in place of the record
+        with self.assertRaises((recover_leases.Refused, OSError)):
+            recover_leases._remove_lease(layout, "cargo", expected, admissions["leases/cargo"])
+        self.assertTrue((self.cache / "leases" / "cargo").exists())
+
+    def test_post_removal_receipt_reread_failure_still_writes_an_honest_manual_recovery_json(self) -> None:
+        self.quiet_world()
+        real = recover_leases._file_facts
+        removed = {"done": False}
+        real_remove = recover_leases._remove_lease
+
+        def tracking(*args: object, **kwargs: object) -> None:
+            real_remove(*args, **kwargs)  # type: ignore[arg-type]
+            removed["done"] = True
+
+        def failing(path: pathlib.Path) -> dict:
+            if removed["done"] and path.name == "receipt.json":
+                raise OSError("receipt vanished")
+            return real(path)
+
+        with mock.patch.object(recover_leases, "_remove_lease", side_effect=tracking), \
+                mock.patch.object(recover_leases, "_file_facts", side_effect=failing):
+            code = self.go(execute=True, dry_run=False, confirm_label=self.LABEL)
+        self.assertEqual(code, recover_leases.EXIT_PARTIAL)
+        archive = next(self.run_dir.glob("manual-recovery-*"))
+        result = json.loads((archive / "manual-recovery.json").read_text())
+        self.assertIsNone(result["failedReceiptUnmodified"], "unverifiable, reported as such, not assumed")
+        self.assertEqual(result["status"], "partial")
+        self.assertTrue(result["bothPathsAbsent"])
+        self.assertFalse(self.summary()["complete"])
 
     def test_cli_parser(self) -> None:
         parsed = recover_leases.build_parser().parse_args(

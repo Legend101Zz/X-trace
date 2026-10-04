@@ -1037,6 +1037,70 @@ def _successful_settle_report(value: Any) -> bool:
     )
 
 
+def _describe_runner_failure(root: pathlib.Path, label: str) -> dict[str, Any]:
+    """Sanitized description of where a floor run stopped: stage, fixed step name, exit code.
+
+    Only fixed names (gate and version-probe names), integers and a scrubbed first line are
+    emitted; no paths, environment, raw logs or process records.
+    """
+    info: dict[str, Any] = {"stage": "unknown"}
+    probe_names = {name for name, _argv, _cwd in run_gates.VERSION_COMMANDS}
+    gate_names = set(EXPECTED_GATE_NAMES)
+    receipt: Any = None
+    try:
+        receipt = private_roots.read_private_json(
+            root / "release-gates" / label / "receipt.json",
+            maximum_nodes=CI_RECEIPT_JSON_BUDGET, maximum_commas=CI_RECEIPT_JSON_BUDGET,
+        )
+    except (private_roots.AdmissionError, OSError, ValueError, RuntimeError):
+        receipt = None
+
+    def small_int(value: Any) -> int | None:
+        return value if type(value) is int and -1000 <= value <= 1000 else None
+
+    if isinstance(receipt, dict):
+        info["stage"] = "runner"
+        if isinstance(receipt.get("decision"), str):
+            info["decision"] = _scrub_text(receipt["decision"], 40)
+        if isinstance(receipt.get("error"), str):
+            info["runnerError"] = _scrub_text(receipt["error"])
+        for probe in receipt.get("versionProbes") or []:
+            if isinstance(probe, dict) and probe.get("status") not in {"passed", "unavailable"}:
+                name = probe.get("name")
+                info.update({"stage": "version-probe", "step": name if name in probe_names else "unknown",
+                             "exitCode": small_int(probe.get("exitCode"))})
+                break
+        else:
+            for gate in receipt.get("gates") or []:
+                if isinstance(gate, dict) and gate.get("status") in {"failed"}:
+                    name = gate.get("name")
+                    info.update({"stage": "gate", "step": name if name in gate_names else "unknown",
+                                 "exitCode": small_int(gate.get("exitCode"))})
+                    break
+        return info
+    info["stage"] = "no-receipt"
+    try:
+        fd = private_roots.open_private_file_read(root / "gate-runner.log")
+        try:
+            kept = b""
+            total = 0
+            while total < 16 * 1024 * 1024:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                kept = (kept + chunk)[-4096:]
+            tail = kept.decode("utf-8", "replace")
+        finally:
+            os.close(fd)
+        lines = [line for line in tail.splitlines() if line.strip()]
+        if lines:
+            info["runnerError"] = _scrub_text(lines[-1])
+    except (private_roots.AdmissionError, OSError, ValueError, RuntimeError):
+        pass
+    return info
+
+
 def _provenance_classified_count(value: Any) -> int:
     """Validate one gate/probe provenance report and return its classified count.
 
@@ -1307,16 +1371,26 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         })
         if _source_proofs(repo, args.expected_head, args.phase_base) != source_proofs:
             raise FloorInputError
-    except (FloorInputError, OSError, RuntimeError, ValueError, TypeError):
+    except (FloorInputError, OSError, RuntimeError, ValueError, TypeError) as floor_error:
+        summary["invalidReason"] = _failure_reason(floor_error)
         summary["floorStatus"] = "invalid" if receipt_was_read or receipt_path.exists() else "unreached"
         summary["gates"] = []
         summary["gateCount"] = 0
         summary["provenance"] = {"reportCount": 0, "classifiedCount": 0}
+    if summary["floorStatus"] != "checks_passed_for_review":
+        try:
+            summary["failure"] = _describe_runner_failure(root, args.label)
+        except Exception:  # noqa: BLE001 - diagnostics must never break the summary
+            summary["failure"] = {"stage": "unavailable"}
     private_roots.atomic_write_private(
         root / "release-floor-summary.json",
         (json.dumps(summary, indent=2, sort_keys=True) + "\n").encode(),
     )
-    print(json.dumps({"floorStatus": summary["floorStatus"], "gateCount": summary["gateCount"]}, sort_keys=True))
+    printed: dict[str, Any] = {"floorStatus": summary["floorStatus"], "gateCount": summary["gateCount"]}
+    for key in ("invalidReason", "failure"):
+        if key in summary:
+            printed[key] = summary[key]
+    print(json.dumps(printed, sort_keys=True))
     return 0 if summary["floorStatus"] == "checks_passed_for_review" else 1
 
 

@@ -98,6 +98,36 @@ def read_coalition_id(pid: int) -> int | None:
     return int(buffer[0])
 
 
+def read_process_start_epoch(pid: int) -> float | None:
+    """Process start time as epoch seconds from the kernel, not from `ps lstart` text.
+
+    macOS: proc_pidinfo(PROC_PIDTBSDINFO) pbi_start_tvsec. Linux: /proc/<pid>/stat starttime
+    ticks plus the boot time. None when unreadable. Free of local-time (DST) ambiguity.
+    """
+    try:
+        if sys.platform == "darwin":
+            libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+            buffer = ctypes.create_string_buffer(136)
+            if libc.proc_pidinfo(int(pid), 3, 0, buffer, 136) != 136:
+                return None
+            raw = bytes(buffer)
+            if int.from_bytes(raw[12:16], "little") != int(pid):
+                return None
+            return float(int.from_bytes(raw[120:128], "little"))
+        if sys.platform.startswith("linux"):
+            with open(f"/proc/{int(pid)}/stat", "rb") as stream:
+                text = stream.read(4096).decode("ascii", "replace")
+            fields = text[text.rindex(")") + 2:].split()
+            ticks = int(fields[19])
+            with open("/proc/stat", "rb") as stream:
+                boot = next(int(line.split()[1]) for line in stream.read(65536).decode("ascii", "replace").splitlines()
+                            if line.startswith("btime "))
+            return boot + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration, AttributeError, TypeError):
+        return None
+    return None
+
+
 def set_child_subreaper(enabled: bool) -> bool:
     """Set and verify PR_SET_CHILD_SUBREAPER for this process; False on any failure."""
     if not sys.platform.startswith("linux"):
@@ -224,6 +254,7 @@ class Provenance:
         self._descendants: set[tuple[int, str]] = set()
         self._adopted: dict[int, str] = {}
         self._subreaper_on = False
+        self._subreaper_was_set = False
 
     @staticmethod
     def _default_reap(pid: int, flags: int) -> Any:
@@ -244,6 +275,7 @@ class Provenance:
                 self.unavailable_reason = "prctl-failed"
                 return False
             self._subreaper_on = True
+            self._subreaper_was_set = True
             self.available = True
             self.unavailable_reason = ""
         return self.available
@@ -360,10 +392,18 @@ class Provenance:
             self.evidence.add(record)
         return result
 
+    def facts(self) -> dict[str, Any]:
+        """Small, durable facts about this run's provenance (kept in owner records and receipts)."""
+        return {
+            "mode": self.mode, "available": self.available,
+            "runCoalitionIds": sorted(self.run_coalitions)[:8], "subreaper": self._subreaper_was_set,
+        }
+
     def report(self) -> dict[str, Any]:
         report = {
             "mode": self.mode, "available": self.available, "overflowed": self.overflowed,
             "unavailableReason": self.unavailable_reason, "adoptedOrphanCount": len(self._adopted),
+            "runCoalitionIds": sorted(self.run_coalitions)[:8], "subreaper": self._subreaper_was_set,
         }
         report.update(self.evidence.report())
         return report

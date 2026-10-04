@@ -91,6 +91,15 @@ class UntrackedProcessScan:
     def unconfirmed(self) -> list[dict[str, Any]]:
         return self.held + self.uninspectable
 
+    @property
+    def resolved_identities(self) -> frozenset[tuple[int, str]]:
+        """Identities the scan positively resolved: inspected clean or provenance-classified."""
+        classified = {
+            (item["pid"], item["startedAt"]) for item in self.classified
+            if isinstance(item, dict) and isinstance(item.get("pid"), int) and isinstance(item.get("startedAt"), str)
+        }
+        return self.clean_identities | frozenset(classified)
+
 
 @dataclass(frozen=True)
 class NaturalExitSettle:
@@ -310,6 +319,7 @@ class UncertainProcessTree(RuntimeError):
         self.unconfirmed_processes: list[dict[str, Any]] = []
         self.unconfirmed_process_count = 0
         self.unconfirmed_processes_truncated = False
+        self.provenance_facts: dict[str, Any] = {}
         self.owned_probe_processes: list[dict[str, Any]] = []
         self.owned_probe_process_count = 0
         self.cleanup_exceptions: list[dict[str, Any]] = []
@@ -530,7 +540,7 @@ def _settle_uninspectable_candidates(
                 return result(False, poll_count, "owned process appeared during settling")
         unresolved = {
             identity for identity in _live_identities(snapshot) & identities
-            if identity not in scan.clean_identities
+            if identity not in scan.resolved_identities
         }
         if not unresolved:
             return result(True, poll_count, None)
@@ -603,7 +613,7 @@ def _final_global_quiescence_scan(
         pending.update((item["pid"], item["startedAt"]) for item in scan.uninspectable)
         unresolved = {
             identity for identity in _live_identities(snapshot) & pending
-            if identity not in scan.clean_identities
+            if identity not in scan.resolved_identities
         }
         if scan.uninspectable or unresolved:
             churn_seen = True
@@ -1571,6 +1581,8 @@ def _run(
         error.unconfirmed_processes_truncated = (
             unconfirmed_processes_truncated or unconfirmed_process_count > len(unconfirmed_processes)
         )
+        if prov is not None:
+            error.provenance_facts = prov.facts()
         error.owned_probe_processes = list(probe_evidence.probes)
         error.owned_probe_process_count = probe_evidence.probe_count
         error.cleanup_exceptions = list(probe_evidence.exceptions)
@@ -1645,8 +1657,8 @@ def _tree_state_digest(repo: pathlib.Path) -> str:
     git = ["git", *GIT_SAFE_ARGS]
     env = _git_environment()
     status = subprocess.run([*git, "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    work = subprocess.run([*git, "diff", "--binary", "HEAD"], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    cached = subprocess.run([*git, "diff", "--cached", "--binary", "HEAD"], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    work = subprocess.run([*git, "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    cached = subprocess.run([*git, "diff", "--no-ext-diff", "--no-textconv", "--cached", "--binary", "HEAD"], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if status.returncode or work.returncode or cached.returncode:
         raise RuntimeError("cannot capture working-tree identity")
     pieces = [status.stdout, work.stdout, cached.stdout]
@@ -1663,7 +1675,7 @@ def _tree_state_digest(repo: pathlib.Path) -> str:
 
 
 def _phase_diff(repo: pathlib.Path, base: str) -> bytes:
-    result = subprocess.run(["git", *GIT_SAFE_ARGS, "diff", "--binary", f"{base}...HEAD"], cwd=repo, env=_git_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    result = subprocess.run(["git", *GIT_SAFE_ARGS, "diff", "--no-ext-diff", "--no-textconv", "--binary", f"{base}...HEAD"], cwd=repo, env=_git_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if result.returncode:
         raise RuntimeError("cannot capture pinned phase diff")
     return result.stdout
@@ -1778,6 +1790,62 @@ def _versions(
         else:
             versions[name] = _first_nonempty_version_line(raw)
     return versions
+
+
+# Parent environment names that reach a build command. Everything else (ambient credentials,
+# code-loading variables, proxies) is dropped; the task-scoped variables are added by
+# build_task_env. One policy for the 23-gate floor and for leased runs.
+ENV_ALLOWLIST = frozenset({
+    "PATH", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ", "CI",
+    "SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET",
+    "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "JAVA_HOME", "CARGO_TERM_COLOR", "CARGO_INCREMENTAL",
+})
+ENV_ALLOWED_PREFIXES = ("LC_",)
+
+
+def build_task_env(
+    cache: pathlib.Path, base_env: dict[str, str], *, scratch: pathlib.Path, home: pathlib.Path,
+    jdk_home: str | None = None, pass_env: Sequence[str] = (),
+) -> dict[str, str]:
+    """The one environment policy for builders: explicit allowlist, task-scoped caches, private HOME.
+
+    - Only ENV_ALLOWLIST/LC_* names and explicitly passed names survive.
+    - HOME is `home` (a private directory the caller created), so ~/.npmrc, ~/.netrc, ~/.ssh and
+      friends are unreachable; the host HOME is passed only when "HOME" is in `pass_env`.
+    - Builders still find their toolchains: PATH, JAVA_HOME and RUSTUP_HOME pass through; when
+      RUSTUP_HOME is unset and the host HOME has a .rustup directory it is set explicitly (rustup
+      would otherwise look under the private HOME); `jdk_home` sets JAVA_HOME and prefixes PATH.
+    - CARGO_HOME, CARGO_TARGET_DIR, GRADLE_USER_HOME, NPM_CONFIG_CACHE, PLAYWRIGHT_BROWSERS_PATH,
+      XDG_CACHE_HOME, TMPDIR/TMP/TEMP and the XTRACE test scratch variables are task-scoped.
+    """
+    extra = set(pass_env)
+    env = {
+        name: value for name, value in base_env.items()
+        if (name in ENV_ALLOWLIST or name in extra or name.startswith(ENV_ALLOWED_PREFIXES)) and name != "HOME"
+    }
+    host_home = base_env.get("HOME")
+    if "HOME" in extra and host_home:
+        env["HOME"] = host_home
+    else:
+        env["HOME"] = str(home)
+        if "RUSTUP_HOME" not in env and host_home:
+            candidate = pathlib.Path(host_home) / ".rustup"
+            if candidate.is_dir():
+                env["RUSTUP_HOME"] = str(candidate)
+    env.update({
+        "CARGO_HOME": str(cache / "cargo"),
+        "CARGO_TARGET_DIR": str(cache / "cargo-target"),
+        "GRADLE_USER_HOME": str(cache / "gradle"),
+        "NPM_CONFIG_CACHE": str(cache / "npm"),
+        "PLAYWRIGHT_BROWSERS_PATH": str(cache / "playwright"),
+        "XDG_CACHE_HOME": str(cache / "xdg"),
+        "TMPDIR": str(scratch), "TMP": str(scratch), "TEMP": str(scratch),
+        "XTRACE_TEST_SCRATCH_ROOT": str(scratch), "XTRACE_TEST_PRIVATE_SCRATCH": str(scratch),
+    })
+    if jdk_home:
+        env["JAVA_HOME"] = jdk_home
+        env["PATH"] = os.pathsep.join(filter(None, [str(pathlib.Path(jdk_home) / "bin"), env.get("PATH", "")]))
+    return env
 
 
 def _restricted_env(base_env: dict[str, str], cache: pathlib.Path, label: str) -> tuple[dict[str, str], str]:
@@ -1918,6 +1986,7 @@ class Lease:
         cleanup_exception_count: int | None = None,
         owned_probe_process_count: int | None = None,
         probe_evidence_truncated: bool | None = None,
+        provenance_facts: dict[str, Any] | None = None,
     ) -> None:
         """Retain the lease with bounded evidence.
 
@@ -1961,6 +2030,13 @@ class Lease:
                 probe_evidence_truncated
                 or (owned_probe_process_count or 0) > len(owned_probe_processes or [])
             )
+        if provenance_facts:
+            owner["provenance"] = {
+                "mode": provenance_facts.get("mode"), "available": provenance_facts.get("available") is True,
+                "runCoalitionIds": [value for value in (provenance_facts.get("runCoalitionIds") or [])
+                                    if type(value) is int and value > 0][:8],
+                "subreaper": provenance_facts.get("subreaper") is True,
+            }
         _fit_owner_record(owner)
         _atomic_json(self.path / "owner.json", owner)
 
@@ -2027,6 +2103,7 @@ def _retain_uncertain_leases(leases: Sequence[Lease], exc: UncertainProcessTree)
                 cleanup_exception_count=exc.cleanup_exception_count,
                 owned_probe_process_count=exc.owned_probe_process_count,
                 probe_evidence_truncated=exc.probe_evidence_truncated,
+                provenance_facts=getattr(exc, "provenance_facts", None),
             )
         except (OSError, RuntimeError, ValueError):
             failed.append(lease.label)
@@ -2131,18 +2208,10 @@ def run(args: argparse.Namespace) -> int:
         diff_start = _phase_diff(repo, base)
         dirty_start = _tree_state_digest(repo)
         use_provenance = bool(getattr(args, "provenance", False))
-        env = os.environ.copy()
-        env.update({
-            "CARGO_HOME": str(cache / "cargo"),
-            "CARGO_TARGET_DIR": str(cache / "cargo-target"),
-            "GRADLE_USER_HOME": str(cache / "gradle"),
-            "NPM_CONFIG_CACHE": str(cache / "npm"),
-            "PLAYWRIGHT_BROWSERS_PATH": str(cache / "playwright"),
-            "TMPDIR": str(cache / "tmp"),
-            "XDG_CACHE_HOME": str(cache / "xdg"),
-            "XTRACE_TEST_SCRATCH_ROOT": str(cache / "tmp"),
-            "XTRACE_TEST_PRIVATE_SCRATCH": str(cache / "tmp"),
-        })
+        floor_home = cache / "tmp" / f"{args.label}-home"
+        private_roots.ensure_private_directory(floor_home, must_create=True)
+        private_roots.admit_directory(floor_home, private_leaf=True)
+        env = build_task_env(cache, os.environ.copy(), scratch=cache / "tmp", home=floor_home)
         manifest["workingTreeDigestBefore"] = dirty_start
         manifest["phaseDiffSha256Before"] = _hash(diff_start)
         recheck_private_roots()
@@ -2235,7 +2304,7 @@ def run(args: argparse.Namespace) -> int:
             log_path = logs_dir / log_name
             temp_log_path = logs_dir / f".{log_name}.{os.getpid()}.tmp"
             if gate.env == "restricted":
-                gate_env, cargo_path = _restricted_env(os.environ.copy(), cache, args.label)
+                gate_env, cargo_path = _restricted_env(env, cache, args.label)
                 if shutil.which("protoc", path=gate_env["PATH"]):
                     _atomic_write(log_path, b"protoc is present on restricted PATH; build not run\n")
                     code, duration = 1, 0.0

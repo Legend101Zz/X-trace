@@ -367,6 +367,53 @@ class CiFloorEvidenceTests(unittest.TestCase):
             ci_floor._sanitize_floor(args)
         return json.loads(output[0])
 
+    def test_invalid_floor_summary_names_the_stage_step_and_reason_without_paths(self) -> None:
+        def stop_at_gradle_probe(receipt: dict) -> None:
+            for probe in receipt["versionProbes"]:
+                if probe["name"] == "gradle-wrapper":
+                    probe.update(status="failed", exitCode=124)
+            receipt["decision"] = "failed"
+            receipt["error"] = "version probe gradle-wrapper failed with exit 124 in /home/runner/work/_temp/xtrace-private-1 GITHUB_TOKEN=abc"
+            for gate in receipt["gates"]:
+                gate.update(status="unreached")
+            receipt["gates"][0].pop("exitCode", None)
+
+        public = self.sanitize_with_provenance(stop_at_gradle_probe)
+        self.assertEqual(public["floorStatus"], "invalid")
+        self.assertEqual(public["gateCount"], 0)
+        failure = public["failure"]
+        self.assertEqual((failure["stage"], failure["step"], failure["exitCode"]), ("version-probe", "gradle-wrapper", 124))
+        self.assertEqual(failure["decision"], "failed")
+        self.assertIn("gradle-wrapper failed with exit 124", failure["runnerError"])
+        self.assertTrue(public["invalidReason"].startswith("FloorInputError/"), public["invalidReason"])
+        rendered = json.dumps(public)
+        for secret in ("/home/runner", "GITHUB_TOKEN", "abc"):
+            self.assertNotIn(secret, rendered)
+
+    def test_describe_runner_failure_for_gates_missing_receipts_and_unknown_names(self) -> None:
+        root = pathlib.Path("/synthetic/private-root")
+        receipt = {"decision": "failed", "versionProbes": [{"name": "java", "status": "passed", "exitCode": 0}],
+                   "gates": [{"name": "rust-format", "status": "passed", "exitCode": 0},
+                             {"name": "rust-clippy", "status": "failed", "exitCode": 101}]}
+        with mock.patch.object(ci_floor.private_roots, "read_private_json", return_value=receipt):
+            info = ci_floor._describe_runner_failure(root, "floor-1-1-jdk17-node22")
+        self.assertEqual((info["stage"], info["step"], info["exitCode"]), ("gate", "rust-clippy", 101))
+        hostile = {"decision": "failed", "versionProbes": [{"name": "/etc/passwd", "status": "failed", "exitCode": 10**9}]}
+        with mock.patch.object(ci_floor.private_roots, "read_private_json", return_value=hostile):
+            info = ci_floor._describe_runner_failure(root, "floor-1-1-jdk17-node22")
+        self.assertEqual((info["step"], info["exitCode"]), ("unknown", None))
+        # No receipt: only the scrubbed last line of the private runner log.
+        raw = b"noise\nrelease gates failed: checkout failed at /home/runner/work/x GITHUB_TOKEN=abc\n"
+        r, w = os.pipe()
+        os.write(w, raw)
+        os.close(w)
+        with mock.patch.object(ci_floor.private_roots, "read_private_json", side_effect=private_roots.AdmissionError("x")), \
+                mock.patch.object(ci_floor.private_roots, "open_private_file_read", return_value=r):
+            info = ci_floor._describe_runner_failure(root, "floor-1-1-jdk17-node22")
+        self.assertEqual(info["stage"], "no-receipt")
+        self.assertIn("release gates failed: checkout failed at <path>", info["runnerError"])
+        self.assertNotIn("GITHUB_TOKEN", json.dumps(info))
+
     def test_sanitizer_surfaces_provenance_counts_and_rejects_an_unavailable_mechanism(self) -> None:
         report = {"mode": "subreaper", "available": True, "overflowed": False, "classifiedCount": 4}
         public = self.sanitize_with_provenance(lambda receipt: (
@@ -2288,5 +2335,10 @@ class CiFloorProvenanceAndWorkflowTests(unittest.TestCase):
             if line.strip().startswith("permissions:") and not line.startswith("permissions:"):
                 continue
         self.assertNotIn("contents: write", text)
+        warm = text.index("Warm the pinned Gradle distribution")
+        self.assertLess(warm, text.index("Run all 23 pinned release gates"), "the distribution is warmed before the budgeted probe")
+        self.assertIn('GRADLE_USER_HOME="$XTRACE_CI_PRIVATE_ROOT/gradle"', text)
+        import inspect
+        self.assertEqual(inspect.signature(run_gates._versions).parameters["timeout"].default, 20, "the 20 s probe budget is unchanged")
         self.assertNotIn("runner.temp", text)
         self.assertEqual(text.count("toolchain: stable"), text.count("dtolnay/rust-toolchain@"))

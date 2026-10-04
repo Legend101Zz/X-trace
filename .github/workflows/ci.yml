@@ -127,6 +127,27 @@ jobs:
           result=$?
           set -e
           exit "$result"
+      - name: Warm the pinned Gradle distribution
+        # The gradle-wrapper version probe has a fixed 20 s budget that a cold download of the
+        # pinned distribution cannot meet (it was the first failure of every floor run). The
+        # wrapper verifies the distribution checksum; this step only fills the same private
+        # GRADLE_USER_HOME the floor uses, before the budgeted probe runs. The budget is unchanged.
+        timeout-minutes: 10
+        working-directory: adapters/java
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$XTRACE_CI_PRIVATE_ROOT/gradle"
+          warmed=0
+          for attempt in 1 2 3; do
+            if GRADLE_USER_HOME="$XTRACE_CI_PRIVATE_ROOT/gradle" ./gradlew --no-daemon --version >/dev/null 2>&1; then
+              warmed=1
+              break
+            fi
+            echo "Gradle warm-up attempt $attempt failed"
+          done
+          test "$warmed" = 1
+          test -z "$(git -C "$GITHUB_WORKSPACE" status --porcelain=v1 --untracked-files=all)"
       - name: Run all 23 pinned release gates
         run: |
           set +e

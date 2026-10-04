@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import pathlib
+import stat
 import sys
 import time
 from typing import Any, Callable, Sequence
@@ -61,7 +62,11 @@ SCAN_GAP_SECONDS = 2.0
 MAX_IDENTITIES = 512
 MAX_LIST_RECORDS = 64
 MAX_UNCERTAIN_SAMPLE = 64
-START_TOLERANCE_SECONDS = 2.0
+# A process counts as predating the run only with a wide margin: it absorbs `ps` second resolution,
+# local-time (DST) ambiguity and small wall-clock steps. Larger or unreliable skews fail closed.
+START_TOLERANCE_SECONDS = 300.0
+START_SOURCE_AGREEMENT_SECONDS = 2.0
+MAX_RUN_COALITION_IDS = 8
 MAX_RECEIPT_WALK_NODES = 20000
 MAX_FILE_BYTES = 65536
 IDENTITY_LIST_KEYS = (
@@ -91,9 +96,22 @@ class InvalidInput(RuntimeError):
 
 
 def parse_start(value: str) -> float | None:
-    """Epoch seconds for a `ps lstart` string (local time), or None when unparsable."""
+    """Epoch seconds for a `ps lstart` string (local time), or None when unparsable or ambiguous.
+
+    A wall-clock time inside the repeated DST fall-back hour maps to two epochs; that is
+    refused (None) rather than guessed, so it can never make a later process look older.
+    """
     try:
-        return time.mktime(time.strptime(" ".join(value.split()), "%a %b %d %H:%M:%S %Y"))
+        parsed = time.strptime(" ".join(value.split()), "%a %b %d %H:%M:%S %Y")
+        candidates = set()
+        for isdst in (0, 1):
+            moment = time.mktime(parsed[:8] + (isdst,))
+            local = time.localtime(moment)
+            if local[:6] == parsed[:6]:
+                candidates.add(moment)
+        if len(candidates) != 1:
+            return None
+        return candidates.pop()
     except (ValueError, OverflowError):
         return None
 
@@ -111,6 +129,7 @@ class Context:
         self.snapshot: Callable[[], dict[int, tuple[int, str, str]]] = run_gates._process_snapshot
         self.coalition_reader: Callable[[int], int | None] = provenance.read_coalition_id
         self.facts_reader: Callable[..., dict[int, tuple[int, str]]] = provenance.read_process_facts
+        self.start_reader: Callable[[int], float | None] = provenance.read_process_start_epoch
         self.inventory: Callable[[], list[tuple[int, str]]] = _read_inventory
         self.lsof: Callable[[list[str]], list[dict[str, Any]]] = _lsof_paths
         self.__dict__.update(overrides)
@@ -298,18 +317,30 @@ def collect_identities(records: dict[str, Any]) -> tuple[dict[tuple[int, str], s
     return found, sorted(set(truncated))
 
 
-def run_coalition_ids(records: dict[str, Any], operator: Sequence[int]) -> tuple[list[int], list[str]]:
-    ids = {int(value) for value in operator}
-    sources = ["operator"] if operator else []
-    receipt_ids: set[int] = set()
+def validate_operator_coalitions(values: Sequence[int]) -> list[int]:
+    """Operator-supplied coalition ids: positive, bounded in count, never silently truncated."""
+    ids = sorted(set(values))
+    if len(ids) > MAX_RUN_COALITION_IDS:
+        raise InvalidInput("too-many-run-coalition-ids")
+    for value in ids:
+        if type(value) is not int or value <= 0 or value >= 2**63:
+            raise InvalidInput("run-coalition-id-invalid")
+    return ids
+
+
+def persisted_coalition_ids(records: dict[str, Any]) -> list[int]:
+    """Coalition ids the run itself recorded (owner records and receipt provenance), authoritative."""
+    found: set[int] = set()
+
+    def take(value: Any) -> None:
+        if isinstance(value, list):
+            found.update(item for item in value if type(item) is int and 0 < item < 2**63)
 
     def walk(value: Any, depth: int = 0) -> None:
         if depth > 8:
             return
         if isinstance(value, dict):
-            found = value.get("runCoalitionIds")
-            if isinstance(found, list):
-                receipt_ids.update(item for item in found if isinstance(item, int) and not isinstance(item, bool) and item > 0)
+            take(value.get("runCoalitionIds"))
             for item in value.values():
                 if isinstance(item, (dict, list)):
                     walk(item, depth + 1)
@@ -317,11 +348,49 @@ def run_coalition_ids(records: dict[str, Any], operator: Sequence[int]) -> tuple
             for item in value[:MAX_IDENTITIES]:
                 walk(item, depth + 1)
 
+    for owner in records["owners"].values():
+        walk(owner)
     walk(records["receipt"])
-    if receipt_ids:
-        sources.append("receipt")
-    ids |= receipt_ids
-    return sorted(ids)[:8], sources
+    if len(found) > MAX_RUN_COALITION_IDS:
+        raise Refused(["evidence-overflow"])
+    return sorted(found)
+
+
+def run_coalition_ids(ctx: Context, records: dict[str, Any], operator: Sequence[int],
+                      identities: dict[tuple[int, str], set[str]]) -> tuple[list[int], list[str]]:
+    """The coalition ids the run is judged against: persisted ids, plus corroborated operator ids.
+
+    An operator id is only additive and only accepted when something independent supports it: it
+    is in the persisted record, it equals this tool's own session coalition, or a still-live recorded
+    identity currently carries it. Anything else refuses (a wrong id would misclassify the run's
+    real descendants as foreign).
+    """
+    persisted = persisted_coalition_ids(records)
+    sources = ["persisted"] if persisted else []
+    ids = set(persisted)
+    if operator:
+        own = ctx.coalition_reader(ctx.self_pid) if ctx.platform == "darwin" else None
+        snapshot = ctx.snapshot()
+        live_ids: set[int] = set()
+        for pid, start in identities:
+            record = snapshot.get(pid)
+            if record and record[1] == start and record[2] not in {"Z", "X"}:
+                value = ctx.coalition_reader(pid)
+                if value is not None:
+                    live_ids.add(value)
+        for value in operator:
+            if value in persisted:
+                continue
+            if value == own:
+                sources.append("operator:tool-session")
+            elif value in live_ids:
+                sources.append("operator:live-identity")
+            else:
+                raise Refused(["run-coalition-uncorroborated"])
+            ids.add(value)
+    if len(ids) > MAX_RUN_COALITION_IDS:
+        raise Refused(["evidence-overflow"])
+    return sorted(ids), sorted(set(sources))
 
 
 class Classifier:
@@ -342,8 +411,18 @@ class Classifier:
         item.available = True
         return item
 
-    def predates(self, start: str) -> bool:
-        epoch = parse_start(start)
+    def start_epoch(self, pid: int, start: str) -> float | None:
+        """Kernel start time, cross-checked against the `ps` text; None when unreadable or they disagree."""
+        text_epoch = parse_start(start)
+        kernel_epoch = self.ctx.start_reader(pid)
+        if kernel_epoch is None or text_epoch is None:
+            return None
+        if abs(kernel_epoch - text_epoch) > START_SOURCE_AGREEMENT_SECONDS:
+            return None
+        return kernel_epoch
+
+    def predates(self, start: str, pid: int | None = None) -> bool:
+        epoch = self.start_epoch(pid, start) if pid is not None else parse_start(start)
         return epoch is not None and epoch < self.run_start - START_TOLERANCE_SECONDS
 
     def ancestor_predating(self, pid: int, snapshot: dict[int, tuple[int, str, str]]) -> tuple[int, str] | None:
@@ -360,7 +439,7 @@ class Classifier:
             parent_record = snapshot.get(parent)
             if parent_record is None:
                 return None
-            if self.predates(parent_record[1]) and parent_record[2] not in {"Z", "X"}:
+            if self.predates(parent_record[1], parent) and parent_record[2] not in {"Z", "X"}:
                 return parent, parent_record[1]
             seen.add(current)
             current = parent
@@ -375,7 +454,7 @@ class Classifier:
             record = snapshot.get(pid)
             if record is None or record[1] != start or record[2] in {"Z", "X"}:
                 result[(pid, start)] = ("exited", {})
-            elif self.predates(start):
+            elif self.predates(start, pid):
                 result[(pid, start)] = ("non-descendant-predates-run", {})
             else:
                 ancestor = self.ancestor_predating(pid, snapshot)
@@ -429,6 +508,10 @@ def _gap(ctx: Context, started: float, seconds: float) -> None:
         remaining = seconds - (ctx.monotonic() - started)
 
 
+def _is_owned(sources: set[str]) -> bool:
+    return any(item.endswith((":ownedProcesses", ":ownedProbeProcesses")) for item in sources)
+
+
 def observe(ctx: Context, classifier: Classifier, identities: Sequence[tuple[int, str]],
             sources: dict[tuple[int, str], set[str]], owner_pid: int, epoch: float) -> dict[str, Any]:
     """Three observations at least two seconds apart of every recorded identity."""
@@ -440,11 +523,15 @@ def observe(ctx: Context, classifier: Classifier, identities: Sequence[tuple[int
         classes = classifier.classify_many(list(identities), snapshot)
         live = {pid for (pid, start), (cls, _e) in classes.items() if cls != "exited"}
         for key, outcome in classes.items():
+            if _is_owned(sources[key]) and outcome[0].startswith("non-descendant"):
+                # An identity the run recorded as owned is a descendant by definition: only a
+                # verified exit may clear it, never a heuristic.
+                outcome = ("uncertain", {"reason": "owned-identity-live"})
             per_identity[key].append(outcome)
         owner_record = snapshot.get(owner_pid)
-        owner_start = parse_start(owner_record[1]) if owner_record else None
+        owner_start = (classifier.start_epoch(owner_pid, owner_record[1]) or parse_start(owner_record[1])) if owner_record else None
         owner_live = bool(owner_record and owner_record[2] not in {"Z", "X"}
-                          and (owner_start is None or owner_start <= epoch + START_TOLERANCE_SECONDS))
+                          and (owner_start is None or owner_start <= epoch + START_SOURCE_AGREEMENT_SECONDS))
         inventory = ctx.inventory()
         summaries.append({
             "matching": len(live), "descendants": _descendants_of(live, snapshot),
@@ -479,8 +566,7 @@ def global_scans(ctx: Context, classifier: Classifier) -> list[dict[str, Any]]:
         for pid, (_ppid, start, state) in snapshot.items():
             if pid in own or state in {"Z", "X"}:
                 continue
-            epoch = parse_start(start)
-            if epoch is not None and epoch < classifier.run_start - START_TOLERANCE_SECONDS:
+            if classifier.predates(start, pid):
                 continue
             candidates.append((pid, start))
         classes = classifier.classify_many(candidates, snapshot)
@@ -519,7 +605,7 @@ def evaluate(ctx: Context, layout: Layout, operator_coalitions: Sequence[int]) -
     records = read_records(layout)
     shared = check_records(layout, records)
     identities, truncated = collect_identities(records)
-    coalitions, coalition_sources = run_coalition_ids(records, operator_coalitions)
+    coalitions, coalition_sources = run_coalition_ids(ctx, records, operator_coalitions, identities)
     classifier = Classifier(ctx, shared["runStartEpoch"], coalitions)
     observed = observe(ctx, classifier, sorted(identities), identities, shared["ownerPid"], shared["runStartEpoch"])
     scans = global_scans(ctx, classifier)
@@ -565,7 +651,10 @@ def build_plan(layout: Layout, evaluation: dict[str, Any], moment: datetime.date
         "refusalReasons": evaluation["reasons"],
         "runStartEpoch": int(evaluation["owner"]["runStartEpoch"]),
         "runCoalitionIds": evaluation["runCoalitionIds"], "runCoalitionSources": evaluation["runCoalitionSources"],
-        "toolCoalitionId": own_coalition,
+        "toolSessionCoalitionId": own_coalition,
+        "notice": ("Provenance proves non-descent in the fork tree, not that nothing can write the caches: a "
+                   "pre-existing daemon or work delegated through launchd/XPC/docker/cron is outside it, and an "
+                   "empty lsof result is weak (it sees only exact directory handles)."),
         "ownerRecords": {name: _public_facts(facts) for name, facts in evaluation["records"]["ownerFacts"].items()},
         "failedReceipt": _public_facts(evaluation["records"]["receiptFacts"]),
         "recordedIdentityCount": len(evaluation["identities"]), "identityClassCounts": counts,
@@ -592,7 +681,12 @@ def _write_new(path: pathlib.Path, data: bytes) -> None:
 
 
 def _remove_lease(layout: Layout, name: str, expected: dict[str, Any], lease_identity: tuple[int, int]) -> None:
-    """Unlink owner.json and rmdir the lease, bound to the identities that were checked."""
+    """Unlink owner.json and rmdir the lease, bound to the identities that were checked.
+
+    Everything after the lease directory is opened happens through that directory descriptor:
+    the owner record is re-read and hashed from a descriptor opened relative to it (regular file,
+    one link), then unlinked by name relative to the same descriptor. No by-path re-read.
+    """
     lease = layout.leases[name]
     private_roots.admit_directory(lease, private_leaf=True)
     root_fd = os.open(layout.lease_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -602,8 +696,18 @@ def _remove_lease(layout: Layout, name: str, expected: dict[str, Any], lease_ide
             info = os.fstat(fd)
             if (info.st_dev, info.st_ino) != tuple(lease_identity) or sorted(os.listdir(fd)) != ["owner.json"]:
                 raise Refused(["records-unstable"])
-            current = _file_facts(lease / "owner.json")
-            if _public_facts(current) != expected:
+            file_fd = os.open("owner.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                file_info = os.fstat(file_fd)
+                if (not stat.S_ISREG(file_info.st_mode) or file_info.st_nlink != 1
+                        or file_info.st_size > MAX_FILE_BYTES):
+                    raise Refused(["records-unstable"])
+                data = os.read(file_fd, MAX_FILE_BYTES + 1)
+            finally:
+                os.close(file_fd)
+            current = {"dev": file_info.st_dev, "ino": file_info.st_ino, "size": len(data),
+                       "sha256": hashlib.sha256(data).hexdigest()}
+            if current != expected:
                 raise Refused(["records-unstable"])
             os.unlink("owner.json", dir_fd=fd)
             os.fsync(fd)
@@ -615,6 +719,18 @@ def _remove_lease(layout: Layout, name: str, expected: dict[str, Any], lease_ide
         os.close(root_fd)
 
 
+def redact_owner_record(raw: bytes) -> bytes:
+    """The owner record for the archive with the lease token replaced by its sha256."""
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return b'{"unparsable": true}\n'
+    if isinstance(record, dict) and "token" in record:
+        token = record["token"]
+        record["token"] = "sha256:" + hashlib.sha256(str(token).encode()).hexdigest()
+    return (json.dumps(record, indent=2, sort_keys=True) + "\n").encode()
+
+
 def execute(ctx: Context, layout: Layout, evaluation: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
     """Archive privately, remove both leases, verify, and write manual-recovery.json."""
     moment = ctx.now()
@@ -624,10 +740,11 @@ def execute(ctx: Context, layout: Layout, evaluation: dict[str, Any], plan: dict
     names = list(run_gates.LEASE_NAMES)
     originals = {name: evaluation["records"]["ownerFacts"][name] for name in names}
     for name in names:
-        _write_new(archive / f"original-owner-{name}.json", originals[name]["bytes"])
+        _write_new(archive / f"owner-{name}-token-redacted.json", redact_owner_record(originals[name]["bytes"]))
     _write_new(archive / "failed-receipt.json", evaluation["records"]["receiptFacts"]["bytes"])
     _write_new(archive / "recovery-plan.json", (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode())
     archived = {
+        "ownerArchive": "token-redacted",
         "originalOwnerSha256": {name: originals[name]["sha256"] for name in names},
         "failedReceiptSha256": evaluation["records"]["receiptFacts"]["sha256"],
     }
@@ -640,18 +757,28 @@ def execute(ctx: Context, layout: Layout, evaluation: dict[str, Any], plan: dict
     except (Refused, OSError, private_roots.AdmissionError) as exc:
         failure = type(exc).__name__
     both_absent = all(not os.path.lexists(layout.leases[name]) for name in names)
-    receipt_after = _file_facts(layout.receipt)
+    receipt_unmodified: bool | None
+    try:
+        receipt_unmodified = _file_facts(layout.receipt)["sha256"] == evaluation["records"]["receiptFacts"]["sha256"]
+    except (OSError, InvalidInput, private_roots.AdmissionError):
+        receipt_unmodified = None  # could not be re-read; reported honestly, never assumed
+    complete = failure is None and both_absent and receipt_unmodified is True
     result = {
         "schemaVersion": 1, "kind": "xtrace-lease-manual-recovery", "label": layout.label,
         "recoveredUtc": _utc_stamp(moment), "removedLeases": removed, "bothPathsAbsent": both_absent,
         "failure": failure, "originalDecision": evaluation["records"]["receipt"].get("decision"),
-        "failedReceiptUnmodified": receipt_after["sha256"] == evaluation["records"]["receiptFacts"]["sha256"],
+        "failedReceiptUnmodified": receipt_unmodified,
+        "status": "complete" if complete else ("partial" if removed else "failed-before-removal"),
         "archive": archived, "privilegeUsed": False, "signalsSent": 0,
     }
     data = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode()
-    _write_new(archive / "manual-recovery.json", data)
     result["manualRecoverySha256"] = hashlib.sha256(data).hexdigest()
-    result["complete"] = failure is None and both_absent and result["failedReceiptUnmodified"]
+    result["complete"] = complete
+    try:
+        _write_new(archive / "manual-recovery.json", data)
+    except OSError:
+        result["manualRecoveryWritten"] = False
+        result["complete"] = False
     return result
 
 
@@ -668,10 +795,11 @@ def run(args: argparse.Namespace, ctx: Context | None = None, out: Callable[[str
         raise InvalidInput("confirm-label-mismatch")
     if not execute_mode and args.confirm_label:
         raise InvalidInput("confirm-label-needs-execute")
+    operator_ids = validate_operator_coalitions(args.run_coalition_id or [])
     mode = "execute" if execute_mode else "dry-run"
     own_coalition = ctx.coalition_reader(ctx.self_pid) if ctx.platform == "darwin" else None
     try:
-        evaluation = evaluate(ctx, layout, args.run_coalition_id or [])
+        evaluation = evaluate(ctx, layout, operator_ids)
     except Refused as exc:
         out(json.dumps({"label": args.label, "mode": mode, "decision": "recovery-refused", "refusalReasons": exc.reasons}, sort_keys=True))
         return EXIT_REFUSED
@@ -679,10 +807,20 @@ def run(args: argparse.Namespace, ctx: Context | None = None, out: Callable[[str
     summary = {"label": args.label, "mode": mode, "decision": plan["decision"], "refusalReasons": plan["refusalReasons"],
                "recordedIdentityCount": plan["recordedIdentityCount"], "identityClassCounts": plan["identityClassCounts"],
                "globalScanUncertain": [scan["uncertainCount"] for scan in plan["globalScans"]],
-               "lsofHolderCount": plan["lsofSupportingEvidence"]["holderCount"], "toolCoalitionId": own_coalition}
+               "lsofHolderCount": plan["lsofSupportingEvidence"]["holderCount"], "toolSessionCoalitionId": own_coalition}
     if not execute_mode:
-        plan_path = layout.run_dir / f"recovery-plan-{plan['createdUtc']}.json"
-        _write_new(plan_path, (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode())
+        plan_bytes = (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode()
+        for attempt in range(1, 10):
+            plan_path = layout.run_dir / (
+                f"recovery-plan-{plan['createdUtc']}.json" if attempt == 1 else f"recovery-plan-{plan['createdUtc']}-{attempt}.json"
+            )
+            try:
+                _write_new(plan_path, plan_bytes)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise InvalidInput("plan-file-exists")
         summary["planFile"] = plan_path.name
         out(json.dumps(summary, sort_keys=True))
         return EXIT_OK if evaluation["allowed"] else EXIT_REFUSED
