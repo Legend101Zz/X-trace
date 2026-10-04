@@ -918,14 +918,15 @@ class RunnerTests(unittest.TestCase):
         real_fdopen = os.fdopen
         real_open = os.open
         diagnostic_fds: set[int] = set()
+        write_fault_reached = [False]
 
         def tracking_open(path: object, *args: object, **kwargs: object) -> int:
             fd = real_open(path, *args, **kwargs)
             name = pathlib.Path(os.fsdecode(path)).name
-            flags = args[1] if len(args) > 1 else kwargs.get("flags", 0)
+            flags = args[0] if args else kwargs.get("flags", 0)
             if (name.startswith(".diagnostic-write.log.")
                     and isinstance(flags, int)
-                    and flags & os.O_WRONLY and flags & os.O_CREAT):
+                    and flags & os.O_WRONLY and flags & os.O_CREAT and flags & os.O_EXCL):
                 diagnostic_fds.add(fd)
             return fd
 
@@ -946,6 +947,7 @@ class RunnerTests(unittest.TestCase):
                 self.stream = real_fdopen(fd, mode)
 
             def write(self, _payload: bytes) -> int:
+                write_fault_reached[0] = True
                 raise OSError("injected diagnostic write failure")
 
             def flush(self) -> None:
@@ -980,6 +982,7 @@ class RunnerTests(unittest.TestCase):
                 mock.patch.object(run_gates.os, "fdopen", side_effect=selective_fdopen):
             self.assertEqual(run_gates.run(self.args()), 1)
 
+        self.assertTrue(write_fault_reached[0], "diagnostic write injection must be reached")
         settle_candidates.assert_not_called()
         global_scan.assert_not_called()
         receipt = json.loads((self.cache / "release-gates/P00-test/receipt.json").read_text())
