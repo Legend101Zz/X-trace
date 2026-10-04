@@ -33,7 +33,7 @@ UTILITY_TERM_GRACE_SECONDS = 0.75
 UTILITY_KILL_SIGNAL_RESERVE_SECONDS = 0.5
 UTILITY_LEADER_REAP_RESERVE_SECONDS = 0.3
 UTILITY_FINAL_SCAN_RESERVE_SECONDS = 0.35
-CI_RECEIPT_JSON_BUDGET = 4096
+CI_RECEIPT_JSON_BUDGET = run_gates.RECEIPT_JSON_BUDGET
 SOURCE_COMMAND_OUTPUT_LIMIT = 64 * 1024 * 1024
 SOURCE_COMMAND_TIMEOUT_SECONDS = 30.0
 SOURCE_LOCK_BYTES_LIMIT = 64 * 1024 * 1024
@@ -65,7 +65,11 @@ CHROMIUM_LIBRARIES = (
 
 
 class FloorInputError(RuntimeError):
-    pass
+    """Sanitized failure; the optional reason is a fixed, non-secret code."""
+
+    def __init__(self, reason: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class _EvidenceTestResult(unittest.TextTestResult):
@@ -181,7 +185,7 @@ def _utility_process_snapshot(
             raise original
         if isinstance(original, FloorInputError):
             raise original
-        raise FloorInputError from None
+        raise FloorInputError(f"snapshot-{type(original).__name__}") from None
     finally:
         try:
             selector.close()
@@ -197,23 +201,32 @@ def _utility_process_snapshot(
         if isinstance(descriptor_cleanup_error, KeyboardInterrupt):
             raise descriptor_cleanup_error
         raise FloorInputError from None
+    return _parse_utility_snapshot(bytes(raw))
+
+
+def _parse_utility_snapshot(raw: bytes) -> dict[int, tuple[int, int, str, str]]:
+    """Parse `ps -axo pid=,ppid=,pgid=,lstart=,stat=` output.
+
+    Linux kernel threads legitimately report process group 0 (and pid 1 has
+    parent 0), so only negative groups and non-positive pids are malformed.
+    """
     try:
-        lines = bytes(raw).decode("ascii", errors="strict").splitlines()
+        lines = raw.decode("ascii", errors="strict").splitlines()
     except UnicodeError:
-        raise FloorInputError from None
+        raise FloorInputError("snapshot-not-ascii") from None
     records: dict[int, tuple[int, int, str, str]] = {}
     for line in lines:
         fields = line.split()
         if not fields:
             continue
         if len(fields) != 9 or not all(fields[index].isdigit() for index in range(3)):
-            raise FloorInputError
+            raise FloorInputError("snapshot-line-shape")
         pid, parent, group = (int(fields[index]) for index in range(3))
-        if pid <= 0 or parent < 0 or group <= 0 or pid in records:
-            raise FloorInputError
+        if pid <= 0 or parent < 0 or group < 0 or pid in records:
+            raise FloorInputError("snapshot-identity-values")
         records[pid] = (parent, group, " ".join(fields[3:8]), fields[8][:1])
     if not records:
-        raise FloorInputError
+        raise FloorInputError("snapshot-empty")
     return records
 
 
@@ -896,8 +909,20 @@ def _successful_settle_report(value: Any) -> bool:
         and type(value.get("pollCount")) is int and value["pollCount"] > 0
         and isinstance(value.get("waitSeconds"), (int, float))
         and not isinstance(value.get("waitSeconds"), bool)
-        and 0 <= value["waitSeconds"] <= 120
+        # waitSeconds covers initial plus global settling measured from slightly
+        # before the single 120 s deadline starts, so allow a small tolerance.
+        and 0 <= value["waitSeconds"] <= run_gates.NATURAL_EXIT_SETTLE_SECONDS + 1.0
         and value.get("error") is None
+        and type(value.get("identityUnionCount")) is int
+        and value["identityUnionCount"] >= value["initialCandidateCount"]
+        and value.get("identityUnionTruncated") is False
+        and isinstance(value.get("identityUnion"), list)
+        and type(value.get("ownedProbeProcessCount")) is int and value["ownedProbeProcessCount"] == 0
+        and value.get("ownedProbeProcesses") == []
+        and type(value.get("cleanupExceptionCount")) is int and value["cleanupExceptionCount"] == 0
+        and value.get("cleanupExceptions") == []
+        and value.get("probeEvidenceTruncated") is False
+        and "evidenceListsCompacted" not in value
     )
 
 
@@ -1162,6 +1187,30 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
     return 0 if summary["floorStatus"] == "checks_passed_for_review" else 1
 
 
+def _failure_reason(exc: BaseException) -> str:
+    """A non-secret code: exception class, fixed reason, and the raising site.
+
+    Only the innermost tools/release frame's file, function and line are used;
+    no message text, paths, arguments or environment appear.
+    """
+    reason = exc.reason if isinstance(exc, FloorInputError) and exc.reason else ""
+    site = ""
+    frame_info = None
+    tb = exc.__traceback__
+    while tb is not None:
+        if os.path.basename(os.path.dirname(tb.tb_frame.f_code.co_filename)) == "release":
+            frame_info = tb
+        tb = tb.tb_next
+    if frame_info is not None:
+        site = f"{os.path.basename(frame_info.tb_frame.f_code.co_filename)}:{frame_info.tb_frame.f_code.co_name}:{frame_info.tb_lineno}"
+    parts = [type(exc).__name__]
+    if reason:
+        parts.append(reason)
+    if site:
+        parts.append(site)
+    return "/".join(parts)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1197,8 +1246,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         return args.handler(args)
-    except (FloorInputError, private_roots.AdmissionError, OSError, RuntimeError, ValueError):
-        print("release floor: preflight or receipt processing failed", file=sys.stderr)
+    except (FloorInputError, private_roots.AdmissionError, OSError, RuntimeError, ValueError) as exc:
+        print(f"release floor: preflight or receipt processing failed (reason: {_failure_reason(exc)})", file=sys.stderr)
         return 1
 
 

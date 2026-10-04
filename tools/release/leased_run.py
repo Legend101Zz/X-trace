@@ -13,9 +13,11 @@ Usage:
         --cache-root <private-root> --timeout <seconds> [--wait <seconds>] \
         [--jdk-home <path>] [--expect-unittest <N>] -- <argv...>
 
-Exit codes: 0 passed, 1 command or expectation failed, 2 invalid input or
-admission failure, 3 uncertain process tree (leases retained for manual
-recovery), 75 builder leases stayed busy for the whole --wait.
+Exit codes: 0 passed, 1 command or expectation failed, 2 invalid input,
+admission failure or label already used, 3 uncertain process tree (leases
+retained for manual recovery) or lease release failure, 4 the receipt could not
+be written, 75 a live owner held a builder lease for the whole --wait, 76 a
+builder lease is retained for manual recovery (waiting cannot help).
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import os
 import pathlib
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -44,22 +47,45 @@ EXIT_PASSED = 0
 EXIT_FAILED = 1
 EXIT_INVALID = 2
 EXIT_UNCERTAIN = 3
+EXIT_RECEIPT_FAILED = 4
 EXIT_LEASE_WAIT_EXPIRED = 75
-LEASE_NAMES = ("cargo", "gradle")
+EXIT_LEASE_RETAINED = 76
+LEASE_NAMES = run_gates.LEASE_NAMES
 LEASE_POLL_SECONDS = 15.0
 MAX_LOG_BYTES = 64 * 1024 * 1024
 LOG_TAIL_BYTES = 64 * 1024
 LOG_NAME = "command.log"
 _RAN_LINE = re.compile(r"^Ran (\d+) tests? in [0-9.]+s$")
+# Parent environment names that reach the command. Everything else (including
+# ambient credentials) is dropped; task variables are added by build_env.
+ENV_ALLOWLIST = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ",
+    "SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET",
+    "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "JAVA_HOME",
+})
+ENV_ALLOWED_PREFIXES = ("LC_",)
+_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_SECRET_WORDS = ("TOKEN", "SECRET", "KEY", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH")
 
 
 class LeaseWaitExpired(RuntimeError):
-    """Both builder leases could not be acquired within the allowed wait."""
+    """Both builder leases stayed busy (live owner) for the whole wait."""
 
 
-def _is_busy(exc: BaseException) -> bool:
-    return (isinstance(exc, RuntimeError) and not isinstance(exc, private_roots.AdmissionError)
-            and "already owned" in str(exc))
+class LeaseRetained(RuntimeError):
+    """A builder lease is retained for manual recovery; waiting cannot help."""
+
+
+def _lease_requires_recovery(lease: run_gates.Lease) -> bool | None:
+    """Read-only, bounded check of whether an existing lease was retained."""
+    try:
+        private_roots.admit_directory(lease.path, private_leaf=True)
+        owner = private_roots.read_private_json(lease.path / "owner.json")
+    except FileNotFoundError:
+        return False
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return owner.get("requiresManualRecovery") is True
 
 
 def acquire_leases(
@@ -70,36 +96,44 @@ def acquire_leases(
     sleep: Callable[[float], None] = time.sleep,
     poll_seconds: float | None = None,
 ) -> list[run_gates.Lease]:
-    """Acquire every lease or none, polling while another owner holds one.
+    """Acquire every lease or none, polling while a live owner holds one.
 
-    An existing lease directory is never borrowed, broken or inspected beyond
-    the production `Lease.acquire` check; this only waits for it to disappear.
+    An existing lease directory is never borrowed, broken or modified. A lease
+    whose owner record says it was retained for manual recovery raises
+    LeaseRetained at once (waiting cannot clear it); any other existing lease is
+    polled until `wait_seconds` expires, then LeaseWaitExpired.
     """
     poll = LEASE_POLL_SECONDS if poll_seconds is None else poll_seconds
     deadline = monotonic() + max(0.0, wait_seconds)
     while True:
         acquired: list[run_gates.Lease] = []
-        busy = False
+        retained = False
         try:
+            existing = []
             for lease in leases:
                 try:
                     private_roots.preflight_directory(lease.path, must_be_absent=True)
                 except FileExistsError:
-                    busy = True
-                    break
-            if not busy:
+                    existing.append(lease)
+            if existing:
+                retained = any(_lease_requires_recovery(lease) for lease in existing)
+            else:
                 for lease in leases:
                     lease.acquire()
                     if lease.borrowed or not lease.acquired:
                         raise RuntimeError("builder lease was not freshly acquired")
                     acquired.append(lease)
                 return acquired
-        except BaseException as exc:
+        except run_gates.LeaseBusy as exc:
             for lease in reversed(acquired):
                 lease.release()
-            if not _is_busy(exc):
-                raise
-            busy = True
+            retained = exc.requires_manual_recovery is True
+        except BaseException:
+            for lease in reversed(acquired):
+                lease.release()
+            raise
+        if retained:
+            raise LeaseRetained("a builder lease is retained for manual recovery")
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise LeaseWaitExpired("builder leases stayed busy for the whole --wait")
@@ -108,9 +142,14 @@ def acquire_leases(
 
 def build_env(
     cache: pathlib.Path, scratch: pathlib.Path, base_env: dict[str, str], jdk_home: str | None,
+    pass_env: Sequence[str] = (),
 ) -> dict[str, str]:
-    """The same task-scoped environment the floor uses, with per-run scratch."""
-    env = dict(base_env)
+    """Allowlisted parent environment plus the floor's task-scoped variables."""
+    extra = set(pass_env)
+    env = {
+        name: value for name, value in base_env.items()
+        if name in ENV_ALLOWLIST or name in extra or name.startswith(ENV_ALLOWED_PREFIXES)
+    }
     env.update({
         "CARGO_HOME": str(cache / "cargo"),
         "CARGO_TARGET_DIR": str(cache / "cargo-target"),
@@ -128,6 +167,15 @@ def build_env(
         env["JAVA_HOME"] = jdk_home
         env["PATH"] = os.pathsep.join(filter(None, [str(pathlib.Path(jdk_home) / "bin"), env.get("PATH", "")]))
     return env
+
+
+def _validate_pass_env(names: Sequence[str]) -> list[str]:
+    result = []
+    for name in names:
+        if not _ENV_NAME.fullmatch(name) or any(word in name for word in _SECRET_WORDS):
+            raise ValueError("--pass-env must name a non-secret variable such as RUST_LOG")
+        result.append(name)
+    return result
 
 
 def parse_unittest_summary(tail: bytes) -> tuple[int | None, bool, bool]:
@@ -179,11 +227,20 @@ def _source_identity(repo: pathlib.Path) -> dict[str, Any]:
 
 
 def _summary(label: str, decision: str, exit_code: int | None, duration: float | None,
-             log_sha256: str | None, cleanup: list[str]) -> dict[str, Any]:
-    return {
+             log_sha256: str | None, cleanup: list[str], receipt_written: bool | None = None) -> dict[str, Any]:
+    summary: dict[str, Any] = {
         "label": label, "decision": decision, "exitCode": exit_code,
         "durationSeconds": duration, "logSha256": log_sha256, "leaseCleanup": cleanup,
     }
+    if receipt_written is not None:
+        summary["receiptWritten"] = receipt_written
+    return summary
+
+
+def _not_started(out: Callable[[str], None], label: str, decision: str, message: str, code: int) -> int:
+    out(json.dumps(_summary(label, decision, None, None, None, ["not-acquired"]), sort_keys=True))
+    print(f"leased run not started: {message}", file=sys.stderr)
+    return code
 
 
 def run(
@@ -209,6 +266,7 @@ def run(
     expect = args.expect_unittest
     if expect is not None and (not isinstance(expect, int) or isinstance(expect, bool) or expect < 1):
         raise ValueError("--expect-unittest must be a positive integer")
+    pass_env = _validate_pass_env(getattr(args, "pass_env", None) or [])
     repo = pathlib.Path(args.repo).expanduser().resolve(strict=True)
     if not (repo / ".git").exists():
         raise ValueError("--repo must be a Git checkout")
@@ -247,9 +305,9 @@ def run(
         private_roots.ensure_private_directory(lease_root)
         acquired = acquire_leases(leases, args.wait, monotonic=monotonic, sleep=sleep)
     except LeaseWaitExpired as exc:
-        out(json.dumps(_summary(args.label, "lease_wait_expired", None, None, None, ["not-acquired"]), sort_keys=True))
-        print(f"leased run not started: {exc}", file=sys.stderr)
-        return EXIT_LEASE_WAIT_EXPIRED
+        return _not_started(out, args.label, "lease_wait_expired", str(exc), EXIT_LEASE_WAIT_EXPIRED)
+    except LeaseRetained as exc:
+        return _not_started(out, args.label, "lease_retained_manual_recovery", str(exc), EXIT_LEASE_RETAINED)
     waited = round(monotonic() - wait_started, 6)
 
     receipt: dict[str, Any] = {
@@ -265,24 +323,30 @@ def run(
         "cacheKeys": list(run_gates.CACHE_NAMES),
         "expectUnittest": expect,
         "jdkHomeSupplied": jdk_home is not None,
+        "passedEnvNames": sorted(pass_env),
     }
     exit_code: int | None = None
     duration: float | None = None
     log_sha256: str | None = None
     runner_code = EXIT_FAILED
     retain = False
+    claimed = False  # this process created run_dir; only then may it write there
     cleanup = ["retained"] * len(acquired)
     settle_report: dict[str, Any] = {}
+    released_ok = False
     try:
-        roots = [cache, *(cache / name for name in run_gates.CACHE_NAMES), release_root, lease_root]
-        for root in roots:
-            private_roots.admit_directory(root, private_leaf=True)
+        # Atomically claim the label now that the leases are held: a label
+        # used by anyone while we waited is refused, never overwritten.
         private_roots.ensure_private_directory(run_dir, must_create=True)
+        claimed = True
+        for root in (cache, *(cache / name for name in run_gates.CACHE_NAMES), release_root, lease_root):
+            private_roots.admit_directory(root, private_leaf=True)
         private_roots.ensure_private_directory(logs_dir, must_create=True)
         private_roots.ensure_private_directory(scratch, must_create=True)
         logs_identity = private_roots.admit_directory(logs_dir, private_leaf=True)
         private_roots.admit_directory(scratch, private_leaf=True)
-        env = build_env(cache, scratch, os.environ.copy(), jdk_home)
+        run_gates._write_receipt(run_dir / "receipt.json", receipt)  # "running" marker
+        env = build_env(cache, scratch, os.environ.copy(), jdk_home, pass_env)
         before = _source_identity(repo)
         receipt["sourceBefore"] = before
         temp_log = logs_dir / f".{LOG_NAME}.{os.getpid()}.tmp"
@@ -291,7 +355,7 @@ def run(
         try:
             exit_code, duration = run_gates._run(
                 argv, cwd=repo, env=env, timeout=args.timeout, log_path=temp_log,
-                settle_report=settle_report,
+                settle_report=settle_report, max_log_bytes=MAX_LOG_BYTES,
             )
         except run_gates.AttemptedGateFailure as exc:
             attempted = exc
@@ -303,63 +367,70 @@ def run(
             exit_code, duration = exc.raw_exit_code, exc.duration_seconds
             receipt["error"] = str(exc)
             retain = True
+            runner_code = EXIT_UNCERTAIN
+            receipt["decision"] = "uncertain_process_tree"
             failed = run_gates._retain_uncertain_leases(acquired, exc)
             if failed:
                 receipt["leaseRetention"] = {
                     "status": "owner records unavailable; leases retained without modification",
                     "leaseNames": failed,
                 }
-            runner_code = EXIT_UNCERTAIN
-            receipt["decision"] = "uncertain_process_tree"
+        if settle_report:
+            receipt["naturalExitSettle"] = settle_report
+        receipt["exitCode"] = exit_code
+        receipt["durationSeconds"] = duration
         if temp_log.exists():
             private_roots.replace_private_file(temp_log, log_path, logs_identity)
         if log_path.is_file():
             receipt["log"] = f"logs/{LOG_NAME}"
             log_sha256 = run_gates._hash_file(log_path)
             receipt["logSha256"] = log_sha256
-        receipt["exitCode"] = exit_code
-        receipt["durationSeconds"] = duration
-        if settle_report:
-            receipt["naturalExitSettle"] = settle_report
-        if retain:
-            pass
-        elif attempted is not None:
-            receipt["decision"] = "failed"
-            runner_code = EXIT_FAILED
-        else:
-            reason = None
-            tail, size = _read_log_tail(log_path)
-            receipt["logBytes"] = size
-            if size > MAX_LOG_BYTES:
-                reason = "log-exceeded-bound"
-            if exit_code != 0:
-                reason = reason or "command-exit-nonzero"
-            if expect is not None:
-                ran, plain_ok, marked = parse_unittest_summary(tail)
-                receipt["unittest"] = {"ran": ran, "ok": plain_ok, "skipOrExpectedFailureMarker": marked}
-                if ran != expect or not plain_ok or marked:
-                    reason = reason or "unittest-expectation-not-met"
-            if reason is None:
-                receipt["decision"] = "passed"
-                runner_code = EXIT_PASSED
-            else:
+        if not retain:
+            if attempted is not None:
                 receipt["decision"] = "failed"
-                receipt["failureReason"] = reason
                 runner_code = EXIT_FAILED
+            else:
+                reason = None
+                tail, size = _read_log_tail(log_path)
+                receipt["logBytes"] = size
+                if exit_code == run_gates.LOG_LIMIT_EXIT_CODE or size > MAX_LOG_BYTES:
+                    reason = "log-exceeded-bound"
+                if exit_code != 0:
+                    reason = reason or "command-exit-nonzero"
+                if expect is not None:
+                    ran, plain_ok, marked = parse_unittest_summary(tail)
+                    receipt["unittest"] = {"ran": ran, "ok": plain_ok, "skipOrExpectedFailureMarker": marked}
+                    if ran != expect or not plain_ok or marked:
+                        reason = reason or "unittest-expectation-not-met"
+                if reason is None:
+                    receipt["decision"] = "passed"
+                    runner_code = EXIT_PASSED
+                else:
+                    receipt["decision"] = "failed"
+                    receipt["failureReason"] = reason
+                    runner_code = EXIT_FAILED
         receipt["sourceAfter"] = _source_identity(repo)
         receipt["sourceChangedDuringRun"] = receipt["sourceAfter"] != before
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
         if isinstance(exc, run_gates.UncertainProcessTree) and exc.command_started:
             raise
-        receipt["decision"] = "failed"
-        receipt["error"] = (
-            str(exc) if isinstance(exc, (run_gates.UncertainProcessTree, run_gates.AttemptedGateFailure))
-            else type(exc).__name__
-        )
-        runner_code = EXIT_INVALID if isinstance(exc, (private_roots.AdmissionError, ValueError)) else EXIT_FAILED
+        label_taken = isinstance(exc, FileExistsError) and not claimed
+        if retain:
+            # The retained-tree result and exit code are primary; finalization
+            # trouble is only recorded.
+            receipt["finalizationError"] = type(exc).__name__
+        else:
+            receipt["decision"] = "label_in_use" if label_taken else "failed"
+            receipt["error"] = (
+                str(exc) if isinstance(exc, (run_gates.UncertainProcessTree, run_gates.AttemptedGateFailure))
+                else type(exc).__name__
+            )
+            runner_code = (
+                EXIT_INVALID if label_taken or isinstance(exc, (private_roots.AdmissionError, ValueError))
+                else EXIT_FAILED
+            )
     finally:
         if not retain:
-            release_failed = False
             cleanup = []
             for lease in reversed(acquired):
                 try:
@@ -367,20 +438,36 @@ def run(
                     cleanup.append("released")
                 except (OSError, RuntimeError, ValueError):
                     cleanup.append("release-failed")
-                    release_failed = True
             cleanup.reverse()
-            if release_failed:
+            released_ok = all(item == "released" for item in cleanup)
+            if not released_ok:
                 receipt["decision"] = "failed"
                 receipt["error"] = "builder lease release failed"
                 runner_code = EXIT_UNCERTAIN
         receipt["leaseCleanup"] = cleanup
+    # Scratch is removed through the production admission check, only after both
+    # leases were released and the run passed; failed runs keep it for diagnosis.
+    receipt["scratchCleanup"] = "kept"
+    if claimed and released_ok and receipt["decision"] == "passed":
         try:
-            if run_dir.is_dir():
-                run_gates._atomic_json(run_dir / "receipt.json", receipt)
+            private_roots.admit_directory(scratch, private_leaf=True)
+            shutil.rmtree(scratch)
+            receipt["scratchCleanup"] = "removed"
         except (OSError, RuntimeError, ValueError):
-            receipt["receiptWriteFailed"] = True
+            receipt["scratchCleanup"] = "remove-failed"
+    receipt_written = False
+    if claimed:
+        try:
+            run_gates._write_receipt(run_dir / "receipt.json", receipt)
+            receipt_written = True
+        except (OSError, RuntimeError, ValueError):
+            receipt_written = False
+    if claimed and not receipt_written and runner_code in (EXIT_PASSED, EXIT_FAILED):
+        receipt["decision"] = "receipt_write_failed"
+        runner_code = EXIT_RECEIPT_FAILED
     out(json.dumps(
-        _summary(args.label, receipt["decision"], exit_code, duration, log_sha256, cleanup), sort_keys=True,
+        _summary(args.label, receipt["decision"], exit_code, duration, log_sha256, cleanup,
+                 receipt_written if claimed else None), sort_keys=True,
     ))
     return runner_code
 
@@ -394,6 +481,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wait", type=float, default=0.0, help="seconds to poll for busy leases (default: do not wait)")
     parser.add_argument("--jdk-home", default=None)
     parser.add_argument("--expect-unittest", type=int, default=None, metavar="N")
+    parser.add_argument("--pass-env", action="append", default=[], metavar="NAME",
+                        help="extra non-secret parent variable to pass through (repeatable)")
     parser.add_argument("argv", nargs=argparse.REMAINDER, help="-- command and arguments")
     return parser
 

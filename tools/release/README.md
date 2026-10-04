@@ -167,9 +167,19 @@ python3.14 -B -m tools.release.leased_run --repo <worktree> --label <new unique 
   every 15 s for at most `--wait` seconds, then exits with code 75.
 - Uncommitted edits are allowed; HEAD and working-tree digests are recorded in
   `release-gates/<label>/receipt.json` (no tokens, paths or environment).
-- Exit codes: 0 passed, 1 command or expectation failed, 2 invalid input or
-  admission failure, 3 uncertain process tree (leases retained for manual
-  recovery) or lease release failure, 75 leases busy past `--wait`.
+- Exit codes: 0 passed, 1 command or expectation failed, 2 invalid input,
+  admission failure or a label already used (also when it was taken while
+  waiting; the other run's files are never overwritten), 3 uncertain process
+  tree (leases retained for manual recovery, also if finalization then fails) or
+  lease release failure, 4 the receipt could not be written, 75 a live owner held
+  a lease for the whole `--wait`, 76 a lease is retained for manual recovery
+  (reported at once; waiting cannot help).
+- The command sees an allowlisted parent environment (PATH, HOME, locale and
+  toolchain locators) plus the task variables; add non-secret names with
+  `--pass-env NAME`. Per-run scratch is removed only after a passing run and a
+  successful lease release. The raw log is capped at 64 MiB while the command
+  runs; on overflow only the run's own process tree is stopped (exit 1, reason
+  `log-exceeded-bound`).
 - `--expect-unittest N` passes only on exit 0, `Ran N tests`, a plain `OK` and
   no skip or expected-failure marker.
 - One JSON summary line is printed: label, decision, exit code, duration, log
