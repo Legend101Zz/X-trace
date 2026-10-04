@@ -1613,7 +1613,7 @@ mod tests {
         let worker_root_path = root.path().to_path_buf();
         let worker_name = name.clone();
         let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             let root = AdmittedPrivateRoot::open(&worker_root_path)
                 .expect("reopen admitted scratch in fixture worker");
             let raced_descriptor = root
@@ -1638,6 +1638,7 @@ mod tests {
         let (descriptor_is_fifo, outcomes) = receiver
             .recv_timeout(Duration::from_secs(10))
             .expect("FIFO validation must not block waiting for a reader or writer");
+        worker.join().expect("FIFO fixture worker must finish before cleanup");
         assert!(descriptor_is_fifo, "the race fixture must reach the descriptor-level opener");
         assert!(outcomes.into_iter().all(|opened| opened));
         #[cfg(target_os = "linux")]

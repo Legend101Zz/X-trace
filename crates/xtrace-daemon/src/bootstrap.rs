@@ -633,11 +633,12 @@ fn write_atomic_admitted(
     )
 }
 
+#[cfg(test)]
 fn write_atomic_admitted_with_suffix<F>(
     root: &AdmittedPrivateRoot,
     target: &str,
     body: &[u8],
-    mut fill_suffix: F,
+    fill_suffix: F,
 ) -> Result<(), DaemonError>
 where
     F: FnMut(&mut [u8]) -> Result<(), ring::error::Unspecified>,
@@ -1091,7 +1092,6 @@ mod tests {
         // path; the bounded retry budget must surface as a typed
         // error rather than an infinite loop.
         let dir = unique_dir("retry-budget");
-        let path = dir.join("bootstrap.json");
         let pinned: [u8; 16] = [0xff; 16];
         let root = AdmittedPrivateRoot::open(&dir).expect("admitted parent");
         let candidate_name = format!("{TEMP_BOOTSTRAP_PREFIX}{}", hex::encode(pinned));
@@ -1202,7 +1202,7 @@ mod tests {
                     .write_all(b"replacement-canary")
                     .map_err(|_| PrivateStorageError::Operation)?;
                 replacement.sync_all().map_err(|_| PrivateStorageError::Operation)?;
-                Err(PrivateStorageError::Operation)
+                Ok(())
             },
             |_| {
                 sync_observation.store(true, Ordering::SeqCst);
