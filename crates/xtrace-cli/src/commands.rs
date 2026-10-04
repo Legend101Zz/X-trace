@@ -593,7 +593,7 @@ where
     if canonical.is_empty() || canonical.contains('\0') {
         return Err(CliError::InvalidArgument("repository path is invalid".into()));
     }
-    if canonical.as_bytes().len() > crate::pointer_io::MAX_PATH_BYTES {
+    if canonical.len() > crate::pointer_io::MAX_PATH_BYTES {
         return Err(CliError::InvalidArgument(
             "repository path exceeds its supported limit".into(),
         ));
@@ -1066,6 +1066,7 @@ impl StatusDocument {
 )]
 mod tests {
     use super::*;
+    use crate::paths::USER_DATA_HOME_ENV;
     use std::collections::HashMap;
     use xtrace_domain::ProjectId;
 
@@ -1179,7 +1180,6 @@ mod tests {
             .lookup_receipt("initialize_project", &legacy_key)
             .expect("lookup legacy receipt")
             .expect("legacy receipt exists");
-        drop(idempotency);
         drop(store);
 
         init(repo.clone(), "Legacy".into(), String::new(), &env_reader)
@@ -1335,7 +1335,7 @@ mod tests {
     fn require_parent_legacy_key(canonical_repo_path: &str) -> String {
         let key = format!("xtrace-init-{canonical_repo_path}");
         assert!(
-            canonical_repo_path.as_bytes().len() <= 116,
+            canonical_repo_path.len() <= 116,
             "legacy-key fixture repository path must be <=116 bytes; shorten XTRACE_TEST_PRIVATE_SCRATCH"
         );
         assert!(
@@ -1440,7 +1440,6 @@ mod tests {
             .lookup_receipt("initialize_project", &key)
             .expect("lookup committed receipt")
             .expect("receipt exists");
-        drop(idempotency);
         drop(store);
 
         let pointer_path = repo.join(".xtrace").join("config.toml");

@@ -2648,6 +2648,7 @@ fn unavailable_source(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
 mod source_projection_tests {
     use super::*;
 
@@ -2689,7 +2690,7 @@ mod source_projection_tests {
 
     #[test]
     fn matching_source_returns_only_the_bounded_recorded_extent() {
-        let root = tempdir().expect("temporary root");
+        let root = tempdir();
         let bytes = b"one\ntwo\nthree\nfour\n";
         write_source(root.path(), bytes);
         let projected = project(&range(PATH, ContentHash::of_bytes(bytes)), Some(root.path()))
@@ -2700,7 +2701,7 @@ mod source_projection_tests {
 
     #[test]
     fn changed_source_is_reported_without_returning_its_contents() {
-        let root = tempdir().expect("temporary root");
+        let root = tempdir();
         write_source(root.path(), b"private-source-canary\nchanged\n");
         let projected =
             project(&range(PATH, ContentHash::of_bytes(b"recorded\nsource\n")), Some(root.path()))
@@ -2711,7 +2712,7 @@ mod source_projection_tests {
 
     #[test]
     fn repeated_frames_hash_near_limit_source_once_per_query() {
-        let root = tempdir().expect("temporary root");
+        let root = tempdir();
         let max_bytes = usize::try_from(MAX_SOURCE_FILE_BYTES).expect("bound fits");
         let mut bytes = b"header\nrecorded line\n".to_vec();
         bytes.resize(max_bytes - 1, b'x');
@@ -2741,7 +2742,7 @@ mod source_projection_tests {
 
     #[test]
     fn source_paths_outside_the_fixture_allowlist_are_never_projected() {
-        let root = tempdir().expect("temporary root");
+        let root = tempdir();
         let projected =
             project(&range("../../private.txt", ContentHash::of_bytes(b"x")), Some(root.path()));
         assert!(projected.is_none());
@@ -2749,7 +2750,7 @@ mod source_projection_tests {
 
     #[test]
     fn source_files_over_the_read_bound_are_unavailable() {
-        let root = tempdir().expect("temporary root");
+        let root = tempdir();
         write_source(
             root.path(),
             &vec![b'x'; usize::try_from(MAX_SOURCE_FILE_BYTES + 1).expect("bound fits")],
@@ -2762,7 +2763,7 @@ mod source_projection_tests {
 
     #[test]
     fn missing_source_root_and_out_of_range_method_lines_are_unavailable() {
-        let root = tempdir().expect("temporary root");
+        let root = tempdir();
         let bytes = b"one\ntwo\n";
         write_source(root.path(), bytes);
         let no_root = project(&range(PATH, ContentHash::of_bytes(bytes)), None)
@@ -2779,7 +2780,7 @@ mod source_projection_tests {
 
     #[test]
     fn excerpt_limit_includes_inter_line_separator_bytes() {
-        let root = tempdir().expect("temporary root");
+        let root = tempdir();
         let first = "a".repeat(MAX_SOURCE_EXCERPT_BYTES);
         let contents = format!("header\n{first}\nnext\n");
         write_source(root.path(), contents.as_bytes());
@@ -2796,7 +2797,7 @@ mod source_projection_tests {
     fn symlinked_source_file_is_not_read() {
         use std::os::unix::fs::symlink;
 
-        let root = tempdir().expect("temporary root");
+        let root = tempdir();
         let file = root.path().join(PATH);
         std::fs::create_dir_all(file.parent().expect("parent exists")).expect("directory created");
         let private = root.path().join("private-source-canary.txt");

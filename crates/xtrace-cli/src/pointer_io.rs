@@ -246,145 +246,6 @@ pub(crate) fn read_unlocked(
     Ok(result)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::symlink;
-    use tempfile::tempdir;
-
-    fn repo() -> (tempfile::TempDir, std::path::PathBuf) {
-        let temp = tempdir().expect("tempdir");
-        let repo = temp.path().join("repo");
-        std::fs::create_dir(&repo).expect("repo");
-        (temp, repo)
-    }
-
-    #[test]
-    fn pointer_read_refuses_symlink_and_hardlink_targets() {
-        let (_temp, repo) = repo();
-        let lock = RepositoryInitLock::acquire(&repo).expect("lock");
-        let outside = repo.join("outside");
-        std::fs::write(&outside, b"secret").expect("outside file");
-        symlink(&outside, repo.join(".xtrace/config.toml")).expect("symlink");
-        assert!(read_unlocked(&repo, "config.toml", POINTER_MAX_BYTES).is_err());
-        std::fs::remove_file(repo.join(".xtrace/config.toml")).expect("remove symlink");
-        std::fs::hard_link(&outside, repo.join(".xtrace/config.toml")).expect("hardlink");
-        assert!(lock.read("config.toml", POINTER_MAX_BYTES).is_err());
-    }
-
-    #[test]
-    fn pointer_read_refuses_fifo_without_waiting_for_a_writer() {
-        let (_temp, repo) = repo();
-        let lock = RepositoryInitLock::acquire(&repo).expect("lock");
-        fs::mkfifoat(&lock.directory, "config.toml", Mode::from_bits_truncate(0o600))
-            .expect("fifo");
-        assert!(lock.read("config.toml", POINTER_MAX_BYTES).is_err());
-    }
-
-    #[test]
-    fn pointer_read_refuses_a_symlinked_metadata_directory() {
-        let (_temp, repo) = repo();
-        let outside = repo.join("outside");
-        std::fs::create_dir(&outside).expect("outside directory");
-        symlink(&outside, repo.join(".xtrace")).expect("metadata directory symlink");
-        assert!(read_unlocked(&repo, "config.toml", POINTER_MAX_BYTES).is_err());
-        assert!(RepositoryInitLock::acquire(&repo).is_err());
-    }
-
-    #[test]
-    fn cooperative_init_lock_serializes_writers() {
-        let (_temp, repo) = repo();
-        let first = RepositoryInitLock::acquire(&repo).expect("first lock");
-        let second_repo = repo.clone();
-        let waiter = std::thread::spawn(move || RepositoryInitLock::acquire(&second_repo));
-        std::thread::sleep(Duration::from_millis(20));
-        drop(first);
-        assert!(waiter.join().expect("join").is_ok());
-    }
-
-    #[test]
-    fn init_lock_rejects_a_replaced_lock_name_after_acquisition() {
-        let (_temp, repo) = repo();
-        let lock = RepositoryInitLock::acquire(&repo).expect("lock");
-        let metadata_dir = repo.join(".xtrace");
-        std::fs::rename(metadata_dir.join("init.lock"), metadata_dir.join("detached.lock"))
-            .expect("detach locked inode");
-        std::fs::write(metadata_dir.join("init.lock"), b"replacement").expect("replace lock name");
-
-        assert!(lock.revalidate().is_err());
-        assert!(lock.read("config.toml", POINTER_MAX_BYTES).is_err());
-    }
-
-    #[test]
-    fn serialized_pointer_read_is_capped_before_parsing() {
-        let (_temp, repo) = repo();
-        let lock = RepositoryInitLock::acquire(&repo).expect("lock");
-        let body = vec![b'x'; POINTER_MAX_BYTES + 1];
-        lock.publish("oversized", &body, POINTER_MAX_BYTES + 1).expect("test publication");
-        assert!(lock.read("oversized", POINTER_MAX_BYTES).is_err());
-    }
-
-    #[test]
-    fn pending_marker_retries_after_injected_temp_and_rename_failures() {
-        for failure_stage in [
-            PublishStage::TemporaryCreated,
-            PublishStage::TemporarySynced,
-            PublishStage::BeforeRename,
-        ] {
-            let (_temp, repo) = repo();
-            let lock = RepositoryInitLock::acquire(&repo).expect("lock");
-            let marker = b"durable recovery locator";
-            let failed =
-                lock.publish_with_hook("init.pending", marker, PENDING_MAX_BYTES, |stage| {
-                    if stage == failure_stage {
-                        Err(CliError::StoreUnavailable("injected publication failure".into()))
-                    } else {
-                        Ok(())
-                    }
-                });
-            assert!(failed.is_err());
-            assert_eq!(lock.read("init.pending", PENDING_MAX_BYTES).expect("marker read"), None);
-            lock.publish("init.pending", marker, PENDING_MAX_BYTES).expect("retry marker");
-            assert_eq!(
-                lock.read("init.pending", PENDING_MAX_BYTES).expect("read published marker"),
-                Some(marker.to_vec())
-            );
-        }
-    }
-
-    #[test]
-    fn pointer_retry_after_rename_and_directory_sync_uncertainty_is_exact() {
-        for failure_stage in [
-            PublishStage::Renamed,
-            PublishStage::BeforeDirectorySync,
-            PublishStage::DirectorySynced,
-        ] {
-            let (_temp, repo) = repo();
-            let lock = RepositoryInitLock::acquire(&repo).expect("lock");
-            let pointer = crate::paths::RepositoryPointer {
-                schema_version: 1,
-                project_id: xtrace_domain::ProjectId::new(),
-                data_home: repo.join("user-data"),
-            };
-            let bytes = pointer.serialized().expect("pointer bytes");
-            let failed =
-                lock.publish_with_hook("config.toml", &bytes, POINTER_MAX_BYTES, |stage| {
-                    if stage == failure_stage {
-                        Err(CliError::StoreUnavailable("injected publication uncertainty".into()))
-                    } else {
-                        Ok(())
-                    }
-                });
-            assert!(failed.is_err());
-            assert_eq!(
-                crate::paths::RepositoryPointer::read_locked(&lock).expect("read pointer"),
-                Some(pointer.clone())
-            );
-            pointer.write_locked(&lock, &bytes).expect("exact retry");
-        }
-    }
-}
-
 fn read_at(
     directory: &File,
     name: &str,
@@ -554,4 +415,144 @@ fn check_budget(started: Instant) -> Result<(), CliError> {
 
 fn io_error(operation: &str) -> CliError {
     CliError::StoreUnavailable(format!("{operation} failed"))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::tempdir;
+
+    fn repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo");
+        (temp, repo)
+    }
+
+    #[test]
+    fn pointer_read_refuses_symlink_and_hardlink_targets() {
+        let (_temp, repo) = repo();
+        let lock = RepositoryInitLock::acquire(&repo).expect("lock");
+        let outside = repo.join("outside");
+        std::fs::write(&outside, b"secret").expect("outside file");
+        symlink(&outside, repo.join(".xtrace/config.toml")).expect("symlink");
+        assert!(read_unlocked(&repo, "config.toml", POINTER_MAX_BYTES).is_err());
+        std::fs::remove_file(repo.join(".xtrace/config.toml")).expect("remove symlink");
+        std::fs::hard_link(&outside, repo.join(".xtrace/config.toml")).expect("hardlink");
+        assert!(lock.read("config.toml", POINTER_MAX_BYTES).is_err());
+    }
+
+    #[test]
+    fn pointer_read_refuses_fifo_without_waiting_for_a_writer() {
+        let (_temp, repo) = repo();
+        let lock = RepositoryInitLock::acquire(&repo).expect("lock");
+        fs::mkfifoat(&lock.directory, "config.toml", Mode::from_bits_truncate(0o600))
+            .expect("fifo");
+        assert!(lock.read("config.toml", POINTER_MAX_BYTES).is_err());
+    }
+
+    #[test]
+    fn pointer_read_refuses_a_symlinked_metadata_directory() {
+        let (_temp, repo) = repo();
+        let outside = repo.join("outside");
+        std::fs::create_dir(&outside).expect("outside directory");
+        symlink(&outside, repo.join(".xtrace")).expect("metadata directory symlink");
+        assert!(read_unlocked(&repo, "config.toml", POINTER_MAX_BYTES).is_err());
+        assert!(RepositoryInitLock::acquire(&repo).is_err());
+    }
+
+    #[test]
+    fn cooperative_init_lock_serializes_writers() {
+        let (_temp, repo) = repo();
+        let first = RepositoryInitLock::acquire(&repo).expect("first lock");
+        let second_repo = repo.clone();
+        let waiter = std::thread::spawn(move || RepositoryInitLock::acquire(&second_repo));
+        std::thread::sleep(Duration::from_millis(20));
+        drop(first);
+        assert!(waiter.join().expect("join").is_ok());
+    }
+
+    #[test]
+    fn init_lock_rejects_a_replaced_lock_name_after_acquisition() {
+        let (_temp, repo) = repo();
+        let lock = RepositoryInitLock::acquire(&repo).expect("lock");
+        let metadata_dir = repo.join(".xtrace");
+        std::fs::rename(metadata_dir.join("init.lock"), metadata_dir.join("detached.lock"))
+            .expect("detach locked inode");
+        std::fs::write(metadata_dir.join("init.lock"), b"replacement").expect("replace lock name");
+
+        assert!(lock.revalidate().is_err());
+        assert!(lock.read("config.toml", POINTER_MAX_BYTES).is_err());
+    }
+
+    #[test]
+    fn serialized_pointer_read_is_capped_before_parsing() {
+        let (_temp, repo) = repo();
+        let lock = RepositoryInitLock::acquire(&repo).expect("lock");
+        let body = vec![b'x'; POINTER_MAX_BYTES + 1];
+        lock.publish("oversized", &body, POINTER_MAX_BYTES + 1).expect("test publication");
+        assert!(lock.read("oversized", POINTER_MAX_BYTES).is_err());
+    }
+
+    #[test]
+    fn pending_marker_retries_after_injected_temp_and_rename_failures() {
+        for failure_stage in [
+            PublishStage::TemporaryCreated,
+            PublishStage::TemporarySynced,
+            PublishStage::BeforeRename,
+        ] {
+            let (_temp, repo) = repo();
+            let lock = RepositoryInitLock::acquire(&repo).expect("lock");
+            let marker = b"durable recovery locator";
+            let failed =
+                lock.publish_with_hook("init.pending", marker, PENDING_MAX_BYTES, |stage| {
+                    if stage == failure_stage {
+                        Err(CliError::StoreUnavailable("injected publication failure".into()))
+                    } else {
+                        Ok(())
+                    }
+                });
+            assert!(failed.is_err());
+            assert_eq!(lock.read("init.pending", PENDING_MAX_BYTES).expect("marker read"), None);
+            lock.publish("init.pending", marker, PENDING_MAX_BYTES).expect("retry marker");
+            assert_eq!(
+                lock.read("init.pending", PENDING_MAX_BYTES).expect("read published marker"),
+                Some(marker.to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_retry_after_rename_and_directory_sync_uncertainty_is_exact() {
+        for failure_stage in [
+            PublishStage::Renamed,
+            PublishStage::BeforeDirectorySync,
+            PublishStage::DirectorySynced,
+        ] {
+            let (_temp, repo) = repo();
+            let lock = RepositoryInitLock::acquire(&repo).expect("lock");
+            let pointer = crate::paths::RepositoryPointer {
+                schema_version: 1,
+                project_id: xtrace_domain::ProjectId::new(),
+                data_home: repo.join("user-data"),
+            };
+            let bytes = pointer.serialized().expect("pointer bytes");
+            let failed =
+                lock.publish_with_hook("config.toml", &bytes, POINTER_MAX_BYTES, |stage| {
+                    if stage == failure_stage {
+                        Err(CliError::StoreUnavailable("injected publication uncertainty".into()))
+                    } else {
+                        Ok(())
+                    }
+                });
+            assert!(failed.is_err());
+            assert_eq!(
+                crate::paths::RepositoryPointer::read_locked(&lock).expect("read pointer"),
+                Some(pointer.clone())
+            );
+            pointer.write_locked(&lock, &bytes).expect("exact retry");
+        }
+    }
 }

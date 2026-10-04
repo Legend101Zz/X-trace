@@ -390,9 +390,10 @@ mod tests {
             &self,
             request: xtrace_application::recording::FinishRecording,
         ) -> Result<FinishRecordingReceipt, PortError> {
+            let recording_id = request.recording_id;
             self.operations.lock().expect("operations").push(Operation::Finished(request));
             Ok(FinishRecordingReceipt {
-                recording_id: request.recording_id,
+                recording_id,
                 persisted_segments: 0,
                 exact_replay: false,
                 completion: xtrace_application::recording::RecordingCompletion::Partial,
@@ -527,7 +528,7 @@ mod tests {
                 request.events[0].payload.encode_to_vec()
             );
         }
-        let Operation::Finished(finish) = operations[3] else {
+        let Operation::Finished(finish) = &operations[3] else {
             panic!("last operation must be finish");
         };
         assert_eq!(finish.recording_id, recording_id);

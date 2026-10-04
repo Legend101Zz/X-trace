@@ -639,7 +639,7 @@ fn decode_helper_result(
 ) -> Result<Value, CliError> {
     let record = match bytes.strip_suffix(b"\r\n") {
         Some(record) => record,
-        None => bytes.strip_suffix(b"\n").unwrap_or(&bytes),
+        None => bytes.strip_suffix(b"\n").unwrap_or(bytes),
     };
     if record.contains(&b'\n') || record.contains(&b'\r') {
         return Err(helper_protocol_error(
@@ -1289,7 +1289,7 @@ mod tests {
 
     #[test]
     fn non_tty_attach_requires_explicit_pid_even_for_one_listed_process() {
-        let rows = vec![serde_json::json!({
+        let rows = [serde_json::json!({
             "pid": 41,
             "startTime": "2026-10-04T00:00:00Z",
             "owner": "xtrace-test"

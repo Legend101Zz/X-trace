@@ -1704,6 +1704,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::panic, reason = "test helper asserts the grant was admitted")]
     fn run_id(grant: DiscoveryRunGrant) -> RunId {
         match grant {
             DiscoveryRunGrant::Admitted { run_id, .. } => run_id,

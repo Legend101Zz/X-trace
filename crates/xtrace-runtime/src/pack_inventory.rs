@@ -1343,7 +1343,7 @@ fn scan_regular_file(
         || after_identity.size != consumed
         || named_after.st_dev != identity.device
         || named_after.st_ino != identity.inode
-        || named_after.st_nlink != identity.links
+        || widen_link_count(named_after.st_nlink) != identity.links
         || rustix::fs::FileType::from_raw_mode(named_after.st_mode)
             != rustix::fs::FileType::RegularFile
     {
@@ -1380,7 +1380,10 @@ fn read_named_file(
     }
     let named = rustix::fs::statat(root, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| SignedPackError::InventoryMismatch)?;
-    if named.st_dev != before.dev() || named.st_ino != before.ino() || named.st_nlink != 1 {
+    if named.st_dev != before.dev()
+        || named.st_ino != before.ino()
+        || widen_link_count(named.st_nlink) != 1
+    {
         return Err(SignedPackError::InventoryMismatch);
     }
     let mut output = Vec::with_capacity(
@@ -1411,7 +1414,7 @@ fn read_named_file(
         || named.st_ino != after.ino()
         || named_after.st_dev != after.dev()
         || named_after.st_ino != after.ino()
-        || named_after.st_nlink != after.nlink()
+        || widen_link_count(named_after.st_nlink) != after.nlink()
         || rustix::fs::FileType::from_raw_mode(named_after.st_mode)
             != rustix::fs::FileType::RegularFile
         || std::time::Instant::now() >= deadline
@@ -1439,7 +1442,14 @@ fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Widens a platform-width `st_nlink` (u32 on aarch64 Linux, u64 on x86_64)
+/// to the u64 used by `std::os::unix::fs::MetadataExt::nlink`.
+fn widen_link_count(value: impl Into<u64>) -> u64 {
+    value.into()
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
 mod tests {
     use super::*;
     use crate::signed_pack::{ArtifactDigest, build_hash};

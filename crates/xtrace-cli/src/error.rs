@@ -41,10 +41,15 @@ pub enum CliError {
     /// A sanitized Java attach operation failed with stable helper-compatible facts.
     #[cfg(unix)]
     Attach {
+        /// Stable helper-compatible error code.
         code: &'static str,
+        /// Stable error category.
         category: &'static str,
+        /// Sanitized human-readable message.
         message: String,
+        /// Sanitized remediation text.
         remediation: String,
+        /// Process exit code for this failure.
         exit_code: i32,
     },
     /// Direct Node launch or process supervision failed.

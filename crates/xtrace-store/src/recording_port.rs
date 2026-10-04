@@ -433,7 +433,7 @@ mod tests {
         let begin_request = begin(project.id(), recording_id);
         let adapter = SqliteRecordingPersistence::new(store.clone(), directory.path());
         adapter.begin_recording(&begin_request).expect("begin recording");
-        let events = vec![event(2, "event-2"), event(3, "event-3")];
+        let events = [event(2, "event-2"), event(3, "event-3")];
         let first_segment = PersistRecordingSegment {
             project_id: project.id(),
             recording_id,
@@ -518,11 +518,7 @@ mod tests {
             xtrace_application::recording_queries::NavigationResult::Unavailable
         );
         let second_page = reader
-            .show_recording(&ShowWindowRequest {
-                limit: 1,
-                after_sequence: Some(2),
-                ..request.clone()
-            })
+            .show_recording(&ShowWindowRequest { limit: 1, after_sequence: Some(2), ..request })
             .expect("read page beginning at a segment boundary");
         assert_eq!(second_page.events[0].frame_id, Some(second_frame));
         assert_eq!(
@@ -574,11 +570,7 @@ mod tests {
             .expect("corrupt only the page lookbehind index");
         drop(connection);
         let corrupted_lookbehind = reopened_reader
-            .show_recording(&ShowWindowRequest {
-                limit: 1,
-                after_sequence: Some(2),
-                ..request.clone()
-            })
+            .show_recording(&ShowWindowRequest { limit: 1, after_sequence: Some(2), ..request })
             .expect("corrupt optional lookbehind degrades to unavailable");
         assert_eq!(corrupted_lookbehind.events[0].frame_id, Some(second_frame));
         assert_eq!(

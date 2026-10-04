@@ -28,7 +28,7 @@ const POINTER_FILENAME: &str = "config.toml";
 /// File name of the SQLite database file inside a project directory.
 const DATABASE_FILENAME: &str = "metadata.sqlite3";
 /// Environment variable that overrides the user-data home directory.
-const USER_DATA_HOME_ENV: &str = "XTRACE_DATA_HOME";
+pub(crate) const USER_DATA_HOME_ENV: &str = "XTRACE_DATA_HOME";
 /// Application folder name under the user-data home.
 const XTRACE_FOLDER: &str = "xtrace";
 /// Subdirectory that holds one folder per project.
@@ -287,6 +287,10 @@ impl TryFrom<RepositoryPointerToml> for RepositoryPointer {
 
 impl RepositoryPointer {
     /// Writes the pointer without replacing a pointer already present.
+    ///
+    /// Production initialization writes through `pointer_io`; this direct writer
+    /// is retained as the unit-test fixture for pointer validation.
+    #[cfg(test)]
     pub fn write(&self, repo: &Path) -> Result<(), CliError> {
         if !valid_project_id(self.project_id) {
             return Err(CliError::StoreCorrupted(

@@ -919,7 +919,6 @@ mod tests {
             store.lock().expect("store lock").execute_batch(trigger_sql).expect("inject fault");
             let repository = SqliteProjectRepository::new(&store);
             assert!(repository.initialize_project_with_receipt(&project, &requested).is_err());
-            drop(repository);
             drop(store);
 
             let reopened = SqliteStore::open(&database_path, OpenOptions::default())

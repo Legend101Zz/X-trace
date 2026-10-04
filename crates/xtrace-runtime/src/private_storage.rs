@@ -1606,6 +1606,7 @@ fn valid_posix_mode(mode: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
 mod tests {
     use super::*;
 

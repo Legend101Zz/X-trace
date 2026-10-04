@@ -1351,7 +1351,7 @@ mod tests {
             "drwx------ 3 xtrace-test staff - 96 Oct 4 12:00 /private/root\n",
             "/private/root"
         ));
-        assert!(!parse_macos_acl_listing(&format!("{header}"), "/private/root"));
+        assert!(!parse_macos_acl_listing(header, "/private/root"));
         assert!(!parse_macos_acl_listing(
             "dssssssss 3 xtrace-test staff - 96 Oct 4 12:00 /private/root\n",
             "/private/root"

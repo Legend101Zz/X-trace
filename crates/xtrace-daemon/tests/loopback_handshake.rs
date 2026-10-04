@@ -82,7 +82,7 @@ use xtrace_protocol::generated::agent::{
 };
 use xtrace_protocol::handshake;
 use xtrace_protocol::xtf::XtfEventEnvelope;
-use xtrace_store::{OpenOptions, SqliteRecordingPersistence, SqliteStore};
+use xtrace_store::{OpenOptions, SqliteRecordingPersistence, SqliteRecordingReader, SqliteStore};
 
 /// Canonical fingerprint used by every happy-path integration test.
 /// The value is the canonical `b3:<64 lowercase hex>` form produced
