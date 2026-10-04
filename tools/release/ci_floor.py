@@ -78,6 +78,10 @@ class _EvidenceTestResult(unittest.TextTestResult):
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self.statuses: dict[str, str] = {}
+        self.details: dict[str, dict[str, str]] = {}
+
+    def _record_detail(self, test: unittest.case.TestCase, err: Any) -> None:
+        self.details[self._identity(test)] = _exception_detail(err)
 
     @staticmethod
     def _identity(test: unittest.case.TestCase) -> str:
@@ -89,10 +93,12 @@ class _EvidenceTestResult(unittest.TextTestResult):
 
     def addFailure(self, test: unittest.case.TestCase, err: Any) -> None:
         self.statuses[self._identity(test)] = "failed"
+        self._record_detail(test, err)
         super().addFailure(test, err)
 
     def addError(self, test: unittest.case.TestCase, err: Any) -> None:
         self.statuses[self._identity(test)] = "error"
+        self._record_detail(test, err)
         super().addError(test, err)
 
     def addSkip(self, test: unittest.case.TestCase, reason: str) -> None:
@@ -106,6 +112,82 @@ class _EvidenceTestResult(unittest.TextTestResult):
     def addUnexpectedSuccess(self, test: unittest.case.TestCase) -> None:
         self.statuses[self._identity(test)] = "unexpected-success"
         super().addUnexpectedSuccess(test)
+
+
+_SCRUB_PATH = re.compile(r"(?<![\w.])/(?:[\w.@+%~=:,-]*/)*[\w.@+%~=:,-]+/?")
+_SCRUB_ENV = re.compile(r"\b[A-Z][A-Z0-9_]{2,}=\S+")
+_SCRUB_HEX = re.compile(r"\b[0-9a-fA-F]{16,}\b")
+_SCRUB_TOKEN = re.compile(r"\b[A-Za-z0-9_+/=-]{32,}\b")
+_SCRUB_BRACES = re.compile(r"\{[^{}]*\}")
+_SCRUB_BRACKETS = re.compile(r"\[[^\[\]]*\]")
+SUMMARY_MESSAGE_LIMIT = 160
+SUMMARY_FAILURE_LIMIT = 80
+
+
+def _scrub_text(value: Any, limit: int = SUMMARY_MESSAGE_LIMIT) -> str:
+    """Reduce exception text to one short line with no paths, env or token-like data."""
+    text = str(value).splitlines()[0] if str(value).strip() else ""
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    for _ in range(8):  # nested record dumps collapse from the inside out
+        reduced = _SCRUB_BRACES.sub("<obj>", text)
+        reduced = _SCRUB_BRACKETS.sub("<list>", reduced)
+        if reduced == text:
+            break
+        text = reduced
+    text = _SCRUB_ENV.sub("<env>", text)
+    text = _SCRUB_PATH.sub("<path>", text)
+    text = _SCRUB_HEX.sub("<hex>", text)
+    text = _SCRUB_TOKEN.sub("<token>", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _exception_detail(err: Any) -> dict[str, str]:
+    """Exception class, sanitized first line, non-secret reason code and raise site."""
+    exc_type, exc, tb = err
+    detail = {"class": getattr(exc_type, "__name__", "Exception"), "message": _scrub_text(exc), "reason": "", "site": ""}
+    reason = getattr(exc, "reason", "")
+    if isinstance(reason, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", reason):
+        detail["reason"] = reason
+    site = None
+    while tb is not None:
+        if os.path.basename(os.path.dirname(tb.tb_frame.f_code.co_filename)) == "release":
+            site = tb
+        tb = tb.tb_next
+    if site is not None:
+        detail["site"] = f"{os.path.basename(site.tb_frame.f_code.co_filename)}:{site.tb_frame.f_code.co_name}:{site.tb_lineno}"
+    return detail
+
+
+def _summary_lines(run_result: Any, elapsed: float) -> list[str]:
+    """Sanitized console summary: the runner's counts and each failing test's cause."""
+    total = run_result.testsRun
+    lines = [f"Ran {total} test{'s' if total != 1 else ''} in {elapsed:.3f}s"]
+    failures, errors, skipped = len(run_result.failures), len(run_result.errors), len(run_result.skipped)
+    unexpected = len(run_result.unexpectedSuccesses)
+    if failures or errors or unexpected:
+        parts = [f"{name}={count}" for name, count in (
+            ("failures", failures), ("errors", errors), ("skipped", skipped), ("unexpected successes", unexpected),
+        ) if count]
+        lines.append(f"FAILED ({', '.join(parts)})")
+    else:
+        lines.append("OK" + (f" (skipped={skipped})" if skipped else ""))
+    bad = sorted(name for name, status in run_result.statuses.items() if status != "passed")
+    details = getattr(run_result, "details", {})
+    for name in bad[:SUMMARY_FAILURE_LIMIT]:
+        info = details.get(name, {})
+        test_id = "".join(ch for ch in name if ch.isalnum() or ch in "._<>")[:200]
+        parts = [run_result.statuses[name].upper(), test_id, info.get("class", "?")]
+        if info.get("reason"):
+            parts.append(f"reason={info['reason']}")
+        if info.get("site"):
+            parts.append(f"at {info['site']}")
+        if info.get("message"):
+            parts.append(f"msg: {info['message']}")
+        lines.append(" | ".join(parts))
+    if len(bad) > SUMMARY_FAILURE_LIMIT:
+        lines.append(f"... and {len(bad) - SUMMARY_FAILURE_LIMIT} more not shown")
+    return lines
 
 
 def _utility_process_snapshot(
@@ -683,8 +765,37 @@ def _summarize_tests(args: argparse.Namespace) -> int:
     discovered = sorted(_suite_ids(suite))
     if not discovered or len(discovered) != len(set(discovered)):
         raise FloorInputError
-    runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=2, resultclass=_EvidenceTestResult)
-    run_result = runner.run(suite)
+    log_stream: Any = sys.stdout
+    log_file = getattr(args, "log_file", None)
+    if log_file:
+        # Raw runner output stays in a private file; only the sanitized summary
+        # below is printed to the console.
+        log_fd = private_roots.create_private_file(
+            pathlib.Path(log_file), flags=os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode=0o600,
+        )
+        log_stream = os.fdopen(log_fd, "w", encoding="utf-8", buffering=1)
+    runner = unittest.TextTestRunner(stream=log_stream, verbosity=2, resultclass=_EvidenceTestResult)
+    started = time.monotonic()
+    saved: list[int] = []
+    try:
+        if log_file:
+            # Tests may print to stdout/stderr; keep all of it in the private log.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            for descriptor in (1, 2):
+                saved.append(os.dup(descriptor))
+                os.dup2(log_stream.fileno(), descriptor)
+        run_result = runner.run(suite)
+    finally:
+        if log_file:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            for descriptor, original in zip((1, 2), saved):
+                os.dup2(original, descriptor)
+                os.close(original)
+            log_stream.close()
+    for line in _summary_lines(run_result, time.monotonic() - started):
+        print(f"release-tool-tests: {line}")
     source_clean_after = _source_is_clean(pathlib.Path(args.repo), args.source_sha)
     recorded = sorted(run_result.statuses)
     tests = [{"name": name, "status": run_result.statuses[name]} for name in recorded]
@@ -1235,6 +1346,7 @@ def main() -> int:
     summarize_tests.add_argument("--root", required=True)
     summarize_tests.add_argument("--repo", required=True)
     summarize_tests.add_argument("--source-sha", required=True)
+    summarize_tests.add_argument("--log-file", default=None, help="private file for the raw runner output")
     summarize_tests.set_defaults(handler=_summarize_tests)
     sanitize = commands.add_parser("sanitize-floor")
     sanitize.add_argument("--root", required=True)

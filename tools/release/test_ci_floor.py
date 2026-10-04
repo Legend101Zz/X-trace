@@ -2058,3 +2058,122 @@ class CiFloorFailureReasonTests(unittest.TestCase):
         for name, change in invalid.items():
             with self.subTest(name):
                 self.assertFalse(ci_floor._successful_settle_report({**base, **change}))
+
+
+class CiFloorSummaryScrubberTests(unittest.TestCase):
+    CANARIES = ("/home/runner/work/_temp/xtrace-private-9f3a", "/Users/owner/secret/repo", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+                "deadbeefdeadbeefdeadbeefdeadbeef", "GITHUB_TOKEN=abc123", "AWS_SECRET_ACCESS_KEY=zzz")
+
+    def test_scrubber_removes_paths_env_tokens_hex_and_process_records(self) -> None:
+        text = (
+            "AssertionError: /home/runner/work/_temp/xtrace-private-9f3a/leases/cargo != /Users/owner/secret/repo "
+            "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 lease deadbeefdeadbeefdeadbeefdeadbeef "
+            "GITHUB_TOKEN=abc123 AWS_SECRET_ACCESS_KEY=zzz record {'pid': 4242, 'startedAt': 'Sun Oct 4', 'x': {'y': 1}} "
+            "list [{'pid': 1}]\nsecond line /etc/passwd"
+        )
+        scrubbed = ci_floor._scrub_text(text)
+        for canary in self.CANARIES + ("4242", "Sun Oct", "/etc/passwd", "second line"):
+            self.assertNotIn(canary, scrubbed)
+        self.assertIn("<path>", scrubbed)
+        self.assertIn("<obj>", scrubbed)
+        self.assertTrue(scrubbed.startswith("AssertionError:"))
+
+    def test_scrubber_is_single_line_bounded_and_keeps_plain_reason_text(self) -> None:
+        self.assertEqual(ci_floor._scrub_text("0 != 125"), "0 != 125")
+        self.assertEqual(ci_floor._scrub_text("private cache admission failed"), "private cache admission failed")
+        self.assertEqual(len(ci_floor._scrub_text("x " * 500)), ci_floor.SUMMARY_MESSAGE_LIMIT)
+        self.assertEqual(ci_floor._scrub_text("a\x00b\x1b[31m"), "a b [31m")
+        self.assertEqual(ci_floor._scrub_text(""), "")
+
+    def test_summary_lists_failures_with_class_reason_and_site_without_secrets(self) -> None:
+        class Fixture(unittest.TestCase):
+            def test_assertion(self) -> None:
+                self.assertEqual(0, 125, "see /home/runner/work/_temp/xtrace-private-9f3a/x GITHUB_TOKEN=abc123")
+
+            def test_admission(self) -> None:
+                raise private_roots._fail("acl-default-present")
+
+            def test_error(self) -> None:
+                raise OSError("/Users/owner/secret/repo is unreadable")
+
+            def test_ok(self) -> None:
+                pass
+
+            @unittest.skip("not today")
+            def test_skipped(self) -> None:
+                pass
+
+        stream = io.StringIO()
+        result = unittest.TextTestRunner(stream=stream, resultclass=ci_floor._EvidenceTestResult).run(
+            unittest.defaultTestLoader.loadTestsFromTestCase(Fixture),
+        )
+        lines = ci_floor._summary_lines(result, 1.5)
+        self.assertEqual(lines[0], "Ran 5 tests in 1.500s")
+        self.assertEqual(lines[1], "FAILED (failures=1, errors=2, skipped=1)")
+        joined = "\n".join(lines)
+        for canary in self.CANARIES:
+            self.assertNotIn(canary, joined)
+        by_name = {line.split(" | ")[1].rsplit(".", 1)[-1]: line for line in lines[2:]}
+        self.assertIn("AssertionError", by_name["test_assertion"])
+        self.assertIn("0 != 125", by_name["test_assertion"])
+        self.assertIn("AdmissionError | reason=acl-default-present", by_name["test_admission"])
+        self.assertIn("OSError", by_name["test_error"])
+        self.assertIn("<path>", by_name["test_error"])
+        self.assertNotIn("test_ok", joined)
+
+    def test_summary_success_and_truncation(self) -> None:
+        class Fixture(unittest.TestCase):
+            def test_ok(self) -> None:
+                pass
+
+        result = unittest.TextTestRunner(stream=io.StringIO(), resultclass=ci_floor._EvidenceTestResult).run(
+            unittest.defaultTestLoader.loadTestsFromTestCase(Fixture),
+        )
+        self.assertEqual(ci_floor._summary_lines(result, 0.25), ["Ran 1 test in 0.250s", "OK"])
+        result.statuses = {f"mod.Class.test_{index:03d}": "error" for index in range(ci_floor.SUMMARY_FAILURE_LIMIT + 5)}
+        result.errors = [(None, "")] * len(result.statuses)
+        lines = ci_floor._summary_lines(result, 1.0)
+        self.assertEqual(len(lines), 2 + ci_floor.SUMMARY_FAILURE_LIMIT + 1)
+        self.assertEqual(lines[-1], "... and 5 more not shown")
+
+    def test_summarize_tests_keeps_raw_output_in_the_private_log_and_prints_only_the_summary(self) -> None:
+        class Fixture(unittest.TestCase):
+            def test_noisy_failure(self) -> None:
+                print("RAW-STDOUT-CANARY /home/runner/secret")
+                print("RAW-STDERR-CANARY GITHUB_TOKEN=abc", file=sys.stderr)
+                self.fail("boom /home/runner/secret")
+
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(Fixture)
+        with tempfile.TemporaryDirectory(dir=os.environ.get("XTRACE_TEST_SCRATCH_ROOT")) as temporary:
+            log = pathlib.Path(temporary) / "raw.log"
+            args = Namespace(root=temporary, repo="/unused", source_sha="a" * 40, log_file=str(log))
+            out_path = pathlib.Path(temporary) / "console.txt"
+            real_stdout_fd = os.dup(1)
+            console_fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            sys.stdout.flush()
+            os.dup2(console_fd, 1)
+            with mock.patch.object(ci_floor.private_roots, "admit_directory"), \
+                    mock.patch.object(ci_floor.private_roots, "atomic_write_private"), \
+                    mock.patch.object(ci_floor.private_roots, "create_private_file",
+                                      side_effect=lambda path, flags, mode: os.open(path, flags, mode)), \
+                    mock.patch.object(ci_floor, "_source_is_clean", return_value=True), \
+                    mock.patch.object(ci_floor, "_load_release_test_suite", return_value=suite), \
+                    mock.patch.dict(os.environ, {"TMPDIR": tempfile.gettempdir(), "TMP": tempfile.gettempdir(), "TEMP": tempfile.gettempdir()}), \
+                    mock.patch.dict(os.environ, {}):
+                try:
+                    code = ci_floor._summarize_tests(args)
+                finally:
+                    sys.stdout.flush()
+                    os.dup2(real_stdout_fd, 1)
+                    os.close(real_stdout_fd)
+                    os.close(console_fd)
+            raw = log.read_text()
+            printed = out_path.read_text()
+        self.assertEqual(code, 1)
+        self.assertIn("release-tool-tests: Ran 1 test in", printed)
+        self.assertIn("release-tool-tests: FAILED (failures=1)", printed)
+        self.assertIn("test_noisy_failure", printed)
+        for canary in ("RAW-STDOUT-CANARY", "RAW-STDERR-CANARY", "/home/runner/secret"):
+            self.assertNotIn(canary, printed)
+        self.assertIn("RAW-STDERR-CANARY", raw)
+        self.assertIn("RAW-STDOUT-CANARY", raw)

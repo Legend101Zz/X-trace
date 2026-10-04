@@ -49,7 +49,7 @@ jobs:
           umask 077
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor summarize-tests \
             --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
-            > "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log" 2>&1
+            --log-file "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log"
           result=$?
           set -e
           exit "$result"
@@ -119,7 +119,7 @@ jobs:
           umask 077
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor summarize-tests \
             --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
-            > "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log" 2>&1
+            --log-file "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log"
           result=$?
           set -e
           exit "$result"
