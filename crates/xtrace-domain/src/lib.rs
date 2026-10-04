@@ -59,8 +59,9 @@ pub use endpoint_identity::{
 pub use error::{AppError, ErrorCategory, ErrorCode, Remediation, RetryAdvice, SafeScalar, codes};
 pub use hash::{ContentHash, HashParseError};
 pub use ids::{
-    ClaimId, CorrelationId, FrameId, InteractionId, OperationId, OperationVersionId, PolicyId,
-    ProjectId, RecordingId, RunId, RuntimeSessionId, SourceArtifactId, SourceRevisionId,
+    CatalogRevisionId, ClaimId, CorrelationId, FrameId, InteractionId, OperationId,
+    OperationVersionId, PolicyId, ProjectId, RecordingId, RunId, RuntimeSessionId,
+    SourceArtifactId, SourceRevisionId,
 };
 pub use project::{FingerprintParseError, Project, RepositoryFingerprint};
 pub use provenance::{

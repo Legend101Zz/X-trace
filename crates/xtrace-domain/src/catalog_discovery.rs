@@ -132,39 +132,62 @@ impl DiscoveryScope {
 pub enum ClaimSourceEvidence {
     /// Producer claim shaped like evidence from an immutable source revision.
     StaticSnapshot {
+        /// Immutable source revision the producer claims the range belongs to.
         source_revision_id: SourceRevisionId,
+        /// Repository-relative path of the source file within that revision.
         relative_path: String,
+        /// Digest of the source bytes as recorded by the producer.
         recorded_source_digest: ContentHash,
+        /// 1-based first line of the cited range.
         start_line: u32,
+        /// 1-based first column of the cited range.
         start_column: u32,
+        /// 1-based last line of the cited range.
         end_line: u32,
+        /// 1-based last column of the cited range.
         end_column: u32,
     },
     /// Producer claim shaped like a loaded-class attestation.
     LoadedClassBound {
+        /// Digest of the loaded class bytes the producer attests to.
         loaded_class_digest: ContentHash,
+        /// Repository-relative path of the source file the class maps to.
         relative_path: String,
+        /// Digest of the source bytes as recorded by the producer.
         recorded_source_digest: ContentHash,
+        /// 1-based first line of the cited range.
         start_line: u32,
+        /// 1-based first column of the cited range.
         start_column: u32,
+        /// 1-based last line of the cited range.
         end_line: u32,
+        /// 1-based last column of the cited range.
         end_column: u32,
     },
     /// Unverified producer location hint.
     RuntimeHint {
+        /// Repository-relative path the runtime reported, when it reported one.
         relative_path: Option<String>,
+        /// Source digest the runtime reported, when it reported one.
         reported_source_digest: Option<ContentHash>,
         // Runtime hints may omit all coordinates or provide a 1-based start
         // pair with an optional 1-based end pair; an end without a start is invalid.
+        /// Optional 1-based first line of the hinted range.
         start_line: Option<u32>,
+        /// Optional 1-based first column of the hinted range.
         start_column: Option<u32>,
+        /// Optional 1-based last line of the hinted range.
         end_line: Option<u32>,
+        /// Optional 1-based last column of the hinted range.
         end_column: Option<u32>,
     },
     /// Creation-time absence or denial with an optional prior digest.
     Unavailable {
+        /// Closed-vocabulary code explaining why evidence could not be captured.
         reason_code: String,
+        /// Repository-relative path involved, when known.
         relative_path: Option<String>,
+        /// Previously recorded source digest, when one existed.
         recorded_source_digest: Option<ContentHash>,
     },
 }
@@ -283,11 +306,17 @@ impl ClaimSourceEvidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimProvenance {
+    /// Inferred from static analysis of source without running the program.
     StaticInferred,
+    /// Discovered from a running program's own registration or metadata.
     RuntimeDiscovered,
+    /// Backed by a complete recorded observation; needs a recording proof.
     Observed,
+    /// Backed by an incomplete recorded observation; needs a recording proof.
     PartialObservation,
+    /// Taken from an imported API specification.
     ImportedSpec,
+    /// Declared directly by a user.
     UserDeclared,
 }
 
@@ -658,7 +687,7 @@ pub fn final_digest(
     rejected_claim_count: u32,
     completion: DiscoveryCompletion,
 ) -> Result<ContentHash, DiscoveryProofError> {
-    if chunks.len() > MAX_DISCOVERY_RUN_CHUNKS as usize
+    if chunks.len() > MAX_DISCOVERY_RUN_CHUNKS
         || (scope.kind == DiscoveryScopeKind::StaticRepository) != source_revision_id.is_some()
     {
         return Err(DiscoveryProofError::LimitExceeded);
@@ -1246,7 +1275,8 @@ mod tests {
         let evidence = (0..MAX_CLAIM_SOURCE_EVIDENCE)
             .map(|index| ClaimSourceEvidence::StaticSnapshot {
                 source_revision_id: SourceRevisionId::from_uuid(Uuid::from_u128(
-                    0x018f_0000_0000_7000_8000_0000_0000_0003 + u128::from(index),
+                    0x018f_0000_0000_7000_8000_0000_0000_0003
+                        + u128::try_from(index).expect("evidence index fits u128"),
                 )),
                 relative_path: format!("src/{seed:04}/{index:02}/{}", "x".repeat(480)),
                 recorded_source_digest: ContentHash::from_digest_bytes(&[index as u8; 32]).unwrap(),
@@ -1635,7 +1665,10 @@ mod tests {
         let oversized = DiscoveryChunk {
             run_id: run_id(),
             chunk_index: 0,
-            claims: (0..MAX_DISCOVERY_CHUNK_CLAIMS).map(large_claim).collect(),
+            claims: (0..u32::try_from(MAX_DISCOVERY_CHUNK_CLAIMS)
+                .expect("chunk claim limit fits u32"))
+                .map(large_claim)
+                .collect(),
         };
         assert_eq!(oversized.canonical_bytes(), Err(DiscoveryProofError::LimitExceeded));
         assert_eq!(
