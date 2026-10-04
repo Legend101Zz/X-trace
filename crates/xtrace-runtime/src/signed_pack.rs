@@ -181,7 +181,8 @@ impl PackManifest {
     /// Returns whether the signed platform list contains this validated host tuple.
     #[must_use]
     pub fn supports_platform(&self, os: &str, arch: &str) -> bool {
-        let Ok(JsonValue::Array(platforms)) = parse_canonical_value(self.platforms.as_canonical_json())
+        let Ok(JsonValue::Array(platforms)) =
+            parse_canonical_value(self.platforms.as_canonical_json())
         else {
             return false;
         };

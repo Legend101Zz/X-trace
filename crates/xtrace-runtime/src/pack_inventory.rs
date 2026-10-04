@@ -455,7 +455,8 @@ fn verify_compatibility_declarations(
         return Err(SignedPackError::UnsupportedManifest);
     }
 
-    let protocol = (xtrace_protocol::envelope::PROTOCOL_MAJOR, xtrace_protocol::envelope::PROTOCOL_MINOR);
+    let protocol =
+        (xtrace_protocol::envelope::PROTOCOL_MAJOR, xtrace_protocol::envelope::PROTOCOL_MINOR);
     let (protocol_minimum, protocol_maximum) = manifest.protocol_range();
     if protocol < protocol_minimum || protocol > protocol_maximum {
         return Err(SignedPackError::UnsupportedManifest);
@@ -463,9 +464,7 @@ fn verify_compatibility_declarations(
 
     let major = runtime_major.number();
     let (minimum, maximum) = manifest.runtime_range();
-    if major < minimum || major >= maximum
-        || !manifest.tested_runtime_majors().contains(&major)
-    {
+    if major < minimum || major >= maximum || !manifest.tested_runtime_majors().contains(&major) {
         return Err(SignedPackError::UnsupportedManifest);
     }
     Ok(())
@@ -1906,10 +1905,7 @@ mod tests {
 
     #[test]
     fn executable_admission_facts_require_core_selected_release_protocol_runtime_and_host() {
-        let artifact = ArtifactDigest {
-            path: "agent/manifest.sha256".to_owned(),
-            digest: [7; 32],
-        };
+        let artifact = ArtifactDigest { path: "agent/manifest.sha256".to_owned(), digest: [7; 32] };
         let manifest = crate::signed_pack::parse_canonical_manifest(&make_manifest_for_pack(
             std::slice::from_ref(&artifact),
             "java",
@@ -1965,10 +1961,8 @@ mod tests {
     #[test]
     fn executable_admission_binds_only_the_known_inner_manifest_inventory_entry() {
         let expected_digest = [9; 32];
-        let known = ArtifactDigest {
-            path: "agent/manifest.sha256".to_owned(),
-            digest: expected_digest,
-        };
+        let known =
+            ArtifactDigest { path: "agent/manifest.sha256".to_owned(), digest: expected_digest };
         let manifest = crate::signed_pack::parse_canonical_manifest(&make_manifest_for_pack(
             std::slice::from_ref(&known),
             "java",
