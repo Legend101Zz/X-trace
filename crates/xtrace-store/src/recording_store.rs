@@ -4182,14 +4182,90 @@ fn find_or_insert_operation(
         if fingerprint_operation_id != tuple_operation_id {
             return Err(endpoint_identity_corrupt(correlation_id));
         }
-        return fingerprint_operation_id.ok_or_else(|| endpoint_identity_corrupt(correlation_id));
+        let operation_id =
+            fingerprint_operation_id.ok_or_else(|| endpoint_identity_corrupt(correlation_id))?;
+        ensure_catalog_operation_alias(
+            transaction,
+            &identity,
+            operation_id,
+            fingerprint.as_bytes(),
+            correlation_id,
+        )?;
+        return Ok(operation_id);
     }
     let operation_id = xtrace_domain::OperationId::new();
     transaction.execute(
         "INSERT INTO operations (operation_id, project_id, transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint, created_at) VALUES (?1, ?2, 'http', 'POST', '/orders', 'spring-fixture', 'default', ?3, ?4, ?5)",
         rusqlite::params![operation_id.as_uuid().as_bytes().to_vec(), project_id.as_uuid().as_bytes().to_vec(), i64::from(ENDPOINT_FINGERPRINT_FORMAT_VERSION), fingerprint.as_bytes().to_vec(), WallTime::now().to_rfc3339()],
     ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+    ensure_catalog_operation_alias(
+        transaction,
+        &identity,
+        operation_id,
+        fingerprint.as_bytes(),
+        correlation_id,
+    )?;
     Ok(operation_id)
+}
+
+/// Keeps the finite legacy `/orders` identity shared by recording-first and
+/// catalog-first writes. Both rows are changed in the caller's transaction;
+/// historical recording IDs and the legacy endpoint query remain untouched.
+fn ensure_catalog_operation_alias(
+    transaction: &rusqlite::Transaction<'_>,
+    identity: &EndpointIdentity,
+    operation_id: xtrace_domain::OperationId,
+    fingerprint: &[u8; 32],
+    correlation_id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    let existing = transaction
+        .query_row(
+            "SELECT operation_id, application_component, binding_key, transport, method, route_template \
+             FROM catalog_operations WHERE project_id = ?1 AND fingerprint_format = 1 AND endpoint_fingerprint = ?2",
+            rusqlite::params![identity.project_id.as_uuid().as_bytes().to_vec(), fingerprint.as_slice()],
+            |row| Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            )),
+        )
+        .optional()
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    if let Some((stored_id, component, binding, transport, method, route)) = existing {
+        if stored_id.as_slice() != operation_id.as_uuid().as_bytes()
+            || component != identity.application_component
+            || binding != identity.binding_key
+            || transport != "http"
+            || method != "POST"
+            || route != "/orders"
+        {
+            return Err(endpoint_identity_corrupt(correlation_id));
+        }
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "INSERT INTO catalog_operations \
+             (operation_id, project_id, fingerprint_format, endpoint_fingerprint, transport, application_component, binding_key, method, route_template, created_at) \
+             VALUES (?1, ?2, 1, ?3, 'http', ?4, ?5, 'POST', '/orders', ?6)",
+            rusqlite::params![
+                operation_id.as_uuid().as_bytes().to_vec(),
+                identity.project_id.as_uuid().as_bytes().to_vec(),
+                fingerprint.as_slice(),
+                identity.application_component,
+                identity.binding_key,
+                WallTime::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    Ok(())
 }
 
 fn map_store_error(error: StoreError, correlation_id: CorrelationId) -> RecordingStoreError {
@@ -4474,6 +4550,14 @@ mod tests {
                 .expect("operation ID");
             let operation_uuid = uuid::Uuid::from_slice(&operation_bytes).expect("UUIDv7 width");
             assert_eq!(operation_uuid.get_version_num(), 7);
+            let catalog_operation_bytes: Vec<u8> = connection
+                .query_row(
+                    "SELECT operation_id FROM catalog_operations WHERE project_id = ?1 AND fingerprint_format = 1",
+                    [project_id.as_uuid().as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .expect("record-first operation is visible to catalog");
+            assert_eq!(catalog_operation_bytes, operation_bytes);
         }
         let counts = || {
             let conn = fixture.store.lock().expect("connection");

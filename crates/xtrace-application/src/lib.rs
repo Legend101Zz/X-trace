@@ -36,6 +36,7 @@
 )]
 
 pub mod application;
+pub mod catalog_discovery;
 pub mod commands;
 pub mod error;
 pub mod observed_endpoint_queries;
@@ -45,6 +46,14 @@ pub mod recording;
 pub mod recording_queries;
 
 pub use application::{Application, RequestContext};
+pub use catalog_discovery::{
+    AdmittedCatalogSelection, CatalogAdmissionPort, CatalogChangeKind, CatalogDiscoveryError,
+    CatalogDiscoveryService, CatalogDiscoveryWritePort, CatalogOperationFilter,
+    CatalogOperationRecord, CatalogOperationsPage, CatalogProducerContext, CatalogQueryService,
+    CatalogReadPort, CatalogRevisionSummary, CatalogRunNamespace, CatalogSourceAvailability,
+    CatalogSourceProofPort, ListCatalogOperations, RefuseCatalogAdmission,
+    RefuseUnboundSourceEvidence,
+};
 pub use commands::{Command, CommandReceipt, InitializeProject, OpenProject};
 pub use error::{PortError, PortErrorKind};
 pub use observed_endpoint_queries::{

@@ -34,6 +34,7 @@
     )
 )]
 
+pub mod catalog_discovery_store;
 pub mod connection;
 pub mod error;
 pub mod idempotency_repository;
@@ -43,6 +44,7 @@ pub mod recording_port;
 pub mod recording_store;
 pub mod xtf;
 
+pub use catalog_discovery_store::SqliteCatalogDiscoveryStore;
 pub use connection::{
     BusyTimeout, CURRENT_SCHEMA_VERSION, OpenOptions, STORE_ABI_VERSION, SqliteStore,
     StoreBootstrap,
