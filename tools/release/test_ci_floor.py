@@ -617,14 +617,21 @@ class CiFloorEvidenceTests(unittest.TestCase):
             fake_bin = root / "bin"
             fake_bin.mkdir()
             pid_file = root / "child-pid"
+            entered_file = root / "script-entered"
             fake_git = fake_bin / "git"
             fake_git.write_text(
                 f"#!{sys.executable}\n"
                 "import json, os, pathlib, subprocess, sys, time\n"
+                "def publish(path, value):\n"
+                " target = pathlib.Path(path)\n"
+                " temporary = target.with_name(target.name + '.tmp')\n"
+                " temporary.write_text(value)\n"
+                " os.replace(temporary, target)\n"
+                "publish(os.environ['XTRACE_FAKE_GIT_ENTERED_FILE'], 'entered')\n"
                 "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
                 "try:\n"
                 " start = ' '.join(subprocess.check_output(['/bin/ps','-o','lstart=','-p',str(child.pid)],text=True).split())\n"
-                " pathlib.Path(os.environ['XTRACE_FAKE_GIT_PID_FILE']).write_text(json.dumps([child.pid,os.getpgid(child.pid),start]))\n"
+                " publish(os.environ['XTRACE_FAKE_GIT_PID_FILE'], json.dumps([child.pid,os.getpgid(child.pid),start]))\n"
                 " time.sleep(.15)\n"
                 "except BaseException:\n"
                 " child.kill(); child.wait(); raise\n",
@@ -632,14 +639,77 @@ class CiFloorEvidenceTests(unittest.TestCase):
             )
             os.chmod(fake_git, 0o700)
             old_path = os.environ.get("PATH", "/usr/bin:/bin")
+            original_snapshot = ci_floor._utility_process_snapshot
+            snapshot_trace: list[dict[str, object]] = []
+
+            def fixture_identity_seen(records: dict[int, tuple[int, int, str, str]]) -> bool:
+                if not pid_file.is_file():
+                    return False
+                try:
+                    expected_pid, expected_group, expected_start = json.loads(pid_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    return False
+                record = records.get(expected_pid)
+                return record is not None and record[1] == expected_group and record[2] == expected_start
+
+            def diagnostic() -> str:
+                return json.dumps({
+                    "fixtureStages": {
+                        "scriptEntered": entered_file.is_file(),
+                        "childIdentityPublished": pid_file.is_file(),
+                    },
+                    "snapshotCalls": snapshot_trace,
+                }, sort_keys=True)
+
+            def record_snapshot(*args: object, **kwargs: object) -> dict[int, tuple[int, int, str, str]]:
+                entered = time.monotonic()
+                timeout = kwargs.get("timeout", 2.0)
+                deadline = kwargs.get("deadline")
+                item: dict[str, object] = {
+                    "enteredOffsetSeconds": round(entered - started, 6),
+                    "timeoutSeconds": timeout if isinstance(timeout, (int, float)) else "invalid",
+                    "deadlineRemainingSeconds": round(deadline - entered, 6)
+                    if isinstance(deadline, (int, float)) else None,
+                }
+                try:
+                    result = original_snapshot(*args, **kwargs)
+                except BaseException as exc:
+                    item.update({
+                        "exitedOffsetSeconds": round(time.monotonic() - started, 6),
+                        "outcome": "exception",
+                        "exceptionType": type(exc).__name__,
+                        "fixtureIdentitySeen": False,
+                    })
+                    snapshot_trace.append(item)
+                    raise
+                item.update({
+                    "exitedOffsetSeconds": round(time.monotonic() - started, 6),
+                    "outcome": "returned",
+                    "fixtureIdentitySeen": fixture_identity_seen(result),
+                })
+                snapshot_trace.append(item)
+                return result
+
+            started = time.monotonic()
             try:
                 with mock.patch.dict(os.environ, {
                     "PATH": f"{fake_bin}{os.pathsep}{old_path}",
                     "XTRACE_FAKE_GIT_PID_FILE": str(pid_file),
-                }), mock.patch.object(ci_floor, "SOURCE_COMMAND_TIMEOUT_SECONDS", 0.5):
-                    with self.assertRaises(ci_floor.FloorInputError):
+                    "XTRACE_FAKE_GIT_ENTERED_FILE": str(entered_file),
+                }), mock.patch.object(ci_floor, "SOURCE_COMMAND_TIMEOUT_SECONDS", 0.5), \
+                        mock.patch.object(ci_floor, "_utility_process_snapshot", side_effect=record_snapshot):
+                    try:
                         ci_floor._bounded_git_output(root, "rev-parse", "--verify", "HEAD")
-                self.assertTrue(pid_file.is_file(), "fake Git child must publish its process identity")
+                    except ci_floor.FloorInputError:
+                        pass
+                    except Exception as exc:
+                        self.fail(
+                            "bounded fake Git command raised " + type(exc).__name__ + ": " + diagnostic()
+                        )
+                    else:
+                        self.fail("bounded fake Git command must fail closed: " + diagnostic())
+                self.assertTrue(entered_file.is_file(), "fake Git script must reach its first statement: " + diagnostic())
+                self.assertTrue(pid_file.is_file(), "fake Git child must publish its process identity: " + diagnostic())
                 child_pid, child_group, child_start = json.loads(pid_file.read_text(encoding="utf-8"))
                 snapshot = ci_floor._utility_process_snapshot()
                 child = snapshot.get(child_pid)
@@ -647,7 +717,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     child is not None and child[1] == child_group and child[2] == child_start
                     and child[3] not in {"Z", "X"}
                 )
-                self.assertFalse(child_is_live, "the Git supervisor left its pipe-holding child alive")
+                self.assertFalse(child_is_live, "the Git supervisor left its pipe-holding child alive: " + diagnostic())
             finally:
                 if pid_file.is_file():
                     child_pid, child_group, child_start = json.loads(pid_file.read_text(encoding="utf-8"))
@@ -666,53 +736,188 @@ class CiFloorEvidenceTests(unittest.TestCase):
             fake_bin = root / "bin"
             fake_bin.mkdir()
             count_file = fake_bin / "ps-count"
+            stall_file = fake_bin / "ps-stall-entered"
             child_pid_file = root / "utility-pid"
+            handler_ready_file = root / "term-handler-ready"
             term_file = root / "term-observed"
             fake_ps = fake_bin / "ps"
             fake_ps.write_text(
                 f"#!{sys.executable}\n"
                 "import os, pathlib, sys, time\n"
+                "def publish(path, value):\n"
+                " target = pathlib.Path(path)\n"
+                " temporary = target.with_name(target.name + '.tmp')\n"
+                " temporary.write_text(value)\n"
+                " os.replace(temporary, target)\n"
                 "counter = pathlib.Path(__file__).with_name('ps-count')\n"
                 "count = int(counter.read_text() or '0') + 1 if counter.exists() else 1\n"
-                "counter.write_text(str(count))\n"
-                "if count == 3: time.sleep(2)\n"
+                "publish(counter, str(count))\n"
+                "if count == 3:\n"
+                " publish(str(pathlib.Path(__file__).with_name('ps-stall-entered')), 'entered')\n"
+                " time.sleep(2)\n"
                 "os.execv('/bin/ps', ['/bin/ps', *sys.argv[1:]])\n",
                 encoding="utf-8",
             )
             os.chmod(fake_ps, 0o700)
             program = (
-                "import json,os,pathlib,signal,subprocess,sys,time; pid=os.getpid(); "
-                "term_file=pathlib.Path(sys.argv[2]); "
-                "signal.signal(signal.SIGTERM,lambda *_: term_file.write_text('term')); "
-                "start=' '.join(subprocess.check_output(['/bin/ps','-o','lstart=','-p',str(pid)],text=True).split()); "
-                "pathlib.Path(sys.argv[1]).write_text(json.dumps([pid,os.getpgid(pid),start])); time.sleep(30)"
+                "import json,os,pathlib,signal,subprocess,sys,time\n"
+                "def publish(path, value):\n"
+                " target=pathlib.Path(path); temporary=target.with_name(target.name+'.tmp')\n"
+                " temporary.write_text(value); os.replace(temporary,target)\n"
+                "pid=os.getpid(); term_file=pathlib.Path(sys.argv[2])\n"
+                "def on_term(*_): publish(term_file, 'term')\n"
+                "signal.signal(signal.SIGTERM,on_term)\n"
+                "publish(sys.argv[3], 'ready')\n"
+                "start=' '.join(subprocess.check_output(['/bin/ps','-o','lstart=','-p',str(pid)],text=True).split())\n"
+                "publish(sys.argv[1], json.dumps([pid,os.getpgid(pid),start]))\n"
+                "time.sleep(30)\n"
             )
             old_path = os.environ.get("PATH", "/usr/bin:/bin")
             started = time.monotonic()
+            original_snapshot = ci_floor._utility_process_snapshot
+            snapshot_trace: list[dict[str, object]] = []
+            signal_trace: list[dict[str, object]] = []
+            exact_signal_identities: list[tuple[int, int, str, int]] = []
+
+            def fixture_identity_seen(records: dict[int, tuple[int, int, str, str]]) -> bool:
+                if not child_pid_file.is_file():
+                    return False
+                try:
+                    expected_pid, expected_group, expected_start = json.loads(child_pid_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    return False
+                record = records.get(expected_pid)
+                return record is not None and record[1] == expected_group and record[2] == expected_start
+
+            def diagnostic() -> str:
+                return json.dumps({
+                    "fixtureStages": {
+                        "handlerReady": handler_ready_file.is_file(),
+                        "identityPublished": child_pid_file.is_file(),
+                        "nestedPsStallEntered": stall_file.is_file(),
+                        "psInvocationCount": count_file.read_text(encoding="utf-8") if count_file.is_file() else "missing",
+                    },
+                    "snapshotCalls": snapshot_trace,
+                    "signalCalls": signal_trace,
+                }, sort_keys=True)
+
+            def record_snapshot(*args: object, **kwargs: object) -> dict[int, tuple[int, int, str, str]]:
+                entered = time.monotonic()
+                timeout = kwargs.get("timeout", 2.0)
+                deadline = kwargs.get("deadline")
+                item: dict[str, object] = {
+                    "enteredOffsetSeconds": round(entered - started, 6),
+                    "timeoutSeconds": timeout if isinstance(timeout, (int, float)) else "invalid",
+                    "deadlineRemainingSeconds": round(deadline - entered, 6)
+                    if isinstance(deadline, (int, float)) else None,
+                }
+                try:
+                    result = original_snapshot(*args, **kwargs)
+                except BaseException as exc:
+                    item.update({
+                        "exitedOffsetSeconds": round(time.monotonic() - started, 6),
+                        "outcome": "exception",
+                        "exceptionType": type(exc).__name__,
+                        "fixtureIdentitySeen": False,
+                    })
+                    snapshot_trace.append(item)
+                    raise
+                item.update({
+                    "exitedOffsetSeconds": round(time.monotonic() - started, 6),
+                    "outcome": "returned",
+                    "fixtureIdentitySeen": fixture_identity_seen(result),
+                })
+                snapshot_trace.append(item)
+                return result
+
+            original_signal = ci_floor._signal_utility_group_members
+
+            def record_signal(
+                group_id: int, identities: dict[int, str], signum: int, *, deadline: float,
+            ) -> bool:
+                expected: tuple[int, int, str] | None = None
+                if child_pid_file.is_file():
+                    try:
+                        expected = tuple(json.loads(child_pid_file.read_text(encoding="utf-8")))  # type: ignore[assignment]
+                    except (OSError, ValueError, TypeError):
+                        expected = None
+                matched = bool(
+                    expected is not None and expected[0] in identities
+                    and expected[1] == group_id and identities.get(expected[0]) == expected[2]
+                )
+                exact_signal_identities.extend(
+                    (group_id, pid, started_at, signum) for pid, started_at in identities.items()
+                )
+                entered = time.monotonic()
+                try:
+                    result = original_signal(group_id, identities, signum, deadline=deadline)
+                except BaseException as exc:
+                    signal_trace.append({
+                        "signum": signum,
+                        "identityCount": len(identities),
+                        "fixtureIdentityMatched": matched,
+                        "deadlineRemainingSeconds": round(deadline - entered, 6),
+                        "outcome": "exception",
+                        "exceptionType": type(exc).__name__,
+                    })
+                    raise
+                signal_trace.append({
+                    "signum": signum,
+                    "identityCount": len(identities),
+                    "fixtureIdentityMatched": matched,
+                    "deadlineRemainingSeconds": round(deadline - entered, 6),
+                    "outcome": "returned",
+                    "result": result,
+                })
+                return result
+
             try:
                 with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{old_path}"}), \
                         mock.patch.object(ci_floor, "UTILITY_CLEANUP_SECONDS", 0.8), \
                         mock.patch.object(ci_floor, "UTILITY_TERM_GRACE_SECONDS", 0.2), \
                         mock.patch.object(ci_floor, "UTILITY_KILL_SIGNAL_RESERVE_SECONDS", 0.15), \
                         mock.patch.object(ci_floor, "UTILITY_LEADER_REAP_RESERVE_SECONDS", 0.15), \
-                        mock.patch.object(ci_floor, "UTILITY_FINAL_SCAN_RESERVE_SECONDS", 0.1):
-                    with self.assertRaises(ci_floor.FloorInputError):
+                        mock.patch.object(ci_floor, "UTILITY_FINAL_SCAN_RESERVE_SECONDS", 0.1), \
+                        mock.patch.object(ci_floor, "_utility_process_snapshot", side_effect=record_snapshot), \
+                        mock.patch.object(ci_floor, "_signal_utility_group_members", side_effect=record_signal):
+                    try:
                         ci_floor._run(
-                            [sys.executable, "-c", program, str(child_pid_file), str(term_file)],
+                            [sys.executable, "-c", program, str(child_pid_file), str(term_file), str(handler_ready_file)],
                             timeout=0.6,
                         )
-                self.assertGreaterEqual(int(count_file.read_text(encoding="utf-8")), 3)
-                self.assertLess(time.monotonic() - started, 1.8)
-                self.assertTrue(term_file.is_file(), "the owned term-ignorer must receive TERM before KILL")
-                self.assertTrue(child_pid_file.is_file(), "utility child must publish its process identity")
+                    except ci_floor.FloorInputError:
+                        pass
+                    except Exception as exc:
+                        self.fail("stalled nested ps raised " + type(exc).__name__ + ": " + diagnostic())
+                    else:
+                        self.fail("stalled nested ps must fail closed: " + diagnostic())
+                self.assertTrue(handler_ready_file.is_file(), "child must install TERM handler before supervision: " + diagnostic())
+                self.assertTrue(child_pid_file.is_file(), "utility child must publish its process identity: " + diagnostic())
+                self.assertTrue(stall_file.is_file(), "the intended nested ps call must stall: " + diagnostic())
+                self.assertGreaterEqual(int(count_file.read_text(encoding="utf-8")), 3, diagnostic())
+                self.assertLess(time.monotonic() - started, 1.8, diagnostic())
+                self.assertTrue(term_file.is_file(), "the owned term-ignorer must receive TERM before KILL: " + diagnostic())
+                self.assertTrue(
+                    any(item[3] == signal.SIGTERM and item[1] > 0 for item in exact_signal_identities)
+                    and any(item["signum"] == signal.SIGTERM and item["fixtureIdentityMatched"] for item in signal_trace),
+                    "TERM attempt must target the exact published fixture identity: " + diagnostic(),
+                )
                 child_pid, child_group, child_start = json.loads(child_pid_file.read_text(encoding="utf-8"))
+                self.assertTrue(
+                    any(
+                        identity_pid == child_pid and group == child_group
+                        and identity_start == child_start and signum == signal.SIGTERM
+                        for group, identity_pid, identity_start, signum in exact_signal_identities
+                    ),
+                    "TERM wrapper must observe the exact published PID/group/start tuple: " + diagnostic(),
+                )
                 snapshot = ci_floor._utility_process_snapshot()
                 child = snapshot.get(child_pid)
                 child_is_live = (
                     child is not None and child[1] == child_group and child[2] == child_start
                     and child[3] not in {"Z", "X"}
                 )
-                self.assertFalse(child_is_live, "the outer supervisor left its utility child alive")
+                self.assertFalse(child_is_live, "the outer supervisor left its utility child alive: " + diagnostic())
             finally:
                 if child_pid_file.is_file():
                     child_pid, child_group, child_start = json.loads(child_pid_file.read_text(encoding="utf-8"))
