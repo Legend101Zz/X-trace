@@ -16,9 +16,11 @@ use std::convert::TryFrom;
 
 use rusqlite::{OptionalExtension as _, Row};
 use uuid::Uuid;
+use xtrace_application::CommandReceipt;
 use xtrace_application::PortError;
 use xtrace_application::PortErrorKind;
 use xtrace_application::ProjectRepository;
+use xtrace_application::StoredReceipt;
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     CorrelationId, PolicyId, Project, ProjectId, RepositoryFingerprint, Run, RunId, RunKind,
@@ -27,6 +29,22 @@ use xtrace_domain::{
 
 use crate::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
+
+fn insert_project_row(
+    tx: &rusqlite::Transaction<'_>,
+    project: &Project,
+    correlation_id: CorrelationId,
+) -> Result<(), PortError> {
+    tx.execute(
+        "INSERT INTO projects (project_id, canonical_repo_hash, display_name, created_at, last_opened_at, config_schema_version, effective_config_hash, active_capture_policy_id, active_redaction_policy_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            project.id.as_uuid().as_bytes().to_vec(), project.canonical_repo_hash.as_str(), project.display_name,
+            project.created_at.to_rfc3339(), project.last_opened_at.to_rfc3339(), i64::from(project.config_schema_version),
+            project.effective_config_hash, policy_bytes(project.active_capture_policy_id), policy_bytes(project.active_redaction_policy_id),
+        ],
+    ).map(|_| ()).map_err(|err| SqliteProjectRepository::map_error(StoreError::from_rusqlite(err, correlation_id)))
+}
 
 /// Typed view over the projects and runs tables.
 pub struct SqliteProjectRepository<'store> {
@@ -74,6 +92,148 @@ impl<'store> SqliteProjectRepository<'store> {
 }
 
 impl ProjectRepository for SqliteProjectRepository<'_> {
+    fn initialize_project_with_receipt(
+        &self,
+        project: &Project,
+        receipt: &StoredReceipt,
+    ) -> Result<StoredReceipt, PortError> {
+        let correlation_id = self.correlation_id();
+        if receipt.project_id != project.id
+            || receipt.command_kind != "initialize_project"
+            || receipt.idempotency_key.is_empty()
+            || receipt.idempotency_key.len() > 128
+            || receipt.idempotency_key.contains(['\0', '\n', '\r'])
+            || receipt.input_digest.len() != 67
+            || !receipt.input_digest.starts_with("b3:")
+            || !receipt.input_digest[3..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            || RepositoryFingerprint::try_from_canonical(project.canonical_repo_hash.as_str())
+                .is_err()
+        {
+            return Err(PortError::new(
+                PortErrorKind::Validation,
+                "invalid atomic initialization receipt",
+                correlation_id,
+            ));
+        }
+        let typed_receipt: CommandReceipt =
+            serde_json::from_str(&receipt.receipt_json).map_err(|_| {
+                PortError::new(
+                    PortErrorKind::Validation,
+                    "invalid typed initialization receipt",
+                    correlation_id,
+                )
+            })?;
+        match typed_receipt {
+            CommandReceipt::ProjectInitialized { project_id, fingerprint, idempotency_key }
+                if project_id == project.id
+                    && fingerprint == project.canonical_repo_hash
+                    && idempotency_key == receipt.idempotency_key => {}
+            _ => {
+                return Err(PortError::new(
+                    PortErrorKind::Validation,
+                    "initialization receipt body does not match its project",
+                    correlation_id,
+                ));
+            }
+        }
+        let mut conn = self.store.lock().map_err(Self::map_error)?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|err| StoreError::from_rusqlite(err, correlation_id))
+            .map_err(Self::map_error)?;
+
+        let mut statement = tx.prepare(
+            "SELECT project_id, command_kind, idempotency_key, input_digest, correlation_id, created_at, receipt_json \
+             FROM command_receipts WHERE command_kind = ?1 AND idempotency_key = ?2",
+        ).map_err(|err| StoreError::from_rusqlite(err, correlation_id)).map_err(Self::map_error)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![receipt.command_kind, receipt.idempotency_key],
+                map_receipt_row,
+            )
+            .map_err(|err| StoreError::from_rusqlite(err, correlation_id))
+            .map_err(Self::map_error)?;
+        let mut existing_receipts = Vec::new();
+        for row in rows {
+            existing_receipts.push(
+                row.map_err(|err| StoreError::from_rusqlite(err, correlation_id))
+                    .map_err(Self::map_error)?,
+            );
+        }
+        drop(statement);
+
+        if existing_receipts.len() > 1 {
+            return Err(PortError::new(
+                PortErrorKind::Conflict,
+                "ambiguous initialization receipt history requires recovery",
+                correlation_id,
+            ));
+        }
+        if let Some(existing) = existing_receipts.into_iter().next() {
+            let expected_project = project.id.as_uuid().as_bytes().to_vec();
+            let stored_typed_receipt: Option<CommandReceipt> =
+                serde_json::from_str(&existing.receipt_json).ok();
+            let typed_receipt_matches = matches!(
+                stored_typed_receipt,
+                Some(CommandReceipt::ProjectInitialized { project_id, fingerprint, idempotency_key })
+                    if project_id == project.id && fingerprint == project.canonical_repo_hash && idempotency_key == receipt.idempotency_key
+            );
+            let stored_project: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT project_id FROM projects WHERE canonical_repo_hash = ?1",
+                    rusqlite::params![project.canonical_repo_hash.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| StoreError::from_rusqlite(err, correlation_id))
+                .map_err(Self::map_error)?;
+            let exact = existing.project_id == receipt.project_id
+                && existing.command_kind == receipt.command_kind
+                && existing.idempotency_key == receipt.idempotency_key
+                && existing.input_digest == receipt.input_digest
+                && typed_receipt_matches
+                && stored_project.as_deref() == Some(expected_project.as_slice());
+            if !exact {
+                return Err(PortError::new(
+                    PortErrorKind::Conflict,
+                    "initialization retry does not match its original project and receipt",
+                    correlation_id,
+                ));
+            }
+            tx.commit()
+                .map_err(|err| StoreError::from_rusqlite(err, correlation_id))
+                .map_err(Self::map_error)?;
+            return Ok(existing);
+        }
+
+        let project_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE project_id = ?1 OR canonical_repo_hash = ?2)",
+            rusqlite::params![project.id.as_uuid().as_bytes().to_vec(), project.canonical_repo_hash.as_str()],
+            |row| row.get(0),
+        ).map_err(|err| StoreError::from_rusqlite(err, correlation_id)).map_err(Self::map_error)?;
+        if project_exists {
+            return Err(PortError::new(
+                PortErrorKind::Conflict,
+                "project exists without independently persisted initialization proof; recovery is required",
+                correlation_id,
+            ));
+        }
+
+        insert_project_row(&tx, project, correlation_id)?;
+        tx.execute(
+            "INSERT INTO command_receipts (project_id, command_kind, idempotency_key, input_digest, receipt_json, correlation_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                project.id.as_uuid().as_bytes().to_vec(), receipt.command_kind, receipt.idempotency_key,
+                receipt.input_digest, receipt.receipt_json, receipt.correlation_id.to_string(), receipt.created_at.to_rfc3339(),
+            ],
+        ).map_err(|err| StoreError::from_rusqlite(err, correlation_id)).map_err(Self::map_error)?;
+        tx.commit()
+            .map_err(|err| StoreError::from_rusqlite(err, correlation_id))
+            .map_err(Self::map_error)?;
+        Ok(receipt.clone())
+    }
+
     fn insert_project(&self, project: &Project) -> Result<(), PortError> {
         let correlation_id = self.correlation_id();
         let conn = self.store.lock().map_err(Self::map_error)?;
@@ -583,6 +743,102 @@ mod tests {
             active_capture_policy_id: None,
             active_redaction_policy_id: None,
         }
+    }
+
+    fn init_receipt(project: &Project) -> StoredReceipt {
+        StoredReceipt {
+            project_id: project.id,
+            command_kind: "initialize_project".into(),
+            idempotency_key: "init-key".into(),
+            input_digest: format!("b3:{}", "0".repeat(64)),
+            correlation_id: CorrelationId::new(),
+            created_at: WallTime::now(),
+            receipt_json: serde_json::to_string(&CommandReceipt::ProjectInitialized {
+                project_id: project.id,
+                fingerprint: project.canonical_repo_hash.clone(),
+                idempotency_key: "init-key".into(),
+            })
+            .expect("typed receipt"),
+        }
+    }
+
+    #[test]
+    fn atomic_init_commits_and_replays_the_original_receipt() {
+        let store = fixture();
+        let repository = SqliteProjectRepository::new(&store);
+        let project = sample_project("atomic");
+        let requested = init_receipt(&project);
+        let first =
+            repository.initialize_project_with_receipt(&project, &requested).expect("atomic init");
+        let mut retry = requested.clone();
+        retry.correlation_id = CorrelationId::new();
+        retry.created_at = WallTime::now();
+        let replay =
+            repository.initialize_project_with_receipt(&project, &retry).expect("exact retry");
+        assert_eq!(replay.receipt_json, first.receipt_json);
+        assert_eq!(replay.correlation_id, first.correlation_id);
+        assert_eq!(repository.list_projects().expect("projects").len(), 1);
+    }
+
+    #[test]
+    fn atomic_init_rejects_same_digest_with_a_different_receipt_body() {
+        let store = fixture();
+        let repository = SqliteProjectRepository::new(&store);
+        let project = sample_project("atomic");
+        let requested = init_receipt(&project);
+        repository.initialize_project_with_receipt(&project, &requested).expect("atomic init");
+        let mut different_project = project.clone();
+        different_project.id = ProjectId::new();
+        let conflicting = init_receipt(&different_project);
+        let error = repository
+            .initialize_project_with_receipt(&different_project, &conflicting)
+            .expect_err("same digest under a different project must conflict");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+    }
+
+    #[test]
+    fn atomic_init_requires_proof_for_a_legacy_project_without_receipt() {
+        let store = fixture();
+        let repository = SqliteProjectRepository::new(&store);
+        let project = sample_project("legacy");
+        repository.insert_project(&project).expect("legacy project row");
+        let error = repository
+            .initialize_project_with_receipt(&project, &init_receipt(&project))
+            .expect_err("public locator cannot repair a legacy row");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+        assert!(error.message().contains("recovery is required"));
+    }
+
+    #[test]
+    fn atomic_init_rejects_ambiguous_global_receipt_keys() {
+        let store = fixture();
+        let repository = SqliteProjectRepository::new(&store);
+        let mut first_project = sample_project("first");
+        first_project.canonical_repo_hash =
+            RepositoryFingerprint::from_canonical_path("/tmp/first");
+        let mut second_project = sample_project("second");
+        second_project.canonical_repo_hash =
+            RepositoryFingerprint::from_canonical_path("/tmp/second");
+        repository.insert_project(&first_project).expect("first project");
+        repository.insert_project(&second_project).expect("second project");
+        let first_receipt = init_receipt(&first_project);
+        let second_receipt = init_receipt(&second_project);
+        let conn = store.lock().expect("store lock");
+        for receipt in [&first_receipt, &second_receipt] {
+            conn.execute(
+                "INSERT INTO command_receipts (project_id, command_kind, idempotency_key, input_digest, receipt_json, correlation_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    receipt.project_id.as_uuid().as_bytes().to_vec(), receipt.command_kind, receipt.idempotency_key,
+                    receipt.input_digest, receipt.receipt_json, receipt.correlation_id.to_string(), receipt.created_at.to_rfc3339(),
+                ],
+            ).expect("legacy duplicate key row");
+        }
+        drop(conn);
+        let error = repository
+            .initialize_project_with_receipt(&first_project, &first_receipt)
+            .expect_err("ambiguous global key");
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
+        assert!(error.message().contains("ambiguous"));
     }
 
     #[test]

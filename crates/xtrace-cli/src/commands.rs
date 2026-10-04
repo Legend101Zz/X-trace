@@ -549,91 +549,187 @@ where
     F: Fn(&str) -> Option<PathBuf>,
 {
     let repo = resolve_repo(&project_dir)?;
-    // Honour an existing pointer so re-running `init` against the
-    // same repository uses the original project identifier. Only a
-    // missing pointer is treated as "fresh init"; every other
-    // pointer failure (corrupt body, unsupported schema version,
-    // relative `data_home`, I/O error) propagates so a corrupt
-    // pointer cannot be silently overwritten.
-    let existing_pointer = match RepositoryPointer::read(&repo) {
-        Ok(pointer) => Some(pointer),
-        Err(CliError::ProjectDirectoryMissing(_)) => None,
-        Err(err) => return Err(err),
-    };
-    let user_data_home = resolve_data_home(existing_pointer.as_ref(), env_reader)?;
-    let project_id =
-        existing_pointer.as_ref().map(|pointer| pointer.project_id).unwrap_or_default();
-    let project_directory = UserDataPaths::project_dir_with_home(&user_data_home, project_id)?;
-    let database_path = UserDataPaths::database_path_with_home(&user_data_home, project_id)?;
-    // Admit or create the project directory with the shared private-storage
-    // capability before SQLite is allowed to inspect or mutate project state.
-    // Existing directories are validated and never permission-repaired.
-    let private_root = AdmittedPrivateRoot::open_or_create(&project_directory)
-        .map_err(|_| CliError::PrivateStorageUnavailable)?;
-    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
-    // Exclusively create or validate the database file through the admitted
-    // directory descriptor. Existing unsafe files fail closed without chmod.
-    let database = private_root
-        .open_or_create_private_file("metadata.sqlite3")
-        .map_err(|_| CliError::PrivateStorageUnavailable)?;
-    drop(database);
-    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
-    let requested_at = WallTime::now();
-    let ctx = RequestContext::new(env_user(), requested_at);
-
-    let store = SqliteStore::open(
-        &database_path,
-        xtrace_store::OpenOptions::default().with_correlation_id(ctx.correlation_id),
-    )
-    .map_err(map_store_error)?;
-    let database = private_root
-        .open_regular_file("metadata.sqlite3")
-        .map_err(|_| CliError::PrivateStorageUnavailable)?;
-    drop(database);
-    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
-    let repository = SqliteProjectRepository::new(&store);
-    let idempotency = SqliteIdempotencyStore::new(&store);
-    let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
-
-    let canonical = repo.display().to_string();
-    let resolved_display_name = if display_name.trim().is_empty() {
+    let canonical = repo
+        .to_str()
+        .ok_or_else(|| CliError::InvalidArgument("repository path must be valid UTF-8".into()))?
+        .to_string();
+    if canonical.is_empty() || canonical.contains('\0') {
+        return Err(CliError::InvalidArgument("repository path is invalid".into()));
+    }
+    if canonical.as_bytes().len() > crate::pointer_io::MAX_PATH_BYTES {
+        return Err(CliError::InvalidArgument(
+            "repository path exceeds its supported limit".into(),
+        ));
+    }
+    let display_name = if display_name.trim().is_empty() {
         repo.file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| canonical.clone())
     } else {
-        display_name
+        display_name.trim().to_string()
     };
-    let resolved_idempotency_key = if idempotency_key.trim().is_empty() {
+    let idempotency_key = if idempotency_key.trim().is_empty() {
         format!("xtrace-init-{canonical}")
     } else {
-        idempotency_key
+        idempotency_key.trim().to_string()
     };
+    if display_name.is_empty() || display_name.len() > 128 {
+        return Err(CliError::InvalidArgument("display name must contain 1 to 128 bytes".into()));
+    }
+    if idempotency_key.is_empty()
+        || idempotency_key.len() > 128
+        || idempotency_key.contains(['\0', '\n', '\r'])
+    {
+        return Err(CliError::InvalidArgument("idempotency key is invalid".into()));
+    }
+    let requested_at = WallTime::now();
+    let ctx = RequestContext::new(env_user(), requested_at);
+    let lock = crate::pointer_io::RepositoryInitLock::acquire(&repo)?;
+    let existing_pointer = RepositoryPointer::read_locked(&lock)?;
+    if existing_pointer.is_some()
+        && env_reader("XTRACE_DATA_HOME").is_some_and(|override_home| !override_home.is_absolute())
+    {
+        return Err(CliError::StoreCorrupted(
+            "configured data home must be absolute and match the repository pointer".into(),
+        ));
+    }
+    let selected_home = resolve_data_home(existing_pointer.as_ref(), env_reader)?;
+    let user_data_home = crate::paths::normalize_absolute_path(&selected_home)?;
+    let fingerprint = xtrace_domain::RepositoryFingerprint::from_canonical_path(&canonical);
+    if let Some(pointer) = existing_pointer.as_ref() {
+        let pointer_home = crate::paths::normalize_absolute_path(&pointer.data_home)?;
+        if pointer_home != user_data_home {
+            return Err(CliError::StoreCorrupted(
+                "configured data home does not match the repository pointer".into(),
+            ));
+        }
+    }
+    let pending_bytes = lock.read("init.pending", crate::pointer_io::PENDING_MAX_BYTES)?;
+    let pending = pending_bytes.as_deref().map(crate::paths::PendingInit::parse).transpose()?;
+    let selected_project_id = existing_pointer
+        .as_ref()
+        .map(|pointer| pointer.project_id)
+        .or_else(|| pending.as_ref().map(crate::paths::PendingInit::project_id))
+        .unwrap_or_else(xtrace_domain::ProjectId::new);
+    let candidate = crate::paths::PendingInit::new(
+        fingerprint.as_str().to_string(),
+        selected_project_id,
+        user_data_home.clone(),
+        &display_name,
+        &idempotency_key,
+        &canonical,
+    )?;
+    let marker = match (&existing_pointer, pending) {
+        (Some(pointer), Some(marker)) => {
+            if marker.project_id() != pointer.project_id || marker.data_home() != user_data_home {
+                return Err(CliError::StoreCorrupted(
+                    "pending init identity conflicts with repository pointer".into(),
+                ));
+            }
+            let expected = crate::paths::PendingInit::new(
+                fingerprint.as_str().to_string(),
+                pointer.project_id,
+                user_data_home.clone(),
+                &display_name,
+                &idempotency_key,
+                &canonical,
+            )?;
+            if marker != expected {
+                return Err(CliError::StoreCorrupted(
+                    "pending init input conflicts with repository state".into(),
+                ));
+            }
+            marker
+        }
+        (Some(pointer), None) => crate::paths::PendingInit::new(
+            fingerprint.as_str().to_string(),
+            pointer.project_id,
+            user_data_home.clone(),
+            &display_name,
+            &idempotency_key,
+            &canonical,
+        )?,
+        (None, Some(marker)) => {
+            let expected_home =
+                crate::paths::normalize_absolute_path(&UserDataPaths::home_with(env_reader)?)?;
+            let expected = crate::paths::PendingInit::new(
+                fingerprint.as_str().to_string(),
+                marker.project_id(),
+                expected_home.clone(),
+                &display_name,
+                &idempotency_key,
+                &canonical,
+            )?;
+            if marker.data_home() != expected_home || marker != expected {
+                return Err(CliError::StoreCorrupted(
+                    "pending init input or data home does not match this retry".into(),
+                ));
+            }
+            marker
+        }
+        (None, None) => candidate,
+    };
+    let marker_bytes = marker.serialized()?;
+    let project_id =
+        existing_pointer.as_ref().map_or_else(|| marker.project_id(), |pointer| pointer.project_id);
+    let pointer =
+        RepositoryPointer { schema_version: 1, project_id, data_home: user_data_home.clone() };
+    let pointer_bytes = pointer.serialized()?;
+    let publish_pending = existing_pointer.is_none() && pending_bytes.is_none();
+    if publish_pending {
+        lock.publish("init.pending", &marker_bytes, crate::pointer_io::PENDING_MAX_BYTES)?;
+    }
+    lock.revalidate()?;
+
+    let project_directory = UserDataPaths::project_dir_with_home(&user_data_home, project_id)?;
+    let database_path = UserDataPaths::database_path_with_home(&user_data_home, project_id)?;
+    let private_root = if existing_pointer.is_some() {
+        AdmittedPrivateRoot::open(&project_directory)
+            .map_err(|_| CliError::PrivateStorageUnavailable)?
+    } else {
+        AdmittedPrivateRoot::open_or_create(&project_directory)
+            .map_err(|_| CliError::PrivateStorageUnavailable)?
+    };
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
+    let database = if existing_pointer.is_some() {
+        private_root.open_regular_file("metadata.sqlite3")
+    } else {
+        private_root.open_or_create_private_file("metadata.sqlite3")
+    }
+    .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    drop(database);
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
+    let mut options = xtrace_store::OpenOptions::default().with_correlation_id(ctx.correlation_id);
+    if existing_pointer.is_some() {
+        options = options.with_must_exist(true);
+    }
+    let store = SqliteStore::open(&database_path, options).map_err(map_store_error)?;
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
+    let database = private_root
+        .open_regular_file("metadata.sqlite3")
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    drop(database);
+    let repository = SqliteProjectRepository::new(&store);
+    let idempotency = SqliteIdempotencyStore::new(&store);
+    let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
     let receipt = app
         .execute(
             Command::InitializeProject(InitializeProject {
                 canonical_repo_path: canonical,
-                display_name: resolved_display_name,
-                idempotency_key: resolved_idempotency_key,
+                display_name,
+                idempotency_key,
                 project_id,
             }),
             &ctx,
         )
         .map_err(CliError::from)?;
 
-    // Persist the repository pointer only after the application
-    // returns success. The pointer is the only place the project ID
-    // is recorded outside the database, so a failed `pointer.write`
-    // leaves Slice 1A in a state it cannot recover from
-    // automatically: the database at
-    // `<data_home>/projects/<project_id>/` contains a project row
-    // but the repository has no `.xtrace/config.toml` pointer, and
-    // a subsequent `init` cannot locate the orphaned database
-    // because the CLI generates a fresh project ID on retry. Slice
-    // 1A does not redesign recovery; the bounded risk is that the
-    // orphaned `<data_home>/projects/<project_id>/` directory must
-    // be cleaned up manually.
-    let pointer = RepositoryPointer { schema_version: 1, project_id, data_home: user_data_home };
-    pointer.write(&repo)?;
+    lock.revalidate()?;
+    pointer.write_locked(&lock, &pointer_bytes)?;
+    if pending_bytes.is_some() || publish_pending {
+        let pending_file = lock.open_owned("init.pending")?;
+        lock.remove_owned("init.pending", &pending_file)?;
+    }
 
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();

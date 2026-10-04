@@ -29,6 +29,21 @@ use crate::error::PortError;
 /// schema-compatibility rejections into
 /// [`crate::error::PortErrorKind::Compatibility`].
 pub trait ProjectRepository: Send + Sync {
+    /// Atomically inserts a new project and its original initialize receipt.
+    /// Implementations without a single-transaction capability must refuse.
+    fn initialize_project_with_receipt(
+        &self,
+        project: &Project,
+        receipt: &StoredReceipt,
+    ) -> Result<StoredReceipt, PortError> {
+        let _ = (project, receipt);
+        Err(PortError::new(
+            crate::error::PortErrorKind::Internal,
+            "atomic project initialization is unsupported",
+            receipt.correlation_id,
+        ))
+    }
+
     /// Inserts a new project. Returns
     /// [`crate::error::PortErrorKind::AlreadyExists`] when another
     /// project already owns the same fingerprint.
