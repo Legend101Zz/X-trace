@@ -203,10 +203,32 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
             created_at: ctx.requested_at,
             receipt_json,
         };
-        let stored = self
-            .repository
-            .initialize_project_with_receipt(&project, &requested)
-            .map_err(|err| port_error_to_app_error(err, ctx.correlation_id))?;
+        let stored = match self.repository.initialize_project_with_receipt(&project, &requested) {
+            Ok(stored) => stored,
+            Err(err) => {
+                // The atomic port reports every retry mismatch as a generic conflict. A
+                // stored receipt for the same key with a different canonical input is the
+                // documented `XTR-COMMAND-409` idempotency conflict; any other conflict
+                // (for example recovery-required history) keeps its port classification.
+                if err.kind() == PortErrorKind::Conflict {
+                    let existing = self
+                        .idempotency
+                        .lookup_receipt(COMMAND_KIND_INIT, &requested.idempotency_key)
+                        .ok()
+                        .flatten();
+                    if let Some(existing) =
+                        existing.filter(|e| e.input_digest != requested.input_digest)
+                    {
+                        return Err(idempotency_conflict(
+                            &requested.idempotency_key,
+                            existing.correlation_id,
+                            ctx.correlation_id,
+                        ));
+                    }
+                }
+                return Err(port_error_to_app_error(err, ctx.correlation_id));
+            }
+        };
         if stored.project_id != requested.project_id
             || stored.command_kind != requested.command_kind
             || stored.idempotency_key != requested.idempotency_key
@@ -1546,16 +1568,60 @@ mod tests {
         );
     }
 
-    /// Idempotency store stub whose `record_receipt` always fails
-    /// with a `PortErrorKind::Internal` carrying a distinct
-    /// infrastructure correlation ID.
-    struct RecordFailureIdem(CorrelationId);
-    impl IdempotencyStore for RecordFailureIdem {
-        fn lookup_receipt(&self, _: &str, _: &str) -> Result<Option<StoredReceipt>, PortError> {
-            Ok(None)
+    /// Repository whose atomic initialization always fails with the given
+    /// kind and a distinct infrastructure correlation ID. Every other
+    /// operation is unreachable for the initialization command.
+    struct FailingInitRepo(PortErrorKind, CorrelationId);
+    impl ProjectRepository for FailingInitRepo {
+        fn initialize_project_with_receipt(
+            &self,
+            _: &Project,
+            _: &StoredReceipt,
+        ) -> Result<StoredReceipt, PortError> {
+            Err(PortError::new(self.0, "initialization failed", self.1))
         }
-        fn record_receipt(&self, _: &StoredReceipt) -> Result<(), PortError> {
-            Err(PortError::new(PortErrorKind::Internal, "record failed", self.0))
+        fn insert_project(&self, _: &Project) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn load_project_by_fingerprint(
+            &self,
+            _: &RepositoryFingerprint,
+        ) -> Result<Project, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn load_project_by_id(&self, _: ProjectId) -> Result<Project, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn list_projects(&self) -> Result<Vec<Project>, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn touch_last_opened(&self, _: ProjectId, _: WallTime) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn insert_run(&self, _: &Run, _: ProjectId, _: &str) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn load_run(&self, _: RunId) -> Result<Run, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn update_run_state(
+            &self,
+            _: RunId,
+            _: RunState,
+            _: Option<WallTime>,
+            _: Option<&str>,
+        ) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn allocate_run(
+            &self,
+            _: ProjectId,
+            _: RunKind,
+            _: &str,
+            _: &str,
+            _: WallTime,
+        ) -> Result<RunId, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
         }
     }
 
@@ -1563,8 +1629,13 @@ mod tests {
     fn idempotency_record_failure_preserves_request_correlation_id() {
         let infra = CorrelationId::new();
         let request = CorrelationId::new();
-        let app: Application<StubRepository, RecordFailureIdem> =
-            Application::new(StubRepository::new(), RecordFailureIdem(infra), 1, 1, 0);
+        let app: Application<FailingInitRepo, StubIdempotencyStore> = Application::new(
+            FailingInitRepo(PortErrorKind::Internal, infra),
+            StubIdempotencyStore::new(),
+            1,
+            1,
+            0,
+        );
         let mut context = RequestContext::new("tester", WallTime::now());
         context.correlation_id = request;
         let err = app
@@ -1591,60 +1662,19 @@ mod tests {
 
     #[test]
     fn load_lookup_propagates_correlation_id_on_infrastructure_failure() {
-        // `load_project_by_fingerprint` failure (e.g. a SQL
+        // Atomic initialization (project load, insert and receipt in one port call) failure (e.g. a SQL
         // `Corruption` report) must surface as a typed
         // `Corruption` `AppError` carrying the request correlation
         // ID rather than an infrastructure-generated one.
-        struct LoadCorruptionRepo(CorrelationId);
-        impl ProjectRepository for LoadCorruptionRepo {
-            fn insert_project(&self, _: &Project) -> Result<(), PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn load_project_by_fingerprint(
-                &self,
-                _: &RepositoryFingerprint,
-            ) -> Result<Project, PortError> {
-                Err(PortError::new(PortErrorKind::Corruption, "schema corrupt", self.0))
-            }
-            fn load_project_by_id(&self, _: ProjectId) -> Result<Project, PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn list_projects(&self) -> Result<Vec<Project>, PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn touch_last_opened(&self, _: ProjectId, _: WallTime) -> Result<(), PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn insert_run(&self, _: &Run, _: ProjectId, _: &str) -> Result<(), PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn load_run(&self, _: RunId) -> Result<Run, PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn update_run_state(
-                &self,
-                _: RunId,
-                _: RunState,
-                _: Option<WallTime>,
-                _: Option<&str>,
-            ) -> Result<(), PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn allocate_run(
-                &self,
-                _: ProjectId,
-                _: RunKind,
-                _: &str,
-                _: &str,
-                _: WallTime,
-            ) -> Result<RunId, PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-        }
         let infra = CorrelationId::new();
         let request = CorrelationId::new();
-        let app: Application<LoadCorruptionRepo, StubIdempotencyStore> =
-            Application::new(LoadCorruptionRepo(infra), StubIdempotencyStore::new(), 1, 1, 0);
+        let app: Application<FailingInitRepo, StubIdempotencyStore> = Application::new(
+            FailingInitRepo(PortErrorKind::Corruption, infra),
+            StubIdempotencyStore::new(),
+            1,
+            1,
+            0,
+        );
         let mut context = RequestContext::new("tester", WallTime::now());
         context.correlation_id = request;
         let err = app

@@ -90,6 +90,34 @@ pub(crate) struct PendingInit {
     canonical_input_digest: String,
 }
 
+/// Longest run of consecutive quote characters accepted in a serialized path.
+///
+/// The TOML writer tracks quote runs in a `u8` counter that overflows (a debug-build
+/// panic, a silent wrap in release) at 256 consecutive quotes. Such a path is never a
+/// legitimate data home, so it is refused before reaching the writer.
+const MAX_SERIALIZED_QUOTE_RUN: usize = 128;
+
+fn reject_unserializable_quote_runs(path: &Path) -> Result<(), CliError> {
+    let mut run = 0_usize;
+    let mut previous = 0_u8;
+    for byte in path.as_os_str().as_encoded_bytes() {
+        if matches!(*byte, b'"' | b'\'') && *byte == previous {
+            run += 1;
+        } else if matches!(*byte, b'"' | b'\'') {
+            run = 1;
+        } else {
+            run = 0;
+        }
+        previous = *byte;
+        if run > MAX_SERIALIZED_QUOTE_RUN {
+            return Err(CliError::StoreCorrupted(
+                "repository data home contains an unsupported quote sequence".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl PendingInit {
     pub(crate) fn new(
         repository_fingerprint: String,
@@ -131,6 +159,7 @@ impl PendingInit {
     }
 
     pub(crate) fn serialized(&self) -> Result<Vec<u8>, CliError> {
+        reject_unserializable_quote_runs(&self.data_home)?;
         let body = toml::to_string_pretty(self).map_err(|_| {
             CliError::StoreCorrupted("could not serialize init recovery metadata".into())
         })?;
@@ -354,6 +383,7 @@ impl RepositoryPointer {
                 "repository data home exceeds its path limit".into(),
             ));
         }
+        reject_unserializable_quote_runs(&self.data_home)?;
         let body =
             toml::to_string_pretty(&RepositoryPointerToml::from(self.clone())).map_err(|_| {
                 CliError::StoreCorrupted("could not serialize repository pointer".into())

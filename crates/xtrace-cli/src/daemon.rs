@@ -472,9 +472,13 @@ mod tests {
         let mismatched_root =
             UserDataPaths::project_dir_with_home(&home, mismatched_id).expect("mismatched root");
         std::fs::rename(&actual_root, &mismatched_root).expect("move project data root");
+        // Pointer writes never replace an existing pointer, so remove the original first
+        // to build the mismatched-identity fixture.
+        std::fs::remove_file(canonical_repo.join(".xtrace").join("config.toml"))
+            .expect("remove original pointer");
         RepositoryPointer { schema_version: 1, project_id: mismatched_id, data_home: home }
             .write(&canonical_repo)
-            .expect("overwrite pointer");
+            .expect("write mismatched pointer");
         assert!(matches!(
             open_validated_project(preflight_project(&repo, &|_| None).expect("preflight")),
             Err(CliError::StoreCorrupted(_))

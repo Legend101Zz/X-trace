@@ -1540,14 +1540,14 @@ mod tests {
         // either the user-data directory or the SQLite file.
         let err = open(repo_dir.clone(), String::new(), &env_reader).unwrap_err();
         assert!(
-            matches!(err, CliError::StoreUnavailable(_)),
+            matches!(err, CliError::PrivateStorageUnavailable),
             "open must fail without mutating: {err:?}"
         );
         assert!(!home.join("projects").exists(), "user-data directory must not be created");
         // `status` follows the same discipline.
         let err = status(repo_dir.clone(), &env_reader).unwrap_err();
         assert!(
-            matches!(err, CliError::StoreUnavailable(_)),
+            matches!(err, CliError::PrivateStorageUnavailable),
             "status must fail without mutating: {err:?}"
         );
         assert!(!home.join("projects").exists(), "user-data directory must not be created");
@@ -1592,9 +1592,9 @@ mod tests {
             values.insert("HOME", repo_dir.clone());
             let env_reader = reader(values);
             let open_err = open(repo_dir.clone(), String::new(), &env_reader).unwrap_err();
-            assert!(matches!(open_err, CliError::StoreUnavailable(_)));
+            assert!(matches!(open_err, CliError::PrivateStorageUnavailable));
             let status_err = status(repo_dir.clone(), &env_reader).unwrap_err();
-            assert!(matches!(status_err, CliError::StoreUnavailable(_)));
+            assert!(matches!(status_err, CliError::PrivateStorageUnavailable));
         }
         // With the override cleared, the pointer-recorded A wins
         // and the open succeeds.
@@ -1633,7 +1633,7 @@ mod tests {
             values.insert("HOME", repo_dir.clone());
             let env_reader = reader(values);
             let err = open(repo_dir.clone(), String::new(), &env_reader).unwrap_err();
-            assert!(matches!(err, CliError::StoreUnavailable(_)));
+            assert!(matches!(err, CliError::PrivateStorageUnavailable));
             assert!(!b.join("projects").exists(), "no mutation under B");
         }
         // With the override cleared, `open` falls back to the
@@ -1770,19 +1770,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn fresh_init_fails_after_storage_creation_keeps_owner_only_modes() {
-        // Regression test for the permission ordering on the error
-        // path of a *fresh* init: a display name over 128 bytes is
-        // rejected by the application's validation after the project
-        // directory and database file have already been created and
-        // restricted. The fresh project directory and database file
-        // must remain `0700` and `0600` respectively; the user-data
-        // directory must contain exactly one project.
-        use std::os::unix::fs::PermissionsExt as _;
+    fn oversized_display_name_is_rejected_before_any_storage_is_created() {
+        // Recoverable initialization validates the display name in the CLI before any
+        // project directory, database, or pointer exists, so an invalid fresh init leaves
+        // no storage behind. (Owner-only modes of a successful fresh init are asserted by
+        // the preceding mode test.)
         let repo_dir = tempdir("fresh-fail");
         std::fs::create_dir_all(&repo_dir).expect("repo");
         let home = tempdir("fresh-fail-home");
-        let projects_root = home.join("projects");
         let mut values: HashMap<&'static str, PathBuf> = HashMap::new();
         values.insert("XTRACE_DATA_HOME", home.clone());
         values.insert("HOME", repo_dir.clone());
@@ -1790,26 +1785,10 @@ mod tests {
         let oversized = "x".repeat(129);
         let err = init(repo_dir.clone(), oversized, String::new(), &env_reader).unwrap_err();
         assert!(
-            matches!(err, CliError::App(ref app) if app.category == xtrace_domain::ErrorCategory::Validation),
-            "oversized display name must surface as Validation, got {err:?}"
+            matches!(err, CliError::InvalidArgument(_)),
+            "oversized display name must be rejected as an invalid argument, got {err:?}"
         );
-        let project_dir = std::fs::read_dir(&projects_root)
-            .expect("projects dir")
-            .filter_map(Result::ok)
-            .next()
-            .expect("exactly one project directory");
-        let dir_mode =
-            std::fs::metadata(project_dir.path()).expect("dir metadata").permissions().mode()
-                & 0o777;
-        let db_mode = std::fs::metadata(project_dir.path().join("metadata.sqlite3"))
-            .expect("db metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            dir_mode, 0o700,
-            "fresh project directory must be 0700 after validation failure"
-        );
-        assert_eq!(db_mode, 0o600, "fresh database file must be 0600 after validation failure");
+        assert!(!home.join("projects").exists(), "no project storage may be created");
+        assert!(!repo_dir.join(".xtrace").exists(), "no repository pointer may be created");
     }
 }
