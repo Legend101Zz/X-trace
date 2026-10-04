@@ -7,7 +7,8 @@
 //!
 //! Slice 1A introduced `v0001_initial`; Slice 1C.4 appends
 //! `v0002_recording_segments`; Slice 1E.3A appends
-//! `v0003_observed_endpoint_catalog`. Migrations remain append-only: later
+//! `v0003_observed_endpoint_catalog`; P02A appends
+//! `v0004_recording_terminal_evidence`. Migrations remain append-only: later
 //! slices must add a new record instead of editing an applied one.
 //!
 //! Migrations deliberately avoid statements that cannot be safely
@@ -68,6 +69,11 @@ impl Migrations {
                 version: 3,
                 label: "v0003_observed_endpoint_catalog",
                 statements: &[OBSERVED_ENDPOINT_CATALOG_SCHEMA],
+            },
+            MigrationRecord {
+                version: 4,
+                label: "v0004_recording_terminal_evidence",
+                statements: &[RECORDING_TERMINAL_EVIDENCE_SCHEMA],
             },
         ]
     }
@@ -301,6 +307,45 @@ CREATE INDEX endpoint_observations_unmatched_recording
     ON recording_endpoint_observations(project_id, disposition, recording_id);
 CREATE INDEX recordings_project_opened
     ON recordings(project_id, opened_at, recording_id);
+";
+
+/// Fourth schema version. Terminal evidence is separate from immutable event
+/// segments so retries and reopen recover the same verified lifecycle result.
+const RECORDING_TERMINAL_EVIDENCE_SCHEMA: &str = r"
+CREATE TABLE recording_frame_index (
+    recording_id         BLOB NOT NULL CHECK(length(recording_id) = 16)
+                             REFERENCES recordings(recording_id),
+    recording_seq        BLOB NOT NULL CHECK(length(recording_seq) = 8),
+    frame_id             BLOB NOT NULL CHECK(length(frame_id) = 16
+                             AND substr(hex(frame_id), 13, 1) = '7'
+                             AND substr(hex(frame_id), 17, 1) IN ('8', '9', 'A', 'B')),
+    segment_ordinal      INTEGER NOT NULL CHECK(segment_ordinal >= 0),
+    event_offset         INTEGER NOT NULL CHECK(event_offset >= 0),
+    event_id_digest      BLOB NOT NULL CHECK(length(event_id_digest) = 32),
+    parent_id_digest     BLOB CHECK(parent_id_digest IS NULL OR length(parent_id_digest) = 32),
+    async_parent_digest  BLOB CHECK(async_parent_digest IS NULL OR length(async_parent_digest) = 32),
+    monotonic_ns         BLOB NOT NULL CHECK(length(monotonic_ns) = 8),
+    PRIMARY KEY(recording_id, recording_seq),
+    UNIQUE(recording_id, frame_id),
+    UNIQUE(recording_id, event_id_digest),
+    FOREIGN KEY(recording_id, segment_ordinal)
+        REFERENCES recording_segments(recording_id, segment_ordinal)
+) STRICT;
+
+CREATE INDEX recording_frame_order
+    ON recording_frame_index(recording_id, recording_seq, frame_id);
+
+CREATE TABLE recording_terminal_evidence (
+    recording_id  BLOB PRIMARY KEY CHECK(length(recording_id) = 16)
+                      REFERENCES recordings(recording_id),
+    request_json  TEXT NOT NULL CHECK(length(CAST(request_json AS BLOB)) <= 16384),
+    completion    TEXT NOT NULL CHECK(completion IN ('complete', 'partial', 'invalid')),
+    final_recording_seq BLOB NOT NULL CHECK(length(final_recording_seq) = 8),
+    event_count   INTEGER NOT NULL CHECK(event_count >= 0 AND event_count <= 2048)
+) STRICT;
+
+CREATE INDEX recording_terminal_completion
+    ON recording_terminal_evidence(completion, recording_id);
 ";
 
 /// Applies every pending migration from the compiled-in catalog to
@@ -647,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_upgrades_to_v3_and_reopens_idempotently() {
+    fn v1_database_upgrades_to_v4_and_reopens_idempotently() {
         let conn = new_memory();
         let v1 = v1_catalog();
         assert_eq!(
@@ -658,14 +703,14 @@ mod tests {
         assert!(!table_exists(&conn, "recording_segments"));
 
         assert_eq!(
-            apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("upgrade v2"),
-            3
+            apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("upgrade v4"),
+            4
         );
         assert_recording_schema_contract(&conn);
         assert_eq!(
             apply_pending(&conn, "0.1.0-test", CorrelationId::new())
                 .expect("repeat open is idempotent"),
-            3
+            4
         );
     }
 
@@ -679,14 +724,20 @@ mod tests {
         insert_project(&conn, &project).expect("project");
         insert_recording(&conn, &recording, &project, &id(0x51), "recording").expect("recording");
 
-        assert_eq!(apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("v3"), 3);
+        assert_eq!(apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("v4"), 4);
         let sidecars: i64 = conn
             .query_row("SELECT count(*) FROM recording_endpoint_observations", [], |row| row.get(0))
             .expect("sidecars");
         assert_eq!(sidecars, 0);
-        assert_eq!(schema_version(&conn), 3);
+        assert_eq!(schema_version(&conn), 4);
         assert!(table_exists(&conn, "operations"));
         assert!(table_exists(&conn, "recording_endpoint_observations"));
+        assert!(table_exists(&conn, "recording_frame_index"));
+        assert!(table_exists(&conn, "recording_terminal_evidence"));
+        let terminal_rows: i64 = conn
+            .query_row("SELECT count(*) FROM recording_terminal_evidence", [], |row| row.get(0))
+            .expect("terminal evidence remains unbackfilled");
+        assert_eq!(terminal_rows, 0);
         let fk_errors: i64 = conn
             .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0))
             .expect("foreign keys");

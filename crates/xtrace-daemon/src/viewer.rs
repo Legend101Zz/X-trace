@@ -1193,6 +1193,7 @@ struct TransportList {
 struct TransportRecording {
     recording_id: RecordingId,
     status: xtrace_application::RecordingStatus,
+    completion: xtrace_application::RecordingCompletionEvidence,
     opened_at: String,
     segment_count: String,
     event_count: String,
@@ -1213,6 +1214,7 @@ fn to_transport_list(page: RecordingListPage, request_id: CorrelationId) -> Tran
             .map(|item| TransportRecording {
                 recording_id: item.recording_id,
                 status: item.status,
+                completion: item.completion,
                 opened_at: item.opened_at,
                 segment_count: item.segment_count,
                 event_count: item.event_count,
@@ -1234,6 +1236,10 @@ struct TransportDetail {
     project_id: ProjectId,
     recording_id: RecordingId,
     status: xtrace_application::RecordingStatus,
+    completion: xtrace_application::RecordingCompletionEvidence,
+    adapter_summary: Option<xtrace_domain::CapturedValue>,
+    duration_ns: Option<String>,
+    drop_counts_by_priority: std::collections::BTreeMap<u32, String>,
     limit: u32,
     cursor: Option<String>,
     next_cursor: Option<String>,
@@ -1248,6 +1254,8 @@ struct TransportDetail {
 #[serde(rename_all = "camelCase")]
 struct TransportEvent {
     sequence: String,
+    frame_id: Option<xtrace_domain::FrameId>,
+    navigation: xtrace_application::FrameNavigation,
     monotonic_ns: String,
     event_id: Option<String>,
     parent_event_id: Option<String>,
@@ -1274,6 +1282,10 @@ fn to_transport_detail(detail: RecordingDetail, request_id: CorrelationId) -> Tr
         project_id: detail.project_id,
         recording_id: detail.recording_id,
         status: detail.status,
+        completion: detail.completion,
+        adapter_summary: detail.adapter_summary,
+        duration_ns: detail.duration_ns,
+        drop_counts_by_priority: detail.drop_counts_by_priority,
         limit: detail.limit,
         cursor: detail.cursor,
         next_cursor: detail.next_cursor,
@@ -1283,6 +1295,8 @@ fn to_transport_detail(detail: RecordingDetail, request_id: CorrelationId) -> Tr
             .into_iter()
             .map(|item| TransportEvent {
                 sequence: item.sequence,
+                frame_id: item.frame_id,
+                navigation: item.navigation,
                 monotonic_ns: item.monotonic_ns,
                 event_id: item.event_id,
                 parent_event_id: item.parent_event_id,
@@ -1734,7 +1748,7 @@ mod tests {
         );
         let list = request(&viewer.host, &valid_list).await;
         assert!(list.starts_with("HTTP/1.1 200"));
-        assert!(list.contains("\"schemaVersion\":1"));
+        assert!(list.contains("\"schemaVersion\":2"));
         assert!(list.contains("\"requestId\""));
         assert!(list.contains("no-store"));
 

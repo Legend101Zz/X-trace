@@ -534,6 +534,7 @@ impl RecordingCapture for ObservedCapture {
             recording_id: request.recording_id,
             persisted_segments: 0,
             exact_replay: false,
+            completion: xtrace_application::recording::RecordingCompletion::Partial,
         })
     }
 }

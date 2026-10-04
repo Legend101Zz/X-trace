@@ -217,6 +217,17 @@ pub trait RecordingPersistencePort: Send + Sync {
         &self,
         request: &PersistRecordingSegment<Self::Event>,
     ) -> Result<PersistSegmentReceipt, PortError>;
+
+    /// Persists and verifies terminal evidence after all segment bytes are durable.
+    fn finish_recording(
+        &self,
+        _request: &FinishRecording,
+    ) -> Result<RecordingCompletion, PortError> {
+        // Ports that have not implemented durable terminal evidence cannot
+        // establish completion. Keep the fallback honest for test and adapter
+        // compositions while the SQLite port supplies the proof.
+        Ok(RecordingCompletion::Partial)
+    }
 }
 
 /// One admitted event plus the canonical bytes used for replay identity.
@@ -242,12 +253,52 @@ pub struct RecordEvents<E> {
 }
 
 /// Structural finish marker accepted by the ingest validator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FinishRecording {
     /// Recording being sealed.
     pub recording_id: RecordingId,
     /// Highest contiguous sequence declared by the adapter.
     pub final_recording_seq: u64,
+    /// Adapter-observed duration in monotonic nanoseconds.
+    pub duration_ns: Option<u64>,
+    /// Adapter's V1 digest over emitted event IDs in order, without separators.
+    pub event_digest: Vec<u8>,
+    /// Counts reported by the adapter for events dropped before emission.
+    pub drop_counts_by_priority: BTreeMap<u32, u64>,
+    /// Stable capability codes that were advertised but not exercised.
+    pub unsupported_capability_codes: Vec<String>,
+    /// Producer-declared response summary; only non-preview states are accepted
+    /// until a verified privacy-policy registry exists. This is not outcome proof.
+    pub response_summary: Option<xtrace_domain::CapturedValue>,
+}
+
+impl FinishRecording {
+    /// Constructs finish evidence for legacy callers without a digest.
+    ///
+    /// The absent proof is durably classified as partial by a capable port.
+    #[must_use]
+    pub fn without_digest(recording_id: RecordingId, final_recording_seq: u64) -> Self {
+        Self {
+            recording_id,
+            final_recording_seq,
+            duration_ns: None,
+            event_digest: Vec::new(),
+            drop_counts_by_priority: BTreeMap::new(),
+            unsupported_capability_codes: Vec::new(),
+            response_summary: None,
+        }
+    }
+}
+
+/// Durable result of comparing a finish marker with persisted recording evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordingCompletion {
+    /// Finish sequence and ID digest match, with no reported drops or gap events.
+    Complete,
+    /// Finish evidence is absent or capture contains a declared gap/drop.
+    Partial,
+    /// Finish digest or event correlation contradicts persisted events.
+    Invalid,
 }
 
 /// Result of staging one event batch.
@@ -270,6 +321,8 @@ pub struct FinishRecordingReceipt {
     pub persisted_segments: usize,
     /// True when the same finish marker was already processed.
     pub exact_replay: bool,
+    /// Completion state returned by the durable persistence port.
+    pub completion: RecordingCompletion,
 }
 
 /// Object-safe recording capture use case consumed by daemon composition.
@@ -566,37 +619,37 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
                 "recording anchor has not been persisted",
             ));
         }
-        if let Some(final_sequence) = state.finish_intent {
-            if final_sequence != request.final_recording_seq {
+        if let Some(existing_request) = &state.finish_intent {
+            if existing_request != &request {
                 return Err(capture_error(
                     PortErrorKind::Conflict,
-                    "recording finish conflicts with the accepted marker",
+                    "recording finish conflicts with the accepted evidence",
                 ));
             }
             if state.finished {
                 let persisted_segments = self.commit_pending(&mut state)?;
+                let completion = self.port.finish_recording(&request)?;
                 return Ok(FinishRecordingReceipt {
                     recording_id: state.recording_id,
                     persisted_segments,
                     exact_replay: true,
+                    completion,
                 });
-            }
-        } else {
-            if request.final_recording_seq != state.highest_contiguous {
-                return Err(capture_error(
-                    PortErrorKind::Conflict,
-                    "recording finish sequence is not contiguous",
-                ));
             }
         }
         let mut persisted_segments = self.commit_pending(&mut state)?;
-        state.finish_intent = Some(request.final_recording_seq);
         persisted_segments += self.seal_current(&mut state)?;
+        let completion = self.port.finish_recording(&request)?;
+        // Only remember a finish marker once the durable port has accepted it.
+        // A rejected/ambiguous attempt must leave room for an exact replay or a
+        // corrected request after the caller resolves the failure.
+        state.finish_intent = Some(request);
         state.finished = true;
         Ok(FinishRecordingReceipt {
             recording_id: state.recording_id,
             persisted_segments,
             exact_replay: false,
+            completion,
         })
     }
 }
@@ -614,7 +667,7 @@ struct RecordingAssembly<E> {
     current_first_monotonic_ns: Option<u64>,
     next_segment_ordinal: Option<u32>,
     pending: Option<PendingSegment<E>>,
-    finish_intent: Option<u64>,
+    finish_intent: Option<FinishRecording>,
     finished: bool,
 }
 
@@ -832,6 +885,32 @@ mod tests {
                 recording_id: request.recording_id,
                 segment_ordinal: request.segment_ordinal,
                 disposition,
+            })
+        }
+
+        fn finish_recording(
+            &self,
+            request: &FinishRecording,
+        ) -> Result<RecordingCompletion, PortError> {
+            if request.unsupported_capability_codes.len() > 64
+                || request.unsupported_capability_codes.iter().any(|code| {
+                    let mut bytes = code.bytes();
+                    !bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+                        || code.len() > 128
+                        || !bytes.all(|byte| {
+                            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                        })
+                })
+            {
+                return Err(capture_error(
+                    PortErrorKind::Validation,
+                    "fake finish validation failure",
+                ));
+            }
+            Ok(if request.event_digest.len() == 32 {
+                RecordingCompletion::Complete
+            } else {
+                RecordingCompletion::Partial
             })
         }
     }
@@ -1267,7 +1346,7 @@ mod tests {
         assert_eq!(accepted.accepted, 1);
         assert_eq!(accepted.persisted_segments, 0);
         service
-            .finish_recording(FinishRecording { recording_id, final_recording_seq: 3 })
+            .finish_recording(FinishRecording::without_digest(recording_id, 3))
             .expect("finish");
         let segments = port.snapshot().segments;
         assert_eq!(segments.len(), 1);
@@ -1291,7 +1370,7 @@ mod tests {
             })
             .expect("stage count and span boundaries");
         count_service
-            .finish_recording(FinishRecording { recording_id, final_recording_seq: 5 })
+            .finish_recording(FinishRecording::without_digest(recording_id, 5))
             .expect("finish");
         let segments = count_port.snapshot().segments;
         let sequences: Vec<Vec<u64>> = segments
@@ -1311,7 +1390,7 @@ mod tests {
             })
             .expect("byte boundary");
         byte_service
-            .finish_recording(FinishRecording { recording_id, final_recording_seq: 3 })
+            .finish_recording(FinishRecording::without_digest(recording_id, 3))
             .expect("finish");
         let byte_sequences: Vec<Vec<u64>> = byte_port
             .snapshot()
@@ -1337,7 +1416,7 @@ mod tests {
         assert_eq!(count_segments[0].events.len(), DEFAULT_SEGMENT_EVENTS);
 
         count_service
-            .finish_recording(FinishRecording { recording_id, final_recording_seq: 2_002 })
+            .finish_recording(FinishRecording::without_digest(recording_id, 2_002))
             .expect("finish");
         let count_segments = count_port.snapshot().segments;
         assert_eq!(count_segments.len(), 2);
@@ -1356,7 +1435,7 @@ mod tests {
         assert_eq!(span_segments.len(), 1);
         assert_eq!(span_segments[0].events[0].recording_seq, 2);
         span_service
-            .finish_recording(FinishRecording { recording_id, final_recording_seq: 3 })
+            .finish_recording(FinishRecording::without_digest(recording_id, 3))
             .expect("finish");
         let span_segments = span_port.snapshot().segments;
         assert_eq!(span_segments.len(), 2);
@@ -1452,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_finish_does_not_flush_and_correct_finish_remains_possible() {
+    fn declared_finish_gap_flushes_and_seals_as_partial() {
         let port = Arc::new(FakePort::default());
         let service = service(Arc::clone(&port), SegmentPolicy::default());
         service.begin_recording(begin(wall(1))).expect("begin");
@@ -1460,14 +1539,15 @@ mod tests {
         service
             .record_events(RecordEvents { recording_id, events: vec![event(2, 0, 2)] })
             .expect("event");
-        let invalid =
-            service.finish_recording(FinishRecording { recording_id, final_recording_seq: 3 });
-        assert_eq!(invalid.expect_err("finish gap").kind(), PortErrorKind::Conflict);
-        assert!(port.snapshot().segments.is_empty());
         let finished = service
-            .finish_recording(FinishRecording { recording_id, final_recording_seq: 2 })
-            .expect("valid finish");
+            .finish_recording(FinishRecording::without_digest(recording_id, 3))
+            .expect("declared finish gap persists terminal evidence");
         assert_eq!(finished.persisted_segments, 1);
+        assert_eq!(finished.completion, RecordingCompletion::Partial);
+        assert!(!port.snapshot().segments.is_empty());
+        let conflicting = service
+            .finish_recording(FinishRecording::without_digest(recording_id, 2));
+        assert_eq!(conflicting.expect_err("finish evidence is immutable").kind(), PortErrorKind::Conflict);
     }
 
     #[test]
@@ -1496,6 +1576,38 @@ mod tests {
     }
 
     #[test]
+    fn rejected_finish_does_not_poison_corrected_retry_after_pending_segment_retry() {
+        let port = Arc::new(FakePort::default());
+        port.fail_next_segment_after_record.store(true, Ordering::SeqCst);
+        let policy = SegmentPolicy::new(1, DEFAULT_SEGMENT_EVENT_BYTES, 1).expect("policy");
+        let service = service(Arc::clone(&port), policy);
+        service.begin_recording(begin(wall(1))).expect("begin");
+        let recording_id = begin(wall(1)).recording_id;
+        let event = event(2, 1, 0xaa);
+
+        let staged = service.record_events(RecordEvents {
+            recording_id,
+            events: vec![event.clone()],
+        });
+        assert_eq!(staged.expect_err("injected ambiguous segment failure").kind(), PortErrorKind::Transport);
+
+        let mut malformed = FinishRecording::without_digest(recording_id, 2);
+        malformed.unsupported_capability_codes = (0..65).map(|_| "optional".to_string()).collect();
+        assert_eq!(
+            service.finish_recording(malformed).expect_err("bounded finish validation").kind(),
+            PortErrorKind::Validation,
+        );
+
+        let corrected = service
+            .finish_recording(FinishRecording::without_digest(recording_id, 2))
+            .expect("corrected finish remains admissible");
+        assert_eq!(corrected.completion, RecordingCompletion::Partial);
+        let snapshot = port.snapshot();
+        assert_eq!(snapshot.segments.len(), 2);
+        assert_eq!(snapshot.segments[0].events, snapshot.segments[1].events);
+    }
+
+    #[test]
     fn finish_flushes_without_allowing_new_events_or_claiming_a_terminal_state() {
         let port = Arc::new(FakePort::default());
         let service = service(Arc::clone(&port), SegmentPolicy::default());
@@ -1506,12 +1618,12 @@ mod tests {
             .record_events(RecordEvents { recording_id, events: vec![original.clone()] })
             .expect("event");
         let finish = service
-            .finish_recording(FinishRecording { recording_id, final_recording_seq: 2 })
+            .finish_recording(FinishRecording::without_digest(recording_id, 2))
             .expect("finish");
         assert_eq!(finish.persisted_segments, 1);
         assert!(!finish.exact_replay);
         let replay = service
-            .finish_recording(FinishRecording { recording_id, final_recording_seq: 2 })
+            .finish_recording(FinishRecording::without_digest(recording_id, 2))
             .expect("finish replay");
         assert!(replay.exact_replay);
 
