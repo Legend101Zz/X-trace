@@ -4,10 +4,14 @@ info:
   version: 1.0.0
   description: >-
     Same-origin, loopback-only read API for persisted recording metadata and
-    bounded verified event windows. It also exposes a finite persisted
+    bounded verified event windows with typed source and frame-navigation
+    availability. Recording details include producer-declared duration and
+    persisted terminal capture-completion evidence, including unavailable
+    states. Captured values, an active execution line, and independently
+    verified application or HTTP outcomes remain unavailable; a producer
+    summary is not outcome proof. It also exposes a finite persisted
     observed-endpoint projection for the exact Spring fixture policy; it does
-    not claim framework discovery or catalog completeness. Source, captured
-    values, durations, and completion claims are not projected by this API. Every
+    not claim framework discovery or catalog completeness. Every
     request must carry the exact Host authority printed by viewer readiness,
     Sec-Fetch-Site: same-origin, and X-XTrace-Client: viewer-v1. There is no
     CORS support. Authentication POST requests require an exact same-origin
@@ -295,7 +299,7 @@ components:
       type: object
       required: [schemaVersion, projectId, limit, after, nextAfter, recordings, unavailable, requestId]
       properties:
-        schemaVersion: { type: integer, const: 1 }
+        schemaVersion: { type: integer, const: 2 }
         projectId: { type: string, format: uuid }
         limit: { type: integer }
         after: { type: [string, 'null'], format: uuid }
@@ -307,10 +311,11 @@ components:
         requestId: { type: string, format: uuid }
     Recording:
       type: object
-      required: [recordingId, status, openedAt, segmentCount, eventCount, incompleteEvidence]
+      required: [recordingId, status, completion, openedAt, segmentCount, eventCount, incompleteEvidence]
       properties:
         recordingId: { type: string, format: uuid }
         status: { type: string, enum: [recording, finalizing, complete, partial, invalid] }
+        completion: { $ref: '#/components/schemas/Completion' }
         openedAt: { type: string, format: date-time }
         segmentCount: { type: string, pattern: '^[0-9]+$' }
         eventCount: { type: string, pattern: '^[0-9]+$' }
@@ -358,10 +363,11 @@ components:
         nextCursor: { type: [string, 'null'], maxLength: 2048 }
     ObservedRecording:
       type: object
-      required: [recordingId, status, openedAt, segmentCount, eventCount, firstSequence, lastSequence, incompleteEvidence, operationId, observationPolicy, unmatchedReason]
+      required: [recordingId, status, completion, openedAt, segmentCount, eventCount, firstSequence, lastSequence, incompleteEvidence, operationId, observationPolicy, unmatchedReason]
       properties:
         recordingId: { type: string, format: uuid }
         status: { type: string, enum: [recording, finalizing, complete, partial, invalid] }
+        completion: { $ref: '#/components/schemas/Completion' }
         openedAt: { type: string, format: date-time }
         segmentCount: { type: string, pattern: '^[0-9]+$' }
         eventCount: { type: string, pattern: '^[0-9]+$' }
@@ -375,12 +381,23 @@ components:
           enum: [observation_policy_missing, observation_policy_invalid, identity_context_missing, identity_context_invalid, method_unsupported, route_unapproved, null]
     RecordingDetail:
       type: object
-      required: [schemaVersion, projectId, recordingId, status, limit, cursor, nextCursor, segmentCount, events, incompleteEvidence, unavailable, requestId]
+      required: [schemaVersion, projectId, recordingId, status, completion, adapterSummary, durationNs, dropCountsByPriority, limit, cursor, nextCursor, segmentCount, events, incompleteEvidence, unavailable, requestId]
       properties:
-        schemaVersion: { type: integer, const: 1 }
+        schemaVersion: { type: integer, const: 2 }
         projectId: { type: string, format: uuid }
         recordingId: { type: string, format: uuid }
         status: { type: string, enum: [recording, finalizing, complete, partial, invalid] }
+        completion: { $ref: '#/components/schemas/Completion' }
+        adapterSummary:
+          description: Producer-declared privacy-safe summary; it is not independently correlated to a RESPONSE event and is not outcome proof.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/AdapterSummary'
+        durationNs: { type: [string, 'null'], pattern: '^[0-9]+$' }
+        dropCountsByPriority:
+          type: object
+          maxProperties: 256
+          additionalProperties: { type: string, pattern: '^[0-9]+$' }
         limit: { type: integer }
         cursor: { type: [string, 'null'] }
         nextCursor: { type: [string, 'null'] }
@@ -391,9 +408,14 @@ components:
         requestId: { type: string, format: uuid }
     Event:
       type: object
-      required: [sequence, monotonicNs, kind, sourceBinding, fieldTruncations]
+      required: [sequence, frameId, navigation, monotonicNs, kind, sourceBinding, fieldTruncations]
       properties:
         sequence: { type: string, pattern: '^[0-9]+$' }
+        frameId:
+          type: [string, 'null']
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+        navigation: { $ref: '#/components/schemas/FrameNavigation' }
         monotonicNs: { type: string, pattern: '^[0-9]+$' }
         eventId: { type: [string, 'null'] }
         parentEventId: { type: [string, 'null'] }
@@ -434,13 +456,64 @@ components:
               field: { type: string }
               originalBytes: { type: string, pattern: '^[0-9]+$' }
               representation: { type: string, enum: [truncated, unavailable] }
+    Completion:
+      type: string
+      enum: [complete, partial, invalid, unavailable]
+    FrameNavigation:
+      type: object
+      required: [previous, next, into, over, out]
+      properties:
+        previous: { $ref: '#/components/schemas/NavigationResult' }
+        next: { $ref: '#/components/schemas/NavigationResult' }
+        into: { $ref: '#/components/schemas/NavigationResult' }
+        over: { $ref: '#/components/schemas/NavigationResult' }
+        out: { $ref: '#/components/schemas/NavigationResult' }
+    NavigationResult:
+      oneOf:
+        - type: object
+          required: [state, frameId]
+          properties:
+            state: { type: string, const: target }
+            frameId: { type: string, format: uuid }
+        - type: object
+          required: [state]
+          properties:
+            state: { type: string, enum: [boundary, unavailable] }
+    AdapterSummary:
+      description: No preview text or producer-supplied rule identifier is exposed until a verified policy registry exists.
+      oneOf:
+        - type: object
+          required: [Redacted]
+          properties:
+            Redacted:
+              type: object
+              required: [rule_id, shape_hint]
+              properties:
+                rule_id: { type: string, const: unverified-producer-redaction }
+                shape_hint: {}
+        - type: object
+          required: [Unavailable]
+          properties:
+            Unavailable:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, enum: [capability_unsupported, debug_metadata_absent, capture_budget_exhausted, source_artifact_missing, recorder_disconnected, privacy_policy_unavailable] }
+        - type: object
+          required: [Dropped]
+          properties:
+            Dropped:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, enum: [backpressure_shed, queue_full, sequence_gap, adapter_dropped] }
     Unavailable:
       type: object
       required: [source, values, completion]
       properties:
         source: { type: string, const: unavailable }
         values: { type: string, const: unavailable }
-        completion: { type: string, const: unavailable }
+        completion: { type: string, enum: [available, unavailable, per_recording] }
     Problem:
       type: object
       required: [type, title, status, detail, code, requestId]

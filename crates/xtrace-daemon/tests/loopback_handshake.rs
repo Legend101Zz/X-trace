@@ -63,6 +63,7 @@ use xtrace_application::recording::{
     DEFAULT_MAX_RETAINED_RECORDINGS, FinishRecording, FinishRecordingReceipt, RecordEvents,
     RecordEventsReceipt, RecordingCapture, SegmentPolicy,
 };
+use xtrace_application::recording_queries::{RecordingReadPort, ShowWindowRequest};
 use xtrace_application::{PortError, PortErrorKind, ProjectRepository};
 use xtrace_daemon::{
     BoundDaemon, DaemonBuilder, DaemonConfig, DaemonError, HandshakeInputs, HandshakeRole,
@@ -534,6 +535,7 @@ impl RecordingCapture for ObservedCapture {
             recording_id: request.recording_id,
             persisted_segments: 0,
             exact_replay: false,
+            completion: xtrace_application::recording::RecordingCompletion::Partial,
         })
     }
 }
@@ -2247,4 +2249,375 @@ async fn configured_daemon_persists_verified_sqlite_segment_with_staged_acks() {
         .expect("shutdown timed out")
         .expect("daemon task")
         .expect("serve");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_finish_can_replay_on_same_runtime_and_restart_keeps_open_capture_unavailable() {
+    let daemon_temp = secure_tempdir("xtrace-finish-replay-daemon-");
+    let bootstrap_path = daemon_temp.path().join("bootstrap.json");
+    let project_root = secure_tempdir("xtrace-finish-replay-project-");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let database_path = project_root.path().join("metadata.sqlite3");
+    let store = SqliteStore::open(&database_path, OpenOptions::default())
+        .expect("open project SQLite store");
+    #[cfg(unix)]
+    set_owner_only(&database_path, 0o600);
+    let timestamp = WallTime::now();
+    let project = Project {
+        id: project_id,
+        canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/fixture/repo"),
+        display_name: "finish replay integration project".to_owned(),
+        created_at: timestamp,
+        last_opened_at: timestamp,
+        config_schema_version: 1,
+        effective_config_hash: String::new(),
+        active_capture_policy_id: None,
+        active_redaction_policy_id: None,
+    };
+    store.project_repository().insert_project(&project).expect("insert project");
+
+    let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), project_root.path()));
+    let capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>> =
+        Arc::new(xtrace_application::recording::RecordingCaptureService::new(
+            adapter.clone(),
+            SegmentPolicy::default(),
+            std::num::NonZeroUsize::new(DEFAULT_MAX_RETAINED_RECORDINGS)
+                .expect("non-zero retained recording limit"),
+        ));
+    let (bound, secret, _, _, address, pin) = spawn_daemon_with_capture(
+        bootstrap_path,
+        Duration::from_secs(60),
+        8,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+        Arc::clone(&capture),
+    )
+    .await
+    .expect("bind SQLite-backed daemon");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+    let recording_id_bytes = Bytes::copy_from_slice(&[0x36; 16]);
+    let recording_id = RecordingId::from_uuid(uuid::Uuid::from_bytes([0x36; 16]));
+    let first_event = RecordingEvent {
+        event_id: "retry-event-2".to_owned(),
+        recording_seq: 2,
+        monotonic_ns: 23,
+        ..RecordingEvent::default()
+    };
+
+    let mut first_stream =
+        connect_authenticated(address, &pin, &secret, &session_id, &[0x85; 32]).await;
+    let (mut first_reader, mut first_writer) = tokio::io::split(&mut first_stream);
+    write_envelope(
+        &mut first_writer,
+        PayloadOneof::RecordingStarted(RecordingStarted {
+            recording_id: recording_id_bytes.clone(),
+            recording_seq: 1,
+            method: "GET".to_owned(),
+            ..RecordingStarted::default()
+        }),
+        &session_id,
+        1,
+        1,
+    )
+    .await
+    .expect("write initial start");
+    assert_eq!(
+        next_ack(&mut first_reader, "initial start").await.durability,
+        AckDurability::Staged as i32
+    );
+    write_envelope(
+        &mut first_writer,
+        PayloadOneof::EventBatch(EventBatch {
+            recording_id: recording_id_bytes.clone(),
+            events: vec![first_event.clone()],
+        }),
+        &session_id,
+        2,
+        2,
+    )
+    .await
+    .expect("write initial event");
+    assert_eq!(
+        next_ack(&mut first_reader, "initial event").await.durability,
+        AckDurability::Staged as i32
+    );
+
+    let malformed_finish = RecordingFinished {
+        recording_id: recording_id_bytes.clone(),
+        final_recording_seq: 2,
+        event_digest: Bytes::copy_from_slice(blake3::hash(b"retry-event-2").as_bytes()),
+        response_summary: Some(xtrace_protocol::generated::agent::CapturedValue {
+            value: Some(xtrace_protocol::generated::agent::captured_value::Value::Redacted(
+                xtrace_protocol::generated::agent::CapturedValueRedacted {
+                    rule_id: "FINISH_PRIVACY_CANARY".to_owned(),
+                    shape_hint: i32::MAX,
+                },
+            )),
+        }),
+        ..RecordingFinished::default()
+    };
+    write_envelope(
+        &mut first_writer,
+        PayloadOneof::RecordingFinished(malformed_finish),
+        &session_id,
+        3,
+        3,
+    )
+    .await
+    .expect("write malformed finish");
+    let failure = next_protocol_error(&mut first_reader, "malformed finish").await;
+    assert_eq!(failure.code, "XTR-DAEMON-TRANSPORT");
+    assert_eq!(failure.message, "recording capture operation failed");
+    assert!(!failure.message.contains("FINISH_PRIVACY_CANARY"));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), read_envelope(&mut first_reader))
+            .await
+            .expect("connection close timed out")
+            .is_err()
+    );
+    drop(first_reader);
+    drop(first_writer);
+    drop(first_stream);
+
+    let reader = SqliteRecordingReader::new(store.clone(), project_root.path());
+    let (before_retry, _) =
+        reader.list_recordings(project_id, None, 10).expect("read persisted start before retry");
+    let opened_at_before_retry = before_retry
+        .iter()
+        .find(|item| item.recording_id == recording_id)
+        .expect("recording anchor before retry")
+        .opened_at
+        .clone();
+    let pending_before_retry = before_retry
+        .iter()
+        .find(|item| item.recording_id == recording_id)
+        .expect("recording anchor before retry");
+    assert_eq!(
+        pending_before_retry.status,
+        xtrace_application::recording_queries::RecordingStatus::Recording
+    );
+    assert_eq!(
+        pending_before_retry.completion,
+        xtrace_application::recording_queries::RecordingCompletionEvidence::Unavailable
+    );
+
+    let mut retry_stream =
+        connect_authenticated(address, &pin, &secret, &session_id, &[0x86; 32]).await;
+    let (mut retry_reader, mut retry_writer) = tokio::io::split(&mut retry_stream);
+    write_envelope(
+        &mut retry_writer,
+        PayloadOneof::RecordingStarted(RecordingStarted {
+            recording_id: recording_id_bytes.clone(),
+            recording_seq: 1,
+            method: "GET".to_owned(),
+            ..RecordingStarted::default()
+        }),
+        &session_id,
+        1,
+        1,
+    )
+    .await
+    .expect("replay original start");
+    assert_eq!(
+        next_ack(&mut retry_reader, "replayed start").await.durability,
+        AckDurability::Staged as i32
+    );
+    write_envelope(
+        &mut retry_writer,
+        PayloadOneof::EventBatch(EventBatch {
+            recording_id: recording_id_bytes.clone(),
+            events: vec![first_event],
+        }),
+        &session_id,
+        2,
+        2,
+    )
+    .await
+    .expect("replay original event");
+    assert_eq!(
+        next_ack(&mut retry_reader, "replayed event").await.durability,
+        AckDurability::Staged as i32
+    );
+    write_envelope(
+        &mut retry_writer,
+        PayloadOneof::RecordingFinished(RecordingFinished {
+            recording_id: recording_id_bytes,
+            final_recording_seq: 2,
+            event_digest: Bytes::copy_from_slice(blake3::hash(b"retry-event-2").as_bytes()),
+            ..RecordingFinished::default()
+        }),
+        &session_id,
+        3,
+        3,
+    )
+    .await
+    .expect("write corrected finish");
+    assert_eq!(
+        next_ack(&mut retry_reader, "corrected finish").await.durability,
+        AckDurability::Staged as i32
+    );
+    drop(retry_reader);
+    drop(retry_writer);
+    drop(retry_stream);
+
+    let (after_retry, _) =
+        reader.list_recordings(project_id, None, 10).expect("read completed recording");
+    assert_eq!(after_retry.len(), 1, "retry must not duplicate the recording anchor");
+    assert_eq!(after_retry[0].opened_at, opened_at_before_retry);
+    assert_eq!(after_retry[0].event_count, "1");
+    assert_eq!(
+        after_retry[0].completion,
+        xtrace_application::recording_queries::RecordingCompletionEvidence::Complete
+    );
+    let completed_window = reader
+        .show_recording(&ShowWindowRequest {
+            project_id,
+            recording_id,
+            limit: 10,
+            after_sequence: None,
+        })
+        .expect("read completed replay");
+    assert_eq!(completed_window.segment_count, "1");
+    assert_eq!(completed_window.events.len(), 1);
+    assert!(completed_window.events[0].frame_id.is_some());
+
+    let interrupted_id_bytes = Bytes::copy_from_slice(&[0x37; 16]);
+    let interrupted_id = RecordingId::from_uuid(uuid::Uuid::from_bytes([0x37; 16]));
+    let mut interrupted_stream =
+        connect_authenticated(address, &pin, &secret, &session_id, &[0x87; 32]).await;
+    let (mut interrupted_reader, mut interrupted_writer) =
+        tokio::io::split(&mut interrupted_stream);
+    write_envelope(
+        &mut interrupted_writer,
+        PayloadOneof::RecordingStarted(RecordingStarted {
+            recording_id: interrupted_id_bytes.clone(),
+            recording_seq: 1,
+            method: "GET".to_owned(),
+            ..RecordingStarted::default()
+        }),
+        &session_id,
+        1,
+        1,
+    )
+    .await
+    .expect("write interrupted start");
+    assert_eq!(
+        next_ack(&mut interrupted_reader, "interrupted start").await.durability,
+        AckDurability::Staged as i32
+    );
+    write_envelope(
+        &mut interrupted_writer,
+        PayloadOneof::EventBatch(EventBatch {
+            recording_id: interrupted_id_bytes,
+            events: vec![RecordingEvent {
+                event_id: "interrupted-event-2".to_owned(),
+                recording_seq: 2,
+                ..RecordingEvent::default()
+            }],
+        }),
+        &session_id,
+        2,
+        2,
+    )
+    .await
+    .expect("write interrupted event");
+    assert_eq!(
+        next_ack(&mut interrupted_reader, "interrupted event").await.durability,
+        AckDurability::Staged as i32
+    );
+    drop(interrupted_reader);
+    drop(interrupted_writer);
+    drop(interrupted_stream);
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("shutdown timed out")
+        .expect("daemon task")
+        .expect("serve");
+
+    drop(reader);
+    drop(capture);
+    drop(adapter);
+    drop(store);
+    let reopened = SqliteStore::open(&database_path, OpenOptions::default())
+        .expect("reopen store after daemon restart");
+    let reopened_reader = SqliteRecordingReader::new(reopened.clone(), project_root.path());
+    let (reopened_rows, _) =
+        reopened_reader.list_recordings(project_id, None, 10).expect("read after daemon restart");
+    assert_eq!(reopened_rows.len(), 2);
+    let completed_after_reopen = reopened_rows
+        .iter()
+        .find(|row| row.recording_id == recording_id)
+        .expect("completed row after reopen");
+    assert_eq!(
+        completed_after_reopen.completion,
+        xtrace_application::recording_queries::RecordingCompletionEvidence::Complete
+    );
+    assert_eq!(completed_after_reopen.opened_at, opened_at_before_retry);
+    let completed_reopen_window = reopened_reader
+        .show_recording(&ShowWindowRequest {
+            project_id,
+            recording_id,
+            limit: 10,
+            after_sequence: None,
+        })
+        .expect("read completed frame index after reopen");
+    assert_eq!(completed_reopen_window.events[0].frame_id, completed_window.events[0].frame_id);
+    let interrupted = reopened_rows
+        .iter()
+        .find(|row| row.recording_id == interrupted_id)
+        .expect("interrupted anchor after restart");
+    assert_eq!(
+        interrupted.status,
+        xtrace_application::recording_queries::RecordingStatus::Recording
+    );
+    assert_eq!(
+        interrupted.completion,
+        xtrace_application::recording_queries::RecordingCompletionEvidence::Unavailable
+    );
+
+    let restarted_adapter =
+        Arc::new(SqliteRecordingPersistence::new(reopened.clone(), project_root.path()));
+    let restarted_capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>> =
+        Arc::new(xtrace_application::recording::RecordingCaptureService::new(
+            restarted_adapter.clone(),
+            SegmentPolicy::default(),
+            std::num::NonZeroUsize::new(DEFAULT_MAX_RETAINED_RECORDINGS)
+                .expect("non-zero retained recording limit"),
+        ));
+    let (restarted_bound, _, _, _, _, _) = spawn_daemon_with_capture(
+        daemon_temp.path().join("restarted-bootstrap.json"),
+        Duration::from_secs(60),
+        8,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+        restarted_capture,
+    )
+    .await
+    .expect("restart daemon with fresh runtime capture state");
+    let (restarted_shutdown_tx, restarted_handle) = daemon_task(restarted_bound);
+    let _ = restarted_shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), restarted_handle)
+        .await
+        .expect("restarted daemon shutdown timed out")
+        .expect("restarted daemon task")
+        .expect("restarted daemon serve");
+    let (after_restart, _) = reopened_reader
+        .list_recordings(project_id, None, 10)
+        .expect("read status after fresh daemon shutdown");
+    let interrupted_after_restart = after_restart
+        .iter()
+        .find(|row| row.recording_id == interrupted_id)
+        .expect("interrupted row after fresh runtime");
+    assert_eq!(
+        interrupted_after_restart.status,
+        xtrace_application::recording_queries::RecordingStatus::Recording
+    );
+    assert_eq!(
+        interrupted_after_restart.completion,
+        xtrace_application::recording_queries::RecordingCompletionEvidence::Unavailable
+    );
 }

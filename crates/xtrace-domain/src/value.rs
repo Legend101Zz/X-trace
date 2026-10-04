@@ -30,6 +30,8 @@ pub enum UnavailableReason {
     SourceArtifactMissing,
     /// Recorder disconnected before sampling completed.
     RecorderDisconnected,
+    /// A producer supplied preview text without a verifiable privacy policy.
+    PrivacyPolicyUnavailable,
 }
 
 impl UnavailableReason {
@@ -42,6 +44,7 @@ impl UnavailableReason {
             Self::CaptureBudgetExhausted => "capture_budget_exhausted",
             Self::SourceArtifactMissing => "source_artifact_missing",
             Self::RecorderDisconnected => "recorder_disconnected",
+            Self::PrivacyPolicyUnavailable => "privacy_policy_unavailable",
         }
     }
 }

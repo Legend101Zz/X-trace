@@ -627,7 +627,7 @@ mod tests {
             .record_events(RecordEvents { recording_id, events: vec![accepted.clone()] })
             .expect("stage event");
         capture
-            .finish_recording(FinishRecording { recording_id, final_recording_seq: 2 })
+            .finish_recording(FinishRecording::without_digest(recording_id, 2))
             .expect("finish and persist segment");
 
         let verifier = SqliteRecordingPersistence::new(

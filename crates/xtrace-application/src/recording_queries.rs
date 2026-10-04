@@ -6,10 +6,11 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
-    AppError, CorrelationId, ErrorCategory, ErrorCode, ProjectId, RecordingId, RetryAdvice,
-    SourceBinding,
+    AppError, CapturedValue, CorrelationId, ErrorCategory, ErrorCode, FrameId, ProjectId,
+    RecordingId, RetryAdvice, SourceBinding,
 };
 
 use crate::PortError;
@@ -34,7 +35,11 @@ pub const MAX_RECORDING_DISPLAY_FIELD_BYTES: usize = 256;
 /// Maximum UTF-8 byte length for an exact projected relationship identifier.
 pub const MAX_RECORDING_RELATIONSHIP_ID_BYTES: usize = 128;
 /// Version of the stable JSON recording-read projection contract.
-pub const RECORDING_READ_SCHEMA_VERSION: u32 = 1;
+pub const RECORDING_READ_SCHEMA_VERSION: u32 = 2;
+
+fn decimal_u64(value: &str) -> bool {
+    value.parse::<u64>().is_ok_and(|parsed| parsed.to_string() == value)
+}
 
 /// Bounded request to list recordings in stable opening-time/ID order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +81,59 @@ pub enum RecordingStatus {
     Invalid,
 }
 
+/// Whether terminal completion is proven by persisted finish evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingCompletionEvidence {
+    /// Durable finish sequence and emitted-event-ID digest were verified.
+    Complete,
+    /// Durable finish proof is absent or explicitly records drops, gaps, or a partial stream.
+    Partial,
+    /// Durable finish evidence contradicted persisted event identity.
+    Invalid,
+    /// No verified terminal evidence exists, including historical rows.
+    Unavailable,
+}
+
+/// Result of resolving one replay-navigation edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "frameId", rename_all = "snake_case")]
+pub enum NavigationResult {
+    /// The adjacent metadata index entry matched its immutable verified XTF event.
+    Target(FrameId),
+    /// The verified sequence or recording boundary has no adjacent frame.
+    Boundary,
+    /// The relationship cannot be established from available event evidence.
+    Unavailable,
+}
+
+/// Bounded step-navigation facts for one indexed frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameNavigation {
+    /// Previous frame in recording sequence order.
+    pub previous: NavigationResult,
+    /// Next frame in recording sequence order.
+    pub next: NavigationResult,
+    /// Verified child call frame, when a complete event graph proves one.
+    pub into: NavigationResult,
+    /// Verified next sibling frame, when a complete event graph proves one.
+    pub over: NavigationResult,
+    /// Verified parent call frame, when a complete event graph proves one.
+    pub out: NavigationResult,
+}
+
+impl FrameNavigation {
+    /// Navigation for legacy or unindexed events.
+    pub const UNAVAILABLE: Self = Self {
+        previous: NavigationResult::Unavailable,
+        next: NavigationResult::Unavailable,
+        into: NavigationResult::Unavailable,
+        over: NavigationResult::Unavailable,
+        out: NavigationResult::Unavailable,
+    };
+}
+
 /// Infrastructure read position decoded from a scoped show cursor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShowWindowRequest {
@@ -111,6 +169,10 @@ pub struct PersistedInteraction {
 pub struct PersistedEvent {
     /// Strictly ordered recording sequence.
     pub sequence: String,
+    /// Stable UUIDv7 identity assigned on first durable frame-index insertion.
+    pub frame_id: Option<FrameId>,
+    /// Step navigation derived from the bounded persisted frame index.
+    pub navigation: FrameNavigation,
     /// Adapter monotonic nanoseconds persisted with this event.
     pub monotonic_ns: String,
     /// Stable event identity persisted by the adapter.
@@ -278,6 +340,8 @@ pub struct RecordingMetadata {
     pub recording_id: RecordingId,
     /// Exact persisted lifecycle status.
     pub status: RecordingStatus,
+    /// Completion state established from durable finish evidence.
+    pub completion: RecordingCompletionEvidence,
     /// Persisted opening wall time.
     pub opened_at: String,
     /// Number of durable segment rows.
@@ -293,12 +357,21 @@ pub struct RecordingMetadata {
 }
 
 /// One verified segment window returned by the storage adapter.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RecordingEventWindow {
     /// Stable recording identity.
     pub recording_id: RecordingId,
     /// Exact persisted lifecycle status.
     pub status: RecordingStatus,
+    /// Completion state established from durable finish evidence.
+    pub completion: RecordingCompletionEvidence,
+    /// Producer-declared sanitized summary from terminal evidence; this is not independently
+    /// correlated to a response event and must not be presented as outcome proof.
+    pub adapter_summary: Option<CapturedValue>,
+    /// Adapter-declared duration; absent for legacy or unavailable evidence.
+    pub duration_ns: Option<String>,
+    /// Adapter-reported dropped-event counts by numeric priority bucket.
+    pub drop_counts_by_priority: BTreeMap<u32, String>,
     /// Number of durable segments in the recording.
     pub segment_count: String,
     /// Persisted events in strict sequence order.
@@ -329,7 +402,7 @@ pub struct RecordingListPage {
 }
 
 /// Stable JSON detail projection for a Linear event window.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecordingDetail {
     /// Version of this stable JSON projection contract.
     pub schema_version: u32,
@@ -339,6 +412,15 @@ pub struct RecordingDetail {
     pub recording_id: RecordingId,
     /// Exact persisted lifecycle status.
     pub status: RecordingStatus,
+    /// Completion state established from durable finish evidence.
+    pub completion: RecordingCompletionEvidence,
+    /// Producer-declared sanitized summary from terminal evidence; this is not independently
+    /// correlated to a response event and must not be presented as outcome proof.
+    pub adapter_summary: Option<CapturedValue>,
+    /// Adapter-declared duration; absent for legacy or unavailable evidence.
+    pub duration_ns: Option<String>,
+    /// Adapter-reported dropped-event counts by numeric priority bucket.
+    pub drop_counts_by_priority: BTreeMap<u32, String>,
     /// Requested event limit.
     pub limit: u32,
     /// Versioned, project- and recording-bound cursor supplied by the caller.
@@ -360,9 +442,9 @@ pub struct RecordingDetail {
 pub struct UnavailableEvidence {
     /// Source locations are not projected by this query contract.
     pub source: String,
-    /// Captured values are deliberately excluded from this read projection.
+    /// Event-level captured values are excluded; finish response summary is projected separately.
     pub values: String,
-    /// A finish marker or completion semantics are not yet persisted.
+    /// Whether durable terminal evidence exists; the typed `completion` field carries its result.
     pub completion: String,
 }
 
@@ -457,6 +539,10 @@ pub fn list_recordings<P: RecordingReadPort>(
         .map_err(|error| crate::application::port_error_to_app_error(error, correlation_id))?;
     let next_after =
         has_more.then(|| recordings.last().map(|recording| recording.recording_id)).flatten();
+    let unavailable = UnavailableEvidence {
+        completion: "per_recording".to_owned(),
+        ..UnavailableEvidence::default()
+    };
     Ok(RecordingListPage {
         schema_version: RECORDING_READ_SCHEMA_VERSION,
         project_id: request.project_id,
@@ -464,7 +550,7 @@ pub fn list_recordings<P: RecordingReadPort>(
         after: request.after,
         recordings,
         next_after,
-        unavailable: UnavailableEvidence::default(),
+        unavailable,
     })
 }
 
@@ -502,11 +588,39 @@ pub fn show_recording<P: RecordingReadPort>(
     let window = port
         .show_recording(&position)
         .map_err(|error| crate::application::port_error_to_app_error(error, correlation_id))?;
+    let adapter_summary = window.adapter_summary;
+    if window.duration_ns.as_ref().is_some_and(|value| !decimal_u64(value))
+        || window.drop_counts_by_priority.len() > 256
+        || window.drop_counts_by_priority.values().any(|value| !decimal_u64(value))
+    {
+        return Err(query_resource_error(correlation_id));
+    }
+    let duration_ns = window.duration_ns;
+    let drop_counts_by_priority = window.drop_counts_by_priority;
+    let summary_bytes = adapter_summary
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|_| query_resource_error(correlation_id))?
+        .map_or(0, |bytes| bytes.len().saturating_add(1));
+    let terminal_metadata_bytes =
+        serde_json::to_vec(&(duration_ns.as_ref(), &drop_counts_by_priority))
+            .map_err(|_| query_resource_error(correlation_id))?
+            .len()
+            .saturating_add(1);
+    let auxiliary_bytes = summary_bytes.checked_add(terminal_metadata_bytes);
+    let Some(auxiliary_bytes) = auxiliary_bytes else {
+        return Err(query_resource_error(correlation_id));
+    };
+    if auxiliary_bytes > MAX_RECORDING_EVENT_PROJECTION_BYTES {
+        return Err(query_resource_error(correlation_id));
+    }
     let mut events = window.events;
     for event in &mut events {
         event.bound_display_fields();
     }
-    let projection_bytes = events.iter().try_fold(2_usize, |total, event| {
+    let initial_projection_bytes = 2_usize.saturating_add(auxiliary_bytes);
+    let projection_bytes = events.iter().try_fold(initial_projection_bytes, |total, event| {
         total.checked_add(event.serialized_size_with_separator().ok()?)
     });
     if projection_bytes.is_none_or(|bytes| bytes > MAX_RECORDING_EVENT_PROJECTION_BYTES) {
@@ -530,13 +644,24 @@ pub fn show_recording<P: RecordingReadPort>(
         project_id: request.project_id,
         recording_id: window.recording_id,
         status: window.status,
+        completion: window.completion,
+        adapter_summary,
+        duration_ns,
+        drop_counts_by_priority,
         limit: request.limit,
         cursor: request.cursor,
         next_cursor,
         segment_count: window.segment_count,
         events,
         incomplete_evidence: window.incomplete_evidence,
-        unavailable: UnavailableEvidence::default(),
+        unavailable: UnavailableEvidence {
+            completion: if window.completion == RecordingCompletionEvidence::Unavailable {
+                "unavailable".to_owned()
+            } else {
+                "available".to_owned()
+            },
+            ..UnavailableEvidence::default()
+        },
     })
 }
 
@@ -639,9 +764,15 @@ mod tests {
         let window = RecordingEventWindow {
             recording_id,
             status: RecordingStatus::Recording,
+            completion: RecordingCompletionEvidence::Unavailable,
+            adapter_summary: None,
+            duration_ns: None,
+            drop_counts_by_priority: BTreeMap::new(),
             segment_count: "1".to_owned(),
             events: vec![PersistedEvent {
                 sequence: u64::MAX.to_string(),
+                frame_id: Some(FrameId::new()),
+                navigation: FrameNavigation::UNAVAILABLE,
                 monotonic_ns: u64::MAX.to_string(),
                 event_id: Some("persisted-event".to_owned()),
                 parent_event_id: None,
@@ -659,6 +790,7 @@ mod tests {
         let list = vec![RecordingMetadata {
             recording_id,
             status: RecordingStatus::Partial,
+            completion: RecordingCompletionEvidence::Unavailable,
             opened_at: "2026-09-30T00:00:00Z".to_owned(),
             segment_count: "1".to_owned(),
             event_count: u64::MAX.to_string(),

@@ -65,15 +65,15 @@ pub use recording::{
     DEFAULT_SEGMENT_SPAN_NS, FinishRecording, FinishRecordingReceipt, MAX_RECORDED_EVENTS,
     MAX_XTF_EVENT_ENVELOPE_BYTES, PersistRecordingSegment, PersistSegmentDisposition,
     PersistSegmentReceipt, RecordEvents, RecordEventsReceipt, RecordingCapture,
-    RecordingCaptureService, RecordingPersistencePort, SegmentPolicy,
+    RecordingCaptureService, RecordingCompletion, RecordingPersistencePort, SegmentPolicy,
 };
 pub use recording_queries::{
     DEFAULT_RECORDING_EVENT_LIMIT, DEFAULT_RECORDING_LIST_LIMIT, FieldRepresentation,
-    FieldTruncation, ListRecordings, MAX_RECORDING_DISPLAY_FIELD_BYTES, MAX_RECORDING_EVENT_LIMIT,
-    MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_LIST_LIMIT,
-    MAX_RECORDING_RELATIONSHIP_ID_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES, PersistedEvent,
-    PersistedInteraction, PersistedSource, RECORDING_READ_SCHEMA_VERSION, RecordingDetail,
-    RecordingEventWindow, RecordingListPage, RecordingMetadata, RecordingQueryService,
-    RecordingReadPort, RecordingStatus, ShowRecording, ShowWindowRequest, SourceStatus,
-    UnavailableEvidence, list_recordings, show_recording,
+    FieldTruncation, FrameNavigation, ListRecordings, MAX_RECORDING_DISPLAY_FIELD_BYTES,
+    MAX_RECORDING_EVENT_LIMIT, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_LIST_LIMIT,
+    MAX_RECORDING_RELATIONSHIP_ID_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES, NavigationResult,
+    PersistedEvent, PersistedInteraction, PersistedSource, RECORDING_READ_SCHEMA_VERSION,
+    RecordingCompletionEvidence, RecordingDetail, RecordingEventWindow, RecordingListPage,
+    RecordingMetadata, RecordingQueryService, RecordingReadPort, RecordingStatus, ShowRecording,
+    ShowWindowRequest, SourceStatus, UnavailableEvidence, list_recordings, show_recording,
 };

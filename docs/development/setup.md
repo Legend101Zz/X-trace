@@ -219,10 +219,12 @@ cargo run -q -p xtrace-cli --bin xtrace -- recording list \
 
 Endpoint pages default to 50 rows and allow at most 100. Linked and unmatched
 recording pages default to 25 rows and allow at most 50. The existing
-`recording list` invocation remains the legacy recording projection: it
-defaults to 50 rows, allows at most 200, accepts `--after <recording-id>`, and
-keeps its legacy JSON fields. `--cursor` is used by the new linked or unmatched
-recording projections; `--after` remains the legacy cursor.
+`recording list` defaults to 50 rows, allows at most 200, and accepts
+`--after <recording-id>`. Recording read JSON schema version 2 adds typed
+completion evidence; historical rows without durable finish proof report
+`unavailable` even if their old lifecycle status is terminal. `--cursor` is
+used by the new linked or unmatched recording projections; `--after` remains
+the recording-list cursor.
 
 The catalog reflects persisted observations accepted by the current exact
 `spring-orders-v1` fixture policy for `POST /orders`. It does not discover
@@ -244,12 +246,24 @@ compressed-plus-logical XTF input per request. If another segment would exceed
 the input budget, the response stops at the preceding event and returns a
 cursor; one codec-bounded first segment may be processed to ensure progress.
 Use the returned versioned `next_cursor` with `--cursor` to continue. The
-cursor is bound to the selected project and recording. Raw interaction paths
+cursor is bound to the selected project and recording. Terminal verification is
+bounded to 2,048 events and 16 MiB of combined compressed and logical segment
+bytes; larger captures remain partial until a higher bound is explicitly
+implemented and tested. Raw interaction paths
 are omitted because path segments may contain identifiers or tokens. Oversized
 display fields become `[truncated]`; oversized identity/relationship fields
 become `[unavailable]`, with field names and original byte lengths reported
-without source text. These are persisted facts, not debugger-complete replay:
-values, source bodies, and completion semantics remain unavailable.
+without source text. Detail includes stable UUIDv7 frame IDs where the index
+matches verified XTF events, and previous/next targets only where adjacent
+immutable events have also been verified. `into`, `over`, and `out` remain
+unavailable until a verified event-graph resolver is implemented. Adapter-
+declared duration and drop counts remain separate from completion. Unexercised
+capability codes remain in the bounded finish evidence but are not projected
+until they can be checked against an adapter manifest. A producer-declared
+summary is exposed only in a non-preview privacy state and is not proof of a
+captured response outcome. Event values and full source replay remain
+unavailable; bounded source excerpts are limited to the attested fixture
+methods.
 Read-only SQLite access keeps normal WAL visibility and may create SQLite
 coordination sidecars, but does not apply migrations or update project or
 pointer metadata.
