@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use xtrace_domain::ProjectId;
+use xtrace_domain::ids::Id as _;
 
 use crate::error::CliError;
 
@@ -34,7 +35,12 @@ const XTRACE_FOLDER: &str = "xtrace";
 const PROJECTS_FOLDER: &str = "projects";
 /// Pointer file format version the binary understands.
 const POINTER_SCHEMA_VERSION: u32 = 1;
-const PENDING_SCHEMA_VERSION: u32 = 1;
+const PENDING_SCHEMA_VERSION: u32 = 2;
+
+fn valid_project_id(project_id: ProjectId) -> bool {
+    let uuid = project_id.as_uuid();
+    uuid.get_version_num() == 7 && uuid.get_variant() == uuid::Variant::RFC4122
+}
 
 /// Pointer file written into the repository root by `xtrace init`.
 ///
@@ -93,6 +99,9 @@ impl PendingInit {
         idempotency_key: &str,
         canonical_repo_path: &str,
     ) -> Result<Self, CliError> {
+        if !valid_project_id(project_id) {
+            return Err(CliError::InvalidArgument("project identifier is invalid".into()));
+        }
         if !data_home.is_absolute()
             || data_home.as_os_str().as_encoded_bytes().len() > crate::pointer_io::MAX_PATH_BYTES
         {
@@ -102,8 +111,7 @@ impl PendingInit {
         }
         let display_name_digest = digest(display_name);
         let idempotency_key_digest = digest(idempotency_key);
-        let canonical_input_digest =
-            digest(&format!("{canonical_repo_path}\n{display_name}\n{idempotency_key}"));
+        let canonical_input_digest = canonical_input_digest(canonical_repo_path, display_name);
         Ok(Self {
             schema_version: PENDING_SCHEMA_VERSION,
             repository_fingerprint,
@@ -145,6 +153,7 @@ impl PendingInit {
         let marker: Self = toml::from_str(text)
             .map_err(|_| CliError::StoreCorrupted("init recovery metadata is invalid".into()))?;
         if marker.schema_version != PENDING_SCHEMA_VERSION
+            || !valid_project_id(marker.project_id)
             || !marker.data_home.is_absolute()
             || marker.data_home.as_os_str().as_encoded_bytes().len()
                 > crate::pointer_io::MAX_PATH_BYTES
@@ -187,6 +196,15 @@ fn digest(value: &str) -> String {
     format!("b3:{}", blake3::hash(value.as_bytes()).to_hex())
 }
 
+fn canonical_input_digest(canonical_repo_path: &str, display_name: &str) -> String {
+    let mut input = b"xtrace.init-input\0\x02".to_vec();
+    for value in [canonical_repo_path.as_bytes(), display_name.as_bytes()] {
+        input.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        input.extend_from_slice(value);
+    }
+    format!("b3:{}", blake3::hash(&input).to_hex())
+}
+
 impl From<RepositoryPointer> for RepositoryPointerToml {
     fn from(value: RepositoryPointer) -> Self {
         Self {
@@ -205,6 +223,9 @@ impl TryFrom<RepositoryPointerToml> for RepositoryPointer {
                 "unsupported pointer schema_version {} (binary expects {})",
                 value.schema_version, POINTER_SCHEMA_VERSION
             )));
+        }
+        if !valid_project_id(value.project_id) {
+            return Err(CliError::StoreCorrupted("pointer project identifier is invalid".into()));
         }
         if !value.data_home.is_absolute() {
             return Err(CliError::StoreCorrupted("pointer data home is not absolute".into()));
@@ -229,6 +250,11 @@ impl TryFrom<RepositoryPointerToml> for RepositoryPointer {
 impl RepositoryPointer {
     /// Writes the pointer without replacing a pointer already present.
     pub fn write(&self, repo: &Path) -> Result<(), CliError> {
+        if !valid_project_id(self.project_id) {
+            return Err(CliError::StoreCorrupted(
+                "refusing pointer with an invalid project identifier".into(),
+            ));
+        }
         if !self.data_home.is_absolute() {
             return Err(CliError::StoreCorrupted(
                 "refusing pointer with non-absolute data home".into(),
@@ -276,6 +302,11 @@ impl RepositoryPointer {
     }
 
     pub(crate) fn serialized(&self) -> Result<Vec<u8>, CliError> {
+        if !valid_project_id(self.project_id) {
+            return Err(CliError::StoreCorrupted(
+                "repository pointer project identifier is invalid".into(),
+            ));
+        }
         if self.data_home.as_os_str().as_encoded_bytes().len() > crate::pointer_io::MAX_PATH_BYTES {
             return Err(CliError::StoreCorrupted(
                 "repository data home exceeds its path limit".into(),
@@ -670,6 +701,60 @@ mod tests {
         )
         .expect("bounded path");
         assert!(pending.serialized().is_err());
+    }
+
+    #[test]
+    fn pending_input_digest_uses_unambiguous_versioned_framing() {
+        let left = canonical_input_digest("/repo\nname", "X");
+        let right = canonical_input_digest("/repo", "name\nX");
+        assert_ne!(left, right);
+        assert_eq!(left, canonical_input_digest("/repo\nname", "X"));
+    }
+
+    #[test]
+    fn pointer_and_pending_reject_non_v7_project_ids() {
+        let v4 = ProjectId::from_uuid(
+            uuid::Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("UUIDv4"),
+        );
+        let pointer = RepositoryPointer {
+            schema_version: POINTER_SCHEMA_VERSION,
+            project_id: v4,
+            data_home: PathBuf::from("/tmp/xtrace-data"),
+        };
+        assert!(pointer.serialized().is_err());
+        assert!(
+            PendingInit::new(
+                "fingerprint".into(),
+                v4,
+                PathBuf::from("/tmp/xtrace-data"),
+                "name",
+                "key",
+                "/repo",
+            )
+            .is_err()
+        );
+        let pointer_text = format!(
+            "schema_version = 1\nproject_id = \"{v4}\"\ndata_home = \"/tmp/xtrace-data\"\n"
+        );
+        assert!(RepositoryPointer::parse(pointer_text.as_bytes()).is_err());
+
+        let mut valid_marker = PendingInit::new(
+            "fingerprint".into(),
+            ProjectId::new(),
+            PathBuf::from("/tmp/xtrace-data"),
+            "name",
+            "key",
+            "/repo",
+        )
+        .expect("valid marker")
+        .serialized()
+        .expect("serialize marker");
+        let valid_id = PendingInit::parse(&valid_marker).expect("parse valid marker").project_id;
+        let changed = String::from_utf8(valid_marker.clone())
+            .expect("marker UTF-8")
+            .replace(&valid_id.to_string(), &v4.to_string());
+        valid_marker = changed.into_bytes();
+        assert!(PendingInit::parse(&valid_marker).is_err());
     }
 
     fn tempdir() -> PathBuf {

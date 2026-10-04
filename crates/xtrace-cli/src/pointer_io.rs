@@ -17,8 +17,18 @@ pub(crate) const PENDING_MAX_BYTES: usize = 8192;
 pub(crate) const MAX_PATH_BYTES: usize = 4096;
 const BUDGET: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublishStage {
+    TemporaryCreated,
+    TemporarySynced,
+    BeforeRename,
+    Renamed,
+    BeforeDirectorySync,
+    DirectorySynced,
+}
+
 pub(crate) struct RepositoryInitLock {
-    _file: File,
+    file: File,
     root: File,
     pub(crate) directory: File,
     started: Instant,
@@ -62,7 +72,8 @@ impl RepositoryInitLock {
             match fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
                 Ok(()) => {
                     validate_directory_name(&repo_file, ".xtrace", &directory)?;
-                    return Ok(Self { _file: file, root: repo_file, directory, started });
+                    validate_file(&file, &directory, "init.lock")?;
+                    return Ok(Self { file, root: repo_file, directory, started });
                 }
                 Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
                     std::thread::sleep(Duration::from_millis(10));
@@ -73,24 +84,38 @@ impl RepositoryInitLock {
     }
 
     pub(crate) fn read(&self, name: &str, cap: usize) -> Result<Option<Vec<u8>>, CliError> {
-        validate_directory_name(&self.root, ".xtrace", &self.directory)?;
+        self.revalidate()?;
         let result = read_at(&self.directory, name, cap, self.started)?;
-        validate_directory_name(&self.root, ".xtrace", &self.directory)?;
+        self.revalidate()?;
         Ok(result)
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), CliError> {
         validate_directory_name(&self.root, ".xtrace", &self.directory)?;
+        validate_file(&self.file, &self.directory, "init.lock")?;
         check_budget(self.started)
     }
 
     pub(crate) fn publish(&self, name: &str, bytes: &[u8], cap: usize) -> Result<(), CliError> {
+        self.publish_with_hook(name, bytes, cap, |_| Ok(()))
+    }
+
+    fn publish_with_hook<F>(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        cap: usize,
+        mut hook: F,
+    ) -> Result<(), CliError>
+    where
+        F: FnMut(PublishStage) -> Result<(), CliError>,
+    {
         if bytes.len() > cap {
             return Err(CliError::StoreCorrupted(
                 "repository metadata exceeds its size limit".into(),
             ));
         }
-        validate_directory_name(&self.root, ".xtrace", &self.directory)?;
+        self.revalidate()?;
         let random = uuid::Uuid::now_v7().simple().to_string();
         let temporary_name = format!(".xtrace-{random}.tmp");
         let file = open_at(
@@ -114,13 +139,16 @@ impl RepositoryInitLock {
             return Err(io_error("secure new repository metadata"));
         }
         let result = (|| {
+            hook(PublishStage::TemporaryCreated)?;
             (&file).write_all(bytes).map_err(|_| io_error("write repository metadata"))?;
             check_budget(self.started)?;
             file.sync_all().map_err(|_| io_error("sync repository metadata"))?;
+            hook(PublishStage::TemporarySynced)?;
             let current = file.metadata().map_err(|_| io_error("inspect repository metadata"))?;
             validate_metadata(&current)?;
             ensure_same(&initial, &current)?;
             ensure_name_matches(&self.directory, &temporary_name, &current)?;
+            hook(PublishStage::BeforeRename)?;
             fs::renameat_with(
                 &self.directory,
                 &temporary_name,
@@ -133,11 +161,13 @@ impl RepositoryInitLock {
                     "repository metadata already exists or could not be published".into(),
                 )
             })?;
+            hook(PublishStage::Renamed)?;
+            hook(PublishStage::BeforeDirectorySync)?;
             self.directory
                 .sync_all()
                 .map_err(|_| io_error("sync repository metadata directory"))?;
-            validate_directory_name(&self.root, ".xtrace", &self.directory)?;
-            check_budget(self.started)
+            hook(PublishStage::DirectorySynced)?;
+            self.revalidate()
         })();
         if result.is_err() {
             match open_at(
@@ -178,7 +208,7 @@ impl RepositoryInitLock {
     }
 
     pub(crate) fn remove_owned(&self, name: &str, expected: &File) -> Result<(), CliError> {
-        validate_directory_name(&self.root, ".xtrace", &self.directory)?;
+        self.revalidate()?;
         let metadata =
             expected.metadata().map_err(|_| io_error("inspect owned repository metadata"))?;
         validate_metadata(&metadata)?;
@@ -186,10 +216,11 @@ impl RepositoryInitLock {
         fs::unlinkat(&self.directory, name, AtFlags::empty())
             .map_err(|_| io_error("remove owned repository metadata"))?;
         self.directory.sync_all().map_err(|_| io_error("sync repository metadata directory"))?;
-        validate_directory_name(&self.root, ".xtrace", &self.directory)
+        self.revalidate()
     }
 
     pub(crate) fn open_owned(&self, name: &str) -> Result<File, CliError> {
+        self.revalidate()?;
         let file = open_at(
             &self.directory,
             name,
@@ -197,6 +228,7 @@ impl RepositoryInitLock {
             Mode::empty(),
         )?;
         validate_file(&file, &self.directory, name)?;
+        self.revalidate()?;
         Ok(file)
     }
 }
@@ -271,12 +303,85 @@ mod tests {
     }
 
     #[test]
+    fn init_lock_rejects_a_replaced_lock_name_after_acquisition() {
+        let (_temp, repo) = repo();
+        let lock = RepositoryInitLock::acquire(&repo).expect("lock");
+        let metadata_dir = repo.join(".xtrace");
+        std::fs::rename(metadata_dir.join("init.lock"), metadata_dir.join("detached.lock"))
+            .expect("detach locked inode");
+        std::fs::write(metadata_dir.join("init.lock"), b"replacement").expect("replace lock name");
+
+        assert!(lock.revalidate().is_err());
+        assert!(lock.read("config.toml", POINTER_MAX_BYTES).is_err());
+    }
+
+    #[test]
     fn serialized_pointer_read_is_capped_before_parsing() {
         let (_temp, repo) = repo();
         let lock = RepositoryInitLock::acquire(&repo).expect("lock");
         let body = vec![b'x'; POINTER_MAX_BYTES + 1];
         lock.publish("oversized", &body, POINTER_MAX_BYTES + 1).expect("test publication");
         assert!(lock.read("oversized", POINTER_MAX_BYTES).is_err());
+    }
+
+    #[test]
+    fn pending_marker_retries_after_injected_temp_and_rename_failures() {
+        for failure_stage in [
+            PublishStage::TemporaryCreated,
+            PublishStage::TemporarySynced,
+            PublishStage::BeforeRename,
+        ] {
+            let (_temp, repo) = repo();
+            let lock = RepositoryInitLock::acquire(&repo).expect("lock");
+            let marker = b"durable recovery locator";
+            let failed =
+                lock.publish_with_hook("init.pending", marker, PENDING_MAX_BYTES, |stage| {
+                    if stage == failure_stage {
+                        Err(CliError::StoreUnavailable("injected publication failure".into()))
+                    } else {
+                        Ok(())
+                    }
+                });
+            assert!(failed.is_err());
+            assert_eq!(lock.read("init.pending", PENDING_MAX_BYTES).expect("marker read"), None);
+            lock.publish("init.pending", marker, PENDING_MAX_BYTES).expect("retry marker");
+            assert_eq!(
+                lock.read("init.pending", PENDING_MAX_BYTES).expect("read published marker"),
+                Some(marker.to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_retry_after_rename_and_directory_sync_uncertainty_is_exact() {
+        for failure_stage in [
+            PublishStage::Renamed,
+            PublishStage::BeforeDirectorySync,
+            PublishStage::DirectorySynced,
+        ] {
+            let (_temp, repo) = repo();
+            let lock = RepositoryInitLock::acquire(&repo).expect("lock");
+            let pointer = crate::paths::RepositoryPointer {
+                schema_version: 1,
+                project_id: xtrace_domain::ProjectId::new(),
+                data_home: repo.join("user-data"),
+            };
+            let bytes = pointer.serialized().expect("pointer bytes");
+            let failed =
+                lock.publish_with_hook("config.toml", &bytes, POINTER_MAX_BYTES, |stage| {
+                    if stage == failure_stage {
+                        Err(CliError::StoreUnavailable("injected publication uncertainty".into()))
+                    } else {
+                        Ok(())
+                    }
+                });
+            assert!(failed.is_err());
+            assert_eq!(
+                crate::paths::RepositoryPointer::read_locked(&lock).expect("read pointer"),
+                Some(pointer.clone())
+            );
+            pointer.write_locked(&lock, &bytes).expect("exact retry");
+        }
     }
 }
 
@@ -376,12 +481,10 @@ fn open_or_create_directory(parent: &File, name: &str) -> Result<File, CliError>
     if created {
         parent.sync_all().map_err(|_| io_error("sync repository directory"))?;
     }
-    let directory = open_existing_directory(parent, name)?;
-    if created {
-        fs::fchmod(&directory, Mode::from_bits_truncate(0o700))
-            .map_err(|_| io_error("secure new repository metadata directory"))?;
-    }
-    Ok(directory)
+    // mkdirat applies 0700 subject only to a restrictive umask. Never repair
+    // permissions through a pathname after creation: the name may have been
+    // replaced between mkdirat and this descriptor open.
+    open_existing_directory(parent, name)
 }
 
 fn open_at(parent: &File, name: &str, flags: OFlags, mode: Mode) -> Result<File, CliError> {

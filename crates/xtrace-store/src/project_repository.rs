@@ -30,6 +30,8 @@ use xtrace_domain::{
 use crate::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
 
+const MAX_INIT_RECEIPT_JSON_BYTES: i64 = 8192;
+
 fn insert_project_row(
     tx: &rusqlite::Transaction<'_>,
     project: &Project,
@@ -99,6 +101,8 @@ impl ProjectRepository for SqliteProjectRepository<'_> {
     ) -> Result<StoredReceipt, PortError> {
         let correlation_id = self.correlation_id();
         if receipt.project_id != project.id
+            || project.id.as_uuid().get_version_num() != 7
+            || project.id.as_uuid().get_variant() != uuid::Variant::RFC4122
             || receipt.command_kind != "initialize_project"
             || receipt.idempotency_key.is_empty()
             || receipt.idempotency_key.len() > 128
@@ -106,6 +110,7 @@ impl ProjectRepository for SqliteProjectRepository<'_> {
             || receipt.input_digest.len() != 67
             || !receipt.input_digest.starts_with("b3:")
             || !receipt.input_digest[3..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            || receipt.receipt_json.len() > MAX_INIT_RECEIPT_JSON_BYTES as usize
             || RepositoryFingerprint::try_from_canonical(project.canonical_repo_hash.as_str())
                 .is_err()
         {
@@ -143,12 +148,21 @@ impl ProjectRepository for SqliteProjectRepository<'_> {
             .map_err(Self::map_error)?;
 
         let mut statement = tx.prepare(
-            "SELECT project_id, command_kind, idempotency_key, input_digest, correlation_id, created_at, receipt_json \
-             FROM command_receipts WHERE command_kind = ?1 AND idempotency_key = ?2",
+            "SELECT CASE WHEN length(CAST(project_id AS BLOB)) = 16 THEN project_id ELSE NULL END, \
+             command_kind, idempotency_key, \
+             CASE WHEN length(CAST(input_digest AS BLOB)) <= 67 THEN input_digest ELSE NULL END, \
+             CASE WHEN length(CAST(correlation_id AS BLOB)) <= 64 THEN correlation_id ELSE NULL END, \
+             CASE WHEN length(CAST(created_at AS BLOB)) <= 64 THEN created_at ELSE NULL END, \
+             CASE WHEN length(CAST(receipt_json AS BLOB)) <= ?3 THEN receipt_json ELSE NULL END \
+             FROM command_receipts WHERE command_kind = ?1 AND idempotency_key = ?2 LIMIT 2",
         ).map_err(|err| StoreError::from_rusqlite(err, correlation_id)).map_err(Self::map_error)?;
         let rows = statement
             .query_map(
-                rusqlite::params![receipt.command_kind, receipt.idempotency_key],
+                rusqlite::params![
+                    receipt.command_kind,
+                    receipt.idempotency_key,
+                    MAX_INIT_RECEIPT_JSON_BYTES
+                ],
                 map_receipt_row,
             )
             .map_err(|err| StoreError::from_rusqlite(err, correlation_id))
@@ -797,6 +811,20 @@ mod tests {
     }
 
     #[test]
+    fn atomic_init_rejects_non_v7_project_identity_at_store_boundary() {
+        let store = fixture();
+        let repository = SqliteProjectRepository::new(&store);
+        let mut project = sample_project("invalid identity");
+        project.id = ProjectId::from_uuid(
+            Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("UUIDv4"),
+        );
+        let error = repository
+            .initialize_project_with_receipt(&project, &init_receipt(&project))
+            .expect_err("store enforces UUIDv7 project identity");
+        assert_eq!(error.kind(), PortErrorKind::Validation);
+    }
+
+    #[test]
     fn atomic_init_requires_proof_for_a_legacy_project_without_receipt() {
         let store = fixture();
         let repository = SqliteProjectRepository::new(&store);
@@ -839,6 +867,77 @@ mod tests {
             .expect_err("ambiguous global key");
         assert_eq!(error.kind(), PortErrorKind::Conflict);
         assert!(error.message().contains("ambiguous"));
+    }
+
+    #[test]
+    fn atomic_init_bounds_persisted_receipt_json_before_deserialization() {
+        let store = fixture();
+        let repository = SqliteProjectRepository::new(&store);
+        let project = sample_project("oversized receipt");
+        repository.insert_project(&project).expect("existing project");
+        let mut receipt = init_receipt(&project);
+        receipt.receipt_json = "x".repeat(MAX_INIT_RECEIPT_JSON_BYTES as usize + 1);
+        let conn = store.lock().expect("store lock");
+        conn.execute(
+            "INSERT INTO command_receipts (project_id, command_kind, idempotency_key, input_digest, receipt_json, correlation_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                receipt.project_id.as_uuid().as_bytes().to_vec(), receipt.command_kind,
+                receipt.idempotency_key, receipt.input_digest, receipt.receipt_json,
+                receipt.correlation_id.to_string(), receipt.created_at.to_rfc3339(),
+            ],
+        ).expect("persist oversized legacy row");
+        drop(conn);
+        let error = repository
+            .initialize_project_with_receipt(&project, &init_receipt(&project))
+            .expect_err("oversized receipt is rejected at query admission");
+        assert_eq!(error.kind(), PortErrorKind::Validation);
+    }
+
+    #[test]
+    fn injected_project_receipt_and_commit_failures_roll_back_and_retry_after_reopen() {
+        for (trigger_sql, trigger_name) in [
+            (
+                "CREATE TRIGGER fail_project BEFORE INSERT ON projects BEGIN SELECT RAISE(ABORT, 'injected project failure'); END",
+                "fail_project",
+            ),
+            (
+                "CREATE TRIGGER fail_receipt BEFORE INSERT ON command_receipts BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END",
+                "fail_receipt",
+            ),
+            (
+                "CREATE TABLE commit_fault (project_id BLOB REFERENCES projects(project_id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_commit AFTER INSERT ON command_receipts BEGIN INSERT INTO commit_fault(project_id) VALUES (zeroblob(16)); END",
+                "fail_commit",
+            ),
+        ] {
+            let directory = tempfile::tempdir().expect("private test directory");
+            let database_path = directory.path().join("metadata.sqlite3");
+            let store = SqliteStore::open(&database_path, OpenOptions::default())
+                .expect("create test database");
+            let project = sample_project("fault recovery");
+            let requested = init_receipt(&project);
+            store.lock().expect("store lock").execute_batch(trigger_sql).expect("inject fault");
+            let repository = SqliteProjectRepository::new(&store);
+            assert!(repository.initialize_project_with_receipt(&project, &requested).is_err());
+            drop(repository);
+            drop(store);
+
+            let reopened = SqliteStore::open(&database_path, OpenOptions::default())
+                .expect("reopen after interrupted transaction");
+            assert!(reopened.project_repository().list_projects().expect("projects").is_empty());
+            let conn = reopened.lock().expect("reopened lock");
+            let receipts: i64 = conn
+                .query_row("SELECT count(*) FROM command_receipts", [], |row| row.get(0))
+                .expect("receipt count");
+            assert_eq!(receipts, 0);
+            conn.execute_batch(&format!("DROP TRIGGER {trigger_name};"))
+                .expect("remove injected trigger");
+            drop(conn);
+            let repository = reopened.project_repository();
+            repository
+                .initialize_project_with_receipt(&project, &requested)
+                .expect("same identity retry after reopen");
+            assert_eq!(repository.list_projects().expect("project after retry").len(), 1);
+        }
     }
 
     #[test]

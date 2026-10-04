@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     AppError, CorrelationId, ErrorCategory, ErrorCode, Project, ProjectId, RepositoryFingerprint,
     RetryAdvice, RunKind, WallTime, codes,
@@ -152,6 +153,18 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
         validate_canonical_repo_path(&cmd.canonical_repo_path, ctx.correlation_id)?;
         validate_display_name(&cmd.display_name, ctx.correlation_id)?;
         validate_idempotency_key(&cmd.idempotency_key, ctx.correlation_id)?;
+        let project_uuid = cmd.project_id.as_uuid();
+        if project_uuid.get_version_num() != 7
+            || project_uuid.get_variant() != uuid::Variant::RFC4122
+        {
+            return Err(AppError::new(
+                ErrorCode::new("XTR-PROJECT-ID-INVALID"),
+                ErrorCategory::Validation,
+                "project identifier must be a canonical UUIDv7",
+                RetryAdvice::None,
+                ctx.correlation_id,
+            ));
+        }
         let fingerprint = RepositoryFingerprint::from_canonical_path(&cmd.canonical_repo_path);
         let input_digest =
             canonical_input_digest(COMMAND_KIND_INIT, &cmd.canonical_repo_path, &cmd.display_name);
@@ -974,7 +987,26 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.category, ErrorCategory::Conflict);
-        assert!(err.message.contains("without independently persisted initialization proof"));
+        assert!(err.message.contains("stub: project exists without receipt"));
+    }
+
+    #[test]
+    fn init_rejects_a_non_v7_project_identifier() {
+        let project_id = ProjectId::from_uuid(
+            uuid::Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("UUIDv4"),
+        );
+        let error = app()
+            .execute(
+                Command::InitializeProject(InitializeProject {
+                    canonical_repo_path: "/tmp/invalid-project-id".into(),
+                    display_name: "Invalid identity".into(),
+                    idempotency_key: "init-key".into(),
+                    project_id,
+                }),
+                &ctx(),
+            )
+            .expect_err("project IDs remain UUIDv7");
+        assert_eq!(error.category, ErrorCategory::Validation);
     }
 
     #[test]

@@ -569,7 +569,7 @@ where
         display_name.trim().to_string()
     };
     let idempotency_key = if idempotency_key.trim().is_empty() {
-        format!("xtrace-init-{canonical}")
+        default_init_idempotency_key(&canonical)
     } else {
         idempotency_key.trim().to_string()
     };
@@ -736,6 +736,10 @@ where
     let document = InitDocument::from_receipt(&receipt, &pointer, &database_path);
     write_success(&mut handle, &document)?;
     Ok(())
+}
+
+fn default_init_idempotency_key(canonical_repo_path: &str) -> String {
+    format!("xtrace-init-v1-{}", blake3::hash(canonical_repo_path.as_bytes()).to_hex())
 }
 
 fn open<F>(project_dir: PathBuf, idempotency_key: String, env_reader: &F) -> Result<(), CliError>
@@ -1023,6 +1027,55 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use xtrace_domain::ProjectId;
+
+    #[test]
+    fn default_init_key_is_bounded_and_path_specific() {
+        let long_path = format!("/{}", "a".repeat(crate::pointer_io::MAX_PATH_BYTES - 1));
+        let key = default_init_idempotency_key(&long_path);
+        assert!(key.len() <= 128);
+        assert_eq!(key, default_init_idempotency_key(&long_path));
+        assert_ne!(key, default_init_idempotency_key("/different"));
+    }
+
+    #[test]
+    fn init_reuses_the_durable_marker_after_private_database_root_failure() {
+        let repo = tempdir("init-recovery-repo");
+        let data_home = tempdir("init-recovery-home").join("blocked-home");
+        std::fs::write(&data_home, b"injected database-root creation failure")
+            .expect("block private root creation");
+        let configured_home = data_home.clone();
+        let env_reader =
+            move |name: &str| (name == USER_DATA_HOME_ENV).then(|| configured_home.clone());
+
+        let first = init(repo.clone(), "Recovery".into(), String::new(), &env_reader);
+        assert!(first.is_err());
+        let marker_bytes = crate::pointer_io::read_unlocked(
+            &repo,
+            "init.pending",
+            crate::pointer_io::PENDING_MAX_BYTES,
+        )
+        .expect("read pending marker")
+        .expect("marker survives database-root failure");
+        let original_project_id = crate::paths::PendingInit::parse(&marker_bytes)
+            .expect("valid pending marker")
+            .project_id();
+
+        std::fs::remove_file(&data_home).expect("remove injected blocker");
+        std::fs::create_dir(&data_home).expect("allow private root creation");
+        init(repo.clone(), "Recovery".into(), String::new(), &env_reader)
+            .expect("retry init with same marker");
+        let pointer = crate::paths::RepositoryPointer::read(&repo).expect("published pointer");
+        assert_eq!(pointer.project_id, original_project_id);
+        assert!(
+            crate::pointer_io::read_unlocked(
+                &repo,
+                "init.pending",
+                crate::pointer_io::PENDING_MAX_BYTES,
+            )
+            .expect("check marker cleanup")
+            .is_none()
+        );
+    }
 
     #[test]
     fn safe_run_identity_uses_ascii_allowlist_and_never_echoes_input() {
