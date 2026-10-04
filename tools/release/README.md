@@ -206,3 +206,28 @@ recorded in the receipt under `provenance` (`leased_run`) or per gate/probe
 (`run_gates`, disable with `--no-provenance`). It proves non-descent in the fork
 tree only; see `docs/decisions/0007-process-provenance-classification-for-builder-quiescence.md`
 for the residual delegated-work routes.
+
+## Manual recovery of retained leases
+
+`tools/release/recover_leases.py` implements the bounded manual-recovery protocol for the two builder
+leases a failed run retains. It uses only `private_roots`, `run_gates` and `provenance`, sends no
+signal, uses no privilege and applies no UID or name exemption. Default is a dry run that writes a
+sanitized `release-gates/<label>/recovery-plan-<utc>.json`; `--execute --confirm-label <label>`
+re-does every check, archives both owner records and the failed receipt privately under
+`release-gates/<label>/manual-recovery-<utc>/`, unlinks each `owner.json`, removes each lease directory,
+fsyncs, verifies both are absent and writes `manual-recovery.json` (its sha256 is printed). The failed
+receipt is never modified.
+
+```
+python3.14 -B -m tools.release.recover_leases --cache-root <root> --label <label> \
+    --receipt <root>/release-gates/<label>/receipt.json [--run-coalition-id <macOS coalition id of the original run's session>]
+```
+
+Recovery is allowed only if both owner records carry the label and `requiresManualRecovery`, their
+directories, inodes and record hashes are stable, every recorded identity (owner records and receipt
+evidence) is exited (PID gone, start differs or zombie) or positively not a descendant
+(`non-descendant-predates-run`, `non-descendant-ancestor-predates-run`, `non-descendant-coalition`), the
+owner process is gone, two complete global scans at least 2 s apart (every live process born since the run
+began) leave nothing unproven, and nothing holds the cache directories open. Identities are observed three
+times at least 2 s apart. An empty `lsof` result is supporting evidence only. Exit codes: 0 allowed or
+recovered, 1 refused, 2 invalid input or admission, 3 recovery started but incomplete.

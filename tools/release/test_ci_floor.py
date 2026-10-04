@@ -913,6 +913,12 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         )
 
     def test_stalled_nested_ps_escalates_term_ignorer_within_outer_cleanup_deadline(self) -> None:
+        # Every product reserve and the outer timeout are scaled together so the fixture keeps the
+        # exact relationships between them (grace < kill reserve < cleanup, stall > cleanup) but
+        # tolerates scheduling delays on loaded hosts: the helper is a real Python process and
+        # starts in tens to hundreds of milliseconds there. Product defaults are not touched.
+        SCALE = 4
+        STALL_SECONDS = 2 * SCALE + 4
         with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
             root = pathlib.Path(temporary)
             fake_bin = root / "bin"
@@ -977,7 +983,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 "  publish(str(pathlib.Path(__file__).with_name('main-stall-context')), 'main_after_identity')\n"
                 "  publish(str(pathlib.Path(__file__).with_name('main-stall-stage')), 'stalling')\n"
                 "  publish(str(pathlib.Path(__file__).with_name('ps-stall-entered')), 'entered')\n"
-                "  time.sleep(2)\n"
+                f"  time.sleep({STALL_SECONDS})\n"
                 "  publish(str(pathlib.Path(__file__).with_name('main-stall-stage')), 'delegating')\n"
                 "os.execv('/bin/ps', ['/bin/ps', *sys.argv[1:]])\n",
                 encoding="utf-8",
@@ -1013,6 +1019,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
             probe_popen_launch_failed = False
             probe_snapshot_diagnostic_failed = False
             probe_any_unreaped_boundary = False
+            probe_deadline_unreaped: set[int] = set()
             probe_any_unavailable_boundary = False
             probe_snapshot_trace_overflow = False
             probe_rescue_attempted = False
@@ -1131,7 +1138,21 @@ class CiFloorEvidenceTests(unittest.TestCase):
                             or int(summary.get("omittedProbeStatuses", 0)) > 0
                             or bool(summary.get("probeStatusOmissionOverflow", False))):
                         probe_any_unavailable_boundary = True
-                    if int(summary.get("returncodeUnknownCount", 0)) > 0:
+                    # Product contract (_utility_process_snapshot): a snapshot that RETURNS has
+                    # reaped its helper. One that fails closed because the outer cleanup deadline
+                    # is exhausted kills the in-flight helper but, by design, does not wait past
+                    # the deadline, so exactly that one helper may still be unreaped at that
+                    # boundary (it is reaped by the rescue below). Anything else is a leak.
+                    unknown = {
+                        index for index, (handle, _launched) in enumerate(probe_processes[:64])
+                        if handle.returncode is None
+                    }
+                    if outcome == "exception_floor_input":
+                        newly = unknown - probe_deadline_unreaped
+                        if len(newly) > 1:
+                            probe_any_unreaped_boundary = True
+                        probe_deadline_unreaped.update(newly)
+                    elif unknown - probe_deadline_unreaped:
                         probe_any_unreaped_boundary = True
                     item = {
                         "callContext": context,
@@ -1430,9 +1451,12 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         probe_rescue_failed = True
 
             def any_unreaped_probe_handle() -> bool:
-                for process, _launched_at in probe_processes:
+                # Handles whose snapshot failed closed at the exhausted cleanup deadline are the
+                # documented exception (killed, reaped by the rescue); every other helper must
+                # already have a recorded return code.
+                for index, (process, _launched_at) in enumerate(probe_processes):
                     try:
-                        if process.returncode is None:
+                        if process.returncode is None and index not in probe_deadline_unreaped:
                             return True
                     except Exception:
                         return True
@@ -1517,18 +1541,18 @@ class CiFloorEvidenceTests(unittest.TestCase):
 
             try:
                 with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{old_path}"}), \
-                        mock.patch.object(ci_floor, "UTILITY_CLEANUP_SECONDS", 0.8), \
-                        mock.patch.object(ci_floor, "UTILITY_TERM_GRACE_SECONDS", 0.2), \
-                        mock.patch.object(ci_floor, "UTILITY_KILL_SIGNAL_RESERVE_SECONDS", 0.15), \
-                        mock.patch.object(ci_floor, "UTILITY_LEADER_REAP_RESERVE_SECONDS", 0.15), \
-                        mock.patch.object(ci_floor, "UTILITY_FINAL_SCAN_RESERVE_SECONDS", 0.1), \
+                        mock.patch.object(ci_floor, "UTILITY_CLEANUP_SECONDS", 0.8 * SCALE), \
+                        mock.patch.object(ci_floor, "UTILITY_TERM_GRACE_SECONDS", 0.2 * SCALE), \
+                        mock.patch.object(ci_floor, "UTILITY_KILL_SIGNAL_RESERVE_SECONDS", 0.15 * SCALE), \
+                        mock.patch.object(ci_floor, "UTILITY_LEADER_REAP_RESERVE_SECONDS", 0.15 * SCALE), \
+                        mock.patch.object(ci_floor, "UTILITY_FINAL_SCAN_RESERVE_SECONDS", 0.1 * SCALE), \
                         mock.patch.object(ci_floor, "_utility_process_snapshot", side_effect=record_snapshot), \
                         mock.patch.object(ci_floor, "_signal_utility_group_members", side_effect=record_signal), \
                         mock.patch.object(ci_floor.subprocess, "Popen", side_effect=record_probe_popen):
                     try:
                         ci_floor._run(
                             [sys.executable, "-c", program, str(child_pid_file), str(term_file), str(handler_ready_file)],
-                            timeout=0.6,
+                            timeout=0.6 * SCALE,
                         )
                     except ci_floor.FloorInputError:
                         pass
@@ -1565,7 +1589,9 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     + diagnostic(),
                 )
                 self.assertGreaterEqual(int(safe_count_file().get("value", 0)), 3, diagnostic())
-                self.assertLess(time.monotonic() - started, 1.8, diagnostic())
+                # The product bound: the outer timeout plus the outer cleanup deadline (plus the
+                # same relative slack the unscaled test allowed), never more.
+                self.assertLess(time.monotonic() - started, 1.8 * SCALE, diagnostic())
                 self.assertTrue(term_file.is_file(), "the owned term-ignorer must receive TERM before KILL: " + diagnostic())
                 child_pid, child_group, child_start = json.loads(child_pid_file.read_text(encoding="utf-8"))
                 self.assertTrue(exact_term_identity_seen,

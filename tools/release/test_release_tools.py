@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import datetime
 import errno
 import hashlib
 import json
@@ -19,7 +20,7 @@ from types import SimpleNamespace
 from argparse import Namespace
 from unittest import mock
 
-from tools.release import check_ledger, leased_run, private_roots, provenance, run_gates
+from tools.release import check_ledger, leased_run, private_roots, provenance, recover_leases, run_gates
 
 REAL_VERSIONS = run_gates._versions
 
@@ -4678,6 +4679,451 @@ class ProvenanceTests(unittest.TestCase):
             value = ctypes.c_int(-1)
             ctypes.CDLL(None).prctl(provenance.PR_GET_CHILD_SUBREAPER, ctypes.byref(value), 0, 0, 0)
             self.assertEqual(value.value, 0, "the subreaper flag is cleared when the command ends")
+
+class RecoverLeasesTests(unittest.TestCase):
+    """recover_leases with fakes for admission, processes, coalitions, lsof and the clock."""
+
+    LABEL = "P00-control-test-run"
+    TOKEN = "feedfacefeedfacefeedfacefeedface"
+    RUN_EPOCH = time.mktime((2026, 10, 4, 16, 0, 0, 0, 0, -1))
+    SELF_PID = 99999
+
+    @staticmethod
+    def lstart(epoch: float) -> str:
+        return time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(epoch))
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(dir=test_scratch_root())
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+        self.cache = self.root / "cache"
+        for name in (*run_gates.CACHE_NAMES, "leases", "release-gates"):
+            (self.cache / name).mkdir(parents=True)
+        self.run_dir = self.cache / "release-gates" / self.LABEL
+        self.run_dir.mkdir()
+        self.clock = FakeClock()
+        self.lines: list[str] = []
+        self.sleeps: list[float] = []
+        self.processes: dict[int, tuple[int, str, str]] = {}
+        self.coalitions: dict[int, int | None] = {}
+        self.uids: dict[int, int] = {}
+        self.holders: list[int] = []
+        self.snapshot_calls = 0
+        self.on_snapshot: object = None
+        self.identities = [(4101, self.lstart(self.RUN_EPOCH + 30)), (4102, self.lstart(self.RUN_EPOCH + 31))]
+        self.write_records()
+
+        def identity(path: object) -> tuple[int, int]:
+            info = os.stat(path)
+            return info.st_dev, info.st_ino
+
+        patches = [
+            mock.patch.object(private_roots, "admit_directory", side_effect=lambda path, private_leaf=False: identity(path)
+                              if os.path.isdir(path) else (_ for _ in ()).throw(private_roots.AdmissionError("private cache admission failed"))),
+            mock.patch.object(private_roots, "read_private_json", side_effect=lambda path, **_k: json.loads(pathlib.Path(os.fspath(path)).read_text())),
+            mock.patch.object(private_roots, "open_private_file_read", side_effect=lambda path: os.open(path, os.O_RDONLY)),
+            mock.patch.object(private_roots, "create_private_file", side_effect=lambda path, flags, mode: os.open(path, flags, mode)),
+            mock.patch.object(private_roots, "ensure_private_directory", side_effect=self.fake_ensure),
+            mock.patch.object(private_roots, "normalize_directory_path", side_effect=lambda value: pathlib.Path(value)),
+            mock.patch.object(os, "kill", side_effect=AssertionError("recovery must never signal")),
+            mock.patch.object(os, "killpg", side_effect=AssertionError("recovery must never signal")),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def fake_ensure(path: object, must_create: bool = False) -> tuple[int, int]:
+        if must_create and os.path.lexists(path):
+            raise FileExistsError("exists")
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.stat(path)
+        return info.st_dev, info.st_ino
+
+    def owner_record(self, **overrides: object) -> dict[str, object]:
+        record: dict[str, object] = {
+            "pid": 70001, "label": self.LABEL, "token": self.TOKEN, "startedAtEpoch": int(self.RUN_EPOCH),
+            "requiresManualRecovery": True, "terminationStatus": "uncertain",
+            "processGroupId": 70001, "ownedProcesses": [{"pid": 4101, "startedAt": self.identities[0][1]}],
+            "unconfirmedProcesses": [{"pid": pid, "startedAt": start, "descriptorStatus": "uninspectable"} for pid, start in self.identities],
+            "unconfirmedProcessCount": 2, "unconfirmedProcessesTruncated": False,
+        }
+        record.update(overrides)
+        return record
+
+    def write_records(self, owner: dict | None = None, receipt: dict | None = None) -> None:
+        for name in ("cargo", "gradle"):
+            lease = self.cache / "leases" / name
+            lease.mkdir(exist_ok=True)
+            (lease / "owner.json").write_text(json.dumps(owner or self.owner_record()))
+        (self.run_dir / "receipt.json").write_text(json.dumps(receipt or {
+            "label": self.LABEL, "decision": "uncertain_process_tree",
+            "naturalExitSettle": {"initialIdentities": [{"pid": pid, "startedAt": start} for pid, start in self.identities]},
+        }))
+
+    def world(self, *rows: tuple[int, int, float, str]) -> None:
+        """Replace the process table: (pid, ppid, start epoch offset from the run start, state)."""
+        self.processes = {pid: (ppid, self.lstart(self.RUN_EPOCH + offset), state) for pid, ppid, offset, state in rows}
+
+    def context(self, **overrides: object) -> recover_leases.Context:
+        def snapshot() -> dict:
+            self.snapshot_calls += 1
+            if callable(self.on_snapshot):
+                self.on_snapshot(self.snapshot_calls)
+            return dict(self.processes)
+
+        def facts(pids: object, _deadline: float) -> dict[int, tuple[int, str]]:
+            return {pid: (self.uids.get(pid, 0), self.processes[pid][1]) for pid in pids if pid in self.processes}  # type: ignore[union-attr]
+
+        def sleep(seconds: float) -> None:
+            self.sleeps.append(seconds)
+            self.clock.now += seconds
+
+        values = dict(
+            platform="darwin", uid=501, self_pid=self.SELF_PID, sleep=sleep, monotonic=self.clock.monotonic,
+            now=lambda: datetime.datetime(2026, 10, 4, 18, 30, 0, tzinfo=datetime.timezone.utc),
+            snapshot=snapshot, coalition_reader=lambda pid: self.coalitions.get(pid), facts_reader=facts,
+            inventory=lambda: [(1, "launchd"), (self.SELF_PID, "python3.14")],
+            lsof=lambda paths: [{"path": path, "pids": list(self.holders), "error": None} for path in paths],
+        )
+        values.update(overrides)
+        return recover_leases.Context(**values)
+
+    def args(self, **overrides: object) -> Namespace:
+        values = dict(cache_root=str(self.cache), label=self.LABEL, receipt=str(self.run_dir / "receipt.json"),
+                      run_coalition_id=[100], execute=False, dry_run=True, confirm_label=None)
+        values.update(overrides)
+        return Namespace(**values)
+
+    def go(self, ctx: recover_leases.Context | None = None, **overrides: object) -> int:
+        return recover_leases.run(self.args(**overrides), ctx or self.context(), out=self.lines.append)
+
+    def summary(self) -> dict:
+        return json.loads(self.lines[-1])
+
+    def quiet_world(self) -> None:
+        # The recorded identities are gone; a pre-existing session process and a launchd daemon
+        # from another coalition exist.
+        self.world((1, 0, -86400, "S"), (500, 1, -3000, "S"), (600, 500, 200, "S"), (700, 1, 300, "S"))
+        self.coalitions.update({700: 7, 600: 100, 500: 100})
+
+    def test_dry_run_allows_when_everything_is_exited_or_provably_not_a_descendant(self) -> None:
+        self.quiet_world()
+        code = self.go()
+        self.assertEqual(code, recover_leases.EXIT_OK, self.lines)
+        summary = self.summary()
+        self.assertEqual(summary["decision"], "recovery-allowed")
+        self.assertEqual(summary["identityClassCounts"], {"exited": 2})
+        self.assertEqual(summary["globalScanUncertain"], [0, 0])
+        self.assertTrue((self.cache / "leases" / "cargo" / "owner.json").exists(), "a dry run never touches the leases")
+        plan = json.loads((self.run_dir / summary["planFile"]).read_text())
+        self.assertEqual(plan["decision"], "recovery-allowed")
+        rendered = json.dumps(plan) + json.dumps(summary)
+        for secret in (self.TOKEN, str(self.root), "token"):
+            self.assertNotIn(secret, rendered)
+        self.assertEqual(plan["protocol"]["observations"], 3)
+        self.assertEqual(len(plan["observations"]), 3)
+        self.assertEqual(len(plan["globalScans"]), 2)
+        self.assertEqual(plan["runCoalitionSources"], ["operator"])
+        # The three observations and two scans are at least two seconds apart.
+        self.assertTrue(all(gap >= 2.0 for gap in self.sleeps), self.sleeps)
+        self.assertGreaterEqual(self.clock.now, 2 * 2.0 + 2.0)
+
+    def test_every_refusal_branch_refuses_and_leaves_the_leases_alone(self) -> None:
+        def tamper(change: object) -> None:
+            self.quiet_world()
+            change()  # type: ignore[operator]
+
+        def mismatch_label() -> None:
+            record = json.loads((self.cache / "leases" / "gradle" / "owner.json").read_text())
+            record["label"] = "someone-else"
+            (self.cache / "leases" / "gradle" / "owner.json").write_text(json.dumps(record))
+
+        def not_retained() -> None:
+            self.write_records(owner=self.owner_record(requiresManualRecovery=False))
+
+        def disagree() -> None:
+            record = json.loads((self.cache / "leases" / "gradle" / "owner.json").read_text())
+            record["pid"] = 70002
+            (self.cache / "leases" / "gradle" / "owner.json").write_text(json.dumps(record))
+
+        def receipt_label() -> None:
+            (self.run_dir / "receipt.json").write_text(json.dumps({"label": "other", "decision": "failed"}))
+
+        def receipt_passed() -> None:
+            (self.run_dir / "receipt.json").write_text(json.dumps({"label": self.LABEL, "decision": "passed"}))
+
+        def extra_file() -> None:
+            (self.cache / "leases" / "cargo" / "stray.txt").write_text("x")
+
+        def live_recorded_same_coalition() -> None:
+            self.processes[4101] = (1, self.identities[0][1], "S")
+            self.coalitions[4101] = 100
+
+        def live_recorded_unreadable() -> None:
+            self.processes[4101] = (1, self.identities[0][1], "S")
+            self.coalitions[4101] = None
+
+        def owner_live() -> None:
+            self.processes[70001] = (1, self.lstart(self.RUN_EPOCH - 5), "S")
+
+        def new_same_coalition_process() -> None:
+            self.processes[800] = (1, self.lstart(self.RUN_EPOCH + 900), "S")
+            self.coalitions[800] = 100
+
+        def new_unreadable_process() -> None:
+            self.processes[801] = (1, self.lstart(self.RUN_EPOCH + 900), "S")
+            self.coalitions[801] = None
+
+        def holder() -> None:
+            self.holders = [4242]
+
+        cases = {
+            "label-mismatch": mismatch_label, "not-retained": not_retained, "owner-records-disagree": disagree,
+            "receipt-label-mismatch": receipt_label, "receipt-not-failed": receipt_passed,
+            "lease-has-extra-files": extra_file, "identity-uncertain": live_recorded_same_coalition,
+            "identity-uncertain ": live_recorded_unreadable, "owner-live": owner_live,
+            "scan-uncertain": new_same_coalition_process, "scan-uncertain ": new_unreadable_process, "lsof-holder": holder,
+        }
+        for expected, change in cases.items():
+            with self.subTest(expected):
+                self.setUp()
+                self.lines.clear()
+                tamper(change)
+                code = self.go()
+                self.assertEqual(code, recover_leases.EXIT_REFUSED, self.lines)
+                reasons = self.summary()["refusalReasons"]
+                self.assertIn(expected.strip(), reasons)
+                for name in ("cargo", "gradle"):
+                    self.assertTrue((self.cache / "leases" / name / "owner.json").exists())
+                self.assertEqual(self.go(execute=True, dry_run=False, confirm_label=self.LABEL), recover_leases.EXIT_REFUSED)
+                self.assertTrue((self.cache / "leases" / "cargo").exists())
+                self.assertFalse(list(self.run_dir.glob("manual-recovery-*")), "nothing is archived when refused")
+
+    def test_records_that_change_during_the_run_are_refused_as_unstable(self) -> None:
+        self.quiet_world()
+        replaced = [False]
+
+        def change_owner(call: int) -> None:
+            if call == 2 and not replaced[0]:
+                replaced[0] = True
+                path = self.cache / "leases" / "cargo" / "owner.json"
+                record = json.loads(path.read_text())
+                record["terminationStatus"] = "edited"
+                path.write_text(json.dumps(record))
+
+        self.on_snapshot = change_owner
+        self.assertEqual(self.go(), recover_leases.EXIT_REFUSED)
+        self.assertIn("records-unstable", self.summary()["refusalReasons"])
+        # A swapped lease directory (different inode) is also unstable.
+        self.setUp()
+        self.quiet_world()
+        swapped = [False]
+
+        def swap_dir(call: int) -> None:
+            if call == 2 and not swapped[0]:
+                swapped[0] = True
+                lease = self.cache / "leases" / "gradle"
+                saved = self.cache / "leases" / "gradle-old"
+                lease.rename(saved)
+                lease.mkdir()
+                (lease / "owner.json").write_text((saved / "owner.json").read_text())
+
+        self.on_snapshot = swap_dir
+        self.assertEqual(self.go(), recover_leases.EXIT_REFUSED)
+        self.assertIn("records-unstable", self.summary()["refusalReasons"])
+
+    def test_admission_failure_and_bad_inputs_are_invalid_not_refused(self) -> None:
+        self.quiet_world()
+        shutil.rmtree(self.cache / "cargo-target")
+        with self.assertRaises(recover_leases.InvalidInput):
+            self.go()
+        self.setUp()
+        with self.assertRaises(recover_leases.InvalidInput):
+            self.go(receipt=str(self.root / "other" / "receipt.json"))
+        with self.assertRaises(recover_leases.InvalidInput):
+            self.go(label="bad label!")
+        with self.assertRaises(recover_leases.InvalidInput):
+            self.go(execute=True, dry_run=False, confirm_label="other")
+        with self.assertRaises(recover_leases.InvalidInput):
+            self.go(confirm_label=self.LABEL)
+        self.assertEqual(recover_leases.main(["--cache-root", str(self.cache), "--label", "bad label!", "--receipt", "x"]), recover_leases.EXIT_INVALID)
+
+    def test_classification_matrix(self) -> None:
+        start = self.lstart(self.RUN_EPOCH + 50)
+        old = self.lstart(self.RUN_EPOCH - 3600)
+        self.world((1, 0, -86400, "S"), (500, 1, -3000, "S"), (610, 500, 100, "S"), (620, 1, 100, "S"), (630, 1, 100, "S"),
+                   (640, 1, 100, "Z"), (650, 1, -100, "S"))
+        self.coalitions.update({620: 7, 630: 100, 610: 100})
+        classifier = recover_leases.Classifier(self.context(), self.RUN_EPOCH, [100])
+        outcomes = classifier.classify_many([
+            (610, self.lstart(self.RUN_EPOCH + 100)), (620, self.lstart(self.RUN_EPOCH + 100)), (630, self.lstart(self.RUN_EPOCH + 100)),
+            (640, self.lstart(self.RUN_EPOCH + 100)), (650, self.lstart(self.RUN_EPOCH - 100)), (999, start),
+            (620, "Mon Jan  1 00:00:00 2001"),
+        ], self.processes)
+        classes = {key: cls for key, (cls, _e) in outcomes.items()}
+        self.assertEqual(classes[(610, self.lstart(self.RUN_EPOCH + 100))], "non-descendant-ancestor-predates-run")
+        self.assertEqual(outcomes[(610, self.lstart(self.RUN_EPOCH + 100))][1]["ancestorPid"], 500)
+        self.assertEqual(classes[(620, self.lstart(self.RUN_EPOCH + 100))], "non-descendant-coalition")
+        self.assertEqual(classes[(630, self.lstart(self.RUN_EPOCH + 100))], "uncertain", "equal coalition, ppid 1: could be a daemonized descendant")
+        self.assertEqual(classes[(640, self.lstart(self.RUN_EPOCH + 100))], "exited", "zombie")
+        self.assertEqual(classes[(650, self.lstart(self.RUN_EPOCH - 100))], "non-descendant-predates-run")
+        self.assertEqual(classes[(999, start)], "exited")
+        self.assertEqual(classes[(620, "Mon Jan  1 00:00:00 2001")], "exited", "start time differs: PID reuse")
+        # Without run coalition ids nothing can be classified by coalition; Linux has no ancestor rule.
+        no_ids = recover_leases.Classifier(self.context(), self.RUN_EPOCH, [])
+        self.assertEqual(no_ids.classify_many([(620, self.lstart(self.RUN_EPOCH + 100))], self.processes)[(620, self.lstart(self.RUN_EPOCH + 100))][0], "uncertain")
+        linux = recover_leases.Classifier(self.context(platform="linux"), self.RUN_EPOCH, [100])
+        linux_outcomes = linux.classify_many([(610, self.lstart(self.RUN_EPOCH + 100)), (620, self.lstart(self.RUN_EPOCH + 100))], self.processes)
+        self.assertEqual({cls for cls, _e in linux_outcomes.values()}, {"uncertain"})
+
+    def test_observation_requires_every_live_sighting_to_be_classified(self) -> None:
+        self.quiet_world()
+        pid, start = self.identities[0]
+        flips = {"count": 0}
+
+        def flicker(call: int) -> None:
+            # Live and foreign-coalition on the first sighting, live and same-coalition afterwards.
+            self.processes[pid] = (1, start, "S")
+            self.coalitions[pid] = 7 if call == 1 else 100
+
+        self.on_snapshot = flicker
+        self.assertEqual(self.go(), recover_leases.EXIT_REFUSED)
+        self.assertIn("identity-uncertain", self.summary()["refusalReasons"])
+        self.setUp()
+        self.quiet_world()
+        # Live and foreign in every sighting is accepted with evidence.
+        self.processes[pid] = (1, start, "S")
+        self.coalitions[pid] = 7
+        self.assertEqual(self.go(), recover_leases.EXIT_OK, self.lines)
+        plan = json.loads((self.run_dir / self.summary()["planFile"]).read_text())
+        recorded = next(item for item in plan["identities"] if item["pid"] == pid)
+        self.assertEqual(recorded["classification"], "non-descendant-coalition")
+        self.assertEqual(recorded["evidence"]["coalitionId"], 7)
+        self.assertEqual(recorded["evidence"]["uidClass"], "other")
+
+    def test_identity_evidence_is_collected_from_owner_records_and_receipt_and_bounded(self) -> None:
+        receipt = {
+            "label": self.LABEL, "decision": "failed",
+            "gates": [{"naturalExitSettle": {"identityUnion": [{"pid": 5000 + n, "startedAt": f"s{n}"} for n in range(64)],
+                                             "identityUnionTruncated": True}}],
+            "provenance": {"classifiedIdentities": [{"pid": 9, "startedAt": "x", "runCoalitionIds": [55]}]},
+        }
+        self.write_records(receipt=receipt)
+        records = recover_leases.read_records(recover_leases.Layout(self.cache, self.LABEL))
+        found, truncated = recover_leases.collect_identities(records)
+        self.assertIn((4101, self.identities[0][1]), found)
+        self.assertEqual(sum(1 for key in found if 5000 <= key[0] < 5064), 64)
+        self.assertIn("identityUnionTruncated", truncated)
+        ids, sources = recover_leases.run_coalition_ids(records, [100])
+        self.assertEqual((ids, sources), ([55, 100], ["operator", "receipt"]))
+        huge = {"label": self.LABEL, "decision": "failed",
+                "a": {"naturalExitSettle": {"identityUnion": [{"pid": 10000 + n, "startedAt": "s"} for n in range(64)]}}}
+        for index in range(10):
+            huge[f"g{index}"] = {"naturalExitSettle": {"initialIdentities": [{"pid": 20000 + index * 100 + n, "startedAt": "s"} for n in range(64)]}}
+        self.write_records(receipt=huge)
+        with self.assertRaises(recover_leases.Refused) as caught:
+            recover_leases.collect_identities(recover_leases.read_records(recover_leases.Layout(self.cache, self.LABEL)))
+        self.assertEqual(caught.exception.reasons, ["evidence-overflow"])
+
+    def test_execute_archives_privately_removes_both_leases_and_never_touches_the_receipt(self) -> None:
+        self.quiet_world()
+        original_bytes = {name: (self.cache / "leases" / name / "owner.json").read_bytes() for name in ("cargo", "gradle")}
+        receipt_bytes = (self.run_dir / "receipt.json").read_bytes()
+        fsyncs: list[int] = []
+        real_fsync = os.fsync
+        with mock.patch.object(os, "fsync", side_effect=lambda fd: (fsyncs.append(fd), real_fsync(fd))[1]):
+            code = self.go(execute=True, dry_run=False, confirm_label=self.LABEL)
+        self.assertEqual(code, recover_leases.EXIT_OK, self.lines)
+        summary = self.summary()
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["removedLeases"], ["cargo", "gradle"])
+        self.assertTrue(summary["bothPathsAbsent"])
+        for name in ("cargo", "gradle"):
+            self.assertFalse((self.cache / "leases" / name).exists())
+        self.assertEqual((self.run_dir / "receipt.json").read_bytes(), receipt_bytes, "the failed receipt is never modified")
+        archive = next(self.run_dir.glob("manual-recovery-*"))
+        self.assertEqual(archive.name, "manual-recovery-20261004T183000Z")
+        for name in ("cargo", "gradle"):
+            self.assertEqual((archive / f"original-owner-{name}.json").read_bytes(), original_bytes[name])
+        self.assertEqual((archive / "failed-receipt.json").read_bytes(), receipt_bytes)
+        data = (archive / "manual-recovery.json").read_bytes()
+        self.assertEqual(hashlib.sha256(data).hexdigest(), summary["manualRecoverySha256"])
+        result = json.loads(data)
+        self.assertEqual((result["bothPathsAbsent"], result["failedReceiptUnmodified"], result["privilegeUsed"], result["signalsSent"]),
+                         (True, True, False, 0))
+        self.assertEqual(result["archive"]["originalOwnerSha256"]["cargo"], hashlib.sha256(original_bytes["cargo"]).hexdigest())
+        self.assertGreaterEqual(len(fsyncs), 6, "archive files and both directories are fsynced")
+        self.assertNotIn(self.TOKEN, data.decode())
+        self.assertNotIn(self.TOKEN, json.dumps(summary))
+        for path in archive.iterdir():
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode) & 0o077, 0, path.name)
+
+    def test_execute_re_checks_everything_and_refuses_when_the_world_changed(self) -> None:
+        self.quiet_world()
+        self.assertEqual(self.go(), recover_leases.EXIT_OK)
+        # Between the dry run and the execute a new same-coalition daemon appears.
+        self.processes[800] = (1, self.lstart(self.RUN_EPOCH + 900), "S")
+        self.coalitions[800] = 100
+        self.assertEqual(self.go(execute=True, dry_run=False, confirm_label=self.LABEL), recover_leases.EXIT_REFUSED)
+        self.assertTrue((self.cache / "leases" / "cargo" / "owner.json").exists())
+        self.assertFalse(list(self.run_dir.glob("manual-recovery-*")))
+
+    def test_partial_failure_is_reported_and_recorded(self) -> None:
+        self.quiet_world()
+        real_rmdir = os.rmdir
+
+        def failing_rmdir(path: object, *args: object, **kwargs: object) -> None:
+            if path == "gradle":
+                raise OSError("busy")
+            real_rmdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        with mock.patch.object(os, "rmdir", side_effect=failing_rmdir):
+            code = self.go(execute=True, dry_run=False, confirm_label=self.LABEL)
+        self.assertEqual(code, recover_leases.EXIT_PARTIAL)
+        summary = self.summary()
+        self.assertFalse(summary["complete"])
+        self.assertEqual(summary["removedLeases"], ["cargo"])
+        self.assertFalse(summary["bothPathsAbsent"])
+        archive = next(self.run_dir.glob("manual-recovery-*"))
+        result = json.loads((archive / "manual-recovery.json").read_text())
+        self.assertEqual(result["failure"], "OSError")
+        self.assertTrue((archive / "original-owner-gradle.json").exists(), "originals were archived before anything was removed")
+
+    def test_execute_refuses_to_remove_a_lease_whose_record_changed_at_the_last_moment(self) -> None:
+        self.quiet_world()
+        real_remove = recover_leases._remove_lease
+
+        def mutating(layout: object, name: str, expected: dict, identity: tuple[int, int]) -> None:
+            if name == "cargo":
+                (self.cache / "leases" / "cargo" / "owner.json").write_text(json.dumps({"changed": True}))
+            real_remove(layout, name, expected, identity)  # type: ignore[arg-type]
+
+        with mock.patch.object(recover_leases, "_remove_lease", side_effect=mutating):
+            code = self.go(execute=True, dry_run=False, confirm_label=self.LABEL)
+        self.assertEqual(code, recover_leases.EXIT_PARTIAL)
+        self.assertTrue((self.cache / "leases" / "cargo" / "owner.json").exists(), "nothing was unlinked after the last-moment change")
+        self.assertTrue((self.cache / "leases" / "gradle").exists())
+        self.assertFalse(self.summary()["complete"])
+
+    def test_recovery_makes_no_signals_and_uses_no_privilege(self) -> None:
+        self.quiet_world()
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("no helper processes in this test")), \
+                mock.patch.object(os, "setuid", side_effect=AssertionError("no privilege"), create=True):
+            self.assertEqual(self.go(), recover_leases.EXIT_OK)
+
+    def test_cli_parser(self) -> None:
+        parsed = recover_leases.build_parser().parse_args(
+            ["--cache-root", "/c", "--label", "L", "--receipt", "/r", "--run-coalition-id", "7", "--run-coalition-id", "9",
+             "--execute", "--confirm-label", "L"])
+        self.assertEqual((parsed.run_coalition_id, parsed.execute, parsed.confirm_label), ([7, 9], True, "L"))
+        with self.assertRaises(SystemExit):
+            recover_leases.build_parser().parse_args(["--cache-root", "/c", "--label", "L", "--receipt", "/r", "--dry-run", "--execute"])
+
+    def test_parse_start(self) -> None:
+        self.assertIsNotNone(recover_leases.parse_start("Sun Oct  4 16:20:29 2026"))
+        self.assertIsNone(recover_leases.parse_start("garbage"))
+        self.assertLess(recover_leases.parse_start("Sun Oct  4 16:20:29 2026"), recover_leases.parse_start("Sun Oct  4 16:20:31 2026"))
 
 
 LEASE_DIRS = ("cargo", "gradle")
