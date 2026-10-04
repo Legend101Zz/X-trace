@@ -706,6 +706,8 @@ class PrivateRootAdmissionTests(unittest.TestCase):
         with mock.patch.object(private_roots.sys, "platform", "linux"), \
                 mock.patch.object(private_roots.os, "removexattr", side_effect=lambda fd, name: removed.append(name), create=True), \
                 mock.patch.object(private_roots.os, "fchmod", side_effect=lambda fd, mode: modes.append(mode)), \
+                mock.patch.object(private_roots.os, "listdir", return_value=[]), \
+                mock.patch.object(private_roots, "_linux_acl_check"), \
                 mock.patch.object(private_roots.os, "open", return_value=99), \
                 mock.patch.object(private_roots.os, "close"):
             private_roots._strip_new_directory_acls(5, "child")
@@ -720,7 +722,8 @@ class PrivateRootAdmissionTests(unittest.TestCase):
 
         with mock.patch.object(private_roots.sys, "platform", "linux"), \
                 mock.patch.object(private_roots.os, "fchmod"), mock.patch.object(private_roots.os, "open", return_value=99), \
-                mock.patch.object(private_roots.os, "close"):
+                mock.patch.object(private_roots.os, "listdir", return_value=[]), mock.patch.object(private_roots, "_linux_acl_check"), \
+                mock.patch.object(private_roots.os, "rmdir"), mock.patch.object(private_roots.os, "close"):
             with mock.patch.object(private_roots.os, "removexattr", side_effect=enodata, create=True):
                 private_roots._strip_new_directory_acls(5, "child")
             with mock.patch.object(private_roots.os, "removexattr", side_effect=denied, create=True):
@@ -731,6 +734,22 @@ class PrivateRootAdmissionTests(unittest.TestCase):
                 mock.patch.object(private_roots.os, "open") as opened:
             private_roots._strip_new_directory_acls(5, "child")
         opened.assert_not_called()
+
+    def test_new_directory_is_removed_when_the_post_strip_recheck_fails(self) -> None:
+        for name, listing, acl_error, reason in (
+            ("planted entry", ["planted"], None, "acl-strip-not-empty"),
+            ("non-minimal acl", [], private_roots._fail("acl-access-extended"), "acl-access-extended"),
+        ):
+            with self.subTest(name), mock.patch.object(private_roots.sys, "platform", "linux"), \
+                    mock.patch.object(private_roots.os, "removexattr", create=True), \
+                    mock.patch.object(private_roots.os, "fchmod"), mock.patch.object(private_roots.os, "open", return_value=99), \
+                    mock.patch.object(private_roots.os, "listdir", return_value=listing), \
+                    mock.patch.object(private_roots, "_linux_acl_check", side_effect=acl_error), \
+                    mock.patch.object(private_roots.os, "rmdir") as removed, mock.patch.object(private_roots.os, "close"):
+                with self.assertRaises(private_roots.AdmissionError) as caught:
+                    private_roots._strip_new_directory_acls(5, "child")
+                self.assertEqual(caught.exception.reason, reason)
+                removed.assert_called_once_with("child", dir_fd=5)
 
     def test_admission_error_reason_reaches_the_ci_failure_code(self) -> None:
         from tools.release import ci_floor
@@ -3731,7 +3750,8 @@ class LeasedRunTests(unittest.TestCase):
                  max_log_bytes: int | None = None, provenance: bool = False,
                  provenance_report: dict | None = None) -> tuple[int, float]:
             captured.update(provenance=provenance, 
-                scratch_existed=pathlib.Path(env["XTRACE_TEST_SCRATCH_ROOT"]).is_dir(), max_log_bytes=max_log_bytes, 
+                scratch_existed=pathlib.Path(env["XTRACE_TEST_SCRATCH_ROOT"]).is_dir(), max_log_bytes=max_log_bytes,
+                home_existed=pathlib.Path(env.get("HOME", "/nonexistent")).is_dir(), 
                 argv=list(argv), cwd=cwd, env=dict(env), timeout=timeout,
                 held=sorted(path.name for path in (self.cache / "leases").iterdir()),
                 log_name=pathlib.Path(log_path).name,
@@ -4159,6 +4179,13 @@ class LeasedRunTests(unittest.TestCase):
         env = self.captured["env"]
         for name in ("PATH", "HOME", "LC_ALL", "LANG", "RUST_LOG", "CARGO_HOME", "TMPDIR"):
             self.assertIn(name, env)  # type: ignore[operator]
+        scratch = self.cache / "tmp" / "leased-test-1-scratch"
+        self.assertEqual(env["HOME"], str(scratch / "home"), "HOME is private, not the host HOME")  # type: ignore[index]
+        self.assertNotEqual(env["HOME"], "/home/test")  # type: ignore[index]
+        self.assertTrue(self.captured["home_existed"])
+        receipt = self.receipt()
+        self.assertIs(receipt["privateHome"], True)
+        self.assertIs(receipt["hostHomePassed"], False)
         for name in ("AWS_SECRET_ACCESS_KEY", "MY_API_TOKEN", "GITHUB_TOKEN", "RANDOM_VAR"):
             self.assertNotIn(name, env)  # type: ignore[operator]
         self.assertEqual(self.receipt()["passedEnvNames"], ["RUST_LOG"])
@@ -4176,6 +4203,89 @@ class LeasedRunTests(unittest.TestCase):
         with self.fake_run(), mock.patch.object(run_gates.Lease, "release", side_effect=OSError("busy")):
             self.assertEqual(self.go(self.args("leased-keep-2")), leased_run.EXIT_UNCERTAIN)
         self.assertTrue((self.cache / "tmp" / "leased-keep-2-scratch").is_dir())
+
+    def test_host_home_is_passed_only_when_explicitly_requested_and_recorded(self) -> None:
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin", "HOME": "/home/test"}, clear=True), self.fake_run():
+            self.go(self.args(pass_env=["HOME"]))
+        self.assertEqual(self.captured["env"]["HOME"], "/home/test")  # type: ignore[index]
+        receipt = self.receipt()
+        self.assertIs(receipt["hostHomePassed"], True)
+        self.assertIs(receipt["privateHome"], False)
+        self.assertIn("HOME", receipt["passedEnvNames"])
+
+    def test_pass_env_denylist_refuses_code_loading_and_redirecting_names(self) -> None:
+        refused = (
+            "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "NODE_OPTIONS", "NODE_PATH",
+            "PYTHONPATH", "PYTHONSTARTUP", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "JAVA_OPTS", "JAVA_HOME",
+            "MAVEN_OPTS", "BASH_ENV", "ENV", "RUSTC_WRAPPER", "RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER", "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "GRADLE_OPTS", "NPM_CONFIG_REGISTRY",
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE", "TMPDIR", "PATH", "XDG_CONFIG_HOME", "XTRACE_TEST_SCRATCH_ROOT",
+        )
+        for name in refused:
+            with self.subTest(name), self.fake_run() as fake:
+                with self.assertRaises(ValueError):
+                    self.go(self.args("leased-deny", pass_env=[name]))
+                fake.assert_not_called()
+        for name in ("RUST_LOG", "RUST_BACKTRACE", "CI", "FORCE_COLOR"):
+            with self.subTest(allowed=name), self.fake_run():
+                self.go(self.args(f"leased-allow-{name.lower()}", pass_env=[name]))
+
+    def test_command_allowlist_admits_build_tools_and_refuses_launchers_before_any_lease(self) -> None:
+        allowed = (
+            ["cargo", "build"], ["./gradlew", "--no-daemon", "test"], ["/usr/bin/npm", "ci"], ["npx", "playwright", "install"],
+            ["node", "x.js"], ["git", "status"], ["java", "-version"],
+            ["python3.14", "-B", "-m", "unittest", "-v", "tools.release.test_release_tools"],
+            ["python3", "-B", "-m", "tools.release.leased_run", "--help"],
+        )
+        for index, argv in enumerate(allowed):
+            with self.subTest(argv=argv), self.fake_run():
+                self.assertEqual(self.go(self.args(f"leased-ok-{index}", argv=argv)), leased_run.EXIT_PASSED)
+        refused = (
+            ["sh", "-c", "cargo build"], ["/bin/bash", "-lc", "x"], ["zsh"], ["open", "-a", "Terminal"], ["launchctl", "submit"],
+            ["osascript", "-e", "x"], ["docker", "run", "x"], ["systemd-run", "--user", "x"], ["at", "now"], ["crontab", "-e"],
+            ["env", "cargo", "build"], ["rustc", "x.rs"], ["curl", "http://x"],
+            ["python3", "-c", "print(1)"], ["python3.14", "script.py"], ["python3", "-m", "http.server"],
+            ["python3", "-B", "-m", "pip", "install", "x"], ["python3.14", "-B", "-c", "x"],
+        )
+        for index, argv in enumerate(refused):
+            with self.subTest(argv=argv), self.fake_run() as fake:
+                self.lines.clear()
+                code = self.go(self.args(f"leased-refused-{index}", argv=argv))
+                self.assertEqual(code, leased_run.EXIT_COMMAND_REFUSED)
+                fake.assert_not_called()
+                self.assertEqual(json.loads(self.lines[-1])["decision"], "command_refused")
+                self.assertEqual(self.leases_present(), [], "refused before any lease was taken")
+                self.assertFalse((self.cache / "release-gates" / f"leased-refused-{index}").exists())
+        self.assertNotIn(leased_run.EXIT_COMMAND_REFUSED, (0, 1, 2, 3, 4, 75, 76))
+
+    def test_receipt_records_the_provenance_residual_and_scrubs_errors(self) -> None:
+        failure = run_gates.AttemptedGateFailure(OSError("/home/test/secret/path failed"), 0, 1.0)
+        with self.fake_run(raise_exc=failure):
+            self.go()
+        receipt = self.receipt()
+        self.assertIn("not that it cannot write the builder caches", receipt["provenanceResidual"])
+        self.assertIn("allowlist", receipt["provenanceResidual"])
+        self.assertNotIn("/home/test", json.dumps(receipt))
+        self.assertEqual(leased_run._safe_error(RuntimeError("bad /Users/owner/x/y token")), "bad <path> token")
+
+    def test_source_identity_git_calls_are_scrubbed(self) -> None:
+        calls: list[tuple[list[str], dict[str, str]]] = []
+        real_run = subprocess.run
+
+        def spy(argv: list[str], *args: object, **kwargs: object) -> object:
+            if argv and argv[0] == "git":
+                calls.append((list(argv), dict(kwargs.get("env") or {})))
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, {"GIT_SSH_COMMAND": "evil", "GIT_EXEC_PATH": "/x", "HOME": "/home/test"}), \
+                mock.patch.object(subprocess, "run", side_effect=spy):
+            leased_run._source_identity(self.repo)
+        self.assertTrue(calls)
+        for argv, env in calls:
+            self.assertEqual(argv[1:3], ["-c", "core.fsmonitor=false"])
+            self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
+            self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+            self.assertFalse([name for name in env if name.startswith("GIT_") and name not in {"GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT"}])
 
     def test_provenance_is_enabled_and_its_evidence_recorded_in_the_receipt(self) -> None:
         report = {
@@ -4412,37 +4522,64 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(self.classify(item, [900], self.snap((900, 1, "S"))), {})
         self.assertTrue(item.report()["overflowed"])
 
-    def test_subreaper_orphans_are_adopted_only_after_persisting_and_zombies_reaped_safely(self) -> None:
-        clock = FakeClock()
+    def test_subreaper_orphans_are_adopted_at_once_without_a_grace_period(self) -> None:
         reaped: list[int] = []
-        item = self.subreaper(monotonic=clock.monotonic, reaper=lambda pid, flags: reaped.append(pid))
+        item = self.subreaper(reaper=lambda pid, flags: reaped.append(pid))
         item.start()
         owned: dict[int, str] = {}
         baseline = self.snap((650, self.RUNNER, "S"))
         live = self.snap((self.RUNNER, 1, "S"), (650, self.RUNNER, "S"), (700, self.RUNNER, "S"), (710, 700, "S"))
         item.observe(live, baseline, owned)
-        self.assertEqual(owned, {}, "first sighting only: a transient probe is never adopted")
-        clock.now = 0.2
-        item.observe(live, baseline, owned)
-        self.assertEqual(owned, {})
-        clock.now = 0.6
-        item.observe(live, baseline, owned)
-        self.assertEqual(owned, {700: "start-700"}, "persisting orphan adopted; baseline child and grandchild excluded")
+        self.assertEqual(owned, {700: "start-700"}, "a daemon born just before the root exits is owned immediately")
         self.assertEqual(item.report()["adoptedOrphanCount"], 1)
         # Its zombie is reaped; a zombie that was never adopted is not.
         zombies = self.snap((self.RUNNER, 1, "S"), (700, self.RUNNER, "Z"), (720, self.RUNNER, "Z"))
         item.observe(zombies, baseline, owned)
         self.assertEqual(reaped, [700])
-        # A pid that disappears between sightings resets its timer.
-        item2 = self.subreaper(monotonic=clock.monotonic)
-        item2.start()
-        owned2: dict[int, str] = {}
-        clock.now = 10.0
-        item2.observe(live, {}, owned2)
-        item2.observe(self.snap((self.RUNNER, 1, "S")), {}, owned2)
-        clock.now = 11.0
-        item2.observe(live, {}, owned2)
-        self.assertEqual(owned2, {})
+
+    def test_runners_own_probes_are_excluded_by_identity_not_by_timing(self) -> None:
+        item = self.subreaper()
+        item.start()
+        owned: dict[int, str] = {}
+        provenance.register_probe(730)
+        live = self.snap((self.RUNNER, 1, "S"), (730, self.RUNNER, "S"), (731, self.RUNNER, "S"))
+        item.observe(live, {}, owned)
+        self.assertEqual(owned, {731: "start-731"}, "the registered ps/lsof helper is skipped, everything else adopted")
+        with mock.patch.object(provenance, "PROBE_EXCLUSION_SECONDS", 0.0), mock.patch.object(provenance.time, "monotonic", return_value=time.monotonic() + 60):
+            self.assertNotIn(730, provenance.recent_probe_pids())
+
+    def test_probe_run_registers_the_child_pid(self) -> None:
+        result = provenance.probe_run([sys.executable, "-c", "import os; print(os.getpid())"], timeout=10)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(int(result.stdout), provenance.recent_probe_pids())
+        with self.assertRaises(subprocess.SubprocessError):
+            provenance.probe_run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.3)
+
+    def test_run_adopts_a_daemon_that_escapes_just_before_the_root_exits_and_never_classifies_it(self) -> None:
+        world = RunOwnershipWorldTests()
+        world.setUp()
+        self.addCleanup(world.temp.cleanup)
+        runner = os.getpid()
+        daemon_start = "start-9100"
+        real_class = provenance.Provenance
+        factory = lambda **_ignored: real_class(  # noqa: E731
+            platform="linux", runner_pid=runner, subreaper_setter=lambda e: True,
+            facts_reader=lambda pids, _d: {pid: (0, f"start-{pid}") for pid in pids})
+        snapshot, _clean, _raise, _probe = world.world()
+        snapshot[9100] = (runner, daemon_start, "S")  # direct child of the runner: a reparented orphan
+        stops: list[dict[int, str]] = []
+        with mock.patch.object(run_gates, "_stop_and_reap_owned_tree", side_effect=lambda proc, root, owned: stops.append(dict(owned)) or True):
+            report, failure, result = world.drive([(snapshot, set(), None, None)], provenance_factory=factory)
+        self.assertIsNone(failure, str(failure))
+        self.assertEqual(result[0], 125, "a live adopted orphan after the command is drained, not released")
+        self.assertEqual(stops and stops[0].get(9100), daemon_start)
+        self.assertEqual(world.provenance_report["classifiedCount"], 0)
+        self.assertEqual(world.provenance_report["adoptedOrphanCount"], 1)
+        # If it cannot be drained the run fails closed.
+        with mock.patch.object(run_gates, "_stop_and_reap_owned_tree", return_value=False):
+            _report, failure, result = world.drive([(snapshot, set(), None, None)], provenance_factory=factory)
+        self.assertIsNone(result)
+        self.assertIsNotNone(failure)
 
     def test_classified_evidence_is_bounded_with_truthful_totals(self) -> None:
         evidence = provenance.ClassifiedEvidence()

@@ -13,6 +13,8 @@ Usage:
         --cache-root <private-root> --timeout <seconds> [--wait <seconds>] \
         [--jdk-home <path>] [--expect-unittest <N>] -- <argv...>
 
+Allowed commands: cargo, gradlew, npm, npx, node, git, java, and python3/python3.14 only as
+`-B -m unittest` or `-B -m tools.release.*`; shells and launchers are refused (exit 77).
 Exit codes: 0 passed, 1 command or expectation failed, 2 invalid input,
 admission failure or label already used, 3 uncertain process tree (leases
 retained for manual recovery) or lease release failure, 4 the receipt could not
@@ -50,22 +52,56 @@ EXIT_UNCERTAIN = 3
 EXIT_RECEIPT_FAILED = 4
 EXIT_LEASE_WAIT_EXPIRED = 75
 EXIT_LEASE_RETAINED = 76
+EXIT_COMMAND_REFUSED = 77
 LEASE_NAMES = run_gates.LEASE_NAMES
 LEASE_POLL_SECONDS = 15.0
 MAX_LOG_BYTES = 64 * 1024 * 1024
 LOG_TAIL_BYTES = 64 * 1024
 LOG_NAME = "command.log"
 _RAN_LINE = re.compile(r"^Ran (\d+) tests? in [0-9.]+s$")
+# argv[0] basenames a leased run may execute. Launchers and shells are excluded on purpose: they
+# are exactly the routes (open, launchctl, osascript, docker, systemd-run, at, cron, sh) through
+# which work could reach the builder caches without being a descendant of the run, which process
+# provenance cannot see (ADR 0007).
+ALLOWED_COMMANDS = frozenset({"cargo", "gradlew", "npm", "npx", "node", "python3", "python3.14", "git", "java"})
+PYTHON_COMMANDS = frozenset({"python3", "python3.14"})
+PROVENANCE_RESIDUAL = (
+    "Provenance proves a process is not a fork-tree descendant of this run, not that it cannot "
+    "write the builder caches. Work delegated through LaunchServices/XPC/launchctl, systemd/docker, "
+    "cron/at or a persistent build daemon is outside the threat model only because the command "
+    "allowlist excludes launchers and builders run with --no-daemon."
+)
 # Parent environment names that reach the command. Everything else (including
 # ambient credentials) is dropped; task variables are added by build_env.
 ENV_ALLOWLIST = frozenset({
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ",
+    "PATH", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ",
     "SDKROOT", "DEVELOPER_DIR", "MACOSX_DEPLOYMENT_TARGET",
     "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "JAVA_HOME",
 })
 ENV_ALLOWED_PREFIXES = ("LC_",)
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _SECRET_WORDS = ("TOKEN", "SECRET", "KEY", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH")
+# Names --pass-env refuses, each because it can load or run code of the caller's choosing inside
+# every tool of the build, or redirect where tools fetch from or write to.
+DENIED_ENV_NAMES = frozenset({
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",  # inject shared objects into every process
+    "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS",  # preload scripts / module roots / trust anchors
+    "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PYTHONINSPECT",  # run or load arbitrary Python
+    "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "JAVA_OPTS", "JAVA_HOME",  # javaagents; use --jdk-home
+    "MAVEN_OPTS", "BASH_ENV", "ENV", "PS4", "IFS", "SHELLOPTS", "PROMPT_COMMAND",  # shell startup injection
+    "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS", "RUSTDOCFLAGS", "RUSTUP_TOOLCHAIN",  # run/choose compilers and linkers
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",  # trust anchors
+    "TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "PATH",  # task-scoped by the runner
+})
+DENIED_ENV_PREFIXES = (
+    "DYLD_",  # macOS dynamic-loader injection
+    "CARGO_",  # build.rustc-wrapper, linkers, registries via env
+    "GIT_",  # exec path, ssh command, config injection
+    "GRADLE_",  # GRADLE_OPTS and friends run agents; the home is task-scoped
+    "NPM_CONFIG_", "NPM_",  # registry/script-shell redirection
+    "XTRACE_",  # task contract names
+)
+DENIED_ENV_SUFFIXES = ("_PROXY",)  # route build traffic through a caller-chosen host
 
 
 class LeaseWaitExpired(RuntimeError):
@@ -142,14 +178,23 @@ def acquire_leases(
 
 def build_env(
     cache: pathlib.Path, scratch: pathlib.Path, base_env: dict[str, str], jdk_home: str | None,
-    pass_env: Sequence[str] = (),
+    pass_env: Sequence[str] = (), home: pathlib.Path | None = None,
 ) -> dict[str, str]:
-    """Allowlisted parent environment plus the floor's task-scoped variables."""
+    """Allowlisted parent environment plus the floor's task-scoped variables.
+
+    HOME is a private directory inside the admitted scratch, so ~/.npmrc, ~/.netrc, ~/.ssh and
+    friends are not reachable and tools cannot write outside the private cache. The host HOME
+    is passed only when `--pass-env HOME` asks for it explicitly.
+    """
     extra = set(pass_env)
     env = {
         name: value for name, value in base_env.items()
-        if name in ENV_ALLOWLIST or name in extra or name.startswith(ENV_ALLOWED_PREFIXES)
+        if (name in ENV_ALLOWLIST or name in extra or name.startswith(ENV_ALLOWED_PREFIXES)) and name != "HOME"
     }
+    if "HOME" in extra and "HOME" in base_env:
+        env["HOME"] = base_env["HOME"]
+    elif home is not None:
+        env["HOME"] = str(home)
     env.update({
         "CARGO_HOME": str(cache / "cargo"),
         "CARGO_TARGET_DIR": str(cache / "cargo-target"),
@@ -169,11 +214,35 @@ def build_env(
     return env
 
 
+class CommandRefused(RuntimeError):
+    """The command is not on the leased-run allowlist."""
+
+
+def check_command_allowed(argv: Sequence[str]) -> None:
+    """Allow only the build tools a lane needs; refuse shells and launchers."""
+    name = os.path.basename(argv[0])
+    if name not in ALLOWED_COMMANDS:
+        raise CommandRefused("command is not on the leased-run allowlist")
+    if name in PYTHON_COMMANDS:
+        head = list(argv[1:4])
+        ok = len(head) >= 3 and head[0] == "-B" and head[1] == "-m" and (
+            head[2] == "unittest" or head[2].startswith("tools.release.")
+        )
+        if not ok:
+            raise CommandRefused("python is allowed only as -B -m unittest or -B -m tools.release.*")
+
+
 def _validate_pass_env(names: Sequence[str]) -> list[str]:
     result = []
     for name in names:
         if not _ENV_NAME.fullmatch(name) or any(word in name for word in _SECRET_WORDS):
             raise ValueError("--pass-env must name a non-secret variable such as RUST_LOG")
+        if name == "HOME":
+            result.append(name)  # explicit host HOME; recorded in the receipt
+            continue
+        if (name in DENIED_ENV_NAMES or name.startswith(DENIED_ENV_PREFIXES)
+                or name.endswith(DENIED_ENV_SUFFIXES)):
+            raise ValueError("--pass-env refuses names that load code or redirect the build")
         result.append(name)
     return result
 
@@ -213,8 +282,8 @@ def _read_log_tail(log_path: pathlib.Path) -> tuple[bytes, int]:
 def _source_identity(repo: pathlib.Path) -> dict[str, Any]:
     """HEAD plus digests of the working tree; uncommitted edits are allowed."""
     status = subprocess.run(
-        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-        cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        ["git", *run_gates.GIT_SAFE_ARGS, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=repo, env=run_gates._git_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
     )
     if status.returncode:
         raise RuntimeError("cannot capture working-tree status")
@@ -224,6 +293,15 @@ def _source_identity(repo: pathlib.Path) -> dict[str, Any]:
         "dirtyEntries": sum(1 for entry in status.stdout.split(b"\0") if entry),
         "workingTreeDigest": run_gates._tree_state_digest(repo),
     }
+
+
+_PATH_TEXT = re.compile(r"(?<![\w.])/(?:[\w.@+%~=:,-]*/)*[\w.@+%~=:,-]+/?")
+
+
+def _safe_error(exc: BaseException) -> str:
+    """First line of a runner error with paths removed and a length cap."""
+    text = str(exc).splitlines()[0] if str(exc).strip() else type(exc).__name__
+    return _PATH_TEXT.sub("<path>", text)[:200]
 
 
 def _summary(label: str, decision: str, exit_code: int | None, duration: float | None,
@@ -267,6 +345,10 @@ def run(
     if expect is not None and (not isinstance(expect, int) or isinstance(expect, bool) or expect < 1):
         raise ValueError("--expect-unittest must be a positive integer")
     pass_env = _validate_pass_env(getattr(args, "pass_env", None) or [])
+    try:
+        check_command_allowed(argv)
+    except CommandRefused as exc:
+        return _not_started(out, args.label, "command_refused", str(exc), EXIT_COMMAND_REFUSED)
     repo = pathlib.Path(args.repo).expanduser().resolve(strict=True)
     if not (repo / ".git").exists():
         raise ValueError("--repo must be a Git checkout")
@@ -324,6 +406,9 @@ def run(
         "expectUnittest": expect,
         "jdkHomeSupplied": jdk_home is not None,
         "passedEnvNames": sorted(pass_env),
+        "privateHome": "HOME" not in pass_env,
+        "hostHomePassed": "HOME" in pass_env,
+        "provenanceResidual": PROVENANCE_RESIDUAL,
     }
     exit_code: int | None = None
     duration: float | None = None
@@ -344,10 +429,12 @@ def run(
             private_roots.admit_directory(root, private_leaf=True)
         private_roots.ensure_private_directory(logs_dir, must_create=True)
         private_roots.ensure_private_directory(scratch, must_create=True)
+        private_roots.ensure_private_directory(scratch / "home", must_create=True)
         logs_identity = private_roots.admit_directory(logs_dir, private_leaf=True)
         private_roots.admit_directory(scratch, private_leaf=True)
+        private_roots.admit_directory(scratch / "home", private_leaf=True)
         run_gates._write_receipt(run_dir / "receipt.json", receipt)  # "running" marker
-        env = build_env(cache, scratch, os.environ.copy(), jdk_home, pass_env)
+        env = build_env(cache, scratch, os.environ.copy(), jdk_home, pass_env, scratch / "home")
         before = _source_identity(repo)
         receipt["sourceBefore"] = before
         temp_log = logs_dir / f".{LOG_NAME}.{os.getpid()}.tmp"
@@ -362,12 +449,12 @@ def run(
         except run_gates.AttemptedGateFailure as exc:
             attempted = exc
             exit_code, duration = exc.raw_exit_code, exc.duration_seconds
-            receipt["error"] = str(exc)
+            receipt["error"] = _safe_error(exc)
         except run_gates.UncertainProcessTree as exc:
             if not exc.command_started:
                 raise
             exit_code, duration = exc.raw_exit_code, exc.duration_seconds
-            receipt["error"] = str(exc)
+            receipt["error"] = _safe_error(exc)
             retain = True
             runner_code = EXIT_UNCERTAIN
             receipt["decision"] = "uncertain_process_tree"
@@ -426,7 +513,7 @@ def run(
         else:
             receipt["decision"] = "label_in_use" if label_taken else "failed"
             receipt["error"] = (
-                str(exc) if isinstance(exc, (run_gates.UncertainProcessTree, run_gates.AttemptedGateFailure))
+                _safe_error(exc) if isinstance(exc, (run_gates.UncertainProcessTree, run_gates.AttemptedGateFailure))
                 else type(exc).__name__
             )
             runner_code = (

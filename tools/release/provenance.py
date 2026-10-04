@@ -39,8 +39,46 @@ MAX_DESCENDANT_IDENTITIES = 4096
 MAX_CHAIN_HOPS = 64
 MAX_PENDING_ORPHANS = 1024
 MAX_EVIDENCE_RECORDS = 64
-ORPHAN_ADOPT_SECONDS = 0.5
 FACTS_TIMEOUT_SECONDS = 1.0
+PROBE_EXCLUSION_SECONDS = 5.0
+MAX_PROBE_REGISTRY = 256
+
+# The runner's own short-lived helpers (ps, lsof) are direct children of the runner.
+# They are registered by pid when spawned and again when they finish, so adoption can
+# exclude exactly them by identity (never by timing): a daemon is never mistaken for one.
+_PROBES: dict[int, float] = {}
+
+
+def register_probe(pid: int) -> None:
+    _PROBES[pid] = time.monotonic()
+    if len(_PROBES) > MAX_PROBE_REGISTRY:
+        for old in sorted(_PROBES, key=_PROBES.__getitem__)[: len(_PROBES) - MAX_PROBE_REGISTRY]:
+            del _PROBES[old]
+
+
+def recent_probe_pids(window: float = PROBE_EXCLUSION_SECONDS) -> set[int]:
+    cutoff = time.monotonic() - window
+    return {pid for pid, when in _PROBES.items() if when >= cutoff}
+
+
+def probe_run(argv: Sequence[str], *, timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """`subprocess.run` for the runner's own text probes, registering the child's pid."""
+    process = subprocess.Popen(
+        list(argv), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env,
+    )
+    register_probe(process.pid)
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except BaseException:
+        process.kill()
+        try:
+            process.communicate(timeout=1.0)
+        except (subprocess.SubprocessError, OSError):
+            pass
+        raise
+    finally:
+        register_probe(process.pid)
+    return subprocess.CompletedProcess(list(argv), process.returncode, output, None)
 
 Snapshot = dict[int, tuple[int, str, str]]
 
@@ -83,11 +121,9 @@ def read_process_facts(pids: Sequence[int], deadline: float) -> dict[int, tuple[
     if ps is None or not pids or remaining <= 0:
         return {}
     try:
-        result = subprocess.run(
+        result = probe_run(
             [ps, "-o", "pid=,uid=,lstart=", "-p", ",".join(str(int(pid)) for pid in pids)],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-            timeout=min(FACTS_TIMEOUT_SECONDS, remaining), check=False,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            timeout=min(FACTS_TIMEOUT_SECONDS, remaining), env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return {}
@@ -186,7 +222,6 @@ class Provenance:
         self.overflowed = False
         self.evidence = ClassifiedEvidence()
         self._descendants: set[tuple[int, str]] = set()
-        self._pending: dict[int, tuple[str, float]] = {}
         self._adopted: dict[int, str] = {}
         self._subreaper_on = False
 
@@ -228,14 +263,16 @@ class Provenance:
     def observe(self, snapshot: Snapshot, baseline: Snapshot, owned: dict[int, str]) -> None:
         """Linux: record every process whose parent chain reaches the runner; adopt orphans.
 
-        An orphan (direct child of the runner, not in the baseline) seen continuously for
-        ORPHAN_ADOPT_SECONDS becomes an owned descendant so the existing drain rules apply;
-        zombies of adopted orphans are reaped. Nothing is ever signaled here.
+        With the subreaper set, every live, non-baseline direct child of the runner other
+        than the runner's own registered probes is provably part of this run (a reparented
+        orphan or the command root). Each is adopted into `owned` at once, with no grace
+        period, so the existing owned-tree drain rules apply (a live adopted orphan after the
+        command ends is drained or fails closed). Zombies of adopted orphans are reaped. Nothing
+        is ever signaled here.
         """
         if self.mode != "subreaper" or not self.available:
             return
-        now = self._monotonic()
-        seen_orphans: set[int] = set()
+        probes = recent_probe_pids()
         for pid, (ppid, started_at, state) in snapshot.items():
             if pid == self.runner_pid:
                 continue
@@ -248,27 +285,19 @@ class Provenance:
                 if (pid, started_at) not in self._descendants:
                     self.overflowed = True
                 continue
-            self._descendants.add((pid, started_at))
             if ppid != self.runner_pid:
+                self._descendants.add((pid, started_at))
                 continue
             if state in {"Z", "X"}:
                 if self._adopted.get(pid) == started_at:
                     self._reap(pid)
                 continue
-            if owned.get(pid) == started_at:
-                continue
-            seen_orphans.add(pid)
-            first = self._pending.get(pid)
-            if first is None or first[0] != started_at:
-                if len(self._pending) < MAX_PENDING_ORPHANS:
-                    self._pending[pid] = (started_at, now)
-                else:
-                    self.overflowed = True
-            elif now - first[1] >= ORPHAN_ADOPT_SECONDS:
+            if pid in probes and owned.get(pid) != started_at:
+                continue  # the runner's own ps/lsof helper
+            self._descendants.add((pid, started_at))
+            if owned.get(pid) != started_at:
                 owned[pid] = started_at
                 self._adopted[pid] = started_at
-        for pid in [pid for pid in self._pending if pid not in seen_orphans]:
-            del self._pending[pid]
 
     def _reap(self, pid: int) -> None:
         try:

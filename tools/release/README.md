@@ -174,6 +174,14 @@ python3.14 -B -m tools.release.leased_run --repo <worktree> --label <new unique 
   lease release failure, 4 the receipt could not be written, 75 a live owner held
   a lease for the whole `--wait`, 76 a lease is retained for manual recovery
   (reported at once; waiting cannot help).
+- Only these commands run: cargo, gradlew, npm, npx, node, git, java, and python3/python3.14 as
+  `-B -m unittest` or `-B -m tools.release.*`; anything else (shells, open, launchctl, osascript,
+  docker, systemd-run, at) is refused with exit code 77 before any lease is taken.
+- HOME is a private directory inside the run's scratch (`~/.npmrc`, `~/.netrc`, `~/.ssh` are not
+  reachable); `--pass-env HOME` passes the host HOME explicitly and is recorded as
+  `hostHomePassed`. Export `RUSTUP_HOME` when rustup toolchains live outside the host HOME.
+  `--pass-env` refuses code-loading and redirecting names (LD_*, DYLD_*, NODE_OPTIONS, PYTHONPATH,
+  JAVA_TOOL_OPTIONS, BASH_ENV, RUSTC_WRAPPER, RUSTFLAGS, CARGO_*, GIT_*, *_PROXY, ...).
 - The command sees an allowlisted parent environment (PATH, HOME, locale and
   toolchain locators) plus the task variables; add non-secret names with
   `--pass-env NAME`. Per-run scratch is removed only after a passing run and a

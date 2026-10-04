@@ -366,10 +366,7 @@ def _process_snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, str, str]
     if timeout <= 0:
         raise RuntimeError("process ownership scan deadline expired")
     try:
-        snapshot = subprocess.run(
-            [PS_BINARY, "-axo", "pid=,ppid=,lstart=,stat="],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=timeout, check=False,
-        )
+        snapshot = provenance_module.probe_run([PS_BINARY, "-axo", "pid=,ppid=,lstart=,stat="], timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError("cannot inspect process ownership")
     if snapshot.returncode:
@@ -875,6 +872,7 @@ def _run_lsof_fields(arguments: list[str], deadline: float) -> LsofProbe:
     except BaseException:
         selector.close()
         raise
+    provenance_module.register_probe(process.pid)
     probe_identity: dict[str, Any] = {"pid": process.pid, "startedAt": None, "processGroupId": process.pid}
     output = {"stdout": bytearray(), "stderr": bytearray()}
     result: LsofProbe | None = None
@@ -1003,11 +1001,7 @@ def _process_start_identity(pid: int, deadline: float) -> str | None:
     if remaining <= 0:
         return None
     try:
-        result = subprocess.run(
-            [PS_BINARY, "-p", str(pid), "-o", "lstart="],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-            timeout=min(remaining, 0.15), check=False,
-        )
+        result = provenance_module.probe_run([PS_BINARY, "-p", str(pid), "-o", "lstart="], timeout=min(remaining, 0.15))
     except (OSError, subprocess.SubprocessError):
         return None
     identity = result.stdout.strip()
@@ -1252,10 +1246,7 @@ def _run(
     unconfirmed_processes_truncated = False
     probe_evidence = ProbeEvidence()
     timed_out = interrupted = log_overflow = False
-    prov: Any = None
-    if provenance:
-        prov = provenance_module.Provenance()
-        prov.start()
+    prov: Any = provenance_module.Provenance() if provenance else None
     try:
         log = os.fdopen(fd, "wb")
     except BaseException:
@@ -1277,6 +1268,8 @@ def _run(
 
     try:
         try:
+            if prov is not None:
+                prov.start()
             baseline_snapshot = _process_snapshot()
             process = subprocess.Popen(list(argv), cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             if prov is not None:
@@ -1613,8 +1606,23 @@ def _hash_file(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+GIT_SAFE_ARGS = ("-c", "core.fsmonitor=false")
+
+
+def _git_environment() -> dict[str, str]:
+    """Environment for git calls made while builder leases may be held.
+
+    No GIT_* caller settings, no optional index-lock writes, no prompts; with
+    core.fsmonitor off, a repository config cannot make git start a daemon.
+    """
+    env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
 def _git(repo: pathlib.Path, *args: str) -> str:
-    result = subprocess.run(["git", *args], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    result = subprocess.run(["git", *GIT_SAFE_ARGS, *args], cwd=repo, env=_git_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
     if result.returncode:
         raise RuntimeError(f"git command failed: {args[0]}")
     return result.stdout.strip()
@@ -1634,9 +1642,11 @@ def _first_nonempty_version_line(raw: bytes) -> str:
 
 
 def _tree_state_digest(repo: pathlib.Path) -> str:
-    status = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    work = subprocess.run(["git", "diff", "--binary", "HEAD"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    cached = subprocess.run(["git", "diff", "--cached", "--binary", "HEAD"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    git = ["git", *GIT_SAFE_ARGS]
+    env = _git_environment()
+    status = subprocess.run([*git, "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    work = subprocess.run([*git, "diff", "--binary", "HEAD"], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    cached = subprocess.run([*git, "diff", "--cached", "--binary", "HEAD"], cwd=repo, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if status.returncode or work.returncode or cached.returncode:
         raise RuntimeError("cannot capture working-tree identity")
     pieces = [status.stdout, work.stdout, cached.stdout]
@@ -1653,7 +1663,7 @@ def _tree_state_digest(repo: pathlib.Path) -> str:
 
 
 def _phase_diff(repo: pathlib.Path, base: str) -> bytes:
-    result = subprocess.run(["git", "diff", "--binary", f"{base}...HEAD"], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    result = subprocess.run(["git", *GIT_SAFE_ARGS, "diff", "--binary", f"{base}...HEAD"], cwd=repo, env=_git_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if result.returncode:
         raise RuntimeError("cannot capture pinned phase diff")
     return result.stdout
@@ -1719,7 +1729,7 @@ def _versions(
                 probe["log"] = f"logs/{log_name}"
             if settle_report:
                 probe["naturalExitSettle"] = settle_report
-            if provenance_report.get("classifiedCount"):
+            if provenance_report:
                 probe["provenance"] = provenance_report
             probes.append(probe)
             raise
@@ -1742,7 +1752,7 @@ def _versions(
                 probe["logHash"] = "unavailable"
             if settle_report:
                 probe["naturalExitSettle"] = settle_report
-            if provenance_report.get("classifiedCount"):
+            if provenance_report:
                 probe["provenance"] = provenance_report
             probes.append(probe)
             raise RuntimeError("version probe log could not be read") from exc
@@ -1758,7 +1768,7 @@ def _versions(
         }
         if settle_report:
             probe["naturalExitSettle"] = settle_report
-        if provenance_report.get("classifiedCount"):
+        if provenance_report:
             probe["provenance"] = provenance_report
         probes.append(probe)
         if exit_code == 127:
@@ -2278,7 +2288,7 @@ def run(args: argparse.Namespace) -> int:
             }
             if gate.name in gate_settle_reports:
                 entry["naturalExitSettle"] = gate_settle_reports[gate.name]
-            if active_attempt is not None and active_attempt.get("provenance", {}).get("classifiedCount"):
+            if active_attempt is not None and active_attempt.get("provenance"):
                 entry["provenance"] = active_attempt["provenance"]
             if (entry["headAfter"] != head_start or entry["workingTreeDigestAfter"] != dirty_start
                     or entry["phaseDiffSha256After"] != _hash(diff_start)):
@@ -2375,7 +2385,7 @@ def run(args: argparse.Namespace) -> int:
                     entry["artifactFinalization"] = "log hash unavailable after private admission or filesystem error"
             if attempt["naturalExitSettle"]:
                 entry["naturalExitSettle"] = attempt["naturalExitSettle"]
-            if attempt.get("provenance", {}).get("classifiedCount"):
+            if attempt.get("provenance"):
                 entry["provenance"] = attempt["provenance"]
             results.append(entry)
             active_attempt = None

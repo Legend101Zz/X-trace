@@ -1037,6 +1037,20 @@ def _successful_settle_report(value: Any) -> bool:
     )
 
 
+def _provenance_classified_count(value: Any) -> int:
+    """Validate one gate/probe provenance report and return its classified count.
+
+    A report that says the mechanism was unavailable (for example prctl failed) is
+    invalid: the floor must not silently run without the classification it relies on.
+    """
+    count = value.get("classifiedCount") if isinstance(value, dict) else None
+    if (not isinstance(value, dict) or value.get("available") is not True
+            or type(count) is not int or count < 0
+            or value.get("overflowed") is True):
+        raise FloorInputError("provenance-unavailable")
+    return count
+
+
 def _sanitize_floor(args: argparse.Namespace) -> int:
     root = pathlib.Path(args.root)
     private_roots.admit_directory(root, private_leaf=True)
@@ -1057,6 +1071,7 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         "gateCount": 0,
         "gates": [],
         "toolVersionNamesRecordedPrivately": False,
+        "provenance": {"reportCount": 0, "classifiedCount": 0},
         "rawLogs": "ephemeral owner-private job storage only; not uploaded",
         "independentRawReviewAfterJob": "unavailable; no verified private artifact facility configured",
         "packageAcceptance": "not run; requires a reviewed P07B candidate artifact",
@@ -1181,6 +1196,9 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
             settle = item.get("naturalExitSettle")
             if settle is not None and not _successful_settle_report(settle):
                 raise FloorInputError
+            if item.get("provenance") is not None:
+                summary["provenance"]["reportCount"] += 1
+                summary["provenance"]["classifiedCount"] += _provenance_classified_count(item["provenance"])
             gate_rows.append({
                 "name": name, "status": "passed", "exitCode": 0,
                 "durationSeconds": duration, "logSha256": item["logSha256"],
@@ -1234,6 +1252,9 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
             settle = probe.get("naturalExitSettle")
             if settle is not None and not _successful_settle_report(settle):
                 raise FloorInputError
+            if probe.get("provenance") is not None:
+                summary["provenance"]["reportCount"] += 1
+                summary["provenance"]["classifiedCount"] += _provenance_classified_count(probe["provenance"])
         expected_java, expected_node = {
             "jdk17-node22": (17, 22), "jdk21-node24": (21, 24),
         }[args.tuple]
@@ -1290,6 +1311,7 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         summary["floorStatus"] = "invalid" if receipt_was_read or receipt_path.exists() else "unreached"
         summary["gates"] = []
         summary["gateCount"] = 0
+        summary["provenance"] = {"reportCount": 0, "classifiedCount": 0}
     private_roots.atomic_write_private(
         root / "release-floor-summary.json",
         (json.dumps(summary, indent=2, sort_keys=True) + "\n").encode(),

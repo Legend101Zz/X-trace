@@ -1022,8 +1022,9 @@ def _strip_new_directory_acls(parent_fd: int, name: str) -> None:
     Only called for a directory this process just created. On Linux a parent's
     default ACL replaces the umask and is copied into the child; removing both
     ACL attributes and restoring mode 0700 gives the child exactly the owner-only
-    permissions it was created with. The directory is still admitted afterwards,
-    so anything this cannot clear fails closed there.
+    permissions it was created with. Before returning it re-checks that the directory
+    is still empty and carries no non-minimal ACL; on any failure the new directory is
+    removed. It is still admitted afterwards, so anything this cannot clear fails closed.
     """
     if not sys.platform.startswith("linux"):
         return
@@ -1037,9 +1038,22 @@ def _strip_new_directory_acls(parent_fd: int, name: str) -> None:
                 if exc.errno not in _ACL_ABSENT_ERRNOS and exc.errno not in _ACL_UNSUPPORTED_ERRNOS:
                     raise _fail("acl-strip-error") from None
         os.fchmod(fd, 0o700)
+        # Re-admit before anything can use the directory: it must be empty (nothing was planted
+        # through the inherited ACL while it was live) and carry no non-minimal ACL.
+        if os.listdir(fd):
+            raise _fail("acl-strip-not-empty")
+        _linux_acl_check(fd)
     except AdmissionError:
+        try:
+            os.rmdir(name, dir_fd=parent_fd)
+        except OSError:
+            pass
         raise
     except (OSError, AttributeError):
+        try:
+            os.rmdir(name, dir_fd=parent_fd)
+        except OSError:
+            pass
         raise _fail("acl-strip-error") from None
     finally:
         if fd is not None:

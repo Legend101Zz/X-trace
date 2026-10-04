@@ -329,6 +329,59 @@ class CiFloorEvidenceTests(unittest.TestCase):
             self.assertEqual(ci_floor._sanitize_floor(args), 1)
         self.assertNotEqual(json.loads(output[0])["floorStatus"], "checks_passed_for_review")
 
+    def sanitize_with_provenance(self, mutate: object) -> dict:
+        label = "floor-123456-1-jdk17-node22"
+        names = sorted(["tools.release.test_release_tools.Public.test_ok", "tools.release.test_ci_floor.Public.test_ok"])
+        tests = {
+            "schemaVersion": 1, "sourceSha": self.source_sha, "sourceIdentityVerified": True,
+            "testScratchAdmissionVerified": True, "suiteModules": list(ci_floor.RELEASE_TEST_MODULES),
+            "status": "passed", "discoveredCount": 2, "discoveredTestIds": names, "testCount": 2,
+            "failedCount": 0, "skippedCount": 0, "tests": [{"name": name, "status": "passed"} for name in names],
+        }
+        receipt = self._passing_receipt(label)
+        private_cargo = "/private/runner/cache/toolchain-cargo-argv/cargo"
+        next(row for row in receipt["gates"] if row["name"] == "restricted-build")["argv"][0] = private_cargo
+        original_which = ci_floor.shutil.which
+        which = lambda name, *a, **k: private_cargo if name == "cargo" else original_which(name, *a, **k)  # noqa: E731
+        mutate(receipt)  # type: ignore[operator]
+        output: list[bytes] = []
+
+        def read(path: pathlib.Path, **kwargs: object):
+            return tests if path.name == "release-tool-tests-summary.json" else receipt
+
+        def version_log(path: pathlib.Path) -> tuple[str, str]:
+            name = path.name.removeprefix("version-").removesuffix(".log")
+            return self.digest, receipt["toolVersions"][name]
+
+        args = Namespace(root="/synthetic/private-root", repo="/public/repo", label=label, expected_head=self.source_sha,
+                         phase_base=self.phase_base, tuple="jdk17-node22")
+        with mock.patch.object(ci_floor.private_roots, "admit_directory"), \
+                mock.patch.object(ci_floor.private_roots, "read_private_json", side_effect=read), \
+                mock.patch.object(ci_floor, "_source_is_clean", return_value=True), \
+                mock.patch.object(ci_floor, "_source_proofs", return_value=self._source_proofs()), \
+                mock.patch.object(ci_floor, "_discover_release_test_ids", return_value=tests["discoveredTestIds"]), \
+                mock.patch.object(ci_floor, "_private_file_sha256", return_value=self.digest), \
+                mock.patch.object(ci_floor, "_private_log_digest_and_first_line", side_effect=version_log), \
+                mock.patch.object(ci_floor.shutil, "which", side_effect=which), \
+                mock.patch.object(ci_floor.private_roots, "atomic_write_private", side_effect=lambda _p, data: output.append(data)):
+            ci_floor._sanitize_floor(args)
+        return json.loads(output[0])
+
+    def test_sanitizer_surfaces_provenance_counts_and_rejects_an_unavailable_mechanism(self) -> None:
+        report = {"mode": "subreaper", "available": True, "overflowed": False, "classifiedCount": 4}
+        public = self.sanitize_with_provenance(lambda receipt: (
+            receipt["gates"][0].update(provenance=report), receipt["gates"][1].update(provenance={**report, "classifiedCount": 0}),
+        ))
+        self.assertEqual(public["floorStatus"], "checks_passed_for_review")
+        self.assertEqual(public["provenance"], {"reportCount": 2, "classifiedCount": 4})
+        for name, change in {"unavailable": {"available": False, "unavailableReason": "prctl-failed"}, "overflowed": {"overflowed": True}}.items():
+            with self.subTest(name):
+                public = self.sanitize_with_provenance(lambda receipt: receipt["gates"][0].update(provenance={**report, **change}))
+                self.assertEqual(public["floorStatus"], "invalid")
+                self.assertEqual(public["provenance"], {"reportCount": 0, "classifiedCount": 0})
+        public = self.sanitize_with_provenance(lambda receipt: None)
+        self.assertEqual(public["provenance"], {"reportCount": 0, "classifiedCount": 0}, "provenance explicitly disabled: nothing claimed")
+
     def test_sanitizer_rejects_unreached_gate_rows_and_mismatched_identity(self) -> None:
         label = "floor-123456-1-jdk21-node24"
         tests = {
@@ -2177,3 +2230,37 @@ class CiFloorSummaryScrubberTests(unittest.TestCase):
             self.assertNotIn(canary, printed)
         self.assertIn("RAW-STDERR-CANARY", raw)
         self.assertIn("RAW-STDOUT-CANARY", raw)
+
+
+class CiFloorProvenanceAndWorkflowTests(unittest.TestCase):
+    def test_provenance_report_must_be_available_and_well_formed(self) -> None:
+        good = {"available": True, "classifiedCount": 3, "overflowed": False}
+        self.assertEqual(ci_floor._provenance_classified_count(good), 3)
+        self.assertEqual(ci_floor._provenance_classified_count({**good, "classifiedCount": 0}), 0)
+        for name, value in {
+            "unavailable": {**good, "available": False},
+            "overflowed": {**good, "overflowed": True},
+            "negative": {**good, "classifiedCount": -1},
+            "non-int": {**good, "classifiedCount": "3"},
+            "bool": {**good, "classifiedCount": True},
+            "missing": {"classifiedCount": 1},
+            "not a dict": [],
+        }.items():
+            with self.subTest(name), self.assertRaises(ci_floor.FloorInputError) as caught:
+                ci_floor._provenance_classified_count(value)
+            self.assertEqual(caught.exception.reason, "provenance-unavailable")
+
+    def test_workflow_pins_actions_by_commit_and_restricts_token_permissions(self) -> None:
+        workflow = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+        text = workflow.read_text()
+        uses = [line.strip() for line in text.splitlines() if "uses:" in line and not line.strip().startswith("#")]
+        self.assertTrue(uses)
+        for line in uses:
+            self.assertRegex(line, r"uses: [\w.-]+/[\w.-]+@[0-9a-f]{40}( #.*)?$", line)
+        self.assertRegex(text, r"(?m)^permissions:\n  contents: read\n", "default token permission is read-only")
+        for line in text.splitlines():
+            if line.strip().startswith("permissions:") and not line.startswith("permissions:"):
+                continue
+        self.assertNotIn("contents: write", text)
+        self.assertNotIn("runner.temp", text)
+        self.assertEqual(text.count("toolchain: stable"), text.count("dtolnay/rust-toolchain@"))

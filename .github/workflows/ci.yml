@@ -10,6 +10,9 @@ on:
       - main
       - "slice/**"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -19,7 +22,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -71,20 +74,21 @@ jobs:
             java-version: 21
             node-version: 24
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node-version }}
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: ${{ matrix.java-version }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - name: Install release-floor system prerequisites
         run: |
@@ -152,7 +156,7 @@ jobs:
           exit "$result"
       - name: Upload sanitized floor summary only
         if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: xtrace-v001-floor-${{ matrix.tuple }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json
@@ -169,11 +173,11 @@ jobs:
       matrix:
         java-version: [17, 21]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: ${{ matrix.java-version }}
@@ -186,9 +190,11 @@ jobs:
             adapters/java/*/gradle.lockfile
             adapters/java/gradle/verification-metadata.xml
             adapters/java/gradle/wrapper/gradle-wrapper.properties
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -220,13 +226,15 @@ jobs:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -250,11 +258,11 @@ jobs:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
           java-version: 17
@@ -268,8 +276,9 @@ jobs:
             adapters/java/gradle/verification-metadata.xml
             adapters/java/gradle/wrapper/gradle-wrapper.properties
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - name: Install and validate Node protocol workspace
         run: |
@@ -290,7 +299,7 @@ jobs:
         working-directory: adapters/java
         run: ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry

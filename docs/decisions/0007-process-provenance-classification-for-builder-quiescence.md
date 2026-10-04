@@ -77,18 +77,29 @@ run behaves exactly as before.
 
 - Foreign launchd, kernel and system processes no longer block quiescence, so
   real runs and the real-scanner tests can pass on a busy host.
-- Provenance proves non-descent in the fork tree, not that a process cannot write
-  the builder caches. Residual routes where work reaches the caches without being
-  a descendant: launchd or XPC activation, `launchctl submit`, `systemd-run` and
-  D-Bus activation, `at` and cron, Docker (a daemon or VM runs it; the Linux runner
-  user is in the docker group), persistent build daemons that outlive a run
-  (Gradle, sccache, Bazel servers), ptrace injection into a non-descendant,
-  and setuid exec, which keeps ancestry but defeats descriptor inspection (such
-  a process stays uncertain because it is a descendant).
-- The gates avoid those routes by construction: Gradle runs with `--no-daemon`, no
-  gate uses Docker or a service manager, and a pre-existing daemon is outside the
-  baseline. This is a property of the gate list, not something the runner can
-  prove; adding a gate that delegates work needs its own review.
+- Provenance proves non-descent in the fork tree, not that a process cannot write the
+  builder caches. The residual is work that reaches the caches without being a descendant:
+  launchd or XPC activation, LaunchServices (`open`), `launchctl submit`, `osascript`,
+  `systemd-run` and D-Bus activation, `at` and cron, Docker (a daemon or VM runs it; the Linux
+  runner user is in the docker group), persistent build daemons that outlive a run (Gradle,
+  sccache, Bazel servers), ptrace injection into a non-descendant, and setuid exec, which
+  keeps ancestry but defeats descriptor inspection (such a process stays uncertain because it
+  is a descendant).
+- These routes are out of the threat model only because the callers are constrained, not
+  because provenance covers them: `leased_run` enforces an argv[0] basename allowlist (cargo,
+  gradlew, npm, npx, node, git, java, and python only as `-B -m unittest` or
+  `-B -m tools.release.*`) and refuses shells and launchers (open, launchctl, osascript,
+  docker, systemd-run, at, sh) with exit code 77; builders run with `--no-daemon`; the 23
+  gates contain no launcher. A pre-existing daemon is outside the baseline. Receipts record
+  this residual as `provenanceResidual`. Adding a command or a gate that delegates work
+  needs its own review.
+- A leased run gets a private HOME inside its admitted scratch and an allowlisted environment;
+  `--pass-env` refuses names that load code or redirect the build (LD_*, DYLD_*, NODE_OPTIONS,
+  PYTHONPATH, JAVA_TOOL_OPTIONS, BASH_ENV, RUSTC_WRAPPER, RUSTFLAGS, CARGO_*, GIT_*, *_PROXY and
+  similar); the host HOME is passed only by an explicit `--pass-env HOME`, recorded in the receipt.
+- On Linux every live non-baseline direct child of the runner except its own registered
+  ps/lsof helpers is adopted into the owned set at once (no grace period), so a daemon that
+  escapes just before the command root exits is drained or fails closed, never classified.
 - On macOS the coalition flavor of `proc_pidinfo` is declared in SDK headers but is
   not a documented stable API; XPC services and LaunchServices apps get their own
   coalitions, so they are classified non-descendant even when started on our
