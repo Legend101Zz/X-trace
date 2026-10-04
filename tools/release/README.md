@@ -184,3 +184,17 @@ python3.14 -B -m tools.release.leased_run --repo <worktree> --label <new unique 
   no skip or expected-failure marker.
 - One JSON summary line is printed: label, decision, exit code, duration, log
   SHA-256 and lease cleanup.
+
+## Process provenance classification
+
+An uninspectable process (other-user or kernel; its descriptors cannot be read
+unprivileged) that is positively not a descendant of the run no longer blocks
+quiescence. macOS compares resource coalition ids (`proc_pidinfo`); Linux makes
+the runner a child subreaper for the command and requires a process that was never
+in the descendant set, whose parent chain does not reach the runner. Unreadable,
+equal, inconsistent or unavailable facts leave the process uncertain (fail
+closed). Evidence (pid, start time, same/other user class, coalition ids) is
+recorded in the receipt under `provenance` (`leased_run`) or per gate/probe
+(`run_gates`, disable with `--no-provenance`). It proves non-descent in the fork
+tree only; see `docs/decisions/0007-process-provenance-classification-for-builder-quiescence.md`
+for the residual delegated-work routes.

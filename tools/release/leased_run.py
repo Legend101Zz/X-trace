@@ -333,6 +333,7 @@ def run(
     claimed = False  # this process created run_dir; only then may it write there
     cleanup = ["retained"] * len(acquired)
     settle_report: dict[str, Any] = {}
+    provenance_report: dict[str, Any] = {}
     released_ok = False
     try:
         # Atomically claim the label now that the leases are held: a label
@@ -356,6 +357,7 @@ def run(
             exit_code, duration = run_gates._run(
                 argv, cwd=repo, env=env, timeout=args.timeout, log_path=temp_log,
                 settle_report=settle_report, max_log_bytes=MAX_LOG_BYTES,
+                provenance=True, provenance_report=provenance_report,
             )
         except run_gates.AttemptedGateFailure as exc:
             attempted = exc
@@ -377,6 +379,8 @@ def run(
                 }
         if settle_report:
             receipt["naturalExitSettle"] = settle_report
+        if provenance_report:
+            receipt["provenance"] = provenance_report
         receipt["exitCode"] = exit_code
         receipt["durationSeconds"] = duration
         if temp_log.exists():

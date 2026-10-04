@@ -22,9 +22,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
 if __package__:
-    from . import private_roots
+    from . import private_roots, provenance as provenance_module
 else:
     import private_roots
+    import provenance as provenance_module
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -82,6 +83,9 @@ class UntrackedProcessScan:
     # Exact (pid, startedAt) identities of candidates the scanner positively
     # inspected and found neither held nor unknown. Empty on any scan error.
     clean_identities: frozenset[tuple[int, str]] = frozenset()
+    # Uninspectable identities positively classified as non-descendants by
+    # provenance; they carry their evidence and no longer block settling.
+    classified: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def unconfirmed(self) -> list[dict[str, Any]]:
@@ -678,8 +682,14 @@ def _untracked_processes_since(
     log_path: pathlib.Path,
     *,
     budget_seconds: float = UNTRACKED_SCAN_BUDGET_SECONDS,
+    provenance: Any = None,
 ) -> UntrackedProcessScan:
-    """Find processes born during the run that retain the private gate log."""
+    """Find processes born during the run that retain the private gate log.
+
+    With a provenance object, an uninspectable candidate that provenance
+    positively classifies as a non-descendant moves to `classified` (with its
+    evidence) instead of `uninspectable`; everything else is unchanged.
+    """
     started = time.monotonic()
     canonical_log_path = os.path.realpath(log_path)
     candidates: list[tuple[int, int, str]] = []
@@ -737,6 +747,15 @@ def _untracked_processes_since(
             and still_live[pid][1] == candidates_by_pid[pid][1]
             and still_live[pid][2] not in {"Z", "X"}
         ]
+        classified_records: list[dict[str, Any]] = []
+        if provenance is not None and unknown_records:
+            classified_by_pid = provenance.classify(
+                [(item["pid"], item["startedAt"]) for item in unknown_records],
+                snapshot, still_live, owned, started + budget_seconds,
+            )
+            if classified_by_pid:
+                classified_records = list(classified_by_pid.values())
+                unknown_records = [item for item in unknown_records if item["pid"] not in classified_by_pid]
         total = len(held_records) + len(unknown_records)
         clean_identities: frozenset[tuple[int, str]] = frozenset()
         if scan_error is None:
@@ -756,6 +775,7 @@ def _untracked_processes_since(
             total,
             owned_probes,
             clean_identities,
+            classified_records[:MAX_UNCONFIRMED_SAMPLE],
         )
 
     if len(candidates) > MAX_UNTRACKED_PROCESSES:
@@ -831,6 +851,7 @@ def _untracked_processes_since(
             result.candidate_count,
             owned_probes,
             result.clean_identities,
+            result.classified,
         )
     return result
 
@@ -1196,8 +1217,16 @@ def _run(
     argv: Sequence[str], *, cwd: pathlib.Path, env: dict[str, str], timeout: int,
     log_path: pathlib.Path, settle_report: dict[str, Any] | None = None,
     max_log_bytes: int | None = None,
+    provenance: bool = False,
+    provenance_report: dict[str, Any] | None = None,
 ) -> tuple[int, float]:
     """Run one supervised command, optionally enforcing a live log-size cap.
+
+    With `provenance`, the run arms process-provenance classification (macOS
+    coalitions; Linux child-subreaper) so uninspectable processes that are
+    positively not descendants stop blocking; the evidence goes to
+    `provenance_report`. If the mechanism is unavailable nothing is classified.
+
 
     With `max_log_bytes`, the poll loop checks the log's size; on overflow it
     stops only this run's owned process tree through the same path as a
@@ -1223,11 +1252,20 @@ def _run(
     unconfirmed_processes_truncated = False
     probe_evidence = ProbeEvidence()
     timed_out = interrupted = log_overflow = False
+    prov: Any = None
+    if provenance:
+        prov = provenance_module.Provenance()
+        prov.start()
     try:
         log = os.fdopen(fd, "wb")
     except BaseException:
         os.close(fd)
         raise
+
+    def track(root: tuple[int, str], snapshot: dict[int, tuple[int, str, str]]) -> None:
+        _track_descendants(root, owned, snapshot)
+        if prov is not None:
+            prov.observe(snapshot, baseline_snapshot or {}, owned)
 
     def write_diagnostic(payload: bytes) -> None:
         nonlocal log_io_error
@@ -1241,6 +1279,8 @@ def _run(
         try:
             baseline_snapshot = _process_snapshot()
             process = subprocess.Popen(list(argv), cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            if prov is not None:
+                prov.note_root(process.pid)
             tree_confirmed_drained = False
             deadline = time.monotonic() + timeout
             # Keep the direct child unreaped until its first ps snapshot; Popen
@@ -1250,12 +1290,12 @@ def _run(
             root_record = snapshot.get(process.pid)
             if root_record is not None:
                 root_identity = (process.pid, root_record[1])
-                _track_descendants(root_identity, owned, snapshot)
+                track(root_identity, snapshot)
             while True:
                 snapshot = _process_snapshot()
                 last_snapshot = snapshot
                 if root_identity is not None:
-                    _track_descendants(root_identity, owned, snapshot)
+                    track(root_identity, snapshot)
                 try:
                     code = process.wait(timeout=0.05)
                     break
@@ -1304,7 +1344,7 @@ def _run(
                     write_diagnostic(b"\nGate interrupted; owned process tree drained.\n")
             else:
                 snapshot = _process_snapshot()
-                _track_descendants(root_identity, owned, snapshot)
+                track(root_identity, snapshot)
                 if _owned_processes_alive(owned, snapshot):
                     if not _stop_and_reap_owned_tree(process, root_identity, owned):
                         uncertain = f"completed process tree rooted at {process.pid} could not be confirmed drained"
@@ -1374,9 +1414,9 @@ def _run(
                 final_snapshot = _process_snapshot()
                 last_snapshot = final_snapshot
                 if root_identity is not None:
-                    _track_descendants(root_identity, owned, final_snapshot)
+                    track(root_identity, final_snapshot)
                 scan = _untracked_processes_since(
-                    baseline_snapshot, owned, final_snapshot, log_path,
+                    baseline_snapshot, owned, final_snapshot, log_path, provenance=prov,
                 )
                 unconfirmed_processes = scan.unconfirmed
                 unconfirmed_process_count = scan.candidate_count
@@ -1404,11 +1444,9 @@ def _run(
                                 deadline,
                                 snapshot=lambda **kwargs: _process_snapshot(**kwargs),
                                 descriptor_scan=lambda snapshot, **kwargs: _untracked_processes_since(
-                                    baseline_snapshot, owned, snapshot, log_path, **kwargs,
+                                    baseline_snapshot, owned, snapshot, log_path, provenance=prov, **kwargs,
                                 ),
-                                after_snapshot=lambda snapshot: _track_descendants(
-                                    root_identity, owned, snapshot,
-                                ),
+                                after_snapshot=lambda snapshot: track(root_identity, snapshot),
                             )
                         except BaseException as scan_exc:
                             probe_evidence.add_exception(scan_exc)
@@ -1516,6 +1554,10 @@ def _run(
         except BaseException as exc:
             if log_io_error is None:
                 log_io_error = exc
+    if prov is not None:
+        prov.stop()
+        if provenance_report is not None:
+            provenance_report.update(prov.report())
     if log_io_error is not None and process is not None and not tree_confirmed_drained:
         if root_identity is not None and _stop_and_reap_owned_tree(process, root_identity, owned):
             tree_confirmed_drained = True
@@ -1640,6 +1682,7 @@ def _versions(
     *,
     names: set[str] | None = None,
     timeout: float = 20,
+    provenance: bool = False,
 ) -> dict[str, str]:
     versions: dict[str, str] = {}
     private_roots.ensure_private_directory(logs_dir)
@@ -1649,10 +1692,11 @@ def _versions(
         log_name = f"version-{name}.log"
         log_path = logs_dir / log_name
         settle_report: dict[str, Any] = {}
+        provenance_report: dict[str, Any] = {}
         try:
             exit_code, duration = _run(
                 argv, cwd=repo / cwd, env=env, timeout=timeout, log_path=log_path,
-                settle_report=settle_report,
+                settle_report=settle_report, provenance=provenance, provenance_report=provenance_report,
             )
         except (UncertainProcessTree, AttemptedGateFailure) as exc:
             if not exc.command_started:
@@ -1675,6 +1719,8 @@ def _versions(
                 probe["log"] = f"logs/{log_name}"
             if settle_report:
                 probe["naturalExitSettle"] = settle_report
+            if provenance_report.get("classifiedCount"):
+                probe["provenance"] = provenance_report
             probes.append(probe)
             raise
         try:
@@ -1696,6 +1742,8 @@ def _versions(
                 probe["logHash"] = "unavailable"
             if settle_report:
                 probe["naturalExitSettle"] = settle_report
+            if provenance_report.get("classifiedCount"):
+                probe["provenance"] = provenance_report
             probes.append(probe)
             raise RuntimeError("version probe log could not be read") from exc
         probe = {
@@ -1710,6 +1758,8 @@ def _versions(
         }
         if settle_report:
             probe["naturalExitSettle"] = settle_report
+        if provenance_report.get("classifiedCount"):
+            probe["provenance"] = provenance_report
         probes.append(probe)
         if exit_code == 127:
             versions[name] = "unavailable"
@@ -1747,16 +1797,17 @@ def _atomic_json(path: pathlib.Path, value: Any) -> None:
     _atomic_write(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode())
 
 
-_SETTLE_LIST_FIELDS = ("initialIdentities", "latestIdentities", "identityUnion", "ownedProbeProcesses", "cleanupExceptions")
+_SETTLE_LIST_FIELDS = ("initialIdentities", "latestIdentities", "identityUnion", "ownedProbeProcesses", "cleanupExceptions", "classifiedIdentities")
 
 
 def _settle_reports(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     reports: list[dict[str, Any]] = []
     for group in ("gates", "versionProbes"):
         for item in manifest.get(group) or []:
-            report = item.get("naturalExitSettle") if isinstance(item, dict) else None
-            if isinstance(report, dict):
-                reports.append(report)
+            for key in ("naturalExitSettle", "provenance"):
+                report = item.get(key) if isinstance(item, dict) else None
+                if isinstance(report, dict):
+                    reports.append(report)
     return reports
 
 
@@ -2069,6 +2120,7 @@ def run(args: argparse.Namespace) -> int:
             raise RuntimeError("checkout must be clean so the receipt identifies exactly HEAD")
         diff_start = _phase_diff(repo, base)
         dirty_start = _tree_state_digest(repo)
+        use_provenance = bool(getattr(args, "provenance", False))
         env = os.environ.copy()
         env.update({
             "CARGO_HOME": str(cache / "cargo"),
@@ -2086,6 +2138,7 @@ def run(args: argparse.Namespace) -> int:
         recheck_private_roots()
         manifest["toolVersions"] = _versions(
             repo, env, logs_dir, manifest["versionProbes"], names={"rustc", "cargo", "rustup", "java", "node", "npm", "gradle-wrapper", "python", "git"},
+            provenance=use_provenance,
         )
         manifest["toolVersions"].update({"buf": "pending node install", "playwright": "pending web install"})
         manifest["platform"] = {"system": platform.system(), "release": platform.release(), "machine": platform.machine()}
@@ -2094,6 +2147,7 @@ def run(args: argparse.Namespace) -> int:
             for name in ("Cargo.lock", "adapters/java/gradle.lockfile", "adapters/node/package-lock.json", "web/app/package-lock.json")
         }
         gate_settle_reports: dict[str, dict[str, Any]] = {}
+        gate_provenance_reports: dict[str, dict[str, Any]] = {}
 
         def run_gate_command(
             argv: list[str], *, cwd: pathlib.Path, env: dict[str, str],
@@ -2102,11 +2156,13 @@ def run(args: argparse.Namespace) -> int:
         ) -> tuple[int, float]:
             nonlocal active_attempt
             natural_exit_settle: dict[str, Any] = {}
+            provenance_evidence: dict[str, Any] = {}
             try:
                 result = _run(
                     argv, cwd=cwd, env=env, timeout=args.command_timeout,
                     log_path=temp_log_path,
                     settle_report=natural_exit_settle,
+                    provenance=use_provenance, provenance_report=provenance_evidence,
                 )
             except (UncertainProcessTree, AttemptedGateFailure) as exc:
                 if not exc.command_started:
@@ -2123,6 +2179,7 @@ def run(args: argparse.Namespace) -> int:
                     "durationSeconds": exc.duration_seconds,
                     "cleanupUncertain": isinstance(exc, UncertainProcessTree),
                     "naturalExitSettle": natural_exit_settle,
+                    "provenance": provenance_evidence,
                     "headAfter": None,
                     "treeAfter": None,
                     "diffAfter": None,
@@ -2144,6 +2201,7 @@ def run(args: argparse.Namespace) -> int:
                 "durationSeconds": result[1],
                 "cleanupUncertain": False,
                 "naturalExitSettle": natural_exit_settle,
+                "provenance": provenance_evidence,
                 "headAfter": None,
                 "treeAfter": None,
                 "diffAfter": None,
@@ -2220,6 +2278,8 @@ def run(args: argparse.Namespace) -> int:
             }
             if gate.name in gate_settle_reports:
                 entry["naturalExitSettle"] = gate_settle_reports[gate.name]
+            if active_attempt is not None and active_attempt.get("provenance", {}).get("classifiedCount"):
+                entry["provenance"] = active_attempt["provenance"]
             if (entry["headAfter"] != head_start or entry["workingTreeDigestAfter"] != dirty_start
                     or entry["phaseDiffSha256After"] != _hash(diff_start)):
                 entry["status"] = "failed"
@@ -2229,10 +2289,10 @@ def run(args: argparse.Namespace) -> int:
             active_attempt = None
             if gate.name == "node-install" and code == 0:
                 recheck_private_roots()
-                manifest["toolVersions"].update(_versions(repo, env, logs_dir, manifest["versionProbes"], names={"buf"}))
+                manifest["toolVersions"].update(_versions(repo, env, logs_dir, manifest["versionProbes"], names={"buf"}, provenance=use_provenance))
             if gate.name == "web-install" and code == 0:
                 recheck_private_roots()
-                manifest["toolVersions"].update(_versions(repo, env, logs_dir, manifest["versionProbes"], names={"playwright"}))
+                manifest["toolVersions"].update(_versions(repo, env, logs_dir, manifest["versionProbes"], names={"playwright"}, provenance=use_provenance))
             manifest["headAfter"] = entry["headAfter"]
             manifest["gates"] = results
             manifest["decision"] = "running" if code == 0 else "failed"
@@ -2315,6 +2375,8 @@ def run(args: argparse.Namespace) -> int:
                     entry["artifactFinalization"] = "log hash unavailable after private admission or filesystem error"
             if attempt["naturalExitSettle"]:
                 entry["naturalExitSettle"] = attempt["naturalExitSettle"]
+            if attempt.get("provenance", {}).get("classifiedCount"):
+                entry["provenance"] = attempt["provenance"]
             results.append(entry)
             active_attempt = None
             manifest["headAfter"] = None
@@ -2358,6 +2420,8 @@ def main() -> int:
     parser.add_argument("--cache-root", required=True, help="explicit local cache and raw-log root")
     parser.add_argument("--lease-token", default="", help="shared 32-hex token for an explicitly nested invocation")
     parser.add_argument("--command-timeout", type=int, default=7200, help="per-command timeout in seconds")
+    parser.add_argument("--no-provenance", dest="provenance", action="store_false", default=True,
+                        help="disable process-provenance classification of uninspectable processes")
     args = parser.parse_args()
     try:
         return run(args)

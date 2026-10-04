@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import hashlib
 import json
@@ -18,7 +19,7 @@ from types import SimpleNamespace
 from argparse import Namespace
 from unittest import mock
 
-from tools.release import check_ledger, leased_run, private_roots, run_gates
+from tools.release import check_ledger, leased_run, private_roots, provenance, run_gates
 
 REAL_VERSIONS = run_gates._versions
 
@@ -1673,7 +1674,7 @@ class RunOwnershipWorldTests(unittest.TestCase):
         snapshot.update(_live(*unknown, *clean))
         return snapshot, {item["pid"] for item in clean}, raise_exc, owned_probe  # type: ignore[arg-type, misc]
 
-    def drive(self, worlds: list, *, settle_seconds: float | None = None) -> tuple[dict[str, object], run_gates.UncertainProcessTree | None, tuple[int, float] | None]:
+    def drive(self, worlds: list, *, settle_seconds: float | None = None, provenance_factory: object = None) -> tuple[dict[str, object], run_gates.UncertainProcessTree | None, tuple[int, float] | None]:
         state = {"calls": 0, "scan": 0, "world": worlds[0]}
 
         def fake_snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, str, str]]:
@@ -1712,9 +1713,15 @@ class RunOwnershipWorldTests(unittest.TestCase):
             return real_settle(*args, **kwargs)  # type: ignore[arg-type]
 
         report: dict[str, object] = {}
+        self.provenance_report: dict[str, object] = {}
         result: tuple[int, float] | None = None
         failure: run_gates.UncertainProcessTree | None = None
-        with mock.patch.object(run_gates, "_process_snapshot", side_effect=fake_snapshot), \
+        extra = {"provenance": True, "provenance_report": self.provenance_report} if provenance_factory else {}
+        factory_patch = (
+            mock.patch.object(run_gates.provenance_module, "Provenance", side_effect=provenance_factory)
+            if provenance_factory else mock.patch.dict(os.environ, {})
+        )
+        with factory_patch, mock.patch.object(run_gates, "_process_snapshot", side_effect=fake_snapshot), \
                 mock.patch.object(run_gates.subprocess, "Popen", return_value=process), \
                 mock.patch.object(run_gates, "_bounded_ownership_scan", side_effect=counting_bounded), \
                 mock.patch.object(run_gates, "_run_lsof_fields", side_effect=fake_lsof), \
@@ -1725,7 +1732,7 @@ class RunOwnershipWorldTests(unittest.TestCase):
             try:
                 result = run_gates._run(
                     ["gate"], cwd=self.root, env={}, timeout=30,
-                    log_path=self.root / f"gate-{id(worlds)}.log", settle_report=report,
+                    log_path=self.root / f"gate-{id(worlds)}.log", settle_report=report, **extra,
                 )
             except run_gates.UncertainProcessTree as exc:
                 failure = exc
@@ -3397,8 +3404,14 @@ class RunnerTests(unittest.TestCase):
         gate = run_gates.Gate("uninspectable-candidate", (sys.executable, "-c", script))
         child_pid: int | None = None
         probe_identity = {"pid": 654321, "startedAt": "Mon Oct  5 12:00:00 2026", "processGroupId": 654321, "reason": "probe-reap-deadline-exceeded"}
+        real_is_dir = pathlib.Path.is_dir
+        # The interrupted probe is an lsof probe. Force the scanner's lsof branch on every
+        # host: on Linux the /proc branch would otherwise be used, no probe would run, and the
+        # candidate would simply exit naturally (correctly) inside the settle window.
         with mock.patch.object(run_gates, "_track_descendants", return_value=None), \
                 mock.patch.object(run_gates, "_process_holds_log", return_value=None), \
+                mock.patch.object(run_gates, "LSOF_BINARY", "/usr/sbin/lsof"), \
+                mock.patch.object(pathlib.Path, "is_dir", lambda path: False if str(path) == "/proc" else real_is_dir(path)), \
                 mock.patch.object(run_gates, "_run_lsof_fields", side_effect=run_gates.InterruptedProbeCleanup(probe_identity)), \
                 mock.patch.object(run_gates, "GATES", (gate,)):
             try:
@@ -3631,20 +3644,23 @@ class LeasedRunTests(unittest.TestCase):
         return Namespace(**values)
 
     def fake_run(self, log: bytes = b"", code: int = 0, raise_exc: BaseException | None = None,
-                 mutate: object = None) -> mock._patch:
+                 mutate: object = None, prov_report: dict | None = None) -> mock._patch:
         captured: dict[str, object] = {}
         self.captured = captured
 
         def fake(argv: list[str], *, cwd: pathlib.Path, env: dict[str, str], timeout: float,
                  log_path: pathlib.Path, settle_report: dict | None = None,
-                 max_log_bytes: int | None = None) -> tuple[int, float]:
-            captured.update(
+                 max_log_bytes: int | None = None, provenance: bool = False,
+                 provenance_report: dict | None = None) -> tuple[int, float]:
+            captured.update(provenance=provenance, 
                 scratch_existed=pathlib.Path(env["XTRACE_TEST_SCRATCH_ROOT"]).is_dir(), max_log_bytes=max_log_bytes, 
                 argv=list(argv), cwd=cwd, env=dict(env), timeout=timeout,
                 held=sorted(path.name for path in (self.cache / "leases").iterdir()),
                 log_name=pathlib.Path(log_path).name,
             )
             pathlib.Path(log_path).write_bytes(log)
+            if prov_report and provenance_report is not None:
+                provenance_report.update(prov_report)
             if callable(mutate):
                 mutate()
             if raise_exc is not None:
@@ -4083,6 +4099,21 @@ class LeasedRunTests(unittest.TestCase):
             self.assertEqual(self.go(self.args("leased-keep-2")), leased_run.EXIT_UNCERTAIN)
         self.assertTrue((self.cache / "tmp" / "leased-keep-2-scratch").is_dir())
 
+    def test_provenance_is_enabled_and_its_evidence_recorded_in_the_receipt(self) -> None:
+        report = {
+            "mode": "subreaper", "available": True, "overflowed": False, "unavailableReason": "",
+            "adoptedOrphanCount": 0, "classifiedCount": 1, "classifiedByClass": {provenance.CLASS_SUBREAPER: 1},
+            "classifiedTruncated": False,
+            "classifiedIdentities": [{"pid": 900, "startedAt": "s", "classification": provenance.CLASS_SUBREAPER, "uidClass": "other"}],
+        }
+        with self.fake_run(prov_report=report):
+            self.assertEqual(self.go(), leased_run.EXIT_PASSED)
+        self.assertIs(self.captured["provenance"], True)
+        receipt = self.receipt()
+        self.assertEqual(receipt["provenance"]["classifiedCount"], 1)
+        self.assertEqual(receipt["provenance"]["classifiedIdentities"][0]["uidClass"], "other")
+        self.assertNotIn("unconfirmedProcesses", receipt)
+
     def test_log_limit_exit_code_is_a_failed_run_with_reason(self) -> None:
         with self.fake_run(code=run_gates.LOG_LIMIT_EXIT_CODE, log=b"partial"):
             self.assertEqual(self.go(), leased_run.EXIT_FAILED)
@@ -4116,6 +4147,322 @@ class LeasedRunTests(unittest.TestCase):
                 env=dict(os.environ), timeout=30, log_path=self.root / "uncapped.log",
             )
         self.assertEqual(code, 0)
+
+class ProvenanceTests(unittest.TestCase):
+    """Provenance classification with fakes for every syscall, plus real-host observers."""
+
+    RUNNER = 500
+
+    def coalition(self, table: dict[int, int | None], runner: int = 100, **kwargs: object) -> provenance.Provenance:
+        values = {self.RUNNER: runner, **table}
+        calls: dict[int, int] = {}
+
+        def reader(pid: int) -> int | None:
+            calls[pid] = calls.get(pid, 0) + 1
+            value = values.get(pid)
+            return value(calls[pid]) if callable(value) else value
+
+        item = provenance.Provenance(
+            platform="darwin", runner_pid=self.RUNNER, uid=501, coalition_reader=reader,
+            facts_reader=kwargs.pop("facts_reader", self.facts), **kwargs,  # type: ignore[arg-type]
+        )
+        return item
+
+    @staticmethod
+    def facts(pids: object, _deadline: float) -> dict[int, tuple[int, str]]:
+        return {pid: (0, f"start-{pid}") for pid in pids}  # type: ignore[union-attr]
+
+    @staticmethod
+    def snap(*rows: tuple[int, int, str]) -> dict[int, tuple[int, str, str]]:
+        return {pid: (ppid, f"start-{pid}", state) for pid, ppid, state in rows}
+
+    def classify(self, item: provenance.Provenance, pids: list[int], scan: dict, fresh: dict | None = None,
+                 owned: dict[int, str] | None = None) -> dict[int, dict]:
+        return item.classify([(pid, f"start-{pid}") for pid in pids], scan, fresh if fresh is not None else scan,
+                             owned or {}, time.monotonic() + 5)
+
+    # macOS coalition mode
+    def test_coalition_different_and_readable_is_classified_with_evidence(self) -> None:
+        item = self.coalition({900: 7})
+        self.assertTrue(item.start())
+        scan = self.snap((900, 1, "S"))
+        result = self.classify(item, [900], scan)
+        self.assertEqual(result[900]["classification"], provenance.CLASS_COALITION)
+        self.assertEqual((result[900]["uidClass"], result[900]["coalitionId"], result[900]["runCoalitionIds"]), ("other", 7, [100]))
+        self.assertEqual(item.report()["classifiedCount"], 1)
+        self.assertEqual(item.report()["classifiedByClass"], {provenance.CLASS_COALITION: 1})
+        same_uid = provenance.Provenance(
+            platform="darwin", runner_pid=self.RUNNER, uid=0, coalition_reader={500: 100, 900: 7}.get,
+            facts_reader=self.facts,
+        )
+        same_uid.start()
+        self.assertEqual(self.classify(same_uid, [900], scan)[900]["uidClass"], "same")
+
+    def test_coalition_equal_unreadable_or_inconsistent_stays_uncertain(self) -> None:
+        scan = self.snap((900, 1, "S"))
+        cases = {
+            "equal to the run": {900: 100},
+            "unreadable": {900: None},
+            "changes between reads": {900: lambda call: 7 if call == 1 else 8},
+        }
+        for name, table in cases.items():
+            with self.subTest(name):
+                item = self.coalition(table)  # type: ignore[arg-type]
+                item.start()
+                self.assertEqual(self.classify(item, [900], scan), {})
+                self.assertEqual(item.report()["classifiedCount"], 0)
+
+    def test_coalition_root_command_coalition_also_counts_as_the_run(self) -> None:
+        item = self.coalition({4321: 55, 900: 55, 901: 7})
+        item.start()
+        item.note_root(4321)
+        scan = self.snap((900, 1, "S"), (901, 1, "S"))
+        result = self.classify(item, [900, 901], scan)
+        self.assertEqual(sorted(result), [901])
+        self.assertEqual(result[901]["runCoalitionIds"], [55, 100])
+
+    def test_coalition_unreadable_run_coalition_disables_classification(self) -> None:
+        item = self.coalition({}, runner=None)  # type: ignore[arg-type]
+        self.assertFalse(item.start())
+        self.assertEqual(item.unavailable_reason, "coalition-unreadable")
+        self.assertEqual(self.classify(item, [900], self.snap((900, 1, "S"))), {})
+
+    def test_pid_reuse_and_stale_identity_are_never_classified(self) -> None:
+        scan = self.snap((900, 1, "S"))
+        item = self.coalition({900: 7})
+        item.start()
+        # ps facts report a different start time than the scan identity.
+        reused = lambda pids, _d: {pid: (0, "Mon Jan  1 00:00:00 2001") for pid in pids}  # noqa: E731
+        item = self.coalition({900: 7}, facts_reader=reused)
+        item.start()
+        self.assertEqual(self.classify(item, [900], scan), {})
+        # The fresh snapshot shows a different process (new start) under the same pid.
+        item = self.coalition({900: 7})
+        item.start()
+        fresh = {900: (1, "start-other", "S")}
+        self.assertEqual(self.classify(item, [900], scan, fresh), {})
+        # The process is gone, a zombie, or owned in the fresh view.
+        self.assertEqual(self.classify(item, [900], scan, {}), {})
+        self.assertEqual(self.classify(item, [900], scan, self.snap((900, 1, "Z"))), {})
+        self.assertEqual(self.classify(item, [900], scan, owned={900: "start-900"}), {})
+        # The start time changes between the first and the confirming read.
+        sequence = iter([{900: (0, "start-900")}, {900: (0, "start-changed")}])
+        item = self.coalition({900: 7}, facts_reader=lambda pids, _d: next(sequence))
+        item.start()
+        self.assertEqual(self.classify(item, [900], scan), {})
+        # Missing facts (ps failed) never classify.
+        item = self.coalition({900: 7}, facts_reader=lambda pids, _d: {})
+        item.start()
+        self.assertEqual(self.classify(item, [900], scan), {})
+
+    # Linux subreaper mode
+    def subreaper(self, setter: object = None, **kwargs: object) -> provenance.Provenance:
+        return provenance.Provenance(
+            platform="linux", runner_pid=self.RUNNER, uid=1001,
+            subreaper_setter=setter or (lambda enabled: True),  # type: ignore[arg-type]
+            facts_reader=kwargs.pop("facts_reader", self.facts), **kwargs,  # type: ignore[arg-type]
+        )
+
+    def test_subreaper_failure_means_no_classification_and_nothing_to_undo(self) -> None:
+        calls: list[bool] = []
+        item = self.subreaper(lambda enabled: calls.append(enabled) or False)
+        self.assertFalse(item.start())
+        self.assertEqual(item.unavailable_reason, "prctl-failed")
+        scan = self.snap((2, 0, "S"), (900, 2, "S"))
+        self.assertEqual(self.classify(item, [900], scan), {})
+        item.stop()
+        self.assertEqual(calls, [True], "a subreaper that was never enabled is not 'disabled' again")
+
+    def test_subreaper_classifies_foreign_processes_whose_chain_never_reaches_the_runner(self) -> None:
+        calls: list[bool] = []
+        item = self.subreaper(lambda enabled: calls.append(enabled) or True)
+        self.assertTrue(item.start())
+        scan = self.snap((1, 0, "S"), (2, 0, "S"), (900, 2, "S"), (800, 1, "S"), (self.RUNNER, 1, "S"))
+        result = self.classify(item, [900, 800], scan)
+        self.assertEqual({pid: record["classification"] for pid, record in result.items()},
+                         {900: provenance.CLASS_SUBREAPER, 800: provenance.CLASS_SUBREAPER})
+        self.assertEqual(result[900]["uidClass"], "other")
+        item.stop()
+        self.assertEqual(calls, [True, False])
+
+    def test_subreaper_descendants_orphans_and_unobserved_chains_are_never_classified(self) -> None:
+        item = self.subreaper()
+        item.start()
+        # 600 is our child, 700 its child; both observed while the chain reaches the runner.
+        first = self.snap((self.RUNNER, 1, "S"), (600, self.RUNNER, "S"), (700, 600, "S"), (900, 1, "S"))
+        item.observe(first, {}, {})
+        # 600 exits; 700 is reparented to the subreaper (the runner), not to init.
+        later = self.snap((self.RUNNER, 1, "S"), (700, self.RUNNER, "S"), (900, 1, "S"))
+        item.observe(later, {}, {})
+        self.assertEqual(self.classify(item, [700], later), {}, "an orphan reparented to the runner is a descendant")
+        self.assertEqual(self.classify(item, [600, 700], first), {}, "chains reaching the runner are never classified")
+        self.assertEqual(sorted(self.classify(item, [900], later)), [900])
+        # Observed descendant identity stays excluded even if a later snapshot shows it elsewhere.
+        moved = self.snap((self.RUNNER, 1, "S"), (700, 1, "S"))
+        self.assertEqual(self.classify(item, [700], moved), {}, "previously a descendant: never classified")
+        # A different process reusing the pid has a new start time and is a new identity.
+        reuse = {700: (2, "start-new", "S"), 2: (0, "start-2", "S")}
+        reused = item.classify([(700, "start-new")], reuse, reuse, {}, time.monotonic() + 5,)
+        self.assertEqual(reused, {}, "facts say start-700, not start-new")
+
+    def test_subreaper_inconsistent_chains_and_start_times_stay_uncertain(self) -> None:
+        item = self.subreaper()
+        item.start()
+        missing_parent = {900: (4000, "start-900", "S")}
+        self.assertEqual(self.classify(item, [900], missing_parent), {})
+        cycle = {900: (901, "start-900", "S"), 901: (900, "start-901", "S")}
+        self.assertEqual(self.classify(item, [900], cycle), {})
+        absent = self.snap((1, 0, "S"))
+        self.assertEqual(self.classify(item, [900], absent), {})
+        good = self.snap((900, 1, "S"))
+        self.assertEqual(self.classify(item, [900], good, fresh=self.snap((900, self.RUNNER, "S"))), {},
+                         "the fresh snapshot shows the chain reaching the runner")
+        bad_facts = provenance.Provenance(
+            platform="linux", runner_pid=self.RUNNER, subreaper_setter=lambda e: True,
+            facts_reader=lambda pids, _d: {pid: (0, "other-start") for pid in pids},
+        )
+        bad_facts.start()
+        self.assertEqual(self.classify(bad_facts, [900], good), {})
+
+    def test_subreaper_descendant_set_overflow_disables_classification(self) -> None:
+        item = self.subreaper()
+        item.start()
+        rows = [(self.RUNNER, 1, "S")] + [(1000 + n, self.RUNNER, "S") for n in range(5)] + [(900, 1, "S")]
+        with mock.patch.object(provenance, "MAX_DESCENDANT_IDENTITIES", 3):
+            item.observe(self.snap(*rows), {}, {})
+        self.assertTrue(item.overflowed)
+        self.assertEqual(self.classify(item, [900], self.snap((900, 1, "S"))), {})
+        self.assertTrue(item.report()["overflowed"])
+
+    def test_subreaper_orphans_are_adopted_only_after_persisting_and_zombies_reaped_safely(self) -> None:
+        clock = FakeClock()
+        reaped: list[int] = []
+        item = self.subreaper(monotonic=clock.monotonic, reaper=lambda pid, flags: reaped.append(pid))
+        item.start()
+        owned: dict[int, str] = {}
+        baseline = self.snap((650, self.RUNNER, "S"))
+        live = self.snap((self.RUNNER, 1, "S"), (650, self.RUNNER, "S"), (700, self.RUNNER, "S"), (710, 700, "S"))
+        item.observe(live, baseline, owned)
+        self.assertEqual(owned, {}, "first sighting only: a transient probe is never adopted")
+        clock.now = 0.2
+        item.observe(live, baseline, owned)
+        self.assertEqual(owned, {})
+        clock.now = 0.6
+        item.observe(live, baseline, owned)
+        self.assertEqual(owned, {700: "start-700"}, "persisting orphan adopted; baseline child and grandchild excluded")
+        self.assertEqual(item.report()["adoptedOrphanCount"], 1)
+        # Its zombie is reaped; a zombie that was never adopted is not.
+        zombies = self.snap((self.RUNNER, 1, "S"), (700, self.RUNNER, "Z"), (720, self.RUNNER, "Z"))
+        item.observe(zombies, baseline, owned)
+        self.assertEqual(reaped, [700])
+        # A pid that disappears between sightings resets its timer.
+        item2 = self.subreaper(monotonic=clock.monotonic)
+        item2.start()
+        owned2: dict[int, str] = {}
+        clock.now = 10.0
+        item2.observe(live, {}, owned2)
+        item2.observe(self.snap((self.RUNNER, 1, "S")), {}, owned2)
+        clock.now = 11.0
+        item2.observe(live, {}, owned2)
+        self.assertEqual(owned2, {})
+
+    def test_classified_evidence_is_bounded_with_truthful_totals(self) -> None:
+        evidence = provenance.ClassifiedEvidence()
+        for pid in range(1, 301):
+            evidence.add({"pid": pid, "startedAt": f"s{pid}", "classification": provenance.CLASS_SUBREAPER})
+        evidence.add({"pid": 1, "startedAt": "s1", "classification": provenance.CLASS_SUBREAPER})
+        report = evidence.report()
+        self.assertEqual(len(report["classifiedIdentities"]), provenance.MAX_EVIDENCE_RECORDS)
+        self.assertEqual(report["classifiedCount"], 300)
+        self.assertTrue(report["classifiedTruncated"])
+        self.assertLess(len(json.dumps(report)), 64 * 1024)
+
+    def test_unsupported_platform_never_classifies(self) -> None:
+        item = provenance.Provenance(platform="freebsd", runner_pid=self.RUNNER, facts_reader=self.facts)
+        self.assertFalse(item.start())
+        self.assertEqual(item.unavailable_reason, "unsupported-platform")
+        self.assertEqual(self.classify(item, [900], self.snap((900, 1, "S"))), {})
+
+    # Scanner and _run integration
+    def scan_with(self, prov: object) -> run_gates.UntrackedProcessScan:
+        start = "Sun Oct  4 21:00:00 2026"
+        supplied = {7001: (1, start, "S")}
+        real_is_dir = pathlib.Path.is_dir
+        with mock.patch.object(run_gates, "LSOF_BINARY", "/test/lsof"), \
+                mock.patch.object(run_gates, "_run_lsof_fields", return_value=run_gates.LsofProbe(0, "", "")), \
+                mock.patch.object(pathlib.Path, "is_dir", lambda path: False if str(path) == "/proc" else real_is_dir(path)), \
+                mock.patch.object(run_gates, "_process_snapshot", return_value=supplied):
+            return run_gates._untracked_processes_since({}, {}, supplied, pathlib.Path("/nonexistent/gate.log"), provenance=prov)
+
+    def test_scanner_moves_classified_unknowns_out_of_the_blocking_list(self) -> None:
+        start = "Sun Oct  4 21:00:00 2026"
+        class Always:
+            def classify(self, unknowns, scan, fresh, owned, deadline):  # type: ignore[no-untyped-def]
+                return {pid: {"pid": pid, "startedAt": started, "classification": provenance.CLASS_SUBREAPER} for pid, started in unknowns}
+
+        class Never:
+            def classify(self, *args):  # type: ignore[no-untyped-def]
+                return {}
+
+        classified = self.scan_with(Always())
+        self.assertEqual((classified.uninspectable, classified.error, classified.candidate_count), ([], None, 0))
+        self.assertEqual([item["pid"] for item in classified.classified], [7001])
+        blocked = self.scan_with(Never())
+        self.assertEqual([item["pid"] for item in blocked.uninspectable], [7001])
+        self.assertEqual(blocked.error, EXPECTED_UNKNOWN)
+        self.assertEqual(blocked.classified, [])
+        self.assertEqual(self.scan_with(None).classified, [])
+
+    def test_run_with_provenance_passes_when_foreign_daemons_are_classified_and_fails_closed_without_it(self) -> None:
+        world = RunOwnershipWorldTests()
+        world.setUp()
+        self.addCleanup(world.temp.cleanup)
+        daemon = _unknown(9001)
+        real_class = provenance.Provenance
+        facts = lambda pids, _d: {pid: (0, f"start-{pid}") for pid in pids}  # noqa: E731
+        ok_factory = lambda **_ignored: real_class(  # noqa: E731
+            platform="linux", runner_pid=self.RUNNER, subreaper_setter=lambda e: True, facts_reader=facts)
+        report, failure, result = world.drive([world.world(daemon)], provenance_factory=ok_factory)
+        self.assertIsNone(failure, str(failure))
+        self.assertIsNotNone(result)
+        self.assertEqual(world.provenance_report["classifiedCount"], 1)
+        self.assertEqual(world.provenance_report["classifiedIdentities"][0]["classification"], provenance.CLASS_SUBREAPER)
+        self.assertEqual(report, {}, "nothing was left uncertain, so no settle report")
+        failing_factory = lambda **_ignored: real_class(  # noqa: E731
+            platform="linux", runner_pid=self.RUNNER, subreaper_setter=lambda e: False, facts_reader=facts)
+        report, failure, result = world.drive([world.world(daemon)], provenance_factory=failing_factory, settle_seconds=2.0)
+        self.assertIsNone(result)
+        self.assertIsNotNone(failure, "prctl failure means no classification: fail closed as before")
+        self.assertEqual(world.provenance_report["unavailableReason"], "prctl-failed")
+        self.assertEqual(world.provenance_report["classifiedCount"], 0)
+
+    # Real host: observe, never fail open
+    def test_real_host_provenance_never_classifies_the_runs_own_descendants(self) -> None:
+        item = provenance.Provenance()
+        started = item.start()
+        child = subprocess.Popen(["sleep", "5"], start_new_session=True)
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        try:
+            snapshot = run_gates._process_snapshot()
+            item.observe(snapshot, {}, {})
+            identity = (child.pid, snapshot[child.pid][1])
+            own = item.classify([identity], snapshot, snapshot, {}, time.monotonic() + 5)
+            self.assertEqual(own, {}, "our own child is never classified as a non-descendant")
+            others = [(pid, record[1]) for pid, record in snapshot.items() if pid in (1, 2)]
+            for _pid, record in item.classify(others, snapshot, snapshot, {}, time.monotonic() + 5).items():
+                self.assertIn(record["classification"], (provenance.CLASS_COALITION, provenance.CLASS_SUBREAPER))
+            if sys.platform == "darwin":
+                coalition = provenance.read_coalition_id(os.getpid())
+                self.assertTrue(coalition is None or coalition > 0)
+                self.assertEqual(started, coalition is not None)
+            elif sys.platform.startswith("linux"):
+                self.assertEqual(started, item.available)
+        finally:
+            item.stop()
+        if sys.platform.startswith("linux") and started:
+            value = ctypes.c_int(-1)
+            ctypes.CDLL(None).prctl(provenance.PR_GET_CHILD_SUBREAPER, ctypes.byref(value), 0, 0, 0)
+            self.assertEqual(value.value, 0, "the subreaper flag is cleared when the command ends")
 
 
 LEASE_DIRS = ("cargo", "gradle")
