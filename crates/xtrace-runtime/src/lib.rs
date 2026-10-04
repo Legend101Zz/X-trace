@@ -28,3 +28,6 @@ pub mod signed_pack;
 /// Descriptor-relative inspection of untrusted public pack directories.
 #[cfg(unix)]
 pub mod pack_inventory;
+
+#[cfg(unix)]
+pub mod node;

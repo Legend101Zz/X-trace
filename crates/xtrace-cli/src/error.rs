@@ -47,6 +47,9 @@ pub enum CliError {
         remediation: String,
         exit_code: i32,
     },
+    /// Direct Node launch or process supervision failed.
+    #[cfg(unix)]
+    NodeRun(xtrace_runtime::node::LaunchError),
 }
 
 impl CliError {
@@ -73,6 +76,7 @@ impl CliError {
             Self::Run(err) => err.exit_code(),
             #[cfg(unix)]
             Self::Attach { exit_code, .. } => *exit_code,
+            Self::NodeRun(err) => err.exit_code(),
         }
     }
 }
@@ -120,6 +124,7 @@ impl std::fmt::Display for CliError {
             Self::Run(err) => std::fmt::Display::fmt(err, f),
             #[cfg(unix)]
             Self::Attach { message, .. } => f.write_str(message),
+            Self::NodeRun(err) => std::fmt::Display::fmt(err, f),
         }
     }
 }

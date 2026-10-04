@@ -223,6 +223,21 @@ impl ErrorDocument {
                 details: BTreeMapString(std::collections::BTreeMap::new()),
                 exit_code: error.exit_code(),
             },
+            #[cfg(unix)]
+            CliError::NodeRun(run_error) => Self {
+                kind: "error",
+                code: run_error.code().to_string(),
+                category: match run_error.kind() {
+                    xtrace_runtime::node::LaunchErrorKind::Validation => "validation",
+                    xtrace_runtime::node::LaunchErrorKind::Unsupported => "compatibility",
+                    xtrace_runtime::node::LaunchErrorKind::Process => "process",
+                }
+                .to_string(),
+                message: run_error.to_string(),
+                remediation: Vec::new(),
+                details: BTreeMapString(std::collections::BTreeMap::new()),
+                exit_code: error.exit_code(),
+            },
         }
     }
 }
@@ -326,5 +341,17 @@ mod tests {
         assert_eq!(document.code, "XTR-RUN-INVALID-LAUNCH");
         assert_eq!(document.category, "validation");
         assert_eq!(document.exit_code, 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn node_runtime_errors_have_node_specific_sanitized_codes() {
+        let error = CliError::NodeRun(xtrace_runtime::node::LaunchError::Validation("invalid"));
+        let document = ErrorDocument::from_error(&error);
+        assert_eq!(document.code, "XTR-NODE-INVALID-LAUNCH");
+        assert_eq!(document.category, "validation");
+        assert_eq!(document.message, "invalid");
+        assert_eq!(document.exit_code, 2);
+        assert!(document.details.0.is_empty());
     }
 }

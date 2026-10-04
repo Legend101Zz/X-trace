@@ -113,8 +113,25 @@ pub enum XtraceCommand {
         #[arg(long = "project-dir", value_name = "DIR")]
         project_dir: PathBuf,
         /// Path to the built X-trace Java agent JAR.
-        #[arg(long = "java-agent", value_name = "PATH")]
-        java_agent: PathBuf,
+        #[arg(long = "java-agent", value_name = "PATH", conflicts_with_all = ["node_adapter", "node_mode"], required_unless_present = "node_adapter")]
+        java_agent: Option<PathBuf>,
+        /// Path to the built Node adapter dist directory.
+        #[arg(
+            long = "node-adapter",
+            value_name = "DIR",
+            conflicts_with = "java_agent",
+            required_unless_present = "java_agent",
+            requires = "node_mode"
+        )]
+        node_adapter: Option<PathBuf>,
+        /// Explicit Node module mode. Required with --node-adapter.
+        #[arg(
+            long = "node-mode",
+            value_name = "cjs|esm",
+            requires = "node_adapter",
+            conflicts_with = "java_agent"
+        )]
+        node_mode: Option<String>,
         /// Explicitly opt into the finite observed-endpoint rule.
         #[arg(long = "observed-endpoint-policy")]
         observed_endpoint_policy: Option<String>,
@@ -232,21 +249,41 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
         XtraceCommand::Run {
             project_dir,
             java_agent,
+            node_adapter,
+            node_mode,
             observed_endpoint_policy,
             application_component,
             binding_key,
             command,
         } => {
             validate_safe_run_identity(application_component.as_deref(), binding_key.as_deref())?;
-            crate::run::run(
-                project_dir,
-                java_agent,
-                observed_endpoint_policy,
-                application_component,
-                binding_key,
-                command,
-            )
-            .await
+            if let Some(java_agent) = java_agent {
+                crate::run::run(
+                    project_dir,
+                    java_agent,
+                    observed_endpoint_policy,
+                    application_component,
+                    binding_key,
+                    command,
+                )
+                .await
+            } else if let (Some(node_adapter), Some(node_mode)) = (node_adapter, node_mode) {
+                if observed_endpoint_policy.is_some()
+                    || application_component.is_some()
+                    || binding_key.is_some()
+                {
+                    return Err(CliError::InvalidArgument(
+                        "Node capture does not yet support endpoint observation options"
+                            .to_string(),
+                    ));
+                }
+                crate::run::run_node(project_dir, node_adapter, node_mode, command).await
+            } else {
+                Err(CliError::InvalidArgument(
+                    "run requires either --java-agent or --node-adapter with --node-mode"
+                        .to_string(),
+                ))
+            }
         }
     }
 }

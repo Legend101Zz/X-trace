@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile, symlink, writeFile, chmod, link, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { AgentEnvelopeSchema, RecordingEventKind, RecordingEventSchema } from "@xtrace/protocol";
 import {
@@ -192,7 +193,7 @@ test("send queue poisoning prevents later accepted tasks from executing", async 
 });
 
 test("Node proof matches the shared Rust/Node transcript golden", async () => {
-  const path = resolve(process.cwd(), "../../schema/fixtures/xtp-agent/handshake-vector.json");
+  const path = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../../../schema/fixtures/xtp-agent/handshake-vector.json");
   const vector = JSON.parse(await readFile(path, "utf8")) as Record<string, string>;
   const proof = transcriptProof(
     Buffer.from(vector.session_secret_hex!, "hex"),
