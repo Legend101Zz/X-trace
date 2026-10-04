@@ -2030,6 +2030,7 @@ mod tests {
             .expect("admitted private test scratch");
         let project_root = tempfile::Builder::new()
             .prefix("viewer-observed-corruption-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .tempdir_in(scratch)
             .expect("temporary project root");
         #[cfg(unix)]

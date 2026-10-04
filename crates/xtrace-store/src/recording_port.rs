@@ -333,6 +333,7 @@ mod tests {
             .expect("admitted private test scratch");
         let directory = tempfile::Builder::new()
             .prefix("recording-port-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .tempdir_in(temp_base)
             .expect("project directory");
         let root = directory.path();

@@ -1160,7 +1160,11 @@ fn daemon_lock_failure_does_not_launch_the_java_child() {
 
 fn temp_root() -> TempDir {
     let base = std::env::temp_dir().canonicalize().expect("temporary root");
-    tempfile::Builder::new().prefix("xtrace run ").tempdir_in(base).expect("temporary test root")
+    tempfile::Builder::new()
+        .prefix("xtrace run ")
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir_in(base)
+        .expect("temporary test root")
 }
 
 fn free_port() -> u16 {

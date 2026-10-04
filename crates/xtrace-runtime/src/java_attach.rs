@@ -1211,6 +1211,13 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
+    /// Creates an owner-only temporary directory regardless of the process umask.
+    fn private_tempdir_in(parent: &Path) -> std::io::Result<tempfile::TempDir> {
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)
+    }
+
     fn make_pack(root: &Path) {
         std::fs::create_dir_all(root.join("attach")).expect("attach directory");
         std::fs::create_dir_all(root.join("agent/runtime")).expect("runtime directory");
@@ -1252,9 +1259,9 @@ mod tests {
             .map(PathBuf::from)
             .expect("the gate must provide an owner-enforced private scratch root");
         admit_private_directory(&scratch).expect("gate-provided scratch admission");
-        let source = tempfile::tempdir_in(&scratch).expect("temporary source pack under scratch");
+        let source = private_tempdir_in(&scratch).expect("temporary source pack under scratch");
         make_pack(source.path());
-        let cache = tempfile::tempdir_in(&scratch).expect("temporary private cache under scratch");
+        let cache = private_tempdir_in(&scratch).expect("temporary private cache under scratch");
         let cache_path = cache.path().join("cache");
         std::fs::create_dir(&cache_path).expect("cache directory");
         std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o700))

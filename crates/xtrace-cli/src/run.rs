@@ -365,6 +365,7 @@ mod tests {
             .expect("admitted private test scratch");
         tempfile::Builder::new()
             .prefix("xtrace-run-test-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .tempdir_in(scratch)
             .expect("private run test directory")
     }

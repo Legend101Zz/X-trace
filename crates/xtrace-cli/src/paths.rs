@@ -807,6 +807,7 @@ mod tests {
             .expect("admitted private test scratch");
         tempfile::Builder::new()
             .prefix("xtrace-cli-paths-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .tempdir_in(scratch)
             .expect("create unique test directory")
             .keep()

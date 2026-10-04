@@ -194,6 +194,7 @@ mod tests {
         AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
         tempfile::Builder::new()
             .prefix("xtrace-daemon-lock-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .tempdir_in(scratch)
             .expect("temp root")
     }

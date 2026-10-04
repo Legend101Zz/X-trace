@@ -384,7 +384,11 @@ mod tests {
                 .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
         );
         AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
-        tempfile::Builder::new().prefix(label).tempdir_in(scratch).expect("temp root")
+        tempfile::Builder::new()
+            .prefix(label)
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir_in(scratch)
+            .expect("temp root")
     }
 
     fn initialized_project(repo: &Path, data_home: &Path) -> ProjectId {

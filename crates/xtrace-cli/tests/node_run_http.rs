@@ -55,7 +55,11 @@ impl Drop for RunChild {
 
 fn temp_root() -> TempDir {
     let base = std::env::temp_dir().canonicalize().expect("canonical temporary root");
-    tempfile::Builder::new().prefix("xtrace node run ").tempdir_in(base).expect("temporary root")
+    tempfile::Builder::new()
+        .prefix("xtrace node run ")
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir_in(base)
+        .expect("temporary root")
 }
 
 #[test]

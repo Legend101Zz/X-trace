@@ -542,8 +542,11 @@ impl RecordingCapture for ObservedCapture {
 
 fn secure_tempdir(prefix: &str) -> TempDir {
     let temp_base = std::env::temp_dir().canonicalize().expect("canonical temp base");
-    let directory =
-        tempfile::Builder::new().prefix(prefix).tempdir_in(temp_base).expect("temp directory");
+    let directory = tempfile::Builder::new()
+        .prefix(prefix)
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir_in(temp_base)
+        .expect("temp directory");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
