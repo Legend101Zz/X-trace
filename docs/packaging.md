@@ -1,0 +1,68 @@
+# Packaging, supply chain and signing
+
+Everything here produces UNSIGNED release-candidate artifacts. Signing, notarization and the release trust table are
+owner-held (see "What needs the owner"). Dev builds in the Docker devbox are feedback only, never acceptance evidence.
+
+## Build
+
+    python3 packaging/build.py --out dist [--platform macos-arm64|linux-x86_64|linux-aarch64-dev]
+
+Builds from a clean git checkout (refuses a dirty tree), then writes `dist/<platform>/`:
+
+| file | content |
+|---|---|
+| `xtrace-0.0.1-<platform>.tar.gz` | deterministic payload: `bin/xtrace`, `share/xtrace/{web,packs/java,packs/node,schema,sbom.cdx.json,licenses.json,THIRD_PARTY_LICENSES,payload.sha256,PACKAGE-MANIFEST.json,VERSION}`, `install.sh`, `uninstall.sh` |
+| `SHA256SUMS` | sha256 of every file in the directory except itself |
+| `sbom.cdx.json` | CycloneDX 1.5: Cargo.lock + Gradle lockfiles/verification metadata + npm lockfiles |
+| `licenses.json`, `THIRD_PARTY_LICENSES` | license inventory; flags `unknown`, `copyleft`, `review` |
+| `build-info.json` | commit, lockfile hashes, toolchain versions (builder-provided, not attested) |
+
+Determinism: sorted tar entries, uid/gid 0 root, mtime = `SOURCE_DATE_EPOCH` (the commit time), modes 0755/0644,
+gzip mtime 0 and no file name, `--locked` Rust with path remapping and stripped symbols, Gradle archives forced
+reproducible through `packaging/gradle/reproducible.init.gradle` (no product build edits), strict Gradle dependency
+verification. `python3 packaging/repro_check.py --out DIR` rebuilds twice from fresh exports in different paths and
+compares every output.
+
+There is one product binary (`xtrace`; the daemon is a library inside it). Web assets are what the binary embeds
+(`crates/xtrace-daemon/assets/ui`, verified against a fresh `vite build` with `npm run check:embedded`). Migrations
+are compiled into the store crate, so no separate migration files ship.
+
+## Install, upgrade, uninstall
+
+    tar -xzf xtrace-0.0.1-<platform>.tar.gz && cd xtrace-0.0.1-<platform>
+    ./install.sh [--prefix DIR]            # default ~/.local/xtrace; prints PATH guidance, never edits profiles
+    ./install.sh verify [--prefix DIR]     # re-check the installed payload against payload.sha256
+    ./install.sh verify-dist DIR           # re-check DIR/SHA256SUMS before extracting
+    ./uninstall.sh [--prefix DIR]
+
+User data (the data home: `XTRACE_DATA_HOME`, else `~/Library/Application Support/xtrace` on macOS or
+`${XDG_DATA_HOME:-~/.local/share}/xtrace` on Linux) is never created, modified or deleted by these scripts. An upgrade
+copies the data home to `<prefix>/backups/<utc>-pre-<version>/` before the new version becomes `current`, keeps one
+previous version for rollback, refuses downgrades without `--allow-downgrade`, and refuses a prefix inside the data
+home. Uninstall removes program files only and prints where data and backups are. The product itself runs store
+migrations at first use; the installer cannot migrate (and does not stop a running daemon: stop it first).
+`packaging/test/install_test.sh dist/<platform>` exercises fresh install, upgrade, tamper/downgrade refusal and uninstall.
+
+## Signing interfaces (fail clearly without real authority)
+
+- `packaging/sign-macos.sh --archive A --out-dir D --identity "Developer ID Application: ..." --notary-profile P`
+  requires macOS, a valid Developer ID identity in the keychain and a notarytool profile; otherwise exits 3 and does
+  nothing. It signs `bin/xtrace` with the hardened runtime, notarizes, runs `spctl`, and repacks via `repack.py`
+  (marks `packTrust=signed-macos-developer-id`). A bare Mach-O/zip cannot be stapled.
+- `packaging/sign-detached.sh --key K --sums SHA256SUMS` writes an Ed25519 signature (`openssl pkeyutl -sign -rawin`,
+  the primitive `tools/release/check_ledger.py` verifies). Needs OpenSSL 3 and a 0600 owner key. Test keys
+  (`--non-release --generate-test-key`) are refused in release mode and their output is `*.nonrelease.sig`.
+
+Pack signing (ADR 0004 Ed25519 embedded in `xtrace-pack.json`) is a different key domain and is not done here.
+
+## CI
+
+`.github/workflows/package.yml` (push to `slice/v001-**`, manual): `ubuntu-24.04` (linux-x86_64) and `macos-15`
+(macos-arm64): tool unit checks, reproducibility double build, build, checksum + install journey, upload of unsigned
+artifacts. `permissions: contents: read`, no secrets, actions pinned by commit SHA.
+
+## What needs the owner
+
+Developer ID identity + notary profile; the Ed25519 release/ledger keys and trust tables; root `LICENSE` files (the
+workspace declares `MIT OR Apache-2.0` but the repo ships none); legal review of flagged licenses; provenance
+attestations (need `id-token`/`attestations` permissions, deliberately not granted here).
