@@ -36,3 +36,5 @@ crates/xtrace-protocol/src/generated/
 
 # Test scratch stores that should never escape the working tree.
 /tmp/
+__pycache__/
+*.pyc
