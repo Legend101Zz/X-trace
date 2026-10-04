@@ -85,9 +85,11 @@ def build_env(src: Path, epoch: int, target_dir: Path) -> dict:
     rustflags = " ".join([
         f"--remap-path-prefix={src}=/xtrace-src",
         f"--remap-path-prefix={cargo_home}=/cargo",
+        f"--remap-path-prefix={target_dir}=/xtrace-target",  # build-script OUT_DIR paths (include!) end up in panic locations
         "-C strip=symbols",
     ])
-    cflags = f"-ffile-prefix-map={src}=/xtrace-src -ffile-prefix-map={cargo_home}=/cargo"
+    cflags = (f"-ffile-prefix-map={src}=/xtrace-src -ffile-prefix-map={cargo_home}=/cargo "
+              f"-ffile-prefix-map={target_dir}=/xtrace-target")
     env.update({
         "SOURCE_DATE_EPOCH": str(epoch), "TZ": "UTC", "LC_ALL": "C", "CARGO_INCREMENTAL": "0",
         "CARGO_TARGET_DIR": str(target_dir), "RUSTFLAGS": rustflags, "CFLAGS": cflags,
