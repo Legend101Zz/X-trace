@@ -283,6 +283,9 @@ def _run(
                     group_identities[pid] = started_at
                     if pid == process.pid:
                         root_identity_observed = True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise FloorInputError
             for key, _events in selector.select(min(remaining, 0.05)):
                 try:
                     chunk = os.read(key.fileobj.fileno(), 8192)
@@ -305,6 +308,9 @@ def _run(
                 if pid == process.pid:
                     root_identity_observed = True
         if not root_identity_observed:
+            raise FloorInputError
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise FloorInputError
         code = process.wait(timeout=remaining)
         remaining = deadline - time.monotonic()

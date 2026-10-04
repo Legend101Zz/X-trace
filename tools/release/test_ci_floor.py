@@ -619,16 +619,22 @@ class CiFloorEvidenceTests(unittest.TestCase):
             fake_bin.mkdir()
             pid_file = root / "child-pid"
             entered_file = root / "script-entered"
+            prepare_file = root / "prepare-entered"
             fake_git = fake_bin / "git"
             fake_git.write_text(
                 f"#!{sys.executable}\n"
-                "import json, os, pathlib, subprocess, sys, time\n"
+                "import os\n"
+                "open(os.environ['XTRACE_FAKE_GIT_ENTERED_FILE'], 'w').write('entered')\n"
+                "import json, pathlib, subprocess, sys, time\n"
+                "if sys.argv[1:] == ['--prepare-only']:\n"
+                " time.sleep(.1)\n"
+                " open(os.environ['XTRACE_FAKE_GIT_PREPARE_FILE'], 'w').write('prepared')\n"
+                " sys.exit(0)\n"
                 "def publish(path, value):\n"
                 " target = pathlib.Path(path)\n"
                 " temporary = target.with_name(target.name + '.tmp')\n"
                 " temporary.write_text(value)\n"
                 " os.replace(temporary, target)\n"
-                "publish(os.environ['XTRACE_FAKE_GIT_ENTERED_FILE'], 'entered')\n"
                 "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
                 "try:\n"
                 " start = ' '.join(subprocess.check_output(['/bin/ps','-o','lstart=','-p',str(child.pid)],text=True).split())\n"
@@ -788,6 +794,20 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 append_snapshot_trace(item)
                 return result
 
+            with mock.patch.dict(os.environ, {
+                "XTRACE_FAKE_GIT_PID_FILE": str(pid_file),
+                "XTRACE_FAKE_GIT_ENTERED_FILE": str(entered_file),
+                "XTRACE_FAKE_GIT_PREPARE_FILE": str(prepare_file),
+            }):
+                preparation = ci_floor._run([str(fake_git), "--prepare-only"], timeout=2.0)
+            self.assertEqual(preparation.returncode, 0, "fake Git prepare-only run must exit cleanly: " + diagnostic())
+            self.assertTrue(prepare_file.is_file(), "fake Git preflight must reach post-import preparation: " + diagnostic())
+            git_fixture_markers = (entered_file, pid_file, prepare_file)
+            for marker in git_fixture_markers:
+                marker.unlink(missing_ok=True)
+                marker.with_name(marker.name + ".tmp").unlink(missing_ok=True)
+            self.assertFalse(any(marker.exists() for marker in git_fixture_markers))
+
             started = time.monotonic()
             try:
                 with mock.patch.dict(os.environ, {
@@ -837,14 +857,27 @@ class CiFloorEvidenceTests(unittest.TestCase):
             fake_bin.mkdir()
             count_file = fake_bin / "ps-count"
             stall_file = fake_bin / "ps-stall-entered"
-            third_invocation_stage_file = fake_bin / "ps-third-stage"
+            script_entered_file = fake_bin / "ps-script-entered"
+            stall_armed_file = fake_bin / "main-stall-armed"
+            stall_consumed_file = fake_bin / "main-stall-consumed"
+            main_snapshot_active_file = fake_bin / "main-snapshot-active"
+            main_deadline_file = fake_bin / "main-deadline"
+            stall_context_file = fake_bin / "main-stall-context"
+            stall_invocation_stage_file = fake_bin / "main-stall-stage"
+            prepare_file = fake_bin / "ps-prepare-entered"
             child_pid_file = root / "utility-pid"
             handler_ready_file = root / "term-handler-ready"
             term_file = root / "term-observed"
             fake_ps = fake_bin / "ps"
             fake_ps.write_text(
                 f"#!{sys.executable}\n"
-                "import os, pathlib, sys, time\n"
+                "import os\n"
+                "open(os.path.join(os.path.dirname(__file__), 'ps-script-entered'), 'w').write('entered')\n"
+                "import math, pathlib, stat, sys, time\n"
+                "if sys.argv[1:] == ['--prepare-only']:\n"
+                " time.sleep(.1)\n"
+                " pathlib.Path(__file__).with_name('ps-prepare-entered').write_text('prepared')\n"
+                " sys.exit(0)\n"
                 "def publish(path, value):\n"
                 " target = pathlib.Path(path)\n"
                 " temporary = target.with_name(target.name + '.tmp')\n"
@@ -853,13 +886,37 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 "counter = pathlib.Path(__file__).with_name('ps-count')\n"
                 "count = int(counter.read_text() or '0') + 1 if counter.exists() else 1\n"
                 "publish(counter, str(count))\n"
-                "if count == 3:\n"
-                " publish(str(pathlib.Path(__file__).with_name('ps-third-stage')), 'entered')\n"
-                " publish(str(pathlib.Path(__file__).with_name('ps-stall-entered')), 'entered')\n"
-                " publish(str(pathlib.Path(__file__).with_name('ps-third-stage')), 'stalling')\n"
-                " time.sleep(2)\n"
-                "if count == 3:\n"
-                " publish(str(pathlib.Path(__file__).with_name('ps-third-stage')), 'delegating')\n"
+                "armed = pathlib.Path(__file__).with_name('main-stall-armed')\n"
+                "active = pathlib.Path(__file__).with_name('main-snapshot-active')\n"
+                "deadline_file = pathlib.Path(__file__).with_name('main-deadline')\n"
+                "def bounded_ascii(path):\n"
+                " descriptor = None\n"
+                " try:\n"
+                "  flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)\n"
+                "  descriptor = os.open(path, flags)\n"
+                "  if not stat.S_ISREG(os.fstat(descriptor).st_mode): return None\n"
+                "  raw = os.read(descriptor, 33)\n"
+                "  if len(raw) > 32: return None\n"
+                "  return raw.decode('ascii')\n"
+                " except (OSError, UnicodeError, ValueError):\n"
+                "  return None\n"
+                " finally:\n"
+                "  if descriptor is not None:\n"
+                "   try: os.close(descriptor)\n"
+                "   except OSError: pass\n"
+                "if armed.exists() and bounded_ascii(active) == 'main':\n"
+                " try:\n"
+                "  main_deadline = float(bounded_ascii(deadline_file) or '')\n"
+                "  if not math.isfinite(main_deadline): main_deadline = 0.0\n"
+                " except ValueError:\n"
+                "  main_deadline = 0.0\n"
+                " if time.monotonic() < main_deadline:\n"
+                "  os.replace(armed, pathlib.Path(__file__).with_name('main-stall-consumed'))\n"
+                "  publish(str(pathlib.Path(__file__).with_name('main-stall-context')), 'main_after_identity')\n"
+                "  publish(str(pathlib.Path(__file__).with_name('main-stall-stage')), 'stalling')\n"
+                "  publish(str(pathlib.Path(__file__).with_name('ps-stall-entered')), 'entered')\n"
+                "  time.sleep(2)\n"
+                "  publish(str(pathlib.Path(__file__).with_name('main-stall-stage')), 'delegating')\n"
                 "os.execv('/bin/ps', ['/bin/ps', *sys.argv[1:]])\n",
                 encoding="utf-8",
             )
@@ -966,6 +1023,55 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 value = safe_count_file().get("value")
                 return value if isinstance(value, int) else None
 
+            def set_main_snapshot_gate(enabled: bool) -> bool:
+                temporary = main_snapshot_active_file.with_name(main_snapshot_active_file.name + ".tmp")
+                if not enabled:
+                    try:
+                        main_snapshot_active_file.unlink(missing_ok=True)
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        try:
+                            stall_armed_file.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    return False
+                try:
+                    temporary.write_text("main", encoding="ascii")
+                    os.replace(temporary, main_snapshot_active_file)
+                    return True
+                except OSError:
+                    try:
+                        stall_armed_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return False
+
+            def snapshot_context() -> str:
+                if active_signal_signum == signal.SIGTERM:
+                    return "term_inner_snapshot"
+                if active_signal_signum == signal.SIGKILL:
+                    return "kill_inner_snapshot"
+                if active_signal_signum is not None:
+                    return "signal_inner_snapshot"
+                frame = sys._getframe(1)
+                for _ in range(32):
+                    if frame is None:
+                        break
+                    if frame.f_code is ci_floor._run.__code__:
+                        if "cleanup_started" in frame.f_locals:
+                            return "cleanup_snapshot"
+                        if frame.f_locals.get("process") is None:
+                            return "baseline_snapshot"
+                        selector = frame.f_locals.get("selector")
+                        if selector is None:
+                            return "unknown_run_snapshot"
+                        try:
+                            return "main_loop_snapshot" if selector.get_map() else "before_reap_snapshot"
+                        except Exception:
+                            return "unknown_run_snapshot"
+                    frame = frame.f_back
+                return "outside_run"
+
             def fixture_identity_seen(records: dict[int, tuple[int, int, str, str]]) -> bool:
                 if not child_pid_file.is_file():
                     return False
@@ -981,10 +1087,19 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     "fixtureStages": {
                         "handlerReady": handler_ready_file.is_file(),
                         "identityPublished": child_pid_file.is_file(),
+                        "fakePsScriptEntered": script_entered_file.is_file(),
                         "nestedPsStallEntered": stall_file.is_file(),
+                        "mainStallArmed": stall_armed_file.is_file(),
+                        "mainStallConsumed": stall_consumed_file.is_file(),
+                        "mainSnapshotGate": safe_marker_file(
+                            main_snapshot_active_file, {"main", "disabled"},
+                        ),
                         "psInvocationCount": safe_count_file(),
-                        "thirdPsInvocationStage": safe_marker_file(
-                            third_invocation_stage_file, {"entered", "stalling", "delegating"},
+                        "mainStallContext": safe_marker_file(
+                            stall_context_file, {"main_after_identity"},
+                        ),
+                        "mainStallStage": safe_marker_file(
+                            stall_invocation_stage_file, {"stalling", "delegating"},
                         ),
                     },
                     "snapshotCalls": snapshot_trace,
@@ -998,21 +1113,18 @@ class CiFloorEvidenceTests(unittest.TestCase):
             def record_snapshot(*args: object, **kwargs: object) -> dict[int, tuple[int, int, str, str]]:
                 entered = time.monotonic()
                 ps_count_before = safe_count_value()
-                third_stage_before = safe_marker_file(
-                    third_invocation_stage_file, {"entered", "stalling", "delegating"},
-                )
                 timeout = kwargs.get("timeout", 2.0)
                 deadline = kwargs.get("deadline")
-                if active_signal_signum == signal.SIGTERM:
-                    call_context = "term_inner_snapshot"
-                elif active_signal_signum == signal.SIGKILL:
-                    call_context = "kill_inner_snapshot"
-                elif active_signal_signum is not None:
-                    call_context = "signal_inner_snapshot"
-                elif entered - started < 0.6:
-                    call_context = "main_deadline_window"
+                call_context = snapshot_context()
+                main_context_active = False
+                if call_context == "main_loop_snapshot" and isinstance(deadline, (int, float)):
+                    try:
+                        main_deadline_file.write_text(str(deadline), encoding="ascii")
+                    except OSError:
+                        pass
+                    main_context_active = set_main_snapshot_gate(True)
                 else:
-                    call_context = "cleanup_window"
+                    set_main_snapshot_gate(False)
                 item: dict[str, object] = {
                     "callContext": call_context,
                     "enteredOffsetSeconds": round(entered - started, 6),
@@ -1020,44 +1132,61 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     "deadlineRemainingSeconds": round(deadline - entered, 6)
                     if isinstance(deadline, (int, float)) else None,
                     "fakePsInvocationCountBefore": ps_count_before,
-                    "fakePsThirdInvocationStageBefore": third_stage_before,
+                    "mainStallArmedBefore": stall_armed_file.is_file(),
+                    "mainStallStageBefore": safe_marker_file(
+                        stall_invocation_stage_file, {"stalling", "delegating"},
+                    ),
                 }
                 try:
                     result = original_snapshot(*args, **kwargs)
                 except BaseException as exc:
                     ps_count_after = safe_count_value()
-                    third_stage_after = safe_marker_file(
-                        third_invocation_stage_file, {"entered", "stalling", "delegating"},
+                    stall_stage_after = safe_marker_file(
+                        stall_invocation_stage_file, {"stalling", "delegating"},
                     )
+                    if main_context_active:
+                        set_main_snapshot_gate(False)
                     item.update({
                         "exitedOffsetSeconds": round(time.monotonic() - started, 6),
                         "outcome": "exception",
                         "exceptionType": type(exc).__name__,
                         "failureCategory": (
-                            "snapshot_failed_during_fake_ps_stall"
+                            "snapshot_failed_during_armed_main_stall"
                             if isinstance(exc, ci_floor.FloorInputError)
-                            and (ps_count_before or 0) < 3 and (ps_count_after or 0) >= 3
-                            and third_stage_after.get("value") == "stalling"
+                            and stall_stage_after.get("value") == "stalling"
+                            and stall_context_file.is_file()
                             else "floor_input_error" if isinstance(exc, ci_floor.FloorInputError)
                             else "other_exception"
                         ),
                         "fakePsInvocationCountAfter": ps_count_after,
-                        "fakePsThirdInvocationStageAfter": third_stage_after,
+                        "mainStallArmedAfter": stall_armed_file.is_file(),
+                        "mainStallStageAfter": stall_stage_after,
                         "fixtureIdentitySeen": False,
                     })
                     append_snapshot_trace(item)
                     raise
                 ps_count_after = safe_count_value()
-                third_stage_after = safe_marker_file(
-                    third_invocation_stage_file, {"entered", "stalling", "delegating"},
+                stall_stage_after = safe_marker_file(
+                    stall_invocation_stage_file, {"stalling", "delegating"},
                 )
+                identity_seen = fixture_identity_seen(result)
+                if main_context_active:
+                    set_main_snapshot_gate(False)
+                    if identity_seen and not stall_consumed_file.exists():
+                        try:
+                            stall_armed_file.touch(exist_ok=False)
+                        except FileExistsError:
+                            pass
+                        except OSError:
+                            pass
                 item.update({
                     "exitedOffsetSeconds": round(time.monotonic() - started, 6),
                     "outcome": "returned",
                     "failureCategory": "none",
                     "fakePsInvocationCountAfter": ps_count_after,
-                    "fakePsThirdInvocationStageAfter": third_stage_after,
-                    "fixtureIdentitySeen": fixture_identity_seen(result),
+                    "mainStallArmedAfter": stall_armed_file.is_file(),
+                    "mainStallStageAfter": stall_stage_after,
+                    "fixtureIdentitySeen": identity_seen,
                 })
                 append_snapshot_trace(item)
                 return result
@@ -1124,6 +1253,21 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 finally:
                     active_signal_signum = prior_signal
 
+            preparation = ci_floor._run([str(fake_ps), "--prepare-only"], timeout=2.0)
+            self.assertEqual(preparation.returncode, 0, "fake ps prepare-only run must exit cleanly: " + diagnostic())
+            self.assertTrue(prepare_file.is_file(), "fake ps preflight must reach post-import preparation: " + diagnostic())
+            fixture_state_files = (
+                count_file, stall_file, script_entered_file, stall_armed_file, stall_consumed_file,
+                main_snapshot_active_file, main_deadline_file, stall_context_file,
+                stall_invocation_stage_file, prepare_file, child_pid_file,
+                handler_ready_file, term_file,
+            )
+            for marker in fixture_state_files:
+                marker.unlink(missing_ok=True)
+                marker.with_name(marker.name + ".tmp").unlink(missing_ok=True)
+            self.assertFalse(any(marker.exists() for marker in fixture_state_files))
+            started = time.monotonic()
+
             try:
                 with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{old_path}"}), \
                         mock.patch.object(ci_floor, "UTILITY_CLEANUP_SECONDS", 0.8), \
@@ -1146,7 +1290,13 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         self.fail("stalled nested ps must fail closed: " + diagnostic())
                 self.assertTrue(handler_ready_file.is_file(), "child must install TERM handler before supervision: " + diagnostic())
                 self.assertTrue(child_pid_file.is_file(), "utility child must publish its process identity: " + diagnostic())
-                self.assertTrue(stall_file.is_file(), "the intended nested ps call must stall: " + diagnostic())
+                self.assertTrue(script_entered_file.is_file(), "fake ps must reach its first statement: " + diagnostic())
+                self.assertTrue(
+                    stall_file.is_file() and stall_consumed_file.is_file()
+                    and safe_marker_file(stall_context_file, {"main_after_identity"}).get("value") == "main_after_identity",
+                    "the armed one-shot stall must occur in a main snapshot after the real child identity is observed: "
+                    + diagnostic(),
+                )
                 self.assertGreaterEqual(int(safe_count_file().get("value", 0)), 3, diagnostic())
                 self.assertLess(time.monotonic() - started, 1.8, diagnostic())
                 self.assertTrue(term_file.is_file(), "the owned term-ignorer must receive TERM before KILL: " + diagnostic())
@@ -1171,6 +1321,192 @@ class CiFloorEvidenceTests(unittest.TestCase):
                             child_group, {child_pid: child_start}, signal.SIGKILL,
                             deadline=time.monotonic() + 1.0,
                         )
+
+    def test_run_rechecks_deadline_after_main_snapshot_before_selector_wait(self) -> None:
+        class Clock:
+            now = 0.0
+
+        clock = Clock()
+        identities: dict[int, tuple[int, int, str, str]] = {}
+
+        class Stream:
+            def __init__(self, fd: int) -> None:
+                self.fd = fd
+
+            def fileno(self) -> int:
+                return self.fd
+
+            def close(self) -> None:
+                pass
+
+        class Process:
+            pid = 41001
+            stdout = Stream(101)
+            stderr = Stream(102)
+
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.wait_calls: list[float | None] = []
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -signal.SIGKILL
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls.append(timeout)
+                if self.returncode is None:
+                    self.returncode = -signal.SIGKILL
+                return self.returncode
+
+        class Selector:
+            def __init__(self) -> None:
+                self.entries: dict[object, object] = {}
+                self.select_calls: list[float] = []
+
+            def register(self, stream: object, _events: int, data: str) -> None:
+                self.entries[stream] = type("Key", (), {"fileobj": stream, "data": data})()
+
+            def unregister(self, stream: object) -> None:
+                self.entries.pop(stream, None)
+
+            def get_map(self) -> dict[object, object]:
+                return self.entries
+
+            def select(self, timeout: float) -> list[tuple[object, int]]:
+                self.select_calls.append(timeout)
+                return []
+
+            def close(self) -> None:
+                pass
+
+        process = Process()
+        selector = Selector()
+        snapshot_count = 0
+
+        def snapshot(*_args: object, **_kwargs: object) -> dict[int, tuple[int, int, str, str]]:
+            nonlocal snapshot_count
+            snapshot_count += 1
+            if snapshot_count == 2:
+                clock.now += 0.05  # A blocking main snapshot consumes the whole 0.04 s budget.
+            return identities
+
+        with mock.patch.object(ci_floor.time, "monotonic", side_effect=lambda: clock.now), \
+                mock.patch.object(ci_floor, "_utility_process_snapshot", side_effect=snapshot), \
+                mock.patch.object(ci_floor.subprocess, "Popen", return_value=process), \
+                mock.patch.object(ci_floor.selectors, "DefaultSelector", return_value=selector), \
+                mock.patch.object(ci_floor.os, "set_blocking"), \
+                mock.patch.object(ci_floor.os, "read", return_value=b""), \
+                mock.patch.object(ci_floor.os, "kill") as os_kill, \
+                mock.patch.object(ci_floor.os, "killpg") as os_killpg, \
+                mock.patch.object(ci_floor, "_signal_utility_group_members") as signal_group:
+            with self.assertRaises(ci_floor.FloorInputError):
+                ci_floor._run(["synthetic"], timeout=0.04)
+
+        self.assertEqual(snapshot_count, 2, "the synthetic snapshot must expire the main-loop budget")
+        self.assertFalse(selector.select_calls, "an expired main snapshot must not be followed by selector waiting")
+        self.assertTrue(process.wait_calls, "cleanup must reap the synthetic Popen-like child")
+        signal_group.assert_not_called()
+        os_kill.assert_not_called()
+        os_killpg.assert_not_called()
+
+    def test_run_rechecks_deadline_after_before_reap_snapshot_before_wait(self) -> None:
+        class Clock:
+            now = 0.0
+
+        clock = Clock()
+        process_pid = 41002
+        identity = {process_pid: (1, process_pid, "synthetic-start", "S")}
+
+        class Stream:
+            def __init__(self, fd: int) -> None:
+                self.fd = fd
+
+            def fileno(self) -> int:
+                return self.fd
+
+            def close(self) -> None:
+                pass
+
+        class Process:
+            pid = process_pid
+            stdout = Stream(201)
+            stderr = Stream(202)
+
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.main_wait_calls: list[float | None] = []
+                self.cleanup_wait_calls: list[float | None] = []
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -signal.SIGKILL
+
+            def wait(self, timeout: float | None = None) -> int:
+                frame = sys._getframe(1)
+                while frame is not None and frame.f_code is not ci_floor._run.__code__:
+                    frame = frame.f_back
+                target = self.cleanup_wait_calls if frame is not None and "cleanup_started" in frame.f_locals else self.main_wait_calls
+                target.append(timeout)
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+        class Selector:
+            def __init__(self) -> None:
+                self.entries: dict[object, object] = {}
+
+            def register(self, stream: object, _events: int, data: str) -> None:
+                self.entries[stream] = type("Key", (), {"fileobj": stream, "data": data})()
+
+            def unregister(self, stream: object) -> None:
+                self.entries.pop(stream, None)
+
+            def get_map(self) -> dict[object, object]:
+                return self.entries
+
+            def select(self, _timeout: float) -> list[tuple[object, int]]:
+                return [(key, ci_floor.selectors.EVENT_READ) for key in self.entries.values()]
+
+            def close(self) -> None:
+                pass
+
+        process = Process()
+        selector = Selector()
+        snapshot_count = 0
+
+        def snapshot(*_args: object, **_kwargs: object) -> dict[int, tuple[int, int, str, str]]:
+            nonlocal snapshot_count
+            snapshot_count += 1
+            if snapshot_count == 1:
+                return {}
+            if snapshot_count in {2, 3}:
+                if snapshot_count == 3:
+                    clock.now += 0.05  # The before-reap snapshot consumes the remaining 0.04 s.
+                return identity
+            return {}
+
+        with mock.patch.object(ci_floor.time, "monotonic", side_effect=lambda: clock.now), \
+                mock.patch.object(ci_floor, "_utility_process_snapshot", side_effect=snapshot), \
+                mock.patch.object(ci_floor.subprocess, "Popen", return_value=process), \
+                mock.patch.object(ci_floor.selectors, "DefaultSelector", return_value=selector), \
+                mock.patch.object(ci_floor.os, "set_blocking"), \
+                mock.patch.object(ci_floor.os, "read", return_value=b""), \
+                mock.patch.object(ci_floor.os, "kill") as os_kill, \
+                mock.patch.object(ci_floor.os, "killpg") as os_killpg, \
+                mock.patch.object(ci_floor, "_signal_utility_group_members", return_value=True) as signal_group:
+            with self.assertRaises(ci_floor.FloorInputError):
+                ci_floor._run(["synthetic"], timeout=0.04)
+
+        self.assertEqual(snapshot_count, 3, "the synthetic before-reap snapshot must expire the main budget")
+        self.assertFalse(process.main_wait_calls, "an expired before-reap snapshot must not reach main process.wait")
+        self.assertTrue(process.cleanup_wait_calls, "cleanup must reap the synthetic Popen-like child")
+        self.assertTrue(signal_group.called, "cleanup may request identity-checked signaling through the mocked helper")
+        os_kill.assert_not_called()
+        os_killpg.assert_not_called()
 
     def test_stalled_cleanup_discovery_preserves_reserved_phases_and_stops_owned_child(self) -> None:
         with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
