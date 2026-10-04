@@ -747,7 +747,6 @@ fn walk_pack(root: &Path, owner: u32) -> Result<PackInventory, AttachError> {
 }
 
 fn check_directory(path: &Path, owner: u32) -> Result<FileIdentity, AttachError> {
-    use std::os::unix::fs::MetadataExt as _;
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|_| AttachError::Validation("a Java pack directory is unavailable"))?;
     let identity = FileIdentity::from_metadata(&metadata);
@@ -1282,13 +1281,13 @@ mod tests {
 
     #[test]
     fn snapshots_verified_pack_and_keeps_executed_bytes_after_source_changes() {
-        let source = tempfile::tempdir().expect("temporary source pack");
-        make_pack(source.path());
         let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
             .map(PathBuf::from)
             .expect("the gate must provide an owner-enforced private scratch root");
         admit_private_directory(&scratch).expect("gate-provided scratch admission");
-        let cache = tempfile::tempdir_in(scratch).expect("temporary private cache under scratch");
+        let source = tempfile::tempdir_in(&scratch).expect("temporary source pack under scratch");
+        make_pack(source.path());
+        let cache = tempfile::tempdir_in(&scratch).expect("temporary private cache under scratch");
         let cache_path = cache.path().join("cache");
         std::fs::create_dir(&cache_path).expect("cache directory");
         std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o700))

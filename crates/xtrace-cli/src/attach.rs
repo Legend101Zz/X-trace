@@ -302,7 +302,10 @@ pub(crate) async fn run(
                     "owned server had already stopped"
                 );
             }
-            OwnedServerResult::Finished(result)
+            match result {
+                Ok(result) => OwnedServerResult::Finished(result),
+                Err(_) => OwnedServerResult::Unconfirmed,
+            }
         }
     };
     let cleanup_result = match &server_result {
@@ -320,7 +323,7 @@ pub(crate) async fn run(
             ));
         }
     };
-    if !matches!(&server_result, OwnedServerResult::Finished(Ok(Ok(())))) {
+    if !matches!(&server_result, OwnedServerResult::Finished(Ok(()))) {
         if cleanup_result.is_err() {
             tracing::warn!(
                 code = "XTR-ATTACH-CLEANUP-UNCONFIRMED",
@@ -368,8 +371,7 @@ async fn cleanup_after_primary(
             ))
         }
     };
-    if cleanup_result.is_err() || !matches!(&server_result, OwnedServerResult::Finished(Ok(Ok(()))))
-    {
+    if cleanup_result.is_err() || !matches!(&server_result, OwnedServerResult::Finished(Ok(()))) {
         tracing::warn!(
             code = "XTR-ATTACH-CLEANUP-UNCONFIRMED",
             "owned attach cleanup did not complete"
@@ -404,7 +406,7 @@ fn retain_unconfirmed_runtime(
 }
 
 enum OwnedServerResult {
-    Finished(Result<Result<(), xtrace_daemon::DaemonError>, tokio::task::JoinError>),
+    Finished(Result<(), xtrace_daemon::DaemonError>),
     Unconfirmed,
 }
 
@@ -419,7 +421,10 @@ async fn await_owned_server_with_timeout(
     timeout: Duration,
 ) -> OwnedServerResult {
     match tokio::time::timeout(timeout, &mut *server).await {
-        Ok(result) => OwnedServerResult::Finished(result),
+        Ok(Ok(result)) => OwnedServerResult::Finished(result),
+        // A JoinError only proves the async wrapper ended. A panic or cancel
+        // cannot certify that started blocking storage work has drained.
+        Ok(Err(_)) => OwnedServerResult::Unconfirmed,
         // Cancellation cannot preempt work already running in spawn_blocking.
         // Do not abort and mistake a cancelled serve future for drained storage.
         Err(_) => OwnedServerResult::Unconfirmed,
@@ -1432,6 +1437,49 @@ mod tests {
         release_tx.send(()).expect("release work after retention assertion");
         server.await.expect("server completes when blocking work is released").expect("server ok");
         assert!(marker_path.exists(), "retained artifacts are left for process-exit cleanup");
+        assert!(matches!(
+            crate::daemon_lock::acquire_project_lock(project.path()),
+            Err(CliError::DaemonAlreadyRunning)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_server_with_started_blocking_work_retains_lock_and_artifacts() {
+        let project = tempfile::tempdir().expect("disposable project data root");
+        let lock = crate::daemon_lock::acquire_project_lock(project.path()).expect("project lock");
+        let runtime =
+            crate::daemon_lock::RuntimeDirectory::create(project.path(), RuntimeSessionId::new())
+                .expect("session directory");
+        let marker_path = runtime.path().join(".blocking-work-marker");
+        std::fs::write(&marker_path, b"storage closure is active").expect("marker");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).expect("signal blocking closure started");
+            release_rx.recv().expect("release blocking closure");
+            finished_tx.send(()).expect("signal blocking closure finished");
+        });
+        let mut server = tokio::spawn(async move {
+            let _ = blocking.await;
+            Ok::<(), xtrace_daemon::DaemonError>(())
+        });
+        started_rx.await.expect("blocking storage closure started");
+        server.abort();
+
+        let drain = await_owned_server_with_timeout(&mut server, Duration::from_secs(1)).await;
+        assert!(matches!(drain, OwnedServerResult::Unconfirmed));
+        retain_unconfirmed_runtime(runtime, lock);
+        assert!(marker_path.exists(), "cancelled wrapper must not clean live-work artifacts");
+        assert!(matches!(
+            crate::daemon_lock::acquire_project_lock(project.path()),
+            Err(CliError::DaemonAlreadyRunning)
+        ));
+
+        release_tx.send(()).expect("release blocking closure after assertions");
+        finished_rx.await.expect("blocking closure completed");
+        assert!(marker_path.exists(), "artifacts remain until process exit");
         assert!(matches!(
             crate::daemon_lock::acquire_project_lock(project.path()),
             Err(CliError::DaemonAlreadyRunning)
