@@ -1099,6 +1099,8 @@ def _runner_reason_code(text: Any) -> str:
 
 _FAILED_TEST_LINE = re.compile(rb"^test ([A-Za-z0-9_:]{1,120}) \.\.\. FAILED\s*$")
 _PANIC_SITE = re.compile(rb"panicked at ((?:crates|adapters|web)/[A-Za-z0-9_./-]{1,100}\.rs):(\d{1,6}):\d{1,4}")
+_ERROR_CODE = re.compile(rb'ErrorCode\("(XTR-[A-Z0-9]{1,16}(?:-[A-Z0-9]{1,16}){0,4})"\)')
+_ERROR_CATEGORY = re.compile(rb"category: ([A-Z][A-Za-z]{1,24}),")
 MAX_FAILURE_HINTS = 20
 
 
@@ -1111,6 +1113,8 @@ def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
     names: list[str] = []
     sites: list[str] = []
     messages: list[str] = []
+    codes: list[str] = []
+    categories: list[str] = []
     expect_message = False
     compile_error = False
     try:
@@ -1146,6 +1150,12 @@ def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
                     text = f"{site.group(1).decode()}:{site.group(2).decode()}"
                     if text not in sites:
                         sites.append(text)
+                for code in _ERROR_CODE.findall(line):
+                    if len(codes) < 10 and code.decode() not in codes:
+                        codes.append(code.decode())
+                for category in _ERROR_CATEGORY.findall(line):
+                    if len(categories) < 10 and category.decode() not in categories:
+                        categories.append(category.decode())
                 if line.startswith(b"error: could not compile"):
                     compile_error = True
     except OSError:
@@ -1159,6 +1169,10 @@ def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
         hints["panicSites"] = sites
     if messages:
         hints["panicMessages"] = messages
+    if codes:
+        hints["errorCodes"] = codes
+    if categories:
+        hints["errorCategories"] = categories
     if compile_error:
         hints["compileError"] = True
     return hints

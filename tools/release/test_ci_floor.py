@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import os
+import re
 import signal
 import stat
 import time
@@ -404,6 +405,8 @@ class CiFloorEvidenceTests(unittest.TestCase):
             b"thread 'x' panicked at crates/xtrace-cli/tests/java_run_spring.rs:781:5:\n"
             b"init: StoreUnavailable(\"secure file /home/runner/work/x/y failed\")\n"
             b"thread 'y' panicked at /home/runner/secret/path.rs:5:1:\n"
+            b"init: App(AppError { code: ErrorCode(\"XTR-VALIDATION-IDEMPOTENCY\"), category: Validation, message: \"x /home/runner/a\" })\n"
+            b"ErrorCode(\"not a code GITHUB_TOKEN=abc\"), category: lower,\n"
             b"error: could not compile `xtrace-cli` (test \"x\") due to 1 previous error\n"
         )
         r, w = os.pipe()
@@ -414,11 +417,22 @@ class CiFloorEvidenceTests(unittest.TestCase):
         self.assertEqual(hints["failingTests"], ["premain::tests::captures_real_request", "crate::mod_x::second_failure"])
         self.assertEqual(hints["panicSites"], ["crates/xtrace-cli/tests/java_run_spring.rs:781"])
         self.assertIs(hints["compileError"], True)
+        self.assertEqual(hints["errorCodes"], ["XTR-VALIDATION-IDEMPOTENCY"])
+        self.assertEqual(hints["errorCategories"], ["Validation"])
         self.assertNotIn("GITHUB_TOKEN", json.dumps(hints))
         self.assertEqual(hints["panicMessages"][0], 'init: StoreUnavailable("secure file <path> failed")')
         self.assertNotIn("/home/runner", json.dumps(hints))
         with mock.patch.object(ci_floor.private_roots, "open_private_file_read", side_effect=private_roots.AdmissionError("x")):
             self.assertEqual(ci_floor._gate_failure_hints(pathlib.Path("/synthetic/log")), {})
+
+    def test_workflow_private_roots_stay_short_for_the_128_char_init_idempotency_key(self) -> None:
+        # The product's default `init` key is `xtrace-init-<repo path>` capped at 128 characters and the
+        # Rust tests create repos under <root>/tmp, so a long CI root fails them with
+        # XTR-VALIDATION-IDEMPOTENCY (run 37232993067). The roots are fixed short names.
+        text = (pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        roots = re.findall(r'root="\$\{RUNNER_TEMP:\?\}/([A-Za-z0-9_-]+)"', text)
+        self.assertEqual(sorted(roots), ["xf", "xr"])
+        self.assertNotIn("GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}", text.split("Select private root path", 1)[1].split("- name:", 1)[0])
 
     def test_describe_runner_failure_for_gates_missing_receipts_and_unknown_names(self) -> None:
         root = pathlib.Path("/synthetic/private-root")
