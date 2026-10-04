@@ -335,6 +335,10 @@ def _bounded_json_shape(fd: int, maximum_bytes: int) -> None:
         os.lseek(fd, 0, os.SEEK_SET)
     except OSError:
         raise _fail() from None
+    _check_json_shape_bytes(bytes(raw), maximum_bytes)
+
+
+def _check_json_shape_bytes(raw: bytes, maximum_bytes: int) -> None:
     if len(raw) > maximum_bytes:
         raise _fail()
     depth = 0
@@ -802,6 +806,20 @@ def preflight_directory(
     if must_be_absent:
         raise FileExistsError("private run directory already exists")
     admit_directory(candidate, private_leaf=private_leaf)
+
+
+def private_json_fits_read_limits(data: bytes, *, maximum_bytes: int = 65536) -> bool:
+    """Return whether `data` would pass `read_private_json`'s content bounds.
+
+    Applies the same byte, depth, comma, node, key, list and string limits so a
+    writer can prove its record stays readable before atomically replacing it.
+    """
+    try:
+        _check_json_shape_bytes(data, maximum_bytes)
+        _loads_bounded_private_json(data)
+    except AdmissionError:
+        return False
+    return True
 
 
 def read_private_json(path: os.PathLike[str] | str, *, maximum_bytes: int = 65536) -> dict[str, Any]:
