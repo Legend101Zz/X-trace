@@ -305,7 +305,9 @@ impl CatalogDiscoveryService {
             .map_err(CatalogDiscoveryError::Refused)?
         {
             Some(selection) => selection,
-            None => self.admission.admit(context, request).map_err(CatalogDiscoveryError::Refused)?,
+            None => {
+                self.admission.admit(context, request).map_err(CatalogDiscoveryError::Refused)?
+            }
         };
         if !selection_matches_context(&selection, context)
             || selection.scope.canonical_bytes()? != request.requested_scope.canonical_bytes()?
@@ -590,11 +592,7 @@ impl<P: CatalogReadPort> CatalogQueryService<P> {
         } else {
             None
         };
-        Ok(CatalogOperationsPage {
-            items,
-            next_cursor,
-            completion: summary.completion,
-        })
+        Ok(CatalogOperationsPage { items, next_cursor, completion: summary.completion })
     }
 }
 
@@ -849,8 +847,8 @@ mod tests {
             if !context.scoped_discovery_negotiated {
                 return Err(DiscoveryRefusal::CapabilityNotNegotiated);
             }
-            self.resolved_starts.fetch_add(1, Ordering::SeqCst);
-            if request.run_hint == "retry-me" {
+            let prior_resolutions = self.resolved_starts.fetch_add(1, Ordering::SeqCst);
+            if request.run_hint == "retry-me" && prior_resolutions > 0 {
                 Ok(Some(self.original.clone()))
             } else {
                 Ok(None)
@@ -996,17 +994,18 @@ mod tests {
                 operation_count: 0,
             },
         });
-        let page = service.list_operations(
-            ListCatalogOperations {
-                project_id,
-                revision_id,
-                filter: CatalogOperationFilter::default(),
-                limit: Some(10),
-                cursor: None,
-            },
-            CorrelationId::new(),
-        ).expect("query page");
+        let page = service
+            .list_operations(
+                ListCatalogOperations {
+                    project_id,
+                    revision_id,
+                    filter: CatalogOperationFilter::default(),
+                    limit: Some(10),
+                    cursor: None,
+                },
+                CorrelationId::new(),
+            )
+            .expect("query page");
         assert_eq!(page.completion, completion);
     }
-
 }

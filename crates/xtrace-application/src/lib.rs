@@ -50,8 +50,9 @@ pub use catalog_discovery::{
     AdmittedCatalogSelection, CatalogAdmissionPort, CatalogChangeKind, CatalogDiscoveryError,
     CatalogDiscoveryService, CatalogDiscoveryWritePort, CatalogOperationFilter,
     CatalogOperationRecord, CatalogOperationsPage, CatalogProducerContext, CatalogQueryService,
-    CatalogReadPort, CatalogRevisionSummary, CatalogSourceAvailability, CatalogSourceProofPort,
-    ListCatalogOperations, RefuseCatalogAdmission, RefuseUnboundSourceEvidence,
+    CatalogReadPort, CatalogRevisionSummary, CatalogRunNamespace, CatalogSourceAvailability,
+    CatalogSourceProofPort, ListCatalogOperations, RefuseCatalogAdmission,
+    RefuseUnboundSourceEvidence,
 };
 pub use commands::{Command, CommandReceipt, InitializeProject, OpenProject};
 pub use error::{PortError, PortErrorKind};
