@@ -580,14 +580,6 @@ impl FileIdentity {
             links: metadata.nlink(),
         }
     }
-
-    pub(super) fn same_directory(self, other: &Self) -> bool {
-        self.device == other.device
-            && self.inode == other.inode
-            && self.owner == other.owner
-            && self.mode == other.mode
-            && self.links == other.links
-    }
 }
 
 struct PackInventory {

@@ -28,7 +28,7 @@ use xtrace_domain::{
     ContentHash, CorrelationId, ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointIdentity, HttpMethod,
     ProjectId, RecordingId, RuntimeSessionId, SourceBinding, SourceRange, Transport, WallTime,
 };
-use xtrace_runtime::private_storage::AdmittedPrivateRoot;
+use xtrace_runtime::private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
 use crate::connection::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
@@ -2110,16 +2110,12 @@ fn create_staging_files(
         .map_err(|_| object_io_error(correlation_id))?;
     // UUIDv7 supplies entropy for collision resistance while preserving no caller
     // material in the staging path.
-    let directory = recording_directory.join(uuid::Uuid::now_v7().to_string());
+    let directory_name = uuid::Uuid::now_v7().to_string();
     let staging = recording_directory
-        .create_private_child(
-            directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| object_io_error(correlation_id))?,
-        )
+        .create_private_child(&directory_name)
         .map_err(|_| object_io_error(correlation_id))?;
     recording_directory.sync().map_err(|_| object_io_error(correlation_id))?;
+    let directory = staging.path().to_path_buf();
     drop(staging);
     Ok(StagingFiles {
         logical: directory.join("logical.xtf"),
@@ -3349,6 +3345,12 @@ fn map_store_error(error: StoreError, correlation_id: CorrelationId) -> Recordin
             "XTR-STORE-RECORDING-SQLITE-IO",
             "SQLite transport operation failed",
             Some("SQLite transport failure"),
+        ),
+        StoreErrorKind::Permission => (
+            RecordingStoreErrorKind::Permission,
+            "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+            "private storage is unavailable",
+            Some("private storage admission failure"),
         ),
         StoreErrorKind::Busy => (
             RecordingStoreErrorKind::Busy,

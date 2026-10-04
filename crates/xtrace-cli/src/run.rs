@@ -304,9 +304,11 @@ mod tests {
         use xtrace_domain::RuntimeSessionId;
 
         let root = private_tempdir();
-        let lock = crate::daemon_lock::acquire_project_lock(root.path()).expect("project lock");
+        let admitted = xtrace_runtime::private_storage::AdmittedPrivateRoot::open(root.path())
+            .expect("admitted project root");
+        let lock = crate::daemon_lock::acquire_project_lock(&admitted).expect("project lock");
         let runtime_dir =
-            crate::daemon_lock::RuntimeDirectory::create(root.path(), RuntimeSessionId::new())
+            crate::daemon_lock::RuntimeDirectory::create(&admitted, RuntimeSessionId::new())
                 .expect("runtime directory");
         let session_path = runtime_dir.path().to_path_buf();
         let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
@@ -322,12 +324,12 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(session_path.exists(), "runtime artifact was removed before drain completed");
         assert!(matches!(
-            crate::daemon_lock::acquire_project_lock(root.path()),
+            crate::daemon_lock::acquire_project_lock(&admitted),
             Err(CliError::DaemonAlreadyRunning)
         ));
 
         assert!(matches!(
-            crate::daemon_lock::acquire_project_lock(root.path()),
+            crate::daemon_lock::acquire_project_lock(&admitted),
             Err(CliError::DaemonAlreadyRunning)
         ));
     }

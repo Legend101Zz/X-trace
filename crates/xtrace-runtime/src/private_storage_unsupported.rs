@@ -10,6 +10,8 @@ pub enum PrivateStorageError {
     Unavailable,
     /// The requested child name is invalid.
     InvalidName,
+    /// An exclusive child creation collided with an existing name.
+    AlreadyExists,
     /// A bounded operation failed.
     Operation,
 }
@@ -88,6 +90,15 @@ impl AdmittedPrivateRoot {
     }
 
     /// Fails closed on unsupported platforms.
+    pub fn remove_private_file_if_matches(
+        &self,
+        _name: &str,
+        _expected: &File,
+    ) -> Result<(), PrivateStorageError> {
+        Err(PrivateStorageError::Unavailable)
+    }
+
+    /// Fails closed on unsupported platforms.
     pub fn remove_managed_file(&self, _name: &str) -> Result<(), PrivateStorageError> {
         Err(PrivateStorageError::Unavailable)
     }
@@ -99,6 +110,11 @@ impl AdmittedPrivateRoot {
 
     /// Fails closed on unsupported platforms.
     pub fn open_regular_file(&self, _name: &str) -> Result<File, PrivateStorageError> {
+        Err(PrivateStorageError::Unavailable)
+    }
+
+    /// Fails closed on unsupported platforms.
+    pub fn validate_optional_private_file(&self, _name: &str) -> Result<bool, PrivateStorageError> {
         Err(PrivateStorageError::Unavailable)
     }
 

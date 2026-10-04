@@ -566,7 +566,8 @@ mod tests {
             .expect("pointer");
         let database = project_root.join("metadata.sqlite3");
         std::fs::write(&database, []).expect("empty database placeholder");
-        let _lock = acquire_project_lock(&project_root).expect("hold project lock");
+        let admitted = AdmittedPrivateRoot::open(&project_root).expect("admitted project root");
+        let _lock = acquire_project_lock(&admitted).expect("hold project lock");
 
         let env_reader = env(HashMap::from([("XTRACE_DATA_HOME", home)]));
         assert!(matches!(

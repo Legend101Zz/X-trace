@@ -18,7 +18,6 @@ const MAX_SESSIONS: usize = 64;
 /// Holds the advisory lock and admitted roots for the lifetime of a project daemon.
 pub(crate) struct ProjectDaemonLock {
     _file: File,
-    _project_root: AdmittedPrivateRoot,
     _daemon_root: AdmittedPrivateRoot,
 }
 
@@ -26,7 +25,6 @@ pub(crate) struct ProjectDaemonLock {
 pub(crate) struct RuntimeDirectory {
     path: PathBuf,
     session_name: String,
-    _project_root: AdmittedPrivateRoot,
     _daemon_root: AdmittedPrivateRoot,
     sessions_root: AdmittedPrivateRoot,
     session_root: AdmittedPrivateRoot,
@@ -37,10 +35,10 @@ pub(crate) struct RuntimeDirectory {
 impl RuntimeDirectory {
     /// Creates a unique private session directory after removing only recognized stale files.
     pub(crate) fn create(
-        project_data_root: &Path,
+        project_root: &AdmittedPrivateRoot,
         runtime_session_id: RuntimeSessionId,
     ) -> Result<Self, CliError> {
-        let project_root = admit_root(project_data_root)?;
+        project_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
         let daemon_root = project_root
             .open_or_create_private_child(DAEMON_DIRECTORY)
             .map_err(|_| CliError::PrivateStorageUnavailable)?;
@@ -57,7 +55,6 @@ impl RuntimeDirectory {
         Ok(Self {
             path,
             session_name,
-            _project_root: project_root,
             _daemon_root: daemon_root,
             sessions_root,
             session_root,
@@ -106,9 +103,9 @@ impl Drop for RuntimeDirectory {
 /// The lock coordinates cooperating processes. Same-user hostile namespace
 /// mutation remains outside this capability's guarantee.
 pub(crate) fn acquire_project_lock(
-    project_data_root: &Path,
+    project_root: &AdmittedPrivateRoot,
 ) -> Result<ProjectDaemonLock, CliError> {
-    let project_root = admit_root(project_data_root)?;
+    project_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     let daemon_root = project_root
         .open_or_create_private_child(DAEMON_DIRECTORY)
         .map_err(|_| CliError::PrivateStorageUnavailable)?;
@@ -120,18 +117,10 @@ pub(crate) fn acquire_project_lock(
     }
     daemon_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     match fs4::FileExt::try_lock(&file) {
-        Ok(()) => Ok(ProjectDaemonLock {
-            _file: file,
-            _project_root: project_root,
-            _daemon_root: daemon_root,
-        }),
+        Ok(()) => Ok(ProjectDaemonLock { _file: file, _daemon_root: daemon_root }),
         Err(fs4::TryLockError::WouldBlock) => Err(CliError::DaemonAlreadyRunning),
         Err(fs4::TryLockError::Error(_)) => Err(CliError::PrivateStorageUnavailable),
     }
-}
-
-fn admit_root(path: &Path) -> Result<AdmittedPrivateRoot, CliError> {
-    AdmittedPrivateRoot::open(path).map_err(|_| CliError::PrivateStorageUnavailable)
 }
 
 fn clean_stale_sessions(sessions_root: &AdmittedPrivateRoot) -> Result<(), CliError> {
@@ -207,10 +196,11 @@ mod tests {
     #[test]
     fn project_lock_is_exclusive_and_released_on_drop() {
         let root = temp_root();
-        let first = acquire_project_lock(root.path()).expect("first lock");
-        assert!(matches!(acquire_project_lock(root.path()), Err(CliError::DaemonAlreadyRunning)));
+        let admitted = AdmittedPrivateRoot::open(root.path()).expect("admitted root");
+        let first = acquire_project_lock(&admitted).expect("first lock");
+        assert!(matches!(acquire_project_lock(&admitted), Err(CliError::DaemonAlreadyRunning)));
         drop(first);
-        let _second = acquire_project_lock(root.path()).expect("lock released");
+        let _second = acquire_project_lock(&admitted).expect("lock released");
     }
 
     #[cfg(unix)]
@@ -219,7 +209,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let root = temp_root();
-        let lock = acquire_project_lock(root.path()).expect("create project lock");
+        let admitted = AdmittedPrivateRoot::open(root.path()).expect("admitted root");
+        let lock = acquire_project_lock(&admitted).expect("create project lock");
         drop(lock);
         let lock_path = root.path().join(DAEMON_DIRECTORY).join(LOCK_FILENAME);
         let external_link = root.path().join("linked-lock");
@@ -229,7 +220,7 @@ mod tests {
         let before_bytes = fs::read(&external_link).expect("linked contents");
 
         assert!(matches!(
-            acquire_project_lock(root.path()),
+            acquire_project_lock(&admitted),
             Err(CliError::PrivateStorageUnavailable)
         ));
         assert_eq!(fs::read(&external_link).expect("unchanged contents"), before_bytes);
@@ -243,7 +234,8 @@ mod tests {
     fn session_cleanup_removes_only_known_bootstrap_artifacts() {
         let root = temp_root();
         let id = RuntimeSessionId::new();
-        let mut runtime = RuntimeDirectory::create(root.path(), id).expect("runtime dir");
+        let admitted = AdmittedPrivateRoot::open(root.path()).expect("admitted root");
+        let mut runtime = RuntimeDirectory::create(&admitted, id).expect("runtime dir");
         fs::write(runtime.path().join(BOOTSTRAP_FILENAME), b"secret fixture")
             .expect("bootstrap fixture");
         runtime.cleanup().expect("cleanup");
@@ -255,12 +247,13 @@ mod tests {
     fn symlinked_runtime_root_is_rejected_without_touching_target() {
         use std::os::unix::fs::symlink;
         let root = temp_root();
+        let admitted = AdmittedPrivateRoot::open(root.path()).expect("admitted root");
         let target = root.path().join("target");
         fs::create_dir(&target).expect("target");
         let daemon = root.path().join(DAEMON_DIRECTORY);
         symlink(&target, &daemon).expect("symlink");
         assert!(matches!(
-            RuntimeDirectory::create(root.path(), RuntimeSessionId::new()),
+            RuntimeDirectory::create(&admitted, RuntimeSessionId::new()),
             Err(CliError::PrivateStorageUnavailable)
         ));
         assert_eq!(fs::read_dir(target).expect("target entries").count(), 0);

@@ -11,6 +11,8 @@ use thiserror::Error;
 
 const MAX_PATH_COMPONENTS: usize = 128;
 const ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_millis(750);
+#[cfg(target_os = "macos")]
+const ACL_PROBE_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
 
 fn new_admission_deadline() -> std::time::Instant {
     std::time::Instant::now() + ADMISSION_BUDGET
@@ -25,6 +27,9 @@ pub enum PrivateStorageError {
     /// A child name was not a single safe path component.
     #[error("private storage child name is invalid")]
     InvalidName,
+    /// An exclusive child creation collided with an existing name.
+    #[error("private storage child already exists")]
+    AlreadyExists,
     /// The requested bounded operation failed.
     #[error("private storage operation failed")]
     Operation,
@@ -98,7 +103,15 @@ impl AdmittedPrivateRoot {
         directory: &File,
         private_leaf: bool,
     ) -> Result<(), PrivateStorageError> {
-        admit_directory_descriptor_until(path, directory, private_leaf, new_admission_deadline())
+        let deadline = new_admission_deadline();
+        let walked = open_directory_without_symlinks_until(path, deadline)?;
+        let supplied = directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let walked_metadata = walked.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let supplied_identity = FileIdentity::from_metadata(&supplied);
+        if !supplied_identity.same_directory(FileIdentity::from_metadata(&walked_metadata)) {
+            return Err(PrivateStorageError::Unavailable);
+        }
+        admit_directory_descriptor_until(path, directory, private_leaf, deadline)
     }
 
     /// Opens and admits an existing exact-owner `0700` directory.
@@ -386,6 +399,29 @@ impl AdmittedPrivateRoot {
         self.revalidate_until(deadline)
     }
 
+    /// Removes a private file only when its name still identifies the caller's open file.
+    pub fn remove_private_file_if_matches(
+        &self,
+        name: &str,
+        expected: &File,
+    ) -> Result<(), PrivateStorageError> {
+        let deadline = new_admission_deadline();
+        let actual = self.open_file_with_link_policy_until(name, false, deadline)?;
+        self.validate_file_binding_with_link_policy_until(name, &actual, false, false, deadline)?;
+        let expected_metadata = expected.metadata().map_err(|_| PrivateStorageError::Operation)?;
+        let actual_metadata = actual.metadata().map_err(|_| PrivateStorageError::Operation)?;
+        if !FileIdentity::from_metadata(&expected_metadata)
+            .same_file(FileIdentity::from_metadata(&actual_metadata))
+            || expected_metadata.nlink() != actual_metadata.nlink()
+        {
+            return Err(PrivateStorageError::Unavailable);
+        }
+        drop(actual);
+        rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty())
+            .map_err(|_| PrivateStorageError::Operation)?;
+        self.revalidate_until(deadline)
+    }
+
     /// Removes a validated private immutable object file that may have hard links.
     pub fn remove_managed_file(&self, name: &str) -> Result<(), PrivateStorageError> {
         let deadline = new_admission_deadline();
@@ -416,6 +452,30 @@ impl AdmittedPrivateRoot {
     /// Opens a regular no-follow child file after revalidating this directory.
     pub fn open_regular_file(&self, name: &str) -> Result<File, PrivateStorageError> {
         self.open_file_with_link_policy(name, false)
+    }
+
+    /// Admits an optional private regular file without treating absence as an error.
+    pub fn validate_optional_private_file(&self, name: &str) -> Result<bool, PrivateStorageError> {
+        let deadline = new_admission_deadline();
+        validate_child_name(name)?;
+        self.revalidate_until(deadline)?;
+        let opened = rustix::fs::openat(
+            &self.directory,
+            name,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        );
+        let file = match opened {
+            Ok(opened) => File::from(opened),
+            Err(error) if error == rustix::io::Errno::NOENT => {
+                self.revalidate_until(deadline)?;
+                return Ok(false);
+            }
+            Err(_) => return Err(PrivateStorageError::Unavailable),
+        };
+        self.validate_file_binding_with_link_policy_until(name, &file, false, false, deadline)?;
+        self.revalidate_until(deadline)?;
+        Ok(true)
     }
 
     /// Opens a private regular file that may intentionally have additional hard links.
@@ -484,7 +544,13 @@ impl AdmittedPrivateRoot {
             rustix::fs::Mode::from_raw_mode(0o600),
         )
         .map(File::from)
-        .map_err(|_| PrivateStorageError::Operation)?;
+        .map_err(|error| {
+            if error == rustix::io::Errno::EXIST {
+                PrivateStorageError::AlreadyExists
+            } else {
+                PrivateStorageError::Operation
+            }
+        })?;
         self.validate_file_binding_with_link_policy_until(name, &file, true, false, deadline)?;
         self.revalidate_until(deadline)?;
         Ok(file)
@@ -676,6 +742,8 @@ impl AdmittedPrivateRoot {
         let opened_after = file.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
         if FileIdentity::from_metadata(&named_after) != descriptor_identity
             || FileIdentity::from_metadata(&opened_after) != descriptor_identity
+            || named_after.nlink() != descriptor.nlink()
+            || opened_after.nlink() != descriptor.nlink()
             || !acl_admits_file(&self.path.join(name), file, descriptor_identity, deadline)
         {
             return Err(PrivateStorageError::Unavailable);
@@ -958,7 +1026,7 @@ fn acl_admits_directory(
         return false;
     };
     let Some(mut stdout) = child.stdout.take() else {
-        stop_acl_probe(&mut child, deadline);
+        report_acl_probe_cleanup(stop_acl_probe(&mut child, probe_cleanup_deadline(deadline)));
         return false;
     };
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -981,11 +1049,23 @@ fn acl_admits_directory(
         }
     };
     if status.is_none() {
-        stop_acl_probe(&mut child, deadline);
+        let cleanup_deadline = probe_cleanup_deadline(deadline);
+        report_acl_probe_cleanup(stop_acl_probe(&mut child, cleanup_deadline));
+        match receiver.recv_timeout(cleanup_deadline.saturating_duration_since(Instant::now())) {
+            Ok(_) => {
+                if reader.join().is_err() {
+                    tracing::warn!("private storage ACL reader did not join after probe cleanup");
+                }
+            }
+            Err(_) => tracing::warn!("private storage ACL reader drain is unconfirmed"),
+        }
         return false;
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let Ok((bounded, bytes)) = receiver.recv_timeout(remaining) else { return false };
+    let Ok((bounded, bytes)) = receiver.recv_timeout(remaining) else {
+        tracing::warn!("private storage ACL reader drain is unconfirmed");
+        return false;
+    };
     if reader.join().is_err() || !status.is_some_and(|value| value.success()) || !bounded {
         return false;
     }
@@ -1030,7 +1110,7 @@ fn acl_admits_file(
         return false;
     };
     let Some(mut stdout) = child.stdout.take() else {
-        stop_acl_probe(&mut child, deadline);
+        report_acl_probe_cleanup(stop_acl_probe(&mut child, probe_cleanup_deadline(deadline)));
         return false;
     };
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -1053,11 +1133,23 @@ fn acl_admits_file(
         }
     };
     if status.is_none() {
-        stop_acl_probe(&mut child, deadline);
+        let cleanup_deadline = probe_cleanup_deadline(deadline);
+        report_acl_probe_cleanup(stop_acl_probe(&mut child, cleanup_deadline));
+        match receiver.recv_timeout(cleanup_deadline.saturating_duration_since(Instant::now())) {
+            Ok(_) => {
+                if reader.join().is_err() {
+                    tracing::warn!("private storage ACL reader did not join after probe cleanup");
+                }
+            }
+            Err(_) => tracing::warn!("private storage ACL reader drain is unconfirmed"),
+        }
         return false;
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let Ok((bounded, bytes)) = receiver.recv_timeout(remaining) else { return false };
+    let Ok((bounded, bytes)) = receiver.recv_timeout(remaining) else {
+        tracing::warn!("private storage ACL reader drain is unconfirmed");
+        return false;
+    };
     if reader.join().is_err() || !status.is_some_and(|value| value.success()) || !bounded {
         return false;
     }
@@ -1075,25 +1167,37 @@ fn acl_admits_file(
 /// Requests termination of the owned ACL probe and confirms reaping within a
 /// short bounded cleanup window. Failure remains a closed admission result.
 #[cfg(target_os = "macos")]
-fn stop_acl_probe(child: &mut std::process::Child, deadline: std::time::Instant) {
+fn stop_acl_probe(child: &mut std::process::Child, deadline: std::time::Instant) -> bool {
     use std::thread;
     use std::time::Instant;
 
     if let Err(error) = child.kill() {
         if error.kind() != std::io::ErrorKind::InvalidInput {
-            return;
+            return false;
         }
     }
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => return true,
             Ok(None) if Instant::now() < deadline => thread::sleep(
                 deadline
                     .saturating_duration_since(Instant::now())
                     .min(std::time::Duration::from_millis(5)),
             ),
-            _ => return,
+            _ => return false,
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn probe_cleanup_deadline(admission_deadline: std::time::Instant) -> std::time::Instant {
+    admission_deadline + ACL_PROBE_CLEANUP_BUDGET
+}
+
+#[cfg(target_os = "macos")]
+fn report_acl_probe_cleanup(drained: bool) {
+    if !drained {
+        tracing::warn!("private storage ACL probe drain is unconfirmed");
     }
 }
 
@@ -1342,7 +1446,7 @@ mod tests {
             "drwxr-xr-x 6 root wheel unknown 192 Feb 25 2026 /System\n",
             "/System",
         ));
-        assert!(!parse_macos_acl_listing(
+        assert!(parse_macos_acl_listing(
             "drwxr-xr-x@ 4 alice staff - 128 Oct 4 00:23 /Users/alice/Documents\n",
             "/Users/alice/Documents",
         ));
@@ -1363,6 +1467,19 @@ mod tests {
             "extra drwxr-xr-x 22 root wheel sunlnk 704 Feb 25 2026 /\n",
             "/",
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn acl_probe_cleanup_reaps_a_stuck_owned_child_within_its_deadline() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn bounded cleanup fixture");
+        assert!(stop_acl_probe(&mut child, std::time::Instant::now() + ACL_PROBE_CLEANUP_BUDGET,));
     }
 
     #[test]
