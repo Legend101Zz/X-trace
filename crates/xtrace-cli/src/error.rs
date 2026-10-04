@@ -36,6 +36,15 @@ pub enum CliError {
     /// Direct runtime launch or process supervision failed.
     #[cfg(unix)]
     Run(xtrace_runtime::java::LaunchError),
+    /// A sanitized Java attach operation failed with stable helper-compatible facts.
+    #[cfg(unix)]
+    Attach {
+        code: &'static str,
+        category: &'static str,
+        message: String,
+        remediation: String,
+        exit_code: i32,
+    },
 }
 
 impl CliError {
@@ -59,6 +68,8 @@ impl CliError {
             Self::DaemonFailure(_) => 5,
             #[cfg(unix)]
             Self::Run(err) => err.exit_code(),
+            #[cfg(unix)]
+            Self::Attach { exit_code, .. } => *exit_code,
         }
     }
 }
@@ -101,6 +112,8 @@ impl std::fmt::Display for CliError {
             Self::DaemonFailure(code) => write!(f, "daemon operation failed ({})", code.as_str()),
             #[cfg(unix)]
             Self::Run(err) => std::fmt::Display::fmt(err, f),
+            #[cfg(unix)]
+            Self::Attach { message, .. } => f.write_str(message),
         }
     }
 }

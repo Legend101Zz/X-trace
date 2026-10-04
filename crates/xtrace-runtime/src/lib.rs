@@ -11,3 +11,6 @@
 
 #[cfg(unix)]
 pub mod java;
+
+#[cfg(unix)]
+pub mod java_attach;

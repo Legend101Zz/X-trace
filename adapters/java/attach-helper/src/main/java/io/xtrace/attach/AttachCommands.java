@@ -142,14 +142,19 @@ final class AttachCommands {
       try {
         before.requireUnchanged(ProcessIdentity.read(pid, "attach"), "attach");
       } catch (Failure changed) {
-        AgentSnapshot.deleteOwnedSnapshot(snapshot.root(), pid, before.startTime());
+        // Identity is no longer reliable. Keep the immutable runtime files until a later
+        // helper invocation proves this PID incarnation exited or was replaced.
         throw changed;
       }
       loadAttempted = true;
       attached.machine().loadAgent(snapshot.agentJar().toString(), snapshot.agentOptions(bootstrap));
-    } catch (AttachNotSupportedException | AgentLoadException error) {
+    } catch (AttachNotSupportedException error) {
       AgentSnapshot.deleteOwnedSnapshot(snapshot.root(), pid, before.startTime());
       throw mapAttachFailure("attach", error);
+    } catch (AgentLoadException error) {
+      // loadAgent may have reached target code before the provider reported failure.
+      // Retain the snapshot while target identity is live or uncertain.
+      throw uncertainAttach("the helper could not confirm whether the target loaded the agent");
     } catch (AgentInitializationException error) {
       throw mapAttachFailure("attach", error);
     } catch (IOException | RuntimeException error) {
@@ -399,6 +404,8 @@ final class AttachCommands {
   }
 
   static final class Failure extends Exception {
+    private static final long serialVersionUID = 1L;
+
     private final String command;
     private final String code;
     private final int exitCode;

@@ -1,6 +1,8 @@
 # X-trace JVM attach helper
 
-`xtrace-attach.jar` is a standalone JDK command for bounded local JVM discovery and a best-effort attach to the current X-trace Spring fixture. Build it with `./gradlew :attach-helper:jar`; the Java distribution task stages it at `build/attach-helper-dist/xtrace-attach.jar`.
+`xtrace-attach.jar` is a standalone JDK command for bounded local JVM discovery and a best-effort attach to the current X-trace Spring fixture. Build it with `./gradlew :attach-helper:jar`; `attachHelperDist` stages it at `build/attach-helper-dist/xtrace-attach.jar`, and `javaPackDist` assembles the closed CLI pack at `build/java-pack-dist/`.
+
+`javaPackDist` is an unsigned development pack. Its SHA-256 manifest checks byte integrity, not publisher authenticity. The interim CLI requires explicit `--java-pack` and prints this limitation; signed installed-pack verification remains a release dependency.
 
 ```text
 java -jar xtrace-attach.jar list --json
