@@ -928,6 +928,7 @@ class RunnerTests(unittest.TestCase):
 
         def selective_fdopen(fd: int, mode: str, *args: object, **kwargs: object) -> object:
             if fd in diagnostic_fds:
+                diagnostic_fds.remove(fd)
                 return FailingDiagnosticLog(fd, mode)
             return real_fdopen(fd, mode, *args, **kwargs)
         real_popen = subprocess.Popen
@@ -952,6 +953,12 @@ class RunnerTests(unittest.TestCase):
 
             def close(self) -> None:
                 self.stream.close()
+
+            def __enter__(self) -> FailingDiagnosticLog:
+                return self
+
+            def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+                self.close()
 
         settle = run_gates.NaturalExitSettle(
             True, 1.0, 1, [], None, time.monotonic() + 120,
