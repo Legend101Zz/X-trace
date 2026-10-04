@@ -671,7 +671,6 @@ class CiFloorEvidenceTests(unittest.TestCase):
             old_path = os.environ.get("PATH", "/usr/bin:/bin")
             started = time.monotonic()
             try:
-                run_started = time.monotonic()
                 with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{old_path}"}), \
                         mock.patch.object(ci_floor, "UTILITY_CLEANUP_SECONDS", 0.8), \
                         mock.patch.object(ci_floor, "UTILITY_TERM_GRACE_SECONDS", 0.2), \
@@ -763,6 +762,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 return real_signal(group_id, identities, signum, deadline=deadline)
 
             try:
+                run_started = time.monotonic()
                 with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{old_path}"}), \
                         mock.patch.object(ci_floor, "_utility_process_snapshot", side_effect=fail_main_probe_then_stall_discovery), \
                         mock.patch.object(ci_floor, "_signal_utility_group_members", side_effect=record_signal):
