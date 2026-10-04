@@ -1384,10 +1384,33 @@ class CiFloorEvidenceTests(unittest.TestCase):
         process = Process()
         selector = Selector()
         snapshot_count = 0
+        snapshot_phases: dict[str, int] = {}
+
+        def current_snapshot_phase() -> str:
+            frame = sys._getframe(1)
+            for _ in range(32):
+                if frame is None:
+                    break
+                if frame.f_code is ci_floor._run.__code__:
+                    if "cleanup_started" in frame.f_locals:
+                        return "cleanup"
+                    if frame.f_locals.get("process") is None:
+                        return "baseline"
+                    run_selector = frame.f_locals.get("selector")
+                    if run_selector is None:
+                        return "unknown"
+                    try:
+                        return "main_loop" if run_selector.get_map() else "before_reap"
+                    except Exception:
+                        return "unknown"
+                frame = frame.f_back
+            return "outside_run"
 
         def snapshot(*_args: object, **_kwargs: object) -> dict[int, tuple[int, int, str, str]]:
             nonlocal snapshot_count
             snapshot_count += 1
+            phase = current_snapshot_phase()
+            snapshot_phases[phase] = snapshot_phases.get(phase, 0) + 1
             if snapshot_count == 2:
                 clock.now += 0.05  # A blocking main snapshot consumes the whole 0.04 s budget.
             return identities
@@ -1404,7 +1427,8 @@ class CiFloorEvidenceTests(unittest.TestCase):
             with self.assertRaises(ci_floor.FloorInputError):
                 ci_floor._run(["synthetic"], timeout=0.04)
 
-        self.assertEqual(snapshot_count, 2, "the synthetic snapshot must expire the main-loop budget")
+        self.assertEqual(snapshot_phases, {"baseline": 1, "main_loop": 1, "cleanup": 1})
+        self.assertEqual(snapshot_count, sum(snapshot_phases.values()))
         self.assertFalse(selector.select_calls, "an expired main snapshot must not be followed by selector waiting")
         self.assertTrue(process.wait_calls, "cleanup must reap the synthetic Popen-like child")
         signal_group.assert_not_called()
@@ -1477,10 +1501,33 @@ class CiFloorEvidenceTests(unittest.TestCase):
         process = Process()
         selector = Selector()
         snapshot_count = 0
+        snapshot_phases: dict[str, int] = {}
+
+        def current_snapshot_phase() -> str:
+            frame = sys._getframe(1)
+            for _ in range(32):
+                if frame is None:
+                    break
+                if frame.f_code is ci_floor._run.__code__:
+                    if "cleanup_started" in frame.f_locals:
+                        return "cleanup"
+                    if frame.f_locals.get("process") is None:
+                        return "baseline"
+                    run_selector = frame.f_locals.get("selector")
+                    if run_selector is None:
+                        return "unknown"
+                    try:
+                        return "main_loop" if run_selector.get_map() else "before_reap"
+                    except Exception:
+                        return "unknown"
+                frame = frame.f_back
+            return "outside_run"
 
         def snapshot(*_args: object, **_kwargs: object) -> dict[int, tuple[int, int, str, str]]:
             nonlocal snapshot_count
             snapshot_count += 1
+            phase = current_snapshot_phase()
+            snapshot_phases[phase] = snapshot_phases.get(phase, 0) + 1
             if snapshot_count == 1:
                 return {}
             if snapshot_count in {2, 3}:
@@ -1501,7 +1548,10 @@ class CiFloorEvidenceTests(unittest.TestCase):
             with self.assertRaises(ci_floor.FloorInputError):
                 ci_floor._run(["synthetic"], timeout=0.04)
 
-        self.assertEqual(snapshot_count, 3, "the synthetic before-reap snapshot must expire the main budget")
+        self.assertEqual(snapshot_phases, {
+            "baseline": 1, "main_loop": 1, "before_reap": 1, "cleanup": 2,
+        })
+        self.assertEqual(snapshot_count, sum(snapshot_phases.values()))
         self.assertFalse(process.main_wait_calls, "an expired before-reap snapshot must not reach main process.wait")
         self.assertTrue(process.cleanup_wait_calls, "cleanup must reap the synthetic Popen-like child")
         self.assertTrue(signal_group.called, "cleanup may request identity-checked signaling through the mocked helper")
