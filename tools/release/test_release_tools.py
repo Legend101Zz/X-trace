@@ -922,7 +922,10 @@ class RunnerTests(unittest.TestCase):
         def tracking_open(path: object, *args: object, **kwargs: object) -> int:
             fd = real_open(path, *args, **kwargs)
             name = pathlib.Path(os.fsdecode(path)).name
-            if name.startswith(".diagnostic-write.log."):
+            flags = args[1] if len(args) > 1 else kwargs.get("flags", 0)
+            if (name.startswith(".diagnostic-write.log.")
+                    and isinstance(flags, int)
+                    and flags & os.O_WRONLY and flags & os.O_CREAT):
                 diagnostic_fds.add(fd)
             return fd
 
@@ -1103,6 +1106,7 @@ class RunnerTests(unittest.TestCase):
         attempted = run_gates.Gate("attempted-java", ("java", "-version"))
         later = run_gates.Gate("later", (sys.executable, "-c", "raise SystemExit(0)"))
         real_replace = os.replace
+        rename_fault_reached = [False]
 
         def uncertain_run(
             _argv: object, *, log_path: pathlib.Path, settle_report: dict[str, object] | None = None,
@@ -1120,16 +1124,21 @@ class RunnerTests(unittest.TestCase):
                 settle_report.update({"eligible": False, "error": "test uncertainty"})
             raise error
 
-        def fail_log_rename(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        def fail_log_rename(
+            source: str | os.PathLike[str], destination: str | os.PathLike[str],
+            *args: object, **kwargs: object,
+        ) -> None:
             if pathlib.Path(destination).name == "attempted-java.log":
+                rename_fault_reached[0] = True
                 raise OSError("injected log rename failure")
-            real_replace(source, destination)
+            real_replace(source, destination, *args, **kwargs)
 
         with mock.patch.object(run_gates, "GATES", (attempted, later)), \
                 mock.patch.object(run_gates, "_run", side_effect=uncertain_run), \
                 mock.patch.object(run_gates.os, "replace", side_effect=fail_log_rename):
             self.assertEqual(run_gates.run(self.args()), 1)
 
+        self.assertTrue(rename_fault_reached[0], "uncertain log rename injection must be reached")
         run_dir = self.cache / "release-gates/P00-test"
         receipt = json.loads((run_dir / "receipt.json").read_text())
         entry = receipt["gates"][0]
@@ -1145,7 +1154,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(entry["naturalExitSettle"]["error"], "test uncertainty")
         self.assertEqual(receipt["gates"][1]["status"], "unreached")
         for name in ("cargo", "gradle"):
-            self.assertTrue((self.cache / "leases" / name / "owner.json").is_file())
+            owner = json.loads((self.cache / "leases" / name / "owner.json").read_text())
+            self.assertTrue(owner["requiresManualRecovery"])
+            self.assertEqual(owner["processGroupId"], 777)
 
     def test_admission_error_finalizing_uncertain_log_does_not_release_leases(self) -> None:
         attempted = run_gates.Gate("uncertain-log", ("java", "-version"))
