@@ -372,13 +372,6 @@ impl SqliteStore {
             )
             .map_err(|err| StoreError::from_rusqlite(err, bootstrap))?
         };
-        let post_open = private_root.open_regular_file(database_name).map_err(|_| {
-            StoreError::new(
-                StoreErrorKind::Permission,
-                "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
-                bootstrap,
-            )
-        })?;
         private_root.validate_file_binding(database_name, &prepared_file, false).map_err(|_| {
             StoreError::new(
                 StoreErrorKind::Permission,
@@ -386,14 +379,15 @@ impl SqliteStore {
                 bootstrap,
             )
         })?;
-        private_root.validate_file_binding(database_name, &post_open, false).map_err(|_| {
+        // Descriptor-free: closing a second descriptor for a database SQLite already has
+        // open would release SQLite's POSIX locks.
+        private_root.validate_regular_file(database_name).map_err(|_| {
             StoreError::new(
                 StoreErrorKind::Permission,
                 "private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)",
                 bootstrap,
             )
         })?;
-        drop(post_open);
         private_root.revalidate().map_err(|_| {
             StoreError::new(
                 StoreErrorKind::Permission,

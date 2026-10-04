@@ -3666,7 +3666,9 @@ impl ProjectRootBinding {
                         correlation_id,
                     )
                 })?;
-            let file = self.private_root.open_regular_file(file_name).map_err(|_| {
+            // Descriptor-free: closing a second descriptor for the live SQLite database would
+            // release SQLite's POSIX locks and let another process delete its WAL.
+            self.private_root.validate_regular_file(file_name).map_err(|_| {
                 RecordingStoreError::new(
                     RecordingStoreErrorKind::Permission,
                     "XTR-PRIVATE-STORAGE-UNAVAILABLE",
@@ -3674,7 +3676,6 @@ impl ProjectRootBinding {
                     correlation_id,
                 )
             })?;
-            drop(file);
             self.private_root.revalidate().map_err(|_| {
                 RecordingStoreError::new(
                     RecordingStoreErrorKind::Permission,

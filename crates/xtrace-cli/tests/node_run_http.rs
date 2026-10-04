@@ -283,10 +283,10 @@ fn assert_recording_evidence(page: &Value, repo: &Path, data_home: &Path) {
             events.iter().any(|event| event["symbol"] == "node:http.response.finish"),
             "missing observed response finish"
         );
-        assert_eq!(
-            detail["unavailable"]["completion"], "unavailable",
-            "do not infer an HTTP outcome projection"
-        );
+        // `unavailable.completion` reports whether durable terminal evidence exists; it is no
+        // HTTP outcome projection. The recording must carry verified completion evidence.
+        assert_eq!(detail["completion"], "complete", "terminal evidence must be verified");
+        assert_eq!(detail["unavailable"]["completion"], "available");
         assert_eq!(detail["unavailable"]["values"], "unavailable");
         for canary in ["NODE_PRIVATE_CANARY", "QUERY_CANARY", "bearer-", "Content-Type"] {
             assert!(

@@ -566,7 +566,96 @@ impl AdmittedPrivateRoot {
         )
     }
 
+    /// Admits an existing private regular file without keeping or opening a descriptor.
+    ///
+    /// SQLite takes POSIX advisory locks on its database, `-wal`, and `-shm` files. POSIX
+    /// releases *every* lock a process holds on a file when that process closes *any*
+    /// descriptor for it, so validating a live database by opening and dropping a second
+    /// descriptor silently drops SQLite's locks and lets another process delete the WAL out
+    /// from under this one. On Linux this check therefore uses only `statat`; elsewhere it
+    /// keeps the descriptor-bound check.
+    pub fn validate_regular_file(&self, name: &str) -> Result<(), PrivateStorageError> {
+        #[cfg(target_os = "linux")]
+        {
+            if self.validate_named_file_without_open(name)? {
+                Ok(())
+            } else {
+                Err(PrivateStorageError::Operation)
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.open_regular_file(name).map(drop)
+        }
+    }
+
+    /// Stat-only admission of an optional private regular file (Linux): returns whether it
+    /// exists. No descriptor for the file is ever opened.
+    #[cfg(target_os = "linux")]
+    fn validate_named_file_without_open(&self, name: &str) -> Result<bool, PrivateStorageError> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if !self.private_leaf {
+            return Err(PrivateStorageError::Unavailable);
+        }
+        validate_child_name(name)?;
+        let deadline = new_admission_deadline();
+        self.revalidate_until(deadline)?;
+        let stat = |directory: &File| {
+            rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        };
+        let first = match stat(&self.directory) {
+            Ok(first) => first,
+            Err(error) if error == rustix::io::Errno::NOENT => {
+                self.revalidate_until(deadline)?;
+                return Ok(false);
+            }
+            Err(_) => return Err(PrivateStorageError::Unavailable),
+        };
+        let directory_metadata =
+            self.directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let group_other = rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO;
+        if rustix::fs::FileType::from_raw_mode(first.st_mode) != rustix::fs::FileType::RegularFile
+            || first.st_uid != rustix::process::getuid().as_raw()
+            || first.st_nlink != 1
+            || rustix::fs::Mode::from_raw_mode(first.st_mode).intersects(group_other)
+            || first.st_dev != directory_metadata.dev()
+        {
+            return Err(PrivateStorageError::Unavailable);
+        }
+        let mut value = [0_u8; 16 * 1024];
+        match rustix::fs::lgetxattr(
+            self.path.join(name),
+            "system.posix_acl_access",
+            value.as_mut_slice(),
+        ) {
+            Ok(_) => return Err(PrivateStorageError::Unavailable),
+            Err(error)
+                if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NODATA => {}
+            Err(_) => return Err(PrivateStorageError::Unavailable),
+        }
+        self.revalidate_until(deadline)?;
+        let second = stat(&self.directory).map_err(|_| PrivateStorageError::Unavailable)?;
+        if second.st_dev != first.st_dev
+            || second.st_ino != first.st_ino
+            || second.st_mode != first.st_mode
+            || second.st_uid != first.st_uid
+            || second.st_nlink != first.st_nlink
+        {
+            return Err(PrivateStorageError::Unavailable);
+        }
+        Ok(true)
+    }
+
     /// Admits an optional private regular file without treating absence as an error.
+    #[cfg(target_os = "linux")]
+    pub fn validate_optional_private_file(&self, name: &str) -> Result<bool, PrivateStorageError> {
+        // Stat-only: see `validate_regular_file` for why no descriptor may be opened.
+        self.validate_named_file_without_open(name)
+    }
+
+    /// Admits an optional private regular file without treating absence as an error.
+    #[cfg(not(target_os = "linux"))]
     pub fn validate_optional_private_file(&self, name: &str) -> Result<bool, PrivateStorageError> {
         if !self.private_leaf {
             return Err(PrivateStorageError::Unavailable);

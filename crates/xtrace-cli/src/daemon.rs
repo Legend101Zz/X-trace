@@ -199,10 +199,9 @@ where
     private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     let project_data_root = private_root.path().to_path_buf();
     let database_path = project_data_root.join("metadata.sqlite3");
-    let database = private_root
-        .open_regular_file("metadata.sqlite3")
+    private_root
+        .validate_regular_file("metadata.sqlite3")
         .map_err(|_| CliError::PrivateStorageUnavailable)?;
-    drop(database);
     private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     Ok(ProjectPreflight {
         canonical_repo_path: canonical_repo_path.to_string(),
@@ -225,10 +224,9 @@ fn open_validated_project(preflight: ProjectPreflight) -> Result<ValidatedProjec
         private_root,
     } = preflight;
     private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
-    let database = private_root
-        .open_regular_file("metadata.sqlite3")
+    private_root
+        .validate_regular_file("metadata.sqlite3")
         .map_err(|_| CliError::PrivateStorageUnavailable)?;
-    drop(database);
 
     let requested_at = WallTime::now();
     let context = RequestContext::new("xtrace-cli".to_string(), requested_at);
@@ -237,10 +235,9 @@ fn open_validated_project(preflight: ProjectPreflight) -> Result<ValidatedProjec
         OpenOptions::default().with_must_exist(true).with_correlation_id(context.correlation_id),
     )
     .map_err(map_store_error)?;
-    let database = private_root
-        .open_regular_file("metadata.sqlite3")
+    private_root
+        .validate_regular_file("metadata.sqlite3")
         .map_err(|_| CliError::PrivateStorageUnavailable)?;
-    drop(database);
     private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     let app = Application::new(
         SqliteProjectRepository::new(&store),

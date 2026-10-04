@@ -1197,7 +1197,9 @@ fn scan_directory(
                 .map(File::from)
                 .map_err(|_| SignedPackError::InventoryMismatch)?;
                 let opened = child.metadata().map_err(|_| SignedPackError::InventoryMismatch)?;
-                if !opened.is_dir() || opened.dev() != named.st_dev || opened.ino() != named.st_ino
+                if !opened.is_dir()
+                    || opened.dev() != widen_device(named.st_dev)
+                    || opened.ino() != widen_u64(named.st_ino)
                 {
                     return Err(SignedPackError::InventoryMismatch);
                 }
@@ -1217,8 +1219,8 @@ fn scan_directory(
                     rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
                 )
                 .map_err(|_| SignedPackError::InventoryMismatch)?;
-                if named_after.st_dev != opened.dev()
-                    || named_after.st_ino != opened.ino()
+                if widen_device(named_after.st_dev) != opened.dev()
+                    || widen_u64(named_after.st_ino) != opened.ino()
                     || rustix::fs::FileType::from_raw_mode(named_after.st_mode)
                         != rustix::fs::FileType::Directory
                 {
@@ -1245,8 +1247,8 @@ fn scan_directory(
                     ScanFileContext {
                         parent: directory,
                         name: name_c.as_c_str(),
-                        named_device: named.st_dev,
-                        named_inode: named.st_ino,
+                        named_device: widen_device(named.st_dev),
+                        named_inode: widen_u64(named.st_ino),
                         outer_manifest: relative == OUTER_MANIFEST,
                         capture_small: matches!(
                             relative.as_str(),
@@ -1341,9 +1343,9 @@ fn scan_regular_file(
     reader.seek(SeekFrom::Start(0)).map_err(|_| SignedPackError::InventoryMismatch)?;
     if !after_identity.stable_file(identity)
         || after_identity.size != consumed
-        || named_after.st_dev != identity.device
-        || named_after.st_ino != identity.inode
-        || widen_link_count(named_after.st_nlink) != identity.links
+        || widen_device(named_after.st_dev) != identity.device
+        || widen_u64(named_after.st_ino) != identity.inode
+        || widen_u64(named_after.st_nlink) != identity.links
         || rustix::fs::FileType::from_raw_mode(named_after.st_mode)
             != rustix::fs::FileType::RegularFile
     {
@@ -1380,9 +1382,9 @@ fn read_named_file(
     }
     let named = rustix::fs::statat(root, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| SignedPackError::InventoryMismatch)?;
-    if named.st_dev != before.dev()
-        || named.st_ino != before.ino()
-        || widen_link_count(named.st_nlink) != 1
+    if widen_device(named.st_dev) != before.dev()
+        || widen_u64(named.st_ino) != before.ino()
+        || widen_u64(named.st_nlink) != 1
     {
         return Err(SignedPackError::InventoryMismatch);
     }
@@ -1410,11 +1412,11 @@ fn read_named_file(
     if output.len() as u64 > maximum
         || Identity::from_metadata(&before) != Identity::from_metadata(&after)
         || output.len() as u64 != after.len()
-        || named.st_dev != after.dev()
-        || named.st_ino != after.ino()
-        || named_after.st_dev != after.dev()
-        || named_after.st_ino != after.ino()
-        || widen_link_count(named_after.st_nlink) != after.nlink()
+        || widen_device(named.st_dev) != after.dev()
+        || widen_u64(named.st_ino) != after.ino()
+        || widen_device(named_after.st_dev) != after.dev()
+        || widen_u64(named_after.st_ino) != after.ino()
+        || widen_u64(named_after.st_nlink) != after.nlink()
         || rustix::fs::FileType::from_raw_mode(named_after.st_mode)
             != rustix::fs::FileType::RegularFile
         || std::time::Instant::now() >= deadline
@@ -1442,10 +1444,24 @@ fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Widens a platform-width `st_nlink` (u32 on aarch64 Linux, u64 on x86_64)
-/// to the u64 used by `std::os::unix::fs::MetadataExt::nlink`.
-fn widen_link_count(value: impl Into<u64>) -> u64 {
+/// Widens a platform-width unsigned `stat` field (`st_nlink` is u16 on macOS, u32 on
+/// aarch64 Linux, u64 on x86_64 Linux; `st_ino` is u64 everywhere) to the u64 returned by
+/// `std::os::unix::fs::MetadataExt`.
+fn widen_u64(value: impl Into<u64>) -> u64 {
     value.into()
+}
+
+/// Widens `st_dev` exactly as `MetadataExt::dev` does: `dev_t` is `i32` on macOS (std
+/// sign-extends it with `as u64`) and `u64` on Linux.
+#[cfg(target_os = "macos")]
+fn widen_device(value: i32) -> u64 {
+    i64::from(value) as u64
+}
+
+/// Widens `st_dev` exactly as `MetadataExt::dev` does (`dev_t` is already `u64` on Linux).
+#[cfg(not(target_os = "macos"))]
+fn widen_device(value: u64) -> u64 {
+    value
 }
 
 #[cfg(test)]

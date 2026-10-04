@@ -502,10 +502,9 @@ where
     let private_root = AdmittedPrivateRoot::open(&project_directory)
         .map_err(|_| CliError::PrivateStorageUnavailable)?;
     private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
-    let database = private_root
-        .open_regular_file("metadata.sqlite3")
+    private_root
+        .validate_regular_file("metadata.sqlite3")
         .map_err(|_| CliError::PrivateStorageUnavailable)?;
-    drop(database);
     let context = RequestContext::new(env_user(), WallTime::now());
     let store = SqliteStore::open(
         &database_path,
@@ -515,10 +514,9 @@ where
             .with_correlation_id(context.correlation_id),
     )
     .map_err(map_store_error)?;
-    let database = private_root
-        .open_regular_file("metadata.sqlite3")
+    private_root
+        .validate_regular_file("metadata.sqlite3")
         .map_err(|_| CliError::PrivateStorageUnavailable)?;
-    drop(database);
     private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
@@ -740,10 +738,9 @@ where
     }
     let store = SqliteStore::open(&database_path, options).map_err(map_store_error)?;
     private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
-    let database = private_root
-        .open_regular_file("metadata.sqlite3")
+    private_root
+        .validate_regular_file("metadata.sqlite3")
         .map_err(|_| CliError::PrivateStorageUnavailable)?;
-    drop(database);
     let repository = SqliteProjectRepository::new(&store);
     let idempotency = SqliteIdempotencyStore::new(&store);
     let app = Application::new(repository, idempotency, CURRENT_SCHEMA_VERSION, 1, 0);
