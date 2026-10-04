@@ -1407,10 +1407,59 @@ class SettleAndGlobalQuiescenceTests(unittest.TestCase):
         )
         data = (json.dumps(owner, indent=2, sort_keys=True) + "\n").encode()
         self.assertTrue(private_roots.private_json_fits_read_limits(data))
-        self.assertIs(owner["probeEvidenceTruncated"], True)
         self.assertIs(owner["ownedProcessesTruncated"], True)
+        self.assertEqual(len(owner["ownedProbeProcesses"]), 64, "run-owned probe identities are trimmed last")
+        self.assertIsNot(owner.get("probeEvidenceTruncated"), True)
         self.assertEqual(owner["ownedProbeProcessCount"], 64, "the truthful total is preserved")
         self.assertTrue(owner["token"] == "test-token-value" and owner["requiresManualRecovery"])
+
+    def test_retention_trims_unconfirmed_before_probes_when_lengths_tie(self) -> None:
+        owner = self.retain(
+            unconfirmed_processes=[_unknown(pid) for pid in range(1, 65)], unconfirmed_process_count=64,
+            owned_probe_processes=[{"pid": pid, "startedAt": "p", "processGroupId": pid, "reason": "probe"} for pid in range(1, 65)],
+            owned_probe_process_count=64,
+        )
+        self.assertTrue(private_roots.private_json_fits_read_limits((json.dumps(owner, indent=2, sort_keys=True) + "\n").encode()))
+        self.assertEqual(len(owner["ownedProbeProcesses"]), 64)  # type: ignore[arg-type]
+        self.assertLess(len(owner["unconfirmedProcesses"]), 64)  # type: ignore[arg-type]
+        self.assertIs(owner["unconfirmedProcessesTruncated"], True)
+        self.assertEqual(owner["unconfirmedProcessCount"], 64, "truthful total preserved")
+
+    def test_receipt_is_compacted_to_stay_readable_with_counts_and_flags_kept(self) -> None:
+        records = [_unknown(pid) for pid in range(1, 65)]
+
+        def report() -> dict[str, object]:
+            return {
+                "eligible": True, "settled": True, "initialIdentities": [dict(item) for item in records],
+                "initialCandidateCount": 64, "latestIdentities": [], "latestCandidateCount": 0,
+                "identityUnion": [dict(item) for item in records], "identityUnionCount": 64,
+                "identityUnionTruncated": False, "ownedProbeProcesses": [], "cleanupExceptions": [],
+            }
+
+        manifest = {"schemaVersion": 1, "gates": [{"name": f"g{i}", "naturalExitSettle": report()} for i in range(23)],
+                    "versionProbes": [{"name": f"v{i}", "naturalExitSettle": report()} for i in range(9)]}
+        data = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+        self.assertFalse(private_roots.private_json_fits_read_limits(
+            data, maximum_nodes=run_gates.RECEIPT_JSON_BUDGET, maximum_commas=run_gates.RECEIPT_JSON_BUDGET,
+        ), "the uncompacted receipt is too large to read back")
+        written: dict[str, bytes] = {}
+        with mock.patch.object(run_gates, "_atomic_json", side_effect=lambda _p, value: written.update(data=json.dumps(value).encode())):
+            run_gates._write_receipt(pathlib.Path("/unused/receipt.json"), manifest)
+        self.assertTrue(private_roots.private_json_fits_read_limits(
+            (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(),
+            maximum_nodes=run_gates.RECEIPT_JSON_BUDGET, maximum_commas=run_gates.RECEIPT_JSON_BUDGET,
+        ))
+        first = manifest["gates"][0]["naturalExitSettle"]  # type: ignore[index]
+        self.assertEqual(first["initialCandidateCount"], 64)
+        self.assertEqual(first["identityUnionCount"], 64)
+        self.assertIs(first["evidenceListsCompacted"], True)
+
+    def test_receipt_that_cannot_be_bounded_is_an_error_not_an_unreadable_file(self) -> None:
+        manifest = {"schemaVersion": 1, "gates": [{"name": f"g{i}", "extra": list(range(100))} for i in range(60)]}
+        with mock.patch.object(run_gates, "_atomic_json") as write:
+            with self.assertRaises(RuntimeError):
+                run_gates._write_receipt(pathlib.Path("/unused/receipt.json"), manifest)
+        write.assert_not_called()
 
     def test_private_json_limits_reject_what_read_private_json_rejects(self) -> None:
         self.assertTrue(private_roots.private_json_fits_read_limits(b'{"a": [1, 2, 3]}'))
@@ -1619,6 +1668,16 @@ class RunOwnershipWorldTests(unittest.TestCase):
         self.assertEqual([item["pid"] for item in failure.owned_probe_processes], [7003])
         self.assertEqual(failure.owned_probe_process_count, 1)
         self.assertEqual([item["pid"] for item in report["ownedProbeProcesses"]], [7003])  # type: ignore[index]
+
+    def test_probe_from_the_first_post_command_scan_reaches_receipt_and_owner_error(self) -> None:
+        initial = _unknown(9001)
+        probe = {"pid": 7005, "startedAt": "probe-start", "processGroupId": 7005}
+        report, failure, _result = self.drive([self.world(initial, owned_probe=probe)])
+        assert failure is not None
+        self.assertNotIn("eligible", report, "a first-scan probe makes the run ineligible for settling")
+        self.assertEqual([item["pid"] for item in report["ownedProbeProcesses"]], [7005])  # type: ignore[index]
+        self.assertEqual(report["ownedProbeProcessCount"], 1)
+        self.assertEqual([item["pid"] for item in failure.owned_probe_processes], [7005])
 
     def test_global_phase_probe_exception_is_retained(self) -> None:
         initial = _unknown(9001)
@@ -3418,7 +3477,7 @@ class LeasedRunTests(unittest.TestCase):
     def args(self, label: str = "leased-test-1", **overrides: object) -> Namespace:
         values = dict(
             repo=str(self.repo), label=label, cache_root=str(self.cache), timeout=30.0, wait=0.0,
-            jdk_home=None, expect_unittest=None, argv=["cargo", "build"],
+            jdk_home=None, expect_unittest=None, argv=["cargo", "build"], pass_env=[],
         )
         values.update(overrides)
         return Namespace(**values)
@@ -3429,8 +3488,10 @@ class LeasedRunTests(unittest.TestCase):
         self.captured = captured
 
         def fake(argv: list[str], *, cwd: pathlib.Path, env: dict[str, str], timeout: float,
-                 log_path: pathlib.Path, settle_report: dict | None = None) -> tuple[int, float]:
+                 log_path: pathlib.Path, settle_report: dict | None = None,
+                 max_log_bytes: int | None = None) -> tuple[int, float]:
             captured.update(
+                scratch_existed=pathlib.Path(env["XTRACE_TEST_SCRATCH_ROOT"]).is_dir(), max_log_bytes=max_log_bytes, 
                 argv=list(argv), cwd=cwd, env=dict(env), timeout=timeout,
                 held=sorted(path.name for path in (self.cache / "leases").iterdir()),
                 log_name=pathlib.Path(log_path).name,
@@ -3475,7 +3536,10 @@ class LeasedRunTests(unittest.TestCase):
         self.assertEqual(self.leases_present(), [], "leases released after success")
         env = self.captured["env"]
         scratch = self.cache / "tmp" / "leased-test-1-scratch"
-        self.assertTrue(scratch.is_dir())
+        self.assertTrue(self.captured["scratch_existed"], "per-run scratch exists while the command runs")
+        self.assertFalse(scratch.exists(), "scratch is removed after a passing run and a successful release")
+        self.assertEqual(self.receipt()["scratchCleanup"], "removed")
+        self.assertEqual(self.captured["max_log_bytes"], leased_run.MAX_LOG_BYTES)
         expected = {
             "CARGO_HOME": self.cache / "cargo", "CARGO_TARGET_DIR": self.cache / "cargo-target",
             "GRADLE_USER_HOME": self.cache / "gradle", "NPM_CONFIG_CACHE": self.cache / "npm",
@@ -3496,8 +3560,9 @@ class LeasedRunTests(unittest.TestCase):
         summary = json.loads(self.lines[-1])
         self.assertEqual(
             sorted(summary),
-            ["decision", "durationSeconds", "exitCode", "label", "leaseCleanup", "logSha256"],
+            ["decision", "durationSeconds", "exitCode", "label", "leaseCleanup", "logSha256", "receiptWritten"],
         )
+        self.assertIs(summary["receiptWritten"], True)
         self.assertEqual(summary["decision"], "passed")
         self.assertEqual(summary["exitCode"], 0)
         self.assertEqual(summary["logSha256"], hashlib.sha256(b"Ran 3 tests in 0.010s\n\nOK\n").hexdigest())
@@ -3568,13 +3633,20 @@ class LeasedRunTests(unittest.TestCase):
         self.assertEqual(receipt["leaseCleanup"], ["retained", "retained"])
         self.assertEqual(json.loads(self.lines[-1])["leaseCleanup"], ["retained", "retained"])
         before = {name: (self.cache / "leases" / name / "owner.json").read_bytes() for name in LEASE_DIRS}
-        # The next run never borrows or breaks them: it reports the busy code.
+        # The next run never borrows or breaks them: it reports "retained" at once,
+        # even with a long --wait (waiting cannot clear a manual-recovery lease).
+        sleeps: list[float] = []
         with self.fake_run() as fake:
-            code = self.go(self.args("leased-test-2"))
-        self.assertEqual(code, leased_run.EXIT_LEASE_WAIT_EXPIRED)
+            code = leased_run.run(
+                self.args("leased-test-2", wait=500.0), monotonic=self.clock.monotonic,
+                sleep=sleeps.append, out=self.lines.append,
+            )
+        self.assertEqual(code, leased_run.EXIT_LEASE_RETAINED)
+        self.assertNotEqual(leased_run.EXIT_LEASE_RETAINED, leased_run.EXIT_LEASE_WAIT_EXPIRED)
+        self.assertEqual(sleeps, [])
         fake.assert_not_called()
         self.assertEqual(before, {name: (self.cache / "leases" / name / "owner.json").read_bytes() for name in LEASE_DIRS})
-        self.assertEqual(json.loads(self.lines[-1])["decision"], "lease_wait_expired")
+        self.assertEqual(json.loads(self.lines[-1])["decision"], "lease_retained_manual_recovery")
         self.assertFalse((self.cache / "release-gates" / "leased-test-2").exists(), "label stays unused")
 
     def test_attempted_gate_failure_is_a_failed_run_that_releases_leases(self) -> None:
@@ -3662,7 +3734,7 @@ class LeasedRunTests(unittest.TestCase):
         def racing_acquire() -> None:
             attempts[0] += 1
             if attempts[0] == 1:
-                raise RuntimeError("release builder lease is already owned (pid 1 label other); share the exact lease token only with a nested gate invocation")
+                raise run_gates.LeaseBusy("release builder lease is already owned (pid 1 label other)", False)
             real_acquire()
 
         with mock.patch.object(leases[1], "acquire", side_effect=racing_acquire):
@@ -3735,6 +3807,167 @@ class LeasedRunTests(unittest.TestCase):
         with self.fake_run():
             self.go(self.args(timeout=1234.5))
         self.assertEqual(self.captured["timeout"], 1234.5)
+
+
+    def test_live_owner_busy_is_distinct_from_retained_and_typed(self) -> None:
+        # A plain RuntimeError that merely contains the old message text is not "busy".
+        leases = [run_gates.Lease(self.cache / "leases" / name, self.TOKEN, "label") for name in LEASE_DIRS]
+        with mock.patch.object(leases[0], "acquire", side_effect=RuntimeError("release builder lease is already owned (x)")):
+            with self.assertRaises(RuntimeError) as caught:
+                leased_run.acquire_leases(leases, 0.0, monotonic=self.clock.monotonic, sleep=self.clock.sleep)
+        self.assertNotIsInstance(caught.exception, (leased_run.LeaseWaitExpired, leased_run.LeaseRetained))
+        # A typed busy error carrying requires_manual_recovery is classified without waiting.
+        with mock.patch.object(leases[1], "acquire", side_effect=run_gates.LeaseBusy("owned", True)):
+            with self.assertRaises(leased_run.LeaseRetained):
+                leased_run.acquire_leases(leases, 500.0, monotonic=self.clock.monotonic, sleep=self.clock.sleep)
+        self.assertEqual(self.clock.now, 0.0)
+        self.assertEqual(self.leases_present(), [], "anything acquired was rolled back")
+
+    def test_lease_acquire_raises_typed_busy_with_recovery_flag(self) -> None:
+        for owner, expected in (
+            ({"pid": 1, "label": "other", "token": "cd" * 16}, False),
+            ({"pid": 1, "label": "other", "token": "cd" * 16, "requiresManualRecovery": True}, True),
+        ):
+            with self.subTest(expected=expected):
+                path = self.cache / f"lease-{expected}"
+                path.mkdir()
+                (path / "owner.json").write_text(json.dumps(owner))
+                with self.assertRaises(run_gates.LeaseBusy) as caught:
+                    run_gates.Lease(path, self.TOKEN, "label").acquire()
+                self.assertIs(caught.exception.requires_manual_recovery, expected)
+        path = self.cache / "lease-unreadable"
+        path.mkdir()
+        with self.assertRaises(run_gates.LeaseBusy) as caught:
+            run_gates.Lease(path, self.TOKEN, "label").acquire()
+        self.assertIsNone(caught.exception.requires_manual_recovery)
+
+    def test_label_used_while_waiting_is_refused_and_never_overwritten(self) -> None:
+        busy = self.cache / "leases" / "gradle"
+        busy.mkdir(parents=True)
+        foreign = self.cache / "release-gates" / "leased-test-1"
+
+        def sleep(seconds: float) -> None:
+            self.clock.now += seconds
+            shutil.rmtree(busy)
+            foreign.mkdir(parents=True)
+            (foreign / "receipt.json").write_text('{"owner": "someone else"}')
+
+        with self.fake_run() as fake:
+            code = leased_run.run(self.args(wait=100.0), monotonic=self.clock.monotonic, sleep=sleep, out=self.lines.append)
+        self.assertEqual(code, leased_run.EXIT_INVALID)
+        fake.assert_not_called()
+        self.assertEqual((foreign / "receipt.json").read_text(), '{"owner": "someone else"}')
+        self.assertEqual(sorted(path.name for path in foreign.iterdir()), ["receipt.json"])
+        self.assertEqual(self.leases_present(), [], "our leases are released")
+        self.assertEqual(json.loads(self.lines[-1])["decision"], "label_in_use")
+
+    def test_retention_exit_code_survives_finalization_failure(self) -> None:
+        with self.fake_run(raise_exc=self.uncertain()), \
+                mock.patch.object(run_gates, "_hash_file", side_effect=OSError("hash")):
+            code = self.go()
+        self.assertEqual(code, leased_run.EXIT_UNCERTAIN)
+        receipt = self.receipt()
+        self.assertEqual(receipt["decision"], "uncertain_process_tree")
+        self.assertEqual(receipt["finalizationError"], "OSError")
+        self.assertEqual(self.leases_present(), ["cargo", "gradle"])
+
+    def test_receipt_write_failure_is_a_distinct_nonzero_failure(self) -> None:
+        real = run_gates._write_receipt
+        calls = [0]
+
+        def flaky(path: pathlib.Path, manifest: dict) -> None:
+            calls[0] += 1
+            if calls[0] > 1:  # the "running" marker succeeds, the final write fails
+                raise OSError("disk full")
+            real(path, manifest)
+
+        with self.fake_run(), mock.patch.object(run_gates, "_write_receipt", side_effect=flaky):
+            code = self.go()
+        self.assertEqual(code, leased_run.EXIT_RECEIPT_FAILED)
+        self.assertNotIn(code, (0, 1, 2, 3, 75, 76))
+        summary = json.loads(self.lines[-1])
+        self.assertEqual(summary["decision"], "receipt_write_failed")
+        self.assertIs(summary["receiptWritten"], False)
+        self.assertEqual(self.leases_present(), [], "leases were still released")
+        # A retained tree keeps exit code 3 even when the receipt cannot be written.
+        calls[0] = 0
+        self.lines.clear()
+        with self.fake_run(raise_exc=self.uncertain()), mock.patch.object(run_gates, "_write_receipt", side_effect=flaky):
+            self.assertEqual(self.go(self.args("leased-test-3")), leased_run.EXIT_UNCERTAIN)
+        self.assertIs(json.loads(self.lines[-1])["receiptWritten"], False)
+
+    def test_running_marker_is_written_before_the_command_starts(self) -> None:
+        seen: dict[str, object] = {}
+
+        def inspect() -> None:
+            seen.update(json.loads((self.cache / "release-gates" / "leased-test-1" / "receipt.json").read_text()))
+
+        with self.fake_run(mutate=inspect):
+            self.go()
+        self.assertEqual(seen["decision"], "running")
+
+    def test_environment_is_an_allowlist_plus_task_variables(self) -> None:
+        ambient = {
+            "PATH": "/usr/bin:/bin", "HOME": "/home/test", "LC_ALL": "C", "LANG": "C",
+            "AWS_SECRET_ACCESS_KEY": "canary-secret", "MY_API_TOKEN": "canary-token",
+            "GITHUB_TOKEN": "canary-gh", "RUST_LOG": "debug", "RANDOM_VAR": "x",
+        }
+        with mock.patch.dict(os.environ, ambient, clear=True), self.fake_run():
+            self.go(self.args(pass_env=["RUST_LOG"]))
+        env = self.captured["env"]
+        for name in ("PATH", "HOME", "LC_ALL", "LANG", "RUST_LOG", "CARGO_HOME", "TMPDIR"):
+            self.assertIn(name, env)  # type: ignore[operator]
+        for name in ("AWS_SECRET_ACCESS_KEY", "MY_API_TOKEN", "GITHUB_TOKEN", "RANDOM_VAR"):
+            self.assertNotIn(name, env)  # type: ignore[operator]
+        self.assertEqual(self.receipt()["passedEnvNames"], ["RUST_LOG"])
+        for bad in ("lowercase", "MY_TOKEN", "AWS_SECRET_ACCESS_KEY", "1BAD", "A" * 80):
+            with self.subTest(bad), self.fake_run() as fake:
+                with self.assertRaises(ValueError):
+                    self.go(self.args("leased-env-bad", pass_env=[bad]))
+                fake.assert_not_called()
+
+    def test_scratch_is_kept_after_failure_and_when_release_fails(self) -> None:
+        with self.fake_run(code=3):
+            self.assertEqual(self.go(self.args("leased-keep-1")), leased_run.EXIT_FAILED)
+        self.assertTrue((self.cache / "tmp" / "leased-keep-1-scratch").is_dir())
+        self.assertEqual(self.receipt("leased-keep-1")["scratchCleanup"], "kept")
+        with self.fake_run(), mock.patch.object(run_gates.Lease, "release", side_effect=OSError("busy")):
+            self.assertEqual(self.go(self.args("leased-keep-2")), leased_run.EXIT_UNCERTAIN)
+        self.assertTrue((self.cache / "tmp" / "leased-keep-2-scratch").is_dir())
+
+    def test_log_limit_exit_code_is_a_failed_run_with_reason(self) -> None:
+        with self.fake_run(code=run_gates.LOG_LIMIT_EXIT_CODE, log=b"partial"):
+            self.assertEqual(self.go(), leased_run.EXIT_FAILED)
+        self.assertEqual(self.receipt()["failureReason"], "log-exceeded-bound")
+
+    def test_run_enforces_the_log_cap_in_flight_and_stops_only_its_own_tree(self) -> None:
+        log_path = self.root / "capped.log"
+        code_text = "import sys,time\nsys.stdout.write('x'*4000000)\nsys.stdout.flush()\ntime.sleep(60)\n"
+        clean = run_gates.UntrackedProcessScan([], [], None, 0)
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        self.addCleanup(lambda: (bystander.kill(), bystander.wait()))
+        started = time.monotonic()
+        with mock.patch.object(private_roots, "create_private_file", side_effect=lambda path, flags, mode: os.open(path, flags, mode)), \
+                mock.patch.object(run_gates, "_untracked_processes_since", return_value=clean):
+            code, _duration = run_gates._run(
+                [sys.executable, "-c", code_text], cwd=self.root, env=dict(os.environ), timeout=60,
+                log_path=log_path, max_log_bytes=1_000_000,
+            )
+        self.assertEqual(code, run_gates.LOG_LIMIT_EXIT_CODE)
+        self.assertLess(time.monotonic() - started, 30, "stopped long before the sleeping child would finish")
+        self.assertGreater(log_path.stat().st_size, 1_000_000)
+        self.assertIn(b"log exceeded its size limit", log_path.read_bytes())
+        self.assertIsNone(bystander.poll(), "an unrelated process was not touched")
+
+    def test_log_cap_is_off_by_default(self) -> None:
+        clean = run_gates.UntrackedProcessScan([], [], None, 0)
+        with mock.patch.object(private_roots, "create_private_file", side_effect=lambda path, flags, mode: os.open(path, flags, mode)), \
+                mock.patch.object(run_gates, "_untracked_processes_since", return_value=clean):
+            code, _ = run_gates._run(
+                [sys.executable, "-c", "import sys; sys.stdout.write('x'*3000000)"], cwd=self.root,
+                env=dict(os.environ), timeout=30, log_path=self.root / "uncapped.log",
+            )
+        self.assertEqual(code, 0)
 
 
 LEASE_DIRS = ("cargo", "gradle")

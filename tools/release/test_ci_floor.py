@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
 import signal
@@ -163,6 +164,14 @@ class CiFloorEvidenceTests(unittest.TestCase):
             "pollCount": 2,
             "globalRescanCount": 3,
             "error": None,
+            "identityUnion": [],
+            "identityUnionCount": 2,
+            "identityUnionTruncated": False,
+            "ownedProbeProcesses": [],
+            "ownedProbeProcessCount": 0,
+            "cleanupExceptions": [],
+            "cleanupExceptionCount": 0,
+            "probeEvidenceTruncated": False,
         }
         gates = [{
             "name": gate.name,
@@ -1967,3 +1976,85 @@ class CiFloorEvidenceTests(unittest.TestCase):
         if not path.is_absolute() or path.is_symlink() or not path.is_dir():
             raise RuntimeError("test scratch root must be an admitted existing directory")
         return path
+
+
+class CiFloorFailureReasonTests(unittest.TestCase):
+    def test_linux_kernel_threads_with_group_zero_are_valid_snapshot_rows(self) -> None:
+        raw = (
+            b"    1     0     1 Sun Oct  4 16:20:29 2026 Ss\n"
+            b"    2     0     0 Sun Oct  4 16:20:29 2026 S\n"
+            b"    3     2     0 Sun Oct  4 16:20:29 2026 I<\n"
+            b"  101     1   101 Sun Oct  4 16:20:30 2026 Z+\n"
+        )
+        records = ci_floor._parse_utility_snapshot(raw)
+        self.assertEqual(records[2][:2], (0, 0))
+        self.assertEqual(records[3][3], "I")
+        self.assertEqual(sorted(records), [1, 2, 3, 101])
+
+    def test_malformed_snapshot_rows_still_fail_with_a_fixed_reason(self) -> None:
+        cases = {
+            "snapshot-line-shape": b"1 0 1 short\n",
+            "snapshot-identity-values": b"0 0 1 Sun Oct  4 16:20:29 2026 S\n",
+            "snapshot-empty": b"\n",
+            "snapshot-not-ascii": "1 0 1 Sun Oct  4 16:20:29 2026 é\n".encode(),
+        }
+        for reason, raw in cases.items():
+            with self.subTest(reason), self.assertRaises(ci_floor.FloorInputError) as caught:
+                ci_floor._parse_utility_snapshot(raw)
+            self.assertEqual(caught.exception.reason, reason)
+        duplicate = b"5 0 1 Sun Oct  4 16:20:29 2026 S\n5 0 1 Sun Oct  4 16:20:29 2026 S\n"
+        with self.assertRaises(ci_floor.FloorInputError):
+            ci_floor._parse_utility_snapshot(duplicate)
+
+    def test_main_failure_message_carries_a_non_secret_reason_code(self) -> None:
+        secret = "SECRET-CANARY-VALUE"
+
+        def failing(_args: object) -> int:
+            raise ci_floor.FloorInputError("snapshot-line-shape")
+
+        argv = ["ci_floor", "prepare-private-root", "--root", f"/{secret}"]
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(ci_floor, "_prepare_private_root", side_effect=failing), \
+                mock.patch("sys.stderr", stderr):
+            code = ci_floor.main()
+        self.assertEqual(code, 1)
+        message = stderr.getvalue()
+        self.assertIn("release floor: preflight or receipt processing failed (reason: FloorInputError/snapshot-line-shape", message)
+        self.assertNotIn(secret, message)
+
+    def test_reason_code_names_class_and_site_without_message_text(self) -> None:
+        try:
+            raise OSError("/home/owner/secret/path token=abc")
+        except OSError as exc:
+            reason = ci_floor._failure_reason(exc)
+        self.assertEqual(reason.split("/")[0], "OSError")
+        self.assertNotIn("secret", reason)
+        self.assertNotIn("token", reason)
+
+    def test_successful_settle_report_requires_clean_probe_and_union_evidence(self) -> None:
+        base = {
+            "eligible": True, "settled": True,
+            "initialIdentities": [{"pid": 41001, "startedAt": "s", "observedParentPid": 1,
+                                   "descriptorStatus": "uninspectable", "reason": "r"}],
+            "initialCandidateCount": 1, "latestIdentities": [], "latestCandidateCount": 0,
+            "waitSeconds": 120.0004, "settleWindowSeconds": 120.0, "deadlineRemainingSeconds": 0.0,
+            "pollCount": 2, "globalRescanCount": 3, "error": None, "identityUnion": [],
+            "identityUnionCount": 1, "identityUnionTruncated": False, "ownedProbeProcesses": [],
+            "ownedProbeProcessCount": 0, "cleanupExceptions": [], "cleanupExceptionCount": 0,
+            "probeEvidenceTruncated": False,
+        }
+        self.assertTrue(ci_floor._successful_settle_report(base), "a legitimate 120.0004 s success is valid")
+        invalid = {
+            "too slow": {"waitSeconds": 122.0},
+            "probe": {"ownedProbeProcessCount": 1, "ownedProbeProcesses": [{"pid": 1}]},
+            "cleanup exception": {"cleanupExceptionCount": 1, "cleanupExceptions": [{"type": "X"}]},
+            "union truncated": {"identityUnionTruncated": True},
+            "probe truncated": {"probeEvidenceTruncated": True},
+            "union below initial": {"identityUnionCount": 0},
+            "compacted": {"evidenceListsCompacted": True},
+            "missing probe fields": {"ownedProbeProcessCount": None},
+        }
+        for name, change in invalid.items():
+            with self.subTest(name):
+                self.assertFalse(ci_floor._successful_settle_report({**base, **change}))
