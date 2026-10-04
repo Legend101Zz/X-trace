@@ -1,6 +1,6 @@
 # ADR 0003: Runtime line, value and outcome probes (Java and Node)
 
-- Status: Proposed
+- Status: Accepted (root decision 2026-10-04)
 - Date: 2026-10-04
 - Context: The approved plans promise active-line cursors, bounded argument,
   return and local values, and the actual recording outcome
@@ -497,3 +497,14 @@ assert the UI never renders an inferred line or value (R1-R8).
 6. Spring Boot fat-jar scope: is `BOOT-INF/classes/` plus package prefix a
    sufficient application-root proof, or must the launcher pass the project's
    own artifact digest?
+
+## Root decision (2026-10-04)
+
+Decided by the root orchestrator under the owner's autonomous v0.01 launch authorization. These answers close the open questions above and supersede any conflicting text in this ADR.
+
+1. Event cap: the 2,048 per-recording cap is raised. Defaults are 16,384 events per recording in `standard` and 131,072 in `focused`, both configuration with tested defaults. A new store migration replaces the `event_count <= 2048` CHECK with a sanity bound of 1,048,576. The replay window API must serve at least 10,000 frames. Overflow is recorded as explicit truncation/drop counts and shown to users; nothing is dropped silently. This amends the plan 03 §6 budget table.
+2. `OBSERVED_UNATTESTED` is acceptable for campaign receipts when it is shown honestly per frame. Campaign builds use unmodified upstream build configuration; no attestation plugin is injected.
+3. Probe depth: `standard` installs function entry/exit/exception probes plus async linkage only. Statement/line probes and value capture are `focused`-only, for both Java and Node. Idle/standard/focused overhead is measured per framework family.
+4. The Node lane's first task is a spike proving `module.registerHooks` returns CommonJS `source` on the pinned Node 22.x and 24.x. If it does not, CommonJS uses a `Module.prototype._compile` wrapper and ESM uses the hooks. The fallback is documented in the Node lane report.
+5. Exception messages are captured by default with pattern redaction and a length cap. Privacy canary tests must prove the redaction; if the privacy review rejects the pattern set, the default becomes off.
+6. Spring Boot fat jars: `BOOT-INF/classes/` plus the package prefix is sufficient application-root proof for v0.01. The launcher also records the jar digest in recording metadata as provenance only, not as an extra claim.

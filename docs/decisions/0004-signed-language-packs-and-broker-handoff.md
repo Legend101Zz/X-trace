@@ -1,6 +1,6 @@
 # ADR 0004: Signed language packs and broker handoff (Java and Node)
 
-- Status: Proposed
+- Status: Accepted (root decision 2026-10-04)
 - Date: 2026-10-04
 - Context: `docs/plans/x-trace/03c-runtime-adapters.md` §1 specifies a signed
   `xtrace-pack.json`, and `03b-protocol-and-api.md` §2.1/§2.4 specify private
@@ -372,3 +372,14 @@ payload (secret never in argv, env after read, logs, or crash output).
    absent (CI containers)?
 6. Do we require Linux/macOS peer start-time binding on the daemon's TLS side as
    well, or is the broker binding sufficient?
+
+## Root decision (2026-10-04)
+
+Decided by the root orchestrator under the owner's autonomous v0.01 launch authorization. These answers close the open questions above and supersede any conflicting text in this ADR.
+
+1. Release key: no real release signing identity exists. Custody of the single v0.01 Ed25519 release key, with a documented rotation note, is an OWNER INPUT. Until the owner provides or authorizes it, only test keys marked non-release are used, the production trust table stays empty, and release is blocked on that input. Root never fabricates a release identity.
+2. JDK 25 is NOT admitted in v0.01. There is no `bestEffortMajors` field. The v0.01 matrix is Java 17/21 and Node 22/24 only.
+3. Broker deadlines are separate absolute bounds: 10 s for launch handoff and 20 s for attach handoff. They are configurable only downward and are measured in tests.
+4. Node packs ship unbundled files with every file digest-listed. `MAX_ARTIFACTS` is raised as needed with a tested bound. No new bundler dependency.
+5. On Linux without `XDG_RUNTIME_DIR`, the broker runtime root is an admitted private directory (0700, private_storage APIs) under the X-trace state root (`$XDG_STATE_HOME` or `~/.local/state/xtrace/run`). Never a shared `/tmp` path.
+6. The broker PID+start-time binding plus the one-shot session join is sufficient for v0.01. No additional daemon-side TLS peer binding.

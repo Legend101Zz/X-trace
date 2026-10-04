@@ -1,6 +1,6 @@
 # ADR 0005: Framework seam scope for v0.01 campaigns
 
-- Status: Proposed
+- Status: Accepted (root decision 2026-10-04)
 - Date: 2026-10-04
 - Context: The v0.01 mandate requires six pinned real-project campaigns and
   names the framework families they must exercise, while the approved plans
@@ -191,3 +191,13 @@ containers, Fastify, CJS/ESM/TypeScript, JVM attach.
    Nest enter? The module set should follow the pinned version, not the plan.
 5. Do we want a doctor message for detected GraphQL servers explaining that
    operations are not enumerated?
+
+## Root decision (2026-10-04)
+
+Decided by the root orchestrator under the owner's autonomous v0.01 launch authorization. These answers close the open questions above and supersede any conflicting text in this ADR.
+
+1. No new ledger row; the 55 mandatory rows are fixed. Jersey resource-method identity is evidenced under JAVA-SERVLET and CAMPAIGN-FINERACT.
+2. The campaign lane verifies the Fineract pin, its canonical upstream URL/tag/SHA and the Jersey line at campaign time and records them in the receipt.
+3. Nest/GraphQL: no `reviewed_internal` GraphQL hook. Frames are Nest controller/provider methods and ordinary application method frames from probes on application code. GraphQL operations are not enumerated.
+4. Medusa's HTTP stack follows the pinned version; the campaign lane verifies whether Nest is present and limits claims to the seams actually observed.
+5. Yes: `doctor` prints an informational message when a GraphQL server is detected, explaining that operations are not enumerated in v0.01.

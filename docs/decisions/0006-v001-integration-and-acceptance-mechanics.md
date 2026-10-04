@@ -1,6 +1,6 @@
 # ADR 0006: v0.01 integration and acceptance mechanics
 
-- Status: Proposed
+- Status: Accepted (root decision 2026-10-04)
 - Date: 2026-10-04
 - Context: Twelve unmerged `slice/v001-*` branches carry overlapping,
   unaccepted preparation (conflict hotspots: `crates/xtrace-cli/src/{error,output}.rs`,
@@ -201,3 +201,13 @@ following hold for that exact SHA; nothing is carried over from an earlier SHA
    with only hashes tracked?
 5. Should `ci-floor` or `control-admission` be the tooling base? They diverge after
    `1d3a2d1` and conflict in `tools/release/test_release_tools.py`; root decides.
+
+## Root decision (2026-10-04)
+
+Decided by the root orchestrator under the owner's autonomous v0.01 launch authorization. These answers close the open questions above and supersede any conflicting text in this ADR.
+
+1. Hosted macOS arm64 runners are acceptable for platform preparation CI and fresh-profile rehearsal. PLATFORM-MAC acceptance still requires signed/notarized artifacts (owner input).
+2. Integration merges to `main` per accepted phase. Phases with mutual dependencies may share one integration checkpoint, but each phase keeps its own gate/evidence record.
+3. Phase receipts before release keys exist are signed with test keys marked non-release. Release receipts need the owner-authenticated trust configuration (owner input).
+4. Rejected-candidate raw evidence stays in the private cache; only sanitized hashes and summaries are tracked in-tree.
+5. The tooling base is `slice/v001-control-admission`, which absorbs ci-floor and release-control (control lane round 2).
