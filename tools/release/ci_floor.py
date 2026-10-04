@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from typing import Any
@@ -89,21 +91,150 @@ class _EvidenceTestResult(unittest.TextTestResult):
         super().addUnexpectedSuccess(test)
 
 
+def _utility_process_snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, int, str, str]]:
+    """Read bounded identity facts for processes in a utility's fresh session."""
+    ps = shutil.which("ps")
+    if ps is None or timeout <= 0:
+        raise FloorInputError
+    deadline = time.monotonic() + timeout
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    raw = bytearray()
+    newline_count = 0
+    descriptor_cleanup_error: BaseException | None = None
+    try:
+        process = subprocess.Popen(
+            [ps, "-axo", "pid=,ppid=,pgid=,lstart=,stat="],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            close_fds=True, start_new_session=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"},
+        )
+        if process.stdout is None:
+            raise FloorInputError
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise FloorInputError
+            for key, _events in selector.select(remaining):
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                raw.extend(chunk)
+                newline_count += chunk.count(b"\n")
+                if len(raw) > 1024 * 1024 or newline_count > 10000:
+                    raise FloorInputError
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FloorInputError
+        if process.wait(timeout=remaining) != 0:
+            raise FloorInputError
+    except BaseException as original:
+        cleanup_deadline = time.monotonic() + UTILITY_CLEANUP_SECONDS
+        cleanup_ok = True
+        if process is not None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except OSError:
+                cleanup_ok = False
+            remaining = cleanup_deadline - time.monotonic()
+            if remaining <= 0:
+                cleanup_ok = False
+            else:
+                try:
+                    process.wait(timeout=remaining)
+                except (OSError, subprocess.SubprocessError):
+                    cleanup_ok = False
+        if not cleanup_ok:
+            raise FloorInputError from None
+        raise original
+    finally:
+        try:
+            selector.close()
+        except BaseException as exc:
+            descriptor_cleanup_error = exc
+        if process is not None and process.stdout is not None:
+            try:
+                process.stdout.close()
+            except BaseException as exc:
+                if descriptor_cleanup_error is None:
+                    descriptor_cleanup_error = exc
+    if descriptor_cleanup_error is not None:
+        if isinstance(descriptor_cleanup_error, KeyboardInterrupt):
+            raise descriptor_cleanup_error
+        raise FloorInputError from None
+    try:
+        lines = bytes(raw).decode("ascii", errors="strict").splitlines()
+    except UnicodeError:
+        raise FloorInputError from None
+    records: dict[int, tuple[int, int, str, str]] = {}
+    for line in lines:
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) != 9 or not all(fields[index].isdigit() for index in range(3)):
+            raise FloorInputError
+        pid, parent, group = (int(fields[index]) for index in range(3))
+        if pid <= 0 or parent < 0 or group <= 0 or pid in records:
+            raise FloorInputError
+        records[pid] = (parent, group, " ".join(fields[3:8]), fields[8][:1])
+    if not records:
+        raise FloorInputError
+    return records
+
+
+def _signal_utility_group_members(
+    group_id: int, identities: dict[int, str], signum: int, *, deadline: float,
+) -> bool:
+    """Signal only members whose start identity and dedicated group still match."""
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        snapshot = _utility_process_snapshot(timeout=min(2.0, remaining))
+        for pid, started_at in identities.items():
+            current = snapshot.get(pid)
+            if current is None or current[1] != group_id or current[2] != started_at or current[3] in {"Z", "X"}:
+                continue
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return False
+        return True
+    except (FloorInputError, OSError):
+        return False
+
+
 def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 20) -> subprocess.CompletedProcess[str]:
     selector = selectors.DefaultSelector()
     captured = {"stdout": bytearray(), "stderr": bytearray()}
     deadline = time.monotonic() + timeout
     pending: BaseException | None = None
     code: int | None = None
+    process: subprocess.Popen[bytes] | None = None
+    group_id: int | None = None
+    group_identities: dict[int, str] = {}
+    root_identity_observed = False
+    baseline: dict[int, tuple[int, int, str, str]] = {}
     try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FloorInputError
+        baseline = _utility_process_snapshot(timeout=min(2.0, remaining))
         process = subprocess.Popen(
             argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=False, close_fds=True, start_new_session=True,
         )
-    except (OSError, subprocess.SubprocessError):
-        selector.close()
-        raise FloorInputError from None
-    try:
+        group_id = process.pid
         for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
             if stream is None:
                 raise FloorInputError
@@ -113,7 +244,14 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise FloorInputError
-            for key, _events in selector.select(min(remaining, 0.1)):
+            snapshot = _utility_process_snapshot(timeout=min(2.0, remaining))
+            for pid, (_parent, pgid, started_at, _state) in snapshot.items():
+                prior = baseline.get(pid)
+                if pgid == group_id and (prior is None or prior[2] != started_at):
+                    group_identities[pid] = started_at
+                    if pid == process.pid:
+                        root_identity_observed = True
+            for key, _events in selector.select(min(remaining, 0.05)):
                 try:
                     chunk = os.read(key.fileobj.fileno(), 8192)
                 except BlockingIOError:
@@ -122,50 +260,134 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
                     selector.unregister(key.fileobj)
                     continue
                 captured[key.data].extend(chunk)
-                if sum(len(value) for value in captured.values()) > UTILITY_OUTPUT_LIMIT:
+                if len(captured["stdout"]) + len(captured["stderr"]) > UTILITY_OUTPUT_LIMIT:
                     raise FloorInputError
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise FloorInputError
+        before_reap = _utility_process_snapshot(timeout=min(2.0, remaining))
+        for pid, (_parent, pgid, started_at, _state) in before_reap.items():
+            prior = baseline.get(pid)
+            if pgid == group_id and (prior is None or prior[2] != started_at):
+                group_identities[pid] = started_at
+                if pid == process.pid:
+                    root_identity_observed = True
+        if not root_identity_observed:
+            raise FloorInputError
         code = process.wait(timeout=remaining)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FloorInputError
+        after_reap = _utility_process_snapshot(timeout=min(2.0, remaining))
+        for pid, (_parent, pgid, started_at, _state) in after_reap.items():
+            prior = baseline.get(pid)
+            if pgid == group_id and (prior is None or prior[2] != started_at):
+                group_identities[pid] = started_at
+        if any(pid != group_id and pid in after_reap and after_reap[pid][1] == group_id
+               and after_reap[pid][2] == started_at and after_reap[pid][3] not in {"Z", "X"}
+               for pid, started_at in group_identities.items()):
+            pending = FloorInputError()
     except BaseException as exc:
         pending = exc
     finally:
         cleanup_ok = True
         try:
-            child_running = process.poll() is None
-        except OSError:
-            child_running = True
-            cleanup_ok = False
-            pending = FloorInputError()
-        if child_running:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError:
-                cleanup_ok = False
-            try:
-                process.wait(timeout=UTILITY_CLEANUP_SECONDS)
-            except (OSError, subprocess.SubprocessError):
-                cleanup_ok = False
-        try:
-            if process.poll() is None:
-                cleanup_ok = False
-        except OSError:
-            cleanup_ok = False
-            pending = FloorInputError()
-        try:
-            selector.close()
-        except OSError:
-            cleanup_ok = False
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
+            if process is not None:
+                if group_id is None or not root_identity_observed:
+                    try:
+                        cleanup_deadline = time.monotonic() + UTILITY_CLEANUP_SECONDS
+                        snapshot = _utility_process_snapshot(timeout=min(2.0, UTILITY_CLEANUP_SECONDS))
+                        for pid, (_parent, pgid, started_at, _state) in snapshot.items():
+                            prior = baseline.get(pid)
+                            if pgid == group_id and (prior is None or prior[2] != started_at):
+                                group_identities[pid] = started_at
+                                if pid == process.pid:
+                                    root_identity_observed = True
+                        if not root_identity_observed:
+                            cleanup_ok = False
+                    except (FloorInputError, OSError):
+                        cleanup_ok = False
+                if group_id is not None and group_identities:
+                    cleanup_deadline = time.monotonic() + UTILITY_CLEANUP_SECONDS
+                    cleanup_ok = _signal_utility_group_members(
+                        group_id, group_identities, signal.SIGTERM, deadline=cleanup_deadline,
+                    ) and cleanup_ok
+                    while cleanup_ok and time.monotonic() < cleanup_deadline:
+                        try:
+                            remaining = cleanup_deadline - time.monotonic()
+                            snapshot = _utility_process_snapshot(timeout=min(2.0, remaining))
+                        except (FloorInputError, OSError):
+                            cleanup_ok = False
+                            break
+                        live = [pid for pid, started_at in group_identities.items()
+                                if pid in snapshot and snapshot[pid][1] == group_id
+                                and snapshot[pid][2] == started_at and snapshot[pid][3] not in {"Z", "X"}]
+                        if not live:
+                            break
+                        time.sleep(0.025)
+                    else:
+                        live = list(group_identities)
+                    if cleanup_ok and live:
+                        cleanup_ok = _signal_utility_group_members(
+                            group_id, group_identities, signal.SIGKILL, deadline=cleanup_deadline,
+                        )
+                    remaining = cleanup_deadline - time.monotonic()
+                    if remaining <= 0:
+                        cleanup_ok = False
+                    else:
+                        try:
+                            process.wait(timeout=remaining)
+                        except (OSError, subprocess.SubprocessError):
+                            cleanup_ok = False
+                    try:
+                        remaining = cleanup_deadline - time.monotonic()
+                        if remaining <= 0:
+                            cleanup_ok = False
+                            snapshot = {}
+                        else:
+                            snapshot = _utility_process_snapshot(timeout=min(2.0, remaining))
+                        if any(pid in snapshot and snapshot[pid][1] == group_id
+                               and snapshot[pid][2] == started_at and snapshot[pid][3] not in {"Z", "X"}
+                               for pid, started_at in group_identities.items()):
+                            cleanup_ok = False
+                    except (FloorInputError, OSError):
+                        cleanup_ok = False
+                else:
+                    # The direct child is owned through Popen even when system
+                    # identity scanning failed; stop that exact child, then fail
+                    # closed because descendants were not accounted for.
+                    try:
+                        if process.poll() is None:
+                            process.kill()
+                        process.wait(timeout=UTILITY_CLEANUP_SECONDS)
+                    except (OSError, subprocess.SubprocessError):
+                        cleanup_ok = False
+                    cleanup_ok = False
                 try:
-                    stream.close()
+                    if process.poll() is None:
+                        cleanup_ok = False
                 except OSError:
                     cleanup_ok = False
-        if not cleanup_ok:
+        except BaseException as cleanup_error:
+            cleanup_ok = False
+            if isinstance(cleanup_error, KeyboardInterrupt):
+                pending = cleanup_error
+        finally:
+            for stream in ((process.stdout, process.stderr) if process is not None else ()):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except BaseException as close_error:
+                        cleanup_ok = False
+                        if isinstance(close_error, KeyboardInterrupt):
+                            pending = close_error
+            try:
+                selector.close()
+            except BaseException as close_error:
+                cleanup_ok = False
+                if isinstance(close_error, KeyboardInterrupt):
+                    pending = close_error
+        if not cleanup_ok and not isinstance(pending, KeyboardInterrupt):
             pending = FloorInputError()
     if pending is not None:
         if isinstance(pending, KeyboardInterrupt):
@@ -339,6 +561,9 @@ def _prepare_private_root(args: argparse.Namespace) -> int:
     with open(github_env, "a", encoding="utf-8") as stream:
         stream.write(f"XTRACE_TEST_SCRATCH_ROOT={scratch}\n")
         stream.write(f"XTRACE_TEST_PRIVATE_SCRATCH={scratch}\n")
+        stream.write(f"TMPDIR={scratch}\n")
+        stream.write(f"TMP={scratch}\n")
+        stream.write(f"TEMP={scratch}\n")
         stream.write("XTRACE_PRIVATE_ROOT_ADMITTED=1\n")
     print("Private CI scratch admission passed.")
     return 0
@@ -347,14 +572,21 @@ def _prepare_private_root(args: argparse.Namespace) -> int:
 def _summarize_tests(args: argparse.Namespace) -> int:
     root = pathlib.Path(args.root)
     private_roots.admit_directory(root, private_leaf=True)
+    scratch_value = os.environ.get("TMPDIR")
+    if (not scratch_value or os.environ.get("TMP") != scratch_value
+            or os.environ.get("TEMP") != scratch_value):
+        raise FloorInputError
+    scratch = pathlib.Path(scratch_value)
+    private_roots.admit_directory(scratch, private_leaf=True)
+    if pathlib.Path(tempfile.gettempdir()) != scratch:
+        raise FloorInputError
     if not SHA_RE.fullmatch(args.source_sha):
         raise FloorInputError
     source_clean_before = _source_is_clean(pathlib.Path(args.repo), args.source_sha)
-    loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-    for module in RELEASE_TEST_MODULES:
-        suite.addTests(loader.loadTestsFromName(module))
+    suite = _load_release_test_suite()
     discovered = sorted(_suite_ids(suite))
+    if not discovered or len(discovered) != len(set(discovered)):
+        raise FloorInputError
     runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=2, resultclass=_EvidenceTestResult)
     run_result = runner.run(suite)
     source_clean_after = _source_is_clean(pathlib.Path(args.repo), args.source_sha)
@@ -372,7 +604,9 @@ def _summarize_tests(args: argparse.Namespace) -> int:
         "schemaVersion": 1,
         "sourceSha": args.source_sha,
         "sourceIdentityVerified": source_clean_before and source_clean_after,
+        "testScratchAdmissionVerified": True,
         "suiteModules": list(RELEASE_TEST_MODULES),
+        "discoveredTestIds": discovered,
         "status": "passed" if complete and failed == 0 and skipped == 0 else "failed",
         "discoveredCount": len(discovered),
         "testCount": len(tests),
@@ -409,8 +643,98 @@ def _suite_ids(suite: unittest.TestSuite) -> list[str]:
     return identities
 
 
+def _load_release_test_suite() -> unittest.TestSuite:
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    for module in RELEASE_TEST_MODULES:
+        suite.addTests(loader.loadTestsFromName(module))
+    return suite
+
+
+def _discover_release_test_ids() -> list[str]:
+    suite = _load_release_test_suite()
+    identities = _suite_ids(suite)
+    if not identities or len(identities) != len(set(identities)):
+        raise FloorInputError
+    return sorted(identities)
+
+
+def _private_file_sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    fd = private_roots.open_private_file_read(path)
+    try:
+        stream = os.fdopen(fd, "rb")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    with stream:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _private_log_digest_and_first_line(path: pathlib.Path) -> tuple[str, str]:
+    digest = hashlib.sha256()
+    fd = private_roots.open_private_file_read(path)
+    try:
+        stream = os.fdopen(fd, "rb")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    first_line: bytes | None = None
+    total = 0
+    with stream:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > UTILITY_OUTPUT_LIMIT:
+                raise FloorInputError
+            digest.update(chunk)
+            if first_line is None:
+                first_line = chunk.splitlines()[0] if chunk.splitlines() else None
+    if first_line is None:
+        raise FloorInputError
+    return digest.hexdigest(), first_line.decode("utf-8", errors="replace")[:240]
+
+
 def _valid_sha(value: Any) -> bool:
     return isinstance(value, str) and SHA_RE.fullmatch(value) is not None
+
+
+def _valid_sha256(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _successful_settle_report(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    initial = value.get("initialIdentities")
+    return (
+        value.get("eligible") is True and value.get("settled") is True
+        and isinstance(initial, list) and bool(initial)
+        and type(value.get("initialCandidateCount")) is int
+        and value["initialCandidateCount"] == len(initial)
+        and value.get("latestIdentities") == []
+        and type(value.get("latestCandidateCount")) is int
+        and value["latestCandidateCount"] == 0
+        and type(value.get("globalRescanCount")) is int and value["globalRescanCount"] > 0
+        and type(value.get("pollCount")) is int and value["pollCount"] > 0
+        and isinstance(value.get("waitSeconds"), (int, float))
+        and not isinstance(value.get("waitSeconds"), bool)
+        and 0 <= value["waitSeconds"] <= 120
+        and value.get("error") is None
+    )
 
 
 def _sanitize_floor(args: argparse.Namespace) -> int:
@@ -444,8 +768,17 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
                 or not _valid_sha(args.phase_base)):
             raise FloorInputError
         test_result = private_roots.read_private_json(test_summary_path)
+        if not isinstance(test_result, dict):
+            raise FloorInputError
+        repo = pathlib.Path(args.repo)
+        if not _source_is_clean(repo, args.expected_head):
+            raise FloorInputError
+        discovered_now = _discover_release_test_ids()
+        if not _source_is_clean(repo, args.expected_head):
+            raise FloorInputError
         test_rows = test_result.get("tests")
-        if not isinstance(test_rows, list) or not test_rows:
+        discovered_names = test_result.get("discoveredTestIds")
+        if not isinstance(test_rows, list) or not test_rows or not isinstance(discovered_names, list):
             raise FloorInputError
         test_names = [item.get("name") for item in test_rows if isinstance(item, dict)]
         test_statuses = [item.get("status") for item in test_rows if isinstance(item, dict)]
@@ -458,11 +791,14 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
             and test_result.get("suiteModules") == list(RELEASE_TEST_MODULES)
             and test_result.get("sourceSha") == args.expected_head
             and test_result.get("sourceIdentityVerified") is True
+            and test_result.get("testScratchAdmissionVerified") is True
+            and discovered_names == discovered_now
+            and len(discovered_names) == len(set(discovered_names))
             and isinstance(test_count, int) and not isinstance(test_count, bool)
             and isinstance(discovered_count, int) and not isinstance(discovered_count, bool)
             and test_count == discovered_count == len(test_rows) == len(test_names)
             and len(set(test_names)) == test_count
-            and all(isinstance(name, str) and name.startswith("tools.release.test_release_tools.") for name in test_names)
+            and test_names == discovered_names
             and test_statuses == ["passed"] * test_count
             and type(failed_count) is int and failed_count == 0
             and type(skipped_count) is int and skipped_count == 0
@@ -480,6 +816,8 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
             maximum_nodes=CI_RECEIPT_JSON_BUDGET,
             maximum_commas=CI_RECEIPT_JSON_BUDGET,
         )
+        if not isinstance(receipt, dict):
+            raise FloorInputError
         names = [gate.name for gate in run_gates.GATES]
         if names != list(EXPECTED_GATE_NAMES) or len(names) != 23:
             raise FloorInputError
@@ -488,21 +826,67 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
             raise FloorInputError
         if [item.get("name") for item in gates if isinstance(item, dict)] != list(EXPECTED_GATE_NAMES):
             raise FloorInputError
+        expected_gate_by_name = {gate.name: gate for gate in run_gates.GATES}
         for item in gates:
             if not isinstance(item, dict):
                 raise FloorInputError
             name = item.get("name")
-            status = item.get("status")
+            gate = expected_gate_by_name.get(name)
             exit_code = item.get("exitCode")
+            if (gate is None or item.get("status") != "passed"
+                    or type(exit_code) is not int or exit_code != 0):
+                raise FloorInputError
             duration = item.get("durationSeconds")
-            if name not in EXPECTED_GATE_NAMES or status not in {"passed", "failed", "unreached"}:
+            if (not isinstance(duration, (int, float)) or isinstance(duration, bool)
+                    or not math.isfinite(duration) or duration < 0 or duration > 21600):
                 raise FloorInputError
-            if exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool)):
+            expected_argv = list(gate.argv)
+            expected_cwd = gate.cwd
+            if gate.env == "phase-diff":
+                expected_argv = ["git", "diff", "--check", f"{args.phase_base}...HEAD"]
+            elif gate.env == "restricted":
+                cargo = shutil.which("cargo")
+                if not cargo:
+                    raise FloorInputError
+                expected_argv = [cargo, *gate.argv[1:]]
+            if item.get("argv") != expected_argv or item.get("cwd") != expected_cwd:
                 raise FloorInputError
-            if duration is not None and (not isinstance(duration, (int, float)) or isinstance(duration, bool)
-                                         or not math.isfinite(duration) or duration < 0 or duration > 21600):
+            if (item.get("cleanupUncertain") not in {None, False}
+                    or any(field in item for field in (
+                        "sourceIdentityAfter", "integrityFailure", "artifactFinalization", "logHash", "reason",
+                    ))):
                 raise FloorInputError
-            gate_rows.append({"name": name, "status": status, "exitCode": exit_code, "durationSeconds": duration})
+            expected_log = f"logs/{name}.log"
+            if item.get("log") != expected_log or not _valid_sha256(item.get("logSha256")):
+                raise FloorInputError
+            actual_log = receipt_path.parent / expected_log
+            if _private_file_sha256(actual_log) != item["logSha256"]:
+                raise FloorInputError
+            if item.get("headBefore") != args.expected_head or item.get("headAfter") != args.expected_head:
+                raise FloorInputError
+            row_tree_before = item.get("workingTreeDigestBefore")
+            row_tree_after = item.get("workingTreeDigestAfter")
+            row_diff_before = item.get("phaseDiffSha256Before")
+            row_diff_after = item.get("phaseDiffSha256After")
+            if (not _valid_sha256(row_tree_before) or row_tree_after != row_tree_before
+                    or row_tree_before != receipt.get("workingTreeDigestBefore")
+                    or not _valid_sha256(row_diff_before) or row_diff_after != row_diff_before
+                    or row_diff_before != receipt.get("phaseDiffSha256Before")):
+                raise FloorInputError
+            settle = item.get("naturalExitSettle")
+            if settle is not None and not _successful_settle_report(settle):
+                raise FloorInputError
+            gate_rows.append({
+                "name": name, "status": "passed", "exitCode": 0,
+                "durationSeconds": duration, "logSha256": item["logSha256"],
+                "sourceProof": {
+                    "headBefore": args.expected_head, "headAfter": args.expected_head,
+                    "workingTreeDigestBefore": row_tree_before,
+                    "workingTreeDigestAfter": row_tree_after,
+                    "phaseDiffSha256Before": row_diff_before,
+                    "phaseDiffSha256After": row_diff_after,
+                },
+            })
         head = receipt.get("headBefore")
         base = receipt.get("phaseBase")
         diff_before = receipt.get("phaseDiffSha256Before")
@@ -512,27 +896,73 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         head_after = receipt.get("headAfter")
         tool_versions = receipt.get("toolVersions")
         receipt_platform = receipt.get("platform")
+        lock_hashes = receipt.get("dependencyLockSha256")
         decision = receipt.get("decision")
-        required_versions = {"rustc", "cargo", "rustup", "java", "node", "npm", "gradle-wrapper", "python", "git"}
+        required_versions = {name for name, _argv, _cwd in run_gates.VERSION_COMMANDS}
+        if not isinstance(tool_versions, dict):
+            raise FloorInputError
+        version_probes = receipt.get("versionProbes")
+        if not isinstance(version_probes, list) or len(version_probes) != len(run_gates.VERSION_COMMANDS):
+            raise FloorInputError
+        probes_by_name = {item.get("name"): item for item in version_probes if isinstance(item, dict)}
+        if len(probes_by_name) != len(version_probes) or set(probes_by_name) != required_versions:
+            raise FloorInputError
+        for name, argv, cwd in run_gates.VERSION_COMMANDS:
+            probe = probes_by_name[name]
+            if (probe.get("argv") != list(argv) or probe.get("cwd") != cwd
+                    or probe.get("status") != "passed" or type(probe.get("exitCode")) is not int
+                    or probe.get("exitCode") != 0
+                    or probe.get("cleanupUncertain") not in {None, False}
+                    or any(field in probe for field in (
+                        "sourceIdentityAfter", "integrityFailure", "artifactFinalization", "logHash",
+                    ))
+                    or not _valid_sha256(probe.get("logSha256"))
+                    or probe.get("log") != f"logs/version-{name}.log"):
+                raise FloorInputError
+            probe_duration = probe.get("durationSeconds")
+            if (not isinstance(probe_duration, (int, float)) or isinstance(probe_duration, bool)
+                    or not math.isfinite(probe_duration) or probe_duration < 0 or probe_duration > 21600):
+                raise FloorInputError
+            probe_digest, first_line = _private_log_digest_and_first_line(receipt_path.parent / probe["log"])
+            if (probe_digest != probe["logSha256"] or tool_versions.get(name) != first_line):
+                raise FloorInputError
+            settle = probe.get("naturalExitSettle")
+            if settle is not None and not _successful_settle_report(settle):
+                raise FloorInputError
+        expected_java, expected_node = {
+            "jdk17-node22": (17, 22), "jdk21-node24": (21, 24),
+        }[args.tuple]
+        java_match = re.search(r'\bversion "(\d+)', tool_versions.get("java", ""))
+        node_match = re.match(r"v(\d+)\.\d+\.\d+$", tool_versions.get("node", ""))
         valid_identity = (
-            receipt.get("schemaVersion") == 1
+            type(receipt.get("schemaVersion")) is int and receipt.get("schemaVersion") == 1
             and receipt.get("label") == args.label
+            and receipt.get("cacheKeys") == list(run_gates.CACHE_NAMES)
+            and receipt.get("restrictedTargetKey") == f"cargo-target-restricted-{args.label}"
+            and isinstance(lock_hashes, dict)
+            and set(lock_hashes) == {"Cargo.lock", "adapters/java/gradle.lockfile", "adapters/node/package-lock.json", "web/app/package-lock.json"}
+            and all(_valid_sha256(value) for value in lock_hashes.values())
+            and not any(field in receipt for field in ("integrityFailure", "error", "leaseRetention"))
             and _valid_sha(head) and head == args.expected_head
             and head_after == head
             and _valid_sha(base) and base == args.phase_base
-            and isinstance(diff_before, str) and re.fullmatch(r"[0-9a-f]{64}", diff_before)
-            and isinstance(diff_after, str) and re.fullmatch(r"[0-9a-f]{64}", diff_after)
+            and _valid_sha256(diff_before)
+            and _valid_sha256(diff_after)
             and diff_after == diff_before
-            and isinstance(tree_before, str) and re.fullmatch(r"[0-9a-f]{64}", tree_before)
+            and _valid_sha256(tree_before)
             and tree_after == tree_before
             and isinstance(tool_versions, dict)
-            and required_versions.issubset(tool_versions)
-            and all(isinstance(tool_versions[name], str) and tool_versions[name] for name in required_versions)
+            and set(tool_versions) == required_versions
+            and all(isinstance(tool_versions[name], str) and tool_versions[name]
+                    and tool_versions[name] not in {"unavailable", "no version output"}
+                    for name in required_versions)
+            and java_match is not None and int(java_match.group(1)) == expected_java
+            and node_match is not None and int(node_match.group(1)) == expected_node
             and isinstance(receipt_platform, dict)
             and receipt_platform.get("system") == "Linux"
             and receipt_platform.get("machine") == "x86_64"
         )
-        all_passed = all(item["status"] == "passed" and item["exitCode"] == 0 for item in gate_rows)
+        all_passed = len(gate_rows) == len(EXPECTED_GATE_NAMES)
         if not valid_identity:
             floor_status = "invalid"
         elif decision == "checks_passed_for_review" and all_passed and summary["fullReleaseToolTests"]["status"] == "passed":
@@ -587,6 +1017,7 @@ def main() -> int:
     summarize_tests.set_defaults(handler=_summarize_tests)
     sanitize = commands.add_parser("sanitize-floor")
     sanitize.add_argument("--root", required=True)
+    sanitize.add_argument("--repo", required=True)
     sanitize.add_argument("--label", required=True)
     sanitize.add_argument("--expected-head", required=True)
     sanitize.add_argument("--phase-base", required=True)
