@@ -361,12 +361,21 @@ class PrivateRootAdmissionTests(unittest.TestCase):
             private_roots._linux_filesystem_from_mountinfo(overlay, pathlib.Path("/Volumes/Local SSD/cache"), info)
 
     def test_linux_acl_presence_or_probe_error_fails_closed(self) -> None:
-        with mock.patch.object(private_roots.os, "listxattr", return_value=[]):
+        with mock.patch.object(private_roots.os, "listxattr", return_value=[], create=True):
             private_roots._linux_acl_check(17)
-        with mock.patch.object(private_roots.os, "listxattr", return_value=["system.posix_acl_access"]):
+        with mock.patch.object(
+            private_roots.os, "listxattr", return_value=["system.posix_acl_access"], create=True,
+        ):
             with self.assertRaises(private_roots.AdmissionError):
                 private_roots._linux_acl_check(17)
-        with mock.patch.object(private_roots.os, "listxattr", side_effect=OSError("xattr unavailable")):
+        with mock.patch.object(
+            private_roots.os, "listxattr", side_effect=OSError("xattr unavailable"), create=True,
+        ):
+            with self.assertRaises(private_roots.AdmissionError):
+                private_roots._linux_acl_check(17)
+        with mock.patch.object(
+            private_roots.os, "listxattr", side_effect=AttributeError("xattr API unavailable"), create=True,
+        ):
             with self.assertRaises(private_roots.AdmissionError):
                 private_roots._linux_acl_check(17)
 
