@@ -621,7 +621,11 @@ def open_private_file_read(path: os.PathLike[str] | str) -> int:
     parent_fd, parent_identity = _open_validated_directory(candidate.parent, private_leaf=True)
     fd: int | None = None
     try:
-        fd = os.open(candidate.name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
+        fd = os.open(
+            candidate.name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
         info = os.fstat(fd)
         named = os.stat(candidate.name, dir_fd=parent_fd, follow_symlinks=False)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()

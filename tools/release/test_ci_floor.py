@@ -24,6 +24,51 @@ class CiFloorEvidenceTests(unittest.TestCase):
         raw = b'\n  \r\nopenjdk version "17.0.1"\nignored later output\n'
         self.assertEqual(run_gates._first_nonempty_version_line(raw), 'openjdk version "17.0.1"')
 
+    def test_private_version_log_reader_hashes_real_bounded_fixture(self) -> None:
+        raw = b'\n\r\nGradle 8.14\nignored later line\n'
+        with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
+            path = pathlib.Path(temporary) / "version.log"
+            path.write_bytes(raw)
+            def public_fixture_reader(candidate: pathlib.Path) -> int:
+                self.assertEqual(candidate, path)
+                return os.open(candidate, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+
+            with mock.patch.object(ci_floor.private_roots, "open_private_file_read", side_effect=public_fixture_reader):
+                digest, first_line = ci_floor._private_log_digest_and_first_line(path)
+            self.assertEqual(digest, ci_floor.hashlib.sha256(raw).hexdigest())
+            self.assertEqual(first_line, "Gradle 8.14")
+            with mock.patch.object(ci_floor, "PRIVATE_VERSION_LOG_READ_SECONDS", 0):
+                with mock.patch.object(ci_floor.private_roots, "open_private_file_read", side_effect=public_fixture_reader):
+                    with self.assertRaises(ci_floor.FloorInputError):
+                        ci_floor._private_log_digest_and_first_line(path)
+
+    def test_source_lock_fifo_is_rejected_after_nonblocking_open(self) -> None:
+        with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
+            path = pathlib.Path(temporary) / "lockfile"
+            os.mkfifo(path)
+            real_open = os.open
+            observed_nonblocking: list[bool] = []
+
+            def checked_open(candidate: object, flags: int, *args: object, **kwargs: object) -> int:
+                if pathlib.Path(candidate) == path:
+                    observed_nonblocking.append(bool(flags & getattr(os, "O_NONBLOCK", 0)))
+                return real_open(candidate, flags, *args, **kwargs)
+
+            with mock.patch.object(ci_floor.os, "open", side_effect=checked_open):
+                with self.assertRaises(ci_floor.FloorInputError):
+                    ci_floor._bounded_source_file_sha256(path)
+            self.assertEqual(observed_nonblocking, [True])
+
+    def test_source_lock_reader_hashes_regular_file_through_nonblocking_fd(self) -> None:
+        raw = b"public synthetic lock bytes\x00\xff\n"
+        with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
+            path = pathlib.Path(temporary) / "lockfile"
+            path.write_bytes(raw)
+            self.assertEqual(
+                ci_floor._bounded_source_file_sha256(path),
+                ci_floor.hashlib.sha256(raw).hexdigest(),
+            )
+
     def test_source_proofs_hash_exact_clean_git_bytes_and_lockfiles(self) -> None:
         phase_diff = b"reviewed-phase-diff\x00"
         outputs = {
@@ -544,6 +589,109 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     if child is not None and child[1] == parent_pid and child[3] not in {"Z", "X"}:
                         ci_floor._signal_utility_group_members(
                             parent_pid, {child_pid: child[2]}, signal.SIGKILL,
+                            deadline=time.monotonic() + 1.0,
+                        )
+
+    def test_bounded_git_supervisor_cleans_exited_leader_pipe_holder(self) -> None:
+        with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
+            root = pathlib.Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            pid_file = root / "child-pid"
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                f"#!{sys.executable}\n"
+                "import os, pathlib, subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                "pathlib.Path(os.environ['XTRACE_FAKE_GIT_PID_FILE']).write_text(str(child.pid))\n"
+                "time.sleep(.15)\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_git, 0o700)
+            old_path = os.environ.get("PATH", "/usr/bin:/bin")
+            try:
+                with mock.patch.dict(os.environ, {
+                    "PATH": f"{fake_bin}{os.pathsep}{old_path}",
+                    "XTRACE_FAKE_GIT_PID_FILE": str(pid_file),
+                }), mock.patch.object(ci_floor, "SOURCE_COMMAND_TIMEOUT_SECONDS", 0.5):
+                    with self.assertRaises(ci_floor.FloorInputError):
+                        ci_floor._bounded_git_output(root, "rev-parse", "--verify", "HEAD")
+                if pid_file.exists():
+                    child_pid = int(pid_file.read_text(encoding="utf-8"))
+                    snapshot = ci_floor._utility_process_snapshot()
+                    child = snapshot.get(child_pid)
+                    if child is not None and child[3] not in {"Z", "X"}:
+                        ci_floor._signal_utility_group_members(
+                            child[1], {child_pid: child[2]}, signal.SIGKILL,
+                            deadline=time.monotonic() + 1.0,
+                        )
+                        snapshot = ci_floor._utility_process_snapshot()
+                        child = snapshot.get(child_pid)
+                    self.assertFalse(child is not None and child[3] not in {"Z", "X"})
+            finally:
+                if pid_file.exists():
+                    child_pid = int(pid_file.read_text(encoding="utf-8"))
+                    snapshot = ci_floor._utility_process_snapshot()
+                    child = snapshot.get(child_pid)
+                    if child is not None and child[3] not in {"Z", "X"}:
+                        ci_floor._signal_utility_group_members(
+                            child[1], {child_pid: child[2]}, signal.SIGKILL,
+                            deadline=time.monotonic() + 1.0,
+                        )
+
+    def test_stalled_nested_ps_keeps_outer_utility_cleanup_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
+            root = pathlib.Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            count_file = fake_bin / "ps-count"
+            child_pid_file = root / "utility-pid"
+            fake_ps = fake_bin / "ps"
+            fake_ps.write_text(
+                f"#!{sys.executable}\n"
+                "import os, pathlib, sys, time\n"
+                "counter = pathlib.Path(__file__).with_name('ps-count')\n"
+                "count = int(counter.read_text() or '0') + 1 if counter.exists() else 1\n"
+                "counter.write_text(str(count))\n"
+                "if count == 3: time.sleep(2)\n"
+                "os.execv('/bin/ps', ['/bin/ps', *sys.argv[1:]])\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_ps, 0o700)
+            program = (
+                "import os,pathlib,time; pathlib.Path(__import__('sys').argv[1]).write_text(str(os.getpid())); time.sleep(30)"
+            )
+            old_path = os.environ.get("PATH", "/usr/bin:/bin")
+            started = time.monotonic()
+            try:
+                with mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{old_path}"}), \
+                        mock.patch.object(ci_floor, "UTILITY_CLEANUP_SECONDS", 0.8), \
+                        mock.patch.object(ci_floor, "UTILITY_TERM_GRACE_SECONDS", 0.2), \
+                        mock.patch.object(ci_floor, "UTILITY_FINAL_SCAN_RESERVE_SECONDS", 0.1):
+                    with self.assertRaises(ci_floor.FloorInputError):
+                        ci_floor._run([sys.executable, "-c", program, str(child_pid_file)], timeout=0.2)
+                self.assertGreaterEqual(int(count_file.read_text(encoding="utf-8")), 3)
+                self.assertLess(time.monotonic() - started, 1.8)
+                if child_pid_file.exists():
+                    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+                    snapshot = ci_floor._utility_process_snapshot()
+                    child = snapshot.get(child_pid)
+                    if child is not None and child[3] not in {"Z", "X"}:
+                        ci_floor._signal_utility_group_members(
+                            child[1], {child_pid: child[2]}, signal.SIGKILL,
+                            deadline=time.monotonic() + 1.0,
+                        )
+                        snapshot = ci_floor._utility_process_snapshot()
+                        child = snapshot.get(child_pid)
+                    self.assertFalse(child is not None and child[3] not in {"Z", "X"})
+            finally:
+                if child_pid_file.exists():
+                    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+                    snapshot = ci_floor._utility_process_snapshot()
+                    child = snapshot.get(child_pid)
+                    if child is not None and child[3] not in {"Z", "X"}:
+                        ci_floor._signal_utility_group_members(
+                            child[1], {child_pid: child[2]}, signal.SIGKILL,
                             deadline=time.monotonic() + 1.0,
                         )
 

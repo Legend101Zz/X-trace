@@ -39,6 +39,7 @@ SOURCE_LOCK_READ_SECONDS = 10.0
 PRIVATE_GATE_LOG_BYTES_LIMIT = 16 * 1024 * 1024
 PRIVATE_GATE_LOG_READ_SECONDS = 15.0
 PRIVATE_VERSION_LOG_BYTES_LIMIT = 1024 * 1024
+PRIVATE_VERSION_LOG_READ_SECONDS = 15.0
 RELEASE_TEST_MODULES = (
     "tools.release.test_release_tools",
     "tools.release.test_ci_floor",
@@ -101,12 +102,22 @@ class _EvidenceTestResult(unittest.TextTestResult):
         super().addUnexpectedSuccess(test)
 
 
-def _utility_process_snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, int, str, str]]:
+def _utility_process_snapshot(
+    *, timeout: float = 2.0, deadline: float | None = None,
+) -> dict[int, tuple[int, int, str, str]]:
     """Read bounded identity facts for processes in a utility's fresh session."""
     ps = shutil.which("ps")
     if ps is None or timeout <= 0:
         raise FloorInputError
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    outer_deadline = deadline if deadline is not None else started + timeout + UTILITY_CLEANUP_SECONDS
+    available = outer_deadline - started
+    if available <= 0:
+        raise FloorInputError
+    reap_reserve = min(0.05, available / 3)
+    probe_deadline = min(started + timeout, outer_deadline - reap_reserve)
+    if probe_deadline <= started:
+        raise FloorInputError
     process: subprocess.Popen[bytes] | None = None
     selector = selectors.DefaultSelector()
     raw = bytearray()
@@ -124,7 +135,7 @@ def _utility_process_snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, i
         os.set_blocking(process.stdout.fileno(), False)
         selector.register(process.stdout, selectors.EVENT_READ)
         while selector.get_map():
-            remaining = deadline - time.monotonic()
+            remaining = probe_deadline - time.monotonic()
             if remaining <= 0:
                 raise FloorInputError
             for key, _events in selector.select(remaining):
@@ -139,13 +150,13 @@ def _utility_process_snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, i
                 newline_count += chunk.count(b"\n")
                 if len(raw) > 1024 * 1024 or newline_count > 10000:
                     raise FloorInputError
-        remaining = deadline - time.monotonic()
+        remaining = probe_deadline - time.monotonic()
         if remaining <= 0:
             raise FloorInputError
         if process.wait(timeout=remaining) != 0:
             raise FloorInputError
     except BaseException as original:
-        cleanup_deadline = time.monotonic() + UTILITY_CLEANUP_SECONDS
+        cleanup_deadline = outer_deadline
         cleanup_ok = True
         if process is not None:
             try:
@@ -164,7 +175,11 @@ def _utility_process_snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, i
                     cleanup_ok = False
         if not cleanup_ok:
             raise FloorInputError from None
-        raise original
+        if isinstance(original, KeyboardInterrupt):
+            raise original
+        if isinstance(original, FloorInputError):
+            raise original
+        raise FloorInputError from None
     finally:
         try:
             selector.close()
@@ -208,7 +223,7 @@ def _signal_utility_group_members(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
-        snapshot = _utility_process_snapshot(timeout=min(2.0, remaining))
+        snapshot = _utility_process_snapshot(timeout=min(2.0, remaining), deadline=deadline)
         for pid, started_at in identities.items():
             current = snapshot.get(pid)
             if current is None or current[1] != group_id or current[2] != started_at or current[3] in {"Z", "X"}:
@@ -226,7 +241,10 @@ def _signal_utility_group_members(
         return False
 
 
-def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 20) -> subprocess.CompletedProcess[str]:
+def _run(
+    argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 20,
+    output_limit: int = UTILITY_OUTPUT_LIMIT, binary_output: bool = False,
+) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     selector = selectors.DefaultSelector()
     captured = {"stdout": bytearray(), "stderr": bytearray()}
     deadline = time.monotonic() + timeout
@@ -241,7 +259,7 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise FloorInputError
-        baseline = _utility_process_snapshot(timeout=min(2.0, remaining))
+        baseline = _utility_process_snapshot(timeout=min(2.0, remaining), deadline=deadline)
         process = subprocess.Popen(
             argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=False, close_fds=True, start_new_session=True,
@@ -256,7 +274,7 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise FloorInputError
-            snapshot = _utility_process_snapshot(timeout=min(2.0, remaining))
+            snapshot = _utility_process_snapshot(timeout=min(2.0, remaining), deadline=deadline)
             for pid, (_parent, pgid, started_at, _state) in snapshot.items():
                 prior = baseline.get(pid)
                 if pgid == group_id and (prior is None or prior[2] != started_at):
@@ -272,12 +290,12 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
                     selector.unregister(key.fileobj)
                     continue
                 captured[key.data].extend(chunk)
-                if len(captured["stdout"]) + len(captured["stderr"]) > UTILITY_OUTPUT_LIMIT:
+                if len(captured["stdout"]) + len(captured["stderr"]) > output_limit:
                     raise FloorInputError
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise FloorInputError
-        before_reap = _utility_process_snapshot(timeout=min(2.0, remaining))
+        before_reap = _utility_process_snapshot(timeout=min(2.0, remaining), deadline=deadline)
         for pid, (_parent, pgid, started_at, _state) in before_reap.items():
             prior = baseline.get(pid)
             if pgid == group_id and (prior is None or prior[2] != started_at):
@@ -290,7 +308,7 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise FloorInputError
-        after_reap = _utility_process_snapshot(timeout=min(2.0, remaining))
+        after_reap = _utility_process_snapshot(timeout=min(2.0, remaining), deadline=deadline)
         for pid, (_parent, pgid, started_at, _state) in after_reap.items():
             prior = baseline.get(pid)
             if pgid == group_id and (prior is None or prior[2] != started_at):
@@ -316,7 +334,7 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
                         )
                         if discovery_budget <= 0:
                             raise FloorInputError
-                        snapshot = _utility_process_snapshot(timeout=discovery_budget)
+                        snapshot = _utility_process_snapshot(timeout=discovery_budget, deadline=cleanup_deadline)
                         for pid, (_parent, pgid, started_at, _state) in snapshot.items():
                             prior = baseline.get(pid)
                             if pgid == group_id and (prior is None or prior[2] != started_at):
@@ -340,7 +358,7 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
                     while time.monotonic() < term_deadline:
                         try:
                             remaining = term_deadline - time.monotonic()
-                            snapshot = _utility_process_snapshot(timeout=min(0.1, remaining))
+                            snapshot = _utility_process_snapshot(timeout=min(0.1, remaining), deadline=term_deadline)
                         except (FloorInputError, OSError):
                             cleanup_ok = False
                             break
@@ -371,7 +389,7 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
                             cleanup_ok = False
                             snapshot = {}
                         else:
-                            snapshot = _utility_process_snapshot(timeout=min(2.0, remaining))
+                            snapshot = _utility_process_snapshot(timeout=min(2.0, remaining), deadline=cleanup_deadline)
                         if any(pid in snapshot and snapshot[pid][1] == group_id
                                and snapshot[pid][2] == started_at and snapshot[pid][3] not in {"Z", "X"}
                                for pid, started_at in group_identities.items()):
@@ -425,11 +443,12 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
         raise FloorInputError from None
     if code is None:
         raise FloorInputError
-    return subprocess.CompletedProcess(
-        argv, code,
-        bytes(captured["stdout"]).decode("utf-8", errors="replace"),
-        bytes(captured["stderr"]).decode("utf-8", errors="replace"),
-    )
+    stdout = bytes(captured["stdout"])
+    stderr = bytes(captured["stderr"])
+    if not binary_output:
+        stdout = stdout.decode("utf-8", errors="replace")
+        stderr = stderr.decode("utf-8", errors="replace")
+    return subprocess.CompletedProcess(argv, code, stdout, stderr)
 
 
 def _read_phase_base(repo: pathlib.Path, metadata: pathlib.Path) -> str:
@@ -666,84 +685,20 @@ def _source_is_clean(repo: pathlib.Path, expected_head: str) -> bool:
 def _bounded_git_output(repo: pathlib.Path, *arguments: str) -> bytes:
     """Capture finite Git output without decoding bytes used by source hashes."""
     argv = ["git", *arguments]
-    deadline = time.monotonic() + SOURCE_COMMAND_TIMEOUT_SECONDS
-    process: subprocess.Popen[bytes] | None = None
-    selector = selectors.DefaultSelector()
-    captured = bytearray()
-    drained_bytes = 0
-    pending: BaseException | None = None
-    code: int | None = None
-    try:
-        process = subprocess.Popen(
-            argv, cwd=repo, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, close_fds=True, start_new_session=True,
-        )
-        for stream in (process.stdout, process.stderr):
-            if stream is None:
-                raise FloorInputError
-            os.set_blocking(stream.fileno(), False)
-            selector.register(stream, selectors.EVENT_READ)
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise FloorInputError
-            for key, _events in selector.select(remaining):
-                try:
-                    chunk = os.read(key.fileobj.fileno(), 65536)
-                except BlockingIOError:
-                    continue
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                drained_bytes += len(chunk)
-                if drained_bytes > SOURCE_COMMAND_OUTPUT_LIMIT:
-                    raise FloorInputError
-                # stderr is bounded but intentionally not included in returned identity bytes.
-                if key.fileobj is process.stdout:
-                    captured.extend(chunk)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise FloorInputError
-        code = process.wait(timeout=remaining)
-    except BaseException as exc:
-        pending = exc
-    finally:
-        cleanup_ok = True
-        if process is not None:
-            try:
-                if process.poll() is None:
-                    process.kill()
-                process.wait(timeout=1.0)
-            except (OSError, subprocess.SubprocessError):
-                cleanup_ok = False
-            for stream in (process.stdout, process.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        cleanup_ok = False
-        try:
-            selector.close()
-        except OSError:
-            cleanup_ok = False
-        if not cleanup_ok:
-            raise FloorInputError from None
-    if pending is not None:
-        if isinstance(pending, KeyboardInterrupt):
-            raise pending
-        if isinstance(pending, FloorInputError):
-            raise pending
-        raise FloorInputError from None
-    if code != 0:
+    result = _run(
+        argv, cwd=repo, timeout=SOURCE_COMMAND_TIMEOUT_SECONDS,
+        output_limit=SOURCE_COMMAND_OUTPUT_LIMIT, binary_output=True,
+    )
+    if result.returncode != 0 or not isinstance(result.stdout, bytes):
         raise FloorInputError
-    return bytes(captured)
+    return result.stdout
 
 
 def _bounded_source_file_sha256(path: pathlib.Path) -> str:
     """Hash a regular source lockfile with finite bytes and identity checks."""
     if path.is_symlink():
         raise FloorInputError
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = os.open(path, flags)
     try:
         before = os.fstat(fd)
