@@ -38,6 +38,7 @@
 )]
 
 pub mod catalog;
+pub mod catalog_discovery;
 pub mod endpoint_identity;
 pub mod error;
 pub mod hash;
