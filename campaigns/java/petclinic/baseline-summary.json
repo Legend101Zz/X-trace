@@ -1,0 +1,112 @@
+{
+ "schemaVersion": 1,
+ "kind": "baseline_stability_summary_preparation",
+ "project": "petclinic",
+ "releaseAcceptance": false,
+ "instrumented": false,
+ "pin": {
+  "sha": "500158f732419217507c7656904b8e6aa1bcc0d6",
+  "jarSha256": "45a515bcffeb3ca69f4777429300562b4d7cb516dc078170845c553ed5473fa6",
+  "jdkImage": "eclipse-temurin:17-jdk-jammy",
+  "postgresImageDigest": "sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db"
+ },
+ "runs": [
+  {
+   "dir": "baseline-1",
+   "result": "passed_baseline_only",
+   "bootMs": 30807,
+   "receiptSha256": "6b951e68f345ae0ba8ea5caa4fb6b167397e7d7cf99a4a2971d22854d26daa14"
+  },
+  {
+   "dir": "baseline-2",
+   "result": "passed_baseline_only",
+   "bootMs": 44140,
+   "receiptSha256": "93ea9c161cf55ddbf70f9cd6a9bdcfea138107f132bf63ea036440a5103764fb"
+  },
+  {
+   "dir": "baseline-3",
+   "result": "passed_baseline_only",
+   "bootMs": 26632,
+   "receiptSha256": "d73a8630be9e1766f6d837938e37f6cbc2c464a7cca00c310e4d28fd37f34c17"
+  },
+  {
+   "dir": "baseline-4",
+   "result": "passed_baseline_only",
+   "bootMs": 68505,
+   "receiptSha256": "be6c4710b5ef0186871ac5f11932f792dd30d3a8f6f5af661b84b667514ad3c9"
+  },
+  {
+   "dir": "baseline-5",
+   "result": "passed_baseline_only",
+   "bootMs": 14857,
+   "receiptSha256": "071e1cc2c1b9ac470b78b8ab7d53367d1d21fa13ba2af35d1ad2a195f4518457"
+  }
+ ],
+ "scenarios": [
+  {
+   "id": "search-seeded",
+   "kind": "business",
+   "requests": 2,
+   "checks": 3,
+   "semanticEffectFingerprint": "8809e2036463924d1577726045d0c6325ab6804a4591ca5bd70bbe16e68db469",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "owner-create-roundtrip",
+   "kind": "db-write-read",
+   "requests": 2,
+   "checks": 3,
+   "semanticEffectFingerprint": "d291d3285460e41d498857271f56fabd7a5fb4ecbed242e30a9a2027672dffd3",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "owner-validation-error",
+   "kind": "validation",
+   "requests": 1,
+   "checks": 3,
+   "semanticEffectFingerprint": "fc44a0fc88d73ee0f4b6a40ba919265390e7130b9133dcc0455427308c7d0b1b",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "pet-and-visit-flow",
+   "kind": "business",
+   "requests": 5,
+   "checks": 6,
+   "semanticEffectFingerprint": "5353905dfb12404318e2c663baf562eac85e92ff71d4afea396a3c2a65c59b0b",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "owner-edit",
+   "kind": "db-write-read",
+   "requests": 2,
+   "checks": 3,
+   "semanticEffectFingerprint": "5aa987aa8347b2265062a1cf008896b3f241f84bde929e4ca43c807cbc6a8893",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "missing-owner-error",
+   "kind": "error",
+   "requests": 1,
+   "checks": 2,
+   "semanticEffectFingerprint": "02c92bb873585a4c8fb82a8b4472480bf21389b05e86e0cf5a8d2ad56a98cd9b",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "controller-crash-path",
+   "kind": "error",
+   "requests": 1,
+   "checks": 1,
+   "semanticEffectFingerprint": "4c9767a8af9fd8627efe0377aa03375120c4b3894370b728ad2fe72108e321d6",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "concurrent-isolation",
+   "kind": "concurrency",
+   "requests": 50,
+   "checks": 3,
+   "semanticEffectFingerprint": "d7f724a9b78f5f34eafbd06249703fde93691b093ab712f6eaeafd6b2fd075a4",
+   "stableAcrossRuns": true
+  }
+ ],
+ "allStable": true
+}
