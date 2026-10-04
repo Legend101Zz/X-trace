@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import signal
+import stat
 import time
 import pathlib
 import sys
@@ -641,6 +642,14 @@ class CiFloorEvidenceTests(unittest.TestCase):
             old_path = os.environ.get("PATH", "/usr/bin:/bin")
             original_snapshot = ci_floor._utility_process_snapshot
             snapshot_trace: list[dict[str, object]] = []
+            snapshot_trace_omitted = 0
+
+            def append_snapshot_trace(item: dict[str, object]) -> None:
+                nonlocal snapshot_trace_omitted
+                if len(snapshot_trace) < 64:
+                    snapshot_trace.append(item)
+                else:
+                    snapshot_trace_omitted += 1
 
             def fixture_identity_seen(records: dict[int, tuple[int, int, str, str]]) -> bool:
                 if not pid_file.is_file():
@@ -659,6 +668,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         "childIdentityPublished": pid_file.is_file(),
                     },
                     "snapshotCalls": snapshot_trace,
+                    "omittedSnapshotCalls": snapshot_trace_omitted,
                 }, sort_keys=True)
 
             def record_snapshot(*args: object, **kwargs: object) -> dict[int, tuple[int, int, str, str]]:
@@ -680,14 +690,14 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         "exceptionType": type(exc).__name__,
                         "fixtureIdentitySeen": False,
                     })
-                    snapshot_trace.append(item)
+                    append_snapshot_trace(item)
                     raise
                 item.update({
                     "exitedOffsetSeconds": round(time.monotonic() - started, 6),
                     "outcome": "returned",
                     "fixtureIdentitySeen": fixture_identity_seen(result),
                 })
-                snapshot_trace.append(item)
+                append_snapshot_trace(item)
                 return result
 
             started = time.monotonic()
@@ -778,6 +788,55 @@ class CiFloorEvidenceTests(unittest.TestCase):
             snapshot_trace: list[dict[str, object]] = []
             signal_trace: list[dict[str, object]] = []
             exact_signal_identities: list[tuple[int, int, str, int]] = []
+            snapshot_trace_omitted = 0
+            signal_trace_omitted = 0
+            exact_signal_identities_omitted = 0
+            exact_term_identity_seen = False
+
+            def append_snapshot_trace(item: dict[str, object]) -> None:
+                nonlocal snapshot_trace_omitted
+                if len(snapshot_trace) < 64:
+                    snapshot_trace.append(item)
+                else:
+                    snapshot_trace_omitted += 1
+
+            def append_signal_trace(item: dict[str, object]) -> None:
+                nonlocal signal_trace_omitted
+                if len(signal_trace) < 64:
+                    signal_trace.append(item)
+                else:
+                    signal_trace_omitted += 1
+
+            def append_exact_signal_identity(item: tuple[int, int, str, int]) -> None:
+                nonlocal exact_signal_identities_omitted
+                if len(exact_signal_identities) < 64:
+                    exact_signal_identities.append(item)
+                else:
+                    exact_signal_identities_omitted += 1
+
+            def safe_count_file() -> dict[str, object]:
+                descriptor: int | None = None
+                try:
+                    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+                    descriptor = os.open(count_file, flags)
+                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        return {"status": "not_regular"}
+                    raw = os.read(descriptor, 33)
+                except FileNotFoundError:
+                    return {"status": "missing"}
+                except (OSError, ValueError) as exc:
+                    return {"status": "unavailable", "errorType": type(exc).__name__}
+                finally:
+                    if descriptor is not None:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+                if len(raw) > 32:
+                    return {"status": "too_long"}
+                if not raw or not raw.isdigit():
+                    return {"status": "invalid"}
+                return {"status": "read", "value": int(raw)}
 
             def fixture_identity_seen(records: dict[int, tuple[int, int, str, str]]) -> bool:
                 if not child_pid_file.is_file():
@@ -795,10 +854,14 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         "handlerReady": handler_ready_file.is_file(),
                         "identityPublished": child_pid_file.is_file(),
                         "nestedPsStallEntered": stall_file.is_file(),
-                        "psInvocationCount": count_file.read_text(encoding="utf-8") if count_file.is_file() else "missing",
+                        "psInvocationCount": safe_count_file(),
                     },
                     "snapshotCalls": snapshot_trace,
+                    "omittedSnapshotCalls": snapshot_trace_omitted,
                     "signalCalls": signal_trace,
+                    "omittedSignalCalls": signal_trace_omitted,
+                    "exactSignalIdentityCount": len(exact_signal_identities),
+                    "omittedExactSignalIdentities": exact_signal_identities_omitted,
                 }, sort_keys=True)
 
             def record_snapshot(*args: object, **kwargs: object) -> dict[int, tuple[int, int, str, str]]:
@@ -820,14 +883,14 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         "exceptionType": type(exc).__name__,
                         "fixtureIdentitySeen": False,
                     })
-                    snapshot_trace.append(item)
+                    append_snapshot_trace(item)
                     raise
                 item.update({
                     "exitedOffsetSeconds": round(time.monotonic() - started, 6),
                     "outcome": "returned",
                     "fixtureIdentitySeen": fixture_identity_seen(result),
                 })
-                snapshot_trace.append(item)
+                append_snapshot_trace(item)
                 return result
 
             original_signal = ci_floor._signal_utility_group_members
@@ -835,6 +898,8 @@ class CiFloorEvidenceTests(unittest.TestCase):
             def record_signal(
                 group_id: int, identities: dict[int, str], signum: int, *, deadline: float,
             ) -> bool:
+                nonlocal exact_term_identity_seen
+                entered = time.monotonic()
                 expected: tuple[int, int, str] | None = None
                 if child_pid_file.is_file():
                     try:
@@ -845,14 +910,20 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     expected is not None and expected[0] in identities
                     and expected[1] == group_id and identities.get(expected[0]) == expected[2]
                 )
-                exact_signal_identities.extend(
-                    (group_id, pid, started_at, signum) for pid, started_at in identities.items()
-                )
-                entered = time.monotonic()
+                for pid, started_at in identities.items():
+                    append_exact_signal_identity((group_id, pid, started_at, signum))
+                if signum == signal.SIGTERM and expected is not None:
+                    exact_term_identity_seen = any(
+                        group_id == expected[1] and pid == expected[0]
+                        and started_at == expected[2]
+                        for pid, started_at in identities.items()
+                    ) or exact_term_identity_seen
                 try:
                     result = original_signal(group_id, identities, signum, deadline=deadline)
                 except BaseException as exc:
-                    signal_trace.append({
+                    append_signal_trace({
+                        "enteredOffsetSeconds": round(entered - started, 6),
+                        "exitedOffsetSeconds": round(time.monotonic() - started, 6),
                         "signum": signum,
                         "identityCount": len(identities),
                         "fixtureIdentityMatched": matched,
@@ -861,7 +932,9 @@ class CiFloorEvidenceTests(unittest.TestCase):
                         "exceptionType": type(exc).__name__,
                     })
                     raise
-                signal_trace.append({
+                append_signal_trace({
+                    "enteredOffsetSeconds": round(entered - started, 6),
+                    "exitedOffsetSeconds": round(time.monotonic() - started, 6),
                     "signum": signum,
                     "identityCount": len(identities),
                     "fixtureIdentityMatched": matched,
@@ -894,23 +967,12 @@ class CiFloorEvidenceTests(unittest.TestCase):
                 self.assertTrue(handler_ready_file.is_file(), "child must install TERM handler before supervision: " + diagnostic())
                 self.assertTrue(child_pid_file.is_file(), "utility child must publish its process identity: " + diagnostic())
                 self.assertTrue(stall_file.is_file(), "the intended nested ps call must stall: " + diagnostic())
-                self.assertGreaterEqual(int(count_file.read_text(encoding="utf-8")), 3, diagnostic())
+                self.assertGreaterEqual(int(safe_count_file().get("value", 0)), 3, diagnostic())
                 self.assertLess(time.monotonic() - started, 1.8, diagnostic())
                 self.assertTrue(term_file.is_file(), "the owned term-ignorer must receive TERM before KILL: " + diagnostic())
-                self.assertTrue(
-                    any(item[3] == signal.SIGTERM and item[1] > 0 for item in exact_signal_identities)
-                    and any(item["signum"] == signal.SIGTERM and item["fixtureIdentityMatched"] for item in signal_trace),
-                    "TERM attempt must target the exact published fixture identity: " + diagnostic(),
-                )
                 child_pid, child_group, child_start = json.loads(child_pid_file.read_text(encoding="utf-8"))
-                self.assertTrue(
-                    any(
-                        identity_pid == child_pid and group == child_group
-                        and identity_start == child_start and signum == signal.SIGTERM
-                        for group, identity_pid, identity_start, signum in exact_signal_identities
-                    ),
-                    "TERM wrapper must observe the exact published PID/group/start tuple: " + diagnostic(),
-                )
+                self.assertTrue(exact_term_identity_seen,
+                                "TERM wrapper must observe the exact published PID/group/start tuple: " + diagnostic())
                 snapshot = ci_floor._utility_process_snapshot()
                 child = snapshot.get(child_pid)
                 child_is_live = (
