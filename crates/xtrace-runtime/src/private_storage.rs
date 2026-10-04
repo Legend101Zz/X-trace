@@ -408,6 +408,7 @@ impl AdmittedPrivateRoot {
         let deadline = new_admission_deadline();
         let actual = self.open_file_with_link_policy_until(name, false, deadline)?;
         self.validate_file_binding_with_link_policy_until(name, &actual, false, false, deadline)?;
+        use std::os::unix::fs::MetadataExt as _;
         let expected_metadata = expected.metadata().map_err(|_| PrivateStorageError::Operation)?;
         let actual_metadata = actual.metadata().map_err(|_| PrivateStorageError::Operation)?;
         if !FileIdentity::from_metadata(&expected_metadata)
