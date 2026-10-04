@@ -1345,9 +1345,7 @@ mod tests {
             .expect("contiguous event at max clock");
         assert_eq!(accepted.accepted, 1);
         assert_eq!(accepted.persisted_segments, 0);
-        service
-            .finish_recording(FinishRecording::without_digest(recording_id, 3))
-            .expect("finish");
+        service.finish_recording(FinishRecording::without_digest(recording_id, 3)).expect("finish");
         let segments = port.snapshot().segments;
         assert_eq!(segments.len(), 1);
         assert_eq!(
@@ -1545,9 +1543,12 @@ mod tests {
         assert_eq!(finished.persisted_segments, 1);
         assert_eq!(finished.completion, RecordingCompletion::Partial);
         assert!(!port.snapshot().segments.is_empty());
-        let conflicting = service
-            .finish_recording(FinishRecording::without_digest(recording_id, 2));
-        assert_eq!(conflicting.expect_err("finish evidence is immutable").kind(), PortErrorKind::Conflict);
+        let conflicting =
+            service.finish_recording(FinishRecording::without_digest(recording_id, 2));
+        assert_eq!(
+            conflicting.expect_err("finish evidence is immutable").kind(),
+            PortErrorKind::Conflict
+        );
     }
 
     #[test]
@@ -1585,11 +1586,12 @@ mod tests {
         let recording_id = begin(wall(1)).recording_id;
         let event = event(2, 1, 0xaa);
 
-        let staged = service.record_events(RecordEvents {
-            recording_id,
-            events: vec![event.clone()],
-        });
-        assert_eq!(staged.expect_err("injected ambiguous segment failure").kind(), PortErrorKind::Transport);
+        let staged =
+            service.record_events(RecordEvents { recording_id, events: vec![event.clone()] });
+        assert_eq!(
+            staged.expect_err("injected ambiguous segment failure").kind(),
+            PortErrorKind::Transport
+        );
 
         let mut malformed = FinishRecording::without_digest(recording_id, 2);
         malformed.unsupported_capability_codes = (0..65).map(|_| "optional".to_string()).collect();

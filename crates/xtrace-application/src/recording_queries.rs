@@ -5,8 +5,8 @@
 //! fields; no storage or protocol types cross this boundary.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     AppError, CapturedValue, CorrelationId, ErrorCategory, ErrorCode, FrameId, ProjectId,
@@ -601,10 +601,11 @@ pub fn show_recording<P: RecordingReadPort>(
         .transpose()
         .map_err(|_| query_resource_error(correlation_id))?
         .map_or(0, |bytes| bytes.len().saturating_add(1));
-    let terminal_metadata_bytes = serde_json::to_vec(&(duration_ns.as_ref(), &drop_counts_by_priority))
-        .map_err(|_| query_resource_error(correlation_id))?
-        .len()
-        .saturating_add(1);
+    let terminal_metadata_bytes =
+        serde_json::to_vec(&(duration_ns.as_ref(), &drop_counts_by_priority))
+            .map_err(|_| query_resource_error(correlation_id))?
+            .len()
+            .saturating_add(1);
     let auxiliary_bytes = summary_bytes.checked_add(terminal_metadata_bytes);
     let Some(auxiliary_bytes) = auxiliary_bytes else {
         return Err(query_resource_error(correlation_id));

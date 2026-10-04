@@ -469,7 +469,10 @@ mod tests {
             adapter.finish_recording(&finish).expect("verified finish"),
             RecordingCompletion::Complete,
         );
-        assert_eq!(adapter.finish_recording(&finish).expect("exact finish retry"), RecordingCompletion::Complete);
+        assert_eq!(
+            adapter.finish_recording(&finish).expect("exact finish retry"),
+            RecordingCompletion::Complete
+        );
 
         let reader = SqliteRecordingReader::new(store.clone(), directory.path());
         let request = ShowWindowRequest {
@@ -479,34 +482,64 @@ mod tests {
             after_sequence: None,
         };
         let first_window = reader.show_recording(&request).expect("read indexed frames");
-        assert_eq!(first_window.completion, xtrace_application::recording_queries::RecordingCompletionEvidence::Complete);
+        assert_eq!(
+            first_window.completion,
+            xtrace_application::recording_queries::RecordingCompletionEvidence::Complete
+        );
         assert_eq!(first_window.adapter_summary, finish.response_summary);
         assert_eq!(first_window.duration_ns.as_deref(), Some("77"));
         assert_eq!(first_window.drop_counts_by_priority.get(&1).map(String::as_str), Some("0"));
         assert_eq!(first_window.events.len(), 2);
         let first_frame = first_window.events[0].frame_id.expect("first frame index");
         let second_frame = first_window.events[1].frame_id.expect("second frame index");
-        assert_eq!(first_window.events[0].navigation.previous, xtrace_application::recording_queries::NavigationResult::Boundary);
-        assert_eq!(first_window.events[0].navigation.next, xtrace_application::recording_queries::NavigationResult::Target(second_frame));
-        assert_eq!(first_window.events[1].navigation.previous, xtrace_application::recording_queries::NavigationResult::Target(first_frame));
-        assert_eq!(first_window.events[1].navigation.next, xtrace_application::recording_queries::NavigationResult::Boundary);
-        assert_eq!(first_window.events[0].navigation.into, xtrace_application::recording_queries::NavigationResult::Unavailable);
+        assert_eq!(
+            first_window.events[0].navigation.previous,
+            xtrace_application::recording_queries::NavigationResult::Boundary
+        );
+        assert_eq!(
+            first_window.events[0].navigation.next,
+            xtrace_application::recording_queries::NavigationResult::Target(second_frame)
+        );
+        assert_eq!(
+            first_window.events[1].navigation.previous,
+            xtrace_application::recording_queries::NavigationResult::Target(first_frame)
+        );
+        assert_eq!(
+            first_window.events[1].navigation.next,
+            xtrace_application::recording_queries::NavigationResult::Boundary
+        );
+        assert_eq!(
+            first_window.events[0].navigation.into,
+            xtrace_application::recording_queries::NavigationResult::Unavailable
+        );
         let second_page = reader
-            .show_recording(&ShowWindowRequest { limit: 1, after_sequence: Some(2), ..request.clone() })
+            .show_recording(&ShowWindowRequest {
+                limit: 1,
+                after_sequence: Some(2),
+                ..request.clone()
+            })
             .expect("read page beginning at a segment boundary");
         assert_eq!(second_page.events[0].frame_id, Some(second_frame));
-        assert_eq!(second_page.events[0].navigation.previous,
-            xtrace_application::recording_queries::NavigationResult::Target(first_frame));
-        assert_eq!(second_page.events[0].navigation.next,
-            xtrace_application::recording_queries::NavigationResult::Boundary);
+        assert_eq!(
+            second_page.events[0].navigation.previous,
+            xtrace_application::recording_queries::NavigationResult::Target(first_frame)
+        );
+        assert_eq!(
+            second_page.events[0].navigation.next,
+            xtrace_application::recording_queries::NavigationResult::Boundary
+        );
 
         drop(reader);
         drop(adapter);
         drop(store);
-        let reopened = SqliteStore::open(&directory.path().join("metadata.sqlite3"), OpenOptions::default())
-            .expect("reopen selected SQLite store");
+        let reopened =
+            SqliteStore::open(&directory.path().join("metadata.sqlite3"), OpenOptions::default())
+                .expect("reopen selected SQLite store");
         let reopened_adapter = SqliteRecordingPersistence::new(reopened.clone(), directory.path());
-        assert_eq!(reopened_adapter.finish_recording(&finish).expect("terminal retry after reopen"), RecordingCompletion::Complete);
+        assert_eq!(
+            reopened_adapter.finish_recording(&finish).expect("terminal retry after reopen"),
+            RecordingCompletion::Complete
+        );
         let reopened_reader = SqliteRecordingReader::new(reopened.clone(), directory.path());
         let reopened_window = reopened_reader.show_recording(&request).expect("read after reopen");
         assert_eq!(reopened_window.duration_ns.as_deref(), Some("77"));
@@ -516,51 +549,69 @@ mod tests {
             reopened_window.events.iter().map(|event| event.frame_id).collect::<Vec<_>>(),
             vec![Some(first_frame), Some(second_frame)],
         );
-        let (metadata, _) = reopened_reader.list_recordings(project.id(), None, 10)
-            .expect("list after reopen");
-        assert_eq!(metadata[0].completion, xtrace_application::recording_queries::RecordingCompletionEvidence::Complete);
+        let (metadata, _) =
+            reopened_reader.list_recordings(project.id(), None, 10).expect("list after reopen");
+        assert_eq!(
+            metadata[0].completion,
+            xtrace_application::recording_queries::RecordingCompletionEvidence::Complete
+        );
 
         let connection = reopened.lock().expect("metadata connection");
-        connection.execute(
-            "UPDATE recording_frame_index SET event_id_digest = zeroblob(32) \
+        connection
+            .execute(
+                "UPDATE recording_frame_index SET event_id_digest = zeroblob(32) \
              WHERE recording_id = ?1 AND recording_seq = ?2",
-            rusqlite::params![
-                recording_id.as_uuid().as_bytes().to_vec(),
-                2_u64.to_be_bytes().as_slice(),
-            ],
-        ).expect("corrupt only the page lookbehind index");
+                rusqlite::params![
+                    recording_id.as_uuid().as_bytes().to_vec(),
+                    2_u64.to_be_bytes().as_slice(),
+                ],
+            )
+            .expect("corrupt only the page lookbehind index");
         drop(connection);
         let corrupted_lookbehind = reopened_reader
-            .show_recording(&ShowWindowRequest { limit: 1, after_sequence: Some(2), ..request.clone() })
+            .show_recording(&ShowWindowRequest {
+                limit: 1,
+                after_sequence: Some(2),
+                ..request.clone()
+            })
             .expect("corrupt optional lookbehind degrades to unavailable");
         assert_eq!(corrupted_lookbehind.events[0].frame_id, Some(second_frame));
-        assert_eq!(corrupted_lookbehind.events[0].navigation.previous,
-            xtrace_application::recording_queries::NavigationResult::Unavailable);
+        assert_eq!(
+            corrupted_lookbehind.events[0].navigation.previous,
+            xtrace_application::recording_queries::NavigationResult::Unavailable
+        );
 
         let connection = reopened.lock().expect("metadata connection");
-        connection.execute(
-            "UPDATE recording_frame_index SET event_id_digest = ?1 \
+        connection
+            .execute(
+                "UPDATE recording_frame_index SET event_id_digest = ?1 \
              WHERE recording_id = ?2 AND recording_seq = ?3",
-            rusqlite::params![
-                blake3::hash(b"event-2").as_bytes().as_slice(),
-                recording_id.as_uuid().as_bytes().to_vec(),
-                2_u64.to_be_bytes().as_slice(),
-            ],
-        ).expect("restore the valid lookbehind index");
-        connection.execute(
-            "UPDATE recording_frame_index SET event_id_digest = zeroblob(32) \
+                rusqlite::params![
+                    blake3::hash(b"event-2").as_bytes().as_slice(),
+                    recording_id.as_uuid().as_bytes().to_vec(),
+                    2_u64.to_be_bytes().as_slice(),
+                ],
+            )
+            .expect("restore the valid lookbehind index");
+        connection
+            .execute(
+                "UPDATE recording_frame_index SET event_id_digest = zeroblob(32) \
              WHERE recording_id = ?1 AND recording_seq = ?2",
-            rusqlite::params![
-                recording_id.as_uuid().as_bytes().to_vec(),
-                3_u64.to_be_bytes().as_slice(),
-            ],
-        ).expect("corrupt only the neighboring metadata index");
+                rusqlite::params![
+                    recording_id.as_uuid().as_bytes().to_vec(),
+                    3_u64.to_be_bytes().as_slice(),
+                ],
+            )
+            .expect("corrupt only the neighboring metadata index");
         drop(connection);
-        let corrupted_neighbor = reopened_reader.show_recording(&request)
+        let corrupted_neighbor = reopened_reader
+            .show_recording(&request)
             .expect("corrupt optional navigation degrades to unavailable");
         assert_eq!(corrupted_neighbor.events[0].frame_id, Some(first_frame));
-        assert_eq!(corrupted_neighbor.events[0].navigation.next,
-            xtrace_application::recording_queries::NavigationResult::Unavailable);
+        assert_eq!(
+            corrupted_neighbor.events[0].navigation.next,
+            xtrace_application::recording_queries::NavigationResult::Unavailable
+        );
         assert_eq!(corrupted_neighbor.events[1].frame_id, None);
     }
 
@@ -570,12 +621,14 @@ mod tests {
         let recording_id = RecordingId::new();
         let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
         persistence.begin_recording(&begin(project.id(), recording_id)).expect("begin");
-        persistence.persist_segment(&PersistRecordingSegment {
-            project_id: project.id(),
-            recording_id,
-            segment_ordinal: 0,
-            events: vec![event(2, "event-2")],
-        }).expect("persist event");
+        persistence
+            .persist_segment(&PersistRecordingSegment {
+                project_id: project.id(),
+                recording_id,
+                segment_ordinal: 0,
+                events: vec![event(2, "event-2")],
+            })
+            .expect("persist event");
         let finish = FinishRecording {
             recording_id,
             final_recording_seq: 2,
@@ -588,40 +641,146 @@ mod tests {
                 shape_hint: None,
             }),
         };
-        assert_eq!(persistence.finish_recording(&finish).expect("invalid proof is durable"),
-            RecordingCompletion::Invalid);
+        assert_eq!(
+            persistence.finish_recording(&finish).expect("invalid proof is durable"),
+            RecordingCompletion::Invalid
+        );
         let reader = SqliteRecordingReader::new(store.clone(), directory.path());
-        let window = reader.show_recording(&ShowWindowRequest {
-            project_id: project.id(),
-            recording_id,
-            limit: 10,
-            after_sequence: None,
-        }).expect("read invalid terminal capture");
-        assert_eq!(window.completion, xtrace_application::recording_queries::RecordingCompletionEvidence::Invalid);
+        let window = reader
+            .show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id,
+                limit: 10,
+                after_sequence: None,
+            })
+            .expect("read invalid terminal capture");
+        assert_eq!(
+            window.completion,
+            xtrace_application::recording_queries::RecordingCompletionEvidence::Invalid
+        );
         assert_eq!(window.adapter_summary, None);
-        assert_eq!(window.events[0].navigation.next,
-            xtrace_application::recording_queries::NavigationResult::Unavailable);
+        assert_eq!(
+            window.events[0].navigation.next,
+            xtrace_application::recording_queries::NavigationResult::Unavailable
+        );
 
         let partial_id = RecordingId::new();
         let partial_persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
-        partial_persistence.begin_recording(&begin(project.id(), partial_id)).expect("begin partial");
-        partial_persistence.persist_segment(&PersistRecordingSegment {
-            project_id: project.id(),
-            recording_id: partial_id,
-            segment_ordinal: 0,
-            events: vec![event(2, "event-partial")],
-        }).expect("persist partial event");
-        assert_eq!(partial_persistence
-            .finish_recording(&FinishRecording::without_digest(partial_id, 2))
-            .expect("missing proof remains partial"), RecordingCompletion::Partial);
-        let partial_window = reader.show_recording(&ShowWindowRequest {
-            project_id: project.id(),
-            recording_id: partial_id,
-            limit: 10,
-            after_sequence: None,
-        }).expect("read partial finish");
-        assert_eq!(partial_window.events[0].navigation.next,
-            xtrace_application::recording_queries::NavigationResult::Unavailable);
+        partial_persistence
+            .begin_recording(&begin(project.id(), partial_id))
+            .expect("begin partial");
+        partial_persistence
+            .persist_segment(&PersistRecordingSegment {
+                project_id: project.id(),
+                recording_id: partial_id,
+                segment_ordinal: 0,
+                events: vec![event(2, "event-partial")],
+            })
+            .expect("persist partial event");
+        assert_eq!(
+            partial_persistence
+                .finish_recording(&FinishRecording::without_digest(partial_id, 2))
+                .expect("missing proof remains partial"),
+            RecordingCompletion::Partial
+        );
+        let partial_window = reader
+            .show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id: partial_id,
+                limit: 10,
+                after_sequence: None,
+            })
+            .expect("read partial finish");
+        assert_eq!(
+            partial_window.events[0].navigation.next,
+            xtrace_application::recording_queries::NavigationResult::Unavailable
+        );
+    }
+
+    #[test]
+    fn read_rejects_complete_labels_without_complete_finish_proof() {
+        let (directory, store, project) = fixture();
+        let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
+        let reader = SqliteRecordingReader::new(store.clone(), directory.path());
+
+        let proof_digest = blake3::hash(b"event-2").as_bytes().to_vec();
+        let finish_cases = [
+            (
+                RecordingId::new(),
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                RecordingCompletion::Partial,
+            ),
+            (
+                RecordingId::new(),
+                vec![9; 31],
+                std::collections::BTreeMap::new(),
+                RecordingCompletion::Invalid,
+            ),
+            (
+                RecordingId::new(),
+                vec![0; 32],
+                std::collections::BTreeMap::new(),
+                RecordingCompletion::Partial,
+            ),
+            (
+                RecordingId::new(),
+                proof_digest,
+                [(1, 1)].into_iter().collect(),
+                RecordingCompletion::Partial,
+            ),
+        ];
+        for (recording_id, event_digest, drop_counts_by_priority, expected_completion) in
+            finish_cases
+        {
+            let finish = FinishRecording {
+                recording_id,
+                final_recording_seq: 2,
+                duration_ns: None,
+                event_digest,
+                drop_counts_by_priority,
+                unsupported_capability_codes: Vec::new(),
+                response_summary: None,
+            };
+            persistence.begin_recording(&begin(project.id(), recording_id)).expect("begin");
+            persistence
+                .persist_segment(&PersistRecordingSegment {
+                    project_id: project.id(),
+                    recording_id,
+                    segment_ordinal: 0,
+                    events: vec![event(2, "event-2")],
+                })
+                .expect("persist event");
+            assert_eq!(
+                persistence.finish_recording(&finish).expect("persist non-complete finish"),
+                expected_completion,
+            );
+
+            let connection = store.lock().expect("metadata connection");
+            connection
+                .execute(
+                    "UPDATE recordings SET status = 'complete' WHERE recording_id = ?1",
+                    rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+                )
+                .expect("corrupt lifecycle label");
+            connection
+                .execute(
+                    "UPDATE recording_terminal_evidence SET completion = 'complete' WHERE recording_id = ?1",
+                    rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+                )
+                .expect("corrupt terminal label");
+            drop(connection);
+
+            let error = reader
+                .show_recording(&ShowWindowRequest {
+                    project_id: project.id(),
+                    recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                })
+                .expect_err("two matching labels cannot replace terminal proof");
+            assert_eq!(error.kind(), PortErrorKind::Corruption);
+        }
     }
 
     #[test]
@@ -928,40 +1087,36 @@ mod tests {
             })
             .expect("persist bounded display fields");
 
-        let first = xtrace_application::show_recording(
-            &reader,
-            ShowRecording {
-                project_id: project.id(),
-                recording_id: request.recording_id,
-                limit: 1_000,
-                cursor: None,
-            },
-            CorrelationId::new(),
-        )
-        .expect("first projection-byte-bounded page");
-        assert!(first.events.len() < 800);
-        assert!(!first.events.is_empty());
-        let first_count = first.events.len();
-        let first_cursor = first.next_cursor.clone().expect("projection cursor");
-        let second = xtrace_application::show_recording(
-            &reader,
-            ShowRecording {
-                project_id: project.id(),
-                recording_id: request.recording_id,
-                limit: 1_000,
-                cursor: Some(first_cursor),
-            },
-            CorrelationId::new(),
-        )
-        .expect("second projection-byte-bounded page");
-        assert_eq!(first_count + second.events.len(), 800);
-        assert!(second.next_cursor.is_none());
-        let sequences = first
-            .events
-            .into_iter()
-            .chain(second.events)
-            .map(|event| event.sequence.parse::<u64>().expect("decimal sequence"))
-            .collect::<Vec<_>>();
+        let mut cursor = None;
+        let mut sequences = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page = xtrace_application::show_recording(
+                &reader,
+                ShowRecording {
+                    project_id: project.id(),
+                    recording_id: request.recording_id,
+                    limit: 1_000,
+                    cursor,
+                },
+                CorrelationId::new(),
+            )
+            .expect("projection-byte-bounded page");
+            assert!(!page.events.is_empty(), "each bounded page makes forward progress");
+            sequences.extend(
+                page.events
+                    .into_iter()
+                    .map(|event| event.sequence.parse::<u64>().expect("decimal sequence")),
+            );
+            pages += 1;
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+            assert!(pages < 800, "pagination must remain bounded and advance");
+        }
+        assert!(pages >= 2, "large projection is split across bounded pages");
+        assert_eq!(sequences.len(), 800);
         assert_eq!(sequences, (2_u64..802).collect::<Vec<_>>());
     }
 

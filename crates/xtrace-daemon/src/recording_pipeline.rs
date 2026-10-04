@@ -191,10 +191,15 @@ fn translate_finished(
         final_recording_seq: finished.final_recording_seq,
         duration_ns: Some(finished.duration_ns),
         event_digest: finished.event_digest.to_vec(),
-        drop_counts_by_priority: finished.drop_counts_by_priority.iter()
-            .map(|(priority, count)| (*priority, *count)).collect::<BTreeMap<_, _>>(),
+        drop_counts_by_priority: finished
+            .drop_counts_by_priority
+            .iter()
+            .map(|(priority, count)| (*priority, *count))
+            .collect::<BTreeMap<_, _>>(),
         unsupported_capability_codes: finished.unsupported_capability_codes.clone(),
-        response_summary: finished.response_summary.as_ref()
+        response_summary: finished
+            .response_summary
+            .as_ref()
             .map(captured_value_from_wire)
             .transpose()?,
     })
@@ -206,16 +211,15 @@ fn captured_value_from_wire(
     use xtrace_protocol::generated::agent::captured_value::Value as WireValue;
     let invalid = || RecordingPipelineError::InvalidFinishEvidence;
     match value.value.as_ref().ok_or_else(invalid)? {
-        WireValue::Captured(_) => Ok(CapturedValue::Unavailable {
-            reason: UnavailableReason::PrivacyPolicyUnavailable,
-        }),
+        WireValue::Captured(_) => {
+            Ok(CapturedValue::Unavailable { reason: UnavailableReason::PrivacyPolicyUnavailable })
+        }
         WireValue::Redacted(redacted) => {
             if redacted.rule_id.is_empty() || redacted.rule_id.len() > 128 {
                 return Err(invalid());
             }
-            let shape_hint = (redacted.shape_hint != 0)
-                .then(|| value_shape(redacted.shape_hint))
-                .flatten();
+            let shape_hint =
+                (redacted.shape_hint != 0).then(|| value_shape(redacted.shape_hint)).flatten();
             if redacted.shape_hint != 0 && shape_hint.is_none() {
                 return Err(invalid());
             }
@@ -230,9 +234,7 @@ fn captured_value_from_wire(
             if truncated.limit == 0 {
                 return Err(invalid());
             }
-            Ok(CapturedValue::Unavailable {
-                reason: UnavailableReason::PrivacyPolicyUnavailable,
-            })
+            Ok(CapturedValue::Unavailable { reason: UnavailableReason::PrivacyPolicyUnavailable })
         }
         WireValue::Unavailable(unavailable) => {
             let reason = match unavailable.reason {
@@ -309,9 +311,9 @@ mod tests {
     use xtrace_application::{PortError, PortErrorKind};
     use xtrace_domain::{CorrelationId, ProjectId, RecordingId, RuntimeSessionId, WallTime};
     use xtrace_protocol::generated::agent::{
-        captured_value::Value as WireValue, CapabilitySet, CapturedValue as WireCapturedValue,
-        CapturedValueCaptured, CapturedValueRedacted, EventBatch, Health, RecordingEvent,
-        RecordingFinished, RecordingStarted, ValueShape as WireValueShape,
+        CapabilitySet, CapturedValue as WireCapturedValue, CapturedValueCaptured,
+        CapturedValueRedacted, EventBatch, Health, RecordingEvent, RecordingFinished,
+        RecordingStarted, ValueShape as WireValueShape, captured_value::Value as WireValue,
     };
 
     use super::{BlockingLane, RecordingPipeline, RecordingPipelineError, run_blocking};

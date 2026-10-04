@@ -653,7 +653,8 @@ impl SqliteRecordingStore<'_> {
             })?;
             let lifecycle_status = recording_status(&status, correlation_id)?;
             let recording_id = recording_id_from_bytes(&raw_id, correlation_id)?;
-            let completion = completion_evidence(&connection, recording_id, &status, correlation_id)?;
+            let completion =
+                completion_evidence(&connection, recording_id, &status, correlation_id)?;
             let incomplete_evidence = match lifecycle_status {
                 RecordingStatus::Partial | RecordingStatus::Invalid => {
                     vec![format!("persisted_status:{status}")]
@@ -725,12 +726,8 @@ impl SqliteRecordingStore<'_> {
         let lifecycle_status = recording_status(&status, correlation_id)?;
         let completion =
             completion_evidence(&connection, request.recording_id, &status, correlation_id)?;
-        let terminal_finish = load_terminal_finish(
-            &connection,
-            request.recording_id,
-            completion,
-            correlation_id,
-        )?;
+        let terminal_finish =
+            load_terminal_finish(&connection, request.recording_id, completion, correlation_id)?;
         let adapter_summary = if completion == RecordingCompletionEvidence::Invalid {
             None
         } else {
@@ -906,21 +903,18 @@ impl SqliteRecordingStore<'_> {
                 let Some((next_logical, next_compressed)) = next_sizes else {
                     continue;
                 };
-                let next_work = usize::try_from(next_logical)
-                    .ok()
-                    .and_then(|logical| {
-                        usize::try_from(next_compressed)
-                            .ok()
-                            .and_then(|compressed| logical.checked_add(compressed))
-                    });
+                let next_work = usize::try_from(next_logical).ok().and_then(|logical| {
+                    usize::try_from(next_compressed)
+                        .ok()
+                        .and_then(|compressed| logical.checked_add(compressed))
+                });
                 if next_work
                     .and_then(|next_work| work_if_added?.checked_add(next_work))
                     .is_none_or(|total| total > MAX_RECORDING_VERIFIED_INPUT_BYTES)
                 {
                     continue;
                 }
-            } else if work_if_added
-                .is_none_or(|total| total > MAX_RECORDING_VERIFIED_INPUT_BYTES)
+            } else if work_if_added.is_none_or(|total| total > MAX_RECORDING_VERIFIED_INPUT_BYTES)
                 && (verified_input_bytes > 0 || !events.is_empty())
             {
                 has_more = true;
@@ -1016,6 +1010,51 @@ impl SqliteRecordingStore<'_> {
             )?;
             event.frame_id = frame_id;
             event.navigation = navigation;
+        }
+        // The application layer serializes this entire DTO. Account for the
+        // terminal sidecar and the final frame/navigation-enriched events
+        // here so a cursor page is shortened before the application rejects
+        // an otherwise valid near-limit response.
+        let summary_bytes = adapter_summary
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|_| recording_query_resource_error(correlation_id))?
+            .map_or(0, |bytes| bytes.len().saturating_add(1));
+        let terminal_metadata_bytes =
+            serde_json::to_vec(&(duration_ns.as_ref(), &drop_counts_by_priority))
+                .map_err(|_| recording_query_resource_error(correlation_id))?
+                .len()
+                .saturating_add(1);
+        let mut final_projection_bytes = 2_usize
+            .checked_add(summary_bytes)
+            .and_then(|bytes| bytes.checked_add(terminal_metadata_bytes))
+            .ok_or_else(|| recording_query_resource_error(correlation_id))?;
+        if final_projection_bytes > MAX_RECORDING_EVENT_PROJECTION_BYTES {
+            return Err(recording_query_resource_error(correlation_id));
+        }
+        let mut final_event_count = 0_usize;
+        let mut final_projection_truncated = false;
+        for event in &events {
+            let event_bytes = event
+                .serialized_size_with_separator()
+                .map_err(|_| recording_query_resource_error(correlation_id))?;
+            let Some(next_bytes) = final_projection_bytes.checked_add(event_bytes) else {
+                return Err(recording_query_resource_error(correlation_id));
+            };
+            if next_bytes > MAX_RECORDING_EVENT_PROJECTION_BYTES {
+                if final_event_count == 0 {
+                    return Err(recording_query_resource_error(correlation_id));
+                }
+                final_projection_truncated = true;
+                break;
+            }
+            final_projection_bytes = next_bytes;
+            final_event_count += 1;
+        }
+        if final_projection_truncated {
+            events.truncate(final_event_count);
+            has_more = true;
         }
         Ok(RecordingEventWindow {
             recording_id: request.recording_id,
@@ -1354,9 +1393,8 @@ impl SqliteRecordingStore<'_> {
         {
             return Err(terminal_validation_error(correlation_id));
         }
-        let request_json = serde_json::to_string(request).map_err(|_| {
-            terminal_validation_error(correlation_id)
-        })?;
+        let request_json = serde_json::to_string(request)
+            .map_err(|_| terminal_validation_error(correlation_id))?;
         if request_json.len() > 16 * 1024 {
             return Err(terminal_validation_error(correlation_id));
         }
@@ -1378,7 +1416,10 @@ impl SqliteRecordingStore<'_> {
                 )
                 .optional()
                 .map_err(|error| {
-                    map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
                 })?;
             if let Some((stored_request, completion)) = existing {
                 if stored_request != request_json {
@@ -1394,7 +1435,10 @@ impl SqliteRecordingStore<'_> {
                     )
                     .optional()
                     .map_err(|error| {
-                        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+                        map_store_error(
+                            StoreError::from_rusqlite(error, correlation_id),
+                            correlation_id,
+                        )
                     })?;
                 let Some(status) = status else {
                     return Err(read_not_found_error(correlation_id));
@@ -1411,8 +1455,7 @@ impl SqliteRecordingStore<'_> {
             return Ok(completion);
         }
 
-        let (completion, event_count) =
-            self.verify_terminal_evidence(request, correlation_id)?;
+        let (completion, event_count) = self.verify_terminal_evidence(request, correlation_id)?;
         let completion_text = completion_label(completion);
         self.binding.revalidate(correlation_id)?;
         let connection =
@@ -1444,7 +1487,8 @@ impl SqliteRecordingStore<'_> {
                     request_json,
                     completion_text,
                     request.final_recording_seq.to_be_bytes().as_slice(),
-                    i64::try_from(event_count).map_err(|_| terminal_validation_error(correlation_id))?,
+                    i64::try_from(event_count)
+                        .map_err(|_| terminal_validation_error(correlation_id))?,
                 ],
             )
             .map_err(|error| {
@@ -1473,7 +1517,10 @@ impl SqliteRecordingStore<'_> {
                 )
                 .optional()
                 .map_err(|error| {
-                    map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
                 })?
                 .ok_or_else(|| read_not_found_error(correlation_id))?;
             let project_id = project_id_from_bytes(&project_bytes, correlation_id)?;
@@ -1484,37 +1531,52 @@ impl SqliteRecordingStore<'_> {
                      FROM recording_segments WHERE recording_id = ?1 ORDER BY segment_ordinal",
                 )
                 .map_err(|error| {
-                    map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
                 })?;
             let rows = statement
                 .query_map(
                     rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
                     |row| {
                         Ok((
-                            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                            row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
                         ))
                     },
                 )
                 .map_err(|error| {
-                    map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
                 })?;
             let mut segments = Vec::new();
             let mut declared_event_count = 0_usize;
             let mut declared_input_bytes = 0_usize;
             for row in rows.take(MAX_RECORDED_EVENTS + 1) {
                 let segment = row.map_err(|error| {
-                    map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
                 })?;
-                let segment_event_count = usize::try_from(segment.4)
-                    .map_err(|_| object_corrupt_error(correlation_id))?;
+                let segment_event_count =
+                    usize::try_from(segment.4).map_err(|_| object_corrupt_error(correlation_id))?;
                 declared_event_count = declared_event_count
                     .checked_add(segment_event_count)
                     .ok_or_else(|| object_corrupt_error(correlation_id))?;
-                let logical_bytes = usize::try_from(segment.5)
-                    .map_err(|_| object_corrupt_error(correlation_id))?;
-                let compressed_bytes = usize::try_from(segment.6)
-                    .map_err(|_| object_corrupt_error(correlation_id))?;
+                let logical_bytes =
+                    usize::try_from(segment.5).map_err(|_| object_corrupt_error(correlation_id))?;
+                let compressed_bytes =
+                    usize::try_from(segment.6).map_err(|_| object_corrupt_error(correlation_id))?;
                 declared_input_bytes = declared_input_bytes
                     .checked_add(logical_bytes)
                     .and_then(|total| total.checked_add(compressed_bytes))
@@ -1545,12 +1607,25 @@ impl SqliteRecordingStore<'_> {
         let mut event_count = 0_u64;
         let mut has_gap_event = false;
         let mut identifiers_valid = true;
-        for (raw_ordinal, raw_hash, raw_first, raw_last, raw_count, raw_logical, raw_compressed, raw_checksum) in segments {
-            let ordinal = u32::try_from(raw_ordinal).map_err(|_| object_corrupt_error(correlation_id))?;
+        for (
+            raw_ordinal,
+            raw_hash,
+            raw_first,
+            raw_last,
+            raw_count,
+            raw_logical,
+            raw_compressed,
+            raw_checksum,
+        ) in segments
+        {
+            let ordinal =
+                u32::try_from(raw_ordinal).map_err(|_| object_corrupt_error(correlation_id))?;
             if ordinal != expected_ordinal {
                 return Err(object_corrupt_error(correlation_id));
             }
-            expected_ordinal = expected_ordinal.checked_add(1).ok_or_else(|| object_corrupt_error(correlation_id))?;
+            expected_ordinal = expected_ordinal
+                .checked_add(1)
+                .ok_or_else(|| object_corrupt_error(correlation_id))?;
             let object_hash = content_hash_from_bytes(&raw_hash, correlation_id)?;
             let path = object_path_from_row(&self.binding.root, &raw_hash, correlation_id)?;
             validate_managed_tree(
@@ -1559,7 +1634,9 @@ impl SqliteRecordingStore<'_> {
                 correlation_id,
             )?;
             let compressed = read_bounded_regular_file(&path, correlation_id, false)?;
-            if i64::try_from(compressed.len()).map_err(|_| object_corrupt_error(correlation_id))? != raw_compressed {
+            if i64::try_from(compressed.len()).map_err(|_| object_corrupt_error(correlation_id))?
+                != raw_compressed
+            {
                 return Err(object_corrupt_error(correlation_id));
             }
             let decoded = crate::xtf::decode_compressed_segment(&compressed, object_hash)
@@ -1572,8 +1649,12 @@ impl SqliteRecordingStore<'_> {
                 || verified.segment_ordinal() != ordinal
                 || verified.first_recording_seq() != first
                 || verified.last_recording_seq() != last
-                || i64::try_from(verified.event_count()).map_err(|_| object_corrupt_error(correlation_id))? != raw_count
-                || i64::try_from(verified.logical_bytes()).map_err(|_| object_corrupt_error(correlation_id))? != raw_logical
+                || i64::try_from(verified.event_count())
+                    .map_err(|_| object_corrupt_error(correlation_id))?
+                    != raw_count
+                || i64::try_from(verified.logical_bytes())
+                    .map_err(|_| object_corrupt_error(correlation_id))?
+                    != raw_logical
                 || verified.footer_prefix_digest().as_bytes() != raw_checksum.as_slice()
                 || Some(first) != next_sequence
             {
@@ -1590,13 +1671,17 @@ impl SqliteRecordingStore<'_> {
                 if event.kind == 14 {
                     has_gap_event = true;
                 }
-                if event.event_id.is_empty() || event.event_id.len() > 128 || !event.event_id.is_ascii()
+                if event.event_id.is_empty()
+                    || event.event_id.len() > 128
+                    || !event.event_id.is_ascii()
                     || !event_ids.insert(event.event_id.clone())
                 {
                     identifiers_valid = false;
                 }
                 hasher.update(event.event_id.as_bytes());
-                event_count = event_count.checked_add(1).ok_or_else(|| object_corrupt_error(correlation_id))?;
+                event_count = event_count
+                    .checked_add(1)
+                    .ok_or_else(|| object_corrupt_error(correlation_id))?;
             }
         }
         let persisted_final_sequence = next_sequence.map_or(u64::MAX, |next| next - 1);
@@ -2092,18 +2177,21 @@ fn load_terminal_finish(
     if !(0..=16_384).contains(&request_bytes) {
         return Err(recording_query_corrupt_error(correlation_id));
     }
-    let (request_json, raw_final_sequence, stored_completion, stored_event_count):
-        (String, Vec<u8>, String, i64) =
-        connection
-            .query_row(
-                "SELECT request_json, final_recording_seq, completion, event_count \
+    let (request_json, raw_final_sequence, stored_completion, stored_event_count): (
+        String,
+        Vec<u8>,
+        String,
+        i64,
+    ) = connection
+        .query_row(
+            "SELECT request_json, final_recording_seq, completion, event_count \
                  FROM recording_terminal_evidence WHERE recording_id = ?1",
-                rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
+            rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
     let finish: FinishRecording = serde_json::from_str(&request_json)
         .map_err(|_| recording_query_corrupt_error(correlation_id))?;
     let final_sequence = decode_stored_sequence(&raw_final_sequence, correlation_id)?;
@@ -2118,6 +2206,10 @@ fn load_terminal_finish(
         || finish.unsupported_capability_codes.iter().any(|code| !stable_capability_code(code))
         || (completion == RecordingCompletionEvidence::Complete
             && event_count.checked_add(1) != Some(final_sequence))
+        || (completion == RecordingCompletionEvidence::Complete
+            && (finish.event_digest.len() != 32
+                || finish.event_digest.iter().all(|byte| *byte == 0)
+                || finish.drop_counts_by_priority.values().any(|count| *count > 0)))
         || (completion == RecordingCompletionEvidence::Partial
             && event_count.checked_add(1).is_none_or(|last| final_sequence < last))
         || stored_completion != completion_label_from_evidence(completion)
@@ -2132,9 +2224,7 @@ fn load_terminal_finish(
     Ok(Some(finish))
 }
 
-fn completion_label_from_evidence(
-    completion: RecordingCompletionEvidence,
-) -> &'static str {
+fn completion_label_from_evidence(completion: RecordingCompletionEvidence) -> &'static str {
     match completion {
         RecordingCompletionEvidence::Complete => "complete",
         RecordingCompletionEvidence::Partial => "partial",
@@ -2273,7 +2363,8 @@ fn terminal_final_sequence(
         recording_id,
         RecordingCompletionEvidence::Complete,
         correlation_id,
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     Ok(Some(finish.final_recording_seq))
