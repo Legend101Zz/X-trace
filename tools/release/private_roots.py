@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import errno
 import os
 import pathlib
 import plistlib
@@ -50,9 +51,14 @@ _MAC_SAFE_FLAGS = frozenset({"sunlnk", "restricted", "hidden"})
 class AdmissionError(RuntimeError):
     """The selected directory cannot be proven suitable for private writes."""
 
+    reason = ""
 
-def _fail() -> AdmissionError:
-    return AdmissionError("private cache admission failed")
+
+def _fail(reason: str = "") -> AdmissionError:
+    """Fixed-message failure; `reason` is an optional non-secret code."""
+    error = AdmissionError("private cache admission failed")
+    error.reason = reason
+    return error
 
 
 def _bounded_utility(argv: list[str]) -> tuple[bytes, bytes]:
@@ -195,13 +201,91 @@ def _parse_macos_acl(output: bytes, path: pathlib.Path, *, directory: bool = Tru
             raise _fail()
 
 
-def _linux_acl_check(fd: int) -> None:
+_ACL_USER_OBJ, _ACL_USER, _ACL_GROUP_OBJ, _ACL_GROUP, _ACL_MASK, _ACL_OTHER = 0x01, 0x02, 0x04, 0x08, 0x10, 0x20
+_ACL_TAGS = frozenset({_ACL_USER_OBJ, _ACL_USER, _ACL_GROUP_OBJ, _ACL_GROUP, _ACL_MASK, _ACL_OTHER})
+_ACL_OBJECT_TAGS = (_ACL_USER_OBJ, _ACL_GROUP_OBJ, _ACL_OTHER)
+_ACL_XATTR_VERSION = 2
+_ACL_MAX_ENTRIES = 64
+_ACL_ABSENT_ERRNOS = frozenset(
+    code for code in (getattr(errno, "ENODATA", None), getattr(errno, "ENOATTR", None)) if code is not None
+)
+# A filesystem that answers ENOTSUP/EOPNOTSUPP for the ACL attribute cannot
+# hold or enforce an ACL on that object, so no ACL can widen access.
+_ACL_UNSUPPORTED_ERRNOS = frozenset(
+    code for code in (getattr(errno, "ENOTSUP", None), getattr(errno, "EOPNOTSUPP", None)) if code is not None
+)
+
+
+def _read_posix_acl(fd: int, name: str) -> list[tuple[int, int]] | None:
+    """Return (tag, perm) entries of a POSIX ACL xattr, or None when absent.
+
+    Absent means ENODATA (no ACL set) or ENOTSUP (ACLs unsupported on this
+    object). Any other error, or any malformed value, fails closed.
+    """
     try:
-        attributes = os.listxattr(fd)
-    except (AttributeError, OSError, TypeError):
-        raise _fail() from None
-    if any(name in {"system.posix_acl_access", "system.posix_acl_default"} for name in attributes):
-        raise _fail()
+        raw = os.getxattr(fd, name)
+    except OSError as exc:
+        if exc.errno in _ACL_ABSENT_ERRNOS or exc.errno in _ACL_UNSUPPORTED_ERRNOS:
+            return None
+        raise _fail("acl-read-error") from None
+    except (AttributeError, TypeError, ValueError):
+        raise _fail("acl-api-unavailable") from None
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) < 4 or (len(raw) - 4) % 8:
+        raise _fail("acl-malformed")
+    if int.from_bytes(raw[:4], "little") != _ACL_XATTR_VERSION:
+        raise _fail("acl-malformed")
+    count = (len(raw) - 4) // 8
+    if count > _ACL_MAX_ENTRIES:
+        raise _fail("acl-malformed")
+    entries: list[tuple[int, int]] = []
+    for index in range(count):
+        offset = 4 + index * 8
+        tag = int.from_bytes(raw[offset:offset + 2], "little")
+        perm = int.from_bytes(raw[offset + 2:offset + 4], "little")
+        if tag not in _ACL_TAGS or perm & ~0o7:
+            raise _fail("acl-malformed")
+        entries.append((tag, perm))
+    object_counts = {tag: sum(1 for item in entries if item[0] == tag) for tag in _ACL_OBJECT_TAGS}
+    if any(value != 1 for value in object_counts.values()):
+        raise _fail("acl-malformed")
+    named = any(tag in {_ACL_USER, _ACL_GROUP} for tag, _perm in entries)
+    masks = sum(1 for tag, _perm in entries if tag == _ACL_MASK)
+    if masks > 1 or (named and masks != 1):
+        raise _fail("acl-malformed")
+    return entries
+
+
+def _linux_acl_check(fd: int, *, private_leaf: bool = True) -> None:
+    """Fail closed unless the object's POSIX ACLs cannot widen access.
+
+    Detection reads `system.posix_acl_access` and `system.posix_acl_default`
+    with getxattr on the already-opened, no-follow descriptor.
+
+    - private leaf (or a private file): the access ACL must be absent or the
+      three-entry minimal form (user, group, other), which is exactly the mode
+      bits, with no group or other permission; a default ACL must be absent or
+      minimal with no group or other permission. Any named user/group entry or
+      mask fails.
+    - other path components: the caller already rejects group/other write mode
+      bits, and on Linux the mode's group bits are the ACL mask, so a write
+      grant would already fail; this check additionally refuses any entry other
+      than the owner's that grants write. Their default ACLs only shape files
+      created later, are verified on the private directories we create, and are
+      validated for form but not rejected.
+    """
+    access = _read_posix_acl(fd, "system.posix_acl_access")
+    default = _read_posix_acl(fd, "system.posix_acl_default")
+    if private_leaf:
+        for acl, reason in ((access, "acl-access-extended"), (default, "acl-default-present")):
+            if acl is None:
+                continue
+            if any(tag not in _ACL_OBJECT_TAGS for tag, _perm in acl):
+                raise _fail(reason)
+            if any(perm for tag, perm in acl if tag in {_ACL_GROUP_OBJ, _ACL_OTHER}):
+                raise _fail(reason)
+        return
+    if access is not None and any(perm & 0o2 for tag, perm in access if tag != _ACL_USER_OBJ):
+        raise _fail("acl-access-write-grant")
 
 
 def _decode_mount_path(value: str) -> str:
@@ -476,7 +560,18 @@ def _open_validated_directory(
     mount_check: Callable[[pathlib.Path, int, os.stat_result], None] | None = None,
 ) -> tuple[int, tuple[int, int]]:
     """Open every directory component with no-follow and bind checks to fds."""
-    acl_check = _acl_check if acl_check is None else acl_check
+    injected_acl_check = acl_check
+
+    def acl_check(prefix: pathlib.Path, fd: int, strict: bool = False) -> None:  # type: ignore[no-redef]
+        # Injected checks keep their two-argument contract; the real check only
+        # applies the private-leaf rules to the private leaf itself.
+        if injected_acl_check is not None:
+            injected_acl_check(prefix, fd)
+        elif strict or not sys.platform.startswith("linux"):
+            _acl_check(prefix, fd)
+        else:
+            _linux_acl_check(fd, private_leaf=False)
+
     mount_check = _mount_check if mount_check is None else mount_check
     candidate = _absolute_path(path)
     uid = os.getuid() if current_uid is None else current_uid
@@ -535,7 +630,7 @@ def _open_validated_directory(
             opened.append((prefix, fd, opened_info, parent_fd, check_mount))
             if _object_signature(opened_info) != _object_signature(named_before):
                 raise _fail()
-            acl_check(prefix, fd)
+            acl_check(prefix, fd, is_leaf and private_leaf)
             if check_mount:
                 mount_check(prefix, fd, opened_info)
             after_name = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
@@ -554,10 +649,10 @@ def _open_validated_directory(
         if (_object_signature(root_named) != _object_signature(root_info)
                 or _object_signature(root_current) != _object_signature(root_info)):
             raise _fail()
-        for prefix, fd, info, parent_fd, check_mount in opened[1:]:
+        for position, (prefix, fd, info, parent_fd, check_mount) in enumerate(opened[1:], start=1):
             if parent_fd is None:
                 raise _fail()
-            acl_check(prefix, fd)
+            acl_check(prefix, fd, private_leaf and position == len(opened) - 1)
             if check_mount:
                 mount_check(prefix, fd, info)
             named = os.stat(prefix.name, dir_fd=parent_fd, follow_symlinks=False)
@@ -921,6 +1016,39 @@ def read_private_json(
         os.close(parent_fd)
 
 
+def _strip_new_directory_acls(parent_fd: int, name: str) -> None:
+    """Drop ACLs a new directory inherited from a parent default ACL.
+
+    Only called for a directory this process just created. On Linux a parent's
+    default ACL replaces the umask and is copied into the child; removing both
+    ACL attributes and restoring mode 0700 gives the child exactly the owner-only
+    permissions it was created with. The directory is still admitted afterwards,
+    so anything this cannot clear fails closed there.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    fd: int | None = None
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        for attribute in ("system.posix_acl_default", "system.posix_acl_access"):
+            try:
+                os.removexattr(fd, attribute)
+            except OSError as exc:
+                if exc.errno not in _ACL_ABSENT_ERRNOS and exc.errno not in _ACL_UNSUPPORTED_ERRNOS:
+                    raise _fail("acl-strip-error") from None
+        os.fchmod(fd, 0o700)
+    except AdmissionError:
+        raise
+    except (OSError, AttributeError):
+        raise _fail("acl-strip-error") from None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def ensure_private_directory(
     path: os.PathLike[str] | str,
     *,
@@ -939,6 +1067,7 @@ def ensure_private_directory(
                 os.mkdir(candidate.name, mode=0o700, dir_fd=parent_fd)
             except OSError:
                 raise _fail() from None
+            _strip_new_directory_acls(parent_fd, candidate.name)
             named = os.stat(candidate.name, dir_fd=parent_fd, follow_symlinks=False)
         else:
             if must_create:

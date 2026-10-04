@@ -1193,7 +1193,8 @@ def _failure_reason(exc: BaseException) -> str:
     Only the innermost tools/release frame's file, function and line are used;
     no message text, paths, arguments or environment appear.
     """
-    reason = exc.reason if isinstance(exc, FloorInputError) and exc.reason else ""
+    reason = getattr(exc, "reason", "") if isinstance(exc, (FloorInputError, private_roots.AdmissionError)) else ""
+    reason = reason if isinstance(reason, str) else ""
     site = ""
     frame_info = None
     tb = exc.__traceback__

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -572,24 +573,171 @@ class PrivateRootAdmissionTests(unittest.TestCase):
         with self.assertRaises(private_roots.AdmissionError):
             private_roots._linux_filesystem_from_mountinfo(overlay, pathlib.Path("/Volumes/Local SSD/cache"), info)
 
-    def test_linux_acl_presence_or_probe_error_fails_closed(self) -> None:
-        with mock.patch.object(private_roots.os, "listxattr", return_value=[], create=True):
+    @staticmethod
+    def posix_acl(*entries: tuple[int, int]) -> bytes:
+        raw = (2).to_bytes(4, "little")
+        for tag, perm in entries:
+            raw += tag.to_bytes(2, "little") + perm.to_bytes(2, "little") + (0xFFFFFFFF).to_bytes(4, "little")
+        return raw
+
+    def acl_outcomes(self, access: object = None, default: object = None) -> mock._patch:
+        """Fake os.getxattr: bytes = value, int = errno raised, None = ENODATA."""
+        outcomes = {"system.posix_acl_access": access, "system.posix_acl_default": default}
+
+        def fake(fd: int, name: str, *args: object, **kwargs: object) -> bytes:
+            outcome = outcomes[name]
+            if outcome is None:
+                raise OSError(errno.ENODATA, "no data")
+            if isinstance(outcome, int):
+                raise OSError(outcome, "xattr error")
+            return outcome  # type: ignore[return-value]
+
+        return mock.patch.object(private_roots.os, "getxattr", side_effect=fake, create=True)
+
+    def test_linux_acl_absent_or_unsupported_is_accepted(self) -> None:
+        for outcome in (None, errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+            with self.subTest(outcome=outcome), self.acl_outcomes(outcome, outcome):
+                private_roots._linux_acl_check(17)
+                private_roots._linux_acl_check(17, private_leaf=False)
+
+    def test_linux_acl_unexpected_errors_and_api_loss_fail_closed(self) -> None:
+        for code in (errno.EACCES, errno.EIO, errno.EINVAL, errno.ERANGE, errno.EPERM):
+            with self.subTest(code=code), self.acl_outcomes(code, None):
+                for leaf in (True, False):
+                    with self.assertRaises(private_roots.AdmissionError) as caught:
+                        private_roots._linux_acl_check(17, private_leaf=leaf)
+                    self.assertEqual(caught.exception.reason, "acl-read-error")
+        with mock.patch.object(private_roots.os, "getxattr", side_effect=AttributeError("no xattr API"), create=True):
+            with self.assertRaises(private_roots.AdmissionError) as caught:
+                private_roots._linux_acl_check(17)
+        self.assertEqual(caught.exception.reason, "acl-api-unavailable")
+
+    def test_linux_acl_malformed_values_fail_closed(self) -> None:
+        user, group, other, mask, named = 0x01, 0x04, 0x20, 0x10, 0x02
+        good = self.posix_acl((user, 7), (group, 0), (other, 0))
+        bad = {
+            "empty": b"",
+            "short header": b"\x02\x00",
+            "wrong version": b"\x03\x00\x00\x00" + good[4:],
+            "partial entry": good + b"\x00",
+            "unknown tag": self.posix_acl((user, 7), (group, 0), (other, 0), (0x40, 0)),
+            "bad perm bits": self.posix_acl((user, 7), (group, 8), (other, 0)),
+            "missing other": self.posix_acl((user, 7), (group, 0)),
+            "duplicate user": self.posix_acl((user, 7), (user, 7), (group, 0), (other, 0)),
+            "named without mask": self.posix_acl((user, 7), (named, 4), (group, 0), (other, 0)),
+            "too many": self.posix_acl(*[(user, 7)] * 70),
+        }
+        for name, value in bad.items():
+            for leaf in (True, False):
+                with self.subTest(name=name, leaf=leaf), self.acl_outcomes(value, None):
+                    with self.assertRaises(private_roots.AdmissionError) as caught:
+                        private_roots._linux_acl_check(17, private_leaf=leaf)
+                    self.assertEqual(caught.exception.reason, "acl-malformed")
+        with self.acl_outcomes(good, None):
             private_roots._linux_acl_check(17)
-        with mock.patch.object(
-            private_roots.os, "listxattr", return_value=["system.posix_acl_access"], create=True,
-        ):
-            with self.assertRaises(private_roots.AdmissionError):
-                private_roots._linux_acl_check(17)
-        with mock.patch.object(
-            private_roots.os, "listxattr", side_effect=OSError("xattr unavailable"), create=True,
-        ):
-            with self.assertRaises(private_roots.AdmissionError):
-                private_roots._linux_acl_check(17)
-        with mock.patch.object(
-            private_roots.os, "listxattr", side_effect=AttributeError("xattr API unavailable"), create=True,
-        ):
-            with self.assertRaises(private_roots.AdmissionError):
-                private_roots._linux_acl_check(17)
+
+    def test_linux_private_leaf_accepts_only_minimal_zero_permission_acls(self) -> None:
+        user, group, other, mask, named, named_group = 0x01, 0x04, 0x20, 0x10, 0x02, 0x08
+        minimal_private = self.posix_acl((user, 7), (group, 0), (other, 0))
+        with self.acl_outcomes(minimal_private, minimal_private):
+            private_roots._linux_acl_check(17)
+        extended = {
+            "group readable": (self.posix_acl((user, 7), (group, 5), (other, 0)), None, "acl-access-extended"),
+            "other readable": (self.posix_acl((user, 7), (group, 0), (other, 4)), None, "acl-access-extended"),
+            "named user": (self.posix_acl((user, 7), (named, 0), (group, 0), (mask, 0), (other, 0)), None, "acl-access-extended"),
+            "named group": (self.posix_acl((user, 7), (named_group, 0), (group, 0), (mask, 0), (other, 0)), None, "acl-access-extended"),
+            "default readable": (None, self.posix_acl((user, 7), (group, 5), (other, 5)), "acl-default-present"),
+            "default named": (None, self.posix_acl((user, 7), (named, 0), (group, 0), (mask, 0), (other, 0)), "acl-default-present"),
+        }
+        for name, (access, default, reason) in extended.items():
+            with self.subTest(name), self.acl_outcomes(access, default):
+                with self.assertRaises(private_roots.AdmissionError) as caught:
+                    private_roots._linux_acl_check(17)
+                self.assertEqual(caught.exception.reason, reason)
+
+    def test_linux_ancestor_default_acl_is_ignored_but_write_grants_fail(self) -> None:
+        user, group, other, mask, named = 0x01, 0x04, 0x20, 0x10, 0x02
+        shared_default = self.posix_acl((user, 7), (named, 5), (group, 5), (mask, 5), (other, 5))
+        with self.acl_outcomes(None, shared_default):
+            private_roots._linux_acl_check(17, private_leaf=False)
+        readable = self.posix_acl((user, 7), (named, 5), (group, 5), (mask, 5), (other, 5))
+        with self.acl_outcomes(readable, shared_default):
+            private_roots._linux_acl_check(17, private_leaf=False)
+        for name, entries in {
+            "named user write": ((user, 7), (named, 6), (group, 5), (mask, 6), (other, 5)),
+            "group write": ((user, 7), (group, 7), (other, 5)),
+            "other write": ((user, 7), (group, 5), (other, 2)),
+            "mask write": ((user, 7), (named, 4), (group, 5), (mask, 2), (other, 5)),
+        }.items():
+            with self.subTest(name), self.acl_outcomes(self.posix_acl(*entries), None):
+                with self.assertRaises(private_roots.AdmissionError) as caught:
+                    private_roots._linux_acl_check(17, private_leaf=False)
+                self.assertEqual(caught.exception.reason, "acl-access-write-grant")
+
+    def test_directory_walk_applies_private_leaf_rules_only_to_the_leaf(self) -> None:
+        seen: list[tuple[tuple[int, int], bool]] = []
+
+        def record(fd: int, *, private_leaf: bool = True) -> None:
+            info = os.fstat(fd)
+            seen.append(((info.st_dev, info.st_ino), private_leaf))
+
+        with tempfile.TemporaryDirectory(dir=test_scratch_root()) as temporary:
+            leaf = pathlib.Path(temporary).resolve() / "leaf"
+            leaf.mkdir(mode=0o700)
+            leaf_id = (leaf.stat().st_dev, leaf.stat().st_ino)
+            with mock.patch.object(private_roots.sys, "platform", "linux"), \
+                    mock.patch.object(private_roots, "_linux_acl_check", side_effect=record), \
+                    mock.patch.object(private_roots, "_mount_check"):
+                try:
+                    fd, _identity = private_roots._open_validated_directory(leaf, private_leaf=True)
+                except private_roots.AdmissionError:
+                    fd = None  # host ancestors may be rejected for non-ACL reasons; ACL calls were still recorded
+                else:
+                    os.close(fd)
+        self.assertTrue(seen)
+        for identity, strict in seen:
+            self.assertEqual(strict, identity == leaf_id)
+        self.assertTrue(any(identity == leaf_id for identity, _ in seen) or fd is None)
+
+    def test_new_directory_acls_are_stripped_only_on_linux_and_failures_fail_closed(self) -> None:
+        removed: list[str] = []
+        modes: list[int] = []
+        with mock.patch.object(private_roots.sys, "platform", "linux"), \
+                mock.patch.object(private_roots.os, "removexattr", side_effect=lambda fd, name: removed.append(name), create=True), \
+                mock.patch.object(private_roots.os, "fchmod", side_effect=lambda fd, mode: modes.append(mode)), \
+                mock.patch.object(private_roots.os, "open", return_value=99), \
+                mock.patch.object(private_roots.os, "close"):
+            private_roots._strip_new_directory_acls(5, "child")
+        self.assertEqual(removed, ["system.posix_acl_default", "system.posix_acl_access"])
+        self.assertEqual(modes, [0o700])
+        # ENODATA while removing is fine; any other error fails closed.
+        def enodata(fd: int, name: str) -> None:
+            raise OSError(errno.ENODATA, "none")
+
+        def denied(fd: int, name: str) -> None:
+            raise OSError(errno.EPERM, "denied")
+
+        with mock.patch.object(private_roots.sys, "platform", "linux"), \
+                mock.patch.object(private_roots.os, "fchmod"), mock.patch.object(private_roots.os, "open", return_value=99), \
+                mock.patch.object(private_roots.os, "close"):
+            with mock.patch.object(private_roots.os, "removexattr", side_effect=enodata, create=True):
+                private_roots._strip_new_directory_acls(5, "child")
+            with mock.patch.object(private_roots.os, "removexattr", side_effect=denied, create=True):
+                with self.assertRaises(private_roots.AdmissionError) as caught:
+                    private_roots._strip_new_directory_acls(5, "child")
+        self.assertEqual(caught.exception.reason, "acl-strip-error")
+        with mock.patch.object(private_roots.sys, "platform", "darwin"), \
+                mock.patch.object(private_roots.os, "open") as opened:
+            private_roots._strip_new_directory_acls(5, "child")
+        opened.assert_not_called()
+
+    def test_admission_error_reason_reaches_the_ci_failure_code(self) -> None:
+        from tools.release import ci_floor
+        try:
+            raise private_roots._fail("acl-default-present")
+        except private_roots.AdmissionError as exc:
+            reason = ci_floor._failure_reason(exc)
+        self.assertTrue(reason.startswith("AdmissionError/acl-default-present/"), reason)
 
     def test_admit_empty_directory_rejects_preexisting_contents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
