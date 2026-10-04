@@ -1,5 +1,7 @@
 package dev.xtrace.agent.bootstrap;
 
+import java.lang.reflect.Method;
+
 /** JDK-only handoff from inlined advice to the private agent runtime. */
 public interface BridgeSink {
   /** A complete request recording could not be admitted. */
@@ -20,6 +22,36 @@ public interface BridgeSink {
       String symbol,
       long monotonicNs,
       int detail);
+
+  /** Offers a method event with bounded compile-time source attestation facts. */
+  default boolean offerSourceEvent(
+      String recordingId,
+      String eventId,
+      String parentEventId,
+      int kind,
+      String symbol,
+      long monotonicNs,
+      int detail,
+      String sourcePath,
+      int startLine,
+      int endLine,
+      byte[] sourceHash,
+      int sourceBinding) {
+    return offerEvent(recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail);
+  }
+
+  /** Offers a fixture frame and delegates manifest lookup to the private agent runtime. */
+  default boolean offerMethodEvent(
+      String recordingId,
+      String eventId,
+      String parentEventId,
+      int kind,
+      String symbol,
+      long monotonicNs,
+      int detail,
+      Method method) {
+    return offerEvent(recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail);
+  }
 
   /** Offers the bounded recording terminal marker and accumulated loss count. */
   boolean offerFinish(

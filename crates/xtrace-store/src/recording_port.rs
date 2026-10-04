@@ -54,13 +54,21 @@ impl SqliteRecordingPersistence {
 pub struct SqliteRecordingReader {
     store: SqliteStore,
     project_data_root: PathBuf,
+    source_root: Option<PathBuf>,
 }
 
 impl SqliteRecordingReader {
     /// Creates a read adapter bound to one project data directory.
     #[must_use]
     pub fn new(store: SqliteStore, project_data_root: impl Into<PathBuf>) -> Self {
-        Self { store, project_data_root: project_data_root.into() }
+        Self { store, project_data_root: project_data_root.into(), source_root: None }
+    }
+
+    /// Enables bounded read-time source verification against a canonical repository root.
+    #[must_use]
+    pub fn with_source_root(mut self, source_root: impl Into<PathBuf>) -> Self {
+        self.source_root = Some(source_root.into());
+        self
     }
 }
 
@@ -82,7 +90,8 @@ impl RecordingReadPort for SqliteRecordingReader {
     ) -> Result<RecordingEventWindow, PortError> {
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
-        view.read_recording_window(request).map_err(map_recording_error)
+        view.read_recording_window(request, self.source_root.as_deref())
+            .map_err(map_recording_error)
     }
 }
 
@@ -206,6 +215,49 @@ fn validate_xtf_event(
             "recording event canonical bytes do not match its XTF envelope",
             CorrelationId::new(),
         ));
+    }
+    use xtrace_protocol::generated::agent::SourceBinding as WireSourceBinding;
+    let binding = WireSourceBinding::try_from(payload.source_binding).map_err(|_| {
+        PortError::new(
+            PortErrorKind::Validation,
+            "recording source binding is invalid",
+            CorrelationId::new(),
+        )
+    })?;
+    match (binding, payload.source.as_ref()) {
+        (WireSourceBinding::Verified, Some(source)) => {
+            let allowed = [
+                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderController.java",
+                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java",
+                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderRepository.java",
+            ];
+            let safe_path = allowed.contains(&source.path.as_str())
+                && !source.path.starts_with('/')
+                && !source.path.contains('\\')
+                && source
+                    .path
+                    .split('/')
+                    .all(|part| !part.is_empty() && part != "." && part != "..");
+            if !safe_path
+                || source.content_hash.len() != 32
+                || source.start_line == 0
+                || (source.end_line != 0 && source.end_line < source.start_line)
+            {
+                return Err(PortError::new(
+                    PortErrorKind::Validation,
+                    "recording source metadata is invalid",
+                    CorrelationId::new(),
+                ));
+            }
+        }
+        (WireSourceBinding::Verified, None) | (_, Some(_)) => {
+            return Err(PortError::new(
+                PortErrorKind::Validation,
+                "recording source binding disagrees with source metadata",
+                CorrelationId::new(),
+            ));
+        }
+        (_, None) => {}
     }
     Ok(event.payload.clone())
 }

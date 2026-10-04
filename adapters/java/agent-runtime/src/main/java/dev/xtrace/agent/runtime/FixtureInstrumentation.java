@@ -7,8 +7,10 @@ import static net.bytebuddy.matcher.ElementMatchers.not;
 import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
 
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
+import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Method;
+import java.security.ProtectionDomain;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.bytebuddy.agent.builder.AgentBuilder;
@@ -41,6 +43,21 @@ final class FixtureInstrumentation {
                 named("dev.xtrace.agent.bootstrap.XTraceAgent")
                     .or(named("dev.xtrace.agent.bootstrap.BootstrapBridge"))
                     .or(named("dev.xtrace.agent.runtime.AgentRuntime")));
+
+    instrumentation.addTransformer(new ClassFileTransformer() {
+      @Override
+      public byte[] transform(
+          ClassLoader loader,
+          String className,
+          Class<?> classBeingRedefined,
+          ProtectionDomain protectionDomain,
+          byte[] classfileBuffer) {
+        if (isApplicationType(className)) {
+          SourceAttestation.observe(loader, className, classfileBuffer);
+        }
+        return null;
+      }
+    }, false);
 
     builder =
         builder
@@ -132,6 +149,11 @@ final class FixtureInstrumentation {
         || (REPOSITORY.equals(typeName) && "save".equals(methodName));
   }
 
+  private static boolean isApplicationType(String internalName) {
+    if (internalName == null) return false;
+    return APPLICATION_TYPES.contains(internalName.replace('/', '.'));
+  }
+
   /** Request advice uses only fixed fixture identity and the response's numeric status. */
   public static final class SpringRequestAdvice {
     private SpringRequestAdvice() {}
@@ -181,8 +203,8 @@ final class FixtureInstrumentation {
     private ControllerAdvice() {}
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void enter() {
-      BootstrapBridge.frameEnter("OrderController.create");
+    public static void enter(@Advice.Origin Method method) {
+      BootstrapBridge.frameEnter("OrderController.create", method);
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
@@ -195,8 +217,8 @@ final class FixtureInstrumentation {
     private ServiceAdvice() {}
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void enter() {
-      BootstrapBridge.frameEnter("OrderService.place");
+    public static void enter(@Advice.Origin Method method) {
+      BootstrapBridge.frameEnter("OrderService.place", method);
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
@@ -209,8 +231,8 @@ final class FixtureInstrumentation {
     private RepositoryAdvice() {}
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void enter() {
-      BootstrapBridge.frameEnter("OrderRepository.save");
+    public static void enter(@Advice.Origin Method method) {
+      BootstrapBridge.frameEnter("OrderRepository.save", method);
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)

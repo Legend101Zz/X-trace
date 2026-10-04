@@ -83,6 +83,7 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
         .output()
         .expect("initialize project");
     assert!(init.status.success(), "init failed: {}", String::from_utf8_lossy(&init.stderr));
+    copy_fixture_sources(&repo);
     let project_id =
         serde_json::from_slice::<Value>(&init.stdout).expect("init JSON")["project_id"]
             .as_str()
@@ -1038,6 +1039,18 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("port address")
         .port()
+}
+
+fn copy_fixture_sources(repo: &Path) {
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture");
+    let destination = repo.join("adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture");
+    fs::create_dir_all(&destination)
+        .expect("create fixture source directory in disposable repository");
+    for name in ["OrderController.java", "OrderService.java", "OrderRepository.java"] {
+        fs::copy(source_root.join(name), destination.join(name))
+            .expect("copy allowlisted fixture source");
+    }
 }
 
 fn wait_for_fixture(port: u16) {

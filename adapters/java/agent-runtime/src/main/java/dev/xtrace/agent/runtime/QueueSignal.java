@@ -19,8 +19,26 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
       String symbol,
       long monotonicNs,
       int detail,
+      String sourcePath,
+      int sourceStartLine,
+      int sourceEndLine,
+      byte[] sourceHash,
+      int sourceBinding,
       int estimatedBytes)
-      implements QueueSignal {}
+      implements QueueSignal {
+    Event(
+        String recordingId,
+        String eventId,
+        String parentEventId,
+        int kind,
+        String symbol,
+        long monotonicNs,
+        int detail,
+        int estimatedBytes) {
+      this(recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail,
+          null, 0, 0, null, 0, estimatedBytes);
+    }
+  }
 
   record Finish(
       String recordingId,

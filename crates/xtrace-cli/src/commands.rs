@@ -475,7 +475,7 @@ where
             context.correlation_id,
         )));
     }
-    let reader = SqliteRecordingReader::new(store, project_directory);
+    let reader = SqliteRecordingReader::new(store, project_directory).with_source_root(repo);
     Ok((project.id(), reader, context.correlation_id))
 }
 

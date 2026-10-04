@@ -1688,6 +1688,7 @@ dependencies = [
  "hex",
  "prost",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

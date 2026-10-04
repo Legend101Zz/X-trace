@@ -391,7 +391,7 @@ components:
         requestId: { type: string, format: uuid }
     Event:
       type: object
-      required: [sequence, monotonicNs, kind, fieldTruncations]
+      required: [sequence, monotonicNs, kind, sourceBinding, fieldTruncations]
       properties:
         sequence: { type: string, pattern: '^[0-9]+$' }
         monotonicNs: { type: string, pattern: '^[0-9]+$' }
@@ -403,6 +403,28 @@ components:
         interaction:
           type: [object, 'null']
           additionalProperties: { type: [string, 'null'] }
+        sourceBinding:
+          type: string
+          description: Adapter-reported compile-time class-to-source binding result.
+          enum: [unspecified, verified, attestation_missing, class_bytes_mismatch, debug_metadata_absent, source_metadata_invalid]
+        source:
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [path, startLine, endLine, status, excerpt, truncated]
+              properties:
+                path: { type: string, maxLength: 256 }
+                startLine:
+                  type: integer
+                  minimum: 1
+                  description: Lower bound of the fixture method debug-line extent, not an active execution cursor.
+                endLine:
+                  type: [integer, 'null']
+                  minimum: 1
+                  description: Inclusive upper bound of the fixture method debug-line extent, when available.
+                status: { type: string, enum: [matched, mismatch, unavailable] }
+                excerpt: { type: [string, 'null'], maxLength: 16384 }
+                truncated: { type: boolean }
         fieldTruncations:
           type: array
           items:
