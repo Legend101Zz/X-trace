@@ -1674,6 +1674,9 @@ dependencies = [
 name = "xtrace-runtime"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "blake3",
+ "ring",
  "rustix",
  "sha2",
  "tempfile",

@@ -219,6 +219,17 @@ impl AdmittedPrivateRoot {
         self.revalidate_until(new_admission_deadline())
     }
 
+    /// Revalidates within a caller-owned bounded multi-step operation.
+    ///
+    /// The caller's absolute deadline is capped by the ordinary admission
+    /// budget for this individual operation.
+    pub(crate) fn revalidate_for_operation(
+        &self,
+        operation_deadline: std::time::Instant,
+    ) -> Result<(), PrivateStorageError> {
+        self.revalidate_until(operation_deadline.min(new_admission_deadline()))
+    }
+
     fn revalidate_until(&self, deadline: std::time::Instant) -> Result<(), PrivateStorageError> {
         // Re-open every component from `/` without following links. Checking
         // only the retained leaf descriptor would miss replacement of an
@@ -246,6 +257,15 @@ impl AdmittedPrivateRoot {
     /// Creates and admits a new owner-only child directory relative to this descriptor.
     pub fn create_private_child(&self, name: &str) -> Result<Self, PrivateStorageError> {
         self.create_private_child_until(name, new_admission_deadline())
+    }
+
+    /// Creates a private child while preserving the caller's absolute deadline.
+    pub(crate) fn create_private_child_for_operation(
+        &self,
+        name: &str,
+        operation_deadline: std::time::Instant,
+    ) -> Result<Self, PrivateStorageError> {
+        self.create_private_child_until(name, operation_deadline.min(new_admission_deadline()))
     }
 
     fn create_private_child_until(
@@ -326,6 +346,15 @@ impl AdmittedPrivateRoot {
         self.open_private_child_until(name, new_admission_deadline())
     }
 
+    /// Opens an admitted private child within a caller-owned bounded operation.
+    pub(crate) fn open_private_child_for_operation(
+        &self,
+        name: &str,
+        operation_deadline: std::time::Instant,
+    ) -> Result<Self, PrivateStorageError> {
+        self.open_private_child_until(name, operation_deadline.min(new_admission_deadline()))
+    }
+
     fn open_private_child_until(
         &self,
         name: &str,
@@ -363,6 +392,18 @@ impl AdmittedPrivateRoot {
         maximum_entries: usize,
     ) -> Result<Vec<String>, PrivateStorageError> {
         self.bounded_child_names_until(maximum_entries, new_admission_deadline())
+    }
+
+    /// Lists bounded child names under the same absolute deadline as a larger operation.
+    pub(crate) fn bounded_child_names_for_operation(
+        &self,
+        maximum_entries: usize,
+        operation_deadline: std::time::Instant,
+    ) -> Result<Vec<String>, PrivateStorageError> {
+        self.bounded_child_names_until(
+            maximum_entries,
+            operation_deadline.min(new_admission_deadline()),
+        )
     }
 
     fn bounded_child_names_until(
@@ -422,6 +463,31 @@ impl AdmittedPrivateRoot {
         self.revalidate_until(deadline)
     }
 
+    /// Removes a file only if its name still identifies the expected descriptor, under one deadline.
+    pub(crate) fn remove_private_file_if_matches_for_operation(
+        &self,
+        name: &str,
+        expected: &File,
+        operation_deadline: std::time::Instant,
+    ) -> Result<(), PrivateStorageError> {
+        let deadline = operation_deadline.min(new_admission_deadline());
+        let actual = self.open_file_with_link_policy_until(name, false, deadline)?;
+        self.validate_file_binding_with_link_policy_until(name, &actual, false, false, deadline)?;
+        let expected_metadata = expected.metadata().map_err(|_| PrivateStorageError::Operation)?;
+        let actual_metadata = actual.metadata().map_err(|_| PrivateStorageError::Operation)?;
+        if !FileIdentity::from_metadata(&expected_metadata)
+            .same_file(FileIdentity::from_metadata(&actual_metadata))
+            || expected_metadata.nlink() != actual_metadata.nlink()
+        {
+            return Err(PrivateStorageError::Unavailable);
+        }
+        drop(actual);
+        rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty())
+            .map_err(|_| PrivateStorageError::Operation)?;
+        self.revalidate_until(deadline)?;
+        self.sync_until(deadline)
+    }
+
     /// Removes a validated private immutable object file that may have hard links.
     pub fn remove_managed_file(&self, name: &str) -> Result<(), PrivateStorageError> {
         let deadline = new_admission_deadline();
@@ -449,9 +515,53 @@ impl AdmittedPrivateRoot {
         self.sync_until(deadline)
     }
 
+    /// Removes an empty admitted child using the caller's absolute deadline.
+    pub(crate) fn remove_private_child_for_operation(
+        &self,
+        name: &str,
+        expected: &AdmittedPrivateRoot,
+        operation_deadline: std::time::Instant,
+    ) -> Result<(), PrivateStorageError> {
+        let deadline = operation_deadline.min(new_admission_deadline());
+        validate_child_name(name)?;
+        let child = self.open_private_child_until(name, deadline)?;
+        let expected_metadata =
+            expected.directory.metadata().map_err(|_| PrivateStorageError::Operation)?;
+        let actual_metadata =
+            child.directory.metadata().map_err(|_| PrivateStorageError::Operation)?;
+        if !FileIdentity::from_metadata(&expected_metadata)
+            .same_directory(FileIdentity::from_metadata(&actual_metadata))
+        {
+            return Err(PrivateStorageError::Unavailable);
+        }
+        if !child.bounded_child_names_until(1, deadline)?.is_empty() {
+            return Err(PrivateStorageError::Unavailable);
+        }
+        child.revalidate_until(deadline)?;
+        expected.revalidate_until(deadline)?;
+        self.revalidate_until(deadline)?;
+        rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::REMOVEDIR)
+            .map_err(|_| PrivateStorageError::Operation)?;
+        self.revalidate_until(deadline)?;
+        self.sync_until(deadline)
+    }
+
     /// Opens a regular no-follow child file after revalidating this directory.
     pub fn open_regular_file(&self, name: &str) -> Result<File, PrivateStorageError> {
         self.open_file_with_link_policy(name, false)
+    }
+
+    /// Opens a regular private file within a caller-owned bounded operation.
+    pub(crate) fn open_regular_file_for_operation(
+        &self,
+        name: &str,
+        operation_deadline: std::time::Instant,
+    ) -> Result<File, PrivateStorageError> {
+        self.open_file_with_link_policy_until(
+            name,
+            false,
+            operation_deadline.min(new_admission_deadline()),
+        )
     }
 
     /// Admits an optional private regular file without treating absence as an error.
@@ -581,6 +691,67 @@ impl AdmittedPrivateRoot {
         self.validate_file_binding_with_link_policy_until(name, &file, true, false, deadline)?;
         self.revalidate_until(deadline)?;
         Ok(file)
+    }
+
+    /// Exclusively creates a private regular file under a caller-owned deadline.
+    pub(crate) fn create_private_file_for_operation(
+        &self,
+        name: &str,
+        operation_deadline: std::time::Instant,
+    ) -> Result<File, PrivateStorageError> {
+        if !self.private_leaf {
+            return Err(PrivateStorageError::Unavailable);
+        }
+        validate_child_name(name)?;
+        let deadline = operation_deadline.min(new_admission_deadline());
+        self.revalidate_until(deadline)?;
+        let file = rustix::fs::openat(
+            &self.directory,
+            name,
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .map(File::from)
+        .map_err(|error| {
+            if error == rustix::io::Errno::EXIST {
+                PrivateStorageError::AlreadyExists
+            } else {
+                PrivateStorageError::Operation
+            }
+        })?;
+        self.validate_file_binding_with_link_policy_until(name, &file, true, false, deadline)?;
+        self.revalidate_until(deadline)?;
+        Ok(file)
+    }
+
+    /// Rechecks that a retained descriptor is still the named private file within a larger operation.
+    pub(crate) fn validate_file_binding_for_operation(
+        &self,
+        name: &str,
+        file: &File,
+        newly_created: bool,
+        operation_deadline: std::time::Instant,
+    ) -> Result<(), PrivateStorageError> {
+        self.validate_file_binding_with_link_policy_until(
+            name,
+            file,
+            newly_created,
+            false,
+            operation_deadline.min(new_admission_deadline()),
+        )
+    }
+
+    /// Syncs the admitted directory within a caller-owned bounded operation.
+    pub(crate) fn sync_for_operation(
+        &self,
+        operation_deadline: std::time::Instant,
+    ) -> Result<(), PrivateStorageError> {
+        self.sync_until(operation_deadline.min(new_admission_deadline()))
     }
 
     /// Opens an existing private regular file or creates it exclusively as `0600`.
