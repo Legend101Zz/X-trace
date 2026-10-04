@@ -93,6 +93,22 @@ pub enum XtraceCommand {
         #[arg(long = "project-dir", value_name = "DIR")]
         project_dir: PathBuf,
     },
+    /// Attach experimental standard Java capture to one already-running JVM.
+    #[cfg(unix)]
+    Attach {
+        /// Path to the initialized repository root.
+        #[arg(long = "project-dir", value_name = "DIR", default_value = ".")]
+        project_dir: PathBuf,
+        /// Explicit target JVM PID. Without it, an interactive terminal must select a listed row.
+        #[arg(long, value_name = "PID")]
+        pid: Option<u32>,
+        /// Explicit unsigned development pack. Publisher authenticity is not verified.
+        #[arg(long = "java-pack", value_name = "DIR", required = true)]
+        java_pack: PathBuf,
+        /// Emit one JSON result after a successful attach.
+        #[arg(long)]
+        json: bool,
+    },
     /// Launch a direct Java process with experimental capture enabled.
     Run {
         /// Path to the initialized repository root.
@@ -211,6 +227,10 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
             endpoint(command, &crate::paths::read_env_path).map(|()| 0)
         }
         XtraceCommand::Daemon { project_dir } => crate::daemon::run(project_dir).await.map(|()| 0),
+        #[cfg(unix)]
+        XtraceCommand::Attach { project_dir, pid, java_pack, json } => {
+            crate::attach::run(project_dir, pid, java_pack, json).await.map(|()| 0)
+        }
         XtraceCommand::Run {
             project_dir,
             java_agent,

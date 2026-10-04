@@ -39,6 +39,8 @@
     deny(clippy::unwrap_used, clippy::expect_used, reason = "library code must not panic")
 )]
 
+#[cfg(unix)]
+mod attach;
 mod commands;
 mod daemon;
 #[cfg(unix)]
@@ -126,6 +128,27 @@ mod tests {
         let cli = Cli::try_parse_from(["xtrace", "daemon", "--project-dir", "/tmp/my repository"])
             .expect("daemon command parses");
         assert!(matches!(cli.command, commands::XtraceCommand::Daemon { .. }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn attach_command_accepts_explicit_pid_pack_and_json_mode() {
+        let cli = Cli::try_parse_from([
+            "xtrace",
+            "attach",
+            "--project-dir",
+            "/tmp/project with spaces",
+            "--pid",
+            "4312",
+            "--java-pack",
+            "/tmp/java pack",
+            "--json",
+        ])
+        .expect("attach command parses");
+        assert!(matches!(
+            cli.command,
+            commands::XtraceCommand::Attach { pid: Some(4312), json: true, .. }
+        ));
     }
 
     #[test]

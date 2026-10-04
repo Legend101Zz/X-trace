@@ -196,6 +196,20 @@ impl ErrorDocument {
                 details: BTreeMapString(std::collections::BTreeMap::new()),
                 exit_code: error.exit_code(),
             },
+            #[cfg(unix)]
+            CliError::Attach { code, category, message, remediation, .. } => Self {
+                kind: "error",
+                code: (*code).to_string(),
+                category: (*category).to_string(),
+                message: message.clone(),
+                remediation: vec![RemediationDocument {
+                    kind: "next_step".to_string(),
+                    label: remediation.clone(),
+                    command_ref: None,
+                }],
+                details: BTreeMapString(std::collections::BTreeMap::new()),
+                exit_code: error.exit_code(),
+            },
         }
     }
 }

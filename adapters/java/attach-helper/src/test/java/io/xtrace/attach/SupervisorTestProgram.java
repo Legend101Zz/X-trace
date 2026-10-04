@@ -11,6 +11,7 @@ public final class SupervisorTestProgram {
     }
     String mode = arguments.length > 1 ? arguments[1] : "hang";
     switch (mode) {
+      case "tmpdir" -> System.out.println(System.getProperty("java.io.tmpdir"));
       case "malformed-json" -> System.out.println("{\"schemaVersion\":1,\"ok\":true");
       case "mismatched-exit" -> {
         System.out.println(

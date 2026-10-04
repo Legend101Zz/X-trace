@@ -103,9 +103,14 @@ final class HelperSupervisor {
       throws IOException, InterruptedException, ExecutionException, URISyntaxException,
           TimeoutException {
     String javaBinary = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+    String privateTemp = System.getProperty("java.io.tmpdir");
+    if (privateTemp == null || privateTemp.isBlank() || !Path.of(privateTemp).isAbsolute()) {
+      throw new IOException("the admitted helper temporary directory is unavailable");
+    }
     var command = new java.util.ArrayList<String>();
     command.add(javaBinary);
     command.add("--add-modules=jdk.attach");
+    command.add("-Djava.io.tmpdir=" + privateTemp);
     command.add("-cp");
     command.add(classPath);
     command.add(mainClass);

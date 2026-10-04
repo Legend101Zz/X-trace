@@ -20,6 +20,18 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class AttachCommandsTest {
+  @Test
+  void helperWorkerReceivesTheAdmittedTemporaryDirectoryProperty() throws Exception {
+    HelperSupervisor.Result result = HelperSupervisor.runWorker(
+        SupervisorTestProgram.class.getName(),
+        new String[] {"inspect", "tmpdir"},
+        java.time.Duration.ofSeconds(5),
+        supervisorTestClassPath());
+
+    assertEquals(System.getProperty("java.io.tmpdir"), result.json());
+    assertFalse(result.reliable());
+  }
+
   private static final String SECRET_CANARY = "xtrace-private-canary-7f38";
 
   @TempDir Path temporaryDirectory;

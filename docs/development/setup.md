@@ -120,6 +120,35 @@ set. It reports best-effort eligibility and does not promise attachment across
 JDK, permission, dynamic-loading, container, or native-image boundaries. Use
 premain relaunch when dynamic attach is disabled or unsupported.
 
+The CLI attaches to one explicit PID, or offers a bounded sanitized picker only
+when both stdin and stdout are interactive. Build the unsigned, fixture-only
+development pack with `javaPackDist` and pass it explicitly with `--java-pack`.
+Publisher authenticity is not verified, so this command does not accept an
+implicit installed production pack. Signed installed-pack verification remains
+a required P07 dependency. The command owns a foreground daemon
+until Ctrl-C or SIGTERM and cleans up only that daemon/session; the selected JVM
+is never its child and remains running. Its first result says
+`agent_load_status: agent_load_requested` and
+`capture_status: unknown_pending_daemon_observation`: this CLI increment does
+not yet observe an authenticated active runtime session. The adapter remains
+fixture-only, with focused capture, active-line evidence, and value capture
+reported unavailable. This is not the later reusable daemon registry/stop
+contract or full Slice 3 acceptance. Project and helper storage must be on an
+owner-enforced local filesystem; noowners mounts and uncertain ACL inspection
+fail closed before private runtime files are written.
+Before launching the helper, the CLI copies the bounded SHA-256-verified pack
+into that private durable cache and executes only the copy. These digests check
+integrity, not publisher authenticity. It retains at most four pack snapshots
+because a live or identity-uncertain target may still load classes lazily; a
+full cache fails closed instead of deleting files still needed by a target.
+
+```bash
+xtrace attach --project-dir /path/to/initialized/repository --pid 12345 --json
+```
+
+For an unpackaged development build, add
+`--java-pack /path/to/adapters/java/build/java-pack-dist`.
+
 ```bash
 adapters/java/gradlew -p adapters/java --dependency-verification strict \
   :attach-helper:test :attach-helper:jar :attachHelperDist
