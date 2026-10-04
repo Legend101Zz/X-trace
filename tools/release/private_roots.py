@@ -39,7 +39,10 @@ _MAC_RIGHTS = frozenset({
     "readextattr", "writeextattr", "readsecurity", "writesecurity", "chown",
     "read_data", "write_data", "append_data",
 })
-_MAC_SAFE_FLAGS = frozenset({"sunlnk", "restricted"})
+# `ls -O` reports the BSD `hidden` flag as a visibility hint for GUI clients.
+# It does not alter file access, so it is safe to accept during owner-boundary
+# admission alongside the other non-access-changing metadata flags here.
+_MAC_SAFE_FLAGS = frozenset({"sunlnk", "restricted", "hidden"})
 
 
 class AdmissionError(RuntimeError):

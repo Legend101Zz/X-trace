@@ -67,6 +67,19 @@ class PrivateRootAdmissionTests(unittest.TestCase):
             documents,
         )
 
+    def test_macos_acl_accepts_hidden_visibility_flag_without_weakening_acl_checks(self) -> None:
+        library = pathlib.Path("/Users/example/Library")
+        header = (
+            f"drwx------@ 129 example staff hidden 4128 Jul 19 16:34 {library}\n"
+            " 0: group:everyone deny delete\n"
+        )
+        private_roots._parse_macos_acl(header.encode(), library)
+
+        for flag in ("uchg", "dataless", "hidden,hidden"):
+            rejected = header.replace(" hidden ", f" {flag} ")
+            with self.subTest(flag=flag), self.assertRaises(private_roots.AdmissionError):
+                private_roots._parse_macos_acl(rejected.encode(), library)
+
     def test_macos_acl_rejects_allow_malformed_header_and_wrong_path(self) -> None:
         path = pathlib.Path("/Users/test/parent with spaces")
         good_header = f"drwx------+ 2 test staff - 64 Oct 4 00:23 {path}\n"
