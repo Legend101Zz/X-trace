@@ -750,7 +750,8 @@ class CiFloorEvidenceTests(unittest.TestCase):
             program = (
                 "import json,os,pathlib,subprocess,sys,time; pid=os.getpid(); "
                 "start=' '.join(subprocess.check_output(['/bin/ps','-o','lstart=','-p',str(pid)],text=True).split()); "
-                "pathlib.Path(sys.argv[1]).write_text(json.dumps([pid,os.getpgid(pid),start])); time.sleep(30)"
+                "identity=pathlib.Path(sys.argv[1]); temporary=identity.with_name(identity.name+'.tmp'); "
+                "temporary.write_text(json.dumps([pid,os.getpgid(pid),start])); os.replace(temporary,identity); time.sleep(30)"
             )
             old_path = os.environ.get("PATH", "/usr/bin:/bin")
             original_snapshot = ci_floor._utility_process_snapshot
