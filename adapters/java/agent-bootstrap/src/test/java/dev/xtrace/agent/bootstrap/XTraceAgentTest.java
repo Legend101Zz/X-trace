@@ -9,10 +9,21 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.jar.Attributes;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
+import java.util.jar.Manifest;
+import dev.xtrace.agent.runtime.AgentRuntime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class XTraceAgentTest {
+  @TempDir Path temporaryDirectory;
+
   @AfterEach
   void resetBridge() {
     BootstrapBridge.resetForTest();
@@ -24,6 +35,98 @@ class XTraceAgentTest {
     assertThrows(IllegalArgumentException.class, () -> XTraceAgent.parseBootstrapPath(null));
     assertThrows(IllegalArgumentException.class, () -> XTraceAgent.parseBootstrapPath("  "));
     assertThrows(IllegalArgumentException.class, () -> XTraceAgent.parseBootstrapPath("bad\0path"));
+  }
+
+  @Test
+  void permanentPremainFailurePreventsUnsafeAttachRetry() throws Exception {
+    assertPremainFailureBlocksRetry("permanent-bootstrap.json", true);
+  }
+
+  @Test
+  void postAppendBootstrapLoadFailurePreventsUnsafeAttachRetry() throws Exception {
+    assertPremainFailureBlocksRetry("post-append-bootstrap.json", false);
+  }
+
+  @Test
+  void identityMismatchFailurePreventsUnsafeAttachRetry() throws Exception {
+    assertPremainFailureBlocksRetry("identity-mismatch", true);
+  }
+
+  private void assertPremainFailureBlocksRetry(String bootstrapName, boolean includeBridge)
+      throws Exception {
+    Path distribution = Files.createDirectory(temporaryDirectory.resolve("distribution"));
+    Path runtime = Files.createDirectory(distribution.resolve("runtime"));
+    Path agent = distribution.resolve("xtrace-java-agent.jar");
+    Path runtimeJar = runtime.resolve("agent-runtime.jar");
+    Path bootstrap = temporaryDirectory.resolve(bootstrapName);
+    Path output = temporaryDirectory.resolve("child.out");
+    Files.writeString(bootstrap, "test bootstrap is consumed only by the fake runtime");
+    writeBootstrapAgentJar(agent, includeBridge);
+    writeFakeRuntimeJar(runtimeJar);
+
+    Path testClasses = Path.of(
+        PremainRetryFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+    String classPath = testClasses + java.io.File.pathSeparator + agent;
+    Process child = new ProcessBuilder(
+        Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+        "-cp",
+        classPath,
+        "-javaagent:" + agent + "=" + bootstrap,
+        PremainRetryFixture.class.getName())
+        .redirectErrorStream(true)
+        .redirectOutput(output.toFile())
+        .start();
+    try {
+      assertTrue(child.waitFor(10, TimeUnit.SECONDS), "premain failure fixture must be bounded");
+      assertEquals(0, child.exitValue(), "the child must reach its assertion after premain returns");
+      assertTrue(Files.readString(output).contains("PREMAIN_PARTIAL_ATTACH_BLOCKED"));
+      assertFalse(Files.readString(output).contains("UNEXPECTEDLY_ALLOWED"));
+    } finally {
+      if (child.isAlive()) {
+        child.destroyForcibly();
+        child.waitFor(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  private static void writeBootstrapAgentJar(Path target, boolean includeBridge) throws Exception {
+    Manifest manifest = new Manifest();
+    manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
+    manifest.getMainAttributes().putValue("Premain-Class", XTraceAgent.class.getName());
+    manifest.getMainAttributes().putValue("Agent-Class", XTraceAgent.class.getName());
+    Path classes = Path.of(XTraceAgent.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+    try (JarOutputStream jar = new JarOutputStream(Files.newOutputStream(target), manifest);
+        var paths = Files.walk(classes)) {
+      for (Path file : paths.filter(Files::isRegularFile).sorted().toList()) {
+        String name = classes.relativize(file).toString().replace(java.io.File.separatorChar, '/');
+        if (!name.startsWith("dev/xtrace/agent/bootstrap/")
+            || !name.endsWith(".class")
+            || (!includeBridge && name.startsWith(
+                "dev/xtrace/agent/bootstrap/BootstrapBridge"))) continue;
+        jar.putNextEntry(new JarEntry(name));
+        Files.copy(file, jar);
+        jar.closeEntry();
+      }
+    }
+  }
+
+  private static void writeFakeRuntimeJar(Path target) throws Exception {
+    try (JarOutputStream jar = new JarOutputStream(Files.newOutputStream(target))) {
+      addClass(jar, AgentRuntime.class, "dev/xtrace/agent/runtime/AgentRuntime.class");
+      addClass(
+          jar,
+          AgentRuntime.StartFailure.class,
+          "dev/xtrace/agent/runtime/AgentRuntime$StartFailure.class");
+    }
+  }
+
+  private static void addClass(JarOutputStream jar, Class<?> type, String entry) throws Exception {
+    try (var input = type.getResourceAsStream("/" + entry)) {
+      if (input == null) throw new AssertionError("the test runtime class is unavailable");
+      jar.putNextEntry(new JarEntry(entry));
+      input.transferTo(jar);
+      jar.closeEntry();
+    }
   }
 
   @Test

@@ -10,35 +10,74 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.instrument.Instrumentation;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Private launch-only runtime loaded outside the target application's classloader. */
+/** Private fixture runtime loaded outside the target application's classloader. */
 public final class AgentRuntime {
   private static final int MAX_MANIFEST_BYTES = 64 * 1024;
   private static final AtomicReference<RuntimeHandle> ACTIVE = new AtomicReference<>();
 
   private AgentRuntime() {}
 
-  /** Connects the writer, installs exact fixture transformations, and returns without blocking. */
-  public static void start(String bootstrapPath, Instrumentation instrumentation)
+  /** Validates the complete bootstrap and bounded attach capability before agent mutation. */
+  public static byte[] prepareBootstrap(
+      String bootstrapPath, Instrumentation instrumentation, boolean attach)
       throws ClientException {
-    if (ACTIVE.get() != null) {
-      throw new ClientException("XTR-JAVA-AGENT", "agent runtime is already active");
+    Bootstrap bootstrap = BootstrapReader.read(Path.of(bootstrapPath));
+    try {
+      if (attach) FixtureInstrumentation.validateAttach(instrumentation);
+      return identityDigest(bootstrap);
+    } finally {
+      bootstrap.close();
     }
-    byte[] manifest = resource("/agent-manifest.json");
+  }
+
+  /** Returns an authenticated-session identity for idempotent agentmain duplicate checks. */
+  public static byte[] bootstrapIdentity(String bootstrapPath) throws ClientException {
+    Bootstrap bootstrap = BootstrapReader.read(Path.of(bootstrapPath));
+    try {
+      return identityDigest(bootstrap);
+    } finally {
+      bootstrap.close();
+    }
+  }
+
+  /** Connects the writer and installs exact fixture transformations without blocking requests. */
+  public static byte[] start(
+      String bootstrapPath,
+      Instrumentation instrumentation,
+      boolean attach,
+      byte[] expectedIdentity)
+      throws StartFailure {
+    if (ACTIVE.get() != null) {
+      throw new StartFailure(true, "XTR-JAVA-AGENT", "agent runtime is already active");
+    }
+    byte[] manifest = null;
+    byte[] identity = null;
     Bootstrap bootstrap = null;
     XtpSession session = null;
     RecordingWriter writer = null;
     RuntimeBridgeSink sink = null;
+    boolean permanent = false;
     try {
+      if (attach) FixtureInstrumentation.validateAttach(instrumentation);
       bootstrap = BootstrapReader.read(Path.of(bootstrapPath));
+      identity = identityDigest(bootstrap);
+      if (!MessageDigest.isEqual(expectedIdentity, identity)) {
+        throw new ClientException(
+            "XTR-JAVA-ATTACH-BOOTSTRAP-CHANGED", "bootstrap identity changed after preflight");
+      }
+      manifest = resource("/agent-manifest.json");
       session =
           XtpSession.open(
               bootstrap,
               manifest,
               new XtpSession.ClientIdentity(
-                  "xtrace-java-premain-fixture",
+                  attach ? "xtrace-java-attach-fixture" : "xtrace-java-premain-fixture",
                   "0.1.0",
                   "java",
                   "openjdk",
@@ -50,7 +89,8 @@ public final class AgentRuntime {
       BoundedEventQueue queue = new BoundedEventQueue(1024, 256 * 1024L);
       sink = new RuntimeBridgeSink(queue);
       writer = new RecordingWriter(session, queue, sink);
-      FixtureInstrumentation.install(instrumentation, writer::stopIncomplete);
+      permanent = true;
+      FixtureInstrumentation.install(instrumentation, writer::stopIncomplete, attach);
       if (writer.isStopping()) {
         throw new ClientException("XTR-JAVA-INSTRUMENTATION", "fixture instrumentation failed");
       }
@@ -64,15 +104,80 @@ public final class AgentRuntime {
       }
       writer.start();
       Runtime.getRuntime().addShutdownHook(new Thread(handle::close, "xtrace-java-shutdown"));
+      byte[] result = identity.clone();
       session = null;
       writer = null;
       sink = null;
+      return result;
+    } catch (ClientException error) {
+      throw new StartFailure(permanent, error.code(), error.getMessage(), error);
+    } catch (RuntimeException | LinkageError error) {
+      throw new StartFailure(
+          permanent, "XTR-JAVA-AGENT", "agent initialization failed safely", error);
     } finally {
-      Arrays.fill(manifest, (byte) 0);
+      if (manifest != null) Arrays.fill(manifest, (byte) 0);
+      if (identity != null) Arrays.fill(identity, (byte) 0);
       if (sink != null) BootstrapBridge.disable(sink);
       if (writer != null) writer.close();
       else if (session != null) closeSession(session);
       if (bootstrap != null) bootstrap.close();
+    }
+  }
+
+  private static byte[] identityDigest(Bootstrap bootstrap) throws ClientException {
+    final MessageDigest digest;
+    try {
+      digest = MessageDigest.getInstance("SHA-256");
+    } catch (NoSuchAlgorithmException error) {
+      throw new ClientException("XTR-JAVA-AGENT", "session identity hashing is unavailable", error);
+    }
+    updateDigest(digest, bootstrap.host());
+    updateDigest(digest, Integer.toString(bootstrap.port()));
+    updateDigest(digest, bootstrap.certificatePin());
+    updateDigest(digest, bootstrap.runtimeSessionId().toString());
+    updateDigest(digest, bootstrap.projectId().toString());
+    updateDigest(digest, bootstrap.repositoryFingerprint());
+    updateDigest(digest, Integer.toString(bootstrap.protocolMajor()));
+    updateDigest(digest, Integer.toString(bootstrap.protocolMinor()));
+    byte[] secret = bootstrap.copySessionSecret();
+    try {
+      digest.update(secret);
+      return digest.digest();
+    } finally {
+      Arrays.fill(secret, (byte) 0);
+    }
+  }
+
+  private static void updateDigest(MessageDigest digest, String value) {
+    byte[] encoded = value.getBytes(StandardCharsets.UTF_8);
+    digest.update(encoded);
+    digest.update((byte) 0);
+    Arrays.fill(encoded, (byte) 0);
+  }
+
+  /** Safe failure metadata used to distinguish retryable setup from partial instrumentation. */
+  public static final class StartFailure extends Exception {
+    private final boolean permanent;
+    private final String code;
+
+    private StartFailure(boolean permanent, String code, String message) {
+      super(message);
+      this.permanent = permanent;
+      this.code = code;
+    }
+
+    private StartFailure(boolean permanent, String code, String message, Throwable cause) {
+      super(message, cause);
+      this.permanent = permanent;
+      this.code = code;
+    }
+
+    public boolean permanent() {
+      return permanent;
+    }
+
+    public String code() {
+      return code;
     }
   }
 
