@@ -6,6 +6,7 @@ import os
 import signal
 import time
 import pathlib
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -18,6 +19,46 @@ class CiFloorEvidenceTests(unittest.TestCase):
     source_sha = "a" * 40
     phase_base = "b" * 40
     digest = "c" * 64
+
+    def test_version_probe_uses_first_nonempty_line_after_bounded_whitespace(self) -> None:
+        raw = b'\n  \r\nopenjdk version "17.0.1"\nignored later output\n'
+        self.assertEqual(run_gates._first_nonempty_version_line(raw), 'openjdk version "17.0.1"')
+
+    def test_source_proofs_hash_exact_clean_git_bytes_and_lockfiles(self) -> None:
+        phase_diff = b"reviewed-phase-diff\x00"
+        outputs = {
+            ("rev-parse", "--verify", "HEAD"): (self.source_sha + "\n").encode(),
+            ("rev-parse", "--verify", f"{self.phase_base}^{{commit}}"): (self.phase_base + "\n").encode(),
+            ("merge-base", "--is-ancestor", self.phase_base, "HEAD"): b"",
+            ("status", "--porcelain=v1", "-z", "--untracked-files=all"): b"",
+            ("diff", "--binary", "HEAD"): b"",
+            ("diff", "--cached", "--binary", "HEAD"): b"",
+            ("diff", "--binary", f"{self.phase_base}...HEAD"): phase_diff,
+        }
+        with mock.patch.object(ci_floor, "_bounded_git_output",
+                               side_effect=lambda _repo, *argv: outputs[tuple(argv)]), \
+                mock.patch.object(ci_floor, "_bounded_source_file_sha256", return_value=self.digest) as lock_hash:
+            proof = ci_floor._source_proofs(pathlib.Path("/synthetic/repo"), self.source_sha, self.phase_base)
+        self.assertEqual(proof["head"], self.source_sha)
+        self.assertEqual(proof["phaseBase"], self.phase_base)
+        self.assertEqual(proof["workingTreeDigest"], ci_floor.hashlib.sha256(b"\0\0").hexdigest())
+        self.assertEqual(proof["phaseDiffSha256"], ci_floor.hashlib.sha256(phase_diff).hexdigest())
+        self.assertEqual(len(proof["dependencyLockSha256"]), 4)
+        self.assertEqual(lock_hash.call_count, 4)
+
+    def _source_proofs(self) -> dict[str, object]:
+        return {
+            "head": self.source_sha,
+            "phaseBase": self.phase_base,
+            "workingTreeDigest": self.digest,
+            "phaseDiffSha256": self.digest,
+            "dependencyLockSha256": {
+                name: self.digest for name in (
+                    "Cargo.lock", "adapters/java/gradle.lockfile",
+                    "adapters/node/package-lock.json", "web/app/package-lock.json",
+                )
+            },
+        }
 
     def test_supported_matrix_is_only_the_two_reviewed_pairs(self) -> None:
         for java, node, label in ((17, 22, "jdk17-node22"), (21, 24, "jdk21-node24")):
@@ -202,6 +243,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
         with mock.patch.object(ci_floor.private_roots, "admit_directory"), \
                 mock.patch.object(ci_floor.private_roots, "read_private_json", side_effect=read), \
                 mock.patch.object(ci_floor, "_source_is_clean", return_value=True), \
+                mock.patch.object(ci_floor, "_source_proofs", return_value=self._source_proofs()), \
                 mock.patch.object(ci_floor, "_discover_release_test_ids", return_value=tests["discoveredTestIds"]), \
                 mock.patch.object(ci_floor, "_private_file_sha256", return_value=self.digest), \
                 mock.patch.object(ci_floor, "_private_log_digest_and_first_line", side_effect=version_log), \
@@ -225,6 +267,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
         with mock.patch.object(ci_floor.private_roots, "admit_directory"), \
                 mock.patch.object(ci_floor.private_roots, "read_private_json", side_effect=read), \
                 mock.patch.object(ci_floor, "_source_is_clean", return_value=True), \
+                mock.patch.object(ci_floor, "_source_proofs", return_value=self._source_proofs()), \
                 mock.patch.object(ci_floor, "_discover_release_test_ids", return_value=tests["discoveredTestIds"]), \
                 mock.patch.object(ci_floor, "_private_file_sha256", return_value=self.digest), \
                 mock.patch.object(ci_floor.private_roots, "atomic_write_private", side_effect=lambda _path, data: output.append(data)):
@@ -268,6 +311,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
         with mock.patch.object(ci_floor.private_roots, "admit_directory"), \
                 mock.patch.object(ci_floor.private_roots, "read_private_json", side_effect=read), \
                 mock.patch.object(ci_floor, "_source_is_clean", return_value=True), \
+                mock.patch.object(ci_floor, "_source_proofs", return_value=self._source_proofs()), \
                 mock.patch.object(ci_floor, "_discover_release_test_ids", return_value=tests["discoveredTestIds"]), \
                 mock.patch.object(ci_floor, "_private_file_sha256", return_value=self.digest), \
                 mock.patch.object(ci_floor.private_roots, "atomic_write_private", side_effect=lambda _path, data: output.append(data)):
@@ -276,6 +320,46 @@ class CiFloorEvidenceTests(unittest.TestCase):
         self.assertNotEqual(public["floorStatus"], "checks_passed_for_review")
         self.assertEqual(public["floorStatus"], "invalid")
         self.assertEqual(public["gateCount"], 0)
+
+    def test_sanitizer_recomputes_source_proofs_instead_of_trusting_consistent_labels(self) -> None:
+        label = "floor-123456-1-jdk17-node22"
+        names = sorted([
+            "tools.release.test_ci_floor.Public.test_ok",
+            "tools.release.test_release_tools.Public.test_ok",
+        ])
+        tests = {
+            "schemaVersion": 1, "sourceSha": self.source_sha, "sourceIdentityVerified": True,
+            "testScratchAdmissionVerified": True, "suiteModules": list(ci_floor.RELEASE_TEST_MODULES),
+            "status": "passed", "discoveredCount": 2, "testCount": 2,
+            "failedCount": 0, "skippedCount": 0, "discoveredTestIds": names,
+            "tests": [{"name": name, "status": "passed"} for name in names],
+        }
+        receipt = self._passing_receipt(label)
+        forged = "d" * 64
+        for field in ("workingTreeDigestBefore", "workingTreeDigestAfter",
+                      "phaseDiffSha256Before", "phaseDiffSha256After"):
+            receipt[field] = forged
+        for row in receipt["gates"]:
+            for field in ("workingTreeDigestBefore", "workingTreeDigestAfter",
+                          "phaseDiffSha256Before", "phaseDiffSha256After"):
+                row[field] = forged
+        receipt["dependencyLockSha256"] = {name: forged for name in receipt["dependencyLockSha256"]}
+        output: list[bytes] = []
+        def read(path: pathlib.Path, **_kwargs: object):
+            return tests if path.name == "release-tool-tests-summary.json" else receipt
+        args = Namespace(root="/synthetic/private-root", repo="/public/repo", label=label,
+                         expected_head=self.source_sha, phase_base=self.phase_base, tuple="jdk17-node22")
+        with mock.patch.object(ci_floor.private_roots, "admit_directory"), \
+                mock.patch.object(ci_floor.private_roots, "read_private_json", side_effect=read), \
+                mock.patch.object(ci_floor, "_source_is_clean", return_value=True), \
+                mock.patch.object(ci_floor, "_source_proofs", return_value=self._source_proofs()), \
+                mock.patch.object(ci_floor, "_discover_release_test_ids", return_value=names), \
+                mock.patch.object(ci_floor, "_private_file_sha256", return_value=self.digest), \
+                mock.patch.object(ci_floor, "_private_log_digest_and_first_line",
+                                  side_effect=lambda path: (self.digest, receipt["toolVersions"][path.name.removeprefix("version-").removesuffix(".log")])), \
+                mock.patch.object(ci_floor.private_roots, "atomic_write_private", side_effect=lambda _path, data: output.append(data)):
+            self.assertEqual(ci_floor._sanitize_floor(args), 1)
+        self.assertEqual(json.loads(output[0])["floorStatus"], "invalid")
 
     def test_sanitizer_requires_exact_freshly_discovered_two_module_suite(self) -> None:
         label = "floor-123456-1-jdk17-node22"
@@ -310,6 +394,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
             with self.subTest(case=case), mock.patch.object(ci_floor.private_roots, "admit_directory"), \
                     mock.patch.object(ci_floor.private_roots, "read_private_json", side_effect=read), \
                     mock.patch.object(ci_floor, "_source_is_clean", return_value=True), \
+                    mock.patch.object(ci_floor, "_source_proofs", return_value=self._source_proofs()), \
                     mock.patch.object(ci_floor, "_discover_release_test_ids", return_value=expected), \
                     mock.patch.object(ci_floor.private_roots, "atomic_write_private", side_effect=lambda _path, data: output.append(data)):
                 self.assertEqual(ci_floor._sanitize_floor(args), 1)
@@ -349,6 +434,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
             with self.subTest(case=case), mock.patch.object(ci_floor.private_roots, "admit_directory"), \
                     mock.patch.object(ci_floor.private_roots, "read_private_json", side_effect=read), \
                     mock.patch.object(ci_floor, "_source_is_clean", return_value=True), \
+                    mock.patch.object(ci_floor, "_source_proofs", return_value=self._source_proofs()), \
                     mock.patch.object(ci_floor, "_discover_release_test_ids", return_value=expected), \
                     mock.patch.object(ci_floor, "_private_file_sha256", return_value=self.digest), \
                     mock.patch.object(ci_floor, "_private_log_digest_and_first_line", side_effect=lambda _path: (self.digest, 'openjdk version "21.0.1"' if "jdk21" in label else 'openjdk version "17.0.1"')) , \
@@ -368,6 +454,7 @@ class CiFloorEvidenceTests(unittest.TestCase):
             with self.subTest(case=case), mock.patch.object(ci_floor.private_roots, "admit_directory"), \
                     mock.patch.object(ci_floor.private_roots, "read_private_json", side_effect=read_probe_case), \
                     mock.patch.object(ci_floor, "_source_is_clean", return_value=True), \
+                    mock.patch.object(ci_floor, "_source_proofs", return_value=self._source_proofs()), \
                     mock.patch.object(ci_floor, "_discover_release_test_ids", return_value=expected), \
                     mock.patch.object(ci_floor, "_private_file_sha256", return_value=self.digest), \
                     mock.patch.object(ci_floor, "_private_log_digest_and_first_line", side_effect=lambda _path: (self.digest, 'openjdk version "21.0.1"' if "jdk21" in label else 'openjdk version "17.0.1"')) , \
@@ -401,7 +488,54 @@ class CiFloorEvidenceTests(unittest.TestCase):
                     parent_pid, child_pid = json.loads(pid_file.read_text(encoding="utf-8"))
                     snapshot = ci_floor._utility_process_snapshot()
                     child = snapshot.get(child_pid)
-                    self.assertFalse(child is not None and child[1] == parent_pid and child[3] not in {"Z", "X"})
+                    self.assertFalse(child is not None and child[1] == parent_pid and child[2] != "" and child[3] not in {"Z", "X"})
+            finally:
+                if pid_file.exists():
+                    parent_pid, child_pid = json.loads(pid_file.read_text(encoding="utf-8"))
+                    snapshot = ci_floor._utility_process_snapshot()
+                    child = snapshot.get(child_pid)
+                    if child is not None and child[1] == parent_pid and child[3] not in {"Z", "X"}:
+                        ci_floor._signal_utility_group_members(
+                            parent_pid, {child_pid: child[2]}, signal.SIGKILL,
+                            deadline=time.monotonic() + 1.0,
+                        )
+
+    def test_utility_supervisor_kills_term_ignoring_pipe_holder_within_cleanup_budget(self) -> None:
+        with tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
+            root = pathlib.Path(temporary)
+            pid_file = root / "owned-child.json"
+            ready_file = root / "child-ready"
+            term_file = root / "term-observed"
+            child_code = (
+                "import pathlib,signal,sys,time; "
+                "signal.signal(signal.SIGTERM,lambda *_: pathlib.Path(sys.argv[2]).write_text('term')); "
+                "pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(30)"
+            )
+            parent_code = (
+                "import json,os,pathlib,subprocess,sys,time\n"
+                "child=subprocess.Popen([sys.executable,'-c',sys.argv[3],sys.argv[2],sys.argv[4]])\n"
+                "ready=pathlib.Path(sys.argv[2]); deadline=time.monotonic()+3\n"
+                "while not ready.exists() and time.monotonic()<deadline:\n"
+                " time.sleep(.01)\n"
+                "open(sys.argv[1],'w').write(json.dumps([os.getpid(),child.pid]))\n"
+                "time.sleep(.2)\n"
+            )
+            started = time.monotonic()
+            try:
+                with self.assertRaises(ci_floor.FloorInputError):
+                    ci_floor._run(
+                        [sys.executable, "-c", parent_code, str(pid_file), str(ready_file), child_code, str(term_file)],
+                        timeout=0.6,
+                    )
+                self.assertLess(time.monotonic() - started, 5.0)
+                self.assertTrue(term_file.is_file(), "TERM was delivered before the forced KILL")
+                parent_pid, child_pid = json.loads(pid_file.read_text(encoding="utf-8"))
+                snapshot = ci_floor._utility_process_snapshot()
+                child = snapshot.get(child_pid)
+                self.assertFalse(
+                    child is not None and child[1] == parent_pid and child[3] not in {"Z", "X"},
+                    "TERM-ignoring owned child remains live in utility process group",
+                )
             finally:
                 if pid_file.exists():
                     parent_pid, child_pid = json.loads(pid_file.read_text(encoding="utf-8"))

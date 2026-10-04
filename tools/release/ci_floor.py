@@ -14,6 +14,7 @@ import re
 import selectors
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,8 +28,17 @@ from tools.release import private_roots, run_gates
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_METADATA_BYTES = 64 * 1024
 UTILITY_OUTPUT_LIMIT = 1024 * 1024
-UTILITY_CLEANUP_SECONDS = 1.0
+UTILITY_CLEANUP_SECONDS = 3.0
+UTILITY_TERM_GRACE_SECONDS = 0.75
+UTILITY_FINAL_SCAN_RESERVE_SECONDS = 0.35
 CI_RECEIPT_JSON_BUDGET = 4096
+SOURCE_COMMAND_OUTPUT_LIMIT = 64 * 1024 * 1024
+SOURCE_COMMAND_TIMEOUT_SECONDS = 30.0
+SOURCE_LOCK_BYTES_LIMIT = 64 * 1024 * 1024
+SOURCE_LOCK_READ_SECONDS = 10.0
+PRIVATE_GATE_LOG_BYTES_LIMIT = 16 * 1024 * 1024
+PRIVATE_GATE_LOG_READ_SECONDS = 15.0
+PRIVATE_VERSION_LOG_BYTES_LIMIT = 1024 * 1024
 RELEASE_TEST_MODULES = (
     "tools.release.test_release_tools",
     "tools.release.test_ci_floor",
@@ -203,6 +213,8 @@ def _signal_utility_group_members(
             current = snapshot.get(pid)
             if current is None or current[1] != group_id or current[2] != started_at or current[3] in {"Z", "X"}:
                 continue
+            if deadline - time.monotonic() <= 0:
+                return False
             try:
                 os.kill(pid, signum)
             except ProcessLookupError:
@@ -290,13 +302,21 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
     except BaseException as exc:
         pending = exc
     finally:
+        cleanup_started = time.monotonic()
+        cleanup_deadline = cleanup_started + UTILITY_CLEANUP_SECONDS
         cleanup_ok = True
         try:
             if process is not None:
                 if group_id is None or not root_identity_observed:
                     try:
-                        cleanup_deadline = time.monotonic() + UTILITY_CLEANUP_SECONDS
-                        snapshot = _utility_process_snapshot(timeout=min(2.0, UTILITY_CLEANUP_SECONDS))
+                        discovery_budget = min(
+                            0.5,
+                            cleanup_deadline - time.monotonic()
+                            - UTILITY_TERM_GRACE_SECONDS - UTILITY_FINAL_SCAN_RESERVE_SECONDS,
+                        )
+                        if discovery_budget <= 0:
+                            raise FloorInputError
+                        snapshot = _utility_process_snapshot(timeout=discovery_budget)
                         for pid, (_parent, pgid, started_at, _state) in snapshot.items():
                             prior = baseline.get(pid)
                             if pgid == group_id and (prior is None or prior[2] != started_at):
@@ -308,14 +328,19 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
                     except (FloorInputError, OSError):
                         cleanup_ok = False
                 if group_id is not None and group_identities:
-                    cleanup_deadline = time.monotonic() + UTILITY_CLEANUP_SECONDS
-                    cleanup_ok = _signal_utility_group_members(
-                        group_id, group_identities, signal.SIGTERM, deadline=cleanup_deadline,
-                    ) and cleanup_ok
-                    while cleanup_ok and time.monotonic() < cleanup_deadline:
+                    term_deadline = min(
+                        cleanup_deadline - UTILITY_FINAL_SCAN_RESERVE_SECONDS,
+                        time.monotonic() + UTILITY_TERM_GRACE_SECONDS,
+                    )
+                    term_signal_ok = _signal_utility_group_members(
+                        group_id, group_identities, signal.SIGTERM, deadline=term_deadline,
+                    )
+                    cleanup_ok = term_signal_ok and cleanup_ok
+                    live: list[int] = list(group_identities)
+                    while time.monotonic() < term_deadline:
                         try:
-                            remaining = cleanup_deadline - time.monotonic()
-                            snapshot = _utility_process_snapshot(timeout=min(2.0, remaining))
+                            remaining = term_deadline - time.monotonic()
+                            snapshot = _utility_process_snapshot(timeout=min(0.1, remaining))
                         except (FloorInputError, OSError):
                             cleanup_ok = False
                             break
@@ -324,14 +349,15 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
                                 and snapshot[pid][2] == started_at and snapshot[pid][3] not in {"Z", "X"}]
                         if not live:
                             break
-                        time.sleep(0.025)
-                    else:
-                        live = list(group_identities)
-                    if cleanup_ok and live:
-                        cleanup_ok = _signal_utility_group_members(
-                            group_id, group_identities, signal.SIGKILL, deadline=cleanup_deadline,
+                        time.sleep(min(0.025, max(0.0, term_deadline - time.monotonic())))
+                    kill_deadline = cleanup_deadline - UTILITY_FINAL_SCAN_RESERVE_SECONDS
+                    if live and time.monotonic() < kill_deadline:
+                        kill_ok = _signal_utility_group_members(
+                            group_id, group_identities, signal.SIGKILL, deadline=kill_deadline,
                         )
-                    remaining = cleanup_deadline - time.monotonic()
+                        cleanup_ok = kill_ok and cleanup_ok
+                    wait_deadline = cleanup_deadline - UTILITY_FINAL_SCAN_RESERVE_SECONDS
+                    remaining = wait_deadline - time.monotonic()
                     if remaining <= 0:
                         cleanup_ok = False
                     else:
@@ -359,7 +385,11 @@ def _run(argv: list[str], *, cwd: pathlib.Path | None = None, timeout: float = 2
                     try:
                         if process.poll() is None:
                             process.kill()
-                        process.wait(timeout=UTILITY_CLEANUP_SECONDS)
+                        remaining = cleanup_deadline - time.monotonic()
+                        if remaining <= 0:
+                            cleanup_ok = False
+                        else:
+                            process.wait(timeout=remaining)
                     except (OSError, subprocess.SubprocessError):
                         cleanup_ok = False
                     cleanup_ok = False
@@ -633,6 +663,142 @@ def _source_is_clean(repo: pathlib.Path, expected_head: str) -> bool:
             and status.returncode == 0 and not status.stdout)
 
 
+def _bounded_git_output(repo: pathlib.Path, *arguments: str) -> bytes:
+    """Capture finite Git output without decoding bytes used by source hashes."""
+    argv = ["git", *arguments]
+    deadline = time.monotonic() + SOURCE_COMMAND_TIMEOUT_SECONDS
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    captured = bytearray()
+    drained_bytes = 0
+    pending: BaseException | None = None
+    code: int | None = None
+    try:
+        process = subprocess.Popen(
+            argv, cwd=repo, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, close_fds=True, start_new_session=True,
+        )
+        for stream in (process.stdout, process.stderr):
+            if stream is None:
+                raise FloorInputError
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise FloorInputError
+            for key, _events in selector.select(remaining):
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                drained_bytes += len(chunk)
+                if drained_bytes > SOURCE_COMMAND_OUTPUT_LIMIT:
+                    raise FloorInputError
+                # stderr is bounded but intentionally not included in returned identity bytes.
+                if key.fileobj is process.stdout:
+                    captured.extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FloorInputError
+        code = process.wait(timeout=remaining)
+    except BaseException as exc:
+        pending = exc
+    finally:
+        cleanup_ok = True
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=1.0)
+            except (OSError, subprocess.SubprocessError):
+                cleanup_ok = False
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        cleanup_ok = False
+        try:
+            selector.close()
+        except OSError:
+            cleanup_ok = False
+        if not cleanup_ok:
+            raise FloorInputError from None
+    if pending is not None:
+        if isinstance(pending, KeyboardInterrupt):
+            raise pending
+        if isinstance(pending, FloorInputError):
+            raise pending
+        raise FloorInputError from None
+    if code != 0:
+        raise FloorInputError
+    return bytes(captured)
+
+
+def _bounded_source_file_sha256(path: pathlib.Path) -> str:
+    """Hash a regular source lockfile with finite bytes and identity checks."""
+    if path.is_symlink():
+        raise FloorInputError
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > SOURCE_LOCK_BYTES_LIMIT:
+            raise FloorInputError
+        deadline = time.monotonic() + SOURCE_LOCK_READ_SECONDS
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            if time.monotonic() >= deadline:
+                raise FloorInputError
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > SOURCE_LOCK_BYTES_LIMIT:
+                raise FloorInputError
+            digest.update(chunk)
+        after = os.fstat(fd)
+        named = path.stat(follow_symlinks=False)
+        identity_before = (before.st_dev, before.st_ino, before.st_uid, before.st_mode, before.st_size, before.st_mtime_ns)
+        identity_after = (after.st_dev, after.st_ino, after.st_uid, after.st_mode, after.st_size, after.st_mtime_ns)
+        identity_named = (named.st_dev, named.st_ino, named.st_uid, named.st_mode, named.st_size, named.st_mtime_ns)
+        if identity_before != identity_after or identity_after != identity_named:
+            raise FloorInputError
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def _source_proofs(repo: pathlib.Path, expected_head: str, phase_base: str) -> dict[str, Any]:
+    """Recompute exact clean-source proofs from bounded Git and lockfile reads."""
+    head = _bounded_git_output(repo, "rev-parse", "--verify", "HEAD").decode("ascii", "strict").strip()
+    base = _bounded_git_output(repo, "rev-parse", "--verify", f"{phase_base}^{{commit}}").decode("ascii", "strict").strip()
+    ancestry = _bounded_git_output(repo, "merge-base", "--is-ancestor", phase_base, "HEAD")
+    status = _bounded_git_output(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    working = _bounded_git_output(repo, "diff", "--binary", "HEAD")
+    cached = _bounded_git_output(repo, "diff", "--cached", "--binary", "HEAD")
+    if head != expected_head or base != phase_base or ancestry or status or working or cached:
+        raise FloorInputError
+    phase_diff = _bounded_git_output(repo, "diff", "--binary", f"{phase_base}...HEAD")
+    lock_names = (
+        "Cargo.lock", "adapters/java/gradle.lockfile",
+        "adapters/node/package-lock.json", "web/app/package-lock.json",
+    )
+    locks = {name: _bounded_source_file_sha256(repo / name) for name in lock_names}
+    return {
+        "head": head,
+        "phaseBase": base,
+        "workingTreeDigest": hashlib.sha256(b"\0\0").hexdigest(),
+        "phaseDiffSha256": hashlib.sha256(phase_diff).hexdigest(),
+        "dependencyLockSha256": locks,
+    }
+
+
 def _suite_ids(suite: unittest.TestSuite) -> list[str]:
     identities: list[str] = []
     for item in suite:
@@ -670,11 +836,18 @@ def _private_file_sha256(path: pathlib.Path) -> str:
         except OSError:
             pass
         raise
+    deadline = time.monotonic() + PRIVATE_GATE_LOG_READ_SECONDS
+    total = 0
     with stream:
         while True:
+            if time.monotonic() >= deadline:
+                raise FloorInputError
             chunk = stream.read(65536)
             if not chunk:
                 break
+            total += len(chunk)
+            if total > PRIVATE_GATE_LOG_BYTES_LIMIT:
+                raise FloorInputError
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -690,22 +863,24 @@ def _private_log_digest_and_first_line(path: pathlib.Path) -> tuple[str, str]:
         except OSError:
             pass
         raise
-    first_line: bytes | None = None
+    raw = bytearray()
     total = 0
+    deadline = time.monotonic() + PRIVATE_VERSION_LOG_READ_SECONDS
     with stream:
         while True:
+            if time.monotonic() >= deadline:
+                raise FloorInputError
             chunk = stream.read(65536)
             if not chunk:
                 break
             total += len(chunk)
-            if total > UTILITY_OUTPUT_LIMIT:
+            if total > PRIVATE_VERSION_LOG_BYTES_LIMIT:
                 raise FloorInputError
             digest.update(chunk)
-            if first_line is None:
-                first_line = chunk.splitlines()[0] if chunk.splitlines() else None
-    if first_line is None:
+            raw.extend(chunk)
+    if not raw:
         raise FloorInputError
-    return digest.hexdigest(), first_line.decode("utf-8", errors="replace")[:240]
+    return digest.hexdigest(), run_gates._first_nonempty_version_line(bytes(raw))
 
 
 def _valid_sha(value: Any) -> bool:
@@ -773,8 +948,11 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
         repo = pathlib.Path(args.repo)
         if not _source_is_clean(repo, args.expected_head):
             raise FloorInputError
+        source_proofs = _source_proofs(repo, args.expected_head, args.phase_base)
         discovered_now = _discover_release_test_ids()
         if not _source_is_clean(repo, args.expected_head):
+            raise FloorInputError
+        if _source_proofs(repo, args.expected_head, args.phase_base) != source_proofs:
             raise FloorInputError
         test_rows = test_result.get("tests")
         discovered_names = test_result.get("discoveredTestIds")
@@ -869,9 +1047,9 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
             row_diff_before = item.get("phaseDiffSha256Before")
             row_diff_after = item.get("phaseDiffSha256After")
             if (not _valid_sha256(row_tree_before) or row_tree_after != row_tree_before
-                    or row_tree_before != receipt.get("workingTreeDigestBefore")
+                    or row_tree_before != source_proofs["workingTreeDigest"]
                     or not _valid_sha256(row_diff_before) or row_diff_after != row_diff_before
-                    or row_diff_before != receipt.get("phaseDiffSha256Before")):
+                    or row_diff_before != source_proofs["phaseDiffSha256"]):
                 raise FloorInputError
             settle = item.get("naturalExitSettle")
             if settle is not None and not _successful_settle_report(settle):
@@ -941,16 +1119,16 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
             and receipt.get("restrictedTargetKey") == f"cargo-target-restricted-{args.label}"
             and isinstance(lock_hashes, dict)
             and set(lock_hashes) == {"Cargo.lock", "adapters/java/gradle.lockfile", "adapters/node/package-lock.json", "web/app/package-lock.json"}
-            and all(_valid_sha256(value) for value in lock_hashes.values())
+            and lock_hashes == source_proofs["dependencyLockSha256"]
             and not any(field in receipt for field in ("integrityFailure", "error", "leaseRetention"))
             and _valid_sha(head) and head == args.expected_head
             and head_after == head
             and _valid_sha(base) and base == args.phase_base
             and _valid_sha256(diff_before)
             and _valid_sha256(diff_after)
-            and diff_after == diff_before
+            and diff_after == diff_before == source_proofs["phaseDiffSha256"]
             and _valid_sha256(tree_before)
-            and tree_after == tree_before
+            and tree_after == tree_before == source_proofs["workingTreeDigest"]
             and isinstance(tool_versions, dict)
             and set(tool_versions) == required_versions
             and all(isinstance(tool_versions[name], str) and tool_versions[name]
@@ -979,6 +1157,8 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
             "gates": gate_rows,
             "toolVersionNamesRecordedPrivately": True,
         })
+        if _source_proofs(repo, args.expected_head, args.phase_base) != source_proofs:
+            raise FloorInputError
     except (FloorInputError, OSError, RuntimeError, ValueError, TypeError):
         summary["floorStatus"] = "invalid" if receipt_path.exists() else "unreached"
         summary["gates"] = []
