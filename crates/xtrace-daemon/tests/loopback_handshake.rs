@@ -558,7 +558,7 @@ fn secure_tempdir(prefix: &str) -> TempDir {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loopback_happy_path_handshake_and_post_hello_traffic() {
-    let temp = TempDir::new().expect("temp dir");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -668,8 +668,8 @@ async fn pinned_client_rejects_wrong_certificate_at_tls_verification() {
     // The wrong-pin path connects to a live daemon using a
     // different pin. The test proves the failure happens at TLS
     // verification, not at TCP connect.
-    let temp_a = TempDir::new().expect("temp a");
-    let temp_b = TempDir::new().expect("temp b");
+    let temp_a = secure_tempdir("xtrace-loopback-");
+    let temp_b = secure_tempdir("xtrace-loopback-");
     let bootstrap_a = temp_a.path().join("bootstrap-a.json");
     let bootstrap_b = temp_b.path().join("bootstrap-b.json");
 
@@ -736,7 +736,7 @@ async fn pinned_client_rejects_wrong_certificate_at_tls_verification() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_transcript_proof_is_rejected_with_documented_code() {
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -829,7 +829,7 @@ async fn oversized_frame_is_rejected_with_frame_too_large() {
     // occasionally closes the listener before the daemon can
     // respond. Keeping the writer open and dropping it after the
     // bounded read removes the race without any timing primitive.
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -870,7 +870,7 @@ async fn oversized_frame_is_rejected_with_frame_too_large() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incompatible_protocol_version_is_rejected_with_documented_code() {
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -930,7 +930,7 @@ async fn incompatible_protocol_version_is_rejected_with_documented_code() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_runtime_session_id_is_rejected_with_session_identity_code() {
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -989,7 +989,7 @@ async fn wrong_runtime_session_id_is_rejected_with_session_identity_code() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_repository_binding_is_rejected_with_project_identity_code() {
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -1047,7 +1047,7 @@ async fn wrong_repository_binding_is_rejected_with_project_identity_code() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gap_is_rejected_with_session_sequence_code() {
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -1113,7 +1113,7 @@ async fn gap_is_rejected_with_session_sequence_code() {
 async fn replay_is_rejected_with_session_sequence_code() {
     // Authenticate and exchange seq 1. Resend seq 1 and observe
     // the documented `XTR-DAEMON-SESSION-SEQUENCE` rejection.
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -1195,7 +1195,7 @@ async fn capacity_one_outbound_still_delivers_every_ack_without_deadlock() {
     // because the reader task owned both halves of the TLS stream;
     // the dedicated writer task drains the channel one frame at a
     // time, so the reader always makes progress.
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -1273,7 +1273,7 @@ async fn capacity_one_outbound_still_delivers_every_ack_without_deadlock() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_with_live_authenticated_client() {
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -1327,7 +1327,7 @@ async fn shutdown_with_live_authenticated_client() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_artifact_round_trips_pin_and_session_secret() {
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -1418,7 +1418,7 @@ async fn session_rejects_adapter_role_when_building_daemon_hello() {
 /// survival, and post-successful-DaemonHello deletion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_artifact_is_deleted_only_after_successful_daemon_hello() {
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -1578,7 +1578,7 @@ async fn verify_transcript_proof_round_trip_with_real_layout() {
 /// policy without polling loops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_disconnect_during_daemon_hello_does_not_take_down_listener() {
-    let temp = TempDir::new().expect("temp");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -1679,7 +1679,7 @@ async fn peer_disconnect_during_daemon_hello_does_not_take_down_listener() {
 // any ACK never arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loopback_recording_wire_admission_acks_through_session_seq_three() {
-    let temp = TempDir::new().expect("temp dir");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();
@@ -1796,7 +1796,7 @@ async fn loopback_recording_wire_admission_acks_through_session_seq_three() {
 // canonical watermark values.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loopback_recording_recoverable_rejection_then_valid_journey() {
-    let temp = TempDir::new().expect("temp dir");
+    let temp = secure_tempdir("xtrace-loopback-");
     let bootstrap_path = temp.path().join("bootstrap.json");
     let project_id = ProjectId::new();
     let session_id = RuntimeSessionId::new();

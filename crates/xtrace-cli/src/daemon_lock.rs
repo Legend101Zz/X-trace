@@ -242,8 +242,18 @@ mod tests {
         let id = RuntimeSessionId::new();
         let admitted = AdmittedPrivateRoot::open(root.path()).expect("admitted root");
         let mut runtime = RuntimeDirectory::create(&admitted, id).expect("runtime dir");
-        fs::write(runtime.path().join(BOOTSTRAP_FILENAME), b"secret fixture")
-            .expect("bootstrap fixture");
+        {
+            // Owner-only whatever the process umask is; cleanup admits it as a private file.
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut fixture = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(runtime.path().join(BOOTSTRAP_FILENAME))
+                .expect("bootstrap fixture");
+            fixture.write_all(b"secret fixture").expect("bootstrap fixture bytes");
+        }
         runtime.cleanup().expect("cleanup");
         assert!(!runtime.path().exists());
     }

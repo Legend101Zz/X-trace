@@ -388,13 +388,35 @@ mod tests {
             .expect("temp root")
     }
 
+    /// Creates `path` and any missing parents as 0700 whatever the process umask is: the product
+    /// admits project storage as private, and a umask 022 runner would make `create_dir_all` 0755.
+    fn private_dir_all(path: &Path) {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .expect("private directory");
+    }
+
+    /// Creates an empty 0600 file whatever the process umask is.
+    fn private_empty_file(path: &Path) {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .expect("private file");
+    }
+
     fn initialized_project(repo: &Path, data_home: &Path) -> ProjectId {
         std::fs::create_dir_all(repo).expect("repo directory");
         let canonical_repo = repo.canonicalize().expect("canonical repo");
         let project_id = ProjectId::new();
         let project_data_root =
             UserDataPaths::project_dir_with_home(data_home, project_id).expect("project root");
-        std::fs::create_dir_all(&project_data_root).expect("project data root");
+        private_dir_all(&project_data_root);
         let database_path = project_data_root.join("metadata.sqlite3");
         let store = SqliteStore::open(&database_path, OpenOptions::default()).expect("store");
         let project = Project {
@@ -448,7 +470,7 @@ mod tests {
         let home = root.path().join("home");
         let id = ProjectId::new();
         let project_root = UserDataPaths::project_dir_with_home(&home, id).expect("project root");
-        std::fs::create_dir_all(&project_root).expect("project root exists");
+        private_dir_all(&project_root);
         RepositoryPointer { schema_version: 1, project_id: id, data_home: home }
             .write(&repo)
             .expect("pointer");
@@ -565,12 +587,12 @@ mod tests {
         let project_id = ProjectId::new();
         let project_root =
             UserDataPaths::project_dir_with_home(&home, project_id).expect("project data root");
-        std::fs::create_dir_all(&project_root).expect("project root");
+        private_dir_all(&project_root);
         RepositoryPointer { schema_version: 1, project_id, data_home: home.clone() }
             .write(&repo)
             .expect("pointer");
         let database = project_root.join("metadata.sqlite3");
-        std::fs::write(&database, []).expect("empty database placeholder");
+        private_empty_file(&database);
         let admitted = AdmittedPrivateRoot::open(&project_root).expect("admitted project root");
         let _lock = acquire_project_lock(&admitted).expect("hold project lock");
 

@@ -910,7 +910,10 @@ mod tests {
                 "fail_commit",
             ),
         ] {
-            let directory = tempfile::tempdir().expect("private test directory");
+            let directory = tempfile::Builder::new()
+                .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .tempdir()
+                .expect("private test directory");
             let database_path = directory.path().join("metadata.sqlite3");
             let store = SqliteStore::open(&database_path, OpenOptions::default())
                 .expect("create test database");

@@ -811,6 +811,9 @@ mod tests {
         migrations::apply_catalog(&connection, "0.1.0-test", CorrelationId::new(), &v1)
             .expect("apply v1 schema");
         drop(connection);
+        // rusqlite created the file with the umask-derived mode; the store requires owner-only.
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("owner-only fixture database");
         let before = file_snapshot(&path);
 
         let error = SqliteStore::open(
