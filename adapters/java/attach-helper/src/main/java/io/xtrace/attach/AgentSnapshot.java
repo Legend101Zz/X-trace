@@ -72,7 +72,12 @@ record AgentSnapshot(Path root, Path agentJar) {
     try {
       reapExited(cache);
       ensureCapacity(cache);
-      snapshot = Files.createTempDirectory(cache, "target-" + pid + "-" + UUID.randomUUID());
+      // Exact name: createTempDirectory appends a random numeric suffix, which would not match the
+      // `target-<pid>-<uuid>` shape the agent and the reaper both require.
+      snapshot =
+          Files.createDirectory(
+              cache.resolve("target-" + pid + "-" + UUID.randomUUID()),
+              PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------")));
       Files.setPosixFilePermissions(snapshot, PosixFilePermissions.fromString("rwx------"));
       Path distribution = Files.createDirectory(snapshot.resolve("distribution"));
       Files.setPosixFilePermissions(distribution, PosixFilePermissions.fromString("rwx------"));
