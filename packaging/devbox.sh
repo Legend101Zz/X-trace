@@ -21,7 +21,4 @@ exec docker run --rm --init --cpus 4 --platform linux/arm64 \
     rm -rf /scratch/tree && mkdir -p /scratch/tree
     rsync -a --exclude .git --exclude target/ --exclude node_modules/ --exclude build/ --exclude .gradle/ /src/ /scratch/tree/
     cd /scratch/tree
-    # DEVBOX-ONLY (never committed): st_nlink is u32 on linux/aarch64 (u64 on x86_64), so pack_inventory.rs does
-    # not compile in this arm64 sandbox. Widen in the /scratch COPY only; the linux-x86_64 CI build is unpatched.
-    sed -i "s/named_after\\.st_nlink != /u64::from(named_after.st_nlink) != /" crates/xtrace-runtime/src/pack_inventory.rs
     '"$*"
