@@ -98,22 +98,54 @@ def read_coalition_id(pid: int) -> int | None:
     return int(buffer[0])
 
 
-def read_process_start_epoch(pid: int) -> float | None:
+# macOS kinfo_proc (sys/sysctl.h), arm64 and x86_64 alike, 648 bytes: struct extern_proc kp_proc first.
+# extern_proc: p_un.__p_starttime (struct timeval {long tv_sec; int tv_usec}) at offset 0 (tv_sec 8 bytes,
+# tv_usec 4 bytes at 8), p_vmspace at 16, p_sigacts at 24, int p_flag at 32, char p_stat at 36,
+# pid_t p_pid at 40. Checked on arm64 macOS 26 against `ps -o lstart` for pid 1 and the caller.
+KINFO_PROC_SIZE = 648
+KINFO_PROC_START_SEC_OFFSET = 0
+KINFO_PROC_PID_OFFSET = 40
+
+
+def _read_kinfo_proc_darwin(pid: int) -> bytes | None:
+    """sysctl({CTL_KERN, KERN_PROC, KERN_PROC_PID, pid}) record; unprivileged, works for other users' processes."""
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    mib = (ctypes.c_int * 4)(1, 14, 1, int(pid))  # CTL_KERN, KERN_PROC, KERN_PROC_PID
+    buffer = ctypes.create_string_buffer(KINFO_PROC_SIZE)
+    size = ctypes.c_size_t(KINFO_PROC_SIZE)
+    if libc.sysctl(mib, 4, buffer, ctypes.byref(size), None, 0) != 0:
+        return None
+    return bytes(buffer)[:size.value]
+
+
+def start_epoch_from_kinfo_proc(raw: bytes | None, pid: int) -> float | None:
+    """Start time from a kinfo_proc record; None unless the record is exactly sized and names `pid`."""
+    if raw is None or len(raw) != KINFO_PROC_SIZE:
+        return None
+    if int.from_bytes(raw[KINFO_PROC_PID_OFFSET:KINFO_PROC_PID_OFFSET + 4], "little", signed=True) != int(pid):
+        return None
+    seconds = int.from_bytes(raw[KINFO_PROC_START_SEC_OFFSET:KINFO_PROC_START_SEC_OFFSET + 8], "little", signed=True)
+    return float(seconds) if seconds > 0 else None
+
+
+def read_process_start_epoch(pid: int, kinfo_reader: Callable[[int], bytes | None] | None = None) -> float | None:
     """Process start time as epoch seconds from the kernel, not from `ps lstart` text.
 
-    macOS: proc_pidinfo(PROC_PIDTBSDINFO) pbi_start_tvsec. Linux: /proc/<pid>/stat starttime
+    macOS: proc_pidinfo(PROC_PIDTBSDINFO) pbi_start_tvsec, which is denied for other users' processes;
+    then the sysctl KERN_PROC_PID kinfo_proc p_starttime (what `ps` uses). Linux: /proc/<pid>/stat starttime
     ticks plus the boot time. None when unreadable. Free of local-time (DST) ambiguity.
     """
     try:
         if sys.platform == "darwin":
-            libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
-            buffer = ctypes.create_string_buffer(136)
-            if libc.proc_pidinfo(int(pid), 3, 0, buffer, 136) != 136:
-                return None
-            raw = bytes(buffer)
-            if int.from_bytes(raw[12:16], "little") != int(pid):
-                return None
-            return float(int.from_bytes(raw[120:128], "little"))
+            if kinfo_reader is None:
+                libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+                buffer = ctypes.create_string_buffer(136)
+                if libc.proc_pidinfo(int(pid), 3, 0, buffer, 136) == 136:
+                    raw = bytes(buffer)
+                    if int.from_bytes(raw[12:16], "little") != int(pid):
+                        return None
+                    return float(int.from_bytes(raw[120:128], "little"))
+            return start_epoch_from_kinfo_proc((kinfo_reader or _read_kinfo_proc_darwin)(int(pid)), pid)
         if sys.platform.startswith("linux"):
             with open(f"/proc/{int(pid)}/stat", "rb") as stream:
                 text = stream.read(4096).decode("ascii", "replace")
@@ -123,7 +155,7 @@ def read_process_start_epoch(pid: int) -> float | None:
                 boot = next(int(line.split()[1]) for line in stream.read(65536).decode("ascii", "replace").splitlines()
                             if line.startswith("btime "))
             return boot + ticks / os.sysconf("SC_CLK_TCK")
-    except (OSError, ValueError, IndexError, StopIteration, AttributeError, TypeError):
+    except (OSError, ValueError, IndexError, StopIteration, AttributeError, TypeError, ctypes.ArgumentError):
         return None
     return None
 

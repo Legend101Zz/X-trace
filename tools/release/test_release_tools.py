@@ -5633,6 +5633,43 @@ class RecoverLeasesTests(unittest.TestCase):
         self.assertLess(epoch, time.time() + 1)
         self.assertIsNone(provenance.read_process_start_epoch(2**22 + 12345))
 
+    @staticmethod
+    def _kinfo(pid: int, seconds: int, size: int = provenance.KINFO_PROC_SIZE) -> bytes:
+        raw = bytearray(size)
+        raw[0:8] = seconds.to_bytes(8, "little", signed=True)
+        raw[40:44] = pid.to_bytes(4, "little", signed=True)
+        return bytes(raw)
+
+    def test_kinfo_proc_start_requires_exact_size_and_matching_pid(self) -> None:
+        good = self._kinfo(77, 1_790_000_000)
+        self.assertEqual(provenance.start_epoch_from_kinfo_proc(good, 77), 1_790_000_000.0)
+        self.assertIsNone(provenance.start_epoch_from_kinfo_proc(good, 78), "a record for another pid")
+        self.assertIsNone(provenance.start_epoch_from_kinfo_proc(good[:-1], 77), "short buffer")
+        self.assertIsNone(provenance.start_epoch_from_kinfo_proc(good + b"\0", 77), "long buffer")
+        self.assertIsNone(provenance.start_epoch_from_kinfo_proc(b"", 77))
+        self.assertIsNone(provenance.start_epoch_from_kinfo_proc(None, 77))
+        self.assertIsNone(provenance.start_epoch_from_kinfo_proc(self._kinfo(77, 0), 77), "zero start time")
+        self.assertIsNone(provenance.start_epoch_from_kinfo_proc(self._kinfo(77, -5), 77))
+
+    def test_darwin_start_epoch_uses_the_injected_sysctl_reader_and_fails_closed(self) -> None:
+        with mock.patch.object(provenance.sys, "platform", "darwin"), \
+                mock.patch.object(provenance.ctypes, "CDLL", side_effect=OSError("no libc")):
+            self.assertIsNone(provenance.read_process_start_epoch(5), "ctypes failure is None")
+        with mock.patch.object(provenance.sys, "platform", "darwin"):
+            self.assertEqual(provenance.read_process_start_epoch(5, kinfo_reader=lambda pid: self._kinfo(pid, 1_700_000_000)),
+                             1_700_000_000.0)
+            self.assertIsNone(provenance.read_process_start_epoch(5, kinfo_reader=lambda pid: self._kinfo(6, 1_700_000_000)))
+            self.assertIsNone(provenance.read_process_start_epoch(5, kinfo_reader=lambda pid: b"short"))
+            self.assertIsNone(provenance.read_process_start_epoch(5, kinfo_reader=lambda pid: None))
+            self.assertIsNone(provenance.read_process_start_epoch(5, kinfo_reader=mock.Mock(side_effect=OSError("x"))))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS kernel start time")
+    def test_darwin_pid_one_start_time_is_readable_and_earlier_than_this_test(self) -> None:
+        began = time.time()
+        epoch = provenance.read_process_start_epoch(1)
+        self.assertIsNotNone(epoch)
+        self.assertLess(epoch, began)
+
     def test_removal_reads_the_record_through_the_lease_descriptor_and_refuses_links(self) -> None:
         self.quiet_world()
         layout = recover_leases.Layout(self.cache, self.LABEL)

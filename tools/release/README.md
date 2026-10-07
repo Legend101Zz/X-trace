@@ -248,7 +248,7 @@ the final fix round. A retained lease without them is refused (`no-persisted-pro
 operator-supplied coalition id any more (the earlier `--run-coalition-id` option was removed because a
 wrong or uncorroborated id could classify the run's real descendants as foreign). No such legacy retained
 lease exists. Identities the run recorded as owned are cleared only by a verified exit. "Predates the run" uses the
-kernel start time (proc_pidinfo or /proc), must agree with `ps` within 2 s, and needs a 300 s margin;
+kernel start time (proc_pidinfo, falling back on macOS to the unprivileged sysctl KERN_PROC_PID `p_starttime`, which also covers other users' processes; or /proc), must agree with `ps` within 2 s, and needs a 300 s margin;
 DST-ambiguous times fail closed. The owner record is re-read and unlinked through the lease directory
 descriptor, archived owner records have the token replaced by its sha256, and `manual-recovery.json`
 is written with an honest `status` even if a step after removal fails. Recovery proves non-descent in the
