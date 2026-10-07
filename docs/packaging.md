@@ -63,6 +63,6 @@ artifacts. `permissions: contents: read`, no secrets, actions pinned by commit S
 
 ## What needs the owner
 
-Developer ID identity + notary profile; the Ed25519 release/ledger keys and trust tables; root `LICENSE` files (the
-workspace declares `MIT OR Apache-2.0` but the repo ships none); legal review of flagged licenses; provenance
-attestations (need `id-token`/`attestations` permissions, deliberately not granted here).
+Developer ID identity + notary profile; the Ed25519 release/ledger keys and trust tables; legal review of flagged
+licenses; provenance attestations (need `id-token`/`attestations` permissions, deliberately not granted here). The
+project license is MIT (root `LICENSE`, workspace `license = "MIT"`).
