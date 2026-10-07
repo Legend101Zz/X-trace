@@ -46,7 +46,7 @@ jobs:
       - name: Build, then rebuild twice from clean exports and compare (reproducibility)
         run: python3 packaging/repro_check.py --out "$RUNNER_TEMP/repro" --platform "${{ matrix.platform }}"
       - name: Build the artifact set
-        run: python3 packaging/build.py --out dist --platform "${{ matrix.platform }}" --work "$RUNNER_TEMP/w"
+        run: python3 packaging/build.py --out dist --platform "${{ matrix.platform }}"
       - name: Verify checksums and fresh-profile install/upgrade/uninstall
         run: |
           set -eu
