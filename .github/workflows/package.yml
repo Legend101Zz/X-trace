@@ -1,0 +1,76 @@
+name: package
+
+# Unsigned release-candidate packaging. Produces archives + checksums + SBOM + licenses per platform and runs a
+# reproducibility double-build. No secrets are used; signing/notarization is an owner-held step (packaging/sign-*.sh).
+on:
+  push:
+    branches:
+      - "slice/v001-**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  package:
+    name: package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: macos-arm64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Rust toolchain (stable, from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+      - name: Tool versions
+        run: |
+          rustc --version; cargo --version; node --version; java -version; python3 --version; openssl version
+      - name: Packaging tool unit checks
+        run: python3 -B -m unittest discover -s tools/supply_chain -p 'test_*.py'
+      - name: Build, then rebuild twice from clean exports and compare (reproducibility)
+        run: python3 packaging/repro_check.py --out "$RUNNER_TEMP/repro" --platform "${{ matrix.platform }}"
+      - name: Build the artifact set
+        run: python3 packaging/build.py --out dist --platform "${{ matrix.platform }}"
+      - name: Verify checksums and fresh-profile install/upgrade/uninstall
+        run: |
+          set -eu
+          sh packaging/install.sh verify-dist "dist/${{ matrix.platform }}"
+          sh packaging/test/install_test.sh "dist/${{ matrix.platform }}"
+      - name: Compare archive hash with the reproducibility build
+        run: |
+          python3 - "dist/${{ matrix.platform }}" "$RUNNER_TEMP/repro/repro.json" <<'PY'
+          import glob, hashlib, json, sys
+          (archive,) = glob.glob(sys.argv[1] + "/xtrace-*.tar.gz")
+          mine = hashlib.sha256(open(archive, "rb").read()).hexdigest()
+          r = json.load(open(sys.argv[2]))
+          assert r["reproducible"], r
+          theirs = [v for k, v in r["buildA"].items() if k.endswith(".tar.gz")][0]
+          assert theirs == mine, (theirs, mine)
+          print("reproducible; archive sha256", mine)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: xtrace-unsigned-${{ matrix.platform }}
+          path: |
+            dist/${{ matrix.platform }}/
+            ${{ runner.temp }}/repro/repro.json
+          if-no-files-found: error
+          retention-days: 30
