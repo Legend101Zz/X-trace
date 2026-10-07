@@ -224,7 +224,7 @@ jobs:
         # admitted 0700 root). It is placed after the Node/Gradle steps so only cargo steps see it.
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/xt"
+          root="${RUNNER_TEMP:?}/xt"
           mkdir -m 700 "$root" "$root/tmp" "$root/priv"
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
@@ -278,7 +278,7 @@ jobs:
         # admitted 0700 root). It is placed after the Node/Gradle steps so only cargo steps see it.
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/xt"
+          root="${RUNNER_TEMP:?}/xt"
           mkdir -m 700 "$root" "$root/tmp" "$root/priv"
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
@@ -348,7 +348,7 @@ jobs:
         # admitted 0700 root). It is placed after the Node/Gradle steps so only cargo steps see it.
         run: |
           set -euo pipefail
-          root="$RUNNER_TEMP/xt"
+          root="${RUNNER_TEMP:?}/xt"
           mkdir -m 700 "$root" "$root/tmp" "$root/priv"
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
