@@ -33,6 +33,13 @@ tasks.test {
     }
 }
 
+// The helper keeps its attach snapshot cache under java.io.tmpdir. macOS JVMs ignore TMPDIR and
+// default to the shared per-user temp directory, so tests would share (and leave) state outside
+// the run. When the run provides its admitted private scratch, the test JVMs use it instead.
+tasks.withType<Test>().configureEach {
+    System.getenv("XTRACE_TEST_PRIVATE_SCRATCH")?.let { systemProperty("java.io.tmpdir", it) }
+}
+
 tasks.register<Test>("acceptanceTest") {
     group = "verification"
     description = "Runs the disposable already-running Spring fixture attach journey."
