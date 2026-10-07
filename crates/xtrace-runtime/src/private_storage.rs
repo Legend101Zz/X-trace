@@ -585,13 +585,16 @@ impl AdmittedPrivateRoot {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            self.open_regular_file(name).map(drop)
+            if self.validate_named_file_without_open(name)? {
+                Ok(())
+            } else {
+                Err(PrivateStorageError::Operation)
+            }
         }
     }
 
-    /// Stat-only admission of an optional private regular file (Linux): returns whether it
-    /// exists. No descriptor for the file is ever opened.
-    #[cfg(target_os = "linux")]
+    /// Stat-only admission of an optional private regular file: returns whether it exists.
+    /// No descriptor for the file is ever opened (Linux uses `lgetxattr`, macOS `/bin/ls`).
     fn validate_named_file_without_open(&self, name: &str) -> Result<bool, PrivateStorageError> {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -619,20 +622,20 @@ impl AdmittedPrivateRoot {
             || first.st_uid != rustix::process::getuid().as_raw()
             || first.st_nlink != 1
             || rustix::fs::Mode::from_raw_mode(first.st_mode).intersects(group_other)
-            || first.st_dev != directory_metadata.dev()
+            || stat_device(&first) != directory_metadata.dev()
         {
             return Err(PrivateStorageError::Unavailable);
         }
-        let mut value = [0_u8; 16 * 1024];
-        match rustix::fs::lgetxattr(
-            self.path.join(name),
-            "system.posix_acl_access",
-            value.as_mut_slice(),
-        ) {
-            Ok(_) => return Err(PrivateStorageError::Unavailable),
-            Err(error)
-                if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NODATA => {}
-            Err(_) => return Err(PrivateStorageError::Unavailable),
+        // The identity deliberately omits size: a live database or WAL grows between probes.
+        let identity = FileIdentity {
+            device: stat_device(&first),
+            inode: stat_inode(&first),
+            size: 0,
+            owner: first.st_uid,
+            mode: stat_mode(&first) & 0o7777,
+        };
+        if !named_file_acl_admits(&self.path.join(name), identity, deadline) {
+            return Err(PrivateStorageError::Unavailable);
         }
         self.revalidate_until(deadline)?;
         let second = stat(&self.directory).map_err(|_| PrivateStorageError::Unavailable)?;
@@ -648,34 +651,9 @@ impl AdmittedPrivateRoot {
     }
 
     /// Admits an optional private regular file without treating absence as an error.
-    #[cfg(target_os = "linux")]
     pub fn validate_optional_private_file(&self, name: &str) -> Result<bool, PrivateStorageError> {
         // Stat-only: see `validate_regular_file` for why no descriptor may be opened.
         self.validate_named_file_without_open(name)
-    }
-
-    /// Admits an optional private regular file without treating absence as an error.
-    #[cfg(not(target_os = "linux"))]
-    pub fn validate_optional_private_file(&self, name: &str) -> Result<bool, PrivateStorageError> {
-        if !self.private_leaf {
-            return Err(PrivateStorageError::Unavailable);
-        }
-        let deadline = new_admission_deadline();
-        validate_child_name(name)?;
-        if !self.named_regular_file_exists_until(name, deadline)? {
-            return Ok(false);
-        }
-        let file = match self.open_nonblocking_read_descriptor(name) {
-            Ok(file) => file,
-            Err(error) if error == rustix::io::Errno::NOENT => {
-                self.revalidate_until(deadline)?;
-                return Ok(false);
-            }
-            Err(_) => return Err(PrivateStorageError::Unavailable),
-        };
-        self.validate_file_binding_with_link_policy_until(name, &file, false, false, deadline)?;
-        self.revalidate_until(deadline)?;
-        Ok(true)
     }
 
     /// Opens a private regular file that may intentionally have additional hard links.
@@ -1344,6 +1322,60 @@ fn linux_default_acl_is_well_formed(bytes: &[u8]) -> bool {
     parse_linux_acl(bytes).is_some()
 }
 
+/// Device number of a `statat` result, widened exactly as `Metadata::dev` widens it
+/// (macOS reports a signed 32-bit device).
+#[allow(clippy::unnecessary_cast, clippy::cast_sign_loss, reason = "st_dev width differs by OS")]
+fn stat_device(stat: &rustix::fs::Stat) -> u64 {
+    stat.st_dev as u64
+}
+
+#[allow(clippy::unnecessary_cast, reason = "st_ino width differs by OS")]
+fn stat_inode(stat: &rustix::fs::Stat) -> u64 {
+    stat.st_ino as u64
+}
+
+#[allow(clippy::unnecessary_cast, reason = "st_mode is u16 on macOS and u32 on Linux")]
+fn stat_mode(stat: &rustix::fs::Stat) -> u32 {
+    stat.st_mode as u32
+}
+
+/// Descriptor-free ACL admission of a named regular file.
+#[cfg(target_os = "linux")]
+fn named_file_acl_admits(
+    path: &Path,
+    _identity: FileIdentity,
+    _deadline: std::time::Instant,
+) -> bool {
+    let mut value = [0_u8; 16 * 1024];
+    match rustix::fs::lgetxattr(path, "system.posix_acl_access", value.as_mut_slice()) {
+        Ok(_) => false,
+        Err(error) => error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NODATA,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn named_file_acl_admits(
+    path: &Path,
+    identity: FileIdentity,
+    deadline: std::time::Instant,
+) -> bool {
+    if !macos_file_acl_listing_admits(path, deadline) {
+        return false;
+    }
+    // Same inode, owner and mode; size is excluded because live SQLite files grow.
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|named| identity.same_directory(FileIdentity::from_metadata(&named)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn named_file_acl_admits(
+    _path: &Path,
+    _identity: FileIdentity,
+    _deadline: std::time::Instant,
+) -> bool {
+    false
+}
+
 #[cfg(target_os = "linux")]
 fn acl_admits_directory(
     _path: &Path,
@@ -1470,6 +1502,18 @@ fn acl_admits_file(
     expected: FileIdentity,
     deadline: std::time::Instant,
 ) -> bool {
+    if !macos_file_acl_listing_admits(path, deadline) {
+        return false;
+    }
+    let Ok(named) = std::fs::symlink_metadata(path) else { return false };
+    let Ok(opened) = file.metadata() else { return false };
+    expected.same_file(FileIdentity::from_metadata(&named))
+        && expected.same_file(FileIdentity::from_metadata(&opened))
+}
+
+/// Path-based macOS ACL probe for a regular file (`/bin/ls -ldeO`); never opens the file.
+#[cfg(target_os = "macos")]
+fn macos_file_acl_listing_admits(path: &Path, deadline: std::time::Instant) -> bool {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
@@ -1538,13 +1582,7 @@ fn acl_admits_file(
     }
     let Ok(text) = std::str::from_utf8(&bytes) else { return false };
     let Some(expected_path) = path.to_str() else { return false };
-    if !parse_macos_acl_listing_kind(text, expected_path, b'-') {
-        return false;
-    }
-    let Ok(named) = std::fs::symlink_metadata(path) else { return false };
-    let Ok(opened) = file.metadata() else { return false };
-    expected.same_file(FileIdentity::from_metadata(&named))
-        && expected.same_file(FileIdentity::from_metadata(&opened))
+    parse_macos_acl_listing_kind(text, expected_path, b'-')
 }
 
 /// Requests termination of the owned ACL probe and confirms reaping within a
@@ -1809,6 +1847,69 @@ mod tests {
             .expect("test clock")
             .as_nanos();
         format!("{stem}-{}-{time}", std::process::id())
+    }
+
+    /// True while `/proc/locks` lists a POSIX lock held by this process on `inode`.
+    #[cfg(target_os = "linux")]
+    fn posix_lock_held(inode: u64) -> bool {
+        let pid = std::process::id().to_string();
+        let suffix = format!(":{inode} ");
+        std::fs::read_to_string("/proc/locks").expect("read /proc/locks").lines().any(|line| {
+            line.contains("POSIX")
+                && line.contains(&suffix)
+                && line.split_whitespace().any(|w| w == pid)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_validation_opens_no_descriptor_and_keeps_posix_locks() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let scratch = private_scratch();
+        let name = unique_name("lock");
+        let child = scratch.create_private_child(&name).expect("create child");
+        let file = child.create_private_file("live.db").expect("create file");
+        rustix::fs::fcntl_lock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .expect("take POSIX lock");
+        let inode = file.metadata().expect("metadata").ino();
+        assert!(posix_lock_held(inode));
+        // Control: POSIX semantics drop the lock when ANY descriptor for the file is closed, so the
+        // probe above can see an open-and-drop validation.
+        drop(std::fs::File::open(child.path().join("live.db")).expect("control open"));
+        assert!(!posix_lock_held(inode), "control: closing a second descriptor releases the lock");
+        rustix::fs::fcntl_lock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .expect("retake POSIX lock");
+        assert!(posix_lock_held(inode));
+        child.validate_regular_file("live.db").expect("validate regular file");
+        assert_eq!(child.validate_optional_private_file("live.db"), Ok(true));
+        assert_eq!(child.validate_optional_private_file("absent.db"), Ok(false));
+        assert!(posix_lock_held(inode), "validation must not open or close a descriptor");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_validation_still_refuses_unsafe_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = private_scratch();
+        let name = unique_name("unsafe");
+        let child = scratch.create_private_child(&name).expect("create child");
+        child.create_private_file("ok").expect("create");
+        let make = |file: &str, mode: u32| {
+            let path = child.path().join(file);
+            std::fs::write(&path, b"x").expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        make("group-readable", 0o640);
+        make("world-writable", 0o606);
+        std::fs::hard_link(child.path().join("ok"), child.path().join("linked")).expect("link");
+        std::os::unix::fs::symlink("ok", child.path().join("symlink")).expect("symlink");
+        std::fs::create_dir(child.path().join("dir")).expect("dir");
+        for bad in ["group-readable", "world-writable", "linked", "symlink", "dir"] {
+            assert!(child.validate_regular_file(bad).is_err(), "{bad}");
+            assert!(child.validate_optional_private_file(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
