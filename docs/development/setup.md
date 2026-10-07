@@ -389,7 +389,7 @@ constraint by setting `PATH` to a minimal set that excludes any directory
 containing `protoc`:
 
 ```bash
-PATH="/usr/bin:/bin:/usr/local/bin:/Users/comreton/.cargo/bin:/Users/comreton/.rustup/toolchains/stable-*/bin" \
+PATH="/usr/bin:/bin:/usr/local/bin:$HOME/.cargo/bin" \
     cargo build -p xtrace-protocol --all-features
 ```
 

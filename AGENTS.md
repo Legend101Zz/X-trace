@@ -33,18 +33,20 @@ Every phase follows this fixed boundary: `Phase -> Implement -> Review -> Verify
 
 ## Storage and caches
 
-Keep large build/cache data on the external SSD whenever the tool allows it:
+Keep large build/cache data on the external SSD whenever the tool allows it. Point every cache at one cache root on that drive, written here as `<CACHE>`. The real path is machine-specific: set it locally and never commit it.
 
 ```text
-CARGO_HOME=/Volumes/Mrigesh SSD/.cache/xtrace/cargo
-CARGO_TARGET_DIR=/Volumes/Mrigesh SSD/.cache/xtrace/cargo-target
-GRADLE_USER_HOME=/Volumes/Mrigesh SSD/.cache/xtrace/gradle
-XDG_CACHE_HOME=/Volumes/Mrigesh SSD/.cache/xtrace/xdg
-PNPM_HOME=/Volumes/Mrigesh SSD/.cache/xtrace/pnpm
-NPM_CONFIG_CACHE=/Volumes/Mrigesh SSD/.cache/xtrace/npm
+CARGO_HOME=<CACHE>/cargo
+CARGO_TARGET_DIR=<CACHE>/cargo-target
+GRADLE_USER_HOME=<CACHE>/gradle
+XDG_CACHE_HOME=<CACHE>/xdg
+PNPM_HOME=<CACHE>/pnpm
+NPM_CONFIG_CACHE=<CACHE>/npm
 ```
 
-Do not commit caches or generated build output.
+Release-gate builds run through `tools/release/leased_run.py`, which admits a private root only on a volume with ownership enabled; a `noowners` mount is refused.
+
+Do not commit caches, generated build output, or owner-specific absolute paths.
 
 ## Reference posture
 
