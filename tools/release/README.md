@@ -225,6 +225,14 @@ python3.14 -B -m tools.release.recover_leases --cache-root <root> --label <label
     --receipt <root>/release-gates/<label>/receipt.json
 ```
 
+A run writes one run-start `startedAtEpoch` into both owner records. Records written by an older run may
+differ in that epoch (each lease was stamped at its own acquisition); recovery accepts such records only
+when they are provably from the same run: identical `pid`, `label` and lease token (compared for equality,
+never printed or stored), both `requiresManualRecovery`, valid positive numeric epochs (booleans, zero,
+negative, non-finite and non-numeric values are refused) at most 120 s apart. The earliest epoch is used
+as the run start, the conservative choice for the "predates the run" test. Any other disagreement refuses
+with `owner-records-disagree`.
+
 Recovery is allowed only if both owner records carry the label and `requiresManualRecovery`, their
 directories, inodes and record hashes are stable, every recorded identity (owner records and receipt
 evidence) is exited (PID gone, start differs or zombie) or positively not a descendant

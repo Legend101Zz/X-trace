@@ -38,6 +38,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import os
 import pathlib
 import stat
@@ -67,6 +68,12 @@ MAX_UNCERTAIN_SAMPLE = 64
 # local-time (DST) ambiguity and small wall-clock steps. Larger or unreliable skews fail closed.
 START_TOLERANCE_SECONDS = 300.0
 START_SOURCE_AGREEMENT_SECONDS = 2.0
+# Owner records of one run may differ in `startedAtEpoch` by at most this much. Runs since the
+# one-epoch fix write an identical value; records written before it stamped each lease at its own
+# acquisition, and private-root admission (ACL probes on macOS) takes seconds, so the observed skew
+# is a few seconds. 120 s leaves wide headroom yet stays well inside START_TOLERANCE_SECONDS.
+# Larger skews fail closed.
+MAX_OWNER_EPOCH_SKEW_SECONDS = 120.0
 MAX_RUN_COALITION_IDS = 8
 MAX_RECEIPT_WALK_NODES = 20000
 MAX_FILE_BYTES = 65536
@@ -251,6 +258,41 @@ def read_records(layout: Layout) -> dict[str, Any]:
     return {"owners": owners, "ownerFacts": facts, "receipt": receipt, "receiptFacts": receipt_facts}
 
 
+def _valid_epoch(value: Any) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
+
+def _agreed_run_start_epoch(owners: dict[str, dict[str, Any]], reasons: list[str]) -> float | None:
+    """The run-start epoch all owner records agree on, or None (and a refusal reason).
+
+    Identical epochs are accepted as before. Records written before the one-epoch fix may differ
+    slightly; they are accepted only when provably from the same run: identical pid, label and
+    lease token (equality only; the token is never printed, logged or stored) and epochs within
+    MAX_OWNER_EPOCH_SKEW_SECONDS. The EARLIEST epoch is returned: it is the conservative choice
+    for the "predates the run" test (a process must have started before the earliest possible
+    run start, with the margin, to be cleared as foreign) and for the global scan window.
+    """
+    values = [owner.get("startedAtEpoch") for owner in owners.values()]
+    if not values or not all(_valid_epoch(value) for value in values):
+        reasons.append("owner-records-disagree")
+        return None
+    if len(set(values)) > 1:
+        tokens = [owner.get("token") for owner in owners.values()]
+        labels = {owner.get("label") for owner in owners.values()}
+        pids = {owner.get("pid") for owner in owners.values()}
+        same_run = (
+            len(pids) == 1 and len(labels) == 1
+            and all(isinstance(token, str) and token for token in tokens) and len(set(tokens)) == 1
+            and all(owner.get("requiresManualRecovery") is True for owner in owners.values())
+            and max(values) - min(values) <= MAX_OWNER_EPOCH_SKEW_SECONDS
+        )
+        if not same_run:
+            reasons.append("owner-records-disagree")
+            return None
+    return float(min(values))
+
+
 def check_records(layout: Layout, records: dict[str, Any]) -> dict[str, Any]:
     """Label, retention and agreement checks; returns the shared owner facts."""
     reasons: list[str] = []
@@ -262,17 +304,15 @@ def check_records(layout: Layout, records: dict[str, Any]) -> dict[str, Any]:
         if owner.get("requiresManualRecovery") is not True:
             reasons.append("not-retained")
     pids = {owner.get("pid") for owner in owners.values()}
-    epochs = {owner.get("startedAtEpoch") for owner in owners.values()}
-    if len(pids) != 1 or len(epochs) != 1:
+    if len(pids) != 1:
         reasons.append("owner-records-disagree")
+    epoch = _agreed_run_start_epoch(owners, reasons)
     if receipt.get("label") != layout.label:
         reasons.append("receipt-label-mismatch")
     if receipt.get("decision") not in {"failed", "uncertain_process_tree"}:
         reasons.append("receipt-not-failed")
     owner_pid = next(iter(pids)) if len(pids) == 1 else None
-    epoch = next(iter(epochs)) if len(epochs) == 1 else None
-    if (not isinstance(owner_pid, int) or isinstance(owner_pid, bool) or owner_pid <= 0
-            or not isinstance(epoch, (int, float)) or isinstance(epoch, bool) or epoch <= 0):
+    if not isinstance(owner_pid, int) or isinstance(owner_pid, bool) or owner_pid <= 0 or epoch is None:
         reasons.append("owner-records-disagree")
     if reasons:
         raise Refused(sorted(set(reasons)))

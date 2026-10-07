@@ -5201,6 +5201,62 @@ class RecoverLeasesTests(unittest.TestCase):
         self.assertTrue(all(gap >= 2.0 for gap in self.sleeps), self.sleeps)
         self.assertGreaterEqual(self.clock.now, 2 * 2.0 + 2.0)
 
+    def _check(self, cargo: dict, gradle: dict) -> dict:
+        records = {"owners": {"cargo": cargo, "gradle": gradle}, "receipt": {"label": self.LABEL, "decision": "failed"}}
+        return recover_leases.check_records(SimpleNamespace(label=self.LABEL), records)  # type: ignore[arg-type]
+
+    def _refusal(self, cargo: dict, gradle: dict) -> list[str]:
+        with self.assertRaises(recover_leases.Refused) as caught:
+            self._check(cargo, gradle)
+        return list(caught.exception.reasons)
+
+    def test_equal_owner_epochs_are_accepted_unchanged(self) -> None:
+        facts = self._check(self.owner_record(), self.owner_record())
+        self.assertEqual(facts, {"ownerPid": 70001, "runStartEpoch": float(int(self.RUN_EPOCH))})
+
+    def test_small_owner_epoch_skew_is_accepted_and_the_earliest_epoch_is_used(self) -> None:
+        base = int(self.RUN_EPOCH)
+        for skew in (3, recover_leases.MAX_OWNER_EPOCH_SKEW_SECONDS):
+            with self.subTest(skew=skew):
+                # Order of the records must not matter.
+                for cargo, gradle in ((base, base + skew), (base + skew, base)):
+                    facts = self._check(self.owner_record(startedAtEpoch=cargo), self.owner_record(startedAtEpoch=gradle))
+                    self.assertEqual(facts["runStartEpoch"], float(base))
+
+    def test_dry_run_recovers_the_observed_three_second_skew(self) -> None:
+        self.quiet_world()
+        path = self.cache / "leases" / "gradle" / "owner.json"
+        record = json.loads(path.read_text())
+        record["startedAtEpoch"] += 3
+        path.write_text(json.dumps(record))
+        self.assertEqual(self.go(), recover_leases.EXIT_OK, self.lines)
+        self.assertEqual(self.summary()["decision"], "recovery-allowed")
+
+    def test_owner_epoch_skew_beyond_the_bound_is_refused(self) -> None:
+        base = int(self.RUN_EPOCH)
+        over = base + int(recover_leases.MAX_OWNER_EPOCH_SKEW_SECONDS) + 1
+        self.assertEqual(self._refusal(self.owner_record(), self.owner_record(startedAtEpoch=over)), ["owner-records-disagree"])
+
+    def test_owner_records_with_different_token_pid_or_label_and_skew_are_refused(self) -> None:
+        skewed = int(self.RUN_EPOCH) + 3
+        for name, change in (("token", {"token": "another-token-value"}), ("pid", {"pid": 70002}),
+                             ("label", {"label": "someone-else"}), ("no-token", {"token": None}),
+                             ("not-retained", {"requiresManualRecovery": False})):
+            with self.subTest(name):
+                reasons = self._refusal(self.owner_record(), self.owner_record(startedAtEpoch=skewed, **change))
+                self.assertIn("owner-records-disagree" if name in ("token", "pid", "no-token") else
+                              ("label-mismatch" if name == "label" else "not-retained"), reasons)
+        # A token mismatch is never echoed in the refusal.
+        self.assertNotIn(self.TOKEN, json.dumps(self._refusal(self.owner_record(), self.owner_record(startedAtEpoch=skewed, token="x" * 8))))
+
+    def test_invalid_owner_epochs_are_refused(self) -> None:
+        base = int(self.RUN_EPOCH)
+        for bad in (True, False, -5, 0, "1791406238", None, float("nan"), float("inf")):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._refusal(self.owner_record(), self.owner_record(startedAtEpoch=bad)), ["owner-records-disagree"])
+                self.assertEqual(self._refusal(self.owner_record(startedAtEpoch=bad), self.owner_record(startedAtEpoch=base + 1)),
+                                 ["owner-records-disagree"])
+
     def test_every_refusal_branch_refuses_and_leaves_the_leases_alone(self) -> None:
         def tamper(change: object) -> None:
             self.quiet_world()
