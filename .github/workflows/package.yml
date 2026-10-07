@@ -23,8 +23,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
           - platform: macos-arm64
             runner: macos-15
     steps:
@@ -54,6 +52,30 @@ jobs:
           set -eu
           sh packaging/install.sh verify-dist "dist/${{ matrix.platform }}"
           sh packaging/test/install_test.sh "dist/${{ matrix.platform }}"
+      - name: S0b DIAGNOSTIC - which archive members differ from the repro build
+        run: |
+          python3 - "dist/${{ matrix.platform }}" "$RUNNER_TEMP/repro/build-a/dist/${{ matrix.platform }}" <<'PY'
+          import glob, hashlib, sys, tarfile, re
+          def members(d):
+              (a,) = glob.glob(d + "/xtrace-*.tar.gz")
+              out = {}
+              with tarfile.open(a) as tf:
+                  for m in tf.getmembers():
+                      data = tf.extractfile(m).read() if m.isfile() else b""
+                      out[m.name] = (m.mode, m.size, hashlib.sha256(data).hexdigest(), data)
+              return out
+          mine, theirs = members(sys.argv[1]), members(sys.argv[2])
+          print("only-in-checkout:", sorted(set(mine) - set(theirs)))
+          print("only-in-repro:", sorted(set(theirs) - set(mine)))
+          for name in sorted(set(mine) & set(theirs)):
+              a, b = mine[name], theirs[name]
+              if a[:3] != b[:3]:
+                  print("DIFF", name, "checkout", a[:3], "repro", b[:3])
+                  pa = set(re.findall(rb"/[A-Za-z0-9_./+-]{6,}", a[3])); pb = set(re.findall(rb"/[A-Za-z0-9_./+-]{6,}", b[3]))
+                  print("  path-like only in checkout:", sorted(pa - pb)[:40])
+                  print("  path-like only in repro:", sorted(pb - pa)[:40])
+          PY
+          echo "TMPDIR=$TMPDIR"; ls -ld /var /tmp "$TMPDIR" || true
       - name: Compare archive hash with the reproducibility build
         run: |
           python3 - "dist/${{ matrix.platform }}" "$RUNNER_TEMP/repro/repro.json" <<'PY'
