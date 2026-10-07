@@ -108,9 +108,26 @@ def parse_start(value: str) -> float | None:
 
     A wall-clock time inside the repeated DST fall-back hour maps to two epochs; that is
     refused (None) rather than guessed, so it can never make a later process look older.
+
+    Exactly two English orders are accepted: month-first (`Sun Sep 27 09:43:13 2026`, the C locale)
+    and day-first (`Sun 27 Sep 09:43:13 2026`, e.g. en_AU, which the inherited-environment `ps`
+    snapshot uses). The month is a name and the day a number, so they cannot be confused. Anything
+    else (other languages, typos, numeric-only) is None. The `ps` environment and the stored
+    identity strings must NOT be changed to match: retained owner records and receipts hold the
+    locale form as written, and identities are compared as exact (pid, string) pairs, so probing
+    in another locale would make a live recorded process look as if its start differs (exited).
     """
+    parsed = None
+    text = " ".join(value.split())
+    for layout in ("%a %b %d %H:%M:%S %Y", "%a %d %b %H:%M:%S %Y"):
+        try:
+            parsed = time.strptime(text, layout)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return None
     try:
-        parsed = time.strptime(" ".join(value.split()), "%a %b %d %H:%M:%S %Y")
         candidates = set()
         for isdst in (0, 1):
             moment = time.mktime(parsed[:8] + (isdst,))

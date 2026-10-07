@@ -5608,6 +5608,9 @@ class RecoverLeasesTests(unittest.TestCase):
             self.assertIsNone(recover_leases.parse_start("Sun Nov  1 01:30:00 2026"), "repeated fall-back hour is ambiguous")
             self.assertIsNotNone(recover_leases.parse_start("Sun Nov  1 03:30:00 2026"))
             self.assertIsNotNone(recover_leases.parse_start("Sun Jul  5 01:30:00 2026"))
+            self.assertIsNone(recover_leases.parse_start("Sun 1 Nov 01:30:00 2026"), "day-first ambiguity")
+            self.assertIsNotNone(recover_leases.parse_start("Sun 1 Nov 03:30:00 2026"))
+            self.assertIsNotNone(recover_leases.parse_start("Sun  5 Jul 01:30:00 2026"))
         finally:
             if old_tz is None:
                 os.environ.pop("TZ", None)
@@ -5722,6 +5725,16 @@ class RecoverLeasesTests(unittest.TestCase):
         self.assertEqual((parsed.execute, parsed.confirm_label), (True, "L"))
         with self.assertRaises(SystemExit):
             recover_leases.build_parser().parse_args(["--cache-root", "/c", "--label", "L", "--receipt", "/r", "--dry-run", "--execute"])
+
+    def test_parse_start_accepts_exactly_the_two_english_orders(self) -> None:
+        month_first = recover_leases.parse_start("Sun Sep 27 09:43:13 2026")
+        self.assertIsNotNone(month_first)
+        self.assertEqual(recover_leases.parse_start("Sun 27 Sep 09:43:13 2026"), month_first)
+        self.assertEqual(recover_leases.parse_start("Sun  7 Sep 09:43:13 2026"), recover_leases.parse_start("Sun Sep  7 09:43:13 2026"))
+        for bad in ("garbage", "", "Sun Sept 27 09:43:13 2026", "Sun 27 Sept 09:43:13 2026", "Sun Sep 27 09:43:13", "27 09 2026 09:43:13",
+                    "Sun 27 09 09:43:13 2026", "dim. 27 sept. 09:43:13 2026", "So 27 Okt 09:43:13 2026", "Sun 27 Sep 09:43:13 2026 x"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(recover_leases.parse_start(bad))
 
     def test_parse_start(self) -> None:
         self.assertIsNotNone(recover_leases.parse_start("Sun Oct  4 16:20:29 2026"))
