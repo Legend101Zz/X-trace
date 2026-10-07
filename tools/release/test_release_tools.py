@@ -1113,7 +1113,7 @@ EXPECTED_UNKNOWN = run_gates.EXPECTED_UNINSPECTABLE_SCAN
 
 def _unknown(pid: int, start: str | None = None, reason: str = "missing-process-record-after-all-fd-fallback") -> dict[str, object]:
     return {
-        "pid": pid, "startedAt": start or f"start-{pid}", "observedParentPid": 1,
+        "pid": pid, "startedAt": start or _lstart(pid), "observedParentPid": 1,
         "descriptorStatus": "uninspectable", "reason": reason,
     }
 
@@ -4566,6 +4566,12 @@ class _NeverClassify:
         return {}
 
 
+
+def _lstart(pid: int) -> str:
+    """A real `ps lstart` string, distinct per pid, for provenance fixtures (starts are compared by instant)."""
+    return f"Sun Sep 27 {pid // 3600:02d}:{pid // 60 % 60:02d}:{pid % 60:02d} 2026"
+
+
 class ProvenanceTests(unittest.TestCase):
     """Provenance classification with fakes for every syscall, plus real-host observers."""
 
@@ -4588,15 +4594,15 @@ class ProvenanceTests(unittest.TestCase):
 
     @staticmethod
     def facts(pids: object, _deadline: float) -> dict[int, tuple[int, str]]:
-        return {pid: (0, f"start-{pid}") for pid in pids}  # type: ignore[union-attr]
+        return {pid: (0, _lstart(pid)) for pid in pids}  # type: ignore[union-attr]
 
     @staticmethod
     def snap(*rows: tuple[int, int, str]) -> dict[int, tuple[int, str, str]]:
-        return {pid: (ppid, f"start-{pid}", state) for pid, ppid, state in rows}
+        return {pid: (ppid, _lstart(pid), state) for pid, ppid, state in rows}
 
     def classify(self, item: provenance.Provenance, pids: list[int], scan: dict, fresh: dict | None = None,
                  owned: dict[int, str] | None = None) -> dict[int, dict]:
-        return item.classify([(pid, f"start-{pid}") for pid in pids], scan, fresh if fresh is not None else scan,
+        return item.classify([(pid, _lstart(pid)) for pid in pids], scan, fresh if fresh is not None else scan,
                              owned or {}, time.monotonic() + 5)
 
     # macOS coalition mode
@@ -4657,14 +4663,14 @@ class ProvenanceTests(unittest.TestCase):
         # The fresh snapshot shows a different process (new start) under the same pid.
         item = self.coalition({900: 7})
         item.start()
-        fresh = {900: (1, "start-other", "S")}
+        fresh = {900: (1, "Sun Sep 27 10:00:01 2026", "S")}
         self.assertEqual(self.classify(item, [900], scan, fresh), {})
         # The process is gone, a zombie, or owned in the fresh view.
         self.assertEqual(self.classify(item, [900], scan, {}), {})
         self.assertEqual(self.classify(item, [900], scan, self.snap((900, 1, "Z"))), {})
-        self.assertEqual(self.classify(item, [900], scan, owned={900: "start-900"}), {})
+        self.assertEqual(self.classify(item, [900], scan, owned={900: _lstart(900)}), {})
         # The start time changes between the first and the confirming read.
-        sequence = iter([{900: (0, "start-900")}, {900: (0, "start-changed")}])
+        sequence = iter([{900: (0, _lstart(900))}, {900: (0, "Sun Sep 27 10:00:02 2026")}])
         item = self.coalition({900: 7}, facts_reader=lambda pids, _d: next(sequence))
         item.start()
         self.assertEqual(self.classify(item, [900], scan), {})
@@ -4719,16 +4725,16 @@ class ProvenanceTests(unittest.TestCase):
         moved = self.snap((self.RUNNER, 1, "S"), (700, 1, "S"))
         self.assertEqual(self.classify(item, [700], moved), {}, "previously a descendant: never classified")
         # A different process reusing the pid has a new start time and is a new identity.
-        reuse = {700: (2, "start-new", "S"), 2: (0, "start-2", "S")}
-        reused = item.classify([(700, "start-new")], reuse, reuse, {}, time.monotonic() + 5,)
+        reuse = {700: (2, "Sun Sep 27 10:00:03 2026", "S"), 2: (0, _lstart(2), "S")}
+        reused = item.classify([(700, "Sun Sep 27 10:00:03 2026")], reuse, reuse, {}, time.monotonic() + 5,)
         self.assertEqual(reused, {}, "facts say start-700, not start-new")
 
     def test_subreaper_inconsistent_chains_and_start_times_stay_uncertain(self) -> None:
         item = self.subreaper()
         item.start()
-        missing_parent = {900: (4000, "start-900", "S")}
+        missing_parent = {900: (4000, _lstart(900), "S")}
         self.assertEqual(self.classify(item, [900], missing_parent), {})
-        cycle = {900: (901, "start-900", "S"), 901: (900, "start-901", "S")}
+        cycle = {900: (901, _lstart(900), "S"), 901: (900, _lstart(901), "S")}
         self.assertEqual(self.classify(item, [900], cycle), {})
         absent = self.snap((1, 0, "S"))
         self.assertEqual(self.classify(item, [900], absent), {})
@@ -4760,7 +4766,7 @@ class ProvenanceTests(unittest.TestCase):
         baseline = self.snap((650, self.RUNNER, "S"))
         live = self.snap((self.RUNNER, 1, "S"), (650, self.RUNNER, "S"), (700, self.RUNNER, "S"), (710, 700, "S"))
         item.observe(live, baseline, owned)
-        self.assertEqual(owned, {700: "start-700"}, "a daemon born just before the root exits is owned immediately")
+        self.assertEqual(owned, {700: _lstart(700)}, "a daemon born just before the root exits is owned immediately")
         self.assertEqual(item.report()["adoptedOrphanCount"], 1)
         # Its zombie is reaped; a zombie that was never adopted is not.
         zombies = self.snap((self.RUNNER, 1, "S"), (700, self.RUNNER, "Z"), (720, self.RUNNER, "Z"))
@@ -4774,7 +4780,7 @@ class ProvenanceTests(unittest.TestCase):
         provenance.register_probe(730)
         live = self.snap((self.RUNNER, 1, "S"), (730, self.RUNNER, "S"), (731, self.RUNNER, "S"))
         item.observe(live, {}, owned)
-        self.assertEqual(owned, {731: "start-731"}, "the registered ps/lsof helper is skipped, everything else adopted")
+        self.assertEqual(owned, {731: _lstart(731)}, "the registered ps/lsof helper is skipped, everything else adopted")
         with mock.patch.object(provenance, "PROBE_EXCLUSION_SECONDS", 0.0), mock.patch.object(provenance.time, "monotonic", return_value=time.monotonic() + 60):
             self.assertNotIn(730, provenance.recent_probe_pids())
 
@@ -4790,11 +4796,11 @@ class ProvenanceTests(unittest.TestCase):
         world.setUp()
         self.addCleanup(world.temp.cleanup)
         runner = os.getpid()
-        daemon_start = "start-9100"
+        daemon_start = _lstart(9100)
         real_class = provenance.Provenance
         factory = lambda **_ignored: real_class(  # noqa: E731
             platform="linux", runner_pid=runner, subreaper_setter=lambda e: True,
-            facts_reader=lambda pids, _d: {pid: (0, f"start-{pid}") for pid in pids})
+            facts_reader=lambda pids, _d: {pid: (0, _lstart(pid)) for pid in pids})
         snapshot, _clean, _raise, _probe = world.world()
         snapshot[9100] = (runner, daemon_start, "S")  # direct child of the runner: a reparented orphan
         stops: list[dict[int, str]] = []
@@ -4952,7 +4958,7 @@ class ProvenanceTests(unittest.TestCase):
         real_class = provenance.Provenance
         factory = lambda **_ignored: real_class(  # noqa: E731
             platform="darwin", runner_pid=self.RUNNER, coalition_reader={self.RUNNER: 100, 9001: 100}.get,
-            facts_reader=lambda pids, _d: {pid: (0, f"start-{pid}") for pid in pids})
+            facts_reader=lambda pids, _d: {pid: (0, _lstart(pid)) for pid in pids})
         _report, failure, _result = world.drive([world.world(_unknown(9001))], provenance_factory=factory, settle_seconds=2.0)
         self.assertIsNotNone(failure)
         assert failure is not None
@@ -5002,7 +5008,7 @@ class ProvenanceTests(unittest.TestCase):
         self.addCleanup(world.temp.cleanup)
         daemon = _unknown(9001)
         real_class = provenance.Provenance
-        facts = lambda pids, _d: {pid: (0, f"start-{pid}") for pid in pids}  # noqa: E731
+        facts = lambda pids, _d: {pid: (0, _lstart(pid)) for pid in pids}  # noqa: E731
         ok_factory = lambda **_ignored: real_class(  # noqa: E731
             platform="linux", runner_pid=self.RUNNER, subreaper_setter=lambda e: True, facts_reader=facts)
         report, failure, result = world.drive([world.world(daemon)], provenance_factory=ok_factory)
@@ -5735,6 +5741,29 @@ class RecoverLeasesTests(unittest.TestCase):
                     "Sun 27 09 09:43:13 2026", "dim. 27 sept. 09:43:13 2026", "So 27 Okt 09:43:13 2026", "Sun 27 Sep 09:43:13 2026 x"):
             with self.subTest(bad=bad):
                 self.assertIsNone(recover_leases.parse_start(bad))
+
+    def test_same_start_instant_compares_by_value_across_locales(self) -> None:
+        same = provenance.same_start_instant
+        self.assertTrue(same("Sun Sep 27 09:43:13 2026", "Sun 27 Sep 09:43:13 2026"))
+        self.assertTrue(same("Sun 27 Sep 09:43:13 2026", "Sun 27 Sep 09:43:13 2026"))
+        self.assertFalse(same("Sun Sep 27 09:43:13 2026", "Sun 27 Sep 09:43:14 2026"))
+        for bad in ("garbage", "", "Sun 27 Sept 09:43:13 2026"):
+            with self.subTest(bad=bad):
+                self.assertFalse(same(bad, "Sun 27 Sep 09:43:13 2026"))
+                self.assertFalse(same("Sun Sep 27 09:43:13 2026", bad))
+                self.assertFalse(same(bad, bad), "identical unparsable text is still not proven equal")
+        old_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "America/New_York"
+            time.tzset()
+            self.assertFalse(same("Sun Nov  1 01:30:00 2026", "Sun 1 Nov 01:30:00 2026"), "DST-ambiguous")
+            self.assertTrue(same("Sun Nov  1 03:30:00 2026", "Sun 1 Nov 03:30:00 2026"))
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
 
     def test_parse_start(self) -> None:
         self.assertIsNotNone(recover_leases.parse_start("Sun Oct  4 16:20:29 2026"))

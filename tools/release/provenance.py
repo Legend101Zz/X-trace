@@ -160,6 +160,55 @@ def read_process_start_epoch(pid: int, kinfo_reader: Callable[[int], bytes | Non
     return None
 
 
+def parse_start(value: str) -> float | None:
+    """Epoch seconds for a `ps lstart` string (local time), or None when unparsable or ambiguous.
+
+    A wall-clock time inside the repeated DST fall-back hour maps to two epochs; that is
+    refused (None) rather than guessed, so it can never make a later process look older.
+
+    Exactly two English orders are accepted: month-first (`Sun Sep 27 09:43:13 2026`, the C locale)
+    and day-first (`Sun 27 Sep 09:43:13 2026`, e.g. en_AU, which the inherited-environment `ps`
+    snapshot uses). The month is a name and the day a number, so they cannot be confused. Anything
+    else (other languages, typos, numeric-only) is None. The `ps` environment and the stored
+    identity strings must NOT be changed to match: retained owner records and receipts hold the
+    locale form as written, and identities are compared as exact (pid, string) pairs, so probing
+    in another locale would make a live recorded process look as if its start differs (exited).
+    """
+    parsed = None
+    text = " ".join(value.split())
+    for layout in ("%a %b %d %H:%M:%S %Y", "%a %d %b %H:%M:%S %Y"):
+        try:
+            parsed = time.strptime(text, layout)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return None
+    try:
+        candidates = set()
+        for isdst in (0, 1):
+            moment = time.mktime(parsed[:8] + (isdst,))
+            local = time.localtime(moment)
+            if local[:6] == parsed[:6]:
+                candidates.add(moment)
+        if len(candidates) != 1:
+            return None
+        return candidates.pop()
+    except (ValueError, OverflowError):
+        return None
+
+
+def same_start_instant(left: str, right: str) -> bool:
+    """True only if both `lstart` strings parse to one unambiguous epoch each and the epochs are equal.
+
+    Used where one side comes from a `LC_ALL=C` probe and the other from the inherited locale; it is
+    exactly as strict as string equality within one locale (1-second resolution). Unparsable or
+    DST-ambiguous on either side is not equal, so the process stays uncertain.
+    """
+    first, second = parse_start(left), parse_start(right)
+    return first is not None and second is not None and first == second
+
+
 def set_child_subreaper(enabled: bool) -> bool:
     """Set and verify PR_SET_CHILD_SUBREAPER for this process; False on any failure."""
     if not sys.platform.startswith("linux"):
@@ -395,7 +444,7 @@ class Provenance:
             fact = facts.get(pid)
             fresh = fresh_snapshot.get(pid)
             original = scan_snapshot.get(pid)
-            if (fact is None or fresh is None or original is None or fact[1] != started_at
+            if (fact is None or fresh is None or original is None or not same_start_instant(fact[1], started_at)
                     or fresh[1] != started_at or original[1] != started_at
                     or fresh[2] in {"Z", "X"} or owned.get(pid) == started_at):
                 continue
@@ -406,7 +455,7 @@ class Provenance:
                 if first is None or first != second or first in self.run_coalitions:
                     continue
                 again = self._facts_reader([pid], deadline).get(pid)
-                if again is None or again[1] != started_at:
+                if again is None or not same_start_instant(again[1], started_at):
                     continue
                 result[pid] = self._record(
                     pid, started_at, fresh[0], uid, CLASS_COALITION,
