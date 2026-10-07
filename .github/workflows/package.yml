@@ -76,6 +76,26 @@ jobs:
                   print("  path-like only in repro:", sorted(pb - pa)[:40])
           PY
           echo "TMPDIR=$TMPDIR"; ls -ld /var /tmp "$TMPDIR" || true
+          set +e
+          mkdir -p "$RUNNER_TEMP/cmpA" "$RUNNER_TEMP/cmpB"
+          tar -xzf dist/${{ matrix.platform }}/xtrace-*.tar.gz -C "$RUNNER_TEMP/cmpA"
+          tar -xzf "$RUNNER_TEMP"/repro/build-a/dist/${{ matrix.platform }}/xtrace-*.tar.gz -C "$RUNNER_TEMP/cmpB"
+          A=$(ls "$RUNNER_TEMP"/cmpA/*/bin/xtrace); B=$(ls "$RUNNER_TEMP"/cmpB/*/bin/xtrace)
+          echo "differing byte count: $(cmp -l "$A" "$B" | wc -l)"; cmp -l "$A" "$B" | head -5; cmp -l "$A" "$B" | tail -3
+          echo "--- uuid checkout"; otool -l "$A" | grep -A2 LC_UUID; echo "--- uuid repro"; otool -l "$B" | grep -A2 LC_UUID
+          echo "--- codesign checkout"; codesign -dvvv "$A" 2>&1 | grep -E 'CodeDirectory|Hash|Identifier|flags|CDHash'
+          echo "--- codesign repro"; codesign -dvvv "$B" 2>&1 | grep -E 'CodeDirectory|Hash|Identifier|flags|CDHash'
+          echo "--- segments checkout"; otool -l "$A" | grep -E 'segname|sectname|fileoff|filesize' | paste - - - - | head -40 > /tmp/segA; echo "--- segments repro"; otool -l "$B" | grep -E 'segname|sectname|fileoff|filesize' | paste - - - - | head -40 > /tmp/segB; diff /tmp/segA /tmp/segB && echo "segment layout identical"
+          python3 - "$A" "$B" <<'PY2'
+          import sys
+          a, b = (open(f, "rb").read() for f in sys.argv[1:3])
+          diffs = [i for i in range(min(len(a), len(b))) if a[i] != b[i]]
+          ranges = []
+          for i in diffs:
+              if ranges and i <= ranges[-1][1] + 64: ranges[-1][1] = i
+              else: ranges.append([i, i])
+          print("diff ranges (start,end,len):", [(s, e, e - s + 1) for s, e in ranges][:30], "total ranges", len(ranges))
+          PY2
       - name: Compare archive hash with the reproducibility build
         run: |
           python3 - "dist/${{ matrix.platform }}" "$RUNNER_TEMP/repro/repro.json" <<'PY'
