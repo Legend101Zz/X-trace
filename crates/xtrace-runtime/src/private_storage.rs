@@ -11,6 +11,10 @@ use thiserror::Error;
 
 const MAX_PATH_COMPONENTS: usize = 128;
 const ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_millis(750);
+/// How often an owned ACL probe is polled for exit. A local `ls` finishes in a few
+/// milliseconds, so a coarse interval would be most of every admission's cost.
+#[cfg(target_os = "macos")]
+const ACL_PROBE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 #[cfg(target_os = "macos")]
 const ACL_PROBE_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -1456,9 +1460,7 @@ fn acl_admits_directory(
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if Instant::now() < deadline => thread::sleep(
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(std::time::Duration::from_millis(10)),
+                deadline.saturating_duration_since(Instant::now()).min(ACL_PROBE_POLL_INTERVAL),
             ),
             _ => break None,
         }
@@ -1552,9 +1554,7 @@ fn macos_file_acl_listing_admits(path: &Path, deadline: std::time::Instant) -> b
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if Instant::now() < deadline => thread::sleep(
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(std::time::Duration::from_millis(10)),
+                deadline.saturating_duration_since(Instant::now()).min(ACL_PROBE_POLL_INTERVAL),
             ),
             _ => break None,
         }
