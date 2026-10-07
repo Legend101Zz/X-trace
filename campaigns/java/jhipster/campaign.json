@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "project": "jhipster",
+  "requirement": "CAMPAIGN-JHIPSTER",
+  "kind": "campaign_definition_preparation",
+  "upstream": {
+    "canonicalUrl": "https://github.com/jhipster/jhipster-sample-app",
+    "sha": "6b000b5d23a36c45e01472471b84a44fa2464044",
+    "stableTag": "v9.4.0",
+    "ref": "refs/tags/v9.4.0"
+  },
+  "license": {"spdx": "Apache-2.0", "file": "LICENSE.txt", "sha256": "be304eadb6744cc7d260966f80f195fce43388caf9b4fe3866476a9ada89d415"},
+  "runtime": {
+    "jdk": 21, "buildImage": "eclipse-temurin:21-jdk-jammy", "buildTool": "maven (./mvnw)",
+    "springBoot": "4.1.1", "jhipsterFramework": "9.4.0",
+    "servletStack": "Spring MVC on embedded Tomcat (jakarta.servlet), Spring Security JWT resource server, Spring Data JPA/Hibernate, Liquibase",
+    "database": "PostgreSQL 18.3 (upstream prod profile database; dev profile H2 not used)",
+    "databaseImage": "postgres:18.3@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db",
+    "platform": "linux/arm64"
+  },
+  "build": {
+    "command": "./mvnw -B -ntp -Pprod -DskipTests -Dskip.installnodenpm=true -Dskip.npm=true -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dmodernizer.skip=true -Dmaven.gitcommitid.skip=true package",
+    "artifact": "target/jhipster-sample-application-0.0.1-SNAPSHOT.jar",
+    "upstreamTests": "not_run"
+  },
+  "ports": {"app": 8080, "db": 5432, "hostBinding": "127.0.0.1:<ephemeral>"},
+  "resetProcedure": "Every run removes and recreates the private network, Postgres container (data on tmpfs) and app container; Liquibase (context prod) recreates the schema and upstream seeds only the built-in admin/user accounts. No faker data.",
+  "configAdaptations": [
+    "Maven `prod` profile with the Angular client build skipped (-Dskip.installnodenpm -Dskip.npm): the campaign exercises the REST/JWT backend only; no webapp assets are served",
+    "build skips tests, checkstyle, spotless, modernizer and git-commit-id plugin; no source changes",
+    "Spring `prod` profile with datasource and JWT secret supplied via environment (campaign-synthetic values only; the JWT secret is NOT the upstream .yo-rc secret)",
+    "Postgres data directory on tmpfs and fsync=off (disposable data)",
+    "JVM -Xmx1g, container memory 2g, TZ=UTC"
+  ],
+  "auth": {"scheme": "JWT bearer via POST /api/authenticate", "syntheticAccounts": "upstream-seeded admin and user (documented JHipster defaults); passwords redacted from recorded request bodies"},
+  "scenarios": [
+    {"id": "anonymous-and-invalid-login-denied", "kind": "auth", "seams": ["Spring Security filter chain 401", "AuthenticateController.authorize (invalid credentials)"]},
+    {"id": "admin-and-user-authentication", "kind": "auth", "seams": ["AuthenticateController.authorize", "AccountResource.getAccount", "UserResource.getAllUsers (403 for ROLE_USER)", "JDBC select jhi_user/jhi_user_authority"]},
+    {"id": "account-create-read-roundtrip", "kind": "db-write-read", "seams": ["BankAccountResource.createBankAccount", "BankAccountResource.getBankAccount", "JDBC insert bank_account"]},
+    {"id": "account-validation-errors", "kind": "validation", "seams": ["BankAccountResource.createBankAccount (BadRequestAlertException idexists / @Valid errors / HttpMessageNotReadable)"]},
+    {"id": "account-update-and-missing", "kind": "db-write-read", "seams": ["BankAccountResource.updateBankAccount", "JDBC update bank_account", "error path for unknown id"]},
+    {"id": "operation-with-relations", "kind": "business", "seams": ["LabelResource.createLabel", "OperationResource.createOperation", "OperationResource.getOperation", "JDBC insert operation + rel_operation__label"]},
+    {"id": "concurrent-isolation", "kind": "concurrency", "seams": ["12 parallel BankAccountResource create+get", "12 parallel authenticate+getAccount as admin/user; recordings must not cross-associate principals"]},
+    {"id": "delete-and-not-found", "kind": "error", "seams": ["OperationResource.deleteOperation", "LabelResource.deleteLabel", "404 paths", "JDBC delete"]}
+  ],
+  "notApplicable": {"outbound": "No outbound HTTP in the sample app; mail health is disabled upstream"}
+}

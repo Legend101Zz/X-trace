@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "project": "fineract",
+  "requirement": "CAMPAIGN-FINERACT",
+  "kind": "campaign_definition_preparation",
+  "upstream": {
+    "canonicalUrl": "https://github.com/apache/fineract",
+    "sha": "d5636847ac556c30b437254c353f05526d172b97",
+    "stableTag": "1.15.0",
+    "ref": "refs/tags/1.15.0^{}",
+    "tagObjectSha": "9e76f088db71a4458b68f7855b03b21d23b86f1c",
+    "note": "annotated tag; the pinned SHA is the peeled commit"
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "file": "LICENSE_SOURCE",
+    "sha256": "7e3b13f42d05b1da02165c5b0e200c9496a3e22f5642afa6b6909f3b1298cc98",
+    "otherFiles": {"LICENSE_RELEASE": "c86b4df35bc41bae3635d652e53432bb37ae8b8906349c40e2228bec9c95f165", "APACHE_LICENSETEXT.md": "1420334db7dcd5979afefa6ffff48d6005b7e4c6116a090322b3ddb686a51de9", "NOTICE_SOURCE": "3e9b097df85708ed2f323ec56c2692e2dcce686a5e30969c5c096caae6fd05ca"}
+  },
+  "runtime": {
+    "jdk": 21, "buildImage": "eclipse-temurin:21-jdk-jammy", "buildTool": "gradle wrapper 8.14.5",
+    "springBoot": "3.5.15",
+    "servletStack": "Spring Boot embedded Tomcat (jakarta.servlet) + Jersey (spring-boot-starter-jersey) application under /fineract-provider/api/v1/*; Spring Security Basic auth",
+    "jersey": "3.1.11 (jersey-server/jersey-common 3.1.11 in BOOT-INF/lib, Jakarta REST; verified from the built jar)",
+    "tomcat": "10.1.55",
+    "pgjdbc": "42.7.11",
+    "database": "PostgreSQL 18.3 (tenant store fineract_tenants + tenant db fineract_default)",
+    "databaseImage": "postgres:18.3@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db",
+    "platform": "linux/arm64"
+  },
+  "build": {
+    "command": "./gradlew --no-daemon --console=plain -Dorg.gradle.jvmargs=\"-Xmx3g -Dfile.encoding=UTF-8\" -x test -x spotlessCheck -x spotlessApply :fineract-provider:bootJar",
+    "artifact": "fineract-provider/build/libs/fineract-provider-1.15.0.jar",
+    "upstreamTests": "not_run"
+  },
+  "ports": {"app": 8080, "db": 5432, "hostBinding": "127.0.0.1:<ephemeral>"},
+  "resetProcedure": "Every run removes and recreates the private network, Postgres container (data on tmpfs, role root) and app container, then creates database fineract_default; on first start Fineract's Liquibase initializes the tenant store, tenant schema and seeds (office 1, mifos user).",
+  "configAdaptations": [
+    "FINERACT_SERVER_SSL_ENABLED=false and FINERACT_SERVER_PORT=8080 (loopback HTTP instead of the upstream default HTTPS 8443)",
+    "FINERACT_HIKARI_*/FINERACT_DEFAULT_TENANTDB_* env point at the campaign Postgres container (upstream's documented env contract)",
+    "build runs bootJar only: tests and spotless are skipped; no source changes",
+    "Postgres data directory on tmpfs and fsync=off (disposable data)",
+    "JVM -Xmx2g, container memory 3g, TZ=UTC (tenant timezone left at upstream default Asia/Kolkata)"
+  ],
+  "auth": {"scheme": "HTTP Basic (upstream demo mifos/password) + Fineract-Platform-TenantId: default", "note": "credentials are Fineract's documented synthetic seed; Authorization header redacted in receipts"},
+  "scenarios": [
+    {"id": "denied-without-valid-credentials", "kind": "auth", "seams": ["Spring Security BasicAuthenticationFilter 401 before Jersey", "no handler expected"]},
+    {"id": "authenticated-seed-read", "kind": "business", "seams": ["OfficesApiResource.retrieveOffices/retrieveOffice (Jersey resource method)", "ClientsApiResource.retrieveAll", "JDBC select m_office/m_client"]},
+    {"id": "client-create-read-roundtrip", "kind": "db-write-read", "seams": ["ClientsApiResource.create", "PortfolioCommandSourceWritePlatformService.logCommandSource", "ClientWritePlatformService.createClient", "JDBC insert m_client", "ClientsApiResource.retrieveOne"]},
+    {"id": "client-validation-errors", "kind": "validation", "seams": ["ClientsApiResource.create -> PlatformApiDataValidationException -> Jersey exception mapper 400", "malformed JSON -> mapper 4xx"]},
+    {"id": "client-update", "kind": "db-write-read", "seams": ["ClientsApiResource.update", "JDBC update m_client"]},
+    {"id": "client-activate-command", "kind": "business", "seams": ["ClientsApiResource.activate (?command=activate)", "command pipeline frames", "domain-rule rejection on second activation"]},
+    {"id": "concurrent-isolation", "kind": "concurrency", "seams": ["12 parallel ClientsApiResource.create+retrieveOne, 16 parallel OfficesApiResource.retrieveOffice; recordings must not cross-associate"]},
+    {"id": "delete-and-not-found", "kind": "error", "seams": ["ClientsApiResource.delete", "404 via Jersey exception mapper", "domain-rule rejection deleting an active client"]}
+  ],
+  "notApplicable": {"outbound": "no outbound dependency exercised: Fineract's hooks/notification senders are not configured in this campaign (no deterministic local dependency added to avoid unrequested scope)"}
+}

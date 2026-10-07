@@ -1,0 +1,100 @@
+{
+ "schemaVersion": 1,
+ "kind": "baseline_stability_summary_preparation",
+ "project": "fineract",
+ "releaseAcceptance": false,
+ "instrumented": false,
+ "pin": {
+  "sha": "d5636847ac556c30b437254c353f05526d172b97",
+  "jarSha256": "e4cff0ca1f633e742b2807110c2f5d42bc809d9b1421bea9e4d99c25afc586ae",
+  "jdkImage": "eclipse-temurin:21-jdk-jammy",
+  "postgresImageDigest": "sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db"
+ },
+ "runs": [
+  {
+   "dir": "baseline-1",
+   "result": "passed_baseline_only",
+   "bootMs": 71932,
+   "receiptSha256": "8ab1c6f161c4b020eb6de033799b33c49757029de0bf264442b22763734001e9"
+  },
+  {
+   "dir": "baseline-2",
+   "result": "passed_baseline_only",
+   "bootMs": 68147,
+   "receiptSha256": "16a08b7a6168ef74aed0e6f9791fe6b0760a4ee33c4a6588a720da2b7f5e8e0a"
+  },
+  {
+   "dir": "baseline-3",
+   "result": "passed_baseline_only",
+   "bootMs": 52182,
+   "receiptSha256": "26d4c152386a2bcaddbb81d9db7f2ed9e92ae9adf314d4a97c9fd9ed360fd6f6"
+  }
+ ],
+ "scenarios": [
+  {
+   "id": "denied-without-valid-credentials",
+   "kind": "auth",
+   "requests": 3,
+   "checks": 4,
+   "semanticEffectFingerprint": "684e69d0106b8a850198840cf6da0d134bd6a9427171e5851dc57379ee291702",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "authenticated-seed-read",
+   "kind": "business",
+   "requests": 3,
+   "checks": 4,
+   "semanticEffectFingerprint": "7456ed2def3f03730cdf7a6719029d4efbc49a219e4a723be62e7af46171b21d",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "client-create-read-roundtrip",
+   "kind": "db-write-read",
+   "requests": 2,
+   "checks": 3,
+   "semanticEffectFingerprint": "42de15723a5240467aa3a53a7c29f4d2783deb92d4c813c80b0a7148123df7d8",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "client-validation-errors",
+   "kind": "validation",
+   "requests": 3,
+   "checks": 4,
+   "semanticEffectFingerprint": "0540c301d3a4173a7821f54dbe6266107db519789e31a23507b760ae0b94b22e",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "client-update",
+   "kind": "db-write-read",
+   "requests": 2,
+   "checks": 3,
+   "semanticEffectFingerprint": "f265d4aca2426e0ec3596a1ce267e78470ce0e641b7e9f508de42b9cc21812ac",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "client-activate-command",
+   "kind": "business",
+   "requests": 3,
+   "checks": 4,
+   "semanticEffectFingerprint": "51f9ae2697463f899a61f2db9f9df3851bf7000c41ec86f69706f471624eca34",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "concurrent-isolation",
+   "kind": "concurrency",
+   "requests": 40,
+   "checks": 3,
+   "semanticEffectFingerprint": "14a7f041d7c0f149d47eec9b894ba40e50f256fb11693c7dba21c2b3e84293e2",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "delete-and-not-found",
+   "kind": "error",
+   "requests": 5,
+   "checks": 6,
+   "semanticEffectFingerprint": "b46f91e9199f960f51d37b9c2f390ed8e064b131cafe92a60b7736947a266910",
+   "stableAcrossRuns": true
+  }
+ ],
+ "allStable": true
+}

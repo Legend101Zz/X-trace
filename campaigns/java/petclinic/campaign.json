@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "project": "petclinic",
+  "requirement": "CAMPAIGN-PETCLINIC",
+  "kind": "campaign_definition_preparation",
+  "upstream": {
+    "canonicalUrl": "https://github.com/spring-projects/spring-petclinic",
+    "sha": "500158f732419217507c7656904b8e6aa1bcc0d6",
+    "stableTag": null,
+    "ref": "refs/heads/main"
+  },
+  "tagException": {
+    "ownerDecision": "Use current main SHA with explicit tag exception",
+    "obsoleteTagUsed": false,
+    "tagWasMissing": true,
+    "testedRefKind": "branch-main-sha"
+  },
+  "license": {"spdx": "Apache-2.0", "file": "LICENSE.txt", "sha256": "56dfc19e0dc836e30177332f73e8e6fbc297941acf3d906eec6eaaa46c2c452a"},
+  "runtime": {
+    "jdk": 17, "buildImage": "eclipse-temurin:17-jdk-jammy", "buildTool": "maven (./mvnw)",
+    "springBoot": "4.1.0", "servletStack": "Spring MVC on embedded Tomcat (jakarta.servlet), Thymeleaf views, Spring Data JPA/Hibernate",
+    "database": "PostgreSQL 18.3 (upstream profile `postgres`; H2 default not used)",
+    "databaseImage": "postgres:18.3@sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db",
+    "platform": "linux/arm64"
+  },
+  "build": {"command": "./mvnw -B -ntp -DskipTests -Dcheckstyle.skip=true -Dspring-javaformat.skip=true package", "artifact": "target/spring-petclinic-4.0.0-SNAPSHOT.jar", "upstreamTests": "not_run"},
+  "ports": {"app": 8080, "db": 5432, "hostBinding": "127.0.0.1:<ephemeral>"},
+  "resetProcedure": "Every run removes and recreates the private network, Postgres container (data on tmpfs) and app container; schema.sql/data.sql (spring.sql.init.mode=always) reseed the upstream synthetic owners/vets/pets.",
+  "configAdaptations": [
+    "spring profile `postgres` (upstream-supported) with env POSTGRES_URL/USER/PASS pointing at the campaign Postgres container",
+    "Postgres data directory on tmpfs and fsync=off (disposable data)",
+    "build skips tests, checkstyle and spring-javaformat (style gates); no source changes",
+    "JVM -Xmx768m, container memory 2g, TZ=UTC"
+  ],
+  "scenarios": [
+    {"id": "search-seeded", "kind": "business", "seams": ["OwnerController.processFindForm", "VetController.showResourcesVetList", "JDBC select owners/vets"]},
+    {"id": "owner-create-roundtrip", "kind": "db-write-read", "seams": ["OwnerController.processCreationForm", "OwnerRepository.save", "JDBC insert owners", "OwnerController.showOwner"]},
+    {"id": "owner-validation-error", "kind": "validation", "seams": ["OwnerController.processCreationForm (BindingResult errors, view re-render, no DB write)"]},
+    {"id": "pet-and-visit-flow", "kind": "business", "seams": ["PetController.processCreationForm (success + duplicate rejection)", "VisitController.processNewVisitForm", "JDBC insert pets/visits"]},
+    {"id": "owner-edit", "kind": "db-write-read", "seams": ["OwnerController.processUpdateOwnerForm", "JDBC update owners"]},
+    {"id": "missing-owner-error", "kind": "error", "seams": ["OwnerController.showOwner throws IllegalArgumentException -> error page 500"]},
+    {"id": "controller-crash-path", "kind": "error", "seams": ["CrashController.triggerException -> RuntimeException -> 500"]},
+    {"id": "concurrent-isolation", "kind": "concurrency", "seams": ["30 parallel OwnerController.showOwner + 10 parallel create/reopen; recordings must not cross-associate"]}
+  ],
+  "notApplicable": {"auth": "Petclinic has no authentication", "outbound": "Petclinic makes no outbound calls"}
+}
