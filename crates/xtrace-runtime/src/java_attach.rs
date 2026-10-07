@@ -834,7 +834,7 @@ pub(super) fn verify_ancestor_metadata(
         identity.owner,
         identity.mode,
         uid,
-        acl_admits_directory(path, descriptor, identity),
+        acl_admits_traversal_directory(path, descriptor, identity),
     ) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -842,6 +842,25 @@ pub(super) fn verify_ancestor_metadata(
         ));
     }
     Ok(())
+}
+
+/// Ancestors are only traversed; on Linux the shared traversal policy applies (see private_storage).
+#[cfg(target_os = "linux")]
+fn acl_admits_traversal_directory(
+    _path: &Path,
+    directory: &std::fs::File,
+    _expected: FileIdentity,
+) -> bool {
+    super::private_storage::linux_directory_admits_traversal(directory)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn acl_admits_traversal_directory(
+    path: &Path,
+    directory: &std::fs::File,
+    expected: FileIdentity,
+) -> bool {
+    acl_admits_directory(path, directory, expected)
 }
 
 fn ancestor_metadata_allowed(owner: u32, mode: u32, current_uid: u32, acl_admitted: bool) -> bool {
@@ -1145,7 +1164,9 @@ fn valid_macos_flags(flags: &str) -> bool {
         return true;
     }
     let mut seen = std::collections::BTreeSet::new();
-    flags.split(',').all(|flag| matches!(flag, "sunlnk" | "restricted") && seen.insert(flag))
+    flags
+        .split(',')
+        .all(|flag| matches!(flag, "sunlnk" | "restricted") && seen.insert(flag))
 }
 
 #[cfg(any(target_os = "macos", test))]

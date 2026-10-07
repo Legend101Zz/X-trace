@@ -1194,7 +1194,7 @@ fn verify_ancestor_metadata(
         || opened.mode() & 0o022 != 0
         || !rustix::fs::fstatfs(descriptor)
             .is_ok_and(|filesystem| owner_enforcing_local_filesystem(&filesystem))
-        || !acl_admits_directory(path, descriptor, identity, deadline)
+        || !acl_admits_traversal_directory(path, descriptor, identity, deadline)
     {
         return Err(PrivateStorageError::Unavailable);
     }
@@ -1252,6 +1252,96 @@ fn admit_directory_descriptor_until(
         return Err(PrivateStorageError::Unavailable);
     }
     Ok(())
+}
+
+/// ACL policy for a directory that is only traversed on the way to a private root.
+///
+/// On Linux a traversed directory is admitted when it carries no ACL, or when its access ACL is
+/// well formed and grants no write permission to anyone but the owning user; its default ACL only
+/// shapes children created later and cannot change who may write into the directory itself.
+/// (Stock CI images give `/home` a default ACL.) The private leaf and every managed container
+/// still go through the strict `acl_admits_directory` check, which refuses any ACL.
+#[cfg(target_os = "linux")]
+fn acl_admits_traversal_directory(
+    _path: &Path,
+    directory: &File,
+    _expected: FileIdentity,
+    _deadline: std::time::Instant,
+) -> bool {
+    linux_directory_admits_traversal(directory)
+}
+
+/// Linux traversal ACL policy, shared with the Java attach ancestor walk.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_directory_admits_traversal(directory: &File) -> bool {
+    let mut value = vec![0_u8; 16 * 1024];
+    match rustix::fs::fgetxattr(directory, "system.posix_acl_access", value.as_mut_slice()) {
+        Ok(length) => {
+            if !linux_access_acl_grants_no_foreign_write(value.get(..length).unwrap_or(&[])) {
+                return false;
+            }
+        }
+        Err(error) if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NODATA => {}
+        Err(_) => return false,
+    }
+    match rustix::fs::fgetxattr(directory, "system.posix_acl_default", value.as_mut_slice()) {
+        Ok(length) => linux_default_acl_is_well_formed(value.get(..length).unwrap_or(&[])),
+        Err(error) => error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NODATA,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn acl_admits_traversal_directory(
+    path: &Path,
+    directory: &File,
+    expected: FileIdentity,
+    deadline: std::time::Instant,
+) -> bool {
+    acl_admits_directory(path, directory, expected, deadline)
+}
+
+/// Parses a Linux `system.posix_acl_*` xattr (version 2, 8-byte entries) into `(tag, perm)`
+/// pairs; `None` for anything malformed, so unknown shapes stay refused.
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_acl(bytes: &[u8]) -> Option<Vec<(u16, u16)>> {
+    const VERSION: u32 = 2;
+    const UNDEFINED_ID: u32 = u32::MAX;
+    const MAX_ENTRIES: usize = 64;
+    let (header, body) = bytes.split_at_checked(4)?;
+    if u32::from_le_bytes(header.try_into().ok()?) != VERSION
+        || body.len() % 8 != 0
+        || body.len() / 8 > MAX_ENTRIES
+    {
+        return None;
+    }
+    let mut entries = Vec::new();
+    for entry in body.chunks_exact(8) {
+        let tag = u16::from_le_bytes([entry[0], entry[1]]);
+        let perm = u16::from_le_bytes([entry[2], entry[3]]);
+        let id = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+        let named = matches!(tag, 0x02 | 0x08);
+        let unnamed = matches!(tag, 0x01 | 0x04 | 0x10 | 0x20);
+        if perm > 7 || !(named || unnamed) || (unnamed && id != UNDEFINED_ID) {
+            return None;
+        }
+        entries.push((tag, perm));
+    }
+    Some(entries)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_access_acl_grants_no_foreign_write(bytes: &[u8]) -> bool {
+    const USER_OBJ: u16 = 0x01;
+    const WRITE: u16 = 0x02;
+    parse_linux_acl(bytes).is_some_and(|entries| {
+        entries.iter().any(|(tag, _)| *tag == USER_OBJ)
+            && entries.iter().all(|(tag, perm)| *tag == USER_OBJ || perm & WRITE == 0)
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_default_acl_is_well_formed(bytes: &[u8]) -> bool {
+    parse_linux_acl(bytes).is_some()
 }
 
 #[cfg(target_os = "linux")]
@@ -1683,7 +1773,9 @@ fn valid_macos_flags(flags: &str) -> bool {
         return true;
     }
     let mut seen = std::collections::BTreeSet::new();
-    flags.split(',').all(|flag| matches!(flag, "sunlnk" | "restricted") && seen.insert(flag))
+    flags
+        .split(',')
+        .all(|flag| matches!(flag, "sunlnk" | "restricted") && seen.insert(flag))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1713,6 +1805,101 @@ mod tests {
             .expect("test clock")
             .as_nanos();
         format!("{stem}-{}-{time}", std::process::id())
+    }
+
+    #[test]
+    fn traversal_acl_parser_admits_read_only_acls_and_refuses_foreign_write() {
+        fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+            let mut out = 2_u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in entries {
+                out.extend_from_slice(&tag.to_le_bytes());
+                out.extend_from_slice(&perm.to_le_bytes());
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            out
+        }
+        const NONE: u32 = u32::MAX;
+        let base = [(1, 7, NONE), (4, 5, NONE), (32, 5, NONE)];
+        assert!(linux_access_acl_grants_no_foreign_write(&acl(&base)));
+        let read_only_named =
+            [(1, 7, NONE), (2, 5, 1000), (4, 5, NONE), (16, 5, NONE), (32, 5, NONE)];
+        assert!(linux_access_acl_grants_no_foreign_write(&acl(&read_only_named)));
+        let writable_named_user =
+            [(1, 7, NONE), (2, 7, 1000), (4, 5, NONE), (16, 7, NONE), (32, 5, NONE)];
+        assert!(!linux_access_acl_grants_no_foreign_write(&acl(&writable_named_user)));
+        let writable_named_group =
+            [(1, 7, NONE), (4, 5, NONE), (8, 2, 7), (16, 7, NONE), (32, 5, NONE)];
+        assert!(!linux_access_acl_grants_no_foreign_write(&acl(&writable_named_group)));
+        let writable_other = [(1, 7, NONE), (4, 5, NONE), (32, 2, NONE)];
+        assert!(!linux_access_acl_grants_no_foreign_write(&acl(&writable_other)));
+        let writable_group_owner = [(1, 7, NONE), (4, 7, NONE), (32, 5, NONE)];
+        assert!(!linux_access_acl_grants_no_foreign_write(&acl(&writable_group_owner)));
+        assert!(!linux_access_acl_grants_no_foreign_write(&[]));
+        assert!(!linux_access_acl_grants_no_foreign_write(&[2, 0, 0, 0, 1, 0]));
+        let mut wrong_version = acl(&base);
+        wrong_version[0] = 3;
+        assert!(!linux_access_acl_grants_no_foreign_write(&wrong_version));
+        assert!(!linux_access_acl_grants_no_foreign_write(&acl(&[(0x40, 5, NONE)])));
+        assert!(!linux_access_acl_grants_no_foreign_write(&acl(&[(1, 8, NONE)])));
+        assert!(!linux_access_acl_grants_no_foreign_write(&acl(&[(1, 7, 5)])));
+        assert!(!linux_access_acl_grants_no_foreign_write(&acl(&[(2, 4, 5)])));
+        assert!(linux_default_acl_is_well_formed(&acl(&base)));
+        assert!(linux_default_acl_is_well_formed(&acl(&[])));
+        assert!(!linux_default_acl_is_well_formed(&[1, 2, 3]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_directory_acls_are_judged_by_traversal_and_strict_policy() {
+        fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+            let mut out = 2_u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in entries {
+                out.extend_from_slice(&tag.to_le_bytes());
+                out.extend_from_slice(&perm.to_le_bytes());
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            out
+        }
+        const NONE: u32 = u32::MAX;
+        let scratch = private_scratch();
+        let name = unique_name("acl");
+        let child = scratch.create_private_child(&name).expect("create child");
+        let directory = open_directory_descriptor(child.path().to_str().expect("utf-8 path"))
+            .expect("open child");
+        let identity = FileIdentity::from_metadata(&directory.metadata().expect("metadata"));
+        let deadline = new_admission_deadline();
+        let admits_traversal =
+            || acl_admits_traversal_directory(child.path(), &directory, identity, deadline);
+        let admits_strict = || acl_admits_directory(child.path(), &directory, identity, deadline);
+        assert!(admits_traversal() && admits_strict());
+        let set = |attr: &str, value: &[u8]| {
+            rustix::fs::fsetxattr(&directory, attr, value, rustix::fs::XattrFlags::empty())
+        };
+        // Default ACL (what stock CI images put on /home): traversal admits, strict refuses.
+        let default_result =
+            set("system.posix_acl_default", &acl(&[(1, 7, NONE), (4, 5, NONE), (32, 5, NONE)]));
+        if default_result == Err(rustix::io::Errno::OPNOTSUPP) {
+            return;
+        }
+        default_result.expect("set default acl");
+        assert!(admits_traversal());
+        assert!(!admits_strict());
+        // A named user with write is refused by both.
+        set(
+            "system.posix_acl_access",
+            &acl(&[(1, 7, NONE), (2, 7, 12345), (4, 5, NONE), (16, 7, NONE), (32, 0, NONE)]),
+        )
+        .expect("set writable access acl");
+        assert!(!admits_traversal());
+        assert!(!admits_strict());
+        // A named user with read only: traversal admits, strict refuses.
+        set(
+            "system.posix_acl_access",
+            &acl(&[(1, 7, NONE), (2, 5, 12345), (4, 5, NONE), (16, 5, NONE), (32, 0, NONE)]),
+        )
+        .expect("set read-only access acl");
+        assert!(admits_traversal());
+        assert!(!admits_strict());
     }
 
     #[test]
