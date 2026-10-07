@@ -1974,11 +1974,25 @@ def _write_receipt(path: pathlib.Path, manifest: dict[str, Any]) -> None:
     _atomic_json(path, manifest)
 
 
+def stamp_run_start(leases: Sequence["Lease"], clock: Callable[[], float] = time.time) -> int:
+    """Capture ONE run-start epoch and give the same value to every lease of the run.
+
+    Called once, before the first lease of a run is acquired, so all owner records the run
+    writes carry an identical `startedAtEpoch` however long each acquisition takes.
+    """
+    epoch = int(clock())
+    for lease in leases:
+        lease.started_at_epoch = epoch
+    return epoch
+
+
 class Lease:
-    def __init__(self, path: pathlib.Path, token: str, label: str):
+    def __init__(self, path: pathlib.Path, token: str, label: str, started_at_epoch: int | None = None):
         self.path = path
         self.token = token
         self.label = label
+        # Shared run-start epoch (see stamp_run_start); None only for a lease used on its own.
+        self.started_at_epoch = started_at_epoch
         self.acquired = False
         self.borrowed = False
 
@@ -2013,7 +2027,8 @@ class Lease:
             raise LeaseBusy("release builder lease is already owned (unknown owner)")
         self.acquired = True
         try:
-            _atomic_json(self.path / "owner.json", {"pid": os.getpid(), "label": self.label, "token": self.token, "startedAtEpoch": int(time.time())})
+            _atomic_json(self.path / "owner.json", {"pid": os.getpid(), "label": self.label, "token": self.token,
+                                                   "startedAtEpoch": self.started_at_epoch if self.started_at_epoch is not None else int(time.time())})
         except BaseException:
             try:
                 private_roots.admit_directory(self.path, private_leaf=True)
@@ -2256,6 +2271,7 @@ def run(args: argparse.Namespace) -> int:
     active_attempt: dict[str, Any] | None = None
     try:
         recheck_private_roots()
+        stamp_run_start(leases)
         for lease in leases:
             lease.acquire()
             acquired_leases.append(lease)
