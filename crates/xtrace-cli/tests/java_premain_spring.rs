@@ -759,7 +759,9 @@ fn wait_for_recordings(project_root: &Path, expected_count: usize) -> Vec<(Strin
         let mut statement = connection
             .prepare(
                 "SELECT hex(rs.recording_id), rs.object_hash \
-                 FROM recording_segments rs WHERE rs.segment_ordinal = 0 ORDER BY rs.rowid",
+                 FROM recording_segments rs \
+                 JOIN recordings r ON r.recording_id = rs.recording_id \
+                 WHERE rs.segment_ordinal = 0 AND r.status = 'complete' ORDER BY rs.rowid",
             )
             .expect("prepare recording query");
         let rows = statement
