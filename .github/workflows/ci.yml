@@ -366,11 +366,10 @@ jobs:
           PATH="/usr/bin:/bin:/usr/local/bin:$HOME/.cargo/bin" \
             cargo build -p xtrace-protocol --all-features
       - name: CLI integration smoke
-        env:
-          SMOKE: ${{ runner.temp }}/xt/smoke
-          XTRACE_DATA_HOME: ${{ runner.temp }}/xt/smoke/userdata
         run: |
           set -euo pipefail
+          SMOKE="${RUNNER_TEMP:?}/xt/smoke"
+          export XTRACE_DATA_HOME="$SMOKE/userdata"
           rm -rf $SMOKE
           mkdir -p $SMOKE/repo
           cargo build -p xtrace-cli --bin xtrace

@@ -483,9 +483,11 @@ class CiFloorEvidenceTests(unittest.TestCase):
         # The product's default `init` key is `xtrace-init-<repo path>` capped at 128 characters and the
         # Rust tests create repos under <root>/tmp, so a long CI root fails them with
         # XTR-VALIDATION-IDEMPOTENCY (run 37232993067). The roots are fixed short names.
+        # xf/xr are the release-floor and release-tool roots; xt is the cargo-job test scratch of the
+        # non-floor jobs (java-client x2 matrix shares one step, node-client, gates), repeated once per job.
         text = (pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         roots = re.findall(r'root="\$\{RUNNER_TEMP:\?\}/([A-Za-z0-9_-]+)"', text)
-        self.assertEqual(sorted(roots), ["xf", "xr"])
+        self.assertEqual(sorted(roots), ["xf", "xr", "xt", "xt", "xt"])
         self.assertNotIn("GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}", text.split("Select private root path", 1)[1].split("- name:", 1)[0])
 
     def test_describe_runner_failure_for_gates_missing_receipts_and_unknown_names(self) -> None:
