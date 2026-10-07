@@ -4606,6 +4606,13 @@ class ProvenanceTests(unittest.TestCase):
                              owned or {}, time.monotonic() + 5)
 
     # macOS coalition mode
+    def test_pid_one_start_time_is_readable_and_earlier_than_this_test(self) -> None:
+        # Platform-neutral and never skipped: sysctl kinfo_proc on macOS, /proc on Linux.
+        began = time.time()
+        epoch = provenance.read_process_start_epoch(1)
+        self.assertIsNotNone(epoch)
+        self.assertLess(epoch, began)
+
     def test_coalition_different_and_readable_is_classified_with_evidence(self) -> None:
         item = self.coalition({900: 7})
         self.assertTrue(item.start())
@@ -5671,13 +5678,6 @@ class RecoverLeasesTests(unittest.TestCase):
             self.assertIsNone(provenance.read_process_start_epoch(5, kinfo_reader=lambda pid: b"short"))
             self.assertIsNone(provenance.read_process_start_epoch(5, kinfo_reader=lambda pid: None))
             self.assertIsNone(provenance.read_process_start_epoch(5, kinfo_reader=mock.Mock(side_effect=OSError("x"))))
-
-    @unittest.skipUnless(sys.platform == "darwin", "macOS kernel start time")
-    def test_darwin_pid_one_start_time_is_readable_and_earlier_than_this_test(self) -> None:
-        began = time.time()
-        epoch = provenance.read_process_start_epoch(1)
-        self.assertIsNotNone(epoch)
-        self.assertLess(epoch, began)
 
     def test_removal_reads_the_record_through_the_lease_descriptor_and_refuses_links(self) -> None:
         self.quiet_world()
