@@ -1215,9 +1215,15 @@ fn admit_directory_descriptor_until(
     }
     let filesystem =
         rustix::fs::fstatfs(descriptor).map_err(|_| PrivateStorageError::Unavailable)?;
-    if !owner_enforcing_local_filesystem(&filesystem)
-        || !acl_admits_directory(path, descriptor, identity, deadline)
-    {
+    // Only the private leaf must carry no ACL at all. Every other component is merely walked
+    // through (or is a container whose created children are re-admitted as private leaves, which
+    // refuses an inherited ACL), so it gets the traversal policy, as in `verify_ancestor_metadata`.
+    let acl_admitted = if private_leaf {
+        acl_admits_directory(path, descriptor, identity, deadline)
+    } else {
+        acl_admits_traversal_directory(path, descriptor, identity, deadline)
+    };
+    if !owner_enforcing_local_filesystem(&filesystem) || !acl_admitted {
         return Err(PrivateStorageError::Unavailable);
     }
     verify_ancestor_metadata(path, descriptor, deadline)?;
@@ -2005,6 +2011,53 @@ mod tests {
         .expect("set read-only access acl");
         assert!(admits_traversal());
         assert!(!admits_strict());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_acl_on_a_walked_directory_does_not_block_a_clean_private_leaf() {
+        fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+            let mut out = 2_u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in entries {
+                out.extend_from_slice(&tag.to_le_bytes());
+                out.extend_from_slice(&perm.to_le_bytes());
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            out
+        }
+        const NONE: u32 = u32::MAX;
+        let scratch = private_scratch();
+        let walked = scratch.create_private_child(&unique_name("walked")).expect("walked dir");
+        let clean = walked.create_private_child("clean").expect("clean leaf");
+        let set = |attr: &str, value: &[u8]| {
+            rustix::fs::fsetxattr(&walked.directory, attr, value, rustix::fs::XattrFlags::empty())
+        };
+        // The shape stock CI images give /home: default ACL naming the runner user with rwx.
+        let stock_home_default =
+            acl(&[(1, 7, NONE), (2, 7, 1000), (4, 5, NONE), (16, 7, NONE), (32, 5, NONE)]);
+        let result = set("system.posix_acl_default", &stock_home_default);
+        if result == Err(rustix::io::Errno::OPNOTSUPP) {
+            return;
+        }
+        result.expect("set default acl on walked directory");
+        let clean_path = clean.path().to_path_buf();
+        // Creating, opening, and re-admitting a clean leaf below the walked directory still works.
+        AdmittedPrivateRoot::open(&clean_path).expect("leaf below default-ACL ancestor");
+        AdmittedPrivateRoot::open_or_create(&clean_path).expect("open_or_create below ancestor");
+        AdmittedPrivateRoot::open_container(walked.path()).expect("container with default ACL");
+        // A directory created below it inherits the ACL and is refused as a private leaf.
+        let inherited = walked.path().join("inherited");
+        assert!(AdmittedPrivateRoot::open_or_create(&inherited).is_err());
+        // The walked directory itself, as a private leaf, is still refused for carrying an ACL.
+        assert!(AdmittedPrivateRoot::open(walked.path()).is_err());
+        // An ancestor whose access ACL grants a foreign write is refused for every use.
+        set(
+            "system.posix_acl_access",
+            &acl(&[(1, 7, NONE), (2, 7, 12345), (4, 5, NONE), (16, 7, NONE), (32, 0, NONE)]),
+        )
+        .expect("set writable access acl");
+        assert!(AdmittedPrivateRoot::open(&clean_path).is_err());
+        assert!(AdmittedPrivateRoot::open_or_create(&clean_path).is_err());
     }
 
     #[test]
