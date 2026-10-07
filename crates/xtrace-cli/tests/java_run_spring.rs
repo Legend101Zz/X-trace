@@ -1263,19 +1263,14 @@ fn wait_for_recording_count(project_root: &Path, expected: i64) {
     loop {
         let database = Connection::open(project_root.join("metadata.sqlite3")).expect("SQLite");
         let count: i64 = database
-            .query_row(
-                "SELECT COUNT(*) FROM recordings WHERE status = 'complete'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM recordings WHERE status = 'complete'", [], |row| {
+                row.get(0)
+            })
             .expect("recording count");
         if count >= expected {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "expected {expected} completed recordings, got {count}"
-        );
+        assert!(Instant::now() < deadline, "expected {expected} completed recordings, got {count}");
         thread::sleep(Duration::from_millis(30));
     }
 }
