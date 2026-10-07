@@ -1768,6 +1768,10 @@ fn valid_acl_principal(value: &str) -> bool {
 }
 
 #[cfg(any(target_os = "macos", test))]
+/// `ls -O` file flags admitted on a directory: `sunlnk` (sticky-like unlink restriction) and
+/// `restricted` (SIP) only narrow what can be changed, and `hidden` (UF_HIDDEN) is a Finder
+/// visibility bit (e.g. `/Volumes`) that changes neither ownership nor access. Anything else
+/// (`opaque`, `uchg`, `dataless`, ...) stays refused so unknown semantics fail closed.
 fn valid_macos_flags(flags: &str) -> bool {
     if flags == "-" {
         return true;
@@ -1775,7 +1779,7 @@ fn valid_macos_flags(flags: &str) -> bool {
     let mut seen = std::collections::BTreeSet::new();
     flags
         .split(',')
-        .all(|flag| matches!(flag, "sunlnk" | "restricted") && seen.insert(flag))
+        .all(|flag| matches!(flag, "sunlnk" | "restricted" | "hidden") && seen.insert(flag))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1934,6 +1938,34 @@ mod tests {
         assert!(!parse_macos_acl_listing(
             "drwxr-xr-x+ 4 alice staff - 128 Oct 4 00:23 /Users/alice/Documents\n",
             "/Users/alice/Documents",
+        ));
+    }
+
+    #[test]
+    fn macos_flags_admit_hidden_volumes_and_refuse_unknown_flags() {
+        let listing =
+            |flags: &str| format!("drwxr-xr-x 7 root wheel {flags} 224 Oct 8 01:32 /Volumes\n");
+        for ok in ["hidden", "hidden,sunlnk", "sunlnk,hidden", "hidden,restricted", "-"] {
+            assert!(parse_macos_acl_listing(&listing(ok), "/Volumes"), "{ok}");
+        }
+        for bad in [
+            "uchg",
+            "opaque",
+            "hidden,uchg",
+            "hidden,hidden",
+            "hidden,",
+            ",hidden",
+            "Hidden",
+            "dataless",
+            "schg",
+            "nodump",
+        ] {
+            assert!(!parse_macos_acl_listing(&listing(bad), "/Volumes"), "{bad}");
+        }
+        // hidden never excuses an ACL entry (write bits are enforced from st_mode, not this parser).
+        assert!(!parse_macos_acl_listing(
+            "drwxr-xr-x+ 7 root wheel hidden 224 Oct 8 01:32 /Volumes\n0: user:evil allow write\n",
+            "/Volumes",
         ));
     }
 
