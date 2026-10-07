@@ -760,7 +760,14 @@ fn drain_probe_pipes(
         std::thread::sleep(timeout_duration);
         return Ok(());
     }
-    poll(&mut fds, Some(&timeout)).map_err(|_| LaunchError::Process)?;
+    match poll(&mut fds, Some(&timeout)) {
+        Ok(_) => {}
+        // A signal handler elsewhere in the process (any caught SIGCHLD, for example) may
+        // interrupt the wait. Nothing was consumed, and both callers poll again under their own
+        // absolute deadlines, so this is a retry rather than a probe failure.
+        Err(rustix::io::Errno::INTR) => return Ok(()),
+        Err(_) => return Err(LaunchError::Process),
+    }
     for (fd, is_stdout) in fds.iter().zip(streams) {
         if !fd.revents().intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
             continue;
