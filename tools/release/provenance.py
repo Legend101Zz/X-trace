@@ -225,6 +225,22 @@ def set_child_subreaper(enabled: bool) -> bool:
         return False
 
 
+def parse_ps_uid(text: str) -> int | None:
+    """uid from `ps -o uid=` text, or None.
+
+    macOS `ps` prints some uids signed (`nobody` is uid_t 4294967294, shown as -2). A decimal in
+    [-2**31, -1] is read as its unsigned 32-bit value; anything else outside [0, 2**32 - 1] or not
+    a plain decimal is refused.
+    """
+    body = text[1:] if text.startswith("-") else text
+    if not (body.isascii() and body.isdigit()) or len(body) > 11:
+        return None
+    value = int(text)
+    if -(2**31) <= value <= -1:
+        return value & 0xFFFFFFFF
+    return value if 0 <= value <= 0xFFFFFFFF else None
+
+
 def read_process_facts(pids: Sequence[int], deadline: float) -> dict[int, tuple[int, str]]:
     """uid and normalized start time for pids via one bounded `ps`; empty on any failure."""
     ps = next((path for path in ("/bin/ps", "/usr/bin/ps") if os.path.isfile(path)), None)
@@ -241,8 +257,9 @@ def read_process_facts(pids: Sequence[int], deadline: float) -> dict[int, tuple[
     facts: dict[int, tuple[int, str]] = {}
     for line in result.stdout.splitlines():
         fields = line.split()
-        if len(fields) >= 7 and fields[0].isdigit() and fields[1].isdigit():
-            facts[int(fields[0])] = (int(fields[1]), " ".join(fields[2:7]))
+        uid = parse_ps_uid(fields[1]) if len(fields) >= 7 else None
+        if uid is not None and fields[0].isdigit():
+            facts[int(fields[0])] = (uid, " ".join(fields[2:7]))
     return facts
 
 

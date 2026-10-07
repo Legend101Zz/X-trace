@@ -4606,6 +4606,23 @@ class ProvenanceTests(unittest.TestCase):
                              owned or {}, time.monotonic() + 5)
 
     # macOS coalition mode
+    def test_parse_ps_uid_reads_signed_display_as_unsigned_32_bit(self) -> None:
+        for text, expected in (("-2", 4294967294), ("-1", 4294967295), ("0", 0), ("501", 501), ("4294967295", 4294967295),
+                               ("-2147483648", 2147483648)):
+            with self.subTest(text):
+                self.assertEqual(provenance.parse_ps_uid(text), expected)
+        for text in (str(-2**31 - 1), str(2**32), "", "-", "--2", "+2", "1.5", "abc", "-0x2", "1" * 30):
+            with self.subTest(text):
+                self.assertIsNone(provenance.parse_ps_uid(text))
+
+    def test_read_process_facts_keeps_a_row_whose_uid_ps_prints_negative(self) -> None:
+        output = "17842 -2 Thu Oct  8 03:30:08 2026\n1 0 Sun Sep 27 09:43:13 2026\n9 -2147483649 Thu Oct  8 03:30:08 2026\n"
+        result = subprocess.CompletedProcess([], 0, stdout=output)
+        with mock.patch.object(provenance, "probe_run", return_value=result), \
+                mock.patch.object(provenance.os.path, "isfile", return_value=True):
+            facts = provenance.read_process_facts([17842, 1, 9], time.monotonic() + 5)
+        self.assertEqual(facts, {17842: (4294967294, "Thu Oct 8 03:30:08 2026"), 1: (0, "Sun Sep 27 09:43:13 2026")})
+
     def test_pid_one_start_time_is_readable_and_earlier_than_this_test(self) -> None:
         # Platform-neutral and never skipped: sysctl kinfo_proc on macOS, /proc on Linux.
         began = time.time()
