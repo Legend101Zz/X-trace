@@ -448,8 +448,19 @@ mod tests {
     fn pointer_read_refuses_fifo_without_waiting_for_a_writer() {
         let (_temp, repo) = repo();
         let lock = RepositoryInitLock::acquire(&repo).expect("lock");
+        // rustix has no mkfifoat on Apple targets; use the system utility there.
+        #[cfg(not(target_os = "macos"))]
         fs::mkfifoat(&lock.directory, "config.toml", Mode::from_bits_truncate(0o600))
             .expect("fifo");
+        #[cfg(target_os = "macos")]
+        {
+            let status = std::process::Command::new("/usr/bin/mkfifo")
+                .args(["-m", "600"])
+                .arg(repo.join(".xtrace").join("config.toml"))
+                .status()
+                .expect("create FIFO fixture with the macOS system utility");
+            assert!(status.success(), "fifo");
+        }
         assert!(lock.read("config.toml", POINTER_MAX_BYTES).is_err());
     }
 
