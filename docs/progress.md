@@ -358,3 +358,31 @@ with no background implementation or scheduled continuation left running.
 The owner requested committing/pushing all current preparation and handing the remaining launch to Opus 5.5 with Sonnet 5.5 agents, using batched routine checks. This supersedes the next-session model assignment; it does not accept unfinished phases. Main remains `3e47895f`; all 55 mandatory release rows remain pending. Focused control tooling passed 85 tests, but the subsequent 23-gate floor failed before every gate. Both exact leases were manually recovered under fresh proof; original failures remain unchanged. All active agents are frozen/completed, and the continuation heartbeat is paused for handoff.
 
 Twelve feature branches preserve current WIP. The pack admission commit `e48d6d2` is unbuilt/untested; the global-quiescence source patch is unapplied and requires changes. See [the sanitized source pins, failures, review findings and remaining launch scope](../evidence/v0.01/handoff-2026-10-04.md). No new phase was accepted, merged into main, tagged or released. Next root must refresh live state, finish the runner and full floor, then complete dependency-aware implementation, exact accepted-phase gates, six real packaged campaigns, platform/supply-chain verification and genuine human/owner acceptance before publication.
+
+
+## P00 accepted and merged — Opus 5.5 / Sonnet 5.5 Session 0 (2026-10-04)
+
+**P00 (release control, exact gate runner and CI floor) is accepted.** `slice/v001-control-admission` at `a304a21ba32a` was no-ff merged into `main` as `77784d9c638f`. **No product requirement row is claimed. All 55 mandatory rows in `evidence/v0.01/requirements.json` remain pending.** The release decision stays `not_ready`.
+
+Evidence on the exact candidate and on `main`:
+- **Leased macOS arm64 floor**, pre-merge, on `a304a21`: `P00-floor-a304a21-210142-ba90c7` passed all 23 gates (`checks_passed_for_review`). Receipt sha256 `257881f6f13bcded9b6f65a288ef640fedc6a754b13c7c8471c1f821068a10aa`. Fresh builder leases were taken and released.
+- **Leased macOS arm64 floor**, post-merge, on `main` `77784d9`: `P00-postmerge-main-77784d9-211015-2450a3` passed all 23 gates. Receipt sha256 `432aff9e2f81a78e7c7892fea47a43cc47ed2e4f56a37ad672d12ae09c682aa1`.
+- **GitHub feature CI run 37234304072** on `a304a21`: every job green, including the Linux x86_64 23-gate release floor for `jdk17-node22` and `jdk21-node24`, and the release-tool suite (265 tests, OK, no skips).
+- **Main CI** on `77784d9`: run 37234986469 attempt 1 had every job green except the Linux floor `jdk17-node22`, where one product test (`run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown`, `crates/xtrace-cli/tests/java_run_spring.rs:138`) failed in gate 17 although the tree is byte-identical to the candidate that passed both tuples; a single re-run of the failed job (attempt 2) passed, so every main job is green on attempt 2 and the test is recorded as nondeterministic (S1 finding, #3). The attempt-1 failure is preserved, not hidden.
+- **Reviews:** independent architecture, security/privacy and build/integration reviews, followed by two delta re-review rounds. Every required fix was applied and verified, including removing a public CI-log leak path found in review.
+
+What P00 delivers:
+- The global-quiescence churn repair: one absolute 120 s settle and two quiet scans after the latest uncertainty, failing closed.
+- **ADR 0007**, provenance classification. On macOS an uninspectable process is classified by its resource coalition; on Linux, by child-subreaper descendant tracking. There are no UID or process-name exemptions and no privileged inspection; delegated-work residuals are documented.
+- The generic leased runner: command allowlist, private HOME, env policy and bounded receipts.
+- The reviewed dry-run-first lease-recovery tool.
+- The release ledger checker, the CI floor workflow (Linux x86_64, both runtime tuples) and the release-control evidence and docs.
+- A deterministic `npm run generate` for the Node adapter. The floor proved the earlier generator was not idempotent.
+
+**Incidents, recorded honestly:**
+- The original owner-authorized task-private cache root was deleted outside this session, most likely by a system cache cleaner. That wiped the two previously retained builder leases and the earlier failed floor and run receipts. Those receipts now survive only as the hashes recorded in the private execution state. The owner approved recreating the private cache at a new location (not published). Nothing was recovered or overwritten; the failed results stay failed.
+- One worker ran a name-based `pkill` against its own dev-container image name, which the lane rules forbid. No other lane's container was running, and no evidence was affected. The rule is restated for future sessions.
+
+**Product finding for S1 (#3):** `xtrace init` derives its default idempotency key from the raw repository path, capped at 128 characters, so it fails on long paths. CI works around this with short private roots; the product fix is a digest-based key.
+
+Next: consolidate the repaired preparation lanes on `slice/v001-integration` and merge them only after their own gates pass. The remaining work is split into seven sessions under epic #2 (#3–#9); start with S1 (#3).

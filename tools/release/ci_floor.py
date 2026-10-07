@@ -1097,22 +1097,81 @@ def _runner_reason_code(text: Any) -> str:
     return "unclassified"
 
 
-_FAILED_TEST_LINE = re.compile(rb"^test ([A-Za-z0-9_:]{1,120}) \.\.\. FAILED\s*$")
-_PANIC_SITE = re.compile(rb"panicked at ((?:crates|adapters|web)/[A-Za-z0-9_./-]{1,100}\.rs):(\d{1,6}):\d{1,4}")
-MAX_FAILURE_HINTS = 20
+_FAILED_TEST_LINE = re.compile(rb"^test (\S{1,400}) \.\.\. FAILED\s*$")
+_PANIC_SITE = re.compile(rb"panicked at (\S{1,400}?):(\d{1,9}):\d{1,9}")
+_ERROR_CODE = re.compile(rb'ErrorCode\("([^"\n]{0,400})"\)')
+_ERROR_CATEGORY = re.compile(rb"category: ([A-Za-z]{1,40}),")
+# Public diagnostics are ALLOWLIST-validated: a candidate that does not match its strict grammar is
+# dropped (never rewritten or scrubbed), so nothing outside these shapes can reach the public log.
+_TEST_ID_GRAMMAR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$")
+_PANIC_SITE_GRAMMAR = re.compile(r"^(crates|adapters|web|tools)/[A-Za-z0-9_./-]+:[0-9]+$")
+_ERROR_CODE_GRAMMAR = re.compile(r"^XTR-[A-Z0-9-]{1,48}$")
+ERROR_CATEGORIES = frozenset(
+    {
+        "Validation",
+        "NotFound",
+        "Conflict",
+        "Compatibility",
+        "Permission",
+        "Policy",
+        "Resource",
+        "Transport",
+        "Corruption",
+        "Internal",
+        "Cancelled",
+    }
+)
+MAX_FAILURE_HINTS = 32
+
+
+def _valid_test_id(value: str) -> bool:
+    return len(value) <= 128 and _TEST_ID_GRAMMAR.fullmatch(value) is not None
+
+
+def _valid_panic_site(value: str) -> bool:
+    return len(value) <= 160 and ".." not in value and _PANIC_SITE_GRAMMAR.fullmatch(value) is not None
+
+
+def _valid_error_code(value: str) -> bool:
+    return _ERROR_CODE_GRAMMAR.fullmatch(value) is not None
+
+
+def _valid_error_category(value: str) -> bool:
+    return value in ERROR_CATEGORIES
+
+
+def _decode_ascii(raw: bytes) -> str | None:
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return text if text.isprintable() else None
 
 
 def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
-    """Failing test names and panic sites from a private cargo gate log, as fixed identifiers only.
+    """Failing test ids, panic sites, error codes and categories from a private cargo gate log.
 
-    Names must be plain Rust test paths and sites repository-relative `.rs:line` locations; anything
-    else in the log is ignored, never echoed. Reads at most 16 MiB.
+    Every value must fully match a strict allowlist grammar (see the `_valid_*` helpers); anything
+    else is dropped, never echoed. Panic message text is never published. Lists are bounded to
+    MAX_FAILURE_HINTS with a truthful `hintsTruncated` count of valid values left out. Reads at most
+    16 MiB.
     """
-    names: list[str] = []
-    sites: list[str] = []
-    messages: list[str] = []
-    expect_message = False
+    found: dict[str, list[str]] = {"failingTests": [], "panicSites": [], "errorCodes": [], "errorCategories": []}
+    dropped = {key: 0 for key in found}
     compile_error = False
+
+    def add(key: str, raw: bytes, valid: Any, suffix: str = "") -> None:
+        text = _decode_ascii(raw)
+        if text is None:
+            return
+        text += suffix
+        if not valid(text) or text in found[key]:
+            return
+        if len(found[key]) < MAX_FAILURE_HINTS:
+            found[key].append(text)
+        else:
+            dropped[key] += 1
+
     try:
         fd = private_roots.open_private_file_read(log_path)
     except (private_roots.AdmissionError, OSError, ValueError, RuntimeError):
@@ -1129,36 +1188,26 @@ def _gate_failure_hints(log_path: pathlib.Path) -> dict[str, Any]:
             *lines, pending = pending.split(b"\n")
             pending = pending[-4096:]
             for line in lines:
-                if expect_message and line.strip():
-                    # The assertion/expect text of our own test code, scrubbed and bounded.
-                    if len(messages) < 10:
-                        text = _scrub_text(line.decode("utf-8", "replace"), 120)
-                        if text and text not in messages:
-                            messages.append(text)
-                    expect_message = False
                 match = _FAILED_TEST_LINE.match(line)
-                if match and len(names) < MAX_FAILURE_HINTS and match.group(1).decode() not in names:
-                    names.append(match.group(1).decode())
+                if match:
+                    add("failingTests", match.group(1), _valid_test_id)
                 site = _PANIC_SITE.search(line)
                 if site:
-                    expect_message = True
-                if site and len(sites) < MAX_FAILURE_HINTS:
-                    text = f"{site.group(1).decode()}:{site.group(2).decode()}"
-                    if text not in sites:
-                        sites.append(text)
+                    add("panicSites", site.group(1), _valid_panic_site, ":" + site.group(2).decode("ascii"))
+                for code in _ERROR_CODE.findall(line):
+                    add("errorCodes", code, _valid_error_code)
+                for category in _ERROR_CATEGORY.findall(line):
+                    add("errorCategories", category, _valid_error_category)
                 if line.startswith(b"error: could not compile"):
                     compile_error = True
     except OSError:
         pass
     finally:
         os.close(fd)
-    hints: dict[str, Any] = {}
-    if names:
-        hints["failingTests"] = names
-    if sites:
-        hints["panicSites"] = sites
-    if messages:
-        hints["panicMessages"] = messages
+    hints: dict[str, Any] = {key: values for key, values in found.items() if values}
+    truncated = {key: count for key, count in dropped.items() if count}
+    if truncated:
+        hints["hintsTruncated"] = truncated
     if compile_error:
         hints["compileError"] = True
     return hints

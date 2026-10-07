@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import os
+import re
 import signal
 import stat
 import time
@@ -404,6 +405,8 @@ class CiFloorEvidenceTests(unittest.TestCase):
             b"thread 'x' panicked at crates/xtrace-cli/tests/java_run_spring.rs:781:5:\n"
             b"init: StoreUnavailable(\"secure file /home/runner/work/x/y failed\")\n"
             b"thread 'y' panicked at /home/runner/secret/path.rs:5:1:\n"
+            b"init: App(AppError { code: ErrorCode(\"XTR-VALIDATION-IDEMPOTENCY\"), category: Validation, message: \"x /home/runner/a\" })\n"
+            b"ErrorCode(\"not a code GITHUB_TOKEN=abc\"), category: lower,\n"
             b"error: could not compile `xtrace-cli` (test \"x\") due to 1 previous error\n"
         )
         r, w = os.pipe()
@@ -414,11 +417,76 @@ class CiFloorEvidenceTests(unittest.TestCase):
         self.assertEqual(hints["failingTests"], ["premain::tests::captures_real_request", "crate::mod_x::second_failure"])
         self.assertEqual(hints["panicSites"], ["crates/xtrace-cli/tests/java_run_spring.rs:781"])
         self.assertIs(hints["compileError"], True)
+        self.assertEqual(hints["errorCodes"], ["XTR-VALIDATION-IDEMPOTENCY"])
+        self.assertEqual(hints["errorCategories"], ["Validation"])
         self.assertNotIn("GITHUB_TOKEN", json.dumps(hints))
-        self.assertEqual(hints["panicMessages"][0], 'init: StoreUnavailable("secure file <path> failed")')
+        self.assertNotIn("panicMessages", hints)
+        self.assertNotIn("secure file", json.dumps(hints))
         self.assertNotIn("/home/runner", json.dumps(hints))
         with mock.patch.object(ci_floor.private_roots, "open_private_file_read", side_effect=private_roots.AdmissionError("x")):
             self.assertEqual(ci_floor._gate_failure_hints(pathlib.Path("/synthetic/log")), {})
+
+    def _hints_for(self, raw: bytes) -> dict:
+        r, w = os.pipe()
+        os.write(w, raw)
+        os.close(w)
+        with mock.patch.object(ci_floor.private_roots, "open_private_file_read", return_value=r):
+            return ci_floor._gate_failure_hints(pathlib.Path("/synthetic/log"))
+
+    def test_gate_failure_hints_drop_adversarial_values_in_every_field(self) -> None:
+        bad_tests = ["a b", "crate::t password=hunter2", "user:pw@host", "../x", "caf\u00e9::t", "{\"k\":1}", "deadbeef0123/x", "9lead", "a" * 129]
+        bad_sites = [
+            "/Users/John Smith/x.rs:1", "secret/dir/file.rs:3", "crates/../etc/passwd:1", "crates/a b/x.rs:1",
+            "user:pw@host:1", "password=hunter2:1", "crates/caf\u00e9.rs:1", "~/x.rs:1", "other/x.rs:1",
+        ]
+        bad_codes = ["XTR-", "XTR-lower", "user:pw@host", "password=abc", "XTR-" + "A" * 49, "XTR-\u00e9", "deadbeef0123"]
+        bad_cats = ["Secret", "lower", "user", "Hunter", "Validations"]
+        lines = []
+        for v in bad_tests:
+            lines.append(f"test {v} ... FAILED\n")
+        for v in bad_sites:
+            lines.append(f"thread 't' panicked at {v.rsplit(':', 1)[0]}:{v.rsplit(':', 1)[1]}:5:\n")
+        for v in bad_codes:
+            lines.append(f'ErrorCode("{v}"), category: Validation,\n')
+        for v in bad_cats:
+            lines.append(f"x category: {v},\n")
+        # newline injection: second line must be judged on its own, and carries nothing valid
+        lines.append("test ok::name\npassword=hunter2 ... FAILED\n")
+        raw = "".join(lines).encode("utf-8")
+        hints = self._hints_for(raw)
+        self.assertEqual(hints.get("failingTests"), None)
+        self.assertEqual(hints.get("panicSites"), None)
+        self.assertEqual(hints.get("errorCodes"), None)
+        self.assertEqual(hints.get("errorCategories"), ["Validation"])
+        rendered = json.dumps(hints)
+        for leak in ("hunter2", "pw@host", "Smith", "deadbeef", "caf"):
+            self.assertNotIn(leak, rendered)
+
+    def test_gate_failure_hints_accept_valid_values_and_bound_lists_truthfully(self) -> None:
+        raw = (
+            b"test a::b_c::d1 ... FAILED\n"
+            b"thread 'x' panicked at crates/xtrace-cli/src/main.rs:12:5:\n"
+            b'ErrorCode("XTR-VALIDATION-X1"), category: NotFound,\n'
+        )
+        hints = self._hints_for(raw)
+        self.assertEqual(hints["failingTests"], ["a::b_c::d1"])
+        self.assertEqual(hints["panicSites"], ["crates/xtrace-cli/src/main.rs:12"])
+        self.assertEqual(hints["errorCodes"], ["XTR-VALIDATION-X1"])
+        self.assertEqual(hints["errorCategories"], ["NotFound"])
+        self.assertNotIn("hintsTruncated", hints)
+        many = "".join(f"test t::n{i} ... FAILED\n" for i in range(40)).encode()
+        hints = self._hints_for(many)
+        self.assertEqual(len(hints["failingTests"]), 32)
+        self.assertEqual(hints["hintsTruncated"], {"failingTests": 8})
+
+    def test_workflow_private_roots_stay_short_for_the_128_char_init_idempotency_key(self) -> None:
+        # The product's default `init` key is `xtrace-init-<repo path>` capped at 128 characters and the
+        # Rust tests create repos under <root>/tmp, so a long CI root fails them with
+        # XTR-VALIDATION-IDEMPOTENCY (run 37232993067). The roots are fixed short names.
+        text = (pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        roots = re.findall(r'root="\$\{RUNNER_TEMP:\?\}/([A-Za-z0-9_-]+)"', text)
+        self.assertEqual(sorted(roots), ["xf", "xr"])
+        self.assertNotIn("GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}", text.split("Select private root path", 1)[1].split("- name:", 1)[0])
 
     def test_describe_runner_failure_for_gates_missing_receipts_and_unknown_names(self) -> None:
         root = pathlib.Path("/synthetic/private-root")
