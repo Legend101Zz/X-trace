@@ -834,7 +834,7 @@ pub(super) fn verify_ancestor_metadata(
         identity.owner,
         identity.mode,
         uid,
-        acl_admits_directory(path, descriptor, identity),
+        acl_admits_traversal_directory(path, descriptor, identity),
     ) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -842,6 +842,25 @@ pub(super) fn verify_ancestor_metadata(
         ));
     }
     Ok(())
+}
+
+/// Ancestors are only traversed; on Linux the shared traversal policy applies (see private_storage).
+#[cfg(target_os = "linux")]
+fn acl_admits_traversal_directory(
+    _path: &Path,
+    directory: &std::fs::File,
+    _expected: FileIdentity,
+) -> bool {
+    super::private_storage::linux_directory_admits_traversal(directory)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn acl_admits_traversal_directory(
+    path: &Path,
+    directory: &std::fs::File,
+    expected: FileIdentity,
+) -> bool {
+    acl_admits_directory(path, directory, expected)
 }
 
 fn ancestor_metadata_allowed(owner: u32, mode: u32, current_uid: u32, acl_admitted: bool) -> bool {
@@ -1140,12 +1159,18 @@ fn parse_macos_acl_listing(text: &str, expected_path: &str) -> bool {
 }
 
 #[cfg(any(target_os = "macos", test))]
+/// `ls -O` file flags admitted on a directory: `sunlnk` (sticky-like unlink restriction) and
+/// `restricted` (SIP) only narrow what can be changed, and `hidden` (UF_HIDDEN) is a Finder
+/// visibility bit (e.g. `/Volumes`) that changes neither ownership nor access. Anything else
+/// (`opaque`, `uchg`, `dataless`, ...) stays refused so unknown semantics fail closed.
 fn valid_macos_flags(flags: &str) -> bool {
     if flags == "-" {
         return true;
     }
     let mut seen = std::collections::BTreeSet::new();
-    flags.split(',').all(|flag| matches!(flag, "sunlnk" | "restricted") && seen.insert(flag))
+    flags
+        .split(',')
+        .all(|flag| matches!(flag, "sunlnk" | "restricted" | "hidden") && seen.insert(flag))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1319,6 +1344,34 @@ mod tests {
         ] {
             assert!(parse_manifest(text.as_bytes()).is_err());
         }
+    }
+
+    #[test]
+    fn macos_flags_admit_hidden_volumes_and_refuse_unknown_flags() {
+        let listing =
+            |flags: &str| format!("drwxr-xr-x 7 root wheel {flags} 224 Oct 8 01:32 /Volumes\n");
+        for ok in ["hidden", "hidden,sunlnk", "sunlnk,hidden", "hidden,restricted", "-"] {
+            assert!(parse_macos_acl_listing(&listing(ok), "/Volumes"), "{ok}");
+        }
+        for bad in [
+            "uchg",
+            "opaque",
+            "hidden,uchg",
+            "hidden,hidden",
+            "hidden,",
+            ",hidden",
+            "Hidden",
+            "dataless",
+            "schg",
+            "nodump",
+        ] {
+            assert!(!parse_macos_acl_listing(&listing(bad), "/Volumes"), "{bad}");
+        }
+        // hidden never excuses an ACL entry (write bits are enforced from st_mode, not this parser).
+        assert!(!parse_macos_acl_listing(
+            "drwxr-xr-x+ 7 root wheel hidden 224 Oct 8 01:32 /Volumes\n0: user:evil allow write\n",
+            "/Volumes",
+        ));
     }
 
     #[test]
