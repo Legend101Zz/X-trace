@@ -25,6 +25,9 @@ public final class XTraceAgent {
   private static volatile byte[] activeIdentity;
   private static volatile ClassLoader activeLoader;
 
+  // Guarded by the class lock: only the synchronized start() reads or writes it.
+  private static boolean bootstrapSearchExtended;
+
   private XTraceAgent() {}
 
   /** Starts the private agent runtime. Setup failure leaves the application running. */
@@ -104,6 +107,26 @@ public final class XTraceAgent {
     boolean permanentFailure = false;
     boolean irreversibleMutationStarted = false;
     try {
+      // Verifying the private runtime resolves bootstrap-bridge types through the bootstrap
+      // loader, so the agent jar must already be on its search path. The append is idempotent
+      // and benign (no bridge is activated), so a preflight failure stays retryable.
+      if (!bootstrapSearchExtended) {
+        JarFile bridgeJar = new JarFile(agentJar.toFile(), false);
+        boolean appended = false;
+        try {
+          instrumentation.appendToBootstrapClassLoaderSearch(bridgeJar);
+          appended = true;
+        } finally {
+          if (!appended) {
+            try {
+              bridgeJar.close();
+            } catch (IOException ignored) {
+              // The append failure is the reported cause; nothing else holds this jar.
+            }
+          }
+        }
+        bootstrapSearchExtended = true;
+      }
       entry = Class.forName(RUNTIME_ENTRY, true, loader);
       identity = (byte[]) entry
           .getMethod("prepareBootstrap", String.class, Instrumentation.class, boolean.class)
@@ -113,7 +136,6 @@ public final class XTraceAgent {
       }
       irreversibleMutationStarted = true;
       keepLoader = true;
-      instrumentation.appendToBootstrapClassLoaderSearch(new JarFile(agentJar.toFile(), false));
       Class.forName("dev.xtrace.agent.bootstrap.BootstrapBridge", true, null);
       byte[] startedIdentity;
       try {
