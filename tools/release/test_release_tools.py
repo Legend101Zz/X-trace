@@ -4228,6 +4228,26 @@ class LeasedRunTests(unittest.TestCase):
         self.assertEqual(self.clock.now, 0.0)
         self.assertEqual(self.leases_present(), [], "anything acquired was rolled back")
 
+    def test_every_owner_record_carries_one_run_start_epoch_despite_slow_acquisition(self) -> None:
+        leases = [run_gates.Lease(self.cache / "leases" / name, self.TOKEN, "label") for name in LEASE_DIRS]
+        wall = [1_000_000.9]
+        real_acquire = leases[1].acquire
+
+        def slow_second_acquire() -> None:
+            wall[0] += 7.0  # the second acquisition straddles a second boundary
+            real_acquire()
+
+        with mock.patch.object(leases[1], "acquire", side_effect=slow_second_acquire):
+            leased_run.acquire_leases(leases, 0.0, monotonic=self.clock.monotonic, sleep=self.clock.sleep,
+                                      wall_clock=lambda: wall[0])
+        epochs = [json.loads((lease.path / "owner.json").read_text())["startedAtEpoch"] for lease in leases]
+        self.assertEqual(epochs, [1_000_000, 1_000_000])
+
+    def test_stamp_run_start_gives_the_same_epoch_to_every_lease(self) -> None:
+        leases = [run_gates.Lease(self.cache / "leases" / name, self.TOKEN, "label") for name in LEASE_DIRS]
+        self.assertEqual(run_gates.stamp_run_start(leases, lambda: 1234.99), 1234)
+        self.assertEqual([lease.started_at_epoch for lease in leases], [1234, 1234])
+
     def test_lease_acquire_raises_typed_busy_with_recovery_flag(self) -> None:
         for owner, expected in (
             ({"pid": 1, "label": "other", "token": "cd" * 16}, False),
