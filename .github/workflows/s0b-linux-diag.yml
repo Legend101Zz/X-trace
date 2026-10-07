@@ -1,0 +1,50 @@
+name: s0b-linux-diag
+# Temporary diagnostic workflow. Never merged.
+on:
+  push:
+    branches: [s0b/linux-diag]
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - name: Environment
+        run: |
+          id; umask
+          mount
+          sudo apt-get install --yes acl >/dev/null 2>&1 || true
+      - name: Create scratch like ci.yml and describe every ancestor
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv"
+          echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
+          echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
+          p="$root/priv"
+          while :; do
+            echo "=== $p"
+            stat -c '%n uid=%u mode=%a type=%F' "$p" || true
+            getfacl -p "$p" 2>&1 || true
+            findmnt -no FSTYPE,OPTIONS -T "$p" || true
+            stat -f -c '%T magic=%t' "$p" || true
+            [ "$p" = "/" ] && break
+            p="$(dirname "$p")"
+          done
+      - name: npm and node workspace
+        run: |
+          npm ci --prefix adapters/node
+          npm test --prefix adapters/node
+      - name: runtime private_storage tests
+        continue-on-error: true
+        run: cargo test -p xtrace-runtime private_storage -- --nocapture 2>&1 | tail -250
+      - name: node synthetic adapter
+        continue-on-error: true
+        run: cargo test -p xtrace-cli --test node_synthetic_adapter -- --nocapture 2>&1 | tail -250

@@ -105,11 +105,11 @@ impl AdmittedPrivateRoot {
     ) -> Result<(), PrivateStorageError> {
         let deadline = new_admission_deadline();
         let walked = open_directory_without_symlinks_until(path, deadline)?;
-        let supplied = directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
-        let walked_metadata = walked.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let supplied = directory.metadata().map_err(|e| diag_err(line!(), &e))?;
+        let walked_metadata = walked.metadata().map_err(|e| diag_err(line!(), &e))?;
         let supplied_identity = FileIdentity::from_metadata(&supplied);
         if !supplied_identity.same_directory(FileIdentity::from_metadata(&walked_metadata)) {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         admit_directory_descriptor_until(path, directory, private_leaf, deadline)
     }
@@ -187,7 +187,7 @@ impl AdmittedPrivateRoot {
                 Err(error) if error == rustix::io::Errno::NOENT => {
                     current = current.create_private_child_until(name, deadline)?;
                 }
-                Err(_) => return Err(PrivateStorageError::Unavailable),
+                Err(_) => return Err(diag_unavailable(line!(), "return")),
             }
         }
         current.revalidate_until(deadline)?;
@@ -201,7 +201,7 @@ impl AdmittedPrivateRoot {
         deadline: std::time::Instant,
     ) -> Result<Self, PrivateStorageError> {
         admit_directory_descriptor_until(&path, &directory, private_leaf, deadline)?;
-        let metadata = directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let metadata = directory.metadata().map_err(|e| diag_err(line!(), &e))?;
         Ok(Self { path, directory, identity: FileIdentity::from_metadata(&metadata), private_leaf })
     }
 
@@ -209,7 +209,7 @@ impl AdmittedPrivateRoot {
         let deadline = new_admission_deadline();
         let directory = open_directory_without_symlinks_until(path, deadline)?;
         admit_directory_descriptor_until(path, &directory, private_leaf, deadline)?;
-        let metadata = directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let metadata = directory.metadata().map_err(|e| diag_err(line!(), &e))?;
         let identity = FileIdentity::from_metadata(&metadata);
         Ok(Self { path: path.to_path_buf(), directory, identity, private_leaf })
     }
@@ -235,12 +235,12 @@ impl AdmittedPrivateRoot {
         // only the retained leaf descriptor would miss replacement of an
         // intermediate ancestor after this capability was created.
         let walked = open_directory_without_symlinks_until(&self.path, deadline)?;
-        let metadata = self.directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
-        let walked_metadata = walked.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let metadata = self.directory.metadata().map_err(|e| diag_err(line!(), &e))?;
+        let walked_metadata = walked.metadata().map_err(|e| diag_err(line!(), &e))?;
         if !self.identity.same_directory(FileIdentity::from_metadata(&metadata))
             || !self.identity.same_directory(FileIdentity::from_metadata(&walked_metadata))
         {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         admit_directory_descriptor_until(&self.path, &self.directory, self.private_leaf, deadline)
     }
@@ -289,12 +289,12 @@ impl AdmittedPrivateRoot {
             rustix::fs::Mode::empty(),
         )
         .map(File::from)
-        .map_err(|_| PrivateStorageError::Unavailable)?;
+        .map_err(|e| diag_err(line!(), &e))?;
         self.revalidate_until(deadline)?;
         let path = self.path.join(name);
         admit_directory_descriptor_until(&path, &child, true, deadline)?;
         self.revalidate_until(deadline)?;
-        let metadata = child.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let metadata = child.metadata().map_err(|e| diag_err(line!(), &e))?;
         Ok(Self {
             path,
             directory: child,
@@ -337,7 +337,7 @@ impl AdmittedPrivateRoot {
             Err(error) if error == rustix::io::Errno::NOENT => {
                 self.create_private_child_until(name, deadline)
             }
-            Err(_) => Err(PrivateStorageError::Unavailable),
+            Err(e) => Err(diag_err(line!(), &e)),
         }
     }
 
@@ -377,7 +377,7 @@ impl AdmittedPrivateRoot {
         let path = self.path.join(name);
         admit_directory_descriptor_until(&path, &child, true, deadline)?;
         self.revalidate_until(deadline)?;
-        let metadata = child.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let metadata = child.metadata().map_err(|e| diag_err(line!(), &e))?;
         Ok(Self {
             path,
             directory: child,
@@ -416,11 +416,11 @@ impl AdmittedPrivateRoot {
         let mut names = Vec::new();
         for entry in entries {
             if names.len() >= maximum_entries {
-                return Err(PrivateStorageError::Unavailable);
+                return Err(diag_unavailable(line!(), "return"));
             }
             let entry = entry.map_err(|_| PrivateStorageError::Operation)?;
             let name =
-                entry.file_name().into_string().map_err(|_| PrivateStorageError::Unavailable)?;
+                entry.file_name().into_string().map_err(|e| diag_err(line!(), &e))?;
             validate_child_name(&name)?;
             names.push(name);
         }
@@ -456,7 +456,7 @@ impl AdmittedPrivateRoot {
             .same_file(FileIdentity::from_metadata(&actual_metadata))
             || expected_metadata.nlink() != actual_metadata.nlink()
         {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         drop(actual);
         rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty())
@@ -481,7 +481,7 @@ impl AdmittedPrivateRoot {
             .same_file(FileIdentity::from_metadata(&actual_metadata))
             || expected_metadata.nlink() != actual_metadata.nlink()
         {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         drop(actual);
         rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty())
@@ -507,7 +507,7 @@ impl AdmittedPrivateRoot {
         validate_child_name(name)?;
         let child = self.open_private_child_until(name, deadline)?;
         if !child.bounded_child_names_until(1, deadline)?.is_empty() {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         child.revalidate_until(deadline)?;
         self.revalidate_until(deadline)?;
@@ -534,10 +534,10 @@ impl AdmittedPrivateRoot {
         if !FileIdentity::from_metadata(&expected_metadata)
             .same_directory(FileIdentity::from_metadata(&actual_metadata))
         {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         if !child.bounded_child_names_until(1, deadline)?.is_empty() {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         child.revalidate_until(deadline)?;
         expected.revalidate_until(deadline)?;
@@ -599,7 +599,7 @@ impl AdmittedPrivateRoot {
         use std::os::unix::fs::MetadataExt as _;
 
         if !self.private_leaf {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         validate_child_name(name)?;
         let deadline = new_admission_deadline();
@@ -613,10 +613,10 @@ impl AdmittedPrivateRoot {
                 self.revalidate_until(deadline)?;
                 return Ok(false);
             }
-            Err(_) => return Err(PrivateStorageError::Unavailable),
+            Err(_) => return Err(diag_unavailable(line!(), "return")),
         };
         let directory_metadata =
-            self.directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+            self.directory.metadata().map_err(|e| diag_err(line!(), &e))?;
         let group_other = rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO;
         if rustix::fs::FileType::from_raw_mode(first.st_mode) != rustix::fs::FileType::RegularFile
             || first.st_uid != rustix::process::getuid().as_raw()
@@ -624,7 +624,7 @@ impl AdmittedPrivateRoot {
             || rustix::fs::Mode::from_raw_mode(first.st_mode).intersects(group_other)
             || stat_device(&first) != directory_metadata.dev()
         {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         // The identity deliberately omits size: a live database or WAL grows between probes.
         let identity = FileIdentity {
@@ -635,17 +635,17 @@ impl AdmittedPrivateRoot {
             mode: stat_mode(&first) & 0o7777,
         };
         if !named_file_acl_admits(&self.path.join(name), identity, deadline) {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         self.revalidate_until(deadline)?;
-        let second = stat(&self.directory).map_err(|_| PrivateStorageError::Unavailable)?;
+        let second = stat(&self.directory).map_err(|e| diag_err(line!(), &e))?;
         if second.st_dev != first.st_dev
             || second.st_ino != first.st_ino
             || second.st_mode != first.st_mode
             || second.st_uid != first.st_uid
             || second.st_nlink != first.st_nlink
         {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         Ok(true)
     }
@@ -680,7 +680,7 @@ impl AdmittedPrivateRoot {
         deadline: std::time::Instant,
     ) -> Result<File, PrivateStorageError> {
         if !self.private_leaf {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         validate_child_name(name)?;
         if !self.named_regular_file_exists_until(name, deadline)? {
@@ -721,19 +721,19 @@ impl AdmittedPrivateRoot {
         self.revalidate_until(deadline)?;
         match std::fs::symlink_metadata(self.path.join(name)) {
             Ok(metadata) if metadata.is_file() => Ok(true),
-            Ok(_) => Err(PrivateStorageError::Unavailable),
+            Ok(_) => Err(diag_unavailable(line!(), "xattr-present")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.revalidate_until(deadline)?;
                 Ok(false)
             }
-            Err(_) => Err(PrivateStorageError::Unavailable),
+            Err(e) => Err(diag_err(line!(), &e)),
         }
     }
 
     /// Exclusively creates a no-follow owner-only regular file relative to this directory.
     pub fn create_private_file(&self, name: &str) -> Result<File, PrivateStorageError> {
         if !self.private_leaf {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         validate_child_name(name)?;
         let deadline = new_admission_deadline();
@@ -769,7 +769,7 @@ impl AdmittedPrivateRoot {
         operation_deadline: std::time::Instant,
     ) -> Result<File, PrivateStorageError> {
         if !self.private_leaf {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         validate_child_name(name)?;
         let deadline = operation_deadline.min(new_admission_deadline());
@@ -830,7 +830,7 @@ impl AdmittedPrivateRoot {
     /// existing files are never chmod-repaired.
     pub fn open_or_create_private_file(&self, name: &str) -> Result<File, PrivateStorageError> {
         if !self.private_leaf {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         validate_child_name(name)?;
         let deadline = new_admission_deadline();
@@ -859,10 +859,10 @@ impl AdmittedPrivateRoot {
                     rustix::fs::Mode::from_raw_mode(0o600),
                 )
                 .map(File::from)
-                .map_err(|_| PrivateStorageError::Unavailable)?;
+                .map_err(|e| diag_err(line!(), &e))?;
                 (created, true)
             }
-            Err(_) => return Err(PrivateStorageError::Unavailable),
+            Err(_) => return Err(diag_unavailable(line!(), "return")),
         };
         self.validate_file_binding_with_link_policy_until(name, &file, created, false, deadline)?;
         self.revalidate_until(deadline)?;
@@ -881,7 +881,7 @@ impl AdmittedPrivateRoot {
         let file = self.open_file_with_link_policy_until(name, false, deadline)?;
         let metadata = file.metadata().map_err(|_| PrivateStorageError::Operation)?;
         if metadata.len() > maximum_bytes as u64 {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         let mut limited = file
             .try_clone()
@@ -890,7 +890,7 @@ impl AdmittedPrivateRoot {
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
         limited.read_to_end(&mut bytes).map_err(|_| PrivateStorageError::Operation)?;
         if bytes.len() > maximum_bytes {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         self.validate_file_binding_with_link_policy_until(name, &file, false, false, deadline)?;
         self.revalidate_until(deadline)?;
@@ -909,7 +909,7 @@ impl AdmittedPrivateRoot {
         let file = self.open_file_with_link_policy_until(name, true, deadline)?;
         let metadata = file.metadata().map_err(|_| PrivateStorageError::Operation)?;
         if metadata.len() > maximum_bytes as u64 {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         let mut limited = file
             .try_clone()
@@ -918,7 +918,7 @@ impl AdmittedPrivateRoot {
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
         limited.read_to_end(&mut bytes).map_err(|_| PrivateStorageError::Operation)?;
         if bytes.len() > maximum_bytes {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         self.validate_file_binding_with_link_policy_until(name, &file, false, true, deadline)?;
         self.revalidate_until(deadline)?;
@@ -970,13 +970,13 @@ impl AdmittedPrivateRoot {
         deadline: std::time::Instant,
     ) -> Result<(), PrivateStorageError> {
         if !self.private_leaf {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         validate_child_name(name)?;
         self.revalidate_until(deadline)?;
         let descriptor = file.metadata().map_err(|_| PrivateStorageError::Operation)?;
         let named = std::fs::symlink_metadata(self.path.join(name))
-            .map_err(|_| PrivateStorageError::Unavailable)?;
+            .map_err(|e| diag_err(line!(), &e))?;
         use std::os::unix::fs::MetadataExt as _;
         let descriptor_identity = FileIdentity::from_metadata(&descriptor);
         let named_identity = FileIdentity::from_metadata(&named);
@@ -993,31 +993,31 @@ impl AdmittedPrivateRoot {
                 descriptor.mode() & 0o077 != 0
             }
         {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         if !acl_admits_file(&self.path.join(name), file, descriptor_identity, deadline) {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         let directory_metadata =
-            self.directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+            self.directory.metadata().map_err(|e| diag_err(line!(), &e))?;
         if descriptor.dev() != directory_metadata.dev() {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
-        let filesystem = rustix::fs::fstatfs(file).map_err(|_| PrivateStorageError::Unavailable)?;
+        let filesystem = rustix::fs::fstatfs(file).map_err(|e| diag_err(line!(), &e))?;
         if !owner_enforcing_local_filesystem(&filesystem) {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         self.revalidate_until(deadline)?;
         let named_after = std::fs::symlink_metadata(self.path.join(name))
-            .map_err(|_| PrivateStorageError::Unavailable)?;
-        let opened_after = file.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+            .map_err(|e| diag_err(line!(), &e))?;
+        let opened_after = file.metadata().map_err(|e| diag_err(line!(), &e))?;
         if FileIdentity::from_metadata(&named_after) != descriptor_identity
             || FileIdentity::from_metadata(&opened_after) != descriptor_identity
             || named_after.nlink() != descriptor.nlink()
             || opened_after.nlink() != descriptor.nlink()
             || !acl_admits_file(&self.path.join(name), file, descriptor_identity, deadline)
         {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         Ok(())
     }
@@ -1025,7 +1025,7 @@ impl AdmittedPrivateRoot {
     /// Atomically renames two validated names within this private directory and syncs it.
     pub fn rename_replace(&self, source: &str, target: &str) -> Result<(), PrivateStorageError> {
         if !self.private_leaf {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
         let deadline = new_admission_deadline();
         validate_child_name(source)?;
@@ -1051,7 +1051,7 @@ impl AdmittedPrivateRoot {
                 )?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(PrivateStorageError::Unavailable),
+            Err(_) => return Err(diag_unavailable(line!(), "return")),
         }
         rustix::fs::renameat(&self.directory, source, &self.directory, target)
             .map_err(|_| PrivateStorageError::Operation)?;
@@ -1100,7 +1100,7 @@ fn open_directory_descriptor(path: &str) -> Result<File, PrivateStorageError> {
         rustix::fs::Mode::empty(),
     )
     .map(File::from)
-    .map_err(|_| PrivateStorageError::Unavailable)
+    .map_err(|e| diag_err(line!(), &e))
 }
 
 fn open_directory_without_symlinks_until(
@@ -1135,7 +1135,7 @@ fn open_directory_without_symlinks_until(
                     rustix::fs::Mode::empty(),
                 )
                 .map(File::from)
-                .map_err(|_| PrivateStorageError::Unavailable)?;
+                .map_err(|e| diag_err(line!(), &e))?;
                 traversed.push(name);
                 descriptor = opened;
                 verify_ancestor_metadata(&traversed, &descriptor, deadline)?;
@@ -1156,16 +1156,17 @@ fn verify_ancestor_metadata(
     use std::os::unix::fs::MetadataExt as _;
 
     if std::time::Instant::now() >= deadline {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(diag_unavailable(line!(), "return"));
     }
-    let named = std::fs::symlink_metadata(path).map_err(|_| PrivateStorageError::Unavailable)?;
-    let opened = descriptor.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+    diag_ancestor(path, descriptor, deadline);
+    let named = std::fs::symlink_metadata(path).map_err(|e| diag_err(line!(), &e))?;
+    let opened = descriptor.metadata().map_err(|e| diag_err(line!(), &e))?;
     let identity = FileIdentity::from_metadata(&opened);
     if named.file_type().is_symlink()
         || !named.is_dir()
         || !identity.same_directory(FileIdentity::from_metadata(&named))
     {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(diag_unavailable(line!(), "return"));
     }
     let owner = rustix::process::getuid().as_raw();
     if !(opened.uid() == owner || opened.uid() == 0)
@@ -1174,15 +1175,15 @@ fn verify_ancestor_metadata(
             .is_ok_and(|filesystem| owner_enforcing_local_filesystem(&filesystem))
         || !acl_admits_traversal_directory(path, descriptor, identity, deadline)
     {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(diag_unavailable(line!(), "return"));
     }
     let named_after =
-        std::fs::symlink_metadata(path).map_err(|_| PrivateStorageError::Unavailable)?;
-    let opened_after = descriptor.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        std::fs::symlink_metadata(path).map_err(|e| diag_err(line!(), &e))?;
+    let opened_after = descriptor.metadata().map_err(|e| diag_err(line!(), &e))?;
     if !identity.same_directory(FileIdentity::from_metadata(&named_after))
         || !identity.same_directory(FileIdentity::from_metadata(&opened_after))
     {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(diag_unavailable(line!(), "return"));
     }
     Ok(())
 }
@@ -1196,38 +1197,38 @@ fn admit_directory_descriptor_until(
     use std::os::unix::fs::MetadataExt as _;
 
     verify_ancestor_metadata(path, descriptor, deadline)?;
-    let named = std::fs::symlink_metadata(path).map_err(|_| PrivateStorageError::Unavailable)?;
-    let opened = descriptor.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+    let named = std::fs::symlink_metadata(path).map_err(|e| diag_err(line!(), &e))?;
+    let opened = descriptor.metadata().map_err(|e| diag_err(line!(), &e))?;
     let identity = FileIdentity::from_metadata(&opened);
     if named.file_type().is_symlink()
         || !named.is_dir()
         || !identity.same_directory(FileIdentity::from_metadata(&named))
     {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(diag_unavailable(line!(), "return"));
     }
     let owner = rustix::process::getuid().as_raw();
     if private_leaf {
         if opened.uid() != owner || opened.mode() & 0o7777 != 0o700 {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(diag_unavailable(line!(), "return"));
         }
     } else if !(opened.uid() == owner || opened.uid() == 0) || opened.mode() & 0o022 != 0 {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(diag_unavailable(line!(), "return"));
     }
     let filesystem =
-        rustix::fs::fstatfs(descriptor).map_err(|_| PrivateStorageError::Unavailable)?;
+        rustix::fs::fstatfs(descriptor).map_err(|e| diag_err(line!(), &e))?;
     if !owner_enforcing_local_filesystem(&filesystem)
         || !acl_admits_directory(path, descriptor, identity, deadline)
     {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(diag_unavailable(line!(), "return"));
     }
     verify_ancestor_metadata(path, descriptor, deadline)?;
     let named_after =
-        std::fs::symlink_metadata(path).map_err(|_| PrivateStorageError::Unavailable)?;
-    let opened_after = descriptor.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        std::fs::symlink_metadata(path).map_err(|e| diag_err(line!(), &e))?;
+    let opened_after = descriptor.metadata().map_err(|e| diag_err(line!(), &e))?;
     if !identity.same_directory(FileIdentity::from_metadata(&named_after))
         || !identity.same_directory(FileIdentity::from_metadata(&opened_after))
     {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(diag_unavailable(line!(), "return"));
     }
     Ok(())
 }
@@ -1828,6 +1829,39 @@ fn valid_posix_mode(mode: &[u8]) -> bool {
         && mode.iter().zip(PERMISSIONS).all(|(actual, allowed)| allowed.contains(actual))
 }
 
+
+// DIAGNOSTIC ONLY (branch s0b/linux-diag, never merged).
+fn diag_unavailable(line: u32, why: &str) -> PrivateStorageError {
+    eprintln!("DIAG unavailable private_storage.rs:{line} {why}");
+    PrivateStorageError::Unavailable
+}
+
+fn diag_err<E: std::fmt::Debug>(line: u32, error: &E) -> PrivateStorageError {
+    eprintln!("DIAG unavailable private_storage.rs:{line} cause={error:?}");
+    PrivateStorageError::Unavailable
+}
+
+fn diag_ancestor(path: &Path, descriptor: &File, deadline: std::time::Instant) {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = descriptor.metadata().ok();
+    let magic = rustix::fs::fstatfs(descriptor).ok().map(|s| s.f_type as u64);
+    let mut value = [0_u8; 16 * 1024];
+    let access = rustix::fs::fgetxattr(descriptor, "system.posix_acl_access", value.as_mut_slice())
+        .map(|n| value[..n].to_vec());
+    let default = rustix::fs::fgetxattr(descriptor, "system.posix_acl_default", value.as_mut_slice())
+        .map(|n| value[..n].to_vec());
+    eprintln!(
+        "DIAG ancestor path={} uid={:?} mode={:?} my_uid={} fs_magic={:x?} expired={} acl_access={:?} acl_default={:?}",
+        path.display(),
+        meta.as_ref().map(|m| m.uid()),
+        meta.as_ref().map(|m| m.mode()),
+        rustix::process::getuid().as_raw(),
+        magic,
+        std::time::Instant::now() >= deadline,
+        access,
+        default,
+    );
+}
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
 mod tests {
