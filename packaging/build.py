@@ -82,12 +82,19 @@ def rust_host() -> str:
 def build_env(src: Path, epoch: int, target_dir: Path) -> dict:
     env = dict(os.environ)
     cargo_home = env.get("CARGO_HOME") or str(Path.home() / ".cargo")
-    rustflags = " ".join([
+    flags = [
         f"--remap-path-prefix={src}=/xtrace-src",
         f"--remap-path-prefix={cargo_home}=/cargo",
         f"--remap-path-prefix={target_dir}=/xtrace-target",  # build-script OUT_DIR paths (include!) end up in panic locations
         "-C strip=symbols",
-    ])
+    ]
+    if pyplatform.system() == "Darwin":
+        # ld64 hashes the pre-strip debug map into LC_UUID; its object paths (N_OSO, below the
+        # target directory) are not remapped, so the target directory's path length changed the
+        # UUID and the ad-hoc signature. -S omits the debug map at link time; the stripped
+        # payload is otherwise identical.
+        flags.append("-C link-arg=-Wl,-S")
+    rustflags = " ".join(flags)
     cflags = (f"-ffile-prefix-map={src}=/xtrace-src -ffile-prefix-map={cargo_home}=/cargo "
               f"-ffile-prefix-map={target_dir}=/xtrace-target")
     env.update({
