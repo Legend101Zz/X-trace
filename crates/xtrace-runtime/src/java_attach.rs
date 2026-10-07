@@ -580,6 +580,16 @@ impl FileIdentity {
             links: metadata.nlink(),
         }
     }
+
+    /// Directory identity that ignores entry-count churn: size and link count change whenever
+    /// anyone adds or removes a child, which says nothing about who may write into the directory.
+    #[cfg(target_os = "macos")]
+    fn same_directory(self, other: Self) -> bool {
+        self.device == other.device
+            && self.inode == other.inode
+            && self.owner == other.owner
+            && self.mode == other.mode
+    }
 }
 
 struct PackInventory {
@@ -899,7 +909,7 @@ fn acl_admits_directory(path: &Path, directory: &std::fs::File, expected: FileId
         Ok(value)
             if value.is_dir()
                 && !value.file_type().is_symlink()
-                && FileIdentity::from_metadata(&value) == expected =>
+                && FileIdentity::from_metadata(&value).same_directory(expected) =>
         {
             value
         }
@@ -1007,9 +1017,9 @@ fn acl_admits_directory(path: &Path, directory: &std::fs::File, expected: FileId
         Ok(value) => value,
         Err(_) => return false,
     };
-    FileIdentity::from_metadata(&before) == expected
-        && FileIdentity::from_metadata(&after) == expected
-        && FileIdentity::from_metadata(&descriptor_after) == expected
+    FileIdentity::from_metadata(&before).same_directory(expected)
+        && FileIdentity::from_metadata(&after).same_directory(expected)
+        && FileIdentity::from_metadata(&descriptor_after).same_directory(expected)
 }
 
 #[cfg(any(target_os = "macos", test))]
