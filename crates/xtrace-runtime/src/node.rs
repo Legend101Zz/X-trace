@@ -1266,6 +1266,32 @@ fn main() {{
         );
     }
 
+    /// A terminated process whose parent has not yet collected it is a zombie: it still
+    /// accepts signals (kill succeeds) but is gone. Under a child-subreaper (the release
+    /// floor runner) orphans reparent to a parent that reaps on its own schedule, so
+    /// "gone" must mean "no longer alive", not only "no longer in the process table".
+    fn is_zombie(pid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            // `pid (comm) S ...`: comm may contain spaces/parens, so split after the last ')'.
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .is_some_and(|state| state == "Z" || state == "X")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .is_ok_and(|output| {
+                    String::from_utf8_lossy(&output.stdout).trim_start().starts_with('Z')
+                })
+        }
+    }
+
     #[tokio::test]
     async fn termination_reaps_the_direct_process_and_its_group() {
         use std::os::unix::process::CommandExt as _;
@@ -1310,7 +1336,7 @@ fn main() {{
             let exists = !matches!(
                 rustix::process::kill_process(helper_pid, rustix::process::Signal::CONT),
                 Err(rustix::io::Errno::SRCH)
-            );
+            ) && !is_zombie(helper);
             assert!(
                 !exists || Instant::now() < gone_by,
                 "process-group helper survived supervised termination"
