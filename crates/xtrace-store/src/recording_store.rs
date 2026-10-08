@@ -2201,7 +2201,7 @@ fn load_terminal_finish(
         .map_err(|_| recording_query_corrupt_error(correlation_id))?;
     if finish.recording_id != recording_id
         || finish.final_recording_seq != final_sequence
-        || event_count > 2_048
+        || event_count > u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
         || finish.event_digest.len() > 32
         || finish.drop_counts_by_priority.len() > 256
         || finish.unsupported_capability_codes.len() > 64
