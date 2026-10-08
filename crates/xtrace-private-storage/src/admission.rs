@@ -215,9 +215,13 @@ impl AdmittedPrivateRoot {
         self.revalidate_until(&Operation::new())
     }
 
+    // The ten `*_for_operation` methods below are public because `xtrace-runtime`'s pack
+    // snapshot code (`pack_inventory`) calls every one of them: it runs a long multi-step
+    // operation (copy a pack tree, then verify and clean it) under ONE caller-owned deadline
+    // instead of a fresh 750 ms budget per step. Each is capped by the ordinary admission budget.
     /// Revalidates within a caller-owned bounded multi-step operation.
     ///
-    /// The caller's absolute op is capped by the ordinary admission
+    /// The caller's absolute deadline is capped by the ordinary admission
     /// budget for this individual operation.
     pub fn revalidate_for_operation(
         &self,
@@ -260,7 +264,7 @@ impl AdmittedPrivateRoot {
         self.create_private_child_until(name, &Operation::new())
     }
 
-    /// Creates a private child while preserving the caller's absolute op.
+    /// Creates a private child while preserving the caller's absolute deadline.
     pub fn create_private_child_for_operation(
         &self,
         name: &str,
@@ -395,7 +399,7 @@ impl AdmittedPrivateRoot {
         self.bounded_child_names_until(maximum_entries, &Operation::new())
     }
 
-    /// Lists bounded child names under the same absolute op as a larger operation.
+    /// Lists bounded child names under the same absolute deadline as a larger operation.
     pub fn bounded_child_names_for_operation(
         &self,
         maximum_entries: usize,
@@ -462,7 +466,7 @@ impl AdmittedPrivateRoot {
         self.revalidate_until(op)
     }
 
-    /// Removes a file only if its name still identifies the expected descriptor, under one op.
+    /// Removes a file only if its name still identifies the expected descriptor, under one deadline.
     pub fn remove_private_file_if_matches_for_operation(
         &self,
         name: &str,
@@ -515,7 +519,7 @@ impl AdmittedPrivateRoot {
         self.sync_until(op)
     }
 
-    /// Removes an empty admitted child using the caller's absolute op.
+    /// Removes an empty admitted child using the caller's absolute deadline.
     pub fn remove_private_child_for_operation(
         &self,
         name: &str,
@@ -740,7 +744,7 @@ impl AdmittedPrivateRoot {
         Ok(file)
     }
 
-    /// Exclusively creates a private regular file under a caller-owned op.
+    /// Exclusively creates a private regular file under a caller-owned deadline.
     pub fn create_private_file_for_operation(
         &self,
         name: &str,
@@ -1234,6 +1238,9 @@ fn admit_directory_descriptor_until(
     Ok(())
 }
 
+/// Kept public only because `xtrace-runtime`'s Java attach tests, in another crate, open a
+/// traversed-only directory descriptor with it; nothing in production calls it.
+///
 /// Walks `path` from `/` without following links and admits every component, the final one
 /// included, under the traversal policy, all inside one admission deadline.
 ///
