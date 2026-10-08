@@ -20,9 +20,9 @@ use xtrace_daemon::{BoundDaemon, DaemonBuilder, DaemonConfig, DaemonError};
 use xtrace_domain::RuntimeSessionId;
 #[cfg(any(unix, test))]
 use xtrace_domain::{ProjectId, WallTime};
+use xtrace_private_storage::AdmittedPrivateRoot;
 #[cfg(unix)]
 use xtrace_protocol::xtf::XtfEventEnvelope;
-use xtrace_runtime::private_storage::AdmittedPrivateRoot;
 #[cfg(unix)]
 use xtrace_store::SqliteRecordingPersistence;
 #[cfg(any(unix, test))]

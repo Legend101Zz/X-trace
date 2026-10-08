@@ -833,7 +833,7 @@ mod tests {
         let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
             .map(PathBuf::from)
             .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required");
-        xtrace_runtime::private_storage::AdmittedPrivateRoot::open(&scratch)
+        xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
             .expect("admitted private test scratch");
         tempfile::Builder::new()
             .prefix("xtrace-cli-paths-")

@@ -4,7 +4,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use xtrace_domain::RuntimeSessionId;
-use xtrace_runtime::private_storage::AdmittedPrivateRoot;
+use xtrace_private_storage::AdmittedPrivateRoot;
 
 use crate::error::CliError;
 

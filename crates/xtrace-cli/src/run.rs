@@ -361,7 +361,7 @@ mod tests {
             std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
                 .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
         );
-        xtrace_runtime::private_storage::AdmittedPrivateRoot::open(&scratch)
+        xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
             .expect("admitted private test scratch");
         tempfile::Builder::new()
             .prefix("xtrace-run-test-")
@@ -417,7 +417,7 @@ mod tests {
         use xtrace_domain::RuntimeSessionId;
 
         let root = private_tempdir();
-        let admitted = xtrace_runtime::private_storage::AdmittedPrivateRoot::open(root.path())
+        let admitted = xtrace_private_storage::AdmittedPrivateRoot::open(root.path())
             .expect("admitted project root");
         let lock = crate::daemon_lock::acquire_project_lock(&admitted).expect("project lock");
         let runtime_dir =

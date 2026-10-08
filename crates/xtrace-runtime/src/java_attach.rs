@@ -482,14 +482,14 @@ fn write_snapshot_file(
 /// are rejected. This remains a point-in-time admission check, not a defense from
 /// privileged remounts or hostile same-user processes.
 pub fn admit_private_directory(path: &Path) -> Result<(), AttachError> {
-    super::private_storage::AdmittedPrivateRoot::open(path)
+    xtrace_private_storage::AdmittedPrivateRoot::open(path)
         .map(|_| ())
         .map_err(|_| AttachError::PrivateStorage("private storage cannot be admitted"))
 }
 
 /// Admits a user-data container that may be traversable but is not writable by other users.
 pub fn admit_private_container_directory(path: &Path) -> Result<(), AttachError> {
-    super::private_storage::AdmittedPrivateRoot::open_container(path)
+    xtrace_private_storage::AdmittedPrivateRoot::open_container(path)
         .map(|_| ())
         .map_err(|_| AttachError::PrivateStorage("private storage cannot be admitted"))
 }
@@ -499,7 +499,7 @@ pub(super) fn admit_directory_descriptor(
     directory: &std::fs::File,
     owner_only: bool,
 ) -> Result<(), AttachError> {
-    super::private_storage::AdmittedPrivateRoot::validate_open_directory(
+    xtrace_private_storage::AdmittedPrivateRoot::validate_open_directory(
         path, directory, owner_only,
     )
     .map_err(|_| AttachError::PrivateStorage("private storage cannot be admitted"))
@@ -507,7 +507,7 @@ pub(super) fn admit_directory_descriptor(
 
 /// Creates a private, durable helper cache below an already-admitted user data home.
 pub fn prepare_helper_cache(data_home: &Path) -> Result<PathBuf, AttachError> {
-    let parent = super::private_storage::AdmittedPrivateRoot::open_container(data_home)
+    let parent = xtrace_private_storage::AdmittedPrivateRoot::open_container(data_home)
         .map_err(|_| AttachError::PrivateStorage("the user data home cannot be admitted"))?;
     let cache = parent
         .open_or_create_private_child(".xtrace-java-attach-cache")
@@ -861,7 +861,7 @@ fn acl_admits_traversal_directory(
     directory: &std::fs::File,
     _expected: FileIdentity,
 ) -> bool {
-    super::private_storage::linux_directory_admits_traversal(directory)
+    xtrace_private_storage::linux_directory_admits_traversal(directory)
 }
 
 #[cfg(not(target_os = "linux"))]

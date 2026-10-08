@@ -227,7 +227,7 @@ impl AdmittedPrivateRoot {
     ///
     /// The caller's absolute deadline is capped by the ordinary admission
     /// budget for this individual operation.
-    pub(crate) fn revalidate_for_operation(
+    pub fn revalidate_for_operation(
         &self,
         operation_deadline: std::time::Instant,
     ) -> Result<(), PrivateStorageError> {
@@ -264,7 +264,7 @@ impl AdmittedPrivateRoot {
     }
 
     /// Creates a private child while preserving the caller's absolute deadline.
-    pub(crate) fn create_private_child_for_operation(
+    pub fn create_private_child_for_operation(
         &self,
         name: &str,
         operation_deadline: std::time::Instant,
@@ -351,7 +351,7 @@ impl AdmittedPrivateRoot {
     }
 
     /// Opens an admitted private child within a caller-owned bounded operation.
-    pub(crate) fn open_private_child_for_operation(
+    pub fn open_private_child_for_operation(
         &self,
         name: &str,
         operation_deadline: std::time::Instant,
@@ -399,7 +399,7 @@ impl AdmittedPrivateRoot {
     }
 
     /// Lists bounded child names under the same absolute deadline as a larger operation.
-    pub(crate) fn bounded_child_names_for_operation(
+    pub fn bounded_child_names_for_operation(
         &self,
         maximum_entries: usize,
         operation_deadline: std::time::Instant,
@@ -469,7 +469,7 @@ impl AdmittedPrivateRoot {
     }
 
     /// Removes a file only if its name still identifies the expected descriptor, under one deadline.
-    pub(crate) fn remove_private_file_if_matches_for_operation(
+    pub fn remove_private_file_if_matches_for_operation(
         &self,
         name: &str,
         expected: &File,
@@ -522,7 +522,7 @@ impl AdmittedPrivateRoot {
     }
 
     /// Removes an empty admitted child using the caller's absolute deadline.
-    pub(crate) fn remove_private_child_for_operation(
+    pub fn remove_private_child_for_operation(
         &self,
         name: &str,
         expected: &AdmittedPrivateRoot,
@@ -558,7 +558,7 @@ impl AdmittedPrivateRoot {
     }
 
     /// Opens a regular private file within a caller-owned bounded operation.
-    pub(crate) fn open_regular_file_for_operation(
+    pub fn open_regular_file_for_operation(
         &self,
         name: &str,
         operation_deadline: std::time::Instant,
@@ -767,7 +767,7 @@ impl AdmittedPrivateRoot {
     }
 
     /// Exclusively creates a private regular file under a caller-owned deadline.
-    pub(crate) fn create_private_file_for_operation(
+    pub fn create_private_file_for_operation(
         &self,
         name: &str,
         operation_deadline: std::time::Instant,
@@ -803,7 +803,7 @@ impl AdmittedPrivateRoot {
     }
 
     /// Rechecks that a retained descriptor is still the named private file within a larger operation.
-    pub(crate) fn validate_file_binding_for_operation(
+    pub fn validate_file_binding_for_operation(
         &self,
         name: &str,
         file: &File,
@@ -820,7 +820,7 @@ impl AdmittedPrivateRoot {
     }
 
     /// Syncs the admitted directory within a caller-owned bounded operation.
-    pub(crate) fn sync_for_operation(
+    pub fn sync_for_operation(
         &self,
         operation_deadline: std::time::Instant,
     ) -> Result<(), PrivateStorageError> {
@@ -1261,7 +1261,7 @@ fn acl_admits_traversal_directory(
 
 /// Linux traversal ACL policy, shared with the Java attach ancestor walk.
 #[cfg(target_os = "linux")]
-pub(crate) fn linux_directory_admits_traversal(directory: &File) -> bool {
+pub fn linux_directory_admits_traversal(directory: &File) -> bool {
     let mut value = vec![0_u8; 16 * 1024];
     match rustix::fs::fgetxattr(directory, "system.posix_acl_access", value.as_mut_slice()) {
         Ok(length) => {
