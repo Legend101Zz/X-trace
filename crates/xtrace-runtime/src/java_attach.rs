@@ -21,6 +21,8 @@ const MAX_CACHE_ENTRIES: usize = 64;
 const MAX_SNAPSHOT_DEPTH: usize = 8;
 /// Bounded wait for a contended cache lock before failing closed.
 const CACHE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long an eviction waits out a conflicting lease before treating the snapshot as in use.
+const EVICT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
 const CACHE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 /// An incoming directory with no builder lock file at all is residue only after this age.
 const STALE_UNLOCKED_INCOMING: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
@@ -192,7 +194,17 @@ impl JavaAttachPack {
         let snapshot_path = packs.path.join(&snapshot_name);
 
         let mut lease = packs.lease(&snapshot_name)?;
-        match packs.existing(&snapshot_path) {
+        // A publisher seals the renamed directory while holding the cache lock, so an
+        // unverifiable result is re-read once after any publish in progress has finished.
+        let first = packs.existing(&snapshot_path);
+        let first = match first {
+            Err(_) => {
+                drop(packs.lock_cache()?);
+                packs.existing(&snapshot_path)
+            }
+            other => other,
+        };
+        match first {
             Ok(Some(snapshot)) => return Ok(snapshot.with_lease(lease, &packs)),
             Ok(None) => {}
             Err(error) => {
@@ -219,20 +231,12 @@ impl JavaAttachPack {
                 false
             } else {
                 packs.make_room()?;
-                rustix::fs::renameat(&packs.packs, &incoming.name, &packs.packs, &snapshot_name)
-                    .map_err(|_| {
-                        AttachError::PrivateStorage(
-                            "the private Java pack snapshot could not be published",
-                        )
-                    })?;
+                packs.publish(&incoming.name, &snapshot_name)?;
                 true
             }
         };
         if published {
             incoming.published();
-            rustix::fs::fsync(&packs.packs).map_err(|_| {
-                AttachError::PrivateStorage("the private Java pack snapshot could not be published")
-            })?;
         }
         match packs.existing(&snapshot_path)? {
             Some(snapshot) => Ok(snapshot.with_lease(lease, &packs)),
@@ -354,10 +358,31 @@ fn try_lock(file: &std::fs::File, exclusive: bool) -> Result<bool, AttachError> 
     } else {
         rustix::fs::FlockOperation::NonBlockingLockShared
     };
-    match rustix::fs::flock(file, operation) {
-        Ok(()) => Ok(true),
-        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(false),
-        Err(_) => Err(lock_error()),
+    loop {
+        match rustix::fs::flock(file, operation) {
+            Ok(()) => return Ok(true),
+            Err(error) if error == rustix::io::Errno::WOULDBLOCK => return Ok(false),
+            Err(error) if error == rustix::io::Errno::INTR => {}
+            Err(_) => return Err(lock_error()),
+        }
+    }
+}
+
+/// Takes an exclusive lock, tolerating a momentary conflict.
+///
+/// A lease descriptor is `CLOEXEC`, but a process that forks a helper holds a duplicate of it
+/// until the child execs, which keeps the lock alive for a moment after the lease is dropped.
+/// A holder that is still there after `EVICT_LOCK_WAIT` is treated as a live attach.
+fn try_lock_briefly(file: &std::fs::File) -> Result<bool, AttachError> {
+    let deadline = std::time::Instant::now() + EVICT_LOCK_WAIT;
+    loop {
+        if try_lock(file, true)? {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(CACHE_LOCK_POLL);
     }
 }
 
@@ -450,7 +475,11 @@ impl PackCache {
         ) {
             Ok(file) => std::fs::File::from(file),
             Err(error) if error == rustix::io::Errno::NOENT && !create => return Ok(None),
-            Err(_) => return Err(lock_error()),
+            Err(_) => {
+                return Err(AttachError::PrivateStorage(
+                    "the Java pack cache state file could not be opened",
+                ));
+            }
         };
         let metadata = file.metadata().map_err(|_| lock_error())?;
         if !metadata.is_file()
@@ -523,13 +552,32 @@ impl PackCache {
         }
     }
 
+    /// Renames the verified incoming directory to its final name and seals its root.
+    ///
+    /// Only called under the cache lock. If sealing fails the final-named directory is
+    /// removed again, so an unsealed directory is never left under a content-addressed name.
+    fn publish(&self, incoming: &str, name: &str) -> Result<(), AttachError> {
+        let failed =
+            || AttachError::PrivateStorage("the private Java pack snapshot could not be published");
+        rustix::fs::renameat(&self.packs, incoming, &self.packs, name).map_err(|_| failed())?;
+        let sealed = open_child_directory(&self.packs, name)
+            .map_err(|_| failed())
+            .and_then(|root| seal_directory(&root))
+            .and_then(|()| rustix::fs::fsync(&self.packs).map_err(|_| failed()));
+        if let Err(error) = sealed {
+            let _ = remove_tree(&self.packs, name, self.owner, self.device, 0);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Removes snapshot `name` if, and only if, no live attach holds a lease on it.
     ///
     /// Returns `false` (nothing removed) when the snapshot is in use.
     fn evict(&self, name: &str) -> Result<bool, AttachError> {
         let file_name = format!("{name}.use");
         let file = self.state_file(&file_name, true)?.ok_or_else(lock_error)?;
-        if !try_lock(&file, true)? {
+        if !try_lock_briefly(&file)? {
             return Ok(false);
         }
         self.revalidate()?;
@@ -677,9 +725,9 @@ impl PackCache {
             let directory = open_relative_directory(&snapshot, directory)?;
             seal_directory(&directory)?;
         }
-        seal_directory(&snapshot)?;
+        // The root stays `0700` until it has been renamed into place: macOS refuses to
+        // rename a read-only directory. `publish` seals it, still under the cache lock.
         JavaAttachPack::validate(incoming_path)?;
-        verify_retained_snapshot_directories(incoming_path)?;
         rustix::fs::fsync(&snapshot).map_err(|_| {
             AttachError::PrivateStorage("the private Java pack snapshot could not be sealed")
         })
