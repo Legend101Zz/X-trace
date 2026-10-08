@@ -953,6 +953,10 @@ mod tests {
     }
 
     fn tempdir() -> PathBuf {
+        // macOS clocks tick in microseconds, so time alone collides between parallel tests (mkdirat
+        // EEXIST surfaces as `Operation`); the process-wide sequence makes the name unique.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let nanos =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let scratch = PathBuf::from(
@@ -960,9 +964,12 @@ mod tests {
                 .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
         );
         let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
-        root.create_private_child(&format!("xtrace-store-{nanos}"))
-            .expect("private store test directory")
-            .path()
-            .to_path_buf()
+        root.create_private_child(&format!(
+            "xtrace-store-{}-{sequence}-{nanos}",
+            std::process::id()
+        ))
+        .expect("private store test directory")
+        .path()
+        .to_path_buf()
     }
 }

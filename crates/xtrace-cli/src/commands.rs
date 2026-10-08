@@ -1252,16 +1252,23 @@ mod tests {
 
     fn tempdir(label: &str) -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
+        // macOS clocks tick in microseconds: add a process-wide sequence so parallel tests never
+        // collide on the directory name.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let scratch = PathBuf::from(
             std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
                 .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
         );
         let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
-        root.create_private_child(&format!("xtrace-cli-commands-{label}-{nanos}"))
-            .expect("private CLI test directory")
-            .path()
-            .to_path_buf()
+        root.create_private_child(&format!(
+            "xtrace-cli-commands-{label}-{}-{sequence}-{nanos}",
+            std::process::id()
+        ))
+        .expect("private CLI test directory")
+        .path()
+        .to_path_buf()
     }
 
     /// Maps a variable name to its configured value. Used to inject
@@ -1313,6 +1320,10 @@ mod tests {
 
     fn legacy_key_repo_dir() -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
+        // Short on purpose (the path must stay under the socket-length bound): pid and a
+        // process-wide sequence in hex keep parallel callers distinct on microsecond clocks.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1323,10 +1334,14 @@ mod tests {
                 .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
         );
         let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
-        root.create_private_child(&format!("r{nanos:x}"))
-            .expect("short legacy-key repository fixture under admitted scratch")
-            .path()
-            .to_path_buf()
+        root.create_private_child(&format!(
+            "r{:x}{sequence:x}{:x}",
+            std::process::id(),
+            nanos / 1000
+        ))
+        .expect("short legacy-key repository fixture under admitted scratch")
+        .path()
+        .to_path_buf()
     }
 
     fn require_parent_legacy_key(canonical_repo_path: &str) -> String {
