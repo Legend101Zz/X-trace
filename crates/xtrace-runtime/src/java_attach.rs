@@ -23,6 +23,8 @@ const MAX_SNAPSHOT_DEPTH: usize = 8;
 const REAP_BATCH: usize = 32;
 /// Entries examined by the reaper even when the cache root is over `MAX_CACHE_ENTRIES`.
 const REAP_SCAN_LIMIT: usize = 1024;
+/// The failure `read_names` reports above its limit.
+const CACHE_TOO_MANY_ENTRIES: &str = "the Java pack cache has too many entries";
 /// Fixed cap for EINTR and lost-race retry loops; exhaustion fails closed.
 const MAX_RETRIES: u32 = 16;
 /// Bounded wait for a contended cache lock before failing closed.
@@ -226,6 +228,14 @@ impl JavaAttachPack {
         }
 
         packs.reap_stale();
+        // Fail fast, before any bytes are copied, when the cache root is still over its entry
+        // bound: `make_room` would reach the same verdict only after the whole pack was copied.
+        packs.list().map_err(|error| match error {
+            AttachError::PrivateStorage(CACHE_TOO_MANY_ENTRIES) => AttachError::PrivateStorage(
+                "the Java pack cache is over its entry limit and is being cleaned up; retry the attach, each attempt removes more stale residue",
+            ),
+            other => other,
+        })?;
         let incoming = packs.begin_incoming()?;
         let incoming_path = packs.path.join(&incoming.name);
         packs.fill_incoming(&incoming, &incoming_path, &current, &declared, &manifest)?;
@@ -653,6 +663,8 @@ impl PackCache {
     }
 
     fn begin_incoming_attempt(&self, attempt: u32) -> Result<Incoming<'_>, AttachError> {
+        #[cfg(test)]
+        tests::BUILDS_STARTED.with(|count| count.set(count.get() + 1));
         use ring::rand::SecureRandom as _;
         let mut nonce = [0_u8; 16];
         ring::rand::SystemRandom::new()
@@ -783,13 +795,21 @@ impl PackCache {
         // Works from a raw bounded scan, not `list()`: a cache over `MAX_CACHE_ENTRIES` (for
         // example after many crashes) must still be able to shed residue, a batch per attach.
         let Ok(names) = read_names(&self.packs, REAP_SCAN_LIMIT) else { return };
-        for name in names.iter().filter(|name| is_incoming_name(name)).take(REAP_BATCH) {
+        // The scan is bounded by `REAP_SCAN_LIMIT` (read_names fails above it, so a root with
+        // more entries than that cannot be healed here); removals are bounded separately by
+        // `REAP_BATCH`, so live builders that are skipped never use up the removal budget.
+        let mut removed = 0;
+        for name in names.iter().filter(|name| is_incoming_name(name)) {
+            if removed >= REAP_BATCH {
+                break;
+            }
             let lock_name = format!("{name}.build");
             match self.state_file(&lock_name, false) {
                 Ok(Some(lock)) => {
                     if matches!(try_lock(&lock, true), Ok(true))
                         && remove_tree(&self.packs, name, self.owner, self.device, 0).is_ok()
                     {
+                        removed += 1;
                         let _ = rustix::fs::unlinkat(
                             &self.state,
                             &lock_name,
@@ -804,8 +824,8 @@ impl PackCache {
                         .and_then(|metadata| metadata.modified().ok())
                         .and_then(|modified| modified.elapsed().ok())
                         .is_some_and(|age| age > STALE_UNLOCKED_INCOMING);
-                    if old {
-                        let _ = remove_tree(&self.packs, name, self.owner, self.device, 0);
+                    if old && remove_tree(&self.packs, name, self.owner, self.device, 0).is_ok() {
+                        removed += 1;
                     }
                 }
                 Err(_) => {}
@@ -845,7 +865,7 @@ fn read_names(directory: &std::fs::File, limit: usize) -> Result<Vec<String>, At
             continue;
         }
         if names.len() >= limit {
-            return Err(AttachError::PrivateStorage("the Java pack cache has too many entries"));
+            return Err(AttachError::PrivateStorage(CACHE_TOO_MANY_ENTRIES));
         }
         names.push(
             std::str::from_utf8(bytes)
@@ -1455,6 +1475,12 @@ mod tests {
         tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(parent)
+    }
+
+    thread_local! {
+        /// Builds started on this thread, to prove a failure happened before any copy.
+        pub(super) static BUILDS_STARTED: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
     }
 
     fn make_pack(root: &Path) {
@@ -2120,5 +2146,63 @@ mod tests {
         PackCache::open(&cache).expect("pack cache opens on tmpfs");
         assert!(admit_private_directory(home.path()).is_err(), "durable roots refuse tmpfs");
         assert!(admit_private_container_directory(home.path()).is_err());
+    }
+
+    #[test]
+    fn an_over_full_cache_root_fails_fast_before_the_pack_is_copied() {
+        let fixture = cache_fixture();
+        let (_seed_source, seed) = tagged_source("seed");
+        drop(seed.snapshot_into(&fixture.cache).expect("creates the cache layout"));
+        let packs = fixture.cache.join(PACKS_DIR);
+        let state = packs.join(STATE_DIR);
+        for index in 0..MAX_CACHE_ENTRIES + 40 {
+            let name = format!("{INCOMING_PREFIX}{}-{index:032x}", index + 1);
+            std::fs::create_dir(packs.join(&name)).expect("residue");
+            std::fs::set_permissions(packs.join(&name), std::fs::Permissions::from_mode(0o700))
+                .expect("mode");
+            let build = state.join(format!("{name}.build"));
+            std::fs::write(&build, b"").expect("unlocked builder file");
+            std::fs::set_permissions(&build, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        }
+        let (_source, other) = tagged_source("other");
+        let started = BUILDS_STARTED.with(std::cell::Cell::get);
+        let error = other.snapshot_into(&fixture.cache).expect_err("over-full cache");
+        // No build (and so no copy of the pack) was ever started.
+        assert_eq!(BUILDS_STARTED.with(std::cell::Cell::get), started);
+        let message = error.to_string();
+        assert!(message.contains("retry the attach"), "unexpected error: {message}");
+        // The failed attempt still shed one batch of residue.
+        assert!(incoming_names(&fixture.cache).len() <= MAX_CACHE_ENTRIES + 40 - REAP_BATCH);
+    }
+
+    #[test]
+    fn the_reaper_sheds_residue_even_when_many_live_builders_come_first() {
+        let fixture = cache_fixture();
+        let (_source, seed) = tagged_source("seed");
+        drop(seed.snapshot_into(&fixture.cache).expect("creates the cache layout"));
+        let cache = PackCache::open(&fixture.cache).expect("cache");
+        // More live builders than one removal batch, all holding their builder locks.
+        let live = (0..REAP_BATCH + 8)
+            .map(|_| cache.begin_incoming().expect("live builder"))
+            .collect::<Vec<_>>();
+        let packs = fixture.cache.join(PACKS_DIR);
+        let state = packs.join(STATE_DIR);
+        let stale = 12;
+        for index in 0..stale {
+            let name = format!("{INCOMING_PREFIX}{}-{index:032x}", index + 1);
+            std::fs::create_dir(packs.join(&name)).expect("residue");
+            std::fs::set_permissions(packs.join(&name), std::fs::Permissions::from_mode(0o700))
+                .expect("mode");
+            let build = state.join(format!("{name}.build"));
+            std::fs::write(&build, b"").expect("unlocked builder file");
+            std::fs::set_permissions(&build, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        }
+        assert_eq!(incoming_names(&fixture.cache).len(), live.len() + stale);
+        cache.reap_stale();
+        let left = incoming_names(&fixture.cache);
+        assert_eq!(left.len(), live.len(), "every stale residue is shed, no live builder is");
+        for builder in &live {
+            assert!(left.contains(&builder.name));
+        }
     }
 }
