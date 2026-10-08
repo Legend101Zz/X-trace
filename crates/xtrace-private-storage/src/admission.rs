@@ -1974,7 +1974,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(60));
         AdmittedPrivateRoot::open(&deepest).expect("admitted again");
         // Non-ASCII listings have always been refused by the ASCII-only parser.
-        let unicode = current.create_private_child("\u{fc}n\u{ef}").expect("unicode child");
-        assert!(AdmittedPrivateRoot::open(unicode.path()).is_err());
+        assert!(current.create_private_child("\u{fc}n\u{ef}").is_err());
+        let unicode = current.path().join("\u{fc}n\u{ef}");
+        assert!(unicode.is_dir(), "the refused child was still created, as before");
+        chmod(&unicode, 0o700);
+        assert!(AdmittedPrivateRoot::open(&unicode).is_err());
     }
 }
