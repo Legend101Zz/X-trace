@@ -87,11 +87,28 @@ pub(crate) fn macos_file_listing_admits(text: &str, expected_path: &str) -> bool
     parse_macos_acl_listing_kind(text, expected_path, b'-')
 }
 
-/// Linux filesystem-type rule: local ext4, XFS and btrfs only. Network, FUSE, overlay, tmpfs and
-/// unknown filesystems fail closed until their ownership semantics are reviewed.
+/// Which Linux filesystem allowlist a caller asks for. macOS has a single rule and ignores it.
+///
+/// `Durable` is the default and what every private root (the data store included) uses.
+/// `Ephemeral` is requested explicitly, and only by Java attach's cache and snapshot roles,
+/// whose contents are rebuildable and which commonly live on tmpfs runtime/temp directories.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FilesystemProfile {
+    /// Local ext4, XFS and btrfs only.
+    #[default]
+    Durable,
+    /// The durable set plus tmpfs.
+    Ephemeral,
+}
+
+/// Linux filesystem-type rule. Every profile admits local ext4, XFS and btrfs; only
+/// [`FilesystemProfile::Ephemeral`] also admits tmpfs. Network, FUSE, overlay and unknown
+/// filesystems fail closed under both until their ownership semantics are reviewed.
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn linux_filesystem_admitted(f_type: u64) -> bool {
-    matches!(f_type, 0xef53 | 0x5846_5342 | 0x9123_683e)
+pub(crate) fn linux_filesystem_admitted(f_type: u64, profile: FilesystemProfile) -> bool {
+    const TMPFS: u64 = 0x0102_1994;
+    let durable = matches!(f_type, 0xef53 | 0x5846_5342 | 0x9123_683e);
+    durable || (profile == FilesystemProfile::Ephemeral && f_type == TMPFS)
 }
 
 /// macOS filesystem rule: APFS or HFS+ mounted with ownership enforced.
@@ -559,7 +576,9 @@ mod tests {
     /// passes the walk's traversal rule first, then its own role's rules.
     fn admits(row: &Row) -> bool {
         let filesystem = match row.filesystem {
-            Filesystem::Linux(f_type) => linux_filesystem_admitted(f_type),
+            Filesystem::Linux(f_type) => {
+                linux_filesystem_admitted(f_type, FilesystemProfile::Durable)
+            }
             Filesystem::Macos(name, flags) => macos_filesystem_admitted(name, flags),
         };
         directory_metadata_admits(DirectoryRole::Traversed, row.owner, row.mode, UID)
@@ -1096,5 +1115,25 @@ mod tests {
         let listings = split_batched_listing(&acl_allow, &paths).expect("splits");
         assert!(macos_directory_listing_admits(&listings[0].text, "/"));
         assert!(!macos_directory_listing_admits(&listings[1].text, "/Users"));
+    }
+
+    #[test]
+    fn filesystem_profiles_differ_only_on_linux_tmpfs() {
+        const TMPFS: u64 = 0x0102_1994;
+        for (name, f_type) in [("ext4", 0xef53), ("xfs", 0x5846_5342_u64), ("btrfs", 0x9123_683e)] {
+            for profile in [FilesystemProfile::Durable, FilesystemProfile::Ephemeral] {
+                assert!(linux_filesystem_admitted(f_type, profile), "{name} under {profile:?}");
+            }
+        }
+        assert!(!linux_filesystem_admitted(TMPFS, FilesystemProfile::Durable));
+        assert!(linux_filesystem_admitted(TMPFS, FilesystemProfile::Ephemeral));
+        assert_eq!(FilesystemProfile::default(), FilesystemProfile::Durable);
+        for (name, f_type) in
+            [("nfs", 0x6969_u64), ("fuse", 0x6573_5546), ("ramfs", 0x8584_58f6), ("zero", 0)]
+        {
+            for profile in [FilesystemProfile::Durable, FilesystemProfile::Ephemeral] {
+                assert!(!linux_filesystem_admitted(f_type, profile), "{name} under {profile:?}");
+            }
+        }
     }
 }

@@ -266,8 +266,12 @@ fn verify_retained_snapshot_directories(root: &Path) -> Result<(), AttachError> 
         .into_iter()
         .map(|relative| if relative.is_empty() { root.to_path_buf() } else { root.join(relative) })
         .collect::<Vec<_>>();
-    xtrace_private_storage::admit_sealed_directories(&paths, 0o500)
-        .map_err(|_| AttachError::PrivateStorage("the retained Java pack snapshot is unsafe"))
+    xtrace_private_storage::admit_sealed_directories_with_profile(
+        &paths,
+        0o500,
+        ATTACH_CACHE_FILESYSTEMS,
+    )
+    .map_err(|_| AttachError::PrivateStorage("the retained Java pack snapshot is unsafe"))
 }
 
 /// The private `java-packs` cache: sealed content-addressed snapshots plus sidecar state.
@@ -410,8 +414,11 @@ fn lock_within_bound(file: &std::fs::File, exclusive: bool) -> Result<(), Attach
 impl PackCache {
     fn open(cache: &Path) -> Result<Self, AttachError> {
         use std::os::unix::fs::MetadataExt as _;
-        let parent = xtrace_private_storage::open_private_directory_descriptor(cache)
-            .map_err(|_| AttachError::PrivateStorage("the Java helper cache changed"))?;
+        let parent = xtrace_private_storage::open_private_directory_descriptor_with_profile(
+            cache,
+            ATTACH_CACHE_FILESYSTEMS,
+        )
+        .map_err(|_| AttachError::PrivateStorage("the Java helper cache changed"))?;
         let path = cache.join(PACKS_DIR);
         let packs = open_or_create_private_child(&parent, PACKS_DIR)?;
         admit_directory_descriptor(&path, &packs, true)?;
@@ -697,8 +704,9 @@ impl PackCache {
         admit_directory_descriptor(incoming_path, &snapshot, true)?;
         for directory in ["attach", "agent", "agent/runtime"] {
             create_private_directory(&snapshot, directory)?;
-            xtrace_private_storage::open_private_directory_descriptor(
+            xtrace_private_storage::open_private_directory_descriptor_with_profile(
                 &incoming_path.join(directory),
+                ATTACH_CACHE_FILESYSTEMS,
             )
             .map_err(|_| {
                 AttachError::PrivateStorage("the private Java pack snapshot is unavailable")
@@ -1029,6 +1037,14 @@ fn create_snapshot_file(
     .map_err(|_| AttachError::PrivateStorage("the private Java pack snapshot could not be written"))
 }
 
+/// Filesystems the Java attach helper cache, retained pack snapshots and their ancestor walk may
+/// live on: the durable set plus tmpfs, because the cache is rebuildable and often sits under a
+/// tmpfs runtime or temp directory. The data store and every other private root keep the strict
+/// durable set (`admit_private_directory` and `admit_private_container_directory` below do not
+/// use this).
+const ATTACH_CACHE_FILESYSTEMS: xtrace_private_storage::FilesystemProfile =
+    xtrace_private_storage::FilesystemProfile::Ephemeral;
+
 /// Verifies that an existing directory is on an owner-enforcing local filesystem.
 ///
 /// The check uses an opened directory descriptor so a path-only mount check cannot
@@ -1053,16 +1069,22 @@ pub(super) fn admit_directory_descriptor(
     directory: &std::fs::File,
     owner_only: bool,
 ) -> Result<(), AttachError> {
-    xtrace_private_storage::AdmittedPrivateRoot::validate_open_directory(
-        path, directory, owner_only,
+    xtrace_private_storage::AdmittedPrivateRoot::validate_open_directory_with_profile(
+        path,
+        directory,
+        owner_only,
+        ATTACH_CACHE_FILESYSTEMS,
     )
     .map_err(|_| AttachError::PrivateStorage("private storage cannot be admitted"))
 }
 
 /// Creates a private, durable helper cache below an already-admitted user data home.
 pub fn prepare_helper_cache(data_home: &Path) -> Result<PathBuf, AttachError> {
-    let parent = xtrace_private_storage::AdmittedPrivateRoot::open_container(data_home)
-        .map_err(|_| AttachError::PrivateStorage("the user data home cannot be admitted"))?;
+    let parent = xtrace_private_storage::AdmittedPrivateRoot::open_container_with_profile(
+        data_home,
+        ATTACH_CACHE_FILESYSTEMS,
+    )
+    .map_err(|_| AttachError::PrivateStorage("the user data home cannot be admitted"))?;
     let cache = parent
         .open_or_create_private_child(".xtrace-java-attach-cache")
         .map_err(|_| AttachError::PrivateStorage("the Java helper cache is unavailable"))?;
@@ -2073,5 +2095,30 @@ mod tests {
             .expect("restore private fixture mode");
         let metadata = std::fs::metadata(root.path()).expect("private fixture metadata");
         assert!(verify_metadata_owner_mode(&metadata, true).is_ok());
+    }
+
+    #[test]
+    fn attach_cache_roles_request_the_ephemeral_filesystem_profile() {
+        use xtrace_private_storage::FilesystemProfile;
+        // The strict durable set stays the default for every other private root.
+        assert_eq!(FilesystemProfile::default(), FilesystemProfile::Durable);
+        // Cache, snapshot, sealed-snapshot and ancestor-walk admission all read this one constant.
+        assert_eq!(ATTACH_CACHE_FILESYSTEMS, FilesystemProfile::Ephemeral);
+    }
+
+    /// Live proof on a real tmpfs. `XTRACE_TEST_TMPFS_DIR` must name a directory that is the root
+    /// of a tmpfs mount owned by the current user with mode 0755 or stricter (a sticky,
+    /// world-writable `/dev/shm` fails the ancestor rule by design). Skipped when unset.
+    #[test]
+    fn helper_cache_is_admitted_on_tmpfs_while_durable_roots_still_refuse_it() {
+        let Some(tmpfs) = std::env::var_os("XTRACE_TEST_TMPFS_DIR").map(PathBuf::from) else {
+            eprintln!("XTRACE_TEST_TMPFS_DIR is unset; skipping the live tmpfs proof");
+            return;
+        };
+        let home = private_tempdir_in(&tmpfs).expect("private directory on tmpfs");
+        let cache = prepare_helper_cache(home.path()).expect("attach cache admitted on tmpfs");
+        PackCache::open(&cache).expect("pack cache opens on tmpfs");
+        assert!(admit_private_directory(home.path()).is_err(), "durable roots refuse tmpfs");
+        assert!(admit_private_container_directory(home.path()).is_err());
     }
 }
