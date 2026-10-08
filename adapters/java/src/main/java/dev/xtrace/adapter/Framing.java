@@ -5,6 +5,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import xtp.agent.v1.Envelope.AgentEnvelope;
 
@@ -71,6 +72,8 @@ public final class Framing {
         offset += count;
       }
       return result;
+    } catch (SocketTimeoutException error) {
+      throw new ClientException("XTR-JAVA-FRAME", "incoming " + part + " read timed out", error);
     } catch (IOException error) {
       throw new ClientException("XTR-JAVA-FRAME", "incoming " + part + " was truncated", error);
     }
