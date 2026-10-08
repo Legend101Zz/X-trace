@@ -2214,6 +2214,11 @@ fn load_terminal_finish(
                 || finish.event_digest.iter().all(|byte| *byte == 0)
                 || finish.capacity_dropped_events > 0
                 || finish.drop_counts_by_priority.values().any(|count| *count > 0)))
+        // Capacity drops only happen once the persisted history is full, and the
+        // unverifiable adapter digest is withheld; anything else is inconsistent.
+        || (finish.capacity_dropped_events > 0
+            && (event_count != u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
+                || !finish.event_digest.is_empty()))
         || finish.capacity_dropped_events
             > finish
                 .drop_counts_by_priority

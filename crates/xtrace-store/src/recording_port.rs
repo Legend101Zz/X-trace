@@ -708,6 +708,48 @@ mod tests {
     }
 
     #[test]
+    fn read_rejects_capacity_drops_inconsistent_with_a_full_history() {
+        // capacity_dropped_events > 0 requires a full persisted history
+        // (event_count == MAX_RECORDED_EVENTS) and an absent adapter digest.
+        let (directory, store, project) = fixture();
+        let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
+        let reader = SqliteRecordingReader::new(store, directory.path());
+        let recording_id = RecordingId::new();
+        persistence.begin_recording(&begin(project.id(), recording_id)).expect("begin");
+        persistence
+            .persist_segment(&PersistRecordingSegment {
+                project_id: project.id(),
+                recording_id,
+                segment_ordinal: 0,
+                events: vec![event(2, "event-2")],
+            })
+            .expect("persist event");
+        let finish = FinishRecording {
+            recording_id,
+            final_recording_seq: 4,
+            duration_ns: None,
+            event_digest: Vec::new(),
+            drop_counts_by_priority: [(1, 2)].into_iter().collect(),
+            unsupported_capability_codes: Vec::new(),
+            capacity_dropped_events: 2,
+            response_summary: None,
+        };
+        assert_eq!(
+            persistence.finish_recording(&finish).expect("finish stores the evidence"),
+            RecordingCompletion::Partial
+        );
+        let error = reader
+            .show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id,
+                limit: 10,
+                after_sequence: None,
+            })
+            .expect_err("one persisted event cannot have come from a full history");
+        assert_eq!(error.kind(), PortErrorKind::Corruption);
+    }
+
+    #[test]
     fn read_rejects_complete_labels_without_complete_finish_proof() {
         let (directory, store, project) = fixture();
         let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());

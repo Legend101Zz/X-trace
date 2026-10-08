@@ -69,6 +69,12 @@ use xtrace_domain::RecordingId;
 use xtrace_domain::ids::Id;
 use xtrace_domain::{ContentHash, ProjectId, RepositoryFingerprint, RuntimeSessionId};
 use xtrace_ingest::{Acceptance, IngestConfig, IngestError, IngestValidator};
+
+// The ingest digest budget and the application persistence bound are one
+// limit seen from two layers; keep them from drifting apart.
+const _: () = assert!(
+    xtrace_ingest::DEFAULT_MAX_EVENTS_PER_RECORDING == xtrace_application::MAX_RECORDED_EVENTS
+);
 use xtrace_protocol::envelope::check_protocol_version;
 use xtrace_protocol::generated::agent as wire;
 use xtrace_protocol::generated::agent::{Ack, AckDurability, AgentEnvelope, ProtocolError};

@@ -330,7 +330,7 @@ pub struct RecordEventsReceipt {
     pub duplicates: usize,
     /// Number of new events dropped because the per-recording event capacity
     /// ([`MAX_RECORDED_EVENTS`]) was reached. They are not persisted and are
-    /// reported in terminal evidence under [`CAPACITY_DROP_PRIORITY`].
+    /// counted per event priority in the terminal evidence drop counts.
     pub dropped: usize,
     /// Number of segments made durable during the call.
     pub persisted_segments: usize,
