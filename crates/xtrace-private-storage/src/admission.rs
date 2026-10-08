@@ -576,24 +576,14 @@ impl AdmittedPrivateRoot {
     /// releases *every* lock a process holds on a file when that process closes *any*
     /// descriptor for it, so validating a live database by opening and dropping a second
     /// descriptor silently drops SQLite's locks and lets another process delete the WAL out
-    /// from under this one. On Linux this check therefore uses only `statat`; elsewhere it
-    /// keeps the descriptor-bound check.
+    /// from under this one. On every supported Unix this check is therefore descriptor-free:
+    /// it uses `statat` plus a path-based ACL query (`lgetxattr` on Linux, `/bin/ls -ldeO` on
+    /// macOS) and never opens the file.
     pub fn validate_regular_file(&self, name: &str) -> Result<(), PrivateStorageError> {
-        #[cfg(target_os = "linux")]
-        {
-            if self.validate_named_file_without_open(name)? {
-                Ok(())
-            } else {
-                Err(PrivateStorageError::Operation)
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            if self.validate_named_file_without_open(name)? {
-                Ok(())
-            } else {
-                Err(PrivateStorageError::Operation)
-            }
+        if self.validate_named_file_without_open(name)? {
+            Ok(())
+        } else {
+            Err(PrivateStorageError::Operation)
         }
     }
 
@@ -1247,8 +1237,12 @@ fn admit_directory_descriptor_until(
 /// On Linux a traversed directory is admitted when it carries no ACL, or when its access ACL is
 /// well formed and grants no write permission to anyone but the owning user; its default ACL only
 /// shapes children created later and cannot change who may write into the directory itself.
-/// (Stock CI images give `/home` a default ACL.) The private leaf and every managed container
-/// still go through the strict `acl_admits_directory` check, which refuses any ACL.
+/// (Stock CI images give `/home` a default ACL.) Only the private leaf goes through the strict
+/// `acl_admits_directory` check, which refuses any ACL. A managed container is admitted with this
+/// traversal policy: it is never a file-creation capability, and every private child created
+/// inside it is re-admitted as a private leaf, which refuses an ACL inherited from the container.
+/// On macOS there is a single listing-based policy (deny-only ACEs, fixed flag vocabulary) for
+/// every role, so the two checks coincide there.
 #[cfg(target_os = "linux")]
 fn acl_admits_traversal_directory(
     _path: &Path,
