@@ -1685,7 +1685,9 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(probes, directories, "one probe per distinct directory");
         } else {
-            assert!(probes <= directories + 3, "{probes} probes for {directories} directories");
+            // No memo: every walked directory once, then the leaf's own admission (traversal
+            // check, strict check, traversal check again).
+            assert_eq!(probes, directories + 3);
         }
     }
 
@@ -1699,14 +1701,15 @@ mod tests {
         });
         assert!(created.is_some());
         if cfg!(target_os = "macos") {
-            // D for the first walk, the parent again after the mkdir moved its ctime (measured to
-            // happen more than once while the directory settles), and the new child once.
-            assert!(probes <= directories + 3, "{probes} probes for {directories} directories");
+            // D for the first walk; the parent once more because the mkdir advanced its ctime
+            // (every later revalidate then hits the memo); the new child once. A first leased
+            // run measured one more, but that was the shared scratch root, which other tests
+            // were busy in and which these counts now exclude.
+            assert!(probes <= directories + 2, "{probes} probes for {directories} directories");
         } else {
-            assert!(
-                probes <= 5 * (directories + 3) + 4,
-                "{probes} probes for {directories} directories"
-            );
+            // Five revalidations of the parent (each directories + 3) and the child's admission
+            // (3 probes), with no memo.
+            assert_eq!(probes, 5 * (directories + 3) + 3);
         }
     }
 
@@ -1732,9 +1735,11 @@ mod tests {
                 "{open_or_create} probes for {directories} directories"
             );
         } else {
-            assert!(opened <= 3 * (directories + 3) + 4);
-            assert!(reopened <= directories + 4);
-            assert!(open_or_create <= 3 * directories + 12);
+            // Three revalidations of the parent plus the child's admission.
+            assert_eq!(opened, 3 * (directories + 3) + 3);
+            assert_eq!(reopened, directories + 3);
+            // Each existing component is admitted (3 probes), then one final revalidation.
+            assert_eq!(open_or_create, 3 * directories + (directories + 3));
         }
     }
 
@@ -1782,5 +1787,145 @@ mod tests {
         let spawns = probe::ls_spawn_count() - before;
         assert!(spawns <= 8, "{spawns} ls runs to create a child below {directories} directories");
         drop(created);
+    }
+
+    // ---- real-filesystem admission through the public entry points -----------------------
+    //
+    // The pure policy table pins each rule; these drive the real entry points on real
+    // directories so that reordering or dropping a step in the orchestration is caught.
+
+    fn fresh_child() -> (AdmittedPrivateRoot, String) {
+        let parent = private_scratch().create_private_child(&unique_name("real")).expect("parent");
+        let name = "subject".to_owned();
+        parent.create_private_child(&name).expect("subject");
+        (parent, name)
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    #[test]
+    fn entry_points_enforce_owner_and_mode_on_real_directories() {
+        let (parent, name) = fresh_child();
+        let subject = parent.path().join(&name);
+        // Private leaf: exactly 0700, so anything looser is refused by `open`.
+        assert!(AdmittedPrivateRoot::open(&subject).is_ok());
+        chmod(&subject, 0o750);
+        assert!(AdmittedPrivateRoot::open(&subject).is_err());
+        assert!(AdmittedPrivateRoot::open_or_create(&subject).is_err());
+        // A container tolerates group read/execute but never group or other write.
+        assert!(AdmittedPrivateRoot::open_container(&subject).is_ok());
+        chmod(&subject, 0o770);
+        assert!(AdmittedPrivateRoot::open_container(&subject).is_err());
+        chmod(&subject, 0o707);
+        assert!(AdmittedPrivateRoot::open_container(&subject).is_err());
+        // A writable ancestor poisons everything below it, even a clean 0700 leaf.
+        chmod(&subject, 0o700);
+        let leaf = subject.join("leaf");
+        std::fs::create_dir(&leaf).expect("leaf");
+        chmod(&leaf, 0o700);
+        assert!(AdmittedPrivateRoot::open(&leaf).is_ok());
+        chmod(&subject, 0o770);
+        assert!(AdmittedPrivateRoot::open(&leaf).is_err());
+        chmod(&subject, 0o700);
+        // Root-owned system directories are never a private leaf, and a sticky world-writable
+        // directory is never even a container.
+        assert!(AdmittedPrivateRoot::open(Path::new("/")).is_err());
+        assert!(AdmittedPrivateRoot::open_container(Path::new("/tmp")).is_err());
+        assert!(AdmittedPrivateRoot::open_container(Path::new("/var/tmp")).is_err());
+    }
+
+    #[test]
+    fn entry_points_refuse_symlinks_at_the_leaf_and_in_an_ancestor() {
+        let (parent, name) = fresh_child();
+        let subject = parent.path().join(&name);
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&subject, &link).expect("symlink");
+        assert!(AdmittedPrivateRoot::open(&link).is_err());
+        assert!(AdmittedPrivateRoot::open_container(&link).is_err());
+        assert!(AdmittedPrivateRoot::open_or_create(&link).is_err());
+        let through = link.join("child");
+        std::fs::create_dir(subject.join("child")).expect("child");
+        chmod(&subject.join("child"), 0o700);
+        assert!(AdmittedPrivateRoot::open(&through).is_err());
+        assert!(AdmittedPrivateRoot::open(&subject.join("child")).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn entry_points_judge_a_real_linux_acl_by_role() {
+        fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+            let mut out = 2_u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in entries {
+                out.extend_from_slice(&tag.to_le_bytes());
+                out.extend_from_slice(&perm.to_le_bytes());
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            out
+        }
+        const NONE: u32 = u32::MAX;
+        let (parent, name) = fresh_child();
+        let subject = parent.path().join(&name);
+        let directory = File::open(&subject).expect("open subject");
+        let set = |attr: &str, value: &[u8]| {
+            rustix::fs::fsetxattr(&directory, attr, value, rustix::fs::XattrFlags::empty())
+        };
+        let read_only_user =
+            acl(&[(1, 7, NONE), (2, 5, 12345), (4, 5, NONE), (16, 5, NONE), (32, 0, NONE)]);
+        let result = set("system.posix_acl_access", &read_only_user);
+        if result == Err(rustix::io::Errno::OPNOTSUPP) {
+            return;
+        }
+        result.expect("set access ACL");
+        // A read-only named user: fine for a container, never for a private leaf.
+        assert!(AdmittedPrivateRoot::open(&subject).is_err());
+        assert!(AdmittedPrivateRoot::open_container(&subject).is_ok());
+        let writable_user =
+            acl(&[(1, 7, NONE), (2, 7, 12345), (4, 5, NONE), (16, 7, NONE), (32, 0, NONE)]);
+        set("system.posix_acl_access", &writable_user).expect("set writable ACL");
+        assert!(AdmittedPrivateRoot::open(&subject).is_err());
+        assert!(AdmittedPrivateRoot::open_container(&subject).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn entry_points_judge_a_real_macos_acl_by_entry_effect() {
+        let (parent, name) = fresh_child();
+        let subject = parent.path().join(&name);
+        let acl = |flag: &str, entry: &str| {
+            std::process::Command::new("/bin/chmod")
+                .args([flag, entry])
+                .arg(&subject)
+                .status()
+                .expect("run chmod")
+                .success()
+        };
+        // A deny-only entry is admitted (macOS has one policy for every role).
+        assert!(acl("+a", "group:everyone deny delete"));
+        assert!(AdmittedPrivateRoot::open(&subject).is_ok());
+        assert!(AdmittedPrivateRoot::open_container(&subject).is_ok());
+        // An allow entry is refused for every role, and removing it restores admission.
+        assert!(acl("+a", "group:everyone allow write"));
+        assert!(AdmittedPrivateRoot::open(&subject).is_err());
+        assert!(AdmittedPrivateRoot::open_container(&subject).is_err());
+        assert!(acl("-a", "group:everyone allow write"));
+        assert!(AdmittedPrivateRoot::open(&subject).is_ok());
+    }
+
+    #[test]
+    fn an_expired_deadline_refuses_before_any_probe() {
+        let leaf = nested_leaf();
+        let expired = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let before = probe::probed_paths().len();
+        assert_eq!(leaf.revalidate_for_operation(expired), Err(PrivateStorageError::Unavailable));
+        assert_eq!(
+            leaf.create_private_child_for_operation("late", expired).map(|_| ()),
+            Err(PrivateStorageError::Unavailable)
+        );
+        assert!(!leaf.path().join("late").exists(), "no directory created after expiry");
+        assert_eq!(probe::probed_paths().len(), before, "no ACL probe after expiry");
     }
 }
