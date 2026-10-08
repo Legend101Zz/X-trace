@@ -840,13 +840,13 @@ fn effective_finish<E>(
     state: &RecordingAssembly<E>,
     request: &FinishRecording,
 ) -> Result<FinishRecording, PortError> {
-    if state.capacity_dropped == 0 {
-        return Ok(request.clone());
-    }
     let mut effective = request.clone();
+    // Derived from the application's own state, never from the caller.
+    effective.capacity_dropped_events = state.capacity_dropped;
+    if state.capacity_dropped == 0 {
+        return Ok(effective);
+    }
     effective.event_digest = Vec::new();
-    effective.capacity_dropped_events =
-        effective.capacity_dropped_events.saturating_add(state.capacity_dropped);
     for (priority, count) in &state.capacity_dropped_by_priority {
         let entry = effective.drop_counts_by_priority.entry(*priority).or_insert(0);
         *entry = entry.saturating_add(*count);
@@ -1740,6 +1740,22 @@ mod tests {
             sealed.expect_err("dropped events are rejected after finish").kind(),
             PortErrorKind::Conflict
         );
+    }
+
+    #[test]
+    fn caller_supplied_capacity_drop_count_is_overwritten_when_nothing_was_dropped() {
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        service.begin_recording(begin(wall(1))).expect("begin");
+        let recording_id = begin(wall(1)).recording_id;
+        let mut finish = FinishRecording::without_digest(recording_id, 1);
+        finish.event_digest = vec![7; 32];
+        finish.capacity_dropped_events = 99;
+        let receipt = service.finish_recording(finish).expect("finish");
+        let finishes = port.finishes.lock().expect("finishes");
+        assert_eq!(finishes[0].capacity_dropped_events, 0, "application state is authoritative");
+        assert_eq!(finishes[0].event_digest, vec![7; 32], "no drops keeps the digest");
+        assert_eq!(receipt.completion, RecordingCompletion::Complete);
     }
 
     #[test]

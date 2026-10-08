@@ -75,6 +75,10 @@ use xtrace_ingest::{Acceptance, IngestConfig, IngestError, IngestValidator};
 const _: () = assert!(
     xtrace_ingest::DEFAULT_MAX_EVENTS_PER_RECORDING == xtrace_application::MAX_RECORDED_EVENTS
 );
+// Likewise the drop-priority bucket bound: ingest and application agree.
+const _: () = assert!(
+    xtrace_ingest::MAX_DROP_PRIORITY_BUCKETS == xtrace_application::MAX_CAPACITY_DROP_PRIORITIES
+);
 use xtrace_protocol::envelope::check_protocol_version;
 use xtrace_protocol::generated::agent as wire;
 use xtrace_protocol::generated::agent::{Ack, AckDurability, AgentEnvelope, ProtocolError};

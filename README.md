@@ -40,9 +40,10 @@ Dependency direction follows `docs/plans/x-trace/02-architecture.md`:
 
 ```text
 xtrace-cli       -> xtrace-application, xtrace-store, xtrace-daemon, xtrace-domain, xtrace-private-storage, xtrace-protocol, xtrace-runtime
-xtrace-runtime   -> xtrace-private-storage, OS process launch and supervision policy
-xtrace-daemon    -> xtrace-application, xtrace-domain, xtrace-private-storage, xtrace-protocol
-xtrace-store     -> xtrace-application, xtrace-domain, xtrace-private-storage
+xtrace-runtime   -> xtrace-private-storage, xtrace-protocol, OS process launch and supervision policy
+xtrace-daemon    -> xtrace-application, xtrace-domain, xtrace-ingest, xtrace-private-storage, xtrace-protocol
+xtrace-store     -> xtrace-application, xtrace-domain, xtrace-private-storage, xtrace-protocol
+xtrace-ingest    -> xtrace-domain, xtrace-protocol
 xtrace-private-storage -> (leaf: no X-trace crates)
 xtrace-protocol  -> xtrace-domain
 xtrace-application -> xtrace-domain

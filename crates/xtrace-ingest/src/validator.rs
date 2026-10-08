@@ -238,7 +238,7 @@ struct RecordingState {
 
 /// Upper bound on distinct priorities tracked for capacity drops of one
 /// recording, so drop accounting is as bounded as the digest table.
-const MAX_DROP_PRIORITY_BUCKETS: usize = 64;
+pub const MAX_DROP_PRIORITY_BUCKETS: usize = 64;
 
 /// Decodes the wire `recording_id` bytes into a domain [`RecordingId`].
 ///

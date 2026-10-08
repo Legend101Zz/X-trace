@@ -74,7 +74,7 @@ sanitized `Unavailable` error; no repair of permissions is ever attempted.
 | Mode | exactly `0700` (Sealed: exactly its sealed mode, `0500`) | no `g+w`, no `o+w` | no group or other bits at all |
 | Link count | n/a | n/a | ordinary private file: exactly 1; managed immutable object file (hard-linked on purpose for deduplication): at least 1 (0 refused) |
 | Filesystem | owner-enforcing local type (see below) | same | same device as the directory |
-| Linux ACL (xattr) | any `posix_acl_access` or `posix_acl_default` refused | no ACL admitted; access ACL admitted only if well formed and no entry other than the owning user grants write; any well-formed default ACL admitted | no ACL (path probe) |
+| Linux ACL (xattr) | any `posix_acl_access` or `posix_acl_default` refused | admitted with no ACL at all; an access ACL is admitted only if well formed, with an owning-user entry, and no other entry grants write; a default ACL is admitted if well formed (any permissions); a malformed ACL of either kind is refused | no ACL (path probe) |
 | macOS ACL (`ls -ldeO`) | deny-only entries from the fixed vocabulary admitted; any allow entry refused | same as leaf | same as leaf |
 | macOS BSD flags | `sunlnk`, `restricted`, `hidden` admitted; any other flag refused | same | same |
 | Name syntax | single safe path component | n/a | single safe path component |

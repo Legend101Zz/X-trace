@@ -136,6 +136,9 @@ reported unavailable. This is not the later reusable daemon registry/stop
 contract or full Slice 3 acceptance. Project and helper storage must be on an
 owner-enforced local filesystem; noowners mounts and uncertain ACL inspection
 fail closed before private runtime files are written.
+These checks live in the `xtrace-private-storage` crate; the admission rules
+are recorded in
+[ADR 0008](../decisions/0008-private-storage-admission-policy.md).
 Before launching the helper, the CLI copies the bounded SHA-256-verified pack
 into that private durable cache and executes only the copy. These digests check
 integrity, not publisher authenticity. It retains at most four pack snapshots
