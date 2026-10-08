@@ -2035,7 +2035,8 @@ mod tests {
         let (_source, pack) = tagged_source("seed");
         drop(pack.snapshot_into(&fixture.cache).expect("creates the cache layout"));
         let cache = PackCache::open(&fixture.cache).expect("cache");
-        let name = format!("{:064x}.use", 7);
+        let stem = format!("{:064x}", 7);
+        let name = format!("{stem}.use");
         drop(cache.state_file(&name, true).expect("create").expect("file"));
 
         let fired = std::rc::Rc::new(std::cell::Cell::new(0_u32));
@@ -2050,7 +2051,7 @@ mod tests {
                 }
             }),
         );
-        let lease = cache.lease(&name).expect("lease survives a concurrent unlink");
+        let lease = cache.lease(&stem).expect("lease survives a concurrent unlink");
         hooks::clear();
         assert_eq!(fired.get(), 1);
         assert!(cache.state_entry_is(&name, &lease).expect("entry"), "lease is on the live file");
