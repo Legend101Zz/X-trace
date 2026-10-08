@@ -10,6 +10,8 @@ const MAX_PACK_ENTRIES: usize = 96;
 const MAX_RETAINED_PACK_SNAPSHOTS: usize = 4;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// Size of the single buffer used to hash and copy pack files.
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Sanitized error from Java attach-pack validation or helper process control.
 #[derive(Debug, Error)]
@@ -96,8 +98,8 @@ impl JavaAttachPack {
                 .get(path)
                 .copied()
                 .ok_or(AttachError::Validation("the Java attach pack is incomplete"))?;
-            let bytes = read_bounded_file(&root.join(path), identity, MAX_FILE_BYTES)?;
-            if sha256(&bytes) != *expected {
+            let digest = stream_file(&root.join(path), identity, MAX_FILE_BYTES, None)?;
+            if digest != *expected {
                 return Err(AttachError::Validation("the Java attach pack digest does not match"));
             }
         }
@@ -216,19 +218,24 @@ impl JavaAttachPack {
                     AttachError::Validation("the Java attach pack changed during snapshot")
                 })?;
             let identity = FileIdentity::from_metadata(&identity);
-            let bytes = read_bounded_file(&current.root.join(relative), identity, MAX_FILE_BYTES)?;
-            if sha256(&bytes) != *expected_digest {
-                return Err(AttachError::Validation(
-                    "the Java attach pack changed during snapshot",
-                ));
-            }
             total = total
-                .checked_add(bytes.len() as u64)
+                .checked_add(identity.size)
                 .ok_or(AttachError::Validation("the Java attach pack exceeds its size limit"))?;
             if total > MAX_PACK_BYTES {
                 return Err(AttachError::Validation("the Java attach pack exceeds its size limit"));
             }
-            write_snapshot_file(&snapshot, relative, &bytes)?;
+            let mut destination = create_snapshot_file(&snapshot, relative)?;
+            let digest = stream_file(
+                &current.root.join(relative),
+                identity,
+                MAX_FILE_BYTES,
+                Some(&mut destination),
+            )?;
+            if digest != *expected_digest {
+                return Err(AttachError::Validation(
+                    "the Java attach pack changed during snapshot",
+                ));
+            }
         }
         total = total
             .checked_add(manifest.len() as u64)
@@ -429,13 +436,11 @@ fn create_private_directory(root: &std::fs::File, relative: &str) -> Result<(), 
     )
 }
 
-fn write_snapshot_file(
+fn create_snapshot_file(
     root: &std::fs::File,
     relative: &str,
-    bytes: &[u8],
-) -> Result<(), AttachError> {
+) -> Result<std::fs::File, AttachError> {
     use rustix::fs::{Mode, OFlags, openat};
-    use std::io::Write as _;
     let (parent, name) = relative
         .rsplit_once('/')
         .ok_or(AttachError::Validation("the Java attach pack manifest is malformed"))?;
@@ -447,19 +452,14 @@ fn write_snapshot_file(
     )
     .map(std::fs::File::from)
     .map_err(|_| AttachError::PrivateStorage("the private Java pack snapshot is unavailable"))?;
-    let mut file = openat(
+    openat(
         &directory,
         name,
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::from_raw_mode(0o400),
     )
     .map(std::fs::File::from)
-    .map_err(|_| {
-        AttachError::PrivateStorage("the private Java pack snapshot could not be written")
-    })?;
-    file.write_all(bytes).map_err(|_| {
-        AttachError::PrivateStorage("the private Java pack snapshot could not be written")
-    })
+    .map_err(|_| AttachError::PrivateStorage("the private Java pack snapshot could not be written"))
 }
 
 /// Verifies that an existing directory is on an owner-enforcing local filesystem.
@@ -764,6 +764,67 @@ fn read_bounded_file(
     Ok(bytes)
 }
 
+/// Streams one pack file through SHA-256 with a bounded buffer, optionally copying it to `sink`.
+///
+/// Memory use is one `STREAM_CHUNK_BYTES` buffer regardless of file size. The same identity
+/// checks as `read_bounded_file` apply: the opened descriptor and the path must both still match
+/// `expected`, and exactly `expected.size` bytes must be read.
+fn stream_file(
+    path: &Path,
+    expected: FileIdentity,
+    bound: u64,
+    mut sink: Option<&mut std::fs::File>,
+) -> Result<String, AttachError> {
+    use std::io::{Read as _, Write as _};
+    if expected.size > bound {
+        return Err(AttachError::Validation("a Java attach pack file exceeds its size limit"));
+    }
+    let unreadable = || AttachError::Validation("a Java attach pack file cannot be read");
+    let changed = || AttachError::Validation("the Java attach pack changed during validation");
+    let mut file = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(|_| unreadable())?;
+    let before = file.metadata().map_err(|_| unreadable())?;
+    if FileIdentity::from_metadata(&before) != expected {
+        return Err(changed());
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
+    let mut total = 0_u64;
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(unreadable()),
+        };
+        if read == 0 {
+            break;
+        }
+        total = total.checked_add(read as u64).ok_or_else(changed)?;
+        if total > expected.size {
+            return Err(changed());
+        }
+        hasher.update(&buffer[..read]);
+        if let Some(sink) = sink.as_deref_mut() {
+            sink.write_all(&buffer[..read]).map_err(|_| {
+                AttachError::PrivateStorage("the private Java pack snapshot could not be written")
+            })?;
+        }
+    }
+    if total != expected.size {
+        return Err(changed());
+    }
+    let after = std::fs::symlink_metadata(path).map_err(|_| changed())?;
+    if FileIdentity::from_metadata(&after) != expected {
+        return Err(changed());
+    }
+    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -887,6 +948,53 @@ mod tests {
         let directory =
             xtrace_private_storage::open_traversed_directory(root.path()).expect("pack cache fd");
         assert!(ensure_snapshot_capacity(root.path(), &directory).is_err());
+    }
+
+    #[test]
+    fn streaming_digest_matches_whole_file_digest_across_chunk_boundaries() {
+        let root = tempfile::tempdir().expect("temporary files");
+        for size in [
+            0,
+            1,
+            STREAM_CHUNK_BYTES - 1,
+            STREAM_CHUNK_BYTES,
+            STREAM_CHUNK_BYTES + 1,
+            3 * STREAM_CHUNK_BYTES + 17,
+        ] {
+            let bytes = (0..size).map(|index| (index * 31 % 251) as u8).collect::<Vec<_>>();
+            let path = root.path().join(format!("file-{size}"));
+            std::fs::write(&path, &bytes).expect("fixture");
+            let identity =
+                FileIdentity::from_metadata(&std::fs::symlink_metadata(&path).expect("metadata"));
+            let mut copy = tempfile::tempfile().expect("copy sink");
+            let streamed =
+                stream_file(&path, identity, MAX_FILE_BYTES, Some(&mut copy)).expect("stream");
+            assert_eq!(streamed, sha256(&bytes), "size {size}");
+            let mut copied = Vec::new();
+            std::io::Read::read_to_end(
+                &mut {
+                    std::io::Seek::rewind(&mut copy).expect("rewind");
+                    copy
+                },
+                &mut copied,
+            )
+            .expect("read copy");
+            assert_eq!(copied, bytes, "copy of size {size}");
+        }
+    }
+
+    #[test]
+    fn streaming_digest_rejects_size_changes_and_oversize_files() {
+        let root = tempfile::tempdir().expect("temporary files");
+        let path = root.path().join("file");
+        std::fs::write(&path, vec![7_u8; 1000]).expect("fixture");
+        let identity =
+            FileIdentity::from_metadata(&std::fs::symlink_metadata(&path).expect("metadata"));
+        std::fs::write(&path, vec![7_u8; 1001]).expect("grow");
+        assert!(stream_file(&path, identity, MAX_FILE_BYTES, None).is_err());
+        let identity =
+            FileIdentity::from_metadata(&std::fs::symlink_metadata(&path).expect("metadata"));
+        assert!(stream_file(&path, identity, 1000, None).is_err());
     }
 
     #[test]
