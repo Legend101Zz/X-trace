@@ -220,7 +220,13 @@ impl JavaAttachPack {
                 // residue (new snapshots are renamed in complete). It is never repaired
                 // in place; it is replaced only when no live attach holds a lease on it.
                 drop(lease);
-                if !packs.evict(&snapshot_name)? {
+                // Sealed entries only change under the cache lock, which keeps listings
+                // under that lock consistent.
+                let evicted = {
+                    let _guard = packs.lock_cache()?;
+                    packs.evict(&snapshot_name)?
+                };
+                if !evicted {
                     return Err(error);
                 }
                 lease = packs.lease(&snapshot_name)?;
@@ -464,7 +470,16 @@ impl PackCache {
             if name != STATE_DIR && !snapshot && !incoming {
                 return Err(unexpected());
             }
-            let child = open_child_directory(&self.packs, &name).map_err(|_| unexpected())?;
+            #[cfg(test)]
+            hooks::fire("list_entry", &name, &self.packs);
+            let child = match open_child_directory(&self.packs, &name) {
+                Ok(child) => child,
+                // Removed since the directory was read (an evicted snapshot, a published or
+                // abandoned incoming directory): it no longer exists, so it is not listed. The
+                // name was already checked above, so unknown names still fail closed.
+                Err(error) if error == rustix::io::Errno::NOENT => continue,
+                Err(_) => return Err(unexpected()),
+            };
             let metadata = child.metadata().map_err(|_| unexpected())?;
             if metadata.uid() != self.owner
                 || metadata.dev() != self.device
@@ -494,36 +509,55 @@ impl PackCache {
         // A plain `O_CREAT` open raced by other creators of the same new name returns a
         // spurious ENOENT on APFS (measured: about 10% of 16-way races; none with this protocol).
         let mut attempts = 0_u32;
-        let file = loop {
-            match rustix::fs::openat(&self.state, name, flags, rustix::fs::Mode::empty()) {
-                Ok(file) => break std::fs::File::from(file),
+        loop {
+            let file = match rustix::fs::openat(&self.state, name, flags, rustix::fs::Mode::empty())
+            {
+                Ok(file) => std::fs::File::from(file),
                 Err(error) if error == rustix::io::Errno::NOENT && !create => return Ok(None),
-                Err(error) if error == rustix::io::Errno::NOENT => {}
-                Err(_) => return Err(unopenable()),
-            }
-            match rustix::fs::openat(
-                &self.state,
-                name,
-                flags | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL,
-                rustix::fs::Mode::from_raw_mode(0o600),
-            ) {
-                Ok(file) => break std::fs::File::from(file),
-                // Another creator won; open theirs on the next pass.
-                Err(error) if error == rustix::io::Errno::EXIST && attempts < MAX_RETRIES => {
-                    attempts += 1;
+                Err(error) if error == rustix::io::Errno::NOENT => {
+                    match rustix::fs::openat(
+                        &self.state,
+                        name,
+                        flags | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL,
+                        rustix::fs::Mode::from_raw_mode(0o600),
+                    ) {
+                        Ok(file) => std::fs::File::from(file),
+                        // Another creator won; open theirs on the next pass.
+                        Err(error)
+                            if error == rustix::io::Errno::EXIST && attempts < MAX_RETRIES =>
+                        {
+                            attempts += 1;
+                            continue;
+                        }
+                        Err(_) => return Err(unopenable()),
+                    }
                 }
                 Err(_) => return Err(unopenable()),
+            };
+            #[cfg(test)]
+            hooks::fire("state_file_opened", name, &self.state);
+            let metadata = file.metadata().map_err(|_| lock_error())?;
+            if metadata.is_file() && metadata.nlink() == 0 {
+                // Unlinked by an evictor or reaper between our open and this check: the name is
+                // gone, not unsafe. Look it up again (bounded) or report it absent.
+                if !create {
+                    return Ok(None);
+                }
+                if attempts >= MAX_RETRIES {
+                    return Err(unopenable());
+                }
+                attempts += 1;
+                continue;
             }
-        };
-        let metadata = file.metadata().map_err(|_| lock_error())?;
-        if !metadata.is_file()
-            || metadata.uid() != self.owner
-            || metadata.mode() & 0o077 != 0
-            || metadata.nlink() != 1
-        {
-            return Err(AttachError::PrivateStorage("the Java pack cache state is unsafe"));
+            if !metadata.is_file()
+                || metadata.uid() != self.owner
+                || metadata.mode() & 0o077 != 0
+                || metadata.nlink() != 1
+            {
+                return Err(AttachError::PrivateStorage("the Java pack cache state is unsafe"));
+            }
+            return Ok(Some(file));
         }
-        Ok(Some(file))
     }
 
     /// Whether `name` in the state directory is still the file behind `held`.
@@ -1463,6 +1497,37 @@ fn open_child_directory(
     Ok(std::fs::File::from(descriptor))
 }
 
+/// Test-only interleaving points: a test installs a closure that runs at a named point of a
+/// production code path, on the calling thread, to force one specific concurrent interleaving.
+#[cfg(test)]
+#[allow(clippy::expect_used, reason = "test-only hook registry")]
+mod hooks {
+    type Hook = Box<dyn Fn(&str, &std::fs::File)>;
+
+    thread_local! {
+        static HOOKS: std::cell::RefCell<Vec<(&'static str, Hook)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn install(point: &'static str, hook: Hook) {
+        HOOKS.with(|hooks| hooks.borrow_mut().push((point, hook)));
+    }
+
+    pub(super) fn clear() {
+        HOOKS.with(|hooks| hooks.borrow_mut().clear());
+    }
+
+    pub(super) fn fire(point: &str, name: &str, directory: &std::fs::File) {
+        HOOKS.with(|hooks| {
+            for (registered, hook) in hooks.borrow().iter() {
+                if *registered == point {
+                    hook(name, directory);
+                }
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, reason = "tests construct fixed bounded pack fixtures")]
 mod tests {
@@ -1960,6 +2025,88 @@ mod tests {
         // later builds. Residue never counts toward the snapshot cap.
         assert!(incoming_names(&fixture.cache).len() < MAX_CACHE_ENTRIES);
         assert!(JavaAttachPack::validate(healed.root()).is_ok());
+    }
+
+    /// Interleaving: an evictor unlinks a state file after a lease holder opened it and before
+    /// the holder checks it. That is a vanished file, not an unsafe one; the holder retries.
+    #[test]
+    fn state_file_unlinked_after_open_is_retried_not_reported_unsafe() {
+        let fixture = cache_fixture();
+        let (_source, pack) = tagged_source("seed");
+        drop(pack.snapshot_into(&fixture.cache).expect("creates the cache layout"));
+        let cache = PackCache::open(&fixture.cache).expect("cache");
+        let name = format!("{:064x}.use", 7);
+        drop(cache.state_file(&name, true).expect("create").expect("file"));
+
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+        let counter = fired.clone();
+        hooks::install(
+            "state_file_opened",
+            Box::new(move |opened, directory| {
+                if counter.get() == 0 && opened.ends_with(".use") {
+                    counter.set(1);
+                    rustix::fs::unlinkat(directory, opened, rustix::fs::AtFlags::empty())
+                        .expect("unlink behind the opener");
+                }
+            }),
+        );
+        let lease = cache.lease(&name).expect("lease survives a concurrent unlink");
+        hooks::clear();
+        assert_eq!(fired.get(), 1);
+        assert!(cache.state_entry_is(&name, &lease).expect("entry"), "lease is on the live file");
+        // Reading a name that vanished reports it absent rather than unsafe.
+        hooks::install(
+            "state_file_opened",
+            Box::new(|opened, directory| {
+                let _ = rustix::fs::unlinkat(directory, opened, rustix::fs::AtFlags::empty());
+            }),
+        );
+        assert!(cache.state_file(&name, false).expect("no error").is_none());
+        hooks::clear();
+    }
+
+    /// Interleaving: a listed entry is removed between reading the directory and opening the
+    /// entry. The lister must skip it; an unknown name must still fail closed.
+    #[test]
+    fn listing_skips_entries_removed_mid_listing_but_still_rejects_unknown_names() {
+        let fixture = cache_fixture();
+        let (_source, pack) = tagged_source("seed");
+        drop(pack.snapshot_into(&fixture.cache).expect("creates the cache layout"));
+        let cache = PackCache::open(&fixture.cache).expect("cache");
+        let packs = fixture.cache.join(PACKS_DIR);
+        let incoming = format!("{INCOMING_PREFIX}9-{}", "d".repeat(32));
+        std::fs::create_dir(packs.join(&incoming)).expect("incoming");
+        std::fs::set_permissions(packs.join(&incoming), std::fs::Permissions::from_mode(0o700))
+            .expect("mode");
+
+        let target = incoming.clone();
+        hooks::install(
+            "list_entry",
+            Box::new(move |name, directory| {
+                if name == target {
+                    rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::REMOVEDIR)
+                        .expect("remove behind the lister");
+                }
+            }),
+        );
+        let listing = cache.list().expect("a vanished entry is not an error");
+        hooks::clear();
+        assert!(listing.incoming.is_empty());
+        assert_eq!(listing.sealed.len(), 1);
+
+        let stray = packs.join("not-a-snapshot");
+        std::fs::create_dir(&stray).expect("stray");
+        std::fs::set_permissions(&stray, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        hooks::install(
+            "list_entry",
+            Box::new(|name, directory| {
+                if name == "not-a-snapshot" {
+                    let _ = rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::REMOVEDIR);
+                }
+            }),
+        );
+        assert!(cache.list().is_err(), "unknown names fail closed even if they vanish");
+        hooks::clear();
     }
 
     #[test]
