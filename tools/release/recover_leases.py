@@ -242,9 +242,16 @@ def read_records(layout: Layout) -> dict[str, Any]:
     return {"owners": owners, "ownerFacts": facts, "receipt": receipt, "receiptFacts": receipt_facts}
 
 
+MAX_OWNER_EPOCH = 2**53  # exactly float-representable; far beyond any real epoch
+
+
 def _valid_epoch(value: Any) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value) and value > 0)
+    """A real, finite, positive epoch below 2**53; huge ints are compared, never converted (no OverflowError)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return 0 < value < MAX_OWNER_EPOCH
 
 
 def _agreed_run_start_epoch(owners: dict[str, dict[str, Any]], reasons: list[str]) -> float | None:
