@@ -750,6 +750,61 @@ mod tests {
     }
 
     #[test]
+    fn capacity_drops_at_a_full_history_require_an_absent_adapter_digest() {
+        use xtrace_application::recording::MAX_RECORDED_EVENTS;
+        let (directory, store, project) = fixture();
+        let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
+        let reader = SqliteRecordingReader::new(store, directory.path());
+        let last_kept = 1 + MAX_RECORDED_EVENTS as u64;
+        for (digest, expect_corruption) in [(vec![9_u8; 32], true), (Vec::new(), false)] {
+            let recording_id = RecordingId::new();
+            persistence.begin_recording(&begin(project.id(), recording_id)).expect("begin");
+            let events = (2..=last_kept)
+                .map(|sequence| event(sequence, &format!("event-{sequence}")))
+                .collect::<Vec<_>>();
+            for (ordinal, chunk) in events.chunks(1_000).enumerate() {
+                persistence
+                    .persist_segment(&PersistRecordingSegment {
+                        project_id: project.id(),
+                        recording_id,
+                        segment_ordinal: u32::try_from(ordinal).expect("small ordinal"),
+                        events: chunk.to_vec(),
+                    })
+                    .expect("persist full history");
+            }
+            persistence
+                .finish_recording(&FinishRecording {
+                    recording_id,
+                    final_recording_seq: last_kept + 1,
+                    duration_ns: None,
+                    event_digest: digest,
+                    drop_counts_by_priority: [(1, 1)].into_iter().collect(),
+                    unsupported_capability_codes: Vec::new(),
+                    capacity_dropped_events: 1,
+                    response_summary: None,
+                })
+                .expect("finish stores the evidence");
+            let result = reader.show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id,
+                limit: 10,
+                after_sequence: None,
+            });
+            if expect_corruption {
+                let error =
+                    result.expect_err("a present adapter digest contradicts capacity drops");
+                assert_eq!(error.kind(), PortErrorKind::Corruption);
+            } else {
+                let window = result.expect("full history with withheld digest reads back");
+                assert_eq!(
+                    window.completion,
+                    xtrace_application::recording_queries::RecordingCompletionEvidence::Partial
+                );
+            }
+        }
+    }
+
+    #[test]
     fn read_rejects_complete_labels_without_complete_finish_proof() {
         let (directory, store, project) = fixture();
         let persistence = SqliteRecordingPersistence::new(store.clone(), directory.path());
