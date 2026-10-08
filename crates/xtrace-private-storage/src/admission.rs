@@ -1316,11 +1316,13 @@ mod tests {
     }
 
     fn unique_name(stem: &str) -> String {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("test clock")
             .as_nanos();
-        format!("{stem}-{}-{time}", std::process::id())
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        format!("{stem}-{}-{time}-{sequence}", std::process::id())
     }
 
     /// True while `/proc/locks` lists a POSIX lock held by this process on `inode`.
@@ -1645,14 +1647,18 @@ mod tests {
     //
     // Linux does not memoize (its probes are two xattr reads), so its bounds are the old ones.
 
+    /// Directories on a path, not counting the scratch root: every test in this module creates
+    /// children there at the same time, so its ctime (and thus its probe count) is noise.
     fn directory_count(path: &Path) -> usize {
-        path.components().count()
+        path.components().count() - 1
     }
 
+    /// Probes of directories other than the busy scratch root.
     fn probes_during(action: impl FnOnce()) -> usize {
-        let before = probe::directory_probe_count();
+        let busy = private_scratch().path().to_path_buf();
+        let before = probe::probed_paths().len();
         action();
-        probe::directory_probe_count() - before
+        probe::probed_paths().iter().skip(before).filter(|path| **path != busy).count()
     }
 
     /// A private leaf several components below the scratch root.

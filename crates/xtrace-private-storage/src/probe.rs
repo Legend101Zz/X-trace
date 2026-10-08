@@ -165,6 +165,14 @@ impl Operation {
 #[cfg(test)]
 thread_local! {
     static DIRECTORY_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROBED_PATHS: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Every directory path this thread has probed, in order. Lets a test ignore a directory that
+/// other tests are busy in, which would otherwise make its probe count nondeterministic.
+#[cfg(test)]
+pub(crate) fn probed_paths() -> Vec<std::path::PathBuf> {
+    PROBED_PATHS.with(|paths| paths.borrow().clone())
 }
 
 /// Number of real directory ACL probes this thread has run (a `/bin/ls` spawn on macOS, the
@@ -203,7 +211,10 @@ pub(crate) fn directory_acl_admits(
         return true;
     }
     #[cfg(test)]
-    DIRECTORY_PROBES.with(|count| count.set(count.get() + 1));
+    {
+        DIRECTORY_PROBES.with(|count| count.set(count.get() + 1));
+        PROBED_PATHS.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
+    }
     if !probe_directory(operation, role, path, directory) {
         return false;
     }
