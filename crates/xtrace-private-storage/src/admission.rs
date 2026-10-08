@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::policy::{self, DirectoryRole};
+use crate::policy::{self, DirectoryRole, FilesystemProfile};
 use crate::probe::{self, Operation};
 
 const MAX_PATH_COMPONENTS: usize = 128;
@@ -78,6 +78,7 @@ pub struct AdmittedPrivateRoot {
     directory: File,
     identity: FileIdentity,
     private_leaf: bool,
+    profile: FilesystemProfile,
 }
 
 impl std::fmt::Debug for AdmittedPrivateRoot {
@@ -99,7 +100,22 @@ impl AdmittedPrivateRoot {
         directory: &File,
         private_leaf: bool,
     ) -> Result<(), PrivateStorageError> {
-        let op = &Operation::new();
+        Self::validate_open_directory_with_profile(
+            path,
+            directory,
+            private_leaf,
+            FilesystemProfile::Durable,
+        )
+    }
+
+    /// [`Self::validate_open_directory`] under an explicit filesystem profile.
+    pub fn validate_open_directory_with_profile(
+        path: &Path,
+        directory: &File,
+        private_leaf: bool,
+        profile: FilesystemProfile,
+    ) -> Result<(), PrivateStorageError> {
+        let op = &Operation::new().with_profile(profile);
         let walked = open_directory_without_symlinks_until(path, op)?;
         let supplied = directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
         let walked_metadata = walked.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
@@ -112,7 +128,15 @@ impl AdmittedPrivateRoot {
 
     /// Opens and admits an existing exact-owner `0700` directory.
     pub fn open(path: &Path) -> Result<Self, PrivateStorageError> {
-        Self::open_with_mode(path, true)
+        Self::open_with_mode(path, true, FilesystemProfile::Durable)
+    }
+
+    /// [`Self::open`] under an explicit filesystem profile; children inherit the profile.
+    pub fn open_with_profile(
+        path: &Path,
+        profile: FilesystemProfile,
+    ) -> Result<Self, PrivateStorageError> {
+        Self::open_with_mode(path, true, profile)
     }
 
     /// Opens an existing container that is safe for traversal but not necessarily private.
@@ -120,7 +144,15 @@ impl AdmittedPrivateRoot {
     /// This is for an already-existing ancestor only; it must not be used as
     /// authorization to create private files directly inside that ancestor.
     pub fn open_container(path: &Path) -> Result<Self, PrivateStorageError> {
-        Self::open_with_mode(path, false)
+        Self::open_with_mode(path, false, FilesystemProfile::Durable)
+    }
+
+    /// [`Self::open_container`] under an explicit filesystem profile; children inherit it.
+    pub fn open_container_with_profile(
+        path: &Path,
+        profile: FilesystemProfile,
+    ) -> Result<Self, PrivateStorageError> {
+        Self::open_with_mode(path, false, profile)
     }
 
     /// Creates missing path components with owner-only permissions and admits the final leaf.
@@ -130,7 +162,8 @@ impl AdmittedPrivateRoot {
     pub fn open_or_create(path: &Path) -> Result<Self, PrivateStorageError> {
         use std::path::Component;
 
-        let op = &Operation::new();
+        let profile = FilesystemProfile::Durable;
+        let op = &Operation::new().with_profile(profile);
         if !path.is_absolute() {
             return Err(PrivateStorageError::InvalidName);
         }
@@ -158,8 +191,13 @@ impl AdmittedPrivateRoot {
             return Err(PrivateStorageError::InvalidName);
         }
         let descriptor = open_directory_descriptor("/")?;
-        let mut current =
-            Self::from_admitted_descriptor_until(PathBuf::from("/"), descriptor, false, op)?;
+        let mut current = Self::from_admitted_descriptor_until(
+            PathBuf::from("/"),
+            descriptor,
+            false,
+            profile,
+            op,
+        )?;
         for (index, name) in names.iter().enumerate() {
             let is_leaf = index + 1 == names.len();
             match rustix::fs::openat(
@@ -177,6 +215,7 @@ impl AdmittedPrivateRoot {
                         next_path,
                         File::from(opened),
                         is_leaf,
+                        profile,
                         op,
                     )?;
                 }
@@ -194,25 +233,46 @@ impl AdmittedPrivateRoot {
         path: PathBuf,
         directory: File,
         private_leaf: bool,
+        profile: FilesystemProfile,
         op: &Operation,
     ) -> Result<Self, PrivateStorageError> {
         admit_directory_descriptor_until(&path, &directory, role_of(private_leaf), op)?;
         let metadata = directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
-        Ok(Self { path, directory, identity: FileIdentity::from_metadata(&metadata), private_leaf })
+        Ok(Self {
+            path,
+            directory,
+            identity: FileIdentity::from_metadata(&metadata),
+            private_leaf,
+            profile,
+        })
     }
 
-    fn open_with_mode(path: &Path, private_leaf: bool) -> Result<Self, PrivateStorageError> {
-        let op = &Operation::new();
+    /// A fresh admission operation judging filesystems under this capability's profile.
+    fn operation(&self) -> Operation {
+        Operation::new().with_profile(self.profile)
+    }
+
+    /// [`Self::operation`] inside a caller's larger deadline.
+    fn operation_capped(&self, operation_deadline: std::time::Instant) -> Operation {
+        Operation::capped(operation_deadline).with_profile(self.profile)
+    }
+
+    fn open_with_mode(
+        path: &Path,
+        private_leaf: bool,
+        profile: FilesystemProfile,
+    ) -> Result<Self, PrivateStorageError> {
+        let op = &Operation::new().with_profile(profile);
         let directory = open_directory_without_symlinks_until(path, op)?;
         admit_directory_descriptor_until(path, &directory, role_of(private_leaf), op)?;
         let metadata = directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
         let identity = FileIdentity::from_metadata(&metadata);
-        Ok(Self { path: path.to_path_buf(), directory, identity, private_leaf })
+        Ok(Self { path: path.to_path_buf(), directory, identity, private_leaf, profile })
     }
 
     /// Revalidates the opened descriptor, its current name, ACL, owner, mode, and filesystem.
     pub fn revalidate(&self) -> Result<(), PrivateStorageError> {
-        self.revalidate_until(&Operation::new())
+        self.revalidate_until(&self.operation())
     }
 
     // The ten `*_for_operation` methods below are public because `xtrace-runtime`'s pack
@@ -227,7 +287,7 @@ impl AdmittedPrivateRoot {
         &self,
         operation_deadline: std::time::Instant,
     ) -> Result<(), PrivateStorageError> {
-        self.revalidate_until(&Operation::capped(operation_deadline))
+        self.revalidate_until(&self.operation_capped(operation_deadline))
     }
 
     fn revalidate_until(&self, op: &Operation) -> Result<(), PrivateStorageError> {
@@ -261,7 +321,7 @@ impl AdmittedPrivateRoot {
 
     /// Creates and admits a new owner-only child directory relative to this descriptor.
     pub fn create_private_child(&self, name: &str) -> Result<Self, PrivateStorageError> {
-        self.create_private_child_until(name, &Operation::new())
+        self.create_private_child_until(name, &self.operation())
     }
 
     /// Creates a private child while preserving the caller's absolute deadline.
@@ -270,7 +330,7 @@ impl AdmittedPrivateRoot {
         name: &str,
         operation_deadline: std::time::Instant,
     ) -> Result<Self, PrivateStorageError> {
-        self.create_private_child_until(name, &Operation::capped(operation_deadline))
+        self.create_private_child_until(name, &self.operation_capped(operation_deadline))
     }
 
     fn create_private_child_until(
@@ -305,12 +365,13 @@ impl AdmittedPrivateRoot {
             directory: child,
             identity: FileIdentity::from_metadata(&metadata),
             private_leaf: true,
+            profile: self.profile,
         })
     }
 
     /// Opens a private child, creating it only when it is absent.
     pub fn open_or_create_private_child(&self, name: &str) -> Result<Self, PrivateStorageError> {
-        self.open_or_create_private_child_until(name, &Operation::new())
+        self.open_or_create_private_child_until(name, &self.operation())
     }
 
     fn open_or_create_private_child_until(
@@ -334,6 +395,7 @@ impl AdmittedPrivateRoot {
                     self.path.join(name),
                     File::from(opened),
                     true,
+                    self.profile,
                     op,
                 )?;
                 self.revalidate_until(op)?;
@@ -348,7 +410,7 @@ impl AdmittedPrivateRoot {
 
     /// Opens an already-existing private child directory relative to this descriptor.
     pub fn open_private_child(&self, name: &str) -> Result<Self, PrivateStorageError> {
-        self.open_private_child_until(name, &Operation::new())
+        self.open_private_child_until(name, &self.operation())
     }
 
     /// Opens an admitted private child within a caller-owned bounded operation.
@@ -357,7 +419,7 @@ impl AdmittedPrivateRoot {
         name: &str,
         operation_deadline: std::time::Instant,
     ) -> Result<Self, PrivateStorageError> {
-        self.open_private_child_until(name, &Operation::capped(operation_deadline))
+        self.open_private_child_until(name, &self.operation_capped(operation_deadline))
     }
 
     fn open_private_child_until(
@@ -388,6 +450,7 @@ impl AdmittedPrivateRoot {
             directory: child,
             identity: FileIdentity::from_metadata(&metadata),
             private_leaf: true,
+            profile: self.profile,
         })
     }
 
@@ -396,7 +459,7 @@ impl AdmittedPrivateRoot {
         &self,
         maximum_entries: usize,
     ) -> Result<Vec<String>, PrivateStorageError> {
-        self.bounded_child_names_until(maximum_entries, &Operation::new())
+        self.bounded_child_names_until(maximum_entries, &self.operation())
     }
 
     /// Lists bounded child names under the same absolute deadline as a larger operation.
@@ -405,7 +468,7 @@ impl AdmittedPrivateRoot {
         maximum_entries: usize,
         operation_deadline: std::time::Instant,
     ) -> Result<Vec<String>, PrivateStorageError> {
-        self.bounded_child_names_until(maximum_entries, &Operation::capped(operation_deadline))
+        self.bounded_child_names_until(maximum_entries, &self.operation_capped(operation_deadline))
     }
 
     fn bounded_child_names_until(
@@ -433,7 +496,7 @@ impl AdmittedPrivateRoot {
 
     /// Removes a validated private regular file by its bounded child name.
     pub fn remove_private_file(&self, name: &str) -> Result<(), PrivateStorageError> {
-        let op = &Operation::new();
+        let op = &self.operation();
         let file = self.open_file_with_link_policy_until(name, false, op)?;
         self.validate_file_binding_with_link_policy_until(name, &file, false, false, op)?;
         drop(file);
@@ -448,7 +511,7 @@ impl AdmittedPrivateRoot {
         name: &str,
         expected: &File,
     ) -> Result<(), PrivateStorageError> {
-        let op = &Operation::new();
+        let op = &self.operation();
         let actual = self.open_file_with_link_policy_until(name, false, op)?;
         self.validate_file_binding_with_link_policy_until(name, &actual, false, false, op)?;
         use std::os::unix::fs::MetadataExt as _;
@@ -474,7 +537,7 @@ impl AdmittedPrivateRoot {
         operation_deadline: std::time::Instant,
     ) -> Result<(), PrivateStorageError> {
         use std::os::unix::fs::MetadataExt as _;
-        let op = &Operation::capped(operation_deadline);
+        let op = &self.operation_capped(operation_deadline);
         let actual = self.open_file_with_link_policy_until(name, false, op)?;
         self.validate_file_binding_with_link_policy_until(name, &actual, false, false, op)?;
         let expected_metadata = expected.metadata().map_err(|_| PrivateStorageError::Operation)?;
@@ -494,7 +557,7 @@ impl AdmittedPrivateRoot {
 
     /// Removes a validated private immutable object file that may have hard links.
     pub fn remove_managed_file(&self, name: &str) -> Result<(), PrivateStorageError> {
-        let op = &Operation::new();
+        let op = &self.operation();
         let file = self.open_file_with_link_policy_until(name, true, op)?;
         self.validate_file_binding_with_link_policy_until(name, &file, false, true, op)?;
         drop(file);
@@ -505,7 +568,7 @@ impl AdmittedPrivateRoot {
 
     /// Removes an admitted empty private child directory.
     pub fn remove_private_child(&self, name: &str) -> Result<(), PrivateStorageError> {
-        let op = &Operation::new();
+        let op = &self.operation();
         validate_child_name(name)?;
         let child = self.open_private_child_until(name, op)?;
         if !child.bounded_child_names_until(1, op)?.is_empty() {
@@ -526,7 +589,7 @@ impl AdmittedPrivateRoot {
         expected: &AdmittedPrivateRoot,
         operation_deadline: std::time::Instant,
     ) -> Result<(), PrivateStorageError> {
-        let op = &Operation::capped(operation_deadline);
+        let op = &self.operation_capped(operation_deadline);
         validate_child_name(name)?;
         let child = self.open_private_child_until(name, op)?;
         let expected_metadata =
@@ -561,7 +624,11 @@ impl AdmittedPrivateRoot {
         name: &str,
         operation_deadline: std::time::Instant,
     ) -> Result<File, PrivateStorageError> {
-        self.open_file_with_link_policy_until(name, false, &Operation::capped(operation_deadline))
+        self.open_file_with_link_policy_until(
+            name,
+            false,
+            &self.operation_capped(operation_deadline),
+        )
     }
 
     /// Admits an existing private regular file without keeping or opening a descriptor.
@@ -590,7 +657,7 @@ impl AdmittedPrivateRoot {
             return Err(PrivateStorageError::Unavailable);
         }
         validate_child_name(name)?;
-        let op = &Operation::new();
+        let op = &self.operation();
         self.revalidate_until(op)?;
         let stat = |directory: &File| {
             rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
@@ -658,7 +725,7 @@ impl AdmittedPrivateRoot {
         name: &str,
         allow_hardlinks: bool,
     ) -> Result<File, PrivateStorageError> {
-        self.open_file_with_link_policy_until(name, allow_hardlinks, &Operation::new())
+        self.open_file_with_link_policy_until(name, allow_hardlinks, &self.operation())
     }
 
     fn open_file_with_link_policy_until(
@@ -718,7 +785,7 @@ impl AdmittedPrivateRoot {
             return Err(PrivateStorageError::Unavailable);
         }
         validate_child_name(name)?;
-        let op = &Operation::new();
+        let op = &self.operation();
         self.revalidate_until(op)?;
         let file = rustix::fs::openat(
             &self.directory,
@@ -754,7 +821,7 @@ impl AdmittedPrivateRoot {
             return Err(PrivateStorageError::Unavailable);
         }
         validate_child_name(name)?;
-        let op = &Operation::capped(operation_deadline);
+        let op = &self.operation_capped(operation_deadline);
         self.revalidate_until(op)?;
         let file = rustix::fs::openat(
             &self.directory,
@@ -793,7 +860,7 @@ impl AdmittedPrivateRoot {
             file,
             newly_created,
             false,
-            &Operation::capped(operation_deadline),
+            &self.operation_capped(operation_deadline),
         )
     }
 
@@ -802,7 +869,7 @@ impl AdmittedPrivateRoot {
         &self,
         operation_deadline: std::time::Instant,
     ) -> Result<(), PrivateStorageError> {
-        self.sync_until(&Operation::capped(operation_deadline))
+        self.sync_until(&self.operation_capped(operation_deadline))
     }
 
     /// Opens an existing private regular file or creates it exclusively as `0600`.
@@ -815,7 +882,7 @@ impl AdmittedPrivateRoot {
             return Err(PrivateStorageError::Unavailable);
         }
         validate_child_name(name)?;
-        let op = &Operation::new();
+        let op = &self.operation();
         self.named_regular_file_exists_until(name, op)?;
         let opened = rustix::fs::openat(
             &self.directory,
@@ -859,7 +926,7 @@ impl AdmittedPrivateRoot {
     ) -> Result<Vec<u8>, PrivateStorageError> {
         use std::io::Read as _;
 
-        let op = &Operation::new();
+        let op = &self.operation();
         let file = self.open_file_with_link_policy_until(name, false, op)?;
         let metadata = file.metadata().map_err(|_| PrivateStorageError::Operation)?;
         if metadata.len() > maximum_bytes as u64 {
@@ -887,7 +954,7 @@ impl AdmittedPrivateRoot {
     ) -> Result<Vec<u8>, PrivateStorageError> {
         use std::io::Read as _;
 
-        let op = &Operation::new();
+        let op = &self.operation();
         let file = self.open_file_with_link_policy_until(name, true, op)?;
         let metadata = file.metadata().map_err(|_| PrivateStorageError::Operation)?;
         if metadata.len() > maximum_bytes as u64 {
@@ -939,7 +1006,7 @@ impl AdmittedPrivateRoot {
             file,
             newly_created,
             allow_hardlinks,
-            &Operation::new(),
+            &self.operation(),
         )
     }
 
@@ -986,7 +1053,7 @@ impl AdmittedPrivateRoot {
             return Err(PrivateStorageError::Unavailable);
         }
         let filesystem = rustix::fs::fstatfs(file).map_err(|_| PrivateStorageError::Unavailable)?;
-        if !owner_enforcing_local_filesystem(&filesystem) {
+        if !owner_enforcing_local_filesystem(&filesystem, self.profile) {
             return Err(PrivateStorageError::Unavailable);
         }
         self.revalidate_until(op)?;
@@ -1009,7 +1076,7 @@ impl AdmittedPrivateRoot {
         if !self.private_leaf {
             return Err(PrivateStorageError::Unavailable);
         }
-        let op = &Operation::new();
+        let op = &self.operation();
         validate_child_name(source)?;
         validate_child_name(target)?;
         self.revalidate_until(op)?;
@@ -1038,7 +1105,7 @@ impl AdmittedPrivateRoot {
 
     /// Syncs this admitted directory descriptor after a descriptor-relative rename.
     pub fn sync(&self) -> Result<(), PrivateStorageError> {
-        self.sync_until(&Operation::new())
+        self.sync_until(&self.operation())
     }
 
     fn sync_until(&self, op: &Operation) -> Result<(), PrivateStorageError> {
@@ -1158,7 +1225,7 @@ fn verify_ancestor_metadata(
             opened.mode(),
             rustix::process::getuid().as_raw(),
         ) || !rustix::fs::fstatfs(descriptor)
-            .is_ok_and(|filesystem| owner_enforcing_local_filesystem(&filesystem))
+            .is_ok_and(|filesystem| owner_enforcing_local_filesystem(&filesystem, op.profile()))
             || !probe::directory_acl_admits(
                 op,
                 DirectoryRole::Traversed,
@@ -1221,7 +1288,7 @@ fn admit_directory_descriptor_until(
     // Only a private (or sealed) leaf must carry no ACL at all. Every other component is merely
     // walked through (or is a container whose created children are re-admitted as private
     // leaves, which refuses an inherited ACL), so it gets the traversal policy.
-    if !owner_enforcing_local_filesystem(&filesystem)
+    if !owner_enforcing_local_filesystem(&filesystem, op.profile())
         || !probe::directory_acl_admits(op, role, path, descriptor, identity)
     {
         return Err(PrivateStorageError::Unavailable);
@@ -1238,22 +1305,18 @@ fn admit_directory_descriptor_until(
     Ok(())
 }
 
-/// Kept public only because `xtrace-runtime`'s Java attach tests, in another crate, open a
-/// traversed-only directory descriptor with it; nothing in production calls it.
-///
-/// Walks `path` from `/` without following links and admits every component, the final one
-/// included, under the traversal policy, all inside one admission deadline.
-///
-/// This is the shared ancestor walk. It does not make the final directory private; use
-/// [`open_private_directory_descriptor`] for that.
-pub fn open_traversed_directory(path: &Path) -> Result<File, PrivateStorageError> {
-    open_directory_without_symlinks_until(path, &Operation::new())
-}
-
 /// Walks `path` and admits the final directory as an exact-owner `0700` private leaf, returning
 /// its descriptor. The walk and the leaf admission share one deadline and one probe memo.
 pub fn open_private_directory_descriptor(path: &Path) -> Result<File, PrivateStorageError> {
-    let op = &Operation::new();
+    open_private_directory_descriptor_with_profile(path, FilesystemProfile::Durable)
+}
+
+/// [`open_private_directory_descriptor`] under an explicit filesystem profile.
+pub fn open_private_directory_descriptor_with_profile(
+    path: &Path,
+    profile: FilesystemProfile,
+) -> Result<File, PrivateStorageError> {
+    let op = &Operation::new().with_profile(profile);
     let directory = open_directory_without_symlinks_until(path, op)?;
     admit_directory_descriptor_until(path, &directory, DirectoryRole::PrivateLeaf, op)?;
     Ok(directory)
@@ -1263,7 +1326,16 @@ pub fn open_private_directory_descriptor(path: &Path) -> Result<File, PrivateSto
 /// retained snapshot), under one shared admission deadline and one probe memo, so ancestors that
 /// the paths have in common are probed once.
 pub fn admit_sealed_directories(paths: &[PathBuf], mode: u32) -> Result<(), PrivateStorageError> {
-    let op = &Operation::new();
+    admit_sealed_directories_with_profile(paths, mode, FilesystemProfile::Durable)
+}
+
+/// [`admit_sealed_directories`] under an explicit filesystem profile.
+pub fn admit_sealed_directories_with_profile(
+    paths: &[PathBuf],
+    mode: u32,
+    profile: FilesystemProfile,
+) -> Result<(), PrivateStorageError> {
+    let op = &Operation::new().with_profile(profile);
     for path in paths {
         let directory = open_directory_without_symlinks_until(path, op)?;
         admit_directory_descriptor_until(path, &directory, DirectoryRole::Sealed { mode }, op)?;
@@ -1289,7 +1361,10 @@ fn stat_mode(stat: &rustix::fs::Stat) -> u32 {
 }
 
 #[cfg(target_os = "macos")]
-fn owner_enforcing_local_filesystem(stats: &rustix::fs::StatFs) -> bool {
+fn owner_enforcing_local_filesystem(
+    stats: &rustix::fs::StatFs,
+    _profile: FilesystemProfile,
+) -> bool {
     let name = stats
         .f_fstypename
         .iter()
@@ -1300,12 +1375,18 @@ fn owner_enforcing_local_filesystem(stats: &rustix::fs::StatFs) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn owner_enforcing_local_filesystem(stats: &rustix::fs::StatFs) -> bool {
-    policy::linux_filesystem_admitted(stats.f_type as u64)
+fn owner_enforcing_local_filesystem(
+    stats: &rustix::fs::StatFs,
+    profile: FilesystemProfile,
+) -> bool {
+    policy::linux_filesystem_admitted(stats.f_type as u64, profile)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn owner_enforcing_local_filesystem(_stats: &rustix::fs::StatFs) -> bool {
+fn owner_enforcing_local_filesystem(
+    _stats: &rustix::fs::StatFs,
+    _profile: FilesystemProfile,
+) -> bool {
     false
 }
 

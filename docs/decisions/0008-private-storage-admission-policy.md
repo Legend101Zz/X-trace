@@ -85,9 +85,10 @@ flagged `MNT_IGNORE_OWNERSHIP`. Anything else, including network, FUSE, overlay,
 tmpfs and unrecognised types, is refused. Decision: the Java attach cache and
 snapshot roles will again admit tmpfs (ext4, XFS, Btrfs and tmpfs), restoring their
 pre-S0b behaviour, because runtime and temp directories are commonly tmpfs. The
-store and the private-state roots stay on the narrower list. The code change for
-this lands in a follow-up commit; until then the code is stricter than this
-paragraph.
+store and the private-state roots stay on the narrower list. The code change has
+landed: callers ask for `FilesystemProfile::Ephemeral` explicitly, Java attach's cache,
+snapshot, sealed-snapshot and ancestor-walk admission do, and the default stays the
+durable list.
 
 Well-formed Linux ACL means: version 2, at most 64 entries, known tags,
 permission bits at most 7, undefined ids on unnamed tags, and a user-object entry

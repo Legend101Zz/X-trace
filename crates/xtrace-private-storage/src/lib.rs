@@ -19,8 +19,11 @@ mod probe;
 #[cfg(unix)]
 pub use admission::{
     AdmittedPrivateRoot, PrivateStorageError, admit_sealed_directories,
-    open_private_directory_descriptor, open_traversed_directory, validate_child_name,
+    admit_sealed_directories_with_profile, open_private_directory_descriptor,
+    open_private_directory_descriptor_with_profile, validate_child_name,
 };
+#[cfg(unix)]
+pub use policy::FilesystemProfile;
 
 #[cfg(not(unix))]
 mod unsupported;

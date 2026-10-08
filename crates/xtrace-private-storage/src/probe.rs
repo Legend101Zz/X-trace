@@ -68,6 +68,7 @@ impl DirectoryState {
 /// One bounded admission operation: a single deadline plus the verdicts earned inside it.
 pub(crate) struct Operation {
     deadline: Instant,
+    profile: crate::policy::FilesystemProfile,
     memoize: bool,
     judged: RefCell<Vec<DirectoryState>>,
     /// Batched macOS listings taken at the start of an ancestor walk (see `prefetch`).
@@ -111,6 +112,7 @@ impl Operation {
         // than relying on ctime granularity of the filesystem for no gain.
         Self {
             deadline,
+            profile: crate::policy::FilesystemProfile::Durable,
             memoize: cfg!(target_os = "macos"),
             judged: RefCell::new(Vec::new()),
             #[cfg(target_os = "macos")]
@@ -122,6 +124,16 @@ impl Operation {
     #[cfg(test)]
     pub(crate) fn memoizing() -> Self {
         Self { memoize: true, ..Self::new() }
+    }
+
+    /// The same operation judging filesystems under `profile`.
+    pub(crate) fn with_profile(mut self, profile: crate::policy::FilesystemProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    pub(crate) fn profile(&self) -> crate::policy::FilesystemProfile {
+        self.profile
     }
 
     #[cfg(target_os = "macos")]
