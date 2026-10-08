@@ -1618,4 +1618,120 @@ mod tests {
         #[cfg(target_os = "macos")]
         std::fs::remove_file(root.path().join(&name)).expect("remove FIFO fixture");
     }
+
+    // ---- probe-count bounds -------------------------------------------------------------
+    //
+    // On macOS every directory ACL probe is a `/bin/ls` subprocess, so the number of probes an
+    // operation runs is its latency. These tests count real probes (the cfg(test) counter in
+    // `probe`) and pin an upper bound per operation for a path of D directories (the root plus
+    // each component). With the per-operation memo each distinct directory state is probed once:
+    // `revalidate` costs D, and `create_private_child` costs D plus the parent (whose ctime the
+    // mkdir bumped) plus the new child. Before the memo they cost D+3 and about 5*(D+3)+3.
+    //
+    // Linux does not memoize (its probes are two xattr reads), so its bounds are the old ones.
+
+    fn directory_count(path: &Path) -> usize {
+        path.components().count()
+    }
+
+    fn probes_during(action: impl FnOnce()) -> usize {
+        let before = probe::directory_probe_count();
+        action();
+        probe::directory_probe_count() - before
+    }
+
+    /// A private leaf several components below the scratch root.
+    fn nested_leaf() -> AdmittedPrivateRoot {
+        let mut current = private_scratch().create_private_child(&unique_name("depth")).expect("a");
+        for name in ["b", "c", "d"] {
+            current = current.create_private_child(name).expect("nested private child");
+        }
+        current
+    }
+
+    #[test]
+    fn revalidate_probes_each_directory_at_most_once() {
+        let leaf = nested_leaf();
+        let directories = directory_count(leaf.path());
+        let probes = probes_during(|| leaf.revalidate().expect("revalidate"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(probes, directories, "one probe per distinct directory");
+        } else {
+            assert!(probes <= directories + 3, "{probes} probes for {directories} directories");
+        }
+    }
+
+    #[test]
+    fn create_private_child_probe_count_is_bounded() {
+        let leaf = nested_leaf();
+        let directories = directory_count(leaf.path());
+        let mut created = None;
+        let probes = probes_during(|| {
+            created = Some(leaf.create_private_child("bounded").expect("create child"));
+        });
+        assert!(created.is_some());
+        if cfg!(target_os = "macos") {
+            assert!(probes <= directories + 2, "{probes} probes for {directories} directories");
+        } else {
+            assert!(
+                probes <= 5 * (directories + 3) + 4,
+                "{probes} probes for {directories} directories"
+            );
+        }
+    }
+
+    #[test]
+    fn open_private_child_and_open_probe_counts_are_bounded() {
+        let leaf = nested_leaf();
+        leaf.create_private_child("child").expect("create child");
+        let directories = directory_count(leaf.path());
+        let opened = probes_during(|| {
+            leaf.open_private_child("child").expect("open child");
+        });
+        let reopened = probes_during(|| {
+            AdmittedPrivateRoot::open(leaf.path()).expect("reopen leaf");
+        });
+        let open_or_create = probes_during(|| {
+            AdmittedPrivateRoot::open_or_create(leaf.path()).expect("open or create existing");
+        });
+        if cfg!(target_os = "macos") {
+            assert!(opened <= directories + 1, "{opened} probes for {directories} directories");
+            assert!(reopened <= directories, "{reopened} probes for {directories} directories");
+            assert!(
+                open_or_create <= directories,
+                "{open_or_create} probes for {directories} directories"
+            );
+        } else {
+            assert!(opened <= 3 * (directories + 3) + 4);
+            assert!(reopened <= directories + 4);
+            assert!(open_or_create <= 3 * directories + 12);
+        }
+    }
+
+    #[test]
+    fn sealed_directories_share_their_ancestors_probes() {
+        let leaf = nested_leaf();
+        let sealed = ["one", "two", "three"]
+            .map(|name| leaf.create_private_child(name).expect("sealed candidate"));
+        for child in &sealed {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(child.path(), std::fs::Permissions::from_mode(0o500))
+                .expect("seal");
+        }
+        let paths = sealed.iter().map(|child| child.path().to_path_buf()).collect::<Vec<_>>();
+        let directories = directory_count(leaf.path());
+        let probes = probes_during(|| {
+            admit_sealed_directories(&paths, 0o500).expect("sealed directories admitted");
+        });
+        if cfg!(target_os = "macos") {
+            // Shared ancestors once, then one probe per sealed directory.
+            assert!(probes <= directories + paths.len(), "{probes} probes");
+        }
+        assert!(admit_sealed_directories(&paths, 0o700).is_err(), "wrong sealed mode is refused");
+        for child in &sealed {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(child.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("unseal");
+        }
+    }
 }
