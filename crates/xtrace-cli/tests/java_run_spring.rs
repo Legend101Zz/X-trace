@@ -930,6 +930,26 @@ fn attach_keeps_existing_spring_target_alive_and_persists_real_request() {
     assert_canaries_absent(&logical);
     wait_for_recording_count(&project_root, 1);
 
+    // The Rust pack cache (`java-packs`, with its `.state` sidecar) and the Java helper's own
+    // snapshot cache are siblings in the helper cache; the helper only lists its own directory,
+    // so neither can break the other. The attach above ran with both present.
+    let helper_cache = data_home.join(".xtrace-java-attach-cache");
+    let mut cache_entries = fs::read_dir(&helper_cache)
+        .expect("helper cache")
+        .map(|entry| entry.expect("cache entry").file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    cache_entries.sort();
+    assert!(cache_entries.contains(&"java-packs".to_string()), "{cache_entries:?}");
+    assert!(cache_entries.contains(&"xtrace-attach-snapshots".to_string()), "{cache_entries:?}");
+    assert!(helper_cache.join("java-packs/.state").is_dir());
+    assert!(
+        fs::read_dir(helper_cache.join("java-packs")).expect("java-packs").all(|entry| !entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .starts_with("target-"))
+    );
+
     let attach_pid =
         rustix::process::Pid::from_raw(attach.child.id() as i32).expect("attach process ID");
     rustix::process::kill_process(attach_pid, rustix::process::Signal::TERM)
