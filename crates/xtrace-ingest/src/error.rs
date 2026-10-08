@@ -182,11 +182,13 @@ pub enum IngestError {
         limit: NonZeroUsize,
     },
 
-    /// Per-recording event digest capacity reached.
+    /// Per-recording capacity-drop accounting is exhausted.
     ///
-    /// The validator cannot retain another event without violating
-    /// the configured event budget. Retained event digests are not
-    /// reclaimed during the validator lifetime in this slice.
+    /// Events past the retained-digest budget are no longer an error:
+    /// they are dropped, counted by priority, and the recording degrades
+    /// to partial. This is returned only when the drop ledger itself would
+    /// need more distinct priority buckets than its fixed bound, so the
+    /// validator never retains more than its limit.
     #[error("recording {recording_id} reached event digest capacity {limit}")]
     EventCapacityReached {
         /// Recording whose event budget was exhausted.

@@ -654,6 +654,7 @@ mod tests {
         let accepted = AcceptedRecordingEvent {
             recording_seq: 2,
             monotonic_ns: 17,
+            priority: 0,
             canonical_bytes: payload.encode_to_vec(),
             payload,
         };

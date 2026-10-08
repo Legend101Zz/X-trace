@@ -12,8 +12,18 @@ use xtrace_domain::{CorrelationId, ProjectId, RecordingId, RuntimeSessionId, Wal
 
 use crate::{PortError, PortErrorKind};
 
-/// Maximum number of unique event digests retained for one recording.
+/// Maximum number of unique event digests retained, and events persisted, for
+/// one recording.
+///
+/// This bounds memory and terminal-verification work. Events beyond it are not
+/// persisted; they are dropped, counted, and the recording degrades to
+/// [`RecordingCompletion::Partial`] instead of failing the capture.
 pub const MAX_RECORDED_EVENTS: usize = 2_048;
+/// Maximum distinct event priorities tracked for capacity drops of one
+/// recording. Keeps the drop accounting bounded (the store accepts at most 256
+/// priority buckets in total, adapter-reported ones included).
+pub const MAX_CAPACITY_DROP_PRIORITIES: usize = 64;
+const MAX_DROP_COUNT_BUCKETS: usize = 256;
 /// Default maximum number of events in one immutable segment.
 pub const DEFAULT_SEGMENT_EVENTS: usize = 2_000;
 /// Default maximum number of recording IDs retained by one capture service.
@@ -237,6 +247,8 @@ pub struct AcceptedRecordingEvent<E> {
     pub recording_seq: u64,
     /// Adapter-monotonic timestamp used only for deterministic segmentation.
     pub monotonic_ns: u64,
+    /// Adapter event priority; events dropped at capacity are counted under it.
+    pub priority: u32,
     /// Canonical encoded event-envelope bytes used for digest and size checks.
     pub canonical_bytes: Vec<u8>,
     /// Typed payload passed unchanged to the persistence port.
@@ -267,6 +279,13 @@ pub struct FinishRecording {
     pub drop_counts_by_priority: BTreeMap<u32, u64>,
     /// Stable capability codes that were advertised but not exercised.
     pub unsupported_capability_codes: Vec<String>,
+    /// Events the capture service dropped at the per-recording event capacity.
+    ///
+    /// Set only by the capture service, never by adapters. They are also
+    /// counted in `drop_counts_by_priority` under their own priorities; this
+    /// field records that those drops came from capacity, not from the adapter.
+    #[serde(default)]
+    pub capacity_dropped_events: u64,
     /// Producer-declared response summary; only non-preview states are accepted
     /// until a verified privacy-policy registry exists. This is not outcome proof.
     pub response_summary: Option<xtrace_domain::CapturedValue>,
@@ -285,6 +304,7 @@ impl FinishRecording {
             event_digest: Vec::new(),
             drop_counts_by_priority: BTreeMap::new(),
             unsupported_capability_codes: Vec::new(),
+            capacity_dropped_events: 0,
             response_summary: None,
         }
     }
@@ -308,6 +328,10 @@ pub struct RecordEventsReceipt {
     pub accepted: usize,
     /// Number of exact replay events ignored.
     pub duplicates: usize,
+    /// Number of new events dropped because the per-recording event capacity
+    /// ([`MAX_RECORDED_EVENTS`]) was reached. They are not persisted and are
+    /// counted per event priority in the terminal evidence drop counts.
+    pub dropped: usize,
     /// Number of segments made durable during the call.
     pub persisted_segments: usize,
 }
@@ -590,7 +614,9 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
         }
 
         let preflight = preflight_events(self.port.as_ref(), &state, &request.events, self.policy)?;
-        if (state.finished || state.finish_intent.is_some()) && !preflight.new_events.is_empty() {
+        if (state.finished || state.finish_intent.is_some())
+            && (!preflight.new_events.is_empty() || preflight.dropped > 0)
+        {
             return Err(capture_error(
                 PortErrorKind::Conflict,
                 "sealed recording cannot accept new events",
@@ -600,10 +626,15 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
             persisted_segments: self.commit_pending(&mut state)?,
             duplicates: preflight.duplicates,
             accepted: preflight.new_events.len(),
+            dropped: preflight.dropped,
         };
         for event in preflight.new_events {
             receipt.persisted_segments += self.stage_new_event(&mut state, event)?;
         }
+        // Counted only after staging succeeded so a retried batch recomputes
+        // the same drops instead of double counting them.
+        state.capacity_dropped = state.capacity_dropped.saturating_add(preflight.dropped as u64);
+        state.capacity_dropped_by_priority = preflight.dropped_by_priority;
         Ok(receipt)
     }
 
@@ -628,7 +659,8 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
             }
             if state.finished {
                 let persisted_segments = self.commit_pending(&mut state)?;
-                let completion = self.port.finish_recording(&request)?;
+                let completion =
+                    self.port.finish_recording(&effective_finish(&state, &request)?)?;
                 return Ok(FinishRecordingReceipt {
                     recording_id: state.recording_id,
                     persisted_segments,
@@ -639,7 +671,7 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
         }
         let mut persisted_segments = self.commit_pending(&mut state)?;
         persisted_segments += self.seal_current(&mut state)?;
-        let completion = self.port.finish_recording(&request)?;
+        let completion = self.port.finish_recording(&effective_finish(&state, &request)?)?;
         // Only remember a finish marker once the durable port has accepted it.
         // A rejected/ambiguous attempt must leave room for an exact replay or a
         // corrected request after the caller resolves the failure.
@@ -660,7 +692,12 @@ struct RecordingAssembly<E> {
     runtime_session_id: RuntimeSessionId,
     opened_at: WallTime,
     begun: bool,
+    /// Highest sequence that was persisted or staged (not dropped).
     highest_contiguous: u64,
+    /// Contiguous events after `highest_contiguous` dropped at capacity.
+    capacity_dropped: u64,
+    /// The same drops by their own event priority (bounded bucket count).
+    capacity_dropped_by_priority: BTreeMap<u32, u64>,
     event_digests: BTreeMap<u64, [u8; 32]>,
     current_events: Vec<AcceptedRecordingEvent<E>>,
     current_event_bytes: usize,
@@ -680,6 +717,8 @@ impl<E> RecordingAssembly<E> {
             opened_at: request.opened_at,
             begun: false,
             highest_contiguous: 1,
+            capacity_dropped: 0,
+            capacity_dropped_by_priority: BTreeMap::new(),
             event_digests: BTreeMap::new(),
             current_events: Vec::new(),
             current_event_bytes: 0,
@@ -699,6 +738,8 @@ struct PendingSegment<E> {
 
 struct Preflight<E> {
     duplicates: usize,
+    dropped: usize,
+    dropped_by_priority: BTreeMap<u32, u64>,
     new_events: Vec<AcceptedRecordingEvent<E>>,
 }
 
@@ -708,10 +749,16 @@ fn preflight_events<P: RecordingPersistencePort + ?Sized>(
     events: &[AcceptedRecordingEvent<P::Event>],
     policy: SegmentPolicy,
 ) -> Result<Preflight<P::Event>, PortError> {
-    let mut scratch_highest = state.highest_contiguous;
+    // Sequences after `highest_contiguous` up to `scratch_highest` were
+    // observed but dropped at capacity; they carry no digest by design, so the
+    // retained state stays bounded by MAX_RECORDED_EVENTS.
+    let persisted_highest = state.highest_contiguous;
+    let mut scratch_highest = persisted_highest.saturating_add(state.capacity_dropped);
     let mut scratch_digests = state.event_digests.clone();
     let mut previous_input = None;
     let mut duplicates = 0usize;
+    let mut dropped = 0usize;
+    let mut dropped_by_priority = state.capacity_dropped_by_priority.clone();
     let mut new_events = Vec::new();
 
     for event in events {
@@ -734,6 +781,12 @@ fn preflight_events<P: RecordingPersistencePort + ?Sized>(
             duplicates += 1;
             continue;
         }
+        if event.recording_seq > persisted_highest && event.recording_seq <= scratch_highest {
+            // Replay of an event already dropped at capacity: nothing was
+            // persisted, so there is no payload to compare and no new drop.
+            duplicates += 1;
+            continue;
+        }
         let expected = scratch_highest.checked_add(1).ok_or_else(|| {
             capture_error(PortErrorKind::Conflict, "recording sequence is exhausted")
         })?;
@@ -743,12 +796,6 @@ fn preflight_events<P: RecordingPersistencePort + ?Sized>(
                 "recording event sequence is not contiguous",
             ));
         }
-        if scratch_digests.len() >= MAX_RECORDED_EVENTS {
-            return Err(capture_error(
-                PortErrorKind::Resource,
-                "recording event history capacity is exhausted",
-            ));
-        }
         let event_bytes = encoded_event_bytes(event)?;
         if event_bytes > policy.max_event_bytes || event_bytes > MAX_XTF_EVENT_ENVELOPE_BYTES {
             return Err(capture_error(
@@ -756,11 +803,61 @@ fn preflight_events<P: RecordingPersistencePort + ?Sized>(
                 "recording event exceeds a segment or XTF envelope byte limit",
             ));
         }
+        if scratch_digests.len() >= MAX_RECORDED_EVENTS {
+            // Bounded capacity: degrade honestly instead of killing capture.
+            // The event is neither persisted nor retained, only counted.
+            if !dropped_by_priority.contains_key(&event.priority)
+                && dropped_by_priority.len() >= MAX_CAPACITY_DROP_PRIORITIES
+            {
+                return Err(capture_error(
+                    PortErrorKind::Resource,
+                    "recording capacity-drop priority buckets are exhausted",
+                ));
+            }
+            let bucket = dropped_by_priority.entry(event.priority).or_insert(0);
+            *bucket = bucket.saturating_add(1);
+            dropped += 1;
+            scratch_highest = event.recording_seq;
+            continue;
+        }
         scratch_highest = event.recording_seq;
         scratch_digests.insert(event.recording_seq, digest);
         new_events.push(event.clone());
     }
-    Ok(Preflight { duplicates, new_events })
+    Ok(Preflight { duplicates, dropped, dropped_by_priority, new_events })
+}
+
+/// Returns the finish evidence handed to the persistence port.
+///
+/// When events were dropped at capacity the adapter's digest covers events that
+/// were never persisted, so it can no longer be verified: it is withheld (the
+/// store then labels the recording `Partial`, never `Complete` or a false
+/// `Invalid`). Each dropped event is added to the bucket of its own priority,
+/// and the total is recorded in `capacity_dropped_events` so the origin of the
+/// drops stays explicit. The result is a pure function of the accepted request
+/// and the frozen drop counts, so exact replays stay byte-identical.
+fn effective_finish<E>(
+    state: &RecordingAssembly<E>,
+    request: &FinishRecording,
+) -> Result<FinishRecording, PortError> {
+    if state.capacity_dropped == 0 {
+        return Ok(request.clone());
+    }
+    let mut effective = request.clone();
+    effective.event_digest = Vec::new();
+    effective.capacity_dropped_events =
+        effective.capacity_dropped_events.saturating_add(state.capacity_dropped);
+    for (priority, count) in &state.capacity_dropped_by_priority {
+        let entry = effective.drop_counts_by_priority.entry(*priority).or_insert(0);
+        *entry = entry.saturating_add(*count);
+    }
+    if effective.drop_counts_by_priority.len() > MAX_DROP_COUNT_BUCKETS {
+        return Err(capture_error(
+            PortErrorKind::Resource,
+            "recording drop-count priority buckets are exhausted",
+        ));
+    }
+    Ok(effective)
 }
 
 fn encoded_event_bytes<E>(event: &AcceptedRecordingEvent<E>) -> Result<usize, PortError> {
@@ -815,6 +912,7 @@ mod tests {
     struct FakePort {
         state: Mutex<FakeState>,
         fail_next_segment_after_record: AtomicBool,
+        finishes: Mutex<Vec<FinishRecording>>,
     }
 
     impl FakePort {
@@ -907,6 +1005,7 @@ mod tests {
                     "fake finish validation failure",
                 ));
             }
+            self.finishes.lock().expect("finishes").push(request.clone());
             Ok(if request.event_digest.len() == 32 {
                 RecordingCompletion::Complete
             } else {
@@ -1053,6 +1152,7 @@ mod tests {
         AcceptedRecordingEvent {
             recording_seq: sequence,
             monotonic_ns,
+            priority: 0,
             canonical_bytes: vec![body, u8::try_from(sequence & 0xff).expect("masked sequence")],
             payload: TestEvent { sequence, body },
         }
@@ -1526,6 +1626,145 @@ mod tests {
                 .highest_contiguous,
             u64::MAX
         );
+    }
+
+    fn capacity_events(first: u64, last: u64) -> Vec<AcceptedRecordingEvent<TestEvent>> {
+        (first..=last)
+            .map(|sequence| AcceptedRecordingEvent {
+                priority: capacity_priority(sequence),
+                ..event(sequence, sequence, (sequence % 251) as u8)
+            })
+            .collect()
+    }
+
+    /// Cycles 0, 10, 20 so priority 0 (a legitimate adapter bucket) is exercised.
+    fn capacity_priority(sequence: u64) -> u32 {
+        u32::try_from(sequence % 3).expect("small") * 10
+    }
+
+    fn persisted_sequences(port: &FakePort) -> Vec<u64> {
+        port.snapshot()
+            .segments
+            .iter()
+            .flat_map(|segment| segment.events.iter().map(|event| event.recording_seq))
+            .collect()
+    }
+
+    #[test]
+    fn events_beyond_capacity_are_dropped_counted_and_finish_partial() {
+        // Intended contract change (owner-ordered F5): reaching the event
+        // capacity used to fail capture with a Resource error. It now drops and
+        // counts the excess and the recording ends Partial.
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        service.begin_recording(begin(wall(1))).expect("begin");
+        let recording_id = begin(wall(1)).recording_id;
+        let last_kept = 1 + MAX_RECORDED_EVENTS as u64;
+
+        let mut accepted = 0;
+        for chunk_start in (2..=last_kept).step_by(500) {
+            let chunk_end = (chunk_start + 499).min(last_kept);
+            let receipt = service
+                .record_events(RecordEvents {
+                    recording_id,
+                    events: capacity_events(chunk_start, chunk_end),
+                })
+                .expect("events within capacity");
+            assert_eq!(receipt.dropped, 0);
+            accepted += receipt.accepted;
+        }
+        assert_eq!(accepted, MAX_RECORDED_EVENTS);
+
+        let over = service
+            .record_events(RecordEvents {
+                recording_id,
+                events: capacity_events(last_kept + 1, last_kept + 5),
+            })
+            .expect("capacity no longer kills the capture");
+        assert_eq!((over.accepted, over.dropped, over.duplicates), (0, 5, 0));
+
+        let replay = service
+            .record_events(RecordEvents {
+                recording_id,
+                events: capacity_events(last_kept + 1, last_kept + 5),
+            })
+            .expect("replay of dropped events");
+        assert_eq!((replay.accepted, replay.dropped, replay.duplicates), (0, 0, 5));
+
+        let next = service
+            .record_events(RecordEvents {
+                recording_id,
+                events: capacity_events(last_kept + 6, last_kept + 6),
+            })
+            .expect("capture continues after capacity");
+        assert_eq!((next.accepted, next.dropped), (0, 1));
+        let gap = service.record_events(RecordEvents {
+            recording_id,
+            events: capacity_events(last_kept + 8, last_kept + 8),
+        });
+        assert_eq!(gap.expect_err("sequence gap stays a conflict").kind(), PortErrorKind::Conflict);
+
+        let mut finish = FinishRecording::without_digest(recording_id, last_kept + 6);
+        finish.event_digest = vec![7; 32];
+        finish.drop_counts_by_priority.insert(10, 3);
+        let receipt = service.finish_recording(finish.clone()).expect("finish");
+        assert_eq!(receipt.completion, RecordingCompletion::Partial);
+
+        let finishes = port.finishes.lock().expect("finishes");
+        assert_eq!(finishes.len(), 1);
+        assert!(finishes[0].event_digest.is_empty(), "unverifiable digest is withheld");
+        assert_eq!(finishes[0].final_recording_seq, last_kept + 6);
+        // Each dropped event is counted under its own priority, added to the
+        // adapter-reported count for that bucket (no reserved bucket).
+        let mut expected_drops: BTreeMap<u32, u64> = [(10, 3)].into_iter().collect();
+        for sequence in last_kept + 1..=last_kept + 6 {
+            *expected_drops.entry(capacity_priority(sequence)).or_insert(0) += 1;
+        }
+        assert_eq!(expected_drops.len(), 3);
+        assert_eq!(finishes[0].drop_counts_by_priority, expected_drops);
+        assert_eq!(finishes[0].capacity_dropped_events, 6);
+        drop(finishes);
+
+        let sequences = persisted_sequences(&port);
+        assert_eq!(sequences.len(), MAX_RECORDED_EVENTS);
+        assert!(sequences.iter().copied().eq(2..=last_kept), "persisted prefix is contiguous");
+
+        let replayed = service.finish_recording(finish).expect("exact finish replay");
+        assert!(replayed.exact_replay);
+        assert_eq!(replayed.completion, RecordingCompletion::Partial);
+        let sealed = service.record_events(RecordEvents {
+            recording_id,
+            events: capacity_events(last_kept + 7, last_kept + 7),
+        });
+        assert_eq!(
+            sealed.expect_err("dropped events are rejected after finish").kind(),
+            PortErrorKind::Conflict
+        );
+    }
+
+    #[test]
+    fn one_batch_crossing_capacity_persists_the_prefix_and_counts_the_rest() {
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        service.begin_recording(begin(wall(1))).expect("begin");
+        let recording_id = begin(wall(1)).recording_id;
+        let last_kept = 1 + MAX_RECORDED_EVENTS as u64;
+
+        let receipt = service
+            .record_events(RecordEvents {
+                recording_id,
+                events: capacity_events(2, last_kept + 13),
+            })
+            .expect("crossing batch");
+        assert_eq!((receipt.accepted, receipt.dropped), (MAX_RECORDED_EVENTS, 13));
+        service
+            .finish_recording(FinishRecording::without_digest(recording_id, last_kept + 13))
+            .expect("finish");
+        assert!(persisted_sequences(&port).iter().copied().eq(2..=last_kept));
+        let finishes = port.finishes.lock().expect("finishes");
+        assert_eq!(finishes[0].capacity_dropped_events, 13);
+        assert_eq!(finishes[0].drop_counts_by_priority.values().sum::<u64>(), 13);
+        assert_eq!(finishes[0].drop_counts_by_priority.len(), 3);
     }
 
     #[test]

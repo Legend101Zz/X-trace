@@ -352,7 +352,7 @@ CREATE TABLE recording_terminal_evidence (
     request_json  TEXT NOT NULL CHECK(length(CAST(request_json AS BLOB)) <= 16384),
     completion    TEXT NOT NULL CHECK(completion IN ('complete', 'partial', 'invalid')),
     final_recording_seq BLOB NOT NULL CHECK(length(final_recording_seq) = 8),
-    event_count   INTEGER NOT NULL CHECK(event_count >= 0 AND event_count <= 2048)
+    event_count   INTEGER NOT NULL CHECK(event_count >= 0)
 ) STRICT;
 
 CREATE INDEX recording_terminal_completion
@@ -1063,6 +1063,29 @@ mod tests {
             .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get(0))
             .expect("foreign keys");
         assert_eq!(fk_errors, 0);
+    }
+
+    #[test]
+    fn terminal_evidence_event_count_has_no_upper_sql_bound() {
+        // The per-recording event capacity is enforced by the capture service,
+        // which degrades to Partial with a drop count; the schema only rejects
+        // negative counts. v0004 is unreleased, so this is edited in place.
+        let conn = new_memory();
+        apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply");
+        let project = id(0x31);
+        let recording = id(0x41);
+        insert_project(&conn, &project).expect("project");
+        insert_recording(&conn, &recording, &project, &id(0x51), "partial").expect("recording");
+        let insert = |count: i64| {
+            conn.execute(
+                "INSERT INTO recording_terminal_evidence \
+                 (recording_id, request_json, completion, final_recording_seq, event_count) \
+                 VALUES (?1, '{}', 'partial', ?2, ?3)",
+                params![recording, 9_u64.to_be_bytes().as_slice(), count],
+            )
+        };
+        assert!(insert(-1).is_err(), "negative counts stay rejected");
+        assert_eq!(insert(5_000).expect("counts above the old 2048 CHECK are accepted"), 1);
     }
 
     #[test]

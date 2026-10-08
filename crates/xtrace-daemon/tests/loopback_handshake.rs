@@ -2229,6 +2229,7 @@ async fn configured_daemon_persists_verified_sqlite_segment_with_staged_acks() {
         events: vec![xtrace_application::recording::AcceptedRecordingEvent {
             recording_seq: 2,
             monotonic_ns: 23,
+            priority: 0,
             canonical_bytes: payload.encode_to_vec(),
             payload,
         }],
@@ -2623,4 +2624,163 @@ async fn malformed_finish_can_replay_on_same_runtime_and_restart_keeps_open_capt
         interrupted_after_restart.completion,
         xtrace_application::recording_queries::RecordingCompletionEvidence::Unavailable
     );
+}
+
+/// Owner-ordered F5 contract change: a capture that exceeds the per-recording
+/// event cap is no longer killed at the ingest gate or the application cap. It
+/// ends Partial with exact per-priority drop counts and a verifiable persisted
+/// prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_over_the_event_cap_ends_partial_with_exact_per_priority_drops() {
+    use xtrace_application::recording::MAX_RECORDED_EVENTS;
+    use xtrace_application::recording_queries::RecordingCompletionEvidence;
+
+    let daemon_temp = secure_tempdir("xtrace-event-cap-daemon-");
+    let bootstrap_path = daemon_temp.path().join("bootstrap.json");
+    let project_root = secure_tempdir("xtrace-event-cap-project-");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let store =
+        SqliteStore::open(&project_root.path().join("metadata.sqlite3"), OpenOptions::default())
+            .expect("open project SQLite store");
+    #[cfg(unix)]
+    set_owner_only(&project_root.path().join("metadata.sqlite3"), 0o600);
+    let timestamp = WallTime::now();
+    let project = Project {
+        id: project_id,
+        canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/fixture/repo"),
+        display_name: "event cap integration project".to_owned(),
+        created_at: timestamp,
+        last_opened_at: timestamp,
+        config_schema_version: 1,
+        effective_config_hash: String::new(),
+        active_capture_policy_id: None,
+        active_redaction_policy_id: None,
+    };
+    store.project_repository().insert_project(&project).expect("insert project");
+    let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), project_root.path()));
+    let capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>> =
+        Arc::new(xtrace_application::recording::RecordingCaptureService::new(
+            adapter,
+            SegmentPolicy::default(),
+            std::num::NonZeroUsize::new(DEFAULT_MAX_RETAINED_RECORDINGS)
+                .expect("non-zero retained recording limit"),
+        ));
+    let (bound, secret, _, _, address, pin) = spawn_daemon_with_capture(
+        bootstrap_path,
+        Duration::from_secs(60),
+        8,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+        capture,
+    )
+    .await
+    .expect("bind SQLite-backed daemon");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+    let mut tls_stream =
+        connect_authenticated(address, &pin, &secret, &session_id, &[0x87; 32]).await;
+    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    let recording_id_bytes = Bytes::copy_from_slice(&[0x35; 16]);
+    let recording_id = RecordingId::from_uuid(uuid::Uuid::from_bytes([0x35; 16]));
+
+    let mut session_seq = 1_u64;
+    write_envelope(
+        &mut writer,
+        PayloadOneof::RecordingStarted(RecordingStarted {
+            recording_id: recording_id_bytes.clone(),
+            recording_seq: 1,
+            method: "GET".to_owned(),
+            ..RecordingStarted::default()
+        }),
+        &session_id,
+        session_seq,
+        session_seq,
+    )
+    .await
+    .expect("write start");
+    next_ack(&mut reader, "cap start ACK").await;
+
+    let last_kept = 1 + MAX_RECORDED_EVENTS as u64;
+    let last_sent = last_kept + 12;
+    let priority_of = |sequence: u64| [1_u32, 5, 9][usize::try_from(sequence % 3).expect("small")];
+    let all_sequences = (2..=last_sent).collect::<Vec<_>>();
+    for chunk in all_sequences.chunks(200) {
+        session_seq += 1;
+        let events = chunk
+            .iter()
+            .map(|sequence| RecordingEvent {
+                event_id: format!("cap-event-{sequence}"),
+                recording_seq: *sequence,
+                monotonic_ns: sequence * 10,
+                priority: priority_of(*sequence),
+                ..RecordingEvent::default()
+            })
+            .collect();
+        write_envelope(
+            &mut writer,
+            PayloadOneof::EventBatch(EventBatch {
+                recording_id: recording_id_bytes.clone(),
+                events,
+            }),
+            &session_id,
+            session_seq,
+            session_seq,
+        )
+        .await
+        .expect("write batch");
+        next_ack(&mut reader, "cap batch ACK").await;
+    }
+
+    session_seq += 1;
+    write_envelope(
+        &mut writer,
+        PayloadOneof::RecordingFinished(RecordingFinished {
+            recording_id: recording_id_bytes,
+            final_recording_seq: last_sent,
+            // The adapter digest covers events that were never persisted.
+            event_digest: Bytes::copy_from_slice(&[9_u8; 32]),
+            drop_counts_by_priority: [(5_u32, 2_u64)].into_iter().collect(),
+            ..RecordingFinished::default()
+        }),
+        &session_id,
+        session_seq,
+        session_seq,
+    )
+    .await
+    .expect("write finish");
+    next_ack(&mut reader, "cap finish ACK").await;
+
+    let projection_reader = SqliteRecordingReader::new(store.clone(), project_root.path());
+    let window = projection_reader
+        .show_recording(&ShowWindowRequest {
+            project_id,
+            recording_id,
+            limit: 1_000,
+            after_sequence: Some(last_kept - 3),
+        })
+        .expect("verified persisted prefix reads back");
+    assert_eq!(window.completion, RecordingCompletionEvidence::Partial);
+    let tail = window.events.iter().map(|event| event.sequence.clone()).collect::<Vec<_>>();
+    assert_eq!(tail, [last_kept - 2, last_kept - 1, last_kept].map(|s| s.to_string()));
+
+    // Exact per-priority counts: the adapter's own 2 at priority 5 plus every
+    // sequence in (last_kept, last_sent] under its own priority.
+    let mut expected: std::collections::BTreeMap<u32, u64> = [(5, 2)].into_iter().collect();
+    for sequence in last_kept + 1..=last_sent {
+        *expected.entry(priority_of(sequence)).or_insert(0) += 1;
+    }
+    let expected: std::collections::BTreeMap<u32, String> =
+        expected.into_iter().map(|(priority, count)| (priority, count.to_string())).collect();
+    assert_eq!(window.drop_counts_by_priority, expected);
+
+    drop(reader);
+    drop(writer);
+    drop(tls_stream);
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("shutdown timed out")
+        .expect("daemon task")
+        .expect("serve");
 }

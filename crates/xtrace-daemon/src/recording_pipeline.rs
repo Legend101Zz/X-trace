@@ -171,10 +171,12 @@ fn translate_batch(
         .map(|event| {
             let recording_seq = event.recording_seq;
             let monotonic_ns = event.monotonic_ns;
+            let priority = event.priority;
             let payload = XtfEventEnvelope { recording_seq, event: Some(event) };
             AcceptedRecordingEvent {
                 recording_seq,
                 monotonic_ns,
+                priority,
                 canonical_bytes: payload.encode_to_vec(),
                 payload,
             }
@@ -197,6 +199,7 @@ fn translate_finished(
             .map(|(priority, count)| (*priority, *count))
             .collect::<BTreeMap<_, _>>(),
         unsupported_capability_codes: finished.unsupported_capability_codes.clone(),
+        capacity_dropped_events: 0,
         response_summary: finished
             .response_summary
             .as_ref()

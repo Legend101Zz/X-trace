@@ -1702,7 +1702,8 @@ impl SqliteRecordingStore<'_> {
         {
             return Ok((RecordingCompletion::Invalid, event_count));
         }
-        let has_drops = request.drop_counts_by_priority.values().any(|count| *count > 0);
+        let has_drops = request.capacity_dropped_events > 0
+            || request.drop_counts_by_priority.values().any(|count| *count > 0);
         // Unsupported codes describe advertised-but-unexercised optional
         // capabilities. They remain separately queryable availability
         // evidence and do not contradict the persisted event stream.
@@ -2201,7 +2202,7 @@ fn load_terminal_finish(
         .map_err(|_| recording_query_corrupt_error(correlation_id))?;
     if finish.recording_id != recording_id
         || finish.final_recording_seq != final_sequence
-        || event_count > 2_048
+        || event_count > u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
         || finish.event_digest.len() > 32
         || finish.drop_counts_by_priority.len() > 256
         || finish.unsupported_capability_codes.len() > 64
@@ -2211,7 +2212,18 @@ fn load_terminal_finish(
         || (completion == RecordingCompletionEvidence::Complete
             && (finish.event_digest.len() != 32
                 || finish.event_digest.iter().all(|byte| *byte == 0)
+                || finish.capacity_dropped_events > 0
                 || finish.drop_counts_by_priority.values().any(|count| *count > 0)))
+        // Capacity drops only happen once the persisted history is full, and the
+        // unverifiable adapter digest is withheld; anything else is inconsistent.
+        || (finish.capacity_dropped_events > 0
+            && (event_count != u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
+                || !finish.event_digest.is_empty()))
+        || finish.capacity_dropped_events
+            > finish
+                .drop_counts_by_priority
+                .values()
+                .fold(0_u64, |sum, count| sum.saturating_add(*count))
         || (completion == RecordingCompletionEvidence::Partial
             && event_count.checked_add(1).is_none_or(|last| final_sequence < last))
         || stored_completion != completion_label_from_evidence(completion)
