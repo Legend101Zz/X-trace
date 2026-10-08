@@ -19,6 +19,12 @@ const INCOMING_PREFIX: &str = ".incoming-";
 /// Upper bound on entries read from the cache root, so a polluted cache fails closed.
 const MAX_CACHE_ENTRIES: usize = 64;
 const MAX_SNAPSHOT_DEPTH: usize = 8;
+/// Stale incoming directories removed per attach, so an over-full cache heals over attaches.
+const REAP_BATCH: usize = 32;
+/// Entries examined by the reaper even when the cache root is over `MAX_CACHE_ENTRIES`.
+const REAP_SCAN_LIMIT: usize = 1024;
+/// Fixed cap for EINTR and lost-race retry loops; exhaustion fails closed.
+const MAX_RETRIES: u32 = 16;
 /// Bounded wait for a contended cache lock before failing closed.
 const CACHE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long an eviction waits out a conflicting lease before treating the snapshot as in use.
@@ -358,7 +364,7 @@ fn try_lock(file: &std::fs::File, exclusive: bool) -> Result<bool, AttachError> 
     } else {
         rustix::fs::FlockOperation::NonBlockingLockShared
     };
-    loop {
+    for _ in 0..MAX_RETRIES {
         match rustix::fs::flock(file, operation) {
             Ok(()) => return Ok(true),
             Err(error) if error == rustix::io::Errno::WOULDBLOCK => return Ok(false),
@@ -366,6 +372,7 @@ fn try_lock(file: &std::fs::File, exclusive: bool) -> Result<bool, AttachError> 
             Err(_) => return Err(lock_error()),
         }
     }
+    Err(lock_error())
 }
 
 /// Takes an exclusive lock, tolerating a momentary conflict.
@@ -460,31 +467,35 @@ impl PackCache {
 
     fn state_file(&self, name: &str, create: bool) -> Result<Option<std::fs::File>, AttachError> {
         use std::os::unix::fs::MetadataExt as _;
-        let mut flags = rustix::fs::OFlags::RDWR
+        let flags = rustix::fs::OFlags::RDWR
             | rustix::fs::OFlags::CLOEXEC
             | rustix::fs::OFlags::NOFOLLOW
             | rustix::fs::OFlags::NONBLOCK;
-        if create {
-            flags |= rustix::fs::OFlags::CREATE;
-        }
+        let unopenable =
+            || AttachError::PrivateStorage("the Java pack cache state file could not be opened");
+        // Creation is `O_CREAT|O_EXCL` after a plain open misses: an exclusive create is atomic.
+        // A plain `O_CREAT` open raced by other creators of the same new name returns a
+        // spurious ENOENT on APFS (measured: about 10% of 16-way races; none with this protocol).
         let mut attempts = 0_u32;
         let file = loop {
+            match rustix::fs::openat(&self.state, name, flags, rustix::fs::Mode::empty()) {
+                Ok(file) => break std::fs::File::from(file),
+                Err(error) if error == rustix::io::Errno::NOENT && !create => return Ok(None),
+                Err(error) if error == rustix::io::Errno::NOENT => {}
+                Err(_) => return Err(unopenable()),
+            }
             match rustix::fs::openat(
                 &self.state,
                 name,
-                flags,
+                flags | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL,
                 rustix::fs::Mode::from_raw_mode(0o600),
             ) {
                 Ok(file) => break std::fs::File::from(file),
-                Err(error) if error == rustix::io::Errno::NOENT && !create => return Ok(None),
-                // APFS can report ENOENT for an O_CREAT open that races another creator of the
-                // same name; the directory is held by descriptor, so retry a few times at once.
-                Err(error) if error == rustix::io::Errno::NOENT && attempts < 8 => attempts += 1,
-                Err(_) => {
-                    return Err(AttachError::PrivateStorage(
-                        "the Java pack cache state file could not be opened",
-                    ));
+                // Another creator won; open theirs on the next pass.
+                Err(error) if error == rustix::io::Errno::EXIST && attempts < MAX_RETRIES => {
+                    attempts += 1;
                 }
+                Err(_) => return Err(unopenable()),
             }
         };
         let metadata = file.metadata().map_err(|_| lock_error())?;
@@ -624,6 +635,17 @@ impl PackCache {
 
     /// Creates a unique private `.incoming-*` directory guarded by an exclusive builder lock.
     fn begin_incoming(&self) -> Result<Incoming<'_>, AttachError> {
+        self.begin_incoming_attempt(0)
+    }
+
+    fn begin_incoming_again(&self, attempt: u32) -> Result<Incoming<'_>, AttachError> {
+        if attempt >= MAX_RETRIES {
+            return Err(lock_error());
+        }
+        self.begin_incoming_attempt(attempt + 1)
+    }
+
+    fn begin_incoming_attempt(&self, attempt: u32) -> Result<Incoming<'_>, AttachError> {
         use ring::rand::SecureRandom as _;
         let mut nonce = [0_u8; 16];
         ring::rand::SystemRandom::new()
@@ -631,9 +653,14 @@ impl PackCache {
             .map_err(|_| AttachError::PrivateStorage("the Java pack cache nonce is unavailable"))?;
         let nonce = nonce.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         let name = format!("{INCOMING_PREFIX}{}-{nonce}", std::process::id());
-        let build_lock = self.state_file(&format!("{name}.build"), true)?.ok_or_else(lock_error)?;
-        if !try_lock(&build_lock, true)? {
-            return Err(lock_error());
+        let build_name = format!("{name}.build");
+        // A reaper may lock and unlink a new `.build` file before this builder locks it. Hold
+        // the lock only once the name is confirmed to still be this very file; otherwise the
+        // lock protects nothing, so start again under a new name.
+        let build_lock = self.state_file(&build_name, true)?.ok_or_else(lock_error)?;
+        if !try_lock(&build_lock, true)? || !self.state_entry_is(&build_name, &build_lock)? {
+            drop(build_lock);
+            return self.begin_incoming_again(attempt);
         }
         let incoming = Incoming {
             cache: self,
@@ -745,8 +772,10 @@ impl PackCache {
     /// lock can be taken (the kernel releases it when the builder exits), or when it has no
     /// builder lock file at all and is older than `STALE_UNLOCKED_INCOMING`.
     fn reap_stale(&self) {
-        let Ok(listing) = self.list() else { return };
-        for name in &listing.incoming {
+        // Works from a raw bounded scan, not `list()`: a cache over `MAX_CACHE_ENTRIES` (for
+        // example after many crashes) must still be able to shed residue, a batch per attach.
+        let Ok(names) = read_names(&self.packs, REAP_SCAN_LIMIT) else { return };
+        for name in names.iter().filter(|name| is_incoming_name(name)).take(REAP_BATCH) {
             let lock_name = format!("{name}.build");
             match self.state_file(&lock_name, false) {
                 Ok(Some(lock)) => {
@@ -774,6 +803,8 @@ impl PackCache {
                 Err(_) => {}
             }
         }
+        // Orphaned state files need the full, validated listing; skip them while over the limit.
+        let Ok(listing) = self.list() else { return };
         let Ok(state_names) = read_names(&self.state, MAX_CACHE_ENTRIES * 4) else { return };
         for name in state_names {
             let orphan = if let Some(stem) = name.strip_suffix(".use") {
@@ -1331,10 +1362,19 @@ fn stream_file(
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
     let mut total = 0_u64;
+    let mut interrupted = 0_u32;
     loop {
         let read = match file.read(&mut buffer) {
-            Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(read) => {
+                interrupted = 0;
+                read
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted && interrupted < MAX_RETRIES =>
+            {
+                interrupted += 1;
+                continue;
+            }
             Err(_) => return Err(unreadable()),
         };
         if read == 0 {
@@ -1772,6 +1812,106 @@ mod tests {
             });
             assert_eq!(sealed_names(&fixture.cache).len(), 4);
         }
+    }
+
+    /// Many creators of one brand-new state file must all get it. A plain `O_CREAT` open raced
+    /// this way returns a spurious ENOENT on APFS (about 1 in 10 here), so this fails without
+    /// the exclusive-create protocol.
+    #[test]
+    fn concurrent_creation_of_one_state_file_never_fails() {
+        let fixture = cache_fixture();
+        let (_source, pack) = tagged_source("seed");
+        drop(pack.snapshot_into(&fixture.cache).expect("creates the cache layout"));
+        let cache = PackCache::open(&fixture.cache).expect("cache");
+        for round in 0..150 {
+            let name = format!("{round:064x}.use");
+            std::thread::scope(|scope| {
+                let handles = (0..16)
+                    .map(|_| {
+                        scope.spawn(|| cache.state_file(&name, true).map(|file| file.is_some()))
+                    })
+                    .collect::<Vec<_>>();
+                for handle in handles {
+                    assert!(handle.join().expect("worker").expect("state file"));
+                }
+            });
+        }
+    }
+
+    /// A reaper racing a new builder must never leave the builder holding a lock on a file
+    /// that is no longer named: once `begin_incoming` returns, the lock is live and exclusive.
+    #[test]
+    fn reaper_cannot_steal_a_new_builders_lock_file() {
+        let fixture = cache_fixture();
+        let (_source, pack) = tagged_source("seed");
+        drop(pack.snapshot_into(&fixture.cache).expect("creates the cache layout"));
+        let cache = PackCache::open(&fixture.cache).expect("cache");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let reapers = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            cache.reap_stale();
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for _ in 0..200 {
+                let incoming = cache.begin_incoming().expect("builder");
+                let build = format!("{}.build", incoming.name);
+                assert!(cache.state_entry_is(&build, &incoming._build_lock).expect("entry"));
+                let other = cache.state_file(&build, false).expect("open").expect("present");
+                assert!(!try_lock(&other, true).expect("lock"), "builder lock must be held");
+                drop(incoming);
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            for reaper in reapers {
+                reaper.join().expect("reaper");
+            }
+        });
+    }
+
+    #[test]
+    fn many_crash_residues_are_shed_a_batch_per_attach_and_the_cache_heals() {
+        let fixture = cache_fixture();
+        let (_source, seed) = tagged_source("seed");
+        drop(seed.snapshot_into(&fixture.cache).expect("creates the cache layout"));
+        let packs = fixture.cache.join(PACKS_DIR);
+        let state = packs.join(STATE_DIR);
+        let residues = MAX_CACHE_ENTRIES + 40;
+        for index in 0..residues {
+            let name = format!("{INCOMING_PREFIX}{}-{index:032x}", index + 1);
+            std::fs::create_dir(packs.join(&name)).expect("residue");
+            std::fs::set_permissions(packs.join(&name), std::fs::Permissions::from_mode(0o700))
+                .expect("mode");
+            std::fs::write(state.join(format!("{name}.build")), b"")
+                .expect("unlocked builder file");
+            std::fs::set_permissions(
+                state.join(format!("{name}.build")),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .expect("mode");
+        }
+        assert!(incoming_names(&fixture.cache).len() > MAX_CACHE_ENTRIES);
+
+        let (_source, other) = tagged_source("other");
+        let mut attempts = 0;
+        let healed = loop {
+            attempts += 1;
+            match other.snapshot_into(&fixture.cache) {
+                Ok(snapshot) => break snapshot,
+                Err(error) => assert!(
+                    attempts <= residues.div_ceil(REAP_BATCH),
+                    "cache did not heal after {attempts} attaches: {error}"
+                ),
+            }
+        };
+        assert!(attempts > 1, "the first attach saw an over-full cache");
+        // Attaches succeed again once the root is back under the limit; the rest is shed by
+        // later builds. Residue never counts toward the snapshot cap.
+        assert!(incoming_names(&fixture.cache).len() < MAX_CACHE_ENTRIES);
+        assert!(JavaAttachPack::validate(healed.root()).is_ok());
     }
 
     #[test]
