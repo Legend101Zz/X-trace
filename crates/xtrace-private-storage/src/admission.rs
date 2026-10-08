@@ -1934,4 +1934,47 @@ mod tests {
         assert!(!leaf.path().join("late").exists(), "no directory created after expiry");
         assert_eq!(probe::probed_paths().len(), before, "no ACL probe after expiry");
     }
+
+    /// Directory names that try to confuse listing parsing: spaces, a trailing space, a name that
+    /// looks like an ACL entry index, an arrow, and non-ASCII. Whatever the batch does, the
+    /// verdicts must be right: ASCII names are admitted, an ACL on one component refuses exactly
+    /// the paths through it, and non-ASCII (which the ASCII-only parser has always refused)
+    /// stays refused rather than being misread.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tricky_directory_names_get_the_right_verdict_from_the_batched_listing() {
+        let mut current =
+            private_scratch().create_private_child(&unique_name("tricky")).expect("base");
+        let mut chain = Vec::new();
+        for name in ["a b", "trail ", "0: x", "b -> c"] {
+            current = current.create_private_child(name).expect("tricky child");
+            chain.push(current.path().to_path_buf());
+        }
+        let deepest = chain[3].clone();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let before = probe::ls_spawn_count();
+        AdmittedPrivateRoot::open(&deepest).expect("tricky ASCII names are admitted");
+        let spawns = probe::ls_spawn_count() - before;
+        assert!(spawns <= 6, "{spawns} ls runs: the batch must have been used");
+        // An allow entry on exactly one component refuses every path through it ...
+        let acl = |flag: &str| {
+            std::process::Command::new("/bin/chmod")
+                .args([flag, "group:everyone allow write"])
+                .arg(&chain[1])
+                .status()
+                .expect("run chmod")
+                .success()
+        };
+        assert!(acl("+a"));
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(AdmittedPrivateRoot::open(&deepest).is_err(), "ACL on 'trail ' must be seen");
+        assert!(AdmittedPrivateRoot::open(&chain[0]).is_ok(), "but not blamed on its parent");
+        // ... and removing it restores admission.
+        assert!(acl("-a"));
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        AdmittedPrivateRoot::open(&deepest).expect("admitted again");
+        // Non-ASCII listings have always been refused by the ASCII-only parser.
+        let unicode = current.create_private_child("\u{fc}n\u{ef}").expect("unicode child");
+        assert!(AdmittedPrivateRoot::open(unicode.path()).is_err());
+    }
 }
