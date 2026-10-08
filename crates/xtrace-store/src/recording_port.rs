@@ -1280,6 +1280,99 @@ mod tests {
     }
 
     #[test]
+    fn capture_beyond_event_capacity_ends_partial_with_durable_drop_count() {
+        // Intended contract change (owner-ordered F5): exceeding the event
+        // capacity no longer kills the capture with a Resource error.
+        use xtrace_application::recording::{CAPACITY_DROP_PRIORITY, MAX_RECORDED_EVENTS};
+        let (directory, store, project) = fixture();
+        let adapter =
+            std::sync::Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
+        let capture = RecordingCaptureService::new(
+            std::sync::Arc::clone(&adapter),
+            SegmentPolicy::default(),
+            std::num::NonZeroUsize::new(2).expect("non-zero recording limit"),
+        );
+        let begin = begin(project.id(), RecordingId::new());
+        let recording_id = begin.recording_id;
+        capture.begin_recording(begin).expect("begin");
+        let last_kept = 1 + MAX_RECORDED_EVENTS as u64;
+        let extra = 7_u64;
+        let events = (2..=last_kept + extra)
+            .map(|sequence| event(sequence, &format!("event-{sequence}")))
+            .collect::<Vec<_>>();
+        let mut accepted = 0;
+        let mut dropped = 0;
+        for chunk in events.chunks(512) {
+            let receipt = capture
+                .record_events(RecordEvents { recording_id, events: chunk.to_vec() })
+                .expect("capture survives the capacity");
+            accepted += receipt.accepted;
+            dropped += receipt.dropped;
+        }
+        assert_eq!((accepted, dropped), (MAX_RECORDED_EVENTS, 7));
+
+        let finish = FinishRecording {
+            recording_id,
+            final_recording_seq: last_kept + extra,
+            duration_ns: None,
+            // The adapter digest covers dropped events too; it cannot verify.
+            event_digest: vec![9; 32],
+            drop_counts_by_priority: [(10, 2)].into_iter().collect(),
+            unsupported_capability_codes: Vec::new(),
+            response_summary: None,
+        };
+        let receipt = capture.finish_recording(finish.clone()).expect("finish");
+        assert_eq!(receipt.completion, RecordingCompletion::Partial);
+        let replay = capture.finish_recording(finish).expect("exact finish replay");
+        assert!(replay.exact_replay);
+        assert_eq!(replay.completion, RecordingCompletion::Partial);
+
+        let stored_count: i64 = store
+            .lock()
+            .expect("metadata connection")
+            .query_row(
+                "SELECT event_count FROM recording_terminal_evidence WHERE recording_id = ?1",
+                rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("terminal evidence row");
+        assert_eq!(stored_count, i64::try_from(MAX_RECORDED_EVENTS).expect("cap fits"));
+
+        // Reopen through a fresh reader: persisted events verify and the drop
+        // is visible, never Complete.
+        let reader = SqliteRecordingReader::new(store, directory.path());
+        let window = reader
+            .show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id,
+                limit: 1_000,
+                after_sequence: None,
+            })
+            .expect("read capped capture");
+        assert_eq!(
+            window.completion,
+            xtrace_application::recording_queries::RecordingCompletionEvidence::Partial
+        );
+        assert!(!window.events.is_empty());
+        assert_eq!(
+            window.drop_counts_by_priority.get(&CAPACITY_DROP_PRIORITY).map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(window.drop_counts_by_priority.get(&10).map(String::as_str), Some("2"));
+        let last_window = reader
+            .show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id,
+                limit: 1_000,
+                after_sequence: Some(last_kept - 3),
+            })
+            .expect("read capped capture tail");
+        let tail =
+            last_window.events.iter().map(|event| event.sequence.clone()).collect::<Vec<_>>();
+        assert_eq!(tail, [last_kept - 2, last_kept - 1, last_kept].map(|s| s.to_string()));
+    }
+
+    #[test]
     fn capture_validates_typed_payload_on_exact_canonical_duplicate_replay() {
         let (directory, store, project) = fixture();
         let adapter = std::sync::Arc::new(SqliteRecordingPersistence::new(store, directory.path()));
