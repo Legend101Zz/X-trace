@@ -312,9 +312,11 @@ Use the returned versioned `next_cursor` with `--cursor` to continue. The
 cursor is bound to the selected project and recording. Terminal verification and
 persistence are bounded to 2,048 events per recording and 16 MiB of combined
 compressed and logical segment bytes. Events beyond the 2,048-event bound are
-not persisted: the capture continues, the excess is counted under drop-count
-priority `0` in the finish evidence, and the recording ends partial (never
-complete). Larger captures stay partial until a higher bound is explicitly
+not persisted: the capture continues, each excess event is counted under its
+own priority in the drop counts (added to any adapter-reported count for that
+priority), the total is kept as a separate capacity-drop count in the finish
+evidence, and the recording ends partial (never complete). The ingest gate
+applies the same rule instead of rejecting the batch. Larger captures stay partial until a higher bound is explicitly
 implemented and tested. Raw interaction paths
 are omitted because path segments may contain identifiers or tokens. Oversized
 display fields become `[truncated]`; oversized identity/relationship fields

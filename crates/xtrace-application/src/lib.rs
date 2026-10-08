@@ -70,8 +70,8 @@ pub use queries::{
 };
 pub use recording::{
     AcceptedRecordingEvent, BeginRecording, BeginRecordingDisposition, BeginRecordingReceipt,
-    CAPACITY_DROP_PRIORITY, DEFAULT_MAX_RETAINED_RECORDINGS, DEFAULT_SEGMENT_EVENT_BYTES,
-    DEFAULT_SEGMENT_EVENTS, DEFAULT_SEGMENT_SPAN_NS, FinishRecording, FinishRecordingReceipt,
+    DEFAULT_MAX_RETAINED_RECORDINGS, DEFAULT_SEGMENT_EVENT_BYTES, DEFAULT_SEGMENT_EVENTS,
+    DEFAULT_SEGMENT_SPAN_NS, FinishRecording, FinishRecordingReceipt, MAX_CAPACITY_DROP_PRIORITIES,
     MAX_RECORDED_EVENTS, MAX_XTF_EVENT_ENVELOPE_BYTES, PersistRecordingSegment,
     PersistSegmentDisposition, PersistSegmentReceipt, RecordEvents, RecordEventsReceipt,
     RecordingCapture, RecordingCaptureService, RecordingCompletion, RecordingPersistencePort,

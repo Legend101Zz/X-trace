@@ -376,10 +376,19 @@ mod tests {
     }
 
     fn event(sequence: u64, event_id: &str) -> AcceptedRecordingEvent<XtfEventEnvelope> {
+        event_with_priority(sequence, event_id, 1)
+    }
+
+    fn event_with_priority(
+        sequence: u64,
+        event_id: &str,
+        priority: u32,
+    ) -> AcceptedRecordingEvent<XtfEventEnvelope> {
         let nested = RecordingEvent {
             event_id: event_id.to_owned(),
             recording_seq: sequence,
             monotonic_ns: sequence * 10,
+            priority,
             ..RecordingEvent::default()
         };
         let payload = XtfEventEnvelope { recording_seq: sequence, event: Some(nested) };
@@ -387,6 +396,7 @@ mod tests {
         AcceptedRecordingEvent {
             recording_seq: sequence,
             monotonic_ns: sequence * 10,
+            priority,
             canonical_bytes,
             payload,
         }
@@ -456,6 +466,7 @@ mod tests {
             event_digest: blake3::hash(b"event-2event-3").as_bytes().to_vec(),
             drop_counts_by_priority: [(1, 0)].into_iter().collect(),
             unsupported_capability_codes: vec!["focused_locals".to_string()],
+            capacity_dropped_events: 0,
             response_summary: Some(CapturedValue::Redacted {
                 rule_id: "unverified-producer-redaction".to_string(),
                 shape_hint: Some(ValueShape::String),
@@ -634,6 +645,7 @@ mod tests {
             event_digest: vec![9; 32],
             drop_counts_by_priority: std::collections::BTreeMap::new(),
             unsupported_capability_codes: Vec::new(),
+            capacity_dropped_events: 0,
             response_summary: Some(CapturedValue::Redacted {
                 rule_id: "unverified-producer-redaction".to_string(),
                 shape_hint: None,
@@ -738,6 +750,7 @@ mod tests {
                 event_digest,
                 drop_counts_by_priority,
                 unsupported_capability_codes: Vec::new(),
+                capacity_dropped_events: 0,
                 response_summary: None,
             };
             persistence.begin_recording(&begin(project.id(), recording_id)).expect("begin");
@@ -1283,7 +1296,7 @@ mod tests {
     fn capture_beyond_event_capacity_ends_partial_with_durable_drop_count() {
         // Intended contract change (owner-ordered F5): exceeding the event
         // capacity no longer kills the capture with a Resource error.
-        use xtrace_application::recording::{CAPACITY_DROP_PRIORITY, MAX_RECORDED_EVENTS};
+        use xtrace_application::recording::MAX_RECORDED_EVENTS;
         let (directory, store, project) = fixture();
         let adapter =
             std::sync::Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
@@ -1298,7 +1311,10 @@ mod tests {
         let last_kept = 1 + MAX_RECORDED_EVENTS as u64;
         let extra = 7_u64;
         let events = (2..=last_kept + extra)
-            .map(|sequence| event(sequence, &format!("event-{sequence}")))
+            .map(|sequence| {
+                let priority = if sequence > last_kept { 5 + (sequence % 2) as u32 } else { 1 };
+                event_with_priority(sequence, &format!("event-{sequence}"), priority)
+            })
             .collect::<Vec<_>>();
         let mut accepted = 0;
         let mut dropped = 0;
@@ -1317,8 +1333,9 @@ mod tests {
             duration_ns: None,
             // The adapter digest covers dropped events too; it cannot verify.
             event_digest: vec![9; 32],
-            drop_counts_by_priority: [(10, 2)].into_iter().collect(),
+            drop_counts_by_priority: [(6, 2)].into_iter().collect(),
             unsupported_capability_codes: Vec::new(),
+            capacity_dropped_events: 0,
             response_summary: None,
         };
         let receipt = capture.finish_recording(finish.clone()).expect("finish");
@@ -1337,6 +1354,16 @@ mod tests {
             )
             .expect("terminal evidence row");
         assert_eq!(stored_count, i64::try_from(MAX_RECORDED_EVENTS).expect("cap fits"));
+        let stored_request: String = store
+            .lock()
+            .expect("metadata connection")
+            .query_row(
+                "SELECT request_json FROM recording_terminal_evidence WHERE recording_id = ?1",
+                rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("terminal evidence request");
+        assert!(stored_request.contains("\"capacity_dropped_events\":7"), "{stored_request}");
 
         // Reopen through a fresh reader: persisted events verify and the drop
         // is visible, never Complete.
@@ -1354,11 +1381,11 @@ mod tests {
             xtrace_application::recording_queries::RecordingCompletionEvidence::Partial
         );
         assert!(!window.events.is_empty());
-        assert_eq!(
-            window.drop_counts_by_priority.get(&CAPACITY_DROP_PRIORITY).map(String::as_str),
-            Some("7")
-        );
-        assert_eq!(window.drop_counts_by_priority.get(&10).map(String::as_str), Some("2"));
+        // Dropped sequences 2050..=2056: priority 5 for even, 6 for odd
+        // sequences (3 + 4); the adapter's own 2 at priority 6 are added to 4.
+        assert_eq!(window.drop_counts_by_priority.get(&5).map(String::as_str), Some("4"));
+        assert_eq!(window.drop_counts_by_priority.get(&6).map(String::as_str), Some("5"));
+        assert_eq!(window.drop_counts_by_priority.len(), 2);
         let last_window = reader
             .show_recording(&ShowWindowRequest {
                 project_id: project.id(),
