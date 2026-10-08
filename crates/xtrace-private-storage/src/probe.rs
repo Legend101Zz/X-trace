@@ -79,7 +79,19 @@ pub(crate) struct Operation {
 #[cfg(target_os = "macos")]
 struct Prefetched {
     taken_at: std::time::SystemTime,
-    listings: Vec<(std::path::PathBuf, crate::policy::BatchedListing)>,
+    entries: Vec<BatchEntry>,
+}
+
+/// One batched listing, bound to the device and inode `lstat` reported for its operand.
+#[cfg(any(target_os = "macos", test))]
+struct BatchEntry {
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only the macOS batch looks entries up by path")
+    )]
+    path: std::path::PathBuf,
+    device: u64,
+    listing: crate::policy::BatchedListing,
 }
 
 impl Operation {
@@ -137,14 +149,35 @@ impl Operation {
         let Some(names) = paths.iter().map(|path| path.to_str()).collect::<Option<Vec<_>>>() else {
             return;
         };
+        let before =
+            paths.iter().map(|path| std::fs::symlink_metadata(path).ok()).collect::<Vec<_>>();
+        let started = Instant::now();
         let taken_at = std::time::SystemTime::now();
         let operands = paths.iter().map(std::path::PathBuf::as_path).collect::<Vec<_>>();
         let Some(text) = run_ls("-ldeOi", &operands, self.deadline, BATCH_OUTPUT_LIMIT) else {
             return;
         };
+        // A realtime clock that stepped while `ls` ran (or went backwards) makes `taken_at`
+        // meaningless for the ctime comparison below: drop the whole batch.
+        if !clock_is_consistent(taken_at, std::time::SystemTime::now(), started.elapsed()) {
+            return;
+        }
         let Some(parsed) = crate::policy::split_batched_listing(&text, &names) else { return };
-        *self.prefetched.borrow_mut() =
-            Some(Prefetched { taken_at, listings: paths.iter().cloned().zip(parsed).collect() });
+        let mut entries = Vec::new();
+        for ((path, listing), before) in paths.iter().zip(parsed).zip(before) {
+            // Bind the listing to (device, inode) as `lstat` saw them on both sides of the run;
+            // an operand that moved, vanished or disagrees with the listing is simply left out.
+            use std::os::unix::fs::MetadataExt as _;
+            let after = std::fs::symlink_metadata(path).ok();
+            let (Some(before), Some(after)) = (before, after) else { continue };
+            if before.dev() == after.dev()
+                && before.ino() == after.ino()
+                && before.ino() == listing.inode
+            {
+                entries.push(BatchEntry { path: path.clone(), device: before.dev(), listing });
+            }
+        }
+        *self.prefetched.borrow_mut() = Some(Prefetched { taken_at, entries });
     }
 
     fn already_judged(&self, state: &DirectoryState) -> bool {
@@ -278,37 +311,65 @@ fn probe_directory(
 }
 
 /// A ctime must be at least this much older than the batched listing to be trusted.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const PREFETCH_QUIET_PERIOD: Duration = Duration::from_millis(20);
+/// How far the realtime clock may disagree with the monotonic clock over one `ls` run.
+#[cfg(any(target_os = "macos", test))]
+const CLOCK_TOLERANCE: Duration = Duration::from_millis(50);
+
+/// Whether the realtime clock behaved over a batch: it did not go backwards, and the time it
+/// measured agrees with the monotonic clock to within [`CLOCK_TOLERANCE`].
+#[cfg(any(target_os = "macos", test))]
+fn clock_is_consistent(
+    taken_at: std::time::SystemTime,
+    after: std::time::SystemTime,
+    monotonic_elapsed: Duration,
+) -> bool {
+    after.duration_since(taken_at).is_ok_and(|realtime_elapsed| {
+        realtime_elapsed.abs_diff(monotonic_elapsed) <= CLOCK_TOLERANCE
+    })
+}
+
+/// Whether a batched entry provably describes the object behind a descriptor.
+///
+/// The listing is trusted only if device and inode both match the descriptor's, and the
+/// descriptor's ctime is at least [`PREFETCH_QUIET_PERIOD`] older than the batch (so, absent root
+/// controlling the clock, nothing changed the directory between the listing and the descriptor
+/// read; any mode, owner, ACL, flag or xattr edit advances ctime). A ctime in the future of the
+/// batch also fails this test.
+#[cfg(any(target_os = "macos", test))]
+fn batch_entry_describes(
+    batch_taken_at: std::time::SystemTime,
+    entry: &BatchEntry,
+    device: u64,
+    inode: u64,
+    ctime: std::time::SystemTime,
+) -> bool {
+    entry.device == device
+        && entry.listing.inode == inode
+        && ctime.checked_add(PREFETCH_QUIET_PERIOD).is_some_and(|quiet| quiet <= batch_taken_at)
+}
 
 /// Judges `directory` from the walk's batched listing when that listing provably describes it.
-///
-/// The listing is used only if its inode equals the descriptor's inode and the descriptor's
-/// ctime is at least [`PREFETCH_QUIET_PERIOD`] older than the moment the listing was taken. Any
-/// change to the directory's mode, owner, ACL, flags or extended attributes advances ctime, so a
-/// ctime that old means nothing changed between the listing and this descriptor read, and the
-/// caller's before/after state check covers the rest of the window. Directories modified
-/// recently (busy ones) return `None` and are probed on their own. Clock manipulation needs
-/// root and is outside the threat model.
+/// Directories modified recently (busy ones) return `None` and are probed on their own.
 #[cfg(target_os = "macos")]
 fn prefetched_verdict(operation: &Operation, path: &Path, directory: &File) -> Option<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
     let prefetched = operation.prefetched.borrow();
     let batch = prefetched.as_ref()?;
-    let (_, listing) = batch.listings.iter().find(|(listed, _)| listed == path)?;
+    let entry = batch.entries.iter().find(|entry| entry.path == path)?;
     let metadata = directory.metadata().ok()?;
     let ctime = std::time::UNIX_EPOCH
         + Duration::new(
             u64::try_from(metadata.ctime()).ok()?,
             u32::try_from(metadata.ctime_nsec()).ok()?,
         );
-    if metadata.ino() != listing.inode || ctime.checked_add(PREFETCH_QUIET_PERIOD)? > batch.taken_at
-    {
+    if !batch_entry_describes(batch.taken_at, entry, metadata.dev(), metadata.ino(), ctime) {
         return None;
     }
     Some(path.to_str().is_some_and(|expected| {
-        crate::policy::macos_directory_listing_admits(&listing.text, expected)
+        crate::policy::macos_directory_listing_admits(&entry.listing.text, expected)
     }))
 }
 
@@ -544,6 +605,41 @@ fn report_acl_probe_cleanup(drained: bool) {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    fn entry(device: u64, inode: u64) -> BatchEntry {
+        BatchEntry {
+            path: std::path::PathBuf::from("/d"),
+            device,
+            listing: crate::policy::BatchedListing { inode, text: String::new() },
+        }
+    }
+
+    #[test]
+    fn a_batched_entry_binds_only_to_the_same_device_inode_and_a_quiet_ctime() {
+        use std::time::{Duration as D, UNIX_EPOCH};
+        let taken = UNIX_EPOCH + D::from_secs(1_000);
+        let quiet = taken - D::from_millis(21);
+        assert!(batch_entry_describes(taken, &entry(7, 42), 7, 42, quiet));
+        assert!(!batch_entry_describes(taken, &entry(7, 42), 7, 43, quiet), "inode mismatch");
+        assert!(!batch_entry_describes(taken, &entry(7, 42), 8, 42, quiet), "device mismatch");
+        assert!(!batch_entry_describes(taken, &entry(7, 42), 7, 42, taken - D::from_millis(19)));
+        assert!(!batch_entry_describes(taken, &entry(7, 42), 7, 42, taken), "ctime at the batch");
+        assert!(!batch_entry_describes(taken, &entry(7, 42), 7, 42, taken + D::from_secs(5)));
+    }
+
+    #[test]
+    fn a_batch_is_dropped_when_the_realtime_clock_stepped_or_disagrees() {
+        use std::time::{Duration as D, UNIX_EPOCH};
+        let taken = UNIX_EPOCH + D::from_secs(1_000);
+        let elapsed = D::from_millis(30);
+        assert!(clock_is_consistent(taken, taken + D::from_millis(30), elapsed));
+        assert!(clock_is_consistent(taken, taken + D::from_millis(70), elapsed));
+        // Stepped back during the run, or a forward step much larger than the monotonic time.
+        assert!(!clock_is_consistent(taken, taken - D::from_secs(3_600), elapsed));
+        assert!(!clock_is_consistent(taken, taken - D::from_millis(1), elapsed));
+        assert!(!clock_is_consistent(taken, taken + D::from_secs(3_600), elapsed));
+        assert!(!clock_is_consistent(taken, taken + D::from_millis(100), elapsed));
+    }
 
     fn identity_of(directory: &File) -> FileIdentity {
         FileIdentity::from_metadata(&directory.metadata().expect("directory metadata"))
