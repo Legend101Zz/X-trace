@@ -89,13 +89,13 @@ pub(crate) fn macos_file_listing_admits(text: &str, expected_path: &str) -> bool
 
 /// Linux filesystem-type rule: local ext4, XFS and btrfs only. Network, FUSE, overlay, tmpfs and
 /// unknown filesystems fail closed until their ownership semantics are reviewed.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn linux_filesystem_admitted(f_type: u64) -> bool {
     matches!(f_type, 0xef53 | 0x5846_5342 | 0x9123_683e)
 }
 
 /// macOS filesystem rule: APFS or HFS+ mounted with ownership enforced.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn macos_filesystem_admitted(type_name: &[u8], mount_flags: u32) -> bool {
     const MNT_IGNORE_OWNERSHIP: u32 = 0x0020_0000;
     mount_flags & MNT_IGNORE_OWNERSHIP == 0 && matches!(type_name, b"apfs" | b"hfs")
@@ -413,6 +413,435 @@ mod tests {
             "extra drwxr-xr-x 22 root wheel sunlnk 704 Feb 25 2026 /\n",
             "/",
         ));
+    }
+
+    fn acl_bytes(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut out = 2_u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&perm.to_le_bytes());
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        out
+    }
+
+    const NONE: u32 = u32::MAX;
+    const UID: u32 = 1000;
+
+    /// Filesystem facts for one row.
+    enum Filesystem {
+        Linux(u64),
+        Macos(&'static [u8], u32),
+    }
+
+    /// ACL facts for one row: raw Linux attributes or a macOS `ls -ldeO` listing.
+    enum Acl {
+        Linux { access: Option<Vec<u8>>, default: Option<Vec<u8>> },
+        Macos(&'static str),
+    }
+
+    struct Row {
+        name: &'static str,
+        role: DirectoryRole,
+        owner: u32,
+        mode: u32,
+        filesystem: Filesystem,
+        acl: Acl,
+        admit: bool,
+    }
+
+    const EXT4: Filesystem = Filesystem::Linux(0xef53);
+
+    fn no_acl() -> Acl {
+        Acl::Linux { access: None, default: None }
+    }
+
+    fn row(
+        name: &'static str,
+        role: DirectoryRole,
+        owner: u32,
+        mode: u32,
+        filesystem: Filesystem,
+        acl: Acl,
+        admit: bool,
+    ) -> Row {
+        Row { name, role, owner, mode, filesystem, acl, admit }
+    }
+
+    fn acl_verdict(role: DirectoryRole, acl: &Acl) -> bool {
+        match acl {
+            Acl::Linux { access, default } => {
+                linux_directory_acl_admits(role, access.as_deref(), default.as_deref())
+            }
+            Acl::Macos(listing) => {
+                let first = listing.lines().next().unwrap_or("");
+                let path = first.rsplit_once(' ').map_or("", |parts| parts.1);
+                macos_directory_listing_admits(listing, path)
+            }
+        }
+    }
+
+    /// Composes the real policy functions exactly as `admission` does: every admitted directory
+    /// passes the walk's traversal rule first, then its own role's rules.
+    fn admits(row: &Row) -> bool {
+        let filesystem = match row.filesystem {
+            Filesystem::Linux(f_type) => linux_filesystem_admitted(f_type),
+            Filesystem::Macos(name, flags) => macos_filesystem_admitted(name, flags),
+        };
+        directory_metadata_admits(DirectoryRole::Traversed, row.owner, row.mode, UID)
+            && directory_metadata_admits(row.role, row.owner, row.mode, UID)
+            && filesystem
+            && acl_verdict(DirectoryRole::Traversed, &row.acl)
+            && acl_verdict(row.role, &row.acl)
+    }
+
+    const LEAF: DirectoryRole = DirectoryRole::PrivateLeaf;
+    const WALKED: DirectoryRole = DirectoryRole::Traversed;
+    const CONTAINER: DirectoryRole = DirectoryRole::Container;
+    const SEALED: DirectoryRole = DirectoryRole::Sealed { mode: 0o500 };
+
+    #[test]
+    fn directory_policy_table_pins_every_role_and_fact() {
+        let read_only_named =
+            acl_bytes(&[(1, 7, NONE), (2, 5, 12345), (4, 5, NONE), (16, 5, NONE), (32, 5, NONE)]);
+        let writable_named_user =
+            acl_bytes(&[(1, 7, NONE), (2, 7, 12345), (4, 5, NONE), (16, 7, NONE), (32, 5, NONE)]);
+        let writable_named_group =
+            acl_bytes(&[(1, 7, NONE), (4, 5, NONE), (8, 2, 7), (16, 7, NONE), (32, 5, NONE)]);
+        let writable_other = acl_bytes(&[(1, 7, NONE), (4, 5, NONE), (32, 2, NONE)]);
+        let stock_home_default =
+            acl_bytes(&[(1, 7, NONE), (2, 7, 1000), (4, 5, NONE), (16, 7, NONE), (32, 5, NONE)]);
+        let base = acl_bytes(&[(1, 7, NONE), (4, 5, NONE), (32, 5, NONE)]);
+        let malformed = vec![1_u8, 2, 3];
+        let linux =
+            |access: Option<Vec<u8>>, default: Option<Vec<u8>>| Acl::Linux { access, default };
+
+        let clean = "drwxr-xr-x 4 alice staff - 128 Oct 4 00:23 /d\n";
+        let deny_only = concat!(
+            "drwxr-xr-x@ 4 alice staff - 128 Oct 4 00:23 /d\n",
+            "0: group:everyone deny delete\n",
+        );
+        let allow_entry = concat!(
+            "drwxr-xr-x+ 4 alice staff - 128 Oct 4 00:23 /d\n",
+            "0: user:evil allow write\n",
+        );
+        let plus_without_entries = "drwxr-xr-x+ 4 alice staff - 128 Oct 4 00:23 /d\n";
+        let flags = |value: &'static str| match value {
+            "hidden" => "drwxr-xr-x 7 root wheel hidden 224 Oct 8 01:32 /d\n",
+            "sunlnk" => "drwxr-xr-x 22 root wheel sunlnk 704 Feb 25 2026 /d\n",
+            "restricted" => "drwxr-xr-x 6 root wheel restricted 192 Feb 25 2026 /d\n",
+            "uchg" => "drwxr-xr-x 7 root wheel uchg 224 Oct 8 01:32 /d\n",
+            "opaque" => "drwxr-xr-x 7 root wheel opaque 224 Oct 8 01:32 /d\n",
+            "hidden,uchg" => "drwxr-xr-x 7 root wheel hidden,uchg 224 Oct 8 01:32 /d\n",
+            _ => "",
+        };
+        let apfs = || Filesystem::Macos(b"apfs", 0);
+        let mac = |listing: &'static str| Acl::Macos(listing);
+
+        let rows = vec![
+            // --- owner and permission bits, per role (Linux ext4, no ACL) ---
+            row("leaf 0700 owned", LEAF, UID, 0o40700, EXT4, no_acl(), true),
+            row("leaf 0750", LEAF, UID, 0o40750, EXT4, no_acl(), false),
+            row("leaf 0770", LEAF, UID, 0o40770, EXT4, no_acl(), false),
+            row("leaf 0707", LEAF, UID, 0o40707, EXT4, no_acl(), false),
+            row("leaf 0755", LEAF, UID, 0o40755, EXT4, no_acl(), false),
+            row("leaf setgid 2700", LEAF, UID, 0o42700, EXT4, no_acl(), false),
+            row("leaf 0500", LEAF, UID, 0o40500, EXT4, no_acl(), false),
+            row("leaf root-owned 0700", LEAF, 0, 0o40700, EXT4, no_acl(), false),
+            row("leaf foreign-owned 0700", LEAF, 2000, 0o40700, EXT4, no_acl(), false),
+            row("walked owned 0755", WALKED, UID, 0o40755, EXT4, no_acl(), true),
+            row("walked root 0755", WALKED, 0, 0o40755, EXT4, no_acl(), true),
+            row("walked foreign 0755", WALKED, 2000, 0o40755, EXT4, no_acl(), false),
+            row("walked group-writable", WALKED, UID, 0o40775, EXT4, no_acl(), false),
+            row("walked other-writable", WALKED, UID, 0o40757, EXT4, no_acl(), false),
+            row("walked sticky world-writable", WALKED, 0, 0o41777, EXT4, no_acl(), false),
+            row("walked 0555", WALKED, 0, 0o40555, EXT4, no_acl(), true),
+            row("container owned 0755", CONTAINER, UID, 0o40755, EXT4, no_acl(), true),
+            row("container root 0755", CONTAINER, 0, 0o40755, EXT4, no_acl(), true),
+            row("container foreign", CONTAINER, 2000, 0o40755, EXT4, no_acl(), false),
+            row("container group-writable", CONTAINER, UID, 0o40775, EXT4, no_acl(), false),
+            row("container other-writable", CONTAINER, UID, 0o40757, EXT4, no_acl(), false),
+            row("sealed 0500 owned", SEALED, UID, 0o40500, EXT4, no_acl(), true),
+            row("sealed but still 0700", SEALED, UID, 0o40700, EXT4, no_acl(), false),
+            row("sealed root-owned", SEALED, 0, 0o40500, EXT4, no_acl(), false),
+            row("sealed group-readable", SEALED, UID, 0o40550, EXT4, no_acl(), false),
+            // --- Linux access and default ACLs, per role ---
+            row("linux no ACL leaf", LEAF, UID, 0o40700, EXT4, linux(None, None), true),
+            row(
+                "linux plain base ACL leaf",
+                LEAF,
+                UID,
+                0o40700,
+                EXT4,
+                linux(Some(base.clone()), None),
+                false,
+            ),
+            row(
+                "linux plain base ACL walked",
+                WALKED,
+                UID,
+                0o40755,
+                EXT4,
+                linux(Some(base.clone()), None),
+                true,
+            ),
+            row(
+                "linux read-only named user, leaf",
+                LEAF,
+                UID,
+                0o40700,
+                EXT4,
+                linux(Some(read_only_named.clone()), None),
+                false,
+            ),
+            row(
+                "linux read-only named user, walked",
+                WALKED,
+                UID,
+                0o40755,
+                EXT4,
+                linux(Some(read_only_named.clone()), None),
+                true,
+            ),
+            row(
+                "linux read-only named user, container",
+                CONTAINER,
+                UID,
+                0o40755,
+                EXT4,
+                linux(Some(read_only_named.clone()), None),
+                true,
+            ),
+            row(
+                "linux read-only named user, sealed",
+                SEALED,
+                UID,
+                0o40500,
+                EXT4,
+                linux(Some(read_only_named.clone()), None),
+                false,
+            ),
+            row(
+                "linux writable named user, walked",
+                WALKED,
+                UID,
+                0o40755,
+                EXT4,
+                linux(Some(writable_named_user.clone()), None),
+                false,
+            ),
+            row(
+                "linux writable named user, container",
+                CONTAINER,
+                UID,
+                0o40755,
+                EXT4,
+                linux(Some(writable_named_user.clone()), None),
+                false,
+            ),
+            row(
+                "linux writable named user, leaf",
+                LEAF,
+                UID,
+                0o40700,
+                EXT4,
+                linux(Some(writable_named_user), None),
+                false,
+            ),
+            row(
+                "linux writable named group, walked",
+                WALKED,
+                UID,
+                0o40755,
+                EXT4,
+                linux(Some(writable_named_group), None),
+                false,
+            ),
+            row(
+                "linux writable other entry, walked",
+                WALKED,
+                UID,
+                0o40755,
+                EXT4,
+                linux(Some(writable_other), None),
+                false,
+            ),
+            row(
+                "linux malformed access ACL, walked",
+                WALKED,
+                UID,
+                0o40755,
+                EXT4,
+                linux(Some(malformed.clone()), None),
+                false,
+            ),
+            row(
+                "linux default ACL only, leaf",
+                LEAF,
+                UID,
+                0o40700,
+                EXT4,
+                linux(None, Some(stock_home_default.clone())),
+                false,
+            ),
+            row(
+                "linux default ACL only, walked",
+                WALKED,
+                UID,
+                0o40755,
+                EXT4,
+                linux(None, Some(stock_home_default.clone())),
+                true,
+            ),
+            row(
+                "linux default ACL only, container",
+                CONTAINER,
+                UID,
+                0o40755,
+                EXT4,
+                linux(None, Some(stock_home_default.clone())),
+                true,
+            ),
+            row(
+                "linux default ACL only, sealed",
+                SEALED,
+                UID,
+                0o40500,
+                EXT4,
+                linux(None, Some(stock_home_default)),
+                false,
+            ),
+            row(
+                "linux malformed default ACL, walked",
+                WALKED,
+                UID,
+                0o40755,
+                EXT4,
+                linux(None, Some(malformed)),
+                false,
+            ),
+            row(
+                "linux default ACL, empty body",
+                WALKED,
+                UID,
+                0o40755,
+                EXT4,
+                linux(None, Some(acl_bytes(&[]))),
+                true,
+            ),
+            // --- filesystem type ---
+            row("ext4", LEAF, UID, 0o40700, Filesystem::Linux(0xef53), no_acl(), true),
+            row("xfs", LEAF, UID, 0o40700, Filesystem::Linux(0x5846_5342), no_acl(), true),
+            row("btrfs", LEAF, UID, 0o40700, Filesystem::Linux(0x9123_683e), no_acl(), true),
+            row("tmpfs", LEAF, UID, 0o40700, Filesystem::Linux(0x0102_1994), no_acl(), false),
+            row("overlayfs", LEAF, UID, 0o40700, Filesystem::Linux(0x794c_7630), no_acl(), false),
+            row("nfs", LEAF, UID, 0o40700, Filesystem::Linux(0x6969), no_acl(), false),
+            row("fuse", LEAF, UID, 0o40700, Filesystem::Linux(0x6573_5546), no_acl(), false),
+            row("apfs", LEAF, UID, 0o40700, apfs(), mac(clean), true),
+            row("hfs", LEAF, UID, 0o40700, Filesystem::Macos(b"hfs", 0), mac(clean), true),
+            row(
+                "apfs ignoring ownership",
+                LEAF,
+                UID,
+                0o40700,
+                Filesystem::Macos(b"apfs", 0x0020_0000),
+                mac(clean),
+                false,
+            ),
+            row(
+                "apfs with other mount flags",
+                LEAF,
+                UID,
+                0o40700,
+                Filesystem::Macos(b"apfs", 0x0000_1000),
+                mac(clean),
+                true,
+            ),
+            row("msdos", LEAF, UID, 0o40700, Filesystem::Macos(b"msdos", 0), mac(clean), false),
+            row("macos nfs", LEAF, UID, 0o40700, Filesystem::Macos(b"nfs", 0), mac(clean), false),
+            row(
+                "macos empty type",
+                LEAF,
+                UID,
+                0o40700,
+                Filesystem::Macos(b"", 0),
+                mac(clean),
+                false,
+            ),
+            // --- macOS listing ACLs and flags (role independent) ---
+            row("macos clean, leaf", LEAF, UID, 0o40700, apfs(), mac(clean), true),
+            row("macos clean, walked", WALKED, UID, 0o40755, apfs(), mac(clean), true),
+            row("macos deny-only ACL, leaf", LEAF, UID, 0o40700, apfs(), mac(deny_only), true),
+            row("macos deny-only ACL, walked", WALKED, UID, 0o40755, apfs(), mac(deny_only), true),
+            row(
+                "macos deny-only ACL, container",
+                CONTAINER,
+                UID,
+                0o40755,
+                apfs(),
+                mac(deny_only),
+                true,
+            ),
+            row("macos allow entry, leaf", LEAF, UID, 0o40700, apfs(), mac(allow_entry), false),
+            row("macos allow entry, walked", WALKED, UID, 0o40755, apfs(), mac(allow_entry), false),
+            row(
+                "macos allow entry, container",
+                CONTAINER,
+                UID,
+                0o40755,
+                apfs(),
+                mac(allow_entry),
+                false,
+            ),
+            row(
+                "macos plus without entries",
+                WALKED,
+                UID,
+                0o40755,
+                apfs(),
+                mac(plus_without_entries),
+                false,
+            ),
+            row("macos flag hidden", WALKED, 0, 0o40755, apfs(), mac(flags("hidden")), true),
+            row("macos flag sunlnk", WALKED, 0, 0o40755, apfs(), mac(flags("sunlnk")), true),
+            row(
+                "macos flag restricted",
+                WALKED,
+                0,
+                0o40755,
+                apfs(),
+                mac(flags("restricted")),
+                true,
+            ),
+            row("macos flag uchg", WALKED, 0, 0o40755, apfs(), mac(flags("uchg")), false),
+            row("macos flag opaque", WALKED, 0, 0o40755, apfs(), mac(flags("opaque")), false),
+            row(
+                "macos flag hidden,uchg",
+                WALKED,
+                0,
+                0o40755,
+                apfs(),
+                mac(flags("hidden,uchg")),
+                false,
+            ),
+            row(
+                "macos hidden never excuses a leaf mode",
+                LEAF,
+                0,
+                0o40755,
+                apfs(),
+                mac(flags("hidden")),
+                false,
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for case in &rows {
+            if admits(case) != case.admit {
+                failures.push(case.name);
+            }
+        }
+        assert!(failures.is_empty(), "policy rows disagree: {failures:?}");
     }
 
     #[test]
