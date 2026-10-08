@@ -20,7 +20,7 @@ use xtrace_domain::{
     AppError, CorrelationId, ErrorCategory, ErrorCode, OperationId, RecordingId, RetryAdvice,
     WallTime,
 };
-use xtrace_runtime::private_storage::AdmittedPrivateRoot;
+use xtrace_private_storage::AdmittedPrivateRoot;
 use xtrace_store::{CURRENT_SCHEMA_VERSION, SqliteIdempotencyStore, SqliteProjectRepository};
 use xtrace_store::{SqliteRecordingReader, SqliteStore, StoreErrorKind};
 

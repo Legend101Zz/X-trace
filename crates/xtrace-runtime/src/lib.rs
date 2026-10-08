@@ -15,13 +15,6 @@ pub mod java;
 #[cfg(unix)]
 pub mod java_attach;
 
-#[cfg(unix)]
-pub mod private_storage;
-
-#[cfg(not(unix))]
-#[path = "private_storage_unsupported.rs"]
-pub mod private_storage;
-
 /// Strict signed language-pack manifest parsing and cryptographic primitives.
 pub mod signed_pack;
 

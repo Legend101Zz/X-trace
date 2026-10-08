@@ -76,7 +76,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use xtrace_domain::{ProjectId, RepositoryFingerprint, RuntimeSessionId};
-use xtrace_runtime::private_storage::{AdmittedPrivateRoot, PrivateStorageError};
+use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 use zeroize::Zeroize;
 
 use crate::error::DaemonError;

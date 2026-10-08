@@ -21,6 +21,7 @@ xtrace-domain = { path = "../xtrace-domain" }
 xtrace-protocol = { path = "../xtrace-protocol" }
 xtrace-store = { path = "../xtrace-store" }
 xtrace-daemon = { path = "../xtrace-daemon" }
+xtrace-private-storage = { path = "../xtrace-private-storage" }
 xtrace-runtime = { path = "../xtrace-runtime" }
 clap = { workspace = true }
 thiserror = { workspace = true }

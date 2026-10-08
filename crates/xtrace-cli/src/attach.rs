@@ -1279,7 +1279,7 @@ mod tests {
             std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
                 .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
         );
-        xtrace_runtime::private_storage::AdmittedPrivateRoot::open(&scratch)
+        xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
             .expect("admitted private test scratch");
         tempfile::Builder::new()
             .prefix("xtrace-attach-test-")
@@ -1419,7 +1419,7 @@ mod tests {
     #[tokio::test]
     async fn unconfirmed_blocking_server_work_retains_lock_and_runtime_artifacts() {
         let project = private_tempdir();
-        let admitted = xtrace_runtime::private_storage::AdmittedPrivateRoot::open(project.path())
+        let admitted = xtrace_private_storage::AdmittedPrivateRoot::open(project.path())
             .expect("admitted project root");
         let lock = crate::daemon_lock::acquire_project_lock(&admitted).expect("project lock");
         let runtime =
@@ -1462,7 +1462,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_server_with_started_blocking_work_retains_lock_and_artifacts() {
         let project = private_tempdir();
-        let admitted = xtrace_runtime::private_storage::AdmittedPrivateRoot::open(project.path())
+        let admitted = xtrace_private_storage::AdmittedPrivateRoot::open(project.path())
             .expect("admitted project root");
         let lock = crate::daemon_lock::acquire_project_lock(&admitted).expect("project lock");
         let runtime =

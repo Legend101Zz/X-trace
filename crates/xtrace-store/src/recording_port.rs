@@ -329,7 +329,7 @@ mod tests {
             std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
                 .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
         );
-        xtrace_runtime::private_storage::AdmittedPrivateRoot::open(&temp_base)
+        xtrace_private_storage::AdmittedPrivateRoot::open(&temp_base)
             .expect("admitted private test scratch");
         let directory = tempfile::Builder::new()
             .prefix("recording-port-")

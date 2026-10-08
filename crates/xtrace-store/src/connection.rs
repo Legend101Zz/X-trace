@@ -34,7 +34,7 @@ use xtrace_domain::CorrelationId;
 use crate::error::{StoreError, StoreErrorKind};
 use crate::migrations;
 use crate::project_repository::SqliteProjectRepository;
-use xtrace_runtime::private_storage::{AdmittedPrivateRoot, PrivateStorageError};
+use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
 /// Application binary identifier stored in `schema_meta.app_version`.
 pub const STORE_APP_VERSION: &str = concat!("xtrace ", env!("CARGO_PKG_VERSION"));

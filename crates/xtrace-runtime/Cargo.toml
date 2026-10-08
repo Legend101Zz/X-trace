@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process", "signal", "time"] }
 sha2 = { workspace = true }
 tracing = { workspace = true }
+xtrace-private-storage = { path = "../xtrace-private-storage" }
 xtrace-protocol = { path = "../xtrace-protocol" }
 
 [target.'cfg(unix)'.dependencies]

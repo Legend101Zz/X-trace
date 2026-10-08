@@ -16,7 +16,7 @@ xtrace-domain = { path = "../xtrace-domain" }
 xtrace-application = { path = "../xtrace-application" }
 xtrace-protocol = { path = "../xtrace-protocol" }
 xtrace-ingest = { path = "../xtrace-ingest" }
-xtrace-runtime = { path = "../xtrace-runtime" }
+xtrace-private-storage = { path = "../xtrace-private-storage" }
 async-trait = { workspace = true }
 axum = { workspace = true }
 blake3 = { workspace = true }

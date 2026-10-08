@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
 
-use crate::private_storage::AdmittedPrivateRoot;
 use crate::signed_pack::{
     PackManifest, SignedPackError, build_hash, parse_canonical_manifest,
     verify_with_installed_trust,
 };
+use xtrace_private_storage::AdmittedPrivateRoot;
 
 const OUTER_MANIFEST: &str = "xtrace-pack.json";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
