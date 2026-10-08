@@ -901,7 +901,7 @@ pub fn confidence_to_basis_points(value: f32) -> Result<Option<u16>, DiscoveryPr
     if bits == (-0.0_f32).to_bits() {
         return Ok(Some(0));
     }
-    if !value.is_finite() || value < 0.0 || value > 1.0 {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
         return Err(DiscoveryProofError::InvalidClaim);
     }
     let exponent = ((bits >> 23) & 0xff) as i32;
