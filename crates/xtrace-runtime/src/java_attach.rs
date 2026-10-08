@@ -855,13 +855,16 @@ fn open_or_create_private_child(
             Ok(child)
         }
         Err(error) if error == rustix::io::Errno::NOENT => {
-            rustix::fs::mkdirat(parent, name, rustix::fs::Mode::from_raw_mode(0o700)).map_err(
-                |_| {
-                    AttachError::PrivateStorage(
+            match rustix::fs::mkdirat(parent, name, rustix::fs::Mode::from_raw_mode(0o700)) {
+                Ok(()) => {}
+                // A concurrent first attach created it; it is admitted below like any existing one.
+                Err(error) if error == rustix::io::Errno::EXIST => {}
+                Err(_) => {
+                    return Err(AttachError::PrivateStorage(
                         "the private Java pack snapshot could not be created",
-                    )
-                },
-            )?;
+                    ));
+                }
+            }
             let child = open_child_directory(parent, name).map_err(|_| {
                 AttachError::PrivateStorage("the private Java pack snapshot could not be opened")
             })?;
@@ -1692,6 +1695,28 @@ mod tests {
             let path = fixture.cache.join(PACKS_DIR).join(name);
             JavaAttachPack::validate(&path).expect("intact snapshot");
             verify_retained_snapshot_directories(&path).expect("sealed snapshot");
+        }
+    }
+
+    #[test]
+    fn concurrent_first_attaches_race_to_create_the_cache_layout() {
+        for _ in 0..8 {
+            let fixture = cache_fixture();
+            let sources =
+                (0..4).map(|index| tagged_source(&format!("first-{index}"))).collect::<Vec<_>>();
+            std::thread::scope(|scope| {
+                let handles = sources
+                    .iter()
+                    .map(|(_, pack)| {
+                        let cache = &fixture.cache;
+                        scope.spawn(move || pack.snapshot_into(cache).map(|_| ()))
+                    })
+                    .collect::<Vec<_>>();
+                for handle in handles {
+                    handle.join().expect("worker").expect("first attach into a fresh cache");
+                }
+            });
+            assert_eq!(sealed_names(&fixture.cache).len(), 4);
         }
     }
 
