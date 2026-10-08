@@ -5279,6 +5279,16 @@ class RecoverLeasesTests(unittest.TestCase):
         # A token mismatch is never echoed in the refusal.
         self.assertNotIn(self.TOKEN, json.dumps(self._refusal(self.owner_record(), self.owner_record(startedAtEpoch=skewed, token="x" * 8))))
 
+    def test_huge_or_unbounded_owner_epochs_are_a_structured_refusal(self) -> None:
+        base = int(self.RUN_EPOCH)
+        for bad in (10**400, 2**53, -(10**400), -1, True, "nan", "inf", float("nan"), 1e300):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._refusal(self.owner_record(), self.owner_record(startedAtEpoch=bad)), ["owner-records-disagree"])
+                self.assertEqual(self._refusal(self.owner_record(startedAtEpoch=bad), self.owner_record(startedAtEpoch=bad)),
+                                 ["owner-records-disagree"])
+        self.assertEqual(self._check(self.owner_record(startedAtEpoch=2**53 - 1), self.owner_record(startedAtEpoch=2**53 - 1))["runStartEpoch"],
+                         float(2**53 - 1))
+
     def test_invalid_owner_epochs_are_refused(self) -> None:
         base = int(self.RUN_EPOCH)
         for bad in (True, False, -5, 0, "1791406238", None, float("nan"), float("inf")):
