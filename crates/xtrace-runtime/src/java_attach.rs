@@ -795,13 +795,21 @@ impl PackCache {
         // Works from a raw bounded scan, not `list()`: a cache over `MAX_CACHE_ENTRIES` (for
         // example after many crashes) must still be able to shed residue, a batch per attach.
         let Ok(names) = read_names(&self.packs, REAP_SCAN_LIMIT) else { return };
-        for name in names.iter().filter(|name| is_incoming_name(name)).take(REAP_BATCH) {
+        // The scan is bounded by `REAP_SCAN_LIMIT` (read_names fails above it, so a root with
+        // more entries than that cannot be healed here); removals are bounded separately by
+        // `REAP_BATCH`, so live builders that are skipped never use up the removal budget.
+        let mut removed = 0;
+        for name in names.iter().filter(|name| is_incoming_name(name)) {
+            if removed >= REAP_BATCH {
+                break;
+            }
             let lock_name = format!("{name}.build");
             match self.state_file(&lock_name, false) {
                 Ok(Some(lock)) => {
                     if matches!(try_lock(&lock, true), Ok(true))
                         && remove_tree(&self.packs, name, self.owner, self.device, 0).is_ok()
                     {
+                        removed += 1;
                         let _ = rustix::fs::unlinkat(
                             &self.state,
                             &lock_name,
@@ -816,8 +824,8 @@ impl PackCache {
                         .and_then(|metadata| metadata.modified().ok())
                         .and_then(|modified| modified.elapsed().ok())
                         .is_some_and(|age| age > STALE_UNLOCKED_INCOMING);
-                    if old {
-                        let _ = remove_tree(&self.packs, name, self.owner, self.device, 0);
+                    if old && remove_tree(&self.packs, name, self.owner, self.device, 0).is_ok() {
+                        removed += 1;
                     }
                 }
                 Err(_) => {}
@@ -2165,5 +2173,36 @@ mod tests {
         assert!(message.contains("retry the attach"), "unexpected error: {message}");
         // The failed attempt still shed one batch of residue.
         assert!(incoming_names(&fixture.cache).len() <= MAX_CACHE_ENTRIES + 40 - REAP_BATCH);
+    }
+
+    #[test]
+    fn the_reaper_sheds_residue_even_when_many_live_builders_come_first() {
+        let fixture = cache_fixture();
+        let (_source, seed) = tagged_source("seed");
+        drop(seed.snapshot_into(&fixture.cache).expect("creates the cache layout"));
+        let cache = PackCache::open(&fixture.cache).expect("cache");
+        // More live builders than one removal batch, all holding their builder locks.
+        let live = (0..REAP_BATCH + 8)
+            .map(|_| cache.begin_incoming().expect("live builder"))
+            .collect::<Vec<_>>();
+        let packs = fixture.cache.join(PACKS_DIR);
+        let state = packs.join(STATE_DIR);
+        let stale = 12;
+        for index in 0..stale {
+            let name = format!("{INCOMING_PREFIX}{}-{index:032x}", index + 1);
+            std::fs::create_dir(packs.join(&name)).expect("residue");
+            std::fs::set_permissions(packs.join(&name), std::fs::Permissions::from_mode(0o700))
+                .expect("mode");
+            let build = state.join(format!("{name}.build"));
+            std::fs::write(&build, b"").expect("unlocked builder file");
+            std::fs::set_permissions(&build, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        }
+        assert_eq!(incoming_names(&fixture.cache).len(), live.len() + stale);
+        cache.reap_stale();
+        let left = incoming_names(&fixture.cache);
+        assert_eq!(left.len(), live.len(), "every stale residue is shed, no live builder is");
+        for builder in &live {
+            assert!(left.contains(&builder.name));
+        }
     }
 }
