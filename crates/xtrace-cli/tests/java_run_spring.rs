@@ -83,6 +83,7 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
         .output()
         .expect("initialize project");
     assert!(init.status.success(), "init failed: {}", String::from_utf8_lossy(&init.stderr));
+    copy_fixture_sources(&repo);
     let project_id =
         serde_json::from_slice::<Value>(&init.stdout).expect("init JSON")["project_id"]
             .as_str()
@@ -282,7 +283,7 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     assert!(first_page_again.status.success());
     assert_eq!(first_page.stdout, first_page_again.stdout, "list output must be stable");
     let first_json: Value = serde_json::from_slice(&first_page.stdout).expect("list projection");
-    assert_eq!(first_json["schema_version"], 1);
+    assert_eq!(first_json["schema_version"], 2);
     let first_recording =
         first_json["recordings"][0]["recording_id"].as_str().expect("recording ID");
     let list_cursor = first_json["next_after"].as_str().expect("second page cursor");
@@ -710,9 +711,10 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     assert!(detail_page.status.success(), "recording show failed: {}", diagnostic(&detail_page));
     assert_eq!(detail_page.stdout, detail_page_again.stdout, "show output must be stable");
     let detail_json: Value = serde_json::from_slice(&detail_page.stdout).expect("show projection");
-    assert_eq!(detail_json["schema_version"], 1);
-    assert_eq!(detail_json["status"], "recording");
-    assert_eq!(detail_json["unavailable"]["completion"], "unavailable");
+    assert_eq!(detail_json["schema_version"], 2);
+    assert_eq!(detail_json["status"], "complete");
+    assert_eq!(detail_json["completion"], "complete");
+    assert_eq!(detail_json["unavailable"]["completion"], "available");
     assert_canaries_absent(&detail_page.stdout);
     let show_cursor = detail_json["next_cursor"].as_str().expect("next show cursor");
     let next_detail = recording_show_page(&repo, &data_home, first_recording, 1, Some(show_cursor));
@@ -823,6 +825,155 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
         .output()
         .expect("reacquire project lock after signal shutdown");
     assert_eq!(reacquired.status.code(), Some(0), "signal path left the project locked");
+}
+
+#[test]
+fn attach_keeps_existing_spring_target_alive_and_persists_real_request() {
+    let root = temp_root();
+    let repo = root.path().join("attach repository");
+    let data_home = root.path().join("attach data");
+    fs::create_dir_all(&repo).expect("repository");
+    let init = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["init", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("initialize attach project");
+    assert!(init.status.success(), "init failed: {}", String::from_utf8_lossy(&init.stderr));
+    copy_fixture_sources(&repo);
+    let project_id =
+        serde_json::from_slice::<Value>(&init.stdout).expect("init JSON")["project_id"]
+            .as_str()
+            .expect("project id")
+            .to_owned();
+    let project_root = data_home.join("projects").join(project_id);
+
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture =
+        workspace.join("adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar");
+    let pack = workspace.join("adapters/java/build/java-pack-dist");
+    assert!(fixture.is_file(), "Gradle fixtureBootJar must run before this test");
+    assert!(pack.join("pack.manifest").is_file(), "Gradle javaPackDist must run before this test");
+
+    let port = free_port();
+    let mut target_command = Command::new("java");
+    target_command
+        .arg("-jar")
+        .arg(&fixture)
+        .arg("--server.address=127.0.0.1")
+        .arg(format!("--server.port={port}"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut target_child = target_command.spawn().expect("start uninstrumented Spring target");
+    let target_stdout = target_child.stdout.take().expect("target stdout");
+    let target_stderr = target_child.stderr.take().expect("target stderr");
+    let mut target = RunProcess {
+        child: target_child,
+        stdout: Some(thread::spawn(move || drain(target_stdout))),
+        stderr: Some(thread::spawn(move || drain(target_stderr))),
+    };
+    wait_for_fixture(port);
+
+    let mut attach_command = Command::new(env!("CARGO_BIN_EXE_xtrace"));
+    attach_command
+        .args(["attach", "--project-dir"])
+        .arg(&repo)
+        .arg("--pid")
+        .arg(target.child.id().to_string())
+        .arg("--java-pack")
+        .arg(&pack)
+        .arg("--json")
+        .env("XTRACE_DATA_HOME", &data_home)
+        .env("JAVA_TOOL_OPTIONS", "-javaagent:/xtrace-env-canary/JAVA_TOOL_OPTIONS")
+        .env("JDK_JAVA_OPTIONS", "-javaagent:/xtrace-env-canary/JDK_JAVA_OPTIONS")
+        .env("_JAVA_OPTIONS", "-javaagent:/xtrace-env-canary/_JAVA_OPTIONS")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut attach_child = attach_command.spawn().expect("start xtrace attach");
+    let attach_stdout = attach_child.stdout.take().expect("attach stdout");
+    let attach_stderr = attach_child.stderr.take().expect("attach stderr");
+    let (ready_send, ready_receive) = std::sync::mpsc::sync_channel(1);
+    let stdout_thread = thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(attach_stdout);
+        let mut line = Vec::new();
+        let result = reader.read_until(b'\n', &mut line);
+        ready_send.send((result, line)).expect("send attach result line to test");
+        drain(reader)
+    });
+    let mut attach = RunProcess {
+        child: attach_child,
+        stdout: Some(stdout_thread),
+        stderr: Some(thread::spawn(move || drain(attach_stderr))),
+    };
+    let (read_result, ready_line) = ready_receive
+        .recv_timeout(Duration::from_secs(50))
+        .expect("attach result line within helper and daemon bounds");
+    read_result.expect("read attach result");
+    let ready: Value = serde_json::from_slice(&ready_line).expect("attach result JSON");
+    assert_eq!(ready["kind"], "java_attach_result");
+    assert_eq!(ready["pack_authenticity"], "unsigned_development_pack");
+    assert_eq!(ready["agent_load_status"], "agent_load_requested");
+    assert_eq!(ready["capture_status"], "unknown_pending_daemon_observation");
+    assert_eq!(ready["target_lifecycle"], "not_owned_by_xtrace");
+    assert_eq!(ready["lifecycle"], "foreground_until_interrupt");
+    assert!(attach.child.try_wait().expect("attach status").is_none());
+    assert!(target.child.try_wait().expect("target status").is_none());
+
+    let response = post_order(port);
+    assert!(
+        response.starts_with(b"HTTP/1.1 201"),
+        "fixture returned {}",
+        String::from_utf8_lossy(&response)
+    );
+    let logical = wait_for_segment(&project_root);
+    assert!(logical.windows(22).any(|bytes| bytes == b"OrderController.create"));
+    assert_canaries_absent(&logical);
+    wait_for_recording_count(&project_root, 1);
+
+    // The Rust pack cache (`java-packs`, with its `.state` sidecar) and the Java helper's own
+    // snapshot cache are siblings in the helper cache; the helper only lists its own directory,
+    // so neither can break the other. The attach above ran with both present.
+    let helper_cache = data_home.join(".xtrace-java-attach-cache");
+    let mut cache_entries = fs::read_dir(&helper_cache)
+        .expect("helper cache")
+        .map(|entry| entry.expect("cache entry").file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    cache_entries.sort();
+    assert!(cache_entries.contains(&"java-packs".to_string()), "{cache_entries:?}");
+    assert!(cache_entries.contains(&"xtrace-attach-snapshots".to_string()), "{cache_entries:?}");
+    assert!(helper_cache.join("java-packs/.state").is_dir());
+    assert!(
+        fs::read_dir(helper_cache.join("java-packs")).expect("java-packs").all(|entry| !entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .starts_with("target-"))
+    );
+
+    let attach_pid =
+        rustix::process::Pid::from_raw(attach.child.id() as i32).expect("attach process ID");
+    rustix::process::kill_process(attach_pid, rustix::process::Signal::TERM)
+        .expect("stop xtrace attach");
+    let attach_status = attach.child.wait().expect("wait for attach shutdown");
+    assert!(attach_status.success(), "attach shutdown failed: {attach_status}");
+    let stdout = attach.stdout.take().expect("stdout thread").join().expect("join stdout");
+    let stderr = attach.stderr.take().expect("stderr thread").join().expect("join stderr");
+    for surface in [&stdout, &stderr] {
+        for canary in
+            ["JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "/xtrace-env-canary/"]
+        {
+            assert!(
+                !surface.windows(canary.len()).any(|window| window == canary.as_bytes()),
+                "ambient JVM option leaked to CLI output"
+            );
+        }
+    }
+    assert!(target.child.try_wait().expect("target survives CLI shutdown").is_none());
+    assert_eq!(
+        fs::read_dir(project_root.join(".daemon/sessions")).expect("sessions directory").count(),
+        0
+    );
+    assert_eq!(fixture_count(port), 1, "xtrace attach shutdown stopped the selected JVM");
 }
 
 #[test]
@@ -1029,7 +1180,11 @@ fn daemon_lock_failure_does_not_launch_the_java_child() {
 
 fn temp_root() -> TempDir {
     let base = std::env::temp_dir().canonicalize().expect("temporary root");
-    tempfile::Builder::new().prefix("xtrace run ").tempdir_in(base).expect("temporary test root")
+    tempfile::Builder::new()
+        .prefix("xtrace run ")
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir_in(base)
+        .expect("temporary test root")
 }
 
 fn free_port() -> u16 {
@@ -1038,6 +1193,18 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("port address")
         .port()
+}
+
+fn copy_fixture_sources(repo: &Path) {
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture");
+    let destination = repo.join("adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture");
+    fs::create_dir_all(&destination)
+        .expect("create fixture source directory in disposable repository");
+    for name in ["OrderController.java", "OrderService.java", "OrderRepository.java"] {
+        fs::copy(source_root.join(name), destination.join(name))
+            .expect("copy allowlisted fixture source");
+    }
 }
 
 fn wait_for_fixture(port: u16) {
@@ -1062,6 +1229,26 @@ fn post_order(port: u16) -> Vec<u8> {
     let mut response = Vec::new();
     stream.read_to_end(&mut response).expect("read response");
     response
+}
+
+fn fixture_count(port: u16) -> u64 {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to live fixture");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("fixture count timeout");
+    write!(stream, "GET /__fixture/count HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .expect("write fixture count request");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read fixture count response");
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "fixture count failed: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let body_offset =
+        response.windows(4).position(|window| window == b"\r\n\r\n").expect("HTTP body separator")
+            + 4;
+    serde_json::from_slice::<Value>(&response[body_offset..]).expect("fixture count JSON")["count"]
+        .as_u64()
+        .expect("fixture count")
 }
 
 fn wait_for_segment(project_root: &Path) -> Vec<u8> {
@@ -1096,12 +1283,14 @@ fn wait_for_recording_count(project_root: &Path, expected: i64) {
     loop {
         let database = Connection::open(project_root.join("metadata.sqlite3")).expect("SQLite");
         let count: i64 = database
-            .query_row("SELECT COUNT(*) FROM recordings", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM recordings WHERE status = 'complete'", [], |row| {
+                row.get(0)
+            })
             .expect("recording count");
         if count >= expected {
             return;
         }
-        assert!(Instant::now() < deadline, "expected {expected} persisted recordings, got {count}");
+        assert!(Instant::now() < deadline, "expected {expected} completed recordings, got {count}");
         thread::sleep(Duration::from_millis(30));
     }
 }

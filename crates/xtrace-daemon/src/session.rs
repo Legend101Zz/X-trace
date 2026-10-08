@@ -69,6 +69,16 @@ use xtrace_domain::RecordingId;
 use xtrace_domain::ids::Id;
 use xtrace_domain::{ContentHash, ProjectId, RepositoryFingerprint, RuntimeSessionId};
 use xtrace_ingest::{Acceptance, IngestConfig, IngestError, IngestValidator};
+
+// The ingest digest budget and the application persistence bound are one
+// limit seen from two layers; keep them from drifting apart.
+const _: () = assert!(
+    xtrace_ingest::DEFAULT_MAX_EVENTS_PER_RECORDING == xtrace_application::MAX_RECORDED_EVENTS
+);
+// Likewise the drop-priority bucket bound: ingest and application agree.
+const _: () = assert!(
+    xtrace_ingest::MAX_DROP_PRIORITY_BUCKETS == xtrace_application::MAX_CAPACITY_DROP_PRIORITIES
+);
 use xtrace_protocol::envelope::check_protocol_version;
 use xtrace_protocol::generated::agent as wire;
 use xtrace_protocol::generated::agent::{Ack, AckDurability, AgentEnvelope, ProtocolError};
@@ -2071,8 +2081,10 @@ mod tests {
         assert_eq!(session.next_expected_seq, 2);
         assert_eq!(session.staged_incoming.len(), 1);
 
-        // Event capacity reached: a single-event budget refuses a
-        // contiguous new event without disturbing the digest table.
+        // Event capacity (owner-ordered F5 contract change): a single-event
+        // budget no longer refuses the next contiguous event. The session
+        // admits it, advances the watermark, and the validator counts the
+        // drop by the event's own priority without retaining its digest.
         let mut session = session_with_ingest(
             IngestConfig::new(NonZeroUsize::new(8).unwrap())
                 .with_limit(NonZeroUsize::new(1).unwrap()),
@@ -2085,16 +2097,32 @@ mod tests {
             2,
             PayloadOneof::EventBatch(batch_with(0x01, vec![event(2, 0xaa)])),
         );
-        let err = session
+        let over = wire::RecordingEvent { priority: 40, ..event(3, 0xab) };
+        let admission = session
             .accept_post_hello(&envelope_with_payload(
                 sid,
                 3,
-                PayloadOneof::EventBatch(batch_with(0x01, vec![event(3, 0xab)])),
+                PayloadOneof::EventBatch(batch_with(0x01, vec![over])),
             ))
-            .unwrap_err();
-        assert_eq!(err.code, ProtocolErrorCode::CaptureIngest);
-        assert!(matches!(err.ingest_error(), Some(IngestError::EventCapacityReached { .. })));
-        assert_eq!(session.next_expected_seq, 3);
+            .expect("event over the cap is admitted and counted");
+        assert!(matches!(
+            admission.acceptance,
+            Some(Acceptance::Events { accepted: 0, duplicates: 0, highest_contiguous: 3 })
+        ));
+        let recording_id = decode_recording_id(&rid_bytes(0x01)).unwrap();
+        let drops = session.ingest_validator().capacity_drops(recording_id).unwrap();
+        assert_eq!(drops.get(&40), Some(&1));
+        assert_eq!(session.next_expected_seq, 4);
+
+        // The finish carries the high-water mark, gap included.
+        let finish = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                4,
+                PayloadOneof::RecordingFinished(finished(0x01, 3)),
+            ))
+            .expect("finish accepts the capacity gap");
+        assert!(matches!(finish.acceptance, Some(Acceptance::Finalizing)));
 
         // Default `Session::new` sizes `max_active_recordings` to the
         // staging limit (every recording consumes at least one

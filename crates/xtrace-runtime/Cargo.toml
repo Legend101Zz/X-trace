@@ -12,12 +12,18 @@ description = "Application-owned runtime launch and supervision policy for X-tra
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
+blake3 = { workspace = true }
+ring = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process", "signal", "time"] }
 sha2 = { workspace = true }
+tracing = { workspace = true }
+xtrace-private-storage = { path = "../xtrace-private-storage" }
+xtrace-protocol = { path = "../xtrace-protocol" }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["event", "fs", "process"] }
 
 [dev-dependencies]
 tempfile = "3.10"

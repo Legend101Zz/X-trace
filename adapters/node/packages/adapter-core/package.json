@@ -4,8 +4,16 @@
   "private": true,
   "type": "module",
   "engines": { "node": ">=22" },
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "scripts": { "build": "tsc -p tsconfig.json" },
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./register.cjs": "./dist/register.cjs",
+    "./register.mjs": "./dist/register.mjs",
+    "./manifest": "./dist/node-http-manifest.json"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node ../../scripts/copy-runtime-assets.mjs",
+    "test": "npm run build && node --test dist/test/*.test.js"
+  },
   "dependencies": {
     "@xtrace/protocol": "0.1.0",
     "@bufbuild/protobuf": "2.16.0",

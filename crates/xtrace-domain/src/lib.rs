@@ -38,6 +38,7 @@
 )]
 
 pub mod catalog;
+pub mod catalog_discovery;
 pub mod endpoint_identity;
 pub mod error;
 pub mod hash;
@@ -58,11 +59,14 @@ pub use endpoint_identity::{
 pub use error::{AppError, ErrorCategory, ErrorCode, Remediation, RetryAdvice, SafeScalar, codes};
 pub use hash::{ContentHash, HashParseError};
 pub use ids::{
-    ClaimId, CorrelationId, FrameId, InteractionId, OperationId, OperationVersionId, PolicyId,
-    ProjectId, RecordingId, RunId, RuntimeSessionId, SourceArtifactId, SourceRevisionId,
+    CatalogRevisionId, ClaimId, CorrelationId, FrameId, InteractionId, OperationId,
+    OperationVersionId, PolicyId, ProjectId, RecordingId, RunId, RuntimeSessionId,
+    SourceArtifactId, SourceRevisionId,
 };
 pub use project::{FingerprintParseError, Project, RepositoryFingerprint};
-pub use provenance::{EvidenceRef, LimitationCode, ProducerIdentity, ProvenanceKind};
+pub use provenance::{
+    EvidenceRef, LimitationCode, ProducerIdentity, ProvenanceKind, SourceBinding, SourceRange,
+};
 pub use run::{Run, RunKind, RunState};
 pub use time::{MonotonicNs, WallTime};
 pub use value::{CapturedValue, DropReason, SafePreview, UnavailableReason, ValueShape};

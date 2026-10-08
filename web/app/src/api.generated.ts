@@ -102,7 +102,7 @@ export interface components {
         };
         RecordingList: {
             /** @constant */
-            schemaVersion: 1;
+            schemaVersion: 2;
             /** Format: uuid */
             projectId: string;
             limit: number;
@@ -120,6 +120,7 @@ export interface components {
             recordingId: string;
             /** @enum {string} */
             status: "recording" | "finalizing" | "complete" | "partial" | "invalid";
+            completion: components["schemas"]["Completion"];
             /** Format: date-time */
             openedAt: string;
             segmentCount: string;
@@ -162,6 +163,7 @@ export interface components {
             recordingId: string;
             /** @enum {string} */
             status: "recording" | "finalizing" | "complete" | "partial" | "invalid";
+            completion: components["schemas"]["Completion"];
             /** Format: date-time */
             openedAt: string;
             segmentCount: string;
@@ -178,13 +180,20 @@ export interface components {
         };
         RecordingDetail: {
             /** @constant */
-            schemaVersion: 1;
+            schemaVersion: 2;
             /** Format: uuid */
             projectId: string;
             /** Format: uuid */
             recordingId: string;
             /** @enum {string} */
             status: "recording" | "finalizing" | "complete" | "partial" | "invalid";
+            completion: components["schemas"]["Completion"];
+            /** @description Producer-declared privacy-safe summary; it is not independently correlated to a RESPONSE event and is not outcome proof. */
+            adapterSummary: null | components["schemas"]["AdapterSummary"];
+            durationNs: string | null;
+            dropCountsByPriority: {
+                [key: string]: string;
+            };
             limit: number;
             cursor: string | null;
             nextCursor: string | null;
@@ -197,6 +206,9 @@ export interface components {
         };
         Event: {
             sequence: string;
+            /** Format: uuid */
+            frameId: string | null;
+            navigation: components["schemas"]["FrameNavigation"];
             monotonicNs: string;
             eventId?: string | null;
             parentEventId?: string | null;
@@ -206,6 +218,22 @@ export interface components {
             interaction?: {
                 [key: string]: string | null;
             } | null;
+            /**
+             * @description Adapter-reported compile-time class-to-source binding result.
+             * @enum {string}
+             */
+            sourceBinding: "unspecified" | "verified" | "attestation_missing" | "class_bytes_mismatch" | "debug_metadata_absent" | "source_metadata_invalid";
+            source?: null | {
+                path: string;
+                /** @description Lower bound of the fixture method debug-line extent, not an active execution cursor. */
+                startLine: number;
+                /** @description Inclusive upper bound of the fixture method debug-line extent, when available. */
+                endLine: number | null;
+                /** @enum {string} */
+                status: "matched" | "mismatch" | "unavailable";
+                excerpt: string | null;
+                truncated: boolean;
+            };
             fieldTruncations: {
                 field: string;
                 originalBytes: string;
@@ -213,13 +241,49 @@ export interface components {
                 representation: "truncated" | "unavailable";
             }[];
         };
+        /** @enum {string} */
+        Completion: "complete" | "partial" | "invalid" | "unavailable";
+        FrameNavigation: {
+            previous: components["schemas"]["NavigationResult"];
+            next: components["schemas"]["NavigationResult"];
+            into: components["schemas"]["NavigationResult"];
+            over: components["schemas"]["NavigationResult"];
+            out: components["schemas"]["NavigationResult"];
+        };
+        NavigationResult: {
+            /** @constant */
+            state: "target";
+            /** Format: uuid */
+            frameId: string;
+        } | {
+            /** @enum {string} */
+            state: "boundary" | "unavailable";
+        };
+        /** @description No preview text or producer-supplied rule identifier is exposed until a verified policy registry exists. */
+        AdapterSummary: {
+            Redacted: {
+                /** @constant */
+                rule_id: "unverified-producer-redaction";
+                shape_hint: unknown;
+            };
+        } | {
+            Unavailable: {
+                /** @enum {string} */
+                reason: "capability_unsupported" | "debug_metadata_absent" | "capture_budget_exhausted" | "source_artifact_missing" | "recorder_disconnected" | "privacy_policy_unavailable";
+            };
+        } | {
+            Dropped: {
+                /** @enum {string} */
+                reason: "backpressure_shed" | "queue_full" | "sequence_gap" | "adapter_dropped";
+            };
+        };
         Unavailable: {
             /** @constant */
             source: "unavailable";
             /** @constant */
             values: "unavailable";
-            /** @constant */
-            completion: "unavailable";
+            /** @enum {string} */
+            completion: "available" | "unavailable" | "per_recording";
         };
         Problem: {
             type: string;

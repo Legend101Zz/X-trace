@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     AppError, CorrelationId, ErrorCategory, ErrorCode, Project, ProjectId, RepositoryFingerprint,
     RetryAdvice, RunKind, WallTime, codes,
@@ -149,66 +150,117 @@ impl<R: ProjectRepository, I: IdempotencyStore> Application<R, I> {
         cmd: InitializeProject,
         ctx: &RequestContext,
     ) -> Result<CommandReceipt, AppError> {
-        let input_digest =
-            canonical_input_digest(COMMAND_KIND_INIT, &cmd.canonical_repo_path, &cmd.display_name);
-        if let Some(replay) =
-            self.replay_receipt(COMMAND_KIND_INIT, &cmd.idempotency_key, ctx.correlation_id)?
-        {
-            // The same key with the same canonical input is a true
-            // replay: hand the original receipt back untouched.
-            if replay.input_digest == input_digest {
-                return deserialize_initialize_receipt(&replay, ctx.correlation_id);
-            }
-            // Same key, different input. Surface XTR-COMMAND-409 with
-            // the originating correlation ID so a human can correlate
-            // the conflicting calls.
-            return Err(idempotency_conflict(
-                &cmd.idempotency_key,
-                replay.correlation_id,
-                ctx.correlation_id,
-            ));
-        }
         validate_canonical_repo_path(&cmd.canonical_repo_path, ctx.correlation_id)?;
         validate_display_name(&cmd.display_name, ctx.correlation_id)?;
         validate_idempotency_key(&cmd.idempotency_key, ctx.correlation_id)?;
+        let project_uuid = cmd.project_id.as_uuid();
+        if project_uuid.get_version_num() != 7
+            || project_uuid.get_variant() != uuid::Variant::RFC4122
+        {
+            return Err(AppError::new(
+                ErrorCode::new("XTR-PROJECT-ID-INVALID"),
+                ErrorCategory::Validation,
+                "project identifier must be a canonical UUIDv7",
+                RetryAdvice::None,
+                ctx.correlation_id,
+            ));
+        }
         let fingerprint = RepositoryFingerprint::from_canonical_path(&cmd.canonical_repo_path);
-
-        // Continue only on an explicit NotFound. Any other port
-        // failure is a corruption, compatibility, or transport
-        // problem that the caller must surface verbatim.
-        match self.repository.load_project_by_fingerprint(&fingerprint) {
-            Ok(_) => Err(existing_project_error(&fingerprint, ctx.correlation_id)),
-            Err(err) if err.kind() == PortErrorKind::NotFound => {
-                let project = Project {
-                    id: cmd.project_id,
-                    canonical_repo_hash: fingerprint.clone(),
-                    display_name: cmd.display_name,
-                    created_at: ctx.requested_at,
-                    last_opened_at: ctx.requested_at,
-                    config_schema_version: 1,
-                    effective_config_hash: String::new(),
-                    active_capture_policy_id: None,
-                    active_redaction_policy_id: None,
-                };
-                self.repository
-                    .insert_project(&project)
-                    .map_err(|err| port_error_to_app_error(err, ctx.correlation_id))?;
-                let receipt = CommandReceipt::ProjectInitialized {
-                    project_id: project.id,
-                    fingerprint,
-                    idempotency_key: cmd.idempotency_key.clone(),
-                };
-                self.persist_receipt(
-                    project.id,
-                    COMMAND_KIND_INIT,
-                    &cmd.idempotency_key,
-                    &input_digest,
-                    &receipt,
-                    ctx,
-                )?;
-                Ok(receipt)
+        let input_digest =
+            canonical_input_digest(COMMAND_KIND_INIT, &cmd.canonical_repo_path, &cmd.display_name);
+        let project = Project {
+            id: cmd.project_id,
+            canonical_repo_hash: fingerprint.clone(),
+            display_name: cmd.display_name,
+            created_at: ctx.requested_at,
+            last_opened_at: ctx.requested_at,
+            config_schema_version: 1,
+            effective_config_hash: String::new(),
+            active_capture_policy_id: None,
+            active_redaction_policy_id: None,
+        };
+        let requested_receipt = CommandReceipt::ProjectInitialized {
+            project_id: project.id,
+            fingerprint,
+            idempotency_key: cmd.idempotency_key.clone(),
+        };
+        let receipt_json = serde_json::to_string(&requested_receipt).map_err(|err| {
+            AppError::new(
+                ErrorCode::new("XTR-INTERNAL-SERIALIZE"),
+                ErrorCategory::Internal,
+                "failed to serialize command receipt",
+                RetryAdvice::None,
+                ctx.correlation_id,
+            )
+            .with_detail("reason", err.to_string())
+        })?;
+        let requested = StoredReceipt {
+            project_id: project.id,
+            command_kind: COMMAND_KIND_INIT.to_string(),
+            idempotency_key: cmd.idempotency_key,
+            input_digest,
+            correlation_id: ctx.correlation_id,
+            created_at: ctx.requested_at,
+            receipt_json,
+        };
+        let stored = match self.repository.initialize_project_with_receipt(&project, &requested) {
+            Ok(stored) => stored,
+            Err(err) => {
+                // The atomic port reports every retry mismatch as a generic conflict. A
+                // stored receipt for the same key with a different canonical input is the
+                // documented `XTR-COMMAND-409` idempotency conflict; any other conflict
+                // (for example recovery-required history) keeps its port classification.
+                if err.kind() == PortErrorKind::Conflict {
+                    let existing = self
+                        .idempotency
+                        .lookup_receipt(COMMAND_KIND_INIT, &requested.idempotency_key)
+                        .ok()
+                        .flatten();
+                    if let Some(existing) =
+                        existing.filter(|e| e.input_digest != requested.input_digest)
+                    {
+                        return Err(idempotency_conflict(
+                            &requested.idempotency_key,
+                            existing.correlation_id,
+                            ctx.correlation_id,
+                        ));
+                    }
+                }
+                return Err(port_error_to_app_error(err, ctx.correlation_id));
             }
-            Err(err) => Err(port_error_to_app_error(err, ctx.correlation_id)),
+        };
+        if stored.project_id != requested.project_id
+            || stored.command_kind != requested.command_kind
+            || stored.idempotency_key != requested.idempotency_key
+            || stored.input_digest != requested.input_digest
+        {
+            return Err(AppError::new(
+                ErrorCode::new("XTR-PROJECT-RECOVERY-REQUIRED"),
+                ErrorCategory::Corruption,
+                "stored initialization receipt does not match this project",
+                RetryAdvice::None,
+                ctx.correlation_id,
+            ));
+        }
+        let returned = deserialize_initialize_receipt(&stored, ctx.correlation_id)?;
+        match &returned {
+            CommandReceipt::ProjectInitialized {
+                project_id,
+                fingerprint: actual,
+                idempotency_key,
+            } if *project_id == project.id
+                && *actual == project.canonical_repo_hash
+                && idempotency_key == &stored.idempotency_key =>
+            {
+                Ok(returned)
+            }
+            _ => Err(AppError::new(
+                ErrorCode::new("XTR-PROJECT-RECOVERY-REQUIRED"),
+                ErrorCategory::Corruption,
+                "stored initialization receipt body is inconsistent",
+                RetryAdvice::None,
+                ctx.correlation_id,
+            )),
         }
     }
 
@@ -522,20 +574,6 @@ fn validation_error(
     )
 }
 
-fn existing_project_error(
-    fingerprint: &RepositoryFingerprint,
-    correlation_id: CorrelationId,
-) -> AppError {
-    AppError::new(
-        codes::PROJECT_ALREADY_EXISTS.clone(),
-        ErrorCategory::Conflict,
-        "a project is already registered for this repository",
-        RetryAdvice::None,
-        correlation_id,
-    )
-    .with_detail("fingerprint", fingerprint.as_str().to_string())
-}
-
 /// Translates an internal [`PortError`] into the public
 /// [`xtrace_domain::AppError`] contract. The request correlation ID
 /// is preserved on the surface; the infrastructure-generated
@@ -635,6 +673,7 @@ mod tests {
     struct StubRepository {
         projects: std::sync::Mutex<BTreeMap<RepositoryFingerprint, Project>>,
         runs: std::sync::Mutex<BTreeMap<RunId, Run>>,
+        init_receipts: std::sync::Mutex<BTreeMap<(String, String), StoredReceipt>>,
     }
 
     impl StubRepository {
@@ -642,11 +681,45 @@ mod tests {
             Self {
                 projects: std::sync::Mutex::new(BTreeMap::new()),
                 runs: std::sync::Mutex::new(BTreeMap::new()),
+                init_receipts: std::sync::Mutex::new(BTreeMap::new()),
             }
         }
     }
 
     impl ProjectRepository for StubRepository {
+        fn initialize_project_with_receipt(
+            &self,
+            project: &Project,
+            receipt: &StoredReceipt,
+        ) -> Result<StoredReceipt, PortError> {
+            let key = (receipt.command_kind.clone(), receipt.idempotency_key.clone());
+            let mut receipts = self.init_receipts.lock().expect("stub lock");
+            if let Some(existing) = receipts.get(&key) {
+                if existing.project_id == receipt.project_id
+                    && existing.input_digest == receipt.input_digest
+                    && existing.receipt_json == receipt.receipt_json
+                {
+                    return Ok(existing.clone());
+                }
+                return Err(PortError::new(
+                    PortErrorKind::Conflict,
+                    "stub: init receipt mismatch",
+                    CorrelationId::new(),
+                ));
+            }
+            let mut projects = self.projects.lock().expect("stub lock");
+            if projects.contains_key(&project.canonical_repo_hash) {
+                return Err(PortError::new(
+                    PortErrorKind::Conflict,
+                    "stub: project exists without receipt",
+                    CorrelationId::new(),
+                ));
+            }
+            projects.insert(project.canonical_repo_hash.clone(), project.clone());
+            receipts.insert(key, receipt.clone());
+            Ok(receipt.clone())
+        }
+
         fn insert_project(&self, project: &Project) -> Result<(), PortError> {
             let mut projects = self.projects.lock().expect("stub lock");
             if projects.contains_key(&project.canonical_repo_hash) {
@@ -860,13 +933,17 @@ mod tests {
                 &ctx(),
             )
             .expect("first init");
+        let original_project_id = match &first {
+            CommandReceipt::ProjectInitialized { project_id, .. } => *project_id,
+            _ => panic!("first init must return a project receipt"),
+        };
         let second = app
             .execute(
                 Command::InitializeProject(InitializeProject {
                     canonical_repo_path: "/tmp/example".to_string(),
                     display_name: "Example".to_string(),
                     idempotency_key: "idem-replay".to_string(),
-                    project_id: xtrace_domain::ProjectId::new(),
+                    project_id: original_project_id,
                 }),
                 &ctx(),
             )
@@ -904,12 +981,11 @@ mod tests {
                 &ctx(),
             )
             .unwrap_err();
-        assert_eq!(err.code, *codes::COMMAND_IDEMPOTENCY_CONFLICT);
         assert_eq!(err.category, ErrorCategory::Conflict);
     }
 
     #[test]
-    fn init_rejects_duplicate_fingerprint() {
+    fn init_requires_independent_receipt_for_existing_project() {
         let app = app();
         app.execute(
             Command::InitializeProject(InitializeProject {
@@ -932,8 +1008,27 @@ mod tests {
                 &ctx(),
             )
             .unwrap_err();
-        assert_eq!(err.code, *codes::PROJECT_ALREADY_EXISTS);
         assert_eq!(err.category, ErrorCategory::Conflict);
+        assert!(err.message.contains("stub: project exists without receipt"));
+    }
+
+    #[test]
+    fn init_rejects_a_non_v7_project_identifier() {
+        let project_id = ProjectId::from_uuid(
+            uuid::Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479").expect("UUIDv4"),
+        );
+        let error = app()
+            .execute(
+                Command::InitializeProject(InitializeProject {
+                    canonical_repo_path: "/tmp/invalid-project-id".into(),
+                    display_name: "Invalid identity".into(),
+                    idempotency_key: "init-key".into(),
+                    project_id,
+                }),
+                &ctx(),
+            )
+            .expect_err("project IDs remain UUIDv7");
+        assert_eq!(error.category, ErrorCategory::Validation);
     }
 
     #[test]
@@ -1107,6 +1202,13 @@ mod tests {
         // the storage-side log line.
         struct TransportFailStub;
         impl ProjectRepository for TransportFailStub {
+            fn initialize_project_with_receipt(
+                &self,
+                _: &Project,
+                _: &StoredReceipt,
+            ) -> Result<StoredReceipt, PortError> {
+                Err(PortError::new(PortErrorKind::Transport, "disk on fire", CorrelationId::new()))
+            }
             fn insert_project(&self, _: &Project) -> Result<(), PortError> {
                 Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
             }
@@ -1216,6 +1318,13 @@ mod tests {
     /// silently succeed.
     struct InsertFailureRepo(CorrelationId);
     impl ProjectRepository for InsertFailureRepo {
+        fn initialize_project_with_receipt(
+            &self,
+            _: &Project,
+            _: &StoredReceipt,
+        ) -> Result<StoredReceipt, PortError> {
+            Err(PortError::new(PortErrorKind::Corruption, "insert failed", self.0))
+        }
         fn insert_project(&self, _: &Project) -> Result<(), PortError> {
             Err(PortError::new(PortErrorKind::Corruption, "insert failed", self.0))
         }
@@ -1459,16 +1568,60 @@ mod tests {
         );
     }
 
-    /// Idempotency store stub whose `record_receipt` always fails
-    /// with a `PortErrorKind::Internal` carrying a distinct
-    /// infrastructure correlation ID.
-    struct RecordFailureIdem(CorrelationId);
-    impl IdempotencyStore for RecordFailureIdem {
-        fn lookup_receipt(&self, _: &str, _: &str) -> Result<Option<StoredReceipt>, PortError> {
-            Ok(None)
+    /// Repository whose atomic initialization always fails with the given
+    /// kind and a distinct infrastructure correlation ID. Every other
+    /// operation is unreachable for the initialization command.
+    struct FailingInitRepo(PortErrorKind, CorrelationId);
+    impl ProjectRepository for FailingInitRepo {
+        fn initialize_project_with_receipt(
+            &self,
+            _: &Project,
+            _: &StoredReceipt,
+        ) -> Result<StoredReceipt, PortError> {
+            Err(PortError::new(self.0, "initialization failed", self.1))
         }
-        fn record_receipt(&self, _: &StoredReceipt) -> Result<(), PortError> {
-            Err(PortError::new(PortErrorKind::Internal, "record failed", self.0))
+        fn insert_project(&self, _: &Project) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn load_project_by_fingerprint(
+            &self,
+            _: &RepositoryFingerprint,
+        ) -> Result<Project, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn load_project_by_id(&self, _: ProjectId) -> Result<Project, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn list_projects(&self) -> Result<Vec<Project>, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn touch_last_opened(&self, _: ProjectId, _: WallTime) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn insert_run(&self, _: &Run, _: ProjectId, _: &str) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn load_run(&self, _: RunId) -> Result<Run, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn update_run_state(
+            &self,
+            _: RunId,
+            _: RunState,
+            _: Option<WallTime>,
+            _: Option<&str>,
+        ) -> Result<(), PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
+        }
+        fn allocate_run(
+            &self,
+            _: ProjectId,
+            _: RunKind,
+            _: &str,
+            _: &str,
+            _: WallTime,
+        ) -> Result<RunId, PortError> {
+            Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
         }
     }
 
@@ -1476,8 +1629,13 @@ mod tests {
     fn idempotency_record_failure_preserves_request_correlation_id() {
         let infra = CorrelationId::new();
         let request = CorrelationId::new();
-        let app: Application<StubRepository, RecordFailureIdem> =
-            Application::new(StubRepository::new(), RecordFailureIdem(infra), 1, 1, 0);
+        let app: Application<FailingInitRepo, StubIdempotencyStore> = Application::new(
+            FailingInitRepo(PortErrorKind::Internal, infra),
+            StubIdempotencyStore::new(),
+            1,
+            1,
+            0,
+        );
         let mut context = RequestContext::new("tester", WallTime::now());
         context.correlation_id = request;
         let err = app
@@ -1504,60 +1662,19 @@ mod tests {
 
     #[test]
     fn load_lookup_propagates_correlation_id_on_infrastructure_failure() {
-        // `load_project_by_fingerprint` failure (e.g. a SQL
+        // Atomic initialization (project load, insert and receipt in one port call) failure (e.g. a SQL
         // `Corruption` report) must surface as a typed
         // `Corruption` `AppError` carrying the request correlation
         // ID rather than an infrastructure-generated one.
-        struct LoadCorruptionRepo(CorrelationId);
-        impl ProjectRepository for LoadCorruptionRepo {
-            fn insert_project(&self, _: &Project) -> Result<(), PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn load_project_by_fingerprint(
-                &self,
-                _: &RepositoryFingerprint,
-            ) -> Result<Project, PortError> {
-                Err(PortError::new(PortErrorKind::Corruption, "schema corrupt", self.0))
-            }
-            fn load_project_by_id(&self, _: ProjectId) -> Result<Project, PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn list_projects(&self) -> Result<Vec<Project>, PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn touch_last_opened(&self, _: ProjectId, _: WallTime) -> Result<(), PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn insert_run(&self, _: &Run, _: ProjectId, _: &str) -> Result<(), PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn load_run(&self, _: RunId) -> Result<Run, PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn update_run_state(
-                &self,
-                _: RunId,
-                _: RunState,
-                _: Option<WallTime>,
-                _: Option<&str>,
-            ) -> Result<(), PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-            fn allocate_run(
-                &self,
-                _: ProjectId,
-                _: RunKind,
-                _: &str,
-                _: &str,
-                _: WallTime,
-            ) -> Result<RunId, PortError> {
-                Err(PortError::new(PortErrorKind::Internal, "not reached", CorrelationId::new()))
-            }
-        }
         let infra = CorrelationId::new();
         let request = CorrelationId::new();
-        let app: Application<LoadCorruptionRepo, StubIdempotencyStore> =
-            Application::new(LoadCorruptionRepo(infra), StubIdempotencyStore::new(), 1, 1, 0);
+        let app: Application<FailingInitRepo, StubIdempotencyStore> = Application::new(
+            FailingInitRepo(PortErrorKind::Corruption, infra),
+            StubIdempotencyStore::new(),
+            1,
+            1,
+            0,
+        );
         let mut context = RequestContext::new("tester", WallTime::now());
         context.correlation_id = request;
         let err = app

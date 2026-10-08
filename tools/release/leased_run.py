@@ -139,6 +139,7 @@ def acquire_leases(
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     poll_seconds: float | None = None,
+    wall_clock: Callable[[], float] = time.time,
 ) -> list[run_gates.Lease]:
     """Acquire every lease or none, polling while a live owner holds one.
 
@@ -162,6 +163,8 @@ def acquire_leases(
             if existing:
                 retained = any(_lease_requires_recovery(lease) for lease in existing)
             else:
+                # One run-start epoch for every owner record, taken before the first acquisition.
+                run_gates.stamp_run_start(leases, wall_clock)
                 for lease in leases:
                     lease.acquire()
                     if lease.borrowed or not lease.acquired:

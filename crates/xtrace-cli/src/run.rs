@@ -43,6 +43,118 @@ pub(crate) async fn run(
     }
 }
 
+/// Launches a validated direct Node process under the project daemon.
+pub(crate) async fn run_node(
+    project_dir: PathBuf,
+    adapter_dist: PathBuf,
+    mode: String,
+    command: Vec<OsString>,
+) -> Result<i32, CliError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (project_dir, adapter_dist, mode, command);
+        Err(CliError::DaemonUnsupportedPlatform)
+    }
+    #[cfg(unix)]
+    {
+        let mode = xtrace_runtime::node::NodeMode::parse(&mode).map_err(CliError::NodeRun)?;
+        run_node_unix(project_dir, adapter_dist, mode, command).await
+    }
+}
+
+#[cfg(unix)]
+async fn run_node_unix(
+    project_dir: PathBuf,
+    adapter_dist: PathBuf,
+    mode: xtrace_runtime::node::NodeMode,
+    command: Vec<OsString>,
+) -> Result<i32, CliError> {
+    use tokio::sync::oneshot;
+    use xtrace_runtime::node::{NodeLaunch, NodeSignals};
+
+    // Runtime, lock, and daemon side effects wait until both Node and its
+    // explicit adapter distribution have passed preflight.
+    let launch = NodeLaunch::validate(&adapter_dist, mode, &command).map_err(CliError::NodeRun)?;
+    let mut signals = NodeSignals::install().map_err(CliError::NodeRun)?;
+    let prepared = crate::daemon::prepare(project_dir, &crate::paths::read_env_path).await?;
+    let crate::daemon::PreparedDaemon { bound, bootstrap_path, mut runtime_dir, lock } = prepared;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let mut daemon_task = tokio::spawn(async move {
+        bound
+            .serve(async move {
+                if shutdown_rx.await.is_err() {
+                    // A dropped sender also ends this one-shot daemon lifetime.
+                }
+            })
+            .await
+    });
+
+    let spawn_result = launch.spawn(&bootstrap_path);
+    let (mut child, mut launch_error) = match spawn_result {
+        Ok(child) => (Some(child), None),
+        Err(error) => (None, Some(error)),
+    };
+    let child_started = child.is_some();
+    let mut capture_notice_written = false;
+    let mut daemon_outcome = None;
+    let mut child_status = None;
+    if let Some(node_child) = child.as_mut() {
+        let (status, observed_daemon) =
+            observe_child_and_daemon(node_child.wait(&mut signals), &mut daemon_task, || {
+                write_capture_incomplete();
+                capture_notice_written = true;
+            })
+            .await;
+        match status {
+            Ok(status) => child_status = Some(status),
+            Err(error) => launch_error = Some(error),
+        }
+        daemon_outcome = observed_daemon;
+    }
+
+    let mut capture_incomplete = child_started && launch_error.is_some();
+    if child_status.is_some_and(|status| {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal().is_some()
+    }) {
+        capture_incomplete = true;
+    }
+    if shutdown_tx.send(()).is_err() {
+        capture_incomplete = true;
+    }
+    if let Some(outcome) = daemon_outcome {
+        if !matches!(outcome, Ok(Ok(()))) {
+            capture_incomplete = true;
+        }
+        let bootstrap_remains = bootstrap_path.exists();
+        let cleanup_failed = runtime_dir.cleanup().is_err();
+        if bootstrap_remains || cleanup_failed {
+            capture_incomplete = true;
+        }
+        drop(runtime_dir);
+        drop(lock);
+    } else {
+        let finalization =
+            finalize_daemon(daemon_task, runtime_dir, lock, DAEMON_DRAIN_BUDGET).await;
+        if finalization.cleanup_failed || finalization.deferred {
+            capture_incomplete = true;
+        }
+        if finalization.outcome.is_some_and(|outcome| !matches!(outcome, Ok(Ok(())))) {
+            capture_incomplete = true;
+        }
+    }
+    drop(child);
+    if capture_incomplete && child_started && !capture_notice_written {
+        write_capture_incomplete();
+    }
+    if let Some(error) = launch_error {
+        return Err(CliError::NodeRun(error));
+    }
+    child_status
+        .map(child_exit_code)
+        .ok_or(CliError::NodeRun(xtrace_runtime::node::LaunchError::Process))
+}
+
 #[cfg(unix)]
 async fn run_unix(
     project_dir: PathBuf,
@@ -242,6 +354,21 @@ fn write_capture_incomplete() {
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "exit mapping uses fixed test values")]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn private_tempdir() -> tempfile::TempDir {
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
+            .expect("admitted private test scratch");
+        tempfile::Builder::new()
+            .prefix("xtrace-run-test-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir_in(scratch)
+            .expect("private run test directory")
+    }
 
     #[test]
     fn signaled_java_status_maps_to_shell_conventional_exit_code() {
@@ -289,10 +416,12 @@ mod tests {
         use std::time::{Duration, Instant};
         use xtrace_domain::RuntimeSessionId;
 
-        let root = tempfile::tempdir().expect("project data root");
-        let lock = crate::daemon_lock::acquire_project_lock(root.path()).expect("project lock");
+        let root = private_tempdir();
+        let admitted = xtrace_private_storage::AdmittedPrivateRoot::open(root.path())
+            .expect("admitted project root");
+        let lock = crate::daemon_lock::acquire_project_lock(&admitted).expect("project lock");
         let runtime_dir =
-            crate::daemon_lock::RuntimeDirectory::create(root.path(), RuntimeSessionId::new())
+            crate::daemon_lock::RuntimeDirectory::create(&admitted, RuntimeSessionId::new())
                 .expect("runtime directory");
         let session_path = runtime_dir.path().to_path_buf();
         let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
@@ -308,12 +437,12 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(session_path.exists(), "runtime artifact was removed before drain completed");
         assert!(matches!(
-            crate::daemon_lock::acquire_project_lock(root.path()),
+            crate::daemon_lock::acquire_project_lock(&admitted),
             Err(CliError::DaemonAlreadyRunning)
         ));
 
         assert!(matches!(
-            crate::daemon_lock::acquire_project_lock(root.path()),
+            crate::daemon_lock::acquire_project_lock(&admitted),
             Err(CliError::DaemonAlreadyRunning)
         ));
     }

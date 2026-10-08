@@ -861,6 +861,10 @@ fn log_recording_pipeline_error(error: &RecordingPipelineError) {
             code = %ProtocolErrorCode::Transport,
             "validated recording identifier could not be translated",
         ),
+        RecordingPipelineError::InvalidFinishEvidence => warn!(
+            code = %ProtocolErrorCode::Transport,
+            "recording finish evidence failed bounded protocol validation",
+        ),
     }
 }
 

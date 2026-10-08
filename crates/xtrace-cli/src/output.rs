@@ -148,6 +148,19 @@ impl ErrorDocument {
                 details: BTreeMapString(std::collections::BTreeMap::new()),
                 exit_code: error.exit_code(),
             },
+            CliError::PrivateStorageUnavailable => Self {
+                kind: "error",
+                code: "XTR-PRIVATE-STORAGE-UNAVAILABLE".to_string(),
+                category: "permission".to_string(),
+                message: "private storage could not be admitted on this filesystem".to_string(),
+                remediation: vec![RemediationDocument {
+                    kind: "next_step".to_string(),
+                    label: "Choose an owner-enforced local data directory and retry".to_string(),
+                    command_ref: None,
+                }],
+                details: BTreeMapString(std::collections::BTreeMap::new()),
+                exit_code: error.exit_code(),
+            },
             CliError::DaemonAlreadyRunning => Self {
                 kind: "error",
                 code: "XTR-CLI-DAEMON-LOCKED".to_string(),
@@ -189,6 +202,35 @@ impl ErrorDocument {
                     xtrace_runtime::java::LaunchErrorKind::Validation => "validation",
                     xtrace_runtime::java::LaunchErrorKind::Unsupported => "compatibility",
                     xtrace_runtime::java::LaunchErrorKind::Process => "process",
+                }
+                .to_string(),
+                message: run_error.to_string(),
+                remediation: Vec::new(),
+                details: BTreeMapString(std::collections::BTreeMap::new()),
+                exit_code: error.exit_code(),
+            },
+            #[cfg(unix)]
+            CliError::Attach { code, category, message, remediation, .. } => Self {
+                kind: "error",
+                code: (*code).to_string(),
+                category: (*category).to_string(),
+                message: message.clone(),
+                remediation: vec![RemediationDocument {
+                    kind: "next_step".to_string(),
+                    label: remediation.clone(),
+                    command_ref: None,
+                }],
+                details: BTreeMapString(std::collections::BTreeMap::new()),
+                exit_code: error.exit_code(),
+            },
+            #[cfg(unix)]
+            CliError::NodeRun(run_error) => Self {
+                kind: "error",
+                code: run_error.code().to_string(),
+                category: match run_error.kind() {
+                    xtrace_runtime::node::LaunchErrorKind::Validation => "validation",
+                    xtrace_runtime::node::LaunchErrorKind::Unsupported => "compatibility",
+                    xtrace_runtime::node::LaunchErrorKind::Process => "process",
                 }
                 .to_string(),
                 message: run_error.to_string(),
@@ -299,5 +341,17 @@ mod tests {
         assert_eq!(document.code, "XTR-RUN-INVALID-LAUNCH");
         assert_eq!(document.category, "validation");
         assert_eq!(document.exit_code, 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn node_runtime_errors_have_node_specific_sanitized_codes() {
+        let error = CliError::NodeRun(xtrace_runtime::node::LaunchError::Validation("invalid"));
+        let document = ErrorDocument::from_error(&error);
+        assert_eq!(document.code, "XTR-NODE-INVALID-LAUNCH");
+        assert_eq!(document.category, "validation");
+        assert_eq!(document.message, "invalid");
+        assert_eq!(document.exit_code, 2);
+        assert!(document.details.0.is_empty());
     }
 }

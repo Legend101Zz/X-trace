@@ -95,6 +95,7 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     fs::create_dir_all(&repo).expect("create repository");
     let initialized = run_cli(&["init", "--project-dir"], &repo, &data_home);
     assert!(initialized.status.success(), "init failed: {}", text(&initialized.stderr));
+    copy_fixture_sources(&repo);
 
     let mut daemon = ManagedChild(
         Command::new(env!("CARGO_BIN_EXE_xtrace"))
@@ -166,6 +167,10 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let (recording_id, object) = &recordings[0];
     let logical = zstd::stream::decode_all(object.as_slice()).expect("decompress stored XTF");
     let events = decode_events(&logical);
+    if events.len() != 10 {
+        let (_, stderr) = valid.stop();
+        panic!("unexpected event count {}: {}", events.len(), text(&stderr.sample));
+    }
     assert_real_event_order(&events);
     assert_canaries_absent("decoded XTF", &logical);
 
@@ -212,9 +217,49 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
         }));
         assert_eq!(detail["unavailable"]["source"], "unavailable");
         assert_eq!(detail["unavailable"]["values"], "unavailable");
-        assert_eq!(detail["unavailable"]["completion"], "unavailable");
+        assert_eq!(detail["completion"], "complete");
+        assert_eq!(detail["unavailable"]["completion"], "available");
+        if *recording_id == ids[1] {
+            for (index, file) in
+                ["OrderController.java", "OrderService.java", "OrderRepository.java"]
+                    .iter()
+                    .enumerate()
+            {
+                let event = &events[index + 1];
+                assert_eq!(event["source_binding"], "verified");
+                assert_eq!(event["source"]["status"], "matched");
+                assert_eq!(
+                    event["source"]["path"],
+                    format!("adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/{file}")
+                );
+                assert!(event["source"]["startLine"].as_u64().unwrap_or_default() > 0);
+                assert!(
+                    event["source"]["excerpt"].as_str().is_some_and(|excerpt| !excerpt.is_empty())
+                );
+            }
+        }
         assert_canaries_absent("recording query output", &shown.stdout);
     }
+    let source_path = repo
+        .join("adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java");
+    let original_source = fs::read(&source_path).expect("read copied source file");
+    fs::write(
+        &source_path,
+        [original_source.as_slice(), b"\n// source mismatch canary\n"].concat(),
+    )
+    .expect("mutate copied source for mismatch proof");
+    let mismatch = run_recording_show_cli(&repo, &data_home, &ids[1]);
+    assert!(mismatch.status.success(), "mismatched source remains queryable");
+    let mismatch_json: Value = serde_json::from_slice(&mismatch.stdout).expect("mismatch JSON");
+    let service_event = mismatch_json["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["symbol"] == "OrderService.place")
+        .expect("service frame");
+    assert_eq!(service_event["source"]["status"], "mismatch");
+    assert!(service_event["source"]["excerpt"].is_null());
+    assert!(!String::from_utf8_lossy(&mismatch.stdout).contains("source mismatch canary"));
     let mut unknown_id = ids[0].clone().into_bytes();
     unknown_id[0] = if unknown_id[0] == b'0' { b'1' } else { b'0' };
     let unknown_id = String::from_utf8(unknown_id).expect("recording ID is ASCII");
@@ -259,6 +304,74 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
         text(&valid_stderr.sample)
     );
 
+    let mut mismatch_daemon = start_quiet_daemon(&repo, &data_home);
+    let mismatch_bootstrap = mismatch_daemon.1.clone();
+    let manifest_mismatched_fixture = tamper_fixture_class_attestation(root.path(), &fixture);
+    let mismatch_port = free_port();
+    let mismatched =
+        launch_fixture(&agent, &manifest_mismatched_fixture, &mismatch_bootstrap, mismatch_port);
+    wait_for_fixture(mismatch_port);
+    assert_eq!(post_order(mismatch_port).status, 201);
+    let (mismatch_stdout, mismatch_stderr) = mismatched.stop();
+    assert_scanned_clean("class mismatch fixture stdout", &mismatch_stdout);
+    assert_scanned_clean("class mismatch fixture stderr", &mismatch_stderr);
+    let mismatch_recordings = wait_for_recordings(&project_root, 3);
+    let loaded_mismatch_logical = zstd::stream::decode_all(mismatch_recordings[2].1.as_slice())
+        .expect("decompress loaded-class mismatch XTF");
+    let loaded_mismatch_events = decode_events(&loaded_mismatch_logical);
+    let loaded_mismatch_frame = loaded_mismatch_events
+        .iter()
+        .find(|event| event.symbol == "OrderController.create")
+        .expect("real loaded controller frame");
+    assert_eq!(loaded_mismatch_frame.source_binding, 3);
+    assert!(loaded_mismatch_frame.source.is_none());
+    assert_canaries_absent("loaded-class mismatch XTF", &loaded_mismatch_logical);
+    signal_and_wait(&mut mismatch_daemon.0, "-INT");
+
+    let mut mutated_class_daemon = start_quiet_daemon(&repo, &data_home);
+    let mutated_class_bootstrap = mutated_class_daemon.1.clone();
+    let mutated_class_fixture = mutate_fixture_classfile(root.path(), &fixture);
+    let mutated_class_port = free_port();
+    let mutated_class = launch_fixture(
+        &agent,
+        &mutated_class_fixture,
+        &mutated_class_bootstrap,
+        mutated_class_port,
+    );
+    wait_for_fixture(mutated_class_port);
+    assert_eq!(post_order(mutated_class_port).status, 201, "mutated class remains loadable");
+    let (mutated_class_stdout, mutated_class_stderr) = mutated_class.stop();
+    assert_scanned_clean("mutated class fixture stdout", &mutated_class_stdout);
+    assert_scanned_clean("mutated class fixture stderr", &mutated_class_stderr);
+    let class_mutation_recordings = wait_for_recordings(&project_root, 4);
+    let class_mutation_recording_id = &class_mutation_recordings[3].0;
+    let class_mutation_logical =
+        zstd::stream::decode_all(class_mutation_recordings[3].1.as_slice())
+            .expect("decompress actual classfile mutation XTF");
+    let class_mutation_events = decode_events(&class_mutation_logical);
+    let class_mutation_frame = class_mutation_events
+        .iter()
+        .find(|event| event.symbol == "OrderController.create")
+        .expect("real controller frame from mutated classfile");
+    assert_eq!(class_mutation_frame.source_binding, 3);
+    assert!(class_mutation_frame.source.is_none());
+    assert_canaries_absent("actual classfile mutation XTF", &class_mutation_logical);
+    let class_mutation_show =
+        run_recording_show_cli(&repo, &data_home, class_mutation_recording_id);
+    assert!(class_mutation_show.status.success(), "class mutation remains queryable");
+    let class_mutation_detail: Value =
+        serde_json::from_slice(&class_mutation_show.stdout).expect("class mismatch CLI JSON");
+    let class_mutation_event = class_mutation_detail["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["symbol"] == "OrderController.create")
+        .expect("controller frame in CLI query");
+    assert_eq!(class_mutation_event["source_binding"], "class_bytes_mismatch");
+    assert!(class_mutation_event["source"].is_null());
+    assert_canaries_absent("actual classfile mutation CLI", &class_mutation_show.stdout);
+    signal_and_wait(&mut mutated_class_daemon.0, "-INT");
+
     let unavailable_port = free_port();
     let unavailable = launch_fixture(&agent, &fixture, &unavailable_bootstrap, unavailable_port);
     wait_for_fixture(unavailable_port);
@@ -302,6 +415,119 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let daemon_output = daemon_stdout_reader.join().expect("join daemon stdout");
     assert_scanned_clean("daemon stdout", &daemon_output);
     readiness_reader.join().expect("join daemon readiness reader");
+}
+
+fn copy_fixture_sources(repo: &Path) {
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture");
+    let destination = repo.join("adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture");
+    fs::create_dir_all(&destination)
+        .expect("create fixture source directory in disposable repository");
+    for name in ["OrderController.java", "OrderService.java", "OrderRepository.java"] {
+        fs::copy(source_root.join(name), destination.join(name))
+            .expect("copy allowlisted fixture source");
+    }
+}
+
+fn start_quiet_daemon(repo: &Path, data_home: &Path) -> (ManagedChild, PathBuf) {
+    let mut child = ManagedChild(
+        Command::new(env!("CARGO_BIN_EXE_xtrace"))
+            .args(["daemon", "--project-dir"])
+            .arg(repo)
+            .env("XTRACE_DATA_HOME", data_home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn source mismatch daemon"),
+    );
+    let stdout = child.stdout.take().expect("mismatch daemon stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut readiness = String::new();
+    reader.read_line(&mut readiness).expect("read mismatch daemon readiness");
+    let ready: Value = serde_json::from_str(&readiness).expect("mismatch daemon readiness JSON");
+    let bootstrap =
+        PathBuf::from(ready["bootstrap_path"].as_str().expect("mismatch bootstrap path"));
+    (child, bootstrap)
+}
+
+fn tamper_fixture_class_attestation(root: &Path, fixture: &Path) -> PathBuf {
+    let working = root.join("manifest-attestation-mismatch");
+    fs::create_dir_all(&working).expect("create class mismatch workspace");
+    let jar = working.join("mismatched-fixture.jar");
+    fs::copy(fixture, &jar).expect("copy fixture jar");
+    let staging = working.join("staging");
+    fs::create_dir_all(&staging).expect("create manifest staging directory");
+    let mut extract_command = Command::new("jar");
+    extract_command.args(["xf"]).arg(&jar).arg("META-INF/xtrace/source-attestation.tsv");
+    let extract =
+        bounded_output_in(extract_command, &staging, "extract fixture source attestation");
+    assert!(extract.status.success(), "manifest extraction failed: {}", text(&extract.stderr));
+    let manifest = staging.join("META-INF/xtrace/source-attestation.tsv");
+    let contents = fs::read_to_string(&manifest).expect("read fixture source attestation");
+    let mut rows = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+    let first = rows.first_mut().expect("source attestation row");
+    let mut fields = first.split('\t').map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(fields.len(), 7);
+    let replacement = if fields[4].starts_with('0') { "1" } else { "0" };
+    fields[4].replace_range(0..1, replacement);
+    *first = fields.join("\t");
+    fs::write(&manifest, format!("{}\n", rows.join("\n"))).expect("write altered attestation");
+    let mut update_command = Command::new("jar");
+    update_command.args(["uf"]).arg(&jar).arg("META-INF/xtrace/source-attestation.tsv");
+    let update = bounded_output_in(update_command, &staging, "update fixture source attestation");
+    assert!(update.status.success(), "manifest update failed: {}", text(&update.stderr));
+    jar
+}
+
+fn mutate_fixture_classfile(root: &Path, fixture: &Path) -> PathBuf {
+    const ENTRY: &str = "BOOT-INF/classes/dev/xtrace/fixture/OrderController.class";
+    const ORIGINAL_SOURCE_NAME: &[u8] = b"OrderController.java";
+    const MUTATED_SOURCE_NAME: &[u8] = b"OrderControllor.java";
+
+    assert_eq!(ORIGINAL_SOURCE_NAME.len(), MUTATED_SOURCE_NAME.len());
+    let working = root.join("actual-classfile-mismatch");
+    fs::create_dir_all(&working).expect("create actual classfile mutation workspace");
+    let jar = working.join("mutated-fixture.jar");
+    fs::copy(fixture, &jar).expect("copy fixture jar");
+    let manifest_entry = "META-INF/xtrace/source-attestation.tsv";
+    let original_manifest = extract_jar_entry(&jar, manifest_entry, &working.join("original"));
+    let staging = working.join("staging");
+    let class_path = extract_jar_entry(&jar, ENTRY, &staging);
+    let mut class_bytes = fs::read(&class_path).expect("read controller classfile");
+    let matches = class_bytes
+        .windows(ORIGINAL_SOURCE_NAME.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == ORIGINAL_SOURCE_NAME).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "classfile has one SourceFile name constant");
+    let offset = matches[0];
+    class_bytes[offset..offset + MUTATED_SOURCE_NAME.len()].copy_from_slice(MUTATED_SOURCE_NAME);
+    fs::write(&class_path, class_bytes).expect("write valid classfile with changed debug name");
+    let mut update_command = Command::new("jar");
+    update_command.args(["uf"]).arg(&jar).arg(ENTRY);
+    let update = bounded_output_in(update_command, &staging, "update mutated controller classfile");
+    assert!(update.status.success(), "classfile update failed: {}", text(&update.stderr));
+    let mutated_manifest = extract_jar_entry(&jar, manifest_entry, &working.join("verify"));
+    assert_eq!(
+        fs::read(mutated_manifest).expect("read unchanged class attestation"),
+        fs::read(original_manifest).expect("read original class attestation"),
+        "classfile mutation must preserve the original manifest byte-for-byte"
+    );
+    jar
+}
+
+fn extract_jar_entry(jar: &Path, entry: &str, destination: &Path) -> PathBuf {
+    fs::create_dir_all(destination).expect("create jar extraction directory");
+    let mut command = Command::new("jar");
+    command.args(["xf"]).arg(jar).arg(entry);
+    let extract = bounded_output_in(command, destination, "extract fixture jar entry");
+    assert!(extract.status.success(), "jar entry extraction failed: {}", text(&extract.stderr));
+    destination.join(entry)
+}
+
+fn bounded_output_in(mut command: Command, directory: &Path, label: &str) -> std::process::Output {
+    command.current_dir(directory);
+    bounded_output(command, label)
 }
 
 fn database_state(database: &Path) -> Vec<(PathBuf, Option<Vec<u8>>, Option<SystemTime>)> {
@@ -361,6 +587,7 @@ fn temp_root() -> TempDir {
     let base = std::env::temp_dir().canonicalize().expect("canonical temporary root");
     tempfile::Builder::new()
         .prefix("xtrace java premain ")
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
         .tempdir_in(base)
         .expect("temporary test root")
 }
@@ -532,7 +759,9 @@ fn wait_for_recordings(project_root: &Path, expected_count: usize) -> Vec<(Strin
         let mut statement = connection
             .prepare(
                 "SELECT hex(rs.recording_id), rs.object_hash \
-                 FROM recording_segments rs WHERE rs.segment_ordinal = 0 ORDER BY rs.rowid",
+                 FROM recording_segments rs \
+                 JOIN recordings r ON r.recording_id = rs.recording_id \
+                 WHERE rs.segment_ordinal = 0 AND r.status = 'complete' ORDER BY rs.rowid",
             )
             .expect("prepare recording query");
         let rows = statement
@@ -592,7 +821,12 @@ fn assert_real_event_order(events: &[RecordingEvent]) {
         (RecordingEventKind::FrameExit, "OrderController.create"),
         (RecordingEventKind::Response, "http.response 201"),
     ];
-    assert_eq!(events.len(), expected.len());
+    assert_eq!(
+        events.len(),
+        expected.len(),
+        "event list: {:?}",
+        events.iter().map(|event| (event.kind, event.symbol.as_str())).collect::<Vec<_>>()
+    );
     for (index, (event, (kind, symbol))) in events.iter().zip(expected).enumerate() {
         assert_eq!(event.recording_seq, index as u64 + 2);
         assert_eq!(event.kind, kind as i32);

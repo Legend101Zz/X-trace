@@ -8,6 +8,7 @@ const operationA = '018f0000-0000-7000-8000-000000000001';
 const recordingA = '018f0000-0000-7000-8000-000000000011';
 const recordingB = '018f0000-0000-7000-8000-000000000012';
 const legacyV4 = '018f0000-0000-4000-8000-000000000013';
+const navigationUnavailable = { previous: { state: 'unavailable' }, next: { state: 'unavailable' }, into: { state: 'unavailable' }, over: { state: 'unavailable' }, out: { state: 'unavailable' } };
 
 const endpoints = {
   items: [
@@ -16,13 +17,13 @@ const endpoints = {
 };
 const linked = {
   items: [
-    { recordingId: recordingA, status: 'complete', openedAt: '2026-10-03T10:00:00Z', segmentCount: '1', eventCount: '1', firstSequence: '1', lastSequence: '1', incompleteEvidence: [], operationId: operationA, observationPolicy: 'spring-orders-v1', unmatchedReason: null },
+    { recordingId: recordingA, status: 'complete', completion: 'complete', openedAt: '2026-10-03T10:00:00Z', segmentCount: '1', eventCount: '1', firstSequence: '1', lastSequence: '1', incompleteEvidence: [], operationId: operationA, observationPolicy: 'spring-orders-v1', unmatchedReason: null },
   ], nextCursor: null,
 };
 const unmatched = {
   items: [
-    { recordingId: recordingB, status: 'partial', openedAt: '2026-10-03T10:01:00Z', segmentCount: '1', eventCount: '1', firstSequence: '1', lastSequence: '1', incompleteEvidence: [], operationId: null, observationPolicy: 'spring-orders-v1', unmatchedReason: 'route_unapproved' },
-    { recordingId: legacyV4, status: 'complete', openedAt: '2025-01-01T00:00:00Z', segmentCount: '1', eventCount: '1', firstSequence: '1', lastSequence: '1', incompleteEvidence: [], operationId: null, observationPolicy: null, unmatchedReason: null },
+    { recordingId: recordingB, status: 'partial', completion: 'partial', openedAt: '2026-10-03T10:01:00Z', segmentCount: '1', eventCount: '1', firstSequence: '1', lastSequence: '1', incompleteEvidence: [], operationId: null, observationPolicy: 'spring-orders-v1', unmatchedReason: 'route_unapproved' },
+    { recordingId: legacyV4, status: 'complete', completion: 'unavailable', openedAt: '2025-01-01T00:00:00Z', segmentCount: '1', eventCount: '1', firstSequence: '1', lastSequence: '1', incompleteEvidence: [], operationId: null, observationPolicy: null, unmatchedReason: null },
   ], nextCursor: null,
 };
 
@@ -32,9 +33,9 @@ function response(body: unknown, status = 200) {
 
 function detail(recordingId: string, symbol = 'fixture.Service.call') {
   return {
-    recordingId, status: 'complete', segmentCount: '1', incompleteEvidence: [], nextCursor: null,
+    recordingId, status: 'complete', completion: 'complete', adapterSummary: null, durationNs: '20', dropCountsByPriority: {}, segmentCount: '1', incompleteEvidence: [], nextCursor: null,
     unavailable: { source: 'unavailable', values: 'unavailable', completion: 'unavailable' },
-    events: [{ sequence: '1', monotonicNs: '10', kind: 'method', symbol, fieldTruncations: [] }],
+    events: [{ sequence: '1', frameId: null, navigation: navigationUnavailable, monotonicNs: '10', kind: 'method', symbol, sourceBinding: 'unspecified', fieldTruncations: [] }],
   };
 }
 
@@ -230,15 +231,15 @@ describe('endpoint-first recording viewer', () => {
 
   it('keeps event stepping, truncation, unavailable evidence, and recording-scoped cursors', async () => {
     const firstEvents = [
-      { sequence: '1', monotonicNs: '10', kind: 'request', symbol: 'fixture.Controller.handle', fieldTruncations: [] },
-      { sequence: '2', monotonicNs: '20', kind: 'recording_event_kind:gap', symbol: null, fieldTruncations: [{ field: 'symbol', originalBytes: '300', representation: 'truncated' }] },
+      { sequence: '1', frameId: null, navigation: navigationUnavailable, monotonicNs: '10', kind: 'request', symbol: 'fixture.Controller.handle', sourceBinding: 'unspecified', fieldTruncations: [] },
+      { sequence: '2', frameId: null, navigation: navigationUnavailable, monotonicNs: '20', kind: 'recording_event_kind:gap', symbol: null, sourceBinding: 'unspecified', fieldTruncations: [{ field: 'symbol', originalBytes: '300', representation: 'truncated' }] },
     ];
     vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
       const path = route(input);
       if (path === '/api/v1/auth/exchange') return Promise.resolve(response({ authenticated: true }));
       if (path.startsWith('/api/v1/endpoints?')) return Promise.resolve(response(endpoints));
       if (path.includes(`/endpoints/${operationA}/recordings`)) return Promise.resolve(response({ ...linked, items: [linked.items[0], { ...linked.items[0], recordingId: recordingB }] }));
-      if (path.startsWith(`/api/v1/recordings/${recordingA}?limit=200&cursor=`)) return Promise.resolve(response({ ...detail(recordingA), nextCursor: null, events: [{ sequence: '3', monotonicNs: '30', kind: 'method', symbol: 'fixture.Service.call', fieldTruncations: [] }] }));
+      if (path.startsWith(`/api/v1/recordings/${recordingA}?limit=200&cursor=`)) return Promise.resolve(response({ ...detail(recordingA), nextCursor: null, events: [{ sequence: '3', frameId: null, navigation: navigationUnavailable, monotonicNs: '30', kind: 'method', symbol: 'fixture.Service.call', sourceBinding: 'unspecified', fieldTruncations: [] }] }));
       if (path.startsWith(`/api/v1/recordings/${recordingA}?limit=200`)) return Promise.resolve(response({ ...detail(recordingA), nextCursor: 'recording-a-next', events: firstEvents }));
       if (path.startsWith(`/api/v1/recordings/${recordingB}?limit=200`)) return Promise.resolve(response(detail(recordingB, 'recording-b-only')));
       throw new Error(`Unexpected request ${path}`);
@@ -252,8 +253,8 @@ describe('endpoint-first recording viewer', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Event 2 selected');
     fireEvent.click(screen.getByRole('button', { name: /recording_event_kind:gap/ }));
     expect(screen.getByText('symbol truncated · 300 bytes')).toBeInTheDocument();
-    expect(screen.getByText('Source unavailable for this capture')).toBeInTheDocument();
-    expect(screen.getByText('Values were not projected')).toBeInTheDocument();
+    expect(screen.getByText('Source location is unavailable for this event')).toBeInTheDocument();
+    expect(screen.getByText(/Values were not projected/)).toBeInTheDocument();
     expect(screen.getByText('Duration unavailable for this capture')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('tab', { name: 'events' }));
     fireEvent.click(screen.getByRole('button', { name: 'Load next window' }));
@@ -264,6 +265,27 @@ describe('endpoint-first recording viewer', () => {
     expect(await screen.findByText('recording-b-only')).toBeInTheDocument();
     expect(screen.queryByText('fixture.Service.call')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Load next window' })).not.toBeInTheDocument();
+  });
+
+  it('shows only matched bounded source returned for a compile-attested frame', async () => {
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const path = route(input);
+      if (path === '/api/v1/auth/exchange') return Promise.resolve(response({ authenticated: true }));
+      if (path.startsWith('/api/v1/endpoints?')) return Promise.resolve(response(endpoints));
+      if (path.includes(`/endpoints/${operationA}/recordings`)) return Promise.resolve(response(linked));
+      if (path.startsWith(`/api/v1/recordings/${recordingA}?limit=200`)) return Promise.resolve(response({
+        ...detail(recordingA),
+        events: [{ sequence: '1', frameId: null, navigation: navigationUnavailable, monotonicNs: '10', kind: 'frame_enter', symbol: 'OrderService.place', sourceBinding: 'verified', source: { path: 'adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java', startLine: 12, endLine: 16, status: 'matched', excerpt: 'public void place() {\n  repository.save();\n}', truncated: false }, fieldTruncations: [] }],
+      }));
+      throw new Error(`Unexpected request ${path}`);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /POST \/orders Component: spring-fixture Binding: default observed/ }));
+    fireEvent.click(await screen.findByRole('button', { name: new RegExp(recordingA) }));
+    fireEvent.click(await screen.findByRole('button', { name: /OrderService\.place/ }));
+    expect(await screen.findByText(/Adapter reported a compile-time source binding; current source matches the recorded identity/)).toBeInTheDocument();
+    expect(screen.getByText(/public void place\(\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/active line/i)).not.toBeInTheDocument();
   });
 
   it('bounds accumulated pages without losing continuation cursors', () => {

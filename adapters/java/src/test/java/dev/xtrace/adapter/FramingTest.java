@@ -58,6 +58,33 @@ final class FramingTest {
   }
 
   @Test
+  void readTimeoutIsReportedDistinctlyFromEof() {
+    InputStream timingOut =
+        new InputStream() {
+          @Override
+          public int read() throws java.io.IOException {
+            throw new java.net.SocketTimeoutException("Read timed out");
+          }
+
+          @Override
+          public int read(byte[] buffer, int offset, int length) throws java.io.IOException {
+            throw new java.net.SocketTimeoutException("Read timed out");
+          }
+        };
+    ClientException timeout =
+        assertThrows(ClientException.class, () -> Framing.read(timingOut, 1024));
+    assertEquals("XTR-JAVA-FRAME", timeout.code());
+    assertEquals("incoming frame length read timed out", timeout.getMessage());
+    assertEquals(java.net.SocketTimeoutException.class, timeout.getCause().getClass());
+    ClientException eof =
+        assertThrows(
+            ClientException.class, () -> Framing.read(new ByteArrayInputStream(new byte[0]), 1024));
+    assertEquals("XTR-JAVA-FRAME", eof.code());
+    assertEquals("incoming frame length was truncated", eof.getMessage());
+    assertEquals(java.io.EOFException.class, eof.getCause().getClass());
+  }
+
+  @Test
   void certificatePinRejectsWrongDigest() throws Exception {
     String actual =
         java.util.HexFormat.of()

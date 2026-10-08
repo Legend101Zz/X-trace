@@ -62,7 +62,7 @@
 //!
 //! [`RecordingEvent`]: xtrace_protocol::generated::agent::RecordingEvent
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 
 use blake3::Hasher;
@@ -124,8 +124,9 @@ pub struct IngestConfig {
     /// Maximum number of recordings the validator will track
     /// concurrently (`Recording` plus `Finalizing`).
     pub max_active_recordings: NonZeroUsize,
-    /// Maximum number of `RecordingEvent` entries retained per
-    /// recording. The structural start marker is not counted.
+    /// Maximum number of `RecordingEvent` digests retained per
+    /// recording. Further new events are dropped and counted by priority
+    /// instead of failing the capture.
     pub max_events_per_recording: NonZeroUsize,
 }
 
@@ -226,7 +227,18 @@ struct RecordingState {
     /// the lifetime of the validator so exact replays remain
     /// idempotent; this crate does not evict them.
     event_digests: HashMap<u64, [u8; 32]>,
+    /// Lowest `recording_seq` dropped at the event capacity, if any. Every
+    /// sequence from here up to `highest_contiguous` was counted but its
+    /// digest was not retained, so a replay of it is a duplicate.
+    first_dropped_seq: Option<u64>,
+    /// Events dropped at the event capacity, counted under their own
+    /// priority. At most [`MAX_DROP_PRIORITY_BUCKETS`] distinct priorities.
+    capacity_dropped_by_priority: BTreeMap<u32, u64>,
 }
+
+/// Upper bound on distinct priorities tracked for capacity drops of one
+/// recording, so drop accounting is as bounded as the digest table.
+pub const MAX_DROP_PRIORITY_BUCKETS: usize = 64;
 
 /// Decodes the wire `recording_id` bytes into a domain [`RecordingId`].
 ///
@@ -325,6 +337,14 @@ impl IngestValidator {
         self.recordings.get(&id).map(|state| state.highest_contiguous)
     }
 
+    /// Returns the events dropped at the per-recording event capacity,
+    /// counted under their own priority, or `None` when the recording is
+    /// unknown. Empty when nothing was dropped.
+    #[must_use]
+    pub fn capacity_drops(&self, id: RecordingId) -> Option<&BTreeMap<u32, u64>> {
+        self.recordings.get(&id).map(|state| &state.capacity_dropped_by_priority)
+    }
+
     /// Accepts a [`RecordingStarted`] payload.
     ///
     /// The `recording_id` must be exactly 16 bytes; `recording_seq`
@@ -379,6 +399,8 @@ impl IngestValidator {
                 finished: None,
                 highest_contiguous: 1,
                 event_digests: HashMap::new(),
+                first_dropped_seq: None,
+                capacity_dropped_by_priority: BTreeMap::new(),
             },
         );
         Ok(Acceptance::Started)
@@ -425,7 +447,8 @@ impl IngestValidator {
     /// [`IngestError::ReplayPayloadMismatch`],
     /// [`IngestError::RetransmissionNeeded`],
     /// [`IngestError::EventAfterFinalization`], or
-    /// [`IngestError::EventCapacityReached`].
+    /// [`IngestError::EventCapacityReached`] (only when the capacity-drop
+    /// ledger itself would exceed its bounded priority buckets).
     pub fn accept_events(&mut self, batch: &EventBatch) -> Result<Acceptance, IngestError> {
         let id = recording_id_from_bytes(&batch.recording_id)?;
 
@@ -458,6 +481,8 @@ impl IngestValidator {
         let mut duplicates: usize = 0;
         let mut candidate_highest: u64 = state.highest_contiguous;
         let mut pending: Vec<(u64, [u8; 32])> = Vec::with_capacity(batch.events.len());
+        let mut drops = state.capacity_dropped_by_priority.clone();
+        let mut first_dropped = state.first_dropped_seq;
 
         for event in &batch.events {
             let seq = event.recording_seq;
@@ -466,6 +491,11 @@ impl IngestValidator {
             if seq <= candidate_highest {
                 match state.event_digests.get(&seq) {
                     Some(stored) if *stored == digest => {
+                        duplicates += 1;
+                    }
+                    // A sequence dropped at capacity kept no digest; its
+                    // replay is a duplicate of something already counted.
+                    None if state.first_dropped_seq.is_some_and(|first| seq >= first) => {
                         duplicates += 1;
                     }
                     _ => {
@@ -490,14 +520,25 @@ impl IngestValidator {
                         recording_seq: seq,
                     });
                 }
-                // Capacity check happens before mutation so a full
-                // batch is rejected atomically rather than
-                // partially retained.
+                // Past the retained-digest budget the event is dropped:
+                // counted under its own priority, advancing the
+                // watermark, but never retained. Only a drop ledger that
+                // itself would outgrow its bound is refused; that check
+                // happens before mutation so the batch is atomic.
                 if event_digest_count.saturating_add(new_count).saturating_add(1) > max_events {
-                    return Err(IngestError::EventCapacityReached {
-                        recording_id: id,
-                        limit: self.config.max_events_per_recording,
-                    });
+                    if !drops.contains_key(&event.priority)
+                        && drops.len() >= MAX_DROP_PRIORITY_BUCKETS
+                    {
+                        return Err(IngestError::EventCapacityReached {
+                            recording_id: id,
+                            limit: self.config.max_events_per_recording,
+                        });
+                    }
+                    let bucket = drops.entry(event.priority).or_insert(0);
+                    *bucket = bucket.saturating_add(1);
+                    first_dropped.get_or_insert(seq);
+                    candidate_highest = seq;
+                    continue;
                 }
                 pending.push((seq, digest));
                 new_count += 1;
@@ -538,6 +579,8 @@ impl IngestValidator {
             state.event_digests.insert(seq, digest);
         }
         state.highest_contiguous = candidate_highest;
+        state.capacity_dropped_by_priority = drops;
+        state.first_dropped_seq = first_dropped;
 
         Ok(Acceptance::Events {
             accepted: new_count,
@@ -609,7 +652,14 @@ impl IngestValidator {
     ) {
         self.recordings.insert(
             id,
-            RecordingState { started, finished: None, highest_contiguous, event_digests },
+            RecordingState {
+                started,
+                finished: None,
+                highest_contiguous,
+                event_digests,
+                first_dropped_seq: None,
+                capacity_dropped_by_priority: BTreeMap::new(),
+            },
         );
     }
 }
@@ -1018,8 +1068,12 @@ mod tests {
         ));
     }
 
+    fn event_with_priority(seq: u64, body: u8, priority: u32) -> RecordingEvent {
+        RecordingEvent { priority, ..event(seq, body) }
+    }
+
     #[test]
-    fn active_and_event_capacity_rejections_leave_state_untouched() {
+    fn active_capacity_rejection_leaves_state_untouched() {
         let mut validator = tight_validator(1, 1);
         let a = rid();
         let b = rid();
@@ -1036,19 +1090,97 @@ mod tests {
         assert!(matches!(err, IngestError::ActiveCapacityReached { .. }));
         assert_eq!(validator.len(), 1);
         assert_eq!(validator.highest_contiguous_seq(a), Some(2));
+    }
 
-        // Event capacity reached; the new contiguous event is
-        // rejected without disturbing the digest table.
-        let err = validator.accept_events(&batch(a, vec![event(3, 0xab)])).unwrap_err();
-        assert!(matches!(err, IngestError::EventCapacityReached { .. }));
-        assert_eq!(validator.highest_contiguous_seq(a), Some(2));
+    #[test]
+    fn events_past_the_cap_are_dropped_counted_by_priority_and_never_retained() {
+        // Intended contract change (owner-ordered F5): the event cap used to
+        // reject the batch with EventCapacityReached; it now drops and counts.
+        let mut validator = tight_validator(1, 2);
+        let id = rid();
+        validator.accept_started(&started(id, "GET")).unwrap();
+        // Two retained, then 4 dropped in the same batch (priorities 7, 7, 3, 0).
+        let accepted = validator
+            .accept_events(&batch(
+                id,
+                vec![
+                    event_with_priority(2, 0xa0, 1),
+                    event_with_priority(3, 0xa1, 1),
+                    event_with_priority(4, 0xa2, 7),
+                    event_with_priority(5, 0xa3, 7),
+                    event_with_priority(6, 0xa4, 3),
+                    event_with_priority(7, 0xa5, 0),
+                ],
+            ))
+            .unwrap();
+        assert_eq!(
+            accepted,
+            Acceptance::Events { accepted: 2, duplicates: 0, highest_contiguous: 7 }
+        );
+        let expected: std::collections::BTreeMap<u32, u64> =
+            [(7, 2), (3, 1), (0, 1)].into_iter().collect();
+        assert_eq!(validator.capacity_drops(id), Some(&expected));
+        // Never retains more than the limit.
+        assert_eq!(validator.recordings.get(&id).unwrap().event_digests.len(), 2);
 
-        // A mixed batch whose suffix would overflow capacity is
-        // rejected atomically without partial retention.
+        // Replays at or below the high-water mark stay duplicates, retained or
+        // dropped, and a changed retained payload is still a mismatch.
+        let replay = validator
+            .accept_events(&batch(
+                id,
+                vec![
+                    event_with_priority(3, 0xa1, 1),
+                    event_with_priority(4, 0xa2, 7),
+                    event_with_priority(7, 0xa5, 0),
+                ],
+            ))
+            .unwrap();
+        assert_eq!(
+            replay,
+            Acceptance::Events { accepted: 0, duplicates: 3, highest_contiguous: 7 }
+        );
+        assert_eq!(validator.capacity_drops(id), Some(&expected));
         let err =
-            validator.accept_events(&batch(a, vec![event(2, 0xaa), event(3, 0xab)])).unwrap_err();
+            validator.accept_events(&batch(id, vec![event_with_priority(3, 0xff, 1)])).unwrap_err();
+        assert!(matches!(err, IngestError::ReplayPayloadMismatch { .. }));
+
+        // A forward gap past the cap is still a gap, and nothing is counted.
+        let err =
+            validator.accept_events(&batch(id, vec![event_with_priority(9, 0xa9, 3)])).unwrap_err();
+        assert!(matches!(err, IngestError::RetransmissionNeeded { expected: 8, received: 9, .. }));
+        assert_eq!(validator.capacity_drops(id), Some(&expected));
+
+        // The next contiguous event keeps being dropped and counted.
+        validator.accept_events(&batch(id, vec![event_with_priority(8, 0xa8, 3)])).unwrap();
+        assert_eq!(validator.capacity_drops(id).unwrap().get(&3), Some(&2));
+
+        // Finish accepts the gap at the high-water mark; a stale mark mismatches.
+        let err = validator.accept_finished(&finished(id, 3)).unwrap_err();
+        assert!(matches!(err, IngestError::FinishSeqMismatch { expected: 8, got: 3, .. }));
+        assert_eq!(validator.accept_finished(&finished(id, 8)).unwrap(), Acceptance::Finalizing);
+        let err =
+            validator.accept_events(&batch(id, vec![event_with_priority(9, 0xa9, 3)])).unwrap_err();
+        assert!(matches!(err, IngestError::EventAfterFinalization { .. }));
+    }
+
+    #[test]
+    fn drop_accounting_is_bounded_by_distinct_priorities() {
+        let mut validator = tight_validator(1, 1);
+        let id = rid();
+        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_events(&batch(id, vec![event(2, 0)])).unwrap();
+        let many = (0..64_u32)
+            .map(|priority| event_with_priority(3 + u64::from(priority), 1, priority))
+            .collect::<Vec<_>>();
+        validator.accept_events(&batch(id, many)).unwrap();
+        assert_eq!(validator.capacity_drops(id).unwrap().len(), 64);
+        // A 65th distinct priority is the only remaining capacity refusal and
+        // is atomic.
+        let err =
+            validator.accept_events(&batch(id, vec![event_with_priority(67, 2, 99)])).unwrap_err();
         assert!(matches!(err, IngestError::EventCapacityReached { .. }));
-        assert_eq!(validator.highest_contiguous_seq(a), Some(2));
+        assert_eq!(validator.highest_contiguous_seq(id), Some(66));
+        assert_eq!(validator.capacity_drops(id).unwrap().len(), 64);
     }
 
     #[test]

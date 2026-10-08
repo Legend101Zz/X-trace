@@ -83,6 +83,24 @@ message RecordingEvent {
     Interaction interaction = 11;
     // Optional exception payload.
     ExceptionPayload exception = 12;
+    // Records the adapter's source-attestation outcome for the loaded class bytes.
+    SourceBinding source_binding = 13;
+}
+
+// Adapter-reported source-attestation outcome. Only VERIFIED events may carry a source range.
+enum SourceBinding {
+    // No source binding facts were recorded for the event.
+    SOURCE_BINDING_UNSPECIFIED = 0;
+    // The adapter reported its build attestation matched the class bytes it observed.
+    SOURCE_BINDING_VERIFIED = 1;
+    // No usable build source attestation was present.
+    SOURCE_BINDING_ATTESTATION_MISSING = 2;
+    // Observed classfileBuffer bytes differed from the build attestation.
+    SOURCE_BINDING_CLASS_BYTES_MISMATCH = 3;
+    // The attested method had no compiled debug line extent.
+    SOURCE_BINDING_DEBUG_METADATA_ABSENT = 4;
+    // The bounded build source attestation was malformed or inconsistent.
+    SOURCE_BINDING_SOURCE_METADATA_INVALID = 5;
 }
 
 // Event kind discriminator.

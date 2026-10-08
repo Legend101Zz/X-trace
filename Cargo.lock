@@ -1582,6 +1582,7 @@ dependencies = [
  "xtrace-application",
  "xtrace-daemon",
  "xtrace-domain",
+ "xtrace-private-storage",
  "xtrace-protocol",
  "xtrace-runtime",
  "xtrace-store",
@@ -1621,6 +1622,7 @@ dependencies = [
  "xtrace-application",
  "xtrace-domain",
  "xtrace-ingest",
+ "xtrace-private-storage",
  "xtrace-protocol",
  "xtrace-store",
  "zeroize",
@@ -1654,6 +1656,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "xtrace-private-storage"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "xtrace-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1673,11 +1685,17 @@ dependencies = [
 name = "xtrace-runtime"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "blake3",
+ "ring",
  "rustix",
  "sha2",
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
+ "xtrace-private-storage",
+ "xtrace-protocol",
 ]
 
 [[package]]
@@ -1688,6 +1706,7 @@ dependencies = [
  "hex",
  "prost",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -1697,6 +1716,7 @@ dependencies = [
  "uuid",
  "xtrace-application",
  "xtrace-domain",
+ "xtrace-private-storage",
  "xtrace-protocol",
  "zstd",
 ]

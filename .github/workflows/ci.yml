@@ -185,6 +185,8 @@ jobs:
         java-version: [17, 21]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -217,6 +219,17 @@ jobs:
       - name: Verify Java protocol, agent, and fixture workspace
         working-directory: adapters/java
         run: ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
+      - name: Admit private test scratch before cargo tests
+        # Product storage refuses a data directory under a world-writable ancestor such as /tmp, so
+        # Rust tests that run `init` need a TMPDIR below the runner's private temp directory. This is
+        # the same shape the release floor uses (TMPDIR and XTRACE_TEST_PRIVATE_SCRATCH inside an
+        # admitted 0700 root). It is placed after the Node/Gradle steps so only cargo steps see it.
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP:?}/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv"
+          echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
+          echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: Java client to daemon and selected-root XTF acceptance
         run: cargo test -p xtrace-cli --test java_synthetic_adapter -- --nocapture
       - name: Direct JDK runtime validation
@@ -238,6 +251,8 @@ jobs:
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -260,6 +275,17 @@ jobs:
         run: npm run generate:check --prefix adapters/node
       - name: Typecheck and Node unit tests
         run: npm test --prefix adapters/node
+      - name: Admit private test scratch before cargo tests
+        # Product storage refuses a data directory under a world-writable ancestor such as /tmp, so
+        # Rust tests that run `init` need a TMPDIR below the runner's private temp directory. This is
+        # the same shape the release floor uses (TMPDIR and XTRACE_TEST_PRIVATE_SCRATCH inside an
+        # admitted 0700 root). It is placed after the Node/Gradle steps so only cargo steps see it.
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP:?}/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv"
+          echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
+          echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: Node client to daemon and selected-root XTF acceptance
         run: cargo test -p xtrace-cli --test node_synthetic_adapter -- --nocapture
 
@@ -270,6 +296,8 @@ jobs:
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -319,6 +347,17 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+      - name: Admit private test scratch before cargo tests
+        # Product storage refuses a data directory under a world-writable ancestor such as /tmp, so
+        # Rust tests that run `init` need a TMPDIR below the runner's private temp directory. This is
+        # the same shape the release floor uses (TMPDIR and XTRACE_TEST_PRIVATE_SCRATCH inside an
+        # admitted 0700 root). It is placed after the Node/Gradle steps so only cargo steps see it.
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP:?}/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv"
+          echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
+          echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: Format gate (stable rustfmt, no nightly-only keys)
         run: cargo fmt --all --check
       - name: Strict clippy
@@ -333,25 +372,25 @@ jobs:
           PATH="/usr/bin:/bin:/usr/local/bin:$HOME/.cargo/bin" \
             cargo build -p xtrace-protocol --all-features
       - name: CLI integration smoke
-        env:
-          XTRACE_DATA_HOME: /tmp/xtrace-cli-smoke/userdata
         run: |
           set -euo pipefail
-          rm -rf /tmp/xtrace-cli-smoke
-          mkdir -p /tmp/xtrace-cli-smoke/repo
+          SMOKE="${RUNNER_TEMP:?}/xt/smoke"
+          export XTRACE_DATA_HOME="$SMOKE/userdata"
+          rm -rf $SMOKE
+          mkdir -p $SMOKE/repo
           cargo build -p xtrace-cli --bin xtrace
           # Uninitialized status: must not create the user-data
           # directory or the repository pointer. Capture both stdout
           # and exit code; `set -e` is suspended only around this
           # command so a future bug that exits non-zero still fails
           # the gate.
-          status_output=$(cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir /tmp/xtrace-cli-smoke/repo)
+          status_output=$(cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir $SMOKE/repo)
           echo "$status_output"
-          if [ -d /tmp/xtrace-cli-smoke/userdata/projects ]; then
+          if [ -d $SMOKE/userdata/projects ]; then
             echo "FAIL: status on uninit created user-data directory"
             exit 1
           fi
-          if [ -e /tmp/xtrace-cli-smoke/repo/.xtrace ]; then
+          if [ -e $SMOKE/repo/.xtrace ]; then
             echo "FAIL: status on uninit created repository pointer"
             exit 1
           fi
@@ -360,10 +399,10 @@ jobs:
             exit 1
           fi
           # init twice with the same canonical input must replay.
-          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-cli-smoke/repo --display-name "Smoke"
-          first_project=$(ls /tmp/xtrace-cli-smoke/userdata/projects | head -n1)
-          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-cli-smoke/repo --display-name "Smoke"
-          after_replay=$(ls /tmp/xtrace-cli-smoke/userdata/projects | wc -l)
+          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Smoke"
+          first_project=$(ls $SMOKE/userdata/projects | head -n1)
+          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Smoke"
+          after_replay=$(ls $SMOKE/userdata/projects | wc -l)
           if [ "$after_replay" -ne 1 ]; then
             echo "FAIL: replay created extra project directory"
             exit 1
@@ -374,7 +413,7 @@ jobs:
           # then enforces the contract explicitly rather than relying
           # on `|| true`.
           set +e
-          conflict_output=$(cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir /tmp/xtrace-cli-smoke/repo --display-name "Different" 2>&1)
+          conflict_output=$(cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Different" 2>&1)
           conflict_exit=$?
           set -e
           if [ "$conflict_exit" -eq 0 ]; then
@@ -387,14 +426,14 @@ jobs:
             echo "$conflict_output"
             exit 1
           fi
-          after_conflict=$(ls /tmp/xtrace-cli-smoke/userdata/projects | wc -l)
+          after_conflict=$(ls $SMOKE/userdata/projects | wc -l)
           if [ "$after_conflict" -ne 1 ]; then
             echo "FAIL: idempotency conflict created extra project directory"
             exit 1
           fi
           # Successful status + open after init.
-          cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir /tmp/xtrace-cli-smoke/repo
-          cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir /tmp/xtrace-cli-smoke/repo
-          test -f /tmp/xtrace-cli-smoke/userdata/projects/"$first_project"/metadata.sqlite3
-          test -f /tmp/xtrace-cli-smoke/repo/.xtrace/config.toml
-          grep -q '^project_id = ' /tmp/xtrace-cli-smoke/repo/.xtrace/config.toml
+          cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir $SMOKE/repo
+          cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir $SMOKE/repo
+          test -f $SMOKE/userdata/projects/"$first_project"/metadata.sqlite3
+          test -f $SMOKE/repo/.xtrace/config.toml
+          grep -q '^project_id = ' $SMOKE/repo/.xtrace/config.toml

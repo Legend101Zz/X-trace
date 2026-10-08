@@ -1,0 +1,100 @@
+{
+ "schemaVersion": 1,
+ "kind": "baseline_stability_summary_preparation",
+ "project": "jhipster",
+ "releaseAcceptance": false,
+ "instrumented": false,
+ "pin": {
+  "sha": "6b000b5d23a36c45e01472471b84a44fa2464044",
+  "jarSha256": "c4163d10b3bb12fb4f9972471c09a0e2bd9069cbcc01a6d8617946549dc07719",
+  "jdkImage": "eclipse-temurin:21-jdk-jammy",
+  "postgresImageDigest": "sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db"
+ },
+ "runs": [
+  {
+   "dir": "baseline-1",
+   "result": "passed_baseline_only",
+   "bootMs": 35876,
+   "receiptSha256": "e4351256f29dfcf8eb14c5c00ce5a0c8e8b330541fd069d82ff42a9754723fe9"
+  },
+  {
+   "dir": "baseline-2",
+   "result": "passed_baseline_only",
+   "bootMs": 25320,
+   "receiptSha256": "b662b2a5a95cc0a714b6824b812256f3ba21f2389d6fbd3a028fd02018203028"
+  },
+  {
+   "dir": "baseline-3",
+   "result": "passed_baseline_only",
+   "bootMs": 21487,
+   "receiptSha256": "941e7e7821abb862b67792c402150626afa18b1328eb425f7ef5665ced557a0c"
+  }
+ ],
+ "scenarios": [
+  {
+   "id": "anonymous-and-invalid-login-denied",
+   "kind": "auth",
+   "requests": 3,
+   "checks": 4,
+   "semanticEffectFingerprint": "e904e1f509c7547f290d759bf029e73a51c29f5ec2014fe6fe6ad803cf934efd",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "admin-and-user-authentication",
+   "kind": "auth",
+   "requests": 5,
+   "checks": 6,
+   "semanticEffectFingerprint": "4805fd230a7fa45be55f88482960b3999a93799c16c2c1d58acbea72394680d8",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "account-create-read-roundtrip",
+   "kind": "db-write-read",
+   "requests": 3,
+   "checks": 5,
+   "semanticEffectFingerprint": "45e5e062dc62e82d02af4642c0077c7ff8a282e9f44795d25454fb5daa703c2d",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "account-validation-errors",
+   "kind": "validation",
+   "requests": 4,
+   "checks": 5,
+   "semanticEffectFingerprint": "1fd436e99d13f1bbffefd7faa5187117bc7894d400cc6a83af33f64505628da9",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "account-update-and-missing",
+   "kind": "db-write-read",
+   "requests": 4,
+   "checks": 5,
+   "semanticEffectFingerprint": "5365ba393633e4e496a878549a6a2cf7f3f602038680c005592fcc300acf88b7",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "operation-with-relations",
+   "kind": "business",
+   "requests": 4,
+   "checks": 4,
+   "semanticEffectFingerprint": "df82c715af6c19758481449025ccbdb345c8a88d9f5bd2a42a83a3140aa4e68e",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "concurrent-isolation",
+   "kind": "concurrency",
+   "requests": 49,
+   "checks": 4,
+   "semanticEffectFingerprint": "1a2b4265f3e591c8022b81a9aa1c04c6144e07992e5a05483cc3555b0e4cb4f7",
+   "stableAcrossRuns": true
+  },
+  {
+   "id": "delete-and-not-found",
+   "kind": "error",
+   "requests": 5,
+   "checks": 6,
+   "semanticEffectFingerprint": "4247af11e73f8cb74d7802e8818c1c725fb6d0a4f6d188cf4e1fc464def88bf6",
+   "stableAcrossRuns": true
+  }
+ ],
+ "allStable": true
+}

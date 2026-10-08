@@ -1,5 +1,6 @@
 //! Daemon-owned translation and blocking execution for recording capture.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use prost::Message as _;
@@ -11,7 +12,10 @@ use xtrace_application::recording::{
     AcceptedRecordingEvent, BeginRecording, EndpointObservationInput, FinishRecording,
     RecordEvents, RecordingCapture,
 };
-use xtrace_domain::{ProjectId, RecordingId, RuntimeSessionId, WallTime};
+use xtrace_domain::{
+    CapturedValue, DropReason, ProjectId, RecordingId, RuntimeSessionId, UnavailableReason,
+    ValueShape, WallTime,
+};
 use xtrace_protocol::generated::agent::{EventBatch, RecordingFinished, RecordingStarted};
 use xtrace_protocol::xtf::XtfEventEnvelope;
 
@@ -167,10 +171,12 @@ fn translate_batch(
         .map(|event| {
             let recording_seq = event.recording_seq;
             let monotonic_ns = event.monotonic_ns;
+            let priority = event.priority;
             let payload = XtfEventEnvelope { recording_seq, event: Some(event) };
             AcceptedRecordingEvent {
                 recording_seq,
                 monotonic_ns,
+                priority,
                 canonical_bytes: payload.encode_to_vec(),
                 payload,
             }
@@ -185,6 +191,94 @@ fn translate_finished(
     Ok(FinishRecording {
         recording_id: recording_id(&finished.recording_id)?,
         final_recording_seq: finished.final_recording_seq,
+        duration_ns: Some(finished.duration_ns),
+        event_digest: finished.event_digest.to_vec(),
+        drop_counts_by_priority: finished
+            .drop_counts_by_priority
+            .iter()
+            .map(|(priority, count)| (*priority, *count))
+            .collect::<BTreeMap<_, _>>(),
+        unsupported_capability_codes: finished.unsupported_capability_codes.clone(),
+        capacity_dropped_events: 0,
+        response_summary: finished
+            .response_summary
+            .as_ref()
+            .map(captured_value_from_wire)
+            .transpose()?,
+    })
+}
+
+fn captured_value_from_wire(
+    value: &xtrace_protocol::generated::agent::CapturedValue,
+) -> Result<CapturedValue, RecordingPipelineError> {
+    use xtrace_protocol::generated::agent::captured_value::Value as WireValue;
+    let invalid = || RecordingPipelineError::InvalidFinishEvidence;
+    match value.value.as_ref().ok_or_else(invalid)? {
+        WireValue::Captured(_) => {
+            Ok(CapturedValue::Unavailable { reason: UnavailableReason::PrivacyPolicyUnavailable })
+        }
+        WireValue::Redacted(redacted) => {
+            if redacted.rule_id.is_empty() || redacted.rule_id.len() > 128 {
+                return Err(invalid());
+            }
+            let shape_hint =
+                (redacted.shape_hint != 0).then(|| value_shape(redacted.shape_hint)).flatten();
+            if redacted.shape_hint != 0 && shape_hint.is_none() {
+                return Err(invalid());
+            }
+            Ok(CapturedValue::Redacted {
+                // The producer's free-form rule label has no manifest-backed
+                // registry, so retain only the state and a fixed provenance.
+                rule_id: "unverified-producer-redaction".to_string(),
+                shape_hint,
+            })
+        }
+        WireValue::Truncated(truncated) => {
+            if truncated.limit == 0 {
+                return Err(invalid());
+            }
+            Ok(CapturedValue::Unavailable { reason: UnavailableReason::PrivacyPolicyUnavailable })
+        }
+        WireValue::Unavailable(unavailable) => {
+            let reason = match unavailable.reason {
+                1 => UnavailableReason::CapabilityUnsupported,
+                2 => UnavailableReason::DebugMetadataAbsent,
+                3 => UnavailableReason::CaptureBudgetExhausted,
+                4 => UnavailableReason::SourceArtifactMissing,
+                5 => UnavailableReason::RecorderDisconnected,
+                _ => return Err(invalid()),
+            };
+            Ok(CapturedValue::Unavailable { reason })
+        }
+        WireValue::Dropped(dropped) => {
+            let reason = match dropped.reason {
+                1 => DropReason::BackpressureShed,
+                2 => DropReason::QueueFull,
+                3 => DropReason::SequenceGap,
+                4 => DropReason::AdapterDropped,
+                _ => return Err(invalid()),
+            };
+            Ok(CapturedValue::Dropped { reason })
+        }
+    }
+}
+
+fn value_shape(shape: i32) -> Option<ValueShape> {
+    Some(match shape {
+        1 => ValueShape::String,
+        2 => ValueShape::Boolean,
+        3 => ValueShape::Integer { bits: 8 },
+        4 => ValueShape::Integer { bits: 16 },
+        5 => ValueShape::Integer { bits: 32 },
+        6 => ValueShape::Integer { bits: 64 },
+        7 => ValueShape::Float { bits: 32 },
+        8 => ValueShape::Float { bits: 64 },
+        9 => ValueShape::Null,
+        10 => ValueShape::Bytes,
+        // The wire enum carries no collection cardinality. Unknown is the
+        // honest domain shape because length cannot be reconstructed.
+        11..=13 => ValueShape::Unknown,
+        _ => return None,
     })
 }
 
@@ -202,6 +296,7 @@ pub(crate) enum RecordingPipelineError {
     QueueFull,
     Cancelled,
     InvalidRecordingId,
+    InvalidFinishEvidence,
 }
 
 #[cfg(test)]
@@ -219,11 +314,42 @@ mod tests {
     use xtrace_application::{PortError, PortErrorKind};
     use xtrace_domain::{CorrelationId, ProjectId, RecordingId, RuntimeSessionId, WallTime};
     use xtrace_protocol::generated::agent::{
-        CapabilitySet, EventBatch, Health, RecordingEvent, RecordingFinished, RecordingStarted,
+        CapabilitySet, CapturedValue as WireCapturedValue, CapturedValueCaptured,
+        CapturedValueRedacted, EventBatch, Health, RecordingEvent, RecordingFinished,
+        RecordingStarted, ValueShape as WireValueShape, captured_value::Value as WireValue,
     };
 
     use super::{BlockingLane, RecordingPipeline, RecordingPipelineError, run_blocking};
     use crate::runtime::IncomingEnvelope;
+
+    #[test]
+    fn finish_summary_previews_and_rule_labels_never_cross_the_privacy_boundary() {
+        let captured = WireCapturedValue {
+            value: Some(WireValue::Captured(CapturedValueCaptured {
+                shape: WireValueShape::String as i32,
+                preview: "private-response-canary".to_string(),
+                content_hash: prost::bytes::Bytes::from(vec![7; 32]),
+            })),
+        };
+        assert!(matches!(
+            super::captured_value_from_wire(&captured).expect("preview becomes unavailable"),
+            xtrace_domain::CapturedValue::Unavailable {
+                reason: xtrace_domain::UnavailableReason::PrivacyPolicyUnavailable
+            }
+        ));
+
+        let redacted = WireCapturedValue {
+            value: Some(WireValue::Redacted(CapturedValueRedacted {
+                rule_id: "private-rule-canary".to_string(),
+                shape_hint: WireValueShape::String as i32,
+            })),
+        };
+        assert!(matches!(
+            super::captured_value_from_wire(&redacted).expect("redaction is normalized"),
+            xtrace_domain::CapturedValue::Redacted { rule_id, .. }
+                if rule_id == "unverified-producer-redaction"
+        ));
+    }
 
     #[derive(Clone, Debug)]
     enum Operation {
@@ -267,11 +393,13 @@ mod tests {
             &self,
             request: xtrace_application::recording::FinishRecording,
         ) -> Result<FinishRecordingReceipt, PortError> {
+            let recording_id = request.recording_id;
             self.operations.lock().expect("operations").push(Operation::Finished(request));
             Ok(FinishRecordingReceipt {
-                recording_id: request.recording_id,
+                recording_id,
                 persisted_segments: 0,
                 exact_replay: false,
+                completion: xtrace_application::recording::RecordingCompletion::Partial,
             })
         }
     }
@@ -366,6 +494,10 @@ mod tests {
                 IncomingEnvelope::RecordingFinished(RecordingFinished {
                     recording_id: recording_id_bytes(),
                     final_recording_seq: 3,
+                    duration_ns: 55,
+                    event_digest: prost::bytes::Bytes::copy_from_slice(
+                        blake3::hash(b"onetwo").as_bytes(),
+                    ),
                     ..RecordingFinished::default()
                 }),
                 project_id,
@@ -399,11 +531,13 @@ mod tests {
                 request.events[0].payload.encode_to_vec()
             );
         }
-        let Operation::Finished(finish) = operations[3] else {
+        let Operation::Finished(finish) = &operations[3] else {
             panic!("last operation must be finish");
         };
         assert_eq!(finish.recording_id, recording_id);
         assert_eq!(finish.final_recording_seq, 3);
+        assert_eq!(finish.duration_ns, Some(55));
+        assert_eq!(finish.event_digest, blake3::hash(b"onetwo").as_bytes());
     }
 
     #[tokio::test]

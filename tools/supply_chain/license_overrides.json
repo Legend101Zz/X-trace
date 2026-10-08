@@ -1,0 +1,9 @@
+{
+  "_comment": "License facts for components whose lockfile/registry metadata carries no SPDX id (Maven). Each entry names its evidence; review before release, never extend silently.",
+  "pkg:maven/com.fasterxml.jackson.core/jackson-core": {"spdx": "Apache-2.0", "evidence": "jackson-core POM <licenses>: The Apache Software License, Version 2.0"},
+  "pkg:maven/com.fasterxml.jackson/jackson-bom": {"spdx": "Apache-2.0", "evidence": "jackson-bom POM <licenses>: Apache-2.0"},
+  "pkg:maven/com.google.protobuf/protobuf-java": {"spdx": "BSD-3-Clause", "evidence": "protobuf-java POM <licenses>: BSD-3-Clause"},
+  "pkg:maven/net.bytebuddy/byte-buddy": {"spdx": "Apache-2.0", "evidence": "byte-buddy POM <licenses>: Apache License, Version 2.0"},
+  "pkg:maven/org.bouncycastle/bcprov-jdk18on": {"spdx": "MIT", "evidence": "Bouncy Castle Licence (https://www.bouncycastle.org/licence.html) is an MIT-style licence; SPDX list maps it to MIT"},
+  "pkg:maven/org.conscrypt/conscrypt-openjdk-uber": {"spdx": "Apache-2.0", "evidence": "conscrypt POM <licenses>: Apache License, Version 2.0 (uber jar also bundles BoringSSL: OpenSSL/ISC-style, review notice)", "notes": "bundles BoringSSL native code; notice review required"}
+}

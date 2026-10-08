@@ -225,6 +225,14 @@ python3.14 -B -m tools.release.recover_leases --cache-root <root> --label <label
     --receipt <root>/release-gates/<label>/receipt.json
 ```
 
+A run writes one run-start `startedAtEpoch` into both owner records. Records written by an older run may
+differ in that epoch (each lease was stamped at its own acquisition); recovery accepts such records only
+when they are provably from the same run: identical `pid`, `label` and lease token (compared for equality,
+never printed or stored), both `requiresManualRecovery`, valid positive numeric epochs (booleans, zero,
+negative, non-finite and non-numeric values are refused) at most 120 s apart. The earliest epoch is used
+as the run start, the conservative choice for the "predates the run" test. Any other disagreement refuses
+with `owner-records-disagree`.
+
 Recovery is allowed only if both owner records carry the label and `requiresManualRecovery`, their
 directories, inodes and record hashes are stable, every recorded identity (owner records and receipt
 evidence) is exited (PID gone, start differs or zombie) or positively not a descendant
@@ -240,7 +248,7 @@ the final fix round. A retained lease without them is refused (`no-persisted-pro
 operator-supplied coalition id any more (the earlier `--run-coalition-id` option was removed because a
 wrong or uncorroborated id could classify the run's real descendants as foreign). No such legacy retained
 lease exists. Identities the run recorded as owned are cleared only by a verified exit. "Predates the run" uses the
-kernel start time (proc_pidinfo or /proc), must agree with `ps` within 2 s, and needs a 300 s margin;
+kernel start time (proc_pidinfo, falling back on macOS to the unprivileged sysctl KERN_PROC_PID `p_starttime`, which also covers other users' processes; or /proc), must agree with `ps` within 2 s, and needs a 300 s margin;
 DST-ambiguous times fail closed. The owner record is re-read and unlinked through the lease directory
 descriptor, archived owner records have the token replaced by its sha256, and `manual-recovery.json`
 is written with an honest `status` even if a step after removal fails. Recovery proves non-descent in the

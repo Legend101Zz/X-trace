@@ -1,6 +1,7 @@
 package dev.xtrace.agent.runtime;
 
 import dev.xtrace.agent.bootstrap.BridgeSink;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -61,9 +62,32 @@ final class RuntimeBridgeSink implements BridgeSink {
       String symbol,
       long monotonicNs,
       int detail) {
+    return offerSourceEvent(
+        recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail,
+        null, 0, 0, null, 0);
+  }
+
+  @Override
+  public boolean offerSourceEvent(
+      String recordingId,
+      String eventId,
+      String parentEventId,
+      int kind,
+      String symbol,
+      long monotonicNs,
+      int detail,
+      String sourcePath,
+      int startLine,
+      int endLine,
+      byte[] sourceHash,
+      int sourceBinding) {
     if (!acceptingExisting.get()
-        || !bounded(recordingId, eventId, parentEventId, symbol)) return false;
+        || !bounded(recordingId, eventId, parentEventId, symbol)
+        || (sourcePath != null && !bounded(sourcePath))
+        || (sourceHash != null && sourceHash.length != 32)) return false;
     int bytes = estimate(recordingId, eventId, parentEventId, symbol);
+    if (sourcePath != null) bytes += sourcePath.getBytes(StandardCharsets.UTF_8).length;
+    if (sourceHash != null) bytes += sourceHash.length;
     return queue.offer(
         new QueueSignal.Event(
             recordingId,
@@ -73,8 +97,31 @@ final class RuntimeBridgeSink implements BridgeSink {
             symbol,
             monotonicNs,
             detail,
+            sourcePath,
+            startLine,
+            endLine,
+            sourceHash == null ? null : sourceHash.clone(),
+            sourceBinding,
             bytes),
         false);
+  }
+
+  @Override
+  public boolean offerMethodEvent(
+      String recordingId,
+      String eventId,
+      String parentEventId,
+      int kind,
+      String symbol,
+      long monotonicNs,
+      int detail,
+      Method method) {
+    SourceAttestation.SourceInfo source = method == null
+        ? SourceAttestation.SourceInfo.unavailable(2)
+        : SourceAttestation.lookup(method.getDeclaringClass().getClassLoader(), method);
+    return offerSourceEvent(
+        recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail,
+        source.path(), source.startLine(), source.endLine(), source.hash(), source.binding());
   }
 
   @Override

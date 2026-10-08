@@ -34,7 +34,7 @@ const MAX_BOOTSTRAP_BYTES = 64 * 1024;
 /** Reads a private daemon bootstrap file, rejecting a symlink at its final path. */
 export async function readBootstrap(path: string): Promise<Bootstrap> {
   if (process.platform === "win32") {
-    throw new XtraceClientError("XTR-NODE-PLATFORM", "synthetic XTP client requires a Unix daemon bootstrap");
+    throw new XtraceClientError("XTR-NODE-PLATFORM", "Node capture requires a Unix daemon bootstrap");
   }
   let handle;
   try {

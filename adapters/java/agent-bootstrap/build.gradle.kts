@@ -30,8 +30,9 @@ tasks.jar {
     manifest {
         attributes(
             "Premain-Class" to "dev.xtrace.agent.bootstrap.XTraceAgent",
+            "Agent-Class" to "dev.xtrace.agent.bootstrap.XTraceAgent",
             "Can-Redefine-Classes" to "false",
-            "Can-Retransform-Classes" to "false",
+            "Can-Retransform-Classes" to "true",
         )
     }
 }

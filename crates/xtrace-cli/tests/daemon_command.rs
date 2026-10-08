@@ -18,7 +18,11 @@ use tempfile::TempDir;
 
 fn temp_root(label: &str) -> TempDir {
     let base = std::env::temp_dir().canonicalize().expect("canonical temp base");
-    tempfile::Builder::new().prefix(label).tempdir_in(base).expect("temporary root")
+    tempfile::Builder::new()
+        .prefix(label)
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir_in(base)
+        .expect("temporary root")
 }
 
 fn initialize(repo: &Path, data_home: &Path) {

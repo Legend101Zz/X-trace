@@ -1,0 +1,10 @@
+// Applied by packaging/build.py via `gradlew -I`. Makes every archive task (jar, zip) byte-reproducible
+// without editing the product build scripts: no embedded timestamps, stable entry order, fixed modes.
+allprojects {
+    tasks.withType(AbstractArchiveTask).configureEach {
+        preserveFileTimestamps = false
+        reproducibleFileOrder = true
+        filePermissions { unix('rw-r--r--') }
+        dirPermissions { unix('rwxr-xr-x') }
+    }
+}

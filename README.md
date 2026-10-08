@@ -32,16 +32,19 @@ Java compatibility.
 | `xtrace-protocol`   | Generated XTP protobuf bindings and domain-DTO translation              |
 | `xtrace-store`      | Bundled SQLite store, migrations, and `ProjectRepository` adapter      |
 | `xtrace-daemon`     | Authenticated XTP ingress and experimental isolated loopback viewer     |
+| `xtrace-private-storage` | Leaf crate: owner-enforced private directory admission (no X-trace deps) |
 | `xtrace-runtime`    | Runtime launch validation, agent injection, and process supervision    |
 | `xtrace-cli`        | Clap subcommands, project composition, output and path resolution       |
 
 Dependency direction follows `docs/plans/x-trace/02-architecture.md`:
 
 ```text
-xtrace-cli       -> xtrace-application, xtrace-store, xtrace-daemon, xtrace-domain, xtrace-protocol, xtrace-runtime
-xtrace-runtime   -> OS process launch and supervision policy
-xtrace-daemon    -> xtrace-application, xtrace-domain, xtrace-protocol
-xtrace-store     -> xtrace-application, xtrace-domain
+xtrace-cli       -> xtrace-application, xtrace-store, xtrace-daemon, xtrace-domain, xtrace-private-storage, xtrace-protocol, xtrace-runtime
+xtrace-runtime   -> xtrace-private-storage, xtrace-protocol, OS process launch and supervision policy
+xtrace-daemon    -> xtrace-application, xtrace-domain, xtrace-ingest, xtrace-private-storage, xtrace-protocol
+xtrace-store     -> xtrace-application, xtrace-domain, xtrace-private-storage, xtrace-protocol
+xtrace-ingest    -> xtrace-domain, xtrace-protocol
+xtrace-private-storage -> (leaf: no X-trace crates)
 xtrace-protocol  -> xtrace-domain
 xtrace-application -> xtrace-domain
 ```
@@ -206,4 +209,4 @@ the filesystem.
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0 at the user's option.
+Licensed under the MIT license (see `LICENSE`).

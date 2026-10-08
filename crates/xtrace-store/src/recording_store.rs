@@ -4,29 +4,34 @@
 //! establishes only the root binding, scoped error surface, and idempotent
 //! recording anchor needed before object publication can be added safely.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr as _;
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::MetadataExt as _;
 
 use rusqlite::OptionalExtension as _;
 use xtrace_application::observed_endpoint_queries::{
     ObservedEndpointKey, ObservedEndpointRecord, ObservedRecordingKey, ObservedRecordingRecord,
 };
-use xtrace_application::recording::EndpointObservationInput;
+use xtrace_application::recording::{
+    EndpointObservationInput, FinishRecording, MAX_RECORDED_EVENTS, RecordingCompletion,
+};
 use xtrace_application::recording_queries::{
-    MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES, PersistedEvent,
-    PersistedInteraction, RecordingEventWindow, RecordingMetadata, RecordingStatus,
-    ShowWindowRequest,
+    FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES,
+    NavigationResult, PersistedEvent, PersistedInteraction, PersistedSource,
+    RecordingCompletionEvidence, RecordingEventWindow, RecordingMetadata, RecordingStatus,
+    ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     ContentHash, CorrelationId, ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointIdentity, HttpMethod,
-    ProjectId, RecordingId, RuntimeSessionId, Transport, WallTime,
+    ProjectId, RecordingId, RuntimeSessionId, SourceBinding, SourceRange, Transport, WallTime,
 };
+use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
 use crate::connection::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
@@ -273,10 +278,7 @@ impl SqliteStore {
                 correlation_id,
             )
         })?;
-        let binding = ProjectRootBinding {
-            root: project_root.to_path_buf(),
-            database_path: database_path.clone(),
-        };
+        let binding = ProjectRootBinding::new(project_root, database_path.clone(), correlation_id)?;
         binding.revalidate(correlation_id)?;
         Ok(SqliteRecordingStore { store: self, binding })
     }
@@ -484,7 +486,7 @@ impl SqliteRecordingStore<'_> {
         while let Some(row) = rows.next().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })? {
-            let metadata = recording_metadata_from_row(row, correlation_id)?;
+            let metadata = recording_metadata_from_row(row, &connection, correlation_id)?;
             let disposition: Option<String> = row.get(7).map_err(|error| {
                 map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
             })?;
@@ -648,6 +650,9 @@ impl SqliteRecordingStore<'_> {
                 map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
             })?;
             let lifecycle_status = recording_status(&status, correlation_id)?;
+            let recording_id = recording_id_from_bytes(&raw_id, correlation_id)?;
+            let completion =
+                completion_evidence(&connection, recording_id, &status, correlation_id)?;
             let incomplete_evidence = match lifecycle_status {
                 RecordingStatus::Partial | RecordingStatus::Invalid => {
                     vec![format!("persisted_status:{status}")]
@@ -655,8 +660,9 @@ impl SqliteRecordingStore<'_> {
                 _ => Vec::new(),
             };
             recordings.push(RecordingMetadata {
-                recording_id: recording_id_from_bytes(&raw_id, correlation_id)?,
+                recording_id,
                 status: lifecycle_status,
+                completion,
                 opened_at,
                 segment_count: u64::try_from(segment_count)
                     .map_err(|_| recording_query_corrupt_error(correlation_id))?
@@ -692,6 +698,7 @@ impl SqliteRecordingStore<'_> {
     pub(crate) fn read_recording_window(
         &self,
         request: &ShowWindowRequest,
+        source_root: Option<&Path>,
     ) -> Result<RecordingEventWindow, RecordingStoreError> {
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
@@ -715,6 +722,29 @@ impl SqliteRecordingStore<'_> {
             return Err(read_not_found_error(correlation_id));
         }
         let lifecycle_status = recording_status(&status, correlation_id)?;
+        let completion =
+            completion_evidence(&connection, request.recording_id, &status, correlation_id)?;
+        let terminal_finish =
+            load_terminal_finish(&connection, request.recording_id, completion, correlation_id)?;
+        let adapter_summary = if completion == RecordingCompletionEvidence::Invalid {
+            None
+        } else {
+            terminal_finish.as_ref().and_then(|finish| finish.response_summary.clone())
+        };
+        let duration_ns = terminal_finish
+            .as_ref()
+            .and_then(|finish| finish.duration_ns)
+            .map(|value| value.to_string());
+        let drop_counts_by_priority = terminal_finish
+            .as_ref()
+            .map(|finish| {
+                finish
+                    .drop_counts_by_priority
+                    .iter()
+                    .map(|(priority, count)| (*priority, count.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let mut statement = connection
             .prepare(
@@ -733,7 +763,8 @@ impl SqliteRecordingStore<'_> {
         let mut expected_ordinal = 0_u32;
         let mut expected_sequence = Some(2_u64);
         let mut segment_count = 0_u64;
-        let mut events = Vec::new();
+        let mut events: Vec<PersistedEvent> = Vec::new();
+        let mut verified_frame_ids = HashMap::new();
         let event_limit = usize::try_from(request.limit)
             .map_err(|_| recording_query_validation_error(correlation_id))?;
         let mut has_more = false;
@@ -742,6 +773,7 @@ impl SqliteRecordingStore<'_> {
         let mut verified_input_bytes = 0_usize;
         let mut verified_work_limit_reached = false;
         let mut incomplete_evidence = Vec::new();
+        let mut source_cache = SourceProjectionCache::default();
         if status == "partial" || status == "invalid" {
             incomplete_evidence.push(format!("persisted_status:{status}"));
         }
@@ -803,10 +835,18 @@ impl SqliteRecordingStore<'_> {
                 .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
 
             let after_sequence = request.after_sequence.unwrap_or(0);
-            if last_sequence <= after_sequence {
+            if last_sequence < after_sequence {
                 continue;
             }
-            if events.len() >= event_limit {
+            let is_page_lookbehind = last_sequence == after_sequence;
+            if events.len() >= event_limit
+                && first_sequence
+                    != events
+                        .last()
+                        .and_then(|event| event.sequence.parse::<u64>().ok())
+                        .and_then(|sequence| sequence.checked_add(1))
+                        .unwrap_or(u64::MAX)
+            {
                 has_more = true;
                 continue;
             }
@@ -833,8 +873,47 @@ impl SqliteRecordingStore<'_> {
                 .checked_add(uncompressed_size)
                 .ok_or_else(|| recording_query_resource_error(correlation_id))?;
             let work_if_added = verified_input_bytes.checked_add(segment_work);
-            if !events.is_empty()
-                && work_if_added.is_none_or(|total| total > MAX_RECORDING_VERIFIED_INPUT_BYTES)
+            if is_page_lookbehind {
+                // Retain one verified predecessor only when both it and the
+                // first page segment fit the same measured work budget.
+                // This keeps boundary navigation useful without letting a
+                // lookbehind consume the bounded page's target allowance.
+                let next_sequence = after_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
+                let next_sizes: Option<(i64, i64)> = connection
+                    .query_row(
+                        "SELECT uncompressed_bytes, compressed_bytes FROM recording_segments \
+                         WHERE recording_id = ?1 AND first_recording_seq = ?2",
+                        rusqlite::params![
+                            request.recording_id.as_uuid().as_bytes().to_vec(),
+                            next_sequence.to_be_bytes().as_slice(),
+                        ],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        map_store_error(
+                            StoreError::from_rusqlite(error, correlation_id),
+                            correlation_id,
+                        )
+                    })?;
+                let Some((next_logical, next_compressed)) = next_sizes else {
+                    continue;
+                };
+                let next_work = usize::try_from(next_logical).ok().and_then(|logical| {
+                    usize::try_from(next_compressed)
+                        .ok()
+                        .and_then(|compressed| logical.checked_add(compressed))
+                });
+                if next_work
+                    .and_then(|next_work| work_if_added?.checked_add(next_work))
+                    .is_none_or(|total| total > MAX_RECORDING_VERIFIED_INPUT_BYTES)
+                {
+                    continue;
+                }
+            } else if work_if_added.is_none_or(|total| total > MAX_RECORDING_VERIFIED_INPUT_BYTES)
+                && (verified_input_bytes > 0 || !events.is_empty())
             {
                 has_more = true;
                 verified_work_limit_reached = true;
@@ -873,6 +952,14 @@ impl SqliteRecordingStore<'_> {
                 return Err(object_corrupt_error(correlation_id));
             }
             verified_input_bytes = work_if_added.unwrap_or(segment_work);
+            index_verified_segment_frames(
+                &connection,
+                request.recording_id,
+                ordinal,
+                decoded.events(),
+                &mut verified_frame_ids,
+                correlation_id,
+            )?;
             for envelope in decoded.events() {
                 let Some(event) = envelope.event.as_ref() else {
                     return Err(object_corrupt_error(correlation_id));
@@ -887,7 +974,7 @@ impl SqliteRecordingStore<'_> {
                 if event.kind == 14 {
                     incomplete_evidence.push(format!("gap_event_sequence:{}", event.recording_seq));
                 }
-                let projected = project_persisted_event(event);
+                let projected = project_persisted_event(event, source_root, &mut source_cache);
                 let projected_size = projected
                     .serialized_size_with_separator()
                     .map_err(|_| recording_query_resource_error(correlation_id))?;
@@ -906,9 +993,74 @@ impl SqliteRecordingStore<'_> {
                 events.push(projected);
             }
         }
+        for event in &mut events {
+            let sequence = event
+                .sequence
+                .parse::<u64>()
+                .map_err(|_| recording_query_corrupt_error(correlation_id))?;
+            let (frame_id, navigation) = frame_navigation(
+                &connection,
+                request.recording_id,
+                sequence,
+                &verified_frame_ids,
+                completion,
+                correlation_id,
+            )?;
+            event.frame_id = frame_id;
+            event.navigation = navigation;
+        }
+        // The application layer serializes this entire DTO. Account for the
+        // terminal sidecar and the final frame/navigation-enriched events
+        // here so a cursor page is shortened before the application rejects
+        // an otherwise valid near-limit response.
+        let summary_bytes = adapter_summary
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|_| recording_query_resource_error(correlation_id))?
+            .map_or(0, |bytes| bytes.len().saturating_add(1));
+        let terminal_metadata_bytes =
+            serde_json::to_vec(&(duration_ns.as_ref(), &drop_counts_by_priority))
+                .map_err(|_| recording_query_resource_error(correlation_id))?
+                .len()
+                .saturating_add(1);
+        let mut final_projection_bytes = 2_usize
+            .checked_add(summary_bytes)
+            .and_then(|bytes| bytes.checked_add(terminal_metadata_bytes))
+            .ok_or_else(|| recording_query_resource_error(correlation_id))?;
+        if final_projection_bytes > MAX_RECORDING_EVENT_PROJECTION_BYTES {
+            return Err(recording_query_resource_error(correlation_id));
+        }
+        let mut final_event_count = 0_usize;
+        let mut final_projection_truncated = false;
+        for event in &events {
+            let event_bytes = event
+                .serialized_size_with_separator()
+                .map_err(|_| recording_query_resource_error(correlation_id))?;
+            let Some(next_bytes) = final_projection_bytes.checked_add(event_bytes) else {
+                return Err(recording_query_resource_error(correlation_id));
+            };
+            if next_bytes > MAX_RECORDING_EVENT_PROJECTION_BYTES {
+                if final_event_count == 0 {
+                    return Err(recording_query_resource_error(correlation_id));
+                }
+                final_projection_truncated = true;
+                break;
+            }
+            final_projection_bytes = next_bytes;
+            final_event_count += 1;
+        }
+        if final_projection_truncated {
+            events.truncate(final_event_count);
+            has_more = true;
+        }
         Ok(RecordingEventWindow {
             recording_id: request.recording_id,
             status: lifecycle_status,
+            completion,
+            adapter_summary,
+            duration_ns,
+            drop_counts_by_priority,
             segment_count: segment_count.to_string(),
             events,
             has_more,
@@ -1063,7 +1215,10 @@ impl SqliteRecordingStore<'_> {
             )? {
                 Some(existing)
             } else {
+                // Sequence and ordinal continuity is the primary structural contract, so it
+                // is reported before the per-frame identity checks.
                 validate_new_continuity(&connection, request, &candidate, correlation_id)?;
+                validate_frame_identities(&connection, request, correlation_id)?;
                 None
             }
         };
@@ -1151,6 +1306,7 @@ impl SqliteRecordingStore<'_> {
             );
             match inserted {
                 Ok(_) => {
+                    insert_frame_index_rows(&transaction, request, correlation_id)?;
                     commit_failpoint("before-transaction-commit", correlation_id, false)?;
                     transaction.commit().map_err(|error| {
                         map_store_error(
@@ -1215,6 +1371,349 @@ impl SqliteRecordingStore<'_> {
         })
     }
 
+    /// Verifies the persisted V1 event-ID digest and commits terminal evidence.
+    ///
+    /// The terminal row and lifecycle status share one SQLite transaction.
+    /// Existing rows without terminal evidence remain unverified and are never
+    /// promoted by this operation.
+    pub fn finish_recording(
+        &self,
+        request: &FinishRecording,
+    ) -> Result<RecordingCompletion, RecordingStoreError> {
+        let correlation_id = CorrelationId::new();
+        if request.event_digest.len() > 32
+            || request.drop_counts_by_priority.len() > 256
+            || request.unsupported_capability_codes.len() > 64
+            || request.unsupported_capability_codes.iter().any(|code| !stable_capability_code(code))
+            || request.response_summary.as_ref().is_some_and(captured_value_has_preview)
+            || request.response_summary.as_ref().is_some_and(|value| {
+                matches!(value, xtrace_domain::CapturedValue::Redacted { rule_id, .. }
+                    if rule_id != "unverified-producer-redaction")
+            })
+        {
+            return Err(terminal_validation_error(correlation_id));
+        }
+        let request_json = serde_json::to_string(request)
+            .map_err(|_| terminal_validation_error(correlation_id))?;
+        if request_json.len() > 16 * 1024 {
+            return Err(terminal_validation_error(correlation_id));
+        }
+        let _writer = self
+            .store
+            .lock_recording_writer(correlation_id)
+            .map_err(|error| map_store_error(error, correlation_id))?;
+        self.binding.revalidate(correlation_id)?;
+
+        let terminal = {
+            let connection =
+                self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+            let existing: Option<(String, String)> = connection
+                .query_row(
+                    "SELECT request_json, completion FROM recording_terminal_evidence \
+                     WHERE recording_id = ?1",
+                    rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| {
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
+                })?;
+            if let Some((stored_request, completion)) = existing {
+                if stored_request != request_json {
+                    return Err(terminal_conflict_error(correlation_id));
+                }
+                Some(parse_completion(&completion, correlation_id)?)
+            } else {
+                let status: Option<String> = connection
+                    .query_row(
+                        "SELECT status FROM recordings WHERE recording_id = ?1",
+                        rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        map_store_error(
+                            StoreError::from_rusqlite(error, correlation_id),
+                            correlation_id,
+                        )
+                    })?;
+                let Some(status) = status else {
+                    return Err(read_not_found_error(correlation_id));
+                };
+                if status != "recording" {
+                    // Historical terminal-looking rows have no proof row.
+                    // Do not reinterpret or upgrade them during a retry.
+                    return Ok(RecordingCompletion::Partial);
+                }
+                None
+            }
+        };
+        if let Some(completion) = terminal {
+            return Ok(completion);
+        }
+
+        let (completion, event_count) = self.verify_terminal_evidence(request, correlation_id)?;
+        let completion_text = completion_label(completion);
+        self.binding.revalidate(correlation_id)?;
+        let connection =
+            self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+        let changed = transaction
+            .execute(
+                "UPDATE recordings SET status = ?1 WHERE recording_id = ?2 AND status = 'recording'",
+                rusqlite::params![
+                    completion_text,
+                    request.recording_id.as_uuid().as_bytes().to_vec(),
+                ],
+            )
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        if changed != 1 {
+            return Err(terminal_conflict_error(correlation_id));
+        }
+        transaction
+            .execute(
+                "INSERT INTO recording_terminal_evidence \
+                 (recording_id, request_json, completion, final_recording_seq, event_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    request.recording_id.as_uuid().as_bytes().to_vec(),
+                    request_json,
+                    completion_text,
+                    request.final_recording_seq.to_be_bytes().as_slice(),
+                    i64::try_from(event_count)
+                        .map_err(|_| terminal_validation_error(correlation_id))?,
+                ],
+            )
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        transaction.commit().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+        Ok(completion)
+    }
+
+    fn verify_terminal_evidence(
+        &self,
+        request: &FinishRecording,
+        correlation_id: CorrelationId,
+    ) -> Result<(RecordingCompletion, u64), RecordingStoreError> {
+        let (project_id, segments, declared_event_count, declared_input_bytes) = {
+            let connection =
+                self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+            let project_bytes: Vec<u8> = connection
+                .query_row(
+                    "SELECT project_id FROM recordings WHERE recording_id = ?1",
+                    rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
+                })?
+                .ok_or_else(|| read_not_found_error(correlation_id))?;
+            let project_id = project_id_from_bytes(&project_bytes, correlation_id)?;
+            /// Row shape of `recording_segments`: ordinal, object hash, first and last
+            /// sequence, event count, uncompressed bytes, compressed bytes, checksum.
+            type SegmentRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64, Vec<u8>);
+            let mut statement = connection
+                .prepare(
+                    "SELECT segment_ordinal, object_hash, first_recording_seq, last_recording_seq, \
+                     event_count, uncompressed_bytes, compressed_bytes, checksum \
+                     FROM recording_segments WHERE recording_id = ?1 ORDER BY segment_ordinal",
+                )
+                .map_err(|error| {
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
+                })?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
+                    |row| -> rusqlite::Result<SegmentRow> {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .map_err(|error| {
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
+                })?;
+            let mut segments = Vec::new();
+            let mut declared_event_count = 0_usize;
+            let mut declared_input_bytes = 0_usize;
+            for row in rows.take(MAX_RECORDED_EVENTS + 1) {
+                let segment = row.map_err(|error| {
+                    map_store_error(
+                        StoreError::from_rusqlite(error, correlation_id),
+                        correlation_id,
+                    )
+                })?;
+                let segment_event_count =
+                    usize::try_from(segment.4).map_err(|_| object_corrupt_error(correlation_id))?;
+                declared_event_count = declared_event_count
+                    .checked_add(segment_event_count)
+                    .ok_or_else(|| object_corrupt_error(correlation_id))?;
+                let logical_bytes =
+                    usize::try_from(segment.5).map_err(|_| object_corrupt_error(correlation_id))?;
+                let compressed_bytes =
+                    usize::try_from(segment.6).map_err(|_| object_corrupt_error(correlation_id))?;
+                declared_input_bytes = declared_input_bytes
+                    .checked_add(logical_bytes)
+                    .and_then(|total| total.checked_add(compressed_bytes))
+                    .ok_or_else(|| object_corrupt_error(correlation_id))?;
+                if segments.len() == MAX_RECORDED_EVENTS
+                    || declared_event_count > MAX_RECORDED_EVENTS
+                    || segment_event_count == 0
+                {
+                    return Err(object_corrupt_error(correlation_id));
+                }
+                segments.push(segment);
+            }
+            (project_id, segments, declared_event_count, declared_input_bytes)
+        };
+
+        if declared_input_bytes > MAX_RECORDING_VERIFIED_INPUT_BYTES {
+            return Ok((
+                RecordingCompletion::Partial,
+                u64::try_from(declared_event_count)
+                    .map_err(|_| object_corrupt_error(correlation_id))?,
+            ));
+        }
+
+        let mut event_ids = HashSet::new();
+        let mut hasher = blake3::Hasher::new();
+        let mut next_sequence = Some(2_u64);
+        let mut expected_ordinal = 0_u32;
+        let mut event_count = 0_u64;
+        let mut has_gap_event = false;
+        let mut identifiers_valid = true;
+        for (
+            raw_ordinal,
+            raw_hash,
+            raw_first,
+            raw_last,
+            raw_count,
+            raw_logical,
+            raw_compressed,
+            raw_checksum,
+        ) in segments
+        {
+            let ordinal =
+                u32::try_from(raw_ordinal).map_err(|_| object_corrupt_error(correlation_id))?;
+            if ordinal != expected_ordinal {
+                return Err(object_corrupt_error(correlation_id));
+            }
+            expected_ordinal = expected_ordinal
+                .checked_add(1)
+                .ok_or_else(|| object_corrupt_error(correlation_id))?;
+            let object_hash = content_hash_from_bytes(&raw_hash, correlation_id)?;
+            let path = object_path_from_row(&self.binding.root, &raw_hash, correlation_id)?;
+            validate_managed_tree(
+                &self.binding.root,
+                path.parent().ok_or_else(|| object_corrupt_error(correlation_id))?,
+                correlation_id,
+            )?;
+            let compressed = read_bounded_regular_file(&path, correlation_id, false)?;
+            if i64::try_from(compressed.len()).map_err(|_| object_corrupt_error(correlation_id))?
+                != raw_compressed
+            {
+                return Err(object_corrupt_error(correlation_id));
+            }
+            let decoded = crate::xtf::decode_compressed_segment(&compressed, object_hash)
+                .map_err(|_| object_corrupt_error(correlation_id))?;
+            let verified = decoded.verified();
+            let first = decode_stored_sequence(&raw_first, correlation_id)?;
+            let last = decode_stored_sequence(&raw_last, correlation_id)?;
+            if verified.recording_id() != request.recording_id
+                || verified.project_id() != project_id
+                || verified.segment_ordinal() != ordinal
+                || verified.first_recording_seq() != first
+                || verified.last_recording_seq() != last
+                || i64::try_from(verified.event_count())
+                    .map_err(|_| object_corrupt_error(correlation_id))?
+                    != raw_count
+                || i64::try_from(verified.logical_bytes())
+                    .map_err(|_| object_corrupt_error(correlation_id))?
+                    != raw_logical
+                || verified.footer_prefix_digest().as_bytes() != raw_checksum.as_slice()
+                || Some(first) != next_sequence
+            {
+                return Err(object_corrupt_error(correlation_id));
+            }
+            for envelope in decoded.events() {
+                let Some(event) = envelope.event.as_ref() else {
+                    return Err(object_corrupt_error(correlation_id));
+                };
+                if Some(event.recording_seq) != next_sequence {
+                    return Err(object_corrupt_error(correlation_id));
+                }
+                next_sequence = event.recording_seq.checked_add(1);
+                if event.kind == 14 {
+                    has_gap_event = true;
+                }
+                if event.event_id.is_empty()
+                    || event.event_id.len() > 128
+                    || !event.event_id.is_ascii()
+                    || !event_ids.insert(event.event_id.clone())
+                {
+                    identifiers_valid = false;
+                }
+                hasher.update(event.event_id.as_bytes());
+                event_count = event_count
+                    .checked_add(1)
+                    .ok_or_else(|| object_corrupt_error(correlation_id))?;
+            }
+        }
+        let persisted_final_sequence = next_sequence.map_or(u64::MAX, |next| next - 1);
+        if request.final_recording_seq < persisted_final_sequence {
+            return Ok((RecordingCompletion::Invalid, event_count));
+        }
+        let declared_sequence_gap = request.final_recording_seq > persisted_final_sequence;
+        if !identifiers_valid {
+            return Ok((RecordingCompletion::Invalid, event_count));
+        }
+        if request.event_digest.is_empty() || request.event_digest.iter().all(|byte| *byte == 0) {
+            return Ok((RecordingCompletion::Partial, event_count));
+        }
+        if request.event_digest.len() != 32
+            || request.event_digest.as_slice() != hasher.finalize().as_bytes()
+        {
+            return Ok((RecordingCompletion::Invalid, event_count));
+        }
+        let has_drops = request.capacity_dropped_events > 0
+            || request.drop_counts_by_priority.values().any(|count| *count > 0);
+        // Unsupported codes describe advertised-but-unexercised optional
+        // capabilities. They remain separately queryable availability
+        // evidence and do not contradict the persisted event stream.
+        let partial = has_gap_event || has_drops || declared_sequence_gap;
+        Ok((
+            if partial { RecordingCompletion::Partial } else { RecordingCompletion::Complete },
+            event_count,
+        ))
+    }
+
     fn exact_or_conflict(
         &self,
         existing: &SegmentRow,
@@ -1247,6 +1746,96 @@ impl SqliteRecordingStore<'_> {
             disposition: SegmentCommitDisposition::ExactReplay,
         })
     }
+}
+
+fn validate_frame_identities(
+    connection: &rusqlite::Connection,
+    request: &SegmentCommitRequest,
+    correlation_id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    let mut local = HashSet::new();
+    for envelope in &request.events {
+        let Some(event) = envelope.event.as_ref() else {
+            return Err(segment_validation_error(correlation_id));
+        };
+        if !valid_frame_identity(&event.event_id) || !local.insert(event.event_id.as_str()) {
+            return Err(frame_identity_error(correlation_id));
+        }
+        for relationship in [&event.parent_event_id, &event.async_parent_event_id] {
+            if !relationship.is_empty() && !valid_frame_identity(relationship) {
+                return Err(frame_identity_error(correlation_id));
+            }
+        }
+        let digest = blake3::hash(event.event_id.as_bytes());
+        let exists: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM recording_frame_index WHERE recording_id = ?1 AND event_id_digest = ?2",
+                rusqlite::params![
+                    request.recording_id.as_uuid().as_bytes().to_vec(),
+                    digest.as_bytes().as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        if exists.is_some() {
+            return Err(frame_identity_error(correlation_id));
+        }
+    }
+    Ok(())
+}
+
+fn valid_frame_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.as_bytes().iter().all(|byte| (0x20..=0x7e).contains(byte))
+}
+
+fn insert_frame_index_rows(
+    transaction: &rusqlite::Transaction<'_>,
+    request: &SegmentCommitRequest,
+    correlation_id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    for (offset, envelope) in request.events.iter().enumerate() {
+        let Some(event) = envelope.event.as_ref() else {
+            return Err(segment_validation_error(correlation_id));
+        };
+        if !valid_frame_identity(&event.event_id) {
+            return Err(frame_identity_error(correlation_id));
+        }
+        let offset = i64::try_from(offset).map_err(|_| segment_validation_error(correlation_id))?;
+        let sequence = event.recording_seq.to_be_bytes();
+        let frame_id = xtrace_domain::FrameId::new();
+        let event_digest = blake3::hash(event.event_id.as_bytes());
+        let parent_digest = (!event.parent_event_id.is_empty())
+            .then(|| blake3::hash(event.parent_event_id.as_bytes()).as_bytes().to_vec());
+        let async_parent_digest = (!event.async_parent_event_id.is_empty())
+            .then(|| blake3::hash(event.async_parent_event_id.as_bytes()).as_bytes().to_vec());
+        transaction
+            .execute(
+                "INSERT INTO recording_frame_index \
+                 (recording_id, recording_seq, frame_id, segment_ordinal, event_offset, \
+                  event_id_digest, parent_id_digest, async_parent_digest, monotonic_ns) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    request.recording_id.as_uuid().as_bytes().to_vec(),
+                    sequence.as_slice(),
+                    frame_id.as_uuid().as_bytes().to_vec(),
+                    i64::from(request.segment_ordinal),
+                    offset,
+                    event_digest.as_bytes().as_slice(),
+                    parent_digest,
+                    async_parent_digest,
+                    event.monotonic_ns.to_be_bytes().as_slice(),
+                ],
+            )
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1532,9 +2121,280 @@ fn recording_status(
     }
 }
 
+fn completion_evidence(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    status: &str,
+    correlation_id: CorrelationId,
+) -> Result<RecordingCompletionEvidence, RecordingStoreError> {
+    let stored: Option<String> = connection
+        .query_row(
+            "SELECT completion FROM recording_terminal_evidence WHERE recording_id = ?1",
+            rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let Some(stored) = stored else {
+        // Older rows may contain a terminal-looking lifecycle label without
+        // the proof row introduced by v4. Keep their completion unverified.
+        return Ok(RecordingCompletionEvidence::Unavailable);
+    };
+    if stored != status {
+        return Err(recording_query_corrupt_error(correlation_id));
+    }
+    let completion = match stored.as_str() {
+        "complete" => Ok(RecordingCompletionEvidence::Complete),
+        "partial" => Ok(RecordingCompletionEvidence::Partial),
+        "invalid" => Ok(RecordingCompletionEvidence::Invalid),
+        _ => Err(recording_query_corrupt_error(correlation_id)),
+    }?;
+    if load_terminal_finish(connection, recording_id, completion, correlation_id)?.is_none() {
+        return Err(recording_query_corrupt_error(correlation_id));
+    }
+    Ok(completion)
+}
+
+fn load_terminal_finish(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    completion: RecordingCompletionEvidence,
+    correlation_id: CorrelationId,
+) -> Result<Option<FinishRecording>, RecordingStoreError> {
+    let request_bytes: Option<i64> = connection
+        .query_row(
+            "SELECT length(CAST(request_json AS BLOB)) \
+             FROM recording_terminal_evidence WHERE recording_id = ?1",
+            rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let Some(request_bytes) = request_bytes else {
+        return Ok(None);
+    };
+    if !(0..=16_384).contains(&request_bytes) {
+        return Err(recording_query_corrupt_error(correlation_id));
+    }
+    let (request_json, raw_final_sequence, stored_completion, stored_event_count): (
+        String,
+        Vec<u8>,
+        String,
+        i64,
+    ) = connection
+        .query_row(
+            "SELECT request_json, final_recording_seq, completion, event_count \
+                 FROM recording_terminal_evidence WHERE recording_id = ?1",
+            rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let finish: FinishRecording = serde_json::from_str(&request_json)
+        .map_err(|_| recording_query_corrupt_error(correlation_id))?;
+    let final_sequence = decode_stored_sequence(&raw_final_sequence, correlation_id)?;
+    let event_count = u64::try_from(stored_event_count)
+        .map_err(|_| recording_query_corrupt_error(correlation_id))?;
+    if finish.recording_id != recording_id
+        || finish.final_recording_seq != final_sequence
+        || event_count > u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
+        || finish.event_digest.len() > 32
+        || finish.drop_counts_by_priority.len() > 256
+        || finish.unsupported_capability_codes.len() > 64
+        || finish.unsupported_capability_codes.iter().any(|code| !stable_capability_code(code))
+        || (completion == RecordingCompletionEvidence::Complete
+            && event_count.checked_add(1) != Some(final_sequence))
+        || (completion == RecordingCompletionEvidence::Complete
+            && (finish.event_digest.len() != 32
+                || finish.event_digest.iter().all(|byte| *byte == 0)
+                || finish.capacity_dropped_events > 0
+                || finish.drop_counts_by_priority.values().any(|count| *count > 0)))
+        // Capacity drops only happen once the persisted history is full, and the
+        // unverifiable adapter digest is withheld; anything else is inconsistent.
+        || (finish.capacity_dropped_events > 0
+            && (event_count != u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
+                || !finish.event_digest.is_empty()))
+        || finish.capacity_dropped_events
+            > finish
+                .drop_counts_by_priority
+                .values()
+                .fold(0_u64, |sum, count| sum.saturating_add(*count))
+        || (completion == RecordingCompletionEvidence::Partial
+            && event_count.checked_add(1).is_none_or(|last| final_sequence < last))
+        || stored_completion != completion_label_from_evidence(completion)
+        || finish.response_summary.as_ref().is_some_and(captured_value_has_preview)
+        || finish.response_summary.as_ref().is_some_and(|value| {
+            matches!(value, xtrace_domain::CapturedValue::Redacted { rule_id, .. }
+                if rule_id != "unverified-producer-redaction")
+        })
+    {
+        return Err(recording_query_corrupt_error(correlation_id));
+    }
+    Ok(Some(finish))
+}
+
+fn completion_label_from_evidence(completion: RecordingCompletionEvidence) -> &'static str {
+    match completion {
+        RecordingCompletionEvidence::Complete => "complete",
+        RecordingCompletionEvidence::Partial => "partial",
+        RecordingCompletionEvidence::Invalid => "invalid",
+        RecordingCompletionEvidence::Unavailable => "",
+    }
+}
+
+fn captured_value_has_preview(value: &xtrace_domain::CapturedValue) -> bool {
+    matches!(
+        value,
+        xtrace_domain::CapturedValue::Captured { .. }
+            | xtrace_domain::CapturedValue::Truncated { .. }
+    )
+}
+
+fn stable_capability_code(code: &str) -> bool {
+    let mut bytes = code.bytes();
+    bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+        && code.len() <= 128
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn frame_navigation(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    sequence: u64,
+    verified_frame_ids: &HashMap<u64, xtrace_domain::FrameId>,
+    completion: RecordingCompletionEvidence,
+    correlation_id: CorrelationId,
+) -> Result<(Option<xtrace_domain::FrameId>, FrameNavigation), RecordingStoreError> {
+    let Some(frame_id) = verified_frame_ids.get(&sequence).copied() else {
+        return Ok((None, FrameNavigation::UNAVAILABLE));
+    };
+    let previous = if sequence == 2 {
+        NavigationResult::Boundary
+    } else {
+        match verified_frame_ids.get(&(sequence - 1)).copied() {
+            Some(frame) => NavigationResult::Target(frame),
+            None => NavigationResult::Unavailable,
+        }
+    };
+    let next = if let Some(next_sequence) = sequence.checked_add(1) {
+        if let Some(frame) = verified_frame_ids.get(&next_sequence).copied() {
+            NavigationResult::Target(frame)
+        } else if completion == RecordingCompletionEvidence::Complete
+            && terminal_final_sequence(connection, recording_id, correlation_id)? == Some(sequence)
+        {
+            NavigationResult::Boundary
+        } else {
+            NavigationResult::Unavailable
+        }
+    } else if completion == RecordingCompletionEvidence::Complete
+        && terminal_final_sequence(connection, recording_id, correlation_id)? == Some(sequence)
+    {
+        NavigationResult::Boundary
+    } else {
+        NavigationResult::Unavailable
+    };
+    Ok((
+        Some(frame_id),
+        FrameNavigation {
+            previous,
+            next,
+            // Parent digests are retained for a future verified graph
+            // resolver. They do not establish call-stack depth by themselves.
+            into: NavigationResult::Unavailable,
+            over: NavigationResult::Unavailable,
+            out: NavigationResult::Unavailable,
+        },
+    ))
+}
+
+/// Row shape of `recording_frame_index`: frame id, segment ordinal, event
+/// offset, event id digest, monotonic nanoseconds.
+type FrameIndexRow = (Vec<u8>, i64, i64, Vec<u8>, Vec<u8>);
+
+fn index_verified_segment_frames(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    segment_ordinal: u32,
+    envelopes: &[xtrace_protocol::xtf::XtfEventEnvelope],
+    verified_frame_ids: &mut HashMap<u64, xtrace_domain::FrameId>,
+    correlation_id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    for (event_offset, envelope) in envelopes.iter().enumerate() {
+        let Some(event) = envelope.event.as_ref() else {
+            return Err(object_corrupt_error(correlation_id));
+        };
+        let indexed: Option<FrameIndexRow> = connection
+            .query_row(
+                "SELECT frame_id, segment_ordinal, event_offset, event_id_digest, monotonic_ns \
+                 FROM recording_frame_index WHERE recording_id = ?1 AND recording_seq = ?2",
+                rusqlite::params![
+                    recording_id.as_uuid().as_bytes().to_vec(),
+                    event.recording_seq.to_be_bytes().as_slice(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        let Some((frame_id, ordinal, offset, event_digest, monotonic)) = indexed else {
+            continue;
+        };
+        if u32::try_from(ordinal).ok() != Some(segment_ordinal)
+            || usize::try_from(offset).ok() != Some(event_offset)
+            || event_digest.as_slice() != blake3::hash(event.event_id.as_bytes()).as_bytes()
+            || monotonic.as_slice() != event.monotonic_ns.to_be_bytes()
+        {
+            continue;
+        }
+        if let Ok(frame_id) = frame_id_from_bytes(&frame_id, correlation_id) {
+            verified_frame_ids.insert(event.recording_seq, frame_id);
+        }
+    }
+    Ok(())
+}
+
+fn frame_id_from_bytes(
+    bytes: &[u8],
+    correlation_id: CorrelationId,
+) -> Result<xtrace_domain::FrameId, RecordingStoreError> {
+    let raw: [u8; 16] = bytes.try_into().map_err(|_| object_corrupt_error(correlation_id))?;
+    let uuid = uuid::Uuid::from_bytes(raw);
+    if uuid.get_version_num() != 7 || uuid.get_variant() != uuid::Variant::RFC4122 {
+        return Err(object_corrupt_error(correlation_id));
+    }
+    Ok(xtrace_domain::FrameId::from_uuid(uuid))
+}
+
+fn terminal_final_sequence(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    correlation_id: CorrelationId,
+) -> Result<Option<u64>, RecordingStoreError> {
+    let Some(finish) = load_terminal_finish(
+        connection,
+        recording_id,
+        RecordingCompletionEvidence::Complete,
+        correlation_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(finish.final_recording_seq))
+}
+
 fn project_persisted_event(
     event: &xtrace_protocol::generated::agent::RecordingEvent,
+    source_root: Option<&Path>,
+    source_cache: &mut SourceProjectionCache,
 ) -> PersistedEvent {
+    use xtrace_protocol::generated::agent::SourceBinding as WireSourceBinding;
+
     let interaction = event.interaction.as_ref().map(|interaction| PersistedInteraction {
         kind: Some(interaction_kind_label(interaction.kind)),
         driver: nonempty(&interaction.driver),
@@ -1543,8 +2403,30 @@ fn project_persisted_event(
         host: nonempty(&interaction.host),
         method: nonempty(&interaction.method),
     });
+    let source_binding = WireSourceBinding::try_from(event.source_binding).ok().map_or(
+        SourceBinding::Unspecified,
+        |binding| match binding {
+            WireSourceBinding::Verified => SourceBinding::Verified,
+            WireSourceBinding::AttestationMissing => SourceBinding::AttestationMissing,
+            WireSourceBinding::ClassBytesMismatch => SourceBinding::ClassBytesMismatch,
+            WireSourceBinding::DebugMetadataAbsent => SourceBinding::DebugMetadataAbsent,
+            WireSourceBinding::SourceMetadataInvalid => SourceBinding::SourceMetadataInvalid,
+            WireSourceBinding::Unspecified => SourceBinding::Unspecified,
+        },
+    );
+    let source = if source_binding.is_verified() {
+        event
+            .source
+            .as_ref()
+            .and_then(source_range_from_wire)
+            .and_then(|source| project_source(&source, source_root, source_cache))
+    } else {
+        None
+    };
     let mut projected = PersistedEvent {
         sequence: event.recording_seq.to_string(),
+        frame_id: None,
+        navigation: FrameNavigation::UNAVAILABLE,
         monotonic_ns: event.monotonic_ns.to_string(),
         event_id: nonempty(&event.event_id),
         parent_event_id: nonempty(&event.parent_event_id),
@@ -1552,10 +2434,398 @@ fn project_persisted_event(
         kind: recording_event_kind_label(event.kind),
         symbol: nonempty(&event.symbol),
         interaction,
+        source,
+        source_binding,
         field_truncations: Vec::new(),
     };
     projected.bound_display_fields();
     projected
+}
+
+fn source_range_from_wire(
+    wire: &xtrace_protocol::generated::agent::SourceRange,
+) -> Option<SourceRange> {
+    Some(SourceRange {
+        path: wire.path.clone(),
+        start_line: (wire.start_line > 0).then_some(wire.start_line),
+        start_column: (wire.start_column > 0).then_some(wire.start_column),
+        end_line: (wire.end_line > 0).then_some(wire.end_line),
+        end_column: (wire.end_column > 0).then_some(wire.end_column),
+        content_hash: ContentHash::from_digest_bytes(&wire.content_hash),
+    })
+}
+
+const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_SOURCE_EXCERPT_BYTES: usize = 16 * 1024;
+const MAX_SOURCE_EXCERPT_LINES: u32 = 64;
+
+#[derive(Default)]
+struct SourceProjectionCache {
+    snapshots: HashMap<String, SourceSnapshot>,
+    reads: usize,
+}
+
+enum SourceSnapshot {
+    Unavailable,
+    Loaded { hash: ContentHash, text: Option<String> },
+}
+
+fn project_source(
+    source: &SourceRange,
+    source_root: Option<&Path>,
+    cache: &mut SourceProjectionCache,
+) -> Option<PersistedSource> {
+    let start_line = source.start_line?;
+    let path = source.path.as_str();
+    let safe = [
+        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderController.java",
+        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java",
+        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderRepository.java",
+    ];
+    if start_line == 0 || !safe.contains(&path) || source.content_hash.is_none() {
+        return None;
+    }
+    let end_line = source.end_line.filter(|end| *end >= start_line);
+    let Some(root) = source_root else {
+        return Some(PersistedSource {
+            path: path.to_owned(),
+            start_line,
+            end_line,
+            status: SourceStatus::Unavailable,
+            excerpt: None,
+            truncated: false,
+        });
+    };
+    if !cache.snapshots.contains_key(path) {
+        cache.reads += 1;
+        cache.snapshots.insert(path.to_owned(), load_source_snapshot(root, path));
+    }
+    let snapshot = cache.snapshots.get(path)?;
+    let SourceSnapshot::Loaded { hash, text } = snapshot else {
+        return unavailable_source(path, start_line, end_line);
+    };
+    let recorded_hash = source.content_hash.as_ref()?;
+    if hash != recorded_hash {
+        return Some(PersistedSource {
+            path: path.to_owned(),
+            start_line,
+            end_line,
+            status: SourceStatus::Mismatch,
+            excerpt: None,
+            truncated: false,
+        });
+    }
+    let Some(text) = text.as_deref() else {
+        return unavailable_source(path, start_line, end_line);
+    };
+    project_matching_source(path, start_line, end_line, text)
+}
+
+fn load_source_snapshot(root: &Path, path: &str) -> SourceSnapshot {
+    let Ok(root) = root.canonicalize() else {
+        return SourceSnapshot::Unavailable;
+    };
+    let relative = Path::new(path);
+    let Ok(root_metadata) = std::fs::symlink_metadata(&root) else {
+        return SourceSnapshot::Unavailable;
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return SourceSnapshot::Unavailable;
+    }
+    let Ok(mut directory) = std::fs::File::open(&root) else {
+        return SourceSnapshot::Unavailable;
+    };
+    let Ok(opened_root) = directory.metadata() else {
+        return SourceSnapshot::Unavailable;
+    };
+    #[cfg(unix)]
+    if root_metadata.dev() != opened_root.dev() || root_metadata.ino() != opened_root.ino() {
+        return SourceSnapshot::Unavailable;
+    }
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(part) = component else {
+            return SourceSnapshot::Unavailable;
+        };
+        let final_component = index + 1 == components.len();
+        let flags = if final_component {
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC
+        } else {
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC
+        };
+        let Ok(opened) = rustix::fs::openat(&directory, *part, flags, rustix::fs::Mode::empty())
+        else {
+            return SourceSnapshot::Unavailable;
+        };
+        let file = std::fs::File::from(opened);
+        if final_component {
+            let Ok(metadata) = file.metadata() else {
+                return SourceSnapshot::Unavailable;
+            };
+            if !metadata.is_file() || metadata.len() > MAX_SOURCE_FILE_BYTES {
+                return SourceSnapshot::Unavailable;
+            }
+            let mut reader = file.take(MAX_SOURCE_FILE_BYTES + 1);
+            let capacity = usize::try_from(metadata.len()).unwrap_or(0);
+            let mut bytes = Vec::with_capacity(capacity);
+            if reader.read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_SOURCE_FILE_BYTES
+            {
+                return SourceSnapshot::Unavailable;
+            }
+            return SourceSnapshot::Loaded {
+                hash: ContentHash::of_bytes(&bytes),
+                text: std::str::from_utf8(&bytes).ok().map(str::to_owned),
+            };
+        }
+        if file.metadata().is_err() {
+            return SourceSnapshot::Unavailable;
+        }
+        directory = file;
+    }
+    SourceSnapshot::Unavailable
+}
+
+fn project_matching_source(
+    path: &str,
+    start_line: u32,
+    end_line: Option<u32>,
+    text: &str,
+) -> Option<PersistedSource> {
+    let mut excerpt = String::new();
+    let mut truncated = false;
+    let mut found = false;
+    let upper =
+        end_line.unwrap_or(start_line).min(start_line.saturating_add(MAX_SOURCE_EXCERPT_LINES - 1));
+    for (index, line) in text.lines().enumerate() {
+        let Ok(number) = u32::try_from(index + 1) else {
+            truncated = true;
+            break;
+        };
+        if number < start_line {
+            continue;
+        }
+        if number > upper {
+            truncated = end_line.is_some_and(|end| end > upper);
+            break;
+        }
+        found = true;
+        let separator_bytes = usize::from(!excerpt.is_empty());
+        if excerpt.len().saturating_add(separator_bytes) > MAX_SOURCE_EXCERPT_BYTES {
+            truncated = true;
+            break;
+        }
+        let remaining =
+            MAX_SOURCE_EXCERPT_BYTES.saturating_sub(excerpt.len().saturating_add(separator_bytes));
+        if separator_bytes != 0 {
+            excerpt.push('\n');
+        }
+        if line.len() > remaining {
+            let mut boundary = remaining.min(line.len());
+            while !line.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            excerpt.push_str(&line[..boundary]);
+            truncated = true;
+            break;
+        }
+        excerpt.push_str(line);
+    }
+    if !found {
+        return unavailable_source(path, start_line, end_line);
+    }
+    Some(PersistedSource {
+        path: path.to_owned(),
+        start_line,
+        end_line,
+        status: SourceStatus::Matched,
+        excerpt: Some(excerpt),
+        truncated,
+    })
+}
+
+fn unavailable_source(
+    path: &str,
+    start_line: u32,
+    end_line: Option<u32>,
+) -> Option<PersistedSource> {
+    Some(PersistedSource {
+        path: path.to_owned(),
+        start_line,
+        end_line,
+        status: SourceStatus::Unavailable,
+        excerpt: None,
+        truncated: false,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
+mod source_projection_tests {
+    use super::*;
+
+    fn tempdir() -> tempfile::TempDir {
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        tempfile::Builder::new()
+            .prefix("xtrace-source-projection-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir_in(scratch)
+            .expect("private source projection test directory")
+    }
+
+    const PATH: &str =
+        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java";
+
+    fn range(path: &str, hash: ContentHash) -> SourceRange {
+        SourceRange {
+            path: path.to_owned(),
+            start_line: Some(2),
+            start_column: None,
+            end_line: Some(3),
+            end_column: None,
+            content_hash: Some(hash),
+        }
+    }
+
+    fn write_source(root: &Path, bytes: &[u8]) {
+        let file = root.join(PATH);
+        std::fs::create_dir_all(file.parent().expect("parent exists")).expect("directory created");
+        std::fs::write(file, bytes).expect("source written");
+    }
+
+    fn project(source: &SourceRange, source_root: Option<&Path>) -> Option<PersistedSource> {
+        project_source(source, source_root, &mut SourceProjectionCache::default())
+    }
+
+    #[test]
+    fn matching_source_returns_only_the_bounded_recorded_extent() {
+        let root = tempdir();
+        let bytes = b"one\ntwo\nthree\nfour\n";
+        write_source(root.path(), bytes);
+        let projected = project(&range(PATH, ContentHash::of_bytes(bytes)), Some(root.path()))
+            .expect("source projection");
+        assert_eq!(projected.status, SourceStatus::Matched);
+        assert_eq!(projected.excerpt.as_deref(), Some("two\nthree"));
+    }
+
+    #[test]
+    fn changed_source_is_reported_without_returning_its_contents() {
+        let root = tempdir();
+        write_source(root.path(), b"private-source-canary\nchanged\n");
+        let projected =
+            project(&range(PATH, ContentHash::of_bytes(b"recorded\nsource\n")), Some(root.path()))
+                .expect("source projection");
+        assert_eq!(projected.status, SourceStatus::Mismatch);
+        assert!(projected.excerpt.is_none());
+    }
+
+    #[test]
+    fn repeated_frames_hash_near_limit_source_once_per_query() {
+        let root = tempdir();
+        let max_bytes = usize::try_from(MAX_SOURCE_FILE_BYTES).expect("bound fits");
+        let mut bytes = b"header\nrecorded line\n".to_vec();
+        bytes.resize(max_bytes - 1, b'x');
+        bytes.push(b'\n');
+        write_source(root.path(), &bytes);
+        let mut source = range(PATH, ContentHash::of_bytes(&bytes));
+        source.end_line = Some(2);
+        let mut cache = SourceProjectionCache::default();
+
+        for _ in 0..1_000 {
+            let projected =
+                project_source(&source, Some(root.path()), &mut cache).expect("source projection");
+            assert_eq!(projected.status, SourceStatus::Matched);
+            assert_eq!(projected.excerpt.as_deref(), Some("recorded line"));
+        }
+        assert_eq!(cache.reads, 1, "repeated frames must share one bounded file read/hash");
+
+        let changed = b"private-source-canary\nchanged\n";
+        write_source(root.path(), changed);
+        let mut next_query_cache = SourceProjectionCache::default();
+        let next_query = project_source(&source, Some(root.path()), &mut next_query_cache)
+            .expect("safe mismatch projection");
+        assert_eq!(next_query.status, SourceStatus::Mismatch);
+        assert!(next_query.excerpt.is_none());
+        assert_eq!(next_query_cache.reads, 1, "a new query must observe live source changes");
+    }
+
+    #[test]
+    fn source_paths_outside_the_fixture_allowlist_are_never_projected() {
+        let root = tempdir();
+        let projected =
+            project(&range("../../private.txt", ContentHash::of_bytes(b"x")), Some(root.path()));
+        assert!(projected.is_none());
+    }
+
+    #[test]
+    fn source_files_over_the_read_bound_are_unavailable() {
+        let root = tempdir();
+        write_source(
+            root.path(),
+            &vec![b'x'; usize::try_from(MAX_SOURCE_FILE_BYTES + 1).expect("bound fits")],
+        );
+        let projected = project(&range(PATH, ContentHash::of_bytes(b"unused")), Some(root.path()))
+            .expect("safe unavailable projection");
+        assert_eq!(projected.status, SourceStatus::Unavailable);
+        assert!(projected.excerpt.is_none());
+    }
+
+    #[test]
+    fn missing_source_root_and_out_of_range_method_lines_are_unavailable() {
+        let root = tempdir();
+        let bytes = b"one\ntwo\n";
+        write_source(root.path(), bytes);
+        let no_root = project(&range(PATH, ContentHash::of_bytes(bytes)), None)
+            .expect("unavailable projection");
+        assert_eq!(no_root.status, SourceStatus::Unavailable);
+        let mut out_of_range = range(PATH, ContentHash::of_bytes(bytes));
+        out_of_range.start_line = Some(20);
+        out_of_range.end_line = Some(20);
+        let projected =
+            project(&out_of_range, Some(root.path())).expect("safe unavailable projection");
+        assert_eq!(projected.status, SourceStatus::Unavailable);
+        assert!(projected.excerpt.is_none());
+    }
+
+    #[test]
+    fn excerpt_limit_includes_inter_line_separator_bytes() {
+        let root = tempdir();
+        let first = "a".repeat(MAX_SOURCE_EXCERPT_BYTES);
+        let contents = format!("header\n{first}\nnext\n");
+        write_source(root.path(), contents.as_bytes());
+        let projected =
+            project(&range(PATH, ContentHash::of_bytes(contents.as_bytes())), Some(root.path()))
+                .expect("source projection");
+        let excerpt = projected.excerpt.expect("matched excerpt");
+        assert_eq!(excerpt.len(), MAX_SOURCE_EXCERPT_BYTES);
+        assert!(projected.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_source_file_is_not_read() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir();
+        let file = root.path().join(PATH);
+        std::fs::create_dir_all(file.parent().expect("parent exists")).expect("directory created");
+        let private = root.path().join("private-source-canary.txt");
+        std::fs::write(&private, b"private-source-canary").expect("private file written");
+        symlink(&private, &file).expect("source symlink created");
+        let projected = project(
+            &range(PATH, ContentHash::of_bytes(b"private-source-canary")),
+            Some(root.path()),
+        )
+        .expect("unavailable projection");
+        assert_eq!(projected.status, SourceStatus::Unavailable);
+        assert!(projected.excerpt.is_none());
+    }
 }
 
 fn nonempty(value: &str) -> Option<String> {
@@ -1650,6 +2920,53 @@ fn segment_conflict_error(correlation_id: CorrelationId) -> RecordingStoreError 
     )
 }
 
+fn terminal_validation_error(correlation_id: CorrelationId) -> RecordingStoreError {
+    RecordingStoreError::new(
+        RecordingStoreErrorKind::Validation,
+        "XTR-STORE-RECORDING-FINISH-VALIDATION",
+        "recording finish evidence is outside supported bounds",
+        correlation_id,
+    )
+}
+
+fn frame_identity_error(correlation_id: CorrelationId) -> RecordingStoreError {
+    RecordingStoreError::new(
+        RecordingStoreErrorKind::Validation,
+        "XTR-STORE-FRAME-IDENTITY",
+        "recording event identity is missing, duplicated, or outside supported bounds",
+        correlation_id,
+    )
+}
+
+fn terminal_conflict_error(correlation_id: CorrelationId) -> RecordingStoreError {
+    RecordingStoreError::new(
+        RecordingStoreErrorKind::Conflict,
+        "XTR-STORE-RECORDING-FINISH-CONFLICT",
+        "recording finish conflicts with immutable terminal evidence",
+        correlation_id,
+    )
+}
+
+fn completion_label(completion: RecordingCompletion) -> &'static str {
+    match completion {
+        RecordingCompletion::Complete => "complete",
+        RecordingCompletion::Partial => "partial",
+        RecordingCompletion::Invalid => "invalid",
+    }
+}
+
+fn parse_completion(
+    completion: &str,
+    correlation_id: CorrelationId,
+) -> Result<RecordingCompletion, RecordingStoreError> {
+    match completion {
+        "complete" => Ok(RecordingCompletion::Complete),
+        "partial" => Ok(RecordingCompletion::Partial),
+        "invalid" => Ok(RecordingCompletion::Invalid),
+        _ => Err(recording_query_corrupt_error(correlation_id)),
+    }
+}
+
 fn segment_continuity_error(correlation_id: CorrelationId) -> RecordingStoreError {
     RecordingStoreError::new(
         RecordingStoreErrorKind::Conflict,
@@ -1688,18 +3005,23 @@ fn create_staging_files(
     correlation_id: CorrelationId,
 ) -> Result<StagingFiles, RecordingStoreError> {
     binding.revalidate(correlation_id)?;
-    let staging_root = binding.root.join("staging");
-    ensure_owner_only_directory(&binding.root, &staging_root, correlation_id)?;
-    let recording_directory = staging_root.join(recording_id.as_uuid().to_string());
-    ensure_owner_only_directory(&binding.root, &recording_directory, correlation_id)?;
+    let root =
+        AdmittedPrivateRoot::open(&binding.root).map_err(|_| object_io_error(correlation_id))?;
+    let staging_root = root
+        .open_or_create_private_child("staging")
+        .map_err(|_| object_io_error(correlation_id))?;
+    let recording_directory = staging_root
+        .open_or_create_private_child(&recording_id.as_uuid().to_string())
+        .map_err(|_| object_io_error(correlation_id))?;
     // UUIDv7 supplies entropy for collision resistance while preserving no caller
     // material in the staging path.
-    let directory = recording_directory.join(uuid::Uuid::now_v7().to_string());
-    let mut builder = std::fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder.create(&directory).map_err(|_| object_io_error(correlation_id))?;
-    set_owner_mode(&directory, 0o700, correlation_id)?;
-    sync_directory(&recording_directory, correlation_id, "XTR-STORE-OBJECT-IO")?;
+    let directory_name = uuid::Uuid::now_v7().to_string();
+    let staging = recording_directory
+        .create_private_child(&directory_name)
+        .map_err(|_| object_io_error(correlation_id))?;
+    recording_directory.sync().map_err(|_| object_io_error(correlation_id))?;
+    let directory = staging.path().to_path_buf();
+    drop(staging);
     Ok(StagingFiles {
         logical: directory.join("logical.xtf"),
         compressed: directory.join("object.xtf.zst"),
@@ -1752,48 +3074,25 @@ fn ensure_owner_only_directory(
     directory: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    if !directory.starts_with(root) {
-        return Err(atomic_install_error(correlation_id));
-    }
-    match std::fs::symlink_metadata(directory) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                return Err(atomic_install_error(correlation_id));
-            }
-            if metadata.mode() & 0o077 != 0 {
-                return Err(RecordingStoreError::new(
-                    RecordingStoreErrorKind::Permission,
-                    "XTR-STORE-OBJECT-IO",
-                    "object storage directory must be owner-only",
-                    correlation_id,
-                ));
-            }
+    let relative =
+        directory.strip_prefix(root).map_err(|_| atomic_install_error(correlation_id))?;
+    let root_cap = AdmittedPrivateRoot::open(root).map_err(|_| object_io_error(correlation_id))?;
+    let mut current = root_cap;
+    let mut traversed = 0_usize;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(atomic_install_error(correlation_id));
+        };
+        traversed += 1;
+        if traversed > 16 {
+            return Err(atomic_install_error(correlation_id));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.mode(0o700);
-            builder.create(directory).map_err(|_| object_io_error(correlation_id))?;
-            set_owner_mode(directory, 0o700, correlation_id)?;
-            let parent = directory.parent().ok_or_else(|| object_io_error(correlation_id))?;
-            sync_directory(parent, correlation_id, "XTR-STORE-OBJECT-IO")?;
-        }
-        Err(_) => return Err(atomic_install_error(correlation_id)),
+        let name = name.to_str().ok_or_else(|| atomic_install_error(correlation_id))?;
+        current = current
+            .open_or_create_private_child(name)
+            .map_err(|_| object_io_error(correlation_id))?;
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_owner_mode(
-    path: &Path,
-    mode: u32,
-    correlation_id: CorrelationId,
-) -> Result<(), RecordingStoreError> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .map_err(|_| object_io_error(correlation_id))
+    current.revalidate().map_err(|_| object_io_error(correlation_id))
 }
 
 fn write_synced_file(
@@ -1801,19 +3100,19 @@ fn write_synced_file(
     bytes: &[u8],
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
-    use std::fs::OpenOptions;
-
     note_staging_write();
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path).map_err(|_| object_io_error(correlation_id))?;
-    #[cfg(unix)]
-    set_owner_mode(path, 0o600, correlation_id)?;
+    let parent = path.parent().ok_or_else(|| object_io_error(correlation_id))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| object_io_error(correlation_id))?;
+    let root = AdmittedPrivateRoot::open(parent).map_err(|_| object_io_error(correlation_id))?;
+    let mut file = root.create_private_file(name).map_err(|_| object_io_error(correlation_id))?;
     file.write_all(bytes).map_err(|_| object_io_error(correlation_id))?;
     file.flush().map_err(|_| object_io_error(correlation_id))?;
-    file.sync_all().map_err(|_| object_io_error(correlation_id))
+    file.sync_all().map_err(|_| object_io_error(correlation_id))?;
+    root.validate_file_binding(name, &file, true).map_err(|_| object_io_error(correlation_id))?;
+    root.sync().map_err(|_| object_io_error(correlation_id))
 }
 
 #[cfg(unix)]
@@ -1821,15 +3120,9 @@ fn validate_managed_directory(
     directory: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
-    let metadata =
-        std::fs::symlink_metadata(directory).map_err(|_| atomic_install_error(correlation_id))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_dir()
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(atomic_install_error(correlation_id));
-    }
-    Ok(())
+    AdmittedPrivateRoot::open(directory)
+        .and_then(|root| root.revalidate())
+        .map_err(|_| atomic_install_error(correlation_id))
 }
 
 #[cfg(unix)]
@@ -1840,16 +3133,22 @@ fn validate_managed_tree(
 ) -> Result<(), RecordingStoreError> {
     let relative =
         directory.strip_prefix(root).map_err(|_| atomic_install_error(correlation_id))?;
-    validate_managed_directory(root, correlation_id)?;
-    let mut current = root.to_path_buf();
+    let mut current =
+        AdmittedPrivateRoot::open(root).map_err(|_| atomic_install_error(correlation_id))?;
+    let mut traversed = 0_usize;
     for component in relative.components() {
         let std::path::Component::Normal(part) = component else {
             return Err(atomic_install_error(correlation_id));
         };
-        current.push(part);
-        validate_managed_directory(&current, correlation_id)?;
+        traversed += 1;
+        if traversed > 16 {
+            return Err(atomic_install_error(correlation_id));
+        }
+        current = current
+            .open_private_child(part.to_str().ok_or_else(|| atomic_install_error(correlation_id))?)
+            .map_err(|_| atomic_install_error(correlation_id))?;
     }
-    Ok(())
+    current.revalidate().map_err(|_| atomic_install_error(correlation_id))
 }
 
 #[cfg(not(unix))]
@@ -1874,22 +3173,21 @@ fn validate_managed_file(
     correlation_id: CorrelationId,
     absent_is_valid: bool,
 ) -> Result<(), RecordingStoreError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            #[cfg(unix)]
-            if metadata.file_type().is_symlink()
-                || !metadata.file_type().is_file()
-                || metadata.mode() & 0o077 != 0
-            {
-                return Err(atomic_install_error(correlation_id));
-            }
-            #[cfg(not(unix))]
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err(atomic_install_error(correlation_id));
-            }
-            Ok(())
-        }
-        Err(error) if absent_is_valid && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    let parent = path.parent().ok_or_else(|| atomic_install_error(correlation_id))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| atomic_install_error(correlation_id))?;
+    let root =
+        AdmittedPrivateRoot::open(parent).map_err(|_| atomic_install_error(correlation_id))?;
+    match root.open_managed_file(name) {
+        Ok(file) => root
+            .validate_managed_file_binding(name, &file, false)
+            .map_err(|_| atomic_install_error(correlation_id)),
+        Err(_) if absent_is_valid => match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(atomic_install_error(correlation_id)),
+        },
         Err(_) => Err(atomic_install_error(correlation_id)),
     }
 }
@@ -1907,8 +3205,8 @@ fn sync_directory(
             object_io_error(correlation_id)
         }
     };
-    let handle = std::fs::File::open(directory).map_err(|_| failure())?;
-    handle.sync_all().map_err(|_| failure())
+    let handle = AdmittedPrivateRoot::open(directory).map_err(|_| failure())?;
+    handle.sync().map_err(|_| failure())
 }
 
 #[cfg(not(unix))]
@@ -1948,33 +3246,15 @@ fn read_bounded_regular_file(
             object_corrupt_error(correlation_id)
         }
     };
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| failure())?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return Err(failure());
-    }
     let limit = max_compressed_segment_bytes();
-    if metadata.len() > u64::try_from(limit).map_err(|_| failure())? {
-        return Err(failure());
+    let parent = path.parent().ok_or_else(failure)?;
+    let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(failure)?;
+    let root = AdmittedPrivateRoot::open(parent).map_err(|_| failure())?;
+    if staging {
+        root.read_bounded_file(name, limit).map_err(|_| failure())
+    } else {
+        root.read_bounded_managed_file(name, limit).map_err(|_| failure())
     }
-    let file = std::fs::File::open(path).map_err(|_| failure())?;
-    #[cfg(unix)]
-    {
-        let opened = file.metadata().map_err(|_| failure())?;
-        if opened.dev() != metadata.dev()
-            || opened.ino() != metadata.ino()
-            || !opened.file_type().is_file()
-            || opened.mode() & 0o077 != 0
-        {
-            return Err(failure());
-        }
-    }
-    let mut reader = file.take(u64::try_from(limit + 1).map_err(|_| failure())?);
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).map_err(|_| failure())?);
-    reader.read_to_end(&mut bytes).map_err(|_| failure())?;
-    if bytes.len() > limit {
-        return Err(failure());
-    }
-    Ok(bytes)
 }
 
 fn verify_staged_object(
@@ -2039,6 +3319,29 @@ fn publish_no_replace<F>(
 where
     F: FnOnce(),
 {
+    let staging_parent = staging.parent().ok_or_else(|| atomic_install_error(correlation_id))?;
+    let staging_name = staging
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| atomic_install_error(correlation_id))?;
+    let destination_parent =
+        destination.parent().ok_or_else(|| atomic_install_error(correlation_id))?;
+    let destination_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| atomic_install_error(correlation_id))?;
+    let staging_root = AdmittedPrivateRoot::open(staging_parent)
+        .map_err(|_| atomic_install_error(correlation_id))?;
+    let staged_file = staging_root
+        .open_regular_file(staging_name)
+        .map_err(|_| atomic_install_error(correlation_id))?;
+    staging_root
+        .validate_file_binding(staging_name, &staged_file, false)
+        .map_err(|_| atomic_install_error(correlation_id))?;
+    let destination_root = AdmittedPrivateRoot::open(destination_parent)
+        .map_err(|_| atomic_install_error(correlation_id))?;
+    staging_root.revalidate().map_err(|_| atomic_install_error(correlation_id))?;
+    destination_root.revalidate().map_err(|_| atomic_install_error(correlation_id))?;
     commit_failpoint("hard-link-syscall", correlation_id, true)?;
     match std::fs::hard_link(staging, destination) {
         Ok(()) => {
@@ -2047,12 +3350,24 @@ where
             // fallible readback can observe the new destination.
             defer_cleanup_after_new_link();
             commit_failpoint("after-hard-link-before-readback", correlation_id, true)?;
+            let persisted_file = destination_root
+                .open_managed_file(destination_name)
+                .map_err(|_| atomic_install_error(correlation_id))?;
+            destination_root
+                .validate_managed_file_binding(destination_name, &persisted_file, false)
+                .map_err(|_| atomic_install_error(correlation_id))?;
             let persisted = read_bounded_regular_file(destination, correlation_id, false)?;
             verify_staged_object(&persisted, candidate, correlation_id)
                 .map_err(|_| object_corrupt_error(correlation_id))?;
             i64::try_from(persisted.len()).map_err(|_| object_corrupt_error(correlation_id))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing_file = destination_root
+                .open_managed_file(destination_name)
+                .map_err(|_| object_corrupt_error(correlation_id))?;
+            destination_root
+                .validate_managed_file_binding(destination_name, &existing_file, false)
+                .map_err(|_| object_corrupt_error(correlation_id))?;
             let existing = read_bounded_regular_file(destination, correlation_id, false)?;
             verify_staged_object(&existing, candidate, correlation_id)
                 .map_err(|_| object_corrupt_error(correlation_id))?;
@@ -2063,20 +3378,45 @@ where
 }
 
 fn cleanup_owned_staging_paths(staging: &StagingFiles, correlation_id: CorrelationId) {
-    let cleanup = std::fs::remove_file(&staging.logical)
-        .and_then(|_| std::fs::remove_file(&staging.compressed))
-        .and_then(|_| std::fs::remove_dir(&staging.directory));
+    let Some(parent) = staging.directory.parent() else {
+        tracing::warn!("recording segment staging cleanup could not bind its parent");
+        return;
+    };
+    let Some(directory_name) = staging.directory.file_name().and_then(|name| name.to_str()) else {
+        tracing::warn!("recording segment staging cleanup had an invalid directory name");
+        return;
+    };
+    let cleanup = (|| {
+        let parent_cap =
+            AdmittedPrivateRoot::open(parent).map_err(|_| PrivateStorageError::Unavailable)?;
+        let staging_cap = parent_cap.open_private_child(directory_name)?;
+        for (path, managed) in [(&staging.logical, false), (&staging.compressed, true)] {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(PrivateStorageError::InvalidName)?;
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(_) => {}
+                Err(_) => return Err(PrivateStorageError::Unavailable),
+            }
+            if managed {
+                staging_cap.remove_managed_file(name)?;
+            } else {
+                staging_cap.remove_private_file(name)?;
+            }
+        }
+        parent_cap.remove_private_child(directory_name)?;
+        Ok::<(), PrivateStorageError>(())
+    })();
     if cleanup.is_err() {
         tracing::warn!("recording segment staging cleanup left safe residue");
         return;
     }
-    #[cfg(unix)]
-    if let Some(parent) = staging.directory.parent() {
-        if commit_failpoint("cleanup-staging-directory-fsync", correlation_id, false).is_err()
-            || sync_directory(parent, correlation_id, "XTR-STORE-OBJECT-IO").is_err()
-        {
-            tracing::warn!("recording segment staging directory synchronization left safe residue");
-        }
+    if commit_failpoint("cleanup-staging-directory-fsync", correlation_id, false).is_err()
+        || sync_directory(parent, correlation_id, "XTR-STORE-OBJECT-IO").is_err()
+    {
+        tracing::warn!("recording segment staging directory synchronization left safe residue");
     }
 }
 
@@ -2257,9 +3597,36 @@ fn commit_failpoint(
 struct ProjectRootBinding {
     root: PathBuf,
     database_path: PathBuf,
+    private_root: AdmittedPrivateRoot,
 }
 
 impl ProjectRootBinding {
+    fn new(
+        root: &Path,
+        database_path: PathBuf,
+        correlation_id: CorrelationId,
+    ) -> Result<Self, RecordingStoreError> {
+        let private_root = AdmittedPrivateRoot::open(root).map_err(|_| {
+            RecordingStoreError::new(
+                RecordingStoreErrorKind::Permission,
+                "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+                "private storage is unavailable",
+                correlation_id,
+            )
+        })?;
+        if private_root.path() != root {
+            return Err(RecordingStoreError::new(
+                RecordingStoreErrorKind::Validation,
+                "XTR-STORE-RECORDING-ROOT-INVALID",
+                "project root identity does not match its requested path",
+                correlation_id,
+            ));
+        }
+        let binding = Self { root: root.to_path_buf(), database_path, private_root };
+        binding.revalidate(correlation_id)?;
+        Ok(binding)
+    }
+
     /// Re-checks the durable root/database identity without canonicalizing.
     ///
     /// Construction-time checks cannot eliminate filesystem TOCTOU. Later
@@ -2277,7 +3644,14 @@ impl ProjectRootBinding {
 
         #[cfg(unix)]
         {
-            validate_absolute_symlink_free_directory(&self.root, correlation_id)?;
+            self.private_root.revalidate().map_err(|_| {
+                RecordingStoreError::new(
+                    RecordingStoreErrorKind::Permission,
+                    "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+                    "private storage is unavailable",
+                    correlation_id,
+                )
+            })?;
             let parent = self.database_path.parent().ok_or_else(|| {
                 RecordingStoreError::new(
                     RecordingStoreErrorKind::Validation,
@@ -2294,97 +3668,36 @@ impl ProjectRootBinding {
                     correlation_id,
                 ));
             }
-            validate_regular_owner_only_file(&self.database_path, correlation_id)
+            validate_regular_owner_only_file(&self.database_path, correlation_id)?;
+            let file_name =
+                self.database_path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+                    RecordingStoreError::new(
+                        RecordingStoreErrorKind::Validation,
+                        "XTR-STORE-RECORDING-ROOT-INVALID",
+                        "SQLite database file name is invalid",
+                        correlation_id,
+                    )
+                })?;
+            // Descriptor-free: closing a second descriptor for the live SQLite database would
+            // release SQLite's POSIX locks and let another process delete its WAL.
+            self.private_root.validate_regular_file(file_name).map_err(|_| {
+                RecordingStoreError::new(
+                    RecordingStoreErrorKind::Permission,
+                    "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+                    "private storage is unavailable",
+                    correlation_id,
+                )
+            })?;
+            self.private_root.revalidate().map_err(|_| {
+                RecordingStoreError::new(
+                    RecordingStoreErrorKind::Permission,
+                    "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+                    "private storage is unavailable",
+                    correlation_id,
+                )
+            })
         }
     }
-}
-
-#[cfg(unix)]
-fn validate_absolute_symlink_free_directory(
-    root: &Path,
-    correlation_id: CorrelationId,
-) -> Result<(), RecordingStoreError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    if !root.is_absolute()
-        || root
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
-        return Err(RecordingStoreError::new(
-            RecordingStoreErrorKind::Validation,
-            "XTR-STORE-RECORDING-ROOT-INVALID",
-            "project root must be an absolute lexical path without dot components",
-            correlation_id,
-        ));
-    }
-    let mut component_path = PathBuf::from("/");
-    let root_metadata = std::fs::symlink_metadata(&component_path).map_err(|_| {
-        RecordingStoreError::new(
-            RecordingStoreErrorKind::Transport,
-            "XTR-STORE-RECORDING-ROOT-IO",
-            "project root metadata could not be read",
-            correlation_id,
-        )
-        .with_source("filesystem metadata failure")
-    })?;
-    if root_metadata.file_type().is_symlink() {
-        return Err(RecordingStoreError::new(
-            RecordingStoreErrorKind::Validation,
-            "XTR-STORE-RECORDING-ROOT-INVALID",
-            "project root path must not contain symbolic links",
-            correlation_id,
-        ));
-    }
-    for component in root.components() {
-        let Component::Normal(segment) = component else {
-            continue;
-        };
-        component_path.push(segment);
-        let metadata = std::fs::symlink_metadata(&component_path).map_err(|_| {
-            RecordingStoreError::new(
-                RecordingStoreErrorKind::Transport,
-                "XTR-STORE-RECORDING-ROOT-IO",
-                "project root metadata could not be read",
-                correlation_id,
-            )
-            .with_source("filesystem metadata failure")
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(RecordingStoreError::new(
-                RecordingStoreErrorKind::Validation,
-                "XTR-STORE-RECORDING-ROOT-INVALID",
-                "project root path must not contain symbolic links",
-                correlation_id,
-            ));
-        }
-    }
-    let metadata = std::fs::symlink_metadata(root).map_err(|_| {
-        RecordingStoreError::new(
-            RecordingStoreErrorKind::Transport,
-            "XTR-STORE-RECORDING-ROOT-IO",
-            "project root metadata could not be read",
-            correlation_id,
-        )
-        .with_source("filesystem metadata failure")
-    })?;
-    if !metadata.file_type().is_dir() {
-        return Err(RecordingStoreError::new(
-            RecordingStoreErrorKind::Validation,
-            "XTR-STORE-RECORDING-ROOT-INVALID",
-            "project root must be a directory",
-            correlation_id,
-        ));
-    }
-    if metadata.mode() & 0o077 != 0 {
-        return Err(RecordingStoreError::new(
-            RecordingStoreErrorKind::Permission,
-            "XTR-STORE-RECORDING-ROOT-PERMISSION",
-            "project root must be owner-only",
-            correlation_id,
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -2782,6 +4095,7 @@ fn validate_operation_has_observation(
 
 fn recording_metadata_from_row(
     row: &rusqlite::Row<'_>,
+    connection: &rusqlite::Connection,
     correlation_id: CorrelationId,
 ) -> Result<RecordingMetadata, RecordingStoreError> {
     let raw_id: Vec<u8> = row.get(0).map_err(|error| {
@@ -2811,6 +4125,8 @@ fn recording_metadata_from_row(
         map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
     })?;
     let lifecycle_status = recording_status(&status, correlation_id)?;
+    let recording_id = observed_recording_id_from_bytes(&raw_id, correlation_id)?;
+    let completion = completion_evidence(connection, recording_id, &status, correlation_id)?;
     let incomplete_evidence = match lifecycle_status {
         RecordingStatus::Partial | RecordingStatus::Invalid => {
             vec![format!("persisted_status:{status}")]
@@ -2818,8 +4134,9 @@ fn recording_metadata_from_row(
         _ => Vec::new(),
     };
     Ok(RecordingMetadata {
-        recording_id: observed_recording_id_from_bytes(&raw_id, correlation_id)?,
+        recording_id,
         status: lifecycle_status,
+        completion,
         opened_at,
         segment_count: u64::try_from(segment_count)
             .map_err(|_| recording_query_corrupt_error(correlation_id))?
@@ -2889,14 +4206,90 @@ fn find_or_insert_operation(
         if fingerprint_operation_id != tuple_operation_id {
             return Err(endpoint_identity_corrupt(correlation_id));
         }
-        return fingerprint_operation_id.ok_or_else(|| endpoint_identity_corrupt(correlation_id));
+        let operation_id =
+            fingerprint_operation_id.ok_or_else(|| endpoint_identity_corrupt(correlation_id))?;
+        ensure_catalog_operation_alias(
+            transaction,
+            &identity,
+            operation_id,
+            fingerprint.as_bytes(),
+            correlation_id,
+        )?;
+        return Ok(operation_id);
     }
     let operation_id = xtrace_domain::OperationId::new();
     transaction.execute(
         "INSERT INTO operations (operation_id, project_id, transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint, created_at) VALUES (?1, ?2, 'http', 'POST', '/orders', 'spring-fixture', 'default', ?3, ?4, ?5)",
         rusqlite::params![operation_id.as_uuid().as_bytes().to_vec(), project_id.as_uuid().as_bytes().to_vec(), i64::from(ENDPOINT_FINGERPRINT_FORMAT_VERSION), fingerprint.as_bytes().to_vec(), WallTime::now().to_rfc3339()],
     ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+    ensure_catalog_operation_alias(
+        transaction,
+        &identity,
+        operation_id,
+        fingerprint.as_bytes(),
+        correlation_id,
+    )?;
     Ok(operation_id)
+}
+
+/// Keeps the finite legacy `/orders` identity shared by recording-first and
+/// catalog-first writes. Both rows are changed in the caller's transaction;
+/// historical recording IDs and the legacy endpoint query remain untouched.
+fn ensure_catalog_operation_alias(
+    transaction: &rusqlite::Transaction<'_>,
+    identity: &EndpointIdentity,
+    operation_id: xtrace_domain::OperationId,
+    fingerprint: &[u8; 32],
+    correlation_id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    let existing = transaction
+        .query_row(
+            "SELECT operation_id, application_component, binding_key, transport, method, route_template \
+             FROM catalog_operations WHERE project_id = ?1 AND fingerprint_format = 1 AND endpoint_fingerprint = ?2",
+            rusqlite::params![identity.project_id.as_uuid().as_bytes().to_vec(), fingerprint.as_slice()],
+            |row| Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            )),
+        )
+        .optional()
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    if let Some((stored_id, component, binding, transport, method, route)) = existing {
+        if stored_id.as_slice() != operation_id.as_uuid().as_bytes()
+            || component != identity.application_component
+            || binding != identity.binding_key
+            || transport != "http"
+            || method != "POST"
+            || route != "/orders"
+        {
+            return Err(endpoint_identity_corrupt(correlation_id));
+        }
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "INSERT INTO catalog_operations \
+             (operation_id, project_id, fingerprint_format, endpoint_fingerprint, transport, application_component, binding_key, method, route_template, created_at) \
+             VALUES (?1, ?2, 1, ?3, 'http', ?4, ?5, 'POST', '/orders', ?6)",
+            rusqlite::params![
+                operation_id.as_uuid().as_bytes().to_vec(),
+                identity.project_id.as_uuid().as_bytes().to_vec(),
+                fingerprint.as_slice(),
+                identity.application_component,
+                identity.binding_key,
+                WallTime::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    Ok(())
 }
 
 fn map_store_error(error: StoreError, correlation_id: CorrelationId) -> RecordingStoreError {
@@ -2938,6 +4331,12 @@ fn map_store_error(error: StoreError, correlation_id: CorrelationId) -> Recordin
             "XTR-STORE-RECORDING-SQLITE-IO",
             "SQLite transport operation failed",
             Some("SQLite transport failure"),
+        ),
+        StoreErrorKind::Permission => (
+            RecordingStoreErrorKind::Permission,
+            "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+            "private storage is unavailable",
+            Some("private storage admission failure"),
         ),
         StoreErrorKind::Busy => (
             RecordingStoreErrorKind::Busy,
@@ -3061,7 +4460,10 @@ mod tests {
         let fixture = on_disk_store("bindings");
         let relative =
             fixture.store.recording_store(Path::new("relative-root")).expect_err("relative root");
-        assert_eq!(relative.kind(), RecordingStoreErrorKind::Validation);
+        // Any path that cannot be admitted as a private root fails closed with the single
+        // sanitized private-storage error rather than distinguishing why.
+        assert_eq!(relative.kind(), RecordingStoreErrorKind::Permission);
+        assert_eq!(relative.code(), "XTR-PRIVATE-STORAGE-UNAVAILABLE");
 
         let mismatch_root = fixture.base.join("other");
         std::fs::create_dir(&mismatch_root).expect("mismatch root");
@@ -3077,7 +4479,7 @@ mod tests {
         let root_link = fixture.base.join("root-link");
         symlink(&fixture.root, &root_link).expect("root link");
         let linked_root = fixture.store.recording_store(&root_link).expect_err("linked root");
-        assert_eq!(linked_root.kind(), RecordingStoreErrorKind::Validation);
+        assert_eq!(linked_root.kind(), RecordingStoreErrorKind::Permission);
 
         let ancestor = fixture.base.join("ancestor");
         std::fs::create_dir(&ancestor).expect("ancestor");
@@ -3089,7 +4491,7 @@ mod tests {
         set_mode(fixture.base.join("ancestor").join("child"), 0o700);
         let ancestor_failure =
             fixture.store.recording_store(&descendant).expect_err("ancestor link");
-        assert_eq!(ancestor_failure.kind(), RecordingStoreErrorKind::Validation);
+        assert_eq!(ancestor_failure.kind(), RecordingStoreErrorKind::Permission);
     }
 
     #[cfg(unix)]
@@ -3181,6 +4583,14 @@ mod tests {
                 .expect("operation ID");
             let operation_uuid = uuid::Uuid::from_slice(&operation_bytes).expect("UUIDv7 width");
             assert_eq!(operation_uuid.get_version_num(), 7);
+            let catalog_operation_bytes: Vec<u8> = connection
+                .query_row(
+                    "SELECT operation_id FROM catalog_operations WHERE project_id = ?1 AND fingerprint_format = 1",
+                    [project_id.as_uuid().as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .expect("record-first operation is visible to catalog");
+            assert_eq!(catalog_operation_bytes, operation_bytes);
         }
         let counts = || {
             let conn = fixture.store.lock().expect("connection");
@@ -3945,10 +5355,8 @@ mod tests {
         assert_ne!(default.len(), alternate.len());
         let destination = object_path(&fixture.root, logical.content_hash());
         ensure_object_parent(
-            &ProjectRootBinding {
-                root: fixture.root.clone(),
-                database_path: fixture.database.clone(),
-            },
+            &ProjectRootBinding::new(&fixture.root, fixture.database.clone(), CorrelationId::new())
+                .expect("admitted project root"),
             &destination,
             CorrelationId::new(),
         )
@@ -4002,6 +5410,9 @@ mod tests {
             .commit_segment(&segment_request(project_id, anchor.recording_id, 0, &[2]))
             .expect_err("unsafe root");
         assert_eq!(error.kind(), RecordingStoreErrorKind::Permission);
+        // A store whose root is unsafe refuses to hand out its connection, so restore the
+        // owner-only mode before asserting that nothing was published.
+        set_mode(&fixture.root, 0o700);
         assert_eq!(segment_count(&fixture.store), 0);
     }
 
@@ -4040,10 +5451,8 @@ mod tests {
         .expect("max object");
         let destination = object_path(&fixture.root, encoded.content_hash());
         ensure_object_parent(
-            &ProjectRootBinding {
-                root: fixture.root.clone(),
-                database_path: fixture.database.clone(),
-            },
+            &ProjectRootBinding::new(&fixture.root, fixture.database.clone(), CorrelationId::new())
+                .expect("admitted project root"),
             &destination,
             CorrelationId::new(),
         )
@@ -4324,8 +5733,10 @@ mod tests {
                 verify_compressed_segment(&object, logical.content_hash()).expect("orphan valid");
                 let staged = staging_compressed_paths(&fixture.root, anchor.recording_id);
                 assert_eq!(staged.len(), 1, "{point} must retain its published staging link");
+                // The staging path is intentionally hard-linked to the published orphan, so it
+                // must be read through the managed (link-tolerant) policy.
                 let staged_bytes =
-                    read_bounded_regular_file(&staged[0], CorrelationId::new(), true)
+                    read_bounded_regular_file(&staged[0], CorrelationId::new(), false)
                         .expect("staging link");
                 verify_compressed_segment(&staged_bytes, logical.content_hash())
                     .expect("staging link valid");
@@ -4855,15 +6266,18 @@ mod tests {
     #[cfg(unix)]
     fn tempdir(label: &str) -> PathBuf {
         let index = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        // Fixture setup may resolve macOS's `/var` alias. Production root
-        // validation intentionally never canonicalizes, because that would
-        // accept a symlinked user-supplied path.
-        let symlink_free_base = std::env::temp_dir().canonicalize().expect("canonical test base");
-        let path = symlink_free_base
-            .join(format!("xtrace-recording-store-{label}-{}-{index}", std::process::id()));
-        std::fs::create_dir(&path).expect("deterministic test directory");
-        set_mode(&path, 0o700);
-        path
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        root.create_private_child(&format!(
+            "xtrace-recording-store-{label}-{}-{index}",
+            std::process::id()
+        ))
+        .expect("private recording store test directory")
+        .path()
+        .to_path_buf()
     }
 
     #[cfg(unix)]
@@ -4998,6 +6412,12 @@ mod tests {
     #[cfg(unix)]
     fn delete_segment_row(store: &SqliteStore, recording_id: RecordingId, ordinal: u32) {
         let connection = store.lock().expect("connection");
+        connection
+            .execute(
+                "DELETE FROM recording_frame_index WHERE recording_id = ?1 AND segment_ordinal = ?2",
+                rusqlite::params![recording_id.as_uuid().as_bytes().to_vec(), i64::from(ordinal)],
+            )
+            .expect("delete dependent frame index rows");
         connection
             .execute(
                 "DELETE FROM recording_segments WHERE recording_id = ?1 AND segment_ordinal = ?2",

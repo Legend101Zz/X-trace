@@ -21,6 +21,7 @@ xtrace-domain = { path = "../xtrace-domain" }
 xtrace-protocol = { path = "../xtrace-protocol" }
 xtrace-store = { path = "../xtrace-store" }
 xtrace-daemon = { path = "../xtrace-daemon" }
+xtrace-private-storage = { path = "../xtrace-private-storage" }
 xtrace-runtime = { path = "../xtrace-runtime" }
 clap = { workspace = true }
 thiserror = { workspace = true }
@@ -30,6 +31,8 @@ serde_json = { workspace = true }
 time = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "signal"] }
+blake3 = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 fs4 = "1.1.0"
@@ -41,5 +44,4 @@ blake3 = { workspace = true }
 prost = { workspace = true }
 rusqlite = { workspace = true }
 tempfile = "3.10"
-uuid = { workspace = true }
 zstd = { workspace = true }

@@ -27,6 +27,8 @@ pub enum CliError {
     StoreCorrupted(String),
     /// The local store cannot be reached (I/O error).
     StoreUnavailable(String),
+    /// Private local storage could not be admitted before a read or write.
+    PrivateStorageUnavailable,
     /// Another daemon currently holds this project's advisory lock.
     DaemonAlreadyRunning,
     /// Durable recording daemon support is unavailable on this platform.
@@ -36,6 +38,23 @@ pub enum CliError {
     /// Direct runtime launch or process supervision failed.
     #[cfg(unix)]
     Run(xtrace_runtime::java::LaunchError),
+    /// A sanitized Java attach operation failed with stable helper-compatible facts.
+    #[cfg(unix)]
+    Attach {
+        /// Stable helper-compatible error code.
+        code: &'static str,
+        /// Stable error category.
+        category: &'static str,
+        /// Sanitized human-readable message.
+        message: String,
+        /// Sanitized remediation text.
+        remediation: String,
+        /// Process exit code for this failure.
+        exit_code: i32,
+    },
+    /// Direct Node launch or process supervision failed.
+    #[cfg(unix)]
+    NodeRun(xtrace_runtime::node::LaunchError),
 }
 
 impl CliError {
@@ -54,11 +73,15 @@ impl CliError {
             Self::StoreSchemaOlder(_) => 6,
             Self::StoreCorrupted(_) => 4,
             Self::StoreUnavailable(_) => 5,
+            Self::PrivateStorageUnavailable => 7,
             Self::DaemonAlreadyRunning => 5,
             Self::DaemonUnsupportedPlatform => 6,
             Self::DaemonFailure(_) => 5,
             #[cfg(unix)]
             Self::Run(err) => err.exit_code(),
+            #[cfg(unix)]
+            Self::Attach { exit_code, .. } => *exit_code,
+            Self::NodeRun(err) => err.exit_code(),
         }
     }
 }
@@ -92,6 +115,9 @@ impl std::fmt::Display for CliError {
             Self::StoreSchemaOlder(message) => write!(f, "store schema older: {message}"),
             Self::StoreCorrupted(message) => write!(f, "store corrupted: {message}"),
             Self::StoreUnavailable(message) => write!(f, "store unavailable: {message}"),
+            Self::PrivateStorageUnavailable => {
+                f.write_str("private storage is unavailable (XTR-PRIVATE-STORAGE-UNAVAILABLE)")
+            }
             Self::DaemonAlreadyRunning => {
                 f.write_str("a daemon is already running for this project")
             }
@@ -101,6 +127,9 @@ impl std::fmt::Display for CliError {
             Self::DaemonFailure(code) => write!(f, "daemon operation failed ({})", code.as_str()),
             #[cfg(unix)]
             Self::Run(err) => std::fmt::Display::fmt(err, f),
+            #[cfg(unix)]
+            Self::Attach { message, .. } => f.write_str(message),
+            Self::NodeRun(err) => std::fmt::Display::fmt(err, f),
         }
     }
 }

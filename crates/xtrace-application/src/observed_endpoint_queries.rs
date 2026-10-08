@@ -10,7 +10,7 @@ use xtrace_domain::{
 
 use crate::{
     PortError,
-    recording_queries::{RecordingMetadata, RecordingStatus},
+    recording_queries::{RecordingCompletionEvidence, RecordingMetadata, RecordingStatus},
 };
 
 /// Default and maximum endpoint page sizes.
@@ -170,6 +170,8 @@ pub struct ObservedRecordingDto {
     pub recording_id: RecordingId,
     /// Persisted lifecycle state.
     pub status: RecordingStatus,
+    /// Completion state established from validated durable finish evidence.
+    pub completion: RecordingCompletionEvidence,
     /// Persisted opening wall time.
     pub opened_at: String,
     /// Number of durable segments.
@@ -404,6 +406,7 @@ fn recording_dto(row: ObservedRecordingRecord) -> ObservedRecordingDto {
     ObservedRecordingDto {
         recording_id: row.metadata.recording_id,
         status: row.metadata.status,
+        completion: row.metadata.completion,
         opened_at: row.metadata.opened_at,
         segment_count: row.metadata.segment_count,
         event_count: row.metadata.event_count,

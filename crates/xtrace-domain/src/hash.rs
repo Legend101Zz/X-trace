@@ -40,6 +40,13 @@ impl ContentHash {
         Self(*digest.as_bytes())
     }
 
+    /// Wraps a raw, already-computed 32-byte BLAKE3 digest from a wire protocol.
+    #[must_use]
+    pub fn from_digest_bytes(bytes: &[u8]) -> Option<Self> {
+        let digest: [u8; 32] = bytes.try_into().ok()?;
+        Some(Self(digest))
+    }
+
     /// Returns the raw 32-byte digest.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {

@@ -407,11 +407,11 @@ ordering, or random-time assumptions.
 Do not change xtrace-application, xtrace-ingest, xtrace-daemon, XTP schemas,
 CLI/UI, or existing plans/progress in 1C.4.
 
-Use external SSD caches:
+Use external SSD caches under the local cache root, written here as `<CACHE>`:
 
 ~~~bash
-export CARGO_HOME='/Volumes/Mrigesh SSD/.cache/xtrace/cargo'
-export CARGO_TARGET_DIR='/Volumes/Mrigesh SSD/.cache/xtrace/cargo-target'
+export CARGO_HOME='<CACHE>/cargo'
+export CARGO_TARGET_DIR='<CACHE>/cargo-target'
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
@@ -419,15 +419,15 @@ cargo test -p xtrace-protocol --all-features --no-fail-fast
 cargo test -p xtrace-store --all-features --no-fail-fast
 cargo test --workspace --all-targets --all-features --no-fail-fast
 cargo test --workspace --all-features --no-fail-fast
-env -i PATH='/Users/comreton/.cargo/bin:/usr/bin:/bin' \
-  HOME='/Users/comreton' \
-  USER='comreton' \
+env -i PATH="$HOME/.cargo/bin:/usr/bin:/bin" \
+  HOME="$HOME" \
+  USER="$USER" \
   LANG='en_US.UTF-8' \
   LC_ALL='en_US.UTF-8' \
-  CARGO_HOME='/Volumes/Mrigesh SSD/.cache/xtrace/cargo' \
-  CARGO_TARGET_DIR='/Volumes/Mrigesh SSD/.cache/xtrace/cargo-target' \
-  XDG_CACHE_HOME='/Volumes/Mrigesh SSD/.cache/xtrace/xdg' \
-  TMPDIR='/Volumes/Mrigesh SSD/.cache/xtrace/tmp' \
+  CARGO_HOME='<CACHE>/cargo' \
+  CARGO_TARGET_DIR='<CACHE>/cargo-target' \
+  XDG_CACHE_HOME='<CACHE>/xdg' \
+  TMPDIR='<CACHE>/tmp' \
   cargo build -p xtrace-protocol --all-features
 if command -v cargo-deny >/dev/null 2>&1; then cargo deny check; fi
 git diff --check

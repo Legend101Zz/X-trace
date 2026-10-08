@@ -39,6 +39,8 @@
     deny(clippy::unwrap_used, clippy::expect_used, reason = "library code must not panic")
 )]
 
+#[cfg(unix)]
+mod attach;
 mod commands;
 mod daemon;
 #[cfg(unix)]
@@ -46,6 +48,55 @@ mod daemon_lock;
 mod error;
 mod output;
 mod paths;
+#[cfg(unix)]
+mod pointer_io;
+#[cfg(not(unix))]
+mod pointer_io {
+    use crate::error::CliError;
+    use std::fs::File;
+    use std::path::Path;
+    pub(crate) const POINTER_MAX_BYTES: usize = 8192;
+    pub(crate) const PENDING_MAX_BYTES: usize = 8192;
+    pub(crate) const MAX_PATH_BYTES: usize = 4096;
+    pub(crate) struct RepositoryInitLock;
+    impl RepositoryInitLock {
+        pub(crate) fn acquire(_: &Path) -> Result<Self, CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+        pub(crate) fn read(&self, _: &str, _: usize) -> Result<Option<Vec<u8>>, CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+        pub(crate) fn publish(&self, _: &str, _: &[u8], _: usize) -> Result<(), CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+        pub(crate) fn remove_owned(&self, _: &str, _: &File) -> Result<(), CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+        pub(crate) fn open_owned(&self, _: &str) -> Result<File, CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+        pub(crate) fn revalidate(&self) -> Result<(), CliError> {
+            Err(CliError::StoreUnavailable(
+                "safe repository metadata I/O is unsupported on this platform".into(),
+            ))
+        }
+    }
+    pub(crate) fn read_unlocked(_: &Path, _: &str, _: usize) -> Result<Option<Vec<u8>>, CliError> {
+        Err(CliError::StoreUnavailable(
+            "safe repository metadata I/O is unsupported on this platform".into(),
+        ))
+    }
+}
 mod run;
 mod viewer;
 
@@ -129,6 +180,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn attach_command_accepts_explicit_pid_pack_and_json_mode() {
+        let cli = Cli::try_parse_from([
+            "xtrace",
+            "attach",
+            "--project-dir",
+            "/tmp/project with spaces",
+            "--pid",
+            "4312",
+            "--java-pack",
+            "/tmp/java pack",
+            "--json",
+        ])
+        .expect("attach command parses");
+        assert!(matches!(
+            cli.command,
+            commands::XtraceCommand::Attach { pid: Some(4312), json: true, .. }
+        ));
+    }
+
+    #[test]
     fn run_command_preserves_exact_java_arguments_and_requires_a_launcher() {
         let cli = Cli::try_parse_from([
             "xtrace",
@@ -158,6 +230,63 @@ mod tests {
                 "--java-agent",
                 "/tmp/agent.jar",
                 "--",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn run_command_requires_explicit_node_mode_and_preserves_node_arguments() {
+        let cli = Cli::try_parse_from([
+            "xtrace",
+            "run",
+            "--project-dir",
+            "/tmp/project",
+            "--node-adapter",
+            "/tmp/adapter dist",
+            "--node-mode",
+            "esm",
+            "--",
+            "node",
+            "--no-warnings",
+            "app with spaces.mjs",
+            "--flag",
+            "value with spaces",
+        ])
+        .expect("Node run parses");
+        assert!(matches!(cli.command, commands::XtraceCommand::Run {
+            node_adapter: Some(adapter), node_mode: Some(mode), command, java_agent: None, ..
+        } if adapter.as_path() == std::path::Path::new("/tmp/adapter dist") && mode == "esm"
+            && command == ["node", "--no-warnings", "app with spaces.mjs", "--flag", "value with spaces"]));
+        assert!(
+            Cli::try_parse_from([
+                "xtrace",
+                "run",
+                "--project-dir",
+                "/tmp/project",
+                "--node-adapter",
+                "/tmp/dist",
+                "--",
+                "node",
+                "app.cjs"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "xtrace",
+                "run",
+                "--project-dir",
+                "/tmp/project",
+                "--java-agent",
+                "/tmp/a.jar",
+                "--node-adapter",
+                "/tmp/dist",
+                "--node-mode",
+                "cjs",
+                "--",
+                "node",
+                "app.cjs"
             ])
             .is_err()
         );

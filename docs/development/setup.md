@@ -111,6 +111,72 @@ XTP data, uses an isolated Conscrypt provider for the TLS exporter, and proves
 four `Staged` acknowledgements plus the selected-root SQLite/XTF artifact. It
 prints one credential-free JSON receipt with `capture_supported: false`.
 
+The standalone `:attach-helper` module packages the experimental fixture-only
+JVM attach helper. It exposes `list`, `inspect`, and `attach` JSON commands and
+requires the explicitly selected agent JAR plus the live owner-private daemon
+bootstrap file. The helper rechecks process start time and owner before loading
+`agentmain`; the agent retransforms only the existing Spring fixture matcher
+set. It reports best-effort eligibility and does not promise attachment across
+JDK, permission, dynamic-loading, container, or native-image boundaries. Use
+premain relaunch when dynamic attach is disabled or unsupported.
+
+The CLI attaches to one explicit PID, or offers a bounded sanitized picker only
+when both stdin and stdout are interactive. Build the unsigned, fixture-only
+development pack with `javaPackDist` and pass it explicitly with `--java-pack`.
+Publisher authenticity is not verified, so this command does not accept an
+implicit installed production pack. Signed installed-pack verification remains
+a required P07 dependency. The command owns a foreground daemon
+until Ctrl-C or SIGTERM and cleans up only that daemon/session; the selected JVM
+is never its child and remains running. Its first result says
+`agent_load_status: agent_load_requested` and
+`capture_status: unknown_pending_daemon_observation`: this CLI increment does
+not yet observe an authenticated active runtime session. The adapter remains
+fixture-only, with focused capture, active-line evidence, and value capture
+reported unavailable. This is not the later reusable daemon registry/stop
+contract or full Slice 3 acceptance. Project and helper storage must be on an
+owner-enforced local filesystem; noowners mounts and uncertain ACL inspection
+fail closed before private runtime files are written.
+These checks live in the `xtrace-private-storage` crate; the admission rules
+are recorded in
+[ADR 0008](../decisions/0008-private-storage-admission-policy.md).
+Before launching the helper, the CLI copies the bounded SHA-256-verified pack
+into that private durable cache and executes only the copy. These digests check
+integrity, not publisher authenticity. It retains at most four pack snapshots
+because a live or identity-uncertain target may still load classes lazily; a
+full cache fails closed instead of deleting files still needed by a target.
+
+```bash
+xtrace attach --project-dir /path/to/initialized/repository --pid 12345 \
+  --java-pack /path/to/adapters/java/build/java-pack-dist --json
+```
+
+For an unpackaged development build, add
+`--java-pack /path/to/adapters/java/build/java-pack-dist`.
+Java attach snapshot tests require `XTRACE_TEST_PRIVATE_SCRATCH` to point at a
+pre-created owner-enforced private scratch directory. They fail when it is
+unset and never fall back to the home directory or system temporary directory.
+
+```bash
+adapters/java/gradlew -p adapters/java --dependency-verification strict \
+  :attach-helper:test :attach-helper:jar :attachHelperDist
+```
+
+The genuine already-running-fixture acceptance task is separate from unit
+checks and uses only disposable repositories and data homes. Provide the
+already-built CLI, selected target JDK, and fixture artifacts as Gradle system
+properties; run it once with JDK 17 and once with JDK 21 where available:
+
+```bash
+adapters/java/gradlew -p adapters/java :attach-helper:acceptanceTest \
+  -Dxtrace.cli=/absolute/path/to/xtrace \
+  -Dxtrace.target.java=/absolute/path/to/jdk/bin/java \
+  -Dxtrace.helper.java=/absolute/path/to/jdk/bin/java \
+  -Dxtrace.agent=/absolute/path/to/xtrace-java-agent.jar \
+  -Dxtrace.fixture=/absolute/path/to/xtrace-spring-fixture.jar \
+  -Dxtrace.helper=/absolute/path/to/xtrace-attach.jar \
+  -Dxtrace.workspace=/absolute/path/to/X-trace
+```
+
 ### Experimental Spring premain tracer bullet
 
 The `agent-bootstrap`, `agent-runtime`, and `spring-fixture` Gradle projects are
@@ -219,10 +285,12 @@ cargo run -q -p xtrace-cli --bin xtrace -- recording list \
 
 Endpoint pages default to 50 rows and allow at most 100. Linked and unmatched
 recording pages default to 25 rows and allow at most 50. The existing
-`recording list` invocation remains the legacy recording projection: it
-defaults to 50 rows, allows at most 200, accepts `--after <recording-id>`, and
-keeps its legacy JSON fields. `--cursor` is used by the new linked or unmatched
-recording projections; `--after` remains the legacy cursor.
+`recording list` defaults to 50 rows, allows at most 200, and accepts
+`--after <recording-id>`. Recording read JSON schema version 2 adds typed
+completion evidence; historical rows without durable finish proof report
+`unavailable` even if their old lifecycle status is terminal. `--cursor` is
+used by the new linked or unmatched recording projections; `--after` remains
+the recording-list cursor.
 
 The catalog reflects persisted observations accepted by the current exact
 `spring-orders-v1` fixture policy for `POST /orders`. It does not discover
@@ -244,12 +312,29 @@ compressed-plus-logical XTF input per request. If another segment would exceed
 the input budget, the response stops at the preceding event and returns a
 cursor; one codec-bounded first segment may be processed to ensure progress.
 Use the returned versioned `next_cursor` with `--cursor` to continue. The
-cursor is bound to the selected project and recording. Raw interaction paths
+cursor is bound to the selected project and recording. Terminal verification and
+persistence are bounded to 2,048 events per recording and 16 MiB of combined
+compressed and logical segment bytes. Events beyond the 2,048-event bound are
+not persisted: the capture continues, each excess event is counted under its
+own priority in the drop counts (added to any adapter-reported count for that
+priority), the total is kept as a separate capacity-drop count in the finish
+evidence, and the recording ends partial (never complete). The ingest gate
+applies the same rule instead of rejecting the batch. Larger captures stay partial until a higher bound is explicitly
+implemented and tested. Raw interaction paths
 are omitted because path segments may contain identifiers or tokens. Oversized
 display fields become `[truncated]`; oversized identity/relationship fields
 become `[unavailable]`, with field names and original byte lengths reported
-without source text. These are persisted facts, not debugger-complete replay:
-values, source bodies, and completion semantics remain unavailable.
+without source text. Detail includes stable UUIDv7 frame IDs where the index
+matches verified XTF events, and previous/next targets only where adjacent
+immutable events have also been verified. `into`, `over`, and `out` remain
+unavailable until a verified event-graph resolver is implemented. Adapter-
+declared duration and drop counts remain separate from completion. Unexercised
+capability codes remain in the bounded finish evidence but are not projected
+until they can be checked against an adapter manifest. A producer-declared
+summary is exposed only in a non-preview privacy state and is not proof of a
+captured response outcome. Event values and full source replay remain
+unavailable; bounded source excerpts are limited to the attested fixture
+methods.
 Read-only SQLite access keeps normal WAL visibility and may create SQLite
 coordination sidecars, but does not apply migrations or update project or
 pointer metadata.
@@ -312,7 +397,7 @@ constraint by setting `PATH` to a minimal set that excludes any directory
 containing `protoc`:
 
 ```bash
-PATH="/usr/bin:/bin:/usr/local/bin:/Users/comreton/.cargo/bin:/Users/comreton/.rustup/toolchains/stable-*/bin" \
+PATH="/usr/bin:/bin:/usr/local/bin:$HOME/.cargo/bin" \
     cargo build -p xtrace-protocol --all-features
 ```
 

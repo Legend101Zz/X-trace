@@ -20,6 +20,7 @@ use xtrace_daemon::{BoundDaemon, DaemonBuilder, DaemonConfig, DaemonError};
 use xtrace_domain::RuntimeSessionId;
 #[cfg(any(unix, test))]
 use xtrace_domain::{ProjectId, WallTime};
+use xtrace_private_storage::AdmittedPrivateRoot;
 #[cfg(unix)]
 use xtrace_protocol::xtf::XtfEventEnvelope;
 #[cfg(unix)]
@@ -38,7 +39,7 @@ use crate::error::CliError;
 #[cfg(unix)]
 use crate::output::write_success_line;
 #[cfg(any(unix, test))]
-use crate::paths::{RepositoryPointer, UserDataPaths, secure_project_dir};
+use crate::paths::{RepositoryPointer, UserDataPaths};
 
 #[cfg(unix)]
 const RETAINED_RECORDING_LIMIT: usize = 1_024;
@@ -129,10 +130,10 @@ where
     F: Fn(&str) -> Option<PathBuf>,
 {
     let preflight = preflight_project(&project_dir, env_reader)?;
-    let lock = acquire_project_lock(&preflight.project_data_root)?;
+    let lock = acquire_project_lock(&preflight.private_root)?;
     let selected = open_validated_project(preflight)?;
     let runtime_session_id = RuntimeSessionId::new();
-    let runtime_dir = RuntimeDirectory::create(&selected.project_data_root, runtime_session_id)?;
+    let runtime_dir = RuntimeDirectory::create(&selected.private_root, runtime_session_id)?;
     let bootstrap_path = runtime_dir.path().join("bootstrap.json");
     let capture = compose_capture(&selected)?;
     let bound = DaemonBuilder::new(DaemonConfig::default())
@@ -166,6 +167,7 @@ struct ValidatedProject {
     project_id: ProjectId,
     repository_fingerprint: xtrace_domain::RepositoryFingerprint,
     project_data_root: PathBuf,
+    private_root: AdmittedPrivateRoot,
 }
 
 #[cfg(any(unix, test))]
@@ -175,6 +177,7 @@ struct ProjectPreflight {
     project_id: ProjectId,
     project_data_root: PathBuf,
     database_path: PathBuf,
+    private_root: AdmittedPrivateRoot,
 }
 
 #[cfg(any(unix, test))]
@@ -191,40 +194,22 @@ where
     let pointer = RepositoryPointer::read(&repo)?;
     let data_home = resolve_data_home(Some(&pointer), env_reader)?;
     let unresolved_root = UserDataPaths::project_dir_with_home(&data_home, pointer.project_id)?;
-    let metadata = std::fs::symlink_metadata(&unresolved_root).map_err(|_| {
-        CliError::ProjectDirectoryMissing(
-            "initialized project data directory is missing".to_string(),
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(CliError::StoreCorrupted(
-            "project data root must be a real directory".to_string(),
-        ));
-    }
-    let project_data_root = std::fs::canonicalize(&unresolved_root)
-        .map_err(|_| CliError::StoreUnavailable("resolve project data root failed".to_string()))?;
+    let private_root = AdmittedPrivateRoot::open(&unresolved_root)
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
+    let project_data_root = private_root.path().to_path_buf();
     let database_path = project_data_root.join("metadata.sqlite3");
-    let database_metadata = std::fs::symlink_metadata(&database_path).map_err(|_| {
-        CliError::StoreUnavailable("initialized project database is missing".to_string())
-    })?;
-    if database_metadata.file_type().is_symlink() || !database_metadata.is_file() {
-        return Err(CliError::StoreCorrupted("project database must be a real file".to_string()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if database_metadata.nlink() != 1 {
-            return Err(CliError::StoreCorrupted(
-                "project database must have exactly one filesystem link".to_string(),
-            ));
-        }
-    }
+    private_root
+        .validate_regular_file("metadata.sqlite3")
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     Ok(ProjectPreflight {
         canonical_repo_path: canonical_repo_path.to_string(),
         expected_repository_fingerprint,
         project_id: pointer.project_id,
         project_data_root,
         database_path,
+        private_root,
     })
 }
 
@@ -236,8 +221,12 @@ fn open_validated_project(preflight: ProjectPreflight) -> Result<ValidatedProjec
         project_id,
         project_data_root,
         database_path,
+        private_root,
     } = preflight;
-    secure_project_dir(&project_data_root)?;
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
+    private_root
+        .validate_regular_file("metadata.sqlite3")
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
 
     let requested_at = WallTime::now();
     let context = RequestContext::new("xtrace-cli".to_string(), requested_at);
@@ -246,6 +235,10 @@ fn open_validated_project(preflight: ProjectPreflight) -> Result<ValidatedProjec
         OpenOptions::default().with_must_exist(true).with_correlation_id(context.correlation_id),
     )
     .map_err(map_store_error)?;
+    private_root
+        .validate_regular_file("metadata.sqlite3")
+        .map_err(|_| CliError::PrivateStorageUnavailable)?;
+    private_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
     let app = Application::new(
         SqliteProjectRepository::new(&store),
         SqliteIdempotencyStore::new(&store),
@@ -280,6 +273,7 @@ fn open_validated_project(preflight: ProjectPreflight) -> Result<ValidatedProjec
         project_id: project.id,
         repository_fingerprint: project.canonical_repo_hash,
         project_data_root,
+        private_root,
     })
 }
 
@@ -382,7 +376,38 @@ mod tests {
     use xtrace_store::SqliteRecordingPersistence;
 
     fn temp_root(label: &str) -> tempfile::TempDir {
-        tempfile::Builder::new().prefix(label).tempdir().expect("temp root")
+        let scratch = PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        tempfile::Builder::new()
+            .prefix(label)
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir_in(scratch)
+            .expect("temp root")
+    }
+
+    /// Creates `path` and any missing parents as 0700 whatever the process umask is: the product
+    /// admits project storage as private, and a umask 022 runner would make `create_dir_all` 0755.
+    fn private_dir_all(path: &Path) {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .expect("private directory");
+    }
+
+    /// Creates an empty 0600 file whatever the process umask is.
+    fn private_empty_file(path: &Path) {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .expect("private file");
     }
 
     fn initialized_project(repo: &Path, data_home: &Path) -> ProjectId {
@@ -391,7 +416,7 @@ mod tests {
         let project_id = ProjectId::new();
         let project_data_root =
             UserDataPaths::project_dir_with_home(data_home, project_id).expect("project root");
-        std::fs::create_dir_all(&project_data_root).expect("project data root");
+        private_dir_all(&project_data_root);
         let database_path = project_data_root.join("metadata.sqlite3");
         let store = SqliteStore::open(&database_path, OpenOptions::default()).expect("store");
         let project = Project {
@@ -445,7 +470,7 @@ mod tests {
         let home = root.path().join("home");
         let id = ProjectId::new();
         let project_root = UserDataPaths::project_dir_with_home(&home, id).expect("project root");
-        std::fs::create_dir_all(&project_root).expect("project root exists");
+        private_dir_all(&project_root);
         RepositoryPointer { schema_version: 1, project_id: id, data_home: home }
             .write(&repo)
             .expect("pointer");
@@ -466,9 +491,13 @@ mod tests {
         let mismatched_root =
             UserDataPaths::project_dir_with_home(&home, mismatched_id).expect("mismatched root");
         std::fs::rename(&actual_root, &mismatched_root).expect("move project data root");
+        // Pointer writes never replace an existing pointer, so remove the original first
+        // to build the mismatched-identity fixture.
+        std::fs::remove_file(canonical_repo.join(".xtrace").join("config.toml"))
+            .expect("remove original pointer");
         RepositoryPointer { schema_version: 1, project_id: mismatched_id, data_home: home }
             .write(&canonical_repo)
-            .expect("overwrite pointer");
+            .expect("write mismatched pointer");
         assert!(matches!(
             open_validated_project(preflight_project(&repo, &|_| None).expect("preflight")),
             Err(CliError::StoreCorrupted(_))
@@ -477,7 +506,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn database_symlink_is_rejected_before_permission_repairs_touch_its_target() {
+    fn database_symlink_is_rejected_before_any_database_open_or_repair() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         let root = temp_root("xtrace-cli-daemon-db-symlink-");
@@ -496,8 +525,10 @@ mod tests {
             .expect("set project root mode");
         let original_bytes = std::fs::read(&target).expect("read target bytes");
 
-        assert!(matches!(preflight_project(&repo, &|_| None), Err(CliError::StoreCorrupted(_))));
-        assert!(matches!(secure_project_dir(&project_root), Err(CliError::StoreCorrupted(_))));
+        assert!(matches!(
+            preflight_project(&repo, &|_| None),
+            Err(CliError::PrivateStorageUnavailable)
+        ));
         assert_eq!(std::fs::read(&target).expect("target bytes unchanged"), original_bytes);
         assert_eq!(
             std::fs::metadata(&target).expect("target metadata").permissions().mode() & 0o777,
@@ -511,7 +542,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn database_hardlink_is_rejected_before_permission_repairs_touch_either_path() {
+    fn database_hardlink_is_rejected_before_any_database_open_or_repair() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let root = temp_root("xtrace-cli-daemon-db-hardlink-");
@@ -529,8 +560,10 @@ mod tests {
             .expect("set project root mode");
         let original_bytes = std::fs::read(&external_link).expect("read linked bytes");
 
-        assert!(matches!(preflight_project(&repo, &|_| None), Err(CliError::StoreCorrupted(_))));
-        assert!(matches!(secure_project_dir(&project_root), Err(CliError::StoreCorrupted(_))));
+        assert!(matches!(
+            preflight_project(&repo, &|_| None),
+            Err(CliError::PrivateStorageUnavailable)
+        ));
         assert_eq!(std::fs::read(&external_link).expect("external bytes"), original_bytes);
         assert_eq!(
             std::fs::metadata(&external_link).expect("external metadata").permissions().mode()
@@ -554,13 +587,14 @@ mod tests {
         let project_id = ProjectId::new();
         let project_root =
             UserDataPaths::project_dir_with_home(&home, project_id).expect("project data root");
-        std::fs::create_dir_all(&project_root).expect("project root");
+        private_dir_all(&project_root);
         RepositoryPointer { schema_version: 1, project_id, data_home: home.clone() }
             .write(&repo)
             .expect("pointer");
         let database = project_root.join("metadata.sqlite3");
-        std::fs::write(&database, []).expect("empty database placeholder");
-        let _lock = acquire_project_lock(&project_root).expect("hold project lock");
+        private_empty_file(&database);
+        let admitted = AdmittedPrivateRoot::open(&project_root).expect("admitted project root");
+        let _lock = acquire_project_lock(&admitted).expect("hold project lock");
 
         let env_reader = env(HashMap::from([("XTRACE_DATA_HOME", home)]));
         assert!(matches!(
@@ -620,6 +654,7 @@ mod tests {
         let accepted = AcceptedRecordingEvent {
             recording_seq: 2,
             monotonic_ns: 17,
+            priority: 0,
             canonical_bytes: payload.encode_to_vec(),
             payload,
         };
@@ -627,7 +662,7 @@ mod tests {
             .record_events(RecordEvents { recording_id, events: vec![accepted.clone()] })
             .expect("stage event");
         capture
-            .finish_recording(FinishRecording { recording_id, final_recording_seq: 2 })
+            .finish_recording(FinishRecording::without_digest(recording_id, 2))
             .expect("finish and persist segment");
 
         let verifier = SqliteRecordingPersistence::new(
