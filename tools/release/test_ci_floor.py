@@ -2580,6 +2580,26 @@ class CiFloorProvenanceAndWorkflowTests(unittest.TestCase):
                 ci_floor._provenance_classified_count(value)
             self.assertEqual(caught.exception.reason, "provenance-unavailable")
 
+    def test_every_checkout_step_drops_persisted_credentials(self) -> None:
+        workflows = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows"
+        seen = 0
+        for path in sorted(workflows.glob("*.yml")):
+            lines = path.read_text().splitlines()
+            for index, line in enumerate(lines):
+                if "uses: actions/checkout@" not in line:
+                    continue
+                seen += 1
+                step_indent = len(line) - len(line.lstrip())
+                block = []
+                for following in lines[index + 1:]:
+                    if following.strip() and len(following) - len(following.lstrip()) < step_indent:
+                        break
+                    if following.lstrip().startswith("- "):
+                        break
+                    block.append(following.strip())
+                self.assertIn("persist-credentials: false", block, f"{path.name}:{index + 1}")
+        self.assertGreaterEqual(seen, 6)
+
     def test_workflow_pins_actions_by_commit_and_restricts_token_permissions(self) -> None:
         workflow = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
         text = workflow.read_text()
