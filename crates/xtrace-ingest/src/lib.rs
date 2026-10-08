@@ -66,5 +66,6 @@ pub mod validator;
 
 pub use error::IngestError;
 pub use validator::{
-    Acceptance, DEFAULT_MAX_EVENTS_PER_RECORDING, IngestConfig, IngestValidator, RecordingLifecycle,
+    Acceptance, DEFAULT_MAX_EVENTS_PER_RECORDING, IngestConfig, IngestValidator, MAX_DROP_PRIORITY_BUCKETS,
+    RecordingLifecycle,
 };
