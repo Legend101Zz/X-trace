@@ -1478,11 +1478,14 @@ mod tests {
     }
 
     fn unique_name(stem: &str) -> String {
+        // Microsecond clocks collide between parallel tests; the sequence keeps names unique.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let ticks = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("test clock")
             .as_nanos();
-        format!("{stem}-{}-{ticks}", std::process::id())
+        format!("{stem}-{}-{sequence}-{ticks}", std::process::id())
     }
 
     fn public_fixture(payload: &[u8]) -> (tempfile::TempDir, InspectedPack) {
