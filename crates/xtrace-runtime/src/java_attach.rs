@@ -467,18 +467,24 @@ impl PackCache {
         if create {
             flags |= rustix::fs::OFlags::CREATE;
         }
-        let file = match rustix::fs::openat(
-            &self.state,
-            name,
-            flags,
-            rustix::fs::Mode::from_raw_mode(0o600),
-        ) {
-            Ok(file) => std::fs::File::from(file),
-            Err(error) if error == rustix::io::Errno::NOENT && !create => return Ok(None),
-            Err(_) => {
-                return Err(AttachError::PrivateStorage(
-                    "the Java pack cache state file could not be opened",
-                ));
+        let mut attempts = 0_u32;
+        let file = loop {
+            match rustix::fs::openat(
+                &self.state,
+                name,
+                flags,
+                rustix::fs::Mode::from_raw_mode(0o600),
+            ) {
+                Ok(file) => break std::fs::File::from(file),
+                Err(error) if error == rustix::io::Errno::NOENT && !create => return Ok(None),
+                // APFS can report ENOENT for an O_CREAT open that races another creator of the
+                // same name; the directory is held by descriptor, so retry a few times at once.
+                Err(error) if error == rustix::io::Errno::NOENT && attempts < 8 => attempts += 1,
+                Err(_) => {
+                    return Err(AttachError::PrivateStorage(
+                        "the Java pack cache state file could not be opened",
+                    ));
+                }
             }
         };
         let metadata = file.metadata().map_err(|_| lock_error())?;
