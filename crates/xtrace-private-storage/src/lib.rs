@@ -13,13 +13,16 @@
 #[cfg(unix)]
 mod admission;
 #[cfg(unix)]
-pub use admission::{AdmittedPrivateRoot, PrivateStorageError, validate_child_name};
+mod policy;
+#[cfg(unix)]
+mod probe;
+#[cfg(unix)]
+pub use admission::{
+    AdmittedPrivateRoot, PrivateStorageError, admit_sealed_directories,
+    open_private_directory_descriptor, open_traversed_directory, validate_child_name,
+};
 
 #[cfg(not(unix))]
 mod unsupported;
 #[cfg(not(unix))]
 pub use unsupported::{AdmittedPrivateRoot, PrivateStorageError, validate_child_name};
-
-// Temporary: removed once the Java attach ancestor walk uses the shared admission.
-#[cfg(target_os = "linux")]
-pub use admission::linux_directory_admits_traversal;

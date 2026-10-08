@@ -164,9 +164,8 @@ impl JavaAttachPack {
         )?;
         let declared = parse_manifest(&manifest)?;
         let snapshot_name = sha256(&manifest);
-        let parent = open_directory_without_symlinks(cache)
+        let parent = xtrace_private_storage::open_private_directory_descriptor(cache)
             .map_err(|_| AttachError::PrivateStorage("the Java helper cache changed"))?;
-        admit_directory_descriptor(cache, &parent, true)?;
         let packs_name = "java-packs";
         let packs = open_or_create_private_child(&parent, packs_name)?;
         admit_directory_descriptor(&cache.join(packs_name), &packs, true)?;
@@ -203,11 +202,12 @@ impl JavaAttachPack {
         admit_directory_descriptor(&snapshot_path, &snapshot, true)?;
         for directory in ["attach", "agent", "agent/runtime"] {
             create_private_directory(&snapshot, directory)?;
-            let descriptor = open_directory_without_symlinks(&snapshot_path.join(directory))
-                .map_err(|_| {
-                    AttachError::PrivateStorage("the private Java pack snapshot is unavailable")
-                })?;
-            admit_directory_descriptor(&snapshot_path.join(directory), &descriptor, true)?;
+            xtrace_private_storage::open_private_directory_descriptor(
+                &snapshot_path.join(directory),
+            )
+            .map_err(|_| {
+                AttachError::PrivateStorage("the private Java pack snapshot is unavailable")
+            })?;
         }
         let mut total = 0_u64;
         for (relative, expected_digest) in &declared {
@@ -274,28 +274,15 @@ impl JavaAttachPack {
     }
 }
 
+/// Re-admits the sealed snapshot directories through the shared admission: one deadline, one
+/// ancestor walk per path, owner-only read-only mode, owner-enforcing filesystem, and no ACL.
 fn verify_retained_snapshot_directories(root: &Path) -> Result<(), AttachError> {
-    for relative in ["", "attach", "agent", "agent/runtime"] {
-        let path = if relative.is_empty() { root.to_path_buf() } else { root.join(relative) };
-        let descriptor = open_directory_without_symlinks(&path).map_err(|_| {
-            AttachError::PrivateStorage("the retained Java pack snapshot is unsafe")
-        })?;
-        let metadata = descriptor.metadata().map_err(|_| {
-            AttachError::PrivateStorage("the retained Java pack snapshot is unsafe")
-        })?;
-        let filesystem = rustix::fs::fstatfs(&descriptor).map_err(|_| {
-            AttachError::PrivateStorage("the retained Java pack snapshot filesystem is unavailable")
-        })?;
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.uid() != rustix::process::getuid().as_raw()
-            || metadata.mode() & 0o7777 != 0o500
-            || !owner_enforcing_local_filesystem(&filesystem)
-            || !acl_admits_directory(&path, &descriptor, FileIdentity::from_metadata(&metadata))
-        {
-            return Err(AttachError::PrivateStorage("the retained Java pack snapshot is unsafe"));
-        }
-    }
-    Ok(())
+    let paths = ["", "attach", "agent", "agent/runtime"]
+        .into_iter()
+        .map(|relative| if relative.is_empty() { root.to_path_buf() } else { root.join(relative) })
+        .collect::<Vec<_>>();
+    xtrace_private_storage::admit_sealed_directories(&paths, 0o500)
+        .map_err(|_| AttachError::PrivateStorage("the retained Java pack snapshot is unsafe"))
 }
 
 fn ensure_snapshot_capacity(path: &Path, packs: &std::fs::File) -> Result<(), AttachError> {
@@ -580,16 +567,6 @@ impl FileIdentity {
             links: metadata.nlink(),
         }
     }
-
-    /// Directory identity that ignores entry-count churn: size and link count change whenever
-    /// anyone adds or removes a child, which says nothing about who may write into the directory.
-    #[cfg(target_os = "macos")]
-    fn same_directory(self, other: Self) -> bool {
-        self.device == other.device
-            && self.inode == other.inode
-            && self.owner == other.owner
-            && self.mode == other.mode
-    }
 }
 
 struct PackInventory {
@@ -791,92 +768,6 @@ fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub(super) fn open_directory_without_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags, open, openat};
-    if !path.is_absolute() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "directory path is not absolute",
-        ));
-    }
-    let mut descriptor = std::fs::File::from(open(
-        "/",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )?);
-    let mut traversed = PathBuf::from("/");
-    verify_ancestor_metadata(&traversed, &descriptor)?;
-    for component in path.components() {
-        match component {
-            std::path::Component::RootDir => {}
-            std::path::Component::Normal(name) => {
-                let opened = openat(
-                    &descriptor,
-                    name,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                    Mode::empty(),
-                )?;
-                traversed.push(name);
-                descriptor = std::fs::File::from(opened);
-                verify_ancestor_metadata(&traversed, &descriptor)?;
-            }
-            std::path::Component::CurDir
-            | std::path::Component::ParentDir
-            | std::path::Component::Prefix(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "directory path is not canonical",
-                ));
-            }
-        }
-    }
-    Ok(descriptor)
-}
-
-pub(super) fn verify_ancestor_metadata(
-    path: &Path,
-    descriptor: &std::fs::File,
-) -> std::io::Result<()> {
-    let metadata = descriptor.metadata()?;
-    let uid = rustix::process::getuid().as_raw();
-    let identity = FileIdentity::from_metadata(&metadata);
-    if !ancestor_metadata_allowed(
-        identity.owner,
-        identity.mode,
-        uid,
-        acl_admits_traversal_directory(path, descriptor, identity),
-    ) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "directory ancestor has unsafe ownership, permissions, or ACL",
-        ));
-    }
-    Ok(())
-}
-
-/// Ancestors are only traversed; on Linux the shared traversal policy applies (see private_storage).
-#[cfg(target_os = "linux")]
-fn acl_admits_traversal_directory(
-    _path: &Path,
-    directory: &std::fs::File,
-    _expected: FileIdentity,
-) -> bool {
-    xtrace_private_storage::linux_directory_admits_traversal(directory)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn acl_admits_traversal_directory(
-    path: &Path,
-    directory: &std::fs::File,
-    expected: FileIdentity,
-) -> bool {
-    acl_admits_directory(path, directory, expected)
-}
-
-fn ancestor_metadata_allowed(owner: u32, mode: u32, current_uid: u32, acl_admitted: bool) -> bool {
-    (owner == current_uid || owner == 0) && mode & 0o022 == 0 && acl_admitted
-}
-
 fn open_child_directory(
     parent: &std::fs::File,
     name: &str,
@@ -891,352 +782,6 @@ fn open_child_directory(
         rustix::fs::Mode::empty(),
     )?;
     Ok(std::fs::File::from(descriptor))
-}
-
-#[cfg(unix)]
-#[cfg(target_os = "macos")]
-fn acl_admits_directory(path: &Path, directory: &std::fs::File, expected: FileIdentity) -> bool {
-    use std::io::Read as _;
-    use std::process::{Command, Stdio};
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    if path.as_os_str().to_string_lossy().chars().any(char::is_control) {
-        return false;
-    }
-    let before = match std::fs::symlink_metadata(path) {
-        Ok(value)
-            if value.is_dir()
-                && !value.file_type().is_symlink()
-                && FileIdentity::from_metadata(&value).same_directory(expected) =>
-        {
-            value
-        }
-        _ => return false,
-    };
-    let Ok(mut child) = Command::new("/bin/ls")
-        .args(["-ldeO"])
-        .arg(path)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    let Some(mut stdout) = child.stdout.take() else {
-        let kill_result = child.kill();
-        let cleanup_deadline = Instant::now() + Duration::from_millis(250);
-        let mut reaped = false;
-        while Instant::now() < cleanup_deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    reaped = true;
-                    break;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(_) => break,
-            }
-        }
-        if kill_result.is_err() || !reaped {
-            tracing::warn!(
-                code = "XTR-ATTACH-ACL-PROBE-UNCONFIRMED",
-                "bounded ACL probe could not be confirmed stopped"
-            );
-        }
-        return false;
-    };
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let _reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        let result = stdout.by_ref().take(16_385).read_to_end(&mut output);
-        let bounded = result.is_ok() && output.len() <= 16_384;
-        if sender.send((bounded, output)).is_err() {
-            tracing::debug!(
-                code = "XTR-ATTACH-ACL-READER-CLOSED",
-                "bounded ACL probe reader result was no longer needed"
-            );
-        }
-    });
-    let deadline = Instant::now() + Duration::from_millis(750);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            _ => break None,
-        }
-    };
-    if status.is_none() {
-        let killed = child.kill();
-        let cleanup_deadline = Instant::now() + Duration::from_millis(250);
-        let mut reaped = false;
-        while Instant::now() < cleanup_deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    reaped = true;
-                    break;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(_) => break,
-            }
-        }
-        if killed.is_err() || !reaped {
-            tracing::warn!(
-                code = "XTR-ATTACH-ACL-PROBE-UNCONFIRMED",
-                "bounded ACL probe could not be confirmed stopped"
-            );
-            return false;
-        }
-    }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let Ok((bounded, output)) = receiver.recv_timeout(remaining) else {
-        tracing::warn!(
-            code = "XTR-ATTACH-ACL-READER-UNCONFIRMED",
-            "bounded ACL probe exited without closing its result pipe"
-        );
-        return false;
-    };
-    let Some(status) = status else { return false };
-    if !status.success() || !bounded {
-        return false;
-    }
-    let Ok(text) = std::str::from_utf8(&output) else { return false };
-    let Some(expected_path) = path.to_str() else {
-        return false;
-    };
-    if !parse_macos_acl_listing(text, expected_path) {
-        return false;
-    }
-    let after = match std::fs::symlink_metadata(path) {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-    let descriptor_after = match directory.metadata() {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-    FileIdentity::from_metadata(&before).same_directory(expected)
-        && FileIdentity::from_metadata(&after).same_directory(expected)
-        && FileIdentity::from_metadata(&descriptor_after).same_directory(expected)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn parse_macos_acl_listing(text: &str, expected_path: &str) -> bool {
-    if text.contains('\r') || !text.is_ascii() || !text.ends_with('\n') {
-        return false;
-    }
-    let mut lines = text.lines();
-    let Some(header) = lines.next() else { return false };
-    let Some(header_prefix) = header.strip_suffix(expected_path) else { return false };
-    if !header_prefix.ends_with(' ') {
-        return false;
-    }
-    let Some(mode) = header.split_ascii_whitespace().next() else { return false };
-    let mode_bytes = mode.as_bytes();
-    if mode_bytes.len() < 10 {
-        return false;
-    }
-    let mode_suffix = &mode_bytes[10..];
-    if mode_bytes[0] != b'd'
-        || !valid_posix_mode(&mode_bytes[1..10])
-        || !(mode_suffix.is_empty()
-            || mode_suffix == b"+"
-            || mode_suffix == b"@"
-            || mode_suffix == b"+@")
-    {
-        return false;
-    }
-    let Some(header_prefix) = header.strip_suffix(expected_path) else { return false };
-    let Some(header_prefix) = header_prefix.strip_suffix(' ') else { return false };
-    let fields = header_prefix.split_ascii_whitespace().collect::<Vec<_>>();
-    if fields.len() != 9
-        || fields[1].parse::<u64>().is_err()
-        || !(fields[2]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')))
-        || !(fields[3]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')))
-        || !valid_macos_flags(fields[4])
-        || fields[5].parse::<u64>().is_err()
-        || !matches!(
-            fields[6],
-            "Jan"
-                | "Feb"
-                | "Mar"
-                | "Apr"
-                | "May"
-                | "Jun"
-                | "Jul"
-                | "Aug"
-                | "Sep"
-                | "Oct"
-                | "Nov"
-                | "Dec"
-        )
-        || fields[7].is_empty()
-        || fields[7].len() > 2
-        || !fields[7].bytes().all(|byte| byte.is_ascii_digit())
-        || !(fields[8].contains(':') || fields[8].bytes().all(|byte| byte.is_ascii_digit()))
-        || (fields[8].contains(':') && fields[8].len() != 5)
-        || (!fields[8].contains(':') && fields[8].len() != 4)
-    {
-        return false;
-    }
-    let acl_required = mode_suffix.contains(&b'+');
-    let mut expected_index = 0_u32;
-    let mut saw_acl = false;
-    for raw in lines {
-        let Some((index, body)) = raw.trim().split_once(':') else { return false };
-        let Ok(index) = index.parse::<u32>() else { return false };
-        if index != expected_index {
-            return false;
-        }
-        expected_index = match expected_index.checked_add(1) {
-            Some(value) => value,
-            None => return false,
-        };
-        let words = body.split_ascii_whitespace().collect::<Vec<_>>();
-        if words.len() < 3 {
-            return false;
-        }
-        let principal = words[0];
-        let (principal_kind, principal_name) = match principal.split_once(':') {
-            Some((kind, name)) => (kind, name),
-            None => return false,
-        };
-        if !matches!(principal_kind, "user" | "group")
-            || principal_name.is_empty()
-            || principal_name.len() > 128
-            || !principal_name.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'$')
-            })
-        {
-            return false;
-        }
-        let effect_positions = words
-            .iter()
-            .enumerate()
-            .filter(|(_, word)| matches!(**word, "allow" | "deny"))
-            .collect::<Vec<_>>();
-        if effect_positions.len() != 1 {
-            return false;
-        }
-        let (effect_index, effect) = effect_positions[0];
-        if *effect == "allow" || effect_index == 0 || effect_index + 1 >= words.len() {
-            return false;
-        }
-        if words[1..effect_index].iter().any(|word| {
-            !matches!(
-                *word,
-                "inherited"
-                    | "file_inherit"
-                    | "directory_inherit"
-                    | "limit_inherit"
-                    | "only_inherit"
-                    | "no_propagate"
-            )
-        }) {
-            return false;
-        }
-        const RIGHTS: &[&str] = &[
-            "read",
-            "write",
-            "append",
-            "delete",
-            "execute",
-            "readattr",
-            "writeattr",
-            "readextattr",
-            "writeextattr",
-            "readsecurity",
-            "writesecurity",
-            "chown",
-        ];
-        let rights = words[effect_index + 1..].join("");
-        let parsed_rights = rights.split(',').collect::<Vec<_>>();
-        if parsed_rights.is_empty()
-            || parsed_rights.iter().any(|right| !RIGHTS.contains(right))
-            || parsed_rights.iter().any(|right| right.is_empty())
-        {
-            return false;
-        }
-        saw_acl = true;
-    }
-    (!acl_required || saw_acl) && (!saw_acl || mode_suffix.contains(&b'@') || acl_required)
-}
-
-#[cfg(any(target_os = "macos", test))]
-/// `ls -O` file flags admitted on a directory: `sunlnk` (sticky-like unlink restriction) and
-/// `restricted` (SIP) only narrow what can be changed, and `hidden` (UF_HIDDEN) is a Finder
-/// visibility bit (e.g. `/Volumes`) that changes neither ownership nor access. Anything else
-/// (`opaque`, `uchg`, `dataless`, ...) stays refused so unknown semantics fail closed.
-fn valid_macos_flags(flags: &str) -> bool {
-    if flags == "-" {
-        return true;
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    flags
-        .split(',')
-        .all(|flag| matches!(flag, "sunlnk" | "restricted" | "hidden") && seen.insert(flag))
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn valid_posix_mode(mode: &[u8]) -> bool {
-    const PERMISSIONS: [&[u8]; 9] =
-        [b"r-", b"w-", b"xSs-", b"r-", b"w-", b"xSs-", b"r-", b"w-", b"xTt-"];
-    mode.len() == PERMISSIONS.len()
-        && mode.iter().zip(PERMISSIONS).all(|(actual, allowed)| allowed.contains(actual))
-}
-
-#[cfg(target_os = "linux")]
-fn acl_admits_directory(_path: &Path, directory: &std::fs::File, _expected: FileIdentity) -> bool {
-    fn absent(error: rustix::io::Errno) -> bool {
-        error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NODATA
-    }
-    for name in ["system.posix_acl_access", "system.posix_acl_default"] {
-        let mut value = [0_u8; 16 * 1024];
-        match rustix::fs::fgetxattr(directory, name, value.as_mut_slice()) {
-            Ok(_) => return false,
-            Err(error) if absent(error) => {}
-            Err(_) => return false,
-        }
-    }
-    true
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn acl_admits_directory(_path: &Path, _directory: &std::fs::File, _expected: FileIdentity) -> bool {
-    false
-}
-
-#[cfg(target_os = "macos")]
-fn owner_enforcing_local_filesystem(stats: &rustix::fs::StatFs) -> bool {
-    const MNT_IGNORE_OWNERSHIP: u32 = 0x0020_0000;
-    if stats.f_flags & MNT_IGNORE_OWNERSHIP != 0 {
-        return false;
-    }
-    let name = stats
-        .f_fstypename
-        .iter()
-        .take_while(|byte| **byte != 0)
-        .map(|byte| *byte as u8)
-        .collect::<Vec<_>>();
-    matches!(name.as_slice(), b"apfs" | b"hfs")
-}
-
-#[cfg(target_os = "linux")]
-fn owner_enforcing_local_filesystem(stats: &rustix::fs::StatFs) -> bool {
-    // Local Linux filesystem type magic values. Network, FUSE, overlay, and
-    // unknown filesystems fail closed until their ownership semantics are reviewed.
-    matches!(stats.f_type as u64, 0xef53 | 0x58465342 | 0x9123683e | 0x01021994)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn owner_enforcing_local_filesystem(_stats: &rustix::fs::StatFs) -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -1339,7 +884,8 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
                 .expect("snapshot permissions");
         }
-        let directory = open_directory_without_symlinks(root.path()).expect("pack cache fd");
+        let directory =
+            xtrace_private_storage::open_traversed_directory(root.path()).expect("pack cache fd");
         assert!(ensure_snapshot_capacity(root.path(), &directory).is_err());
     }
 
@@ -1354,113 +900,6 @@ mod tests {
         ] {
             assert!(parse_manifest(text.as_bytes()).is_err());
         }
-    }
-
-    #[test]
-    fn macos_flags_admit_hidden_volumes_and_refuse_unknown_flags() {
-        let listing =
-            |flags: &str| format!("drwxr-xr-x 7 root wheel {flags} 224 Oct 8 01:32 /Volumes\n");
-        for ok in ["hidden", "hidden,sunlnk", "sunlnk,hidden", "hidden,restricted", "-"] {
-            assert!(parse_macos_acl_listing(&listing(ok), "/Volumes"), "{ok}");
-        }
-        for bad in [
-            "uchg",
-            "opaque",
-            "hidden,uchg",
-            "hidden,hidden",
-            "hidden,",
-            ",hidden",
-            "Hidden",
-            "dataless",
-            "schg",
-            "nodump",
-        ] {
-            assert!(!parse_macos_acl_listing(&listing(bad), "/Volumes"), "{bad}");
-        }
-        // hidden never excuses an ACL entry (write bits are enforced from st_mode, not this parser).
-        assert!(!parse_macos_acl_listing(
-            "drwxr-xr-x+ 7 root wheel hidden 224 Oct 8 01:32 /Volumes\n0: user:evil allow write\n",
-            "/Volumes",
-        ));
-    }
-
-    #[test]
-    fn macos_acl_parser_accepts_deny_only_and_rejects_allows_or_ambiguous_output() {
-        let header = "drwx------+ 3 xtrace-test staff - 96 Oct 4 12:00 /private/root\n";
-        assert!(parse_macos_acl_listing(
-            &format!("{header} 0: group:everyone deny delete\n"),
-            "/private/root"
-        ));
-        assert!(!parse_macos_acl_listing(
-            &format!("{header} 0: user:other allow read,write\n"),
-            "/private/root"
-        ));
-        assert!(!parse_macos_acl_listing(
-            &format!("{header} 0: user:other inherited allow read\n"),
-            "/private/root"
-        ));
-        assert!(!parse_macos_acl_listing(
-            &format!("{header} 0: group:everyone deny read,,write\n"),
-            "/private/root"
-        ));
-        assert!(!parse_macos_acl_listing(
-            "lrwx------+ 1 xtrace-test staff - 12 Oct 4 12:00 /private/root\n 0: group:everyone deny delete\n",
-            "/private/root"
-        ));
-        assert!(!parse_macos_acl_listing(
-            &format!("{header} 1: group:everyone deny delete\n"),
-            "/private/root"
-        ));
-        assert!(!parse_macos_acl_listing("not a stat line\n", "/private/root"));
-        assert!(!parse_macos_acl_listing(
-            "drwx------+@+ 3 xtrace-test staff - 96 Oct 4 12:00 /private/root\n",
-            "/private/root"
-        ));
-        assert!(!parse_macos_acl_listing(&format!("{header}\r\n"), "/private/root"));
-        assert!(parse_macos_acl_listing(
-            "drwx------ 3 xtrace-test staff - 96 Oct 4 12:00 /private/root\n",
-            "/private/root"
-        ));
-        assert!(!parse_macos_acl_listing(header, "/private/root"));
-        assert!(!parse_macos_acl_listing(
-            "dssssssss 3 xtrace-test staff - 96 Oct 4 12:00 /private/root\n",
-            "/private/root"
-        ));
-        assert!(parse_macos_acl_listing(
-            "drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 /Volumes/Example SSD/project\n",
-            "/Volumes/Example SSD/project"
-        ));
-        assert!(parse_macos_acl_listing(
-            "drwxr-xr-x 4 example staff - 128 Oct 3 2026 /Users/example\n",
-            "/Users/example"
-        ));
-        assert!(!parse_macos_acl_listing(
-            "drwxr-xr-x@ 4 example staff 128 Oct 4 00:23 /private/root\n",
-            "/private/root"
-        ));
-        assert!(!parse_macos_acl_listing(
-            "drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 /private/root extra\n",
-            "/private/root"
-        ));
-        for (listing, path) in [
-            ("drwxr-xr-x 22 root wheel sunlnk 704 Feb 25 2026 /\n", "/"),
-            ("drwxr-xr-x 5 root wheel restricted 160 Oct 4 00:23 /System\n", "/System"),
-            ("drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 /Users\n", "/Users"),
-            (
-                "drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 /Users/example/Documents\n 0: group:everyone deny delete\n",
-                "/Users/example/Documents",
-            ),
-        ] {
-            assert!(parse_macos_acl_listing(listing, path), "{listing}");
-        }
-        assert!(!parse_macos_acl_listing(
-            "drwxr-xr-x 5 root wheel unknown 160 Oct 4 00:23 /System\n",
-            "/System"
-        ));
-        assert!(!parse_macos_acl_listing(
-            "drwxr-xr-x+ 5 root wheel - 160 Oct 4 00:23 /System\n",
-            "/System"
-        ));
     }
 
     #[cfg(unix)]
@@ -1510,12 +949,6 @@ mod tests {
         assert!(directory_mode_allowed(0o755, false));
         assert!(!directory_mode_allowed(0o757, false));
 
-        assert!(ancestor_metadata_allowed(0, 0o755, 501, true));
-        assert!(ancestor_metadata_allowed(501, 0o755, 501, true));
-        assert!(!ancestor_metadata_allowed(501, 0o755, 501, false));
-        assert!(!ancestor_metadata_allowed(501, 0o777, 501, true));
-        assert!(!ancestor_metadata_allowed(502, 0o755, 501, true));
-
         let root = tempfile::tempdir().expect("policy fixture directory");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))
             .expect("loosen policy fixture mode");
@@ -1526,31 +959,5 @@ mod tests {
             .expect("restore private fixture mode");
         let metadata = std::fs::metadata(root.path()).expect("private fixture metadata");
         assert!(verify_metadata_owner_mode(&metadata, true).is_ok());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_acl_parser_accepts_known_system_flags_and_deny_only_extended_acl() {
-        for header in [
-            "drwxr-xr-x 22 root wheel sunlnk 704 Feb 25 2026 /\n",
-            "drwxr-xr-x 5 root wheel restricted 160 Oct 4 00:23 /System\n",
-            "drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 /Users\n",
-            "drwxr-xr-x@ 4 example staff - 128 Oct 4 00:23 /Users/example/Documents\n 0: group:everyone deny delete\n",
-        ] {
-            let path = header
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().last())
-                .expect("fixture path");
-            assert!(parse_macos_acl_listing(header, path), "{header}");
-        }
-        assert!(!parse_macos_acl_listing(
-            "drwxr-xr-x 5 root wheel unexpected 160 Oct 4 00:23 /System\n",
-            "/System"
-        ));
-        assert!(!parse_macos_acl_listing(
-            "drwxr-xr-x+ 5 root wheel - 160 Oct 4 00:23 /System\n",
-            "/System"
-        ));
     }
 }
