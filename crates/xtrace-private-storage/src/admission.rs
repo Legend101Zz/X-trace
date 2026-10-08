@@ -1625,8 +1625,9 @@ mod tests {
     // operation runs is its latency. These tests count real probes (the cfg(test) counter in
     // `probe`) and pin an upper bound per operation for a path of D directories (the root plus
     // each component). With the per-operation memo each distinct directory state is probed once:
-    // `revalidate` costs D, and `create_private_child` costs D plus the parent (whose ctime the
-    // mkdir bumped) plus the new child. Before the memo they cost D+3 and about 5*(D+3)+3.
+    // `revalidate` costs D, and `create_private_child` costs D plus re-probes of the parent (whose
+    // ctime the mkdir bumped) plus the new child (measured on macOS: D+3). Before the memo they
+    // cost D+3 and about 5*(D+3)+3.
     //
     // Linux does not memoize (its probes are two xattr reads), so its bounds are the old ones.
 
@@ -1671,7 +1672,9 @@ mod tests {
         });
         assert!(created.is_some());
         if cfg!(target_os = "macos") {
-            assert!(probes <= directories + 2, "{probes} probes for {directories} directories");
+            // D for the first walk, the parent again after the mkdir moved its ctime (measured to
+            // happen more than once while the directory settles), and the new child once.
+            assert!(probes <= directories + 3, "{probes} probes for {directories} directories");
         } else {
             assert!(
                 probes <= 5 * (directories + 3) + 4,
