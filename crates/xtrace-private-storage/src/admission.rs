@@ -1862,7 +1862,7 @@ mod tests {
         let before = probe::ls_spawn_count();
         leaf.revalidate().expect("revalidate");
         let spawns = probe::ls_spawn_count() - before;
-        assert!(spawns >= 1 && spawns <= 4, "{spawns} ls runs for {directories} directories");
+        assert!((1..=4).contains(&spawns), "{spawns} ls runs for {directories} directories");
         let before = probe::ls_spawn_count();
         let created = leaf.create_private_child("spawns").expect("create child");
         let spawns = probe::ls_spawn_count() - before;

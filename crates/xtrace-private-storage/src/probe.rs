@@ -541,9 +541,8 @@ fn run_ls(flags: &str, paths: &[&Path], deadline: Instant, limit: usize) -> Opti
     let reader = thread::spawn(move || {
         let mut bytes = Vec::new();
         let result = stdout.by_ref().take(limit as u64 + 1).read_to_end(&mut bytes);
-        if sender.send((result.is_ok() && bytes.len() <= limit, bytes)).is_err() {
-            return;
-        }
+        // A failed send only means the receiver is gone, so there is nobody left to tell.
+        let _ = sender.send((result.is_ok() && bytes.len() <= limit, bytes));
     });
     let status = loop {
         match child.try_wait() {
