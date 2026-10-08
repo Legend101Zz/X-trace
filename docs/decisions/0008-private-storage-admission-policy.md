@@ -42,7 +42,7 @@
 
 ### Roles
 
-Every directory the policy judges has exactly one role:
+Every directory the policy judges has exactly one of four roles:
 
 - Private leaf: the directory that holds private state. Owned by the current
   user, mode exactly `0700`.
@@ -53,28 +53,41 @@ Every directory the policy judges has exactly one role:
   every child created or opened in it is admitted afresh as a strict private leaf,
   so an inherited ACL on a child fails closed.
 
-Named files inside a private leaf are a fourth object, judged as files (below).
+- Sealed: a private leaf deliberately made read-only at a fixed mode, `0500` for a
+  retained Java pack snapshot. Same owner and ACL rules as the private leaf; the
+  mode must equal the sealed mode exactly.
+
+Every admitted directory, whatever its role, must also pass the traversed rule,
+because the ancestor walk applies it to the final component too.
+
+Named files inside a private leaf are a separate object, judged as files (below).
 
 ### Policy table
 
 All rows apply on every revalidation. "Refuse" means the operation returns the
 sanitized `Unavailable` error; no repair of permissions is ever attempted.
 
-| Check | Private leaf | Traversed component / container | Named file |
+| Check | Private leaf / Sealed | Traversed component / container | Named file |
 |---|---|---|---|
 | Object type | directory, not a symlink | directory, not a symlink | regular file only; FIFO, socket, device, symlink refused |
 | Owner | current user | current user or root (uid 0) | current user |
-| Mode | exactly `0700` | no `g+w`, no `o+w` | no group or other bits at all |
-| Link count | n/a | n/a | exactly 1 (hardlink refused) |
-| Filesystem | owner-enforcing local type | owner-enforcing local type | same device as the directory |
+| Mode | exactly `0700` (Sealed: exactly its sealed mode, `0500`) | no `g+w`, no `o+w` | no group or other bits at all |
+| Link count | n/a | n/a | ordinary private file: exactly 1; managed immutable object file (hard-linked on purpose for deduplication): at least 1 (0 refused) |
+| Filesystem | owner-enforcing local type (see below) | same | same device as the directory |
 | Linux ACL (xattr) | any `posix_acl_access` or `posix_acl_default` refused | no ACL admitted; access ACL admitted only if well formed and no entry other than the owning user grants write; any well-formed default ACL admitted | no ACL (path probe) |
 | macOS ACL (`ls -ldeO`) | deny-only entries from the fixed vocabulary admitted; any allow entry refused | same as leaf | same as leaf |
 | macOS BSD flags | `sunlnk`, `restricted`, `hidden` admitted; any other flag refused | same | same |
 | Name syntax | single safe path component | n/a | single safe path component |
 
-Owner-enforcing local filesystems: on Linux the ext2/3/4, XFS and Btrfs types; on
-macOS `apfs` and `hfs`, and never a mount flagged `MNT_IGNORE_OWNERSHIP`. Anything
-else, including network, FUSE, overlay-unknown and unrecognised types, is refused.
+Owner-enforcing local filesystems: on Linux ext4 (the ext2/3/4 magic), XFS and
+Btrfs for the store and private roots; on macOS `apfs` and `hfs`, and never a mount
+flagged `MNT_IGNORE_OWNERSHIP`. Anything else, including network, FUSE, overlay,
+tmpfs and unrecognised types, is refused. Decision: the Java attach cache and
+snapshot roles will again admit tmpfs (ext4, XFS, Btrfs and tmpfs), restoring their
+pre-S0b behaviour, because runtime and temp directories are commonly tmpfs. The
+store and the private-state roots stay on the narrower list. The code change for
+this lands in a follow-up commit; until then the code is stricter than this
+paragraph.
 
 Well-formed Linux ACL means: version 2, at most 64 entries, known tags,
 permission bits at most 7, undefined ids on unnamed tags, and a user-object entry
@@ -86,7 +99,9 @@ Why macOS is the same for leaf and traversal: the macOS listing cannot
 distinguish access from inherited entries, and deny-only entries cannot grant
 anyone access, so one rule covers all roles. Allow entries are refused because they
 can grant access the mode bits hide. ACL principals and owner names outside
-`[A-Za-z0-9_.-]` fail closed (the parser refuses what it cannot classify).
+ASCII letters, digits and `_ . -` fail closed; owner and group names in the
+listing use that set, and ACL principal names (`user:` or `group:`, at most 128
+bytes) additionally admit `$`. The parser refuses what it cannot classify.
 
 ### Walk and descriptor rules
 
@@ -107,32 +122,62 @@ can grant access the mode bits hide. ACL principals and owner names outside
   descriptor, because closing any descriptor on a file releases all POSIX
   (fcntl) locks the process holds on that file. Opening for use goes through the
   non-blocking opener, which refuses FIFOs without waiting for a peer.
+- The final directory is judged with its role after the traversed rule, then the
+  chain is verified again (before and after, so a swap during the probe is caught).
 - Creation is exclusive and uses `0600` files and `0700` directories; existing
   unsafe objects are refused, never chmod-repaired.
 
 ### Deadline semantics
 
-- One admission operation has one absolute deadline of 750 ms (`ADMISSION_BUDGET`),
-  created at operation start and passed to every step, including every ACL probe
-  in the walk. N components do not get N budgets.
-- Reaching the deadline anywhere refuses the operation (fail closed). A refusal
-  from timeout is indistinguishable from any other refusal and is never retried
-  silently inside the policy.
+- Each public entry point is one operation with one absolute deadline of 750 ms
+  (`ADMISSION_BUDGET`), created at entry and passed to every step, including every
+  ACL probe in the walk and the directory fsync of a create. N components do not
+  get N budgets. Sealed-directory admission of several paths shares one deadline.
+- An already-expired deadline refuses before any probe is spawned. Reaching the
+  deadline anywhere refuses the operation (fail closed). A timeout refusal is
+  indistinguishable from any other refusal and is never retried inside the policy.
 - An owned ACL probe process is polled at 1 ms and is killed and reaped when the
   deadline passes. Cleanup has its own bound of 100 ms past the admission deadline;
   if the child cannot be reaped within it the verdict is refuse and the failure is
   reported.
 
-### ACL probe memoization
+### ACL probe memoization and the batched macOS probe
 
-On macOS, probe verdicts may be reused only within one admission operation, and
-only for a directory whose identity is unchanged. The key is
-(device, inode, owner, mode) taken from the held descriptor at the time of the
-probe. Verdicts are never carried between operations, never stored in a process
-global, and never keyed by path alone. A changed key re-probes. The leaf is probed
-under the strict-leaf role even when an ancestor with the same identity was
-cached under the traversal role (role is part of the verdict). A verdict is cached
-only when it is "admit"; a refusal or a timeout is not reused.
+Memoization (macOS only; Linux probes are two cheap xattr reads and are strict, with
+no memo):
+
+- A verdict is remembered inside one operation only and dropped with it. It is never
+  carried between operations, threads or processes and never keyed by path alone.
+- The key is the directory's state read from the held descriptor: device, inode,
+  owner, mode and ctime. Any chmod, chown, ACL or xattr edit, and any child create
+  or remove, advances ctime, so a changed directory misses and is probed again.
+- On macOS the listing verdict does not depend on the role (the ACL rule is the
+  same for every role), so one verdict serves a directory in any role for that
+  state within the operation. Role-specific mode and owner rules are still applied
+  on every use.
+- A verdict is stored only if it was admit and the descriptor state was unchanged
+  across the probe. A busy directory is therefore still admitted, but its verdict is
+  too old to reuse. Refusals and timeouts are never reused. A hit is additionally
+  gated by the usual named-path versus descriptor identity checks.
+
+Batched probe: to bound cost at depth, a walk lists all of its directories with one
+`/bin/ls -ldeOi` spawn.
+
+- Any path containing a control character is refused before the spawn. Any
+  ambiguity (non-ASCII output, carriage return, a header without a numeric inode,
+  an entry that matches no operand or two entries for one operand, a different
+  number of entries than operands, output over 512 KiB) discards the whole batch.
+- Because `ls` sorts operands, entries are matched to operands by exact trailing
+  path (longest match), not by position, and are bound to a directory by (device,
+  inode) taken with `lstat` before and after the run.
+- A realtime/monotonic consistency check applies: the realtime clock must not go
+  backwards and must agree with the monotonic clock over the run to within 50 ms,
+  otherwise the batch is dropped.
+- A batched listing is used for a directory only if that descriptor's ctime is at
+  least 20 ms older than the moment the batch was taken (and not in the future);
+  otherwise that directory is probed alone. Each listing is still validated by the
+  normal single-directory parser. A discarded batch falls back to per-directory
+  probes, never to admission.
 
 ### Fail-closed rules
 
@@ -141,10 +186,10 @@ only when it is "admit"; a refusal or a timeout is not reused.
   non-zero, exceeds its output bound or is killed: refuse.
 - A missing xattr (`ENODATA` and equivalent) is "no ACL"; a failing xattr read
   for any other reason is refuse.
-- Every public path through the policy, including the release tooling's Python
-  admission (`tools/release/private_roots.py`), must reach the same verdict for
-  the same layout on Linux. The Python and Rust copies are kept equal by shared
-  golden vectors (see test obligations).
+- The release tooling's Python admission (`tools/release/private_roots.py`) is
+  intended to reach the same verdict as the Rust policy for the same layout on
+  Linux. They are not yet tied together by shared golden vectors (a known gap, see
+  test obligations).
 
 ### Out of scope (explicit non-guarantees)
 
@@ -157,6 +202,21 @@ only when it is "admit"; a refusal or a timeout is not reused.
   the user runs.
 - Time-of-check windows shorter than one operation: the policy revalidates around
   each operation, it does not make a file system transaction.
+
+### Pack snapshot cache (Sealed role in use)
+
+Retained Java pack snapshots are built under a private `.incoming-*` name, fully
+verified, sealed to `0500`, and renamed into place. A pack holds a shared per-snapshot
+use lease while in use; eviction (oldest unleased snapshot, bound of four retained)
+never removes a leased snapshot. Retained snapshots are re-admitted with the Sealed
+role under one shared deadline and one memo. A partial incoming directory is residue
+and is swept; it is not admitted.
+
+### Known limitations
+
+- The macOS listing parser is ASCII-only: a path containing non-ASCII characters is
+  refused (fail closed) on macOS. This predates S0b and is accepted until a native
+  ACL query replaces the text oracle.
 
 ## Alternatives considered
 
@@ -193,8 +253,15 @@ only when it is "admit"; a refusal or a timeout is not reused.
   probed directory per operation. The deadline makes slowness a refusal, not a
   bypass: a loaded machine (Spotlight, SSD wake) can refuse spuriously. Denial of
   service by refusal is acceptable; unsafe admission is not.
-- Memoization reduces spawns to one per distinct directory per operation but does
-  not remove them. A native query (see alternatives) is the long-term fix.
+- Memoization and batching reduce spawns to roughly one per walk plus one per
+  directory that changed recently, but do not remove them. A native query (see
+  alternatives) is the long-term fix.
+- Linux: under heavy parallel I/O the parent-directory fsync inside
+  `create_private_child` dominates the 750 ms budget (about 90 ms on average, 558 ms
+  maximum observed). The budget still includes it. The residual is refusal under
+  extreme I/O load, which fails closed.
+- The batched probe trusts the clock only within the 50 ms and 20 ms tolerances
+  above; a root-controlled clock is out of scope.
 - The Linux ACL decision uses xattrs read through the held descriptor; filesystems
   without xattr support in the admitted set are treated as having no ACL.
 - Every change to this table is a security-contract change and needs its own review
@@ -202,21 +269,27 @@ only when it is "admit"; a refusal or a timeout is not reused.
 
 ## Test obligations
 
-- Policy-table test: one case per row above, per platform, pinning admit or refuse
-  (including role: a default ACL admitted on a walked component but refused on the
-  leaf; an allow entry refused on macOS at every role; `hidden` admitted and an
-  unknown flag refused; a mode 1777 ancestor refused; owner mismatch refused).
-- Probe-count test: asserts the number of ACL probe spawns per admission and per
-  `create_private_child` on macOS (each distinct directory identity at most once
-  per operation, and none reused across two operations).
-- POSIX-lock-survival test: hold a POSIX lock on a file, validate it by name, and
-  show the lock is still held.
-- Runner-shape default-ACL test: a real filesystem directory with a default ACL
-  (and a read-only named-user access ACL) is admitted as a traversed component and
-  refused as the private leaf; a writable named-user entry is refused in both.
-- Refusal tests for FIFO, symlink, hardlink, ancestor replaced by a symlink, and
-  unsupported container capability creating files.
-- Deadline test: an expired deadline refuses without spawning; a stuck owned probe
-  is reaped within its cleanup bound.
-- Golden vectors: a shared file of ACL listing text to verdict consumed by both the
-  Rust parser tests and the Python admission tests.
+Existing:
+- Policy-table tests over the pure policy functions (owner, mode, Linux ACL bytes,
+  macOS listing text, filesystem type, flags, roles including Sealed).
+- Real-entry-point tests: admission through the public operations, including a
+  default ACL (and a read-only named-user ACL) admitted on a walked component and
+  refused as the private leaf, writable named-user refused, symlink replacement of
+  an ancestor, FIFO refused without waiting, hardlink refused, and an unsupported
+  container unable to create private files.
+- Probe-count and spawn-count tests: each distinct directory state is probed once
+  per operation, nothing is reused across operations, and a walk spawns one batched
+  `ls`.
+- Expired-deadline test: an expired deadline refuses before any probe; a stuck
+  owned probe is reaped within its cleanup bound.
+- Tricky-name test against the real `ls` (spaces, prefix chains, unusual
+  characters) for the batch splitter.
+- Batch-binding tests (inode and device mismatch, ctime quiet period, clock step).
+- POSIX-lock-survival test: a lock held on a file survives name-based validation.
+- Runner-shape default-ACL test on a real filesystem.
+
+Gaps (not yet covered):
+- Shared Python and Rust golden vectors (listing text to verdict) for
+  `tools/release/private_roots.py`.
+- Named-file rows in the policy table (file owner, mode, link count, ACL) are not
+  yet pinned as a table; they are covered only by the real-entry-point tests.
