@@ -1082,6 +1082,20 @@ fn open_directory_without_symlinks_until(
     if components > MAX_PATH_COMPONENTS + 1 || path.as_os_str().len() > 4096 {
         return Err(PrivateStorageError::InvalidName);
     }
+    // One ACL listing for the whole walk instead of one per component (macOS only; see
+    // `Operation::prefetch_directory_listings` for why this cannot admit anything by itself).
+    #[cfg(target_os = "macos")]
+    {
+        let mut prefix = PathBuf::from("/");
+        let mut prefixes = vec![prefix.clone()];
+        for component in path.components() {
+            if let Component::Normal(name) = component {
+                prefix.push(name);
+                prefixes.push(prefix.clone());
+            }
+        }
+        op.prefetch_directory_listings(&prefixes);
+    }
     let mut descriptor = open_directory_descriptor("/")?;
     let mut traversed = PathBuf::from("/");
     verify_ancestor_metadata(&traversed, &descriptor, op)?;
@@ -1736,5 +1750,24 @@ mod tests {
             std::fs::set_permissions(child.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("unseal");
         }
+    }
+
+    /// On macOS one walk lists all of its directories with a single `ls`; only directories that
+    /// changed within the last 20 ms (the scratch root other tests are busy in) are probed alone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_quiet_walk_spawns_one_ls_not_one_per_component() {
+        let leaf = nested_leaf();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let directories = directory_count(leaf.path());
+        let before = probe::ls_spawn_count();
+        leaf.revalidate().expect("revalidate");
+        let spawns = probe::ls_spawn_count() - before;
+        assert!(spawns >= 1 && spawns <= 4, "{spawns} ls runs for {directories} directories");
+        let before = probe::ls_spawn_count();
+        let created = leaf.create_private_child("spawns").expect("create child");
+        let spawns = probe::ls_spawn_count() - before;
+        assert!(spawns <= 8, "{spawns} ls runs to create a child below {directories} directories");
+        drop(created);
     }
 }

@@ -70,6 +70,16 @@ pub(crate) struct Operation {
     deadline: Instant,
     memoize: bool,
     judged: RefCell<Vec<DirectoryState>>,
+    /// Batched macOS listings taken at the start of an ancestor walk (see `prefetch`).
+    #[cfg(target_os = "macos")]
+    prefetched: RefCell<Option<Prefetched>>,
+}
+
+/// Listings for every component of a walk, taken by one `ls` run at `taken_at`.
+#[cfg(target_os = "macos")]
+struct Prefetched {
+    taken_at: std::time::SystemTime,
+    listings: Vec<(std::path::PathBuf, crate::policy::BatchedListing)>,
 }
 
 impl Operation {
@@ -87,7 +97,13 @@ impl Operation {
         // The memo exists because a macOS probe is a subprocess. A Linux probe is two
         // extended-attribute reads, so Linux keeps probing every time, exactly as before, rather
         // than relying on ctime granularity of the filesystem for no gain.
-        Self { deadline, memoize: cfg!(target_os = "macos"), judged: RefCell::new(Vec::new()) }
+        Self {
+            deadline,
+            memoize: cfg!(target_os = "macos"),
+            judged: RefCell::new(Vec::new()),
+            #[cfg(target_os = "macos")]
+            prefetched: RefCell::new(None),
+        }
     }
 
     /// An operation that memoizes on every platform, so the memo logic is testable on Linux.
@@ -103,6 +119,32 @@ impl Operation {
 
     pub(crate) fn expired(&self) -> bool {
         Instant::now() >= self.deadline
+    }
+
+    /// Lists every directory on a walk with a single `ls` run instead of one run per component.
+    ///
+    /// The listings are not verdicts. `probe_directory` uses one only for a directory whose
+    /// opened descriptor reports the listing's inode and a ctime that is older than the moment
+    /// the listing was taken, which proves the directory has not been modified since (a chmod,
+    /// ACL edit or child change all advance ctime) and is the object that was listed. Otherwise
+    /// it probes that directory on its own, so a batch that is stale, misparsed or raced never
+    /// admits anything.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn prefetch_directory_listings(&self, paths: &[std::path::PathBuf]) {
+        if !self.memoize || paths.len() < 2 {
+            return;
+        }
+        let Some(names) = paths.iter().map(|path| path.to_str()).collect::<Option<Vec<_>>>() else {
+            return;
+        };
+        let taken_at = std::time::SystemTime::now();
+        let operands = paths.iter().map(std::path::PathBuf::as_path).collect::<Vec<_>>();
+        let Some(text) = run_ls("-ldeOi", &operands, self.deadline, BATCH_OUTPUT_LIMIT) else {
+            return;
+        };
+        let Some(parsed) = crate::policy::split_batched_listing(&text, &names) else { return };
+        *self.prefetched.borrow_mut() =
+            Some(Prefetched { taken_at, listings: paths.iter().cloned().zip(parsed).collect() });
     }
 
     fn already_judged(&self, state: &DirectoryState) -> bool {
@@ -214,11 +256,49 @@ fn probe_directory(
     operation: &Operation,
     _role: DirectoryRole,
     path: &Path,
-    _directory: &File,
+    directory: &File,
 ) -> bool {
+    if let Some(verdict) = prefetched_verdict(operation, path, directory) {
+        return verdict;
+    }
     let Some(text) = run_acl_listing(path, operation.deadline()) else { return false };
     path.to_str()
         .is_some_and(|expected| crate::policy::macos_directory_listing_admits(&text, expected))
+}
+
+/// A ctime must be at least this much older than the batched listing to be trusted.
+#[cfg(target_os = "macos")]
+const PREFETCH_QUIET_PERIOD: Duration = Duration::from_millis(20);
+
+/// Judges `directory` from the walk's batched listing when that listing provably describes it.
+///
+/// The listing is used only if its inode equals the descriptor's inode and the descriptor's
+/// ctime is at least [`PREFETCH_QUIET_PERIOD`] older than the moment the listing was taken. Any
+/// change to the directory's mode, owner, ACL, flags or extended attributes advances ctime, so a
+/// ctime that old means nothing changed between the listing and this descriptor read, and the
+/// caller's before/after state check covers the rest of the window. Directories modified
+/// recently (busy ones) return `None` and are probed on their own. Clock manipulation needs
+/// root and is outside the threat model.
+#[cfg(target_os = "macos")]
+fn prefetched_verdict(operation: &Operation, path: &Path, directory: &File) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let prefetched = operation.prefetched.borrow();
+    let batch = prefetched.as_ref()?;
+    let (_, listing) = batch.listings.iter().find(|(listed, _)| listed == path)?;
+    let metadata = directory.metadata().ok()?;
+    let ctime = std::time::UNIX_EPOCH
+        + Duration::new(
+            u64::try_from(metadata.ctime()).ok()?,
+            u32::try_from(metadata.ctime_nsec()).ok()?,
+        );
+    if metadata.ino() != listing.inode || ctime.checked_add(PREFETCH_QUIET_PERIOD)? > batch.taken_at
+    {
+        return None;
+    }
+    Some(path.to_str().is_some_and(|expected| {
+        crate::policy::macos_directory_listing_admits(&listing.text, expected)
+    }))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -315,26 +395,52 @@ fn file_listing_admits(path: &Path, operation: &Operation) -> bool {
     path.to_str().is_some_and(|expected| crate::policy::macos_file_listing_admits(&text, expected))
 }
 
-/// Runs `/bin/ls -ldeO <path>` under the operation's deadline and returns its bounded stdout.
-///
-/// This is the only place that spawns the probe. Any failure (control characters in the path,
-/// spawn failure, deadline, oversized or non-UTF-8 output, nonzero exit) is `None`, which every
-/// caller treats as a refusal.
+/// Longest single-directory listing accepted.
+#[cfg(target_os = "macos")]
+const LISTING_OUTPUT_LIMIT: usize = 16_384;
+/// Longest batched listing accepted (a walk is at most 129 directories).
+#[cfg(target_os = "macos")]
+const BATCH_OUTPUT_LIMIT: usize = 512 * 1024;
+
+#[cfg(all(target_os = "macos", test))]
+thread_local! {
+    static LS_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of `/bin/ls` processes this thread has spawned. Test seam for spawn-count bounds.
+#[cfg(all(target_os = "macos", test))]
+pub(crate) fn ls_spawn_count() -> usize {
+    LS_SPAWNS.with(std::cell::Cell::get)
+}
+
+/// Runs `/bin/ls -ldeO <path>` under the deadline and returns its bounded stdout.
 #[cfg(target_os = "macos")]
 fn run_acl_listing(path: &Path, deadline: Instant) -> Option<String> {
+    run_ls("-ldeO", &[path], deadline, LISTING_OUTPUT_LIMIT)
+}
+
+/// Runs `/bin/ls <flags> <paths...>` under the deadline and returns its bounded stdout.
+///
+/// This is the only place that spawns the probe. Any failure (control characters in a path,
+/// spawn failure, deadline, oversized or non-UTF-8 output, nonzero exit) is `None`, which every
+/// caller treats as a refusal or a fallback to a single-directory probe.
+#[cfg(target_os = "macos")]
+fn run_ls(flags: &str, paths: &[&Path], deadline: Instant, limit: usize) -> Option<String> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::thread;
 
     if Instant::now() >= deadline
-        || path.as_os_str().to_string_lossy().chars().any(char::is_control)
+        || paths.iter().any(|path| path.as_os_str().to_string_lossy().chars().any(char::is_control))
     {
         return None;
     }
+    #[cfg(test)]
+    LS_SPAWNS.with(|count| count.set(count.get() + 1));
     let Ok(mut child) = Command::new("/bin/ls")
-        .args(["-ldeO"])
-        .arg(path)
+        .arg(flags)
+        .args(paths)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -350,8 +456,8 @@ fn run_acl_listing(path: &Path, deadline: Instant) -> Option<String> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let reader = thread::spawn(move || {
         let mut bytes = Vec::new();
-        let result = stdout.by_ref().take(16_385).read_to_end(&mut bytes);
-        if sender.send((result.is_ok() && bytes.len() <= 16_384, bytes)).is_err() {
+        let result = stdout.by_ref().take(limit as u64 + 1).read_to_end(&mut bytes);
+        if sender.send((result.is_ok() && bytes.len() <= limit, bytes)).is_err() {
             return;
         }
     });

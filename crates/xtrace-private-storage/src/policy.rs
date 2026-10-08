@@ -101,6 +101,80 @@ pub(crate) fn macos_filesystem_admitted(type_name: &[u8], mount_flags: u32) -> b
     mount_flags & MNT_IGNORE_OWNERSHIP == 0 && matches!(type_name, b"apfs" | b"hfs")
 }
 
+/// One directory's listing taken from a batched `ls -ldeOi` run.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct BatchedListing {
+    /// Inode number the listing reports, so the caller can bind it to an opened descriptor.
+    pub(crate) inode: u64,
+    /// The entry as a single-directory `ls -ldeO` listing (inode column removed).
+    pub(crate) text: String,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_acl_line(line: &str) -> bool {
+    line.trim_start().split_once(':').is_some_and(|(index, _)| {
+        !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// Splits the output of one `ls -ldeOi` over several operands into one listing per operand.
+///
+/// `ls` sorts its operands, so entries are matched to operands by their exact trailing path (the
+/// longest operand the header ends with, which keeps prefix chains like `/a` and `/a/b /a`
+/// apart), not by position. Anything unexpected returns `None` for the whole batch: not ASCII,
+/// carriage returns, a leading ACL line, a header without a numeric inode, an entry that matches
+/// no operand or two entries for one operand, or a different number of entries than operands.
+/// The caller then falls back to probing each directory on its own. Each returned listing is
+/// still validated by the normal single-directory parser.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn split_batched_listing(text: &str, paths: &[&str]) -> Option<Vec<BatchedListing>> {
+    if text.contains('\r') || !text.is_ascii() || !text.ends_with('\n') || paths.is_empty() {
+        return None;
+    }
+    let mut slots: Vec<Option<BatchedListing>> = paths.iter().map(|_| None).collect();
+    let mut current: Option<(usize, u64, String)> = None;
+    let mut seen = 0_usize;
+    for line in text.lines() {
+        if is_acl_line(line) {
+            let (_, _, entry) = current.as_mut()?;
+            entry.push_str(line);
+            entry.push('\n');
+            continue;
+        }
+        if let Some((slot, inode, entry)) = current.take() {
+            slots[slot] = Some(BatchedListing { inode, text: entry });
+        }
+        let (inode, rest) = line.trim_start().split_once(char::is_whitespace)?;
+        let inode = inode.parse::<u64>().ok()?;
+        let slot = paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| {
+                rest.strip_suffix(**path).is_some_and(|before| before.ends_with(' '))
+            })
+            .max_by_key(|(_, path)| path.len())
+            .map(|(index, _)| index)?;
+        if slots[slot].is_some() {
+            return None;
+        }
+        seen += 1;
+        let mut entry = rest.to_owned();
+        entry.push('\n');
+        current = Some((slot, inode, entry));
+    }
+    if let Some((slot, inode, entry)) = current.take() {
+        if slots[slot].is_some() {
+            return None;
+        }
+        slots[slot] = Some(BatchedListing { inode, text: entry });
+    }
+    if seen != paths.len() {
+        return None;
+    }
+    slots.into_iter().collect()
+}
+
 /// Parses a Linux `system.posix_acl_*` xattr (version 2, 8-byte entries) into `(tag, perm)`
 /// pairs; `None` for anything malformed, so unknown shapes stay refused.
 #[cfg(any(target_os = "linux", test))]
@@ -946,5 +1020,81 @@ mod tests {
             "drwxr-xr-x+ 5 root wheel - 160 Oct 4 00:23 /System\n",
             "/System"
         ));
+    }
+
+    #[test]
+    fn batched_listing_is_split_by_exact_path_whatever_the_output_order() {
+        let paths = ["/", "/Users", "/Users/alice/Desktop", "/Volumes"];
+        let text = concat!(
+            "      2 drwxr-xr-x   22 root      wheel  sunlnk  704 Feb 25 2026 /\n",
+            "  17204 drwxr-xr-x    5 root      admin  sunlnk  160 Mar 22 2026 /Users\n",
+            "1060071 drwx------@ 152 alice     staff  -      4864 Oct  8 01:36 /Users/alice/Desktop\n",
+            " 0: group:everyone deny delete\n",
+            "  17214 drwxr-xr-x    7 root      wheel  hidden  224 Oct  8 02:00 /Volumes\n",
+        );
+        let listings = split_batched_listing(text, &paths).expect("well formed batch");
+        assert_eq!(listings.len(), 4);
+        assert_eq!(listings[0].inode, 2);
+        assert_eq!(listings[3].inode, 17214);
+        assert_eq!(listings[2].inode, 1_060_071);
+        for (listing, path) in listings.iter().zip(paths) {
+            assert!(macos_directory_listing_admits(&listing.text, path), "{path}");
+        }
+        assert!(listings[2].text.contains("deny delete"));
+        // Shuffled operands still land on the right slots.
+        let shuffled = ["/Volumes", "/", "/Users/alice/Desktop", "/Users"];
+        let again = split_batched_listing(text, &shuffled).expect("order independent");
+        assert_eq!(again[0].inode, 17214);
+        assert_eq!(again[1].inode, 2);
+    }
+
+    #[test]
+    fn batched_listing_keeps_overlapping_suffix_paths_apart() {
+        let paths = ["/a", "/a/b /a"];
+        let text = concat!(
+            "10 drwxr-xr-x 3 alice staff - 96 Oct  4 00:23 /a\n",
+            "11 drwxr-xr-x 3 alice staff - 96 Oct  4 00:23 /a/b /a\n",
+        );
+        let listings = split_batched_listing(text, &paths).expect("longest path wins");
+        assert_eq!((listings[0].inode, listings[1].inode), (10, 11));
+    }
+
+    #[test]
+    fn batched_listing_fails_closed_on_any_ambiguity() {
+        let paths = ["/", "/Users"];
+        let root = "2 drwxr-xr-x 22 root wheel sunlnk 704 Feb 25 2026 /\n";
+        let users = "17204 drwxr-xr-x 5 root admin sunlnk 160 Mar 22 2026 /Users\n";
+        assert!(split_batched_listing(&format!("{root}{users}"), &paths).is_some());
+        // Missing entry, duplicate entry, extra entry, unknown path, no inode, ACL line first,
+        // carriage return, missing trailing newline, non-ASCII, empty.
+        assert!(split_batched_listing(root, &paths).is_none());
+        assert!(split_batched_listing(&format!("{root}{root}"), &paths).is_none());
+        assert!(split_batched_listing(&format!("{root}{users}{users}"), &paths).is_none());
+        assert!(
+            split_batched_listing(&format!("{root}{}", users.replace("/Users", "/Other")), &paths)
+                .is_none()
+        );
+        assert!(split_batched_listing(&format!("{root}{}", &users[6..]), &paths).is_none());
+        assert!(
+            split_batched_listing(
+                &format!(" 0: group:everyone deny delete\n{root}{users}"),
+                &paths
+            )
+            .is_none()
+        );
+        assert!(
+            split_batched_listing(&format!("{root}{users}").replace('\n', "\r\n"), &paths)
+                .is_none()
+        );
+        assert!(split_batched_listing(format!("{root}{users}").trim_end(), &paths).is_none());
+        assert!(split_batched_listing("", &paths).is_none());
+        assert!(split_batched_listing(&format!("{root}{users}\u{e9}\n"), &paths).is_none());
+        // A listing that parses as a batch is still judged entry by entry by the real parser.
+        let acl_allow = format!(
+            "{root}17204 drwxr-xr-x+ 5 root admin sunlnk 160 Mar 22 2026 /Users\n 0: user:evil allow write\n"
+        );
+        let listings = split_batched_listing(&acl_allow, &paths).expect("splits");
+        assert!(macos_directory_listing_admits(&listings[0].text, "/"));
+        assert!(!macos_directory_listing_admits(&listings[1].text, "/Users"));
     }
 }
