@@ -107,3 +107,19 @@ test("transport: finish carries the resolved summary and still reserves its term
   assert.deepEqual(worker.sent.at(-1)?.summary, { route: "/users/:id", httpStatus: 200, outcome: "responded" });
   assert.equal(transport.finish("r", 2n, 5n, 0), false);
 });
+
+test("manifest is deterministic and limitations shrink when a module installs", () => {
+  const manifestModule = require("../manifest.cjs") as typeof import("../manifest.cjs");
+  const first = JSON.stringify(manifestModule.buildManifest());
+  assert.equal(first, JSON.stringify(manifestModule.buildManifest([...manifestModule.BUILTIN_MODULES].reverse())));
+  const parsed = manifestModule.buildManifest();
+  assert.equal(parsed.schema, 2);
+  assert.ok(parsed.capabilities.includes("http.server.request_root"));
+  const none = manifestModule.effectiveLimitations(new Set());
+  const withHttp = manifestModule.effectiveLimitations(new Set(["node-http", "async-context"]));
+  assert.ok(none.includes("http_root_unavailable") && none.includes("http_status_unavailable"));
+  assert.equal(withHttp.includes("http_root_unavailable"), false);
+  assert.equal(withHttp.includes("http_status_unavailable"), false);
+  assert.ok(withHttp.includes("route_unavailable"), "route needs a framework module");
+  assert.ok(withHttp.includes("values_unavailable"), "baseline limitations never shrink");
+});

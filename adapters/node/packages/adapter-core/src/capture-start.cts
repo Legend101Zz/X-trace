@@ -19,7 +19,7 @@ export function startCaptureFromRequire(): void {
       workerData: {
         bootstrapPath,
         startupBarrier,
-        manifestPath: join(__dirname, "node-http-manifest.json"),
+        manifestPath: join(__dirname, "node-capabilities.json"),
       },
     });
   } catch {

@@ -8,7 +8,7 @@
     ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
     "./register.cjs": "./dist/register.cjs",
     "./register.mjs": "./dist/register.mjs",
-    "./manifest": "./dist/node-http-manifest.json"
+    "./manifest": "./dist/node-capabilities.json"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node ../../scripts/copy-runtime-assets.mjs",

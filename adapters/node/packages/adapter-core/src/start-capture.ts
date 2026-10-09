@@ -19,7 +19,7 @@ export async function startCapture(): Promise<void> {
   try {
     worker = new Worker(join(DIST_DIRECTORY, "transport-worker.js"), {
       execArgv: [],
-      workerData: { bootstrapPath, startupBarrier: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT), manifestPath: join(DIST_DIRECTORY, "node-http-manifest.json") },
+      workerData: { bootstrapPath, startupBarrier: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT), manifestPath: join(DIST_DIRECTORY, "node-capabilities.json") },
     });
   } catch {
     warnUnavailable("XTR-NODE-STARTUP");
