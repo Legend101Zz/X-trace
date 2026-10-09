@@ -27,6 +27,16 @@ case "$P" in
     ;;
   vendure)
     node "$run" create; own
+    # The seed step reads the create package's assets (initial-data.json, products.csv, images): take them from the pinned,
+    # hash-verified npm tarball, exactly the artifact campaign.json pins.
+    ver=$(python3 -B -c "import json;print(json.load(open('campaigns/node/vendure/campaign.json'))['starter']['package']['version'])")
+    want=$(python3 -B -c "import json;print(json.load(open('campaigns/node/vendure/campaign.json'))['starter']['package']['tarballSha256'])")
+    tmp=$(mktemp -d)
+    (cd "$tmp" && npm pack "@vendure/create@$ver" --silent >/dev/null)
+    got=$(sha256sum "$tmp"/vendure-create-*.tgz | cut -d' ' -f1)
+    [ "$got" = "$want" ] || { echo "vendure create tarball sha256 does not match the pin"; exit 1; }
+    mkdir -p "$tmp/x" && tar -xzf "$tmp"/vendure-create-*.tgz -C "$tmp/x"
+    rm -rf "$root/create-assets" && cp -R "$tmp/x/package/assets" "$root/create-assets"
     node "$run" build; own
     node "$run" seed; own
     ;;
