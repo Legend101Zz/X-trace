@@ -82,7 +82,7 @@ public final class AgentRuntime {
               manifest,
               new XtpSession.ClientIdentity(
                   attach ? "xtrace-java-attach-fixture" : "xtrace-java-premain-fixture",
-                  "0.1.0",
+                  "0.0.1",
                   "java",
                   "openjdk",
                   System.getProperty("java.version"),

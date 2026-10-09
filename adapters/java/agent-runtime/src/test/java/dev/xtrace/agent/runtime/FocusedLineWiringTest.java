@@ -232,6 +232,14 @@ class FocusedLineWiringTest {
         events.stream().anyMatch(e -> e.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_GAP
             && e.getGap().getReason() == xtp.agent.v1.Recording.GapReason.GAP_REASON_LINE_BUDGET),
         "withheld line events are reported as LINE_BUDGET");
+    // The last accepted event keeps only its own iteration's locals: ignored sites attach nothing.
+    RecordingEvent last =
+        events.stream().filter(e -> e.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR)
+            .reduce((a, b) -> b).orElseThrow();
+    java.util.Set<String> names = new java.util.HashSet<>();
+    for (ValueBinding b : last.getBindingsList()) {
+      assertTrue(names.add(b.getName()), "duplicate local on the last line cursor: " + b.getName());
+    }
     assertNotNull(reports);
   }
 

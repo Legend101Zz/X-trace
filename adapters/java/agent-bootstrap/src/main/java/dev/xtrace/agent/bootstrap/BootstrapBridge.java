@@ -57,9 +57,13 @@ public final class BootstrapBridge {
       LineSink sink = LINE_SINK.get();
       if (sink == null) return;
       RequestContext context = CONTEXT.get();
-      if (context == null || context.deferred) return;
+      if (context == null || context.deferred) {
+        sink.lineIgnored();
+        return;
+      }
       if (context.lineEvents >= MAX_LINE_EVENTS_PER_REQUEST) {
         context.lineDropped++;
+        sink.lineIgnored();
         return;
       }
       context.lineEvents++;

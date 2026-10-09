@@ -58,6 +58,7 @@ final class LineProbeBridgeSink implements LineSink {
     flush();
     Pending p = pending.get();
     p.active = true;
+    p.valuesBlocked = false;
     p.collecting = false;
     p.recordingId = recordingId;
     p.eventId = eventId;
@@ -71,7 +72,14 @@ final class LineProbeBridgeSink implements LineSink {
   @Override
   public void valuesBegin(int siteId) {
     Pending p = pending.get();
-    p.collecting = p.active && p.siteId == siteId;
+    p.collecting = p.active && !p.valuesBlocked && p.siteId == siteId;
+  }
+
+  @Override
+  public void lineIgnored() {
+    Pending p = pending.get();
+    p.valuesBlocked = true;
+    p.collecting = false;
   }
 
   @Override
@@ -165,6 +173,7 @@ final class LineProbeBridgeSink implements LineSink {
   private static final class Pending {
     boolean active;
     boolean collecting;
+    boolean valuesBlocked;
     String recordingId;
     String eventId;
     String parentEventId;
