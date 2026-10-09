@@ -8,7 +8,8 @@ const MAX_ACTIVE_RECORDINGS = 64;
 
 /** What the application thread needs from the worker handoff. */
 export interface HttpCaptureTransport {
-  start(recordingId: string, method: string, startedAtNs: bigint): boolean;
+  /** `holdStart` asks the worker to delay RecordingStarted until finish (only when a module can still set the route). */
+  start(recordingId: string, method: string, startedAtNs: bigint, holdStart?: boolean): boolean;
   event(recordingId: string, event: CaptureEvent): boolean;
   finish(recordingId: string, finalSequence: bigint, durationNs: bigint, droppedEvents: number, summary?: RecordingSummary): boolean;
   onFailure(callback: () => void): void;
@@ -22,6 +23,9 @@ export interface RecordingSummary {
   httpStatus?: number;
   outcome?: "responded" | "exception-propagated" | "client-aborted" | "unobserved";
   limitations?: readonly string[];
+  /** Set for exception-propagated: the root frame-throw event and the thrown constructor name. */
+  thrownFromEventId?: string;
+  exceptionType?: string;
 }
 
 interface WorkerMessage {
@@ -67,10 +71,10 @@ export function createHttpCaptureTransport(worker: Worker): HttpCaptureTransport
   };
 
   return {
-    start(recordingId, method, startedAtNs) {
+    start(recordingId, method, startedAtNs, holdStart = false) {
       if (pending + reservedFinishes + 2 > MAX_IN_FLIGHT_MESSAGES || reservedFinishes >= MAX_ACTIVE_RECORDINGS) return false;
       reservedFinishes += 1;
-      if (post({ type: "start", recordingId, method, startedAtNs })) return true;
+      if (post({ type: "start", recordingId, method, startedAtNs, holdStart })) return true;
       reservedFinishes = Math.max(0, reservedFinishes - 1);
       return false;
     },

@@ -13,7 +13,7 @@ export type CaptureEventKind =
   | "gap";
 
 /** Closed interaction kinds; the worker maps them onto the protocol enum. */
-export type InteractionKindName = "database" | "outbound-http" | "process";
+export type InteractionKindName = "database" | "outbound-http";
 
 export interface InteractionFacts {
   kind: InteractionKindName;
@@ -34,12 +34,18 @@ export interface ExceptionFacts {
   message: string;
 }
 
+/** Source-attestation outcome the adapter itself observed; maps onto the protocol SourceBinding. */
+export type SourceBindingName = "verified" | "observed-unattested" | "source-map-absent" | "source-map-unresolved";
+
 export interface SourceFacts {
+  /** Repo-relative path; the worker drops a source that is inconsistent with its binding. */
+  binding: SourceBindingName;
   path: string;
   startLine: number;
   startColumn: number;
   endLine: number;
   endColumn: number;
+  /** 64 lowercase hex chars (BLAKE3 or SHA-256 per attestation); may be empty only for source-map bindings. */
   contentHash: string;
 }
 

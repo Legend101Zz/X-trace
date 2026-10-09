@@ -1,6 +1,11 @@
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
-import { createHttpCaptureTransport, installHttpCapture } from "./http-capture.cjs";
+import { createHttpCaptureTransport } from "./http-capture.cjs";
+import { effectiveLimitations } from "./manifest.cjs";
+import { asyncContextModule, nodeHttpModule } from "./modules.cjs";
+import { setCaptureProfile } from "./runtime/context.cjs";
+import { ModuleRegistry, type InstallEnvironment, type InstrumentationModule } from "./runtime/registry.cjs";
+import type { HttpCaptureTransport } from "./runtime/transport.cjs";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 
@@ -22,6 +27,10 @@ export function startCaptureFromRequire(): void {
     warnUnavailable("XTR-NODE-BOOTSTRAP");
     return;
   }
+  const environment: InstallEnvironment = { nodeVersion: process.version, packageVersion: "" };
+  let transport: HttpCaptureTransport | undefined;
+  const modules: InstrumentationModule[] = [nodeHttpModule(() => transport!), asyncContextModule()];
+  const planned = modules.filter((module) => module.detect(environment).supported).map((module) => module.descriptor.capability);
   const startupBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   let worker: Worker;
   try {
@@ -31,6 +40,7 @@ export function startCaptureFromRequire(): void {
         bootstrapPath,
         startupBarrier,
         manifestPath: join(__dirname, "node-capabilities.json"),
+        capabilities: planned,
       },
     });
   } catch {
@@ -45,7 +55,14 @@ export function startCaptureFromRequire(): void {
     return;
   }
   try {
-    installHttpCapture(createHttpCaptureTransport(worker));
+    transport = createHttpCaptureTransport(worker);
+    const registry = new ModuleRegistry();
+    for (const module of modules) registry.tryInstall(module, environment);
+    // Recordings carry the limitations that really hold: the baseline plus every module that did not install.
+    setCaptureProfile({
+      limitations: effectiveLimitations(new Set(registry.statuses().filter((status) => status.state === "installed").map((status) => status.name))),
+      holdStart: false,
+    });
     worker.unref();
   } catch {
     void worker.terminate();

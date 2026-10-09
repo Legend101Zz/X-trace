@@ -74,7 +74,7 @@ function captureRequest(_thisArg: unknown, request: IncomingMessage, response: S
   const method = typeof request.method === "string" && HTTP_METHODS.has(request.method) ? request.method : "";
   const context = createContext(method, startedAtNs);
   context.urlShape = urlShapeOf(request.url);
-  if (!transport.start(context.id, method, startedAtNs)) return invoke();
+  if (!transport.start(context.id, method, startedAtNs, context.holdStart)) return invoke();
 
   return runInContext(context, () => {
     response.once("finish", () => runInContext(context, () => closeRecording(context, "response-finish", response, transport)));
@@ -88,7 +88,9 @@ function captureRequest(_thisArg: unknown, request: IncomingMessage, response: S
       return result;
     } catch (error) {
       context.threw = true;
-      recordEvent(context, transport, events.frameThrow(ROOT_SYMBOL, context.frameEventId, error));
+      const thrown = events.frameThrow(ROOT_SYMBOL, context.frameEventId, error);
+      context.exceptionType = thrown.exceptionType ?? "UnknownError";
+      context.thrownFromEventId = recordEvent(context, transport, thrown);
       throw error;
     }
   });

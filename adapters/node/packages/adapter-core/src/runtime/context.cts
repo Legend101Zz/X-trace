@@ -25,10 +25,27 @@ export interface RecordingContext {
   /** Response status once observed; 0 means not observed. */
   status: number;
   threw: boolean;
+  /** Event id of the root frame-throw and the thrown type, when the root listener threw. */
+  thrownFromEventId: string;
+  exceptionType: string;
+  /** True when a framework module may still resolve the route, so the start is held until finish. */
+  holdStart: boolean;
   outcome: ObservedOutcome;
   /** Stack of open frame event ids, innermost last. */
   frameStack: string[];
   limitations: Set<string>;
+}
+
+/** What this process's installed modules imply for every recording; set once at capture start. */
+export interface CaptureProfile {
+  limitations: readonly string[];
+  holdStart: boolean;
+}
+
+let profile: CaptureProfile = { limitations: [], holdStart: false };
+
+export function setCaptureProfile(next: CaptureProfile): void {
+  profile = { limitations: [...next.limitations], holdStart: next.holdStart };
 }
 
 const contexts = new AsyncLocalStorage<RecordingContext>();
@@ -65,9 +82,12 @@ export function createContext(method: string, startedAtNs: bigint): RecordingCon
     urlShape: "",
     status: 0,
     threw: false,
+    thrownFromEventId: "",
+    exceptionType: "",
+    holdStart: profile.holdStart,
     outcome: "unobserved",
     frameStack: [],
-    limitations: new Set(),
+    limitations: new Set(profile.limitations),
   };
 }
 
@@ -110,6 +130,9 @@ export function finishContext(context: RecordingContext, transport: HttpCaptureT
     httpStatus: context.status,
     outcome: context.outcome,
     limitations: [...context.limitations].sort(),
+    ...(context.outcome === "exception-propagated"
+      ? { thrownFromEventId: context.thrownFromEventId, exceptionType: context.exceptionType || "UnknownError" }
+      : {}),
   };
   transport.finish(context.id, context.nextSequence - 1n, duration >= 0n ? duration : 0n, context.droppedEvents, summary);
 }
