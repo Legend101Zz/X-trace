@@ -42,7 +42,7 @@ async function initialize(): Promise<void> {
   const bootstrap = await readBootstrap(data.bootstrapPath);
   session = await openXtpSession(bootstrap, data.manifestPath, {
     adapterName: "xtrace-node-http",
-    adapterVersion: "0.1.0",
+    adapterVersion: "0.0.1",
     language: "node",
     runtimeName: "node",
     runtimeVersion: process.version,

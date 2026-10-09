@@ -112,7 +112,7 @@ test("openXtpSession erases its secret when pre-connect setup fails", async () =
   const missingManifest = validateBootstrap(validBootstrap());
   const missingSecret = missingManifest.session_secret;
   await assert.rejects(openXtpSession(missingManifest, "/missing/xtrace-manifest.json", {
-    adapterName: "synthetic", adapterVersion: "0.1.0", language: "node", runtimeName: "node",
+    adapterName: "synthetic", adapterVersion: "0.0.1", language: "node", runtimeName: "node",
     runtimeVersion: process.version, pid: BigInt(process.pid), processStartMonotonicNs: 1n,
   }));
   assert.deepEqual(missingSecret, Buffer.alloc(32));
@@ -124,7 +124,7 @@ test("openXtpSession erases its secret when pre-connect setup fails", async () =
   const invalidSecret = invalidIdentity.session_secret;
   const manifest = resolve(process.cwd(), "fixtures/synthetic-manifest.json");
   await assert.rejects(openXtpSession(invalidIdentity, manifest, {
-    adapterName: "synthetic", adapterVersion: "0.1.0", language: "node", runtimeName: "node",
+    adapterName: "synthetic", adapterVersion: "0.0.1", language: "node", runtimeName: "node",
     runtimeVersion: process.version, pid: BigInt(process.pid), processStartMonotonicNs: 1n,
   }));
   assert.deepEqual(invalidSecret, Buffer.alloc(32));
@@ -135,7 +135,7 @@ test("openXtpSession erases its secret when pre-connect setup fails", async () =
   };
   const hostSecret = invalidHost.session_secret;
   await assert.rejects(openXtpSession(invalidHost, manifest, {
-    adapterName: "synthetic", adapterVersion: "0.1.0", language: "node", runtimeName: "node",
+    adapterName: "synthetic", adapterVersion: "0.0.1", language: "node", runtimeName: "node",
     runtimeVersion: process.version, pid: BigInt(process.pid), processStartMonotonicNs: 1n,
   }));
   assert.deepEqual(hostSecret, Buffer.alloc(32));

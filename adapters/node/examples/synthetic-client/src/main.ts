@@ -21,7 +21,7 @@ async function main(): Promise<void> {
   const manifestPath = fileURLToPath(new URL("../../../fixtures/synthetic-manifest.json", import.meta.url));
   const session = await openXtpSession(bootstrap, manifestPath, {
     adapterName: "xtrace-node-synthetic-client",
-    adapterVersion: "0.1.0",
+    adapterVersion: "0.0.1",
     language: "node",
     runtimeName: "node",
     runtimeVersion: process.version,
