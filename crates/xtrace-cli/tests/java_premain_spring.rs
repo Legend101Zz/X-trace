@@ -134,7 +134,11 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let fixture =
         repo_root.join("adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar");
     assert!(agent.is_file(), "Gradle agentDist must run before this test: {}", agent.display());
-    assert!(fixture.is_file(), "Gradle fixtureBootJar must run before this test: {}", fixture.display());
+    assert!(
+        fixture.is_file(),
+        "Gradle fixtureBootJar must run before this test: {}",
+        fixture.display()
+    );
     assert_agent_distribution_is_private(&agent, &fixture);
 
     let mut java_version_command = Command::new("java");
@@ -675,7 +679,7 @@ fn post_order(port: u16) -> HttpResponse {
 }
 
 fn post_error(port: u16) -> HttpResponse {
-    let body = br#"{"description":"safe","bodyCanary":"BODY_CANARY_1D3","errorCanary":"token=ERROR_CANARY_1D3"}"#;
+    let body = br#"{"description":"safe","bodyCanary":"BODY_CANARY_1D3","errorCanary":"ERROR_CANARY_1D3"}"#;
     post_fixture_request(port, body)
 }
 

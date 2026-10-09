@@ -140,7 +140,7 @@ public class SpringMvcBridgeTest {
     assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
     assertEquals(0, sink.outcome.httpStatus());
     assertEquals("java.lang.IllegalStateException", sink.outcome.exceptionType());
-    assertEquals("handler failed", sink.outcome.exceptionMessage());
+    assertEquals(null, sink.outcome.exceptionMessage());
     assertEquals("http.response unavailable", sink.symbols.get(1));
   }
 
@@ -187,12 +187,12 @@ public class SpringMvcBridgeTest {
   }
 
   @Test
-  void throwEventCarriesExceptionTypeAndRawBoundedMessage() {
+  void throwEventCarriesExceptionTypeAndWithholdsMessage() {
     assertTrue(BootstrapBridge.requestStart("GET", "/x"));
     assertEquals("SpringMvcBridgeTest$Controller.go", BootstrapBridge.frameEnter(Controller.class, "go", "()V"));
     BootstrapBridge.frameExit("SpringMvcBridgeTest$Controller.go", new IllegalStateException("m".repeat(5000)));
     assertEquals("java.lang.IllegalStateException", sink.thrownType);
-    assertEquals(1024, sink.thrownMessage.length());
+    assertEquals(null, sink.thrownMessage);
     BootstrapBridge.requestEnd(500, false);
     assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
   }

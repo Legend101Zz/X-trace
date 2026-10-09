@@ -10,6 +10,13 @@ import java.util.concurrent.atomic.AtomicReference;
  * transport or file operations on an application thread.
  */
 public final class BootstrapBridge {
+  /**
+   * Exception message text is withheld (type only) until root rules on J-003 and the daemon audit
+   * redactor is on integration: pattern redaction cannot catch a plain user value echoed into a
+   * message. Flip here, in one place, if root keeps messages.
+   */
+  static final boolean FORWARD_EXCEPTION_MESSAGES = false;
+
   private static final AtomicReference<BridgeSink> SINK = new AtomicReference<>();
   private static final ThreadLocal<RequestContext> CONTEXT = new ThreadLocal<>();
 
@@ -264,7 +271,7 @@ public final class BootstrapBridge {
       type = boundedText(thrown.getClass().getName(), 200);
       try {
         // Application-defined getMessage may misbehave; any failure just omits the message.
-        message = boundedText(thrown.getMessage(), 1024);
+        message = FORWARD_EXCEPTION_MESSAGES ? boundedText(thrown.getMessage(), 1024) : null;
       } catch (RuntimeException | LinkageError ignored) {
         message = null;
       }
@@ -377,7 +384,7 @@ public final class BootstrapBridge {
     if (source != null && source != UNKNOWN_THROWABLE) {
       type = boundedText(source.getClass().getName(), 200);
       try {
-        message = boundedText(source.getMessage(), 1024);
+        message = FORWARD_EXCEPTION_MESSAGES ? boundedText(source.getMessage(), 1024) : null;
       } catch (RuntimeException | LinkageError ignored) {
         message = null;
       }

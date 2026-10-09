@@ -1,6 +1,7 @@
 package dev.xtrace.agent.runtime;
 
 import static net.bytebuddy.matcher.ElementMatchers.isAbstract;
+import static net.bytebuddy.matcher.ElementMatchers.isAnnotatedWith;
 import static net.bytebuddy.matcher.ElementMatchers.isBridge;
 import static net.bytebuddy.matcher.ElementMatchers.isMethod;
 import static net.bytebuddy.matcher.ElementMatchers.isNative;
@@ -205,7 +206,11 @@ final class FixtureInstrumentation {
         .and(not(isAbstract()))
         .and(not(isNative()))
         .and(not(nameStartsWith("lambda$")))
-        .and(not(nameMatches("(get|is)\\p{Lu}.*").and(takesArguments(0))))
+        .and(
+            not(
+                nameMatches("(get|is)\\p{Lu}.*")
+                    .and(takesArguments(0))
+                    .and(not(isAnnotatedWith(nameStartsWith("org.springframework.web.bind.annotation."))))))
         .and(not(nameMatches("set\\p{Lu}.*").and(takesArguments(1)).and(returns(void.class))))
         .and(not(named("toString").and(takesArguments(0))))
         .and(not(named("hashCode").and(takesArguments(0))))

@@ -200,22 +200,34 @@ final class RecordingWriter implements AutoCloseable, Runnable {
             pending.writerDrops,
             pending.start.monotonicNs(),
             finish.finishedMonotonicNs());
-    EventBatch.Builder batch =
-        EventBatch.newBuilder().setRecordingId(ByteString.copyFrom(recordingBytes));
-    List<String> eventIds = new ArrayList<>(ordered.size());
-    long sequence = 1;
-    for (QueueSignal.Event event : ordered) {
-      sequence = Math.addExact(sequence, 1);
-      batch.addEvents(toProto(event, sequence));
-      eventIds.add(event.eventId());
-    }
     if (ordered.isEmpty()) {
       throw new ClientException("XTR-JAVA-RECORDING", "recording contains no accepted events");
     }
-    Ack events =
-        session.send(
-            pending.start.recordingId() + ":events", pending.start.recordingId(), batch.build());
-    requireRecordingAck(events, recordingId, sequence);
+    List<String> eventIds = new ArrayList<>(ordered.size());
+    long sequence = 1;
+    EventBatch.Builder batch = newBatch(recordingBytes);
+    int inBatch = 0;
+    int batchBytes = 0;
+    int chunk = 0;
+    for (QueueSignal.Event event : ordered) {
+      sequence = Math.addExact(sequence, 1);
+      RecordingEvent proto = toProto(event, sequence);
+      int size = proto.getSerializedSize() + 8;
+      if (size > MAX_BATCH_BYTES) {
+        throw new ClientException("XTR-JAVA-RECORDING", "one event exceeds the batch byte bound");
+      }
+      if (inBatch > 0 && (inBatch >= MAX_BATCH_EVENTS || batchBytes + size > MAX_BATCH_BYTES)) {
+        sendChunk(pending, recordingId, batch, chunk++, sequence - 1);
+        batch = newBatch(recordingBytes);
+        inBatch = 0;
+        batchBytes = 0;
+      }
+      batch.addEvents(proto);
+      inBatch++;
+      batchBytes += size;
+      eventIds.add(event.eventId());
+    }
+    sendChunk(pending, recordingId, batch, chunk, sequence);
 
     RecordingFinished.Builder terminal =
         RecordingFinished.newBuilder()
@@ -327,6 +339,23 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         monotonicNs,
         (int) Math.min(Integer.MAX_VALUE, Math.max(1, droppedEvents)),
         128);
+  }
+
+  /** Conservative bounds under the daemon's advertised 256 events and 1 MiB envelope. */
+  static final int MAX_BATCH_EVENTS = 200;
+
+  static final int MAX_BATCH_BYTES = 256 * 1024;
+
+  private static EventBatch.Builder newBatch(byte[] recordingBytes) {
+    return EventBatch.newBuilder().setRecordingId(ByteString.copyFrom(recordingBytes));
+  }
+
+  private void sendChunk(
+      PendingRecording pending, UUID recordingId, EventBatch.Builder batch, int chunk, long lastSeq)
+      throws ClientException {
+    String id = pending.start.recordingId() + ":events" + (chunk == 0 ? "" : ":" + chunk);
+    Ack ack = session.send(id, pending.start.recordingId(), batch.build());
+    requireRecordingAck(ack, recordingId, lastSeq);
   }
 
   static RecordingEvent toProto(QueueSignal.Event event, long sequence)

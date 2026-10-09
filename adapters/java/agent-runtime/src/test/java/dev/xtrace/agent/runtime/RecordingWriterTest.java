@@ -184,10 +184,12 @@ class RecordingWriterTest {
     assertTrue(sink.offerFinish(REC, 1, 6, 200, 0));
     writer.start();
     writer.close();
-    EventBatch batch = transport.batches.get(0);
-    assertEquals(2 + 300 + 300, batch.getEventsCount());
+    assertTrue(transport.batches.size() > 1, "602 events must be split into bounded batches");
+    int total = transport.batches.stream().mapToInt(EventBatch::getEventsCount).sum();
+    assertEquals(2 + 300 + 300, total);
+    EventBatch lastBatch = transport.batches.get(transport.batches.size() - 1);
     assertEquals(RecordingEventKind.RECORDING_EVENT_KIND_RESPONSE,
-        batch.getEvents(batch.getEventsCount() - 1).getKind());
+        lastBatch.getEvents(lastBatch.getEventsCount() - 1).getKind());
     assertFalse(writer.incompleteWasReported());
   }
 
@@ -209,16 +211,24 @@ class RecordingWriterTest {
     assertTrue(sink.offerFinish(REC, 1, 6, 500, 0));
     writer.start();
     writer.close();
-    EventBatch batch = transport.batches.get(0);
-    var last = batch.getEvents(batch.getEventsCount() - 1);
+    assertTrue(transport.batches.size() > 1, "a capped recording is still split into bounded batches");
+    List<xtp.agent.v1.Recording.RecordingEvent> all = new java.util.ArrayList<>();
+    long expectedSeq = 2;
+    for (EventBatch b : transport.batches) {
+      for (var e : b.getEventsList()) {
+        assertEquals(expectedSeq++, e.getRecordingSeq(), "contiguous recording_seq across batches");
+        all.add(e);
+      }
+    }
+    var last = all.get(all.size() - 1);
     assertEquals(RecordingEventKind.RECORDING_EVENT_KIND_RESPONSE, last.getKind());
-    var gap = batch.getEvents(batch.getEventsCount() - 2);
+    var gap = all.get(all.size() - 2);
     assertEquals(RecordingEventKind.RECORDING_EVENT_KIND_GAP, gap.getKind());
     assertEquals(xtp.agent.v1.Recording.GapReason.GAP_REASON_THROTTLE, gap.getGap().getReason());
     int kept = RecordingWriter.MAX_EVENTS_PER_RECORDING - RecordingWriter.CLOSING_RESERVE;
     assertEquals(enters + 1 - kept, gap.getGap().getCount());
     assertTrue(gap.getGap().getCount() > 0);
-    long exits = batch.getEventsList().stream()
+    long exits = all.stream()
         .filter(e -> e.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_EXIT).count();
     assertEquals(10, exits);
   }
@@ -275,6 +285,9 @@ class RecordingWriterTest {
       if (payload instanceof RecordingStarted started) {
         ack.putHighestContiguousRecordingSeq(uuid(started.getRecordingId().toByteArray()), 1);
       } else if (payload instanceof EventBatch batch) {
+        // Daemon-advertised limits: 256 events per batch, 1 MiB per envelope.
+        assertTrue(batch.getEventsCount() <= 256, "batch event bound");
+        assertTrue(batch.getSerializedSize() <= 1024 * 1024 - 4096, "batch byte bound");
         batches.add(batch);
         long sequence = batch.getEvents(batch.getEventsCount() - 1).getRecordingSeq();
         ack.putHighestContiguousRecordingSeq(uuid(batch.getRecordingId().toByteArray()), sequence);
