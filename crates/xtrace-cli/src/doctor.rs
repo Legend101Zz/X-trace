@@ -19,13 +19,13 @@ pub struct DoctorArgs {
     /// Path to the repository root.
     #[arg(long = "project-dir", value_name = "DIR", default_value = ".")]
     pub project_dir: PathBuf,
-    /// Emit machine-readable JSON.
+    /// Accepted for compatibility; output is always JSON.
     #[arg(long)]
     pub json: bool,
-    /// Write a diagnostic bundle to this path.
+    /// Not implemented in this build: exits 9 (not-implemented) without writing anything.
     #[arg(long, value_name = "PATH")]
     pub bundle: Option<PathBuf>,
-    /// Confirm without prompting.
+    /// Accepted for compatibility; doctor never prompts.
     #[arg(long)]
     pub yes: bool,
 }

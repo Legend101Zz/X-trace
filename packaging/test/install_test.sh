@@ -1,13 +1,36 @@
 #!/bin/sh
 # Install / upgrade / uninstall journey for a built archive, in a throwaway HOME (fresh profile).
 #   packaging/test/install_test.sh dist/<platform>
+# Scratch: $XTRACE_TEST_PRIVATE_SCRATCH (a private 0700 dir) when set, else $TMPDIR; only the self-created, marked work dir is removed.
 # Needs only POSIX sh, tar and sha256sum|shasum. Exits non-zero on the first failed assertion (every check is `cmd && ok || fail`; the final count is
 # asserted so a silently skipped check also fails).
 set -eu
 dist=$(cd "${1:?usage: install_test.sh dist/<platform>}" && pwd)
 archive=$(ls "$dist"/xtrace-*.tar.gz)
-work=$(cd "$(mktemp -d)" && pwd -P)  # physical path: private storage refuses symlinked components (macOS /var)
-trap 'rm -rf "$work"' EXIT
+# Private scratch root: product storage refuses a data dir under a world-writable ancestor (Linux /tmp), so CI points
+# XTRACE_TEST_PRIVATE_SCRATCH at a 0700 directory it created; otherwise fall back to TMPDIR (user-private on macOS).
+scratch_root=${XTRACE_TEST_PRIVATE_SCRATCH:-${TMPDIR:-/tmp}}
+[ -d "$scratch_root" ] || { echo "scratch root $scratch_root is not a directory" >&2; exit 1; }
+# Product storage refuses group/world-writable ancestors (A-10); refuse early with a pointer instead of dying at `xtrace init`.
+scratch_perm=$(ls -ld "$scratch_root" | cut -c1-10)
+case $scratch_perm in
+  ?????w????|????????w?) echo "scratch root $scratch_root is group- or world-writable; set XTRACE_TEST_PRIVATE_SCRATCH to a private 0700 directory" >&2; exit 1 ;;
+esac
+start_dir=$(pwd -P)
+work=$(mktemp -d "${scratch_root%/}/xt.XXXXXX") || { echo 'mktemp failed' >&2; exit 1; }
+# physical path: private storage refuses symlinked components (macOS /var)
+work=$(cd "$work" && pwd -P) || { echo 'cannot enter work dir' >&2; exit 1; }
+case $work in ""|/|"$PWD"|"$start_dir"|"${HOME:-/nonexistent}") echo 'unsafe work dir' >&2; exit 1 ;; esac
+# We only delete a directory this script created: it must have been brand new (empty) when we claimed it, then carries our marker.
+[ -z "$(ls -A "$work")" ] || { echo 'work dir not empty (not freshly created)' >&2; exit 1; }
+marker=".xtrace-install-test-owned"
+: > "$work/$marker" || { echo 'cannot write ownership marker' >&2; exit 1; }
+cleanup() {
+  # best-effort, PID-identified stop of a daemon we may have left running (no pattern kill)
+  if [ -n "${prefix:-}" ] && [ -x "$prefix/bin/xtrace" ] && [ -n "${repo:-}" ]; then "$prefix/bin/xtrace" stop --project-dir "$repo" >/dev/null 2>&1 || :; fi
+  if [ -n "${work:-}" ] && [ -f "$work/$marker" ]; then rm -rf "$work"; fi
+}
+trap cleanup EXIT
 export HOME="$work/home"; mkdir -p "$HOME"
 unset XTRACE_DATA_HOME XDG_DATA_HOME XTRACE_PREFIX
 pass=0

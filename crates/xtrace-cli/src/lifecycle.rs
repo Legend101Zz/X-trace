@@ -30,7 +30,7 @@ pub struct RecordArgs {
     /// Path to the initialized repository root.
     #[arg(long = "project-dir", value_name = "DIR", default_value = ".")]
     pub project_dir: PathBuf,
-    /// Emit machine-readable JSON.
+    /// Accepted for compatibility; output is always JSON.
     #[arg(long)]
     pub json: bool,
     /// Capture depth: `standard` or `focused`.
@@ -44,7 +44,7 @@ pub struct StopArgs {
     /// Path to the initialized repository root.
     #[arg(long = "project-dir", value_name = "DIR", default_value = ".")]
     pub project_dir: PathBuf,
-    /// Emit machine-readable JSON.
+    /// Accepted for compatibility; output is always JSON.
     #[arg(long)]
     pub json: bool,
     /// Session to end; must equal the running daemon's runtime session id.
@@ -58,7 +58,7 @@ pub struct RestartArgs {
     /// Path to the initialized repository root.
     #[arg(long = "project-dir", value_name = "DIR", default_value = ".")]
     pub project_dir: PathBuf,
-    /// Emit machine-readable JSON.
+    /// Accepted for compatibility; output is always JSON.
     #[arg(long)]
     pub json: bool,
     /// Capture depth: `standard` or `focused`.
