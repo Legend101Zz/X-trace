@@ -34,8 +34,9 @@ finds it only from the `--analyzer PATH` flag or, when the flag is absent, the e
 `XTRACE_NODE_ANALYZER` (express, fastify, nest) or `XTRACE_JAVA_ANALYZER` (spring-mvc, spring-webflux). There is no
 default lookup: with neither set the command exits with a usage error naming the variable. The Node analyzer is built
 from `adapters/node` (`npm ci && npm run build`; entry `packages/analyzer/dist/main.js`, run with `node`, so point
-`--analyzer` at a small executable wrapper). The Java analyzer is `adapters/java/static-analyzer` and is not yet part
-of the Gradle build. CI proves the Node path end to end with `crates/xtrace-cli/tests/scan_real_node_analyzer.rs`,
+`--analyzer` at a small executable wrapper). The Java analyzer is `adapters/java/static-analyzer`. It is part of the
+Java Gradle build (`adapters/java/settings.gradle.kts`) and has unit tests (`SpringMvcAnalyzerTest`), but it is
+not bundled in the release payload, and no test yet runs `xtrace scan` against the built Java analyzer. CI proves the Node path end to end with `crates/xtrace-cli/tests/scan_real_node_analyzer.rs`,
 which scans the `express-basic` fixture with the built analyzer and reads the catalog back.
 
 ## Install, upgrade, uninstall
@@ -77,7 +78,7 @@ per-file size and sha256 against the manifest, no unlisted files, `payload.sha25
 `unsigned` or `dev` only (a release claim is rejected, the report always says `release_evidence: false`). With
 `--run-binary` it runs `bin/xtrace --version` and requires `xtrace <version>` plus `schema-version:` and `xtp-protocol:` lines, and
 `xtrace tui --help` (`tui_subcommand_registered`: the subcommand exists) plus `xtrace tui` with stdin closed
-(`tui_implemented`: red while the TUI is the exit-9 skeleton); with `--repo` it requires the reported schema version to equal the migration catalog's latest.
+(`tui_implemented`: the TUI is wired, so it must not exit 9 or report the old skeleton); with `--repo` it requires the reported schema version to equal the migration catalog's latest.
 `packaging/test/test_verify_package.py` pins each check on synthetic layouts (not a product build). CI wiring is a
 request to the CI lane (additive steps in `package.yml`).
 
@@ -98,14 +99,19 @@ request to the CI lane (additive steps in `package.yml`).
 * A start that fails after the daemon was spawned (bad readiness line, state write failure, timeout) terminates the child it spawned, so no unmanaged daemon is left holding the project lock.
 * Identity checks need a procps or BSD `ps` supporting `-o lstart=` and `-o command=` (BusyBox `ps` does not); they run with `LC_ALL=C`. If `ps` is unusable, `record`/`stop` fail with `XTR-LIFECYCLE-IDENTITY-UNAVAILABLE` and change nothing.
 * Limits: events a daemon had staged in memory but not yet written as a segment are lost on SIGTERM/SIGKILL (a
-  daemon-side flush on shutdown is requested separately); `--capture-depth` is validated and recorded but not yet
-  applied by the daemon.
+  daemon-side flush on shutdown is requested separately). `record` and `restart` take the same capture flags as
+  `run`; what `capture_depth_enforced` promises is described in `docs/security-local.md` (capture depth). When a
+  verified daemon is already running, `record` reports it and does not apply newly given capture flags.
 
 ## CI
 
-`.github/workflows/package.yml` (push to `slice/v001-**`, manual): `ubuntu-24.04` (linux-x86_64) and `macos-15`
-(macos-arm64): tool unit checks, reproducibility double build, build, checksum + install journey, upload of unsigned
-artifacts. `permissions: contents: read`, no secrets, actions pinned by commit SHA.
+`.github/workflows/package.yml` (push to `slice/v001-**`, `ultra/*-integration` and `ultra/rc-*`, manual):
+`ubuntu-24.04` (linux-x86_64) and `macos-15` (macos-arm64): tool unit checks, reproducibility double build, build,
+checksum + install journey, the install scratch test, the package content verifier (`packaging/verify_package.py`),
+upload of unsigned artifacts. If the verifier is absent on a branch the step warns and records "NOT RUN" (a skip, not a
+pass). `permissions: contents: read`, no secrets, actions pinned by commit SHA. `ci.yml` (push to `main`, `slice/**`,
+`ultra/*-integration`, `ultra/rc-*`, and pull requests) runs the Linux 23-gate floors and the hosted macOS arm64 job;
+`lane.yml` runs per-branch suites on `ultra/**`; `campaigns.yml` runs on `ultra/campaign/**` pushes and manual dispatch.
 
 ## What needs the owner
 
