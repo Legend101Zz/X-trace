@@ -145,7 +145,15 @@ impl std::fmt::Display for PlanError {
 impl std::error::Error for PlanError {}
 
 /// Checks a target base URL: http/https, host present, no userinfo, query,
-/// fragment, whitespace or control characters, and not secret-shaped.
+/// fragment, backslash, percent-encoded authority, whitespace or control
+/// characters, a malformed or non-canonical host, port 0, and not
+/// secret-shaped. Host names are limited to letters, digits, `-` and `.`
+/// (underscores are refused).
+///
+/// This is a textual syntax gate. It is necessary but NOT sufficient for
+/// destination safety: it does not resolve names, and a sender must also
+/// use a real URL parser, restrict hosts via [`classify_target_host`], and
+/// re-check the resolved address at connect time (SEC-06 remainder).
 ///
 /// # Errors
 ///
@@ -179,8 +187,10 @@ pub fn validate_target(target: &str) -> Result<(), PlanError> {
     if authority.contains('%') {
         return bad("percent_encoded_authority");
     }
-    if parse_authority(authority).is_none() {
-        return bad("malformed_authority");
+    match parse_authority(authority) {
+        None => return bad("malformed_authority"),
+        Some((_, Some(0))) => return bad("port_zero"),
+        Some(_) => {}
     }
     if sanitize::is_secret_value(target) {
         return bad("secret_shaped");
@@ -193,14 +203,33 @@ pub fn validate_target(target: &str) -> Result<(), PlanError> {
 /// must re-check the resolved address at connect time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostClass {
-    /// `localhost`, `*.localhost`, `127.0.0.0/8`, `::1`.
+    /// `127.0.0.0/8` or `::1` as an IP literal.
     Loopback,
-    /// Private, link-local, unspecified or otherwise non-public IP literal.
+    /// `localhost` or `*.localhost`. A name is not known to be loopback until
+    /// it is resolved: the sender must verify the resolved address.
+    LoopbackName,
+    /// Not loopback; only the common private, link-local and unspecified
+    /// ranges are recognised as non-public (other reserved ranges report
+    /// `PublicIp`).
     NonPublicIp,
     /// Public IP literal.
     PublicIp,
     /// A DNS name that is not a loopback name (resolution is not done here).
     Name,
+}
+
+impl HostClass {
+    /// Stable lowercase name used in previews.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::LoopbackName => "loopback_name_unverified",
+            Self::NonPublicIp => "non_public_ip",
+            Self::PublicIp => "public_ip",
+            Self::Name => "name_unverified",
+        }
+    }
 }
 
 /// Splits `host[:port]` into a lowercase host and optional port. Hosts are a
@@ -288,7 +317,7 @@ pub fn classify_target_host(target: &str) -> Result<HostClass, PlanError> {
         return Ok(classify_v4(v4));
     }
     if host == "localhost" || host.ends_with(".localhost") {
-        return Ok(HostClass::Loopback);
+        return Ok(HostClass::LoopbackName);
     }
     Ok(HostClass::Name)
 }

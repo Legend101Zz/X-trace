@@ -44,6 +44,8 @@ pub fn preview(plan: &Plan) -> Value {
         "plan_hash": plan.plan_hash,
         "revision_id": plan.revision_id,
         "target": plan.target,
+        "target_host_class": crate::candidate::classify_target_host(&plan.target)
+            .map_or("invalid", |c| c.name()),
         "requests_sent": 0,
         "selected_items": selected,
         "items_needing_approval": approvals,

@@ -404,6 +404,16 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
         }
         safe
     });
+    // A symbol is a short identifier-like string; refuse path separators,
+    // control characters and oversize values.
+    handlers.retain(|h| {
+        let ok = h.symbol.len() <= 200
+            && !h.symbol.chars().any(|c| c == '/' || c == '\\' || c.is_control());
+        if !ok {
+            omit(omissions, &op.operation_id, "handler".to_owned(), "handler_symbol_invalid");
+        }
+        ok
+    });
     let request_media = claims.iter().filter_map(|c| c.request_body_media_type.clone()).min();
 
     PreparedOp {
