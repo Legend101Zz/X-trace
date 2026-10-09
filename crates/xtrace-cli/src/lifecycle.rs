@@ -105,6 +105,28 @@ pub async fn run_restart(args: RestartArgs) -> Result<i32, CliError> {
     }
 }
 
+/// What `daemon.json` says compared with what is actually running (for `xtrace doctor`).
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleState {
+    /// No daemon record exists.
+    NoRecord,
+    /// The record names the live recorded daemon.
+    Verified,
+    /// The record names a process that is not the recorded daemon (or no process at all).
+    Stale(String),
+    /// The record or `ps` could not be read; nothing is inferred.
+    Unavailable(String),
+}
+
+/// Inspects the daemon record without changing anything.
+#[cfg(unix)]
+pub(crate) fn lifecycle_state(
+    private_root: &xtrace_private_storage::AdmittedPrivateRoot,
+) -> LifecycleState {
+    unix::lifecycle_state(private_root)
+}
+
 #[cfg(unix)]
 mod unix {
     use std::io::Write as _;
@@ -244,7 +266,11 @@ mod unix {
     /// Needs a procps or BSD `ps` (`-o lstart=`/`command=`); BusyBox `ps` is reported as
     /// unavailable. Runs with `LC_ALL=C` so the start-time text does not depend on the locale.
     fn ps(pid: u32, column: &str) -> Ps {
-        for binary in ["/bin/ps", "/usr/bin/ps"] {
+        ps_with(&["/bin/ps", "/usr/bin/ps"], pid, column)
+    }
+
+    fn ps_with(binaries: &[&str], pid: u32, column: &str) -> Ps {
+        for binary in binaries {
             let Ok(output) = Command::new(binary)
                 .args(["-o", column, "-p", &pid.to_string()])
                 .env("LC_ALL", "C")
@@ -307,6 +333,33 @@ mod unix {
             return Identity::Mismatch("process is not an xtrace daemon");
         }
         Identity::Verified
+    }
+
+    pub(super) fn lifecycle_state(private_root: &AdmittedPrivateRoot) -> super::LifecycleState {
+        use super::LifecycleState;
+        let state = match daemon_state_root(private_root) {
+            Ok(state) => state,
+            Err(_) => return LifecycleState::NoRecord,
+        };
+        let record = match read_record(&state) {
+            Ok(Some(record)) => record,
+            Ok(None) => return LifecycleState::NoRecord,
+            Err(error) => return LifecycleState::Unavailable(error.to_string()),
+        };
+        match verify_identity(&record) {
+            Identity::Verified => LifecycleState::Verified,
+            Identity::NotRunning => LifecycleState::Stale(format!(
+                "daemon.json names pid {}, which is not running",
+                record.pid
+            )),
+            Identity::Mismatch(reason) => LifecycleState::Stale(format!(
+                "daemon.json names pid {}, which is not the recorded daemon ({reason})",
+                record.pid
+            )),
+            Identity::Unavailable => {
+                LifecycleState::Unavailable("`ps` is missing or unusable".to_string())
+            }
+        }
     }
 
     fn identity_unavailable() -> CliError {
@@ -713,8 +766,7 @@ mod unix {
             }
             if Instant::now() >= deadline {
                 // We started this child and recorded its PID at spawn; it is ours to stop.
-                let _ = signal_term(child.id());
-                let _ = child.wait();
+                abort_child(child);
                 return Err(lifecycle_error(
                     "XTR-LIFECYCLE-START-TIMEOUT",
                     ErrorCategory::Transport,
@@ -795,8 +847,32 @@ mod unix {
         }
 
         match verify_identity(&record) {
+            Identity::Mismatch(_) if !project_lock_is_held(&project_root)? => {
+                // Stale record (reboot, crash, recycled PID, zombie) and no daemon holds the
+                // project lock: nothing to stop. Never signal the bystander; drop the record.
+                remove_record(&state);
+                drop(state);
+                drop(project_root);
+                let recovered = recover_interrupted(project_dir)?;
+                if not_running_is_error && recovered.is_empty() {
+                    return Err(lifecycle_error(
+                        "XTR-LIFECYCLE-NOT-RUNNING",
+                        ErrorCategory::NotFound,
+                        "the recorded daemon is no longer running; its stale state was cleaned up",
+                        RetryAdvice::None,
+                    ));
+                }
+                return Ok(StopDocument {
+                    kind: "stop_not_running",
+                    project_id,
+                    pid: Some(record.pid),
+                    runtime_session_id: Some(record.runtime_session_id),
+                    was_running: false,
+                    recovered_recordings: recovered,
+                });
+            }
             Identity::Mismatch(reason) => {
-                // The PID now belongs to something else: never signal it.
+                // A daemon holds the lock but the record names another process: never signal it.
                 return Err(lifecycle_error(
                     "XTR-LIFECYCLE-IDENTITY-MISMATCH",
                     ErrorCategory::Conflict,
@@ -941,6 +1017,61 @@ mod unix {
                 verify_identity(&record_for(pid, "Mon Jan  1 00:00:00 1990", "/bin/sleep")),
                 Identity::NotRunning
             );
+        }
+
+        #[test]
+        fn abort_child_terminates_a_live_child_and_leaves_a_reaped_one_alone() {
+            let mut live = Command::new("/bin/sleep").arg("30").spawn().expect("spawn sleep");
+            abort_child(&mut live);
+            assert!(live.try_wait().expect("try_wait").is_some(), "child must be reaped");
+
+            let mut done =
+                Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().expect("spawn sh");
+            done.wait().expect("reap");
+            abort_child(&mut done); // must not signal a reaped pid, must return promptly
+        }
+
+        #[test]
+        fn a_zombie_is_a_mismatch_not_verified() {
+            let mut zombie =
+                Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().expect("spawn sh");
+            let pid = zombie.id();
+            // Wait until the child has exited but has NOT been reaped.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let started = loop {
+                if let Some(started) = process_started(pid) {
+                    if ps(pid, "command=") != Ps::Present("/bin/sh -c exit 0".into()) {
+                        break started;
+                    }
+                }
+                assert!(Instant::now() < deadline, "child never became a zombie");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let verdict = verify_identity(&record_for(pid, &started, "/nonexistent/xtrace"));
+            assert!(matches!(verdict, Identity::Mismatch(_)), "{verdict:?}");
+            zombie.wait().expect("reap");
+        }
+
+        #[test]
+        fn unusable_ps_is_unavailable_not_absent() {
+            assert_eq!(
+                ps_with(&["/nonexistent/ps-binary"], std::process::id(), "lstart="),
+                Ps::Unavailable
+            );
+            // A `ps` that exits 1 with no output is the "no such pid" answer.
+            assert_eq!(ps_with(&["/usr/bin/false"], std::process::id(), "lstart="), Ps::Absent);
+        }
+
+        #[test]
+        fn exit_code_is_ten_only_when_a_recording_failed_to_seal() {
+            let item = |completion: &'static str| RecoveredRecording {
+                recording_id: String::new(),
+                persisted_events: String::new(),
+                completion,
+            };
+            assert_eq!(exit_for(&[]), 0);
+            assert_eq!(exit_for(&[item("partial")]), 0);
+            assert_eq!(exit_for(&[item("partial"), item("failed")]), 10);
         }
 
         #[test]

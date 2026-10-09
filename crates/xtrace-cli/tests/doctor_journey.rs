@@ -166,3 +166,26 @@ fn a_store_with_an_older_schema_is_a_warning_not_a_failure() {
     assert_eq!(status_of(&report, "store_schema"), "warn", "{report}");
     assert_eq!(out.status.code(), Some(0), "a pending migration is not a failure: {report}");
 }
+
+#[test]
+fn doctor_warns_when_the_daemon_record_names_a_process_that_is_not_the_daemon() {
+    let fx = fx();
+    let started = fx.xtrace(&["record"]);
+    assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+    let state_file = fx.data_home.join("projects").join(&fx.project_id).join(".daemon/daemon.json");
+    let saved = std::fs::read_to_string(&state_file).expect("state");
+    let stopped = fx.xtrace(&["stop"]);
+    assert!(stopped.status.success());
+
+    let mut bystander = Command::new("/bin/sleep").arg("60").spawn().expect("bystander");
+    let mut state: Value = serde_json::from_str(&saved).expect("state JSON");
+    state["pid"] = Value::from(bystander.id());
+    std::fs::write(&state_file, serde_json::to_vec(&state).unwrap()).expect("forge");
+    std::fs::set_permissions(&state_file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    let out = fx.xtrace(&["doctor"]);
+    let report: Value = serde_json::from_slice(&out.stdout).expect("report JSON");
+    assert_eq!(status_of(&report, "lifecycle_state"), "warn", "{report}");
+    bystander.kill().expect("kill own bystander");
+    bystander.wait().expect("reap own bystander");
+}

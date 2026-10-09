@@ -222,6 +222,25 @@ fn unix_project_checks(project_dir: &std::path::Path, checks: &mut Vec<Check>) {
         )),
     }
 
+    checks.push(match crate::lifecycle::lifecycle_state(&preflight.private_root) {
+        crate::lifecycle::LifecycleState::NoRecord => {
+            Check::new("lifecycle_state", Status::Ok, "no daemon record is present")
+        }
+        crate::lifecycle::LifecycleState::Verified => Check::new(
+            "lifecycle_state",
+            Status::Ok,
+            "the daemon record names the running recorded daemon",
+        ),
+        crate::lifecycle::LifecycleState::Stale(detail) => Check::new(
+            "lifecycle_state",
+            Status::Warn,
+            format!("{detail}; `xtrace stop` or `xtrace restart` removes the stale record"),
+        ),
+        crate::lifecycle::LifecycleState::Unavailable(detail) => {
+            Check::new("lifecycle_state", Status::Unavailable, detail)
+        }
+    });
+
     let database = root.join("metadata.sqlite3");
     let store = SqliteStore::open(
         &database,

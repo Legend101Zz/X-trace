@@ -466,3 +466,81 @@ fn record_refuses_when_a_foreground_daemon_owns_the_lock_and_never_signals_it() 
         own.wait().expect("reap own child");
     }
 }
+
+/// Writes a daemon.json copied from a real run but naming `pid`, with no daemon running.
+fn forge_stale_record(fx: &Fixture, pid: u32) {
+    let started = fx.ok_json(&["record"]);
+    let real_pid = fx.track(started["pid"].as_u64().expect("pid"));
+    let mut state: Value =
+        serde_json::from_str(&std::fs::read_to_string(fx.state_file()).unwrap()).unwrap();
+    fx.ok_json(&["stop"]);
+    wait_gone(real_pid);
+    state["pid"] = Value::from(pid);
+    std::fs::write(fx.state_file(), serde_json::to_vec(&state).unwrap()).expect("forge");
+    std::fs::set_permissions(fx.state_file(), std::fs::Permissions::from_mode(0o600))
+        .expect("chmod");
+}
+
+#[test]
+fn stale_record_naming_a_live_bystander_is_cleaned_up_by_stop_and_restart() {
+    let fx = fixture();
+    let mut bystander =
+        ChildGuard(Some(Command::new("/bin/sleep").arg("60").spawn().expect("spawn bystander")));
+    let bystander_pid = bystander.0.as_ref().expect("child").id();
+    forge_stale_record(&fx, bystander_pid);
+
+    // No daemon holds the lock: stop says not running (3), removes the record, spares the PID.
+    let out = fx.xtrace(&["stop"]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    let error: Value = serde_json::from_slice(&out.stderr).expect("error JSON");
+    assert_eq!(error["code"], "XTR-LIFECYCLE-NOT-RUNNING");
+    assert!(!fx.state_file().exists(), "stale record removed");
+    assert!(pid_alive(bystander_pid), "the bystander must never be signalled");
+
+    // restart is the documented recovery command and must succeed from the same state.
+    forge_stale_record(&fx, bystander_pid);
+    let restarted = fx.ok_json(&["restart"]);
+    assert_eq!(restarted["previously_running"], false);
+    fx.track(restarted["started"]["pid"].as_u64().expect("pid"));
+    assert!(pid_alive(bystander_pid));
+    fx.ok_json(&["stop"]);
+    if let Some(child) = bystander.0.as_mut() {
+        child.kill().expect("kill own bystander");
+        child.wait().expect("reap own bystander");
+    }
+    bystander.0 = None;
+}
+
+#[test]
+fn stale_record_naming_a_zombie_is_cleaned_up_by_stop_and_restart() {
+    let fx = fixture();
+    // Exits immediately and is deliberately not waited on: a zombie until the end of the test.
+    let mut zombie = Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().expect("spawn zombie");
+    let zombie_pid = zombie.id();
+    thread::sleep(Duration::from_millis(300));
+    forge_stale_record(&fx, zombie_pid);
+
+    let out = fx.xtrace(&["stop"]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!fx.state_file().exists());
+
+    forge_stale_record(&fx, zombie_pid);
+    let restarted = fx.ok_json(&["restart"]);
+    fx.track(restarted["started"]["pid"].as_u64().expect("pid"));
+    fx.ok_json(&["stop"]);
+    zombie.wait().expect("reap zombie");
+}
+
+#[test]
+fn stop_with_nothing_running_but_an_open_recording_seals_it_and_exits_three_with_a_document() {
+    let fx = fixture();
+    let open_id = fx.seed_open_recording();
+    let out = fx.xtrace(&["stop"]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    let doc: Value = serde_json::from_slice(&out.stdout).expect("document on stdout");
+    assert_eq!(doc["was_running"], false);
+    let recovered = doc["recovered_recordings"].as_array().expect("recovered");
+    assert_eq!(recovered.len(), 1, "{doc}");
+    assert_eq!(recovered[0]["recording_id"], open_id.to_string().as_str());
+    assert_eq!(recovered[0]["completion"], "partial");
+}
