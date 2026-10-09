@@ -41,7 +41,9 @@ PY_FAILED = re.compile(r"^FAILED \((?:failures=(\d+))?(?:, )?(?:errors=(\d+))?")
 NODE_PASS = re.compile(r"^\S{0,2}\s*pass (\d+)$")  # node:test spec reporter summary: "ℹ pass 12"
 NODE_FAIL = re.compile(r"^\S{0,2}\s*fail (\d+)$")
 NODE_SKIP = re.compile(r"^\S{0,2}\s*(?:skipped|todo|cancelled) (\d+)$")
-VITEST_TESTS = re.compile(r"^\s*Tests\s+(?:.*?(\d+) failed)?.*?(\d+) passed")
+# vitest summary: "Tests  2 failed | 70 passed | 3 skipped | 1 todo (76)"; every count token on the line is read.
+VITEST_LINE = re.compile(r"^\s*Tests\s+(?=.*\d+ (?:failed|passed|skipped|todo))")
+VITEST_TOKEN = re.compile(r"(\d+) (failed|passed|skipped|todo)\b")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 TAP_NOT_OK = re.compile(r"^\s*not ok \d+ - (\S+)\s*$")
 
@@ -78,9 +80,14 @@ def parse_output(text: str) -> dict:
             counted = True
         elif m := NODE_SKIP.match(line):
             ignored += int(m.group(1))
-        elif m := VITEST_TESTS.match(line):
-            failed += int(m.group(1) or 0)
-            passed += int(m.group(2))
+        elif VITEST_LINE.match(line):
+            for count, kind in VITEST_TOKEN.findall(line):
+                if kind == "failed":
+                    failed += int(count)
+                elif kind == "passed":
+                    passed += int(count)
+                else:  # skipped and todo tests are ignored tests: --max-ignored 0 must fail on them
+                    ignored += int(count)
             counted = True
         elif m := CARGO_RESULT.match(line):
             passed += int(m.group(1))
@@ -177,6 +184,34 @@ def panic_sites(text: str) -> tuple[list[str], int]:
     return out, dropped
 
 
+# Error code and category hints for failing tests. Same sources and the same allowlist grammars as the release floor
+# (tools.release.ci_floor): a candidate that does not match is dropped and counted, never scrubbed or echoed.
+ERROR_CODE_SRC = re.compile(r'ErrorCode\("([^"\n]{0,400})"\)')
+ERROR_CATEGORY_SRC = re.compile(r"category: ([A-Za-z]{1,40}),")
+MAX_ERROR_HINTS = 16
+
+
+def error_hints(text: str) -> dict:
+    """Allowlisted XTR-* error codes and error categories seen in a (failing) log, in first-seen order."""
+    codes: list[str] = []
+    categories: list[str] = []
+    dropped = 0
+    for raw in ANSI.sub("", text).splitlines():
+        for code in ERROR_CODE_SRC.findall(raw):
+            if not ci_floor._valid_error_code(code):
+                dropped += 1
+            elif code not in codes:
+                codes.append(code)
+        for category in ERROR_CATEGORY_SRC.findall(raw):
+            if not ci_floor._valid_error_category(category):
+                dropped += 1
+            elif category not in categories:
+                categories.append(category)
+    truncated = max(0, len(codes) - MAX_ERROR_HINTS) + max(0, len(categories) - MAX_ERROR_HINTS)
+    return {"errorCodes": codes[:MAX_ERROR_HINTS], "errorCategories": categories[:MAX_ERROR_HINTS],
+            "droppedInvalid": dropped, "truncated": truncated}
+
+
 def diagnostics(text: str) -> tuple[list[str], int]:
     """(lines to print, dropped count). Pairs each `error: msg` with the `--> file:line:col` that follows it."""
     out: list[str] = []
@@ -263,6 +298,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"lane panic-site {site}")
         if sdropped:
             print(f"lane panic-site-overflow dropped={sdropped}")
+        hints = error_hints(text)
+        for code in hints["errorCodes"]:
+            print(f"lane error-code {code}")
+        for category in hints["errorCategories"]:
+            print(f"lane error-category {category}")
+        if hints["droppedInvalid"] or hints["truncated"]:
+            print(f"lane error-hint-overflow dropped={hints['droppedInvalid']} truncated={hints['truncated']}")
     if facts["failingTruncated"] or facts["droppedInvalidNames"]:
         print(f"lane failing-test-overflow truncated={facts['failingTruncated']} "
               f"dropped-invalid={facts['droppedInvalidNames']}")

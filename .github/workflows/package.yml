@@ -61,6 +61,14 @@ jobs:
           root="${RUNNER_TEMP:?}/xt-install"
           mkdir -m 700 "$root" "$root/tmp"
           TMPDIR="$root/tmp" sh packaging/test/install_test.sh "dist/${{ matrix.platform }}"
+      - name: Install script scratch-handling guards (SEC-02)
+        # packaging/test/install_scratch_test.sh asserts install_test.sh aborts on a bad or failing scratch root and
+        # never deletes the starting directory. It needs a private TMPDIR (same shape as the journey above).
+        run: |
+          set -eu
+          root="${RUNNER_TEMP:?}/xt-scratch-guard"
+          mkdir -m 700 "$root" "$root/tmp"
+          TMPDIR="$root/tmp" sh packaging/test/install_scratch_test.sh
       - name: Package verifier present on this branch?
         id: verifier
         run: |

@@ -80,11 +80,11 @@ jobs:
             --out "$RUNNER_TEMP/lane-frag" -- python3 -B -m tools.qa.workflow_lint .github/workflows/ci.yml .github/workflows/package.yml .github/workflows/lane.yml .github/workflows/campaigns.yml
       - name: Lane tool unit tests
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step qa-unit-tests --min-passed 1 \
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step qa-unit-tests --min-passed 100 \
             --out "$RUNNER_TEMP/lane-frag" -- python3 -B -m unittest discover -s tools/qa -p "test_*.py"
       - name: Campaign library unit tests
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step campaign-lib-unit-tests --min-passed 1 \
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step campaign-lib-unit-tests --min-passed 15 \
             --out "$RUNNER_TEMP/lane-frag" -- python3 -B -m unittest discover -s campaigns/lib -p "test_*.py"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
@@ -186,7 +186,7 @@ jobs:
       - name: cargo test
         if: ${{ !cancelled() }}
         run: |
-          python3 -B -m tools.qa.lane_run run --suite rust --step test --min-passed 900 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- \
+          python3 -B -m tools.qa.lane_run run --suite rust --step test --min-passed 1030 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- \
             cargo test --locked --workspace --all-features --no-fail-fast
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
@@ -238,7 +238,7 @@ jobs:
           LANE_JDK: ${{ matrix.java-version }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite java --variant "${{ matrix.java-version }}" --step gradle-test \
-            --cwd adapters/java --junit-glob "*/build/test-results/test/*.xml" --min-passed 170 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- \
+            --cwd adapters/java --junit-glob "*/build/test-results/test/*.xml" --min-passed 190 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- \
             ./gradlew --dependency-verification strict "-Porg.gradle.java.installations.paths=$JAVA_HOME_17_X64" \
             -I "$GITHUB_WORKSPACE/tools/qa/lane-test-jdk.init.gradle" clean test
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -285,7 +285,7 @@ jobs:
       - name: Typecheck and unit tests
         run: |
           python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step test \
-            --min-passed 80 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- npm test --prefix adapters/node
+            --min-passed 85 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- npm test --prefix adapters/node
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
@@ -330,7 +330,7 @@ jobs:
             npm run typecheck --prefix web/app
       - name: Unit tests
         run: |
-          python3 -B -m tools.qa.lane_run run --suite web --step unit-tests --min-passed 70 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- \
+          python3 -B -m tools.qa.lane_run run --suite web --step unit-tests --min-passed 75 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- \
             npm test --prefix web/app
       - name: API and embedded asset checks
         run: |
@@ -374,8 +374,8 @@ jobs:
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: TUI PTY tests
         run: |
-          python3 -B -m tools.qa.lane_run run --suite tui --step pty-tests --min-passed 1 --out "$RUNNER_TEMP/lane-frag" -- \
-            cargo test -p xtrace-tui --all-features --no-fail-fast
+          python3 -B -m tools.qa.lane_run run --suite tui --step pty-tests --min-passed 28 --out "$RUNNER_TEMP/lane-frag" -- \
+            cargo test --locked -p xtrace-tui --all-features --no-fail-fast
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
