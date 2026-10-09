@@ -34,11 +34,6 @@ fn version_prints_schema_version_and_protocol() {
 #[test]
 fn unimplemented_command_exits_nine_with_stable_message_for_each() {
     let table: &[(&[&str], &str)] = &[
-        (&["catalog", "list"], "catalog list"),
-        (&["catalog", "history"], "catalog history"),
-        (&["catalog", "diff"], "catalog diff"),
-        (&["catalog", "conflicts"], "catalog conflicts"),
-        (&["catalog", "runs"], "catalog runs"),
         (&["exercise", "approve", "--plan-hash", "abc"], "exercise approve"),
         (&["exercise", "run"], "exercise run"),
         (&["exercise", "show"], "exercise show"),
@@ -77,6 +72,23 @@ fn implemented_lifecycle_commands_refuse_an_uninitialized_directory_with_exit_th
             serde_json::from_slice(&output.stderr).expect("error document is JSON");
         assert_eq!(doc["code"], "XTR-CLI-DIRECTORY", "{name}");
         assert_ne!(doc["code"], "XTR-CLI-NOT-IMPLEMENTED", "{name}");
+    }
+}
+
+/// The `catalog` read commands are implemented: outside an initialized repository they fail with
+/// the directory error (exit 3), never the not-implemented error (exit 9). The success paths are
+/// covered by `scan_catalog_journey.rs`.
+#[test]
+fn implemented_catalog_commands_refuse_an_uninitialized_directory_with_exit_three() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let project = dir.path().to_str().expect("utf-8 temp path");
+    for name in ["list", "history", "diff", "conflicts", "runs"] {
+        let output = xtrace(&["catalog", name, "--project-dir", project]);
+        assert_eq!(output.status.code(), Some(3), "catalog {name}");
+        assert!(output.stdout.is_empty(), "catalog {name} wrote to stdout");
+        let doc: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("error document is JSON");
+        assert_eq!(doc["code"], "XTR-CLI-DIRECTORY", "catalog {name}");
     }
 }
 

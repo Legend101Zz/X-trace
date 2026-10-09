@@ -343,7 +343,9 @@ const SPRING_TRANSCRIPT: &str = r#"{"type":"header","contractVersion":1,"analyze
 fn record_orders_observation(fx: &Fx) {
     use xtrace_application::recording::EndpointObservationInput;
     use xtrace_domain::{ProjectId, RecordingId, RuntimeSessionId, WallTime};
-    use xtrace_store::{BeginRecordingDisposition, BeginRecordingRequest, OpenOptions, SqliteStore};
+    use xtrace_store::{
+        BeginRecordingDisposition, BeginRecordingRequest, OpenOptions, SqliteStore,
+    };
 
     let database = fx.database();
     let root = database.parent().expect("project data root").to_path_buf();

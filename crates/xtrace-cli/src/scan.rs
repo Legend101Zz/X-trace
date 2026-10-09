@@ -146,6 +146,7 @@ pub enum TranscriptError {
 }
 
 /// Turns analyzer output into a [`ScanResult`]. `digest_of` hashes the cited source file.
+#[cfg(test)]
 pub fn process_transcript(
     lines: &[String],
     application_component: &str,
@@ -511,7 +512,8 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
         cited.into_iter().map(|path| (path.clone(), digest(&path))).collect();
     let lookup = |path: &str| digests.get(path).copied().flatten();
 
-    let source_revision_id = derive_source_revision_id(&digests);
+    let snapshot = snapshot_digests(&source, &digests);
+    let source_revision_id = derive_source_revision_id(&snapshot);
     let target = persist::open_target(&args.project_dir);
     let project_id = target.as_ref().map_or(ProjectId::from_uuid(Uuid::nil()), |t| t.project_id);
     let (mut result, claims) = match process_transcript_claims(
@@ -1002,9 +1004,52 @@ mod persist {
     }
 }
 
+/// Most files read when identifying the scanned source tree.
+const MAX_SNAPSHOT_FILES: usize = 5_000;
+
+/// Directories that never hold analyzed source.
+const SNAPSHOT_SKIPPED_DIRS: [&str; 5] = [".git", "node_modules", "target", "build", "dist"];
+
+/// Digests identifying the scanned source tree: every regular file under `root` (symlinks and
+/// build output skipped), plus the cited files. A tree too large to walk falls back to the cited
+/// files alone, so the id is then as precise as the claims themselves.
+fn snapshot_digests(
+    root: &Path,
+    cited: &HashMap<String, Option<ContentHash>>,
+) -> HashMap<String, Option<ContentHash>> {
+    let mut found: HashMap<String, Option<ContentHash>> = HashMap::new();
+    let mut pending = vec![PathBuf::new()];
+    while let Some(relative) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(root.join(&relative)) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            let name = entry.file_name();
+            let child = relative.join(&name);
+            if kind.is_dir() {
+                if !name.to_str().is_some_and(|n| SNAPSHOT_SKIPPED_DIRS.contains(&n)) {
+                    pending.push(child);
+                }
+            } else if kind.is_file() {
+                if found.len() >= MAX_SNAPSHOT_FILES {
+                    return cited.clone();
+                }
+                if let Some(text) = child.to_str() {
+                    let text = text.replace('\\', "/");
+                    let digest = hash_source_file(root, &text);
+                    found.insert(text, digest);
+                }
+            }
+        }
+    }
+    for (path, digest) in cited {
+        found.insert(path.clone(), *digest);
+    }
+    found
+}
+
 /// Content-derived source revision id: identical cited bytes give an identical id, so a rescan of
-/// unchanged source yields identical claim digests and the diff reports `unchanged`. A cited file
-/// that changes (or disappears) changes the id, so `changed` means a cited byte changed.
+/// unchanged source yields identical claim digests and the diff reports `unchanged`. A source file
+/// that changes (or disappears) changes the id; a claim that merely stops being reported does not.
 fn derive_source_revision_id(digests: &HashMap<String, Option<ContentHash>>) -> SourceRevisionId {
     let ordered: BTreeMap<&str, Option<&ContentHash>> =
         digests.iter().map(|(path, hash)| (path.as_str(), hash.as_ref())).collect();

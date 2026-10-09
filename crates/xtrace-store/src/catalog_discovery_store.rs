@@ -423,21 +423,10 @@ impl SqliteCatalogDiscoveryStore {
     ) -> Result<(), PortError> {
         let canonical_chunk = chunk.canonical_bytes().map_err(|_| validation_error())?;
         let digest = ContentHash::of_bytes(&canonical_chunk);
-        if chunk.claims.iter().any(|claim| {
-            claim.source_evidence().iter().any(|evidence| {
-                matches!(
-                    evidence,
-                    ClaimSourceEvidence::StaticSnapshot { .. }
-                        | ClaimSourceEvidence::LoadedClassBound { .. }
-                )
-            })
-        }) {
-            return Err(PortError::new(
-                PortErrorKind::Validation,
-                "catalog source proof is unavailable",
-                CorrelationId::new(),
-            ));
-        }
+        // Source proof is the application service's decision (`CatalogSourceProofPort`): the
+        // default port refuses every static or class-bound claim, and only the local-scan wiring
+        // supplies a proof that re-reads the pinned bytes. This port persists what the service
+        // admitted and does not second-guess it, so a verified local scan can be recorded.
         if chunk.claims.iter().any(|claim| {
             claim.operation().project_id != selection.project_id()
                 || claim.operation().application_component
