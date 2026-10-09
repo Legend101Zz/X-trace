@@ -9,7 +9,7 @@
 //!   daemon publishes a one-shot bootstrap artifact; that arms capture for
 //!   exactly one next launch (multi-session grants are a later contract).
 //!   Before starting it, recordings that a previous daemon left open are
-//!   sealed as partial (see [`recover_interrupted`]).
+//!   sealed as partial (see `recover_interrupted` below).
 //! * `stop` signals the daemon with SIGTERM only after proving that the PID in
 //!   the state file still is that daemon (same process start time, same
 //!   executable and a `daemon` command line). It waits
