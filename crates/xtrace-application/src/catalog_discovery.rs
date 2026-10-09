@@ -23,6 +23,9 @@ use xtrace_domain::{
 
 use crate::error::PortError;
 
+pub mod admission;
+pub mod history;
+
 /// Authenticated transport context supplied by the runtime session manager.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CatalogProducerContext {

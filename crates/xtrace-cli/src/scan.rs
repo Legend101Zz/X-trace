@@ -5,11 +5,14 @@
 //! contract, hashes the cited source files itself, and reports what a catalog revision would
 //! contain: operations, provenance, confidence, limitation codes and completeness.
 //!
-//! Honest scope of this build: claims are validated but not yet persisted as a catalog revision,
-//! because the owner-selection admission that lets a local scan submit through
-//! `CatalogDiscoveryService` (AD-1) is not implemented. The command therefore prints the full
-//! result and exits with the partial status (10); it never claims a stored revision. Static path
-//! hypotheses (call graphs) are not produced at all.
+//! A scan inside an initialized project is persisted as a catalog discovery run (AD-1): the
+//! invoking owner's own command is the owner selection, recorded with a revocation epoch before any
+//! claim is written, and the cited source files are re-read when claims are submitted. A complete
+//! scan publishes an immutable catalog revision (exit 0); an incomplete one records the run only
+//! and never a revision (exit 10), so absence in an incomplete scan can never look like removal.
+//! Without an initialized project the scan still analyzes and prints, says why it did not
+//! persist, and exits 10. Every revision made here is `dev_unsigned`. Static path hypotheses
+//! (call graphs) are not produced at all.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -21,6 +24,7 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use uuid::Uuid;
+use xtrace_domain::catalog_discovery::ValidatedEndpointClaim;
 use xtrace_domain::static_claims::{
     ANALYZER_INCOMPLETE_REASONS, AnalyzerLine, StaticClaimContext, StaticClaimError,
     framework_syntax,
@@ -149,6 +153,29 @@ pub fn process_transcript(
     expected_framework: &str,
     digest_of: &dyn Fn(&str) -> Option<ContentHash>,
 ) -> Result<ScanResult, TranscriptError> {
+    process_transcript_claims(
+        lines,
+        application_component,
+        binding_key,
+        expected_framework,
+        digest_of,
+        ProjectId::from_uuid(Uuid::nil()),
+        SourceRevisionId::from_uuid(Uuid::nil()),
+    )
+    .map(|(result, _claims)| result)
+}
+
+/// Like [`process_transcript`], but cites `source_revision_id` in every claim and also returns the
+/// validated claims in transcript order, ready to be submitted to a discovery run.
+pub fn process_transcript_claims(
+    lines: &[String],
+    application_component: &str,
+    binding_key: &str,
+    expected_framework: &str,
+    digest_of: &dyn Fn(&str) -> Option<ContentHash>,
+    project_id: ProjectId,
+    source_revision_id: SourceRevisionId,
+) -> Result<(ScanResult, Vec<ValidatedEndpointClaim>), TranscriptError> {
     let mut parsed = lines.iter().filter(|line| !line.trim().is_empty());
     let header =
         match parsed.next().and_then(|line| serde_json::from_str::<AnalyzerLine>(line).ok()) {
@@ -160,11 +187,11 @@ pub fn process_transcript(
         return Err(TranscriptError::Header(StaticClaimError::UnknownFramework));
     }
     let context = StaticClaimContext {
-        project_id: ProjectId::from_uuid(Uuid::nil()),
+        project_id,
         application_component,
         binding_key,
         route_syntax,
-        source_revision_id: SourceRevisionId::from_uuid(Uuid::nil()),
+        source_revision_id,
     };
 
     let mut reasons: BTreeSet<&'static str> = BTreeSet::new();
@@ -179,6 +206,7 @@ pub fn process_transcript(
     let mut histogram: BTreeMap<String, usize> = BTreeMap::new();
     let mut operations: BTreeMap<(String, String), ScannedOperation> = BTreeMap::new();
     let mut claim_count = 0;
+    let mut kept_claims: Vec<ValidatedEndpointClaim> = Vec::new();
     for line in parsed {
         let Ok(parsed_line) = serde_json::from_str::<AnalyzerLine>(line) else {
             reasons.insert("transcript_invalid");
@@ -264,6 +292,7 @@ pub fn process_transcript(
                                 entry.handlers.push(handler.to_owned());
                             }
                         }
+                        kept_claims.push(validated);
                     }
                     Err(_) => {
                         rejected += 1;
@@ -301,7 +330,7 @@ pub fn process_transcript(
         operation.handler_conflict = operation.handlers.len() > 1;
     }
     operations.sort_by(|a, b| (&a.route_template, &a.method).cmp(&(&b.route_template, &b.method)));
-    Ok(ScanResult {
+    let result = ScanResult {
         framework: header.framework,
         analyzer: format!("{} {}", header.analyzer_name, header.analyzer_version),
         ruleset_id: header.ruleset_id,
@@ -313,7 +342,8 @@ pub fn process_transcript(
         files_scanned,
         limitation_histogram: histogram,
         operations,
-    })
+    };
+    Ok((result, kept_claims))
 }
 
 /// Joins `relative` under `root` only when it stays inside it (no absolute path, no `..`).
@@ -330,6 +360,11 @@ fn hash_source_file(root: &Path, relative: &str) -> Option<ContentHash> {
     let path = contained_join(root, relative)?;
     let metadata = std::fs::symlink_metadata(&path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_HASHED_FILE_BYTES {
+        return None;
+    }
+    // An intermediate directory symlink must not lead outside the source root.
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    if !std::fs::canonicalize(&path).ok()?.starts_with(&canonical_root) {
         return None;
     }
     let bytes = std::fs::read(&path).ok()?;
@@ -476,29 +511,37 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
         cited.into_iter().map(|path| (path.clone(), digest(&path))).collect();
     let lookup = |path: &str| digests.get(path).copied().flatten();
 
-    let mut result = match process_transcript(
+    let source_revision_id = derive_source_revision_id(&digests);
+    let target = persist::open_target(&args.project_dir);
+    let project_id = target.as_ref().map_or(ProjectId::from_uuid(Uuid::nil()), |t| t.project_id);
+    let (mut result, claims) = match process_transcript_claims(
         &lines,
         &args.application_component,
         &args.binding_key,
         &args.framework,
         &lookup,
+        project_id,
+        source_revision_id,
     ) {
-        Ok(result) => result,
+        Ok(found) => found,
         // A killed or failed analyzer may have written nothing; report that as an incomplete scan
         // rather than a usage error.
-        Err(_) if problem.is_some() => ScanResult {
-            framework: args.framework.clone(),
-            analyzer: "unknown".to_owned(),
-            ruleset_id: "unknown".to_owned(),
-            completion: "incomplete",
-            incomplete_reasons: Vec::new(),
-            claim_count: 0,
-            rejected_claims: 0,
-            diagnostics: 0,
-            files_scanned: 0,
-            limitation_histogram: BTreeMap::new(),
-            operations: Vec::new(),
-        },
+        Err(_) if problem.is_some() => (
+            ScanResult {
+                framework: args.framework.clone(),
+                analyzer: "unknown".to_owned(),
+                ruleset_id: "unknown".to_owned(),
+                completion: "incomplete",
+                incomplete_reasons: Vec::new(),
+                claim_count: 0,
+                rejected_claims: 0,
+                diagnostics: 0,
+                files_scanned: 0,
+                limitation_histogram: BTreeMap::new(),
+                operations: Vec::new(),
+            },
+            Vec::new(),
+        ),
         Err(_) => {
             return Err(invalid("the analyzer did not produce a valid transcript header"));
         }
@@ -510,12 +553,27 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
         result.completion = "incomplete";
     }
 
+    let persistence = persist::persist_scan(
+        target,
+        &args,
+        &project,
+        &source,
+        &mut result,
+        &claims,
+        source_revision_id,
+    );
+    let (status, exit_code) = persistence.status_and_exit(&result);
     let document = serde_json::json!({
-        "status": "analyzed_not_persisted",
-        "persisted": false,
-        "catalogRevisionId": serde_json::Value::Null,
+        "status": status,
+        "persisted": persistence.revision.is_some(),
+        "runId": persistence.run_id,
+        "catalogRevisionId": persistence.revision.as_ref().map(|r| r.revision_id),
+        "revisionOrdinal": persistence.revision.as_ref().map(|r| r.ordinal),
+        "parentRevisionId": persistence.revision.as_ref().and_then(|r| r.parent_revision_id),
+        "changes": persistence.changes,
+        "reconciliation": persistence.reconciliation,
+        "notPersistedBecause": persistence.not_persisted_because,
         "packStatus": "dev_unsigned",
-        "notPersistedBecause": "owner-selection admission for local scans (AD-1) is not implemented in this build",
         "pathHypotheses": "not_produced",
         "coverage": coverage_statement(&result.framework),
         "result": result,
@@ -524,9 +582,10 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
     if args.json {
         write_success(&mut stdout, &document).map_err(|_| invalid("could not write output"))?;
     } else {
-        write_text(&mut stdout, &result).map_err(|_| invalid("could not write output"))?;
+        write_text(&mut stdout, &result, &persistence, status)
+            .map_err(|_| invalid("could not write output"))?;
     }
-    Ok(10)
+    Ok(exit_code)
 }
 
 /// What the static analyzer for a framework does and does not see. `completion: complete` only
@@ -554,7 +613,12 @@ fn coverage_statement(framework: &str) -> &'static str {
     }
 }
 
-fn write_text<W: Write>(out: &mut W, result: &ScanResult) -> std::io::Result<()> {
+fn write_text<W: Write>(
+    out: &mut W,
+    result: &ScanResult,
+    persistence: &persist::Persistence,
+    status: &str,
+) -> std::io::Result<()> {
     writeln!(
         out,
         "scan {} ({}): {} operations from {} claims in {} files, {}",
@@ -586,10 +650,385 @@ fn write_text<W: Write>(out: &mut W, result: &ScanResult) -> std::io::Result<()>
             }
         )?;
     }
-    writeln!(
-        out,
-        "not persisted: catalog admission (AD-1) is not implemented in this build; exit 10"
-    )
+    match (&persistence.revision, &persistence.not_persisted_because) {
+        (Some(revision), _) => {
+            writeln!(
+                out,
+                "persisted: catalog revision {} (ordinal {}), {}",
+                revision.revision_id, revision.ordinal, status
+            )?;
+            if let Some(changes) = &persistence.changes {
+                let line: Vec<String> =
+                    changes.iter().map(|(kind, count)| format!("{count} {kind}")).collect();
+                writeln!(out, "changes: {}", line.join(", "))?;
+            }
+            if let Some(rec) = &persistence.reconciliation {
+                writeln!(
+                    out,
+                    "observed: {} confirmed, {} unobserved, {} undeclared, {} unresolved",
+                    rec.confirmed, rec.unobserved, rec.undeclared, rec.unresolved
+                )?;
+            }
+        }
+        (None, Some(reason)) => writeln!(out, "not persisted: {reason}; exit 10")?,
+        (None, None) => writeln!(out, "not persisted; exit 10")?,
+    }
+    Ok(())
+}
+
+mod persist {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use xtrace_application::catalog_discovery::admission::{
+        LocalScanAuthority, LocalScanSelection, SourceSnapshotReader, snapshot_digest,
+    };
+    use xtrace_application::catalog_discovery::history::{
+        CatalogHistoryPort as _, CatalogHistoryService, RevisionEntry, RevisionReconciliation,
+    };
+    use xtrace_application::{CatalogChangeKind, CatalogDiscoveryService};
+    use xtrace_domain::catalog_discovery::{
+        ClaimSourceEvidence, DiscoveryChunk, DiscoveryCompletion, DiscoveryRunFinish,
+        DiscoveryRunGrant, DiscoveryRunStartRequest, DiscoveryScope, DiscoveryScopeKind,
+        MAX_DISCOVERY_CHUNK_BYTES, MAX_DISCOVERY_CHUNK_CLAIMS, MAX_DISCOVERY_RUN_CHUNKS,
+        ValidatedEndpointClaim, final_digest, is_discovery_limitation_code,
+    };
+    use xtrace_domain::{ContentHash, ProjectId, RunId, SourceRevisionId};
+    use xtrace_store::SqliteStore;
+    use xtrace_store::catalog_admission_store::SqliteCatalogAdmissionStore;
+    use xtrace_store::catalog_discovery_store::SqliteCatalogDiscoveryStore;
+    use xtrace_store::catalog_history_store::SqliteCatalogHistoryStore;
+
+    use super::{ScanArgs, ScanResult, hash_source_file};
+
+    /// An opened, validated project the scan can persist into.
+    pub(super) struct Target {
+        pub(super) store: SqliteStore,
+        pub(super) project_id: ProjectId,
+    }
+
+    /// What persistence achieved. Serialized into the scan document by the caller.
+    #[derive(Default)]
+    pub(super) struct Persistence {
+        pub(super) run_id: Option<RunId>,
+        pub(super) run_status: Option<String>,
+        pub(super) revision: Option<RevisionEntry>,
+        pub(super) changes: Option<BTreeMap<String, usize>>,
+        pub(super) reconciliation: Option<RevisionReconciliation>,
+        pub(super) not_persisted_because: Option<String>,
+    }
+
+    impl Persistence {
+        pub(super) fn status_and_exit(&self, result: &ScanResult) -> (&'static str, i32) {
+            if self.revision.is_some() && result.completion == "complete" {
+                ("persisted_complete", 0)
+            } else if self.run_status.as_deref() == Some("incomplete") {
+                ("incomplete_recorded", 10)
+            } else {
+                ("not_persisted", 10)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn open_target(project_dir: &Path) -> Result<Target, String> {
+        let env_reader = crate::paths::read_env_path;
+        let preflight = crate::daemon::preflight_project(project_dir, &env_reader)
+            .map_err(|_| "the project is not initialized; run `xtrace init` first".to_owned())?;
+        let validated = crate::daemon::open_validated_project(preflight)
+            .map_err(|_| "the project store could not be opened".to_owned())?;
+        Ok(Target { store: validated.store, project_id: validated.project_id })
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn open_target(_project_dir: &Path) -> Result<Target, String> {
+        Err("catalog persistence needs the Unix private-storage layer".to_owned())
+    }
+
+    struct FsReader {
+        root: PathBuf,
+    }
+
+    impl SourceSnapshotReader for FsReader {
+        fn digest(&self, relative_path: &str) -> Option<ContentHash> {
+            hash_source_file(&self.root, relative_path)
+        }
+    }
+
+    fn scope_for(
+        args: &ScanArgs,
+        project: &Path,
+        source: &Path,
+        result: &ScanResult,
+    ) -> Result<DiscoveryScope, String> {
+        let relative = source.strip_prefix(project).unwrap_or(source);
+        let key = blake3::hash(relative.to_string_lossy().as_bytes());
+        Ok(DiscoveryScope {
+            kind: DiscoveryScopeKind::StaticRepository,
+            source_root_key: Some(format!("src-{}", &key.to_hex()[..24])),
+            module_selector: "default".to_owned(),
+            application_component: args.application_component.clone(),
+            binding_key: args.binding_key.clone(),
+            framework_family: args.framework.clone(),
+            producer_family: "local-static-scan".to_owned(),
+            ruleset_digest: ContentHash::of_bytes(result.ruleset_id.as_bytes()),
+        })
+    }
+
+    /// Splits claims into chunks within the claim-count and byte limits.
+    fn chunk_claims(
+        run_id: RunId,
+        claims: &[&ValidatedEndpointClaim],
+    ) -> (Vec<DiscoveryChunk>, usize) {
+        let mut chunks: Vec<DiscoveryChunk> = Vec::new();
+        let mut current: Vec<ValidatedEndpointClaim> = Vec::new();
+        let mut bytes = 0_usize;
+        let mut dropped = 0_usize;
+        for claim in claims {
+            let size = claim.canonical_bytes().len();
+            if !current.is_empty()
+                && (current.len() >= MAX_DISCOVERY_CHUNK_CLAIMS
+                    || bytes + size > MAX_DISCOVERY_CHUNK_BYTES - 1024)
+            {
+                let index = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
+                chunks.push(DiscoveryChunk {
+                    run_id,
+                    chunk_index: index,
+                    claims: std::mem::take(&mut current),
+                });
+                bytes = 0;
+            }
+            if chunks.len() >= MAX_DISCOVERY_RUN_CHUNKS {
+                dropped += 1;
+                continue;
+            }
+            bytes += size;
+            current.push((*claim).clone());
+        }
+        if !current.is_empty() && chunks.len() < MAX_DISCOVERY_RUN_CHUNKS {
+            let index = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
+            chunks.push(DiscoveryChunk { run_id, chunk_index: index, claims: current });
+        }
+        (chunks, dropped)
+    }
+
+    pub(super) fn persist_scan(
+        target: Result<Target, String>,
+        args: &ScanArgs,
+        project: &Path,
+        source: &Path,
+        result: &mut ScanResult,
+        claims: &[ValidatedEndpointClaim],
+        source_revision_id: SourceRevisionId,
+    ) -> Persistence {
+        let mut out = Persistence::default();
+        let target = match target {
+            Ok(target) => target,
+            Err(reason) => {
+                out.not_persisted_because = Some(reason);
+                return out;
+            }
+        };
+        if claims.is_empty() {
+            out.not_persisted_because = Some("the scan produced no claims to record".to_owned());
+            return out;
+        }
+        if let Err(reason) = run_persist(
+            &target,
+            args,
+            project,
+            source,
+            result,
+            claims,
+            source_revision_id,
+            &mut out,
+        ) {
+            out.not_persisted_because = Some(reason);
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "one linear persistence sequence")]
+    fn run_persist(
+        target: &Target,
+        args: &ScanArgs,
+        project: &Path,
+        source: &Path,
+        result: &mut ScanResult,
+        claims: &[ValidatedEndpointClaim],
+        source_revision_id: SourceRevisionId,
+        out: &mut Persistence,
+    ) -> Result<(), String> {
+        // Cited files and the digests the claims recorded form the pinned snapshot.
+        let mut files: BTreeMap<String, ContentHash> = BTreeMap::new();
+        for claim in claims {
+            for evidence in claim.source_evidence() {
+                if let ClaimSourceEvidence::StaticSnapshot {
+                    relative_path,
+                    recorded_source_digest,
+                    ..
+                } = evidence
+                {
+                    files.insert(relative_path.clone(), *recorded_source_digest);
+                }
+            }
+        }
+        let scope = scope_for(args, project, source, result)
+            .map_err(|_| "the scan scope is invalid".to_owned())?;
+        scope.digest().map_err(|_| {
+            "--application-component and --binding-key may use letters, digits and ._:- only"
+                .to_owned()
+        })?;
+        let analyzer_digest = ContentHash::of_bytes(
+            format!("xtrace.local-analyzer.v1\0{}\0{}", result.analyzer, result.ruleset_id)
+                .as_bytes(),
+        );
+        let selection = LocalScanSelection {
+            project_id: target.project_id,
+            scope: scope.clone(),
+            analyzer_digest,
+            source_revision_id,
+            pinned_source_digest: snapshot_digest(&files),
+        };
+        let authority = LocalScanAuthority::establish(
+            &SqliteCatalogAdmissionStore::new(target.store.clone()),
+            &selection,
+            Arc::new(FsReader { root: source.to_path_buf() }),
+        )
+        .map_err(|error| format!("owner selection could not be recorded: {}", error.message()))?;
+        let service = CatalogDiscoveryService::for_local_scan(
+            Arc::new(SqliteCatalogDiscoveryStore::new(target.store.clone())),
+            &authority,
+        );
+        let context = authority.context();
+        let request = DiscoveryRunStartRequest {
+            schema_version: 1,
+            run_hint: format!("scan-{}", uuid::Uuid::now_v7().simple()),
+            requested_scope: scope.clone(),
+            owner_selection_ref: None,
+        };
+        let run_id = match service.start_run(context, &request) {
+            Ok(DiscoveryRunGrant::Admitted { run_id, .. }) => run_id,
+            Ok(DiscoveryRunGrant::Refused { reason }) => {
+                return Err(format!("the catalog run was refused: {reason:?}"));
+            }
+            Err(error) => return Err(format!("the catalog run could not start: {error}")),
+        };
+        out.run_id = Some(run_id);
+
+        // One claim per producer hint: a repeated hint is the same mapping, not a second claim.
+        let mut seen = std::collections::BTreeSet::new();
+        let unique: Vec<&ValidatedEndpointClaim> =
+            claims.iter().filter(|claim| seen.insert(claim.claim_hint().to_owned())).collect();
+        let (chunks, dropped) = chunk_claims(run_id, &unique);
+        let mut rejected = u32::try_from(result.rejected_claims).unwrap_or(u32::MAX);
+        if dropped > 0 {
+            rejected = rejected.saturating_add(u32::try_from(dropped).unwrap_or(u32::MAX));
+            if !result.incomplete_reasons.iter().any(|r| r == "claim_budget_exceeded") {
+                result.incomplete_reasons.push("claim_budget_exceeded".to_owned());
+                result.incomplete_reasons.sort();
+            }
+            result.completion = "incomplete";
+        }
+        for chunk in &chunks {
+            service
+                .submit_chunk(context, chunk)
+                .map_err(|error| format!("a claim chunk was refused: {error}"))?;
+        }
+        let completion = if result.completion == "complete" {
+            DiscoveryCompletion::Complete
+        } else {
+            DiscoveryCompletion::Incomplete
+        };
+        let mut codes: Vec<String> = result
+            .incomplete_reasons
+            .iter()
+            .filter(|reason| is_discovery_limitation_code(reason))
+            .cloned()
+            .collect();
+        codes.sort();
+        codes.dedup();
+        if completion == DiscoveryCompletion::Complete {
+            codes.clear();
+        }
+        let accepted: u32 =
+            u32::try_from(chunks.iter().map(|c| c.claims.len()).sum::<usize>()).unwrap_or(u32::MAX);
+        let digest =
+            final_digest(run_id, &scope, Some(source_revision_id), &chunks, rejected, completion)
+                .map_err(|_| "the run digest could not be computed".to_owned())?;
+        let finish = DiscoveryRunFinish {
+            run_id,
+            expected_chunk_count: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
+            accepted_claim_count: accepted,
+            rejected_claim_count: rejected,
+            final_digest: digest,
+            completion,
+            limitation_codes: codes,
+        };
+        service
+            .finish_run(context, &finish)
+            .map_err(|error| format!("the catalog run could not finish: {error}"))?;
+
+        let history = SqliteCatalogHistoryStore::new(target.store.clone());
+        let run = history
+            .run(target.project_id, run_id)
+            .map_err(|error| format!("the run could not be read back: {}", error.message()))?;
+        out.run_status = run.as_ref().map(|run| run.status.clone());
+        let Some(revision_id) = run.and_then(|run| run.revision_id) else {
+            return Ok(());
+        };
+        let reader = CatalogHistoryService::new(history);
+        let (entry, operations) = reader
+            .operations(target.project_id, Some(revision_id))
+            .map_err(|error| format!("the revision could not be read back: {error}"))?;
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for operation in &operations {
+            *counts.entry(operation.change_kind.as_str().to_owned()).or_default() += 1;
+        }
+        for kind in [
+            CatalogChangeKind::Added,
+            CatalogChangeKind::Changed,
+            CatalogChangeKind::Unchanged,
+            CatalogChangeKind::Unknown,
+        ] {
+            counts.entry(kind.as_str().to_owned()).or_default();
+        }
+        out.changes = Some(counts);
+        out.reconciliation =
+            reader.reconcile_with_observations(target.project_id, Some(revision_id)).ok();
+        out.revision = Some(entry);
+        Ok(())
+    }
+}
+
+/// Content-derived source revision id: identical cited bytes give an identical id, so a rescan of
+/// unchanged source yields identical claim digests and the diff reports `unchanged`. A cited file
+/// that changes (or disappears) changes the id, so `changed` means a cited byte changed.
+fn derive_source_revision_id(digests: &HashMap<String, Option<ContentHash>>) -> SourceRevisionId {
+    let ordered: BTreeMap<&str, Option<&ContentHash>> =
+        digests.iter().map(|(path, hash)| (path.as_str(), hash.as_ref())).collect();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"xtrace.scan.source-revision.v1\0");
+    for (path, hash) in ordered {
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        match hash {
+            Some(hash) => {
+                hasher.update(&[1]);
+                hasher.update(hash.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    SourceRevisionId::from_uuid(Uuid::from_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -600,6 +1039,21 @@ fn write_text<W: Write>(out: &mut W, result: &ScanResult) -> std::io::Result<()>
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_revision_id_is_content_derived_and_uuid_v7_shaped() {
+        use xtrace_domain::ids::Id as _;
+        let mut digests: HashMap<String, Option<ContentHash>> = HashMap::new();
+        digests.insert("a.js".to_owned(), Some(ContentHash::of_bytes(b"one")));
+        digests.insert("b.js".to_owned(), None);
+        let first = derive_source_revision_id(&digests);
+        assert_eq!(first, derive_source_revision_id(&digests.clone()));
+        let uuid = first.as_uuid();
+        assert_eq!(uuid.get_version_num(), 7);
+        assert_eq!(uuid.get_variant(), uuid::Variant::RFC4122);
+        digests.insert("a.js".to_owned(), Some(ContentHash::of_bytes(b"two")));
+        assert_ne!(first, derive_source_revision_id(&digests));
+    }
 
     fn digest(path: &str) -> Option<ContentHash> {
         (path != "missing.js").then(|| ContentHash::of_bytes(path.as_bytes()))
