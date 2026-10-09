@@ -38,6 +38,8 @@ GRADLE_FAIL = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\(.*\))?(?:\[.*\])? FA
 PY_FAIL = re.compile(r"^(?:FAIL|ERROR): (\w+) \((?:[\w.]+\.)?(\w+)\.(\w+)\)")
 PY_RAN = re.compile(r"^Ran (\d+) tests? in ")
 PY_FAILED = re.compile(r"^FAILED \((?:failures=(\d+))?(?:, )?(?:errors=(\d+))?")
+PY_SKIPPED = re.compile(r"^(?:OK|FAILED) \(.*\bskipped=(\d+)")  # unittest: skips (and expected failures) are ignored tests
+PY_XFAIL = re.compile(r"^(?:OK|FAILED) \(.*\bexpected failures=(\d+)")
 NODE_PASS = re.compile(r"^\S{0,2}\s*pass (\d+)$")  # node:test spec reporter summary: "ℹ pass 12"
 NODE_FAIL = re.compile(r"^\S{0,2}\s*fail (\d+)$")
 NODE_SKIP = re.compile(r"^\S{0,2}\s*(?:skipped|todo|cancelled) (\d+)$")
@@ -66,6 +68,18 @@ def parse_output(text: str) -> dict:
             cand = m.group(1)
         elif m := PY_RAN.match(line):
             passed += int(m.group(1))
+            counted = True
+        elif (m := PY_SKIPPED.match(line)) or (m2 := PY_XFAIL.match(line)):
+            # "OK (skipped=N)" / "FAILED (failures=1, skipped=N)": skipped tests are counted in "Ran N", so move
+            # them from passed to ignored; the failure counts of a FAILED line are read just below.
+            skipped = int(m.group(1)) if m else int(m2.group(1))
+            ignored += skipped
+            passed -= skipped
+            if line.startswith("FAILED"):
+                fm = PY_FAILED.match(line)
+                bad = int(fm.group(1) or 0) + int(fm.group(2) or 0)
+                failed += bad
+                passed -= bad
             counted = True
         elif m := PY_FAILED.match(line):
             bad = int(m.group(1) or 0) + int(m.group(2) or 0)

@@ -247,6 +247,14 @@ class CountTests(unittest.TestCase):
         r = lane_run.parse_output("      Test Files  1 failed | 5 passed (6)")
         self.assertFalse(r["counted"])
 
+    def test_unittest_skips_are_ignored_tests(self):
+        r = lane_run.parse_output("Ran 10 tests in 0.1s\n\nOK (skipped=3)")
+        self.assertEqual((r["passed"], r["failed"], r["ignored"]), (7, 0, 3))
+        r = lane_run.parse_output("Ran 10 tests in 0.1s\n\nFAILED (failures=1, skipped=2)")
+        self.assertEqual((r["passed"], r["failed"], r["ignored"]), (7, 1, 2))
+        r = lane_run.parse_output("Ran 10 tests in 0.1s\n\nOK")
+        self.assertEqual((r["passed"], r["failed"], r["ignored"]), (10, 0, 0))
+
     def test_vitest_skip_fails_a_no_skips_step(self):
         with tempfile.TemporaryDirectory() as d:
             for skipped, want in ((0, "pass"), (1, "fail")):

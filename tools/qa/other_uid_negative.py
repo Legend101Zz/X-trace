@@ -143,8 +143,13 @@ def _is_denied(rc: int, err: str) -> bool:
     return rc != 0 and any(token in err.lower() for token in DENIED)
 
 
-def run_negative(root: pathlib.Path, user: str, runner: Runner = default_runner) -> int:
-    """Run the whole negative. Returns the number of probed targets; raises CheckError on any failure."""
+def run_negative(root: pathlib.Path, user: str, runner: Runner = default_runner,
+                 parent: "pathlib.Path | None" = None) -> int:
+    """Run the whole negative. Returns the number of probed targets; raises CheckError on any failure.
+
+    `parent` is the directory that holds the store. The other user must be able to stat it (positive control), so
+    the first denial on every probe is the store's own boundary and not a locked ancestor.
+    """
     if not USER_RE.fullmatch(user):
         raise CheckError("bad-user-name")
     dirs, files, db = audit_store(root)
@@ -154,6 +159,10 @@ def run_negative(root: pathlib.Path, user: str, runner: Runner = default_runner)
         rc, _ = runner(probe_argv(user, kind, control))
         if rc != 0:
             raise CheckError("control-failed")
+    if parent is not None:
+        rc, _ = runner(["sudo", "-n", "-u", user, "/bin/ls", "-ld", "--", str(parent)])
+        if rc != 0:
+            raise CheckError("parent-not-traversable")
     targets = choose_targets(root, dirs, files, db)
     for kind, path in targets:
         rc, err = runner(probe_argv(user, kind, path))
@@ -194,13 +203,19 @@ def cmd_create_user(args: argparse.Namespace) -> int:
     _, out = _sh(["dscl", ".", "-list", "/Users", "UniqueID"])
     uids = [int(p[-1]) for p in (line.split() for line in out.splitlines()) if p and p[-1].isdigit()]
     uid = pick_uid(uids)
+    _, gout = _sh(["dscl", ".", "-list", "/Groups", "PrimaryGroupID"])
+    gids = [int(p[-1]) for p in (line.split() for line in gout.splitlines()) if p and p[-1].isdigit()]
+    gid = pick_uid(gids, uid)  # a dedicated primary group the runner user is not a member of
     base = f"/Users/{args.user}"
+    gbase = f"/Groups/{args.user}"
     steps = [
+        ["sudo", "-n", "dscl", ".", "-create", gbase],
+        ["sudo", "-n", "dscl", ".", "-create", gbase, "PrimaryGroupID", str(gid)],
         ["sudo", "-n", "dscl", ".", "-create", base],
         ["sudo", "-n", "dscl", ".", "-create", base, "UserShell", "/usr/bin/false"],
         ["sudo", "-n", "dscl", ".", "-create", base, "RealName", "xtrace other uid"],
         ["sudo", "-n", "dscl", ".", "-create", base, "UniqueID", str(uid)],
-        ["sudo", "-n", "dscl", ".", "-create", base, "PrimaryGroupID", "20"],
+        ["sudo", "-n", "dscl", ".", "-create", base, "PrimaryGroupID", str(gid)],
         ["sudo", "-n", "dscl", ".", "-create", base, "NFSHomeDirectory", "/var/empty"],
     ]
     for step in steps:
@@ -212,6 +227,10 @@ def cmd_create_user(args: argparse.Namespace) -> int:
     if rc != 0 or out.strip() != str(uid) or uid == os.getuid():
         _emit("create-user FAIL not-created")
         return 1
+    rc, gout = _sh(["id", "-g", args.user])
+    if rc != 0 or gout.strip() != str(gid) or gid == os.getgid():
+        _emit("create-user FAIL group")
+        return 1
     _emit("create-user ok")
     return 0
 
@@ -221,11 +240,15 @@ def cmd_delete_user(args: argparse.Namespace) -> int:
         _emit("delete-user skipped-cleanup")  # cleanup only; the verdict comes from verify-marker
         return 0
     rc, _ = _sh(["sudo", "-n", "dscl", ".", "-delete", f"/Users/{args.user}"])
-    _emit("delete-user ok" if rc == 0 else "delete-user failed")
+    rg, _ = _sh(["sudo", "-n", "dscl", ".", "-delete", f"/Groups/{args.user}"])
+    _emit("delete-user ok" if rc == 0 and rg == 0 else "delete-user failed")
     return 0
 
 
 def cmd_check(args: argparse.Namespace) -> int:
+    if not is_hosted_runner():
+        _emit("check FAIL not-a-hosted-macos-runner")  # check runs sudo; never anywhere else
+        return 2
     marker = pathlib.Path(args.marker)
     try:
         marker.unlink()
@@ -235,7 +258,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         _emit("check FAIL marker-unremovable")
         return 1
     try:
-        n = run_negative(pathlib.Path(args.store_root), args.user, default_runner)
+        n = run_negative(pathlib.Path(args.store_root), args.user, default_runner,
+                         pathlib.Path(args.parent))
     except CheckError as err:
         _emit(f"check FAIL {err}")
         return 1
@@ -261,6 +285,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         p.set_defaults(fn=fn)
     p = sub.add_parser("check")
     p.add_argument("--store-root", required=True)
+    p.add_argument("--parent", required=True, help="directory holding the store; must be traversable by the user")
     p.add_argument("--user", required=True)
     p.add_argument("--marker", required=True)
     p.set_defaults(fn=cmd_check)

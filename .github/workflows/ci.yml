@@ -596,13 +596,16 @@ jobs:
             bash -ec '
               oid="$XTRACE_CI_PRIVATE_ROOT/oid"
               mkdir -m 700 "$oid" "$oid/repo"
-              XTRACE_DATA_HOME="$oid/userdata" target/debug/xtrace init --project-dir "$oid/repo" --display-name OtherUid
+              # The data home sits under its own traversable (0711) parent outside the 0700 private root, so the
+              # other user is first denied at the store boundary itself.
+              mkdir -m 711 "$RUNNER_TEMP/xt-oid"
+              XTRACE_DATA_HOME="$RUNNER_TEMP/xt-oid/userdata" target/debug/xtrace init --project-dir "$oid/repo" --display-name OtherUid
             '
       - name: Other-UID negative (cannot traverse or read the store)
         if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.other_uid_negative check \
-            --store-root "$XTRACE_CI_PRIVATE_ROOT/oid/userdata" --user xtrother --marker "$XTRACE_CI_PRIVATE_ROOT/other-uid.ok"
+            --store-root "$RUNNER_TEMP/xt-oid/userdata" --parent "$RUNNER_TEMP/xt-oid" --user xtrother --marker "$XTRACE_CI_PRIVATE_ROOT/other-uid.ok"
       - name: Other-UID negative must have run and passed
         if: always()
         run: |

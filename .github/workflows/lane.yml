@@ -80,11 +80,11 @@ jobs:
             --out "$RUNNER_TEMP/lane-frag" -- python3 -B -m tools.qa.workflow_lint .github/workflows/ci.yml .github/workflows/package.yml .github/workflows/lane.yml .github/workflows/campaigns.yml
       - name: Lane tool unit tests
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step qa-unit-tests --min-passed 100 \
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step qa-unit-tests --min-passed 100 --max-ignored 0 \
             --out "$RUNNER_TEMP/lane-frag" -- python3 -B -m unittest discover -s tools/qa -p "test_*.py"
       - name: Campaign library unit tests
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step campaign-lib-unit-tests --min-passed 15 \
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step campaign-lib-unit-tests --min-passed 15 --max-ignored 0 \
             --out "$RUNNER_TEMP/lane-frag" -- python3 -B -m unittest discover -s campaigns/lib -p "test_*.py"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
@@ -374,7 +374,7 @@ jobs:
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: TUI PTY tests
         run: |
-          python3 -B -m tools.qa.lane_run run --suite tui --step pty-tests --min-passed 28 --out "$RUNNER_TEMP/lane-frag" -- \
+          python3 -B -m tools.qa.lane_run run --suite tui --step pty-tests --min-passed 28 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- \
             cargo test --locked -p xtrace-tui --all-features --no-fail-fast
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
