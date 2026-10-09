@@ -53,12 +53,14 @@ const SHORT_NAME_PARTS: &[&str] = &["pwd", "sig"];
 #[must_use]
 pub fn has_secret_assignment(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
+    // A quote after the name only counts as the JSON-key form `"name":`.
     let follows = |end: usize| {
-        lower[end..]
-            .trim_start()
-            .chars()
-            .next()
-            .is_some_and(|c| matches!(c, '=' | ':' | '>' | '"' | '\''))
+        let rest = lower[end..].trim_start();
+        match rest.chars().next() {
+            Some('=' | ':' | '>') => true,
+            Some('"' | '\'') => rest[1..].trim_start().starts_with(':'),
+            _ => false,
+        }
     };
     for part in SECRET_NAME_PARTS {
         let mut from = 0;
@@ -97,7 +99,7 @@ pub fn is_secret_value(value: &str) -> bool {
 #[must_use]
 pub fn is_secret_shape(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    if lower.contains("-----begin") || lower.contains("canary") {
+    if lower.contains("-----begin") || lower.contains("xtrace-canary") {
         return true;
     }
     if has_run(&lower, "bearer ", 8, |c| c.is_ascii_alphanumeric() || "-._~+/=".contains(c))
@@ -171,7 +173,9 @@ pub fn gate_with_metadata(value: &Value, metadata: &[&str]) -> Option<String> {
     fn walk(value: &Value, path: &mut String, metadata: &[&str]) -> Option<String> {
         match value {
             Value::String(s) => {
-                let meta = metadata.iter().any(|m| path.starts_with(m));
+                // Free-text descriptions are prose: token shapes only, no name scan.
+                let meta = path.ends_with("/description")
+                    || metadata.iter().any(|m| path.starts_with(m));
                 let bad = if meta { is_secret_shape(s) } else { is_secret_value(s) };
                 bad.then(|| path.clone())
             }
@@ -281,6 +285,11 @@ mod tests {
             "the session expires soon",
             "tokens are discussed elsewhere",
             "/auth/token",
+            "'/oauth/token'",
+            "\"${BASE_URL}\"'/api/session'",
+            "'/auth/password' \\",
+            "/csrf-token",
+            "/canary/deploy",
             "sigma=3",
             "application/json",
             "{\"name\":\"Ada\",\"count\":3}",

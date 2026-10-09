@@ -7,8 +7,12 @@ use std::net::TcpListener;
 use xtrace_exercise::canonical::{plan_value, recompute_hash};
 use xtrace_exercise::{
     CandidateOp, CandidateParam, ChangeKind, Effect, PlanInput, ValueSource, classify, preview,
-    synthesize,
+    PlanError, synthesize as try_synthesize,
 };
+
+fn synthesize(i: &PlanInput) -> xtrace_exercise::Plan {
+    try_synthesize(i).unwrap()
+}
 
 fn param(name: &str, location: &str, required: bool) -> CandidateParam {
     CandidateParam { name: name.into(), location: location.into(), required, ..Default::default() }
@@ -290,4 +294,55 @@ fn item_ids_are_uuid_text_and_differ_between_plans() {
         again.items.iter().map(|i| &i.item_id).collect::<Vec<_>>()
     );
     assert_eq!(recompute_hash(&a), a.plan_hash);
+}
+
+#[test]
+fn target_with_userinfo_rejected() {
+    let mut i = input();
+    i.target = "http://user:pass@host/?token=abc".into();
+    assert!(matches!(try_synthesize(&i), Err(PlanError::InvalidTarget(_))));
+    i.target = "http://user@host".into();
+    assert_eq!(try_synthesize(&i), Err(PlanError::InvalidTarget("userinfo")));
+}
+
+#[test]
+fn target_with_query_secret_rejected() {
+    let mut i = input();
+    i.target = "http://host/api?token=hunter2".into();
+    let err = try_synthesize(&i).unwrap_err();
+    assert!(!err.to_string().contains("hunter2"));
+    i.target = "http://host/#frag".into();
+    assert!(try_synthesize(&i).is_err());
+    i.target = "http://ho st".into();
+    assert!(try_synthesize(&i).is_err());
+}
+
+#[test]
+fn non_http_scheme_rejected() {
+    for t in ["file:///etc/passwd", "ftp://host", "host:80", "http://", "http://:80"] {
+        let mut i = input();
+        i.target = t.into();
+        assert!(try_synthesize(&i).is_err(), "{t}");
+    }
+    let mut i = input();
+    i.target = "https://api.example.com:8443/base".into();
+    assert!(try_synthesize(&i).is_ok());
+}
+
+#[test]
+fn selection_reason_does_not_claim_unknown_observation() {
+    let reasons = |change, observed| {
+        let mut i = input();
+        i.ops = vec![op("x", "GET", "/x", change, observed)];
+        let p = synthesize(&i);
+        (p.items[0].selected, p.items[0].selection_reason.clone())
+    };
+    let unknown = (true, "change_and_observation_unknown".to_owned());
+    assert_eq!(reasons(ChangeKind::Unknown, None), unknown);
+    assert_eq!(reasons(ChangeKind::Unchanged, None), unknown);
+    assert_eq!(reasons(ChangeKind::Unknown, Some(3)), unknown);
+    assert_eq!(
+        reasons(ChangeKind::Unchanged, Some(3)),
+        (false, "already_observed_and_unchanged".to_owned())
+    );
 }

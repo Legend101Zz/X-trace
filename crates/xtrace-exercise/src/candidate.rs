@@ -118,15 +118,72 @@ fn default_selection(op: &CandidateOp) -> (bool, &'static str) {
         ChangeKind::Changed => return (true, "changed_in_revision"),
         ChangeKind::Unchanged | ChangeKind::Unknown => {}
     }
-    if op.observed_recording_count == Some(0) {
-        return (true, "never_observed");
+    match (op.change_kind, op.observed_recording_count) {
+        (_, Some(0)) => (true, "never_observed"),
+        (ChangeKind::Unchanged, Some(_)) => (false, "already_observed_and_unchanged"),
+        // Nothing proves it was observed or unchanged: select it.
+        _ => (true, "change_and_observation_unknown"),
     }
-    (false, "already_observed_and_unchanged")
+}
+
+/// Why a plan could not be built.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlanError {
+    /// The target is not a plain `http(s)://host[:port][/path]` URL. The
+    /// rejected text is deliberately not echoed.
+    InvalidTarget(&'static str),
+}
+
+impl std::fmt::Display for PlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTarget(why) => write!(f, "invalid exercise target: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for PlanError {}
+
+/// Checks a target base URL: http/https, host present, no userinfo, query,
+/// fragment, whitespace or control characters, and not secret-shaped.
+///
+/// # Errors
+///
+/// [`PlanError::InvalidTarget`] with a fixed reason.
+pub fn validate_target(target: &str) -> Result<(), PlanError> {
+    let bad = |why| Err(PlanError::InvalidTarget(why));
+    if target.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return bad("whitespace_or_control_character");
+    }
+    let Some((scheme, rest)) = target.split_once("://") else {
+        return bad("missing_scheme");
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return bad("scheme_not_http_or_https");
+    }
+    if rest.contains(['?', '#']) {
+        return bad("query_or_fragment");
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.contains('@') {
+        return bad("userinfo");
+    }
+    if authority.is_empty() || authority.starts_with(':') {
+        return bad("missing_host");
+    }
+    if sanitize::is_secret_value(target) {
+        return bad("secret_shaped");
+    }
+    Ok(())
 }
 
 /// Builds the plan. Same candidates in any order give the same plan and hash.
-#[must_use]
-pub fn synthesize(input: &PlanInput) -> Plan {
+///
+/// # Errors
+///
+/// [`PlanError`] when the target is not acceptable.
+pub fn synthesize(input: &PlanInput) -> Result<Plan, PlanError> {
+    validate_target(&input.target)?;
     let mut ops: Vec<&CandidateOp> = input.ops.iter().collect();
     ops.sort_by(|a, b| {
         (&a.route_template, method_rank(&a.method.to_ascii_uppercase()), &a.operation_id).cmp(&(
@@ -175,11 +232,11 @@ pub fn synthesize(input: &PlanInput) -> Plan {
     for item in &mut items {
         item.item_id = canonical::item_uuid(&plan_hash, &item.operation_id);
     }
-    Plan {
+    Ok(Plan {
         revision_id: input.revision_id.clone(),
         catalog_hash: input.catalog_hash.clone(),
         target: input.target.clone(),
         items,
         plan_hash,
-    }
+    })
 }

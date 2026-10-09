@@ -137,3 +137,28 @@ fn files_are_never_executable() {
         }
     }
 }
+
+#[test]
+fn secret_word_routes_and_prose_descriptions_export() {
+    use common::{claim, op, response};
+    let routes =
+        ["/oauth/token", "/api/session", "/auth/password", "/csrf-token", "/canary/deploy"];
+    let mut input = spring_orders();
+    input.operations = routes
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let mut c = claim(&format!("c{i}"));
+            c.responses = vec![response("401", "Invalid token: expired")];
+            op(&format!("op{i}"), "GET", r, vec![c])
+        })
+        .collect();
+    for format in [ExportFormat::OpenApi, ExportFormat::Curl, ExportFormat::Postman] {
+        let out = export(&input, &ExportRequest::new(format))
+            .unwrap_or_else(|e| panic!("{format:?} refused: {e}"));
+        let all: String = out.files.iter().map(|f| text(f).to_owned()).collect();
+        for r in routes {
+            assert!(all.contains(r), "{format:?} lost route {r}");
+        }
+    }
+}

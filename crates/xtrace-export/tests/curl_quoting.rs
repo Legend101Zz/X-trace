@@ -287,7 +287,7 @@ fn hostile_catalog_text_cannot_escape_the_recipe() {
         assert_eq!(argv[argv.iter().position(|a| a == "-X").unwrap() + 1], "POST");
         assert!(!dir.join("pwnflag").exists(), "pwnflag side effect in round {round}");
     }
-    assert!(refused < 150, "gate refused too many rounds: {refused}");
+    assert!(refused == 0, "gate refused too many rounds: {refused}");
     std::fs::remove_dir_all(&dir).ok();
 }
 

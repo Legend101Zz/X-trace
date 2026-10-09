@@ -20,7 +20,7 @@ pub mod input_json;
 pub mod plan;
 pub mod preview;
 
-pub use candidate::{CandidateOp, CandidateParam, ChangeKind, PlanInput, synthesize};
+pub use candidate::{CandidateOp, CandidateParam, ChangeKind, PlanError, PlanInput, synthesize, validate_target};
 pub use effect::{Effect, classify};
 pub use plan::{ParamValue, Plan, PlanItem, ValueSource};
 pub use preview::preview;
