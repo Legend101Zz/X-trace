@@ -18,6 +18,7 @@ import xtp.agent.v1.CapabilityOuterClass.Capability;
 import xtp.agent.v1.CapabilityOuterClass.CapabilitySet;
 import xtp.agent.v1.CapabilityOuterClass.SourceRange;
 import xtp.agent.v1.Recording.EventBatch;
+import xtp.agent.v1.Recording.ExceptionPayload;
 import xtp.agent.v1.Recording.Interaction;
 import xtp.agent.v1.Recording.InteractionKind;
 import xtp.agent.v1.Recording.RecordingEvent;
@@ -265,6 +266,14 @@ final class RecordingWriter implements AutoCloseable, Runnable {
               .setStartLine(event.sourceStartLine())
               .setEndLine(event.sourceEndLine())
               .setContentHash(ByteString.copyFrom(event.sourceHash())));
+    }
+    if (kind == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_THROW
+        && event.exceptionType() != null) {
+      ExceptionPayload.Builder exception =
+          ExceptionPayload.newBuilder().setExceptionType(ExceptionSummary.type(event.exceptionType()));
+      String message = ExceptionSummary.message(event.exceptionMessage());
+      if (message != null) exception.setSanitizedMessage(message);
+      builder.setException(exception);
     }
     if (kind == RecordingEventKind.RECORDING_EVENT_KIND_REQUEST_UPDATE) {
       // The request event symbol is "http.request <METHOD> <route template>", both validated by

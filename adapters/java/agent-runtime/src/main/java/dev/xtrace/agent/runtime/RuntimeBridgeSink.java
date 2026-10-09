@@ -1,5 +1,6 @@
 package dev.xtrace.agent.runtime;
 
+import dev.xtrace.agent.bootstrap.BridgeEventKind;
 import dev.xtrace.agent.bootstrap.BridgeSink;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
@@ -108,6 +109,26 @@ final class RuntimeBridgeSink implements BridgeSink {
   }
 
   @Override
+  public boolean offerThrowEvent(
+      String recordingId,
+      String eventId,
+      String parentEventId,
+      String symbol,
+      long monotonicNs,
+      String exceptionType,
+      String exceptionMessage) {
+    if (!acceptingExisting.get() || !bounded(recordingId, eventId, parentEventId, symbol)) {
+      return false;
+    }
+    int bytes = estimate(recordingId, eventId, parentEventId, symbol) + 1600;
+    return queue.offer(
+        new QueueSignal.Event(
+            recordingId, eventId, parentEventId, BridgeEventKind.FRAME_THROW, symbol,
+            monotonicNs, 0, null, 0, 0, null, 0, bytes, exceptionType, exceptionMessage),
+        false);
+  }
+
+  @Override
   public boolean offerMethodEvent(
       String recordingId,
       String eventId,
@@ -171,9 +192,21 @@ final class RuntimeBridgeSink implements BridgeSink {
       long finishedMonotonicNs,
       int responseStatus,
       long droppedEvents) {
+    return offerFinishWithOutcome(
+        recordingId, startedMonotonicNs, finishedMonotonicNs, responseStatus, droppedEvents, null);
+  }
+
+  @Override
+  public boolean offerFinishWithOutcome(
+      String recordingId,
+      long startedMonotonicNs,
+      long finishedMonotonicNs,
+      int responseStatus,
+      long droppedEvents,
+      Outcome outcome) {
     try {
       if (!acceptingExisting.get() || !bounded(recordingId)) return false;
-      int bytes = estimate(recordingId);
+      int bytes = estimate(recordingId) + (outcome == null ? 0 : 1800);
       return queue.offer(
           new QueueSignal.Finish(
               recordingId,
@@ -181,7 +214,8 @@ final class RuntimeBridgeSink implements BridgeSink {
               finishedMonotonicNs,
               responseStatus,
               droppedEvents,
-              bytes),
+              bytes,
+              outcome),
           true);
     } finally {
       activeRecordings.updateAndGet(current -> current > 0 ? current - 1 : 0);

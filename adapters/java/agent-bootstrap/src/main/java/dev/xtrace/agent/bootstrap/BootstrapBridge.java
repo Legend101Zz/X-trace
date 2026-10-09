@@ -27,6 +27,10 @@ public final class BootstrapBridge {
 
   /** Opens a request context for one matched route and emits its sanitized request identity. */
   public static boolean requestStart(String method, String route) {
+    RequestContext stale = CONTEXT.get();
+    // A request whose end was deferred for exception resolution but never resolved on this
+    // thread is closed as unobserved so it cannot block or leak into the next request.
+    if (stale != null && stale.deferred) requestEnd(0, stale.lastThrown);
     if (CONTEXT.get() != null || !validMethod(method) || !validRoute(route)) return false;
     BridgeSink sink = SINK.get();
     if (sink == null) return false;
@@ -129,9 +133,28 @@ public final class BootstrapBridge {
     }
   }
 
-  /** True when a request context is already open on this thread. */
+  /** True when a live request context is already open on this thread. */
   public static boolean inRequest() {
-    return CONTEXT.get() != null;
+    RequestContext context = CONTEXT.get();
+    return context != null && !context.deferred;
+  }
+
+  /**
+   * Keeps the request open after the handler threw, so the container's exception resolution can
+   * report the response it chose. Returns false when there is no open request.
+   */
+  public static boolean deferRequestEnd(Throwable thrown) {
+    RequestContext context = CONTEXT.get();
+    if (context == null) return false;
+    context.deferred = true;
+    context.lastThrown = thrown;
+    return true;
+  }
+
+  /** True when the request on this thread is waiting for exception resolution. */
+  public static boolean awaitingResolution() {
+    RequestContext context = CONTEXT.get();
+    return context != null && context.deferred;
   }
 
   static String simpleName(String binaryName) {
@@ -194,8 +217,18 @@ public final class BootstrapBridge {
     }
   }
 
-  /** Emits a fixture method exit or throw and removes the matching frame on every path. */
+  /** Emits a method exit or throw and removes the matching frame on every path. */
   public static void frameExit(String symbol, boolean threw) {
+    frameExit(symbol, threw ? UNKNOWN_THROWABLE : null);
+  }
+
+  private static final Throwable UNKNOWN_THROWABLE = new Throwable("unknown", null, false, false) {};
+
+  /**
+   * Emits a method exit, or a throw carrying the exception's type and message. Only a throwable
+   * that leaves the method is a throw; one caught inside it never reaches this call.
+   */
+  public static void frameExit(String symbol, Throwable thrown) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
     if (context == null || sink == null || context.frames.isEmpty()) return;
@@ -206,11 +239,48 @@ public final class BootstrapBridge {
       return;
     }
     String eventId = context.nextEventId();
-    int kind = threw ? BridgeEventKind.FRAME_THROW : BridgeEventKind.FRAME_EXIT;
     String parent = frame.eventId.isEmpty() ? context.currentParent() : frame.eventId;
-    if (!safeEvent(sink, context, eventId, parent, kind, symbol, 0)) {
-      context.dropped++;
+    boolean accepted;
+    if (thrown == null) {
+      accepted = safeEvent(sink, context, eventId, parent, BridgeEventKind.FRAME_EXIT, symbol, 0);
+    } else {
+      accepted = safeThrow(sink, context, eventId, parent, symbol, thrown);
+      if (accepted) context.lastThrowEventId = eventId;
+      context.lastThrown = thrown;
     }
+    if (!accepted) context.dropped++;
+  }
+
+  private static boolean safeThrow(
+      BridgeSink sink,
+      RequestContext context,
+      String eventId,
+      String parent,
+      String symbol,
+      Throwable thrown) {
+    String type = null;
+    String message = null;
+    if (thrown != UNKNOWN_THROWABLE) {
+      type = boundedText(thrown.getClass().getName(), 200);
+      try {
+        // Application-defined getMessage may misbehave; any failure just omits the message.
+        message = boundedText(thrown.getMessage(), 1024);
+      } catch (RuntimeException | LinkageError ignored) {
+        message = null;
+      }
+    }
+    try {
+      return sink.offerThrowEvent(
+          context.recordingId, eventId, parent, symbol, System.nanoTime(), type, message);
+    } catch (RuntimeException | LinkageError ignored) {
+      disable(sink);
+      return false;
+    }
+  }
+
+  private static String boundedText(String value, int max) {
+    if (value == null) return null;
+    return value.length() <= max ? value : value.substring(0, max);
   }
 
   /** Emits the coarse H2 execute boundary without reading SQL or bind values. */
@@ -258,6 +328,15 @@ public final class BootstrapBridge {
 
   /** Emits the response marker, offers the terminal signal, and always clears request context. */
   public static void requestEnd(int responseStatus, boolean threw) {
+    requestEnd(responseStatus, threw ? UNKNOWN_THROWABLE : null);
+  }
+
+  /**
+   * Ends the request. A non-null {@code thrown} means an exception left the handler; the observed
+   * outcome is then EXCEPTION_PROPAGATED unless a response status was observed, in which case the
+   * exception was mapped to that response (RESPONDED). No status and no exception is UNOBSERVED.
+   */
+  public static void requestEnd(int responseStatus, Throwable thrown) {
     RequestContext context = CONTEXT.get();
     try {
       BridgeSink sink = SINK.get();
@@ -274,11 +353,38 @@ public final class BootstrapBridge {
           sanitizedStatus)) {
         context.dropped++;
       }
-      if (threw && sanitizedStatus < 500) context.dropped++;
-      safeFinish(sink, context, sanitizedStatus);
+      boolean threw = thrown != null;
+      if (threw && sanitizedStatus != 0 && sanitizedStatus < 500) context.dropped++;
+      safeFinish(sink, context, sanitizedStatus, outcome(context, sanitizedStatus, thrown));
     } finally {
       CONTEXT.remove();
     }
+  }
+
+  private static BridgeSink.Outcome outcome(
+      RequestContext context, int status, Throwable thrown) {
+    String thrownFrom = context.lastThrowEventId;
+    if (status != 0) {
+      // A status was observed. A mapped exception is a response, not a propagated failure.
+      return new BridgeSink.Outcome(BridgeSink.Outcome.RESPONDED, status, null, null, null);
+    }
+    if (thrown == null) {
+      return new BridgeSink.Outcome(BridgeSink.Outcome.UNOBSERVED, 0, null, null, null);
+    }
+    String type = null;
+    String message = null;
+    Throwable source = thrown == UNKNOWN_THROWABLE ? context.lastThrown : thrown;
+    if (source != null && source != UNKNOWN_THROWABLE) {
+      type = boundedText(source.getClass().getName(), 200);
+      try {
+        message = boundedText(source.getMessage(), 1024);
+      } catch (RuntimeException | LinkageError ignored) {
+        message = null;
+      }
+    }
+    return new BridgeSink.Outcome(
+        BridgeSink.Outcome.EXCEPTION_PROPAGATED, 0, type, message,
+        thrownFrom.isEmpty() ? null : thrownFrom);
   }
 
   public static boolean hasContext() {
@@ -323,14 +429,16 @@ public final class BootstrapBridge {
     }
   }
 
-  private static void safeFinish(BridgeSink sink, RequestContext context, int responseStatus) {
+  private static void safeFinish(
+      BridgeSink sink, RequestContext context, int responseStatus, BridgeSink.Outcome outcome) {
     try {
-      if (!sink.offerFinish(
+      if (!sink.offerFinishWithOutcome(
           context.recordingId,
           context.startedMonotonicNs,
           System.nanoTime(),
           responseStatus,
-          context.dropped)) {
+          context.dropped,
+          outcome)) {
         safeIncomplete(sink, BridgeSink.INCOMPLETE_FINISH_REJECTED);
         disable(sink);
       }
@@ -354,7 +462,10 @@ public final class BootstrapBridge {
     private final Deque<Frame> frames = new ArrayDeque<>(3);
     private int nextEvent = 1;
     private String requestEventId = "";
+    private boolean deferred;
     private boolean unresolvedReported;
+    private String lastThrowEventId = "";
+    private Throwable lastThrown;
     private boolean databaseActive;
     private String databaseEventId = "";
     private long dropped;

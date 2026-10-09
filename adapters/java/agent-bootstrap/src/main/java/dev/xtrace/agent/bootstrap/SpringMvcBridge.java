@@ -62,12 +62,35 @@ public final class SpringMvcBridge {
     return true;
   }
 
-  /** Closes the request root with the response status, or 0 when the status is not observable. */
+  /**
+   * Closes the request root with the response status, or 0 when the status is not observable.
+   *
+   * <p>When the handler threw, the container decides the final status later (an exception
+   * resolver may map it to a 4xx), and the response object still carries its pre-error default.
+   * The root therefore stays open until {@link #exceptionResolved} reports the outcome.
+   */
   public static void end(Object response, Throwable thrown) {
-    // A handler exception means the container, not this method, decides the final status; the
-    // response object still carries its pre-error default, so it must not be reported.
-    int status = thrown != null ? 0 : status(response);
-    BootstrapBridge.requestEnd(status, thrown != null);
+    if (thrown != null) {
+      if (!BootstrapBridge.deferRequestEnd(thrown)) BootstrapBridge.requestEnd(0, thrown);
+      return;
+    }
+    BootstrapBridge.requestEnd(status(response), (Throwable) null);
+  }
+
+  /**
+   * Reports the end of {@code DispatcherServlet#processHandlerException}. A resolver that returned
+   * a result mapped the exception to a response, so the observed status is reported as RESPONDED;
+   * an unresolved exception (the method threw) is propagated with no status observed.
+   */
+  public static void exceptionResolved(Object response, Object resolved, Throwable thrown) {
+    if (!BootstrapBridge.awaitingResolution()) return;
+    if (thrown != null) {
+      BootstrapBridge.requestEnd(0, thrown);
+    } else if (resolved != null) {
+      BootstrapBridge.requestEnd(status(response), (Throwable) null);
+    } else {
+      BootstrapBridge.requestEnd(0, (Throwable) null);
+    }
   }
 
   static Class<?> beanType(Object handlerMethod) {

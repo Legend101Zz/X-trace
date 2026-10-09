@@ -95,11 +95,99 @@ public class SpringMvcBridgeTest {
   }
 
   @Test
-  void thrownHandlerDoesNotReportTheContainersDefaultStatus() {
+  void respondedWithStatus() {
+    assertTrue(SpringMvcBridge.start(new Request("GET", "/owners"), new Handler(Controller.class)));
+    SpringMvcBridge.end(new Response(200), null);
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+    assertEquals(200, sink.outcome.httpStatus());
+  }
+
+  @Test
+  void exceptionPropagated500() {
     assertTrue(SpringMvcBridge.start(new Request("POST", "/orders"), new Handler(Controller.class)));
-    SpringMvcBridge.end(new Response(200), new IllegalStateException("handler failed"));
+    IllegalStateException failure = new IllegalStateException("handler failed");
+    SpringMvcBridge.end(new Response(200), failure);
+    // The handler threw: the request stays open and the container's default status is not used.
+    assertTrue(BootstrapBridge.awaitingResolution());
+    assertTrue(sink.symbols.size() == 1, "no response event before resolution");
+    SpringMvcBridge.exceptionResolved(new Response(200), null, failure);
+    assertFalse(BootstrapBridge.hasContext());
+    assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+    assertEquals(0, sink.outcome.httpStatus());
+    assertEquals("java.lang.IllegalStateException", sink.outcome.exceptionType());
+    assertEquals("handler failed", sink.outcome.exceptionMessage());
     assertEquals("http.response unavailable", sink.symbols.get(1));
-    assertEquals(0, sink.status);
+  }
+
+  @Test
+  void mappedExceptionIs4xxResponded() {
+    assertTrue(SpringMvcBridge.start(new Request("GET", "/owners/{id}"), new Handler(Controller.class)));
+    SpringMvcBridge.end(new Response(200), new IllegalArgumentException("no owner"));
+    SpringMvcBridge.exceptionResolved(new Response(404), new Object(), null);
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+    assertEquals(404, sink.outcome.httpStatus());
+    assertEquals(null, sink.outcome.exceptionType());
+    assertEquals(404, sink.status);
+  }
+
+  @Test
+  void unresolvedStatusAfterAMappedExceptionIsUnobservedNotInvented() {
+    assertTrue(SpringMvcBridge.start(new Request("GET", "/x"), new Handler(Controller.class)));
+    SpringMvcBridge.end(new Response(200), new IllegalArgumentException("x"));
+    SpringMvcBridge.exceptionResolved(null, new Object(), null);
+    assertEquals(BridgeSink.Outcome.UNOBSERVED, sink.outcome.kind());
+    assertEquals(0, sink.outcome.httpStatus());
+  }
+
+  @Test
+  void resolutionWithoutADeferredRequestIsIgnored() {
+    SpringMvcBridge.exceptionResolved(new Response(500), new Object(), null);
+    assertTrue(sink.symbols.isEmpty());
+    assertTrue(SpringMvcBridge.start(new Request("GET", "/ok"), new Handler(Controller.class)));
+    SpringMvcBridge.end(new Response(200), null);
+    SpringMvcBridge.exceptionResolved(new Response(500), new Object(), null);
+    assertEquals(200, sink.outcome.httpStatus());
+  }
+
+  @Test
+  void staleDeferredRequestIsClosedUnobservedWhenTheNextRequestStarts() {
+    assertTrue(SpringMvcBridge.start(new Request("GET", "/a"), new Handler(Controller.class)));
+    SpringMvcBridge.end(new Response(200), new IllegalStateException("never resolved"));
+    assertTrue(BootstrapBridge.awaitingResolution());
+    assertTrue(SpringMvcBridge.start(new Request("GET", "/b"), new Handler(Controller.class)));
+    assertEquals(2, sink.starts());
+    assertFalse(BootstrapBridge.awaitingResolution());
+    SpringMvcBridge.end(new Response(204), null);
+    assertEquals(204, sink.outcome.httpStatus());
+  }
+
+  @Test
+  void throwEventCarriesExceptionTypeAndRawBoundedMessage() {
+    assertTrue(BootstrapBridge.requestStart("GET", "/x"));
+    assertEquals("SpringMvcBridgeTest$Controller.go", BootstrapBridge.frameEnter(Controller.class, "go", "()V"));
+    BootstrapBridge.frameExit("SpringMvcBridgeTest$Controller.go", new IllegalStateException("m".repeat(5000)));
+    assertEquals("java.lang.IllegalStateException", sink.thrownType);
+    assertEquals(1024, sink.thrownMessage.length());
+    BootstrapBridge.requestEnd(500, false);
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+  }
+
+  @Test
+  void throwingGetMessageNeverEscapes() {
+    assertTrue(BootstrapBridge.requestStart("GET", "/x"));
+    BootstrapBridge.frameEnter(Controller.class, "go", "()V");
+    BootstrapBridge.frameExit(
+        "SpringMvcBridgeTest$Controller.go",
+        new RuntimeException() {
+          @Override
+          public String getMessage() {
+            throw new IllegalStateException("hostile getMessage");
+          }
+        });
+    assertEquals(null, sink.thrownMessage);
+    BootstrapBridge.requestEnd(0, new IllegalStateException("x"));
+    assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+    assertTrue(sink.outcome.thrownFromEventId() != null);
   }
 
   @Test
@@ -191,6 +279,9 @@ public class SpringMvcBridgeTest {
     private volatile String route;
     private volatile int status = -1;
     private volatile int scope = 1;
+    private volatile BridgeSink.Outcome outcome;
+    private volatile String thrownType;
+    private volatile String thrownMessage;
 
     int starts() {
       return starts.size();
@@ -220,6 +311,23 @@ public class SpringMvcBridgeTest {
       symbols.add(symbol);
       kinds.add(kind);
       return true;
+    }
+
+    @Override
+    public boolean offerThrowEvent(
+        String id, String event, String parent, String symbol, long ns, String type, String text) {
+      thrownType = type;
+      thrownMessage = text;
+      symbols.add(symbol);
+      kinds.add(BridgeEventKind.FRAME_THROW);
+      return true;
+    }
+
+    @Override
+    public boolean offerFinishWithOutcome(
+        String id, long started, long finished, int status, long dropped, Outcome outcome) {
+      this.outcome = outcome;
+      return offerFinish(id, started, finished, status, dropped);
     }
 
     @Override

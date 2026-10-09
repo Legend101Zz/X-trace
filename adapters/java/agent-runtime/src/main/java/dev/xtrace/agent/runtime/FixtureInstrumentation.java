@@ -31,6 +31,7 @@ import net.bytebuddy.utility.JavaModule;
 final class FixtureInstrumentation {
   static final String SPRING_ADAPTER =
       "org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter";
+  static final String DISPATCHER = "org.springframework.web.servlet.DispatcherServlet";
   static final String H2_STATEMENT = "org.h2.jdbc.JdbcPreparedStatement";
   static final String CONTROLLER = "dev.xtrace.fixture.OrderController";
   static final String SERVICE = "dev.xtrace.fixture.OrderService";
@@ -129,6 +130,16 @@ final class FixtureInstrumentation {
                                     .and(named("handleInternal"))
                                     .and(takesArguments(3))
                                     .and(not(isSynthetic())))))
+            .type(named(DISPATCHER))
+            .transform(
+                (target, type, loader, module, domain) ->
+                    target.visit(
+                        Advice.to(ExceptionResolutionAdvice.class)
+                            .on(
+                                isMethod()
+                                    .and(named("processHandlerException"))
+                                    .and(takesArguments(4))
+                                    .and(not(isSynthetic())))))
             .type(
                 (type, loader, module, redefined, domain) ->
                     !type.isInterface()
@@ -180,6 +191,7 @@ final class FixtureInstrumentation {
 
   static boolean isExplicitTarget(String typeName) {
     return SPRING_ADAPTER.equals(typeName)
+        || DISPATCHER.equals(typeName)
         || H2_STATEMENT.equals(typeName)
         || APPLICATION_TYPES.contains(typeName);
   }
@@ -238,6 +250,22 @@ final class FixtureInstrumentation {
     }
   }
 
+  /**
+   * Reports how the container resolved a handler exception, so a mapped exception is recorded as
+   * the response it produced rather than as a propagated failure.
+   */
+  public static final class ExceptionResolutionAdvice {
+    private ExceptionResolutionAdvice() {}
+
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void exit(
+        @Advice.Argument(1) Object response,
+        @Advice.Return Object resolved,
+        @Advice.Thrown Throwable thrown) {
+      dev.xtrace.agent.bootstrap.SpringMvcBridge.exceptionResolved(response, resolved, thrown);
+    }
+  }
+
   /** Method boundary advice for in-scope application classes. */
   public static final class FrameAdvice {
     private FrameAdvice() {}
@@ -252,7 +280,7 @@ final class FixtureInstrumentation {
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void exit(@Advice.Enter String symbol, @Advice.Thrown Throwable thrown) {
-      if (symbol != null) BootstrapBridge.frameExit(symbol, thrown != null);
+      if (symbol != null) BootstrapBridge.frameExit(symbol, thrown);
     }
   }
 
