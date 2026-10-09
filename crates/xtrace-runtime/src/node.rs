@@ -255,22 +255,42 @@ pub struct NodeChild {
     process_group: i32,
     reaped: bool,
 }
+/// Whether a failed process-group signal means the group has nothing left to signal.
+///
+/// `ESRCH` always means the group is gone. On macOS, `killpg` on a group whose only remaining
+/// members are zombies (exited but not yet reaped by their parent, or by launchd once the parent
+/// died) fails with `EPERM` instead; the supervised processes share our UID, so there `EPERM` is
+/// the same "nothing alive to signal" outcome. Any other error, and `EPERM` elsewhere, is real.
+fn group_already_gone(error: rustix::io::Errno) -> bool {
+    error == rustix::io::Errno::SRCH
+        || (cfg!(target_os = "macos") && error == rustix::io::Errno::PERM)
+}
+
+/// Signals a process group, treating an already-gone group as success.
+fn signal_group(
+    group: rustix::process::Pid,
+    signal: rustix::process::Signal,
+) -> Result<(), rustix::io::Errno> {
+    match rustix::process::kill_process_group(group, signal) {
+        Err(error) if !group_already_gone(error) => Err(error),
+        _ => Ok(()),
+    }
+}
+
 impl NodeChild {
     /// Waits for normal exit or forwards SIGINT/SIGTERM with bounded escalation.
     pub async fn wait(
         &mut self,
         signals: &mut NodeSignals,
     ) -> Result<std::process::ExitStatus, LaunchError> {
-        use rustix::process::{Pid, Signal, kill_process_group};
+        use rustix::process::{Pid, Signal};
         use tokio::time::{Duration, timeout};
         let result = tokio::select! { result = self.child.wait() => result.map_err(|_| LaunchError::Process), _ = signals.interrupt.recv() => self.forward_and_reap(Signal::INT).await, _ = signals.terminate.recv() => self.forward_and_reap(Signal::TERM).await };
         match result {
             Ok(status) => {
                 self.reaped = true;
                 if let Some(group) = Pid::from_raw(self.process_group) {
-                    if kill_process_group(group, Signal::KILL)
-                        .is_err_and(|error| error != rustix::io::Errno::SRCH)
-                    {
+                    if signal_group(group, Signal::KILL).is_err() {
                         return Err(LaunchError::Process);
                     }
                 }
@@ -278,9 +298,7 @@ impl NodeChild {
             }
             Err(_) => {
                 if let Some(group) = Pid::from_raw(self.process_group) {
-                    if kill_process_group(group, Signal::KILL)
-                        .is_err_and(|error| error != rustix::io::Errno::SRCH)
-                    {
+                    if signal_group(group, Signal::KILL).is_err() {
                         // Direct-child kill below is the fallback when group signalling fails.
                     }
                 }
@@ -301,23 +319,19 @@ impl NodeChild {
         &mut self,
         signal: rustix::process::Signal,
     ) -> Result<std::process::ExitStatus, LaunchError> {
-        use rustix::process::{Pid, Signal, kill_process_group};
+        use rustix::process::{Pid, Signal};
         use tokio::time::{Duration, timeout};
         let mut forwarding_failed = false;
         if let Some(group) = Pid::from_raw(self.process_group) {
-            if kill_process_group(group, signal)
-                .is_err_and(|error| error != rustix::io::Errno::SRCH)
-            {
+            if signal_group(group, signal).is_err() {
                 forwarding_failed = self.child.start_kill().is_err();
             }
         }
         match timeout(Duration::from_secs(10), self.child.wait()).await {
             Ok(Ok(status)) => {
                 self.reaped = true;
-                let cleanup_failed = Pid::from_raw(self.process_group).is_some_and(|group| {
-                    kill_process_group(group, Signal::KILL)
-                        .is_err_and(|error| error != rustix::io::Errno::SRCH)
-                });
+                let cleanup_failed = Pid::from_raw(self.process_group)
+                    .is_some_and(|group| signal_group(group, Signal::KILL).is_err());
                 if forwarding_failed || cleanup_failed {
                     Err(LaunchError::Process)
                 } else {
@@ -325,10 +339,8 @@ impl NodeChild {
                 }
             }
             _ => {
-                let cleanup_failed = Pid::from_raw(self.process_group).is_some_and(|group| {
-                    kill_process_group(group, Signal::KILL)
-                        .is_err_and(|error| error != rustix::io::Errno::SRCH)
-                });
+                let cleanup_failed = Pid::from_raw(self.process_group)
+                    .is_some_and(|group| signal_group(group, Signal::KILL).is_err());
                 let child_kill_failed = self.child.start_kill().is_err();
                 let result = timeout(Duration::from_secs(10), self.child.wait())
                     .await
@@ -808,12 +820,11 @@ fn drain_probe_pipes(
 }
 
 fn terminate_probe(child: &mut std::process::Child, pid: u32) -> Result<(), LaunchError> {
-    use rustix::process::{Pid, Signal, kill_process_group};
+    use rustix::process::{Pid, Signal};
     use std::thread;
     use std::time::{Duration, Instant};
-    let group_cleanup_failed = Pid::from_raw(pid as i32).is_some_and(|group| {
-        kill_process_group(group, Signal::KILL).is_err_and(|error| error != rustix::io::Errno::SRCH)
-    });
+    let group_cleanup_failed =
+        Pid::from_raw(pid as i32).is_some_and(|group| signal_group(group, Signal::KILL).is_err());
     match child.kill() {
         Ok(()) => {}
         Err(_) => { /* The bounded wait below distinguishes an exit race from a surviving child. */
@@ -1293,13 +1304,9 @@ mod tests {
 
     impl ProbeFixtureCleanup {
         fn terminate(&self) -> bool {
-            use rustix::process::{Pid, Signal, kill_process_group};
-            Pid::from_raw(self.0).is_none_or(|group| {
-                matches!(
-                    kill_process_group(group, Signal::KILL),
-                    Ok(()) | Err(rustix::io::Errno::SRCH)
-                )
-            })
+            use rustix::process::{Pid, Signal};
+            Pid::from_raw(self.0)
+                .is_none_or(|group| super::signal_group(group, Signal::KILL).is_ok())
         }
     }
 
@@ -1441,6 +1448,37 @@ fn main() {{
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[test]
+    fn group_already_gone_classifies_errors() {
+        use rustix::io::Errno;
+        assert!(super::group_already_gone(Errno::SRCH));
+        // A group of unreaped zombies reports EPERM on macOS only; elsewhere EPERM is real.
+        assert_eq!(super::group_already_gone(Errno::PERM), cfg!(target_os = "macos"));
+        assert!(!super::group_already_gone(Errno::INVAL));
+    }
+
+    #[tokio::test]
+    async fn termination_of_an_already_exited_group_still_reaps() {
+        use std::os::unix::process::CommandExt as _;
+        use tokio::process::Command;
+
+        let mut command = Command::new("true");
+        command.as_std_mut().process_group(0);
+        command.kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn short-lived leader");
+        let leader = child.id().expect("leader PID");
+        // The leader has exited and been reaped before termination is forwarded: the group no
+        // longer exists, which is the success case, not an error.
+        child.wait().await.expect("leader exits");
+        let mut supervised = NodeChild { child, process_group: leader as i32, reaped: false };
+        let status = supervised
+            .forward_and_reap(rustix::process::Signal::TERM)
+            .await
+            .expect("an already-gone group is not a termination failure");
+        assert!(status.success());
+        assert!(supervised.reaped);
     }
 
     #[test]
