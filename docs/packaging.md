@@ -55,6 +55,40 @@ migrations at first use; the installer cannot migrate (and does not stop a runni
 
 Pack signing (ADR 0004 Ed25519 embedded in `xtrace-pack.json`) is a different key domain and is not done here.
 
+## Package content verification
+
+`packaging/verify_package.py PACKAGE [--version 0.0.1] [--repo REPO] [--run-binary]` (stdlib only) verifies an
+extracted package directory or the `.tar.gz`: manifest shape, version 0.0.1 in the manifest and `share/xtrace/VERSION`,
+required components (the single `bin/xtrace` binary is checked only for presence; whether it contains a working
+daemon or TUI is what the `--run-binary` checks below probe; web assets; Java pack; Node pack; protobuf schemas and OpenAPI; SBOM; licenses; installers),
+per-file size and sha256 against the manifest, no unlisted files, `payload.sha256` rows, and a pack trust of
+`unsigned` or `dev` only (a release claim is rejected, the report always says `release_evidence: false`). With
+`--run-binary` it runs `bin/xtrace --version` and requires `xtrace <version>` plus `schema-version:` and `xtp-protocol:` lines, and
+`xtrace tui --help` (`tui_subcommand_registered`: the subcommand exists) plus `xtrace tui` with stdin closed
+(`tui_implemented`: red while the TUI is the exit-9 skeleton); with `--repo` it requires the reported schema version to equal the migration catalog's latest.
+`packaging/test/test_verify_package.py` pins each check on synthetic layouts (not a product build). CI wiring is a
+request to the CI lane (additive steps in `package.yml`).
+
+## Daemon lifecycle (`xtrace record | stop | restart`)
+
+* `record` starts `xtrace daemon` detached (own process group, output to private files under the project's
+  `.daemon/` directory), waits for its readiness document, and writes `.daemon/daemon.json` (0600): pid, process start
+  time, executable, session id, port, pin, bootstrap path. The bootstrap is single use, so a `record` arms exactly one
+  launch; no secret is copied into the state file or the command output. Before starting, recordings that a previous
+  daemon left open are sealed as partial.
+* `stop` signals only that recorded pid, and only after it proves the pid is still that daemon (same process start
+  time, same executable, an `xtrace daemon` command line). A mismatch is refused (exit 4, `XTR-LIFECYCLE-IDENTITY-MISMATCH`)
+  and nothing is signalled. A daemon holding the project lock that `record` did not start is not signalled either. It
+  waits for the lock to be released (it never escalates to SIGKILL), then seals recordings the daemon left open as
+  partial. Not running is exit 3 (`XTR-LIFECYCLE-NOT-RUNNING`).
+* `restart` is `stop` (not running is fine) then `record`; no data is deleted, but recordings left open are sealed as partial (store rows change).
+* `record`, `stop` and `restart` are serialized per project by `.daemon/lifecycle.lock` (bounded 60 s wait, then `XTR-LIFECYCLE-BUSY`). Recordings are sealed best-effort one by one: a recording that cannot be sealed is listed with completion `failed` and `stop`/`restart` exit 10 (partial); `stop` with nothing running but rows sealed prints the document and exits 3.
+* A start that fails after the daemon was spawned (bad readiness line, state write failure, timeout) terminates the child it spawned, so no unmanaged daemon is left holding the project lock.
+* Identity checks need a procps or BSD `ps` supporting `-o lstart=` and `-o command=` (BusyBox `ps` does not); they run with `LC_ALL=C`. If `ps` is unusable, `record`/`stop` fail with `XTR-LIFECYCLE-IDENTITY-UNAVAILABLE` and change nothing.
+* Limits: events a daemon had staged in memory but not yet written as a segment are lost on SIGTERM/SIGKILL (a
+  daemon-side flush on shutdown is requested separately); `--capture-depth` is validated and recorded but not yet
+  applied by the daemon.
+
 ## CI
 
 `.github/workflows/package.yml` (push to `slice/v001-**`, manual): `ubuntu-24.04` (linux-x86_64) and `macos-15`

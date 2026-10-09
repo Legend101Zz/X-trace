@@ -123,6 +123,31 @@ pub(crate) fn acquire_project_lock(
     }
 }
 
+/// Opens (creating when absent) the private `.daemon` directory that holds lifecycle state files.
+pub(crate) fn daemon_state_root(
+    project_root: &AdmittedPrivateRoot,
+) -> Result<AdmittedPrivateRoot, CliError> {
+    project_root.revalidate().map_err(|_| CliError::PrivateStorageUnavailable)?;
+    project_root
+        .open_or_create_private_child(DAEMON_DIRECTORY)
+        .map_err(|_| CliError::PrivateStorageUnavailable)
+}
+
+/// Reports whether a live process currently holds the project daemon lock.
+///
+/// The probe takes and immediately releases the advisory lock, so it never
+/// blocks a daemon start that follows.
+pub(crate) fn project_lock_is_held(project_root: &AdmittedPrivateRoot) -> Result<bool, CliError> {
+    match acquire_project_lock(project_root) {
+        Ok(lock) => {
+            drop(lock);
+            Ok(false)
+        }
+        Err(CliError::DaemonAlreadyRunning) => Ok(true),
+        Err(other) => Err(other),
+    }
+}
+
 fn clean_stale_sessions(sessions_root: &AdmittedPrivateRoot) -> Result<(), CliError> {
     let names = sessions_root
         .bounded_child_names(MAX_SESSIONS)
