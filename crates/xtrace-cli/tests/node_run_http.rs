@@ -113,7 +113,10 @@ fn auto_mode_records_cjs_and_esm_entries_once_each() {
     assert!(init.status.success(), "init failed: {}", diagnostic(&init));
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let adapter_dist = workspace.join("adapters/node/packages/adapter-core/dist");
-    assert!(adapter_dist.join("manifest.sha256").is_file(), "run `npm run build:core --offline` before this test");
+    assert!(
+        adapter_dist.join("manifest.sha256").is_file(),
+        "run `npm run build:core --offline` before this test"
+    );
 
     run_application_as(&repo, &data_home, &adapter_dist, "auto", "cjs");
     let first = list_recordings(&repo, &data_home);
@@ -329,7 +332,10 @@ fn assert_recording_evidence(page: &Value, repo: &Path, data_home: &Path) {
         let kinds: Vec<(&str, &str)> = events
             .iter()
             .map(|event| {
-                (event["kind"].as_str().expect("event kind"), event["symbol"].as_str().expect("event symbol"))
+                (
+                    event["kind"].as_str().expect("event kind"),
+                    event["symbol"].as_str().expect("event symbol"),
+                )
             })
             .collect();
         assert_eq!(
@@ -347,7 +353,9 @@ fn assert_recording_evidence(page: &Value, repo: &Path, data_home: &Path) {
         let root_id = events[0]["event_id"].as_str().expect("root event id");
         assert_eq!(events[2]["parent_event_id"], root_id, "response is a child of the root frame");
         assert!(
-            !events.iter().any(|event| event["symbol"].as_str().is_some_and(|s| s.contains("one") || s.contains("two"))),
+            !events.iter().any(|event| event["symbol"]
+                .as_str()
+                .is_some_and(|s| s.contains("one") || s.contains("two"))),
             "request path must not appear in event symbols"
         );
         // `unavailable.completion` reports whether durable terminal evidence exists; it is no
