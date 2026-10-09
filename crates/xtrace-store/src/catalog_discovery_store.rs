@@ -1855,7 +1855,7 @@ mod tests {
         let error = adapter
             .submit_chunk_with_view(&selection, &chunk(SourceRevisionId::new()))
             .expect_err("wrong snapshot is refused");
-        assert_eq!(error.kind, PortErrorKind::Conflict);
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
         assert_eq!(row_count(&shared, "catalog_discovery_claims"), 0);
         adapter.submit_chunk_with_view(&selection, &chunk(pinned)).expect("pinned snapshot");
         assert_eq!(row_count(&shared, "catalog_discovery_claims"), 1);
@@ -1905,7 +1905,7 @@ mod tests {
         let error = adapter
             .submit_chunk_with_view(&selection, &chunk)
             .expect_err("class-bound claim is refused in the local-scan namespace");
-        assert_eq!(error.kind, PortErrorKind::Conflict);
+        assert_eq!(error.kind(), PortErrorKind::Conflict);
         assert_eq!(row_count(&shared, "catalog_discovery_claims"), 0);
     }
 
