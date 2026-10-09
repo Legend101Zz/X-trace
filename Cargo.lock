@@ -1661,6 +1661,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "serde_json",
+ "xtrace-domain",
 ]
 
 [[package]]

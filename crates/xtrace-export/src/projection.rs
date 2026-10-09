@@ -390,6 +390,20 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
         (&a.path, a.line_start, &a.symbol).cmp(&(&b.path, b.line_start, &b.symbol))
     });
     handlers.dedup();
+    // Handler paths are source locations from claims: only repo-relative ones
+    // may leave the product (no absolute owner paths, `..`, backslashes).
+    handlers.retain(|h| {
+        let safe = xtrace_domain::is_safe_repo_relative_path(&h.path);
+        if !safe {
+            omit(
+                omissions,
+                &op.operation_id,
+                "handler".to_owned(),
+                "handler_path_not_repo_relative",
+            );
+        }
+        safe
+    });
     let request_media = claims.iter().filter_map(|c| c.request_body_media_type.clone()).min();
 
     PreparedOp {

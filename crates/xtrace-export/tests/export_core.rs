@@ -163,3 +163,31 @@ fn secret_word_routes_and_prose_descriptions_export() {
         }
     }
 }
+
+#[test]
+fn unsafe_handler_paths_are_dropped_and_listed_as_omissions() {
+    let bad_paths = ["/Users/someone/proj/Ctl.java", "../x/Ctl.java", "a\\b.java", "C:/x/Ctl.java"];
+    for bad in bad_paths {
+        let mut input = spring_orders();
+        let handler = input
+            .operations
+            .iter_mut()
+            .flat_map(|o| o.claims.iter_mut())
+            .find_map(|c| c.handler.as_mut())
+            .unwrap();
+        handler.path = bad.to_owned();
+        let out = export(&input, &ExportRequest::new(ExportFormat::OpenApi)).unwrap();
+        let text = String::from_utf8(out.files[0].bytes.clone()).unwrap();
+        assert!(!text.contains(bad.trim_start_matches("../")), "leaked {bad}: {text}");
+        assert!(
+            out.omissions
+                .iter()
+                .any(|o| o.what == "handler" && o.reason == "handler_path_not_repo_relative"),
+            "no omission for {bad}"
+        );
+    }
+    let out = export(&spring_orders(), &ExportRequest::new(ExportFormat::OpenApi)).unwrap();
+    let text = String::from_utf8(out.files[0].bytes.clone()).unwrap();
+    assert!(text.contains("src/main/java/demo/OrderController.java"));
+    assert!(!out.omissions.iter().any(|o| o.what == "handler"));
+}

@@ -346,3 +346,53 @@ fn selection_reason_does_not_claim_unknown_observation() {
         (false, "already_observed_and_unchanged".to_owned())
     );
 }
+
+#[test]
+fn target_differentials_rejected() {
+    for t in [
+        "http://evil.com\\@127.0.0.1/",
+        "http://127.0.0.1\\.evil.com/",
+        "http://host/a\\b",
+        "http://127.0.0.1%2e.evil/",
+        "http://%31%32%37.0.0.1/",
+        "http://127.1/",
+        "http://0x7f.0.0.1/",
+        "http://2130706433/",
+        "http://host:99999/",
+        "http://host:80a/",
+        "http://host:/",
+        "http://[::1/",
+        "http://[::1]x/",
+        "http://-bad.example/",
+        "http://a..b/",
+    ] {
+        let mut i = input();
+        i.target = t.into();
+        assert!(try_synthesize(&i).is_err(), "should reject {t}");
+    }
+}
+
+#[test]
+fn target_host_classification() {
+    use xtrace_exercise::{HostClass, classify_target_host as c};
+    let cases = [
+        ("http://localhost:8080", HostClass::Loopback),
+        ("http://api.localhost/x", HostClass::Loopback),
+        ("http://127.0.0.1:3000", HostClass::Loopback),
+        ("http://127.9.9.9", HostClass::Loopback),
+        ("http://[::1]:80/", HostClass::Loopback),
+        ("http://[::ffff:127.0.0.1]/", HostClass::Loopback),
+        ("http://10.1.2.3", HostClass::NonPublicIp),
+        ("http://192.168.0.5", HostClass::NonPublicIp),
+        ("http://169.254.169.254/latest", HostClass::NonPublicIp),
+        ("http://0.0.0.0", HostClass::NonPublicIp),
+        ("http://[fe80::1]", HostClass::NonPublicIp),
+        ("http://[fd00::1]", HostClass::NonPublicIp),
+        ("http://8.8.8.8", HostClass::PublicIp),
+        ("https://api.example.com:8443/base", HostClass::Name),
+    ];
+    for (t, want) in cases {
+        assert_eq!(c(t), Ok(want), "{t}");
+    }
+    assert!(c("http://127.1").is_err());
+}
