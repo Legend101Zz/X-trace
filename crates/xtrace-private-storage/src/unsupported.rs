@@ -16,6 +16,19 @@ pub enum PrivateStorageError {
     Operation,
 }
 
+/// No-op admission scope: this platform admits nothing, so there is nothing to share.
+#[must_use = "an admission scope ends as soon as its guard is dropped"]
+pub struct AdmissionScope {
+    _single_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl AdmissionScope {
+    /// Opens a scope (a no-op on this platform).
+    pub fn enter() -> Self {
+        Self { _single_thread: std::marker::PhantomData }
+    }
+}
+
 /// Platform placeholder that deliberately cannot admit a private root.
 pub struct AdmittedPrivateRoot;
 

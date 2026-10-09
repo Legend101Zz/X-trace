@@ -11,6 +11,11 @@ description = "Owner-enforced private directory admission shared by X-trace stor
 [lints]
 workspace = true
 
+[features]
+# Test seam: counts `/bin/ls` spawns per thread. Off by default; consumers enable it only through
+# [dev-dependencies] so release builds never contain it.
+spawn-counter = []
+
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }

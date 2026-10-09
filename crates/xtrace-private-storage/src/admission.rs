@@ -1153,8 +1153,9 @@ fn open_directory_without_symlinks_until(
     if components > MAX_PATH_COMPONENTS + 1 || path.as_os_str().len() > 4096 {
         return Err(PrivateStorageError::InvalidName);
     }
-    // One ACL listing for the whole walk instead of one per component (macOS only; see
-    // `Operation::prefetch_directory_listings` for why this cannot admit anything by itself).
+    // Register the walk's prefixes; the one batched ACL listing is taken lazily on the first
+    // memo miss (macOS only; see `Operation::spawn_batch_for` for why it cannot admit anything
+    // by itself).
     #[cfg(target_os = "macos")]
     {
         let mut prefix = PathBuf::from("/");
@@ -1165,7 +1166,7 @@ fn open_directory_without_symlinks_until(
                 prefixes.push(prefix.clone());
             }
         }
-        op.prefetch_directory_listings(&prefixes);
+        op.register_walk(&prefixes);
     }
     let mut descriptor = open_directory_descriptor("/")?;
     let mut traversed = PathBuf::from("/");

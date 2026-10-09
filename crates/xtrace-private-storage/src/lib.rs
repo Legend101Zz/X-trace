@@ -17,6 +17,10 @@ mod policy;
 #[cfg(unix)]
 mod probe;
 #[cfg(unix)]
+mod scope;
+#[cfg(feature = "spawn-counter")]
+pub mod spawn_counter;
+#[cfg(unix)]
 pub use admission::{
     AdmittedPrivateRoot, PrivateStorageError, admit_sealed_directories,
     admit_sealed_directories_with_profile, open_private_directory_descriptor,
@@ -24,8 +28,10 @@ pub use admission::{
 };
 #[cfg(unix)]
 pub use policy::FilesystemProfile;
+#[cfg(unix)]
+pub use scope::AdmissionScope;
 
 #[cfg(not(unix))]
 mod unsupported;
 #[cfg(not(unix))]
-pub use unsupported::{AdmittedPrivateRoot, PrivateStorageError, validate_child_name};
+pub use unsupported::{AdmissionScope, AdmittedPrivateRoot, PrivateStorageError, validate_child_name};
