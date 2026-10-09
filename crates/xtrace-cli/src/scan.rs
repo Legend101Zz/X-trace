@@ -1225,7 +1225,8 @@ mod tests {
         let result =
             scan(&[header("express"), claim("GET", r#"["/a"]"#, "a.js", 1, ""), end_ok(1)]);
         let mut out = Vec::new();
-        write_text(&mut out, &result).expect("writes");
+        write_text(&mut out, &result, &persist::Persistence::default(), "not_persisted")
+            .expect("writes");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("coverage: app/router calls"), "{text}");
         for framework in ["spring-mvc", "spring-webflux", "express", "fastify", "nest"] {

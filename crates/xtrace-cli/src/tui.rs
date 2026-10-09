@@ -57,6 +57,7 @@ impl Facade {
                     recording_id,
                     limit: WINDOW_LIMIT,
                     cursor,
+                    around_frame: None,
                 },
                 CorrelationId::new(),
             )

@@ -341,9 +341,9 @@ const SPRING_TRANSCRIPT: &str = r#"{"type":"header","contractVersion":1,"analyze
 /// Records one `POST /orders` observation exactly as a run of the Spring fixture would, through
 /// the store's public recording API.
 fn record_orders_observation(fx: &Fx) {
-    use xtrace_application::recording::{BeginRecordingDisposition, EndpointObservationInput};
+    use xtrace_application::recording::EndpointObservationInput;
     use xtrace_domain::{ProjectId, RecordingId, RuntimeSessionId, WallTime};
-    use xtrace_store::{BeginRecordingRequest, OpenOptions, SqliteStore};
+    use xtrace_store::{BeginRecordingDisposition, BeginRecordingRequest, OpenOptions, SqliteStore};
 
     let database = fx.database();
     let root = database.parent().expect("project data root").to_path_buf();
