@@ -852,9 +852,12 @@ fn legacy_open_idempotency_key(canonical_repo_path: &str) -> Option<String> {
     idempotency_key_is_valid(&legacy).then_some(legacy)
 }
 
-/// Best-effort read-only probe used to decide whether a legacy implicit key
-/// already has a stored receipt. Any failure answers `false`; the real command
-/// path reports the underlying store problem itself.
+/// Best-effort probe used to decide whether a legacy implicit key already has a
+/// stored receipt. It opens the existing store with the same options the command
+/// itself uses next, so it can apply pending migrations; a read-only open would
+/// refuse every pre-current schema, which are exactly the stores that can hold a
+/// legacy key. Any failure answers `false`; the real command path reports the
+/// underlying store problem itself.
 fn store_holds_receipt(
     data_home: &Path,
     project_id: xtrace_domain::ProjectId,
