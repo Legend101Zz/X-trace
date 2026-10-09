@@ -38,9 +38,9 @@ GRADLE_FAIL = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\(.*\))?(?:\[.*\])? FA
 PY_FAIL = re.compile(r"^(?:FAIL|ERROR): (\w+) \((?:[\w.]+\.)?(\w+)\.(\w+)\)")
 PY_RAN = re.compile(r"^Ran (\d+) tests? in ")
 PY_FAILED = re.compile(r"^FAILED \((?:failures=(\d+))?(?:, )?(?:errors=(\d+))?")
-NODE_PASS = re.compile(r"^\W{0,3}\s*pass (\d+)$")  # node:test spec reporter summary: "ℹ pass 12"
-NODE_FAIL = re.compile(r"^\W{0,3}\s*fail (\d+)$")
-NODE_SKIP = re.compile(r"^\W{0,3}\s*(?:skipped|todo|cancelled) (\d+)$")
+NODE_PASS = re.compile(r"^\S{0,2}\s*pass (\d+)$")  # node:test spec reporter summary: "ℹ pass 12"
+NODE_FAIL = re.compile(r"^\S{0,2}\s*fail (\d+)$")
+NODE_SKIP = re.compile(r"^\S{0,2}\s*(?:skipped|todo|cancelled) (\d+)$")
 VITEST_TESTS = re.compile(r"^\s*Tests\s+(?:(\d+) failed \| )?(\d+) passed(?: \| (\d+) (?:skipped|todo))*\s*\((\d+)\)")
 TAP_NOT_OK = re.compile(r"^\s*not ok \d+ - (\S+)\s*$")
 
@@ -205,7 +205,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"lane {suite}/{variant}/{step}: timeout after {args.timeout}s")
     text = log_path.read_text(encoding="utf-8", errors="replace")
     facts = parse_output(text)
-    if args.junit_glob:
+    if getattr(args, "junit_glob", ""):
         # Gradle prints no totals on success; the JUnit XML reports are the count of record for the Java suite.
         jc = junit_counts(pathlib.Path(args.cwd or "."), args.junit_glob)
         if jc is not None:
