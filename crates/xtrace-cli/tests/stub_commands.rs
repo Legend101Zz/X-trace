@@ -27,18 +27,13 @@ fn version_prints_schema_version_and_protocol() {
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 3, "{text}");
-    assert_eq!(lines[1], "schema-version: 8");
+    assert_eq!(lines[1], format!("schema-version: {}", xtrace_store::CURRENT_SCHEMA_VERSION));
     assert_eq!(lines[2], "xtp-protocol: 1.0");
 }
 
 #[test]
 fn unimplemented_command_exits_nine_with_stable_message_for_each() {
     let table: &[(&[&str], &str)] = &[
-        (&["catalog", "list"], "catalog list"),
-        (&["catalog", "history"], "catalog history"),
-        (&["catalog", "diff"], "catalog diff"),
-        (&["catalog", "conflicts"], "catalog conflicts"),
-        (&["catalog", "runs"], "catalog runs"),
         (&["exercise", "approve", "--plan-hash", "abc"], "exercise approve"),
         (&["exercise", "run"], "exercise run"),
         (&["exercise", "show"], "exercise show"),
