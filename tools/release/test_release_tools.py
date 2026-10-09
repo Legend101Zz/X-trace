@@ -873,6 +873,10 @@ def own_process_snapshot(extra_pids=lambda: ()):
         full = real_snapshot(timeout=timeout)
         with lock:
             me = os.getpid()
+            # Identity is (pid, start time): a remembered pid whose start time changed is a
+            # reused pid, i.e. a different process, and must not stay trusted.
+            for pid in [p for p, started in mine.items() if p in full and full[p][1] != started]:
+                del mine[pid]
             if me in full:
                 mine[me] = full[me][1]
             for pid in extra_pids():
@@ -882,7 +886,13 @@ def own_process_snapshot(extra_pids=lambda: ()):
             while changed:
                 changed = False
                 for pid, (ppid, started_at, _state) in full.items():
-                    if pid not in mine and ppid in mine and full[ppid][1] == mine[ppid]:
+                    if pid in mine:
+                        continue
+                    parent = full.get(ppid)
+                    # A parent absent from this snapshot (it exited) cannot be verified, so
+                    # the child is not adopted: hiding an unattributable process is safe,
+                    # because everything already adopted stays visible by pid and start time.
+                    if parent is not None and mine.get(ppid) == parent[1]:
                         mine[pid] = started_at
                         changed = True
             return {pid: record for pid, record in full.items() if mine.get(pid) == record[1]}
@@ -893,6 +903,37 @@ def own_process_snapshot(extra_pids=lambda: ()):
 def process_running(pid: int) -> bool:
     record = run_gates._process_snapshot().get(pid)
     return record is not None and record[2] not in {"Z", "X"}
+
+class OwnProcessSnapshotTests(unittest.TestCase):
+    def test_own_process_snapshot_adoption_is_deterministic_and_identity_keyed(self) -> None:
+        me = os.getpid()
+        base = {1: (0, "t0", "S"), me: (1, "m0", "S"), 9000: (1, "u0", "S")}
+        snaps = [
+            {**base, 5001: (me, "c1", "S")},  # child of the test process: adopted
+            {**base, 5001: (me, "c1", "S"), 5002: (5001, "c2", "S"), 9100: (1, "u1", "S")},
+            {**base, 5003: (5002, "c3", "S")},  # parent 5002 absent: no KeyError, not adopted
+            {**base, 5001: (me, "cX", "S"), 5004: (5001, "c4", "S")},  # pid 5001 reused
+            {**base, 7777: (1, "d0", "S")},  # detached, named through extra_pids
+        ]
+        feed = iter(snaps)
+        extra: list[int] = []
+        with mock.patch.object(run_gates, "_process_snapshot", side_effect=lambda **_k: next(feed)):
+            snapshot = own_process_snapshot(lambda: extra)
+            first = snapshot()
+            self.assertEqual({me, 5001}, set(first))
+            second = snapshot()
+            self.assertEqual({me, 5001, 5002}, set(second))  # unrelated 9000/9100 hidden
+            third = snapshot()
+            self.assertEqual({me}, set(third))  # 5003 has an absent parent: hidden, no KeyError
+            fourth = snapshot()
+            # reused pid 5001 (new start time) is a different process, adopted only because
+            # its parent is verified; its child 5004 then follows from it.
+            self.assertEqual("cX", fourth[5001][1])
+            self.assertEqual({me, 5001, 5004}, set(fourth))
+            extra.append(7777)
+            fifth = snapshot()
+            self.assertEqual({me, 7777}, set(fifth))
+
 
 
 class LedgerTests(unittest.TestCase):
