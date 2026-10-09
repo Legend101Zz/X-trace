@@ -283,7 +283,7 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     assert!(first_page_again.status.success());
     assert_eq!(first_page.stdout, first_page_again.stdout, "list output must be stable");
     let first_json: Value = serde_json::from_slice(&first_page.stdout).expect("list projection");
-    assert_eq!(first_json["schema_version"], 2);
+    assert_eq!(first_json["schema_version"], 3);
     let first_recording =
         first_json["recordings"][0]["recording_id"].as_str().expect("recording ID");
     let list_cursor = first_json["next_after"].as_str().expect("second page cursor");
@@ -711,7 +711,7 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     assert!(detail_page.status.success(), "recording show failed: {}", diagnostic(&detail_page));
     assert_eq!(detail_page.stdout, detail_page_again.stdout, "show output must be stable");
     let detail_json: Value = serde_json::from_slice(&detail_page.stdout).expect("show projection");
-    assert_eq!(detail_json["schema_version"], 2);
+    assert_eq!(detail_json["schema_version"], 3);
     assert_eq!(detail_json["status"], "complete");
     assert_eq!(detail_json["completion"], "complete");
     assert_eq!(detail_json["unavailable"]["completion"], "available");
@@ -908,8 +908,15 @@ fn attach_keeps_existing_spring_target_alive_and_persists_real_request() {
     let (read_result, ready_line) = ready_receive
         .recv_timeout(Duration::from_secs(50))
         .expect("attach result line within helper and daemon bounds");
-    read_result.expect("read attach result");
-    let ready: Value = serde_json::from_slice(&ready_line).expect("attach result JSON");
+    let ready: Value = match read_result
+        .map_err(|error| format!("read error: {error}"))
+        .and_then(|_| serde_json::from_slice(&ready_line).map_err(|error| error.to_string()))
+    {
+        Ok(ready) => ready,
+        Err(parse_error) => {
+            panic!("{}", attach_failure_report(&mut attach, &mut target, &ready_line, &parse_error))
+        }
+    };
     assert_eq!(ready["kind"], "java_attach_result");
     assert_eq!(ready["pack_authenticity"], "unsigned_development_pack");
     assert_eq!(ready["agent_load_status"], "agent_load_requested");
@@ -1665,6 +1672,47 @@ fn assert_canaries_absent(bytes: &[u8]) {
             "{canary} leaked"
         );
     }
+}
+
+/// Failure-path diagnostics only: gives the first attach line read, the attach exit status,
+/// the attach stderr (structured `XTR-ATTACH-*` error) and whether the target is still alive.
+/// It never changes what the test asserts.
+fn attach_failure_report(
+    attach: &mut RunProcess,
+    target: &mut RunProcess,
+    first_line: &[u8],
+    parse_error: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match attach.child.try_wait() {
+            Ok(Some(status)) => break format!("exited: {status}"),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                // Only the child this test spawned is signalled.
+                let _ = attach.child.kill();
+                let _ = attach.child.wait();
+                break "still running after 5s; killed by test harness".to_string();
+            }
+            Err(error) => break format!("status unavailable: {error}"),
+        }
+    };
+    let stderr =
+        attach.stderr.take().map(|handle| handle.join().unwrap_or_default()).unwrap_or_default();
+    let target_state = match target.child.try_wait() {
+        Ok(None) => "alive".to_string(),
+        Ok(Some(status)) => format!("exited: {status}"),
+        Err(error) => format!("unknown: {error}"),
+    };
+    format!(
+        "attach result line not valid JSON ({parse_error}); first line bytes={}: {:?}\n\
+         attach process {status}\nattach stderr:\n{}\ntarget process {target_state}",
+        first_line.len(),
+        String::from_utf8_lossy(first_line),
+        String::from_utf8_lossy(&stderr),
+    )
 }
 
 fn diagnostic(output: &std::process::Output) -> String {

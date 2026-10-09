@@ -66,6 +66,9 @@ public final class AgentRuntime {
     try {
       if (attach) FixtureInstrumentation.validateAttach(instrumentation);
       bootstrap = BootstrapReader.read(Path.of(bootstrapPath));
+      // capture.json sits beside the bootstrap and may be removed once the session is open, so it
+      // is read together with the bootstrap; absent or invalid means the default scope.
+      CaptureConfig config = CaptureConfig.readBeside(Path.of(bootstrapPath));
       identity = identityDigest(bootstrap);
       if (!MessageDigest.isEqual(expectedIdentity, identity)) {
         throw new ClientException(
@@ -86,11 +89,13 @@ public final class AgentRuntime {
                   System.nanoTime()));
       bootstrap.close();
       bootstrap = null;
-      BoundedEventQueue queue = new BoundedEventQueue(1024, 256 * 1024L);
+      BoundedEventQueue queue = new BoundedEventQueue(8192, 2L * 1024 * 1024);
       sink = new RuntimeBridgeSink(queue);
+      sink.useScope(config.scope());
       writer = new RecordingWriter(session, queue, sink);
       permanent = true;
-      FixtureInstrumentation.install(instrumentation, writer::stopIncomplete, attach);
+      FixtureInstrumentation.install(
+          instrumentation, writer::stopIncomplete, attach, config.scope());
       if (writer.isStopping()) {
         throw new ClientException("XTR-JAVA-INSTRUMENTATION", "fixture instrumentation failed");
       }

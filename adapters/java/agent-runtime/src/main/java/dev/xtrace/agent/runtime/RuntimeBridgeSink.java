@@ -1,5 +1,6 @@
 package dev.xtrace.agent.runtime;
 
+import dev.xtrace.agent.bootstrap.BridgeEventKind;
 import dev.xtrace.agent.bootstrap.BridgeSink;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
@@ -17,6 +18,7 @@ final class RuntimeBridgeSink implements BridgeSink {
   private final AtomicInteger activeRecordings = new AtomicInteger();
   private final AtomicInteger inFlightStartAdmissions = new AtomicInteger();
   private final AtomicInteger incompleteKind = new AtomicInteger();
+  private volatile ApplicationScope scope = ApplicationScope.defaultScope();
   private final Runnable afterStartIncrement;
   private final Runnable beforeStartDecrement;
 
@@ -107,6 +109,26 @@ final class RuntimeBridgeSink implements BridgeSink {
   }
 
   @Override
+  public boolean offerThrowEvent(
+      String recordingId,
+      String eventId,
+      String parentEventId,
+      String symbol,
+      long monotonicNs,
+      String exceptionType,
+      String exceptionMessage) {
+    if (!acceptingExisting.get() || !bounded(recordingId, eventId, parentEventId, symbol)) {
+      return false;
+    }
+    int bytes = estimate(recordingId, eventId, parentEventId, symbol) + 1600;
+    return queue.offer(
+        new QueueSignal.Event(
+            recordingId, eventId, parentEventId, BridgeEventKind.FRAME_THROW, symbol,
+            monotonicNs, 0, null, 0, 0, null, 0, bytes, exceptionType, exceptionMessage),
+        false);
+  }
+
+  @Override
   public boolean offerMethodEvent(
       String recordingId,
       String eventId,
@@ -125,15 +147,69 @@ final class RuntimeBridgeSink implements BridgeSink {
   }
 
   @Override
+  public boolean offerFrameEvent(
+      String recordingId,
+      String eventId,
+      String parentEventId,
+      int kind,
+      String symbol,
+      long monotonicNs,
+      int detail,
+      Class<?> type,
+      String method,
+      String descriptor) {
+    SourceAttestation.SourceInfo source = resolveSource(type, method, descriptor);
+    return offerSourceEvent(
+        recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail,
+        source.path(), source.startLine(), source.endLine(), source.hash(), source.binding());
+  }
+
+  /** Build-attested source wins; otherwise the class is bound to the source file it names. */
+  private static SourceAttestation.SourceInfo resolveSource(
+      Class<?> type, String method, String descriptor) {
+    ClassLoader loader = type == null ? null : type.getClassLoader();
+    if (loader != null && type != null) {
+      SourceAttestation.SourceInfo attested =
+          SourceAttestation.attest(loader, type.getName(), method, descriptor);
+      if (attested != null) return attested;
+    }
+    return SourceIdentity.lookup(type, method, descriptor);
+  }
+
+  @Override
+  public int applicationScope(Class<?> type) {
+    return scope.verdict(type);
+  }
+
+  void useScope(ApplicationScope scope) {
+    this.scope = java.util.Objects.requireNonNull(scope, "scope");
+  }
+
+  @Override
   public boolean offerFinish(
       String recordingId,
       long startedMonotonicNs,
       long finishedMonotonicNs,
       int responseStatus,
       long droppedEvents) {
-    try {
+    return offerFinishWithOutcome(
+        recordingId, startedMonotonicNs, finishedMonotonicNs, responseStatus, droppedEvents, null);
+  }
+
+  @Override
+  public boolean offerFinishWithOutcome(
+      String recordingId,
+      long startedMonotonicNs,
+      long finishedMonotonicNs,
+      int responseStatus,
+      long droppedEvents,
+      Outcome outcome) {
+    // The recording slot stays counted until the writer has written (or abandoned) it, so the
+    // sink never admits more recordings than the writer can hold. A rejected finish keeps its
+    // slot: the writer still holds the recording and the shortfall is reported as incomplete.
+    {
       if (!acceptingExisting.get() || !bounded(recordingId)) return false;
-      int bytes = estimate(recordingId);
+      int bytes = estimate(recordingId) + (outcome == null ? 0 : 1800);
       return queue.offer(
           new QueueSignal.Finish(
               recordingId,
@@ -141,11 +217,15 @@ final class RuntimeBridgeSink implements BridgeSink {
               finishedMonotonicNs,
               responseStatus,
               droppedEvents,
-              bytes),
+              bytes,
+              outcome),
           true);
-    } finally {
-      activeRecordings.updateAndGet(current -> current > 0 ? current - 1 : 0);
     }
+  }
+
+  /** Called by the writer once a recording is written or abandoned; frees its admission slot. */
+  void recordingClosed() {
+    activeRecordings.updateAndGet(current -> current > 0 ? current - 1 : 0);
   }
 
   @Override

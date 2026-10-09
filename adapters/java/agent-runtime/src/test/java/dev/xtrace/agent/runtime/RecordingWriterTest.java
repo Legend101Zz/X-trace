@@ -26,7 +26,7 @@ import xtp.agent.v1.Transport.AckDurability;
 class RecordingWriterTest {
   @Test
   void insertsSupportedGapBeforeResponseAndPreservesSanitizedIdentity() throws Exception {
-    QueueSignal.Event request = event("r:1", "", BridgeEventKind.REQUEST_UPDATE, "request", 0);
+    QueueSignal.Event request = event("r:1", "", BridgeEventKind.REQUEST_UPDATE, "http.request POST /orders", 0);
     QueueSignal.Event response =
         event("r:2", "r:1", BridgeEventKind.RESPONSE, "http.response 201", 201);
     List<QueueSignal.Event> events =
@@ -156,6 +156,108 @@ class RecordingWriterTest {
     assertTrue(transport.closed.get());
   }
 
+  private static final String REC = "00000000-0000-4000-8000-0000000000aa";
+
+  private static void offerTree(RuntimeBridgeSink sink, int frames) {
+    assertTrue(sink.offerStart(REC, 1, "GET", "/big"));
+    assertTrue(sink.offerEvent(REC, REC + ":0", "", BridgeEventKind.REQUEST_UPDATE,
+        "http.request GET /big", 2, 0));
+    for (int i = 1; i <= frames; i++) {
+      assertTrue(sink.offerEvent(REC, REC + ":e" + i, REC + ":0",
+          BridgeEventKind.FRAME_ENTER, "app.F.m" + i, 3, 0));
+    }
+  }
+
+  @Test
+  void aRecordingOfMoreThanTwoHundredFramesKeepsItsTailAndResponse() throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(4096, 4L * 1024 * 1024);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofSeconds(5));
+    offerTree(sink, 300);
+    for (int i = 300; i >= 1; i--) {
+      assertTrue(sink.offerEvent(REC, REC + ":x" + i, REC + ":e" + i,
+          BridgeEventKind.FRAME_EXIT, "app.F.m" + i, 4, 0));
+    }
+    assertTrue(sink.offerEvent(REC, REC + ":resp", REC + ":0", BridgeEventKind.RESPONSE,
+        "http.response 200", 5, 200));
+    assertTrue(sink.offerFinish(REC, 1, 6, 200, 0));
+    writer.start();
+    writer.close();
+    assertTrue(transport.batches.size() > 1, "602 events must be split into bounded batches");
+    int total = transport.batches.stream().mapToInt(EventBatch::getEventsCount).sum();
+    assertEquals(2 + 300 + 300, total);
+    EventBatch lastBatch = transport.batches.get(transport.batches.size() - 1);
+    assertEquals(RecordingEventKind.RECORDING_EVENT_KIND_RESPONSE,
+        lastBatch.getEvents(lastBatch.getEventsCount() - 1).getKind());
+    assertFalse(writer.incompleteWasReported());
+  }
+
+  @Test
+  void perRecordingCapOverflowDropsMiddleEventsButNeverTheClosingEventsAndSaysWhy()
+      throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(20_000, 32L * 1024 * 1024);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofSeconds(10));
+    int enters = RecordingWriter.MAX_EVENTS_PER_RECORDING + 100;
+    offerTree(sink, enters);
+    for (int i = 1; i <= 10; i++) {
+      assertTrue(sink.offerEvent(REC, REC + ":x" + i, REC + ":e" + i,
+          BridgeEventKind.FRAME_EXIT, "app.F.m" + i, 4, 0));
+    }
+    assertTrue(sink.offerEvent(REC, REC + ":resp", REC + ":0", BridgeEventKind.RESPONSE,
+        "http.response 500", 5, 500));
+    assertTrue(sink.offerFinish(REC, 1, 6, 500, 0));
+    writer.start();
+    writer.close();
+    assertTrue(transport.batches.size() > 1, "a capped recording is still split into bounded batches");
+    List<xtp.agent.v1.Recording.RecordingEvent> all = new java.util.ArrayList<>();
+    long expectedSeq = 2;
+    for (EventBatch b : transport.batches) {
+      for (var e : b.getEventsList()) {
+        assertEquals(expectedSeq++, e.getRecordingSeq(), "contiguous recording_seq across batches");
+        all.add(e);
+      }
+    }
+    var last = all.get(all.size() - 1);
+    assertEquals(RecordingEventKind.RECORDING_EVENT_KIND_RESPONSE, last.getKind());
+    var gap = all.get(all.size() - 2);
+    assertEquals(RecordingEventKind.RECORDING_EVENT_KIND_GAP, gap.getKind());
+    assertEquals(xtp.agent.v1.Recording.GapReason.GAP_REASON_THROTTLE, gap.getGap().getReason());
+    int kept = RecordingWriter.MAX_EVENTS_PER_RECORDING - RecordingWriter.CLOSING_RESERVE;
+    assertEquals(enters + 1 - kept, gap.getGap().getCount());
+    assertTrue(gap.getGap().getCount() > 0);
+    long exits = all.stream()
+        .filter(e -> e.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_EXIT).count();
+    assertEquals(10, exits);
+  }
+
+  @Test
+  void sinkNeverAdmitsMoreRecordingsThanTheWriterHoldsAndRecoversAfterTheWriteCompletes()
+      throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(256, 1024L * 1024);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofSeconds(5));
+    for (int i = 0; i < 8; i++) {
+      String id = String.format("00000000-0000-4000-8000-%012d", i);
+      assertTrue(sink.offerStart(id, 1, "GET", "/x"));
+      assertTrue(sink.offerEvent(id, id + ":0", "", BridgeEventKind.REQUEST_UPDATE,
+          "http.request GET /x", 2, 0));
+      assertTrue(sink.offerFinish(id, 1, 3, 200, 0));
+    }
+    // All eight finishes are queued, none written: a ninth recording must be refused.
+    assertFalse(sink.offerStart("00000000-0000-4000-8000-000000000099", 1, "GET", "/x"));
+    writer.start();
+    long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+    while (sink.activeRecordings() > 0 && System.nanoTime() < deadline) Thread.sleep(10);
+    assertEquals(0, sink.activeRecordings());
+    assertTrue(sink.offerStart("00000000-0000-4000-8000-000000000098", 1, "GET", "/x"));
+    assertFalse(writer.isStopping());
+    writer.close();
+  }
+
   private static QueueSignal.Event event(
       String id, String parent, int kind, String symbol, int detail) {
     return new QueueSignal.Event(
@@ -171,6 +273,7 @@ class RecordingWriterTest {
 
   private static final class FakeTransport implements RecordingWriter.Transport {
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final List<EventBatch> batches = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     @Override
     public Ack send(String messageId, String correlationToken, Message payload)
@@ -182,6 +285,10 @@ class RecordingWriterTest {
       if (payload instanceof RecordingStarted started) {
         ack.putHighestContiguousRecordingSeq(uuid(started.getRecordingId().toByteArray()), 1);
       } else if (payload instanceof EventBatch batch) {
+        // Daemon-advertised limits: 256 events per batch, 1 MiB per envelope.
+        assertTrue(batch.getEventsCount() <= 256, "batch event bound");
+        assertTrue(batch.getSerializedSize() <= 1024 * 1024 - 4096, "batch byte bound");
+        batches.add(batch);
         long sequence = batch.getEvents(batch.getEventsCount() - 1).getRecordingSeq();
         ack.putHighestContiguousRecordingSeq(uuid(batch.getRecordingId().toByteArray()), sequence);
       } else if (payload instanceof RecordingFinished finished) {
