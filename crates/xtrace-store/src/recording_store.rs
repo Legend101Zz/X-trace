@@ -2773,26 +2773,9 @@ fn project_matching_source(
 const SOURCE_EXTENSIONS: [&str; 12] =
     ["java", "kt", "scala", "groovy", "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
 
-/// Longest accepted repository-relative path, in bytes (CONTRACTS section 3 rule 7).
-const MAX_REPO_RELATIVE_PATH_BYTES: usize = 1024;
-
-/// Write-time gate for a recorded source path (CONTRACTS section 3 rules 6-7): 1 to 1024
-/// bytes, no leading `/`, no backslash, no NUL or other control character, no empty, `.` or
-/// `..` segment and no drive prefix such as `C:`. It does not look at extensions or the
-/// file system; those rules apply only to the read projection.
-pub(crate) fn is_safe_repo_relative_path(path: &str) -> bool {
-    if path.is_empty() || path.len() > MAX_REPO_RELATIVE_PATH_BYTES {
-        return false;
-    }
-    if path.starts_with('/') || path.contains('\\') || path.chars().any(char::is_control) {
-        return false;
-    }
-    let bytes = path.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return false;
-    }
-    path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..")
-}
+/// Write-time gate for a recorded source path (CONTRACTS section 3 rules 6-7): the one domain
+/// function shared with ingest, so the write rules cannot drift between the two.
+pub(crate) use xtrace_domain::is_safe_repo_relative_path;
 
 /// Read-time gate: a path that passes [`is_safe_repo_relative_path`] and may also be
 /// read and shown. No dot-directory segment (`.env`, `.git`, `.xtrace`), no
