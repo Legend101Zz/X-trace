@@ -435,3 +435,72 @@ What S0b delivers on top of P00:
   - `recover_leases` cannot recover leases whose runner was killed mid-run (receipt still `running`).
 
 Next: S1 (#3). The session prompt is in the private execution state's session kit.
+
+## v0.01 unattended wave batch — release candidate rc-1, NOT merged (2026-10-09)
+
+The owner authorized one bounded, unattended ten-hour batch toward issue #1 (ADR 0009: three build waves in place of the per-session phases, no tag, release or publication). Opus 5.5 root, Sonnet 5.5 lanes. The batch ran 05:15–15:15 UTC.
+
+**Outcome.** All work is integrated on the pushed branch `ultra/rc-1` at `dffeb8d88d58e6d81ab052a2b89ccaebfcdc8518`. It is **not merged to `main`**, which stays at `a181a0c`. Two acceptance conditions could not be met in the batch:
+- The leased macOS arm64 23-gate floor could not run. Both builder leases have been retained since 11:02 UTC by a leased run that was killed mid-run, and removing a killed runner's lease needs the owner's approval with recorded proof. No local leased build ran after that point.
+- The final exact-candidate review approves with fixes but leaves ten major findings open (listed below).
+
+**No requirement row is accepted.** `tools/release/check_ledger.py` passes only when all 55 mandatory rows are accepted under an owner-authenticated trust configuration and an accepted release build. Neither exists. `evidence/v0.01/requirements.json` records each row as `in_progress`, `blocked` or `failing` with a public note naming the evidence, the gap and the missing owner input.
+
+Evidence on the exact candidate `dffeb8d` (GitHub Actions):
+- **lane** run 37942590270: green. Rust fmt, clippy and 998 workspace tests passed with 0 failed. TUI PTY suite 30 tests. Java adapter on JDK 17, 21 and 25. Node adapter on Node 22 and 24. Web unit tests and Playwright, plus API drift and embedded-asset checks.
+- **ci** run 37942590330: green. Gates, java-client 17/21, node-client, release-tool-tests, and the Linux x86_64 23-gate release floor for both `jdk17-node22` and `jdk21-node24`.
+- **package** run 37942590293: green. linux-x86_64 and macos-arm64 packages, plus the package content verifier.
+- **campaigns** run 37942593526, against the petclinic upstream pinned at `main@500158f`:
+  - Passed: the uninstrumented baseline (8/8 scenarios); the same 8 scenarios through the packaged `xtrace run` with responses equal to baseline; Linear and Canvas browser journeys at 320, 736 and 1280 px (screenshots in the run's `campaign-petclinic` artifact); `xtrace record`/`xtrace stop` lifecycle; the privacy canary scans.
+  - Failed: per-scenario recording expectations (14 recordings for the 8 scenarios, routes and outcomes not matched, no repository frames); source identity (no frame carries a matched `.java` file and line); the TUI transcript; exports (not implemented in this build).
+  - The other five campaign jobs fail because their instrumented legs are not implemented yet. The directus, medusa and vendure baselines run on ubuntu x86_64.
+- **Reviews:** three independent reviews of the wave-1 integration (40 findings survived adversarial refutation, including 6 blockers; all 6 blockers are fixed on the candidate). Then three independent reviews of the exact candidate: architecture, security and privacy, and build and integration. All approve with fixes, with 0 blockers and 10 majors.
+
+What the candidate adds on top of `a181a0c`:
+- **Contracts:**
+  - ADR 0003 wire additions (bindings, gap, outcome, source-binding states), with golden envelopes checked in Rust, Java and Node.
+  - Domain capture modes and caps, the honesty vocabulary and one shared safe-path gate.
+  - Ingest event rules and the daemon audit redactor, wired before encoding and covered by a canary test.
+  - Store migrations v7 (event-cap bound) and v8 (frame index, populated at commit).
+  - Read API v3 with index-based previous, next, into, over and out navigation, an anchored window, and persisted outcomes.
+  - `init` and `open` idempotency keys are a fixed-length digest of the canonical repository path, tested with a 200+ character path.
+  - Version `0.0.1` for the Rust workspace and the Java adapter (Node packages still at `0.1.0`, see below).
+  - ADR 0010: navigation extras, catalog CLI naming and the exit-code table.
+- **Java:**
+  - A generic Spring MVC request root.
+  - Application scope, the source-identity emitter, and method boundary probes with an outcome sanitizer.
+  - `java -jar` launch hardening.
+  - Diagnostics for the earlier attach flake.
+  - ASM line probes and focused-mode local-variable values, verified with `-Xverify:all` on JDK 17 and 21. These are wired into the agent but not armed by the daemon yet.
+- **Node:** a capture-core refactor, an HTTP/HTTPS request root with status and abort outcomes, `--require` plus `--import` launch, and Express 4 and 5 with journey tests.
+- **Catalog:**
+  - A route normalizer and the static-claim contract.
+  - Java (Spring MVC) and Node (Express, Fastify, Nest) static analyzers.
+  - `xtrace scan` with immutable revisions, history and diff, plus links to observed recordings.
+- **Experience:**
+  - The web app split into modules, with a shared replay state.
+  - A Canvas frame graph with a parallel ARIA tree, alongside Linear.
+  - Honest source and outcome states, and navigation controls on the server API.
+  - A `xtrace-tui` library with snapshot and PTY tests.
+- **Workflow:** deterministic OpenAPI 3.1, Postman 2.1 (local) and cURL recipe generators, and an exercise plan whose preview sends no requests. All have golden tests on fixture input; the `xtrace export` and `xtrace exercise` commands are not wired yet.
+- **Platform:** `xtrace record`, `stop` and `restart`, which signal only an identity-checked daemon PID and seal interrupted recordings as partial; `xtrace doctor` basics; a package content verifier; a safer install test.
+- **CI:**
+  - `lane.yml`: per-branch suites planned from the diff against the merge-base with `main`.
+  - `campaigns.yml`: six projects on ubuntu x86_64 that fail closed, and a privacy canary scanner.
+  - `ultra/*-integration` and `ultra/rc-*` triggers for `ci.yml` and `package.yml` (trigger-only additions).
+
+Open major findings on the candidate (from the final review):
+- The session and daemon record at most 256 requests and 1,024 recordings for their lifetime, because finished recordings are never evicted.
+- The Java static analyzer is not registered in the Gradle build.
+- Focused-mode arming is not wired: the 131,072-event focused cap and line capture cannot be armed.
+- The Node packages still carry version `0.1.0`.
+- The relocated catalog source-proof gate has no test.
+- The hosted macOS arm64 CI job that ADR 0006 §2.3 asks for is missing.
+- Capture scope and source roots do not reach the Java agent from `xtrace run`.
+
+**Incidents, recorded honestly:**
+- **Builder leases retained since 11:02 UTC.** A worker wrapped the leased runner in an external `timeout`, which killed the runner mid-build. The receipt still says `running`, so the recovery tool refuses it, and the leases were not touched. Owner approval is needed. Lesson: never wrap the leased runner in a killer; use its own timeout.
+- **Shared cargo target directory.** It gave stale cross-worktree artifacts and possible false passes on local leased runs. From then on every lane used its own `--target-dir`, and no local leased pass is counted as evidence.
+- **The wave-1 integration branch was red for about four hours.** It was merged mid-wave before its lane was green on strict clippy, which hid every Rust test until it was fixed.
+
+Next: the owner decides on the retained leases. Then the leased macOS floor runs on `ultra/rc-1`, the ten majors are fixed, and the candidate is merged. Owner review steps are in `docs/releases/v0.01-owner-review.md`.
