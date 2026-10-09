@@ -446,10 +446,12 @@ jobs:
     # ignored or skipped test is accepted (--max-ignored 0). Rust, Java, Node and web steps print only allowlisted
     # facts (tools.qa.lane_run keeps raw output in a private log). prepare-private-root exports the scratch
     # environment (TMPDIR, TMP, TEMP, XTRACE_TEST_PRIVATE_SCRATCH, XTRACE_TEST_SCRATCH_ROOT) for every later step.
-    # The ADR 0006 2.3 other-UID negative (tools.qa.other_uid_negative) creates a second local user on the runner
-    # (sudo is fine inside the hosted job), makes a real store with `xtrace init`, and requires that the user can
-    # neither list nor read it. Its ok-marker is checked by an `if: always()` step, so a skipped, failed or
-    # store-less run fails the job.
+    # The ADR 0006 2.3 other-UID private-storage substitute (tools.qa.other_uid_negative) creates a second local user
+    # on the runner (sudo is fine inside the hosted job), makes a real store with `xtrace init`, and requires that
+    # the user reaches the store's parent but can neither list, read, write nor replace anything in the store, and
+    # that no store entry has an ACL allow entry. Its ok-marker is checked by an `if: always()` step, so a skipped,
+    # failed or store-less run fails the job.
+    # NOT COVERED until broker code exists: other-UID broker negative (ADR 0006 addendum 2026-10-10, item 3)
     needs: release-tool-tests
     runs-on: macos-15
     timeout-minutes: 180
@@ -596,12 +598,12 @@ jobs:
             bash -ec '
               oid="$XTRACE_CI_PRIVATE_ROOT/oid"
               mkdir -m 700 "$oid" "$oid/repo"
-              # The data home sits under its own traversable (0711) parent outside the 0700 private root, so the
-              # other user is first denied at the store boundary itself.
-              mkdir -m 711 "$RUNNER_TEMP/xt-oid"
+              # The data home sits under its own listable and traversable (0755) parent outside the 0700 private
+              # root, so the other user is first denied at the product-created store directory itself.
+              mkdir -m 755 "$RUNNER_TEMP/xt-oid"
               XTRACE_DATA_HOME="$RUNNER_TEMP/xt-oid/userdata" target/debug/xtrace init --project-dir "$oid/repo" --display-name OtherUid
             '
-      - name: Other-UID negative (cannot traverse or read the store)
+      - name: Other-UID private-storage substitute (cannot traverse, read or write the store)
         if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.other_uid_negative check \
