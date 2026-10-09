@@ -1,0 +1,455 @@
+package linecorpus;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.IntSupplier;
+import java.util.function.Supplier;
+
+/**
+ * Tricky-method corpus. Each public static s_* method returns a String that must be identical with
+ * and without instrumentation. A line tagged //@name contains exactly one Trace.hit statement: the
+ * probe events that land on tagged lines must equal the hit sequence.
+ */
+public final class LineCorpus {
+  private LineCorpus() {}
+
+  public static String s_straight() {
+    int a = 1;
+    Trace.hit("st1", "a=" + a); //@st1
+    int b = a + 41;
+    Trace.hit("st2", "a=" + a + ",b=" + b); //@st2
+    long big = 1L << 40;
+    double d = 2.5;
+    Trace.hit("st3", "big=" + big + ",d=" + d); //@st3
+    return "r" + (a + b) + big + d;
+  }
+
+  public static String s_loops() {
+    int sum = 0;
+    for (int i = 0; i < 4; i++) {
+      if (i == 1) {
+        continue;
+      }
+      Trace.hit("lp1", "i=" + i + ",sum=" + sum); //@lp1
+      sum += i;
+    }
+    int j = 0;
+    while (j < 3) {
+      Trace.hit("lp2", "j=" + j); //@lp2
+      j++;
+    }
+    do {
+      Trace.hit("lp3", "j=" + j); //@lp3
+      j--;
+    } while (j > 1);
+    outer:
+    for (int x = 0; x < 3; x++) {
+      for (int y = 0; y < 3; y++) {
+        if (y == 2) {
+          break;
+        }
+        if (x == 2) {
+          break outer;
+        }
+        Trace.hit("lp4", "x=" + x + ",y=" + y); //@lp4
+      }
+    }
+    return "sum" + sum + "j" + j;
+  }
+
+  private static int risky(int v) {
+    if (v == 2) {
+      throw new IllegalStateException("boom" + v);
+    }
+    return v * 2;
+  }
+
+  public static String s_tryCatchFinally() {
+    StringBuilder out = new StringBuilder();
+    for (int i = 0; i < 4; i++) {
+      try {
+        Trace.hit("tc1", "i=" + i); //@tc1
+        out.append(risky(i));
+      } catch (IllegalStateException e) {
+        Trace.hit("tc2", "i=" + i); //@tc2
+        out.append("E").append(e.getStackTrace()[0].getLineNumber() > 0);
+      } finally {
+        Trace.hit("tc3", "i=" + i); //@tc3
+        out.append('f');
+      }
+    }
+    return out + nested() + earlyReturn(1) + earlyReturn(2);
+  }
+
+  private static String nested() {
+    try {
+      try {
+        Trace.hit("tn1"); //@tn1
+        throw new RuntimeException("inner");
+      } finally {
+        Trace.hit("tn2"); //@tn2
+      }
+    } catch (RuntimeException e) {
+      Trace.hit("tn3"); //@tn3
+      return e.getMessage();
+    }
+  }
+
+  private static String earlyReturn(int v) {
+    try {
+      if (v == 1) {
+        Trace.hit("er1"); //@er1
+        return "one";
+      }
+      Trace.hit("er2"); //@er2
+      return "other";
+    } finally {
+      Trace.hit("er3"); //@er3
+    }
+  }
+
+  public static String s_switches() {
+    StringBuilder out = new StringBuilder();
+    for (int i = 0; i < 6; i++) {
+      switch (i) {
+        case 0:
+          Trace.hit("sw0"); //@sw0
+        case 1:
+          Trace.hit("sw1"); //@sw1
+          break;
+        case 4:
+          Trace.hit("sw4"); //@sw4
+          break;
+        case 100:
+        default:
+          Trace.hit("swd"); //@swd
+      }
+    }
+    for (String s : new String[] {"a", "bb", "zz"}) {
+      switch (s) {
+        case "a":
+          Trace.hit("ss1"); //@ss1
+          out.append(1);
+          break;
+        case "bb":
+          Trace.hit("ss2"); //@ss2
+          out.append(2);
+          break;
+        default:
+          Trace.hit("ss3"); //@ss3
+          out.append(3);
+      }
+    }
+    for (Color c : Color.values()) {
+      int v =
+          switch (c) {
+            case RED -> {
+              Trace.hit("se1"); //@se1
+              yield 10;
+            }
+            case GREEN -> 20;
+            default -> {
+              Trace.hit("se2"); //@se2
+              yield 30;
+            }
+          };
+      out.append(v);
+    }
+    return out.toString();
+  }
+
+  enum Color {
+    RED,
+    GREEN {
+      @Override
+      String label() {
+        Trace.hit("en1"); //@en1
+        return "g";
+      }
+    },
+    BLUE;
+
+    String label() {
+      return name();
+    }
+  }
+
+  public static String s_lambdas() {
+    int base = 7;
+    IntSupplier sup =
+        () -> {
+          Trace.hit("la1", "base=" + base); //@la1
+          return base * 2;
+        };
+    Supplier<String> s2 = () -> "x" + sup.getAsInt();
+    Runnable r =
+        new Runnable() {
+          @Override
+          public void run() {
+            Trace.hit("la2"); //@la2
+          }
+        };
+    r.run();
+    class Local {
+      int twice(int v) {
+        Trace.hit("la3", "v=" + v); //@la3
+        return v * 2;
+      }
+    }
+    List<Integer> list = new ArrayList<>();
+    for (int i = 0; i < 2; i++) {
+      list.add(new Local().twice(i));
+    }
+    return s2.get() + list;
+  }
+
+  static class Base {
+    final int v;
+
+    Base(int v) {
+      this.v = v;
+    }
+  }
+
+  static class Derived extends Base {
+    int field = initField(); // plain field initialiser
+    final String note;
+
+    {
+      Trace.hit("ct1"); //@ct1
+    }
+
+    Derived(int a, int b) {
+      super(
+          compute(
+              a,
+              b));
+      Trace.hit("ct2", "a=" + a + ",b=" + b); //@ct2
+      note = "n" + v;
+    }
+
+    Derived(int a) {
+      this(a, a + 1);
+      Trace.hit("ct3", "a=" + a); //@ct3
+    }
+
+    static int compute(int a, int b) {
+      Trace.hit("ct4", "a=" + a + ",b=" + b); //@ct4
+      return a * 10 + b;
+    }
+
+    int initField() {
+      return 5;
+    }
+  }
+
+  public static String s_ctors() {
+    Derived d = new Derived(3);
+    return d.note + d.field;
+  }
+
+  public static String s_sync() {
+    Object lock = new Object();
+    int n = 0;
+    synchronized (lock) {
+      Trace.hit("sy1", "n=" + n); //@sy1
+      n++;
+    }
+    try {
+      synchronized (lock) {
+        Trace.hit("sy2", "n=" + n); //@sy2
+        throw new IllegalArgumentException("x");
+      }
+    } catch (IllegalArgumentException e) {
+      Trace.hit("sy3", "n=" + n); //@sy3
+    }
+    return "n" + n;
+  }
+
+  static class Res implements AutoCloseable {
+    final String name;
+
+    Res(String name) {
+      this.name = name;
+    }
+
+    @Override
+    public void close() {
+      Trace.hit("rs0"); //@rs0
+      throw new IllegalStateException("close " + name);
+    }
+  }
+
+  public static String s_twr() {
+    String tw = "tw";
+    try (Res a = new Res("a");
+        Res b = new Res("b")) {
+      Trace.hit("rs1", "tw=" + tw); //@rs1
+      throw new RuntimeException("body");
+    } catch (RuntimeException e) {
+      Trace.hit("rs2"); //@rs2
+      return e.getMessage() + e.getSuppressed().length;
+    }
+  }
+
+  public static String s_multilineExpr() {
+    int a = 2;
+    int b = 3;
+    String s =
+        String.valueOf(
+            sum3(
+                a,
+                inc(
+                    b),
+                inc(inc(a))));
+    Trace.hit("ml1", "s=" + s); //@ml1
+    boolean flag = a > 1
+        && b > 2
+        || inc(a) > 100;
+    Trace.hit("ml2", "flag=" + flag); //@ml2
+    return s + flag;
+  }
+
+  private static int sum3(int x, int y, int z) {
+    return x + y + z;
+  }
+
+  private static int inc(int x) {
+    return x + 1;
+  }
+
+  public static String s_definiteAssignment() {
+    int x;
+    if (inc(0) > 0) {
+      x = 1;
+    } else {
+      x = 2;
+    }
+    Trace.hit("da1", "x=" + x); //@da1
+    final String label;
+    switch (x) {
+      case 1:
+        label = "one";
+        break;
+      default:
+        label = "many";
+    }
+    Trace.hit("da2", "x=" + x + ",label=" + label); //@da2
+    int y;
+    try {
+      y = risky(1);
+    } catch (RuntimeException e) {
+      y = -1;
+    }
+    Trace.hit("da3", "y=" + y); //@da3
+    return label + x + y;
+  }
+
+  public static String s_manyCases() {
+    int total = 0;
+    for (int i = 0; i < 12; i++) {
+      switch (i) {
+        case 0: total += 1; break;
+        case 1: total += 2; break;
+        case 2: total += 3; break;
+        case 3: total += 4; break;
+        case 5: total += 6; break;
+        case 8: total += 9; break;
+        case 9: total += 10; break;
+        case 11: total += 12; break;
+        default:
+          Trace.hit("mc1", "i=" + i); //@mc1
+      }
+    }
+    return "t" + total;
+  }
+
+  public static String s_widePrims() {
+    long l = 123456789012L;
+    double d = 1.25;
+    float f = 2.5f;
+    char c = 'q';
+    byte by = (byte) -3;
+    short sh = (short) 300;
+    boolean z = true;
+    String str = "text";
+    Trace.hit("wp1", "l=" + l + ",d=" + d + ",f=" + f + ",c=" + c + ",by=" + by + ",sh=" + sh + ",z=" + z + ",str=" + str); //@wp1
+    return "" + l + d + f + c + by + sh + z + str;
+  }
+
+  public static String s_secretNames() {
+    String password = "xtrace-canary-0001";
+    String apiKey = "xtrace-canary-0002";
+    String plain = "visible";
+    Trace.hit("sn1", "plain=" + plain); //@sn1
+    return plain + password.length() + apiKey.length();
+  }
+
+  public static String s_stackTraceLines() {
+    try {
+      Object o = null;
+      Trace.hit("sl1"); //@sl1
+      return o.toString();
+    } catch (NullPointerException e) {
+      StackTraceElement top = e.getStackTrace()[0];
+      return top.getMethodName() + ":" + top.getLineNumber();
+    }
+  }
+
+  public static String s_exceptionEscapes() {
+    try {
+      deep(3);
+    } catch (RuntimeException e) {
+      StringBuilder b = new StringBuilder();
+      for (StackTraceElement el : e.getStackTrace()) {
+        if (el.getClassName().startsWith("linecorpus.")) {
+          b.append(el.getMethodName()).append(':').append(el.getLineNumber()).append(';');
+        }
+      }
+      return b.toString();
+    }
+    return "none";
+  }
+
+  private static void deep(int n) {
+    if (n == 0) {
+      throw new IllegalStateException("bottom");
+    }
+    deep(n - 1);
+  }
+
+  interface Shape {
+    double area();
+
+    default String describe() {
+      Trace.hit("if1"); //@if1
+      return "area" + area();
+    }
+
+    static Shape unit() {
+      Trace.hit("if2"); //@if2
+      return () -> 1.0;
+    }
+  }
+
+  record Pt(int x, int y) implements Comparable<Pt> {
+    @Override
+    public int compareTo(Pt o) {
+      Trace.hit("rc1"); //@rc1
+      return Integer.compare(x, o.x);
+    }
+  }
+
+  public static String s_interfacesAndRecords() {
+    Comparable<Pt> c = new Pt(1, 2); // calls the synthetic bridge compareTo(Object)
+    int cmp = c.compareTo(new Pt(3, 4));
+    Object o = new Pt(5, 6);
+    String pat = "no";
+    if (o instanceof Pt p && p.x() == 5) {
+      pat = "yes" + p.y();
+    }
+    return Shape.unit().describe() + cmp + pat + """
+        text
+        block""".length();
+  }
+}

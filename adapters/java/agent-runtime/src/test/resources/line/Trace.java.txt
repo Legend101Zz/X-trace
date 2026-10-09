@@ -1,0 +1,19 @@
+package linecorpus;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/** Ground-truth recorder: statements call hit(tag) so the test never has to predict javac tables. */
+public final class Trace {
+  public static final List<String> HITS = new ArrayList<>();
+
+  private Trace() {}
+
+  public static void hit(String tag) {
+    HITS.add(tag + "|");
+  }
+
+  public static void hit(String tag, String details) {
+    HITS.add(tag + "|" + details);
+  }
+}
