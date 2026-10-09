@@ -155,7 +155,8 @@ fn secret_word_routes_and_prose_descriptions_export() {
         .collect();
     for format in [ExportFormat::OpenApi, ExportFormat::Curl, ExportFormat::Postman] {
         let out = export(&input, &ExportRequest::new(format))
-            .unwrap_or_else(|e| panic!("{format:?} refused: {e}"));
+            .map_err(|e| format!("{format:?} refused: {e}"))
+            .expect("every format exports the multi-route input");
         let all: String = out.files.iter().map(|f| text(f).to_owned()).collect();
         for r in routes {
             assert!(all.contains(r), "{format:?} lost route {r}");
