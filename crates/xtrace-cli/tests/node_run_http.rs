@@ -96,6 +96,77 @@ fn direct_node_http_run_persists_private_concurrent_cjs_and_esm_recordings_acros
     assert_recording_evidence(&reopened, &repo, &data_home);
 }
 
+/// `--node-mode auto` injects the `--require` preload only; it must capture CommonJS and ES module
+/// entries once each without perturbing a CommonJS entry's `nextTick`/microtask ordering.
+#[test]
+fn auto_mode_records_cjs_and_esm_entries_once_each() {
+    let root = temp_root();
+    let repo = root.path().join("repository");
+    let data_home = root.path().join("data");
+    std::fs::create_dir_all(&repo).expect("create repository");
+    let init = cli()
+        .args(["init", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("initialize project");
+    assert!(init.status.success(), "init failed: {}", diagnostic(&init));
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let adapter_dist = workspace.join("adapters/node/packages/adapter-core/dist");
+    assert!(
+        adapter_dist.join("manifest.sha256").is_file(),
+        "run `npm run build:core --offline` before this test"
+    );
+
+    run_application_as(&repo, &data_home, &adapter_dist, "auto", "cjs");
+    let first = list_recordings(&repo, &data_home);
+    assert_eq!(first["recordings"].as_array().expect("recordings").len(), 2);
+    assert_recording_evidence(&first, &repo, &data_home);
+    run_application_as(&repo, &data_home, &adapter_dist, "auto", "esm");
+    let second = list_recordings(&repo, &data_home);
+    assert_eq!(second["recordings"].as_array().expect("recordings").len(), 4);
+    assert_recording_evidence(&second, &repo, &data_home);
+}
+
+#[test]
+fn auto_mode_keeps_next_tick_before_promise_microtask_for_a_cjs_entry() {
+    let root = temp_root();
+    let repo = root.path().join("repository");
+    let data_home = root.path().join("data");
+    std::fs::create_dir_all(&repo).expect("create repository");
+    let init = cli()
+        .args(["init", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("initialize project");
+    assert!(init.status.success(), "init failed: {}", diagnostic(&init));
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let adapter_dist = workspace.join("adapters/node/packages/adapter-core/dist");
+    let app = root.path().join("ordering.cjs");
+    std::fs::write(
+        &app,
+        "const order = [];\nsetImmediate(() => { order.push('immediate'); console.log('ORDER ' + order.join(',')); });\nPromise.resolve().then(() => order.push('microtask'));\nprocess.nextTick(() => order.push('tick'));\n",
+    )
+    .expect("write ordering fixture");
+    let output = cli()
+        .args(["run", "--project-dir"])
+        .arg(&repo)
+        .args(["--node-adapter"])
+        .arg(adapter_dist)
+        .args(["--node-mode", "auto", "--", "node"])
+        .arg(app)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("run ordering fixture");
+    assert!(output.status.success(), "run failed: {}", diagnostic(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ORDER tick,microtask,immediate"),
+        "auto mode perturbed CommonJS ordering: {stdout}"
+    );
+}
+
 #[test]
 fn direct_node_run_preserves_application_exit_code() {
     let root = temp_root();
@@ -133,6 +204,18 @@ fn direct_node_run_preserves_application_exit_code() {
 }
 
 fn run_application(repo: &Path, data_home: &Path, adapter_dist: &Path, mode: &str) {
+    run_application_as(repo, data_home, adapter_dist, mode, mode);
+}
+
+/// `launch_mode` is the `--node-mode` value; `entry` is the module system of the application file.
+fn run_application_as(
+    repo: &Path,
+    data_home: &Path,
+    adapter_dist: &Path,
+    launch_mode: &str,
+    entry: &str,
+) {
+    let mode = entry;
     let root = repo.parent().expect("temporary root");
     let extension = if mode == "cjs" { "cjs" } else { "mjs" };
     let app = root.join(format!("http-app-{mode}.{extension}"));
@@ -169,7 +252,7 @@ server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => console.log('NODE
             .arg(repo)
             .args(["--node-adapter"])
             .arg(adapter_dist)
-            .args(["--node-mode", mode, "--", "node", "--no-warnings"])
+            .args(["--node-mode", launch_mode, "--", "node", "--no-warnings"])
             .arg(&app)
             .env("XTRACE_DATA_HOME", data_home)
             .env("APP_PORT", port.to_string())
@@ -201,7 +284,7 @@ server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => console.log('NODE
     });
     let ready = line_receiver.recv_timeout(Duration::from_secs(10)).expect("Node app readiness");
     assert_eq!(ready.trim(), "NODE_HTTP_READY", "unexpected child output: {ready}");
-    let canary = format!("NODE_PRIVATE_CANARY_{mode}_4a7");
+    let canary = format!("NODE_PRIVATE_CANARY_{launch_mode}_{mode}_4a7");
     let first = canary.clone();
     let second = canary.clone();
     let address = format!("127.0.0.1:{port}");
@@ -276,12 +359,43 @@ fn assert_recording_evidence(page: &Value, repo: &Path, data_home: &Path) {
         let detail: Value = serde_json::from_slice(&output.stdout).expect("recording detail JSON");
         let events = detail["events"].as_array().expect("persisted events");
         assert!(
-            events.iter().any(|event| event["symbol"] == "node:http.createServer.listener"),
+            events.iter().any(|event| event["symbol"] == "node:http.Server.request"),
             "missing real HTTP application callback evidence"
         );
         assert!(
             events.iter().any(|event| event["symbol"] == "node:http.response.finish"),
             "missing observed response finish"
+        );
+        // One root per request: the application callback frame is entered and exited exactly once,
+        // events are contiguous from sequence 2, and the response hangs off the root.
+        let kinds: Vec<(&str, &str)> = events
+            .iter()
+            .map(|event| {
+                (
+                    event["kind"].as_str().expect("event kind"),
+                    event["symbol"].as_str().expect("event symbol"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("recording_event_kind:frame_enter", "node:http.Server.request"),
+                ("recording_event_kind:frame_exit", "node:http.Server.request"),
+                ("recording_event_kind:response", "node:http.response.finish"),
+            ],
+            "exactly one root frame and one response per request"
+        );
+        let sequences: Vec<&str> =
+            events.iter().map(|event| event["sequence"].as_str().expect("sequence")).collect();
+        assert_eq!(sequences, ["2", "3", "4"]);
+        let root_id = events[0]["event_id"].as_str().expect("root event id");
+        assert_eq!(events[2]["parent_event_id"], root_id, "response is a child of the root frame");
+        assert!(
+            !events.iter().any(|event| event["symbol"]
+                .as_str()
+                .is_some_and(|s| s.contains("one") || s.contains("two"))),
+            "request path must not appear in event symbols"
         );
         // `unavailable.completion` reports whether durable terminal evidence exists; it is no
         // HTTP outcome projection. The recording must carry verified completion evidence.

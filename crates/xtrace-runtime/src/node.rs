@@ -62,9 +62,16 @@ impl LaunchError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Explicit Node module mode used to select the adapter preload.
 pub enum NodeMode {
-    /// CommonJS application launched with `--require`.
+    /// Only the `--require` preload is injected. The adapter patches `node:http`, which is
+    /// independent of the module system, so one preload captures CommonJS and ES module entries
+    /// alike and leaves a CommonJS entry on Node's CommonJS loader. `--import` is deliberately
+    /// not used here: it makes Node load a CommonJS entry through the ES module loader, which
+    /// flips `process.nextTick` versus promise microtask ordering and adds stack frames
+    /// (verified on Node 22.23.0). Use `EsModule` to add the `--import` preload explicitly.
+    Auto,
+    /// CommonJS application launched with `--require` only.
     CommonJs,
-    /// ES module application launched with `--import`.
+    /// ES module application launched with `--import` only.
     EsModule,
 }
 
@@ -72,9 +79,10 @@ impl NodeMode {
     /// Parses only the documented short mode names.
     pub fn parse(value: &str) -> Result<Self, LaunchError> {
         match value {
+            "auto" => Ok(Self::Auto),
             "cjs" => Ok(Self::CommonJs),
             "esm" => Ok(Self::EsModule),
-            _ => Err(LaunchError::Validation("Node mode must be cjs or esm")),
+            _ => Err(LaunchError::Validation("Node mode must be auto, cjs or esm")),
         }
     }
 }
@@ -84,7 +92,6 @@ impl NodeMode {
 pub struct NodeLaunch {
     executable: PathBuf,
     adapter: PathBuf,
-    preload: PathBuf,
     mode: NodeMode,
     arguments: Vec<OsString>,
     original_options: Option<OsString>,
@@ -150,10 +157,6 @@ impl NodeLaunch {
             .canonicalize()
             .map_err(|_| LaunchError::Validation("the Node adapter distribution is unavailable"))?;
         validate_distribution(&adapter)?;
-        let preload = adapter.join(match mode {
-            NodeMode::CommonJs => "register.cjs",
-            NodeMode::EsModule => "register.mjs",
-        });
         let original_options = env("NODE_OPTIONS");
         if let Some(options) = original_options.as_ref() {
             let text = options
@@ -173,14 +176,7 @@ impl NodeLaunch {
                 ));
             }
         }
-        Ok(Self {
-            executable,
-            adapter,
-            preload,
-            mode,
-            arguments: arguments.to_vec(),
-            original_options,
-        })
+        Ok(Self { executable, adapter, mode, arguments: arguments.to_vec(), original_options })
     }
 
     /// Returns the canonical executable selected during preflight.
@@ -199,23 +195,33 @@ impl NodeLaunch {
         self.mode
     }
 
-    /// Spawns the direct Node child with one private preloader and bootstrap.
+    /// Builds the child's `NODE_OPTIONS`: the application's own options first, then the adapter
+    /// preloads this mode selects (`--require` for CommonJS and Auto, `--import` for ESM).
+    fn node_options(&self) -> Result<String, LaunchError> {
+        let mut options =
+            self.original_options.as_ref().and_then(|v| v.to_str()).unwrap_or("").to_owned();
+        let mut push = |flag: String| {
+            if !options.is_empty() {
+                options.push(' ');
+            }
+            options.push_str(&flag);
+        };
+        if matches!(self.mode, NodeMode::Auto | NodeMode::CommonJs) {
+            let value = quote_node_option(&self.adapter.join("register.cjs"))?;
+            push(format!("--require={value}"));
+        }
+        if matches!(self.mode, NodeMode::EsModule) {
+            let value = file_url(&self.adapter.join("register.mjs"))?;
+            push(format!("--import={value}"));
+        }
+        Ok(options)
+    }
+
+    /// Spawns the direct Node child with the adapter preloads and bootstrap.
     pub fn spawn(&self, bootstrap: &Path) -> Result<NodeChild, LaunchError> {
         use std::os::unix::process::CommandExt as _;
         use tokio::process::Command;
-        let preload_value = match self.mode {
-            NodeMode::CommonJs => quote_node_option(&self.preload)?,
-            NodeMode::EsModule => file_url(&self.preload)?,
-        };
-        let mut options =
-            self.original_options.as_ref().and_then(|v| v.to_str()).unwrap_or("").to_owned();
-        if !options.is_empty() {
-            options.push(' ');
-        }
-        match self.mode {
-            NodeMode::CommonJs => options.push_str(&format!("--require={preload_value}")),
-            NodeMode::EsModule => options.push_str(&format!("--import={preload_value}")),
-        }
+        let options = self.node_options()?;
         let mut command = Command::new(&self.executable);
         command
             .args(&self.arguments)
@@ -827,6 +833,32 @@ fn terminate_probe(child: &mut std::process::Child, pid: u32) -> Result<(), Laun
     if group_cleanup_failed || !reaped { Err(LaunchError::Process) } else { Ok(()) }
 }
 
+/// Files every launchable adapter dist must carry and hash: both preloads, the generated
+/// capability manifest, and the capture entry points they load.
+const REQUIRED_DIST_FILES: &[&str] = &[
+    "bootstrap.js",
+    "capture-start.cjs",
+    "errors.js",
+    "framing.js",
+    "handshake.js",
+    "http-capture.cjs",
+    "index.js",
+    "manifest.cjs",
+    "modules.cjs",
+    "node-capabilities.json",
+    "register.cjs",
+    "register.mjs",
+    "runtime/context.cjs",
+    "runtime/events.cjs",
+    "runtime/registry.cjs",
+    "runtime/transport.cjs",
+    "send-queue.js",
+    "session.js",
+    "start-capture.js",
+    "transport-worker.js",
+    "worker-core.js",
+];
+
 fn validate_distribution(root: &Path) -> Result<(), LaunchError> {
     use std::collections::{BTreeMap, BTreeSet};
     let owner = rustix::process::getuid().as_raw();
@@ -857,9 +889,7 @@ fn validate_distribution(root: &Path) -> Result<(), LaunchError> {
     collect_files(root, root, owner, &mut actual)?;
     if declared.len() != actual.len()
         || declared.keys().any(|name| !actual.contains(name))
-        || !declared.contains_key("register.cjs")
-        || !declared.contains_key("register.mjs")
-        || !declared.contains_key("node-http-manifest.json")
+        || REQUIRED_DIST_FILES.iter().any(|name| !declared.contains_key(*name))
     {
         return Err(LaunchError::Validation("the Node adapter manifest membership does not match"));
     }
@@ -1029,7 +1059,72 @@ mod tests {
     fn module_mode_is_explicit_and_closed() {
         assert_eq!(NodeMode::parse("cjs").unwrap(), NodeMode::CommonJs);
         assert_eq!(NodeMode::parse("esm").unwrap(), NodeMode::EsModule);
+        assert_eq!(NodeMode::parse("auto").unwrap(), NodeMode::Auto);
         assert_eq!(NodeMode::parse("guess").unwrap_err().code(), "XTR-NODE-INVALID-LAUNCH");
+    }
+
+    fn launch_for(mode: NodeMode, original: Option<&str>) -> NodeLaunch {
+        NodeLaunch {
+            executable: PathBuf::from("/usr/bin/node"),
+            adapter: PathBuf::from("/adapter dir"),
+            mode,
+            arguments: Vec::new(),
+            original_options: original.map(OsString::from),
+        }
+    }
+
+    #[test]
+    fn auto_mode_injects_the_require_preload_only() {
+        let options =
+            launch_for(NodeMode::Auto, Some("--max-old-space-size=64")).node_options().unwrap();
+        assert_eq!(options.matches("--require=").count(), 1, "{options}");
+        assert_eq!(options.matches("--import").count(), 0, "{options}");
+        assert_eq!(options, "--max-old-space-size=64 --require=\"/adapter dir/register.cjs\"");
+    }
+
+    #[test]
+    fn explicit_cjs_and_esm_modes_still_inject_exactly_one_preload() {
+        let cjs = launch_for(NodeMode::CommonJs, None).node_options().unwrap();
+        assert!(cjs.starts_with("--require=") && !cjs.contains("--import"), "{cjs}");
+        let esm = launch_for(NodeMode::EsModule, None).node_options().unwrap();
+        assert!(esm.starts_with("--import=") && !esm.contains("--require"), "{esm}");
+    }
+
+    #[test]
+    fn distribution_requires_every_listed_file_and_new_loader_entrypoints() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let build = |omit: Option<&str>| {
+            let directory = tempfile::tempdir().expect("fixture directory");
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("owner-only directory");
+            let owner = rustix::process::getuid().as_raw();
+            let mut lines = Vec::new();
+            for name in REQUIRED_DIST_FILES.iter().filter(|name| Some(**name) != omit) {
+                let path = directory.path().join(name);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("fixture dir");
+                std::fs::write(&path, format!("// {name}\n")).expect("fixture file");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("owner-only file");
+                let digest = sha256(&path, owned_file(&path, owner).expect("stamp")).expect("hash");
+                lines.push(format!("{digest}  {name}"));
+            }
+            let manifest = directory.path().join("manifest.sha256");
+            std::fs::write(&manifest, format!("{}\n", lines.join("\n"))).expect("manifest");
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o600))
+                .expect("owner-only manifest");
+            directory
+        };
+        let complete = build(None);
+        validate_distribution(complete.path()).expect("complete dist validates");
+        for name in REQUIRED_DIST_FILES {
+            let partial = build(Some(name));
+            assert!(
+                validate_distribution(partial.path()).is_err(),
+                "dist without {name} must be rejected"
+            );
+        }
+        assert!(REQUIRED_DIST_FILES.contains(&"node-capabilities.json"));
+        assert!(!REQUIRED_DIST_FILES.contains(&"node-http-manifest.json"));
     }
 
     #[test]
