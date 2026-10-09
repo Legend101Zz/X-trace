@@ -366,12 +366,13 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         if canaries:
             notes["canaryRequests"] = send_canary_requests(stack.base, canaries, extra_canary_paths)
     finally:
-        try:
+        stack.down()  # SIGTERM to the launcher we started; `xtrace run` forwards it and drains the daemon
+        try:  # after the stop, so the launcher's own closing diagnostics are in the log
             (out_dir / "application.log").write_text(stack.logs())
         except Exception:
             pass
-        stack.down()  # SIGTERM to the launcher process group we started; `xtrace run` drains the daemon
     xcamp.REQUEST_HOOK = None
+    notes["launcherExitCode"] = getattr(stack, "launcher_exit", None)
 
     # product lifecycle commands that exist in the CLI surface: exit code 9 means "not implemented yet"
     stop = subprocess.run([xtrace, "stop", "--project-dir", str(project_dir)], env=env, capture_output=True, text=True, timeout=60)
@@ -416,6 +417,8 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         "durationSeconds": round(time.time() - started, 1), "notes": notes,
         "api": {"ok": api["ok"], "reason": api["reason"], "recordings": len(api["recordings"])},
         "problemClasses": problem_classes(verdicts), "scenarios": scen_out,
+        "recordingsWithSource": sum(e["recordingsWithSource"] for v in verdicts.values() for e in v["expectations"]),
+        "recordingsWithStatus": sum(e["recordingsWithStatus"] for v in verdicts.values() for e in v["expectations"]),
         "result": "recorded" if api["ok"] and results else "failed",
     }
     (out_dir / "receipt.json").write_text(json.dumps(receipt, indent=1, sort_keys=True))

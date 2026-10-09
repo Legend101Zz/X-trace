@@ -56,6 +56,25 @@ jobs:
           set -eu
           sh packaging/install.sh verify-dist "dist/${{ matrix.platform }}"
           sh packaging/test/install_test.sh "dist/${{ matrix.platform }}"
+      - name: Package verifier present on this branch?
+        id: verifier
+        run: |
+          if [ -f packaging/verify_package.py ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=package verifier absent::packaging/verify_package.py is not on this branch; the package content checks did NOT run (a skip, not a pass)"
+            echo "package content verification: NOT RUN (packaging/verify_package.py absent on this branch)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Package unit tests
+        if: steps.verifier.outputs.present == 'true'
+        run: python3 -B -m unittest discover -s packaging/test -p 'test_*.py'
+      - name: Verify package contents
+        if: steps.verifier.outputs.present == 'true'
+        run: |
+          set -eu
+          python3 -B packaging/verify_package.py "$(ls dist/${{ matrix.platform }}/xtrace-*-${{ matrix.platform }}.tar.gz)" \
+            --run-binary --repo . --out "dist/${{ matrix.platform }}/package-verification.json"
       - name: Compare archive hash with the reproducibility build
         run: |
           python3 - "dist/${{ matrix.platform }}" "$RUNNER_TEMP/repro/repro.json" <<'PY'

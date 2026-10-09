@@ -57,6 +57,9 @@ def owner_form(first, last, tel="6085550100", addr="1 Synthetic Way", city="Test
 OWNER_SQL = ("select first_name,last_name,address,city,telephone from owners "
              "where last_name like '{p}%' order by last_name,first_name")
 ID_NORM = [(r"/owners/\d+", "/owners/<ID>")]
+# The upstream visit form renders `min=<tomorrow>` (today + 1 day) on every re-render, so the rejected past-dated visit page
+# changes with the calendar. Root cause of the pet-and-visit-flow fingerprint drift (2026-10-09); normalized, not hidden.
+DATE_NORM = [(r'min="\d{4}-\d{2}-\d{2}"', 'min="<TOMORROW>"')]
 STATE: dict = {}
 
 
@@ -98,7 +101,7 @@ def s_pet_visit(c):
           "join owners o on o.id=p.owner_id where o.last_name='Campaign' order by p.name")
     pet_id = c.stack.psql("select p.id from pets p join owners o on o.id=p.owner_id where o.last_name='Campaign' and p.name='Rex'")[0][0]
     past = c.http("POST", f"{path}/pets/{pet_id}/visits/new", form={"date": "2020-01-05", "description": "past visit"},
-                  label="past-dated visit", norm=ID_NORM + [(r"/pets/\d+", "/pets/<ID>")])
+                  label="past-dated visit", norm=ID_NORM + [(r"/pets/\d+", "/pets/<ID>")] + DATE_NORM)
     c.check("past-dated visit rejected (200 form, no redirect)", past["status"] == 200 and "location" not in past["headers"])
     r = c.http("POST", f"{path}/pets/{pet_id}/visits/new", form={"date": "2099-01-05", "description": "synthetic checkup"},
                norm=ID_NORM + [(r"/pets/\d+", "/pets/<ID>")])

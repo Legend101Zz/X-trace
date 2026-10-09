@@ -82,6 +82,10 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step qa-unit-tests --min-passed 1 \
             --out "$RUNNER_TEMP/lane-frag" -- python3 -B -m unittest discover -s tools/qa -p "test_*.py"
+      - name: Campaign library unit tests
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.qa.lane_run run --suite meta --step campaign-lib-unit-tests --min-passed 1 \
+            --out "$RUNNER_TEMP/lane-frag" -- python3 -B -m unittest discover -s campaigns/lib -p "test_*.py"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

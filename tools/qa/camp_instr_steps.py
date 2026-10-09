@@ -54,8 +54,9 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
         out.append(("recordings-per-scenario", "pass" if sc and len(v) == len(sc) else "fail",
                     f"{len(v)}/{len(sc)} scenarios meet route, HTTP outcome and controller/repository frame expectations "
                     f"({api.get('recordings', 0)} recordings); problems: {json.dumps(pc, sort_keys=True)}"))
-        out.append(("source-identity", "fail" if pc.get("no-source-file-line") or not sc else "pass",
-                    "no recording frame carried a matched .java file and line" if pc.get("no-source-file-line") else "source file+line present"))
+        n_src = r.get("recordingsWithSource", 0)
+        out.append(("source-identity", "pass" if n_src > 0 and not pc.get("no-source-file-line") else "fail",
+                    f"{n_src} recordings carry a matched .java file and line" if n_src > 0 else "no recording frame carried a matched .java file and line"))
         out.append(("api-json-artifact", "pass", f"{api.get('recordings', 0)} recordings saved as API JSON"))
     stop = r.get("notes", {}).get("stopCommand", {})
     if stop.get("notImplemented"):

@@ -315,6 +315,7 @@ class Stack:
     _proc: Any = None
     _logfile: pathlib.Path | None = None
     db_host_port: int = 0
+    launcher_exit: int | None = None
 
     def _subst(self, value: str) -> str:
         host = self.mode == "host"
@@ -374,13 +375,16 @@ class Stack:
             import signal
             if self._proc.poll() is None:
                 try:
-                    os.killpg(self._proc.pid, signal.SIGTERM)  # only the process group we started
-                    self._proc.wait(timeout=30)
+                    # SIGTERM to the launcher PID we started (not the whole group): under `xtrace run` the launcher forwards
+                    # it to the JVM and then drains the daemon, which a group-wide signal would cut short.
+                    os.kill(self._proc.pid, signal.SIGTERM)
+                    self._proc.wait(timeout=90)
                 except Exception:
                     try:
-                        os.killpg(self._proc.pid, signal.SIGKILL)
+                        os.killpg(self._proc.pid, signal.SIGKILL)  # only the process group we started
                     except Exception:
                         pass
+            self.launcher_exit = self._proc.poll()
             self._proc = None
         rm_container(self.app)
         rm_container(self.db)

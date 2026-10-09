@@ -133,20 +133,32 @@ jobs:
         run: |
           export XTRACE_CAMPAIGN_ROOT="$CAMP_ROOT"
           export XCAMP_JAVA="$JAVA_HOME/bin/java"
+          # normalized response bodies of the synthetic baseline (no secrets) for the fingerprint root-cause diff
+          export XCAMP_DUMP_BODIES="$CAMP_OUT/baseline-bodies"
           python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
             --step baseline -- python3 -B "campaigns/java/$CAMP_PROJECT/harness/run.py" baseline
       - name: Compare with the tracked baseline (fingerprints and Postgres digest gate, jar sha is reported)
         if: matrix.kind == 'java' && always()
         run: |
+          # platform pins carry provenance; prefer the x86_64 pin made on this kind of runner, then the newest arm64 pin
+          pinned="campaigns/java/$CAMP_PROJECT/baseline-summary.json"
+          for cand in $(ls campaigns/java/"$CAMP_PROJECT"/baseline-summary.linux-arm64.*.json 2>/dev/null | sort) \
+                      $(ls campaigns/java/"$CAMP_PROJECT"/baseline-summary.linux-x86_64.*.json 2>/dev/null | sort); do pinned="$cand"; done
+          echo "pinned baseline: $pinned"
           python3 -B tools/qa/camp_compare.py --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
-            --receipt "$CAMP_ROOT/java/$CAMP_PROJECT/baseline-1/receipt.json" \
-            --pinned "campaigns/java/$CAMP_PROJECT/baseline-summary.json"
-      - name: Node baseline is not runnable on this runner yet
+            --receipt "$CAMP_ROOT/java/$CAMP_PROJECT/baseline-1/receipt.json" --pinned "$pinned"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: matrix.kind == 'node'
+        with:
+          node-version: 22
+      - name: Pinned baseline (x86_64 Docker images, node harness)
+        if: matrix.kind == 'node'
+        env:
+          XCAMP_PLATFORM: linux/amd64
         run: |
-          python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
-            --step baseline --status not-implemented \
-            --note "node harness is bound to linux/arm64 Docker images; no x86_64 path yet"
+          export XTRACE_CAMP_NODE_ROOT="$CAMP_ROOT/node"
+          python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+            --step baseline -- sh tools/qa/camp_node_baseline.sh "$CAMP_PROJECT"
       # ---- instrumented stages (petclinic has the harness; other projects record not-implemented below)
       - name: Unpack the candidate package
         id: unpack
@@ -261,6 +273,10 @@ jobs:
             if grep -q '"clean": true' "$CAMP_OUT/privacy-canary-report.json" 2>/dev/null; then
               mkdir -p "$CAMP_OUT/instrumented-raw"
               cp -R "$INSTR_DIR/api" "$INSTR_DIR/viewer.log" "$INSTR_DIR/application.log" "$CAMP_OUT/instrumented-raw/" 2>/dev/null || true
+              # names and sizes of the private store, and the CLI's own view of the recordings (cross-check of the read path)
+              (cd "$RUNNER_TEMP/xt" && find . -type f -printf '%P %s\n' | sort) > "$CAMP_OUT/instrumented-raw/store-tree.txt" 2>/dev/null || true
+              XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp" "$XCAMP_XTRACE" recording list \
+                --project-dir "$CAMP_ROOT/java/petclinic/src" > "$CAMP_OUT/instrumented-raw/cli-recording-list.json" 2>&1 || true
             else
               echo "privacy scan not clean or absent: raw instrumented logs and API JSON are NOT uploaded"
             fi

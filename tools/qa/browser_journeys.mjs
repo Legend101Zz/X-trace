@@ -53,14 +53,13 @@ try {
       const page = await ctx.newPage();
       const consoleErrors = [];
       page.on("pageerror", (e) => consoleErrors.push(String(e).slice(0, 120)));
-      await page.goto(ready.url, { waitUntil: "networkidle", timeout: 30000 });
+      await page.goto(ready.url, { waitUntil: "domcontentloaded", timeout: 30000 });
       await page.waitForTimeout(1500);
       await page.screenshot({ path: path.join(out, `list-${w}.png`), fullPage: true });
       row.steps.list = { status: "pass", screenshot: `list-${w}.png` };
       const rowLoc = page.locator('[data-testid*="recording" i], a[href*="recording" i], tr, li, button').filter({ hasText: /GET|POST|PUT|DELETE|owners|vets|oups/i }).first();
       if (await rowLoc.count()) {
         await rowLoc.click({ timeout: 10000 });
-        await page.waitForLoadState("networkidle");
         await page.waitForTimeout(1500);
         await page.screenshot({ path: path.join(out, `linear-${w}.png`), fullPage: true });
         row.steps.linear = { status: "pass", screenshot: `linear-${w}.png` };
