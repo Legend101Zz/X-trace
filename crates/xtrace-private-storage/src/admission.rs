@@ -1153,8 +1153,9 @@ fn open_directory_without_symlinks_until(
     if components > MAX_PATH_COMPONENTS + 1 || path.as_os_str().len() > 4096 {
         return Err(PrivateStorageError::InvalidName);
     }
-    // One ACL listing for the whole walk instead of one per component (macOS only; see
-    // `Operation::prefetch_directory_listings` for why this cannot admit anything by itself).
+    // Register the walk's prefixes; the one batched ACL listing is taken lazily on the first
+    // memo miss (macOS only; see `Operation::spawn_batch_for` for why it cannot admit anything
+    // by itself).
     #[cfg(target_os = "macos")]
     {
         let mut prefix = PathBuf::from("/");
@@ -1165,7 +1166,7 @@ fn open_directory_without_symlinks_until(
                 prefixes.push(prefix.clone());
             }
         }
-        op.prefetch_directory_listings(&prefixes);
+        op.register_walk(&prefixes);
     }
     let mut descriptor = open_directory_descriptor("/")?;
     let mut traversed = PathBuf::from("/");
@@ -2004,6 +2005,296 @@ mod tests {
     #[test]
     fn an_expired_deadline_refuses_before_any_probe() {
         let leaf = nested_leaf();
+        let expired = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let before = probe::probed_paths().len();
+        assert_eq!(leaf.revalidate_for_operation(expired), Err(PrivateStorageError::Unavailable));
+        assert_eq!(
+            leaf.create_private_child_for_operation("late", expired).map(|_| ()),
+            Err(PrivateStorageError::Unavailable)
+        );
+        assert!(!leaf.path().join("late").exists(), "no directory created after expiry");
+        assert_eq!(probe::probed_paths().len(), before, "no ACL probe after expiry");
+    }
+
+    // ---- admission scope through the public entry points (ADR 0008 Amendment 1) -----------
+
+    use crate::scope::AdmissionScope;
+
+    /// The leaf a scope test works on, with its parent holding it, after the clock has moved past
+    /// the batch quiet period so the batch can describe it.
+    fn scoped_subject() -> (AdmittedPrivateRoot, std::path::PathBuf) {
+        let (parent, name) = fresh_child();
+        let subject = parent.path().join(&name);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        (parent, subject)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_scope_spawns_far_fewer_listings_than_the_same_calls_without_one() {
+        const CALLS: usize = 10;
+        let busy = private_scratch().path().to_path_buf();
+        let leaf = nested_leaf();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let directories = directory_count(leaf.path());
+        let (probed, spawned) = (probe::probed_paths().len(), probe::ls_spawn_count());
+        for _ in 0..CALLS {
+            leaf.revalidate().expect("revalidate without a scope");
+        }
+        let unscoped = probe::ls_spawn_count() - spawned;
+        let unscoped_probes = probe::probed_paths().len() - probed;
+        let (probed, spawned) = (probe::probed_paths().len(), probe::ls_spawn_count());
+        let counter_before = scope_counter();
+        {
+            let _scope = AdmissionScope::enter();
+            for _ in 0..CALLS {
+                leaf.revalidate().expect("revalidate inside a scope");
+            }
+        }
+        let scoped = probe::ls_spawn_count() - spawned;
+        let scoped_paths: Vec<_> = probe::probed_paths().into_iter().skip(probed).collect();
+        // The shared scratch root is busy (other tests create children in it), so its state moves
+        // between calls and it is legitimately probed again; everything else is quiet.
+        let busy_probes = scoped_paths.iter().filter(|path| **path == busy).count();
+        let quiet_probes = scoped_paths.len() - busy_probes;
+        assert!(unscoped >= CALLS, "every operation lists at least once: {unscoped}");
+        assert!(unscoped_probes >= CALLS * directories / 2, "unscoped re-judges every call");
+        assert!(quiet_probes <= directories, "{quiet_probes} judgments of quiet directories");
+        // One batch for the whole scope, plus a single listing per busy-root judgment and per
+        // quiet directory the batch could not describe.
+        assert!(
+            scoped <= 1 + busy_probes + directories,
+            "{scoped} ls runs ({busy_probes} busy-root judgments) for {CALLS} scoped calls"
+        );
+        assert!(
+            scoped < unscoped || busy_probes >= CALLS,
+            "scoped {scoped} vs unscoped {unscoped}"
+        );
+        assert_eq!(scope_counter() - counter_before, scoped as u64);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "spawn-counter"))]
+    fn scope_counter() -> u64 {
+        crate::spawn_counter::ls_spawns_on_this_thread()
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "spawn-counter")))]
+    fn scope_counter() -> u64 {
+        probe::ls_spawn_count() as u64
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_walk_registers_its_operands_and_spawns_only_when_a_directory_misses() {
+        let leaf = nested_leaf();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let spawns = probe::ls_spawn_count();
+        let batches = probe::batch_attempt_count();
+        let op = Operation::new();
+        let mut prefixes = vec![PathBuf::from("/")];
+        let mut prefix = PathBuf::from("/");
+        for component in leaf.path().components().skip(1) {
+            prefix.push(component);
+            prefixes.push(prefix.clone());
+        }
+        op.register_walk(&prefixes);
+        assert_eq!(probe::ls_spawn_count(), spawns, "registering a walk spawns nothing");
+        for _ in 0..5 {
+            open_directory_without_symlinks_until(leaf.path(), &op).expect("walk");
+        }
+        assert_eq!(probe::batch_attempt_count() - batches, 1, "at most one batch per operation");
+        // A second operation with a warm scope: still at most one batch for the whole scope.
+        let batches = probe::batch_attempt_count();
+        {
+            let _scope = AdmissionScope::enter();
+            for _ in 0..5 {
+                leaf.revalidate().expect("revalidate in scope");
+            }
+        }
+        assert_eq!(probe::batch_attempt_count() - batches, 1, "at most one batch per scope");
+    }
+
+    #[test]
+    fn a_mode_change_inside_a_scope_is_seen_by_the_next_call() {
+        // Key invalidation itself (ctime in the memo key) is shown by the probe.rs test
+        // `the_scope_key_separates_state_filesystem_flags_and_profile` and the ctime tests there;
+        // this test shows the end-to-end refusal on whatever platform runs it.
+        let (parent, subject) = scoped_subject();
+        let _scope = AdmissionScope::enter();
+        let held = AdmittedPrivateRoot::open(&subject).expect("admitted first");
+        held.revalidate().expect("revalidates");
+        chmod(&subject, 0o750);
+        assert!(held.revalidate().is_err(), "the held capability sees the new mode");
+        assert!(AdmittedPrivateRoot::open(&subject).is_err(), "private leaf must be 0700");
+        assert!(AdmittedPrivateRoot::open_container(&subject).is_ok(), "container tolerates 0750");
+        chmod(&subject, 0o770);
+        assert!(AdmittedPrivateRoot::open_container(&subject).is_err());
+        chmod(&subject, 0o700);
+        assert!(AdmittedPrivateRoot::open(&subject).is_ok(), "restored mode is admitted again");
+        // An ancestor loosened mid-scope poisons the walk below it.
+        let leaf = subject.join("leaf");
+        std::fs::create_dir(&leaf).expect("leaf");
+        chmod(&leaf, 0o700);
+        assert!(AdmittedPrivateRoot::open(&leaf).is_ok());
+        chmod(&subject, 0o770);
+        assert!(AdmittedPrivateRoot::open(&leaf).is_err());
+        chmod(&subject, 0o700);
+        drop(parent);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_acl_added_inside_a_scope_is_seen_and_refused() {
+        let (_parent, subject) = scoped_subject();
+        let leaf = subject.join("leaf");
+        std::fs::create_dir(&leaf).expect("leaf");
+        chmod(&leaf, 0o700);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let acl = |flag: &str, path: &Path| {
+            std::process::Command::new("/bin/chmod")
+                .args([flag, "group:everyone allow write"])
+                .arg(path)
+                .status()
+                .expect("run chmod")
+                .success()
+        };
+        let _scope = AdmissionScope::enter();
+        assert!(AdmittedPrivateRoot::open(&subject).is_ok());
+        assert!(AdmittedPrivateRoot::open(&leaf).is_ok());
+        // On the private leaf itself ...
+        assert!(acl("+a", &leaf));
+        assert!(AdmittedPrivateRoot::open(&leaf).is_err(), "leaf ACL must be probed afresh");
+        assert!(acl("-a", &leaf));
+        assert!(AdmittedPrivateRoot::open(&leaf).is_ok());
+        // ... and on an ancestor that was already walked and remembered.
+        assert!(acl("+a", &subject));
+        assert!(AdmittedPrivateRoot::open(&leaf).is_err(), "ancestor ACL must be probed afresh");
+        assert!(AdmittedPrivateRoot::open_container(&subject).is_err());
+        assert!(acl("-a", &subject));
+        assert!(AdmittedPrivateRoot::open(&leaf).is_ok());
+    }
+
+    #[test]
+    fn a_directory_replaced_under_the_same_name_inside_a_scope_is_refused() {
+        let (parent, subject) = scoped_subject();
+        let _scope = AdmissionScope::enter();
+        let held = AdmittedPrivateRoot::open(&subject).expect("admitted first");
+        held.revalidate().expect("revalidates");
+        std::fs::rename(&subject, parent.path().join("moved-away")).expect("move original");
+        std::fs::create_dir(&subject).expect("replacement");
+        chmod(&subject, 0o700);
+        assert!(held.revalidate().is_err(), "the capability is bound to the original directory");
+        assert!(held.create_private_child("late").is_err());
+        assert!(held.open_or_create_private_child("late").is_err());
+        // A loose replacement is refused by a fresh open as well.
+        chmod(&subject, 0o770);
+        assert!(AdmittedPrivateRoot::open(&subject).is_err());
+        assert!(AdmittedPrivateRoot::open_container(&subject).is_err());
+    }
+
+    #[test]
+    fn a_symlink_swapped_in_inside_a_scope_is_refused_at_the_leaf_and_at_an_ancestor() {
+        let (parent, subject) = scoped_subject();
+        let child = subject.join("child");
+        std::fs::create_dir(&child).expect("child");
+        chmod(&child, 0o700);
+        let _scope = AdmissionScope::enter();
+        let held_child = AdmittedPrivateRoot::open(&child).expect("child admitted first");
+        let held_subject = AdmittedPrivateRoot::open(&subject).expect("subject admitted first");
+        // Leaf swapped for a symlink.
+        let moved_child = subject.join("child-moved");
+        std::fs::rename(&child, &moved_child).expect("move child");
+        std::os::unix::fs::symlink(&moved_child, &child).expect("leaf symlink");
+        assert!(held_child.revalidate().is_err());
+        assert!(AdmittedPrivateRoot::open(&child).is_err());
+        assert!(AdmittedPrivateRoot::open_container(&child).is_err());
+        std::fs::remove_file(&child).expect("remove leaf symlink");
+        std::fs::rename(&moved_child, &child).expect("restore child");
+        assert!(AdmittedPrivateRoot::open(&child).is_ok());
+        // Ancestor swapped for a symlink.
+        let moved_subject = parent.path().join("subject-moved");
+        std::fs::rename(&subject, &moved_subject).expect("move subject");
+        std::os::unix::fs::symlink(&moved_subject, &subject).expect("ancestor symlink");
+        assert!(held_child.revalidate().is_err());
+        assert!(held_subject.revalidate().is_err());
+        assert!(AdmittedPrivateRoot::open(&child).is_err());
+        assert!(AdmittedPrivateRoot::open(&subject).is_err());
+    }
+
+    #[test]
+    fn hardlinked_and_fifo_files_are_still_refused_inside_a_scope() {
+        let (parent, name) = fresh_child();
+        let dir = parent.open_private_child(&name).expect("subject");
+        let linked = "linked";
+        drop(dir.open_or_create_private_file(linked).expect("private file"));
+        let _scope = AdmissionScope::enter();
+        assert!(dir.validate_regular_file(linked).is_ok(), "a single-link file is fine");
+        std::fs::hard_link(dir.path().join(linked), dir.path().join("second-name"))
+            .expect("hard link");
+        assert!(dir.validate_regular_file(linked).is_err(), "link count 2 is refused");
+        assert!(dir.open_regular_file(linked).is_err());
+        assert!(dir.open_or_create_private_file(linked).is_err());
+        std::fs::remove_file(dir.path().join("second-name")).expect("unlink second name");
+        assert!(dir.validate_regular_file(linked).is_ok(), "named-file checks run on every call");
+
+        let fifo = "fifo";
+        #[cfg(target_os = "linux")]
+        rustix::fs::mkfifoat(&dir.directory, fifo, rustix::fs::Mode::from_raw_mode(0o600))
+            .expect("create FIFO fixture");
+        #[cfg(target_os = "macos")]
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(dir.path().join(fifo))
+                .status()
+                .expect("mkfifo")
+                .success()
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_dir = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _scope = AdmissionScope::enter();
+            let root = AdmittedPrivateRoot::open(&worker_dir).expect("reopen in worker");
+            let outcomes = [
+                root.open_regular_file(fifo).is_err(),
+                root.validate_regular_file(fifo).is_err(),
+                root.validate_optional_private_file(fifo).is_err(),
+                root.open_or_create_private_file(fifo).is_err(),
+            ];
+            let _ = sender.send(outcomes);
+        });
+        let outcomes = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("FIFO validation must not block inside a scope");
+        assert!(outcomes.into_iter().all(|refused| refused));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_scope_past_its_cap_lists_afresh() {
+        let leaf = nested_leaf();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let _scope = AdmissionScope::enter_with_cap(std::time::Duration::from_millis(1_500));
+        leaf.revalidate().expect("warm the scope");
+        let before = probe::batch_attempt_count();
+        let spawns = probe::ls_spawn_count();
+        leaf.revalidate().expect("inside the cap");
+        let within = probe::ls_spawn_count() - spawns;
+        assert_eq!(probe::batch_attempt_count(), before, "no new batch inside the cap");
+        assert!(within <= 4, "{within} ls runs inside the cap: only busy directories relist");
+        std::thread::sleep(std::time::Duration::from_millis(1_600));
+        let spawns = probe::ls_spawn_count();
+        leaf.revalidate().expect("past the cap");
+        let after = probe::ls_spawn_count() - spawns;
+        assert!(after >= 1, "past the cap the scope remembers nothing, so it lists again");
+        assert_eq!(probe::batch_attempt_count() - before, 1, "one fresh batch for the operation");
+    }
+
+    #[test]
+    fn an_expired_deadline_inside_a_live_scope_refuses_before_any_probe() {
+        let leaf = nested_leaf();
+        let _scope = AdmissionScope::enter();
+        leaf.revalidate().expect("warm the scope");
         let expired = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(5));
         let before = probe::probed_paths().len();

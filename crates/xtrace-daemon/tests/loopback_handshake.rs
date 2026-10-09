@@ -374,34 +374,17 @@ async fn next_ack<R>(reader: &mut R, label: &str) -> xtrace_protocol::generated:
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    next_ack_within(reader, label, READ_ENVELOPE_BUDGET).await
-}
-
-/// Budget for an Ack that follows recording finalization (segment commit and sealing). On macOS
-/// the commit runs private-storage admission, a `/bin/ls` spawn per admitted directory, so a
-/// 16,384-event recording needs seconds on a hosted runner where Linux needs milliseconds.
-const FINALIZE_ACK_BUDGET: Duration = Duration::from_secs(60);
-
-/// [`next_ack`] with an explicit budget.
-async fn next_ack_within<R>(
-    reader: &mut R,
-    label: &str,
-    budget: Duration,
-) -> xtrace_protocol::generated::agent::Ack
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
     let start = std::time::Instant::now();
     loop {
         let envelope = match tokio::time::timeout(
-            budget.saturating_sub(start.elapsed()),
+            READ_ENVELOPE_BUDGET.saturating_sub(start.elapsed()),
             read_envelope(reader),
         )
         .await
         {
             Ok(Ok(env)) => env,
             Ok(Err(err)) => panic!("{label}: read failed: {err}"),
-            Err(_) => panic!("{label}: timed out waiting for Ack after {budget:?}"),
+            Err(_) => panic!("{label}: timed out waiting for Ack after {READ_ENVELOPE_BUDGET:?}"),
         };
         match envelope.payload {
             Some(PayloadOneof::Ack(ack)) => return ack,
@@ -2768,7 +2751,7 @@ async fn capture_over_the_event_cap_ends_partial_with_exact_per_priority_drops()
     )
     .await
     .expect("write finish");
-    next_ack_within(&mut reader, "cap finish ACK", FINALIZE_ACK_BUDGET).await;
+    next_ack(&mut reader, "cap finish ACK").await;
 
     let projection_reader = SqliteRecordingReader::new(store.clone(), project_root.path());
     let window = projection_reader
