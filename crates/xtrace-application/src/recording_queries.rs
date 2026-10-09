@@ -35,7 +35,7 @@ pub const MAX_RECORDING_DISPLAY_FIELD_BYTES: usize = 256;
 /// Maximum UTF-8 byte length for an exact projected relationship identifier.
 pub const MAX_RECORDING_RELATIONSHIP_ID_BYTES: usize = 128;
 /// Version of the stable JSON recording-read projection contract.
-pub const RECORDING_READ_SCHEMA_VERSION: u32 = 2;
+pub const RECORDING_READ_SCHEMA_VERSION: u32 = 3;
 
 fn decimal_u64(value: &str) -> bool {
     value.parse::<u64>().is_ok_and(|parsed| parsed.to_string() == value)
@@ -96,15 +96,48 @@ pub enum RecordingCompletionEvidence {
 }
 
 /// Result of resolving one replay-navigation edge.
+///
+/// Internally tagged: `target` carries `frameId`, `boundary` carries nothing and
+/// `unavailable` carries a stable `reason`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", content = "frameId", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum NavigationResult {
     /// The adjacent metadata index entry matched its immutable verified XTF event.
-    Target(FrameId),
+    Target {
+        /// Frame the action lands on.
+        frame_id: FrameId,
+    },
     /// The verified sequence or recording boundary has no adjacent frame.
     Boundary,
     /// The relationship cannot be established from available event evidence.
-    Unavailable,
+    Unavailable {
+        /// Why the relationship cannot be established.
+        reason: NavigationUnavailable,
+    },
+}
+
+impl NavigationResult {
+    /// Unavailable with the supplied reason.
+    #[must_use]
+    pub const fn unavailable(reason: NavigationUnavailable) -> Self {
+        Self::Unavailable { reason }
+    }
+}
+
+/// Stable reasons a navigation edge is unavailable (snake_case on the wire).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationUnavailable {
+    /// The persisted frontier is not verified; more events may exist.
+    PartialFrontier,
+    /// The row predates the frame index that records depth and parents.
+    LegacyUnindexed,
+    /// The frame is deeper than the indexed depth bound.
+    DepthOverflow,
+    /// The parent was never observed.
+    OrphanParent,
+    /// The event is not a navigable frame.
+    NotNavigable,
 }
 
 /// Bounded step-navigation facts for one indexed frame.
@@ -126,11 +159,11 @@ pub struct FrameNavigation {
 impl FrameNavigation {
     /// Navigation for legacy or unindexed events.
     pub const UNAVAILABLE: Self = Self {
-        previous: NavigationResult::Unavailable,
-        next: NavigationResult::Unavailable,
-        into: NavigationResult::Unavailable,
-        over: NavigationResult::Unavailable,
-        out: NavigationResult::Unavailable,
+        previous: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+        next: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+        into: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+        over: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+        out: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
     };
 }
 
@@ -193,6 +226,87 @@ pub struct PersistedEvent {
     pub source_binding: SourceBinding,
     /// Explicit record of unprojected oversized fields without their contents.
     pub field_truncations: Vec<FieldTruncation>,
+    /// Call depth from the frame index; `None` for legacy or unindexed rows.
+    pub depth: Option<u32>,
+    /// Parent frame, only when the parent was observed.
+    pub parent_frame_id: Option<FrameId>,
+    /// Async parent frame, only when the async parent was observed.
+    pub async_parent_frame_id: Option<FrameId>,
+    /// Observed line; `Some` only for `line_cursor` events, never a method extent.
+    pub line: Option<u32>,
+    /// Observed bindings; an empty list means none were observed.
+    pub bindings: Vec<PersistedBinding>,
+    /// Declared gap; `Some` only for `gap` events.
+    pub gap: Option<PersistedGap>,
+}
+
+/// One observed binding (argument, local, field or return value) at an event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedBinding {
+    /// Binding name as emitted (display-bounded).
+    pub name: String,
+    /// Binding role label (snake_case domain vocabulary).
+    pub role: String,
+    /// Where the name came from (snake_case domain vocabulary).
+    pub name_origin: String,
+    /// Observed value state.
+    pub value: PersistedValue,
+}
+
+/// Value state of one binding; no state is ever a stand-in for another.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum PersistedValue {
+    /// Value preview captured and hashed.
+    Captured {
+        /// Sanitized value shape label.
+        shape: String,
+        /// Bounded sanitized preview.
+        preview: String,
+        /// `b3:<hex>` of the emitted preview bytes.
+        content_hash: String,
+    },
+    /// Value withheld by a redaction rule.
+    Redacted {
+        /// Rule that withheld the value.
+        rule_id: String,
+        /// Optional shape hint safe to display.
+        shape_hint: Option<String>,
+    },
+    /// Value cut at a budget.
+    Truncated {
+        /// Bounded sanitized preview.
+        preview: String,
+        /// Lower bound of the original size, decimal string.
+        original_size_lower_bound: String,
+        /// Limit that applied, decimal string.
+        limit: String,
+    },
+    /// Value could not be observed.
+    Unavailable {
+        /// Snake_case domain reason.
+        reason: String,
+    },
+    /// Value was dropped by a budget.
+    Dropped {
+        /// Snake_case domain reason.
+        reason: String,
+    },
+}
+
+/// Declared gap in the emitted event sequence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedGap {
+    /// Snake_case gap reason.
+    pub reason: String,
+    /// Count of suppressed observations, decimal string.
+    pub count: String,
+    /// Nearest emitted sequence before the suppressed span, decimal string.
+    pub first_sequence: String,
+    /// Nearest emitted sequence after the suppressed span, decimal string.
+    pub last_sequence: String,
 }
 
 /// Bounded source projection for one method event.
@@ -223,6 +337,8 @@ pub enum SourceStatus {
     Mismatch,
     /// Source could not be read safely or usable metadata is absent.
     Unavailable,
+    /// The recorded file is absent from the project source root.
+    MissingFile,
 }
 
 /// Safe metadata describing a display or relationship field that was bounded.
@@ -354,6 +470,10 @@ pub struct RecordingMetadata {
     pub last_sequence: Option<String>,
     /// Persisted incomplete status evidence; no completion is inferred otherwise.
     pub incomplete_evidence: Vec<String>,
+    /// Event cap recorded in terminal evidence, when present.
+    pub event_cap: Option<u32>,
+    /// Outcome kind recorded in terminal evidence, when present.
+    pub outcome_kind: Option<String>,
 }
 
 /// One verified segment window returned by the storage adapter.
@@ -380,6 +500,219 @@ pub struct RecordingEventWindow {
     pub has_more: bool,
     /// Exact incomplete status or observed sequence-gap marker evidence.
     pub incomplete_evidence: Vec<String>,
+    /// Adapter-observed outcome; `None` when terminal evidence is absent.
+    pub outcome: Option<PersistedOutcome>,
+    /// Event capacity facts; `None` when terminal evidence is absent.
+    pub capacity: Option<RecordingCapacity>,
+    /// Stable limitation codes recorded for this recording.
+    pub limitations: Vec<String>,
+}
+
+/// Adapter-observed outcome of the recorded operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedOutcome {
+    /// `responded`, `exception` or `unobserved` (snake_case).
+    pub kind: String,
+    /// HTTP status when observed.
+    pub http_status: Option<u16>,
+    /// Propagated exception facts when the outcome is an exception.
+    pub exception: Option<OutcomeException>,
+    /// Event the exception was thrown from, when observed.
+    pub thrown_from_event_id: Option<String>,
+}
+
+/// Sanitized exception facts attached to an outcome.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeException {
+    /// Exception type name, bounded.
+    pub exception_type: String,
+    /// Sanitized message, bounded, when present.
+    pub message: Option<String>,
+}
+
+/// Event capacity facts from terminal evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingCapacity {
+    /// Cap in force for this recording.
+    pub event_cap: u32,
+    /// Events persisted.
+    pub event_count: u32,
+    /// Events dropped at the cap, decimal string.
+    pub capacity_dropped_events: String,
+    /// Dropped-event counts by priority, decimal strings.
+    pub drops_by_priority: BTreeMap<u32, String>,
+}
+
+/// Which event projection a window carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Projection {
+    /// Every event field, including navigation, ids and bindings.
+    #[default]
+    Full,
+    /// Outline fields only.
+    Structure,
+}
+
+/// Server-computed honesty counts; clients render these and never recompute them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HonestySummary {
+    /// Version of this summary shape.
+    pub schema_version: u32,
+    /// Whole-recording facts.
+    pub recording: HonestyRecording,
+    /// Facts about the returned window only.
+    pub window: HonestyWindow,
+}
+
+/// Whole-recording honesty facts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HonestyRecording {
+    /// `complete`, `partial`, `invalid` or `unavailable`.
+    pub completion: String,
+    /// Incomplete-evidence strings.
+    pub incomplete: Vec<String>,
+    /// Events dropped at the cap, decimal string.
+    pub capacity_dropped_events: String,
+    /// Dropped counts by priority, decimal strings.
+    pub drops_by_priority: BTreeMap<u32, String>,
+    /// Frames carrying a gap flag; `None` when counts are unavailable.
+    pub frames_with_gap: Option<u64>,
+    /// Frames carrying a redacted value; `None` when counts are unavailable.
+    pub frames_with_redacted: Option<u64>,
+    /// Frames carrying a truncated value; `None` when counts are unavailable.
+    pub frames_with_truncated: Option<u64>,
+    /// Frames carrying an unavailable value; `None` when counts are unavailable.
+    pub frames_with_unavailable: Option<u64>,
+    /// Frames carrying a dropped value; `None` when counts are unavailable.
+    pub frames_with_dropped: Option<u64>,
+    /// Frames with an unobserved parent; `None` when counts are unavailable.
+    pub frames_with_orphan_parent: Option<u64>,
+    /// False when the frame counts cannot be computed (never zero-filled).
+    pub counts_available: bool,
+}
+
+/// Honesty facts for the returned window.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HonestyWindow {
+    /// Events in the window.
+    pub events: u64,
+    /// Bindings by value state.
+    pub bindings_by_state: BTreeMap<String, u64>,
+    /// Unavailable values by reason.
+    pub unavailable_by_reason: BTreeMap<String, u64>,
+    /// Dropped values by reason.
+    pub dropped_by_reason: BTreeMap<String, u64>,
+    /// Gap events in the window.
+    pub gaps: Vec<WindowGap>,
+    /// Events by source-binding state.
+    pub source_bindings: BTreeMap<String, u64>,
+    /// Projected sources by status.
+    pub source_status: BTreeMap<String, u64>,
+}
+
+/// One gap event in the window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowGap {
+    /// Gap event sequence, decimal string.
+    pub sequence: String,
+    /// Snake_case gap reason.
+    pub reason: String,
+    /// Suppressed observation count, decimal string.
+    pub count: String,
+    /// Bracketing sequence before the span, decimal string.
+    pub first_sequence: String,
+    /// Bracketing sequence after the span, decimal string.
+    pub last_sequence: String,
+}
+
+impl HonestySummary {
+    /// Builds the summary from the facts a window carries; whole-recording frame
+    /// counts stay unavailable until the frame index supplies them.
+    #[must_use]
+    pub fn from_window(
+        completion: RecordingCompletionEvidence,
+        incomplete: &[String],
+        capacity: Option<&RecordingCapacity>,
+        drops_by_priority: &BTreeMap<u32, String>,
+        events: &[PersistedEvent],
+    ) -> Self {
+        let mut window = HonestyWindow { events: events.len() as u64, ..HonestyWindow::default() };
+        for event in events {
+            for binding in &event.bindings {
+                let (state, reason) = match &binding.value {
+                    PersistedValue::Captured { .. } => ("captured", None),
+                    PersistedValue::Redacted { .. } => ("redacted", None),
+                    PersistedValue::Truncated { .. } => ("truncated", None),
+                    PersistedValue::Unavailable { reason } => ("unavailable", Some(reason)),
+                    PersistedValue::Dropped { reason } => ("dropped", Some(reason)),
+                };
+                *window.bindings_by_state.entry(state.to_owned()).or_default() += 1;
+                if let Some(reason) = reason {
+                    let map = if state == "unavailable" {
+                        &mut window.unavailable_by_reason
+                    } else {
+                        &mut window.dropped_by_reason
+                    };
+                    *map.entry(reason.clone()).or_default() += 1;
+                }
+            }
+            if let Some(gap) = &event.gap {
+                window.gaps.push(WindowGap {
+                    sequence: event.sequence.clone(),
+                    reason: gap.reason.clone(),
+                    count: gap.count.clone(),
+                    first_sequence: gap.first_sequence.clone(),
+                    last_sequence: gap.last_sequence.clone(),
+                });
+            }
+            let binding = serde_json::to_value(event.source_binding)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unspecified".to_owned());
+            *window.source_bindings.entry(binding).or_default() += 1;
+            if let Some(source) = &event.source {
+                let status = match source.status {
+                    SourceStatus::Matched => "matched",
+                    SourceStatus::Mismatch => "mismatch",
+                    SourceStatus::Unavailable => "unavailable",
+                    SourceStatus::MissingFile => "missing_file",
+                };
+                *window.source_status.entry(status.to_owned()).or_default() += 1;
+            }
+        }
+        let completion_label = match completion {
+            RecordingCompletionEvidence::Complete => "complete",
+            RecordingCompletionEvidence::Partial => "partial",
+            RecordingCompletionEvidence::Invalid => "invalid",
+            RecordingCompletionEvidence::Unavailable => "unavailable",
+        };
+        Self {
+            schema_version: 1,
+            recording: HonestyRecording {
+                completion: completion_label.to_owned(),
+                incomplete: incomplete.to_vec(),
+                capacity_dropped_events: capacity
+                    .map_or_else(|| "0".to_owned(), |value| value.capacity_dropped_events.clone()),
+                drops_by_priority: drops_by_priority.clone(),
+                frames_with_gap: None,
+                frames_with_redacted: None,
+                frames_with_truncated: None,
+                frames_with_unavailable: None,
+                frames_with_dropped: None,
+                frames_with_orphan_parent: None,
+                counts_available: false,
+            },
+            window,
+        }
+    }
 }
 
 /// Stable JSON list projection.
@@ -435,6 +768,24 @@ pub struct RecordingDetail {
     pub incomplete_evidence: Vec<String>,
     /// Source, value, and completion details absent from this persistence slice.
     pub unavailable: UnavailableEvidence,
+    /// Adapter-observed outcome; `None` when terminal evidence is absent.
+    pub outcome: Option<PersistedOutcome>,
+    /// Event capacity facts; `None` when terminal evidence is absent.
+    pub capacity: Option<RecordingCapacity>,
+    /// Stable limitation codes (for example `capture_policy_not_armed`).
+    pub limitations: Vec<String>,
+    /// Server-computed honesty summary.
+    pub honesty: HonestySummary,
+    /// Anchor frame of an `aroundFrame` window.
+    pub anchor_frame_id: Option<FrameId>,
+    /// First sequence in the returned window, decimal string.
+    pub first_sequence: Option<String>,
+    /// Last sequence in the returned window, decimal string.
+    pub last_sequence: Option<String>,
+    /// Backward-paging cursor, when an earlier window exists.
+    pub prev_cursor: Option<String>,
+    /// Projection the events carry.
+    pub projection: Projection,
 }
 
 /// Explicit representation of details this projection cannot establish.
@@ -639,6 +990,15 @@ pub fn show_recording<P: RecordingReadPort>(
     } else {
         None
     };
+    let honesty = HonestySummary::from_window(
+        window.completion,
+        &window.incomplete_evidence,
+        window.capacity.as_ref(),
+        &drop_counts_by_priority,
+        &events,
+    );
+    let first_sequence = events.first().map(|event| event.sequence.clone());
+    let last_sequence = events.last().map(|event| event.sequence.clone());
     Ok(RecordingDetail {
         schema_version: RECORDING_READ_SCHEMA_VERSION,
         project_id: request.project_id,
@@ -662,6 +1022,15 @@ pub fn show_recording<P: RecordingReadPort>(
             },
             ..UnavailableEvidence::default()
         },
+        outcome: window.outcome,
+        capacity: window.capacity,
+        limitations: window.limitations,
+        honesty,
+        anchor_frame_id: None,
+        first_sequence,
+        last_sequence,
+        prev_cursor: None,
+        projection: Projection::Full,
     })
 }
 
@@ -783,9 +1152,18 @@ mod tests {
                 source: None,
                 source_binding: SourceBinding::Unspecified,
                 field_truncations: Vec::new(),
+                depth: None,
+                parent_frame_id: None,
+                async_parent_frame_id: None,
+                line: None,
+                bindings: Vec::new(),
+                gap: None,
             }],
             has_more: true,
             incomplete_evidence: Vec::new(),
+            outcome: None,
+            capacity: None,
+            limitations: Vec::new(),
         };
         let list = vec![RecordingMetadata {
             recording_id,
@@ -797,6 +1175,8 @@ mod tests {
             first_sequence: Some("2".to_owned()),
             last_sequence: Some(u64::MAX.to_string()),
             incomplete_evidence: vec!["persisted_status:partial".to_owned()],
+            event_cap: None,
+            outcome_kind: None,
         }];
         (project_id, recording_id, ReadFixture { list, window })
     }
