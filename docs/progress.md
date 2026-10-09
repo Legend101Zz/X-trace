@@ -570,5 +570,7 @@ The owner authorized a second unattended batch of at most ten hours (ADR 0009 ad
 - The campaign analysis treats only `responded` and `exception` as observed outcomes, while the product emits `exception_propagated` (to fix in the Petclinic wave).
 - Release-tool process-tree tests flaked on hosted macOS (BI-F8); see the merge record for the fix and its evidence.
 
+The row notes in `evidence/v0.01/requirements.json` still describe rc-1 and rc-2 heads by SHA; they are updated with rc-3 evidence only after the gates have run on the exact candidate. No row is accepted.
+
 **Decision records for the owner to ratify:** ADR 0008 Amendment 1, the ADR 0006 addendum (other-UID negative before the broker exists), ADR 0011 (recording limitations), and the ADR 0009 addendum (this batch).
 
