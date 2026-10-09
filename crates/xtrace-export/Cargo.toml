@@ -10,3 +10,7 @@ description = "Export formats and bundles (lane W). Skeleton created by C0."
 
 [lints]
 workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+serde_json = { workspace = true }

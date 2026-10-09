@@ -1649,10 +1649,19 @@ dependencies = [
 [[package]]
 name = "xtrace-exercise"
 version = "0.0.1"
+dependencies = [
+ "blake3",
+ "serde_json",
+ "xtrace-export",
+]
 
 [[package]]
 name = "xtrace-export"
 version = "0.0.1"
+dependencies = [
+ "blake3",
+ "serde_json",
+]
 
 [[package]]
 name = "xtrace-ingest"
