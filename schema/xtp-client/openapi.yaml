@@ -224,6 +224,18 @@ paths:
           name: cursor
           description: Opaque project and recording scoped versioned continuation token.
           schema: { type: string, maxLength: 128 }
+        - in: query
+          name: aroundFrame
+          description: >-
+            Window of limit events centred on this frame. Mutually exclusive with
+            cursor. Registered; answers 501 XTR-REPLAY-NOT-IMPLEMENTED until served.
+          schema: { type: string, format: uuid }
+        - in: query
+          name: projection
+          description: >-
+            full (default) returns every event field; structure returns outline
+            fields only. structure answers 501 XTR-REPLAY-NOT-IMPLEMENTED until served.
+          schema: { type: string, enum: [full, structure], default: full }
       responses:
         '200':
           description: Bounded ordered event projection backed by verified XTF segments.
@@ -237,6 +249,143 @@ paths:
         '413': { $ref: '#/components/responses/Problem' }
         '422': { $ref: '#/components/responses/Problem' }
         '500': { $ref: '#/components/responses/Problem' }
+        '501': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+  /api/v1/recordings/{recordingId}/frames/{frameId}/navigation:
+    get:
+      operationId: showFrameNavigation
+      description: All navigation actions of one frame in a single call.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/OptionalApiOrigin'
+        - in: path
+          name: recordingId
+          required: true
+          schema: { type: string, format: uuid }
+        - in: path
+          name: frameId
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Navigation facts for the frame.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FrameNavigationDocument' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '501': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+  /api/v1/recordings/{recordingId}/navigate:
+    get:
+      operationId: navigateRecording
+      description: >-
+        Resolve one navigation action from a frame (action) or jump to the next or
+        previous gap, error or interaction (kind and dir).
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/OptionalApiOrigin'
+        - in: path
+          name: recordingId
+          required: true
+          schema: { type: string, format: uuid }
+        - in: query
+          name: frame
+          required: true
+          schema: { type: string, format: uuid }
+        - in: query
+          name: action
+          schema: { type: string, enum: [previous, next, into, over, out] }
+        - in: query
+          name: kinds
+          description: Comma separated event kinds applied to previous and next.
+          schema: { type: string, maxLength: 256 }
+        - in: query
+          name: kind
+          schema: { type: string, enum: [gap, error, interaction] }
+        - in: query
+          name: dir
+          schema: { type: string, enum: [next, previous] }
+      responses:
+        '200':
+          description: Result of the requested navigation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NavigateDocument' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '501': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+  /api/v1/recordings/{recordingId}/frames:
+    get:
+      operationId: listRecordingFrames
+      description: Window of frames by ordinal under the structure or full projection.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/OptionalApiOrigin'
+        - in: path
+          name: recordingId
+          required: true
+          schema: { type: string, format: uuid }
+        - in: query
+          name: fromOrdinal
+          schema: { type: integer, minimum: 0 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 2500 }
+        - in: query
+          name: kinds
+          schema: { type: string, maxLength: 256 }
+      responses:
+        '200':
+          description: Frame window.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingDetail' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '501': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+  /api/v1/recordings/{recordingId}/graph:
+    get:
+      operationId: showRecordingGraph
+      description: Async and frame graph derived from structure rows.
+      security: [{ viewerCookie: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ViewerHost'
+        - $ref: '#/components/parameters/ViewerFetchSite'
+        - $ref: '#/components/parameters/ViewerClient'
+        - $ref: '#/components/parameters/OptionalApiOrigin'
+        - in: path
+          name: recordingId
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Frame graph.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingGraph' }
+        '400': { $ref: '#/components/responses/Problem' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '501': { $ref: '#/components/responses/Problem' }
         '503': { $ref: '#/components/responses/Problem' }
 components:
   parameters:
@@ -299,7 +448,7 @@ components:
       type: object
       required: [schemaVersion, projectId, limit, after, nextAfter, recordings, unavailable, requestId]
       properties:
-        schemaVersion: { type: integer, const: 2 }
+        schemaVersion: { type: integer, const: 3 }
         projectId: { type: string, format: uuid }
         limit: { type: integer }
         after: { type: [string, 'null'], format: uuid }
@@ -322,6 +471,11 @@ components:
         firstSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
         lastSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
         incompleteEvidence: { type: array, items: { type: string } }
+        eventCap: { type: [integer, 'null'], minimum: 1, description: Event cap recorded in terminal evidence. }
+        outcomeKind:
+          type: [string, 'null']
+          enum: [responded, exception, unobserved, null]
+          description: Outcome kind from terminal evidence; null when no terminal evidence exists.
     ObservedEndpointPage:
       type: object
       required: [items, nextCursor]
@@ -381,9 +535,9 @@ components:
           enum: [observation_policy_missing, observation_policy_invalid, identity_context_missing, identity_context_invalid, method_unsupported, route_unapproved, null]
     RecordingDetail:
       type: object
-      required: [schemaVersion, projectId, recordingId, status, completion, adapterSummary, durationNs, dropCountsByPriority, limit, cursor, nextCursor, segmentCount, events, incompleteEvidence, unavailable, requestId]
+      required: [schemaVersion, projectId, recordingId, status, completion, adapterSummary, durationNs, dropCountsByPriority, limit, cursor, nextCursor, segmentCount, events, incompleteEvidence, unavailable, outcome, capacity, limitations, honesty, anchorFrameId, firstSequence, lastSequence, prevCursor, projection, requestId]
       properties:
-        schemaVersion: { type: integer, const: 2 }
+        schemaVersion: { type: integer, const: 3 }
         projectId: { type: string, format: uuid }
         recordingId: { type: string, format: uuid }
         status: { type: string, enum: [recording, finalizing, complete, partial, invalid] }
@@ -405,10 +559,191 @@ components:
         events: { type: array, items: { $ref: '#/components/schemas/Event' } }
         incompleteEvidence: { type: array, items: { type: string } }
         unavailable: { $ref: '#/components/schemas/Unavailable' }
+        outcome:
+          description: Adapter-observed outcome; null when terminal evidence is absent. Nothing is synthesized.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/Outcome'
+        capacity:
+          description: Event capacity facts; null when terminal evidence is absent.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/Capacity'
+        limitations:
+          type: array
+          items: { type: string }
+          description: Stable limitation codes, for example capture_policy_not_armed.
+        honesty: { $ref: '#/components/schemas/Honesty' }
+        anchorFrameId: { type: [string, 'null'], format: uuid }
+        firstSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
+        lastSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
+        prevCursor: { type: [string, 'null'], maxLength: 128 }
+        projection: { type: string, enum: [full, structure] }
         requestId: { type: string, format: uuid }
+    Outcome:
+      type: object
+      required: [kind, httpStatus, exception, thrownFromEventId]
+      properties:
+        kind: { type: string, enum: [responded, exception, unobserved] }
+        httpStatus: { type: [integer, 'null'], minimum: 100, maximum: 599 }
+        exception:
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [exceptionType, message]
+              properties:
+                exceptionType: { type: string, maxLength: 256 }
+                message: { type: [string, 'null'], maxLength: 512 }
+        thrownFromEventId: { type: [string, 'null'], maxLength: 128 }
+    Capacity:
+      type: object
+      required: [eventCap, eventCount, capacityDroppedEvents, dropsByPriority]
+      properties:
+        eventCap: { type: integer, minimum: 1 }
+        eventCount: { type: integer, minimum: 0 }
+        capacityDroppedEvents: { type: string, pattern: '^[0-9]+$' }
+        dropsByPriority:
+          type: object
+          maxProperties: 256
+          additionalProperties: { type: string, pattern: '^[0-9]+$' }
+    Honesty:
+      type: object
+      required: [schemaVersion, recording, window]
+      properties:
+        schemaVersion: { type: integer, const: 1 }
+        recording:
+          type: object
+          required: [completion, incomplete, capacityDroppedEvents, dropsByPriority, framesWithGap, framesWithRedacted, framesWithTruncated, framesWithUnavailable, framesWithDropped, framesWithOrphanParent, countsAvailable]
+          properties:
+            completion: { $ref: '#/components/schemas/Completion' }
+            incomplete: { type: array, items: { type: string } }
+            capacityDroppedEvents: { type: string, pattern: '^[0-9]+$' }
+            dropsByPriority:
+              type: object
+              additionalProperties: { type: string, pattern: '^[0-9]+$' }
+            framesWithGap: { type: [integer, 'null'], minimum: 0 }
+            framesWithRedacted: { type: [integer, 'null'], minimum: 0 }
+            framesWithTruncated: { type: [integer, 'null'], minimum: 0 }
+            framesWithUnavailable: { type: [integer, 'null'], minimum: 0 }
+            framesWithDropped: { type: [integer, 'null'], minimum: 0 }
+            framesWithOrphanParent: { type: [integer, 'null'], minimum: 0 }
+            countsAvailable:
+              type: boolean
+              description: False when frame counts cannot be computed; counts are then null, never zero.
+        window:
+          type: object
+          required: [events, bindingsByState, unavailableByReason, droppedByReason, gaps, sourceBindings, sourceStatus]
+          properties:
+            events: { type: integer, minimum: 0 }
+            bindingsByState: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+            unavailableByReason: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+            droppedByReason: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+            gaps:
+              type: array
+              items:
+                type: object
+                required: [sequence, reason, count, firstSequence, lastSequence]
+                properties:
+                  sequence: { type: string, pattern: '^[0-9]+$' }
+                  reason: { type: string }
+                  count: { type: string, pattern: '^[0-9]+$' }
+                  firstSequence: { type: string, pattern: '^[0-9]+$' }
+                  lastSequence: { type: string, pattern: '^[0-9]+$' }
+            sourceBindings: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+            sourceStatus: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+    Binding:
+      type: object
+      required: [name, role, nameOrigin, value]
+      properties:
+        name: { type: string }
+        role: { type: string }
+        nameOrigin: { type: string }
+        value:
+          oneOf:
+            - type: object
+              required: [state, shape, preview, contentHash]
+              properties:
+                state: { type: string, const: captured }
+                shape: { type: string }
+                preview: { type: string, maxLength: 512 }
+                contentHash: { type: string, pattern: '^b3:[0-9a-f]{64}$' }
+            - type: object
+              required: [state, ruleId, shapeHint]
+              properties:
+                state: { type: string, const: redacted }
+                ruleId: { type: string }
+                shapeHint: { type: [string, 'null'] }
+            - type: object
+              required: [state, preview, originalSizeLowerBound, limit]
+              properties:
+                state: { type: string, const: truncated }
+                preview: { type: string, maxLength: 512 }
+                originalSizeLowerBound: { type: string, pattern: '^[0-9]+$' }
+                limit: { type: string, pattern: '^[0-9]+$' }
+            - type: object
+              required: [state, reason]
+              properties:
+                state: { type: string, const: unavailable }
+                reason: { type: string }
+            - type: object
+              required: [state, reason]
+              properties:
+                state: { type: string, const: dropped }
+                reason: { type: string }
+    Gap:
+      type: object
+      required: [reason, count, firstSequence, lastSequence]
+      description: >-
+        Suppressed observations never receive a sequence. firstSequence and
+        lastSequence bracket the nearest emitted events; count is the number
+        suppressed and may exceed their distance.
+      properties:
+        reason: { type: string }
+        count: { type: string, pattern: '^[0-9]+$' }
+        firstSequence: { type: string, pattern: '^[0-9]+$' }
+        lastSequence: { type: string, pattern: '^[0-9]+$' }
+    FrameNavigationDocument:
+      type: object
+      required: [frameId, sequence, depth, parentFrameId, navigation]
+      properties:
+        frameId: { type: string, format: uuid }
+        sequence: { type: string, pattern: '^[0-9]+$' }
+        depth: { type: [integer, 'null'], minimum: 0 }
+        parentFrameId: { type: [string, 'null'], format: uuid }
+        navigation: { $ref: '#/components/schemas/FrameNavigation' }
+    NavigateDocument:
+      type: object
+      required: [frameId, result]
+      properties:
+        frameId: { type: string, format: uuid }
+        action: { type: string, enum: [previous, next, into, over, out] }
+        result: { $ref: '#/components/schemas/NavigationResult' }
+    RecordingGraph:
+      type: object
+      required: [nodes, edges]
+      properties:
+        nodes:
+          type: array
+          items:
+            type: object
+            required: [frameId, kind, depth]
+            properties:
+              frameId: { type: string, format: uuid }
+              kind: { type: string }
+              depth: { type: [integer, 'null'], minimum: 0 }
+              count: { type: integer, minimum: 1 }
+        edges:
+          type: array
+          items:
+            type: object
+            required: [from, to, relation]
+            properties:
+              from: { type: string, format: uuid }
+              to: { type: string, format: uuid }
+              relation: { type: string, enum: [parent, async_parent] }
     Event:
       type: object
-      required: [sequence, frameId, navigation, monotonicNs, kind, sourceBinding, fieldTruncations]
+      required: [sequence, frameId, navigation, monotonicNs, kind, sourceBinding, fieldTruncations, depth, parentFrameId, asyncParentFrameId, line, bindings, gap]
       properties:
         sequence: { type: string, pattern: '^[0-9]+$' }
         frameId:
@@ -428,7 +763,7 @@ components:
         sourceBinding:
           type: string
           description: Adapter-reported compile-time class-to-source binding result.
-          enum: [unspecified, verified, attestation_missing, class_bytes_mismatch, debug_metadata_absent, source_metadata_invalid]
+          enum: [unspecified, verified, attestation_missing, class_bytes_mismatch, debug_metadata_absent, source_metadata_invalid, observed_unattested, source_map_absent, source_map_unresolved]
         source:
           oneOf:
             - type: 'null'
@@ -444,7 +779,7 @@ components:
                   type: [integer, 'null']
                   minimum: 1
                   description: Inclusive upper bound of the fixture method debug-line extent, when available.
-                status: { type: string, enum: [matched, mismatch, unavailable] }
+                status: { type: string, enum: [matched, mismatch, unavailable, missing_file] }
                 excerpt: { type: [string, 'null'], maxLength: 16384 }
                 truncated: { type: boolean }
         fieldTruncations:
@@ -456,6 +791,21 @@ components:
               field: { type: string }
               originalBytes: { type: string, pattern: '^[0-9]+$' }
               representation: { type: string, enum: [truncated, unavailable] }
+        depth: { type: [integer, 'null'], minimum: 0, description: Null for legacy or unindexed rows. }
+        parentFrameId: { type: [string, 'null'], format: uuid, description: Only when the parent was observed. }
+        asyncParentFrameId: { type: [string, 'null'], format: uuid, description: Only when the async parent was observed. }
+        line:
+          type: [integer, 'null']
+          minimum: 1
+          description: Observed line; set only for line_cursor events and never a method extent.
+        bindings:
+          type: array
+          items: { $ref: '#/components/schemas/Binding' }
+          description: Empty means none observed.
+        gap:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/Gap'
     Completion:
       type: string
       enum: [complete, partial, invalid, unavailable]
@@ -478,7 +828,14 @@ components:
         - type: object
           required: [state]
           properties:
-            state: { type: string, enum: [boundary, unavailable] }
+            state: { type: string, const: boundary }
+        - type: object
+          required: [state, reason]
+          properties:
+            state: { type: string, const: unavailable }
+            reason:
+              type: string
+              enum: [partial_frontier, legacy_unindexed, depth_overflow, orphan_parent, not_navigable]
     AdapterSummary:
       description: No preview text or producer-supplied rule identifier is exposed until a verified policy registry exists.
       oneOf:
@@ -511,8 +868,8 @@ components:
       type: object
       required: [source, values, completion]
       properties:
-        source: { type: string, const: unavailable }
-        values: { type: string, const: unavailable }
+        source: { type: string, enum: [unavailable, available] }
+        values: { type: string, enum: [unavailable, available] }
         completion: { type: string, enum: [available, unavailable, per_recording] }
     Problem:
       type: object

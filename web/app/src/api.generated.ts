@@ -90,6 +90,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/recordings/{recordingId}/frames/{frameId}/navigation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description All navigation actions of one frame in a single call. */
+        get: operations["showFrameNavigation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/recordings/{recordingId}/navigate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Resolve one navigation action from a frame (action) or jump to the next or previous gap, error or interaction (kind and dir). */
+        get: operations["navigateRecording"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/recordings/{recordingId}/frames": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Window of frames by ordinal under the structure or full projection. */
+        get: operations["listRecordingFrames"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/recordings/{recordingId}/graph": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Async and frame graph derived from structure rows. */
+        get: operations["showRecordingGraph"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -102,7 +170,7 @@ export interface components {
         };
         RecordingList: {
             /** @constant */
-            schemaVersion: 2;
+            schemaVersion: 3;
             /** Format: uuid */
             projectId: string;
             limit: number;
@@ -128,6 +196,13 @@ export interface components {
             firstSequence?: string | null;
             lastSequence?: string | null;
             incompleteEvidence: string[];
+            /** @description Event cap recorded in terminal evidence. */
+            eventCap?: number | null;
+            /**
+             * @description Outcome kind from terminal evidence; null when no terminal evidence exists.
+             * @enum {string|null}
+             */
+            outcomeKind?: "responded" | "exception" | "unobserved" | null;
         };
         ObservedEndpointPage: {
             items: components["schemas"]["ObservedEndpoint"][];
@@ -180,7 +255,7 @@ export interface components {
         };
         RecordingDetail: {
             /** @constant */
-            schemaVersion: 2;
+            schemaVersion: 3;
             /** Format: uuid */
             projectId: string;
             /** Format: uuid */
@@ -201,8 +276,156 @@ export interface components {
             events: components["schemas"]["Event"][];
             incompleteEvidence: string[];
             unavailable: components["schemas"]["Unavailable"];
+            /** @description Adapter-observed outcome; null when terminal evidence is absent. Nothing is synthesized. */
+            outcome: null | components["schemas"]["Outcome"];
+            /** @description Event capacity facts; null when terminal evidence is absent. */
+            capacity: null | components["schemas"]["Capacity"];
+            /** @description Stable limitation codes, for example capture_policy_not_armed. */
+            limitations: string[];
+            honesty: components["schemas"]["Honesty"];
+            /** Format: uuid */
+            anchorFrameId: string | null;
+            firstSequence: string | null;
+            lastSequence: string | null;
+            prevCursor: string | null;
+            /** @enum {string} */
+            projection: "full" | "structure";
             /** Format: uuid */
             requestId: string;
+        };
+        Outcome: {
+            /** @enum {string} */
+            kind: "responded" | "exception" | "unobserved";
+            httpStatus: number | null;
+            exception: null | {
+                exceptionType: string;
+                message: string | null;
+            };
+            thrownFromEventId: string | null;
+        };
+        Capacity: {
+            eventCap: number;
+            eventCount: number;
+            capacityDroppedEvents: string;
+            dropsByPriority: {
+                [key: string]: string;
+            };
+        };
+        Honesty: {
+            /** @constant */
+            schemaVersion: 1;
+            recording: {
+                completion: components["schemas"]["Completion"];
+                incomplete: string[];
+                capacityDroppedEvents: string;
+                dropsByPriority: {
+                    [key: string]: string;
+                };
+                framesWithGap: number | null;
+                framesWithRedacted: number | null;
+                framesWithTruncated: number | null;
+                framesWithUnavailable: number | null;
+                framesWithDropped: number | null;
+                framesWithOrphanParent: number | null;
+                /** @description False when frame counts cannot be computed; counts are then null, never zero. */
+                countsAvailable: boolean;
+            };
+            window: {
+                events: number;
+                bindingsByState: {
+                    [key: string]: number;
+                };
+                unavailableByReason: {
+                    [key: string]: number;
+                };
+                droppedByReason: {
+                    [key: string]: number;
+                };
+                gaps: {
+                    sequence: string;
+                    reason: string;
+                    count: string;
+                    firstSequence: string;
+                    lastSequence: string;
+                }[];
+                sourceBindings: {
+                    [key: string]: number;
+                };
+                sourceStatus: {
+                    [key: string]: number;
+                };
+            };
+        };
+        Binding: {
+            name: string;
+            role: string;
+            nameOrigin: string;
+            value: {
+                /** @constant */
+                state: "captured";
+                shape: string;
+                preview: string;
+                contentHash: string;
+            } | {
+                /** @constant */
+                state: "redacted";
+                ruleId: string;
+                shapeHint: string | null;
+            } | {
+                /** @constant */
+                state: "truncated";
+                preview: string;
+                originalSizeLowerBound: string;
+                limit: string;
+            } | {
+                /** @constant */
+                state: "unavailable";
+                reason: string;
+            } | {
+                /** @constant */
+                state: "dropped";
+                reason: string;
+            };
+        };
+        /** @description Suppressed observations never receive a sequence. firstSequence and lastSequence bracket the nearest emitted events; count is the number suppressed and may exceed their distance. */
+        Gap: {
+            reason: string;
+            count: string;
+            firstSequence: string;
+            lastSequence: string;
+        };
+        FrameNavigationDocument: {
+            /** Format: uuid */
+            frameId: string;
+            sequence: string;
+            depth: number | null;
+            /** Format: uuid */
+            parentFrameId: string | null;
+            navigation: components["schemas"]["FrameNavigation"];
+        };
+        NavigateDocument: {
+            /** Format: uuid */
+            frameId: string;
+            /** @enum {string} */
+            action?: "previous" | "next" | "into" | "over" | "out";
+            result: components["schemas"]["NavigationResult"];
+        };
+        RecordingGraph: {
+            nodes: {
+                /** Format: uuid */
+                frameId: string;
+                kind: string;
+                depth: number | null;
+                count?: number;
+            }[];
+            edges: {
+                /** Format: uuid */
+                from: string;
+                /** Format: uuid */
+                to: string;
+                /** @enum {string} */
+                relation: "parent" | "async_parent";
+            }[];
         };
         Event: {
             sequence: string;
@@ -222,7 +445,7 @@ export interface components {
              * @description Adapter-reported compile-time class-to-source binding result.
              * @enum {string}
              */
-            sourceBinding: "unspecified" | "verified" | "attestation_missing" | "class_bytes_mismatch" | "debug_metadata_absent" | "source_metadata_invalid";
+            sourceBinding: "unspecified" | "verified" | "attestation_missing" | "class_bytes_mismatch" | "debug_metadata_absent" | "source_metadata_invalid" | "observed_unattested" | "source_map_absent" | "source_map_unresolved";
             source?: null | {
                 path: string;
                 /** @description Lower bound of the fixture method debug-line extent, not an active execution cursor. */
@@ -230,7 +453,7 @@ export interface components {
                 /** @description Inclusive upper bound of the fixture method debug-line extent, when available. */
                 endLine: number | null;
                 /** @enum {string} */
-                status: "matched" | "mismatch" | "unavailable";
+                status: "matched" | "mismatch" | "unavailable" | "missing_file";
                 excerpt: string | null;
                 truncated: boolean;
             };
@@ -240,6 +463,23 @@ export interface components {
                 /** @enum {string} */
                 representation: "truncated" | "unavailable";
             }[];
+            /** @description Null for legacy or unindexed rows. */
+            depth: number | null;
+            /**
+             * Format: uuid
+             * @description Only when the parent was observed.
+             */
+            parentFrameId: string | null;
+            /**
+             * Format: uuid
+             * @description Only when the async parent was observed.
+             */
+            asyncParentFrameId: string | null;
+            /** @description Observed line; set only for line_cursor events and never a method extent. */
+            line: number | null;
+            /** @description Empty means none observed. */
+            bindings: components["schemas"]["Binding"][];
+            gap: null | components["schemas"]["Gap"];
         };
         /** @enum {string} */
         Completion: "complete" | "partial" | "invalid" | "unavailable";
@@ -256,8 +496,13 @@ export interface components {
             /** Format: uuid */
             frameId: string;
         } | {
+            /** @constant */
+            state: "boundary";
+        } | {
+            /** @constant */
+            state: "unavailable";
             /** @enum {string} */
-            state: "boundary" | "unavailable";
+            reason: "partial_frontier" | "legacy_unindexed" | "depth_overflow" | "orphan_parent" | "not_navigable";
         };
         /** @description No preview text or producer-supplied rule identifier is exposed until a verified policy registry exists. */
         AdapterSummary: {
@@ -278,10 +523,10 @@ export interface components {
             };
         };
         Unavailable: {
-            /** @constant */
-            source: "unavailable";
-            /** @constant */
-            values: "unavailable";
+            /** @enum {string} */
+            source: "unavailable" | "available";
+            /** @enum {string} */
+            values: "unavailable" | "available";
             /** @enum {string} */
             completion: "available" | "unavailable" | "per_recording";
         };
@@ -509,6 +754,10 @@ export interface operations {
                 limit?: number;
                 /** @description Opaque project and recording scoped versioned continuation token. */
                 cursor?: string;
+                /** @description Window of limit events centred on this frame. Mutually exclusive with cursor. Registered; answers 501 XTR-REPLAY-NOT-IMPLEMENTED until served. */
+                aroundFrame?: string;
+                /** @description full (default) returns every event field; structure returns outline fields only. structure answers 501 XTR-REPLAY-NOT-IMPLEMENTED until served. */
+                projection?: "full" | "structure";
             };
             header: {
                 /** @description Exact 127.0.0.1 authority, including the viewer's assigned port. */
@@ -543,6 +792,167 @@ export interface operations {
             413: components["responses"]["Problem"];
             422: components["responses"]["Problem"];
             500: components["responses"]["Problem"];
+            501: components["responses"]["Problem"];
+            503: components["responses"]["Problem"];
+        };
+    };
+    showFrameNavigation: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact 127.0.0.1 authority, including the viewer's assigned port. */
+                Host: components["parameters"]["ViewerHost"];
+                /** @description Must be exactly same-origin. */
+                "Sec-Fetch-Site": components["parameters"]["ViewerFetchSite"];
+                /** @description Required browser-client marker; must be exactly viewer-v1. */
+                "X-XTrace-Client": components["parameters"]["ViewerClient"];
+                /** @description If supplied, must exactly equal the printed viewer origin. It may be absent on browser GET requests only; Host, Sec-Fetch-Site, and X-XTrace-Client remain required. */
+                Origin?: components["parameters"]["OptionalApiOrigin"];
+            };
+            path: {
+                recordingId: string;
+                frameId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Navigation facts for the frame. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FrameNavigationDocument"];
+                };
+            };
+            400: components["responses"]["Problem"];
+            401: components["responses"]["Problem"];
+            403: components["responses"]["Problem"];
+            404: components["responses"]["Problem"];
+            501: components["responses"]["Problem"];
+            503: components["responses"]["Problem"];
+        };
+    };
+    navigateRecording: {
+        parameters: {
+            query: {
+                frame: string;
+                action?: "previous" | "next" | "into" | "over" | "out";
+                /** @description Comma separated event kinds applied to previous and next. */
+                kinds?: string;
+                kind?: "gap" | "error" | "interaction";
+                dir?: "next" | "previous";
+            };
+            header: {
+                /** @description Exact 127.0.0.1 authority, including the viewer's assigned port. */
+                Host: components["parameters"]["ViewerHost"];
+                /** @description Must be exactly same-origin. */
+                "Sec-Fetch-Site": components["parameters"]["ViewerFetchSite"];
+                /** @description Required browser-client marker; must be exactly viewer-v1. */
+                "X-XTrace-Client": components["parameters"]["ViewerClient"];
+                /** @description If supplied, must exactly equal the printed viewer origin. It may be absent on browser GET requests only; Host, Sec-Fetch-Site, and X-XTrace-Client remain required. */
+                Origin?: components["parameters"]["OptionalApiOrigin"];
+            };
+            path: {
+                recordingId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Result of the requested navigation. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NavigateDocument"];
+                };
+            };
+            400: components["responses"]["Problem"];
+            401: components["responses"]["Problem"];
+            403: components["responses"]["Problem"];
+            404: components["responses"]["Problem"];
+            501: components["responses"]["Problem"];
+            503: components["responses"]["Problem"];
+        };
+    };
+    listRecordingFrames: {
+        parameters: {
+            query?: {
+                fromOrdinal?: number;
+                limit?: number;
+                kinds?: string;
+            };
+            header: {
+                /** @description Exact 127.0.0.1 authority, including the viewer's assigned port. */
+                Host: components["parameters"]["ViewerHost"];
+                /** @description Must be exactly same-origin. */
+                "Sec-Fetch-Site": components["parameters"]["ViewerFetchSite"];
+                /** @description Required browser-client marker; must be exactly viewer-v1. */
+                "X-XTrace-Client": components["parameters"]["ViewerClient"];
+                /** @description If supplied, must exactly equal the printed viewer origin. It may be absent on browser GET requests only; Host, Sec-Fetch-Site, and X-XTrace-Client remain required. */
+                Origin?: components["parameters"]["OptionalApiOrigin"];
+            };
+            path: {
+                recordingId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Frame window. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordingDetail"];
+                };
+            };
+            400: components["responses"]["Problem"];
+            401: components["responses"]["Problem"];
+            403: components["responses"]["Problem"];
+            404: components["responses"]["Problem"];
+            501: components["responses"]["Problem"];
+            503: components["responses"]["Problem"];
+        };
+    };
+    showRecordingGraph: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exact 127.0.0.1 authority, including the viewer's assigned port. */
+                Host: components["parameters"]["ViewerHost"];
+                /** @description Must be exactly same-origin. */
+                "Sec-Fetch-Site": components["parameters"]["ViewerFetchSite"];
+                /** @description Required browser-client marker; must be exactly viewer-v1. */
+                "X-XTrace-Client": components["parameters"]["ViewerClient"];
+                /** @description If supplied, must exactly equal the printed viewer origin. It may be absent on browser GET requests only; Host, Sec-Fetch-Site, and X-XTrace-Client remain required. */
+                Origin?: components["parameters"]["OptionalApiOrigin"];
+            };
+            path: {
+                recordingId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Frame graph. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecordingGraph"];
+                };
+            };
+            400: components["responses"]["Problem"];
+            401: components["responses"]["Problem"];
+            403: components["responses"]["Problem"];
+            404: components["responses"]["Problem"];
+            501: components["responses"]["Problem"];
             503: components["responses"]["Problem"];
         };
     };

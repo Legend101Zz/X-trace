@@ -22,7 +22,7 @@ use xtrace_application::recording::{
 };
 use xtrace_application::recording_queries::{
     FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES,
-    NavigationResult, PersistedEvent, PersistedInteraction, PersistedSource,
+    NavigationResult, NavigationUnavailable, PersistedEvent, PersistedInteraction, PersistedSource,
     RecordingCompletionEvidence, RecordingEventWindow, RecordingMetadata, RecordingStatus,
     ShowWindowRequest, SourceStatus,
 };
@@ -681,6 +681,8 @@ impl SqliteRecordingStore<'_> {
                     .transpose()?
                     .map(|value| value.to_string()),
                 incomplete_evidence,
+                event_cap: None,
+                outcome_kind: None,
             });
         }
         let has_more = recordings.len() > usize::try_from(limit).unwrap_or(usize::MAX);
@@ -1065,6 +1067,9 @@ impl SqliteRecordingStore<'_> {
             events,
             has_more,
             incomplete_evidence,
+            outcome: None,
+            capacity: None,
+            limitations: Vec::new(),
         })
     }
 
@@ -2277,26 +2282,26 @@ fn frame_navigation(
         NavigationResult::Boundary
     } else {
         match verified_frame_ids.get(&(sequence - 1)).copied() {
-            Some(frame) => NavigationResult::Target(frame),
-            None => NavigationResult::Unavailable,
+            Some(frame_id) => NavigationResult::Target { frame_id },
+            None => NavigationResult::unavailable(NavigationUnavailable::PartialFrontier),
         }
     };
     let next = if let Some(next_sequence) = sequence.checked_add(1) {
         if let Some(frame) = verified_frame_ids.get(&next_sequence).copied() {
-            NavigationResult::Target(frame)
+            NavigationResult::Target { frame_id: frame }
         } else if completion == RecordingCompletionEvidence::Complete
             && terminal_final_sequence(connection, recording_id, correlation_id)? == Some(sequence)
         {
             NavigationResult::Boundary
         } else {
-            NavigationResult::Unavailable
+            NavigationResult::unavailable(NavigationUnavailable::PartialFrontier)
         }
     } else if completion == RecordingCompletionEvidence::Complete
         && terminal_final_sequence(connection, recording_id, correlation_id)? == Some(sequence)
     {
         NavigationResult::Boundary
     } else {
-        NavigationResult::Unavailable
+        NavigationResult::unavailable(NavigationUnavailable::PartialFrontier)
     };
     Ok((
         Some(frame_id),
@@ -2305,9 +2310,9 @@ fn frame_navigation(
             next,
             // Parent digests are retained for a future verified graph
             // resolver. They do not establish call-stack depth by themselves.
-            into: NavigationResult::Unavailable,
-            over: NavigationResult::Unavailable,
-            out: NavigationResult::Unavailable,
+            into: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+            over: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+            out: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
         },
     ))
 }
@@ -2440,6 +2445,12 @@ fn project_persisted_event(
         source,
         source_binding,
         field_truncations: Vec::new(),
+        depth: None,
+        parent_frame_id: None,
+        async_parent_frame_id: None,
+        line: None,
+        bindings: Vec::new(),
+        gap: None,
     };
     projected.bound_display_fields();
     projected
@@ -4158,6 +4169,8 @@ fn recording_metadata_from_row(
             .transpose()?
             .map(|value| value.to_string()),
         incomplete_evidence,
+        event_cap: None,
+        outcome_kind: None,
     })
 }
 

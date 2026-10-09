@@ -79,11 +79,14 @@ pub use recording::{
 };
 pub use recording_queries::{
     DEFAULT_RECORDING_EVENT_LIMIT, DEFAULT_RECORDING_LIST_LIMIT, FieldRepresentation,
-    FieldTruncation, FrameNavigation, ListRecordings, MAX_RECORDING_DISPLAY_FIELD_BYTES,
-    MAX_RECORDING_EVENT_LIMIT, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_LIST_LIMIT,
+    FieldTruncation, FrameNavigation, HonestyRecording, HonestySummary, HonestyWindow,
+    ListRecordings, MAX_RECORDING_DISPLAY_FIELD_BYTES, MAX_RECORDING_EVENT_LIMIT,
+    MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_LIST_LIMIT,
     MAX_RECORDING_RELATIONSHIP_ID_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES, NavigationResult,
-    PersistedEvent, PersistedInteraction, PersistedSource, RECORDING_READ_SCHEMA_VERSION,
-    RecordingCompletionEvidence, RecordingDetail, RecordingEventWindow, RecordingListPage,
-    RecordingMetadata, RecordingQueryService, RecordingReadPort, RecordingStatus, ShowRecording,
-    ShowWindowRequest, SourceStatus, UnavailableEvidence, list_recordings, show_recording,
+    NavigationUnavailable, OutcomeException, PersistedBinding, PersistedEvent, PersistedGap,
+    PersistedInteraction, PersistedOutcome, PersistedSource, PersistedValue, Projection,
+    RECORDING_READ_SCHEMA_VERSION, RecordingCapacity, RecordingCompletionEvidence, RecordingDetail,
+    RecordingEventWindow, RecordingListPage, RecordingMetadata, RecordingQueryService,
+    RecordingReadPort, RecordingStatus, ShowRecording, ShowWindowRequest, SourceStatus,
+    UnavailableEvidence, WindowGap, list_recordings, show_recording,
 };

@@ -515,11 +515,15 @@ mod tests {
         );
         assert_eq!(
             first_window.events[0].navigation.next,
-            xtrace_application::recording_queries::NavigationResult::Target(second_frame)
+            xtrace_application::recording_queries::NavigationResult::Target {
+                frame_id: second_frame
+            }
         );
         assert_eq!(
             first_window.events[1].navigation.previous,
-            xtrace_application::recording_queries::NavigationResult::Target(first_frame)
+            xtrace_application::recording_queries::NavigationResult::Target {
+                frame_id: first_frame
+            }
         );
         assert_eq!(
             first_window.events[1].navigation.next,
@@ -527,7 +531,9 @@ mod tests {
         );
         assert_eq!(
             first_window.events[0].navigation.into,
-            xtrace_application::recording_queries::NavigationResult::Unavailable
+            xtrace_application::recording_queries::NavigationResult::unavailable(
+                xtrace_application::recording_queries::NavigationUnavailable::LegacyUnindexed,
+            )
         );
         let second_page = reader
             .show_recording(&ShowWindowRequest { limit: 1, after_sequence: Some(2), ..request })
@@ -535,7 +541,9 @@ mod tests {
         assert_eq!(second_page.events[0].frame_id, Some(second_frame));
         assert_eq!(
             second_page.events[0].navigation.previous,
-            xtrace_application::recording_queries::NavigationResult::Target(first_frame)
+            xtrace_application::recording_queries::NavigationResult::Target {
+                frame_id: first_frame
+            }
         );
         assert_eq!(
             second_page.events[0].navigation.next,
@@ -587,7 +595,9 @@ mod tests {
         assert_eq!(corrupted_lookbehind.events[0].frame_id, Some(second_frame));
         assert_eq!(
             corrupted_lookbehind.events[0].navigation.previous,
-            xtrace_application::recording_queries::NavigationResult::Unavailable
+            xtrace_application::recording_queries::NavigationResult::unavailable(
+                xtrace_application::recording_queries::NavigationUnavailable::PartialFrontier,
+            )
         );
 
         let connection = reopened.lock().expect("metadata connection");
@@ -619,7 +629,9 @@ mod tests {
         assert_eq!(corrupted_neighbor.events[0].frame_id, Some(first_frame));
         assert_eq!(
             corrupted_neighbor.events[0].navigation.next,
-            xtrace_application::recording_queries::NavigationResult::Unavailable
+            xtrace_application::recording_queries::NavigationResult::unavailable(
+                xtrace_application::recording_queries::NavigationUnavailable::PartialFrontier,
+            )
         );
         assert_eq!(corrupted_neighbor.events[1].frame_id, None);
     }
@@ -671,7 +683,9 @@ mod tests {
         assert_eq!(window.adapter_summary, None);
         assert_eq!(
             window.events[0].navigation.next,
-            xtrace_application::recording_queries::NavigationResult::Unavailable
+            xtrace_application::recording_queries::NavigationResult::unavailable(
+                xtrace_application::recording_queries::NavigationUnavailable::PartialFrontier,
+            )
         );
 
         let partial_id = RecordingId::new();
@@ -703,7 +717,9 @@ mod tests {
             .expect("read partial finish");
         assert_eq!(
             partial_window.events[0].navigation.next,
-            xtrace_application::recording_queries::NavigationResult::Unavailable
+            xtrace_application::recording_queries::NavigationResult::unavailable(
+                xtrace_application::recording_queries::NavigationUnavailable::PartialFrontier,
+            )
         );
     }
 
