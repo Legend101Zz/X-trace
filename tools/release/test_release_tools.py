@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -849,6 +850,44 @@ class PrivateRootAdmissionTests(unittest.TestCase):
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+
+def own_process_snapshot(extra_pids=lambda: ()):
+    """Return a `_process_snapshot` replacement that only shows this test's own processes.
+
+    The runner's ownership scan is deliberately global, so on a shared machine (a hosted
+    runner or a developer Mac) any unrelated process that starts while a test runs becomes
+    an unknown candidate and makes tests that assert exact candidate counts or a clean
+    rescan flaky. This wrapper keeps the real `ps` snapshot but filters it to the test
+    process, every process ever seen descending from it, and any pid the test names through
+    `extra_pids` (for deliberately detached children that are reparented away). The runner
+    code, its deadlines and its checks are untouched; only the machine-wide noise input is
+    removed.
+    """
+    real_snapshot = run_gates._process_snapshot
+    lock = threading.Lock()
+    mine: dict[int, str] = {}
+
+    def snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, str, str]]:
+        full = real_snapshot(timeout=timeout)
+        with lock:
+            me = os.getpid()
+            if me in full:
+                mine[me] = full[me][1]
+            for pid in extra_pids():
+                if pid in full:
+                    mine.setdefault(pid, full[pid][1])
+            changed = True
+            while changed:
+                changed = False
+                for pid, (ppid, started_at, _state) in full.items():
+                    if pid not in mine and ppid in mine and full[ppid][1] == mine[ppid]:
+                        mine[pid] = started_at
+                        changed = True
+            return {pid: record for pid, record in full.items() if mine.get(pid) == record[1]}
+
+    return snapshot
 
 
 def process_running(pid: int) -> bool:
@@ -2887,7 +2926,10 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(commands, "at least git should be available for fast version probes")
         logs = self.cache / "fast-version-logs"
         probes: list[dict[str, object]] = []
-        with mock.patch.object(run_gates, "VERSION_COMMANDS", tuple(commands)):
+        # Real probe processes, but the machine-wide scan sees only this test's own tree, so an
+        # unrelated process starting elsewhere on the host cannot look like unowned churn.
+        with mock.patch.object(run_gates, "VERSION_COMMANDS", tuple(commands)), \
+                mock.patch.object(run_gates, "_process_snapshot", side_effect=own_process_snapshot()):
             versions = REAL_VERSIONS(self.repo, os.environ.copy(), logs, probes)
         self.assertEqual(len(probes), len(commands))
         self.assertTrue(all(probe["status"] == "passed" and probe["exitCode"] == 0 for probe in probes))
@@ -3722,6 +3764,7 @@ class RunnerTests(unittest.TestCase):
             "import subprocess,sys,time; time.sleep(.35); "
             "c=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
             "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); "
+            f"open({str(self.root / 'detached-child.pid')!r},'w').write(str(c.pid)); "
             "print(c.pid,flush=True)"
         )
         gate = run_gates.Gate("classified-candidate", (sys.executable, "-c", script))
@@ -3760,9 +3803,18 @@ class RunnerTests(unittest.TestCase):
                 return False
             return True if path == pathlib.Path("/proc") else real_is_dir(path)
 
+        def gate_children() -> list[int]:
+            # The gate records the detached child's pid; it is reparented away from the test
+            # tree, so name it explicitly. Unrelated host processes stay invisible.
+            try:
+                return [int((self.root / "detached-child.pid").read_text())]
+            except (OSError, ValueError):
+                return []
+
         try:
             with mock.patch.object(run_gates, "GATES", (gate,)), \
                     mock.patch.object(run_gates, "_track_descendants", return_value=None), \
+                    mock.patch.object(run_gates, "_process_snapshot", side_effect=own_process_snapshot(gate_children)), \
                     mock.patch.object(run_gates.provenance_module, "Provenance", StubProvenance), \
                     mock.patch.object(pathlib.Path, "is_dir", is_dir):
                 code = run_gates.run(args)
