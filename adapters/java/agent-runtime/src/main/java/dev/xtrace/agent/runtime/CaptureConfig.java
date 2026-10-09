@@ -20,9 +20,20 @@ final class CaptureConfig {
   private static final int MAX_BYTES = 64 * 1024;
 
   private final ApplicationScope scope;
+  private final boolean focused;
 
   private CaptureConfig(ApplicationScope scope) {
+    this(scope, false);
+  }
+
+  private CaptureConfig(ApplicationScope scope, boolean focused) {
     this.scope = scope;
+    this.focused = focused;
+  }
+
+  /** True only when the launch asked for focused capture (capture.mode == "focused"). */
+  boolean focused() {
+    return focused;
   }
 
   static CaptureConfig defaults() {
@@ -60,7 +71,11 @@ final class CaptureConfig {
         if (safeRelative(root1) && safeRoots.size() < 32) safeRoots.add(root1);
       }
       if (safeRoots.isEmpty()) safeRoots.add("src/main/java");
-      return new CaptureConfig(new ApplicationScope(packages, safeRoots));
+      boolean focused = false;
+      if (top.get("capture") instanceof Map<?, ?> capture) {
+        focused = "focused".equals(capture.get("mode"));
+      }
+      return new CaptureConfig(new ApplicationScope(packages, safeRoots), focused);
     } catch (RuntimeException invalid) {
       return defaults();
     }

@@ -62,6 +62,7 @@ public final class AgentRuntime {
     XtpSession session = null;
     RecordingWriter writer = null;
     RuntimeBridgeSink sink = null;
+    LineProbeBridgeSink lineSink = null;
     boolean permanent = false;
     try {
       if (attach) FixtureInstrumentation.validateAttach(instrumentation);
@@ -81,7 +82,7 @@ public final class AgentRuntime {
               manifest,
               new XtpSession.ClientIdentity(
                   attach ? "xtrace-java-attach-fixture" : "xtrace-java-premain-fixture",
-                  "0.1.0",
+                  "0.0.1",
                   "java",
                   "openjdk",
                   System.getProperty("java.version"),
@@ -94,15 +95,29 @@ public final class AgentRuntime {
       sink.useScope(config.scope());
       writer = new RecordingWriter(session, queue, sink);
       permanent = true;
+      // Line probes and value reads exist only in effective focused mode (CONTRACTS section 4:
+      // the standard line budget is 0). The daemon honours the focused claim only when armed.
+      FixtureInstrumentation.LineProbes lineProbes = null;
+      if (config.focused()) {
+        lineProbes =
+            new FixtureInstrumentation.LineProbes(
+                new dev.xtrace.agent.runtime.line.SiteRegistry());
+        lineSink = new LineProbeBridgeSink(sink, lineProbes.registry());
+        writer.capturePolicy("xtrace.focused.v1");
+        writer.untransformedCount(lineProbes::skippedCount);
+      }
       FixtureInstrumentation.install(
-          instrumentation, writer::stopIncomplete, attach, config.scope());
+          instrumentation, writer::stopIncomplete, attach, config.scope(), lineProbes);
+      if (lineSink != null && !BootstrapBridge.installLineSink(lineSink)) {
+        throw new ClientException("XTR-JAVA-AGENT", "line sink is already active");
+      }
       if (writer.isStopping()) {
         throw new ClientException("XTR-JAVA-INSTRUMENTATION", "fixture instrumentation failed");
       }
       if (!BootstrapBridge.install(sink)) {
         throw new ClientException("XTR-JAVA-AGENT", "bootstrap bridge is already active");
       }
-      RuntimeHandle handle = new RuntimeHandle(writer, sink);
+      RuntimeHandle handle = new RuntimeHandle(writer, sink, lineSink);
       if (!ACTIVE.compareAndSet(null, handle)) {
         BootstrapBridge.disable(sink);
         throw new ClientException("XTR-JAVA-AGENT", "agent runtime activation raced");
@@ -113,6 +128,7 @@ public final class AgentRuntime {
       session = null;
       writer = null;
       sink = null;
+      lineSink = null;
       return result;
     } catch (ClientException error) {
       throw new StartFailure(permanent, error.code(), error.getMessage(), error);
@@ -123,6 +139,7 @@ public final class AgentRuntime {
       if (manifest != null) Arrays.fill(manifest, (byte) 0);
       if (identity != null) Arrays.fill(identity, (byte) 0);
       if (sink != null) BootstrapBridge.disable(sink);
+      if (lineSink != null) BootstrapBridge.disableLineSink(lineSink);
       if (writer != null) writer.close();
       else if (session != null) closeSession(session);
       if (bootstrap != null) bootstrap.close();
@@ -215,16 +232,20 @@ public final class AgentRuntime {
   private static final class RuntimeHandle {
     private final RecordingWriter writer;
     private final RuntimeBridgeSink sink;
+    private final LineProbeBridgeSink lineSink;
     private final java.util.concurrent.atomic.AtomicBoolean closed =
         new java.util.concurrent.atomic.AtomicBoolean();
 
-    private RuntimeHandle(RecordingWriter writer, RuntimeBridgeSink sink) {
+    private RuntimeHandle(
+        RecordingWriter writer, RuntimeBridgeSink sink, LineProbeBridgeSink lineSink) {
       this.writer = writer;
       this.sink = sink;
+      this.lineSink = lineSink;
     }
 
     private void close() {
       if (!closed.compareAndSet(false, true)) return;
+      if (lineSink != null) BootstrapBridge.disableLineSink(lineSink);
       writer.close();
       BootstrapBridge.disable(sink);
       ACTIVE.compareAndSet(this, null);

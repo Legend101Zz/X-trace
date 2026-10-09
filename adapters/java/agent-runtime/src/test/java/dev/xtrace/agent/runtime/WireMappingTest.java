@@ -33,6 +33,25 @@ class WireMappingTest {
   }
 
   @Test
+  void untransformedClassesAreAClassNotTransformedGapBeforeTheResponse() throws Exception {
+    String id = "00000000-0000-4000-8000-000000000001";
+    List<QueueSignal.Event> events =
+        RecordingWriter.withGap(
+            id,
+            List.of(
+                plain(BridgeEventKind.REQUEST_UPDATE, "http.request GET /a", 0),
+                plain(BridgeEventKind.RESPONSE, "http.response 200", 200)),
+            0, 0, 3, 1, 2);
+    assertEquals(3, events.size());
+    assertEquals(BridgeEventKind.RESPONSE, events.get(2).kind());
+    RecordingEvent gap = RecordingWriter.toProto(events.get(1), 3);
+    assertEquals(GapReason.GAP_REASON_CLASS_NOT_TRANSFORMED, gap.getGap().getReason());
+    assertEquals(3, gap.getGap().getCount());
+    // Nothing skipped, nothing added.
+    assertEquals(1, RecordingWriter.withGap(id, events.subList(0, 1), 0, 0, 0, 1, 2).size());
+  }
+
+  @Test
   void handlerUnresolvedIsALostCorrelationNotAFabricatedHandler() throws Exception {
     RecordingEvent gap =
         RecordingWriter.toProto(

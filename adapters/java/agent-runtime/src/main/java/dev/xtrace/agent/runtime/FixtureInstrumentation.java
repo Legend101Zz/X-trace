@@ -76,6 +76,26 @@ final class FixtureInstrumentation {
       Runnable onFailure,
       boolean attach,
       ApplicationScope scope) {
+    install(instrumentation, onFailure, attach, scope, null);
+  }
+
+  /** Probe owner application classes call; bootstrap-visible, so every loader resolves it. */
+  static final String PROBE_OWNER = "dev/xtrace/agent/bootstrap/BootstrapBridge";
+
+  /** Method reports kept for diagnostics; bounded so a huge application cannot grow it. */
+  static final int MAX_LINE_REPORTS = 4096;
+
+  /**
+   * @param lineProbes non-null only in effective focused mode: in-scope classes then also get the
+   *     line-probe wrapper with LocalVariableTable-gated value reads. Standard mode passes null and
+   *     pays no class-rewrite or verifier risk for evidence it may not record.
+   */
+  static void install(
+      Instrumentation instrumentation,
+      Runnable onFailure,
+      boolean attach,
+      ApplicationScope scope,
+      LineProbes lineProbes) {
     if (!INSTALLED.compareAndSet(false, true)) {
       throw new IllegalStateException("fixture instrumentation is already installed");
     }
@@ -149,8 +169,11 @@ final class FixtureInstrumentation {
                         && !type.isRecord()
                         && scope.isApplication(type.getName(), domain))
             .transform(
-                (target, type, loader, module, domain) ->
-                    target.visit(Advice.to(FrameAdvice.class).on(frameMethods())))
+                (target, type, loader, module, domain) -> {
+                  net.bytebuddy.dynamic.DynamicType.Builder<?> framed =
+                      target.visit(Advice.to(FrameAdvice.class).on(frameMethods()));
+                  return lineProbes == null ? framed : framed.visit(lineProbes.wrapper());
+                })
             .type(named(H2_STATEMENT))
             .transform(
                 (target, type, loader, module, domain) ->
@@ -162,6 +185,63 @@ final class FixtureInstrumentation {
                                     .and(takesArguments(0))
                                     .and(not(isSynthetic())))));
     builder.installOn(instrumentation);
+  }
+
+  /** Focused-mode line probe wiring: one site registry and one thread-safe report sink. */
+  static final class LineProbes {
+    private final dev.xtrace.agent.runtime.line.SiteRegistry registry;
+    private final java.util.concurrent.ConcurrentLinkedQueue<
+            dev.xtrace.agent.runtime.line.MethodReport>
+        reports = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final java.util.concurrent.atomic.AtomicInteger reportCount =
+        new java.util.concurrent.atomic.AtomicInteger();
+
+    LineProbes(dev.xtrace.agent.runtime.line.SiteRegistry registry) {
+      this.registry = java.util.Objects.requireNonNull(registry, "registry");
+    }
+
+    dev.xtrace.agent.runtime.line.SiteRegistry registry() {
+      return registry;
+    }
+
+    /**
+     * Methods or classes the wrapper left untouched for a reason that is not by design (bridge and
+     * synthetic methods are never probed on purpose and are not counted).
+     */
+    long skippedCount() {
+      long skipped = 0;
+      for (dev.xtrace.agent.runtime.line.MethodReport report : reports) {
+        if (report.status() != dev.xtrace.agent.runtime.line.MethodReport.Status.SKIPPED) continue;
+        String reason = report.reason();
+        if (dev.xtrace.agent.runtime.line.MethodReport.Reasons.BRIDGE.equals(reason)
+            || dev.xtrace.agent.runtime.line.MethodReport.Reasons.SYNTHETIC.equals(reason)) {
+          continue;
+        }
+        skipped++;
+      }
+      return skipped;
+    }
+
+    java.util.List<dev.xtrace.agent.runtime.line.MethodReport> reports() {
+      return java.util.List.copyOf(reports);
+    }
+
+    dev.xtrace.agent.runtime.line.LineProbeAsmWrapper wrapper() {
+      return new dev.xtrace.agent.runtime.line.LineProbeAsmWrapper(
+          dev.xtrace.agent.runtime.line.LineProbeConfig.focused(PROBE_OWNER),
+          registry,
+          type -> null,
+          batch -> {
+            for (dev.xtrace.agent.runtime.line.MethodReport report : batch) {
+              if (reportCount.incrementAndGet() > MAX_LINE_REPORTS) {
+                reportCount.decrementAndGet();
+                return;
+              }
+              reports.add(report);
+            }
+          },
+          null);
+    }
   }
 
   static final class SafeListener extends AgentBuilder.Listener.Adapter {

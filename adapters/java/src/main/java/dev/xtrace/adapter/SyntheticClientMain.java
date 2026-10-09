@@ -56,7 +56,7 @@ public final class SyntheticClientMain {
                 manifest,
                 new XtpSession.ClientIdentity(
                     "xtrace-java-synthetic-client",
-                    "0.1.0",
+                    "0.0.1",
                     "java",
                     "openjdk",
                     System.getProperty("java.version"),

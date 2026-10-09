@@ -1,7 +1,6 @@
 package dev.xtrace.agent.runtime;
 
 import java.nio.charset.StandardCharsets;
-import java.util.regex.Pattern;
 
 /**
  * Bounded, redacted exception text for the recording. The adapter never sends a stack trace or
@@ -19,35 +18,14 @@ final class ExceptionSummary {
   /** Replacement for redacted content. */
   static final String REDACTED = "[redacted]";
 
-  private static final Pattern[] SECRET_SHAPES = {
-    // PEM blocks, including truncated ones.
-    Pattern.compile("-----BEGIN [A-Z ]+-----[\\s\\S]*"),
-    // JSON web tokens.
-    Pattern.compile("eyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]*"),
-    // Authorization-style credentials.
-    Pattern.compile("(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}"),
-    // Cloud access keys.
-    Pattern.compile("\\b(AKIA|ASIA)[0-9A-Z]{16}\\b"),
-    // Credentials embedded in URLs.
-    Pattern.compile("(?i)\\b[a-z][a-z0-9+.-]*://[^\\s/@:]+:[^\\s/@]+@"),
-    // key=value or key: value where the key names a secret.
-    Pattern.compile(
-        "(?i)\\b(password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|"
-            + "authorization|cookie|session[_-]?id)\\b\\s*[=:]\\s*[^\\s,;&]+"),
-    // Long opaque tokens: 32 or more hex or base64url characters.
-    Pattern.compile("\\b[A-Fa-f0-9]{32,}\\b"),
-    Pattern.compile("\\b[A-Za-z0-9_-]{40,}\\b"),
-  };
-
   private ExceptionSummary() {}
 
   /** Sanitized message, or null when the exception had none. */
   static String message(String raw) {
     if (raw == null) return null;
     String text = raw.length() > 4096 ? raw.substring(0, 4096) : raw;
-    for (Pattern pattern : SECRET_SHAPES) {
-      text = pattern.matcher(text).replaceAll(REDACTED);
-    }
+    // One redaction policy for values and exception messages (JB-2).
+    text = dev.xtrace.agent.runtime.line.Redaction.replaceSecrets(text);
     StringBuilder clean = new StringBuilder(text.length());
     for (int i = 0; i < text.length(); i++) {
       char c = text.charAt(i);

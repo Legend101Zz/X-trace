@@ -77,6 +77,24 @@ final class SourceIdentity {
     return facts.info(method + descriptor);
   }
 
+  /**
+   * Source facts for one line of an application class named by its internal or dotted name, from
+   * the class bytes observed at load. Null when the class, file or line cannot be tied to a file.
+   * The probe site registry has no loader, so the first loader that observed the class wins.
+   */
+  static SourceAttestation.SourceInfo lookupLine(String className, int line) {
+    if (className == null) return null;
+    String dotted = className.replace('/', '.');
+    ClassFacts facts = null;
+    synchronized (LOADERS) {
+      for (Map<String, ClassFacts> classes : LOADERS.values()) {
+        facts = classes.get(dotted);
+        if (facts != null) break;
+      }
+    }
+    return facts == null ? null : facts.lineInfo(line);
+  }
+
   static void resetForTest() {
     synchronized (LOADERS) {
       LOADERS.clear();
@@ -187,6 +205,13 @@ final class SourceIdentity {
       }
       return new SourceAttestation.SourceInfo(
           path, range[0], range[1], hash.clone(), OBSERVED_UNATTESTED);
+    }
+
+    SourceAttestation.SourceInfo lineInfo(int line) {
+      if (fileProblem != 0 || hash == null || path == null || line < 1 || line > fileLines) {
+        return null;
+      }
+      return new SourceAttestation.SourceInfo(path, line, line, hash.clone(), OBSERVED_UNATTESTED);
     }
 
     String className() {

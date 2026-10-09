@@ -29,7 +29,9 @@ import xtp.agent.v1.Recording.RecordingEvent;
 import xtp.agent.v1.Recording.RecordingEventKind;
 import xtp.agent.v1.Recording.RecordingFinished;
 import xtp.agent.v1.Recording.RecordingStarted;
+import xtp.agent.v1.Recording.CapturedValue;
 import xtp.agent.v1.Recording.SourceBinding;
+import xtp.agent.v1.Recording.ValueBinding;
 import xtp.agent.v1.Transport.Ack;
 
 /** Single owner of XTP session order, protobuf encoding, batching, and staged ACK validation. */
@@ -41,6 +43,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   /** Slots only closing events may use, so exits, throws and the response are never the drops. */
   static final int CLOSING_RESERVE = 64;
   static final String CAP_GAP_SYMBOL = "xtrace.capture.gap.recording-cap";
+  /** Focused mode: methods or classes the line-probe wrapper could not instrument. */
+  static final String UNTRANSFORMED_GAP_SYMBOL = "xtrace.capture.gap.not-transformed";
 
   private final Transport session;
   private final BoundedEventQueue queue;
@@ -53,6 +57,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   private final Map<String, PendingRecording> recordings = new HashMap<>();
   private final java.util.Set<String> abandoned = new java.util.HashSet<>();
   private volatile long shutdownStartedNs;
+  private volatile String capturePolicyId = "";
+  private volatile java.util.function.LongSupplier untransformed = () -> 0L;
 
   RecordingWriter(XtpSession session, BoundedEventQueue queue, RuntimeBridgeSink sink)
       throws ClientException {
@@ -168,6 +174,16 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         || kind == BridgeEventKind.RESPONSE;
   }
 
+  /** Count of methods or classes that could not be line-instrumented (focused mode only). */
+  void untransformedCount(java.util.function.LongSupplier supplier) {
+    this.untransformed = java.util.Objects.requireNonNull(supplier, "supplier");
+  }
+
+  /** Policy the recordings claim; the daemon grants focused only for a session armed focused. */
+  void capturePolicy(String policyId) {
+    this.capturePolicyId = policyId == null ? "" : policyId;
+  }
+
   private void write(PendingRecording pending, QueueSignal.Finish finish) throws ClientException {
     UUID recordingId;
     try {
@@ -188,6 +204,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
                 .setUrlShape(pending.start.route())
                 .setStartMonotonicNs(pending.start.monotonicNs())
                 .setThreadOrTaskId("request-thread")
+                .setCapturePolicyId(capturePolicyId)
                 .build());
     requireRecordingAck(started, recordingId, 1);
 
@@ -198,6 +215,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
             pending.events,
             finish.droppedEvents(),
             pending.writerDrops,
+            untransformed.getAsLong(),
             pending.start.monotonicNs(),
             finish.finishedMonotonicNs());
     if (ordered.isEmpty()) {
@@ -289,13 +307,26 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       long capDrops,
       long startedMonotonicNs,
       long finishedMonotonicNs) {
-    if (queueDrops <= 0 && capDrops <= 0) return List.copyOf(events);
+    return withGap(
+        recordingId, events, queueDrops, capDrops, 0, startedMonotonicNs, finishedMonotonicNs);
+  }
+
+  /** As above, plus one CLASS_NOT_TRANSFORMED gap when {@code untransformed} classes or methods were skipped. */
+  static List<QueueSignal.Event> withGap(
+      String recordingId,
+      List<QueueSignal.Event> events,
+      long queueDrops,
+      long capDrops,
+      long untransformed,
+      long startedMonotonicNs,
+      long finishedMonotonicNs) {
+    if (queueDrops <= 0 && capDrops <= 0 && untransformed <= 0) return List.copyOf(events);
     List<QueueSignal.Event> result = new ArrayList<>(events.size() + 2);
     boolean inserted = false;
     for (QueueSignal.Event event : events) {
       if (!inserted && event.kind() == BridgeEventKind.RESPONSE) {
         addGaps(result, event.recordingId(), event.parentEventId(), event.monotonicNs(),
-            queueDrops, capDrops);
+            queueDrops, capDrops, untransformed);
         inserted = true;
       }
       result.add(event);
@@ -306,14 +337,14 @@ final class RecordingWriter implements AutoCloseable, Runnable {
           events.isEmpty()
               ? terminalMonotonic(startedMonotonicNs, finishedMonotonicNs)
               : events.get(events.size() - 1).monotonicNs();
-      addGaps(result, recordingId, parent, monotonicNs, queueDrops, capDrops);
+      addGaps(result, recordingId, parent, monotonicNs, queueDrops, capDrops, untransformed);
     }
     return result;
   }
 
   private static void addGaps(
       List<QueueSignal.Event> out, String recordingId, String parent, long monotonicNs,
-      long queueDrops, long capDrops) {
+      long queueDrops, long capDrops, long untransformed) {
     String last = parent;
     if (queueDrops > 0) {
       QueueSignal.Event gap = gap(recordingId, last, monotonicNs, queueDrops, ":gap",
@@ -322,7 +353,14 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       last = gap.eventId();
     }
     if (capDrops > 0) {
-      out.add(gap(recordingId, last, monotonicNs, capDrops, ":gap-cap", CAP_GAP_SYMBOL));
+      QueueSignal.Event gap =
+          gap(recordingId, last, monotonicNs, capDrops, ":gap-cap", CAP_GAP_SYMBOL);
+      out.add(gap);
+      last = gap.eventId();
+    }
+    if (untransformed > 0) {
+      out.add(gap(recordingId, last, monotonicNs, untransformed, ":gap-untransformed",
+          UNTRANSFORMED_GAP_SYMBOL));
     }
   }
 
@@ -391,11 +429,20 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       // The per-recording event cap has no dedicated reason: THROTTLE is the nearest accurate
       // one (events withheld by a configured limit); a dedicated reason is requested from C.
       boolean cap = event.symbol().equals(CAP_GAP_SYMBOL);
+      boolean lines = event.symbol().equals(BootstrapBridge.LINE_BUDGET_SYMBOL);
+      boolean untransformed = event.symbol().equals(UNTRANSFORMED_GAP_SYMBOL);
       builder.setGap(
           GapPayload.newBuilder()
               .setReason(handler ? GapReason.GAP_REASON_CORRELATION_LOST
+                  : lines ? GapReason.GAP_REASON_LINE_BUDGET
+                  : untransformed ? GapReason.GAP_REASON_CLASS_NOT_TRANSFORMED
                   : cap ? GapReason.GAP_REASON_THROTTLE : GapReason.GAP_REASON_QUEUE_FULL)
               .setCount(handler ? 1 : Math.max(1, event.detail())));
+    }
+    if (event.values() != null) {
+      for (dev.xtrace.agent.runtime.line.ValueSnapshot value : event.values()) {
+        builder.addBindings(binding(value));
+      }
     }
     if (kind == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_THROW
         && event.exceptionType() != null) {
@@ -432,6 +479,51 @@ final class RecordingWriter implements AutoCloseable, Runnable {
               .setMethod("executeUpdate"));
     }
     return builder.build();
+  }
+
+  /** Wire binding for one sanitized local (CAPTURED, TRUNCATED, REDACTED or UNAVAILABLE). */
+  static ValueBinding binding(dev.xtrace.agent.runtime.line.ValueSnapshot value) {
+    CapturedValue.Builder captured = CapturedValue.newBuilder();
+    xtp.agent.v1.Recording.ValueShape shape =
+        xtp.agent.v1.Recording.ValueShape.valueOf("VALUE_SHAPE_" + value.shape().name());
+    switch (value.state()) {
+      case CAPTURED -> captured.setCaptured(
+          xtp.agent.v1.Recording.CapturedValueCaptured.newBuilder()
+              .setShape(shape)
+              .setPreview(value.preview())
+              .setContentHash(ByteString.copyFrom(value.contentHash())));
+      case TRUNCATED -> captured.setTruncated(
+          xtp.agent.v1.Recording.CapturedValueTruncated.newBuilder()
+              .setPreview(value.preview())
+              .setOriginalSizeLowerBound(value.originalSizeLowerBound())
+              .setLimit(value.limit()));
+      case REDACTED -> captured.setRedacted(
+          xtp.agent.v1.Recording.CapturedValueRedacted.newBuilder()
+              .setRuleId(value.ruleId())
+              .setShapeHint(shape));
+      default -> captured.setUnavailable(
+          xtp.agent.v1.Recording.CapturedValueUnavailable.newBuilder()
+              .setReason(
+                  value.reason() == dev.xtrace.agent.runtime.line.ValueSnapshot.Reason.DEBUG_METADATA_ABSENT
+                      ? xtp.agent.v1.Recording.UnavailableReason.UNAVAILABLE_REASON_DEBUG_METADATA_ABSENT
+                      : xtp.agent.v1.Recording.UnavailableReason.UNAVAILABLE_REASON_UNSAFE_TO_RENDER));
+    }
+    return ValueBinding.newBuilder()
+        .setName(value.name())
+        .setRole(
+            switch (value.role()) {
+              case ARGUMENT -> xtp.agent.v1.Recording.BindingRole.BINDING_ROLE_ARGUMENT;
+              case RETURN -> xtp.agent.v1.Recording.BindingRole.BINDING_ROLE_RETURN;
+              case LOCAL -> xtp.agent.v1.Recording.BindingRole.BINDING_ROLE_LOCAL;
+              case EXCEPTION -> xtp.agent.v1.Recording.BindingRole.BINDING_ROLE_EXCEPTION;
+              case RECEIVER -> xtp.agent.v1.Recording.BindingRole.BINDING_ROLE_RECEIVER;
+            })
+        .setNameOrigin(
+            value.nameOrigin() == dev.xtrace.agent.runtime.line.ValueSnapshot.NameOrigin.DECLARED
+                ? xtp.agent.v1.Recording.NameOrigin.NAME_ORIGIN_DECLARED
+                : xtp.agent.v1.Recording.NameOrigin.NAME_ORIGIN_SYNTHESIZED)
+        .setValue(captured)
+        .build();
   }
 
   private void sendCapabilities() throws ClientException {

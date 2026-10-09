@@ -10,6 +10,9 @@ public final class BridgeEventKind {
   public static final int FRAME_EXIT = 3;
   /** Exact fixture method exceptional exit. */
   public static final int FRAME_THROW = 4;
+  /** Focused-mode line cursor with the locals visible at that line. */
+  public static final int LINE_CURSOR = 5;
+
   /** Coarse H2 execute start. */
   public static final int DATABASE_START = 7;
   /** Coarse H2 execute end. */

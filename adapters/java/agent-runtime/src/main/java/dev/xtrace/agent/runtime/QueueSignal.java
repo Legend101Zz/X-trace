@@ -26,8 +26,30 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
       int sourceBinding,
       int estimatedBytes,
       String exceptionType,
-      String exceptionMessage)
+      String exceptionMessage,
+      java.util.List<dev.xtrace.agent.runtime.line.ValueSnapshot> values)
       implements QueueSignal {
+    Event(
+        String recordingId,
+        String eventId,
+        String parentEventId,
+        int kind,
+        String symbol,
+        long monotonicNs,
+        int detail,
+        String sourcePath,
+        int sourceStartLine,
+        int sourceEndLine,
+        byte[] sourceHash,
+        int sourceBinding,
+        int estimatedBytes,
+        String exceptionType,
+        String exceptionMessage) {
+      this(recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail, sourcePath,
+          sourceStartLine, sourceEndLine, sourceHash, sourceBinding, estimatedBytes,
+          exceptionType, exceptionMessage, null);
+    }
+
     Event(
         String recordingId,
         String eventId,

@@ -62,4 +62,28 @@ class ExceptionSummaryTest {
     assertEquals(256, ExceptionSummary.type("x".repeat(1000)).length());
     assertNull(ExceptionSummary.type(null));
   }
+
+  @Test
+  void sharedRedactionVectorsApplyToExceptionMessages() throws Exception {
+    java.util.List<String> lines =
+        java.nio.file.Files.readAllLines(
+            java.nio.file.Path.of(
+                getClass().getResource("/line/redaction-vectors.tsv").toURI()),
+            StandardCharsets.UTF_8);
+    int checked = 0;
+    for (String line : lines) {
+      if (line.isBlank() || line.startsWith("#")) continue;
+      String[] fields = line.split("\t", 2);
+      String text = fields[1].replace("\\n", " ");
+      String clean = ExceptionSummary.message(text);
+      if (fields[0].equals("secret")) {
+        assertTrue(clean.contains(ExceptionSummary.REDACTED), line);
+        assertFalse(clean.equals(text), line);
+      } else {
+        assertEquals(text, clean, line);
+      }
+      checked++;
+    }
+    assertTrue(checked >= 12, "vectors read: " + checked);
+  }
 }
