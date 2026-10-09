@@ -590,7 +590,7 @@ jobs:
       - name: Other-UID setup (second local user on the hosted runner)
         if: ${{ !cancelled() }}
         run: |
-          python3 -B -m tools.qa.other_uid_negative create-user --user xtrother
+          python3 -B -m tools.qa.other_uid_negative create-user --user xtrother --created-marker "$XTRACE_CI_PRIVATE_ROOT/other-uid.created"
       - name: Other-UID store creation (real xtrace init)
         if: ${{ !cancelled() }}
         run: |
@@ -598,16 +598,29 @@ jobs:
             bash -ec '
               oid="$XTRACE_CI_PRIVATE_ROOT/oid"
               mkdir -m 700 "$oid" "$oid/repo"
-              # The data home sits under its own listable and traversable (0755) parent outside the 0700 private
-              # root, so the other user is first denied at the product-created store directory itself.
-              mkdir -m 755 "$RUNNER_TEMP/xt-oid"
-              XTRACE_DATA_HOME="$RUNNER_TEMP/xt-oid/userdata" target/debug/xtrace init --project-dir "$oid/repo" --display-name OtherUid
+              # The data home sits under its own listable and traversable (0755) parent on the ephemeral hosted VM.
+              # The runner home and RUNNER_TEMP are not traversable by other users, so the parent lives under a
+              # root-owned 0755 ancestor chain (never by loosening the runner home). The product creates the store
+              # directory itself, so the other user is first denied at that directory.
+              [ -d /opt ] || sudo -n install -d -o root -g wheel -m 755 /opt
+              sudo -n install -d -o "$(id -un)" -g "$(id -gn)" -m 755 /opt/xt-oid
+              # Every ancestor of the parent must be root-owned with no group/other write and no sticky bit, so the
+              # product admission (ADR 0008) still admits the data home. Anything else fails closed here.
+              p=/opt
+              while :; do
+                set -- $(stat -f "%u %p" "$p")
+                [ "$1" = 0 ] || { echo "other-uid layout FAIL ancestor-not-root-owned"; exit 1; }
+                [ $(( 8#$2 & 8#1022 )) -eq 0 ] || { echo "other-uid layout FAIL ancestor-writable-or-sticky"; exit 1; }
+                [ "$p" = / ] && break
+                p=$(dirname "$p")
+              done
+              XTRACE_DATA_HOME="/opt/xt-oid/userdata" target/debug/xtrace init --project-dir "$oid/repo" --display-name OtherUid
             '
       - name: Other-UID private-storage substitute (cannot traverse, read or write the store)
         if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.other_uid_negative check \
-            --store-root "$RUNNER_TEMP/xt-oid/userdata" --parent "$RUNNER_TEMP/xt-oid" --user xtrother --marker "$XTRACE_CI_PRIVATE_ROOT/other-uid.ok"
+            --store-root "/opt/xt-oid/userdata" --parent "/opt/xt-oid" --user xtrother --marker "$XTRACE_CI_PRIVATE_ROOT/other-uid.ok"
       - name: Other-UID negative must have run and passed
         if: always()
         run: |
@@ -615,7 +628,7 @@ jobs:
       - name: Other-UID cleanup
         if: always()
         run: |
-          python3 -B -m tools.qa.other_uid_negative delete-user --user xtrother
+          python3 -B -m tools.qa.other_uid_negative delete-user --user xtrother --created-marker "$XTRACE_CI_PRIVATE_ROOT/other-uid.created"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

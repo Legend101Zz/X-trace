@@ -39,16 +39,19 @@ class FakeRunner:
     """Simulates the other user: control paths succeed, every store path is denied (or allowed when asked)."""
 
     def __init__(self, store, allow=None, err="cat: x: Permission denied", rc=1, control_rc=0, parent=None,
-                 parent_rc=0, write_rc=1, write_err=None, mutate=None):
+                 parent_rc=0, write_rc=1, write_err=None, mutate=None, wcontrol_rc=0):
         self.store, self.allow, self.err, self.rc, self.control_rc = str(store), allow, err, rc, control_rc
         self.parent = str(parent) if parent is not None else str(pathlib.Path(self.store).parent)
         self.parent_rc = parent_rc
         self.write_rc, self.write_err, self.mutate = write_rc, write_err or err, mutate
+        self.wcontrol_rc = wcontrol_rc
         self.calls = []
 
     def __call__(self, argv):
         self.calls.append(list(argv))
         tool, target = argv[4], argv[-1]
+        if tool == "/bin/sh":
+            return self.wcontrol_rc, ("" if self.wcontrol_rc == 0 else "sh: Permission denied")
         if tool in ("/usr/bin/touch", "/bin/mv", "/bin/cp"):
             if self.mutate:
                 self.mutate()
@@ -81,10 +84,11 @@ class NegativeTests(unittest.TestCase):
         self.assertEqual(n, 10)
         self.assertEqual(runner.calls[0], ["sudo", "-n", "-u", "xtother", "/bin/ls", "--", "/usr/bin"])
         self.assertEqual(runner.calls[1], ["sudo", "-n", "-u", "xtother", "/bin/cat", "--", "/etc/hosts"])
-        self.assertEqual(runner.calls[2], ["sudo", "-n", "-u", "xtother", "/bin/ls", "--", str(self.base)])
-        self.assertEqual(runner.calls[3], ["sudo", "-n", "-u", "xtother", "/bin/cat", "--",
+        self.assertEqual(runner.calls[2], ou.write_control_argv("xtother"))
+        self.assertEqual(runner.calls[3], ["sudo", "-n", "-u", "xtother", "/bin/ls", "--", str(self.base)])
+        self.assertEqual(runner.calls[4], ["sudo", "-n", "-u", "xtother", "/bin/cat", "--",
                                            str(self.base / ou.CANARY_NAME)])
-        self.assertEqual(len(runner.calls), 4 + 10)
+        self.assertEqual(len(runner.calls), 5 + 10)
         self.assertTrue(all(c[:4] == ["sudo", "-n", "-u", "xtother"] for c in runner.calls))
         self.assertEqual((self.base / ou.CANARY_NAME).stat().st_mode & 0o777, 0o644)
 
@@ -211,6 +215,38 @@ class NegativeTests(unittest.TestCase):
         with self.assertRaisesRegex(ou.CheckError, "control-failed"):
             negative(store, FakeRunner(store, control_rc=1))
 
+    def test_write_control_must_pass_before_write_probes(self):
+        store = make_store(self.base)
+        runner = FakeRunner(store, wcontrol_rc=1)
+        with self.assertRaisesRegex(ou.CheckError, "write-control-failed"):
+            negative(store, runner)
+        self.assertFalse([c for c in runner.calls if c[4] in ("/usr/bin/touch", "/bin/mv", "/bin/cp")])
+        ok = FakeRunner(store)
+        negative(store, ok)
+        control = [c for c in ok.calls if c[4] == "/bin/sh"]
+        self.assertEqual(len(control), 1)
+        self.assertIn("mktemp -d", control[0][-1])
+        self.assertNotIn(str(store), control[0][-1])
+
+    def test_fifo_in_store_fails(self):
+        store = make_store(self.base)
+        os.mkfifo(store / "pipe", 0o600)
+        with self.assertRaisesRegex(ou.CheckError, "store-special-entry"):
+            negative(store, FakeRunner(store))
+
+    def test_first_snapshot_oserror_is_fixed_phrase(self):
+        store = make_store(self.base)
+        original = ou._snapshot
+
+        def boom(root, db):
+            raise OSError(2, "gone", str(db))
+        ou._snapshot = boom
+        try:
+            with self.assertRaisesRegex(ou.CheckError, "^store-unreadable$"):
+                negative(store, FakeRunner(store))
+        finally:
+            ou._snapshot = original
+
     def test_bad_user_name_rejected(self):
         store = make_store(self.base)
         for bad in ("Root", "a b", "x;rm", "ab", "../x"):
@@ -241,7 +277,25 @@ class MarkerTests(unittest.TestCase):
             rc = ou.main(argv)
         return rc, buf.getvalue()
 
+    def test_verify_marker_fails_without_run_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            m = pathlib.Path(d) / "m"
+            ou.write_marker(m, 3, "7")
+            saved = os.environ.pop("GITHUB_RUN_ID", None)
+            try:
+                rc, out = self.run_main(["verify-marker", "--marker", str(m)])
+                self.assertEqual((rc, out.strip()), (1, "other-uid verify-marker FAIL run-id-missing"))
+                os.environ["GITHUB_RUN_ID"] = "7"
+                rc, out = self.run_main(["verify-marker", "--marker", str(m)])
+                self.assertEqual((rc, out.strip()), (0, "other-uid verify-marker ok"))
+            finally:
+                os.environ.pop("GITHUB_RUN_ID", None)
+                if saved is not None:
+                    os.environ["GITHUB_RUN_ID"] = saved
+
     def test_verify_marker_fails_when_check_never_ran(self):
+        os.environ["GITHUB_RUN_ID"] = "7"
+        self.addCleanup(os.environ.pop, "GITHUB_RUN_ID", None)
         with tempfile.TemporaryDirectory() as d:
             rc, out = self.run_main(["verify-marker", "--marker", str(pathlib.Path(d) / "m")])
             self.assertEqual(rc, 1)
@@ -333,7 +387,7 @@ class UserTests(unittest.TestCase):
         saved = {k: os.environ.pop(k, None) for k in ("GITHUB_ACTIONS", "RUNNER_ENVIRONMENT")}
         try:
             with contextlib.redirect_stdout(buf):
-                rc = ou.main(["create-user", "--user", "xtother"])
+                rc = ou.main(["create-user", "--user", "xtother", "--created-marker", "/nonexistent/created"])
         finally:
             for k, v in saved.items():
                 if v is not None:
@@ -349,10 +403,18 @@ class CommandSequenceTests(unittest.TestCase):
         self.exists = False
         self.saved = (ou._sh, ou.is_hosted_runner)
         ou.is_hosted_runner = lambda *a, **k: True
+        self.tmp = tempfile.TemporaryDirectory()
+        self.created = str(pathlib.Path(self.tmp.name) / "created")
+        self.saved_run = os.environ.get("GITHUB_RUN_ID")
+        os.environ["GITHUB_RUN_ID"] = "99"
         self.addCleanup(self.restore)
 
     def restore(self):
         ou._sh, ou.is_hosted_runner = self.saved
+        self.tmp.cleanup()
+        os.environ.pop("GITHUB_RUN_ID", None)
+        if self.saved_run is not None:
+            os.environ["GITHUB_RUN_ID"] = self.saved_run
 
     def fake_sh(self, fail_at=None, ids=None):
         def sh(argv):
@@ -380,7 +442,7 @@ class CommandSequenceTests(unittest.TestCase):
 
     def test_create_user_step_order_and_dedicated_group(self):
         self.fake_sh()
-        rc, out = self.run_cmd(["create-user", "--user", "xtother"])
+        rc, out = self.run_cmd(["create-user", "--user", "xtother", "--created-marker", self.created])
         self.assertEqual(rc, 0, out)
         sudo = [c[4:] for c in self.calls if c[:2] == ["sudo", "-n"]]
         self.assertEqual(sudo[0], ["-create", "/Groups/xtother"])
@@ -394,20 +456,43 @@ class CommandSequenceTests(unittest.TestCase):
     def test_create_user_refuses_existing_account(self):
         self.fake_sh()
         self.exists = True
-        rc, out = self.run_cmd(["create-user", "--user", "xtother"])
+        rc, out = self.run_cmd(["create-user", "--user", "xtother", "--created-marker", self.created])
         self.assertEqual((rc, out.strip()), (2, "other-uid create-user FAIL account-exists"))
         self.assertEqual([c for c in self.calls if c[:2] == ["sudo", "-n"]], [])
 
     def test_create_user_failure_stops_with_fixed_phrase(self):
         self.fake_sh(fail_at=3)
-        rc, out = self.run_cmd(["create-user", "--user", "xtother"])
+        rc, out = self.run_cmd(["create-user", "--user", "xtother", "--created-marker", self.created])
         self.assertEqual(rc, 1)
         self.assertEqual(out.strip(), "other-uid create-user FAIL dscl")
         self.assertEqual(len([c for c in self.calls if c[:2] == ["sudo", "-n"]]), 3)
 
+    def test_delete_user_refuses_account_not_created_by_this_run(self):
+        self.fake_sh()
+        rc, out = self.run_cmd(["delete-user", "--user", "xtother", "--created-marker", self.created])
+        self.assertEqual((rc, out.strip()), (0, "other-uid delete-user skipped-not-created-by-this-run"))
+        pathlib.Path(self.created).write_text("other-uid-created run=98\n")  # another run's marker
+        rc, out = self.run_cmd(["delete-user", "--user", "xtother", "--created-marker", self.created])
+        self.assertIn("skipped-not-created-by-this-run", out)
+        self.assertEqual(self.calls, [])
+
+    def test_create_user_records_marker_then_delete_consumes_it(self):
+        self.fake_sh()
+        self.assertEqual(self.run_cmd(["create-user", "--user", "xtother", "--created-marker", self.created])[0], 0)
+        self.assertEqual(pathlib.Path(self.created).read_text(), "other-uid-created run=99\n")
+        self.assertEqual(self.run_cmd(["delete-user", "--user", "xtother", "--created-marker", self.created])[0], 0)
+        self.assertFalse(pathlib.Path(self.created).exists())
+
+    def test_create_user_refusal_leaves_no_marker(self):
+        self.fake_sh()
+        self.exists = True
+        self.run_cmd(["create-user", "--user", "xtother", "--created-marker", self.created])
+        self.assertFalse(pathlib.Path(self.created).exists())
+
     def test_delete_user_removes_user_and_group(self):
         self.fake_sh()
-        rc, out = self.run_cmd(["delete-user", "--user", "xtother"])
+        pathlib.Path(self.created).write_text("other-uid-created run=99\n")
+        rc, out = self.run_cmd(["delete-user", "--user", "xtother", "--created-marker", self.created])
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), "other-uid delete-user ok")
         self.assertEqual([c[4:] for c in self.calls],
@@ -448,6 +533,27 @@ class WorkflowStructureTests(unittest.TestCase):
                          marker.search(self.steps[verify]["run"]).group(1))
         self.assertLess(self.find("other_uid_negative create-user"), check)
         self.assertGreater(self.find("other_uid_negative delete-user"), verify)
+
+    def test_store_root_and_parent_layout_are_pinned(self):
+        init = self.steps[self.find("xtrace init")]["run"]
+        check = self.steps[self.find("other_uid_negative check")]["run"]
+        data_home = re.search(r'XTRACE_DATA_HOME="([^"]+)" target/debug/xtrace init', init).group(1)
+        store_root = re.search(r'--store-root\s+"([^"]+)"', check).group(1)
+        parent = re.search(r'--parent\s+"([^"]+)"', check).group(1)
+        self.assertEqual(store_root, data_home)
+        made = re.findall(r'install -d [^\n]*-m 755 (\S+)', init)
+        self.assertIn(parent, made)
+        self.assertEqual(str(pathlib.PurePosixPath(data_home).parent), parent)
+        # root-owned ancestors only: never under the runner home or RUNNER_TEMP, and the walk fails closed
+        self.assertTrue(parent.startswith("/opt/"))
+        self.assertIn("ancestor-not-root-owned", init)
+        self.assertIn("ancestor-writable-or-sticky", init)
+
+    def test_created_marker_is_shared_by_setup_and_cleanup(self):
+        marker = re.compile(r"--created-marker\s+(\S+)")
+        a = marker.search(self.steps[self.find("other_uid_negative create-user")]["run"]).group(1)
+        b = marker.search(self.steps[self.find("other_uid_negative delete-user")]["run"]).group(1)
+        self.assertEqual(a, b)
 
     def test_not_covered_marker_comment_is_present(self):
         self.assertIn("# NOT COVERED until broker code exists: other-UID broker negative "
