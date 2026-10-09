@@ -208,7 +208,8 @@ fn scan_timeout_stops_the_whole_process_group_of_a_forking_wrapper() {
     assert!(!pid_file.exists(), "warm-up must not start the grandchild");
     let output = project.scan(&analyzer, &project.dir.path().join("src"), &["--timeout-secs", "1"]);
     assert_eq!(output.status.code(), Some(10), "{output:?}");
-    let pid = fs::read_to_string(&pid_file).expect("wrapper never recorded a grandchild pid within the 1 s scan deadline");
+    let pid = fs::read_to_string(&pid_file)
+        .expect("wrapper never recorded a grandchild pid within the 1 s scan deadline");
     let pid = pid.trim();
     let mut gone = false;
     for _ in 0..50 {
