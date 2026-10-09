@@ -191,17 +191,25 @@ fn alive(pid: &str) -> bool {
 
 #[test]
 fn scan_timeout_stops_the_whole_process_group_of_a_forking_wrapper() {
-    // The first exec of a freshly written script can take over a second on macOS, so a 1 s
-    // timeout may expire before the wrapper has forked the grandchild and recorded its pid. 5 s
-    // is enough for the wrapper to start; the grandchild sleeps 30 s, so it is still the timeout
-    // that stops it, and the assertion that it is gone is unchanged.
+    // Warm-up mitigation (not a readiness handshake): the first exec of a freshly written script
+    // (and of `sleep`) can take over a second on macOS. The wrapper has a warm-up mode that execs
+    // both and exits; running it once before the scan pays that one-off cost outside the scan's
+    // timeout clock, which still starts at spawn. The scan then runs with the normal 1 s deadline
+    // and the grandchild (30 s) must be stopped by it.
     let project = Project::new();
     let pid_file = project.dir.path().join("grandchild.pid");
-    let body = format!("sleep 30 &\necho $! > '{}'\nwait", pid_file.display());
+    let body = format!(
+        "if [ -n \"$XTRACE_TEST_WARMUP\" ]; then sleep 0; exit 0; fi\nsleep 30 &\necho $! > '{}'\nwait",
+        pid_file.display()
+    );
     let analyzer = write_analyzer(project.dir.path(), &body);
-    let output = project.scan(&analyzer, &project.dir.path().join("src"), &["--timeout-secs", "5"]);
+    let warmup = Command::new(&analyzer).env("XTRACE_TEST_WARMUP", "1").status().expect("warm up");
+    assert!(warmup.success(), "analyzer warm-up failed");
+    assert!(!pid_file.exists(), "warm-up must not start the grandchild");
+    let output = project.scan(&analyzer, &project.dir.path().join("src"), &["--timeout-secs", "1"]);
     assert_eq!(output.status.code(), Some(10), "{output:?}");
-    let pid = fs::read_to_string(&pid_file).expect("grandchild pid recorded");
+    let pid = fs::read_to_string(&pid_file)
+        .expect("wrapper never recorded a grandchild pid within the 1 s scan deadline");
     let pid = pid.trim();
     let mut gone = false;
     for _ in 0..50 {
