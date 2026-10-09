@@ -294,6 +294,12 @@ jobs:
           python3 -B tools/qa/camp_overhead.py --baseline "$CAMP_ROOT/java/petclinic/baseline-1/receipt.json" \
             --instrumented "${INSTR_DIR:-/nonexistent}/receipt.json" --out "$CAMP_OUT/overhead.json" || true
           python3 -B tools/qa/camp_instr_steps.py overhead --file "$CAMP_OUT/summary.json" --project petclinic --overhead "$CAMP_OUT/overhead.json"
+      - name: Lifecycle, xtrace record then xtrace stop (daemon only, no application launch)
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          python3 -B tools/qa/camp_lifecycle.py --xtrace "$XCAMP_XTRACE" --project-dir "$CAMP_ROOT/java/petclinic/src" \
+            --file "$CAMP_OUT/summary.json" --project petclinic
       - name: Privacy canary scan (class names only, canaries are never printed)
         if: matrix.project == 'petclinic' && always()
         run: |
