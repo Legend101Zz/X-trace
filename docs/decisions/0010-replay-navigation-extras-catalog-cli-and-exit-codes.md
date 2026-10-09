@@ -1,6 +1,6 @@
 # ADR 0010: Replay navigation extras, catalog CLI naming and one exit-code table
 
-- Status: Accepted (contract owner, v0.01 unattended run, wave 1)
+- Status: Accepted (root ruling, PLAN A5, v0.01 unattended run, wave 1)
 - Date: 2026-10-09
 - Amends: `docs/plans/x-trace/03a-domain-and-storage.md` (replay navigation),
   `docs/plans/x-trace/03b-protocol-and-api.md` section 9.3 (routes) and
@@ -68,28 +68,42 @@ list|history|diff|conflicts|runs` and `xtrace scan`. The catalog lane may remap
 names to the 03d spellings inside its own module without a new decision; the
 registered top-level entries and their stub behaviour do not change.
 
-### 4. One exit-code table
+### 4. The exit-code list in 03d section 2.1 is superseded as a whole
 
-The CLI has exactly one mapping from error category to exit code
-(`exit_code_for_category` in `crates/xtrace-cli/src/error.rs`):
+03d section 2.1 lists: `0` success, `2` usage/validation, `3` policy/approval
+required, `4` compatibility, `5` unavailable/not found, `6` partial result,
+`7` external process failure, `8` store/corruption, `10` internal. The code
+follows a different table and this ADR makes the code's table authoritative
+for the whole list, not only for approval-required and partial results.
 
-| Code | Meaning |
-|---|---|
-| 0 | success |
-| 1 | internal error or cancelled |
-| 2 | validation (invalid argument, malformed input) |
-| 3 | not found |
-| 4 | conflict or corruption |
-| 5 | resource or transport |
-| 6 | compatibility (schema or protocol mismatch) |
-| 7 | permission |
-| 8 | policy (including "approval required") |
-| 9 | not implemented (`CliError::NotImplemented`, `XTR-CLI-NOT-IMPLEMENTED`) |
-| 10 | partial result (`CliError::Partial`, `XTR-CLI-PARTIAL`) |
+Category mapping (`exit_code_for_category` in
+`crates/xtrace-cli/src/error.rs`):
 
-The numbers in 03d for approval-required and partial results are superseded by
-8 and 10 respectively. Commands registered ahead of their implementation exit 9
-with a message; they never exit 0 and never print a success document.
+| Code | Meaning | 03d said |
+|---|---|---|
+| 0 | success | 0 |
+| 1 | internal error or cancelled | 10 (internal) |
+| 2 | validation (invalid argument, malformed input) | 2 |
+| 3 | not found | 5 (unavailable/not found) |
+| 4 | conflict or corruption | 8 (store/corruption) |
+| 5 | resource or transport | 5 (unavailable) |
+| 6 | compatibility (schema or protocol mismatch) | 4 |
+| 7 | permission | no equivalent; 7 was external process failure |
+| 8 | policy (including "approval required") | 3 |
+| 9 | not implemented (`CliError::NotImplemented`) | none |
+| 10 | partial result (`CliError::Partial`) | 6 |
+
+External process failure has no code of its own in this table: `xtrace run`
+returns the child's exit status through `CliError::Run`/`Attach`.
+
+This is one category mapping, not the only source of exit codes. `CliError`
+variants that are not domain categories keep their own codes and are part of
+the table: `PrivateStorageUnavailable` exits 7, `StoreUnavailable` and
+`DaemonAlreadyRunning` and `DaemonFailure` exit 5, `StoreSchemaNewer`,
+`StoreSchemaOlder` and `DaemonUnsupportedPlatform` exit 6, `StoreCorrupted`
+exits 4, `ProjectDirectoryMissing` exits 3, and `Run`/`Attach` pass through
+the wrapped process status. Commands registered ahead of their implementation
+exit 9 with a message; they never exit 0 and never print a success document.
 
 ## Consequences
 
@@ -99,4 +113,6 @@ with a message; they never exit 0 and never print a success document.
   population of migration v8 follow in later increments; this ADR is the
   prerequisite for authoring the navigation vectors.
 - Reading the planning text and the code disagree only in the places listed
-  here; everywhere else the approved text stands.
+  here: the navigation extras of section 2, the catalog command names of
+  section 3 and the whole exit-code list of section 4. Everywhere else the
+  approved text stands.

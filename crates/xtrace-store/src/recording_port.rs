@@ -233,40 +233,60 @@ fn validate_xtf_event(
             CorrelationId::new(),
         )
     })?;
+    let invalid_source = || {
+        PortError::new(
+            PortErrorKind::Validation,
+            "recording source metadata is invalid",
+            CorrelationId::new(),
+        )
+    };
+    let mismatched = || {
+        PortError::new(
+            PortErrorKind::Validation,
+            "recording source binding disagrees with source metadata",
+            CorrelationId::new(),
+        )
+    };
+    let extent_ok = |source: &xtrace_protocol::generated::agent::SourceRange| {
+        source.start_line != 0 && (source.end_line == 0 || source.end_line >= source.start_line)
+    };
     match (binding, payload.source.as_ref()) {
-        (WireSourceBinding::Verified, Some(source)) => {
-            let allowed = [
-                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderController.java",
-                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java",
-                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderRepository.java",
-            ];
-            let safe_path = allowed.contains(&source.path.as_str())
-                && !source.path.starts_with('/')
-                && !source.path.contains('\\')
-                && source
-                    .path
-                    .split('/')
-                    .all(|part| !part.is_empty() && part != "." && part != "..");
-            if !safe_path
+        (WireSourceBinding::Verified | WireSourceBinding::ObservedUnattested, Some(source)) => {
+            if !crate::recording_store::is_safe_repo_relative_path(&source.path)
                 || source.content_hash.len() != 32
-                || source.start_line == 0
-                || (source.end_line != 0 && source.end_line < source.start_line)
+                || !extent_ok(source)
             {
-                return Err(PortError::new(
-                    PortErrorKind::Validation,
-                    "recording source metadata is invalid",
-                    CorrelationId::new(),
-                ));
+                return Err(invalid_source());
             }
         }
-        (WireSourceBinding::Verified, None) | (_, Some(_)) => {
-            return Err(PortError::new(
-                PortErrorKind::Validation,
-                "recording source binding disagrees with source metadata",
-                CorrelationId::new(),
-            ));
+        (
+            WireSourceBinding::SourceMapAbsent | WireSourceBinding::SourceMapUnresolved,
+            Some(source),
+        ) => {
+            if !crate::recording_store::is_safe_repo_relative_path(&source.path)
+                || (!source.content_hash.is_empty() && source.content_hash.len() != 32)
+                || !extent_ok(source)
+            {
+                return Err(invalid_source());
+            }
         }
-        (_, None) => {}
+        // CONTRACTS section 3 rule 6: source is present iff the binding has a source claim.
+        (
+            WireSourceBinding::Verified
+            | WireSourceBinding::ObservedUnattested
+            | WireSourceBinding::SourceMapAbsent
+            | WireSourceBinding::SourceMapUnresolved,
+            None,
+        )
+        | (
+            WireSourceBinding::AttestationMissing
+            | WireSourceBinding::ClassBytesMismatch
+            | WireSourceBinding::DebugMetadataAbsent
+            | WireSourceBinding::SourceMetadataInvalid
+            | WireSourceBinding::Unspecified,
+            Some(_),
+        ) => return Err(mismatched()),
+        _ => {}
     }
     Ok(event.payload.clone())
 }
@@ -402,6 +422,80 @@ mod tests {
         }
     }
 
+    fn source_event(
+        binding: xtrace_protocol::generated::agent::SourceBinding,
+        path: &str,
+        hash_len: usize,
+    ) -> AcceptedRecordingEvent<XtfEventEnvelope> {
+        let mut accepted = event(2, "evt-src");
+        let nested = accepted.payload.event.as_mut().expect("typed payload");
+        nested.source_binding = binding as i32;
+        nested.source = Some(xtrace_protocol::generated::agent::SourceRange {
+            path: path.to_owned(),
+            start_line: 2,
+            end_line: 3,
+            content_hash: vec![7; hash_len].into(),
+            ..Default::default()
+        });
+        accepted.canonical_bytes = accepted.payload.encode_to_vec();
+        accepted
+    }
+
+    #[test]
+    fn write_gate_accepts_generic_verified_and_unattested_sources() {
+        use xtrace_protocol::generated::agent::SourceBinding as B;
+        for binding in [B::Verified, B::ObservedUnattested] {
+            let accepted =
+                source_event(binding, "services/petclinic/src/main/java/org/p/Owner.java", 32);
+            super::validate_xtf_event(&accepted).expect("generic source path accepted");
+        }
+        let mapped = source_event(B::SourceMapUnresolved, "src/routes/users.ts", 0);
+        super::validate_xtf_event(&mapped).expect("mapped path without hash accepted");
+    }
+
+    #[test]
+    fn write_gate_refuses_unsafe_paths_and_mismatched_bindings() {
+        use xtrace_protocol::generated::agent::SourceBinding as B;
+        for path in [
+            "../x/A.java",
+            "src/./A.java",
+            "/abs/A.java",
+            "C:/x/A.java",
+            "src/\u{1b}[2J/A.java",
+            "src/\tA.java",
+            "src/\u{7f}A.java",
+        ] {
+            let accepted = source_event(B::Verified, path, 32);
+            assert!(super::validate_xtf_event(&accepted).is_err(), "{path:?} must be refused");
+        }
+        let too_long = format!("{}.java", "a".repeat(1025));
+        assert!(super::validate_xtf_event(&source_event(B::Verified, &too_long, 32)).is_err());
+        let long_ok = format!("{}/A.java", "a".repeat(1000));
+        super::validate_xtf_event(&source_event(B::Verified, &long_ok, 32))
+            .expect("paths up to 1024 bytes are accepted");
+        // Extension and dot-directory rules are read-projection rules, not write rules: a
+        // refused write would reject the whole batch.
+        for path in [".env", "config/.env.ts", "README.md"] {
+            let result = super::validate_xtf_event(&source_event(B::Verified, path, 32));
+            assert!(result.is_ok(), "{path} is accepted at write time");
+        }
+        for binding in [B::SourceMapAbsent, B::SourceMapUnresolved] {
+            let mut missing = source_event(binding, "src/A.ts", 0);
+            missing.payload.event.as_mut().expect("typed").source = None;
+            missing.canonical_bytes = missing.payload.encode_to_vec();
+            assert!(super::validate_xtf_event(&missing).is_err(), "{binding:?} needs a source");
+        }
+        assert!(super::validate_xtf_event(&source_event(B::Verified, "src/A.java", 31)).is_err());
+        assert!(
+            super::validate_xtf_event(&source_event(B::AttestationMissing, "src/A.java", 32))
+                .is_err()
+        );
+        let mut missing = source_event(B::ObservedUnattested, "src/A.java", 32);
+        missing.payload.event.as_mut().expect("typed").source = None;
+        missing.canonical_bytes = missing.payload.encode_to_vec();
+        assert!(super::validate_xtf_event(&missing).is_err());
+    }
+
     #[test]
     fn sqlite_adapter_replays_begin_and_segment_idempotently() {
         let (directory, store, project) = fixture();
@@ -467,6 +561,7 @@ mod tests {
             drop_counts_by_priority: [(1, 0)].into_iter().collect(),
             unsupported_capability_codes: vec!["focused_locals".to_string()],
             capacity_dropped_events: 0,
+            event_cap: 2_048,
             response_summary: Some(CapturedValue::Redacted {
                 rule_id: "unverified-producer-redaction".to_string(),
                 shape_hint: Some(ValueShape::String),
@@ -658,6 +753,7 @@ mod tests {
             drop_counts_by_priority: std::collections::BTreeMap::new(),
             unsupported_capability_codes: Vec::new(),
             capacity_dropped_events: 0,
+            event_cap: 2_048,
             response_summary: Some(CapturedValue::Redacted {
                 rule_id: "unverified-producer-redaction".to_string(),
                 shape_hint: None,
@@ -748,6 +844,7 @@ mod tests {
             drop_counts_by_priority: [(1, 2)].into_iter().collect(),
             unsupported_capability_codes: Vec::new(),
             capacity_dropped_events: 2,
+            event_cap: 2_048,
             response_summary: None,
         };
         assert_eq!(
@@ -797,6 +894,7 @@ mod tests {
                     drop_counts_by_priority: [(1, 1)].into_iter().collect(),
                     unsupported_capability_codes: Vec::new(),
                     capacity_dropped_events: 1,
+                    event_cap: 2_048,
                     response_summary: None,
                 })
                 .expect("finish stores the evidence");
@@ -864,6 +962,7 @@ mod tests {
                 drop_counts_by_priority,
                 unsupported_capability_codes: Vec::new(),
                 capacity_dropped_events: 0,
+                event_cap: 2_048,
                 response_summary: None,
             };
             persistence.begin_recording(&begin(project.id(), recording_id)).expect("begin");
@@ -1449,6 +1548,7 @@ mod tests {
             drop_counts_by_priority: [(6, 2)].into_iter().collect(),
             unsupported_capability_codes: Vec::new(),
             capacity_dropped_events: 0,
+            event_cap: 2_048,
             response_summary: None,
         };
         let receipt = capture.finish_recording(finish.clone()).expect("finish");

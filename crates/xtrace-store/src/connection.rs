@@ -60,7 +60,7 @@ pub const BUSY_TIMEOUT_PRAGMA: &str = "PRAGMA busy_timeout = 5000";
 
 /// Maximum schema version this binary can read. Bumped together with
 /// new migrations.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 /// Stable ABI version of the store crate. Bumped when the on-disk
 /// representation changes in a way that requires all linked code to

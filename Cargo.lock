@@ -1582,10 +1582,13 @@ dependencies = [
  "xtrace-application",
  "xtrace-daemon",
  "xtrace-domain",
+ "xtrace-exercise",
+ "xtrace-export",
  "xtrace-private-storage",
  "xtrace-protocol",
  "xtrace-runtime",
  "xtrace-store",
+ "xtrace-tui",
  "zstd",
 ]
 

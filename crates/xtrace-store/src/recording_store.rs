@@ -18,13 +18,16 @@ use xtrace_application::observed_endpoint_queries::{
     ObservedEndpointKey, ObservedEndpointRecord, ObservedRecordingKey, ObservedRecordingRecord,
 };
 use xtrace_application::recording::{
-    EndpointObservationInput, FinishRecording, MAX_RECORDED_EVENTS, RecordingCompletion,
+    EVENT_CAP_SANITY_BOUND, EndpointObservationInput, FinishRecording, RecordingCompletion,
 };
+
+/// Largest `request_json` accepted for terminal evidence (matches the v7 CHECK).
+const MAX_TERMINAL_REQUEST_JSON_BYTES: usize = 64 * 1024;
 use xtrace_application::recording_queries::{
     FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES,
-    NavigationResult, NavigationUnavailable, PersistedEvent, PersistedInteraction, PersistedSource,
-    RecordingCompletionEvidence, RecordingEventWindow, RecordingMetadata, RecordingStatus,
-    ShowWindowRequest, SourceStatus,
+    NavigationResult, NavigationUnavailable, PersistedEvent, PersistedInteraction,
+    PersistedOutcome, PersistedSource, RecordingCapacity, RecordingCompletionEvidence,
+    RecordingEventWindow, RecordingMetadata, RecordingStatus, ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
@@ -659,6 +662,12 @@ impl SqliteRecordingStore<'_> {
                 }
                 _ => Vec::new(),
             };
+            // A corrupt terminal row is already reported through `completion`
+            // and `incomplete_evidence`; list metadata then stays null.
+            let terminal =
+                load_terminal_finish(&connection, recording_id, completion, correlation_id)
+                    .ok()
+                    .flatten();
             recordings.push(RecordingMetadata {
                 recording_id,
                 status: lifecycle_status,
@@ -681,8 +690,12 @@ impl SqliteRecordingStore<'_> {
                     .transpose()?
                     .map(|value| value.to_string()),
                 incomplete_evidence,
-                event_cap: None,
-                outcome_kind: None,
+                event_cap: terminal
+                    .as_ref()
+                    .and_then(|finish| u32::try_from(finish.event_cap).ok()),
+                // No adapter outcome is persisted in this build; terminal
+                // evidence without one reads as `unobserved` (CONTRACTS 5).
+                outcome_kind: terminal.as_ref().map(|_| "unobserved".to_owned()),
             });
         }
         let has_more = recordings.len() > usize::try_from(limit).unwrap_or(usize::MAX);
@@ -747,6 +760,35 @@ impl SqliteRecordingStore<'_> {
                     .collect()
             })
             .unwrap_or_default();
+        let capacity = match terminal_finish.as_ref() {
+            None => None,
+            Some(finish) => {
+                let stored_event_count: i64 = connection
+                    .query_row(
+                        "SELECT event_count FROM recording_terminal_evidence WHERE recording_id = ?1",
+                        rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        map_store_error(
+                            StoreError::from_rusqlite(error, correlation_id),
+                            correlation_id,
+                        )
+                    })?;
+                Some(RecordingCapacity {
+                    event_cap: u32::try_from(finish.event_cap)
+                        .map_err(|_| recording_query_corrupt_error(correlation_id))?,
+                    event_count: u32::try_from(stored_event_count)
+                        .map_err(|_| recording_query_corrupt_error(correlation_id))?,
+                    capacity_dropped_events: finish.capacity_dropped_events.to_string(),
+                    drops_by_priority: finish
+                        .drop_counts_by_priority
+                        .iter()
+                        .map(|(priority, count)| (*priority, count.to_string()))
+                        .collect(),
+                })
+            }
+        };
 
         let mut statement = connection
             .prepare(
@@ -1009,7 +1051,20 @@ impl SqliteRecordingStore<'_> {
                 correlation_id,
             )?;
             event.frame_id = frame_id;
-            event.navigation = navigation;
+            event.navigation = if frame_id.is_none() && event.kind == "request_update" {
+                // CONTRACTS 8.3: request updates are never frames.
+                let not_navigable =
+                    NavigationResult::unavailable(NavigationUnavailable::NotNavigable);
+                FrameNavigation {
+                    previous: not_navigable,
+                    next: not_navigable,
+                    into: not_navigable,
+                    over: not_navigable,
+                    out: not_navigable,
+                }
+            } else {
+                navigation
+            };
         }
         // The application layer serializes this entire DTO. Account for the
         // terminal sidecar and the final frame/navigation-enriched events
@@ -1067,8 +1122,15 @@ impl SqliteRecordingStore<'_> {
             events,
             has_more,
             incomplete_evidence,
-            outcome: None,
-            capacity: None,
+            // Adapter outcomes are not persisted yet (RecordingOutcome has not
+            // landed), so terminal evidence reads as `unobserved`.
+            outcome: terminal_finish.as_ref().map(|_| PersistedOutcome {
+                kind: "unobserved".to_owned(),
+                http_status: None,
+                exception: None,
+                thrown_from_event_id: None,
+            }),
+            capacity,
             limitations: Vec::new(),
         })
     }
@@ -1395,12 +1457,13 @@ impl SqliteRecordingStore<'_> {
                 matches!(value, xtrace_domain::CapturedValue::Redacted { rule_id, .. }
                     if rule_id != "unverified-producer-redaction")
             })
+            || !event_cap_in_bounds(request.event_cap)
         {
             return Err(terminal_validation_error(correlation_id));
         }
         let request_json = serde_json::to_string(request)
             .map_err(|_| terminal_validation_error(correlation_id))?;
-        if request_json.len() > 16 * 1024 {
+        if request_json.len() > MAX_TERMINAL_REQUEST_JSON_BYTES {
             return Err(terminal_validation_error(correlation_id));
         }
         let _writer = self
@@ -1485,14 +1548,17 @@ impl SqliteRecordingStore<'_> {
         transaction
             .execute(
                 "INSERT INTO recording_terminal_evidence \
-                 (recording_id, request_json, completion, final_recording_seq, event_count) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (recording_id, request_json, completion, final_recording_seq, event_count, \
+                  event_cap) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     request.recording_id.as_uuid().as_bytes().to_vec(),
                     request_json,
                     completion_text,
                     request.final_recording_seq.to_be_bytes().as_slice(),
                     i64::try_from(event_count)
+                        .map_err(|_| terminal_validation_error(correlation_id))?,
+                    i64::try_from(request.event_cap)
                         .map_err(|_| terminal_validation_error(correlation_id))?,
                 ],
             )
@@ -1568,7 +1634,9 @@ impl SqliteRecordingStore<'_> {
             let mut segments = Vec::new();
             let mut declared_event_count = 0_usize;
             let mut declared_input_bytes = 0_usize;
-            for row in rows.take(MAX_RECORDED_EVENTS + 1) {
+            let event_cap = usize::try_from(request.event_cap)
+                .map_err(|_| terminal_validation_error(correlation_id))?;
+            for row in rows.take(event_cap.saturating_add(1)) {
                 let segment = row.map_err(|error| {
                     map_store_error(
                         StoreError::from_rusqlite(error, correlation_id),
@@ -1588,8 +1656,8 @@ impl SqliteRecordingStore<'_> {
                     .checked_add(logical_bytes)
                     .and_then(|total| total.checked_add(compressed_bytes))
                     .ok_or_else(|| object_corrupt_error(correlation_id))?;
-                if segments.len() == MAX_RECORDED_EVENTS
-                    || declared_event_count > MAX_RECORDED_EVENTS
+                if segments.len() == event_cap
+                    || declared_event_count > event_cap
                     || segment_event_count == 0
                 {
                     return Err(object_corrupt_error(correlation_id));
@@ -2182,20 +2250,21 @@ fn load_terminal_finish(
     let Some(request_bytes) = request_bytes else {
         return Ok(None);
     };
-    if !(0..=16_384).contains(&request_bytes) {
+    if !(0..=MAX_TERMINAL_REQUEST_JSON_BYTES as i64).contains(&request_bytes) {
         return Err(recording_query_corrupt_error(correlation_id));
     }
-    let (request_json, raw_final_sequence, stored_completion, stored_event_count): (
+    let (request_json, raw_final_sequence, stored_completion, stored_event_count, stored_cap): (
         String,
         Vec<u8>,
         String,
         i64,
+        i64,
     ) = connection
         .query_row(
-            "SELECT request_json, final_recording_seq, completion, event_count \
+            "SELECT request_json, final_recording_seq, completion, event_count, event_cap \
                  FROM recording_terminal_evidence WHERE recording_id = ?1",
             rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
@@ -2207,7 +2276,9 @@ fn load_terminal_finish(
         .map_err(|_| recording_query_corrupt_error(correlation_id))?;
     if finish.recording_id != recording_id
         || finish.final_recording_seq != final_sequence
-        || event_count > u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
+        || !event_cap_in_bounds(finish.event_cap)
+        || i64::try_from(finish.event_cap).ok() != Some(stored_cap)
+        || event_count > finish.event_cap
         || finish.event_digest.len() > 32
         || finish.drop_counts_by_priority.len() > 256
         || finish.unsupported_capability_codes.len() > 64
@@ -2222,8 +2293,7 @@ fn load_terminal_finish(
         // Capacity drops only happen once the persisted history is full, and the
         // unverifiable adapter digest is withheld; anything else is inconsistent.
         || (finish.capacity_dropped_events > 0
-            && (event_count != u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
-                || !finish.event_digest.is_empty()))
+            && (event_count != finish.event_cap || !finish.event_digest.is_empty()))
         || finish.capacity_dropped_events
             > finish
                 .drop_counts_by_priority
@@ -2241,6 +2311,11 @@ fn load_terminal_finish(
         return Err(recording_query_corrupt_error(correlation_id));
     }
     Ok(Some(finish))
+}
+
+/// An event cap is valid when it is positive and not above the sanity bound.
+fn event_cap_in_bounds(cap: u64) -> bool {
+    (1..=EVENT_CAP_SANITY_BOUND as u64).contains(&cap)
 }
 
 fn completion_label_from_evidence(completion: RecordingCompletionEvidence) -> &'static str {
@@ -2422,14 +2497,20 @@ fn project_persisted_event(
             WireSourceBinding::Unspecified => SourceBinding::Unspecified,
         },
     );
-    let source = if source_binding.is_verified() {
-        event
+    let source = match source_binding {
+        SourceBinding::Verified | SourceBinding::ObservedUnattested => event
             .source
             .as_ref()
             .and_then(source_range_from_wire)
-            .and_then(|source| project_source(&source, source_root, source_cache))
-    } else {
-        None
+            .and_then(|source| project_source(&source, source_root, source_cache)),
+        // CONTRACTS 7.3: a source-map claim is never an excerpt. The mapped path is
+        // shown as unavailable; the file is neither read nor cached.
+        SourceBinding::SourceMapAbsent | SourceBinding::SourceMapUnresolved => event
+            .source
+            .as_ref()
+            .and_then(source_range_from_wire)
+            .and_then(|source| project_unverified_source_map(&source)),
+        _ => None,
     };
     let mut projected = PersistedEvent {
         sequence: event.recording_seq.to_string(),
@@ -2472,16 +2553,26 @@ fn source_range_from_wire(
 const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SOURCE_EXCERPT_BYTES: usize = 16 * 1024;
 const MAX_SOURCE_EXCERPT_LINES: u32 = 64;
+/// Distinct source files read for one window query.
+const MAX_SOURCE_FILES_PER_WINDOW: usize = 64;
+/// Total source text kept resident for one window query.
+const MAX_SOURCE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 struct SourceProjectionCache {
     snapshots: HashMap<String, SourceSnapshot>,
     reads: usize,
+    cached_bytes: usize,
 }
 
 enum SourceSnapshot {
     Unavailable,
-    Loaded { hash: ContentHash, text: Option<String> },
+    /// The recorded file does not exist under the source root.
+    Missing,
+    Loaded {
+        hash: ContentHash,
+        text: Option<String>,
+    },
 }
 
 fn project_source(
@@ -2491,12 +2582,7 @@ fn project_source(
 ) -> Option<PersistedSource> {
     let start_line = source.start_line?;
     let path = source.path.as_str();
-    let safe = [
-        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderController.java",
-        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java",
-        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderRepository.java",
-    ];
-    if start_line == 0 || !safe.contains(&path) || source.content_hash.is_none() {
+    if start_line == 0 || !is_projectable_source_path(path) || source.content_hash.is_none() {
         return None;
     }
     let end_line = source.end_line.filter(|end| *end >= start_line);
@@ -2511,11 +2597,31 @@ fn project_source(
         });
     };
     if !cache.snapshots.contains_key(path) {
-        cache.reads += 1;
-        cache.snapshots.insert(path.to_owned(), load_source_snapshot(root, path));
+        let snapshot = if cache.reads >= MAX_SOURCE_FILES_PER_WINDOW
+            || cache.cached_bytes >= MAX_SOURCE_CACHE_BYTES
+        {
+            SourceSnapshot::Unavailable
+        } else {
+            cache.reads += 1;
+            load_source_snapshot(root, path)
+        };
+        if let SourceSnapshot::Loaded { text: Some(text), .. } = &snapshot {
+            cache.cached_bytes = cache.cached_bytes.saturating_add(text.len());
+        }
+        cache.snapshots.insert(path.to_owned(), snapshot);
     }
     let snapshot = cache.snapshots.get(path)?;
     let SourceSnapshot::Loaded { hash, text } = snapshot else {
+        if matches!(snapshot, SourceSnapshot::Missing) {
+            return Some(PersistedSource {
+                path: path.to_owned(),
+                start_line,
+                end_line,
+                status: SourceStatus::MissingFile,
+                excerpt: None,
+                truncated: false,
+            });
+        }
         return unavailable_source(path, start_line, end_line);
     };
     let recorded_hash = source.content_hash.as_ref()?;
@@ -2570,9 +2676,10 @@ fn load_source_snapshot(root: &Path, path: &str) -> SourceSnapshot {
                 | rustix::fs::OFlags::NOFOLLOW
                 | rustix::fs::OFlags::CLOEXEC
         };
-        let Ok(opened) = rustix::fs::openat(&directory, *part, flags, rustix::fs::Mode::empty())
-        else {
-            return SourceSnapshot::Unavailable;
+        let opened = match rustix::fs::openat(&directory, *part, flags, rustix::fs::Mode::empty()) {
+            Ok(opened) => opened,
+            Err(rustix::io::Errno::NOENT) => return SourceSnapshot::Missing,
+            Err(_) => return SourceSnapshot::Unavailable,
         };
         let file = std::fs::File::from(opened);
         if final_component {
@@ -2636,6 +2743,7 @@ fn project_matching_source(
         if separator_bytes != 0 {
             excerpt.push('\n');
         }
+        let line = redact_source_line(line);
         if line.len() > remaining {
             let mut boundary = remaining.min(line.len());
             while !line.is_char_boundary(boundary) {
@@ -2645,7 +2753,7 @@ fn project_matching_source(
             truncated = true;
             break;
         }
-        excerpt.push_str(line);
+        excerpt.push_str(&line);
     }
     if !found {
         return unavailable_source(path, start_line, end_line);
@@ -2658,6 +2766,115 @@ fn project_matching_source(
         excerpt: Some(excerpt),
         truncated,
     })
+}
+
+/// Source file extensions a recorded path may carry (adapter-supplied hashes prove
+/// nothing about authenticity, so the path gate is the control).
+const SOURCE_EXTENSIONS: [&str; 12] =
+    ["java", "kt", "scala", "groovy", "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
+
+/// Longest accepted repository-relative path, in bytes (CONTRACTS section 3 rule 7).
+const MAX_REPO_RELATIVE_PATH_BYTES: usize = 1024;
+
+/// Write-time gate for a recorded source path (CONTRACTS section 3 rules 6-7): 1 to 1024
+/// bytes, no leading `/`, no backslash, no NUL or other control character, no empty, `.` or
+/// `..` segment and no drive prefix such as `C:`. It does not look at extensions or the
+/// file system; those rules apply only to the read projection.
+pub(crate) fn is_safe_repo_relative_path(path: &str) -> bool {
+    if path.is_empty() || path.len() > MAX_REPO_RELATIVE_PATH_BYTES {
+        return false;
+    }
+    if path.starts_with('/') || path.contains('\\') || path.chars().any(char::is_control) {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+/// Read-time gate: a path that passes [`is_safe_repo_relative_path`] and may also be
+/// read and shown. No dot-directory segment (`.env`, `.git`, `.xtrace`), no
+/// `node_modules` segment, and a known source extension.
+pub(crate) fn is_projectable_source_path(path: &str) -> bool {
+    if !is_safe_repo_relative_path(path) {
+        return false;
+    }
+    let mut segments = path.split('/').peekable();
+    while let Some(segment) = segments.next() {
+        if segment.starts_with('.') || segment == "node_modules" {
+            return false;
+        }
+        if segments.peek().is_none() {
+            let Some((_, extension)) = segment.rsplit_once('.') else {
+                return false;
+            };
+            return SOURCE_EXTENSIONS.contains(&extension);
+        }
+    }
+    false
+}
+
+/// Replacement shown instead of an excerpt line that looks like a credential.
+const SOURCE_LINE_REDACTION: &str = "[redacted by x-trace]";
+
+/// Replaces a whole line that matches the ADR 0003 content patterns (JWT, AWS
+/// access key id, PEM block, bearer token).
+fn redact_source_line(line: &str) -> String {
+    if source_line_has_secret_shape(line) {
+        SOURCE_LINE_REDACTION.to_owned()
+    } else {
+        line.to_owned()
+    }
+}
+
+fn source_line_has_secret_shape(line: &str) -> bool {
+    if line.contains("-----BEGIN ") {
+        return true;
+    }
+    let bytes = line.as_bytes();
+    // AKIA followed by sixteen upper-case letters or digits.
+    for (index, window) in bytes.windows(20).enumerate() {
+        let _ = index;
+        if window.starts_with(b"AKIA")
+            && window[4..].iter().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    // Bearer <token>
+    if let Some(position) = line.find("Bearer ") {
+        let token = &line[position + "Bearer ".len()..];
+        if token.chars().take_while(|ch| !ch.is_whitespace() && *ch != '"').count() >= 8 {
+            return true;
+        }
+    }
+    // JWT: eyJ<base64url>.<base64url>.<base64url?>
+    let mut rest = line;
+    while let Some(position) = rest.find("eyJ") {
+        let candidate = &rest[position..];
+        let token: String = candidate
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+            .collect();
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() >= 3 && parts[0].len() >= 8 && parts[1].len() >= 8 {
+            return true;
+        }
+        rest = &candidate[3..];
+    }
+    false
+}
+
+/// Projects a source-map binding: gated path and extent, status unavailable, no file read.
+fn project_unverified_source_map(source: &SourceRange) -> Option<PersistedSource> {
+    let start_line = source.start_line.filter(|line| *line > 0)?;
+    if !is_projectable_source_path(&source.path) {
+        return None;
+    }
+    let end_line = source.end_line.filter(|end| *end >= start_line);
+    unavailable_source(&source.path, start_line, end_line)
 }
 
 fn unavailable_source(
@@ -2819,6 +3036,236 @@ mod source_projection_tests {
         let excerpt = projected.excerpt.expect("matched excerpt");
         assert_eq!(excerpt.len(), MAX_SOURCE_EXCERPT_BYTES);
         assert!(projected.truncated);
+    }
+
+    fn write_at(root: &Path, relative: &str, bytes: &[u8]) {
+        let file = root.join(relative);
+        std::fs::create_dir_all(file.parent().expect("parent exists")).expect("directory created");
+        std::fs::write(file, bytes).expect("source written");
+    }
+
+    #[test]
+    fn non_fixture_path_projects_source() {
+        let root = tempdir();
+        let path = "services/petclinic/src/main/java/org/petclinic/OwnerController.java";
+        let bytes = b"package x;\nclass OwnerController {\n  void list() {}\n}\n";
+        write_at(root.path(), path, bytes);
+        let projected = project(&range(path, ContentHash::of_bytes(bytes)), Some(root.path()))
+            .expect("generic source projection");
+        assert_eq!(projected.status, SourceStatus::Matched);
+        assert_eq!(projected.excerpt.as_deref(), Some("class OwnerController {\n  void list() {}"));
+        let ts = "src/routes/users.ts";
+        write_at(root.path(), ts, b"a\nb\nc\n");
+        assert!(
+            project(&range(ts, ContentHash::of_bytes(b"a\nb\nc\n")), Some(root.path())).is_some()
+        );
+    }
+
+    #[test]
+    fn distinct_source_files_per_window_are_bounded() {
+        let root = tempdir();
+        let mut cache = SourceProjectionCache::default();
+        let mut unavailable = 0usize;
+        for index in 0..200 {
+            let path = format!("src/File{index}.java");
+            let bytes = format!("package x;\nclass File{index} {{\n  void run() {{}}\n}}\n");
+            write_at(root.path(), &path, bytes.as_bytes());
+            let projected = project_source(
+                &range(&path, ContentHash::of_bytes(bytes.as_bytes())),
+                Some(root.path()),
+                &mut cache,
+            )
+            .expect("projection");
+            if projected.status == SourceStatus::Unavailable {
+                unavailable += 1;
+            }
+        }
+        assert_eq!(cache.reads, MAX_SOURCE_FILES_PER_WINDOW);
+        assert_eq!(unavailable, 200 - MAX_SOURCE_FILES_PER_WINDOW);
+    }
+
+    #[test]
+    fn verified_and_unattested_events_project_generic_sources_end_to_end() {
+        use xtrace_protocol::generated::agent::{RecordingEvent, SourceBinding as B, SourceRange};
+        let root = tempdir();
+        let path = "services/petclinic/src/main/java/org/p/Owner.java";
+        let bytes = b"package x;\nclass Owner {\n  void list() {}\n}\n";
+        write_at(root.path(), path, bytes);
+        for binding in [B::Verified, B::ObservedUnattested] {
+            let event = RecordingEvent {
+                source_binding: binding as i32,
+                source: Some(SourceRange {
+                    path: path.to_owned(),
+                    start_line: 2,
+                    end_line: 3,
+                    content_hash: ContentHash::of_bytes(bytes).as_bytes().to_vec().into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let projected = project_persisted_event(
+                &event,
+                Some(root.path()),
+                &mut SourceProjectionCache::default(),
+            );
+            let source = projected.source.expect("source claim projected");
+            assert_eq!(source.status, SourceStatus::Matched, "{binding:?}");
+        }
+    }
+
+    #[test]
+    fn missing_file_status_missing_file() {
+        let root = tempdir();
+        let projected = project(
+            &range("src/main/java/Gone.java", ContentHash::of_bytes(b"x")),
+            Some(root.path()),
+        )
+        .expect("missing file projection");
+        assert_eq!(projected.status, SourceStatus::MissingFile);
+        assert!(projected.excerpt.is_none());
+    }
+
+    #[test]
+    fn path_traversal_and_absolute_paths_rejected() {
+        let root = tempdir();
+        for path in [
+            "../outside/Secret.java",
+            "src/../../Secret.java",
+            "/etc/Passwd.java",
+            "src//Double.java",
+            "src\\Back.java",
+            "",
+        ] {
+            assert!(
+                project(&range(path, ContentHash::of_bytes(b"x")), Some(root.path())).is_none(),
+                "{path:?} must not project"
+            );
+        }
+    }
+
+    #[test]
+    fn write_gate_follows_the_contract_path_rules() {
+        for good in ["src/A.java", "a.b/c/D.ts", "x/.hidden/E.java"] {
+            assert!(is_safe_repo_relative_path(good), "{good:?}");
+        }
+        assert!(is_safe_repo_relative_path(&"a".repeat(1024)));
+        for bad in [
+            "",
+            "/abs/A.java",
+            "C:/x/A.java",
+            "c:A.java",
+            "src\\A.java",
+            "src/\u{1b}[2J/A.java",
+            "src/\tA.java",
+            "src/\u{7f}A.java",
+            "src//A.java",
+            "src/./A.java",
+            "../A.java",
+        ] {
+            assert!(!is_safe_repo_relative_path(bad), "{bad:?}");
+        }
+        assert!(!is_safe_repo_relative_path(&"a".repeat(1025)));
+    }
+
+    fn source_map_event(
+        binding: xtrace_protocol::generated::agent::SourceBinding,
+        hash: &[u8],
+        path: &str,
+    ) -> xtrace_protocol::generated::agent::RecordingEvent {
+        xtrace_protocol::generated::agent::RecordingEvent {
+            source_binding: binding as i32,
+            source: Some(xtrace_protocol::generated::agent::SourceRange {
+                path: path.to_owned(),
+                start_line: 1,
+                end_line: 2,
+                content_hash: hash.to_vec().into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn source_map_absent_never_projects_excerpt() {
+        use xtrace_protocol::generated::agent::SourceBinding as Wire;
+        let root = tempdir();
+        let bytes = b"one\ntwo\n";
+        write_source(root.path(), bytes);
+        let hash = ContentHash::of_bytes(bytes);
+        let digest = hash.as_bytes().to_vec();
+        for binding in [Wire::SourceMapAbsent, Wire::SourceMapUnresolved] {
+            let event = source_map_event(binding, &digest, PATH);
+            let mut cache = SourceProjectionCache::default();
+            let projected = project_persisted_event(&event, Some(root.path()), &mut cache);
+            let source = projected.source.expect("path is projected");
+            assert_eq!(source.status, SourceStatus::Unavailable);
+            assert!(source.excerpt.is_none());
+            assert_eq!(cache.reads, 0, "the file must not be read");
+        }
+    }
+
+    #[test]
+    fn source_map_unresolved_empty_hash_projects_unavailable_path() {
+        use xtrace_protocol::generated::agent::SourceBinding as Wire;
+        let event = source_map_event(Wire::SourceMapUnresolved, &[], PATH);
+        let mut cache = SourceProjectionCache::default();
+        let projected = project_persisted_event(&event, None, &mut cache);
+        let source = projected.source.expect("path is projected");
+        assert_eq!(source.path, PATH);
+        assert_eq!(source.status, SourceStatus::Unavailable);
+        assert!(source.excerpt.is_none());
+        let event = source_map_event(Wire::SourceMapUnresolved, &[], ".env");
+        assert!(project_persisted_event(&event, None, &mut cache).source.is_none());
+    }
+
+    #[test]
+    fn dotenv_path_refused() {
+        assert!(!is_projectable_source_path(".env"));
+        assert!(!is_projectable_source_path("config/.env.ts"));
+    }
+
+    #[test]
+    fn git_config_path_refused() {
+        assert!(!is_projectable_source_path(".git/config"));
+        assert!(!is_projectable_source_path(".xtrace/state.ts"));
+        assert!(!is_projectable_source_path(".github/workflows/ci.ts"));
+    }
+
+    #[test]
+    fn config_yml_non_source_extension_refused() {
+        assert!(!is_projectable_source_path("src/main/resources/application.yml"));
+        assert!(!is_projectable_source_path("README.md"));
+        assert!(!is_projectable_source_path("src/Makefile"));
+        assert!(!is_projectable_source_path("node_modules/pkg/index.js"));
+        assert!(is_projectable_source_path("src/main/java/a/B.java"));
+        assert!(is_projectable_source_path("lib/server.mjs"));
+    }
+
+    #[test]
+    fn source_line_with_akia_literal_redacted_in_excerpt() {
+        let root = tempdir();
+        let path = "src/Config.java";
+        let bytes = format!(
+            "header\nString key = \"{}\";\nplain line\nBearer abcdefghijkl\n",
+            ["AKIA", "ABCDEFGHIJKLMNOP"].concat()
+        );
+        write_at(root.path(), path, bytes.as_bytes());
+        let mut source = range(path, ContentHash::of_bytes(bytes.as_bytes()));
+        source.start_line = Some(2);
+        source.end_line = Some(4);
+        let projected = project(&source, Some(root.path())).expect("projection");
+        let excerpt = projected.excerpt.expect("excerpt");
+        assert_eq!(excerpt, "[redacted by x-trace]\nplain line\n[redacted by x-trace]");
+        assert!(!excerpt.contains("ABCDEFGHIJKLMNOP"));
+    }
+
+    #[test]
+    fn jwt_and_pem_lines_are_redacted() {
+        assert!(source_line_has_secret_shape(
+            "token = \"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123_-signature\""
+        ));
+        assert!(source_line_has_secret_shape("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(!source_line_has_secret_shape("String s = \"eyJ\";"));
     }
 
     #[cfg(unix)]

@@ -200,6 +200,7 @@ fn translate_finished(
             .collect::<BTreeMap<_, _>>(),
         unsupported_capability_codes: finished.unsupported_capability_codes.clone(),
         capacity_dropped_events: 0,
+        event_cap: xtrace_application::legacy_event_cap(),
         response_summary: finished
             .response_summary
             .as_ref()

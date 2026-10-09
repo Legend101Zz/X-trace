@@ -19,6 +19,63 @@ use crate::{PortError, PortErrorKind};
 /// persisted; they are dropped, counted, and the recording degrades to
 /// [`RecordingCompletion::Partial`] instead of failing the capture.
 pub const MAX_RECORDED_EVENTS: usize = 2_048;
+/// Event cap of a recording in the default (standard) capture mode.
+pub const STANDARD_EVENT_CAP: usize = 16_384;
+/// Event cap of a recording captured in focused mode.
+pub const FOCUSED_EVENT_CAP: usize = 131_072;
+/// Hard bound on any event cap or persisted event count; also the SQL CHECK bound.
+pub const EVENT_CAP_SANITY_BOUND: usize = 1_048_576;
+/// Capture policy identifier selecting [`CaptureMode::Standard`].
+pub const CAPTURE_POLICY_STANDARD_ID: &str = "xtrace.standard.v1";
+/// Capture policy identifier selecting [`CaptureMode::Focused`].
+pub const CAPTURE_POLICY_FOCUSED_ID: &str = "xtrace.focused.v1";
+
+/// Capture depth that selects the per-recording event cap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    /// Method boundaries and request facts within [`STANDARD_EVENT_CAP`].
+    #[default]
+    Standard,
+    /// Armed focused capture within [`FOCUSED_EVENT_CAP`].
+    Focused,
+}
+
+impl CaptureMode {
+    /// Events one recording may persist in this mode.
+    #[must_use]
+    pub const fn event_cap(self) -> usize {
+        match self {
+            Self::Standard => STANDARD_EVENT_CAP,
+            Self::Focused => FOCUSED_EVENT_CAP,
+        }
+    }
+
+    /// Stable capture policy identifier for this mode.
+    #[must_use]
+    pub const fn policy_id(self) -> &'static str {
+        match self {
+            Self::Standard => CAPTURE_POLICY_STANDARD_ID,
+            Self::Focused => CAPTURE_POLICY_FOCUSED_ID,
+        }
+    }
+
+    /// Mode named by a policy identifier; empty or unknown identifiers mean standard.
+    #[must_use]
+    pub fn from_policy_id(id: &str) -> Self {
+        if id == CAPTURE_POLICY_FOCUSED_ID { Self::Focused } else { Self::Standard }
+    }
+}
+
+/// Cap that terminal evidence written before the cap was recorded was under.
+#[must_use]
+pub const fn legacy_event_cap() -> u64 {
+    MAX_RECORDED_EVENTS as u64
+}
+
+fn is_legacy_event_cap(cap: &u64) -> bool {
+    *cap == legacy_event_cap()
+}
 /// Maximum distinct event priorities tracked for capacity drops of one
 /// recording. Keeps the drop accounting bounded (the store accepts at most 256
 /// priority buckets in total, adapter-reported ones included).
@@ -286,6 +343,13 @@ pub struct FinishRecording {
     /// field records that those drops came from capacity, not from the adapter.
     #[serde(default)]
     pub capacity_dropped_events: u64,
+    /// Event cap in force for this recording. Older rows without the field were
+    /// recorded under [`legacy_event_cap`].
+    ///
+    /// The legacy value is omitted when serializing so a finish written before
+    /// the field existed replays byte-identically.
+    #[serde(default = "legacy_event_cap", skip_serializing_if = "is_legacy_event_cap")]
+    pub event_cap: u64,
     /// Producer-declared response summary; only non-preview states are accepted
     /// until a verified privacy-policy registry exists. This is not outcome proof.
     pub response_summary: Option<xtrace_domain::CapturedValue>,
@@ -305,6 +369,7 @@ impl FinishRecording {
             drop_counts_by_priority: BTreeMap::new(),
             unsupported_capability_codes: Vec::new(),
             capacity_dropped_events: 0,
+            event_cap: legacy_event_cap(),
             response_summary: None,
         }
     }
@@ -843,6 +908,7 @@ fn effective_finish<E>(
     let mut effective = request.clone();
     // Derived from the application's own state, never from the caller.
     effective.capacity_dropped_events = state.capacity_dropped;
+    effective.event_cap = legacy_event_cap();
     if state.capacity_dropped == 0 {
         return Ok(effective);
     }
@@ -893,6 +959,22 @@ fn capture_error(kind: PortErrorKind, message: &'static str) -> PortError {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn legacy_finish_json_without_event_cap_verifies_under_2048() {
+        let finish = FinishRecording::without_digest(RecordingId::new(), 7);
+        assert_eq!(finish.event_cap, legacy_event_cap());
+        let json = serde_json::to_string(&finish).expect("serialize");
+        assert!(!json.contains("event_cap"), "legacy-cap finish stays byte-identical: {json}");
+        let parsed: FinishRecording = serde_json::from_str(&json).expect("legacy json parses");
+        assert_eq!(parsed.event_cap, 2048);
+        assert_eq!(serde_json::to_string(&parsed).expect("reserialize"), json);
+        let mut raised = finish;
+        raised.event_cap = 16_384;
+        let raised_json = serde_json::to_string(&raised).expect("serialize");
+        assert!(raised_json.contains("\"event_cap\":16384"));
+    }
+
     use std::time::{Duration, Instant};
     use uuid::Uuid;
 

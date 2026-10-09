@@ -9,7 +9,9 @@
 //! `v0002_recording_segments`; Slice 1E.3A appends
 //! `v0003_observed_endpoint_catalog`; P02A appends
 //! `v0004_recording_terminal_evidence`; P03A appends
-//! `v0005_catalog_discovery` and `v0006_catalog_retry_namespace_expiry`. Migrations remain append-only: later
+//! `v0005_catalog_discovery` and `v0006_catalog_retry_namespace_expiry`; the
+//! replay contract appends `v0007_recording_event_cap_sanity_bound` and
+//! `v0008_frame_index_depth_async`. Migrations remain append-only: later
 //! slices must add a new record instead of editing an applied one.
 //!
 //! Migrations deliberately avoid statements that cannot be safely
@@ -85,6 +87,16 @@ impl Migrations {
                 version: 6,
                 label: "v0006_catalog_retry_namespace_expiry",
                 statements: &[CATALOG_RETRY_NAMESPACE_EXPIRY_SCHEMA],
+            },
+            MigrationRecord {
+                version: 7,
+                label: "v0007_recording_event_cap_sanity_bound",
+                statements: &[RECORDING_EVENT_CAP_SANITY_BOUND_SCHEMA],
+            },
+            MigrationRecord {
+                version: 8,
+                label: "v0008_frame_index_depth_async",
+                statements: &[FRAME_INDEX_DEPTH_ASYNC_SCHEMA],
             },
         ]
     }
@@ -357,6 +369,55 @@ CREATE TABLE recording_terminal_evidence (
 
 CREATE INDEX recording_terminal_completion
     ON recording_terminal_evidence(completion, recording_id);
+";
+
+/// Rebuilds terminal evidence with the per-recording event cap column, a sanity
+/// bound on counts and a larger `request_json` allowance for outcome facts.
+///
+/// Nothing references `recording_terminal_evidence`, so no foreign-key rebuild
+/// order is needed. Legacy rows keep their bytes and receive the cap they were
+/// recorded under (2048).
+const RECORDING_EVENT_CAP_SANITY_BOUND_SCHEMA: &str = "
+CREATE TABLE recording_terminal_evidence_v7 (
+    recording_id  BLOB PRIMARY KEY CHECK(length(recording_id) = 16)
+                      REFERENCES recordings(recording_id),
+    request_json  TEXT NOT NULL CHECK(length(CAST(request_json AS BLOB)) <= 65536),
+    completion    TEXT NOT NULL CHECK(completion IN ('complete', 'partial', 'invalid')),
+    final_recording_seq BLOB NOT NULL CHECK(length(final_recording_seq) = 8),
+    event_count   INTEGER NOT NULL CHECK(event_count >= 0 AND event_count <= 1048576),
+    event_cap     INTEGER NOT NULL DEFAULT 2048
+                      CHECK(event_cap >= 1 AND event_cap <= 1048576 AND event_count <= event_cap)
+) STRICT;
+
+INSERT INTO recording_terminal_evidence_v7
+    (recording_id, request_json, completion, final_recording_seq, event_count)
+    SELECT recording_id, request_json, completion, final_recording_seq, event_count
+    FROM recording_terminal_evidence;
+
+DROP TABLE recording_terminal_evidence;
+
+ALTER TABLE recording_terminal_evidence_v7 RENAME TO recording_terminal_evidence;
+
+CREATE INDEX recording_terminal_completion
+    ON recording_terminal_evidence(completion, recording_id);
+";
+
+/// Adds the replay navigation columns to the frame index. Existing rows keep
+/// `indexed_v = 0` (legacy, unindexed); the population step marks new rows `1`.
+/// There is deliberately no subtree column and no backfill.
+const FRAME_INDEX_DEPTH_ASYNC_SCHEMA: &str = "
+ALTER TABLE recording_frame_index
+    ADD COLUMN depth INTEGER NOT NULL DEFAULT 0 CHECK(depth >= 0 AND depth <= 4096);
+ALTER TABLE recording_frame_index
+    ADD COLUMN async_parent_seq BLOB
+        CHECK(async_parent_seq IS NULL OR length(async_parent_seq) = 8);
+ALTER TABLE recording_frame_index
+    ADD COLUMN parent_seq BLOB CHECK(parent_seq IS NULL OR length(parent_seq) = 8);
+ALTER TABLE recording_frame_index ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE recording_frame_index ADD COLUMN honesty_flags INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE recording_frame_index ADD COLUMN indexed_v INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX recording_frame_parent
+    ON recording_frame_index(recording_id, parent_seq, recording_seq);
 ";
 
 /// Durable owner-scoped discovery ledger and immutable catalog history.
@@ -997,7 +1058,10 @@ mod tests {
         conn.execute_batch("DROP TABLE catalog_discovery_retry_keys")
             .expect("clear injected collision");
 
-        assert_eq!(apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v6"), 6);
+        assert_eq!(
+            apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v6"),
+            Migrations::latest_version()
+        );
         let history: (i64, i64, i64, i64) = conn.query_row(
             "SELECT (SELECT COUNT(*) FROM catalog_discovery_runs), (SELECT COUNT(*) FROM catalog_discovery_chunks), (SELECT COUNT(*) FROM catalog_discovery_claims), (SELECT COUNT(*) FROM catalog_discovery_retry_keys)",
             [],
@@ -1066,26 +1130,167 @@ mod tests {
     }
 
     #[test]
-    fn terminal_evidence_event_count_has_no_upper_sql_bound() {
-        // The per-recording event capacity is enforced by the capture service,
-        // which degrades to Partial with a drop count; the schema only rejects
-        // negative counts. v0004 is unreleased, so this is edited in place.
+    fn terminal_evidence_event_cap_and_sanity_bound_are_enforced_in_sql() {
         let conn = new_memory();
         apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply");
         let project = id(0x31);
         let recording = id(0x41);
         insert_project(&conn, &project).expect("project");
         insert_recording(&conn, &recording, &project, &id(0x51), "partial").expect("recording");
-        let insert = |count: i64| {
+        let insert = |count: i64, cap: i64| {
+            conn.execute(
+                "DELETE FROM recording_terminal_evidence WHERE recording_id = ?1",
+                params![recording],
+            )
+            .expect("clear");
             conn.execute(
                 "INSERT INTO recording_terminal_evidence \
-                 (recording_id, request_json, completion, final_recording_seq, event_count) \
-                 VALUES (?1, '{}', 'partial', ?2, ?3)",
-                params![recording, 9_u64.to_be_bytes().as_slice(), count],
+                 (recording_id, request_json, completion, final_recording_seq, event_count, event_cap) \
+                 VALUES (?1, '{}', 'partial', ?2, ?3, ?4)",
+                params![recording, 9_u64.to_be_bytes().as_slice(), count, cap],
             )
         };
-        assert!(insert(-1).is_err(), "negative counts stay rejected");
-        assert_eq!(insert(5_000).expect("counts above the old 2048 CHECK are accepted"), 1);
+        assert!(insert(-1, 2048).is_err(), "negative counts stay rejected");
+        assert!(insert(1_048_577, 1_048_577).is_err(), "event_count over the sanity bound");
+        assert!(insert(5, 1_048_577).is_err(), "event_cap over the sanity bound");
+        assert!(insert(0, 0).is_err(), "event_cap below one");
+        assert!(insert(5_000, 4_999).is_err(), "event_count above its own cap");
+        assert_eq!(insert(5_000, 16_384).expect("count within a standard cap"), 1);
+        assert_eq!(insert(131_072, 131_072).expect("count at a focused cap"), 1);
+        assert_eq!(insert(1_048_576, 1_048_576).expect("count at the sanity bound"), 1);
+    }
+
+    #[test]
+    fn migration_v7_preserves_v4_terminal_rows_byte_identical() {
+        let conn = new_memory();
+        let v6 = Migrations::catalog()[..6].to_vec();
+        assert_eq!(
+            apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v6).expect("apply exact v6"),
+            6
+        );
+        let v6_checksum = applied_checksum(&conn);
+        let project = id(0x31);
+        let recording = id(0x41);
+        insert_project(&conn, &project).expect("project");
+        insert_recording(&conn, &recording, &project, &id(0x51), "partial").expect("recording");
+        conn.execute(
+            "INSERT INTO recording_terminal_evidence \
+             (recording_id, request_json, completion, final_recording_seq, event_count) \
+             VALUES (?1, '{\"legacy\":true}', 'partial', ?2, 2000)",
+            params![recording, 9_u64.to_be_bytes().as_slice()],
+        )
+        .expect("legacy terminal row");
+        assert_eq!(
+            apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v7"),
+            Migrations::latest_version()
+        );
+        assert_ne!(applied_checksum(&conn), v6_checksum, "checksum changes with v7");
+        let row: (String, String, Vec<u8>, i64, i64) = conn
+            .query_row(
+                "SELECT request_json, completion, final_recording_seq, event_count, event_cap \
+                 FROM recording_terminal_evidence WHERE recording_id = ?1",
+                params![recording],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("migrated row");
+        assert_eq!(row.0, "{\"legacy\":true}");
+        assert_eq!(row.1, "partial");
+        assert_eq!(row.2, 9_u64.to_be_bytes().to_vec());
+        assert_eq!(
+            (row.3, row.4),
+            (2000, 2048),
+            "legacy rows get the cap they were recorded under"
+        );
+        let fk_errors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))
+            .expect("foreign keys");
+        assert_eq!(fk_errors, 0);
+        assert!(Migrations::latest_version() >= 7);
+    }
+
+    #[test]
+    fn migration_v8_applies_on_v7_db_and_legacy_rows_unindexed() {
+        let conn = new_memory();
+        let v7 = Migrations::catalog()[..7].to_vec();
+        assert_eq!(
+            apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v7).expect("apply exact v7"),
+            7
+        );
+        let project = id(0x31);
+        let recording = id(0x41);
+        insert_project(&conn, &project).expect("project");
+        insert_recording(&conn, &recording, &project, &id(0x51), "partial").expect("recording");
+        conn.execute(
+            "INSERT INTO recording_segments (recording_id, segment_ordinal, object_hash, \
+             first_recording_seq, last_recording_seq, event_count, uncompressed_bytes, \
+             compressed_bytes, checksum) VALUES (?1, 0, ?2, ?3, ?3, 1, 1, 1, ?2)",
+            params![recording, [7_u8; 32].as_slice(), 2_u64.to_be_bytes().as_slice()],
+        )
+        .expect("segment");
+        let mut frame = [0_u8; 16];
+        frame[6] = 0x70;
+        frame[8] = 0x80;
+        conn.execute(
+            "INSERT INTO recording_frame_index (recording_id, recording_seq, frame_id, \
+             segment_ordinal, event_offset, event_id_digest, monotonic_ns) \
+             VALUES (?1, ?2, ?3, 0, 0, ?4, ?5)",
+            params![
+                recording,
+                2_u64.to_be_bytes().as_slice(),
+                frame.as_slice(),
+                [1_u8; 32].as_slice(),
+                0_u64.to_be_bytes().as_slice()
+            ],
+        )
+        .expect("legacy frame row");
+        assert_eq!(
+            apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v8"),
+            Migrations::latest_version()
+        );
+        type LegacyRow = (i64, i64, i64, i64, Option<Vec<u8>>, Option<Vec<u8>>);
+        let legacy: LegacyRow = conn
+            .query_row(
+                "SELECT depth, kind, honesty_flags, indexed_v, parent_seq, async_parent_seq \
+                 FROM recording_frame_index WHERE recording_id = ?1",
+                params![recording],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("legacy row after v8");
+        assert_eq!(legacy, (0, 0, 0, 0, None, None), "legacy rows are unindexed, not backfilled");
+        assert!(
+            conn.execute(
+                "UPDATE recording_frame_index SET depth = 4097 WHERE recording_id = ?1",
+                params![recording]
+            )
+            .is_err(),
+            "depth is bounded in SQL"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE recording_frame_index SET parent_seq = X'01' WHERE recording_id = ?1",
+                params![recording]
+            )
+            .is_err(),
+            "parent_seq must be an 8 byte sequence"
+        );
+        let index_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'recording_frame_parent'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index lookup");
+        assert_eq!(index_exists, 1);
     }
 
     #[test]
