@@ -1273,6 +1273,7 @@ fn query_resource_error(correlation_id: CorrelationId) -> AppError {
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "fixed query fixtures")]
 mod tests {
     use super::*;
+    use crate::error::PortErrorKind;
 
     #[derive(Clone)]
     struct ReadFixture {

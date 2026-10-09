@@ -1757,6 +1757,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use xtrace_application::FrameNavigationView;
     use xtrace_application::observed_endpoint_queries::{
         ObservedEndpointKey, ObservedEndpointRecord, ObservedRecordingKey, ObservedRecordingRecord,
     };
@@ -1765,7 +1766,7 @@ mod tests {
         ObservedEndpointReadPort, PortError, PortErrorKind, ProjectRepository,
         RecordingEventWindow, RecordingMetadata, RecordingPersistencePort, ShowWindowRequest,
     };
-    use xtrace_domain::{Project, RepositoryFingerprint, RuntimeSessionId, WallTime};
+    use xtrace_domain::{FrameId, Project, RepositoryFingerprint, RuntimeSessionId, WallTime};
     use xtrace_store::{
         OpenOptions, SqliteRecordingPersistence, SqliteRecordingReader, SqliteStore,
     };
