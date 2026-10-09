@@ -2356,7 +2356,7 @@ async fn malformed_finish_can_replay_on_same_runtime_and_restart_keeps_open_capt
         response_summary: Some(xtrace_protocol::generated::agent::CapturedValue {
             value: Some(xtrace_protocol::generated::agent::captured_value::Value::Redacted(
                 xtrace_protocol::generated::agent::CapturedValueRedacted {
-                    rule_id: "FINISH_PRIVACY_CANARY".to_owned(),
+                    rule_id: "finish_privacy_canary".to_owned(),
                     shape_hint: i32::MAX,
                 },
             )),
@@ -2375,7 +2375,7 @@ async fn malformed_finish_can_replay_on_same_runtime_and_restart_keeps_open_capt
     let failure = next_protocol_error(&mut first_reader, "malformed finish").await;
     assert_eq!(failure.code, "XTR-DAEMON-TRANSPORT");
     assert_eq!(failure.message, "recording capture operation failed");
-    assert!(!failure.message.contains("FINISH_PRIVACY_CANARY"));
+    assert!(!failure.message.contains("finish_privacy_canary"));
     assert!(
         tokio::time::timeout(Duration::from_secs(3), read_envelope(&mut first_reader))
             .await

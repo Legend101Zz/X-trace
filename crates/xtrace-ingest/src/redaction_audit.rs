@@ -1,7 +1,10 @@
 //! Daemon-side audit redactor (CONTRACTS section 9.3, FR-2).
 //!
-//! A second pass the daemon runs on every accepted event before storage, so a secret the adapter
-//! failed to redact never reaches an immutable XTF segment. The audit can only make a value safer:
+//! A second pass the daemon is meant to run on every accepted event before storage, so a secret
+//! the adapter failed to redact never reaches an immutable XTF segment. NOT WIRED YET: no
+//! production caller exists until the C-surface request Cc-002 lands, so today only the validator's
+//! refusal of `bindings` (without `bindings_audit_active`) protects storage; `sanitized_shape`,
+//! tables, exception text, `event.value` and interaction summaries are persisted unaudited. The audit can only make a value safer:
 //! it downgrades `Captured` and `Truncated` values to `Redacted { rule_id: "daemon.audit" }` and
 //! replaces matching free text with a marker. It never upgrades a value, never reads a file and
 //! performs no I/O.
