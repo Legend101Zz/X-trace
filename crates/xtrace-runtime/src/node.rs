@@ -63,7 +63,10 @@ impl LaunchError {
 /// Explicit Node module mode used to select the adapter preload.
 pub enum NodeMode {
     /// Both preloads are injected; the adapter starts exactly once, whichever module system the
-    /// application entry uses.
+    /// application entry uses. Known limitation: `--import` makes Node load a CommonJS entry
+    /// through the ES module loader, which changes `process.nextTick` versus promise microtask
+    /// ordering and adds stack frames (verified on Node 22.23.0 and 24.21.0); use `CommonJs`
+    /// when that matters.
     Auto,
     /// CommonJS application launched with `--require` only.
     CommonJs,
@@ -832,13 +835,27 @@ fn terminate_probe(child: &mut std::process::Child, pid: u32) -> Result<(), Laun
 /// Files every launchable adapter dist must carry and hash: both preloads, the generated
 /// capability manifest, and the capture entry points they load.
 const REQUIRED_DIST_FILES: &[&str] = &[
+    "bootstrap.js",
     "capture-start.cjs",
+    "errors.js",
+    "framing.js",
+    "handshake.js",
     "http-capture.cjs",
+    "index.js",
+    "manifest.cjs",
+    "modules.cjs",
     "node-capabilities.json",
     "register.cjs",
     "register.mjs",
+    "runtime/context.cjs",
+    "runtime/events.cjs",
+    "runtime/registry.cjs",
+    "runtime/transport.cjs",
+    "send-queue.js",
+    "session.js",
     "start-capture.js",
     "transport-worker.js",
+    "worker-core.js",
 ];
 
 fn validate_distribution(root: &Path) -> Result<(), LaunchError> {
@@ -1086,6 +1103,7 @@ mod tests {
             let mut lines = Vec::new();
             for name in REQUIRED_DIST_FILES.iter().filter(|name| Some(**name) != omit) {
                 let path = directory.path().join(name);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("fixture dir");
                 std::fs::write(&path, format!("// {name}\n")).expect("fixture file");
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
                     .expect("owner-only file");
