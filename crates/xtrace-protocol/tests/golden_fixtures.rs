@@ -60,7 +60,8 @@ fn captured(preview: &str) -> wire::CapturedValue {
         value: Some(wire::captured_value::Value::Captured(wire::CapturedValueCaptured {
             shape: wire::ValueShape::String as i32,
             preview: preview.to_string(),
-            content_hash: Bytes::from(vec![0xAB; 32]),
+            // Ingest rule 1 requires BLAKE3(preview), so the fixture J and N copy validates.
+            content_hash: Bytes::copy_from_slice(blake3::hash(preview.as_bytes()).as_bytes()),
         })),
     }
 }

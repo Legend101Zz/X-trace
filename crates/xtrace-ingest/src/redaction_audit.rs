@@ -26,9 +26,10 @@ pub const AUDIT_POLICY_VERSION: &str = "xtrace.audit.v1";
 pub const AUDIT_TEXT_MARKER: &str = "[redacted:daemon.audit]";
 
 /// Words that mark a binding name as secret-bearing (compared lowercase, separators removed).
-const SECRET_NAME_WORDS: [&str; 14] = [
+const SECRET_NAME_WORDS: [&str; 15] = [
     "password",
     "passwd",
+    "pwd",
     "passphrase",
     "secret",
     "token",
@@ -37,7 +38,7 @@ const SECRET_NAME_WORDS: [&str; 14] = [
     "credential",
     "privatekey",
     "cookie",
-    "sessionid",
+    "session",
     "bearer",
     "accesskey",
     "signature",
@@ -94,26 +95,26 @@ pub fn text_has_secret(text: &str) -> bool {
         || contains_bearer(text)
 }
 
-fn is_b64url(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
-}
-
 /// `eyJ<b64>.<b64>.<b64>` where each part is at least 4 bytes.
+///
+/// Linear in the text length: the text is split once into runs of base64url characters and dots,
+/// and each run is walked part by part with a two-part window, so no candidate is rescanned and
+/// nothing is allocated (a 1 MiB run of `eyJ` costs one pass).
 fn contains_jwt(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut start = 0;
-    while let Some(offset) = text[start..].find("eyJ") {
-        let begin = start + offset;
-        let mut end = begin;
-        while end < bytes.len() && (is_b64url(bytes[end]) || bytes[end] == b'.') {
-            end += 1;
+    for run in text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))) {
+        // `head_prev`: the previous part contains `eyJ` followed by at least one more byte (the
+        // earliest occurrence leaves the longest header, so it dominates later ones).
+        // `window`: the part before the previous one is such a head and the previous part is
+        // at least 4 bytes, so a current part of at least 4 bytes completes a token.
+        let mut head_prev = false;
+        let mut window = false;
+        for part in run.split('.') {
+            if window && part.len() >= 4 {
+                return true;
+            }
+            window = head_prev && part.len() >= 4;
+            head_prev = part.find("eyJ").is_some_and(|at| part.len() - at >= 4);
         }
-        let candidate = &text[begin..end];
-        let parts: Vec<&str> = candidate.split('.').collect();
-        if parts.len() >= 3 && parts.iter().take(3).all(|p| p.len() >= 4) {
-            return true;
-        }
-        start = begin + 3;
     }
     false
 }
@@ -305,13 +306,38 @@ mod tests {
             binding("user_token", captured("abc")),
             binding("Api-Key", captured("k")),
             binding("owner", captured("Ada")),
+            binding("pwd", captured("hunter2")),
+            binding("session", captured("JSESSIONID-value")),
         ]);
         let report = audit_event(&mut event);
-        assert_eq!(report.downgraded_values, 3);
+        assert_eq!(report.downgraded_values, 5);
+        assert!(is_audit_redacted(&event.bindings[4]), "pwd is a secret name (ADR 0003 6.2)");
+        assert!(is_audit_redacted(&event.bindings[5]), "session is a secret name (ADR 0003 6.2)");
         assert!(is_audit_redacted(&event.bindings[0]));
         assert!(is_audit_redacted(&event.bindings[1]));
         assert!(is_audit_redacted(&event.bindings[2]));
         assert!(!is_audit_redacted(&event.bindings[3]), "an ordinary name stays captured");
+    }
+
+    #[test]
+    fn jwt_scan_is_linear_on_adversarial_input() {
+        // 256 KiB of overlapping `eyJ` candidates: the old per-candidate rescan was quadratic.
+        let text = "eyJ".repeat(256 * 1024 / 3);
+        let started = std::time::Instant::now();
+        assert!(!text_has_secret(&text));
+        let mixed = format!("{}{JWT}", "eyJ.".repeat(64 * 1024));
+        assert!(text_has_secret(&mixed), "a real token after the noise is still found");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "scan must stay linear");
+    }
+
+    #[test]
+    fn jwt_shapes_match_the_old_rule() {
+        assert!(contains_jwt("eyJa.bbbb.cccc"));
+        assert!(contains_jwt("xx eyJhbGciOi.payload.sig_x end"));
+        assert!(!contains_jwt("eyJ.bbbb.cccc"), "header needs at least 4 bytes from eyJ");
+        assert!(!contains_jwt("eyJhbGc.bbb.cccc"), "payload under 4 bytes");
+        assert!(!contains_jwt("eyJhbGc.bbbb"), "two parts only");
+        assert!(!contains_jwt("eyJhbGc..cccc"), "empty middle part");
     }
 
     #[test]

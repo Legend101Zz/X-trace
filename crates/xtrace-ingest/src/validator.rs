@@ -68,13 +68,15 @@ use std::num::NonZeroUsize;
 use blake3::Hasher;
 use prost::Message as _;
 use uuid::Uuid;
-use xtrace_domain::{CaptureMode, RecordingId};
+use xtrace_domain::{CaptureBudget, CaptureMode, RecordingId};
 use xtrace_protocol::generated::agent::{
-    EventBatch, RecordingEvent, RecordingFinished, RecordingStarted,
+    EventBatch, RecordingEvent, RecordingEventKind, RecordingFinished, RecordingStarted,
 };
 
 use crate::error::IngestError;
-use crate::event_rules::{normalize_started, validate_event, validate_finished};
+use crate::event_rules::{
+    event_preview_bytes, normalize_started, validate_event, validate_finished,
+};
 
 /// Legacy S0b per-recording event budget, kept as the cap [`IngestConfig::new`] applies until the
 /// daemon and application layers adopt the mode-derived caps (`CaptureMode::event_cap`) together
@@ -260,6 +262,10 @@ struct RecordingState {
     /// Events dropped at the event capacity, counted under their own
     /// priority. At most [`MAX_DROP_PRIORITY_BUCKETS`] distinct priorities.
     capacity_dropped_by_priority: BTreeMap<u32, u64>,
+    /// Running preview bytes of every retained event (CaptureBudget `max_value_bytes_per_recording`).
+    value_bytes: u64,
+    /// Running count of retained `LINE_CURSOR` events (CaptureBudget `max_line_events`).
+    line_events: u32,
 }
 
 /// Upper bound on distinct priorities tracked for capacity drops of one
@@ -432,6 +438,8 @@ impl IngestValidator {
                 event_digests: HashMap::new(),
                 first_dropped_seq: None,
                 capacity_dropped_by_priority: BTreeMap::new(),
+                value_bytes: 0,
+                line_events: 0,
             },
         );
         Ok(Acceptance::Started)
@@ -514,6 +522,9 @@ impl IngestValidator {
         let mut duplicates: usize = 0;
         let mut candidate_highest: u64 = state.highest_contiguous;
         let mut pending: Vec<(u64, [u8; 32])> = Vec::with_capacity(batch.events.len());
+        let budget = CaptureBudget::for_mode(mode);
+        let mut pending_value_bytes: u64 = 0;
+        let mut pending_lines: u32 = 0;
         let mut drops = state.capacity_dropped_by_priority.clone();
         let mut first_dropped = state.first_dropped_seq;
 
@@ -564,7 +575,23 @@ impl IngestValidator {
                 // watermark, but never retained. Only a drop ledger that
                 // itself would outgrow its bound is refused; that check
                 // happens before mutation so the batch is atomic.
-                if event_digest_count.saturating_add(new_count).saturating_add(1) > max_events {
+                // The per-recording budgets (CaptureBudget) are enforced here as well: an event
+                // that would push the running preview-byte or line-event total over its budget
+                // is dropped and counted under its own priority exactly like a capacity drop.
+                let event_bytes = event_preview_bytes(event);
+                let is_line = event.kind == RecordingEventKind::LineCursor as i32;
+                let over_value_budget = state
+                    .value_bytes
+                    .saturating_add(pending_value_bytes)
+                    .saturating_add(event_bytes)
+                    > budget.max_value_bytes_per_recording;
+                let over_line_budget = is_line
+                    && state.line_events.saturating_add(pending_lines).saturating_add(1)
+                        > budget.max_line_events;
+                if event_digest_count.saturating_add(new_count).saturating_add(1) > max_events
+                    || over_value_budget
+                    || over_line_budget
+                {
                     if !drops.contains_key(&event.priority)
                         && drops.len() >= MAX_DROP_PRIORITY_BUCKETS
                     {
@@ -580,6 +607,8 @@ impl IngestValidator {
                     continue;
                 }
                 pending.push((seq, digest));
+                pending_value_bytes = pending_value_bytes.saturating_add(event_bytes);
+                pending_lines = pending_lines.saturating_add(u32::from(is_line));
                 new_count += 1;
                 // Advance the local watermark so a contiguous run
                 // such as `[3, 4, 5]` is matched against the latest
@@ -617,6 +646,8 @@ impl IngestValidator {
         for (seq, digest) in pending {
             state.event_digests.insert(seq, digest);
         }
+        state.value_bytes = state.value_bytes.saturating_add(pending_value_bytes);
+        state.line_events = state.line_events.saturating_add(pending_lines);
         state.highest_contiguous = candidate_highest;
         state.capacity_dropped_by_priority = drops;
         state.first_dropped_seq = first_dropped;
@@ -701,6 +732,8 @@ impl IngestValidator {
                 event_digests,
                 first_dropped_seq: None,
                 capacity_dropped_by_priority: BTreeMap::new(),
+                value_bytes: 0,
+                line_events: 0,
             },
         );
     }
@@ -1592,6 +1625,62 @@ mod tests {
             IngestError::LineEventNotAllowedInStandardMode { .. }
         ));
         validator.accept_events(&batch(focused, vec![line(2)])).unwrap();
+    }
+
+    #[test]
+    fn per_recording_value_byte_budget_drops_and_counts_by_priority() {
+        use xtrace_protocol::generated::agent::{
+            CapturedValue, CapturedValueTruncated, captured_value::Value,
+        };
+        let big = |seq: u64| RecordingEvent {
+            priority: 7,
+            value: Some(CapturedValue {
+                value: Some(Value::Truncated(CapturedValueTruncated {
+                    preview: "x".repeat(512),
+                    ..CapturedValueTruncated::default()
+                })),
+            }),
+            ..event(seq, 1)
+        };
+        let id = rid();
+        let mut validator = mode_validator();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
+        // Standard budget: 256 KiB of preview bytes = 512 events of 512 bytes.
+        let events: Vec<_> = (2..=601).map(big).collect();
+        let acceptance = validator.accept_events(&batch(id, events)).unwrap();
+        assert!(matches!(acceptance, Acceptance::Events { accepted: 512, .. }));
+        assert_eq!(validator.highest_contiguous_seq(id), Some(601));
+        assert_eq!(validator.capacity_drops(id).unwrap().get(&7), Some(&88));
+        // A dropped sequence replays as a duplicate, not a conflict.
+        let replay = validator.accept_events(&batch(id, vec![big(601)])).unwrap();
+        assert!(matches!(replay, Acceptance::Events { duplicates: 1, .. }));
+    }
+
+    #[test]
+    fn per_recording_line_event_budget_drops_and_counts() {
+        use xtrace_protocol::generated::agent::{
+            RecordingEventKind, SourceBinding as WireBinding, SourceRange,
+        };
+        let line = |seq: u64| RecordingEvent {
+            kind: RecordingEventKind::LineCursor as i32,
+            priority: 3,
+            source: Some(SourceRange {
+                path: "src/A.java".to_string(),
+                start_line: 5,
+                end_line: 5,
+                content_hash: Bytes::from(vec![1_u8; 32]),
+                ..SourceRange::default()
+            }),
+            source_binding: WireBinding::ObservedUnattested as i32,
+            ..event(seq, 1)
+        };
+        let id = rid();
+        let mut validator = mode_validator();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Focused).unwrap();
+        let events: Vec<_> = (2..=8_201).map(line).collect();
+        let acceptance = validator.accept_events(&batch(id, events)).unwrap();
+        assert!(matches!(acceptance, Acceptance::Events { accepted: 8_192, .. }));
+        assert_eq!(validator.capacity_drops(id).unwrap().get(&3), Some(&8));
     }
 
     #[test]

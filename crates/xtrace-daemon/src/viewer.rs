@@ -2020,7 +2020,7 @@ mod tests {
         for (path, status) in [
             (format!("/api/v1/recordings/{recording}?cursor=abc&aroundFrame={frame}"), "400"),
             (format!("/api/v1/recordings/{recording}?projection=other"), "400"),
-            ("/api/v1/recordings/not-a-recording/graph".to_owned(), "404"),
+            (format!("/api/v1/recordings/not-a-recording/graph"), "404"),
         ] {
             let raw = format!(
                 "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",

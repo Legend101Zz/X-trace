@@ -56,6 +56,18 @@ fn honesty_strings_cover_every_stable_code() {
         .map(SourceBinding::as_str)),
         "sourceBindings"
     );
+    // CONTRACTS 7.3 (SRC-4): the per-status UI labels ship verbatim so X and the TUI share them.
+    let status = &doc["sourceStatus"];
+    for (code, text) in [
+        ("verified", "verified build attestation"),
+        ("observed_unattested", "source as read when the class loaded"),
+        ("mismatch", "source changed since recording"),
+        ("missing_file", "source file missing"),
+        ("source_map_absent", "map absent"),
+    ] {
+        assert_eq!(status[code], text, "sourceStatus.{code}");
+    }
+    assert_eq!(keys(&doc, "sourceStatus").len(), 5, "sourceStatus");
     assert_eq!(
         keys(&doc, "unavailableReasons"),
         set(&[

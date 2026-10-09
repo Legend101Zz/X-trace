@@ -20,6 +20,13 @@
     "orphan_parent": "The parent frame was not observed.",
     "legacy_unindexed": "Recorded before frame indexing existed; counts are not available."
   },
+  "sourceStatus": {
+    "verified": "verified build attestation",
+    "observed_unattested": "source as read when the class loaded",
+    "mismatch": "source changed since recording",
+    "missing_file": "source file missing",
+    "source_map_absent": "map absent"
+  },
   "sourceBindings": {
     "unspecified": "No source information was recorded.",
     "verified": "Source verified against the build attestation.",

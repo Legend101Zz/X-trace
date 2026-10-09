@@ -224,6 +224,35 @@ pub fn is_safe_repo_relative_path(path: &str) -> bool {
     path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
+/// Source file extensions the read projection may show an excerpt of (CONTRACTS section 7.3).
+pub const PROJECTABLE_SOURCE_EXTENSIONS: [&str; 12] =
+    ["java", "kt", "scala", "groovy", "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
+
+/// Returns `true` when the read projection may read and excerpt `path`: it is a safe
+/// repository-relative path ([`is_safe_repo_relative_path`]) that also has a source extension from
+/// [`PROJECTABLE_SOURCE_EXTENSIONS`], has no dot-directory or dot-file segment (`.env`, `.git`,
+/// `.xtrace`, `.github`) and no `node_modules` segment. Ingest deliberately uses only the
+/// structural function so library frames are never rejected on the wire; this stricter gate decides
+/// what the daemon will open and show. The adapter-supplied hash proves nothing about authenticity,
+/// so this path gate is the control.
+#[must_use]
+pub fn is_projectable_source_path(path: &str) -> bool {
+    if !is_safe_repo_relative_path(path) {
+        return false;
+    }
+    let mut segments = path.split('/');
+    let Some(file) = path.rsplit('/').next() else {
+        return false;
+    };
+    if segments.any(|segment| segment.starts_with('.') || segment == "node_modules") {
+        return false;
+    }
+    file.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty()
+            && PROJECTABLE_SOURCE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+    })
+}
+
 /// Reference describing how an evidence item was produced.
 ///
 /// `EvidenceRef` is immutable: a downstream layer may evolve it into
@@ -361,6 +390,33 @@ mod tests {
         }
         assert!(is_safe_repo_relative_path(&"a".repeat(1024)));
         assert!(!is_safe_repo_relative_path(&"a".repeat(1025)));
+    }
+
+    #[test]
+    fn projectable_source_path_adds_extension_dot_and_node_modules_rules() {
+        for good in
+            ["src/main/java/A.java", "app/Main.kt", "src/index.ts", "lib/x.MJS", "src/\u{e9}.java"]
+        {
+            assert!(is_projectable_source_path(good), "{good:?} should project");
+        }
+        for bad in [
+            ".github/workflows/x.yml",
+            "src/.env",
+            ".git/config",
+            "a/.xtrace/x.java",
+            "node_modules/pkg/index.js",
+            "src/node_modules/pkg/index.js",
+            "src/notes.txt",
+            "src/Makefile",
+            "src/.java",
+            "src/A.pem",
+            "../A.java",
+            "/A.java",
+        ] {
+            assert!(!is_projectable_source_path(bad), "{bad:?} must not project");
+        }
+        // Structural safety alone still admits what ingest must not reject on the wire.
+        assert!(is_safe_repo_relative_path("node_modules/pkg/index.js"));
     }
 
     #[test]

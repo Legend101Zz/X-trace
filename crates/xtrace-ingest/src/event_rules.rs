@@ -86,6 +86,9 @@ pub fn validate_event(
 
     check_gap(event, kind)?;
     check_bindings(event, kind, &budget, audit_active)?;
+    if let Some(value) = &event.value {
+        check_free_value(seq, value)?;
+    }
     if let Some(interaction) = &event.interaction {
         check_interaction(seq, interaction)?;
     }
@@ -253,6 +256,54 @@ fn check_value(
     }
 }
 
+/// Validates a value that is not a binding (`event.value`, interaction summaries and the finish
+/// marker's response summary): the preview is bounded by the largest per-mode preview budget so the
+/// audit redactor never scans an unbounded string, and a `Redacted` rule id keeps the pattern.
+pub(crate) fn check_free_value(seq: u64, value: &wire::CapturedValue) -> Result<(), IngestError> {
+    let max = usize::try_from(CaptureBudget::FOCUSED.max_preview_bytes).unwrap_or(usize::MAX);
+    match value.value.as_ref() {
+        Some(Value::Captured(c)) if c.preview.len() > max => {
+            Err(IngestError::BindingPreviewTooLong { recording_seq: seq })
+        }
+        Some(Value::Truncated(t)) if t.preview.len() > max => {
+            Err(IngestError::BindingPreviewTooLong { recording_seq: seq })
+        }
+        Some(Value::Redacted(r)) if !rule_id_is_valid(&r.rule_id) => {
+            Err(IngestError::RedactionRuleIdInvalid { recording_seq: seq })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Preview bytes one event adds to the recording's running value-byte total (binding previews,
+/// `event.value` and interaction summaries). Redacted, unavailable and dropped values count zero.
+#[must_use]
+pub fn event_preview_bytes(event: &RecordingEvent) -> u64 {
+    fn preview_len(value: &wire::CapturedValue) -> u64 {
+        let len = match value.value.as_ref() {
+            Some(Value::Captured(c)) => c.preview.len(),
+            Some(Value::Truncated(t)) => t.preview.len(),
+            _ => 0,
+        };
+        u64::try_from(len).unwrap_or(u64::MAX)
+    }
+    let mut total = event.bindings.iter().filter_map(|b| b.value.as_ref()).map(preview_len).sum();
+    total += event.value.as_ref().map_or(0, preview_len);
+    if let Some(interaction) = &event.interaction {
+        for summary in [
+            interaction.request_summary.as_ref(),
+            interaction.response_summary.as_ref(),
+            interaction.error.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            total += preview_len(summary);
+        }
+    }
+    total
+}
+
 /// `^[a-z0-9_.:-]{1,64}$`
 fn rule_id_is_valid(rule_id: &str) -> bool {
     !rule_id.is_empty()
@@ -284,6 +335,16 @@ fn check_interaction(seq: u64, interaction: &wire::Interaction) -> Result<(), In
         || interaction.sanitized_shape.contains(['\'', '"', '`'])
     {
         return Err(bad());
+    }
+    for summary in [
+        interaction.request_summary.as_ref(),
+        interaction.response_summary.as_ref(),
+        interaction.error.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        check_free_value(seq, summary)?;
     }
     if interaction.port > 65_535 {
         return Err(bad());
@@ -319,6 +380,9 @@ pub fn validate_finished(
     finished: &RecordingFinished,
     recording_id: xtrace_domain::RecordingId,
 ) -> Result<(), IngestError> {
+    if let Some(summary) = &finished.response_summary {
+        check_free_value(finished.final_recording_seq, summary)?;
+    }
     if let Some(outcome) = &finished.outcome {
         outcome_from_wire(outcome)
             .map_err(|reason| IngestError::OutcomeInvalid { recording_id, reason })?;

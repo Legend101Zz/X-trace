@@ -77,8 +77,8 @@ pub use ids::{
 };
 pub use project::{FingerprintParseError, Project, RepositoryFingerprint};
 pub use provenance::{
-    EvidenceRef, LimitationCode, ProducerIdentity, ProvenanceKind, SourceBinding, SourceRange,
-    is_safe_repo_relative_path,
+    EvidenceRef, LimitationCode, PROJECTABLE_SOURCE_EXTENSIONS, ProducerIdentity, ProvenanceKind,
+    SourceBinding, SourceRange, is_projectable_source_path, is_safe_repo_relative_path,
 };
 pub use recording::{
     BindingRole, Gap, GapReason, NameOrigin, OutcomeException, OutcomeKind, RecordingOutcome,

@@ -1657,6 +1657,7 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "prost",
+ "serde_json",
  "thiserror",
  "uuid",
  "xtrace-domain",
@@ -1677,6 +1678,7 @@ dependencies = [
 name = "xtrace-protocol"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "constant_time_eq 0.3.1",
  "hmac",
  "prost",
