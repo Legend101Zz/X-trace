@@ -100,3 +100,11 @@ artifacts. `permissions: contents: read`, no secrets, actions pinned by commit S
 Developer ID identity + notary profile; the Ed25519 release/ledger keys and trust tables; legal review of flagged
 licenses; provenance attestations (need `id-token`/`attestations` permissions, deliberately not granted here). The
 project license is MIT (root `LICENSE`, workspace `license = "MIT"`).
+
+## Install test scratch
+
+`packaging/test/install_test.sh` creates its work directory under `$XTRACE_TEST_PRIVATE_SCRATCH` (a private 0700 directory the caller
+created; CI sets it from `$RUNNER_TEMP`), falling back to `$TMPDIR`. Product storage refuses data directories below world-writable
+ancestors such as Linux `/tmp`, so the fallback only works where the temp root is user-private (macOS). The script aborts if `mktemp`
+fails, refuses unsafe work directories, and removes only a directory carrying the ownership marker it wrote itself.
+`packaging/test/install_scratch_test.sh` covers those guards.
