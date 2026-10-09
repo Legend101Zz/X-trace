@@ -67,7 +67,7 @@ fn scan_fixture_prints_provenance_static_inferred_and_is_honestly_partial() {
     let output = project.scan(&analyzer, &project.dir.path().join("src"), &[]);
     assert_eq!(output.status.code(), Some(10), "{output:?}");
     let document = json(&output);
-    assert_eq!(document["status"], "analyzed_not_persisted");
+    assert_eq!(document["status"], "not_persisted");
     assert_eq!(document["persisted"], false);
     assert!(document["catalogRevisionId"].is_null());
     assert_eq!(document["packStatus"], "dev_unsigned");
@@ -105,12 +105,17 @@ fn scan_json_output_matches_schema() {
         keys,
         [
             "catalogRevisionId",
+            "changes",
             "coverage",
             "notPersistedBecause",
             "packStatus",
+            "parentRevisionId",
             "pathHypotheses",
             "persisted",
+            "reconciliation",
             "result",
+            "revisionOrdinal",
+            "runId",
             "status"
         ]
     );
