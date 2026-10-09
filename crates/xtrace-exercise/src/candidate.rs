@@ -214,7 +214,7 @@ fn parse_authority(authority: &str) -> Option<(String, Option<u16>)> {
             "" => None,
             _ => Some(after.strip_prefix(':')?),
         };
-        h.parse::<std::net::Ipv6Addr>().ok()?;
+        h.parse::<core::net::Ipv6Addr>().ok()?;
         (format!("[{}]", h.to_ascii_lowercase()), port)
     } else {
         let (h, port) = match authority.split_once(':') {
@@ -237,7 +237,7 @@ fn parse_authority(authority: &str) -> Option<(String, Option<u16>)> {
         let numeric_like = last.bytes().all(|b| b.is_ascii_digit())
             || last.starts_with("0x")
             || last.starts_with("0X");
-        if numeric_like && h.parse::<std::net::Ipv4Addr>().is_err() {
+        if numeric_like && h.parse::<core::net::Ipv4Addr>().is_err() {
             return None;
         }
         (h.to_ascii_lowercase(), port)
@@ -267,7 +267,7 @@ pub fn classify_target_host(target: &str) -> Result<HostClass, PlanError> {
         return Err(PlanError::InvalidTarget("malformed_authority"));
     };
     if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        let ip: std::net::Ipv6Addr =
+        let ip: core::net::Ipv6Addr =
             inner.parse().map_err(|_| PlanError::InvalidTarget("malformed_authority"))?;
         if let Some(v4) = ip.to_ipv4_mapped() {
             return Ok(classify_v4(v4));
@@ -284,7 +284,7 @@ pub fn classify_target_host(target: &str) -> Result<HostClass, PlanError> {
             HostClass::PublicIp
         });
     }
-    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+    if let Ok(v4) = host.parse::<core::net::Ipv4Addr>() {
         return Ok(classify_v4(v4));
     }
     if host == "localhost" || host.ends_with(".localhost") {
@@ -293,7 +293,7 @@ pub fn classify_target_host(target: &str) -> Result<HostClass, PlanError> {
     Ok(HostClass::Name)
 }
 
-fn classify_v4(ip: std::net::Ipv4Addr) -> HostClass {
+fn classify_v4(ip: core::net::Ipv4Addr) -> HostClass {
     if ip.is_loopback() {
         HostClass::Loopback
     } else if ip.is_private()
