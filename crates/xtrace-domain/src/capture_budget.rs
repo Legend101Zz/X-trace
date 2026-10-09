@@ -12,6 +12,8 @@ pub const STANDARD_EVENT_CAP: usize = 16_384;
 pub const FOCUSED_EVENT_CAP: usize = 131_072;
 /// Hard sanity bound for any configured event cap (also the SQL CHECK in migration v7).
 pub const EVENT_CAP_SANITY_BOUND: usize = 1_048_576;
+const _: () = assert!(FOCUSED_EVENT_CAP <= EVENT_CAP_SANITY_BOUND);
+
 /// Capture policy id for `standard` recordings.
 pub const CAPTURE_POLICY_STANDARD_ID: &str = "xtrace.standard.v1";
 /// Capture policy id for `focused` recordings.
@@ -161,7 +163,6 @@ mod tests {
     fn caps_and_policy_ids_match_the_contract() {
         assert_eq!(CaptureMode::Standard.event_cap(), 16_384);
         assert_eq!(CaptureMode::Focused.event_cap(), 131_072);
-        assert!(FOCUSED_EVENT_CAP <= EVENT_CAP_SANITY_BOUND);
         assert_eq!(CaptureMode::Standard.policy_id(), "xtrace.standard.v1");
         assert_eq!(CaptureMode::Focused.policy_id(), "xtrace.focused.v1");
     }

@@ -76,10 +76,10 @@ pub fn validate_event(
         }
         RecordingEventKind::FrameEnter
         | RecordingEventKind::FrameExit
-        | RecordingEventKind::FrameThrow => {
-            if event.symbol.is_empty() {
-                return Err(IngestError::SymbolRequired { recording_seq: seq });
-            }
+        | RecordingEventKind::FrameThrow
+            if event.symbol.is_empty() =>
+        {
+            return Err(IngestError::SymbolRequired { recording_seq: seq });
         }
         _ => {}
     }
@@ -480,7 +480,7 @@ mod tests {
             ..bare
         };
         assert!(check(&ok, STD).is_ok());
-        let stray = RecordingEvent { gap: ok.gap.clone(), ..base(RecordingEventKind::FrameExit) };
+        let stray = RecordingEvent { gap: ok.gap, ..base(RecordingEventKind::FrameExit) };
         assert!(matches!(check(&stray, STD), Err(IngestError::GapPayloadInvalid { .. })));
     }
 

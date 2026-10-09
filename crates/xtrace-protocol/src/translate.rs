@@ -478,16 +478,10 @@ mod tests {
             (gap.reason, gap.count, gap.first_seq, gap.last_seq),
             (GapReason::LineBudget, 7, 5, 11)
         );
+        assert_eq!(gap_from_wire(&wire::GapPayload { count: 0, ..ok }), Err("gap_count_zero"));
+        assert_eq!(gap_from_wire(&wire::GapPayload { reason: 0, ..ok }), Err("gap_reason_unknown"));
         assert_eq!(
-            gap_from_wire(&wire::GapPayload { count: 0, ..ok.clone() }),
-            Err("gap_count_zero")
-        );
-        assert_eq!(
-            gap_from_wire(&wire::GapPayload { reason: 0, ..ok.clone() }),
-            Err("gap_reason_unknown")
-        );
-        assert_eq!(
-            gap_from_wire(&wire::GapPayload { first_recording_seq: 12, ..ok.clone() }),
+            gap_from_wire(&wire::GapPayload { first_recording_seq: 12, ..ok }),
             Err("gap_sequence_range_inverted")
         );
         let unknown = wire::GapPayload { first_recording_seq: 0, last_recording_seq: 0, ..ok };
