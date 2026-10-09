@@ -27,7 +27,13 @@ impl Grid {
     /// Plain text with trailing blanks trimmed; never contains an escape sequence.
     #[must_use]
     pub fn to_plain(&self) -> String {
-        let mut text = self.rows.iter().map(|row| row.trim_end()).collect::<Vec<_>>().join("\n");
+        // Trailing blank rows are dropped so the text never ends in blank lines (`git diff
+        // --check` flags blank lines at end of file in the stored snapshots).
+        let mut rows: Vec<&str> = self.rows.iter().map(|row| row.trim_end()).collect();
+        while rows.last().is_some_and(|row| row.is_empty()) {
+            rows.pop();
+        }
+        let mut text = rows.join("\n");
         text.push('\n');
         text
     }

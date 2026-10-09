@@ -1746,6 +1746,9 @@ dependencies = [
 [[package]]
 name = "xtrace-tui"
 version = "0.0.1"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "yasna"

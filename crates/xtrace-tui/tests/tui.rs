@@ -402,3 +402,60 @@ fn untrusted_recorded_text_never_reaches_the_terminal_as_control_sequences() {
         assert!(!render(&model).rows().iter().any(|r| r.chars().any(char::is_control)));
     }
 }
+
+#[test]
+fn moving_the_selection_clears_a_stale_notice() {
+    let model = open_replay(80, 24, true);
+    let (model, _) = update(model, Message::Key(Key::Nav(NavAction::Over)));
+    assert!(!model.notice.is_empty(), "the unavailable step explains itself");
+    let (model, _) = update(model, Message::Key(Key::Down));
+    assert!(model.notice.is_empty(), "stale notice survived a selection move: {}", model.notice);
+}
+
+#[test]
+fn nav_action_discriminants_are_the_navigation_slot_indexes() {
+    assert_eq!(NavAction::Previous as usize, 0);
+    assert_eq!(NavAction::Next as usize, 1);
+    assert_eq!(NavAction::Into as usize, 2);
+    assert_eq!(NavAction::Over as usize, 3);
+    assert_eq!(NavAction::Out as usize, 4);
+}
+
+#[test]
+fn key_decoder_maps_arrows_and_keeps_partial_escapes_for_the_next_read() {
+    use xtrace_tui::driver::decode_keys;
+    let mut pending = Vec::new();
+    assert_eq!(decode_keys(&mut pending, b"\x1b[A\x1b[Bq"), vec![Key::Up, Key::Down, Key::Quit]);
+    assert!(pending.is_empty());
+    // An escape sequence split across two reads is decoded once complete.
+    assert_eq!(decode_keys(&mut pending, b"\x1b["), vec![]);
+    assert_eq!(decode_keys(&mut pending, b"B"), vec![Key::Down]);
+    // A bare escape waits (the driver turns it into Back after a quiet interval); unknown CSI
+    // sequences and unknown bytes are dropped, not guessed.
+    assert_eq!(decode_keys(&mut pending, b"\x1b"), vec![]);
+    assert_eq!(pending, vec![0x1b]);
+    pending.clear();
+    assert_eq!(decode_keys(&mut pending, b"\x1b[3~zx"), vec![]);
+    assert_eq!(decode_keys(&mut pending, b"[]iou"), vec![
+        Key::Nav(NavAction::Previous),
+        Key::Nav(NavAction::Next),
+        Key::Nav(NavAction::Into),
+        Key::Nav(NavAction::Over),
+        Key::Nav(NavAction::Out),
+    ]);
+}
+
+#[test]
+fn driver_step_settles_effects_against_a_client_and_reports_quit() {
+    use xtrace_tui::driver::{render_plain, step};
+    let (model, quit) = step(&Fake, Model::new(80, 24, true), Message::Key(Key::Refresh));
+    assert!(!quit);
+    assert_eq!(model.status, Status::Ready);
+    assert!(!model.recordings.is_empty());
+    let (_, quit) = step(&Fake, model, Message::Key(Key::Quit));
+    assert!(quit);
+    let text = render_plain(&Fake, (80, 24), None).expect("plain list");
+    assert!(!text.contains('\u{1b}'));
+    let err = render_plain(&Fake, (80, 24), Some("no-such-recording")).expect_err("unknown id");
+    assert!(err.contains("not in this project"), "{err}");
+}
