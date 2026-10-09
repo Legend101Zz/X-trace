@@ -985,6 +985,10 @@ fn verify_identity(expected: &ProcessIdentity, observed: &ProcessIdentity) -> Re
 async fn verify_os_identity(identity: &ProcessIdentity) -> Result<(), CliError> {
     use tokio::time::{timeout, timeout_at};
     let pid = identity.pid.to_string();
+    // `ps` samples the elapsed time at some instant after this point and before its output is
+    // read, so the wall clock is bracketed rather than read once afterwards: a stalled runner
+    // that delays this task must not look like a changed process.
+    let probe_started = time::OffsetDateTime::now_utc().unix_timestamp();
     let mut command = Command::new("/bin/ps");
     command
         .args(["-p", &pid, "-o", "etime=", "-o", "uid="])
@@ -1145,8 +1149,7 @@ async fn verify_os_identity(identity: &ProcessIdentity) -> Result<(), CliError> 
         )
     })?
     .unix_timestamp();
-    let expected_elapsed =
-        time::OffsetDateTime::now_utc().unix_timestamp().saturating_sub(observed_start);
+    let probe_finished = time::OffsetDateTime::now_utc().unix_timestamp().max(probe_started);
     if uid != rustix::process::getuid().as_raw() {
         return Err(attach_error(
             "XTR-ATTACH-OWNER-MISMATCH",
@@ -1156,9 +1159,7 @@ async fn verify_os_identity(identity: &ProcessIdentity) -> Result<(), CliError> 
             7,
         ));
     }
-    if expected_elapsed < 0
-        || expected_elapsed.abs_diff(i64::try_from(elapsed).unwrap_or(i64::MAX)) > 2
-    {
+    if !elapsed_is_consistent(observed_start, probe_started, probe_finished, elapsed) {
         return Err(attach_error(
             "XTR-ATTACH-PROCESS-CHANGED",
             "conflict",
@@ -1168,6 +1169,27 @@ async fn verify_os_identity(identity: &ProcessIdentity) -> Result<(), CliError> 
         ));
     }
     Ok(())
+}
+
+/// True when `ps`'s whole-second elapsed time fits a process that started at `start_unix`, given
+/// that `ps` sampled it at an unknown instant in `[probe_started, probe_finished]` (whole unix
+/// seconds). The two-second slack covers whole-second truncation on both sides; a start time that
+/// is genuinely different still falls outside it.
+fn elapsed_is_consistent(
+    start_unix: i64,
+    probe_started: i64,
+    probe_finished: i64,
+    ps_elapsed: u64,
+) -> bool {
+    let low = probe_started.saturating_sub(start_unix);
+    let high = probe_finished.saturating_sub(start_unix);
+    if high < 0 {
+        return false;
+    }
+    let Ok(ps) = i64::try_from(ps_elapsed) else {
+        return false;
+    };
+    ps >= low.saturating_sub(2) && ps <= high.saturating_add(2)
 }
 
 fn parse_elapsed(value: &str) -> Option<u64> {
@@ -1315,6 +1337,25 @@ mod tests {
         ])
         .expect_err("unsigned development pack must be explicit");
         assert_eq!(error.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn elapsed_check_brackets_the_probe_window_and_still_rejects_a_different_start() {
+        // Same instant: exactly the old two-second tolerance.
+        assert!(elapsed_is_consistent(1_000, 1_100, 1_100, 100));
+        assert!(elapsed_is_consistent(1_000, 1_100, 1_100, 102));
+        assert!(elapsed_is_consistent(1_000, 1_100, 1_100, 98));
+        assert!(!elapsed_is_consistent(1_000, 1_100, 1_100, 103));
+        assert!(!elapsed_is_consistent(1_000, 1_100, 1_100, 97));
+        // A probe that took five seconds (stalled runner): ps sampled anywhere inside it.
+        assert!(elapsed_is_consistent(1_000, 1_100, 1_105, 104));
+        assert!(elapsed_is_consistent(1_000, 1_100, 1_105, 107));
+        assert!(!elapsed_is_consistent(1_000, 1_100, 1_105, 108));
+        // A process that started ten seconds earlier or later is a different process.
+        assert!(!elapsed_is_consistent(990, 1_100, 1_101, 100));
+        assert!(!elapsed_is_consistent(1_010, 1_100, 1_101, 100));
+        // A start time in the future is never consistent.
+        assert!(!elapsed_is_consistent(2_000, 1_100, 1_101, 0));
     }
 
     #[test]

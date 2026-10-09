@@ -148,6 +148,20 @@ class FocusedLineWiringTest {
   }
 
   @Test
+  void webAnnotatedAccessorShapedHandlersAreProbedButPlainAccessorsAreNot() throws Exception {
+    var matcher = FixtureInstrumentation.frameMethods();
+    var methods =
+        net.bytebuddy.description.type.TypeDescription.ForLoadedType.of(demo.probe.Accessors.class)
+            .getDeclaredMethods();
+    java.util.Map<String, Boolean> probed = new java.util.HashMap<>();
+    for (var method : methods) probed.put(method.getName(), matcher.matches(method));
+    assertEquals(true, probed.get("getAllOwners"), "annotated handler is probed");
+    assertEquals(false, probed.get("getName"));
+    assertEquals(false, probed.get("isReady"));
+    assertEquals(false, probed.get("setName"));
+  }
+
+  @Test
   void theRealBridgeIsACompleteProbeOwner() {
     assertEquals(
         null,
