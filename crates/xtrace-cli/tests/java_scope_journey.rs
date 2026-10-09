@@ -54,6 +54,15 @@ struct OutOfScope {
 /// finalized, the store opened and listed successfully, and it holds zero recordings.
 #[test]
 fn out_of_scope_app_package_serves_the_request_and_persists_no_recording() {
+    // Differential control: the same fixture, request and shutdown with a matching scope must
+    // persist exactly one recording, so the zero below cannot come from a broken capture path.
+    let control = run_out_of_scope(&["--app-package", "dev.xtrace.fixture"]);
+    assert!(control.list_succeeded, "control store must open and list; stderr: {}", control.stderr);
+    assert_eq!(
+        control.recording_count, 1,
+        "the in-scope control must record the one POST /orders; stderr: {}",
+        control.stderr
+    );
     let outcome = run_out_of_scope(&["--app-package", "com.nonexistent.app"]);
     assert!(outcome.list_succeeded, "the store must open and list; stderr: {}", outcome.stderr);
     assert_eq!(
