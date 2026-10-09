@@ -102,9 +102,10 @@ fn openapi_duplicate_method_path_is_reported_not_merged() {
     let out = export(&spring_orders(), &ExportRequest::new(ExportFormat::OpenApi)).unwrap();
     // op-dup shares GET /orders with op-list; the canonical winner keeps the slot.
     assert!(
-        out.omissions.iter().any(
-            |o| o.operation_id == "op-zdup" && o.reason.starts_with("duplicate_method_path_of:")
-        )
+        out.omissions
+            .iter()
+            .any(|o| o.operation_id == "op-zdup"
+                && o.reason.starts_with("duplicate_method_path_of:"))
     );
 }
 
