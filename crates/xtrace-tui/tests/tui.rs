@@ -25,11 +25,8 @@ fn nav(
 
 fn frame(n: u64) -> FrameRow {
     let id = format!("f{n}");
-    let prev = if n == 1 {
-        NavResult::Boundary(None)
-    } else {
-        NavResult::Target(format!("f{}", n - 1))
-    };
+    let prev =
+        if n == 1 { NavResult::Boundary(None) } else { NavResult::Target(format!("f{}", n - 1)) };
     FrameRow {
         frame_id: Some(id),
         sequence: n,
@@ -377,7 +374,10 @@ fn untrusted_recorded_text_never_reaches_the_terminal_as_control_sequences() {
         // Ready state first: the hostile frame fields must be rendered (and neutralised) in the rows.
         assert_fits(&model);
         let ready = render(&model);
-        assert!(ready.rows().iter().any(|row| row.contains('\u{fffd}')), "hostile frame row was not rendered");
+        assert!(
+            ready.rows().iter().any(|row| row.contains('\u{fffd}')),
+            "hostile frame row was not rendered"
+        );
         for row in ready.rows() {
             assert!(!row.chars().any(|c| c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')), "unsafe char in row {row:?}");
         }
