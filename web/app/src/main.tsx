@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { components } from './api.generated';
 import { api, ApiError, failureMessage } from './api';
 import { AppShell } from './app-shell';
@@ -6,6 +6,8 @@ import { CatalogPanel } from './features/catalog/CatalogPanel';
 import { EventsPanel } from './features/events/EventsPanel';
 import { EvidencePanel } from './features/evidence/EvidencePanel';
 import { retainPage } from './retained-page';
+import { initialReplayState, replayReducer } from './replay/state';
+import type { NavAction } from './replay/navigation';
 import { useLane } from './state/lane';
 import { MAX_RETAINED_EVENTS, MAX_RETAINED_ROWS } from './types';
 import type { AuthState, CatalogMode, Detail, Endpoint, Pane, Recording } from './types';
@@ -15,6 +17,7 @@ import './style.css';
 export default function App() {
   const [auth, setAuth] = useState<AuthState>('checking');
   const [authError, setAuthError] = useState('');
+  const [replay, dispatchReplay] = useReducer(replayReducer, initialReplayState);
   const [catalogMode, setCatalogMode] = useState<CatalogMode>('endpoints');
   const [activePane, setActivePane] = useState<Pane>('recordings');
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
@@ -317,6 +320,13 @@ export default function App() {
     setAnnouncement(`Navigated ${action} to event ${detail?.events[index]?.sequence ?? ''}`);
   };
 
+  const selectFrame = (frameId: string) => navigateToFrame('select', frameId);
+  const navigateKey = (action: NavAction) => {
+    const result = (event?.navigation as Partial<Record<NavAction, { state: string; frameId?: string }>> | undefined)?.[action];
+    if (result?.state === 'target' && result.frameId) navigateToFrame(action, result.frameId);
+    else setAnnouncement(`${action}: ${result?.state === 'boundary' ? 'boundary, no further frame' : 'unavailable for this frame'}`);
+  };
+
   return <AppShell activePane={activePane} onPane={setActivePane} announcement={announcement} auth={auth} authError={authError}>
     <CatalogPanel
       active={activePane === 'recordings'}
@@ -349,6 +359,10 @@ export default function App() {
       onRefresh={refreshDetail}
       onPickEvent={pickEvent}
       onNextWindow={nextDetail}
+      mode={replay.mode}
+      onMode={(mode) => dispatchReplay({ type: 'set-mode', mode })}
+      onSelectFrame={selectFrame}
+      onNavigateKey={navigateKey}
     />
     <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectedEvent={selectedEvent} eventCount={eventCount} onMoveEvent={moveEvent} onNavigate={navigateToFrame} />
   </AppShell>;
