@@ -34,4 +34,6 @@ pub use scope::AdmissionScope;
 #[cfg(not(unix))]
 mod unsupported;
 #[cfg(not(unix))]
-pub use unsupported::{AdmissionScope, AdmittedPrivateRoot, PrivateStorageError, validate_child_name};
+pub use unsupported::{
+    AdmissionScope, AdmittedPrivateRoot, PrivateStorageError, validate_child_name,
+};
