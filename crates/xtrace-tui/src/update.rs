@@ -28,14 +28,16 @@ pub fn update(mut model: Model, message: Message) -> (Model, Vec<Effect>) {
                     .window
                     .as_ref()
                     .and_then(|old| selected_frame_id(old, model.selected_frame));
-                model.selected_frame = keep
-                    .and_then(|id| {
-                        window
-                            .frames
-                            .iter()
-                            .position(|f| f.frame_id.as_deref() == Some(id.as_str()))
-                    })
-                    .unwrap_or(0);
+                let find =
+                    |id: &str| window.frames.iter().position(|f| f.frame_id.as_deref() == Some(id));
+                // A window requested around a navigation target selects that target; otherwise
+                // the previous selection is kept when it is still inside the new window.
+                let anchored = window.anchor_frame_id.as_deref().and_then(find);
+                model.selected_frame =
+                    anchored.or_else(|| keep.as_deref().and_then(find)).unwrap_or(0);
+                if anchored.is_some() {
+                    model.notice.clear();
+                }
                 model.window = Some(window);
                 model.status = Status::Ready;
             }

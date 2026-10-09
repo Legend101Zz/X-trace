@@ -53,7 +53,15 @@ impl Grid {
     }
 }
 
+/// Replaces every control character (ESC, newline, CR, C1, DEL) with U+FFFD. Recorded text is
+/// untrusted: it must never reach the terminal as an escape sequence or change the row count.
+fn sanitize(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect()
+}
+
 fn fit(text: &str, width: usize) -> String {
+    let clean = sanitize(text);
+    let text = clean.as_str();
     let count = text.chars().count();
     if count <= width {
         let mut out = text.to_owned();

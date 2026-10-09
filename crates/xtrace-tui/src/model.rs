@@ -99,6 +99,8 @@ pub struct Window {
     pub frames: Vec<FrameRow>,
     /// Completion of the recording.
     pub completion: String,
+    /// Frame the window was centred on when it was requested around one.
+    pub anchor_frame_id: Option<String>,
 }
 
 /// Keys the core understands. The driver maps terminal events onto these.

@@ -51,6 +51,7 @@ fn window(id: &str, count: u64) -> Window {
         recording_id: id.into(),
         frames: (1..=count).map(frame).collect(),
         completion: "partial".into(),
+        anchor_frame_id: None,
     }
 }
 
@@ -299,4 +300,86 @@ fn client_trait_drives_the_loop_without_a_terminal() {
     let (model, effects) = update(model, Message::Key(Key::Enter));
     assert_eq!(effects.len(), 1);
     assert_eq!(model.screen, Screen::Replay);
+}
+
+fn model_with_window_navigating_to_far() -> Model {
+    let mut model = open_replay(80, 24, true);
+    model.window.as_mut().expect("window").frames[0].navigation[1] =
+        Some(NavResult::Target("far".into()));
+    let (model, _) = update(model, Message::Key(Key::Nav(NavAction::Next)));
+    model
+}
+
+fn window_with_far(id: &str, anchor: &str) -> Window {
+    let mut w = window(id, 5);
+    w.frames[3].frame_id = Some("far".into());
+    w.anchor_frame_id = Some(anchor.into());
+    w
+}
+
+#[test]
+fn cross_window_target_is_selected_when_old_frame_is_not_in_the_new_window() {
+    let model = model_with_window_navigating_to_far();
+    let mut w = window_with_far("018f0000-0000-7000-8000-000000000011", "far");
+    // The old selection (f1) is not present in the new window.
+    w.frames[0].frame_id = Some("other".into());
+    let (model, _) = update(model, Message::WindowLoaded(Ok(w)));
+    assert_eq!(model.selected_frame, 3);
+    assert!(model.notice.is_empty(), "stale loading notice must be cleared");
+    assert_eq!(model.status, Status::Ready);
+}
+
+#[test]
+fn cross_window_target_is_selected_when_old_frame_is_inside_the_new_window() {
+    let model = model_with_window_navigating_to_far();
+    let w = window_with_far("018f0000-0000-7000-8000-000000000011", "far");
+    // f1 is still inside the new window at index 0, but the target must win.
+    let (model, _) = update(model, Message::WindowLoaded(Ok(w)));
+    assert_eq!(model.selected_frame, 3);
+}
+
+#[test]
+fn window_without_anchor_keeps_the_previous_selection() {
+    let model = open_replay(80, 24, true);
+    let (model, _) = update(model, Message::Key(Key::Down));
+    let (model, _) = update(
+        model,
+        Message::WindowLoaded(Ok(window("018f0000-0000-7000-8000-000000000011", 30))),
+    );
+    assert_eq!(model.selected_frame, 1);
+}
+
+#[test]
+fn untrusted_recorded_text_never_reaches_the_terminal_as_control_sequences() {
+    let hostile = "a\u{1b}[31mred\u{1b}]52;c;AAAA\u{7}\nnext\r\u{9b}x\u{7f}";
+    for plain in [true, false] {
+        let mut model = open_replay(80, 24, plain);
+        {
+            let w = model.window.as_mut().expect("window");
+            w.frames[0].symbol = Some(hostile.into());
+            w.frames[0].kind = hostile.into();
+            w.frames[0].frame_id = Some(hostile.into());
+        }
+        model.recordings[0].id = hostile.into();
+        model.recordings[0].completion = hostile.into();
+        model.notice = hostile.into();
+        let (model, _) = update(model, Message::WindowLoaded(Err(hostile.into())));
+        assert_fits(&model);
+        let grid = render(&model);
+        for row in grid.rows() {
+            assert!(!row.chars().any(char::is_control), "control char in row {row:?}");
+        }
+        let output = grid.output(plain);
+        if plain {
+            assert!(!output.contains('\u{1b}'));
+        } else {
+            // Only the renderer's own selection marker escapes are allowed.
+            let stripped = output.replace("\u{1b}[7m", "").replace("\u{1b}[0m", "");
+            assert!(!stripped.contains('\u{1b}'));
+        }
+        assert_eq!(output.lines().count(), usize::from(model.height));
+        let (model, _) = update(model, Message::Key(Key::Back));
+        assert_fits(&model);
+        assert!(!render(&model).rows().iter().any(|r| r.chars().any(char::is_control)));
+    }
 }
