@@ -283,7 +283,7 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     assert!(first_page_again.status.success());
     assert_eq!(first_page.stdout, first_page_again.stdout, "list output must be stable");
     let first_json: Value = serde_json::from_slice(&first_page.stdout).expect("list projection");
-    assert_eq!(first_json["schema_version"], 2);
+    assert_eq!(first_json["schema_version"], 3);
     let first_recording =
         first_json["recordings"][0]["recording_id"].as_str().expect("recording ID");
     let list_cursor = first_json["next_after"].as_str().expect("second page cursor");
@@ -711,7 +711,7 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     assert!(detail_page.status.success(), "recording show failed: {}", diagnostic(&detail_page));
     assert_eq!(detail_page.stdout, detail_page_again.stdout, "show output must be stable");
     let detail_json: Value = serde_json::from_slice(&detail_page.stdout).expect("show projection");
-    assert_eq!(detail_json["schema_version"], 2);
+    assert_eq!(detail_json["schema_version"], 3);
     assert_eq!(detail_json["status"], "complete");
     assert_eq!(detail_json["completion"], "complete");
     assert_eq!(detail_json["unavailable"]["completion"], "available");
