@@ -15,7 +15,6 @@ for t in / /done; do curl -s -o /dev/null -w "%{http_code} " http://127.0.0.1:18
 echo "sent done $(ts)"
 for i in $(seq 1 40); do
   kill -0 $P 2>/dev/null || { echo "xtrace exited at $(ts)"; break; }
-  if [ $i = 3 ] || [ $i = 6 ]; then echo "== t=$i $(ts)"; sample $P 1 -file $W/sample$i.txt >/dev/null 2>&1; sed -n '/Sort by top of stack/,$p' $W/sample$i.txt | cut -c1-200 | head -25; grep -n -E "spawn|posix_spawn|fork" $W/sample$i.txt | head -5; grep -E "^ +\+ +[! :|]*[0-9]+ .*xtrace_(store|private_storage)" $W/sample$i.txt | sed -E 's/\(in xtrace\).*//' | cut -c1-260 | sort -t' ' -k1 | head -0; fi
   sleep 1
 done
-cat $W/out.log; tail -20 $W/err.log
+cat $W/out.log; grep -c DIAGLS $W/err.log; grep DIAGLS $W/err.log | awk '{n[$2" "$3]++; s[$2" "$3]+=substr($4,4)} END{for(k in n) print k, n[k], s[k]/n[k]}'; grep DIAGLS $W/err.log | sort -t= -k3 -n | tail -3

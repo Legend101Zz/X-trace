@@ -522,6 +522,8 @@ fn run_ls(flags: &str, paths: &[&Path], deadline: Instant, limit: usize) -> Opti
     }
     #[cfg(test)]
     LS_SPAWNS.with(|count| count.set(count.get() + 1));
+    let diag_start = Instant::now();
+    let _diag = DiagGuard(diag_start, flags.to_owned(), paths.len());
     let Ok(mut child) = Command::new("/bin/ls")
         .arg(flags)
         .args(paths)
@@ -821,5 +823,14 @@ mod tests {
             .spawn()
             .expect("spawn bounded cleanup fixture");
         assert!(stop_acl_probe(&mut child, std::time::Instant::now() + ACL_PROBE_CLEANUP_BUDGET,));
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct DiagGuard(Instant, String, usize);
+#[cfg(target_os = "macos")]
+impl Drop for DiagGuard {
+    fn drop(&mut self) {
+        eprintln!("DIAGLS {} paths={} ms={}", self.1, self.2, self.0.elapsed().as_millis());
     }
 }
