@@ -25,9 +25,9 @@ use xtrace_application::recording::{
 const MAX_TERMINAL_REQUEST_JSON_BYTES: usize = 64 * 1024;
 use xtrace_application::recording_queries::{
     FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES,
-    NavigationResult, NavigationUnavailable, PersistedEvent, PersistedInteraction, PersistedOutcome, PersistedSource,
-    RecordingCapacity, RecordingCompletionEvidence, RecordingEventWindow, RecordingMetadata,
-    RecordingStatus, ShowWindowRequest, SourceStatus,
+    NavigationResult, NavigationUnavailable, PersistedEvent, PersistedInteraction,
+    PersistedOutcome, PersistedSource, RecordingCapacity, RecordingCompletionEvidence,
+    RecordingEventWindow, RecordingMetadata, RecordingStatus, ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
@@ -690,7 +690,9 @@ impl SqliteRecordingStore<'_> {
                     .transpose()?
                     .map(|value| value.to_string()),
                 incomplete_evidence,
-                event_cap: terminal.as_ref().and_then(|finish| u32::try_from(finish.event_cap).ok()),
+                event_cap: terminal
+                    .as_ref()
+                    .and_then(|finish| u32::try_from(finish.event_cap).ok()),
                 // No adapter outcome is persisted in this build; terminal
                 // evidence without one reads as `unobserved` (CONTRACTS 5).
                 outcome_kind: terminal.as_ref().map(|_| "unobserved".to_owned()),

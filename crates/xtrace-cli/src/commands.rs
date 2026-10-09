@@ -313,8 +313,7 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
                 crate::run::run_node(project_dir, node_adapter, node_mode, command).await
             } else {
                 Err(CliError::InvalidArgument(
-                    "run requires either --java-agent or --node-adapter"
-                        .to_string(),
+                    "run requires either --java-agent or --node-adapter".to_string(),
                 ))
             }
         }

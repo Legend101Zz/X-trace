@@ -277,9 +277,10 @@ mod tests {
             "app.cjs",
         ])
         .expect("node-mode is optional and defaults to auto at run time");
-        assert!(matches!(defaulted.command, commands::XtraceCommand::Run {
-            node_adapter: Some(_), node_mode: None, ..
-        }));
+        assert!(matches!(
+            defaulted.command,
+            commands::XtraceCommand::Run { node_adapter: Some(_), node_mode: None, .. }
+        ));
         assert!(
             Cli::try_parse_from([
                 "xtrace",

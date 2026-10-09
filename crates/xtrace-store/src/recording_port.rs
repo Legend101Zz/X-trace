@@ -251,10 +251,7 @@ fn validate_xtf_event(
         source.start_line != 0 && (source.end_line == 0 || source.end_line >= source.start_line)
     };
     match (binding, payload.source.as_ref()) {
-        (
-            WireSourceBinding::Verified | WireSourceBinding::ObservedUnattested,
-            Some(source),
-        ) => {
+        (WireSourceBinding::Verified | WireSourceBinding::ObservedUnattested, Some(source)) => {
             if !crate::recording_store::is_safe_repo_relative_path(&source.path)
                 || source.content_hash.len() != 32
                 || !extent_ok(source)
@@ -452,7 +449,8 @@ mod tests {
     #[test]
     fn write_gate_refuses_unsafe_paths_and_mismatched_bindings() {
         use xtrace_protocol::generated::agent::SourceBinding as B;
-        for path in ["../x/A.java", "src/./A.java", ".env", "config/.env.ts", "/abs/A.java", "README.md"]
+        for path in
+            ["../x/A.java", "src/./A.java", ".env", "config/.env.ts", "/abs/A.java", "README.md"]
         {
             let accepted = source_event(B::Verified, path, 32);
             assert!(super::validate_xtf_event(&accepted).is_err(), "{path} must be refused");
