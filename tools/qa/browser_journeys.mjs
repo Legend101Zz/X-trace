@@ -84,7 +84,9 @@ try {
         await canvas.click({ timeout: 10000 });
         await page.waitForTimeout(1500);
         await page.screenshot({ path: path.join(out, `canvas-${w}.png`), fullPage: true });
-        row.steps.canvas = { status: "pass", screenshot: `canvas-${w}.png` };
+        const drawn = await page.getByText(/http\.request/i).first().count();
+        row.steps.canvas = drawn ? { status: "pass", screenshot: `canvas-${w}.png` }
+          : { status: "fail", reason: "Canvas opened but shows no request or frame node", screenshot: `canvas-${w}.png` };
       } else {
         row.steps.canvas = { status: "not-implemented", reason: "the viewer offers no Canvas control" };
       }
