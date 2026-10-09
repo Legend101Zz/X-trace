@@ -7,12 +7,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import xinstr  # noqa: E402
 
 
-def rec(method, path, status, symbols=("OwnerController#showOwner", "OwnerRepository#findById"), src=True):
-    evs = [{"kind": "request", "symbol": None, "interaction": {"method": method, "path": path}, "source": None}]
-    for s in symbols:
-        evs.append({"kind": "frame_enter", "symbol": s, "interaction": None,
+def rec(method, path, status, symbols=("OwnerController.showOwner", "OwnerRepository.findById"), src=True, kind="responded",
+        resp_symbol=None):
+    evs = [{"kind": "recording_event_kind:request_update", "symbol": f"http.request {method} {path}", "interaction": {"method": method}, "source": None}]
+    for sy in symbols:
+        evs.append({"kind": "recording_event_kind:frame_enter", "symbol": sy, "interaction": {},
                     "source": {"path": "src/main/java/X.java", "startLine": 3, "status": "matched"} if src else None})
-    return {"events": evs, "outcome": {"kind": "responded", "httpStatus": status}}
+    evs.append({"kind": "recording_event_kind:response", "symbol": resp_symbol or f"http.response {status}", "interaction": {}, "source": None})
+    return {"events": evs, "outcome": {"kind": kind, "httpStatus": status if kind == "responded" else None}}
 
 
 class T(unittest.TestCase):
@@ -44,6 +46,8 @@ class T(unittest.TestCase):
         nof = xinstr.analyze({"a": rec("GET", "/owners/4", 200, symbols=())}, exp)["s"]["expectations"][0]["problems"]
         self.assertIn("no-controller-frame", nof)
         self.assertIn("no-repository-frame", nof)
+        un = xinstr.analyze({"a": rec("GET", "/owners/4", 200, kind="unobserved")}, exp)["s"]["expectations"][0]["problems"]
+        self.assertEqual(un, ["outcome-unobserved"])
         nos = xinstr.analyze({"a": rec("GET", "/owners/4", 200, src=False)}, exp)["s"]["expectations"][0]["problems"]
         self.assertEqual(nos, ["no-source-file-line"])
         self.assertEqual(xinstr.problem_classes(xinstr.analyze({"a": rec("GET", "/owners/4", 500)}, exp)),

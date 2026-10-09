@@ -21,9 +21,9 @@ class T(unittest.TestCase):
 
     def test_all_good(self):
         r = {"scenarios": [sc("a"), sc("b")], "api": {"ok": True, "recordings": 5}, "problemClasses": {}, "recordingsWithSource": 3,
-             "notes": {"stopCommand": {"exitCode": 0}}}
+             "notes": {"stopCommand": {"exitCode": 3}, "launcherExitCode": 0}}
         d = by(s.instrumented_steps(r))
-        self.assertTrue(all(v[0] == "pass" for v in d.values()), d)
+        self.assertTrue(all(v[0] in ("pass", "reported") for v in d.values()), d)
 
     def test_each_failure_is_visible(self):
         r = {"scenarios": [sc("a", eq=False), sc("b", rec=False)], "api": {"ok": True, "recordings": 5},
@@ -32,7 +32,8 @@ class T(unittest.TestCase):
         self.assertEqual(d["instrumented-fingerprints-equal-baseline"][0], "fail")
         self.assertEqual(d["recordings-per-scenario"][0], "fail")
         self.assertEqual(d["source-identity"][0], "fail")
-        self.assertEqual(d["product-stop-command"][0], "not-implemented")
+        self.assertEqual(d["product-stop-command"][0], "reported")
+        self.assertEqual(d["launcher-exit-after-sigterm"][0], "fail")
 
     def test_zero_recordings_never_pass_source_identity(self):
         r = {"scenarios": [sc("a", rec=False)], "api": {"ok": True, "recordings": 0}, "problemClasses": {"no-recording-for-route": 1},

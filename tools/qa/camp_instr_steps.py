@@ -59,12 +59,12 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
                     f"{n_src} recordings carry a matched .java file and line" if n_src > 0 else "no recording frame carried a matched .java file and line"))
         out.append(("api-json-artifact", "pass", f"{api.get('recordings', 0)} recordings saved as API JSON"))
     stop = r.get("notes", {}).get("stopCommand", {})
-    if stop.get("notImplemented"):
-        out.append(("product-stop-command", "not-implemented", "xtrace stop exited 9 (not implemented in this build)"))
-    elif stop.get("exitCode") == 0:
-        out.append(("product-stop-command", "pass", "xtrace stop exited 0"))
-    else:
-        out.append(("product-stop-command", "fail", f"xtrace stop exited {stop.get('exitCode')}"))
+    # `xtrace run` owns its daemon for the life of the JVM, so `xtrace stop` (which ends a `xtrace record` daemon) has nothing
+    # to stop after it. The record+stop flow is not exercised by this harness yet: reported, never a pass for that flow.
+    out.append(("product-stop-command", "reported",
+                f"xtrace stop after `xtrace run` exited {stop.get('exitCode')}; the record+stop flow is not exercised here"))
+    out.append(("launcher-exit-after-sigterm", "pass" if r.get("notes", {}).get("launcherExitCode") in (0, 143, -15) else "fail",
+                f"xtrace run exited {r.get('notes', {}).get('launcherExitCode')} after SIGTERM to the launcher pid"))
     return out
 
 
