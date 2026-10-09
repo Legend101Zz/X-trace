@@ -55,6 +55,7 @@ pub mod provenance;
 pub mod recording;
 pub mod run;
 pub mod runtime;
+pub mod static_claims;
 pub mod time;
 pub mod value;
 
