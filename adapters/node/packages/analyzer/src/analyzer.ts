@@ -227,6 +227,17 @@ class Analysis {
       if (ts.isFunctionDeclaration(statement) && statement.name !== undefined) {
         file.fns.set(statement.name.text, fnKey(file.rel, statement));
       }
+      // exports.NAME = expr / module.exports.NAME = expr: a named string constant of this module
+      if (
+        ts.isExpressionStatement(statement) &&
+        ts.isBinaryExpression(statement.expression) &&
+        statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isPropertyAccessExpression(statement.expression.left) &&
+        /^(module\.)?exports$/.test(statement.expression.left.expression.getText(file.sf))
+      ) {
+        const right = unwrap(statement.expression.right);
+        if (ts.isStringLiteralLike(right)) file.consts.set(statement.expression.left.name.text, right);
+      }
       if (ts.isVariableStatement(statement)) {
         for (const declaration of statement.declarationList.declarations) {
           this.indexTopLevelDeclaration(file, declaration, noteSpec);
@@ -608,7 +619,14 @@ class Analysis {
     let prefix = EMPTY_PATH;
     let rest: readonly ts.Expression[] = args;
     const first = args[0];
-    if (first !== undefined && (ts.isStringLiteralLike(unwrap(first)) || ts.isArrayLiteralExpression(unwrap(first)) || ts.isTemplateExpression(unwrap(first)))) {
+    // `use(path, router)`: the first argument is the mount path unless it is itself a scope or a function.
+    if (
+      first !== undefined &&
+      args.length >= 2 &&
+      this.resolveScopeRef(file, first) === undefined &&
+      !ts.isArrowFunction(unwrap(first)) &&
+      !ts.isFunctionExpression(unwrap(first))
+    ) {
       prefix = this.evalPathList(file, first)[0] ?? EMPTY_PATH;
       rest = args.slice(1);
     }

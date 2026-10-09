@@ -7,6 +7,7 @@
 
 use rusqlite::{Connection, params, types::Value};
 use uuid::Uuid;
+use xtrace_private_storage::AdmittedPrivateRoot;
 use xtrace_store::{OpenOptions, SqliteStore};
 
 const V9_SQL: &str = include_str!("../src/lane_sql/catalog_v9.sql");
@@ -15,8 +16,16 @@ fn uuid7() -> Vec<u8> {
     Uuid::now_v7().as_bytes().to_vec()
 }
 
-fn fresh_database() -> (tempfile::TempDir, Connection) {
-    let dir = tempfile::tempdir().expect("temp dir");
+/// Private scratch directory (owner-only, admitted) the store requires; the leased runner exports
+/// `XTRACE_TEST_PRIVATE_SCRATCH` for it.
+fn fresh_database() -> (AdmittedPrivateRoot, Connection) {
+    let scratch = std::path::PathBuf::from(
+        std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+            .expect("XTRACE_TEST_PRIVATE_SCRATCH must point to private test storage"),
+    );
+    let root = AdmittedPrivateRoot::open(&scratch).expect("private scratch is admitted");
+    let name = format!("catalog-link-{}-{}", std::process::id(), Uuid::now_v7());
+    let dir = root.create_private_child(&name).expect("private child");
     let path = dir.path().join("xtrace.sqlite3");
     drop(SqliteStore::open(&path, OpenOptions::default()).expect("store opens and migrates"));
     let connection = Connection::open(&path).expect("raw connection");

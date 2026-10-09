@@ -140,7 +140,7 @@ fn scan_refuses_outside_project_dir() {
 #[test]
 fn scan_incomplete_when_analyzer_times_out() {
     let project = Project::new();
-    let analyzer = write_analyzer(project.dir.path(), "sleep 30");
+    let analyzer = write_analyzer(project.dir.path(), "exec sleep 30");
     let output = project.scan(&analyzer, &project.dir.path().join("src"), &["--timeout-secs", "1"]);
     assert_eq!(output.status.code(), Some(10), "{output:?}");
     let result = &json(&output)["result"];
