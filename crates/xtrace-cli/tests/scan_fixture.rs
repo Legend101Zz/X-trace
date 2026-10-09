@@ -72,6 +72,8 @@ fn scan_fixture_prints_provenance_static_inferred_and_is_honestly_partial() {
     assert!(document["catalogRevisionId"].is_null());
     assert_eq!(document["packStatus"], "dev_unsigned");
     assert_eq!(document["pathHypotheses"], "not_produced");
+    let coverage = document["coverage"].as_str().expect("coverage statement");
+    assert!(coverage.contains("receiver") && coverage.contains("unresolved"), "{coverage}");
     let result = &document["result"];
     assert_eq!(result["completion"], "complete");
     assert_eq!(result["claimCount"], 2);
@@ -103,6 +105,7 @@ fn scan_json_output_matches_schema() {
         keys,
         [
             "catalogRevisionId",
+            "coverage",
             "notPersistedBecause",
             "packStatus",
             "pathHypotheses",

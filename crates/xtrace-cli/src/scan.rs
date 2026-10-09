@@ -517,6 +517,7 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
         "packStatus": "dev_unsigned",
         "notPersistedBecause": "owner-selection admission for local scans (AD-1) is not implemented in this build",
         "pathHypotheses": "not_produced",
+        "coverage": coverage_statement(&result.framework),
         "result": result,
     });
     let mut stdout = std::io::stdout().lock();
@@ -526,6 +527,31 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
         write_text(&mut stdout, &result).map_err(|_| invalid("could not write output"))?;
     }
     Ok(10)
+}
+
+/// What the static analyzer for a framework does and does not see. `completion: complete` only
+/// means that no gap the analyzer can detect was found; it never means the whole route table was
+/// seen, so a static `complete` must never be the sole grounds for marking an operation removed.
+fn coverage_statement(framework: &str) -> &'static str {
+    match framework {
+        "spring-mvc" | "spring-webflux" => {
+            "annotation-declared mappings in class bodies only; functional RouterFunction routes, \
+             interface-declared mappings and programmatic registration are not analyzed"
+        }
+        "express" => {
+            "app/router calls with a statically known receiver; routers built by factories, \
+             computed mounts and receivers guessed from their name are partial or unresolved"
+        }
+        "fastify" => {
+            "app.METHOD, route() and relative-plugin register() prefixes; plugins from packages \
+             and dynamic registration are not analyzed"
+        }
+        "nest" => {
+            "controller decorators with setGlobalPrefix; RouterModule prefixes, versioning and \
+             prefix exclusions are not modelled and mark claims unsupported_mapping"
+        }
+        _ => "unknown framework: no coverage statement",
+    }
 }
 
 fn write_text<W: Write>(out: &mut W, result: &ScanResult) -> std::io::Result<()> {
@@ -539,6 +565,7 @@ fn write_text<W: Write>(out: &mut W, result: &ScanResult) -> std::io::Result<()>
         result.files_scanned,
         result.completion
     )?;
+    writeln!(out, "coverage: {}", coverage_statement(&result.framework))?;
     if !result.incomplete_reasons.is_empty() {
         writeln!(out, "incomplete: {}", result.incomplete_reasons.join(", "))?;
     }
@@ -737,6 +764,21 @@ mod tests {
             process_transcript(&[header("fastify")], "a", "b", "express", &digest).unwrap_err(),
             TranscriptError::Header(StaticClaimError::UnknownFramework)
         );
+    }
+
+    #[test]
+    fn text_output_states_per_framework_coverage() {
+        let result = scan(&[header("express"), claim("GET", r#"["/a"]"#, "a.js", 1, ""), end_ok(1)]);
+        let mut out = Vec::new();
+        write_text(&mut out, &result).expect("writes");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("coverage: app/router calls"), "{text}");
+        for framework in ["spring-mvc", "spring-webflux", "express", "fastify", "nest"] {
+            assert!(
+                !coverage_statement(framework).starts_with("unknown"),
+                "{framework} has a statement"
+            );
+        }
     }
 
     #[test]
