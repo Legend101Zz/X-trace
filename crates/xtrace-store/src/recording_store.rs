@@ -2497,14 +2497,20 @@ fn project_persisted_event(
             WireSourceBinding::Unspecified => SourceBinding::Unspecified,
         },
     );
-    let source = if source_binding.has_source_claim() {
-        event
+    let source = match source_binding {
+        SourceBinding::Verified | SourceBinding::ObservedUnattested => event
             .source
             .as_ref()
             .and_then(source_range_from_wire)
-            .and_then(|source| project_source(&source, source_root, source_cache))
-    } else {
-        None
+            .and_then(|source| project_source(&source, source_root, source_cache)),
+        // CONTRACTS 7.3: a source-map claim is never an excerpt. The mapped path is
+        // shown as unavailable; the file is neither read nor cached.
+        SourceBinding::SourceMapAbsent | SourceBinding::SourceMapUnresolved => event
+            .source
+            .as_ref()
+            .and_then(source_range_from_wire)
+            .and_then(|source| project_unverified_source_map(&source)),
+        _ => None,
     };
     let mut projected = PersistedEvent {
         sequence: event.recording_seq.to_string(),
@@ -2576,7 +2582,7 @@ fn project_source(
 ) -> Option<PersistedSource> {
     let start_line = source.start_line?;
     let path = source.path.as_str();
-    if start_line == 0 || !is_safe_repo_relative_path(path) || source.content_hash.is_none() {
+    if start_line == 0 || !is_projectable_source_path(path) || source.content_hash.is_none() {
         return None;
     }
     let end_line = source.end_line.filter(|end| *end >= start_line);
@@ -2767,21 +2773,37 @@ fn project_matching_source(
 const SOURCE_EXTENSIONS: [&str; 12] =
     ["java", "kt", "scala", "groovy", "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
 
-/// True for a repository-relative source path that is safe to read and show:
-/// relative, forward-slash separated, no empty, dot or dot-directory segment
-/// (`.env`, `.git`, `.xtrace`, `..`), no `node_modules` segment, and a known
-/// source extension.
+/// Longest accepted repository-relative path, in bytes (CONTRACTS section 3 rule 7).
+const MAX_REPO_RELATIVE_PATH_BYTES: usize = 1024;
+
+/// Write-time gate for a recorded source path (CONTRACTS section 3 rules 6-7): 1 to 1024
+/// bytes, no leading `/`, no backslash, no NUL or other control character, no empty, `.` or
+/// `..` segment and no drive prefix such as `C:`. It does not look at extensions or the
+/// file system; those rules apply only to the read projection.
 pub(crate) fn is_safe_repo_relative_path(path: &str) -> bool {
-    if path.is_empty()
-        || path.len() > 256
-        || path.starts_with('/')
-        || path.contains(['\\', '\0', '\n', '\r'])
-    {
+    if path.is_empty() || path.len() > MAX_REPO_RELATIVE_PATH_BYTES {
+        return false;
+    }
+    if path.starts_with('/') || path.contains('\\') || path.chars().any(char::is_control) {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+/// Read-time gate: a path that passes [`is_safe_repo_relative_path`] and may also be
+/// read and shown. No dot-directory segment (`.env`, `.git`, `.xtrace`), no
+/// `node_modules` segment, and a known source extension.
+pub(crate) fn is_projectable_source_path(path: &str) -> bool {
+    if !is_safe_repo_relative_path(path) {
         return false;
     }
     let mut segments = path.split('/').peekable();
     while let Some(segment) = segments.next() {
-        if segment.is_empty() || segment.starts_with('.') || segment == "node_modules" {
+        if segment.starts_with('.') || segment == "node_modules" {
             return false;
         }
         if segments.peek().is_none() {
@@ -2843,6 +2865,16 @@ fn source_line_has_secret_shape(line: &str) -> bool {
         rest = &candidate[3..];
     }
     false
+}
+
+/// Projects a source-map binding: gated path and extent, status unavailable, no file read.
+fn project_unverified_source_map(source: &SourceRange) -> Option<PersistedSource> {
+    let start_line = source.start_line.filter(|line| *line > 0)?;
+    if !is_projectable_source_path(&source.path) {
+        return None;
+    }
+    let end_line = source.end_line.filter(|end| *end >= start_line);
+    unavailable_source(&source.path, start_line, end_line)
 }
 
 fn unavailable_source(
@@ -3112,26 +3144,101 @@ mod source_projection_tests {
     }
 
     #[test]
+    fn write_gate_follows_the_contract_path_rules() {
+        for good in ["src/A.java", "a.b/c/D.ts", "x/.hidden/E.java"] {
+            assert!(is_safe_repo_relative_path(good), "{good:?}");
+        }
+        assert!(is_safe_repo_relative_path(&"a".repeat(1024)));
+        for bad in [
+            "",
+            "/abs/A.java",
+            "C:/x/A.java",
+            "c:A.java",
+            "src\\A.java",
+            "src/\u{1b}[2J/A.java",
+            "src/\tA.java",
+            "src/\u{7f}A.java",
+            "src//A.java",
+            "src/./A.java",
+            "../A.java",
+        ] {
+            assert!(!is_safe_repo_relative_path(bad), "{bad:?}");
+        }
+        assert!(!is_safe_repo_relative_path(&"a".repeat(1025)));
+    }
+
+    fn source_map_event(
+        binding: xtrace_protocol::generated::agent::SourceBinding,
+        hash: &[u8],
+        path: &str,
+    ) -> xtrace_protocol::generated::agent::RecordingEvent {
+        xtrace_protocol::generated::agent::RecordingEvent {
+            source_binding: binding as i32,
+            source: Some(xtrace_protocol::generated::agent::SourceRange {
+                path: path.to_owned(),
+                start_line: 1,
+                end_line: 2,
+                content_hash: hash.to_vec().into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn source_map_absent_never_projects_excerpt() {
+        use xtrace_protocol::generated::agent::SourceBinding as Wire;
+        let root = tempdir();
+        let bytes = b"one\ntwo\n";
+        write_source(root.path(), bytes);
+        let hash = ContentHash::of_bytes(bytes);
+        let digest = hash.as_bytes().to_vec();
+        for binding in [Wire::SourceMapAbsent, Wire::SourceMapUnresolved] {
+            let event = source_map_event(binding, &digest, PATH);
+            let mut cache = SourceProjectionCache::default();
+            let projected = project_persisted_event(&event, Some(root.path()), &mut cache);
+            let source = projected.source.expect("path is projected");
+            assert_eq!(source.status, SourceStatus::Unavailable);
+            assert!(source.excerpt.is_none());
+            assert_eq!(cache.reads, 0, "the file must not be read");
+        }
+    }
+
+    #[test]
+    fn source_map_unresolved_empty_hash_projects_unavailable_path() {
+        use xtrace_protocol::generated::agent::SourceBinding as Wire;
+        let event = source_map_event(Wire::SourceMapUnresolved, &[], PATH);
+        let mut cache = SourceProjectionCache::default();
+        let projected = project_persisted_event(&event, None, &mut cache);
+        let source = projected.source.expect("path is projected");
+        assert_eq!(source.path, PATH);
+        assert_eq!(source.status, SourceStatus::Unavailable);
+        assert!(source.excerpt.is_none());
+        let event = source_map_event(Wire::SourceMapUnresolved, &[], ".env");
+        assert!(project_persisted_event(&event, None, &mut cache).source.is_none());
+    }
+
+    #[test]
     fn dotenv_path_refused() {
-        assert!(!is_safe_repo_relative_path(".env"));
-        assert!(!is_safe_repo_relative_path("config/.env.ts"));
+        assert!(!is_projectable_source_path(".env"));
+        assert!(!is_projectable_source_path("config/.env.ts"));
     }
 
     #[test]
     fn git_config_path_refused() {
-        assert!(!is_safe_repo_relative_path(".git/config"));
-        assert!(!is_safe_repo_relative_path(".xtrace/state.ts"));
-        assert!(!is_safe_repo_relative_path(".github/workflows/ci.ts"));
+        assert!(!is_projectable_source_path(".git/config"));
+        assert!(!is_projectable_source_path(".xtrace/state.ts"));
+        assert!(!is_projectable_source_path(".github/workflows/ci.ts"));
     }
 
     #[test]
     fn config_yml_non_source_extension_refused() {
-        assert!(!is_safe_repo_relative_path("src/main/resources/application.yml"));
-        assert!(!is_safe_repo_relative_path("README.md"));
-        assert!(!is_safe_repo_relative_path("src/Makefile"));
-        assert!(!is_safe_repo_relative_path("node_modules/pkg/index.js"));
-        assert!(is_safe_repo_relative_path("src/main/java/a/B.java"));
-        assert!(is_safe_repo_relative_path("lib/server.mjs"));
+        assert!(!is_projectable_source_path("src/main/resources/application.yml"));
+        assert!(!is_projectable_source_path("README.md"));
+        assert!(!is_projectable_source_path("src/Makefile"));
+        assert!(!is_projectable_source_path("node_modules/pkg/index.js"));
+        assert!(is_projectable_source_path("src/main/java/a/B.java"));
+        assert!(is_projectable_source_path("lib/server.mjs"));
     }
 
     #[test]

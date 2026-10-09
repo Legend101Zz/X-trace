@@ -270,7 +270,14 @@ fn validate_xtf_event(
                 return Err(invalid_source());
             }
         }
-        (WireSourceBinding::Verified | WireSourceBinding::ObservedUnattested, None)
+        // CONTRACTS section 3 rule 6: source is present iff the binding has a source claim.
+        (
+            WireSourceBinding::Verified
+            | WireSourceBinding::ObservedUnattested
+            | WireSourceBinding::SourceMapAbsent
+            | WireSourceBinding::SourceMapUnresolved,
+            None,
+        )
         | (
             WireSourceBinding::AttestationMissing
             | WireSourceBinding::ClassBytesMismatch
@@ -449,11 +456,34 @@ mod tests {
     #[test]
     fn write_gate_refuses_unsafe_paths_and_mismatched_bindings() {
         use xtrace_protocol::generated::agent::SourceBinding as B;
-        for path in
-            ["../x/A.java", "src/./A.java", ".env", "config/.env.ts", "/abs/A.java", "README.md"]
-        {
+        for path in [
+            "../x/A.java",
+            "src/./A.java",
+            "/abs/A.java",
+            "C:/x/A.java",
+            "src/\u{1b}[2J/A.java",
+            "src/\tA.java",
+            "src/\u{7f}A.java",
+        ] {
             let accepted = source_event(B::Verified, path, 32);
-            assert!(super::validate_xtf_event(&accepted).is_err(), "{path} must be refused");
+            assert!(super::validate_xtf_event(&accepted).is_err(), "{path:?} must be refused");
+        }
+        let too_long = format!("{}.java", "a".repeat(1025));
+        assert!(super::validate_xtf_event(&source_event(B::Verified, &too_long, 32)).is_err());
+        let long_ok = format!("{}/A.java", "a".repeat(1000));
+        super::validate_xtf_event(&source_event(B::Verified, &long_ok, 32))
+            .expect("paths up to 1024 bytes are accepted");
+        // Extension and dot-directory rules are read-projection rules, not write rules: a
+        // refused write would reject the whole batch.
+        for path in [".env", "config/.env.ts", "README.md"] {
+            let result = super::validate_xtf_event(&source_event(B::Verified, path, 32));
+            assert!(result.is_ok(), "{path} is accepted at write time");
+        }
+        for binding in [B::SourceMapAbsent, B::SourceMapUnresolved] {
+            let mut missing = source_event(binding, "src/A.ts", 0);
+            missing.payload.event.as_mut().expect("typed").source = None;
+            missing.canonical_bytes = missing.payload.encode_to_vec();
+            assert!(super::validate_xtf_event(&missing).is_err(), "{binding:?} needs a source");
         }
         assert!(super::validate_xtf_event(&source_event(B::Verified, "src/A.java", 31)).is_err());
         assert!(

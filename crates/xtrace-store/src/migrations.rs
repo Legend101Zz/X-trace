@@ -1247,7 +1247,8 @@ mod tests {
             apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v8"),
             Migrations::latest_version()
         );
-        let legacy: (i64, i64, i64, i64, Option<Vec<u8>>, Option<Vec<u8>>) = conn
+        type LegacyRow = (i64, i64, i64, i64, Option<Vec<u8>>, Option<Vec<u8>>);
+        let legacy: LegacyRow = conn
             .query_row(
                 "SELECT depth, kind, honesty_flags, indexed_v, parent_seq, async_parent_seq \
                  FROM recording_frame_index WHERE recording_id = ?1",
