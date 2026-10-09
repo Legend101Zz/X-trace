@@ -529,7 +529,7 @@ The owner approved removing the retained builder leases by hand and asked to con
 - The macOS failures above.
 - The `capture_policy_not_armed` limitation is not persisted to the read API; it needs a new `BeginRecording` field and a migration.
 - Line events from focused capture do not reach the read API for the fixture methods yet (an honest gap is recorded instead).
-- `java_launch` supports direct launch only.
+- Java launch supports a direct `java` executable only (`xtrace_runtime::java::JavaLaunch`); Gradle, Maven and wrapper launches are refused with a named error.
 - The Petclinic campaign still records too few requests, with no repository frames or source lines.
 
 Next: fix macOS private-storage admission cost (one batched or native ACL query per commit), make the macOS floor and the hosted macOS job green on `ultra/rc-2`, then merge.
@@ -539,3 +539,36 @@ Next: fix macOS private-storage admission cost (one batched or native ACL query 
 - **Open:** the hosted macOS job is red.
 - **New: deadlines raised.** The macOS test fixes raised several test deadlines 4.5–12×: Express child wait 20→90 s, premain recording wait 10→60 s, event-cap finish acknowledgement 5→60 s, and scan timeout 1→5 s. They work around the slow macOS admission rather than fixing it. Under the project's rules this counts as weakening deadlines. These changes must be reverted once the admission cost is fixed, and they are one more reason rc-2 is not merged.
 - **New: stale row notes.** The row notes describe rc-1, as stated above.
+
+## v0.01 second unattended batch: release candidate rc-3 (2026-10-09 20:11 UTC to 2026-10-10)
+
+The owner authorized a second unattended batch of at most ten hours (ADR 0009 addendum of 2026-10-10) to finish `ultra/rc-2`, merge it to `main`, then work on issues #3 and #4. Opus 5.5 ran as root with Sonnet 5.5 workers. This section describes the candidate `ultra/rc-3`; acceptance evidence and the merge record are added after the gates run.
+
+**Correction to the rc-2 entry.** The rc-2 entry blamed "about 140 `/bin/ls` spawns per recording commit". Measured on the leased Mac, one segment commit made 119 admission operations and about 327 spawns (begin 32, finish 277), for only 15 directories and 8 files. Every walk re-spawned its batched listing even when every directory was already judged. No single operation came near its 750 ms deadline; the cost was the count.
+
+**What rc-3 adds on top of `ultra/rc-2`:**
+- **macOS admission cost (ADR 0008 Amendment 1, proposed, for owner ratification).** One admission scope per store call (begin, one segment commit, finish): operations on the same thread share directory verdicts and one lazily taken batched listing. The 750 ms per-operation deadline, the identity checks on every use, the role rules and the un-memoized named-file probes are unchanged. Sharing is APFS-only; the memo key also carries the filesystem id, type and mount flags; the scope is capped at 10 s. Measured after the change: begin 9, steady commit 70, finish 52 spawns, pinned by a spawn-bound test (20, 85, 100). A security review with refuters found no blocker or major.
+- **Raised deadlines restored** to their pre-rc-2 values: premain recording wait 10 s, Express child wait 20 s, scan timeout 1 s, event-cap finish acknowledgement 5 s.
+- **Recording limitations persisted (ADR 0011, proposed).** The daemon decides `capture_policy_not_armed`; it is stored by migration v9 (`recording_limitations`) in the recording's anchor transaction and read back as `RecordingDetail.limitations`. The vocabulary is closed (one code). Recordings made before v9 have no rows and read as "none recorded".
+- **Capture scope.** `xtrace record` and `restart` take the same capture flags as `run` and write the resolved scope; `capture_depth_enforced` means the daemon's own reader yields the recorded depth (`docs/security-local.md`). `--observed-endpoint-policy` needs a resolved application scope. Build-tool and wrapper launchers are refused before any side effect. An out-of-scope Spring handler produces no recording, by design; a journey test proves both the in-scope and the out-of-scope case.
+- **Node:** the process-group reap race is fixed. On macOS, `killpg` on a group whose members are all zombies returns `EPERM`, which is now treated as "gone" (accepted trade-off: a real `EPERM` on macOS is no longer reported as a cleanup failure).
+- **CI:** the hosted macOS arm64 job runs an other-UID private-storage negative in place of the broker negative until broker code exists (ADR 0006 addendum of 2026-10-10, for owner ratification). A second local user must reach the store's parent but cannot list, read, write or replace anything in the product-created store, and no store entry may carry an ACL allow entry; the job fails if the check is skipped. All cargo steps are `--locked`; minimum test counts were raised from measured values; the install scratch test runs in `package.yml`; failing steps print allowlisted `XTR-*` error codes and categories.
+
+**Open majors from the rc-1 review, as of rc-3:**
+- Closed: lifetime session caps (ARCH-01/BI-F5), Java static analyzer registered (ARCH-02/BI-F1), Node version sweep (ARCH-04/BI-F2), relocated source-proof gate tests (F1).
+- Closed for P01 to P03, pending a green hosted run on the candidate: the hosted macOS arm64 job (BI-F3), with the private-storage substitute for the broker negative.
+- Partly closed: focused-mode arming (ARCH-03): the not-armed limitation is persisted, but line events from focused capture still do not reach the read API for the fixture methods; a declared not-transformed gap is recorded instead. Capture scope (BI-F4): scope reaches the agent and the record document, but the observed-endpoint policy is still the operator-selected fixture literal `spring-orders-v1`, so real-Spring route and outcome rows stay unclaimed.
+
+**Known limits, stated so they can be found:**
+- A session retains at most 2,000,000 event digests (`MAX_SESSION_RETAINED_DIGESTS`), so it can hold about 122 standard (16,384-event) or 15 focused (131,072-event) recordings open at full size at once, while `ActiveCapacityReached` still reports 256.
+- A changed-payload replay of an event that was already persisted, arriving after finish, is counted as a duplicate.
+- A recording older than the 1,024-entry terminal tombstone ring looks new on retry.
+- Ingest value-byte and line budgets are counted, but over-budget events are still persisted.
+- `xtrace doctor` reports `overall: ok` while some checks are `unavailable`.
+- The `dev-trust-table` feature is not enabled by any release build.
+- Two leased-floor-only store failures (`XTR-STORE-OBJECT-IO` in two recording-port tests under full-workspace load on rc-2) have no established cause; they did not reproduce on the leased Mac under heavy load, and the admission change is the only remedy applied.
+- The campaign analysis treats only `responded` and `exception` as observed outcomes, while the product emits `exception_propagated` (to fix in the Petclinic wave).
+- Release-tool process-tree tests flaked on hosted macOS (BI-F8); see the merge record for the fix and its evidence.
+
+**Decision records for the owner to ratify:** ADR 0008 Amendment 1, the ADR 0006 addendum (other-UID negative before the broker exists), ADR 0011 (recording limitations), and the ADR 0009 addendum (this batch).
+
