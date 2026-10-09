@@ -15,7 +15,7 @@ for t in / /done; do curl -s -o /dev/null -w "%{http_code} " http://127.0.0.1:18
 echo "sent done $(ts)"
 for i in $(seq 1 40); do
   kill -0 $P 2>/dev/null || { echo "xtrace exited at $(ts)"; break; }
-  if [ $i = 1 ] || [ $i = 4 ] || [ $i = 7 ] || [ $i = 10 ]; then echo "== t=$i $(ts)"; ps -axo pid,ppid,etime,time,stat,command | grep -E "xtrace|node|/bin/ls" | grep -v grep | cut -c1-150; sample $P 1 -file $W/sample$i.txt >/dev/null 2>&1; grep -E "^\s*\+? *[!:| +]* *[0-9]+ " $W/sample$i.txt | grep -E "xtrace_|xtrace\)" | grep -v "tokio\|core\|std" | cut -c1-230 | head -30; fi
+  if [ $i = 3 ] || [ $i = 6 ]; then echo "== t=$i $(ts)"; sample $P 1 -file $W/sample$i.txt >/dev/null 2>&1; sed -n '/Sort by top of stack/,$p' $W/sample$i.txt | cut -c1-200 | head -25; grep -n -E "spawn|posix_spawn|fork" $W/sample$i.txt | head -5; grep -E "^ +\+ +[! :|]*[0-9]+ .*xtrace_(store|private_storage)" $W/sample$i.txt | sed -E 's/\(in xtrace\).*//' | cut -c1-260 | sort -t' ' -k1 | head -0; fi
   sleep 1
 done
 cat $W/out.log; tail -20 $W/err.log
