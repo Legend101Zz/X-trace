@@ -102,7 +102,9 @@ impl JavaLaunch {
         let program_path = Path::new(program);
         if program_path.file_name().is_none_or(|name| name != "java") {
             return Err(LaunchError::Validation(
-                "xtrace run accepts only a direct executable named java",
+                "xtrace run accepts only a direct executable named java; build-tool and wrapper launches \
+                 (gradle bootRun, mvn spring-boot:run, gradlew, scripts) are refused: run the built \
+                 application with java -jar",
             ));
         }
         if arguments.iter().any(|argument| {
@@ -683,6 +685,32 @@ mod tests {
             ),
             "baseline validation or expected delimiter check failed: {result:?}"
         );
+    }
+
+    #[test]
+    fn refuses_build_tool_and_wrapper_launchers_before_any_side_effect() {
+        let root = tempfile::tempdir().expect("temp root");
+        let agent = distribution(root.path());
+        for command in [
+            &["gradle", "bootRun"][..],
+            &["./gradlew", "bootRun"][..],
+            &["mvn", "spring-boot:run"][..],
+            &["./mvnw", "spring-boot:run"][..],
+            &["/usr/bin/env", "java", "-jar", "app.jar"][..],
+            &["sh", "-c", "java -jar app.jar"][..],
+            &["./run.sh"][..],
+        ] {
+            let command: Vec<OsString> = command.iter().map(OsString::from).collect();
+            let error = JavaLaunch::validate(&agent, &command)
+                .expect_err("non-direct launcher must be refused");
+            assert!(
+                matches!(&error, LaunchError::Validation(message)
+                    if message.contains("only a direct executable named java")
+                        && message.contains("gradle bootRun")),
+                "{command:?}: {error:?}"
+            );
+            assert_eq!(error.exit_code(), 2);
+        }
     }
 
     #[test]

@@ -16,9 +16,6 @@ pub mod java;
 pub mod java_attach;
 
 #[cfg(unix)]
-pub mod java_launch;
-
-#[cfg(unix)]
 pub mod java_scope;
 
 pub mod pack_discovery;
