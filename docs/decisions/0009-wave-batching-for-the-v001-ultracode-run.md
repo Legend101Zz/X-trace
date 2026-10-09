@@ -120,10 +120,11 @@ skips, unreached code or synthetic traces never count as a pass.
 
 - Status: Accepted (owner authorization, 2026-10-10, for one run only)
 - Date: 2026-10-10
-- Context: the first batch ended without a merge. Its candidate,
-  `ultra/rc-2`, passed Linux CI, but both hosted macOS arm64 jobs and the
-  leased macOS floor failed at gate 18 (`rust-workspace`), and the delta review
-  left open majors. The owner authorized a second unattended batch of at most
+- Context: the first batch ended without a merge. Linux CI passed on the
+  parent `b7b260f` of its candidate `ultra/rc-2` (run 37963545129). On the
+  candidate heads `85c0d1d` and `4c699ed`, both hosted macOS arm64 jobs failed in
+  the Rust test step, the leased macOS floor on `85c0d1d` failed at gate 18
+  (`rust-workspace`), and the delta review left open majors. The owner authorized a second unattended batch of at most
   ten hours to finish that candidate, merge it to `main`, and then work toward
   the exit criteria of issue #3 (S1) and, if time allows, issue #4 (S2).
 
@@ -166,7 +167,11 @@ Sections 1 to 5 above apply to the second batch, with these changes.
    progress entry says why.
 8. **No weakened deadlines.** No test deadline, timeout or product budget is
    raised to make a candidate pass. If a fix cannot meet the original values,
-   the wave stays pushed and unmerged and the measurements are recorded.
+   the wave stays pushed and unmerged and the measurements are recorded. The
+   deadlines already raised on `ultra/rc-2` (Express child wait 20 to 90 s,
+   premain recording wait 10 to 60 s, finish acknowledgement 5 to 60 s, scan
+   timeout 1 to 5 s) are restored to their earlier values before `ultra/rc-3`
+   can be a merge candidate; otherwise it stays unmerged.
 9. **Decision records this batch may add**, each with its own security review
    and each listed for the owner to ratify afterwards: an amendment to ADR 0008,
    only if the macOS admission fix cannot stay inside it; an addendum that scopes

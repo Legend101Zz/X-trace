@@ -1,6 +1,8 @@
 # ADR 0006: v0.01 integration and acceptance mechanics
 
 - Status: Accepted (root decision 2026-10-04)
+- Amended by: the addendum of 2026-10-10 at the end (the other-UID negative of §2
+  item 3 before the broker exists)
 - Date: 2026-10-04
 - Context: Twelve unmerged `slice/v001-*` branches carry overlapping,
   unaccepted preparation (conflict hotspots: `crates/xtrace-cli/src/{error,output}.rs`,
@@ -74,7 +76,8 @@ following hold for that exact SHA; nothing is carried over from an earlier SHA
    --locked --workspace`, the Java strict Gradle build on JDK 17 and 21, the Node
    workspace on Node 22 and 24, the packaged-journey tests that can run
    unattended, and the other-UID broker negative (the hosted runner permits a
-   second local user). It must run without skips for the rows it claims. Local
+   second local user). (Until a candidate contains broker code, an other-UID
+   private-storage negative runs in its place; see the 2026-10-10 addendum.) It must run without skips for the rows it claims. Local
    macOS floor runs and the hosted job are complementary: the job proves a clean
    machine, the local run proves the leased builder discipline.
 4. **Three independent reviews**: architecture, security/privacy,
@@ -183,6 +186,8 @@ following hold for that exact SHA; nothing is carried over from an earlier SHA
   missing or skipped; a review's diff digest differs; the macOS job is absent for a
   phase that requires it; the floor receipt label was reused.
 - CI workflow test: the macOS job fails if the other-UID broker test is skipped.
+  (Until broker code exists: the macOS job fails if the private-storage
+  substitute of the 2026-10-10 addendum is skipped.)
 - The first accepted phase demonstrates the complete receipt end to end (dry run
   through `check_ledger.py` with test signing keys) before real receipts are cut.
 - Postmerge: after each root merge to `main`, record main SHA, floor receipt hash,
@@ -215,26 +220,40 @@ Decided by the root orchestrator under the owner's autonomous v0.01 launch autho
 ## Addendum (2026-10-10): the other-UID negative before the broker exists
 
 - Status: Accepted for the second unattended batch under the owner's
-  authorization of 2026-10-10; listed for the owner to ratify afterwards.
+  authorization of 2026-10-10 (recorded verbatim in that run's private
+  checkpoint); listed for the owner to ratify afterwards. If the owner does not
+  ratify it, the substitute lapses: candidates again need the broker negative
+  of §2 item 3 as written, and none can be accepted before the broker exists.
 - Date: 2026-10-10
 - Context: §2 item 3 asks the hosted macOS job to run "the other-UID broker
-  negative". The broker (ADR 0004) is P04 work, so P01 to P03 candidates have no
-  broker to test, and the job could not run that check. What P01 to P03 do ship on
-  macOS is private storage (ADR 0008), whose security claim is that another local
-  user can neither traverse nor read a project's store.
+  negative". No broker (ADR 0004) exists in the tree yet, so the job has nothing
+  to run that check against. What the current candidates do ship on macOS is
+  private storage (ADR 0008), whose security claim is that another local user
+  can neither traverse, read nor replace a project's store.
 
 ### Decision
 
-1. For P01, P02 and P03 candidates, the hosted macOS job runs an other-UID
-   private-storage negative in place of the broker negative. After the job has
-   created a real store, a second local user created on the runner must fail to
-   list or traverse the store directory and must fail to read the store database
-   and its object files.
+1. While a candidate's tree contains no broker code, the hosted macOS job runs
+   an other-UID private-storage negative in place of the broker negative. The
+   trigger is the tree, not a phase label. The job creates a real store with
+   the product, then a second local user created on the runner:
+   - must be able to reach the store's parent directory (a positive control),
+     so the store's own directory, created by the product, is the barrier
+     being tested and not a directory the workflow made;
+   - must fail to list or traverse the store directory, to read the store
+     database, and to create or replace anything in the store;
+   - and every store entry must show owner-only modes, no symlinks, and no ACL
+     entry granting access to anyone else.
+   The CI store is created with `xtrace init` and holds no recording objects,
+   so this check does not cover object files; they are covered by the store's
+   own owner-only file and directory rules (ADR 0008) and their tests.
 2. The check fails closed. It fails when the store is missing, when the second
    user cannot be created, or when the check is skipped: an always-run final step
    requires the marker that only a passing check writes. Its public output stays
    within the allowlisted CI grammar.
-3. From P04 onward, when the broker exists, the other-UID broker negative of §2
-   item 3 is required as written, in addition to the private-storage negative.
-4. Nothing else in §2 changes. The broker negative is deferred to the phase that
-   adds the broker; it is not waived.
+3. Any candidate whose tree contains broker code must run the other-UID broker
+   negative of §2 item 3 as written, in the same candidate, in addition to the
+   private-storage negative. No phase from the one that adds the broker onward
+   may be marked accepted without a broker-negative result in its receipt.
+4. Nothing else in §2 changes. The broker negative is deferred until broker code
+   exists; it is not waived.
