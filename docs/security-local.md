@@ -23,9 +23,10 @@ reachable from another machine.
 * **No secrets in lifecycle output.** The daemon bootstrap secret is not written to `daemon.json` or printed by
   `record`/`stop`/`restart` (asserted in `crates/xtrace-cli/tests/lifecycle_journey.rs`). The one-shot bootstrap
   file lives under the private root.
-* **Packs are verified, not trusted by location.** Installed packs are discovered relative to the executable only
-  (never environment variables or the working directory) and an unsigned or unverifiable pack is not admitted;
-  v0.0.1 ships no release signing key, so every packaged pack is marked non-release (`docs/packaging.md`).
+* **Packs are located by executable path, not trusted by location.** Installed packs are discovered relative to the
+  executable only (never environment variables or the working directory; `pack_discovery.rs`). Admission of a
+  discovered pack into `xtrace run` is NOT wired yet and the trust table is empty, so nothing can be reported as
+  verified; v0.0.1 ships no release signing key and every packaged pack is marked non-release (`docs/packaging.md`).
 
 ## Where state lives
 
