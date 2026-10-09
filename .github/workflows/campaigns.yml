@@ -80,6 +80,36 @@ jobs:
           retention-days: 14
           overwrite: true
 
+  package-verify:
+    # P-001: the package content verifier on the candidate built above (a failing check is a real finding, never waived).
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.candidate || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: xtrace-candidate-linux-x86_64
+          path: ${{ runner.temp }}/pkg
+      - name: Package unit tests
+        run: python3 -B -m unittest discover -s packaging/test -p 'test_*.py'
+      - name: Verify package contents
+        run: |
+          mkdir -p "$RUNNER_TEMP/verify"
+          python3 -B packaging/verify_package.py "$RUNNER_TEMP"/pkg/xtrace-*-linux-x86_64.tar.gz --run-binary --repo . \
+            --out "$RUNNER_TEMP/verify/package-verification.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: package-verification
+          path: ${{ runner.temp }}/verify
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
+
   campaign:
     name: campaign (${{ matrix.project }})
     needs: [select, package]
