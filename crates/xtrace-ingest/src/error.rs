@@ -333,8 +333,9 @@ pub enum IngestError {
         recording_seq: u64,
     },
 
-    /// Event {recording_seq} rejected: frame event carries no symbol.
-    #[error("event seq {recording_seq}: frame event carries no symbol")]
+    /// Event {recording_seq} rejected: frame event carries no symbol, or any event carries a
+    /// symbol over its byte bound.
+    #[error("event seq {recording_seq}: event symbol is missing or over its bound")]
     SymbolRequired {
         /// Sequence of the offending event.
         recording_seq: u64,

@@ -24,11 +24,11 @@ use xtrace_application::recording::{
 /// Largest `request_json` accepted for terminal evidence (matches the v7 CHECK).
 const MAX_TERMINAL_REQUEST_JSON_BYTES: usize = 64 * 1024;
 use xtrace_application::recording_queries::{
-    FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES,
-    NavigationResult, NavigationUnavailable, PersistedBinding, PersistedEvent, PersistedGap,
-    PersistedInteraction, PersistedOutcome, PersistedSource, PersistedValue, RecordingCapacity,
-    RecordingCompletionEvidence, RecordingEventWindow, RecordingMetadata, RecordingStatus,
-    ShowWindowRequest, SourceStatus,
+    FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_FINISH_VERIFIED_BYTES,
+    MAX_RECORDING_VERIFIED_INPUT_BYTES, NavigationResult, NavigationUnavailable, PersistedBinding,
+    PersistedEvent, PersistedGap, PersistedInteraction, PersistedOutcome, PersistedSource,
+    PersistedValue, RecordingCapacity, RecordingCompletionEvidence, RecordingEventWindow,
+    RecordingMetadata, RecordingStatus, ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::is_projectable_source_path;
@@ -1813,7 +1813,7 @@ impl SqliteRecordingStore<'_> {
             (project_id, segments, declared_event_count, declared_input_bytes)
         };
 
-        if declared_input_bytes > MAX_RECORDING_VERIFIED_INPUT_BYTES {
+        if declared_input_bytes > MAX_RECORDING_FINISH_VERIFIED_BYTES {
             return Ok((
                 RecordingCompletion::Partial,
                 u64::try_from(declared_event_count)
@@ -2892,7 +2892,7 @@ fn first_frame_where(
 
 /// Whether the recording's declared segment bytes fit the finish verification bound.
 /// `verify_terminal_evidence` answers Partial WITHOUT hashing when they do not.
-fn declared_bytes_within_verification_bound(
+pub(crate) fn declared_bytes_within_verification_bound(
     connection: &rusqlite::Connection,
     recording_id: RecordingId,
     correlation_id: CorrelationId,
@@ -2909,7 +2909,7 @@ fn declared_bytes_within_verification_bound(
         })?;
     Ok(declared
         .and_then(|total| usize::try_from(total).ok())
-        .is_some_and(|total| total <= MAX_RECORDING_VERIFIED_INPUT_BYTES))
+        .is_some_and(|total| total <= MAX_RECORDING_FINISH_VERIFIED_BYTES))
 }
 
 /// Whether every event up to the finish sequence is persisted, so that "no later

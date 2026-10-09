@@ -41,8 +41,13 @@ pub const MAX_CAPACITY_DROP_PRIORITIES: usize = 64;
 const MAX_DROP_COUNT_BUCKETS: usize = 256;
 /// Default maximum number of events in one immutable segment.
 pub const DEFAULT_SEGMENT_EVENTS: usize = 2_000;
-/// Default maximum number of recording IDs retained by one capture service.
+/// Default maximum number of unfinished recording IDs retained by one capture service.
 pub const DEFAULT_MAX_RETAINED_RECORDINGS: usize = 1_024;
+
+/// Bounded ring of terminal (persisted-finish) recordings kept, without their digest tables, so
+/// an exact replay of a finish or a replayed event batch stays idempotent. The oldest is dropped
+/// beyond this bound.
+pub const TERMINAL_TOMBSTONE_RING: usize = 1_024;
 /// Maximum length-prefixed encoded XTF event envelope accepted by the codec.
 pub const MAX_XTF_EVENT_ENVELOPE_BYTES: usize = 1024 * 1024 + 4;
 /// Event-byte budget after reserving the XTF prefix, maximum header, and footer.
@@ -434,15 +439,17 @@ pub trait RecordingCapture: Send + Sync {
 ///
 /// The service is intended to be daemon-scoped. Its map survives individual
 /// adapter sessions, while each recording has a separate lock so unrelated
-/// recordings do not serialize their in-memory assembly work. Finished
-/// recordings remain retained: until cleanup or recovery is implemented, the
-/// configured recording budget can be exhausted for the rest of the daemon
-/// lifetime, and new recording IDs will be rejected until restart.
+/// recordings do not serialize their in-memory assembly work. Only unfinished
+/// recordings count against the retained-ID budget: once the durable port has
+/// accepted a finish, the recording drops its digest table and moves to a
+/// bounded tombstone ring ([`TERMINAL_TOMBSTONE_RING`]) for exact replay.
 pub struct RecordingCaptureService<P: RecordingPersistencePort + ?Sized> {
     port: Arc<P>,
     policy: SegmentPolicy,
     max_retained_recordings: NonZeroUsize,
     recordings: Mutex<HashMap<RecordingId, SharedAssembly<P::Event>>>,
+    /// Terminal recordings, oldest first. Lock order: `recordings`, then `terminal`.
+    terminal: Mutex<std::collections::VecDeque<RecordingId>>,
 }
 
 type SharedAssembly<E> = Arc<Mutex<RecordingAssembly<E>>>;
@@ -452,11 +459,17 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
     ///
     /// The bound applies across adapter sessions. Existing IDs remain
     /// retryable when the bound is full; a new ID returns a typed resource
-    /// error before the persistence port is called. Finished entries are not
-    /// removed, so the budget can remain exhausted until the daemon restarts.
+    /// error before the persistence port is called. Only unfinished entries
+    /// count; terminal ones roll into a bounded tombstone ring.
     #[must_use]
     pub fn new(port: Arc<P>, policy: SegmentPolicy, max_retained_recordings: NonZeroUsize) -> Self {
-        Self { port, policy, max_retained_recordings, recordings: Mutex::new(HashMap::new()) }
+        Self {
+            port,
+            policy,
+            max_retained_recordings,
+            recordings: Mutex::new(HashMap::new()),
+            terminal: Mutex::new(std::collections::VecDeque::new()),
+        }
     }
 
     fn begin_with_cap(
@@ -469,7 +482,8 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
             if let Some(recording) = recordings.get(&request.recording_id) {
                 Arc::clone(recording)
             } else {
-                if recordings.len() >= self.max_retained_recordings.get() {
+                let terminal = lock(&self.terminal)?.len();
+                if recordings.len().saturating_sub(terminal) >= self.max_retained_recordings.get() {
                     return Err(capture_error(
                         PortErrorKind::Resource,
                         "recording capture retained-ID capacity is exhausted",
@@ -524,6 +538,24 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
         }
         state.begun = true;
         Ok(receipt)
+    }
+
+    /// Moves a recording whose finish the durable port accepted into the tombstone ring and
+    /// drops the oldest tombstones beyond the bound. Takes the registry lock, so callers must
+    /// not hold an assembly lock.
+    fn note_terminal(&self, recording_id: RecordingId) -> Result<(), PortError> {
+        let mut recordings = lock(&self.recordings)?;
+        let mut terminal = lock(&self.terminal)?;
+        if terminal.contains(&recording_id) {
+            return Ok(());
+        }
+        terminal.push_back(recording_id);
+        while terminal.len() > TERMINAL_TOMBSTONE_RING {
+            if let Some(oldest) = terminal.pop_front() {
+                recordings.remove(&oldest);
+            }
+        }
+        Ok(())
     }
 
     fn recording(&self, recording_id: RecordingId) -> Result<SharedAssembly<P::Event>, PortError> {
@@ -721,8 +753,12 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
                 let persisted_segments = self.commit_pending(&mut state)?;
                 let completion =
                     self.port.finish_recording(&effective_finish(&state, &request)?)?;
+                let recording_id = state.recording_id;
+                release_digests(&mut state);
+                drop(state);
+                self.note_terminal(recording_id)?;
                 return Ok(FinishRecordingReceipt {
-                    recording_id: state.recording_id,
+                    recording_id,
                     persisted_segments,
                     exact_replay: true,
                     completion,
@@ -737,8 +773,12 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
         // corrected request after the caller resolves the failure.
         state.finish_intent = Some(request);
         state.finished = true;
+        let recording_id = state.recording_id;
+        release_digests(&mut state);
+        drop(state);
+        self.note_terminal(recording_id)?;
         Ok(FinishRecordingReceipt {
-            recording_id: state.recording_id,
+            recording_id,
             persisted_segments,
             exact_replay: false,
             completion,
@@ -766,6 +806,9 @@ struct RecordingAssembly<E> {
     pending: Option<PendingSegment<E>>,
     finish_intent: Option<FinishRecording>,
     finished: bool,
+    /// The digest table was released after the terminal commit; replays at or below
+    /// `highest_contiguous` are then duplicates that cannot be payload-compared here.
+    digests_released: bool,
     /// Events this recording may persist (mode-derived, or the legacy 2,048).
     event_cap: usize,
 }
@@ -790,8 +833,14 @@ impl<E> RecordingAssembly<E> {
             pending: None,
             finish_intent: None,
             finished: false,
+            digests_released: false,
         }
     }
+}
+
+fn release_digests<E>(state: &mut RecordingAssembly<E>) {
+    state.event_digests = BTreeMap::new();
+    state.digests_released = true;
 }
 
 struct PendingSegment<E> {
@@ -847,6 +896,10 @@ fn preflight_events<P: RecordingPersistencePort + ?Sized>(
                     "recording event replay changed its canonical payload",
                 ));
             }
+            duplicates += 1;
+            continue;
+        }
+        if state.digests_released && event.recording_seq <= persisted_highest {
             duplicates += 1;
             continue;
         }
@@ -2032,5 +2085,89 @@ mod tests {
         let new_event =
             service.record_events(RecordEvents { recording_id, events: vec![event(3, 2, 0xbb)] });
         assert_eq!(new_event.expect_err("new event rejected").kind(), PortErrorKind::Conflict);
+    }
+
+    fn numbered(n: u128) -> BeginRecording {
+        BeginRecording { recording_id: Uuid::from_u128(n).into(), ..begin(wall(1)) }
+    }
+
+    fn begin_and_finish(service: &RecordingCaptureService<FakePort>, n: u128) {
+        let request = numbered(n);
+        let recording_id = request.recording_id;
+        service.begin_recording(request).expect("begin");
+        service
+            .record_events(RecordEvents { recording_id, events: vec![event(2, 1, 0xaa)] })
+            .expect("event");
+        service.finish_recording(FinishRecording::without_digest(recording_id, 2)).expect("finish");
+    }
+
+    #[test]
+    fn finished_recordings_free_the_retained_id_bound() {
+        let port = Arc::new(FakePort::default());
+        let service = RecordingCaptureService::new(
+            Arc::clone(&port),
+            SegmentPolicy::default(),
+            NonZeroUsize::new(1).expect("non-zero recording limit"),
+        );
+        for n in 1..=20u128 {
+            begin_and_finish(&service, n);
+        }
+        service.begin_recording(numbered(100)).expect("next begin after finished recordings");
+    }
+
+    #[test]
+    fn unfinished_recording_still_counts_at_the_bound() {
+        let port = Arc::new(FakePort::default());
+        let service = RecordingCaptureService::new(
+            Arc::clone(&port),
+            SegmentPolicy::default(),
+            NonZeroUsize::new(1).expect("non-zero recording limit"),
+        );
+        begin_and_finish(&service, 1);
+        service.begin_recording(numbered(2)).expect("one unfinished fits");
+        let error = service.begin_recording(numbered(3)).expect_err("second unfinished refused");
+        assert_eq!(error.kind(), PortErrorKind::Resource);
+    }
+
+    #[test]
+    fn terminal_map_is_bounded_by_the_tombstone_ring() {
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        let total = TERMINAL_TOMBSTONE_RING + 5;
+        for n in 1..=total as u128 {
+            begin_and_finish(&service, n);
+        }
+        assert_eq!(service.recordings.lock().expect("recordings").len(), TERMINAL_TOMBSTONE_RING);
+        assert_eq!(service.terminal.lock().expect("terminal").len(), TERMINAL_TOMBSTONE_RING);
+        // The oldest was evicted; the newest is still a tombstone.
+        assert_eq!(
+            service.recording(numbered(1).recording_id).err().map(|e| e.kind()),
+            Some(PortErrorKind::NotFound),
+        );
+        assert!(service.recording(numbered(total as u128).recording_id).is_ok());
+    }
+
+    #[test]
+    fn replays_after_finish_are_duplicates_and_exact_finish_replays() {
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        begin_and_finish(&service, 7);
+        let recording_id = numbered(7).recording_id;
+        // Digests are released at finish: a replayed persisted sequence is a duplicate.
+        let replay = service
+            .record_events(RecordEvents { recording_id, events: vec![event(2, 1, 0xaa)] })
+            .expect("late exact replay");
+        assert_eq!(replay.duplicates, 1);
+        assert_eq!(replay.accepted, 0);
+        // Documented trade-off: a changed payload for a persisted sequence is no longer
+        // detected after the finish, because the digest table is gone.
+        let changed = service
+            .record_events(RecordEvents { recording_id, events: vec![event(2, 1, 0xbb)] })
+            .expect("changed replay counted as duplicate");
+        assert_eq!(changed.duplicates, 1);
+        let again = service
+            .finish_recording(FinishRecording::without_digest(recording_id, 2))
+            .expect("second identical finish");
+        assert!(again.exact_replay);
     }
 }
