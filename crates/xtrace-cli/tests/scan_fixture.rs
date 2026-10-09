@@ -168,11 +168,7 @@ fn scan_times_out_an_analyzer_that_closes_stdout_and_keeps_running() {
 }
 
 fn alive(pid: &str) -> bool {
-    Command::new("kill")
-        .args(["-0", pid])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    Command::new("kill").args(["-0", pid]).output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 #[test]

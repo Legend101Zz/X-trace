@@ -22,7 +22,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use uuid::Uuid;
 use xtrace_domain::static_claims::{
-    ANALYZER_INCOMPLETE_REASONS, AnalyzerLine, StaticClaimContext, StaticClaimError, framework_syntax,
+    ANALYZER_INCOMPLETE_REASONS, AnalyzerLine, StaticClaimContext, StaticClaimError,
+    framework_syntax,
 };
 use xtrace_domain::{ContentHash, ProjectId, SourceRevisionId};
 
@@ -272,7 +273,9 @@ pub fn process_transcript(
             }
         }
     }
-    if declared_claims.is_some_and(|declared| usize::try_from(declared).ok() != Some(lines_of_claims)) {
+    if declared_claims
+        .is_some_and(|declared| usize::try_from(declared).ok() != Some(lines_of_claims))
+    {
         // The analyzer's own count disagrees with what arrived: lines were lost or invented.
         reasons.insert("transcript_invalid");
     }
@@ -285,8 +288,11 @@ pub fn process_transcript(
     } else if !analyzer_complete && reasons.is_empty() {
         reasons.insert("analyzer_failed");
     }
-    debug_assert!(reasons.iter().all(|r| CLI_INCOMPLETE_REASONS.contains(r)
-        || ANALYZER_INCOMPLETE_REASONS.contains(r)));
+    debug_assert!(
+        reasons
+            .iter()
+            .all(|r| CLI_INCOMPLETE_REASONS.contains(r) || ANALYZER_INCOMPLETE_REASONS.contains(r))
+    );
 
     let mut operations: Vec<ScannedOperation> = operations.into_values().collect();
     for operation in &mut operations {
@@ -375,7 +381,9 @@ async fn run_analyzer(
     };
     let outcome = tokio::time::timeout(timeout, work).await;
     let (bytes, problem) = match outcome {
-        Ok(Ok((bytes, status))) => (bytes, if status.success() { None } else { Some("analyzer_failed") }),
+        Ok(Ok((bytes, status))) => {
+            (bytes, if status.success() { None } else { Some("analyzer_failed") })
+        }
         Ok(Err(_)) => (Vec::new(), Some("analyzer_failed")),
         Err(_) => (Vec::new(), Some("analyzer_timeout")),
     };
@@ -422,7 +430,9 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
     }
     // jaxrs is a valid claim vocabulary entry but no analyzer produces it yet.
     if args.framework == "jaxrs" {
-        return Err(invalid("no jaxrs analyzer exists yet; use spring-mvc, spring-webflux, express, fastify or nest"));
+        return Err(invalid(
+            "no jaxrs analyzer exists yet; use spring-mvc, spring-webflux, express, fastify or nest",
+        ));
     }
     framework_syntax(&args.framework).map_err(|_| {
         invalid("framework must be spring-mvc, spring-webflux, express, fastify or nest")
@@ -656,7 +666,8 @@ mod tests {
 
     #[test]
     fn end_count_mismatch_and_lines_after_end_are_invalid() {
-        let mismatch = scan(&[header("express"), claim("GET", r#"["/a"]"#, "a.js", 1, ""), end_ok(5)]);
+        let mismatch =
+            scan(&[header("express"), claim("GET", r#"["/a"]"#, "a.js", 1, ""), end_ok(5)]);
         assert_eq!(mismatch.incomplete_reasons, ["transcript_invalid"]);
         let after = scan(&[
             header("express"),
