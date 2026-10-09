@@ -27,6 +27,17 @@ There is one product binary (`xtrace`; the daemon is a library inside it). Web a
 (`crates/xtrace-daemon/assets/ui`, verified against a fresh `vite build` with `npm run check:embedded`). Migrations
 are compiled into the store crate, so no separate migration files ship.
 
+## Static analyzers and `xtrace scan`
+
+The release payload does not bundle the static analyzers. `xtrace scan` runs an analyzer as a separate subprocess and
+finds it only from the `--analyzer PATH` flag or, when the flag is absent, the environment variable
+`XTRACE_NODE_ANALYZER` (express, fastify, nest) or `XTRACE_JAVA_ANALYZER` (spring-mvc, spring-webflux). There is no
+default lookup: with neither set the command exits with a usage error naming the variable. The Node analyzer is built
+from `adapters/node` (`npm ci && npm run build`; entry `packages/analyzer/dist/main.js`, run with `node`, so point
+`--analyzer` at a small executable wrapper). The Java analyzer is `adapters/java/static-analyzer` and is not yet part
+of the Gradle build. CI proves the Node path end to end with `crates/xtrace-cli/tests/scan_real_node_analyzer.rs`,
+which scans the `express-basic` fixture with the built analyzer and reads the catalog back.
+
 ## Install, upgrade, uninstall
 
     tar -xzf xtrace-0.0.1-<platform>.tar.gz && cd xtrace-0.0.1-<platform>
