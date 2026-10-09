@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "note": "Human text for every stable honesty code. Clients key behaviour on the code (the object key), never on the text; the code is also exposed in title/aria-label. Wording follows ADR 0003 section 7: absence is 'not observed', never 'did not run'.",
+  "note": "Human text for every stable honesty code. Clients key behaviour on the code (the object key), never on the text; the code is also exposed in title/aria-label. Wording follows ADR 0003 section 7: an absence of evidence is worded as 'not observed', and no string claims what the program did or did not do beyond what was observed.",
   "markers": {
     "redacted": "Value withheld by a redaction rule.",
     "truncated": "Value cut at its size limit; only the retained prefix is shown.",
