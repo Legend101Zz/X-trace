@@ -1,0 +1,36 @@
+name: mac-diag
+on:
+  push:
+    branches: ["ultra/mac-diag"]
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {java: 21, node: 24}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with: {node-version: "${{ matrix.node }}"}
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with: {distribution: temurin, java-version: "${{ matrix.java }}"}
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with: {toolchain: stable}
+      - run: |
+          mkdir -p "$RUNNER_TEMP/mr/tmp"
+          npm ci --prefix adapters/node && npm test --prefix adapters/node
+          (cd adapters/java && ./gradlew --dependency-verification strict installDist agentDist fixtureBootJar)
+      - name: five
+        env:
+          TMPDIR: ${{ runner.temp }}/mr/tmp
+          XTRACE_TEST_SCRATCH_ROOT: ${{ runner.temp }}/mr/tmp
+          XTRACE_TEST_PRIVATE_SCRATCH: ${{ runner.temp }}/mr/tmp
+          RUST_BACKTRACE: "0"
+        run: |
+          cargo test --locked -p xtrace-cli --test java_premain_spring --test node_express_journey --test lifecycle_journey --test java_synthetic_adapter --no-fail-fast -- --nocapture 2>&1 | tail -150
+          cargo test --locked -p xtrace-daemon --test loopback_handshake --no-fail-fast -- --nocapture 2>&1 | tail -60

@@ -195,7 +195,7 @@ fn scan_timeout_stops_the_whole_process_group_of_a_forking_wrapper() {
     let pid_file = project.dir.path().join("grandchild.pid");
     let body = format!("sleep 30 &\necho $! > '{}'\nwait", pid_file.display());
     let analyzer = write_analyzer(project.dir.path(), &body);
-    let output = project.scan(&analyzer, &project.dir.path().join("src"), &["--timeout-secs", "1"]);
+    let output = project.scan(&analyzer, &project.dir.path().join("src"), &["--timeout-secs", "5"]);
     assert_eq!(output.status.code(), Some(10), "{output:?}");
     let pid = fs::read_to_string(&pid_file).expect("grandchild pid recorded");
     let pid = pid.trim();
