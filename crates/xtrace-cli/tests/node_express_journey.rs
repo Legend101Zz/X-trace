@@ -216,7 +216,11 @@ fn journey(fixture: &str) {
     assert_eq!(get(port, SENTINEL), 200, "status of the shutdown request");
     let closed = line_receiver.recv_timeout(Duration::from_secs(10)).expect("server close");
     assert_eq!(closed.trim(), "EXPRESS_SERVER_CLOSED");
-    let status = wait_for_child(&mut child.0, Duration::from_secs(20));
+    // After the server closes, `xtrace run` finalizes every recording through private-storage
+    // admission, which on macOS spawns `/bin/ls` per admitted directory (about 1,100 spawns for
+    // these eight recordings, ~7 ms each on a hosted runner, ~8 s) while the two fixtures run in
+    // parallel on three cores. The wait is for that bounded finalization, not for a hang.
+    let status = wait_for_child(&mut child.0, Duration::from_secs(90));
     assert!(status.success(), "Express run failed with {status}");
     stdout_reader.join().expect("join stdout reader");
     let stderr_text =

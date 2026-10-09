@@ -191,11 +191,15 @@ fn alive(pid: &str) -> bool {
 
 #[test]
 fn scan_timeout_stops_the_whole_process_group_of_a_forking_wrapper() {
+    // The first exec of a freshly written script can take over a second on macOS, so a 1 s
+    // timeout may expire before the wrapper has forked the grandchild and recorded its pid. 5 s
+    // is enough for the wrapper to start; the grandchild sleeps 30 s, so it is still the timeout
+    // that stops it, and the assertion that it is gone is unchanged.
     let project = Project::new();
     let pid_file = project.dir.path().join("grandchild.pid");
     let body = format!("sleep 30 &\necho $! > '{}'\nwait", pid_file.display());
     let analyzer = write_analyzer(project.dir.path(), &body);
-    let output = project.scan(&analyzer, &project.dir.path().join("src"), &["--timeout-secs", "1"]);
+    let output = project.scan(&analyzer, &project.dir.path().join("src"), &["--timeout-secs", "5"]);
     assert_eq!(output.status.code(), Some(10), "{output:?}");
     let pid = fs::read_to_string(&pid_file).expect("grandchild pid recorded");
     let pid = pid.trim();
