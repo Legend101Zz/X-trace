@@ -41,6 +41,7 @@
 
 #[cfg(unix)]
 mod attach;
+mod capture_args;
 mod catalog_cmd;
 mod commands;
 mod daemon;

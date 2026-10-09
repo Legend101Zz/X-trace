@@ -12,6 +12,8 @@ const DAEMON_DIRECTORY: &str = ".daemon";
 const SESSION_DIRECTORY: &str = "sessions";
 const LOCK_FILENAME: &str = "project.lock";
 const BOOTSTRAP_FILENAME: &str = "bootstrap.json";
+/// Private capture description written beside the bootstrap (CONTRACTS 10.3).
+const CAPTURE_FILENAME: &str = crate::capture_args::CAPTURE_FILE_NAME;
 const TEMP_BOOTSTRAP_PREFIX: &str = ".bootstrap.json.tmp-";
 const MAX_SESSIONS: usize = 64;
 
@@ -68,7 +70,7 @@ impl RuntimeDirectory {
         &self.path
     }
 
-    /// Removes only recognized bootstrap files through the admitted session descriptor.
+    /// Removes only recognized bootstrap and capture files through the admitted session descriptor.
     pub(crate) fn cleanup(&mut self) -> Result<(), CliError> {
         if !self.active {
             return Ok(());
@@ -171,7 +173,10 @@ fn remove_session_directory(
 ) -> Result<(), CliError> {
     let names = session.bounded_child_names(9).map_err(|_| CliError::PrivateStorageUnavailable)?;
     for name in names {
-        if name != BOOTSTRAP_FILENAME && !valid_temp_bootstrap_name(&name) {
+        if name != BOOTSTRAP_FILENAME
+            && name != CAPTURE_FILENAME
+            && !valid_temp_bootstrap_name(&name)
+        {
             return Err(CliError::PrivateStorageUnavailable);
         }
         session.remove_private_file(&name).map_err(|_| CliError::PrivateStorageUnavailable)?;

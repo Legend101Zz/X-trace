@@ -520,6 +520,12 @@ async fn handle_connection(
         }
     };
 
+    // CONTRACTS 4.2: the launch arms the session. The private capture.json beside the
+    // bootstrap names the mode; anything unreadable leaves the session standard.
+    let armed_mode =
+        ctx.bootstrap.as_ref().map_or(xtrace_domain::CaptureMode::Standard, |handle| {
+            crate::capture_config::armed_mode_beside(handle.path())
+        });
     let mut session = Session::new(HandshakeInputs {
         session_secret: ctx.session_secret.clone(),
         tls_exporter,
@@ -533,6 +539,8 @@ async fn handle_connection(
         health_interval: HealthInterval(ctx.config.health_interval),
         role: HandshakeRole::Daemon,
     });
+
+    session.arm(armed_mode);
 
     if let Err(err) = session.accept_adapter_hello(&first) {
         let _ = send_protocol_error_stream(
@@ -691,13 +699,21 @@ async fn handle_connection(
                     };
                     match post_hello_session.accept_post_hello(&envelope) {
                         Ok(admission) => {
+                            for code in &admission.limitations {
+                                warn!(
+                                    limitation = *code,
+                                    "adapter claimed a capture policy this session is not armed for; \
+                                     the recording is served under the standard policy",
+                                );
+                            }
                             if let Some(pipeline) = ctx.recording_pipeline.as_ref() {
                                 if let Err(err) = pipeline
-                                    .process(
+                                    .process_armed(
                                         admission.incoming.clone(),
                                         ctx.project_id,
                                         ctx.runtime_session_id,
                                         ctx.shutdown.clone(),
+                                        post_hello_session.armed_mode(),
                                     )
                                     .await
                                 {

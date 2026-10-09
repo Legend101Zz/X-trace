@@ -175,6 +175,9 @@ pub enum XtraceCommand {
         /// Stable, run-scoped transport binding (must be paired with --application-component).
         #[arg(long = "binding-key", requires = "application_component")]
         binding_key: Option<String>,
+        /// Capture depth, application scope and launcher (CONTRACTS 11.2).
+        #[command(flatten)]
+        capture: crate::capture_args::CaptureArgs,
         /// Java executable followed by its original arguments.
         #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<OsString>,
@@ -299,9 +302,11 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
             observed_endpoint_policy,
             application_component,
             binding_key,
+            capture,
             command,
         } => {
             validate_safe_run_identity(application_component.as_deref(), binding_key.as_deref())?;
+            let capture_options = capture.validate()?;
             if let Some(java_agent) = java_agent {
                 crate::run::run(
                     project_dir,
@@ -309,11 +314,19 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
                     observed_endpoint_policy,
                     application_component,
                     binding_key,
+                    capture_options,
                     command,
                 )
                 .await
             } else if let Some(node_adapter) = node_adapter {
                 let node_mode = node_mode.unwrap_or_else(|| "auto".to_owned());
+                if capture.any_given() {
+                    return Err(CliError::InvalidArgument(
+                        "Node capture does not yet support --capture-depth, --app-package, \
+                         --source-root or --launcher"
+                            .to_string(),
+                    ));
+                }
                 if observed_endpoint_policy.is_some()
                     || application_component.is_some()
                     || binding_key.is_some()

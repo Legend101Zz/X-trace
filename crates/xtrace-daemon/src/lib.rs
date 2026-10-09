@@ -89,6 +89,7 @@
 )]
 
 pub mod bootstrap;
+pub mod capture_config;
 pub mod config;
 pub mod daemon;
 pub mod error;
