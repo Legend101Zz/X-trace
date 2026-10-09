@@ -277,7 +277,8 @@ fn migration_v9_counts_route_length_in_bytes_and_rejects_nul() {
         )
     };
     // 600 two-byte characters: 601 characters but 1201 bytes.
-    insert(&format!("/{}", "\u{e9}".repeat(600))).expect_err("1201 bytes exceed the 1024 byte limit");
+    insert(&format!("/{}", "\u{e9}".repeat(600)))
+        .expect_err("1201 bytes exceed the 1024 byte limit");
     insert(&format!("/{}", "\u{e9}".repeat(500))).expect("1001 bytes fit");
     insert("/a\u{0}b").expect_err("a NUL byte in the route is rejected");
 }

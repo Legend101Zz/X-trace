@@ -768,7 +768,8 @@ mod tests {
 
     #[test]
     fn text_output_states_per_framework_coverage() {
-        let result = scan(&[header("express"), claim("GET", r#"["/a"]"#, "a.js", 1, ""), end_ok(1)]);
+        let result =
+            scan(&[header("express"), claim("GET", r#"["/a"]"#, "a.js", 1, ""), end_ok(1)]);
         let mut out = Vec::new();
         write_text(&mut out, &result).expect("writes");
         let text = String::from_utf8(out).expect("utf8");

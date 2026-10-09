@@ -15,12 +15,8 @@ use serde::Serialize;
 /// token: a static wildcard stands for an unknown set of routes, so a match would overstate what
 /// the scan proved. `route_computed` is listed so that the rule does not depend on every analyzer
 /// pairing it with another unresolved code.
-pub const UNLINKABLE_LIMITATIONS: &[&str] = &[
-    "mount_unresolved",
-    "route_computed",
-    "route_constant_unresolved",
-    "route_wildcard",
-];
+pub const UNLINKABLE_LIMITATIONS: &[&str] =
+    &["mount_unresolved", "route_computed", "route_constant_unresolved", "route_wildcard"];
 
 /// One operation found by a static scan, in identity form.
 #[derive(Clone, Debug, PartialEq, Eq)]
