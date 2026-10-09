@@ -96,8 +96,8 @@ fn direct_node_http_run_persists_private_concurrent_cjs_and_esm_recordings_acros
     assert_recording_evidence(&reopened, &repo, &data_home);
 }
 
-/// `--node-mode auto` injects both the `--require` and `--import` preloads; capture must still start
-/// once, so each request yields exactly one root whether the entry is CommonJS or an ES module.
+/// `--node-mode auto` injects the `--require` preload only; it must capture CommonJS and ES module
+/// entries once each without perturbing a CommonJS entry's `nextTick`/microtask ordering.
 #[test]
 fn auto_mode_records_cjs_and_esm_entries_once_each() {
     let root = temp_root();
@@ -126,6 +126,45 @@ fn auto_mode_records_cjs_and_esm_entries_once_each() {
     let second = list_recordings(&repo, &data_home);
     assert_eq!(second["recordings"].as_array().expect("recordings").len(), 4);
     assert_recording_evidence(&second, &repo, &data_home);
+}
+
+#[test]
+fn auto_mode_keeps_next_tick_before_promise_microtask_for_a_cjs_entry() {
+    let root = temp_root();
+    let repo = root.path().join("repository");
+    let data_home = root.path().join("data");
+    std::fs::create_dir_all(&repo).expect("create repository");
+    let init = cli()
+        .args(["init", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("initialize project");
+    assert!(init.status.success(), "init failed: {}", diagnostic(&init));
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let adapter_dist = workspace.join("adapters/node/packages/adapter-core/dist");
+    let app = root.path().join("ordering.cjs");
+    std::fs::write(
+        &app,
+        "const order = [];\nsetImmediate(() => { order.push('immediate'); console.log('ORDER ' + order.join(',')); });\nPromise.resolve().then(() => order.push('microtask'));\nprocess.nextTick(() => order.push('tick'));\n",
+    )
+    .expect("write ordering fixture");
+    let output = cli()
+        .args(["run", "--project-dir"])
+        .arg(&repo)
+        .args(["--node-adapter"])
+        .arg(adapter_dist)
+        .args(["--node-mode", "auto", "--", "node"])
+        .arg(app)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("run ordering fixture");
+    assert!(output.status.success(), "run failed: {}", diagnostic(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ORDER tick,microtask,immediate"),
+        "auto mode perturbed CommonJS ordering: {stdout}"
+    );
 }
 
 #[test]

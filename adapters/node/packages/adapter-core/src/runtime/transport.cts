@@ -19,7 +19,6 @@ export interface HttpCaptureTransport {
 /** Facts resolved while the request ran; the worker uses them when it releases the held start. */
 export interface RecordingSummary {
   route?: string;
-  urlShape?: string;
   httpStatus?: number;
   outcome?: "responded" | "exception-propagated" | "client-aborted" | "unobserved";
   limitations?: readonly string[];

@@ -13,7 +13,6 @@ const PATCHED = Symbol.for("xtrace.node.http.capture.v2");
 const SEEN = new WeakSet<object>();
 const HTTP_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"]);
 const ROOT_SYMBOL = "node:http.Server.request";
-const MAX_URL_SHAPE_BYTES = 2048;
 type RequestListener = (request: IncomingMessage, response: ServerResponse) => unknown;
 type Emit = (this: unknown, event: string | symbol, ...args: unknown[]) => boolean;
 
@@ -58,27 +57,27 @@ export function wrapRequestListener(listener: RequestListener): RequestListener 
   };
 }
 
-/** Path only: no query, fragment or authority, so URL canaries cannot reach the recording. */
-export function urlShapeOf(rawUrl: string | undefined): string {
-  if (typeof rawUrl !== "string" || !rawUrl.startsWith("/")) return "";
-  const cut = rawUrl.search(/[?#]/);
-  const path = cut < 0 ? rawUrl : rawUrl.slice(0, cut);
-  return Buffer.byteLength(path) > MAX_URL_SHAPE_BYTES ? "" : path;
-}
-
 function captureRequest(_thisArg: unknown, request: IncomingMessage, response: ServerResponse, invoke: () => unknown): unknown {
   const transport = activeTransport;
   if (!transport || SEEN.has(request) || captureSuppressed()) return invoke();
+  if (typeof response?.once !== "function") return invoke();
   SEEN.add(request);
   const startedAtNs = process.hrtime.bigint();
   const method = typeof request.method === "string" && HTTP_METHODS.has(request.method) ? request.method : "";
   const context = createContext(method, startedAtNs);
-  context.urlShape = urlShapeOf(request.url);
   if (!transport.start(context.id, method, startedAtNs, context.holdStart)) return invoke();
 
   return runInContext(context, () => {
-    response.once("finish", () => runInContext(context, () => closeRecording(context, "response-finish", response, transport, request)));
-    response.once("close", () => runInContext(context, () => closeRecording(context, "response-close", response, transport, request)));
+    // Listener bodies must never throw into the application's response machinery.
+    const close = (kind: "response-finish" | "response-close") => {
+      try {
+        runInContext(context, () => closeRecording(context, kind, response, transport, request));
+      } catch {
+        context.finished = true;
+      }
+    };
+    response.once("finish", () => close("response-finish"));
+    response.once("close", () => close("response-close"));
     context.frameEventId = recordEvent(context, transport, events.frameEnter(ROOT_SYMBOL));
     if (context.frameEventId) context.frameStack.push(context.frameEventId);
     try {

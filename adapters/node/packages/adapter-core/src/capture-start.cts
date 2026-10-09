@@ -19,6 +19,35 @@ export function claimCaptureStart(): boolean {
   return true;
 }
 
+export interface CapturePlan {
+  /** Capability names the worker handshake advertises (computed from detection, before install). */
+  planned: string[];
+  /** Installs the modules for the transport, then sets the recording profile (limitations, hold). */
+  install(transport: HttpCaptureTransport): void;
+}
+
+/** One place for module detection, registry install and capture profile, shared by the CJS and ESM entries. */
+export function planCapture(): CapturePlan {
+  const environment: InstallEnvironment = { nodeVersion: process.version, packageVersion: "" };
+  let transport: HttpCaptureTransport | undefined;
+  const modules: InstrumentationModule[] = [nodeHttpModule(() => transport!), asyncContextModule(), expressModule()];
+  const planned = modules.filter((module) => module.detect(environment).supported).map((module) => module.descriptor.capability);
+  return {
+    planned,
+    install(created) {
+      transport = created;
+      const registry = new ModuleRegistry();
+      for (const module of modules) registry.tryInstall(module, environment);
+      // Recordings carry the limitations that really hold: the baseline plus every module that did not install.
+      setCaptureProfile({
+        limitations: effectiveLimitations(new Set(registry.statuses().filter((status) => status.state === "installed").map((status) => status.name))),
+        // The start is held briefly (bounded in the worker) so a route resolved at finish can ride on it.
+        holdStart: registry.capabilities().includes("http.server.route_template"),
+      });
+    },
+  };
+}
+
 export function startCaptureFromRequire(): void {
   if (!claimCaptureStart()) return;
   const bootstrapPath = process.env.XTRACE_BOOTSTRAP_PATH;
@@ -27,10 +56,7 @@ export function startCaptureFromRequire(): void {
     warnUnavailable("XTR-NODE-BOOTSTRAP");
     return;
   }
-  const environment: InstallEnvironment = { nodeVersion: process.version, packageVersion: "" };
-  let transport: HttpCaptureTransport | undefined;
-  const modules: InstrumentationModule[] = [nodeHttpModule(() => transport!), asyncContextModule(), expressModule()];
-  const planned = modules.filter((module) => module.detect(environment).supported).map((module) => module.descriptor.capability);
+  const plan = planCapture();
   const startupBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   let worker: Worker;
   try {
@@ -40,7 +66,7 @@ export function startCaptureFromRequire(): void {
         bootstrapPath,
         startupBarrier,
         manifestPath: join(__dirname, "node-capabilities.json"),
-        capabilities: planned,
+        capabilities: plan.planned,
       },
     });
   } catch {
@@ -55,15 +81,7 @@ export function startCaptureFromRequire(): void {
     return;
   }
   try {
-    transport = createHttpCaptureTransport(worker);
-    const registry = new ModuleRegistry();
-    for (const module of modules) registry.tryInstall(module, environment);
-    // Recordings carry the limitations that really hold: the baseline plus every module that did not install.
-    setCaptureProfile({
-      limitations: effectiveLimitations(new Set(registry.statuses().filter((status) => status.state === "installed").map((status) => status.name))),
-      // The route is only known when the response finishes, so the start is held while a route module is active.
-      holdStart: registry.capabilities().includes("http.server.route_template"),
-    });
+    plan.install(createHttpCaptureTransport(worker));
     worker.unref();
   } catch {
     void worker.terminate();

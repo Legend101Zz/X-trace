@@ -40,6 +40,8 @@ async function filesUnder(directory) {
   return files;
 }
 
+// Generated files from older builds must not stay in the hashed, launchable dist.
+await rm(join(target, "node-http-manifest.json"), { force: true });
 const manifestPath = join(target, "manifest.sha256");
 const files = (await filesUnder(target)).filter((path) => path !== manifestPath).sort();
 const lines = [];

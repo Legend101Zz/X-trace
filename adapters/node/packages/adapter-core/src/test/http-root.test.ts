@@ -7,7 +7,7 @@ import test from "node:test";
 import type { CaptureEvent, HttpCaptureTransport, RecordingSummary } from "../runtime/transport.cjs";
 
 const require = createRequire(import.meta.url);
-const { installHttpCapture, urlShapeOf } = require("../http-capture.cjs") as typeof import("../http-capture.cjs");
+const { installHttpCapture } = require("../http-capture.cjs") as typeof import("../http-capture.cjs");
 
 interface Recorded { method: string; events: CaptureEvent[]; summary?: RecordingSummary; finalSequence?: bigint; dropped?: number }
 
@@ -36,14 +36,7 @@ async function listen(server: http.Server): Promise<number> {
 const settle = () => new Promise((resolve) => setTimeout(resolve, 15));
 const closeServer = (server: http.Server) => new Promise<void>((resolve, reject) => { server.closeAllConnections(); server.close((error) => error ? reject(error) : resolve()); });
 
-test("url shape drops query and fragment and rejects non-path targets", () => {
-  assert.equal(urlShapeOf("/users/7?token=secret-canary#frag"), "/users/7");
-  assert.equal(urlShapeOf("http://evil.example/x?q=1"), "");
-  assert.equal(urlShapeOf(undefined), "");
-  assert.equal(urlShapeOf(`/${"a".repeat(3000)}`), "");
-});
-
-test("server.on('request') and new http.Server are each captured exactly once with status and shape", async () => {
+test("server.on('request') and new http.Server are each captured exactly once with status", async () => {
   const transport = new Transport();
   installHttpCapture(transport);
   const canary = "query-canary-5f2a";
@@ -59,8 +52,8 @@ test("server.on('request') and new http.Server are each captured exactly once wi
   }
   const recordings = transport.list();
   assert.equal(recordings.length, 3);
-  assert.deepEqual(recordings.map((r) => [r.summary?.urlShape, r.summary?.httpStatus, r.summary?.outcome]), [
-    ["/ok", 200, "responded"], ["/missing/1", 404, "responded"], ["/ctor", 500, "responded"],
+  assert.deepEqual(recordings.map((r) => [r.summary?.httpStatus, r.summary?.outcome]), [
+    [200, "responded"], [404, "responded"], [500, "responded"],
   ]);
   for (const recording of recordings) {
     assert.deepEqual(recording.events.map((event) => event.kind), ["frame-enter", "frame-exit", "response-finish"]);
@@ -105,7 +98,7 @@ test("50 concurrent keep-alive requests produce 50 distinct recordings with cont
   await closeServer(server);
   const recordings = transport.list();
   assert.equal(recordings.length, 50);
-  assert.equal(new Set(recordings.map((r) => r.summary?.urlShape)).size, 50);
+  assert.equal(new Set(transport.recordings.keys()).size, 50);
   for (const recording of recordings) {
     assert.deepEqual(recording.events.map((event) => event.sequence), [2n, 3n, 4n]);
     assert.equal(recording.finalSequence, 4n);
@@ -123,7 +116,7 @@ test("https servers get the same root at the shared emit seam", () => {
   assert.equal(handled, 1);
   const [recording] = transport.list();
   assert.equal(recording?.method, "DELETE");
-  assert.deepEqual([recording?.summary?.urlShape, recording?.summary?.httpStatus], ["/things/1", 204]);
+  assert.equal(recording?.summary?.httpStatus, 204);
 });
 
 test("a request already rooted is not recorded twice and unknown methods map to empty", () => {

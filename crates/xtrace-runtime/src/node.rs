@@ -62,11 +62,12 @@ impl LaunchError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Explicit Node module mode used to select the adapter preload.
 pub enum NodeMode {
-    /// Both preloads are injected; the adapter starts exactly once, whichever module system the
-    /// application entry uses. Known limitation: `--import` makes Node load a CommonJS entry
-    /// through the ES module loader, which changes `process.nextTick` versus promise microtask
-    /// ordering and adds stack frames (verified on Node 22.23.0 and 24.21.0); use `CommonJs`
-    /// when that matters.
+    /// Only the `--require` preload is injected. The adapter patches `node:http`, which is
+    /// independent of the module system, so one preload captures CommonJS and ES module entries
+    /// alike and leaves a CommonJS entry on Node's CommonJS loader. `--import` is deliberately
+    /// not used here: it makes Node load a CommonJS entry through the ES module loader, which
+    /// flips `process.nextTick` versus promise microtask ordering and adds stack frames
+    /// (verified on Node 22.23.0). Use `EsModule` to add the `--import` preload explicitly.
     Auto,
     /// CommonJS application launched with `--require` only.
     CommonJs,
@@ -195,7 +196,7 @@ impl NodeLaunch {
     }
 
     /// Builds the child's `NODE_OPTIONS`: the application's own options first, then the adapter
-    /// preloads this mode selects (`--require` for CommonJS, `--import` for ESM, both for Auto).
+    /// preloads this mode selects (`--require` for CommonJS and Auto, `--import` for ESM).
     fn node_options(&self) -> Result<String, LaunchError> {
         let mut options =
             self.original_options.as_ref().and_then(|v| v.to_str()).unwrap_or("").to_owned();
@@ -209,7 +210,7 @@ impl NodeLaunch {
             let value = quote_node_option(&self.adapter.join("register.cjs"))?;
             push(format!("--require={value}"));
         }
-        if matches!(self.mode, NodeMode::Auto | NodeMode::EsModule) {
+        if matches!(self.mode, NodeMode::EsModule) {
             let value = file_url(&self.adapter.join("register.mjs"))?;
             push(format!("--import={value}"));
         }
@@ -1073,15 +1074,12 @@ mod tests {
     }
 
     #[test]
-    fn spawn_options_contain_require_and_import_once() {
+    fn auto_mode_injects_the_require_preload_only() {
         let options =
             launch_for(NodeMode::Auto, Some("--max-old-space-size=64")).node_options().unwrap();
         assert_eq!(options.matches("--require=").count(), 1, "{options}");
-        assert_eq!(options.matches("--import=").count(), 1, "{options}");
-        assert!(
-            options.starts_with("--max-old-space-size=64 --require=\"/adapter dir/register.cjs\"")
-        );
-        assert!(options.ends_with("--import=file:///adapter%20dir/register.mjs"), "{options}");
+        assert_eq!(options.matches("--import").count(), 0, "{options}");
+        assert_eq!(options, "--max-old-space-size=64 --require=\"/adapter dir/register.cjs\"");
     }
 
     #[test]

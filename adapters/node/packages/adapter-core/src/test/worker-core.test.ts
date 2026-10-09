@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
@@ -254,4 +254,59 @@ test("worker output decodes with the shared protocol and matches the shape of th
   assert.equal(mine.httpStatus, goldenOutcome.httpStatus);
   assert.equal(mine.thrownFromEventId, goldenOutcome.thrownFromEventId);
   assert.equal(mine.exception?.exceptionType, goldenOutcome.exception?.exceptionType);
+});
+
+test("a held start is released after the hold window without a route and the finish says so", async () => {
+  const sent: Sent[] = [];
+  const assembler = createRecordingAssembler(async (id, payload) => { sent.push({ id, payload }); return undefined; }, () => 5n, 20);
+  await assembler.handle(start({ holdStart: true }));
+  await assembler.handle(event(2n));
+  assert.equal(sent.length, 0, "held inside the window");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(sent[0]?.payload.case, "recordingStarted", "released by the timer while the request is still in flight");
+  assert.equal((sent[0]!.payload.value as RecordingStarted).matchedRouteTemplate, "");
+  assert.equal(sent.length, 2, "held event follows the start");
+  await assembler.handle(finish({ route: "/owners/:id", httpStatus: 200, outcome: "responded", limitations: [] }));
+  assert.ok(finished(sent).unsupportedCapabilityCodes.includes("route_unavailable"), "the start carries no route, so the finish must not claim one");
+});
+
+test("a start released with its finish keeps the route and claims no route limitation", async () => {
+  const { sent, assembler } = harness();
+  await assembler.handle(start({ holdStart: true }));
+  await assembler.handle(finish({ route: "/owners/:id", httpStatus: 200, outcome: "responded", limitations: [] }));
+  assert.equal((sent[0]!.payload.value as RecordingStarted).matchedRouteTemplate, "/owners/:id");
+  assert.deepEqual(finished(sent).unsupportedCapabilityCodes, []);
+});
+
+test("both entry points build capture through the one shared plan and install the same profile", async () => {
+  const { planCapture } = require("../capture-start.cjs") as typeof import("../capture-start.cjs");
+  const here = dirname(fileURLToPath(import.meta.url));
+  const entries = [await readFile(resolve(here, "../capture-start.cjs"), "utf8"), await readFile(resolve(here, "../start-capture.js"), "utf8")];
+  for (const source of entries) {
+    assert.match(source, /planCapture\)?\(/, "entry uses the shared plan");
+    assert.match(source, /capabilities: plan\.planned/, "entry advertises the planned capabilities");
+    assert.match(source, /plan\.install\(/, "entry installs through the shared plan");
+  }
+  const plan = planCapture();
+  assert.ok(plan.planned.includes("http.server.request_root"));
+  const fake: HttpCaptureTransport = {
+    start: () => true, event: () => true, finish: () => true, onFailure() {}, close() {},
+  };
+  plan.install(fake);
+  const profile = context.captureProfile();
+  assert.ok(profile.limitations.includes("values_unavailable"), "ESM and CJS recordings carry the baseline limitations");
+});
+
+test("every shared xtp-agent golden decodes with the shared protocol and re-encodes byte-identically", async () => {
+  const directory = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../../../schema/fixtures/xtp-agent");
+  let checked = 0;
+  for (const name of (await readdir(directory)).filter((file) => file.endsWith(".json")).sort()) {
+    const fixture = JSON.parse(await readFile(resolve(directory, name), "utf8")) as { bytes_hex?: string };
+    if (typeof fixture.bytes_hex !== "string") continue;
+    const bytes = Buffer.from(fixture.bytes_hex, "hex");
+    const envelope = fromBinary(AgentEnvelopeSchema, bytes);
+    assert.equal(Buffer.from(toBinary(AgentEnvelopeSchema, envelope)).toString("hex"), fixture.bytes_hex, name);
+    checked += 1;
+  }
+  assert.ok(checked >= 10, `decoded ${checked} goldens`);
 });

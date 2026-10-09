@@ -20,8 +20,6 @@ export interface RecordingContext {
   rootCreated: boolean;
   /** Route template once a framework module resolves it; empty when unresolved. */
   route: string;
-  /** Path with the query string removed; empty until the HTTP root records it. */
-  urlShape: string;
   /** Response status once observed; 0 means not observed. */
   status: number;
   threw: boolean;
@@ -46,6 +44,10 @@ let profile: CaptureProfile = { limitations: [], holdStart: false };
 
 export function setCaptureProfile(next: CaptureProfile): void {
   profile = { limitations: [...next.limitations], holdStart: next.holdStart };
+}
+
+export function captureProfile(): CaptureProfile {
+  return { limitations: [...profile.limitations], holdStart: profile.holdStart };
 }
 
 /** Resolves a route template from the finished request; framework modules register one each. */
@@ -98,7 +100,6 @@ export function createContext(method: string, startedAtNs: bigint): RecordingCon
     frameEventId: "",
     rootCreated: true,
     route: "",
-    urlShape: "",
     status: 0,
     threw: false,
     thrownFromEventId: "",
@@ -145,7 +146,6 @@ export function finishContext(context: RecordingContext, transport: HttpCaptureT
   const duration = process.hrtime.bigint() - context.startedAtNs;
   const summary: RecordingSummary = {
     route: context.route,
-    urlShape: context.urlShape,
     httpStatus: context.status,
     outcome: context.outcome,
     limitations: [...context.limitations].sort(),

@@ -56,6 +56,14 @@ export type SendFn = (messageId: string, payload: AgentEnvelope["payload"], corr
 /** Events held back per recording while the route is unresolved; beyond this the start is released without it. */
 export const MAX_HELD_EVENTS = 4096;
 
+/**
+ * Longest a RecordingStarted is held waiting for a route that is only known at response finish.
+ * After this the start goes out without it, so a long-running, crashing or killed request is
+ * still visible (and reopens as partial). A process that dies inside this window loses that
+ * request: the documented trade-off for carrying the route on the start.
+ */
+export const HOLD_START_MS = 250;
+
 interface RecordingState {
   bytes: Uint8Array;
   eventIds: string[];
@@ -65,6 +73,9 @@ interface RecordingState {
   /** RecordingStarted has been sent. */
   started: boolean;
   held: InputMessage[];
+  /** Start went out before the response finished, so it carries no route template. */
+  routeLost: boolean;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 /** Config the handshake advertises per capability name; unknown names are never advertised. */
@@ -76,9 +87,10 @@ const CAPABILITY_CONFIG: Record<string, Record<string, string>> = {
     handler_depth: "registered-listener-call",
     response_boundary: "finish-or-close",
     async_handler_completion: "unobserved",
+    abort_attribution: "connection-closed-before-finish",
   },
   async_correlation: { mechanism: "AsyncLocalStorage", scope: "request-callback-and-descendant-async-resources" },
-  "http.server.route_template": { source: "express-layer-route-path", scope: "express-4-and-5" },
+  "http.server.route_template": { source: "express-layer-route-path", scope: "literal-path-on-app-or-unmounted-router", mounted_routers: "unresolved", path_form: "as-authored" },
 };
 
 const START_KINDS: Record<CaptureEventKind, RecordingEventKind> = {
@@ -231,7 +243,11 @@ export interface RecordingAssembler {
   flushHeld(): Promise<void>;
 }
 
-export function createRecordingAssembler(send: SendFn, now: () => bigint = () => process.hrtime.bigint()): RecordingAssembler {
+export function createRecordingAssembler(
+  send: SendFn,
+  now: () => bigint = () => process.hrtime.bigint(),
+  holdMs: number = HOLD_START_MS,
+): RecordingAssembler {
   const recordings = new Map<string, RecordingState>();
 
   async function sendStart(recordingId: string, state: RecordingState, summary?: RecordingSummary): Promise<void> {
@@ -263,7 +279,11 @@ export function createRecordingAssembler(send: SendFn, now: () => bigint = () =>
   }
 
   async function release(recordingId: string, state: RecordingState, summary?: RecordingSummary): Promise<void> {
-    if (!state.started) await sendStart(recordingId, state, summary);
+    if (state.timer) clearTimeout(state.timer);
+    if (!state.started) {
+      state.routeLost = summary === undefined;
+      await sendStart(recordingId, state, summary);
+    }
     for (const held of state.held.splice(0)) await sendEvent(recordingId, state, held);
   }
 
@@ -283,11 +303,18 @@ export function createRecordingAssembler(send: SendFn, now: () => bigint = () =>
           hold: message.holdStart === true,
           started: false,
           held: [],
+          routeLost: false,
         };
         recordings.set(recordingId, state);
         // Without a module that can still resolve a route the start goes out immediately, so an
         // interrupted request is visible (and reopens as partial) instead of vanishing.
         if (!state.hold) await sendStart(recordingId, state);
+        else {
+          state.timer = setTimeout(() => {
+            if (recordings.get(recordingId) === state && !state.started) void release(recordingId, state).catch(() => undefined);
+          }, holdMs);
+          state.timer.unref?.();
+        }
         return true;
       }
       const state = recordings.get(recordingId);
@@ -307,6 +334,8 @@ export function createRecordingAssembler(send: SendFn, now: () => bigint = () =>
         const digest = Buffer.from(await blake3(Buffer.from(state.eventIds.join(""), "utf8")), "hex");
         const dropped = Math.max(0, Math.min(message.droppedEvents ?? 0, 0xffff_ffff));
         const limitations = (summary?.limitations ?? []).filter((code) => /^[a-z][a-z0-9_]{0,127}$/.test(code)).slice(0, 64);
+        // The start already went out without the route, so the finished recording must not claim one.
+        if (state.routeLost && !limitations.includes("route_unavailable")) limitations.push("route_unavailable");
         await send(`node-http-${recordingId}-finish`, {
           case: "recordingFinished",
           value: create(RecordingFinishedSchema, {
