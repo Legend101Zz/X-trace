@@ -158,8 +158,8 @@ fn migration_v9_accepts_general_routes_and_links_with_a_bound_tuple() {
         )
         .expect_err("a second operation cannot reuse the fingerprint");
     assert!(
-        duplicate.to_string().contains("UNIQUE"),
-        "rejected by the fingerprint UNIQUE constraint, not by a type error: {duplicate}"
+        duplicate.to_string().contains("endpoint_fingerprint"),
+        "rejected by the endpoint_fingerprint UNIQUE constraint, not by a type error: {duplicate}"
     );
     connection
         .execute(
@@ -226,4 +226,58 @@ fn migration_v9_keeps_structural_limits_and_new_reason_codes() {
         params![recording],
     );
     raw_route_retained.expect_err("an unmatched row can never retain the raw route");
+}
+
+#[test]
+fn migration_v9_rejects_links_that_skip_the_foreign_key_through_nulls() {
+    let (_dir, mut connection) = fresh_database();
+    let seed = seed_v3_rows(&connection);
+    apply_v9(&mut connection);
+    let recording = uuid7();
+    connection
+        .execute(
+            "INSERT INTO recordings (recording_id, project_id, runtime_session_id, status, opened_at) VALUES (?1, ?2, ?3, 'complete', 't')",
+            params![recording, seed.project, uuid7()],
+        )
+        .expect("recording");
+    // SQLite skips a composite foreign key when any child column is NULL, so a linked row with a
+    // NULL method and a nonexistent operation id must be stopped by the CHECK instead.
+    let null_method = connection.execute(
+        "INSERT INTO recording_endpoint_observations (recording_id, project_id, disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code) VALUES (?1, ?2, 'linked', 'runtime-route-v1', ?3, 'svc', 'default', NULL, '/x', NULL)",
+        params![recording, seed.project, uuid7()],
+    );
+    assert!(
+        null_method.expect_err("linked row with NULL method").to_string().contains("CHECK"),
+        "stopped by the CHECK constraint"
+    );
+    let null_reason = connection.execute(
+        "INSERT INTO recording_endpoint_observations (recording_id, project_id, disposition, observation_policy_id, application_component, binding_key, reason_code) VALUES (?1, ?2, 'unmatched', 'runtime-route-v1', 'svc', 'default', NULL)",
+        params![recording, seed.project],
+    );
+    assert!(
+        null_reason.expect_err("unmatched row without reason").to_string().contains("CHECK"),
+        "stopped by the CHECK constraint"
+    );
+    let dangling = connection.execute(
+        "INSERT INTO recording_endpoint_observations (recording_id, project_id, disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code) VALUES (?1, ?2, 'linked', 'runtime-route-v1', ?3, 'svc', 'default', 'GET', '/x', NULL)",
+        params![recording, seed.project, uuid7()],
+    );
+    dangling.expect_err("a link to a nonexistent operation is rejected");
+}
+
+#[test]
+fn migration_v9_counts_route_length_in_bytes_and_rejects_nul() {
+    let (_dir, mut connection) = fresh_database();
+    let seed = seed_v3_rows(&connection);
+    apply_v9(&mut connection);
+    let insert = |route: &str| {
+        connection.execute(
+            "INSERT INTO operations (operation_id, project_id, transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint, created_at) VALUES (?1, ?2, 'http', 'GET', ?3, 'svc', 'default', 1, randomblob(32), 't')",
+            params![uuid7(), seed.project, route],
+        )
+    };
+    // 600 two-byte characters: 601 characters but 1201 bytes.
+    insert(&format!("/{}", "\u{e9}".repeat(600))).expect_err("1201 bytes exceed the 1024 byte limit");
+    insert(&format!("/{}", "\u{e9}".repeat(500))).expect("1001 bytes fit");
+    insert("/a\u{0}b").expect_err("a NUL byte in the route is rejected");
 }

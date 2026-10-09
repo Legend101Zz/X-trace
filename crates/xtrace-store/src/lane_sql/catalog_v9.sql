@@ -25,8 +25,10 @@ CREATE TABLE operations_v9 (
                                     ('GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE', 'CONNECT')),
     route_template              TEXT NOT NULL CHECK(length(CAST(route_template AS BLOB)) BETWEEN 1 AND 1024
                                     AND substr(route_template, 1, 1) = '/'
+           AND instr(CAST(route_template AS BLOB), x'00') = 0
                                     AND instr(route_template, '?') = 0
                                     AND instr(route_template, '#') = 0
+                                    AND instr(CAST(route_template AS BLOB), x'00') = 0
                                     AND route_template NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*'),
     application_component       TEXT NOT NULL CHECK(length(application_component) BETWEEN 1 AND 128
                                     AND application_component NOT GLOB '*[^A-Za-z0-9._:-]*'),
@@ -72,15 +74,16 @@ CREATE TABLE recording_endpoint_observations_v9 (
            AND binding_key NOT GLOB '*[^A-Za-z0-9._:-]*')),
     CHECK((disposition = 'linked' AND observation_policy_id IS NOT NULL
            AND operation_id IS NOT NULL AND application_component IS NOT NULL
-           AND method IN ('GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE', 'CONNECT')
+           AND method IS NOT NULL AND method IN ('GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE', 'CONNECT')
            AND route_template IS NOT NULL AND length(CAST(route_template AS BLOB)) BETWEEN 1 AND 1024
            AND substr(route_template, 1, 1) = '/'
+           AND instr(CAST(route_template AS BLOB), x'00') = 0
            AND reason_code IS NULL
            AND (observation_policy_id = 'runtime-route-v1'
                 OR (application_component = 'spring-fixture' AND binding_key = 'default'
                     AND method = 'POST' AND route_template = '/orders')))
        OR (disposition = 'unmatched' AND operation_id IS NULL AND method IS NULL
-           AND route_template IS NULL AND reason_code IN
+           AND route_template IS NULL AND reason_code IS NOT NULL AND reason_code IN
            ('observation_policy_missing', 'observation_policy_invalid',
             'identity_context_missing', 'identity_context_invalid',
             'method_unsupported', 'route_unapproved',
@@ -95,6 +98,7 @@ CREATE TABLE recording_endpoint_observations_v9 (
     CHECK(reason_code NOT IN ('no_catalog_match', 'route_unmatched_after_normalization')
           OR (observation_policy_id = 'runtime-route-v1' AND application_component IS NOT NULL)),
     FOREIGN KEY(recording_id, project_id) REFERENCES recordings(recording_id, project_id),
+    FOREIGN KEY(project_id, operation_id) REFERENCES operations_v9(project_id, operation_id),
     FOREIGN KEY(project_id, operation_id, application_component, binding_key, method, route_template)
         REFERENCES operations_v9(project_id, operation_id, application_component, binding_key, method, route_template)
 ) STRICT;
