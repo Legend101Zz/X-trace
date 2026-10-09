@@ -25,7 +25,7 @@ use xtrace_application::recording::{
 const MAX_TERMINAL_REQUEST_JSON_BYTES: usize = 64 * 1024;
 use xtrace_application::recording_queries::{
     FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES,
-    NavigationResult, NavigationUnavailable, PersistedEvent, PersistedInteraction, PersistedSource,
+    NavigationResult, NavigationUnavailable, PersistedEvent, PersistedInteraction, PersistedOutcome, PersistedSource,
     RecordingCapacity, RecordingCompletionEvidence, RecordingEventWindow, RecordingMetadata,
     RecordingStatus, ShowWindowRequest, SourceStatus,
 };
@@ -662,6 +662,12 @@ impl SqliteRecordingStore<'_> {
                 }
                 _ => Vec::new(),
             };
+            // A corrupt terminal row is already reported through `completion`
+            // and `incomplete_evidence`; list metadata then stays null.
+            let terminal =
+                load_terminal_finish(&connection, recording_id, completion, correlation_id)
+                    .ok()
+                    .flatten();
             recordings.push(RecordingMetadata {
                 recording_id,
                 status: lifecycle_status,
@@ -684,8 +690,10 @@ impl SqliteRecordingStore<'_> {
                     .transpose()?
                     .map(|value| value.to_string()),
                 incomplete_evidence,
-                event_cap: None,
-                outcome_kind: None,
+                event_cap: terminal.as_ref().and_then(|finish| u32::try_from(finish.event_cap).ok()),
+                // No adapter outcome is persisted in this build; terminal
+                // evidence without one reads as `unobserved` (CONTRACTS 5).
+                outcome_kind: terminal.as_ref().map(|_| "unobserved".to_owned()),
             });
         }
         let has_more = recordings.len() > usize::try_from(limit).unwrap_or(usize::MAX);
@@ -1041,7 +1049,20 @@ impl SqliteRecordingStore<'_> {
                 correlation_id,
             )?;
             event.frame_id = frame_id;
-            event.navigation = navigation;
+            event.navigation = if frame_id.is_none() && event.kind == "request_update" {
+                // CONTRACTS 8.3: request updates are never frames.
+                let not_navigable =
+                    NavigationResult::unavailable(NavigationUnavailable::NotNavigable);
+                FrameNavigation {
+                    previous: not_navigable,
+                    next: not_navigable,
+                    into: not_navigable,
+                    over: not_navigable,
+                    out: not_navigable,
+                }
+            } else {
+                navigation
+            };
         }
         // The application layer serializes this entire DTO. Account for the
         // terminal sidecar and the final frame/navigation-enriched events
@@ -1099,7 +1120,14 @@ impl SqliteRecordingStore<'_> {
             events,
             has_more,
             incomplete_evidence,
-            outcome: None,
+            // Adapter outcomes are not persisted yet (RecordingOutcome has not
+            // landed), so terminal evidence reads as `unobserved`.
+            outcome: terminal_finish.as_ref().map(|_| PersistedOutcome {
+                kind: "unobserved".to_owned(),
+                http_status: None,
+                exception: None,
+                thrown_from_event_id: None,
+            }),
             capacity,
             limitations: Vec::new(),
         })
@@ -2285,7 +2313,7 @@ fn load_terminal_finish(
 
 /// An event cap is valid when it is positive and not above the sanity bound.
 fn event_cap_in_bounds(cap: u64) -> bool {
-    cap >= 1 && cap <= EVENT_CAP_SANITY_BOUND as u64
+    (1..=EVENT_CAP_SANITY_BOUND as u64).contains(&cap)
 }
 
 fn completion_label_from_evidence(completion: RecordingCompletionEvidence) -> &'static str {
@@ -2467,7 +2495,7 @@ fn project_persisted_event(
             WireSourceBinding::Unspecified => SourceBinding::Unspecified,
         },
     );
-    let source = if source_binding.is_verified() {
+    let source = if source_binding.has_source_claim() {
         event
             .source
             .as_ref()
@@ -2517,11 +2545,16 @@ fn source_range_from_wire(
 const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SOURCE_EXCERPT_BYTES: usize = 16 * 1024;
 const MAX_SOURCE_EXCERPT_LINES: u32 = 64;
+/// Distinct source files read for one window query.
+const MAX_SOURCE_FILES_PER_WINDOW: usize = 64;
+/// Total source text kept resident for one window query.
+const MAX_SOURCE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 struct SourceProjectionCache {
     snapshots: HashMap<String, SourceSnapshot>,
     reads: usize,
+    cached_bytes: usize,
 }
 
 enum SourceSnapshot {
@@ -2556,8 +2589,18 @@ fn project_source(
         });
     };
     if !cache.snapshots.contains_key(path) {
-        cache.reads += 1;
-        cache.snapshots.insert(path.to_owned(), load_source_snapshot(root, path));
+        let snapshot = if cache.reads >= MAX_SOURCE_FILES_PER_WINDOW
+            || cache.cached_bytes >= MAX_SOURCE_CACHE_BYTES
+        {
+            SourceSnapshot::Unavailable
+        } else {
+            cache.reads += 1;
+            load_source_snapshot(root, path)
+        };
+        if let SourceSnapshot::Loaded { text: Some(text), .. } = &snapshot {
+            cache.cached_bytes = cache.cached_bytes.saturating_add(text.len());
+        }
+        cache.snapshots.insert(path.to_owned(), snapshot);
     }
     let snapshot = cache.snapshots.get(path)?;
     let SourceSnapshot::Loaded { hash, text } = snapshot else {
@@ -2726,7 +2769,7 @@ const SOURCE_EXTENSIONS: [&str; 12] =
 /// relative, forward-slash separated, no empty, dot or dot-directory segment
 /// (`.env`, `.git`, `.xtrace`, `..`), no `node_modules` segment, and a known
 /// source extension.
-fn is_safe_repo_relative_path(path: &str) -> bool {
+pub(crate) fn is_safe_repo_relative_path(path: &str) -> bool {
     if path.is_empty()
         || path.len() > 256
         || path.starts_with('/')
@@ -2982,6 +3025,58 @@ mod source_projection_tests {
         assert!(
             project(&range(ts, ContentHash::of_bytes(b"a\nb\nc\n")), Some(root.path())).is_some()
         );
+    }
+
+    #[test]
+    fn distinct_source_files_per_window_are_bounded() {
+        let root = tempdir();
+        let mut cache = SourceProjectionCache::default();
+        let mut unavailable = 0usize;
+        for index in 0..200 {
+            let path = format!("src/File{index}.java");
+            let bytes = format!("package x;\nclass File{index} {{\n  void run() {{}}\n}}\n");
+            write_at(root.path(), &path, bytes.as_bytes());
+            let projected = project_source(
+                &range(&path, ContentHash::of_bytes(bytes.as_bytes())),
+                Some(root.path()),
+                &mut cache,
+            )
+            .expect("projection");
+            if projected.status == SourceStatus::Unavailable {
+                unavailable += 1;
+            }
+        }
+        assert_eq!(cache.reads, MAX_SOURCE_FILES_PER_WINDOW);
+        assert_eq!(unavailable, 200 - MAX_SOURCE_FILES_PER_WINDOW);
+    }
+
+    #[test]
+    fn verified_and_unattested_events_project_generic_sources_end_to_end() {
+        use xtrace_protocol::generated::agent::{RecordingEvent, SourceBinding as B, SourceRange};
+        let root = tempdir();
+        let path = "services/petclinic/src/main/java/org/p/Owner.java";
+        let bytes = b"package x;\nclass Owner {\n  void list() {}\n}\n";
+        write_at(root.path(), path, bytes);
+        for binding in [B::Verified, B::ObservedUnattested] {
+            let event = RecordingEvent {
+                source_binding: binding as i32,
+                source: Some(SourceRange {
+                    path: path.to_owned(),
+                    start_line: 2,
+                    end_line: 3,
+                    content_hash: ContentHash::of_bytes(bytes).as_bytes().to_vec().into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let projected = project_persisted_event(
+                &event,
+                Some(root.path()),
+                &mut SourceProjectionCache::default(),
+            );
+            let source = projected.source.expect("source claim projected");
+            assert_eq!(source.status, SourceStatus::Matched, "{binding:?}");
+        }
     }
 
     #[test]

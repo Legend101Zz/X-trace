@@ -233,40 +233,56 @@ fn validate_xtf_event(
             CorrelationId::new(),
         )
     })?;
+    let invalid_source = || {
+        PortError::new(
+            PortErrorKind::Validation,
+            "recording source metadata is invalid",
+            CorrelationId::new(),
+        )
+    };
+    let mismatched = || {
+        PortError::new(
+            PortErrorKind::Validation,
+            "recording source binding disagrees with source metadata",
+            CorrelationId::new(),
+        )
+    };
+    let extent_ok = |source: &xtrace_protocol::generated::agent::SourceRange| {
+        source.start_line != 0 && (source.end_line == 0 || source.end_line >= source.start_line)
+    };
     match (binding, payload.source.as_ref()) {
-        (WireSourceBinding::Verified, Some(source)) => {
-            let allowed = [
-                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderController.java",
-                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java",
-                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderRepository.java",
-            ];
-            let safe_path = allowed.contains(&source.path.as_str())
-                && !source.path.starts_with('/')
-                && !source.path.contains('\\')
-                && source
-                    .path
-                    .split('/')
-                    .all(|part| !part.is_empty() && part != "." && part != "..");
-            if !safe_path
+        (
+            WireSourceBinding::Verified | WireSourceBinding::ObservedUnattested,
+            Some(source),
+        ) => {
+            if !crate::recording_store::is_safe_repo_relative_path(&source.path)
                 || source.content_hash.len() != 32
-                || source.start_line == 0
-                || (source.end_line != 0 && source.end_line < source.start_line)
+                || !extent_ok(source)
             {
-                return Err(PortError::new(
-                    PortErrorKind::Validation,
-                    "recording source metadata is invalid",
-                    CorrelationId::new(),
-                ));
+                return Err(invalid_source());
             }
         }
-        (WireSourceBinding::Verified, None) | (_, Some(_)) => {
-            return Err(PortError::new(
-                PortErrorKind::Validation,
-                "recording source binding disagrees with source metadata",
-                CorrelationId::new(),
-            ));
+        (
+            WireSourceBinding::SourceMapAbsent | WireSourceBinding::SourceMapUnresolved,
+            Some(source),
+        ) => {
+            if !crate::recording_store::is_safe_repo_relative_path(&source.path)
+                || (!source.content_hash.is_empty() && source.content_hash.len() != 32)
+                || !extent_ok(source)
+            {
+                return Err(invalid_source());
+            }
         }
-        (_, None) => {}
+        (WireSourceBinding::Verified | WireSourceBinding::ObservedUnattested, None)
+        | (
+            WireSourceBinding::AttestationMissing
+            | WireSourceBinding::ClassBytesMismatch
+            | WireSourceBinding::DebugMetadataAbsent
+            | WireSourceBinding::SourceMetadataInvalid
+            | WireSourceBinding::Unspecified,
+            Some(_),
+        ) => return Err(mismatched()),
+        _ => {}
     }
     Ok(event.payload.clone())
 }
@@ -400,6 +416,56 @@ mod tests {
             canonical_bytes,
             payload,
         }
+    }
+
+    fn source_event(
+        binding: xtrace_protocol::generated::agent::SourceBinding,
+        path: &str,
+        hash_len: usize,
+    ) -> AcceptedRecordingEvent<XtfEventEnvelope> {
+        let mut accepted = event(2, "evt-src");
+        let nested = accepted.payload.event.as_mut().expect("typed payload");
+        nested.source_binding = binding as i32;
+        nested.source = Some(xtrace_protocol::generated::agent::SourceRange {
+            path: path.to_owned(),
+            start_line: 2,
+            end_line: 3,
+            content_hash: vec![7; hash_len].into(),
+            ..Default::default()
+        });
+        accepted.canonical_bytes = accepted.payload.encode_to_vec();
+        accepted
+    }
+
+    #[test]
+    fn write_gate_accepts_generic_verified_and_unattested_sources() {
+        use xtrace_protocol::generated::agent::SourceBinding as B;
+        for binding in [B::Verified, B::ObservedUnattested] {
+            let accepted =
+                source_event(binding, "services/petclinic/src/main/java/org/p/Owner.java", 32);
+            super::validate_xtf_event(&accepted).expect("generic source path accepted");
+        }
+        let mapped = source_event(B::SourceMapUnresolved, "src/routes/users.ts", 0);
+        super::validate_xtf_event(&mapped).expect("mapped path without hash accepted");
+    }
+
+    #[test]
+    fn write_gate_refuses_unsafe_paths_and_mismatched_bindings() {
+        use xtrace_protocol::generated::agent::SourceBinding as B;
+        for path in ["../x/A.java", "src/./A.java", ".env", "config/.env.ts", "/abs/A.java", "README.md"]
+        {
+            let accepted = source_event(B::Verified, path, 32);
+            assert!(super::validate_xtf_event(&accepted).is_err(), "{path} must be refused");
+        }
+        assert!(super::validate_xtf_event(&source_event(B::Verified, "src/A.java", 31)).is_err());
+        assert!(
+            super::validate_xtf_event(&source_event(B::AttestationMissing, "src/A.java", 32))
+                .is_err()
+        );
+        let mut missing = source_event(B::ObservedUnattested, "src/A.java", 32);
+        missing.payload.event.as_mut().expect("typed").source = None;
+        missing.canonical_bytes = missing.payload.encode_to_vec();
+        assert!(super::validate_xtf_event(&missing).is_err());
     }
 
     #[test]

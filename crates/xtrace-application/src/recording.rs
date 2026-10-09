@@ -72,6 +72,10 @@ impl CaptureMode {
 pub const fn legacy_event_cap() -> u64 {
     MAX_RECORDED_EVENTS as u64
 }
+
+fn is_legacy_event_cap(cap: &u64) -> bool {
+    *cap == legacy_event_cap()
+}
 /// Maximum distinct event priorities tracked for capacity drops of one
 /// recording. Keeps the drop accounting bounded (the store accepts at most 256
 /// priority buckets in total, adapter-reported ones included).
@@ -341,7 +345,10 @@ pub struct FinishRecording {
     pub capacity_dropped_events: u64,
     /// Event cap in force for this recording. Older rows without the field were
     /// recorded under [`legacy_event_cap`].
-    #[serde(default = "legacy_event_cap")]
+    ///
+    /// The legacy value is omitted when serializing so a finish written before
+    /// the field existed replays byte-identically.
+    #[serde(default = "legacy_event_cap", skip_serializing_if = "is_legacy_event_cap")]
     pub event_cap: u64,
     /// Producer-declared response summary; only non-preview states are accepted
     /// until a verified privacy-policy registry exists. This is not outcome proof.
@@ -952,6 +959,22 @@ fn capture_error(kind: PortErrorKind, message: &'static str) -> PortError {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn legacy_finish_json_without_event_cap_verifies_under_2048() {
+        let finish = FinishRecording::without_digest(RecordingId::new(), 7);
+        assert_eq!(finish.event_cap, legacy_event_cap());
+        let json = serde_json::to_string(&finish).expect("serialize");
+        assert!(!json.contains("event_cap"), "legacy-cap finish stays byte-identical: {json}");
+        let parsed: FinishRecording = serde_json::from_str(&json).expect("legacy json parses");
+        assert_eq!(parsed.event_cap, 2048);
+        assert_eq!(serde_json::to_string(&parsed).expect("reserialize"), json);
+        let mut raised = finish;
+        raised.event_cap = 16_384;
+        let raised_json = serde_json::to_string(&raised).expect("serialize");
+        assert!(raised_json.contains("\"event_cap\":16384"));
+    }
+
     use std::time::{Duration, Instant};
     use uuid::Uuid;
 
