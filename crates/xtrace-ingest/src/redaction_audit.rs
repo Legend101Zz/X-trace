@@ -238,9 +238,25 @@ pub fn audit_event(event: &mut RecordingEvent) -> AuditReport {
                 report.downgraded_values += 1;
             }
         }
-        if scrub_text(&mut interaction.sanitized_shape) {
-            report.redacted_text_fields += 1;
+        for text in [
+            &mut interaction.sanitized_shape,
+            &mut interaction.path,
+            &mut interaction.host,
+            &mut interaction.schema,
+            &mut interaction.table,
+        ] {
+            if scrub_text(text) {
+                report.redacted_text_fields += 1;
+            }
         }
+        for table in &mut interaction.tables {
+            if scrub_text(table) {
+                report.redacted_text_fields += 1;
+            }
+        }
+    }
+    if scrub_text(&mut event.symbol) {
+        report.redacted_text_fields += 1;
     }
     if let Some(exception) = event.exception.as_mut() {
         if scrub_text(&mut exception.sanitized_message) {
@@ -402,6 +418,30 @@ mod tests {
         assert!(report.is_clean());
         assert_eq!(event, before, "an already safe event is returned untouched");
         assert_eq!(event.bindings[0].value, Some(redacted), "the original rule id is kept");
+    }
+
+    #[test]
+    fn interaction_labels_and_symbol_text_are_scrubbed() {
+        let canary = "AKIAIOSFODNN7EXAMPLE";
+        let mut event = RecordingEvent {
+            symbol: format!("Svc.{canary}"),
+            interaction: Some(wire::Interaction {
+                path: format!("/k/{canary}"),
+                host: format!("{canary}.example.com"),
+                schema: canary.to_string(),
+                table: canary.to_string(),
+                tables: vec![canary.to_string(), "safe".to_string()],
+                ..wire::Interaction::default()
+            }),
+            ..RecordingEvent::default()
+        };
+        let report = audit_event(&mut event);
+        assert_eq!(report.redacted_text_fields, 6);
+        let interaction = event.interaction.as_ref().unwrap();
+        for text in [&event.symbol, &interaction.path, &interaction.host, &interaction.schema] {
+            assert_eq!(text, AUDIT_TEXT_MARKER);
+        }
+        assert_eq!(interaction.tables, [AUDIT_TEXT_MARKER, "safe"]);
     }
 
     #[test]

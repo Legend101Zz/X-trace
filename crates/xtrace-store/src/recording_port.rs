@@ -2304,7 +2304,7 @@ mod tests {
         assert!(check(), "a verified gap-only partial ends at its last frame");
         // verify_terminal_evidence answers Partial without hashing once the declared
         // segment bytes pass the verification bound; that digest proves nothing.
-        let over_bound = i64::try_from(xtrace_application::MAX_RECORDING_VERIFIED_INPUT_BYTES)
+        let over_bound = i64::try_from(xtrace_application::MAX_RECORDING_FINISH_VERIFIED_BYTES)
             .expect("fits")
             + 1;
         persisted
@@ -2320,7 +2320,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_over_verification_bound_is_partial_with_reason() {
+    fn finish_between_read_bound_and_finish_bound_still_verifies_complete() {
         use xtrace_protocol::generated::agent::{
             BindingRole, CapturedValue as Wire, CapturedValueTruncated, NameOrigin, ValueBinding,
             captured_value::Value as V,
@@ -2359,18 +2359,73 @@ mod tests {
         let events: Vec<_> = (2..=3_001_u64).map(heavy).collect();
         let persisted = persist_finished_with(&events, 100, 0, None);
         let window = window(&persisted, 10, None);
+        // Declared bytes pass the 16 MiB WINDOW bound but sit far under the 512 MiB finish
+        // bound, so the finish verified the digest and the recording is Complete.
         assert!(
-            window
+            !window
                 .incomplete_evidence
                 .iter()
                 .any(|reason| reason == "verification_budget_exceeded"),
             "{:?}",
             window.incomplete_evidence
         );
+        let status: String = persisted
+            .store
+            .lock()
+            .expect("connection")
+            .query_row(
+                "SELECT status FROM recordings WHERE recording_id = ?1",
+                rusqlite::params![persisted.recording_id.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("status");
+        assert_eq!(status, "complete");
         // a normal complete recording carries no such reason
         let small = persist(&tree(), 4, true);
         assert!(
             !window_reasons(&small).iter().any(|reason| reason == "verification_budget_exceeded")
+        );
+    }
+
+    #[test]
+    fn finish_over_finish_bound_is_partial_with_reason() {
+        let events = tree();
+        let persisted = persist(&events, 4, false);
+        // Declare more segment bytes than the 512 MiB finish bound before the finish arrives.
+        let over_bound = i64::try_from(xtrace_application::MAX_RECORDING_FINISH_VERIFIED_BYTES)
+            .expect("fits")
+            + 1;
+        persisted
+            .store
+            .lock()
+            .expect("connection")
+            .execute(
+                "UPDATE recording_segments SET uncompressed_bytes = ?1 WHERE recording_id = ?2",
+                rusqlite::params![over_bound, persisted.recording_id.as_uuid().as_bytes().to_vec()],
+            )
+            .expect("simulate an over-bound declaration");
+        let adapter = SqliteRecordingPersistence::new(persisted.store.clone(), &persisted.root);
+        let last = events.last().map_or(1, |event| event.recording_seq);
+        let completion = adapter
+            .finish_recording(&FinishRecording {
+                recording_id: persisted.recording_id,
+                final_recording_seq: last,
+                duration_ns: Some(1),
+                event_digest: digest_of(&events),
+                drop_counts_by_priority: std::collections::BTreeMap::new(),
+                unsupported_capability_codes: Vec::new(),
+                capacity_dropped_events: 0,
+                event_cap: 2_048,
+                outcome: None,
+                response_summary: None,
+            })
+            .expect("finish");
+        assert_eq!(completion, RecordingCompletion::Partial);
+        assert!(
+            window_reasons(&persisted)
+                .iter()
+                .any(|reason| reason == "verification_budget_exceeded"),
+            "a Partial caused by the finish bound must name its cause"
         );
     }
 

@@ -30,6 +30,11 @@ pub const MAX_RECORDING_EVENT_PROJECTION_BYTES: usize = 256 * 1024;
 /// The store may process one codec-bounded segment when that segment alone
 /// crosses this threshold, ensuring a cursor can still make progress.
 pub const MAX_RECORDING_VERIFIED_INPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum declared (logical plus compressed) segment bytes the store verifies when a recording
+/// is finished (CONTRACTS 4.1 item 4). Separate from the per-request read bound above, which
+/// applies to window reads only. Beyond it the recording is sealed Partial and the read surface
+/// names `verification_budget_exceeded`.
+pub const MAX_RECORDING_FINISH_VERIFIED_BYTES: usize = 512 * 1024 * 1024;
 /// Maximum UTF-8 byte length for a projected display field.
 pub const MAX_RECORDING_DISPLAY_FIELD_BYTES: usize = 256;
 /// Maximum UTF-8 byte length for an exact projected relationship identifier.

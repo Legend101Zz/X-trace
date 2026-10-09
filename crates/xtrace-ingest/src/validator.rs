@@ -14,10 +14,10 @@
 //!
 //! - Maintain a map keyed by validated [`RecordingId`] so multiple
 //!   recording IDs interleave independently inside one validator.
-//!   Every accepted entry — including [`RecordingLifecycle::Finalizing`]
-//!   — and its retained event digests remain in the map for the
-//!   lifetime of the [`IngestValidator`] because this slice does not
-//!   expose a drain or removal API.
+//!   Only unfinished recordings count against `max_active_recordings`;
+//!   finished ones live in a bounded tombstone ring and release their
+//!   digest tables (see [`FINALIZING_DIGEST_WINDOW`],
+//!   [`FINISHED_TOMBSTONE_RING`], [`IngestValidator::release_terminal`]).
 //! - Reject malformed wire [`RecordingId`]s (anything other than
 //!   exactly 16 bytes) before mutating state.
 //! - Enforce `recording_seq == 1` for the structural start marker and
@@ -39,15 +39,14 @@
 //! - Transition a recording to [`RecordingLifecycle::Finalizing`] only
 //!   when the `RecordingFinished.final_recording_seq` matches the
 //!   validator's highest contiguous value. The retained event digests
-//!   stay available for replay after finalization for the lifetime of
-//!   the validator.
+//!   stay available for replay for the finalizing window only.
 //! - Enforce active recording and per-recording event capacities as
 //!   typed, no-mutation rejections.
 //!
 //! What the validator does **not** do:
 //!
-//! - It does not decode protobuf, allocate sockets, own durable
-//!   storage, drain finalizing entries, or release retained digests.
+//! - It does not decode protobuf, allocate sockets or own durable
+//!   storage.
 //! - It does not depend on `xtrace-application`, `xtrace-store`, the
 //!   daemon loop, the CLI, or any language-pack runtime.
 //! - It does not apply `DropNotice` handling or priority-based
@@ -100,9 +99,9 @@ const EVENT_DIGEST_DOMAIN: &[u8] = b"xtrace.ingest.event.v1";
 /// `RecordingState::Complete` / `Partial` / `Invalid` variants live
 /// downstream and are out of scope for this boundary.
 ///
-/// Finalizing entries and their retained event digests stay in the
-/// validator's map for the validator's lifetime; this crate does not
-/// evict, drop, or otherwise reclaim them.
+/// Finalizing entries are bounded tombstones: their digest tables roll out
+/// after [`FINALIZING_DIGEST_WINDOW`] newer finishes and the oldest
+/// tombstone goes after [`FINISHED_TOMBSTONE_RING`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RecordingLifecycle {
     /// `RecordingStarted` accepted; events still arriving.
@@ -122,7 +121,7 @@ pub enum RecordingLifecycle {
 #[derive(Clone, Debug)]
 pub struct IngestConfig {
     /// Maximum number of recordings the validator will track
-    /// concurrently (`Recording` plus `Finalizing`).
+    /// concurrently. Only unfinished (`Recording`) entries count.
     pub max_active_recordings: NonZeroUsize,
     /// Overrides the mode-derived per-recording event cap. Further new events
     /// are dropped and counted by priority instead of failing the capture.
@@ -266,7 +265,25 @@ struct RecordingState {
     value_bytes: u64,
     /// Running count of retained `LINE_CURSOR` events (CaptureBudget `max_line_events`).
     line_events: u32,
+    /// Set once the digest table was released after the terminal commit (or when the
+    /// finalizing window rolled past this recording). A replay of an event at or below
+    /// `highest_contiguous` is then a duplicate that cannot be digest-checked.
+    digests_released: bool,
 }
+
+/// Per-session budget for retained event digests (CONTRACTS 4.1 item 1). A new recording whose
+/// event cap would push the sum over this bound is refused with
+/// [`IngestError::ActiveCapacityReached`].
+pub const MAX_SESSION_RETAINED_DIGESTS: usize = 2_000_000;
+
+/// Number of most recently finished recordings that keep their digest tables so a
+/// retransmission window right after the finish still verifies payloads exactly.
+pub const FINALIZING_DIGEST_WINDOW: usize = 16;
+
+/// Bounded tombstone ring: the most recently finished recordings keep their started/finished
+/// markers (without digest tables) for idempotent replay. The oldest tombstone is dropped
+/// beyond this bound.
+pub const FINISHED_TOMBSTONE_RING: usize = 1_024;
 
 /// Upper bound on distinct priorities tracked for capacity drops of one
 /// recording, so drop accounting is as bounded as the digest table.
@@ -318,13 +335,74 @@ fn event_digest(event: &RecordingEvent) -> [u8; 32] {
 pub struct IngestValidator {
     config: IngestConfig,
     recordings: HashMap<RecordingId, RecordingState>,
+    /// Finished recordings, oldest first. Bounded by [`FINISHED_TOMBSTONE_RING`].
+    finished_order: std::collections::VecDeque<RecordingId>,
 }
 
 impl IngestValidator {
     /// Builds a fresh validator with the supplied configuration.
     #[must_use]
     pub fn new(config: IngestConfig) -> Self {
-        Self { config, recordings: HashMap::new() }
+        Self {
+            config,
+            recordings: HashMap::new(),
+            finished_order: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Number of recordings that have not yet been finished. Only these count against
+    /// `max_active_recordings`.
+    fn unfinished_count(&self) -> usize {
+        self.recordings.len() - self.finished_order.len()
+    }
+
+    /// Digest entries the session may still hold: the event cap of every unfinished recording
+    /// plus the tables of finished recordings that have not released theirs.
+    fn retained_digest_commitment(&self) -> usize {
+        self.recordings
+            .values()
+            .map(|state| {
+                if state.finished.is_none() {
+                    self.config.event_cap(state.mode)
+                } else {
+                    state.event_digests.len()
+                }
+            })
+            .fold(0usize, usize::saturating_add)
+    }
+
+    /// Releases a finished recording's digest table once its terminal evidence is durable. The
+    /// tombstone (start and finish markers, watermark) stays in the bounded ring so exact
+    /// retries of the start, the finish and already-known events remain idempotent. Returns
+    /// `false` when the recording is unknown or not finished.
+    pub fn release_terminal(&mut self, recording_id: RecordingId) -> bool {
+        match self.recordings.get_mut(&recording_id) {
+            Some(state) if state.finished.is_some() => {
+                state.event_digests = HashMap::new();
+                state.digests_released = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Moves a just-finished recording into the tombstone ring and rolls the windows.
+    fn note_finished(&mut self, id: RecordingId) {
+        self.finished_order.push_back(id);
+        let digest_holders = self.finished_order.len().saturating_sub(FINALIZING_DIGEST_WINDOW);
+        for old in self.finished_order.iter().take(digest_holders).copied().collect::<Vec<_>>() {
+            if let Some(state) = self.recordings.get_mut(&old) {
+                if !state.digests_released {
+                    state.event_digests = HashMap::new();
+                    state.digests_released = true;
+                }
+            }
+        }
+        while self.finished_order.len() > FINISHED_TOMBSTONE_RING {
+            if let Some(oldest) = self.finished_order.pop_front() {
+                self.recordings.remove(&oldest);
+            }
+        }
     }
 
     /// Returns the configuration the validator was built with.
@@ -334,8 +412,8 @@ impl IngestValidator {
     }
 
     /// Returns the number of recordings the validator is currently
-    /// tracking, counting both [`RecordingLifecycle::Recording`] and
-    /// [`RecordingLifecycle::Finalizing`] entries.
+    /// tracking, counting [`RecordingLifecycle::Recording`] entries and the bounded ring of
+    /// [`RecordingLifecycle::Finalizing`] tombstones.
     #[must_use]
     pub fn len(&self) -> usize {
         self.recordings.len()
@@ -422,7 +500,10 @@ impl IngestValidator {
             return Err(IngestError::StartedConflict(id));
         }
 
-        if self.recordings.len() >= self.config.max_active_recordings.get() {
+        if self.unfinished_count() >= self.config.max_active_recordings.get()
+            || self.retained_digest_commitment().saturating_add(self.config.event_cap(mode))
+                > MAX_SESSION_RETAINED_DIGESTS
+        {
             return Err(IngestError::ActiveCapacityReached {
                 limit: self.config.max_active_recordings,
             });
@@ -440,6 +521,7 @@ impl IngestValidator {
                 capacity_dropped_by_priority: BTreeMap::new(),
                 value_bytes: 0,
                 line_events: 0,
+                digests_released: false,
             },
         );
         Ok(Acceptance::Started)
@@ -546,6 +628,11 @@ impl IngestValidator {
                     // A sequence dropped at capacity kept no digest; its
                     // replay is a duplicate of something already counted.
                     None if state.first_dropped_seq.is_some_and(|first| seq >= first) => {
+                        duplicates += 1;
+                    }
+                    // After the digest table was released the replay can no longer be
+                    // payload-checked; it is below the watermark, so it is a duplicate.
+                    None if state.digests_released => {
                         duplicates += 1;
                     }
                     _ => {
@@ -704,6 +791,7 @@ impl IngestValidator {
         }
 
         state.finished = Some(finished.clone());
+        self.note_finished(id);
         Ok(Acceptance::Finalizing)
     }
 }
@@ -737,6 +825,7 @@ impl IngestValidator {
                 capacity_dropped_by_priority: BTreeMap::new(),
                 value_bytes: 0,
                 line_events: 0,
+                digests_released: false,
             },
         );
     }
@@ -765,6 +854,7 @@ mod tests {
         Acceptance, DEFAULT_MAX_EVENTS_PER_RECORDING, IngestConfig, IngestError, IngestValidator,
         RecordingLifecycle, event_digest,
     };
+    use super::{FINALIZING_DIGEST_WINDOW, FINISHED_TOMBSTONE_RING, MAX_SESSION_RETAINED_DIGESTS};
     use xtrace_domain::CaptureMode;
 
     fn rid() -> RecordingId {
@@ -1779,5 +1869,108 @@ mod tests {
             ..finished(id, 1)
         };
         assert_eq!(validator.accept_finished(&good).unwrap(), Acceptance::Finalizing);
+    }
+
+    fn started_with_policy(id: RecordingId, policy: &str) -> RecordingStarted {
+        RecordingStarted { capture_policy_id: policy.to_string(), ..started(id, "GET") }
+    }
+
+    #[test]
+    fn finished_recordings_do_not_count_against_active_budget() {
+        let mut validator = IngestValidator::new(IngestConfig::new(NonZeroUsize::new(2).unwrap()));
+        for _ in 0..300 {
+            let id = rid();
+            validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
+            validator.accept_events(&batch(id, vec![event(2, 2)])).unwrap();
+            validator.accept_finished(&finished(id, 2)).unwrap();
+        }
+        // Two unfinished recordings fit; a third does not.
+        let (a, b, c) = (rid(), rid(), rid());
+        validator.accept_started(&started(a, "GET"), CaptureMode::Standard).unwrap();
+        validator.accept_started(&started(b, "GET"), CaptureMode::Standard).unwrap();
+        let err = validator.accept_started(&started(c, "GET"), CaptureMode::Standard).unwrap_err();
+        assert!(matches!(err, IngestError::ActiveCapacityReached { .. }));
+        assert!(validator.len() <= FINISHED_TOMBSTONE_RING + 2);
+    }
+
+    #[test]
+    fn tombstone_ring_is_bounded_and_replays_stay_idempotent() {
+        let mut validator = IngestValidator::new(IngestConfig::new(NonZeroUsize::new(4).unwrap()));
+        let first = rid();
+        let first_start = started(first, "GET");
+        validator.accept_started(&first_start, CaptureMode::Standard).unwrap();
+        validator.accept_events(&batch(first, vec![event(2, 2)])).unwrap();
+        validator.accept_finished(&finished(first, 2)).unwrap();
+        for _ in 0..(FINALIZING_DIGEST_WINDOW + 1) {
+            let id = rid();
+            validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
+            validator.accept_finished(&finished(id, 1)).unwrap();
+        }
+        // The first recording rolled out of the digest window but its tombstone replays.
+        assert_eq!(
+            validator.accept_started(&first_start, CaptureMode::Standard).unwrap(),
+            Acceptance::StartedRetry
+        );
+        assert_eq!(
+            validator.accept_finished(&finished(first, 2)).unwrap(),
+            Acceptance::FinishedRetry
+        );
+        assert!(matches!(
+            validator.accept_events(&batch(first, vec![event(2, 2)])).unwrap(),
+            Acceptance::Events { accepted: 0, duplicates: 1, .. }
+        ));
+        assert!(matches!(
+            validator.accept_events(&batch(first, vec![event(3, 3)])).unwrap_err(),
+            IngestError::EventAfterFinalization { .. }
+        ));
+        assert!(validator.recordings.get(&first).unwrap().event_digests.is_empty());
+        for _ in 0..(FINISHED_TOMBSTONE_RING + 5) {
+            let id = rid();
+            validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
+            validator.accept_finished(&finished(id, 1)).unwrap();
+        }
+        assert_eq!(validator.len(), FINISHED_TOMBSTONE_RING);
+        assert_eq!(validator.lifecycle(first), None);
+    }
+
+    #[test]
+    fn release_terminal_drops_the_digest_table_only_for_finished_recordings() {
+        let mut validator = IngestValidator::new(IngestConfig::new(NonZeroUsize::new(2).unwrap()));
+        let id = rid();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
+        validator.accept_events(&batch(id, vec![event(2, 2)])).unwrap();
+        assert!(!validator.release_terminal(id));
+        validator.accept_finished(&finished(id, 2)).unwrap();
+        assert!(validator.release_terminal(id));
+        assert!(validator.recordings.get(&id).unwrap().event_digests.is_empty());
+        assert_eq!(validator.lifecycle(id), Some(RecordingLifecycle::Finalizing));
+    }
+
+    #[test]
+    fn retained_digest_budget_refuses_new_recording() {
+        let mut validator =
+            IngestValidator::new(IngestConfig::mode_derived(NonZeroUsize::new(64).unwrap()));
+        let focused = CaptureMode::Focused;
+        let per = focused.event_cap();
+        let fits = MAX_SESSION_RETAINED_DIGESTS / per;
+        let mut ids = Vec::new();
+        for _ in 0..fits {
+            let id = rid();
+            validator
+                .accept_started(&started_with_policy(id, "xtrace.focused.v1"), focused)
+                .unwrap();
+            ids.push(id);
+        }
+        let over = rid();
+        let err = validator
+            .accept_started(&started_with_policy(over, "xtrace.focused.v1"), focused)
+            .unwrap_err();
+        assert!(matches!(err, IngestError::ActiveCapacityReached { .. }));
+        assert_eq!(validator.lifecycle(over), None);
+        // A standard recording still fits in the remainder, and finishing one frees budget.
+        validator.accept_started(&started(rid(), "GET"), CaptureMode::Standard).unwrap();
+        validator.accept_finished(&finished(ids[0], 1)).unwrap();
+        validator.release_terminal(ids[0]);
+        validator.accept_started(&started_with_policy(over, "xtrace.focused.v1"), focused).unwrap();
     }
 }

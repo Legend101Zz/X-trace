@@ -32,6 +32,16 @@ pub const MAX_INTERACTION_TABLES: usize = 16;
 pub const MAX_TABLE_NAME_BYTES: usize = 128;
 /// Longest `Interaction.sanitized_shape`, in bytes.
 pub const MAX_SANITIZED_SHAPE_BYTES: usize = 512;
+/// Longest `Interaction.path` and `RecordingEvent.symbol`, in bytes.
+pub const MAX_PATH_OR_SYMBOL_BYTES: usize = 1_024;
+/// Longest `Interaction.host`, in bytes.
+pub const MAX_HOST_BYTES: usize = 253;
+/// Longest `Interaction.schema`, `.table`, `.driver` or `.method`, in bytes.
+pub const MAX_INTERACTION_LABEL_BYTES: usize = 128;
+/// Most frames on one exception, and the longest one, in bytes.
+pub const MAX_STACK_FRAMES: usize = 64;
+/// Longest single stack frame, in bytes.
+pub const MAX_STACK_FRAME_BYTES: usize = 512;
 /// Longest `RuntimeFacts` string, in bytes.
 pub const MAX_RUNTIME_FACT_BYTES: usize = 64;
 /// Closed vocabulary for `Interaction.statement_kind`.
@@ -82,6 +92,10 @@ pub fn validate_event(
             return Err(IngestError::SymbolRequired { recording_seq: seq });
         }
         _ => {}
+    }
+
+    if event.symbol.len() > MAX_PATH_OR_SYMBOL_BYTES || has_control(&event.symbol) {
+        return Err(IngestError::SymbolRequired { recording_seq: seq });
     }
 
     check_gap(event, kind)?;
@@ -364,8 +378,23 @@ fn check_interaction(seq: u64, interaction: &wire::Interaction) -> Result<(), In
     if interaction.status_code != 0 && !(100..=599).contains(&interaction.status_code) {
         return Err(bad());
     }
-    if has_control(&interaction.path) {
+    if interaction.path.len() > MAX_PATH_OR_SYMBOL_BYTES
+        || has_control(&interaction.path)
+        || interaction.path.contains(['?', '#'])
+    {
         return Err(bad());
+    }
+    if interaction.host.len() > MAX_HOST_BYTES
+        || has_control(&interaction.host)
+        || interaction.host.contains(['?', '#', '@'])
+    {
+        return Err(bad());
+    }
+    for label in [&interaction.schema, &interaction.table, &interaction.driver, &interaction.method]
+    {
+        if label.len() > MAX_INTERACTION_LABEL_BYTES || has_control(label) {
+            return Err(bad());
+        }
     }
     Ok(())
 }
@@ -377,6 +406,8 @@ fn has_control(text: &str) -> bool {
 fn check_exception(seq: u64, exception: &wire::ExceptionPayload) -> Result<(), IngestError> {
     if exception.exception_type.len() > MAX_EXCEPTION_TYPE_BYTES
         || exception.sanitized_message.len() > MAX_EXCEPTION_MESSAGE_BYTES
+        || exception.stack_frames.len() > MAX_STACK_FRAMES
+        || exception.stack_frames.iter().any(|frame| frame.len() > MAX_STACK_FRAME_BYTES)
     {
         return Err(IngestError::ExceptionFieldInvalid { recording_seq: seq });
     }
@@ -909,6 +940,47 @@ mod tests {
         ] {
             assert!(matches!(check(&bad, STD), Err(IngestError::InteractionFieldInvalid { .. })));
         }
+    }
+
+    #[test]
+    fn interaction_free_text_fields_are_bounded_and_clean() {
+        let with = |f: &dyn Fn(&mut wire::Interaction)| {
+            let mut interaction = wire::Interaction::default();
+            f(&mut interaction);
+            RecordingEvent {
+                interaction: Some(interaction),
+                ..base(RecordingEventKind::OutboundHttpEnd)
+            }
+        };
+        assert!(check(&with(&|i| i.path = "/users/42".to_string()), STD).is_ok());
+        for bad in [
+            with(&|i| i.path = format!("/{}", "a".repeat(1_024))),
+            with(&|i| i.path = "/a?token=abc".to_string()),
+            with(&|i| i.path = "/a#frag".to_string()),
+            with(&|i| i.host = "h".repeat(254)),
+            with(&|i| i.host = "user:pw@example.com".to_string()),
+            with(&|i| i.host = "exa\nmple.com".to_string()),
+            with(&|i| i.schema = "s".repeat(129)),
+            with(&|i| i.table = "t\u{7}".to_string()),
+            with(&|i| i.driver = "d".repeat(129)),
+            with(&|i| i.method = "m".repeat(129)),
+        ] {
+            assert!(matches!(check(&bad, STD), Err(IngestError::InteractionFieldInvalid { .. })));
+        }
+    }
+
+    #[test]
+    fn symbol_and_stack_frames_are_bounded() {
+        let long_symbol =
+            RecordingEvent { symbol: "s".repeat(1_025), ..base(RecordingEventKind::FrameEnter) };
+        assert!(matches!(check(&long_symbol, STD), Err(IngestError::SymbolRequired { .. })));
+        let exception = |frames: Vec<String>| wire::ExceptionPayload {
+            stack_frames: frames,
+            ..wire::ExceptionPayload::default()
+        };
+        assert!(check_exception(2, &exception(vec!["f".repeat(512); 64])).is_ok());
+        assert!(check_exception(2, &exception(vec!["f".to_string(); 65])).is_err());
+        assert!(check_exception(2, &exception(vec!["f".repeat(513)])).is_err());
     }
 
     #[test]
