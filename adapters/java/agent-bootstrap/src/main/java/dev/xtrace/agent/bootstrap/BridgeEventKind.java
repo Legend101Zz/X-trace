@@ -16,6 +16,8 @@ public final class BridgeEventKind {
   public static final int DATABASE_END = 8;
   /** Sanitized response-status observation. */
   public static final int RESPONSE = 13;
+  /** Honest capture gap marker. */
+  public static final int GAP = 14;
 
   private BridgeEventKind() {}
 }

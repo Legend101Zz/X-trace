@@ -61,6 +61,33 @@ final class SourceAttestation {
     }
   }
 
+  /** True when the fixture build map names this class, so a build attestation can apply. */
+  static boolean hasEntry(String className) {
+    return className.equals("dev.xtrace.fixture.OrderController")
+        || className.equals("dev.xtrace.fixture.OrderService")
+        || className.equals("dev.xtrace.fixture.OrderRepository");
+  }
+
+  static SourceInfo lookup(ClassLoader loader, String className, String method,
+                           String descriptor) {
+    if (loader == null || className == null)
+      return SourceInfo.unavailable(2);
+    synchronized (STATES) {
+      State state = state(loader);
+      Entry entry = state.entries.get(key(className, method, descriptor));
+      if (entry == null)
+        return SourceInfo.unavailable(state.failure == 0 ? 2 : state.failure);
+      if (!entry.classObserved)
+        return SourceInfo.unavailable(2);
+      if (!entry.classMatches)
+        return SourceInfo.unavailable(3);
+      if (entry.startLine < 1 || entry.endLine < entry.startLine)
+        return SourceInfo.unavailable(4);
+      return new SourceInfo(entry.path, entry.startLine, entry.endLine,
+                            unhex(entry.sourceHash), 1);
+    }
+  }
+
   private static State state(ClassLoader loader) {
     State existing = STATES.get(loader);
     if (existing != null)
@@ -135,6 +162,7 @@ final class SourceAttestation {
   private static boolean validHash(String value) {
     return value.length() == 64 && value.matches("[0-9a-f]{64}");
   }
+  static byte[] blake3Of(byte[] value) { return blake3(value); }
   private static byte[] blake3(byte[] value) {
     Blake3Digest d = new Blake3Digest(256);
     d.update(value, 0, value.length);

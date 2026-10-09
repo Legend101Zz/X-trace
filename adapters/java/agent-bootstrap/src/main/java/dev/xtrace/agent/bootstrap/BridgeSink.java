@@ -53,6 +53,29 @@ public interface BridgeSink {
     return offerEvent(recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail);
   }
 
+  /**
+   * Offers a method boundary identified by declaring class, method name and descriptor. The
+   * runtime resolves source facts from its own class registry. Defaults to a plain event.
+   */
+  default boolean offerFrameEvent(
+      String recordingId,
+      String eventId,
+      String parentEventId,
+      int kind,
+      String symbol,
+      long monotonicNs,
+      int detail,
+      Class<?> type,
+      String method,
+      String descriptor) {
+    return offerEvent(recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail);
+  }
+
+  /** Scope verdict for a handler type: 1 application, 0 not application, -1 scope unknown. */
+  default int applicationScope(Class<?> type) {
+    return 1;
+  }
+
   /** Offers the bounded recording terminal marker and accumulated loss count. */
   boolean offerFinish(
       String recordingId,

@@ -267,12 +267,16 @@ final class RecordingWriter implements AutoCloseable, Runnable {
               .setContentHash(ByteString.copyFrom(event.sourceHash())));
     }
     if (kind == RecordingEventKind.RECORDING_EVENT_KIND_REQUEST_UPDATE) {
+      // The request event symbol is "http.request <METHOD> <route template>", both validated by
+      // the bridge; nothing about the route is assumed here.
+      String[] parts = event.symbol().split(" ", 3);
+      boolean shaped = parts.length == 3 && parts[0].equals("http.request");
       builder.setInteraction(
           Interaction.newBuilder()
               .setKind(InteractionKind.INTERACTION_KIND_FRAMEWORK)
               .setDriver("spring-mvc")
-              .setMethod("POST")
-              .setPath("/orders"));
+              .setMethod(shaped ? parts[1] : "")
+              .setPath(shaped ? parts[2] : ""));
     } else if (kind == RecordingEventKind.RECORDING_EVENT_KIND_RESPONSE) {
       builder.setInteraction(
           Interaction.newBuilder()

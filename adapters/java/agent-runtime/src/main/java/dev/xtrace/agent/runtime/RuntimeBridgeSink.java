@@ -17,6 +17,7 @@ final class RuntimeBridgeSink implements BridgeSink {
   private final AtomicInteger activeRecordings = new AtomicInteger();
   private final AtomicInteger inFlightStartAdmissions = new AtomicInteger();
   private final AtomicInteger incompleteKind = new AtomicInteger();
+  private volatile ApplicationScope scope = ApplicationScope.defaultScope();
   private final Runnable afterStartIncrement;
   private final Runnable beforeStartDecrement;
 
@@ -122,6 +123,45 @@ final class RuntimeBridgeSink implements BridgeSink {
     return offerSourceEvent(
         recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail,
         source.path(), source.startLine(), source.endLine(), source.hash(), source.binding());
+  }
+
+  @Override
+  public boolean offerFrameEvent(
+      String recordingId,
+      String eventId,
+      String parentEventId,
+      int kind,
+      String symbol,
+      long monotonicNs,
+      int detail,
+      Class<?> type,
+      String method,
+      String descriptor) {
+    SourceAttestation.SourceInfo source = resolveSource(type, method, descriptor);
+    return offerSourceEvent(
+        recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail,
+        source.path(), source.startLine(), source.endLine(), source.hash(), source.binding());
+  }
+
+  /** Build-attested source wins; otherwise the class is bound to the source file it names. */
+  private static SourceAttestation.SourceInfo resolveSource(
+      Class<?> type, String method, String descriptor) {
+    ClassLoader loader = type == null ? null : type.getClassLoader();
+    if (loader != null && type != null && SourceAttestation.hasEntry(type.getName())) {
+      SourceAttestation.SourceInfo attested =
+          SourceAttestation.lookup(loader, type.getName(), method, descriptor);
+      if (attested.binding() == 1) return attested;
+    }
+    return SourceIdentity.lookup(type, method, descriptor);
+  }
+
+  @Override
+  public int applicationScope(Class<?> type) {
+    return scope.verdict(type);
+  }
+
+  void useScope(ApplicationScope scope) {
+    this.scope = java.util.Objects.requireNonNull(scope, "scope");
   }
 
   @Override

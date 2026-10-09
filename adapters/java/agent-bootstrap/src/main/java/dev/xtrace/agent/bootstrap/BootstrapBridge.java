@@ -25,9 +25,9 @@ public final class BootstrapBridge {
     SINK.compareAndSet(sink, null);
   }
 
-  /** Opens a fixture request context and emits its sanitized request identity. */
+  /** Opens a request context for one matched route and emits its sanitized request identity. */
   public static boolean requestStart(String method, String route) {
-    if (CONTEXT.get() != null || !"POST".equals(method) || !"/orders".equals(route)) return false;
+    if (CONTEXT.get() != null || !validMethod(method) || !validRoute(route)) return false;
     BridgeSink sink = SINK.get();
     if (sink == null) return false;
     String recordingId = UuidV7.random().toString();
@@ -45,7 +45,7 @@ public final class BootstrapBridge {
         requestId,
         "",
         BridgeEventKind.REQUEST_UPDATE,
-        "http.request POST /orders",
+        "http.request " + method + " " + route,
         0)) {
       context.requestEventId = requestId;
     } else {
@@ -63,7 +63,7 @@ public final class BootstrapBridge {
   public static void frameEnter(String symbol, java.lang.reflect.Method method) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || !isFixtureSymbol(symbol)) return;
+    if (context == null || sink == null || !validSymbol(symbol)) return;
     String eventId = context.nextEventId();
     String parent = context.currentParent();
     boolean accepted = safeMethodEvent(
@@ -72,6 +72,108 @@ public final class BootstrapBridge {
       context.dropped++;
     }
     context.frames.push(new Frame(symbol, accepted ? eventId : ""));
+  }
+
+  /**
+   * Emits a method boundary for an in-scope application class. The symbol is the simple class
+   * name plus the method name; source facts are resolved by the runtime from the declaring class,
+   * method name and descriptor, never from reflection on application objects.
+   */
+  public static String frameEnter(Class<?> type, String method, String descriptor) {
+    RequestContext context = CONTEXT.get();
+    BridgeSink sink = SINK.get();
+    if (context == null || sink == null || type == null || method == null) return null;
+    String symbol = simpleName(type.getName()) + "." + method;
+    if (!validSymbol(symbol)) return null;
+    String eventId = context.nextEventId();
+    String parent = context.currentParent();
+    boolean accepted;
+    try {
+      accepted = sink.offerFrameEvent(
+          context.recordingId, eventId, parent, BridgeEventKind.FRAME_ENTER, symbol,
+          System.nanoTime(), 0, type, method, descriptor);
+    } catch (RuntimeException | LinkageError ignored) {
+      disable(sink);
+      accepted = false;
+    }
+    if (!accepted) context.dropped++;
+    context.frames.push(new Frame(symbol, accepted ? eventId : ""));
+    return symbol;
+  }
+
+  /** Marks the active request as having no resolvable application handler (scope unknown). */
+  public static void handlerUnresolved() {
+    RequestContext context = CONTEXT.get();
+    BridgeSink sink = SINK.get();
+    if (context == null || sink == null || context.unresolvedReported) return;
+    context.unresolvedReported = true;
+    if (!safeEvent(
+        sink, context, context.nextEventId(), context.requestEventId, BridgeEventKind.GAP,
+        HANDLER_UNRESOLVED_SYMBOL, 0)) {
+      context.dropped++;
+    }
+  }
+
+  /** Symbol of the GAP event that records an unresolvable application handler. */
+  public static final String HANDLER_UNRESOLVED_SYMBOL = "xtrace.capture.handler_unresolved";
+
+  /** Returns the sink's scope verdict for a handler type: 1 in scope, 0 out of scope, -1 unknown. */
+  public static int scopeOf(Class<?> type) {
+    BridgeSink sink = SINK.get();
+    if (sink == null || type == null) return 0;
+    try {
+      return sink.applicationScope(type);
+    } catch (RuntimeException | LinkageError ignored) {
+      disable(sink);
+      return 0;
+    }
+  }
+
+  /** True when a request context is already open on this thread. */
+  public static boolean inRequest() {
+    return CONTEXT.get() != null;
+  }
+
+  static String simpleName(String binaryName) {
+    int dot = binaryName.lastIndexOf('.');
+    return dot < 0 ? binaryName : binaryName.substring(dot + 1);
+  }
+
+  static boolean validMethod(String method) {
+    if (method == null) return false;
+    switch (method) {
+      case "GET":
+      case "HEAD":
+      case "POST":
+      case "PUT":
+      case "PATCH":
+      case "DELETE":
+      case "OPTIONS":
+      case "TRACE":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /** A route is a bounded template: leading slash, no query, fragment, control or space chars. */
+  static boolean validRoute(String route) {
+    if (route == null || route.isEmpty() || route.length() > 200 || route.charAt(0) != '/') {
+      return false;
+    }
+    for (int i = 0; i < route.length(); i++) {
+      char c = route.charAt(i);
+      if (c <= ' ' || c == 0x7f || c == '?' || c == '#') return false;
+    }
+    return true;
+  }
+
+  static boolean validSymbol(String symbol) {
+    if (symbol == null || symbol.isEmpty() || symbol.length() > 200) return false;
+    for (int i = 0; i < symbol.length(); i++) {
+      if (symbol.charAt(i) <= ' ') return false;
+    }
+    return true;
   }
 
   private static boolean safeMethodEvent(
@@ -179,7 +281,7 @@ public final class BootstrapBridge {
     }
   }
 
-  static boolean hasContext() {
+  public static boolean hasContext() {
     return CONTEXT.get() != null;
   }
 
@@ -246,19 +348,13 @@ public final class BootstrapBridge {
     }
   }
 
-  private static boolean isFixtureSymbol(String symbol) {
-    return symbol != null
-        && (symbol.equals("OrderController.create")
-            || symbol.equals("OrderService.place")
-            || symbol.equals("OrderRepository.save"));
-  }
-
   private static final class RequestContext {
     private final String recordingId;
     private final long startedMonotonicNs;
     private final Deque<Frame> frames = new ArrayDeque<>(3);
     private int nextEvent = 1;
     private String requestEventId = "";
+    private boolean unresolvedReported;
     private boolean databaseActive;
     private String databaseEventId = "";
     private long dropped;

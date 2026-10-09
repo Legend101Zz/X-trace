@@ -26,7 +26,7 @@ import xtp.agent.v1.Transport.AckDurability;
 class RecordingWriterTest {
   @Test
   void insertsSupportedGapBeforeResponseAndPreservesSanitizedIdentity() throws Exception {
-    QueueSignal.Event request = event("r:1", "", BridgeEventKind.REQUEST_UPDATE, "request", 0);
+    QueueSignal.Event request = event("r:1", "", BridgeEventKind.REQUEST_UPDATE, "http.request POST /orders", 0);
     QueueSignal.Event response =
         event("r:2", "r:1", BridgeEventKind.RESPONSE, "http.response 201", 201);
     List<QueueSignal.Event> events =
