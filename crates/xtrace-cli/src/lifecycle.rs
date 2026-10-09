@@ -1093,6 +1093,29 @@ mod unix {
         }
 
         #[test]
+        fn capture_depth_enforced_is_true_only_when_the_daemon_will_arm_the_depth() {
+            use std::os::unix::fs::PermissionsExt;
+            const FOCUSED: &str = r#"{"capture_schema_version":1,"capture":{"mode":"focused"}}"#;
+            let dir = tempfile::tempdir().expect("dir");
+            let mut record = record_for(1, "", "");
+            record.bootstrap_path = dir.path().join("bootstrap.json").display().to_string();
+            record.capture_depth = "focused".to_string();
+            // No capture.json beside the bootstrap: the daemon arms standard.
+            assert!(!record_document(&record, None, Vec::new()).capture_depth_enforced);
+            // A group/world-readable capture.json is ignored by the daemon.
+            let file = dir.path().join("capture.json");
+            std::fs::write(&file, FOCUSED).expect("write");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+            assert!(!record_document(&record, None, Vec::new()).capture_depth_enforced);
+            // A private (0600) focused document is armed.
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+            assert!(record_document(&record, None, Vec::new()).capture_depth_enforced);
+            // A standard record is enforced only while the document does not arm focused.
+            record.capture_depth = "standard".to_string();
+            assert!(!record_document(&record, None, Vec::new()).capture_depth_enforced);
+        }
+
+        #[test]
         fn exit_code_is_ten_only_when_a_recording_failed_to_seal() {
             let item = |completion: &'static str| RecoveredRecording {
                 recording_id: String::new(),

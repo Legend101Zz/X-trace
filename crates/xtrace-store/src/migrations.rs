@@ -11,7 +11,8 @@
 //! `v0004_recording_terminal_evidence`; P03A appends
 //! `v0005_catalog_discovery` and `v0006_catalog_retry_namespace_expiry`; the
 //! replay contract appends `v0007_recording_event_cap_sanity_bound` and
-//! `v0008_frame_index_depth_async`. Migrations remain append-only: later
+//! `v0008_frame_index_depth_async`; ADR 0011 appends `v0009_recording_limitations`.
+//! Migrations remain append-only: later
 //! slices must add a new record instead of editing an applied one.
 //!
 //! Migrations deliberately avoid statements that cannot be safely

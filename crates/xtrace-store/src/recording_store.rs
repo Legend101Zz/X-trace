@@ -5779,6 +5779,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn exact_replay_never_changes_the_stored_limitations() {
+        let fixture = on_disk_store("limitations-replay");
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let mut request =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        request.limitations = vec!["capture_policy_not_armed".to_owned()];
+        let stored = |fixture: &StoreFixture| -> Vec<String> {
+            let connection = fixture.store.lock().expect("connection");
+            let mut statement = connection
+                .prepare("SELECT code FROM recording_limitations ORDER BY code")
+                .expect("prepare");
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows")
+        };
+
+        assert_eq!(
+            view.begin_recording(&request).expect("insert").disposition,
+            BeginRecordingDisposition::Inserted
+        );
+        assert_eq!(stored(&fixture), vec!["capture_policy_not_armed".to_owned()]);
+
+        // The replay arrives with a different (here: empty) list; the anchor keeps its own.
+        let mut replay = request.clone();
+        replay.limitations = Vec::new();
+        assert_eq!(
+            view.begin_recording(&replay).expect("replay").disposition,
+            BeginRecordingDisposition::ExactReplay
+        );
+        assert_eq!(stored(&fixture), vec!["capture_policy_not_armed".to_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn observed_begin_links_exact_fixture_and_replays_only_safe_disposition() {
         let fixture = on_disk_store("observed-start");
         let view = fixture.store.recording_store(&fixture.root).expect("view");
