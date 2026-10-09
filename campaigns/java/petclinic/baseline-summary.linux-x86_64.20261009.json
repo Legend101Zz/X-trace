@@ -1,0 +1,98 @@
+{
+ "instrumented": false,
+ "kind": "baseline_stability_summary_platform_pin",
+ "pin": {
+  "jarSha256": "5abc368b1cee5e800cf2da4283198e260081ef1ac274bd030e03b467f024b1d4",
+  "jdkImage": "eclipse-temurin:17-jdk-jammy",
+  "postgresImageDigest": "sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db",
+  "sha": "500158f732419217507c7656904b8e6aa1bcc0d6"
+ },
+ "project": "petclinic",
+ "provenance": {
+  "harnessSha256": {
+   "run.py": "f92f9245085b8513a44da0f79a895a32ad974b5a21e2250ec43f883765913702"
+  },
+  "note": "Host-JVM baseline (temurin 17, host-built jar) with Postgres 18.3 in a linux/amd64 container on an ubuntu-24.04 GitHub runner, two runs in one job with the visit-form date normalization. All eight fingerprints equal the arm64 container pin of the same date: the only drift was the calendar-dependent min= attribute, not the platform. The host-built jar sha256 differs from the container-built jar and between builds (not byte-reproducible); it is reported, not gated.",
+  "platform": "linux/amd64",
+  "receiptSha256": [
+   "774d5d761cd62b2a186e7c2b9ff5135d2ed13aafd6f0da1c36150b0e020e52fc",
+   "870c96d2ea3f3d12088025f1e8e6ca7d3664b41705ba739b72554df4e52e5e01"
+  ],
+  "recordedAt": "2026-10-09T11:10:00Z",
+  "source": {
+   "branch": "ultra/campaign/petclinic-w2c",
+   "kind": "github-actions",
+   "runId": 37920836682,
+   "runner": "ubuntu-24.04",
+   "workflow": "campaigns"
+  }
+ },
+ "releaseAcceptance": false,
+ "scenarios": [
+  {
+   "checks": 3,
+   "id": "search-seeded",
+   "kind": "business",
+   "requests": 2,
+   "semanticEffectFingerprint": "8809e2036463924d1577726045d0c6325ab6804a4591ca5bd70bbe16e68db469",
+   "stableAcrossRuns": true
+  },
+  {
+   "checks": 3,
+   "id": "owner-create-roundtrip",
+   "kind": "db-write-read",
+   "requests": 2,
+   "semanticEffectFingerprint": "d291d3285460e41d498857271f56fabd7a5fb4ecbed242e30a9a2027672dffd3",
+   "stableAcrossRuns": true
+  },
+  {
+   "checks": 3,
+   "id": "owner-validation-error",
+   "kind": "validation",
+   "requests": 1,
+   "semanticEffectFingerprint": "fc44a0fc88d73ee0f4b6a40ba919265390e7130b9133dcc0455427308c7d0b1b",
+   "stableAcrossRuns": true
+  },
+  {
+   "checks": 6,
+   "id": "pet-and-visit-flow",
+   "kind": "business",
+   "requests": 5,
+   "semanticEffectFingerprint": "515abc698f857fb07c79e189d1e73d1b4c199ef0aef3e1599000add4b61746f9",
+   "stableAcrossRuns": true
+  },
+  {
+   "checks": 3,
+   "id": "owner-edit",
+   "kind": "db-write-read",
+   "requests": 2,
+   "semanticEffectFingerprint": "5aa987aa8347b2265062a1cf008896b3f241f84bde929e4ca43c807cbc6a8893",
+   "stableAcrossRuns": true
+  },
+  {
+   "checks": 2,
+   "id": "missing-owner-error",
+   "kind": "error",
+   "requests": 1,
+   "semanticEffectFingerprint": "02c92bb873585a4c8fb82a8b4472480bf21389b05e86e0cf5a8d2ad56a98cd9b",
+   "stableAcrossRuns": true
+  },
+  {
+   "checks": 1,
+   "id": "controller-crash-path",
+   "kind": "error",
+   "requests": 1,
+   "semanticEffectFingerprint": "4c9767a8af9fd8627efe0377aa03375120c4b3894370b728ad2fe72108e321d6",
+   "stableAcrossRuns": true
+  },
+  {
+   "checks": 3,
+   "id": "concurrent-isolation",
+   "kind": "concurrency",
+   "requests": 50,
+   "semanticEffectFingerprint": "d7f724a9b78f5f34eafbd06249703fde93691b093ab712f6eaeafd6b2fd075a4",
+   "stableAcrossRuns": true
+  }
+ ],
+ "schemaVersion": 1
+}

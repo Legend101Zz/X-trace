@@ -41,7 +41,7 @@ def main() -> int:
     bad = sorted(k for k, v in want.items() if got.get(k) != v)
     waived = sorted(k for k in bad if k in args.waive)
     unwaived = [k for k in bad if k not in args.waive]
-    note = f"{len(want) - len(bad)}/{len(want)} equal the tracked arm64-container baseline"
+    note = f"{len(want) - len(bad)}/{len(want)} equal the pinned platform baseline"
     if unwaived:
         note += "; differs: " + ",".join(unwaived)
     if waived:
