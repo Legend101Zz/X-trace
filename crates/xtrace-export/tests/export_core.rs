@@ -75,20 +75,21 @@ fn export_has_no_secret_or_canary_values() {
 #[test]
 fn export_omissions_listed_for_every_dropped_example() {
     let out = export(&spring_orders(), &ExportRequest::new(ExportFormat::OpenApi)).unwrap();
-    let dropped: Vec<&str> = out
+    let mut dropped: Vec<&str> = out
         .omissions
         .iter()
         .filter(|o| o.reason == "secret_shaped")
         .map(|o| o.what.as_str())
         .collect();
+    dropped.sort_unstable();
+    assert_eq!(dropped.len(), 3, "{dropped:?}");
+    let targets: Vec<&str> = dropped.iter().map(|w| w.rsplit_once(':').unwrap().0).collect();
     assert_eq!(
-        dropped,
-        [
-            "example:param:Authorization:auth",
-            "example:request_body:canary",
-            "example:request_body:leaky",
-        ]
+        targets,
+        ["example:param:Authorization", "example:request_body", "example:request_body"]
     );
+    // identified by digest, never by the (possibly secret-shaped) label
+    assert!(dropped.iter().all(|w| !w.contains("canary") && !w.contains("leaky")));
     // operations with no kept example say so
     assert!(out.omissions.iter().any(|o| o.operation_id == "op-delete" && o.what == "examples"));
     // and the document carries the same list

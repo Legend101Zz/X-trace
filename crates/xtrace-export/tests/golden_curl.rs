@@ -22,9 +22,10 @@ fn curl_golden() {
         names,
         [
             "001-get-orders.sh",
-            "002-post-orders.sh",
-            "003-get-orders-id.sh",
-            "004-delete-orders-id.sh",
+            "002-get-orders.sh",
+            "003-post-orders.sh",
+            "004-get-orders-id.sh",
+            "005-delete-orders-id.sh",
             "all.sh"
         ]
     );
@@ -38,8 +39,8 @@ fn curl_all_sh_contains_no_mutating_command() {
     let o = out();
     let all = text(o.files.iter().find(|f| f.path == "all.sh").unwrap());
     assert!(all.contains("sh \"$DIR/001-get-orders.sh\""));
-    assert!(all.contains("sh \"$DIR/003-get-orders-id.sh\""));
-    for mutating in ["002-post-orders.sh", "004-delete-orders-id.sh"] {
+    assert!(all.contains("sh \"$DIR/004-get-orders-id.sh\""));
+    for mutating in ["003-post-orders.sh", "005-delete-orders-id.sh"] {
         assert!(all.contains(&format!("# not run (mutating")), "{all}");
         for line in all.lines().filter(|l| l.contains(mutating)) {
             assert!(line.starts_with('#'), "mutating recipe invoked: {line}");
@@ -76,7 +77,7 @@ fn curl_no_secret_values() {
     }
     // the credential header is a required environment placeholder, never a value
     let o = out();
-    let get = text(o.files.iter().find(|f| f.path == "003-get-orders-id.sh").unwrap());
+    let get = text(o.files.iter().find(|f| f.path == "004-get-orders-id.sh").unwrap());
     assert!(get.contains("-H \"Authorization: ${XT_HEADER_AUTHORIZATION}\""), "{get}");
     assert!(get.contains(": \"${XT_HEADER_AUTHORIZATION:?set XT_HEADER_AUTHORIZATION}\""));
 }
@@ -116,5 +117,7 @@ fn hostile_names_and_comments_stay_on_one_line() {
     input.operations = vec![o];
     let out = export(&input, &ExportRequest::new(ExportFormat::Curl)).unwrap();
     let script = text(&out.files[0]);
-    assert!(!script.lines().any(|l| l.starts_with("rm ") || l.starts_with("; echo")), "{script}");
+    // control characters in comment text are neutralised, so each stays on one line
+    assert!(script.contains("\n# operation: op?rm -rf /\n"), "{script}");
+    assert!(script.contains("\n# route: GET /x?; echo pwned\n"), "{script}");
 }

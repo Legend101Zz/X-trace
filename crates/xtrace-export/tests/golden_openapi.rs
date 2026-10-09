@@ -103,7 +103,7 @@ fn openapi_duplicate_method_path_is_reported_not_merged() {
     // op-dup shares GET /orders with op-list; the canonical winner keeps the slot.
     assert!(
         out.omissions.iter().any(
-            |o| o.operation_id == "op-dup" && o.reason.starts_with("duplicate_method_path_of:")
+            |o| o.operation_id == "op-zdup" && o.reason.starts_with("duplicate_method_path_of:")
         )
     );
 }

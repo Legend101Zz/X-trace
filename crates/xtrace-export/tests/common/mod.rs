@@ -105,7 +105,7 @@ pub fn spring_orders() -> ExportInput {
         op("op-list", "GET", "/orders", vec![list_a, list_b]),
         op("op-create", "POST", "/orders", vec![create]),
         op("op-delete", "DELETE", "/orders/:id", vec![delete]),
-        op("op-dup", "GET", "/orders", vec![dup]),
+        op("op-zdup", "GET", "/orders", vec![dup]),
     ];
     ops[1].effective_state = EffectiveState::Conflicted;
     ops[2].effective_state = EffectiveState::Observed;
@@ -126,10 +126,10 @@ pub fn golden_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(rel)
 }
 
-/// Compares to a golden file; `XTRACE_BLESS=1` rewrites it.
+/// Compares to a golden file; an existing `tests/fixtures/.bless` file rewrites it.
 pub fn assert_golden(rel: &str, actual: &[u8]) {
     let path = golden_path(rel);
-    if std::env::var_os("XTRACE_BLESS").is_some() {
+    if golden_path(".bless").exists() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, actual).unwrap();
     }

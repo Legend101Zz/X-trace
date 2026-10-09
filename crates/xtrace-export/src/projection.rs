@@ -210,6 +210,14 @@ pub fn prepare(input: &ExportInput, request: &ExportRequest) -> Prepared {
     }
 }
 
+fn example_digest(label: &str, value: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(label.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(value.as_bytes());
+    hasher.finalize().to_hex().as_str()[..8].to_owned()
+}
+
 fn omit(set: &mut BTreeSet<Omission>, op: &str, what: String, reason: &str) {
     set.insert(Omission { operation_id: op.to_owned(), what, reason: reason.to_owned() });
 }
@@ -351,7 +359,9 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
                 omit(
                     omissions,
                     &op.operation_id,
-                    format!("example:{}:{}", ex.target, ex.label),
+                    // Labels and values may themselves be secret-shaped: identify the
+                    // dropped example by target and a digest, never by its text.
+                    format!("example:{}:{}", ex.target, example_digest(&ex.label, &ex.value)),
                     "secret_shaped",
                 );
                 continue;

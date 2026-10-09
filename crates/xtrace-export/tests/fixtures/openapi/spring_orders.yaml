@@ -1,0 +1,173 @@
+info:
+  title: "Orders demo"
+  version: "catalog-r3"
+  x-xtrace:
+    catalog_hash: "abababababababababababababababababababababababababababababababab"
+    notice: "Generated from the X-trace catalog. effective_state says how each operation was learned; no request or response bodies were observed or retained."
+    omissions:
+      -
+        operation_id: "op-create"
+        reason: "secret_shaped"
+        what: "example:param:Authorization:220108d7"
+      -
+        operation_id: "op-create"
+        reason: "secret_shaped"
+        what: "example:request_body:27cb7f5f"
+      -
+        operation_id: "op-create"
+        reason: "secret_shaped"
+        what: "example:request_body:8cd6c6fd"
+      -
+        operation_id: "op-delete"
+        reason: "no_scenario_or_claim_example"
+        what: "examples"
+      -
+        operation_id: "op-zdup"
+        reason: "no_scenario_or_claim_example"
+        what: "examples"
+      -
+        operation_id: "op-zdup"
+        reason: "duplicate_method_path_of:op-list"
+        what: "operation"
+    policy_digest: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+    revision_id: "rev-0001"
+openapi: "3.1.0"
+paths:
+  "/orders":
+    get:
+      operationId: "getOrders"
+      parameters:
+        -
+          in: "query"
+          name: "page"
+          required: false
+          schema: {}
+      responses:
+        "200":
+          description: "Declared by catalog claims (description unavailable or conflicting)"
+      tags:
+        - "orders"
+      x-xtrace:
+        application_component: "orders"
+        binding_key: "spring:GET /orders"
+        conflicts:
+          -
+            claims:
+              -
+                claim_id: "c-list-a"
+                value: "integer"
+              -
+                claim_id: "c-list-b"
+                value: "string"
+            kind: "param_type"
+            subject: "query:page"
+          -
+            claims:
+              -
+                claim_id: "c-list-a"
+                value: "A page of orders"
+              -
+                claim_id: "c-list-b"
+                value: "All orders"
+            kind: "response_description"
+            subject: "200"
+        effective_state: "conflicted"
+        examples:
+          -
+            label: "first"
+            origin: "claim"
+            target: "param:page"
+            value: 1
+        operation_id: "op-list"
+        provenance:
+          - "adapter_registration"
+          - "static_analysis"
+    post:
+      operationId: "postOrders"
+      requestBody:
+        content:
+          "application/json":
+            schema: {}
+      responses:
+        "201":
+          description: "Created"
+      tags:
+        - "orders"
+      x-xtrace:
+        application_component: "orders"
+        binding_key: "spring:POST /orders"
+        effective_state: "observed"
+        examples:
+          -
+            label: "new-order"
+            origin: "scenario"
+            target: "request_body"
+            value:
+              qty: 2
+              sku: "A-1"
+        operation_id: "op-create"
+        provenance:
+          - "static_analysis"
+  "/orders/{id}":
+    delete:
+      operationId: "deleteOrdersById"
+      parameters:
+        -
+          in: "path"
+          name: "id"
+          required: true
+          schema: {}
+      responses:
+        "204":
+          description: "Declared by catalog claims (description unavailable or conflicting)"
+      tags:
+        - "orders"
+      x-xtrace:
+        application_component: "orders"
+        binding_key: "spring:DELETE /orders/:id"
+        effective_state: "registered"
+        operation_id: "op-delete"
+        provenance:
+          - "static_analysis"
+    get:
+      operationId: "getOrdersById"
+      parameters:
+        -
+          in: "header"
+          name: "Authorization"
+          required: true
+          schema:
+            type: "string"
+        -
+          in: "path"
+          name: "id"
+          required: true
+          schema:
+            type: "integer"
+      responses:
+        "200":
+          description: "The order"
+        "404":
+          description: "No such order"
+      tags:
+        - "orders"
+      x-xtrace:
+        application_component: "orders"
+        binding_key: "spring:GET /orders/{id}"
+        confidence_basis_points: 9000
+        effective_state: "registered"
+        examples:
+          -
+            label: "typical"
+            origin: "scenario"
+            target: "param:id"
+            value: 42
+        handlers:
+          -
+            line_end: 31
+            line_start: 20
+            path: "src/main/java/demo/OrderController.java"
+            symbol: "OrderController.get"
+        operation_id: "op-get-one"
+        provenance:
+          - "static_analysis"
