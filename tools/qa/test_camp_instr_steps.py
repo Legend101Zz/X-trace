@@ -20,7 +20,7 @@ class T(unittest.TestCase):
         self.assertEqual(by(s.instrumented_steps(None))["instrumented-run"][0], "fail")
 
     def test_all_good(self):
-        r = {"scenarios": [sc("a"), sc("b")], "api": {"ok": True, "recordings": 5}, "problemClasses": {},
+        r = {"scenarios": [sc("a"), sc("b")], "api": {"ok": True, "recordings": 5}, "problemClasses": {}, "recordingsWithSource": 3,
              "notes": {"stopCommand": {"exitCode": 0}}}
         d = by(s.instrumented_steps(r))
         self.assertTrue(all(v[0] == "pass" for v in d.values()), d)
@@ -33,6 +33,13 @@ class T(unittest.TestCase):
         self.assertEqual(d["recordings-per-scenario"][0], "fail")
         self.assertEqual(d["source-identity"][0], "fail")
         self.assertEqual(d["product-stop-command"][0], "not-implemented")
+
+    def test_zero_recordings_never_pass_source_identity(self):
+        r = {"scenarios": [sc("a", rec=False)], "api": {"ok": True, "recordings": 0}, "problemClasses": {"no-recording-for-route": 1},
+             "recordingsWithSource": 0, "notes": {}}
+        d = by(s.instrumented_steps(r))
+        self.assertEqual(d["source-identity"][0], "fail")
+        self.assertEqual(d["recordings-per-scenario"][0], "fail")
 
     def test_no_baseline_is_fail_not_pass(self):
         r = {"scenarios": [{"id": "a", "scenarioChecksPassed": True, "fingerprintEqualsBaseline": None}],

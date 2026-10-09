@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { dockerLogged, container, docker } from "../../lib/docker.mjs";
+import { dockerLogged, container, docker, PLATFORM } from "../../lib/docker.mjs";
 import { projectRoot, IMAGE } from "../../lib/paths.mjs";
 import { runBaseline, randomSecret, imageId } from "../../lib/baseline.mjs";
 import { startPostgres, waitHttp } from "../../lib/stack.mjs";
@@ -34,7 +34,7 @@ async function prepare() {
   fs.writeFileSync(path.join(upstream, ".xtrace-prepare.sh"), PREPARE);
   const log = path.join(root, "prepare.log");
   const code = await dockerLogged(
-    ["run", "--rm", "--name", "xtrace-camp-node-directus-prepare", "--platform", "linux/arm64", "-v", `${upstream}:/work`, "-e", "COREPACK_HOME=/work/.xtrace-corepack", "-e", "NODE_OPTIONS=--max-old-space-size=6144", image, "sh", "/work/.xtrace-prepare.sh"],
+    ["run", "--rm", "--name", "xtrace-camp-node-directus-prepare", "--platform", PLATFORM, "-v", `${upstream}:/work`, "-e", "COREPACK_HOME=/work/.xtrace-corepack", "-e", "NODE_OPTIONS=--max-old-space-size=6144", image, "sh", "/work/.xtrace-prepare.sh"],
     log,
   );
   console.log("prepare exit", code, "log", log);
@@ -114,7 +114,7 @@ else if (cmd === "baseline") {
       nodeVersion: NODE_VERSION,
       nodeImage: image,
       nodeImageId: imageId(image),
-      platform: "linux/arm64 (Docker Desktop)",
+      platform: `${PLATFORM} (${process.env.XCAMP_PLATFORM ? "CI runner" : "Docker Desktop"})`,
       database: campaign.runtime.database,
       lockfileSha256: pkgSha,
       scenarioHarnessSha256: sha256Hex(fs.readFileSync(path.join(here, "scenarios.mjs"))),
