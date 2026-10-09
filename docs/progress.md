@@ -503,3 +503,39 @@ Open major findings on the candidate (from the final review):
 - **The wave-1 integration branch was red for about four hours.** It was merged mid-wave before its lane was green on strict clippy, which hid every Rust test until it was fixed.
 
 Next: the owner decides on the retained leases. Then the leased macOS floor runs on `ultra/rc-1`, the ten majors are fixed, and the candidate is merged. Owner review steps are in `docs/releases/v0.01-owner-review.md`.
+
+### Continuation after owner approval: release candidate rc-2, still NOT merged (2026-10-09, 14:48–18:50 UTC)
+
+The owner approved removing the retained builder leases by hand and asked to continue. The leases were removed exactly as in S0b: a proof file, the label re-checked immediately before removal, and only the two lease directories deleted. The continuation then worked on the ten major findings from the final review of rc-1.
+
+**Fixes.** Six fix branches went onto `ultra/rc-2`, then two fixers:
+- Finished recordings no longer count against the session or daemon budgets. There is a bounded tombstone ring, digest tables are released after the terminal commit, there is a 2,000,000 retained-digest refusal and a separate 512 MiB finish-verification bound, and a daemon test shows request 257 is accepted after 256 finished recordings.
+- Focused capture can be armed from `capture.json`. `xtrace run` accepts `--capture-depth`, `--app-package`, `--source-root` and `--launcher`, writes `capture.json`, and resolves the application scope on the launch path. A journey test shows the focused event cap (131,072) through the read API.
+- The Java static analyzer is part of the Gradle build, with strict dependency verification.
+- Every Node version site is `0.0.1`, and a test keeps the Rust, Java and Node version families in step.
+- The relocated catalog source-proof gate has unit tests and SQLite integration tests, and `xtrace scan` runs the real Node analyzer in a journey.
+- `ci.yml` gains a hosted macOS arm64 job (ADR 0006 §2.3), `--locked` gates and minimum test counts.
+- Several macOS test fixes.
+
+**Evidence on `ultra/rc-2` at `85c0d1db1518f814cde3949864ccdb0277beff8b`:**
+- **GitHub Actions on the parent `b7b260f`:** lane 37963545185 and package 37963545238 are green. In ci 37963545129, every Linux job is green, including both Linux x86_64 23-gate floors, but the **new hosted macOS arm64 job fails** on both runtime tuples. The macOS fix proof (ci 37967096191) also fails.
+- **Leased macOS arm64 23-gate floors:**
+  - On rc-1 `4c060ec`: `U1P-4c060ec-1` failed at gate 18 (`rust-workspace`) after gates 1–17 passed. One scan timeout test raced on macOS (since fixed). Receipt sha256 `157bc56a870bdb83cb0847fe6bd423bab4c2b55d937782a9633eb35f5f1e95bd`.
+  - On rc-2 `85c0d1d`: `U2F-85c0d1d-1` failed at gate 18 (`rust-workspace`) after gates 1–17 passed. The Spring premain journey did not persist its recordings before its deadline, and two store tests hit segment object I/O errors under full-workspace load. Receipt sha256 `5efd3d2cfe4744c72857c455ec2ca60c890c4ada762f3554c83cf47a59820e50`.
+
+**Why it is not merged.** The macOS floor and the hosted macOS job are red. The likely cause: macOS private-storage admission still runs `/bin/ls` about 140 times per recording commit (the ACL probe cost noted in ADR 0008), which does not hold up under parallel load. **`main` stays at `a181a0c`. No requirement row is accepted.** The row notes in `evidence/v0.01/requirements.json` describe rc-1 (`4c060ec`); this entry describes what changed after that.
+
+**Still open:**
+- The macOS failures above.
+- The `capture_policy_not_armed` limitation is not persisted to the read API; it needs a new `BeginRecording` field and a migration.
+- Line events from focused capture do not reach the read API for the fixture methods yet (an honest gap is recorded instead).
+- `java_launch` supports direct launch only.
+- The Petclinic campaign still records too few requests, with no repository frames or source lines.
+
+Next: fix macOS private-storage admission cost (one batched or native ACL query per commit), make the macOS floor and the hosted macOS job green on `ultra/rc-2`, then merge.
+
+**Delta review of `85c0d1d`.** The architecture and security reviews approve with fixes. Findings not yet closed:
+- **Partly closed:** focused-mode arming (the not-armed limitation is not persisted) and scope delivery (the observation policy is still the fixture policy).
+- **Open:** the hosted macOS job is red.
+- **New: deadlines raised.** The macOS test fixes raised several test deadlines 4.5–12×: Express child wait 20→90 s, premain recording wait 10→60 s, event-cap finish acknowledgement 5→60 s, and scan timeout 1→5 s. They work around the slow macOS admission rather than fixing it. Under the project's rules this counts as weakening deadlines. These changes must be reverted once the admission cost is fixed, and they are one more reason rc-2 is not merged.
+- **New: stale row notes.** The row notes describe rc-1, as stated above.
