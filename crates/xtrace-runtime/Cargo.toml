@@ -25,5 +25,9 @@ xtrace-protocol = { path = "../xtrace-protocol" }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["event", "fs", "process"] }
 
+[features]
+# Test-key trust table for lane P's pack verification tests; never enabled in release builds.
+dev-trust-table = []
+
 [dev-dependencies]
 tempfile = "3.10"

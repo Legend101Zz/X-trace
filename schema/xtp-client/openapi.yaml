@@ -228,7 +228,7 @@ paths:
           name: aroundFrame
           description: >-
             Window of limit events centred on this frame. Mutually exclusive with
-            cursor. Registered; answers 501 XTR-REPLAY-NOT-IMPLEMENTED until served.
+            cursor. A frame that is not in this recording answers 404.
           schema: { type: string, format: uuid }
         - in: query
           name: projection
@@ -285,8 +285,9 @@ paths:
     get:
       operationId: navigateRecording
       description: >-
-        Resolve one navigation action from a frame (action) or jump to the next or
-        previous gap, error or interaction (kind and dir).
+        Resolve one navigation action from a frame (action). The kinds filter and the
+        gap, error or interaction jump (kind and dir) are registered and answer 501
+        XTR-REPLAY-NOT-IMPLEMENTED until served.
       security: [{ viewerCookie: [] }]
       parameters:
         - $ref: '#/components/parameters/ViewerHost'
@@ -474,7 +475,7 @@ components:
         eventCap: { type: [integer, 'null'], minimum: 1, description: Event cap recorded in terminal evidence. }
         outcomeKind:
           type: [string, 'null']
-          enum: [responded, exception, unobserved, null]
+          enum: [responded, exception_propagated, client_aborted, unobserved, null]
           description: Outcome kind from terminal evidence; null when no terminal evidence exists.
     ObservedEndpointPage:
       type: object
@@ -584,7 +585,7 @@ components:
       type: object
       required: [kind, httpStatus, exception, thrownFromEventId]
       properties:
-        kind: { type: string, enum: [responded, exception, unobserved] }
+        kind: { type: string, enum: [responded, exception_propagated, client_aborted, unobserved] }
         httpStatus: { type: [integer, 'null'], minimum: 100, maximum: 599 }
         exception:
           oneOf:
@@ -711,6 +712,7 @@ components:
         depth: { type: [integer, 'null'], minimum: 0 }
         parentFrameId: { type: [string, 'null'], format: uuid }
         navigation: { $ref: '#/components/schemas/FrameNavigation' }
+        requestId: { type: string, format: uuid }
     NavigateDocument:
       type: object
       required: [frameId, result]
@@ -718,6 +720,7 @@ components:
         frameId: { type: string, format: uuid }
         action: { type: string, enum: [previous, next, into, over, out] }
         result: { $ref: '#/components/schemas/NavigationResult' }
+        requestId: { type: string, format: uuid }
     RecordingGraph:
       type: object
       required: [nodes, edges]

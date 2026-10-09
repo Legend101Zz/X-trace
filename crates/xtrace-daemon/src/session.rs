@@ -70,11 +70,9 @@ use xtrace_domain::ids::Id;
 use xtrace_domain::{ContentHash, ProjectId, RepositoryFingerprint, RuntimeSessionId};
 use xtrace_ingest::{Acceptance, IngestConfig, IngestError, IngestValidator};
 
-// The ingest digest budget and the application persistence bound are one
-// limit seen from two layers; keep them from drifting apart.
-const _: () = assert!(
-    xtrace_ingest::DEFAULT_MAX_EVENTS_PER_RECORDING == xtrace_application::MAX_RECORDED_EVENTS
-);
+// The ingest cap and the application cap are one limit seen from two layers; both derive it
+// from the recording's effective capture mode (see `effective_capture_mode`). The test
+// `ingest_and_application_caps_agree` guards that they do not drift apart.
 // Likewise the drop-priority bucket bound: ingest and application agree.
 const _: () = assert!(
     xtrace_ingest::MAX_DROP_PRIORITY_BUCKETS == xtrace_application::MAX_CAPACITY_DROP_PRIORITIES
@@ -245,7 +243,9 @@ impl Session {
     pub fn new(inputs: HandshakeInputs) -> Self {
         let active_recordings =
             NonZeroUsize::new(STAGED_INCOMING_LIMIT).unwrap_or(NonZeroUsize::MIN);
-        let ingest_config = IngestConfig::new(active_recordings);
+        // The audit redactor runs on every accepted event and finish (the event and finish arms
+        // of the post-hello handler), so bindings may be accepted.
+        let ingest_config = IngestConfig::mode_derived(active_recordings).with_bindings_audit_active();
         Self::new_with_ingest_config(inputs, ingest_config)
     }
 
@@ -610,7 +610,13 @@ impl Session {
                 let default_watermark = self.ingest_validator.highest_contiguous_seq(recording_id);
                 let acceptance = self
                     .ingest_validator
-                    .accept_started(started, xtrace_domain::CaptureMode::Standard)
+                    .accept_started(
+                        started,
+                        crate::recording_pipeline::effective_capture_mode(
+                            xtrace_domain::CaptureMode::Standard,
+                            &started.capture_policy_id,
+                        ),
+                    )
                     .map_err(SessionError::with_ingest)?;
                 let incoming = IncomingEnvelope::RecordingStarted(started.clone());
                 Ok(self.admit_recording(
@@ -629,7 +635,13 @@ impl Session {
                     .ingest_validator
                     .accept_events(batch)
                     .map_err(SessionError::with_ingest)?;
-                let incoming = IncomingEnvelope::EventBatch(batch.clone());
+                // CONTRACTS 9.3: the daemon audit redactor is the second pass over every
+                // accepted event, before the batch is translated and encoded into an XTF segment.
+                let mut audited = batch.clone();
+                for event in &mut audited.events {
+                    let _ = xtrace_ingest::redaction_audit::audit_event(event);
+                }
+                let incoming = IncomingEnvelope::EventBatch(audited);
                 Ok(self.admit_recording(
                     recording_id,
                     incoming,
@@ -650,7 +662,9 @@ impl Session {
                     .ingest_validator
                     .accept_finished(finished)
                     .map_err(SessionError::with_ingest)?;
-                let incoming = IncomingEnvelope::RecordingFinished(finished.clone());
+                let mut audited = finished.clone();
+                let _ = xtrace_ingest::redaction_audit::audit_finished(&mut audited);
+                let incoming = IncomingEnvelope::RecordingFinished(audited);
                 Ok(self.admit_recording(
                     recording_id,
                     incoming,
@@ -1883,6 +1897,53 @@ mod tests {
             recording_seq: seq,
             ..wire::RecordingEvent::default()
         }
+    }
+
+    #[test]
+    #[allow(clippy::panic, reason = "test asserts the staged payload kind")]
+    fn audit_redactor_downgrades_secret_values_before_they_are_staged() {
+        // CONTRACTS 9.3 / review A-01: the audit runs on every accepted event, so a value under a
+        // secret-looking name never reaches the translator as a captured preview.
+        let (mut session, session_id, _) = session_after_hello();
+        session
+            .accept_post_hello(&envelope_with_payload(
+                session_id,
+                1,
+                PayloadOneof::RecordingStarted(valid_started(0x01)),
+            ))
+            .expect("start");
+        let preview = "hunter2-canary";
+        let mut secret_event = event(2, 0xaa);
+        secret_event.kind = wire::RecordingEventKind::FrameEnter as i32;
+        secret_event.bindings = vec![wire::ValueBinding {
+            name: "password".to_owned(),
+            role: wire::BindingRole::Argument as i32,
+            name_origin: wire::NameOrigin::Declared as i32,
+            value: Some(wire::CapturedValue {
+                value: Some(wire::captured_value::Value::Captured(wire::CapturedValueCaptured {
+                    shape: wire::ValueShape::String as i32,
+                    preview: preview.to_owned(),
+                    content_hash: blake3::hash(preview.as_bytes()).as_bytes().to_vec().into(),
+                })),
+            }),
+        }];
+        session
+            .accept_post_hello(&envelope_with_payload(
+                session_id,
+                2,
+                PayloadOneof::EventBatch(batch_with(0x01, vec![secret_event])),
+            ))
+            .expect("batch is accepted, then audited");
+        let staged = match session.staged_incoming.back() {
+            Some((_, IncomingEnvelope::EventBatch(batch))) => batch.clone(),
+            other => panic!("expected a staged event batch, got {other:?}"),
+        };
+        let value = staged.events[0].bindings[0].value.as_ref().and_then(|v| v.value.as_ref());
+        assert!(
+            matches!(value, Some(wire::captured_value::Value::Redacted(_))),
+            "secret-named binding must be downgraded to Redacted, got {value:?}"
+        );
+        assert!(!format!("{staged:?}").contains(preview), "the canary preview must not be staged");
     }
 
     fn batch_with(seed: u8, events: Vec<wire::RecordingEvent>) -> wire::EventBatch {

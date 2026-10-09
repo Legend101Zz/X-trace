@@ -102,8 +102,10 @@ mod pointer_io {
         ))
     }
 }
+mod retention;
 mod run;
 mod scan;
+mod store_cmd;
 mod tui;
 mod viewer;
 
@@ -113,11 +115,27 @@ use xtrace_domain::{AppError, CorrelationId, ErrorCategory, ErrorCode, RetryAdvi
 
 pub use error::CliError;
 
+/// `--version` text after the program name (CONTRACTS 11.1): the package version, the
+/// store schema version and the XTP protocol version, one per line.
+fn long_version() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        format!(
+            "{}\nschema-version: {}\nxtp-protocol: {}.{}",
+            env!("CARGO_PKG_VERSION"),
+            xtrace_store::CURRENT_SCHEMA_VERSION,
+            xtrace_protocol::envelope::PROTOCOL_MAJOR,
+            xtrace_protocol::envelope::PROTOCOL_MINOR,
+        )
+    })
+}
+
 /// Top-level CLI surface parsed by [`clap`].
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "xtrace",
     version,
+    long_version = long_version(),
     about = "X-trace: capture, replay, and review for HTTP services.",
     long_about = None,
 )]

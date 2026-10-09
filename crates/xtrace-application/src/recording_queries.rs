@@ -63,6 +63,9 @@ pub struct ShowRecording {
     pub limit: u32,
     /// Versioned opaque continuation returned by an earlier show response.
     pub cursor: Option<String>,
+    /// Centre the window on this frame instead of paging from a cursor; mutually
+    /// exclusive with `cursor` (CONTRACTS 8.2).
+    pub around_frame: Option<FrameId>,
 }
 
 /// Versioned persisted lifecycle status; a nonterminal state is not completion.
@@ -506,13 +509,34 @@ pub struct RecordingEventWindow {
     pub capacity: Option<RecordingCapacity>,
     /// Stable limitation codes recorded for this recording.
     pub limitations: Vec<String>,
+    /// Whole-recording frame honesty counts from the frame index; `None` when any frame
+    /// predates the index (counts are then unavailable, never zero-filled).
+    pub frame_honesty: Option<FrameHonestyCounts>,
+}
+
+/// Frames carrying each honesty flag, counted once per frame (CONTRACTS 9.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameHonestyCounts {
+    /// Frames with a gap.
+    pub gap: u64,
+    /// Frames with a redacted binding.
+    pub redacted: u64,
+    /// Frames with a truncated binding.
+    pub truncated: u64,
+    /// Frames with an unavailable binding.
+    pub unavailable: u64,
+    /// Frames with a dropped binding.
+    pub dropped: u64,
+    /// Frames whose parent was never observed.
+    pub orphan_parent: u64,
 }
 
 /// Adapter-observed outcome of the recorded operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedOutcome {
-    /// `responded`, `exception` or `unobserved` (snake_case).
+    /// `responded`, `exception_propagated`, `client_aborted` or `unobserved` (the domain
+    /// `OutcomeKind` vocabulary, snake_case).
     pub kind: String,
     /// HTTP status when observed.
     pub http_status: Option<u16>,
@@ -809,8 +833,91 @@ impl Default for UnavailableEvidence {
     }
 }
 
+/// Every navigation action for one frame, with the facts a client needs to place it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameNavigationView {
+    /// Frame the facts describe.
+    pub frame_id: FrameId,
+    /// Recording sequence of the frame, decimal string.
+    pub sequence: String,
+    /// Call depth; `None` for legacy or unindexed frames.
+    pub depth: Option<u32>,
+    /// Parent frame, only when the parent was observed.
+    pub parent_frame_id: Option<FrameId>,
+    /// Resolved navigation edges.
+    pub navigation: FrameNavigation,
+}
+
+/// One replay-navigation action (CONTRACTS 8.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavigationAction {
+    /// Nearest earlier navigable frame.
+    Previous,
+    /// Nearest later navigable frame.
+    Next,
+    /// First child frame, else the next frame.
+    Into,
+    /// First later frame at the same or lower depth.
+    Over,
+    /// First later frame at lower depth.
+    Out,
+}
+
+impl NavigationAction {
+    /// Parses the stable query-string spelling.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "previous" => Self::Previous,
+            "next" => Self::Next,
+            "into" => Self::Into,
+            "over" => Self::Over,
+            "out" => Self::Out,
+            _ => return None,
+        })
+    }
+
+    /// The stable query-string spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Previous => "previous",
+            Self::Next => "next",
+            Self::Into => "into",
+            Self::Over => "over",
+            Self::Out => "out",
+        }
+    }
+
+    /// Picks this action's edge out of a frame's navigation.
+    #[must_use]
+    pub const fn select(self, navigation: &FrameNavigation) -> NavigationResult {
+        match self {
+            Self::Previous => navigation.previous,
+            Self::Next => navigation.next,
+            Self::Into => navigation.into,
+            Self::Over => navigation.over,
+            Self::Out => navigation.out,
+        }
+    }
+}
+
 /// Infrastructure contract for bounded persisted-recording reads.
 pub trait RecordingReadPort: Send + Sync {
+    /// Resolves every navigation edge of one frame of a project-owned recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` when the recording is not owned by the project or the
+    /// frame does not belong to it.
+    fn frame_navigation(
+        &self,
+        project_id: ProjectId,
+        recording_id: RecordingId,
+        frame_id: FrameId,
+    ) -> Result<FrameNavigationView, PortError>;
+
     /// Lists one stable, bounded page and reports whether another page exists.
     fn list_recordings(
         &self,
@@ -869,6 +976,37 @@ impl<P: RecordingReadPort> RecordingQueryService<P> {
     ) -> Result<RecordingDetail, AppError> {
         show_recording(&self.port, request, correlation_id)
     }
+
+    /// Resolves every navigation edge of one frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized read-port failure; an unknown frame is not found.
+    pub fn frame_navigation(
+        &self,
+        project_id: ProjectId,
+        recording_id: RecordingId,
+        frame_id: FrameId,
+        correlation_id: CorrelationId,
+    ) -> Result<FrameNavigationView, AppError> {
+        frame_navigation(&self.port, project_id, recording_id, frame_id, correlation_id)
+    }
+}
+
+/// Resolves all navigation edges of one frame (the five-in-one endpoint).
+///
+/// # Errors
+///
+/// Propagates a sanitized read-port failure; an unknown frame is `NotFound`.
+pub fn frame_navigation<P: RecordingReadPort>(
+    port: &P,
+    project_id: ProjectId,
+    recording_id: RecordingId,
+    frame_id: FrameId,
+    correlation_id: CorrelationId,
+) -> Result<FrameNavigationView, AppError> {
+    port.frame_navigation(project_id, recording_id, frame_id)
+        .map_err(|error| crate::application::port_error_to_app_error(error, correlation_id))
 }
 
 /// Lists persisted recordings after validating application-owned bounds.
@@ -930,11 +1068,37 @@ pub fn show_recording<P: RecordingReadPort>(
     }) {
         return Err(cursor_validation_error(correlation_id));
     }
+    if request.around_frame.is_some() && request.cursor.is_some() {
+        return Err(query_validation_error(correlation_id));
+    }
+    // An around-window starts `limit / 2` events before the anchor, clamped to the first
+    // event (sequence 2), so the anchor is the middle element whenever the recording allows.
+    let anchor = request
+        .around_frame
+        .map(|frame_id| {
+            let view = port
+                .frame_navigation(request.project_id, request.recording_id, frame_id)
+                .map_err(|error| {
+                    crate::application::port_error_to_app_error(error, correlation_id)
+                })?;
+            let sequence = view
+                .sequence
+                .parse::<u64>()
+                .map_err(|_| query_resource_error(correlation_id))?;
+            Ok::<_, AppError>((frame_id, sequence))
+        })
+        .transpose()?;
+    let after_sequence_start = match anchor {
+        Some((_, sequence)) => {
+            Some(sequence.saturating_sub(u64::from(request.limit / 2)).max(2).saturating_sub(1))
+        }
+        None => after_sequence.map(|cursor| cursor.sequence),
+    };
     let position = ShowWindowRequest {
         project_id: request.project_id,
         recording_id: request.recording_id,
         limit: request.limit,
-        after_sequence: after_sequence.map(|cursor| cursor.sequence),
+        after_sequence: after_sequence_start,
     };
     let window = port
         .show_recording(&position)
@@ -997,6 +1161,16 @@ pub fn show_recording<P: RecordingReadPort>(
         &drop_counts_by_priority,
         &events,
     );
+    let mut honesty = honesty;
+    if let Some(counts) = window.frame_honesty {
+        honesty.recording.frames_with_gap = Some(counts.gap);
+        honesty.recording.frames_with_redacted = Some(counts.redacted);
+        honesty.recording.frames_with_truncated = Some(counts.truncated);
+        honesty.recording.frames_with_unavailable = Some(counts.unavailable);
+        honesty.recording.frames_with_dropped = Some(counts.dropped);
+        honesty.recording.frames_with_orphan_parent = Some(counts.orphan_parent);
+        honesty.recording.counts_available = true;
+    }
     let first_sequence = events.first().map(|event| event.sequence.clone());
     let last_sequence = events.last().map(|event| event.sequence.clone());
     Ok(RecordingDetail {
@@ -1026,7 +1200,7 @@ pub fn show_recording<P: RecordingReadPort>(
         capacity: window.capacity,
         limitations: window.limitations,
         honesty,
-        anchor_frame_id: None,
+        anchor_frame_id: anchor.map(|(frame_id, _)| frame_id),
         first_sequence,
         last_sequence,
         prev_cursor: None,
@@ -1110,6 +1284,19 @@ mod tests {
     }
 
     impl RecordingReadPort for ReadFixture {
+        fn frame_navigation(
+            &self,
+            _project_id: ProjectId,
+            _recording_id: RecordingId,
+            _frame_id: FrameId,
+        ) -> Result<FrameNavigationView, PortError> {
+            Err(PortError::new(
+                PortErrorKind::NotFound,
+                "fixture has no frames",
+                CorrelationId::new(),
+            ))
+        }
+
         fn list_recordings(
             &self,
             _project_id: ProjectId,
@@ -1164,6 +1351,7 @@ mod tests {
             outcome: None,
             capacity: None,
             limitations: Vec::new(),
+            frame_honesty: None,
         };
         let list = vec![RecordingMetadata {
             recording_id,
@@ -1193,7 +1381,7 @@ mod tests {
 
         let detail = service
             .show(
-                ShowRecording { project_id, recording_id, limit: 1, cursor: None },
+                ShowRecording { project_id, recording_id, limit: 1, cursor: None, around_frame: None  },
                 CorrelationId::new(),
             )
             .expect("show through shared service");
@@ -1230,7 +1418,7 @@ mod tests {
                     project_id,
                     recording_id,
                     sequence: 4,
-                })),
+                })), around_frame: None,
             },
             CorrelationId::new(),
         )
@@ -1266,7 +1454,7 @@ mod tests {
         for limit in [0, MAX_RECORDING_EVENT_LIMIT + 1] {
             let error = show_recording(
                 &fixture,
-                ShowRecording { project_id, recording_id, limit, cursor: None },
+                ShowRecording { project_id, recording_id, limit, cursor: None, around_frame: None  },
                 CorrelationId::new(),
             )
             .expect_err("invalid event bound");
@@ -1287,7 +1475,7 @@ mod tests {
         for cursor in tokens {
             let error = show_recording(
                 &fixture,
-                ShowRecording { project_id, recording_id, limit: 10, cursor: Some(cursor) },
+                ShowRecording { project_id, recording_id, limit: 10, cursor: Some(cursor), around_frame: None  },
                 CorrelationId::new(),
             )
             .expect_err("malformed or cross-bound cursor rejected");
@@ -1302,7 +1490,7 @@ mod tests {
         fixture.window.events[0].event_id = Some("relationship-canary".repeat(20));
         let result = show_recording(
             &fixture,
-            ShowRecording { project_id, recording_id, limit: 10, cursor: None },
+            ShowRecording { project_id, recording_id, limit: 10, cursor: None, around_frame: None  },
             CorrelationId::new(),
         )
         .expect("oversized event is represented within the response budget");
