@@ -1,5 +1,11 @@
 //! Snapshot and behaviour tests for the pure TUI core.
 
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test helpers fail loudly on setup errors and on a missing snapshot"
+)]
+
 use std::path::PathBuf;
 
 use xtrace_tui::{
