@@ -151,6 +151,8 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
     }
 
     fn begin_recording(&self, request: &BeginRecording) -> Result<PortBeginReceipt, PortError> {
+        // One admission scope per store call (ADR 0008 Amendment 1); never held across calls.
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
         let receipt = view
@@ -176,6 +178,8 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
         &self,
         request: &PersistRecordingSegment<Self::Event>,
     ) -> Result<PortSegmentReceipt, PortError> {
+        // One admission scope per store call (ADR 0008 Amendment 1); never held across calls.
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
         let events =
             request.events.iter().map(validate_xtf_event).collect::<Result<Vec<_>, _>>()?;
         let view =
@@ -203,6 +207,8 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
         &self,
         request: &FinishRecording,
     ) -> Result<RecordingCompletion, PortError> {
+        // One admission scope per store call (ADR 0008 Amendment 1); never held across calls.
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
         view.finish_recording(request).map_err(map_recording_error)
@@ -2764,5 +2770,64 @@ mod tests {
         );
         assert_eq!(flags(3), 0);
         assert_eq!(flags(4), f::HAS_GAP);
+    }
+
+    /// Upper bound on `/bin/ls` spawns for one steady-state `commit_segment` (ADR 0008
+    /// Amendment 1). Measured at 70 with the scope on the leased Mac; a commit spawned about 327 before it.
+    const COMMIT_SPAWN_BOUND: u64 = 85;
+
+    #[test]
+    fn a_steady_state_commit_segment_stays_within_the_admission_spawn_bound() {
+        use xtrace_private_storage::spawn_counter::ls_spawns_on_this_thread as spawns;
+        let (directory, store, project) = fixture();
+        let recording_id = RecordingId::new();
+        let adapter = SqliteRecordingPersistence::new(store, directory.path());
+        let before = spawns();
+        adapter.begin_recording(&begin(project.id(), recording_id)).expect("begin recording");
+        let begin_spawns = spawns() - before;
+        let mut digest_input = String::new();
+        let mut commits = Vec::new();
+        for ordinal in 0_u32..6 {
+            let sequence = u64::from(ordinal) + 2;
+            let name = format!("event-{sequence}");
+            digest_input.push_str(&name);
+            let segment = PersistRecordingSegment {
+                project_id: project.id(),
+                recording_id,
+                segment_ordinal: ordinal,
+                events: vec![event(sequence, &name)],
+            };
+            let before = spawns();
+            adapter.persist_segment(&segment).expect("persist segment");
+            commits.push(spawns() - before);
+        }
+        let finish = FinishRecording {
+            recording_id,
+            final_recording_seq: 7,
+            duration_ns: Some(77),
+            event_digest: blake3::hash(digest_input.as_bytes()).as_bytes().to_vec(),
+            drop_counts_by_priority: [(1, 0)].into_iter().collect(),
+            unsupported_capability_codes: Vec::new(),
+            capacity_dropped_events: 0,
+            event_cap: 2_048,
+            outcome: None,
+            response_summary: None,
+        };
+        let before = spawns();
+        adapter.finish_recording(&finish).expect("finish recording");
+        let finish_spawns = spawns() - before;
+        println!(
+            "SPAWNS begin={begin_spawns} commits={commits:?} finish={finish_spawns} bound={COMMIT_SPAWN_BOUND}"
+        );
+        if cfg!(target_os = "macos") {
+            assert!(commits.iter().all(|count| *count > 0), "the macOS probe must be counted");
+        }
+        // Commit 0 creates the recording's staging directories; the rest are steady state.
+        for (ordinal, count) in commits.iter().enumerate().skip(1) {
+            assert!(
+                *count <= COMMIT_SPAWN_BOUND,
+                "commit {ordinal} spawned {count} probes, bound {COMMIT_SPAWN_BOUND}"
+            );
+        }
     }
 }

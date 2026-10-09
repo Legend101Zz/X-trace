@@ -31,3 +31,5 @@ rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3.10"
+# Test-only: counts /bin/ls spawns for the spawn-bound test. Never enabled for a release build.
+xtrace-private-storage = { path = "../xtrace-private-storage", features = ["spawn-counter"] }
