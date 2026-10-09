@@ -127,6 +127,9 @@ fn check_gap(event: &RecordingEvent, kind: RecordingEventKind) -> Result<(), Ing
     let seq = event.recording_seq;
     match (kind == RecordingEventKind::Gap, event.gap.as_ref()) {
         (true, Some(gap)) => {
+            // The golden coalesced-gap fixture (seq 4 describing 5..11) shows emitters may report
+            // a range that is not below the GAP event's own seq, so only the range shape is
+            // validated (first <= last, count > 0); CONTRACTS 7.1 needs that amendment.
             if !event.bindings.is_empty() || gap_from_wire(gap).is_err() {
                 return Err(IngestError::GapPayloadInvalid { recording_seq: seq });
             }
@@ -270,6 +273,15 @@ pub(crate) fn check_free_value(seq: u64, value: &wire::CapturedValue) -> Result<
         }
         Some(Value::Redacted(r)) if !rule_id_is_valid(&r.rule_id) => {
             Err(IngestError::RedactionRuleIdInvalid { recording_seq: seq })
+        }
+        Some(Value::Unavailable(u)) if unavailable_reason_from_wire(u.reason).is_none() => {
+            Err(IngestError::UnknownEnumValue {
+                recording_seq: seq,
+                field: "value.unavailable.reason",
+            })
+        }
+        Some(Value::Dropped(d)) if drop_reason_from_wire(d.reason).is_none() => {
+            Err(IngestError::UnknownEnumValue { recording_seq: seq, field: "value.dropped.reason" })
         }
         _ => Ok(()),
     }
@@ -541,9 +553,14 @@ mod tests {
                 first_recording_seq: 3,
                 last_recording_seq: 9,
             }),
+            recording_seq: 12,
             ..bare
         };
         assert!(check(&ok, STD).is_ok());
+        // The range is not required to precede the GAP event's own seq (golden fixture).
+        let mut early = ok.clone();
+        early.recording_seq = 2;
+        assert!(check(&early, STD).is_ok());
         let stray = RecordingEvent { gap: ok.gap, ..base(RecordingEventKind::FrameExit) };
         assert!(matches!(check(&stray, STD), Err(IngestError::GapPayloadInvalid { .. })));
     }
@@ -676,6 +693,21 @@ mod tests {
             check(&two_returns, FOC),
             Err(IngestError::BindingRoleKindMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn free_value_unknown_reason_numbers_rejected() {
+        let unavailable = wire::CapturedValue {
+            value: Some(Value::Unavailable(wire::CapturedValueUnavailable { reason: 99 })),
+        };
+        assert!(matches!(
+            check_free_value(2, &unavailable),
+            Err(IngestError::UnknownEnumValue { .. })
+        ));
+        let dropped = wire::CapturedValue {
+            value: Some(Value::Dropped(wire::CapturedValueDropped { reason: 99 })),
+        };
+        assert!(matches!(check_free_value(2, &dropped), Err(IngestError::UnknownEnumValue { .. })));
     }
 
     #[test]

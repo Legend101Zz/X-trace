@@ -575,7 +575,10 @@ impl IngestValidator {
                 // watermark, but never retained. Only a drop ledger that
                 // itself would outgrow its bound is refused; that check
                 // happens before mutation so the batch is atomic.
-                // The per-recording budgets (CaptureBudget) are enforced here as well: an event
+                // INGEST-PRIVATE ACCOUNTING (Cc-003): the per-recording budgets (CaptureBudget) are
+                // counted here only. The daemon forwards the unmodified batch and the application
+                // knows the event-count cap alone, so these drops are not mirrored downstream (the
+                // recording still persists the event). An event
                 // that would push the running preview-byte or line-event total over its budget
                 // is dropped and counted under its own priority exactly like a capacity drop.
                 let event_bytes = event_preview_bytes(event);
