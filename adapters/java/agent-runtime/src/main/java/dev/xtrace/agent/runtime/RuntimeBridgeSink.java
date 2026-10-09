@@ -168,10 +168,10 @@ final class RuntimeBridgeSink implements BridgeSink {
   private static SourceAttestation.SourceInfo resolveSource(
       Class<?> type, String method, String descriptor) {
     ClassLoader loader = type == null ? null : type.getClassLoader();
-    if (loader != null && type != null && SourceAttestation.hasEntry(type.getName())) {
+    if (loader != null && type != null) {
       SourceAttestation.SourceInfo attested =
-          SourceAttestation.lookup(loader, type.getName(), method, descriptor);
-      if (attested.binding() == 1) return attested;
+          SourceAttestation.attest(loader, type.getName(), method, descriptor);
+      if (attested != null) return attested;
     }
     return SourceIdentity.lookup(type, method, descriptor);
   }
@@ -204,7 +204,10 @@ final class RuntimeBridgeSink implements BridgeSink {
       int responseStatus,
       long droppedEvents,
       Outcome outcome) {
-    try {
+    // The recording slot stays counted until the writer has written (or abandoned) it, so the
+    // sink never admits more recordings than the writer can hold. A rejected finish keeps its
+    // slot: the writer still holds the recording and the shortfall is reported as incomplete.
+    {
       if (!acceptingExisting.get() || !bounded(recordingId)) return false;
       int bytes = estimate(recordingId) + (outcome == null ? 0 : 1800);
       return queue.offer(
@@ -217,9 +220,12 @@ final class RuntimeBridgeSink implements BridgeSink {
               bytes,
               outcome),
           true);
-    } finally {
-      activeRecordings.updateAndGet(current -> current > 0 ? current - 1 : 0);
     }
+  }
+
+  /** Called by the writer once a recording is written or abandoned; frees its admission slot. */
+  void recordingClosed() {
+    activeRecordings.updateAndGet(current -> current > 0 ? current - 1 : 0);
   }
 
   @Override

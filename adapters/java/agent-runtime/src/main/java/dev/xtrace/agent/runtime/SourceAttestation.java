@@ -61,11 +61,49 @@ final class SourceAttestation {
     }
   }
 
-  /** True when the fixture build map names this class, so a build attestation can apply. */
-  static boolean hasEntry(String className) {
-    return className.equals("dev.xtrace.fixture.OrderController")
-        || className.equals("dev.xtrace.fixture.OrderService")
-        || className.equals("dev.xtrace.fixture.OrderRepository");
+  /**
+   * Resolves a build attestation for a frame, or null when none applies to this class (no manifest
+   * resource, or a valid manifest that does not name the class). Mismatch (3), invalid range (4)
+   * and a malformed manifest (5) are returned as-is so a detected tamper is never replaced by a
+   * weaker source claim.
+   */
+  static SourceInfo attest(ClassLoader loader, String className, String method,
+                           String descriptor) {
+    if (loader == null || className == null)
+      return null;
+    synchronized (STATES) {
+      State state = state(loader);
+      if (state.malformed)
+        return SourceInfo.unavailable(5);
+      if (state.manifestAbsent)
+        return null;
+      boolean named = false;
+      boolean tampered = false;
+      for (Entry entry : state.entries.values()) {
+        if (!entry.className.equals(className))
+          continue;
+        named = true;
+        if (entry.classObserved && !entry.classMatches)
+          tampered = true;
+      }
+      if (!named)
+        return null;
+      Entry exact = state.entries.get(key(className, method, descriptor));
+      if (exact == null)
+        return tampered ? SourceInfo.unavailable(3) : null;
+      return resultOf(exact, state);
+    }
+  }
+
+  private static SourceInfo resultOf(Entry entry, State state) {
+    if (!entry.classObserved)
+      return SourceInfo.unavailable(2);
+    if (!entry.classMatches)
+      return SourceInfo.unavailable(3);
+    if (entry.startLine < 1 || entry.endLine < entry.startLine)
+      return SourceInfo.unavailable(4);
+    return new SourceInfo(entry.path, entry.startLine, entry.endLine,
+                          unhex(entry.sourceHash), 1);
   }
 
   static SourceInfo lookup(ClassLoader loader, String className, String method,
@@ -97,6 +135,7 @@ final class SourceAttestation {
     try (var stream = loader.getResourceAsStream(RESOURCE)) {
       if (stream == null) {
         state.failure = 2;
+        state.manifestAbsent = true;
         return state;
       }
       byte[] manifest = stream.readNBytes(64 * 1024 + 1);
@@ -137,6 +176,7 @@ final class SourceAttestation {
     } catch (Exception invalid) {
       state.entries.clear();
       state.failure = 5;
+      state.malformed = true;
     }
     return state;
   }
@@ -192,6 +232,8 @@ final class SourceAttestation {
   private static final class State {
     final Map<String, Entry> entries = new HashMap<>();
     int failure;
+    boolean manifestAbsent;
+    boolean malformed;
   }
   private static final class Entry {
     final String className, methodName, descriptor, path, classHash, sourceHash;

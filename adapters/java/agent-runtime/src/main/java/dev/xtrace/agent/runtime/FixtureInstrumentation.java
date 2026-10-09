@@ -243,10 +243,11 @@ final class FixtureInstrumentation {
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void exit(
         @Advice.Enter boolean traced,
+        @Advice.Argument(0) Object request,
         @Advice.Argument(1) Object response,
         @Advice.Thrown Throwable thrown) {
       if (!traced) return;
-      dev.xtrace.agent.bootstrap.SpringMvcBridge.end(response, thrown);
+      dev.xtrace.agent.bootstrap.SpringMvcBridge.end(request, response, thrown);
     }
   }
 

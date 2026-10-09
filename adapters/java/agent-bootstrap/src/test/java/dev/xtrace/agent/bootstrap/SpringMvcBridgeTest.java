@@ -40,6 +40,31 @@ public class SpringMvcBridgeTest {
   }
 
   @Test
+  void asyncStartedHandlerClosesUnobservedAndTheAsyncRedispatchOpensNoSecondRoot() {
+    Request async = new Request("GET", "/slow");
+    async.asyncStarted = true;
+    assertTrue(SpringMvcBridge.start(async, new Handler(Controller.class)));
+    SpringMvcBridge.end(async, new Response(200), null);
+    assertEquals(0, sink.status);
+    assertEquals("http.response unavailable", sink.symbols.get(1));
+    assertEquals(BridgeSink.Outcome.UNOBSERVED, sink.outcome.kind());
+    assertFalse(BootstrapBridge.hasContext());
+    int before = sink.symbols.size();
+    Request redispatch = new Request("GET", "/slow");
+    redispatch.dispatcher = Dispatch.ASYNC;
+    assertFalse(SpringMvcBridge.start(redispatch, new Handler(Controller.class)));
+    assertEquals(before, sink.symbols.size());
+  }
+
+  @Test
+  void syncHandlerWithAsyncNotStartedStillReportsRespondedStatus() {
+    Request sync = new Request("GET", "/fast");
+    assertTrue(SpringMvcBridge.start(sync, new Handler(Controller.class)));
+    SpringMvcBridge.end(sync, new Response(201), null);
+    assertEquals(201, sink.status);
+  }
+
+  @Test
   void requestWithoutMatchedPatternIsNotRecordedAndNeverFallsBackToThePath() {
     Request request = new Request("GET", null);
     assertFalse(SpringMvcBridge.start(request, new Handler(Controller.class)));
@@ -241,7 +266,19 @@ public class SpringMvcBridgeTest {
     }
   }
 
+  public enum Dispatch { REQUEST, ASYNC }
+
   public static final class Request {
+    boolean asyncStarted;
+    Dispatch dispatcher = Dispatch.REQUEST;
+    public boolean isAsyncStarted() {
+      return asyncStarted;
+    }
+
+    public Dispatch getDispatcherType() {
+      return dispatcher;
+    }
+
     private final String method;
     private final String pattern;
 

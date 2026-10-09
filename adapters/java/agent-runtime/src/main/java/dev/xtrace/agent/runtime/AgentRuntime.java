@@ -89,7 +89,7 @@ public final class AgentRuntime {
                   System.nanoTime()));
       bootstrap.close();
       bootstrap = null;
-      BoundedEventQueue queue = new BoundedEventQueue(1024, 256 * 1024L);
+      BoundedEventQueue queue = new BoundedEventQueue(8192, 2L * 1024 * 1024);
       sink = new RuntimeBridgeSink(queue);
       sink.useScope(config.scope());
       writer = new RecordingWriter(session, queue, sink);

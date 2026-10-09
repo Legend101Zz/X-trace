@@ -36,7 +36,11 @@ import xtp.agent.v1.Transport.Ack;
 final class RecordingWriter implements AutoCloseable, Runnable {
   private static final Duration POLL_INTERVAL = Duration.ofMillis(25);
   private static final Duration SHUTDOWN_TIMEOUT = Duration.ofSeconds(2);
-  private static final int MAX_EVENTS_PER_RECORDING = 128;
+  /** CONTRACTS 4.4: standard mode sends up to 16,384 events per recording. */
+  static final int MAX_EVENTS_PER_RECORDING = 16_384;
+  /** Slots only closing events may use, so exits, throws and the response are never the drops. */
+  static final int CLOSING_RESERVE = 64;
+  static final String CAP_GAP_SYMBOL = "xtrace.capture.gap.recording-cap";
 
   private final Transport session;
   private final BoundedEventQueue queue;
@@ -47,6 +51,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   private final AtomicBoolean shutdownRequested = new AtomicBoolean();
   private final AtomicBoolean incompleteReported = new AtomicBoolean();
   private final Map<String, PendingRecording> recordings = new HashMap<>();
+  private final java.util.Set<String> abandoned = new java.util.HashSet<>();
   private volatile long shutdownStartedNs;
 
   RecordingWriter(XtpSession session, BoundedEventQueue queue, RuntimeBridgeSink sink)
@@ -118,28 +123,49 @@ final class RecordingWriter implements AutoCloseable, Runnable {
 
   private void accept(QueueSignal signal) throws ClientException {
     if (signal instanceof QueueSignal.Start start) {
-      if (recordings.size() >= 8 || recordings.containsKey(start.recordingId())) {
-        throw new ClientException(
-            "XTR-JAVA-RECORDING", "recording writer capacity or identity is invalid");
+      if (recordings.containsKey(start.recordingId())) {
+        throw new ClientException("XTR-JAVA-RECORDING", "recording identity is invalid");
+      }
+      if (recordings.size() >= 8) {
+        // Capacity is a loss of this recording, never of the whole capture.
+        if (abandoned.size() < 1024) abandoned.add(start.recordingId());
+        sink.reportIncomplete(BridgeSink.INCOMPLETE_START_REJECTED);
+        sink.recordingClosed();
+        return;
       }
       recordings.put(start.recordingId(), new PendingRecording(start));
     } else if (signal instanceof QueueSignal.Event event) {
       PendingRecording recording = recordings.get(event.recordingId());
+      if (recording == null && abandoned.contains(event.recordingId())) return;
       if (recording == null) {
         throw new ClientException("XTR-JAVA-RECORDING", "event recording identity is unknown");
       }
-      if (recording.events.size() < MAX_EVENTS_PER_RECORDING) {
+      int limit = closing(event.kind())
+          ? MAX_EVENTS_PER_RECORDING
+          : MAX_EVENTS_PER_RECORDING - CLOSING_RESERVE;
+      if (recording.events.size() < limit) {
         recording.events.add(event);
       } else {
         recording.writerDrops++;
       }
     } else if (signal instanceof QueueSignal.Finish finish) {
       PendingRecording recording = recordings.remove(finish.recordingId());
+      if (recording == null && abandoned.remove(finish.recordingId())) return;
       if (recording == null) {
         throw new ClientException("XTR-JAVA-RECORDING", "finish recording identity is unknown");
       }
-      write(recording, finish);
+      try {
+        write(recording, finish);
+      } finally {
+        sink.recordingClosed();
+      }
     }
+  }
+
+  private static boolean closing(int kind) {
+    return kind == BridgeEventKind.FRAME_EXIT
+        || kind == BridgeEventKind.FRAME_THROW
+        || kind == BridgeEventKind.RESPONSE;
   }
 
   private void write(PendingRecording pending, QueueSignal.Finish finish) throws ClientException {
@@ -170,7 +196,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         withGap(
             pending.start.recordingId(),
             pending.events,
-            droppedEvents,
+            finish.droppedEvents(),
+            pending.writerDrops,
             pending.start.monotonicNs(),
             finish.finishedMonotonicNs());
     EventBatch.Builder batch =
@@ -236,13 +263,27 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       long droppedEvents,
       long startedMonotonicNs,
       long finishedMonotonicNs) {
-    if (droppedEvents <= 0) return List.copyOf(events);
-    List<QueueSignal.Event> result = new ArrayList<>(events.size() + 1);
+    return withGap(recordingId, events, droppedEvents, 0, startedMonotonicNs, finishedMonotonicNs);
+  }
+
+  /**
+   * Queue sheds and per-recording cap overflow are separate causes with separate gap events
+   * (QUEUE_FULL versus THROTTLE), both placed before the response.
+   */
+  static List<QueueSignal.Event> withGap(
+      String recordingId,
+      List<QueueSignal.Event> events,
+      long queueDrops,
+      long capDrops,
+      long startedMonotonicNs,
+      long finishedMonotonicNs) {
+    if (queueDrops <= 0 && capDrops <= 0) return List.copyOf(events);
+    List<QueueSignal.Event> result = new ArrayList<>(events.size() + 2);
     boolean inserted = false;
     for (QueueSignal.Event event : events) {
       if (!inserted && event.kind() == BridgeEventKind.RESPONSE) {
-        result.add(
-            gap(event.recordingId(), event.parentEventId(), event.monotonicNs(), droppedEvents));
+        addGaps(result, event.recordingId(), event.parentEventId(), event.monotonicNs(),
+            queueDrops, capDrops);
         inserted = true;
       }
       result.add(event);
@@ -253,20 +294,36 @@ final class RecordingWriter implements AutoCloseable, Runnable {
           events.isEmpty()
               ? terminalMonotonic(startedMonotonicNs, finishedMonotonicNs)
               : events.get(events.size() - 1).monotonicNs();
-      result.add(gap(recordingId, parent, monotonicNs, droppedEvents));
+      addGaps(result, recordingId, parent, monotonicNs, queueDrops, capDrops);
     }
     return result;
   }
 
+  private static void addGaps(
+      List<QueueSignal.Event> out, String recordingId, String parent, long monotonicNs,
+      long queueDrops, long capDrops) {
+    String last = parent;
+    if (queueDrops > 0) {
+      QueueSignal.Event gap = gap(recordingId, last, monotonicNs, queueDrops, ":gap",
+          "xtrace.capture.gap");
+      out.add(gap);
+      last = gap.eventId();
+    }
+    if (capDrops > 0) {
+      out.add(gap(recordingId, last, monotonicNs, capDrops, ":gap-cap", CAP_GAP_SYMBOL));
+    }
+  }
+
   private static QueueSignal.Event gap(
-      String recordingId, String parent, long monotonicNs, long droppedEvents) {
-    String eventId = recordingId + ":gap";
+      String recordingId, String parent, long monotonicNs, long droppedEvents, String suffix,
+      String symbol) {
+    String eventId = recordingId + suffix;
     return new QueueSignal.Event(
         recordingId,
         eventId,
         parent,
         RecordingEventKind.RECORDING_EVENT_KIND_GAP.getNumber(),
-        "xtrace.capture.gap",
+        symbol,
         monotonicNs,
         (int) Math.min(Integer.MAX_VALUE, Math.max(1, droppedEvents)),
         128);
@@ -302,9 +359,13 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       // A gap always states why and how much. Events shed by the bounded queue are QUEUE_FULL
       // with the shed count; an unresolvable handler is a lost correlation, count one.
       boolean handler = event.symbol().equals(BootstrapBridge.HANDLER_UNRESOLVED_SYMBOL);
+      // The per-recording event cap has no dedicated reason: THROTTLE is the nearest accurate
+      // one (events withheld by a configured limit); a dedicated reason is requested from C.
+      boolean cap = event.symbol().equals(CAP_GAP_SYMBOL);
       builder.setGap(
           GapPayload.newBuilder()
-              .setReason(handler ? GapReason.GAP_REASON_CORRELATION_LOST : GapReason.GAP_REASON_QUEUE_FULL)
+              .setReason(handler ? GapReason.GAP_REASON_CORRELATION_LOST
+                  : cap ? GapReason.GAP_REASON_THROTTLE : GapReason.GAP_REASON_QUEUE_FULL)
               .setCount(handler ? 1 : Math.max(1, event.detail())));
     }
     if (kind == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_THROW

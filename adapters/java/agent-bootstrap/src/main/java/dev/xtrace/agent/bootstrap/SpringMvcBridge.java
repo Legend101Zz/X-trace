@@ -21,7 +21,10 @@ public final class SpringMvcBridge {
         @Override
         protected Method[] computeValue(Class<?> type) {
           return new Method[] {
-            publicMethod(type, "getMethod"), publicMethod(type, "getAttribute", String.class)
+            publicMethod(type, "getMethod"),
+            publicMethod(type, "getAttribute", String.class),
+            publicMethod(type, "isAsyncStarted"),
+            publicMethod(type, "getDispatcherType")
           };
         }
       };
@@ -49,6 +52,8 @@ public final class SpringMvcBridge {
    */
   public static boolean start(Object request, Object handlerMethod) {
     if (request == null || handlerMethod == null || BootstrapBridge.inRequest()) return false;
+    // The ASYNC re-dispatch of a request already opened (and closed UNOBSERVED) is not a new root.
+    if (isAsyncDispatch(request)) return false;
     Class<?> beanType = beanType(handlerMethod);
     int scope = BootstrapBridge.scopeOf(beanType);
     if (scope == 0) return false;
@@ -70,6 +75,19 @@ public final class SpringMvcBridge {
    * The root therefore stays open until {@link #exceptionResolved} reports the outcome.
    */
   public static void end(Object response, Throwable thrown) {
+    end(null, response, thrown);
+  }
+
+  /**
+   * Closes the request root. RESPONDED means the status the response carried when the handler
+   * returned. If the handler started asynchronous processing (Callable, DeferredResult, reactive
+   * types) the real status is not known at return, so the root closes UNOBSERVED with no status.
+   */
+  public static void end(Object request, Object response, Throwable thrown) {
+    if (thrown == null && request != null && asyncStarted(request)) {
+      BootstrapBridge.requestEnd(0, (Throwable) null);
+      return;
+    }
     if (thrown != null) {
       if (!BootstrapBridge.deferRequestEnd(thrown)) BootstrapBridge.requestEnd(0, thrown);
       return;
@@ -90,6 +108,25 @@ public final class SpringMvcBridge {
       BootstrapBridge.requestEnd(status(response), (Throwable) null);
     } else {
       BootstrapBridge.requestEnd(0, (Throwable) null);
+    }
+  }
+
+  static boolean asyncStarted(Object request) {
+    try {
+      Method method = REQUEST_METHODS.get(request.getClass())[2];
+      return method != null && Boolean.TRUE.equals(method.invoke(request));
+    } catch (ReflectiveOperationException | RuntimeException ignored) {
+      return false;
+    }
+  }
+
+  static boolean isAsyncDispatch(Object request) {
+    try {
+      Method method = REQUEST_METHODS.get(request.getClass())[3];
+      Object value = method == null ? null : method.invoke(request);
+      return value instanceof Enum<?> kind && kind.name().equals("ASYNC");
+    } catch (ReflectiveOperationException | RuntimeException ignored) {
+      return false;
     }
   }
 
