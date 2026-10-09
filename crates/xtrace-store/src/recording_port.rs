@@ -2209,6 +2209,296 @@ mod tests {
         assert_eq!(rows(&store), before, "a retried segment keeps the same frame ids and depths");
     }
 
+    // ---- RC-1 fixer B: review majors F1, F2, F3, F5 ----
+
+    /// Like `persist` but finishes with a chosen capacity drop count and outcome.
+    fn persist_finished_with(
+        events: &[AcceptedRecordingEvent<XtfEventEnvelope>],
+        per_segment: usize,
+        capacity_dropped_events: u64,
+        outcome: Option<xtrace_domain::RecordingOutcome>,
+    ) -> Persisted {
+        let persisted = persist(events, per_segment, false);
+        let adapter = SqliteRecordingPersistence::new(persisted.store.clone(), &persisted.root);
+        let last = events.last().map_or(1, |event| event.recording_seq);
+        adapter
+            .finish_recording(&FinishRecording {
+                recording_id: persisted.recording_id,
+                final_recording_seq: last,
+                duration_ns: Some(1),
+                // the adapter digest covers dropped events too, so it is withheld
+                event_digest: if capacity_dropped_events > 0 {
+                    Vec::new()
+                } else {
+                    digest_of(events)
+                },
+                drop_counts_by_priority: if capacity_dropped_events > 0 {
+                    [(5, capacity_dropped_events)].into_iter().collect()
+                } else {
+                    std::collections::BTreeMap::new()
+                },
+                unsupported_capability_codes: Vec::new(),
+                capacity_dropped_events,
+                // a recording that dropped at capacity must have filled it
+                event_cap: if capacity_dropped_events > 0 {
+                    u64::try_from(events.len()).expect("fits")
+                } else {
+                    2_048
+                },
+                outcome,
+                response_summary: None,
+            })
+            .expect("finish");
+        persisted
+    }
+
+    fn gap_node(sequence: u64, event_id: &str) -> AcceptedRecordingEvent<XtfEventEnvelope> {
+        use xtrace_protocol::generated::agent::{GapPayload, GapReason};
+        let mut gap = node(sequence, event_id, "", 14);
+        gap.payload.event.as_mut().expect("event").gap = Some(GapPayload {
+            reason: GapReason::LineBudget as i32,
+            count: 1,
+            first_recording_seq: sequence,
+            last_recording_seq: sequence,
+        });
+        gap.canonical_bytes = gap.payload.encode_to_vec();
+        gap
+    }
+
+    fn gap_only_events() -> Vec<AcceptedRecordingEvent<XtfEventEnvelope>> {
+        let mut events = tree()[..8].to_vec();
+        events.push(gap_node(10, "gap"));
+        events
+    }
+
+    #[test]
+    fn next_on_gap_only_partial_is_boundary() {
+        let persisted = persist_finished_with(&gap_only_events(), 4, 0, None);
+        let window = window(&persisted, 50, None);
+        // the digest was verified and nothing was dropped: the end is real
+        assert_eq!(nav_of(&window, 10).next, Nav::Boundary);
+    }
+
+    #[test]
+    fn partial_with_capacity_drops_never_reports_boundary_past_the_frontier() {
+        let persisted = persist_finished_with(&gap_only_events(), 4, 3, None);
+        let window = window(&persisted, 50, None);
+        assert_eq!(nav_of(&window, 10).next, Nav::unavailable(Unav::PartialFrontier));
+    }
+
+    #[test]
+    fn partial_whose_digest_was_never_verified_is_not_a_final_frontier() {
+        use xtrace_application::recording_queries::RecordingCompletionEvidence as Evidence;
+        let persisted = persist_finished_with(&gap_only_events(), 4, 0, None);
+        let cid = CorrelationId::new();
+        let check = || {
+            let connection = persisted.store.lock().expect("connection");
+            crate::recording_store::persisted_frontier_is_final(
+                &connection,
+                persisted.recording_id,
+                Evidence::Partial,
+                cid,
+            )
+            .expect("frontier decision")
+        };
+        assert!(check(), "a verified gap-only partial ends at its last frame");
+        // verify_terminal_evidence answers Partial without hashing once the declared
+        // segment bytes pass the verification bound; that digest proves nothing.
+        let over_bound =
+            i64::try_from(xtrace_application::MAX_RECORDING_VERIFIED_INPUT_BYTES).expect("fits")
+                + 1;
+        persisted
+            .store
+            .lock()
+            .expect("connection")
+            .execute(
+                "UPDATE recording_segments SET uncompressed_bytes = ?1 WHERE recording_id = ?2",
+                rusqlite::params![over_bound, persisted.recording_id.as_uuid().as_bytes().to_vec()],
+            )
+            .expect("simulate an over-budget declaration");
+        assert!(!check(), "an unverified digest must not prove the end of the recording");
+    }
+
+    #[test]
+    fn invalid_or_unavailable_completion_is_never_a_final_frontier() {
+        use xtrace_application::recording_queries::RecordingCompletionEvidence as Evidence;
+        let persisted = persist_finished_with(&gap_only_events(), 4, 0, None);
+        let connection = persisted.store.lock().expect("connection");
+        for completion in [Evidence::Invalid, Evidence::Unavailable] {
+            assert!(
+                !crate::recording_store::persisted_frontier_is_final(
+                    &connection,
+                    persisted.recording_id,
+                    completion,
+                    CorrelationId::new(),
+                )
+                .expect("decision"),
+                "{completion:?}"
+            );
+        }
+    }
+
+    fn async_node(
+        sequence: u64,
+        event_id: &str,
+        async_parent: &str,
+    ) -> AcceptedRecordingEvent<XtfEventEnvelope> {
+        let mut accepted = node(sequence, event_id, "", K_ENTER);
+        accepted.payload.event.as_mut().expect("event").async_parent_event_id =
+            async_parent.to_owned();
+        accepted.canonical_bytes = accepted.payload.encode_to_vec();
+        accepted
+    }
+
+    #[test]
+    fn over_not_fooled_by_interleaved_async_root() {
+        // root(2) > a(3) ; an async root(4) interleaved ; a-exit(5) ; root-exit(6)
+        let events = vec![
+            node(2, "root", "", K_ENTER),
+            node(3, "a", "root", K_ENTER),
+            async_node(4, "async-root", "a"),
+            node(5, "ax", "a", K_EXIT),
+            node(6, "rootx", "root", K_EXIT),
+        ];
+        let persisted = persist_finished_with(&events, 5, 0, None);
+        let window = window(&persisted, 50, None);
+        let id = frame_ids(&window);
+        let async_root = Nav::Target { frame_id: id[&4] };
+        let a = nav_of(&window, 3);
+        // an async root is depth 0 and would satisfy `depth <= current` for every frame
+        assert_ne!(a.over, async_root, "over landed on an async root");
+        assert_eq!(a.over, Nav::Target { frame_id: id[&6] });
+        assert_ne!(nav_of(&window, 2).over, async_root);
+        assert_ne!(a.out, async_root, "out landed on an async root");
+        assert_ne!(nav_of(&window, 5).out, async_root);
+    }
+
+    #[test]
+    fn around_window_trim_keeps_anchor() {
+        use xtrace_application::recording_queries::{RecordingQueryService, ShowRecording};
+        use xtrace_protocol::generated::agent::{
+            BindingRole, CapturedValue as Wire, CapturedValueTruncated, NameOrigin, ValueBinding,
+            captured_value::Value as V,
+        };
+        // 300 fat frames (several KiB of projected bindings each): a 200-event window
+        // cannot fit the 256 KiB projection budget, so the page must be trimmed.
+        let fat = |sequence: u64| {
+            let mut accepted = node(sequence, &format!("e{sequence}"), "", K_ENTER);
+            accepted.payload.event.as_mut().expect("event").bindings = (0..8)
+                .map(|index| ValueBinding {
+                    name: format!("arg{index}"),
+                    role: BindingRole::Argument as i32,
+                    name_origin: NameOrigin::Declared as i32,
+                    value: Some(Wire {
+                        value: Some(V::Truncated(CapturedValueTruncated {
+                            preview: "p".repeat(500),
+                            original_size_lower_bound: 9_000,
+                            limit: 500,
+                        })),
+                    }),
+                })
+                .collect();
+            accepted.canonical_bytes = accepted.payload.encode_to_vec();
+            accepted
+        };
+        let events: Vec<_> = (2..=301_u64).map(fat).collect();
+        let persisted = persist_finished_with(&events, 100, 0, None);
+        let anchor = frame_ids(&window(&persisted, 20, Some(145)))[&151];
+        let service = RecordingQueryService::new(SqliteRecordingReader::new(
+            persisted.store.clone(),
+            &persisted.root,
+        ));
+        let detail = service
+            .show(
+                ShowRecording {
+                    project_id: persisted.project.id(),
+                    recording_id: persisted.recording_id,
+                    limit: 200,
+                    cursor: None,
+                    around_frame: Some(anchor),
+                },
+                CorrelationId::new(),
+            )
+            .expect("around window");
+        assert!(detail.events.len() < 200, "the byte budget must actually trim this page");
+        assert_eq!(detail.anchor_frame_id, Some(anchor));
+        assert!(
+            detail.events.iter().any(|event| event.frame_id == Some(anchor)),
+            "anchorFrameId must name a frame that is in the page"
+        );
+    }
+
+    #[test]
+    fn outcome_persists_and_reopens_and_unset_reads_unobserved() {
+        use xtrace_domain::{OutcomeException, OutcomeKind, RecordingOutcome};
+        let events = tree()[..8].to_vec();
+        let responded = RecordingOutcome {
+            kind: OutcomeKind::Responded,
+            http_status: Some(201),
+            exception: None,
+            thrown_from_event_id: None,
+        };
+        let persisted = persist_finished_with(&events, 4, 0, Some(responded));
+        let outcome = window(&persisted, 50, None).outcome.expect("terminal evidence present");
+        assert_eq!(
+            (outcome.kind.as_str(), outcome.http_status, outcome.exception.is_none()),
+            ("responded", Some(201), true)
+        );
+
+        let thrown = RecordingOutcome {
+            kind: OutcomeKind::ExceptionPropagated,
+            http_status: Some(500),
+            exception: Some(OutcomeException {
+                exception_type: "IllegalStateException".to_owned(),
+                message: "boom".to_owned(),
+            }),
+            thrown_from_event_id: Some("a1".to_owned()),
+        };
+        let persisted = persist_finished_with(&events, 4, 0, Some(thrown));
+        let outcome = window(&persisted, 50, None).outcome.expect("outcome");
+        assert_eq!(outcome.kind, "exception_propagated");
+        let exception = outcome.exception.expect("exception");
+        assert_eq!(
+            (exception.exception_type.as_str(), exception.message.as_deref()),
+            ("IllegalStateException", Some("boom"))
+        );
+        assert_eq!(outcome.thrown_from_event_id.as_deref(), Some("a1"));
+
+        // an adapter that observed nothing is never defaulted to `responded`
+        let persisted = persist_finished_with(&events, 4, 0, None);
+        let outcome = window(&persisted, 50, None).outcome.expect("outcome");
+        assert_eq!((outcome.kind.as_str(), outcome.http_status), ("unobserved", None));
+        // no terminal evidence at all reads null
+        let unfinished = persist(&events, 4, false);
+        assert!(window(&unfinished, 50, None).outcome.is_none());
+    }
+
+    #[test]
+    fn frame_honesty_counts_are_exact_and_unavailable_for_legacy_frames() {
+        let persisted = persist(&tree(), 4, true);
+        let counts = window(&persisted, 50, None).frame_honesty.expect("indexed counts");
+        assert_eq!(counts.orphan_parent, 1, "only the ghost frame has an unobserved parent");
+        assert_eq!(
+            (counts.gap, counts.redacted, counts.truncated, counts.unavailable, counts.dropped),
+            (0, 0, 0, 0, 0)
+        );
+        let with_gap = persist_finished_with(&gap_only_events(), 4, 0, None);
+        assert_eq!(window(&with_gap, 50, None).frame_honesty.expect("counts").gap, 1);
+        persisted
+            .store
+            .lock()
+            .expect("connection")
+            .execute(
+                "UPDATE recording_frame_index SET indexed_v = 0, depth = 0 WHERE recording_seq = ?1",
+                rusqlite::params![3_u64.to_be_bytes().as_slice()],
+            )
+            .expect("make one frame legacy");
+        assert!(
+            window(&persisted, 50, None).frame_honesty.is_none(),
+            "counts are unavailable, never zero-filled, once any frame predates the index"
+        );
+    }
+
     #[test]
     fn bindings_gap_and_line_are_projected_from_stored_events() {
         use xtrace_protocol::generated::agent::{

@@ -2875,7 +2875,7 @@ fn first_frame_where(
 
 /// Whether every event up to the finish sequence is persisted, so that "no later
 /// frame" is a real end rather than an unverified frontier.
-fn persisted_frontier_is_final(
+pub(crate) fn persisted_frontier_is_final(
     connection: &rusqlite::Connection,
     recording_id: RecordingId,
     completion: RecordingCompletionEvidence,
@@ -2899,6 +2899,27 @@ fn persisted_frontier_is_final(
             || finish.capacity_dropped_events > 0)
     {
         return Ok(false);
+    }
+    // verify_terminal_evidence answers Partial WITHOUT hashing when the declared
+    // segment bytes exceed the verification bound, so the digest of such a
+    // recording was never checked: its frontier is not proven final.
+    if completion == RecordingCompletionEvidence::Partial {
+        let declared: Option<i64> = connection
+            .query_row(
+                "SELECT SUM(uncompressed_bytes + compressed_bytes) FROM recording_segments \
+                 WHERE recording_id = ?1",
+                rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        let within_bound = declared
+            .and_then(|total| usize::try_from(total).ok())
+            .is_some_and(|total| total <= MAX_RECORDING_VERIFIED_INPUT_BYTES);
+        if !within_bound {
+            return Ok(false);
+        }
     }
     let last: Option<Vec<u8>> = connection
         .query_row(
@@ -3022,7 +3043,7 @@ pub(crate) fn navigate_indexed_frame(
         recording_id,
         sequence,
         true,
-        "AND depth <= ?3",
+        "AND depth <= ?3 AND async_parent_seq IS NULL",
         Some(i64::from(frame.depth)),
         correlation_id,
     )?) {
@@ -3041,7 +3062,7 @@ pub(crate) fn navigate_indexed_frame(
             recording_id,
             sequence,
             true,
-            "AND depth < ?3",
+            "AND depth < ?3 AND async_parent_seq IS NULL",
             Some(i64::from(frame.depth)),
             correlation_id,
         )?) {

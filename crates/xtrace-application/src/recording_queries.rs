@@ -1097,9 +1097,31 @@ pub fn show_recording<P: RecordingReadPort>(
         limit: request.limit,
         after_sequence: after_sequence_start,
     };
-    let window = port
+    let mut window = port
         .show_recording(&position)
         .map_err(|error| crate::application::port_error_to_app_error(error, correlation_id))?;
+    if let Some((_, anchor_sequence)) = anchor {
+        // CONTRACTS 8.2: the byte budget trims the far end of the page, but the anchor is
+        // never dropped. When the tail trim cut the anchor off, move the window start
+        // towards the anchor (halving the distance) until the anchor is inside it.
+        let mut start = after_sequence_start.unwrap_or(0);
+        let floor = anchor_sequence.saturating_sub(1);
+        while !window
+            .events
+            .iter()
+            .any(|event| event.sequence.parse::<u64>().ok() == Some(anchor_sequence))
+        {
+            if start >= floor || !window.has_more {
+                return Err(query_resource_error(correlation_id));
+            }
+            start += (floor - start).div_ceil(2);
+            window = port
+                .show_recording(&ShowWindowRequest { after_sequence: Some(start), ..position })
+                .map_err(|error| {
+                    crate::application::port_error_to_app_error(error, correlation_id)
+                })?;
+        }
+    }
     let adapter_summary = window.adapter_summary;
     if window.duration_ns.as_ref().is_some_and(|value| !decimal_u64(value))
         || window.drop_counts_by_priority.len() > 256
