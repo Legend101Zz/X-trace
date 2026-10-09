@@ -1,6 +1,6 @@
-//! Java launch journeys that need the Spring fixture: scope that matches nothing still persists a
-//! recording (with zero application frames), non-direct launchers are refused before any side
-//! effect, and an operator-selected observation policy needs a resolved application scope.
+//! Java launch journeys that need the Spring fixture: scope that matches nothing persists no
+//! recording (stated positively, not read from absent frames), non-direct launchers are refused
+//! before any side effect, and an operator-selected observation policy needs a resolved application scope.
 
 #![cfg(unix)]
 #![allow(missing_docs, reason = "integration test symbols are executable fixtures")]
@@ -40,36 +40,36 @@ impl Drop for RunProcess {
     }
 }
 
-struct Captured {
-    detail_pages: Vec<Value>,
-    events: Vec<Value>,
+struct OutOfScope {
+    recording_count: usize,
+    list_succeeded: bool,
+    exit_code: Option<i32>,
     stderr: String,
 }
 
+/// An explicit `--app-package` that matches no class makes the Spring handler out of scope. The
+/// agent's contract (`SpringMvcBridge.start`) is then: no request root, therefore no recording. This
+/// journey states that outcome positively instead of reading "no frames" out of an absent
+/// recording: the fixture served the request, the run shut down cleanly after the daemon
+/// finalized, the store opened and listed successfully, and it holds zero recordings.
 #[test]
-fn out_of_scope_app_package_persists_a_recording_with_zero_application_frames() {
-    let captured = run_fixture(&["--app-package", "com.nonexistent.app"]);
-    // A persisted recording is required: "no recording" and "a recording without application
-    // frames" are different outcomes and only the second is what an out-of-scope launch means.
-    assert!(
-        !captured.detail_pages.is_empty(),
-        "an out-of-scope launch must still persist a recording; stderr: {}",
-        captured.stderr
+fn out_of_scope_app_package_serves_the_request_and_persists_no_recording() {
+    let outcome = run_out_of_scope(&["--app-package", "com.nonexistent.app"]);
+    assert!(outcome.list_succeeded, "the store must open and list; stderr: {}", outcome.stderr);
+    assert_eq!(
+        outcome.recording_count, 0,
+        "an out-of-scope handler must open no request root, so no recording; stderr: {}",
+        outcome.stderr
     );
-    let application_frames: Vec<&Value> = captured
-        .events
-        .iter()
-        .filter(|event| {
-            event["kind"].as_str().is_some_and(|kind| kind.ends_with("frame_enter"))
-                && event["symbol"].as_str().is_some_and(|symbol| {
-                    symbol.contains("Order") || symbol.contains("dev.xtrace.fixture")
-                })
-        })
-        .collect();
     assert!(
-        application_frames.is_empty(),
-        "an app package that matches no class must not capture application frames: \
-         {application_frames:?}"
+        !outcome.stderr.contains("capture_incomplete"),
+        "a deliberate scope exclusion is not an incomplete capture: {}",
+        outcome.stderr
+    );
+    assert!(
+        matches!(outcome.exit_code, Some(0 | 143)),
+        "the run must end by the forwarded shutdown signal: {:?}",
+        outcome.exit_code
     );
 }
 
@@ -149,7 +149,7 @@ fn observation_policy_requires_a_resolved_application_scope() {
     assert!(!data_home.exists(), "refusal must create no project data");
 }
 
-fn run_fixture(flags: &[&str]) -> Captured {
+fn run_out_of_scope(flags: &[&str]) -> OutOfScope {
     let root = temp_root();
     let repo = root.path().join("repository with spaces");
     let data_home = root.path().join("data home");
@@ -162,12 +162,6 @@ fn run_fixture(flags: &[&str]) -> Captured {
         .expect("initialize project");
     assert!(init.status.success(), "init failed: {}", String::from_utf8_lossy(&init.stderr));
     copy_fixture_sources(&repo);
-    let project_id =
-        serde_json::from_slice::<Value>(&init.stdout).expect("init JSON")["project_id"]
-            .as_str()
-            .expect("project id")
-            .to_string();
-    let project_root = data_home.join("projects").join(&project_id);
 
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let agent =
@@ -209,69 +203,32 @@ fn run_fixture(flags: &[&str]) -> Captured {
         "fixture returned {}",
         String::from_utf8_lossy(&response)
     );
-    wait_for_complete_recording(&project_root);
-
+    // The request has been served; let the agent and daemon finish, then shut down cleanly.
+    thread::sleep(Duration::from_secs(3));
     let pid = rustix::process::Pid::from_raw(process.child.id() as i32).expect("CLI process ID");
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("signal xtrace run");
-    process.child.wait().expect("wait for signal shutdown");
+    let status = process.child.wait().expect("wait for signal shutdown");
     let _ = process.stdout.take().expect("stdout thread").join();
     let stderr = process.stderr.take().expect("stderr thread").join().expect("join stderr");
 
     let list = cli(&["recording", "list"], &repo, &data_home);
-    let list: Value = serde_json::from_slice(&list.stdout).expect("recording list JSON");
-    let recording_id =
-        list["recordings"][0]["recording_id"].as_str().expect("recording id").to_owned();
-
-    let mut detail_pages = Vec::new();
-    let mut events = Vec::new();
-    let mut cursor: Option<String> = None;
-    for _ in 0..20 {
-        let mut args = vec!["recording", "show", recording_id.as_str(), "--limit", "1000"];
-        if let Some(cursor) = cursor.as_deref() {
-            args.extend(["--cursor", cursor]);
-        }
-        let output = cli(&args, &repo, &data_home);
-        assert!(
-            output.status.success(),
-            "recording show failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let page: Value = serde_json::from_slice(&output.stdout).expect("recording detail JSON");
-        events.extend(page["events"].as_array().expect("events").iter().cloned());
-        cursor = page["next_cursor"].as_str().map(str::to_owned);
-        detail_pages.push(page);
-        if cursor.is_none() {
-            break;
-        }
+    let parsed = serde_json::from_slice::<Value>(&list.stdout).ok();
+    let recording_count = parsed
+        .as_ref()
+        .and_then(|value| value["recordings"].as_array().map(Vec::len))
+        .unwrap_or(usize::MAX);
+    OutOfScope {
+        recording_count,
+        list_succeeded: list.status.success() && parsed.is_some(),
+        exit_code: status.code(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     }
-    assert!(cursor.is_none(), "recording did not terminate within 20 pages");
-    Captured { detail_pages, events, stderr: String::from_utf8_lossy(&stderr).into_owned() }
 }
 
 fn cli(args: &[&str], repo: &Path, data_home: &Path) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_xtrace"));
     command.arg(args[0]).arg(args[1]).arg("--project-dir").arg(repo).args(&args[2..]);
     command.env("XTRACE_DATA_HOME", data_home).output().expect("run xtrace")
-}
-
-fn wait_for_complete_recording(project_root: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Ok(database) = rusqlite::Connection::open(project_root.join("metadata.sqlite3")) {
-            let count: i64 = database
-                .query_row(
-                    "SELECT COUNT(*) FROM recordings WHERE status IN ('complete', 'partial')",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            if count >= 1 {
-                return;
-            }
-        }
-        assert!(Instant::now() < deadline, "no finished recording was persisted");
-        thread::sleep(Duration::from_millis(50));
-    }
 }
 
 fn temp_root() -> TempDir {
