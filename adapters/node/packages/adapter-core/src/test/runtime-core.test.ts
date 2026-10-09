@@ -123,3 +123,9 @@ test("manifest is deterministic and limitations shrink when a module installs", 
   assert.ok(withHttp.includes("route_unavailable"), "route needs a framework module");
   assert.ok(withHttp.includes("values_unavailable"), "baseline limitations never shrink");
 });
+
+test("both preloads may run but capture starts exactly once", () => {
+  const { claimCaptureStart } = require("../capture-start.cjs") as typeof import("../capture-start.cjs");
+  assert.equal(claimCaptureStart(), true);
+  assert.equal(claimCaptureStart(), false);
+});

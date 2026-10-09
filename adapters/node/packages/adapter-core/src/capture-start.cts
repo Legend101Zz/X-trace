@@ -4,7 +4,18 @@ import { createHttpCaptureTransport, installHttpCapture } from "./http-capture.c
 
 const STARTUP_TIMEOUT_MS = 5_000;
 
+const STARTED = Symbol.for("xtrace.capture.started.v1");
+
+/** True the first time only: `--require` and `--import` preloads may both run, capture starts once. */
+export function claimCaptureStart(): boolean {
+  const holder = globalThis as unknown as Record<symbol, boolean | undefined>;
+  if (holder[STARTED]) return false;
+  Object.defineProperty(holder, STARTED, { value: true, enumerable: false });
+  return true;
+}
+
 export function startCaptureFromRequire(): void {
+  if (!claimCaptureStart()) return;
   const bootstrapPath = process.env.XTRACE_BOOTSTRAP_PATH;
   restoreLauncherEnvironment();
   if (!bootstrapPath) {

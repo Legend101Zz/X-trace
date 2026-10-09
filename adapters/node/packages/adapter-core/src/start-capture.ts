@@ -3,12 +3,14 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { createHttpCaptureTransport, installHttpCapture } from "./http-capture.cjs";
+import { claimCaptureStart } from "./capture-start.cjs";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 const DIST_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 
 /** Starts authenticated transport before an ESM application's entry module executes. */
 export async function startCapture(): Promise<void> {
+  if (!claimCaptureStart()) return;
   const bootstrapPath = process.env.XTRACE_BOOTSTRAP_PATH;
   restoreLauncherEnvironment();
   if (!bootstrapPath) {
