@@ -191,10 +191,11 @@ fn alive(pid: &str) -> bool {
 
 #[test]
 fn scan_timeout_stops_the_whole_process_group_of_a_forking_wrapper() {
-    // Readiness handshake: the first exec of a freshly written script (and of `sleep`) can take
-    // over a second on macOS. The wrapper has a warm-up mode that execs both and exits; running
-    // it once before the scan pays that one-off cost outside the scan's timeout clock. The scan
-    // itself then runs with the normal 1 s deadline and the grandchild (30 s) is stopped by it.
+    // Warm-up mitigation (not a readiness handshake): the first exec of a freshly written script
+    // (and of `sleep`) can take over a second on macOS. The wrapper has a warm-up mode that execs
+    // both and exits; running it once before the scan pays that one-off cost outside the scan's
+    // timeout clock, which still starts at spawn. The scan then runs with the normal 1 s deadline
+    // and the grandchild (30 s) must be stopped by it.
     let project = Project::new();
     let pid_file = project.dir.path().join("grandchild.pid");
     let body = format!(
@@ -207,7 +208,7 @@ fn scan_timeout_stops_the_whole_process_group_of_a_forking_wrapper() {
     assert!(!pid_file.exists(), "warm-up must not start the grandchild");
     let output = project.scan(&analyzer, &project.dir.path().join("src"), &["--timeout-secs", "1"]);
     assert_eq!(output.status.code(), Some(10), "{output:?}");
-    let pid = fs::read_to_string(&pid_file).expect("grandchild pid recorded");
+    let pid = fs::read_to_string(&pid_file).expect("wrapper never recorded a grandchild pid within the 1 s scan deadline");
     let pid = pid.trim();
     let mut gone = false;
     for _ in 0..50 {

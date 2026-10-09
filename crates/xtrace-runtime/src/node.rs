@@ -1459,24 +1459,33 @@ fn main() {{
         assert!(!super::group_already_gone(Errno::INVAL));
     }
 
+    /// The flake path: a group whose only member is an exited-but-unreaped leader (a zombie).
+    /// Darwin `killpg` reports `EPERM` for it; the reap paths must still succeed and reap.
     #[tokio::test]
-    async fn termination_of_an_already_exited_group_still_reaps() {
+    async fn termination_of_a_zombie_only_group_still_reaps() {
         use std::os::unix::process::CommandExt as _;
+        use std::time::{Duration, Instant};
         use tokio::process::Command;
 
         let mut command = Command::new("true");
         command.as_std_mut().process_group(0);
         command.kill_on_drop(true);
-        let mut child = command.spawn().expect("spawn short-lived leader");
-        let leader = child.id().expect("leader PID");
-        // The leader has exited and been reaped before termination is forwarded: the group no
-        // longer exists, which is the success case, not an error.
-        child.wait().await.expect("leader exits");
-        let mut supervised = NodeChild { child, process_group: leader as i32, reaped: false };
+        let child = command.spawn().expect("spawn short-lived leader");
+        let leader = child.id().expect("leader PID") as i32;
+        // Deliberately do not wait on the child: poll until it is an unreaped zombie.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !is_zombie(leader) {
+            assert!(Instant::now() < deadline, "leader never became a zombie");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let group = rustix::process::Pid::from_raw(leader).expect("leader PID");
+        super::signal_group(group, rustix::process::Signal::KILL)
+            .expect("signalling a zombie-only group is not a failure");
+        let mut supervised = NodeChild { child, process_group: leader, reaped: false };
         let status = supervised
             .forward_and_reap(rustix::process::Signal::TERM)
             .await
-            .expect("an already-gone group is not a termination failure");
+            .expect("a zombie-only group is not a termination failure");
         assert!(status.success());
         assert!(supervised.reaped);
     }
