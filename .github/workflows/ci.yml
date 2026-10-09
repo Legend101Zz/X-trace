@@ -481,6 +481,13 @@ jobs:
           root="$RUNNER_TEMP/mr"
           [ "${#root}" -le 40 ] || { echo "private root path too long"; exit 1; }
           echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
+      - name: Put Homebrew OpenSSL 3 first on PATH
+        # The macOS system openssl is LibreSSL; the release tooling preflight requires OpenSSL 3.
+        run: |
+          set -euo pipefail
+          prefix="$(brew --prefix openssl@3)"
+          test -x "$prefix/bin/openssl"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
       - name: Verify exact source and architecture
         run: |
           test "$(uname -s)" = Darwin
