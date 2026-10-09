@@ -427,6 +427,22 @@ impl SqliteCatalogDiscoveryStore {
         // default port refuses every static or class-bound claim, and only the local-scan wiring
         // supplies a proof that re-reads the pinned bytes. This port persists what the service
         // admitted and does not second-guess it, so a verified local scan can be recorded.
+        // Cheap independent layer behind the application proof port: a static snapshot claim must
+        // cite exactly the snapshot the owner selection pinned, and a local static scan has no
+        // loaded classes, so a class-bound claim in that namespace is never stored.
+        if chunk.claims.iter().any(|claim| {
+            claim.source_evidence().iter().any(|evidence| match evidence {
+                ClaimSourceEvidence::StaticSnapshot { source_revision_id, .. } => {
+                    Some(*source_revision_id) != selection.source_revision_id()
+                }
+                ClaimSourceEvidence::LoadedClassBound { .. } => {
+                    matches!(selection.namespace(), CatalogRunNamespace::LocalStaticScanner)
+                }
+                _ => false,
+            })
+        }) {
+            return Err(refusal_error());
+        }
         if chunk.claims.iter().any(|claim| {
             claim.operation().project_id != selection.project_id()
                 || claim.operation().application_component
@@ -1749,6 +1765,200 @@ mod tests {
             completion: DiscoveryCompletion::Complete,
             limitation_codes: Vec::new(),
         }
+    }
+
+    fn insert_project(store: &SqliteStore, project_id: ProjectId) {
+        let connection = store.lock().expect("database connection");
+        connection.execute(
+            "INSERT INTO projects (project_id, canonical_repo_hash, display_name, created_at, last_opened_at, config_schema_version, effective_config_hash) VALUES (?1, ?2, 'fixture', '2026-10-04T00:00:00Z', '2026-10-04T00:00:00Z', 1, ?3)",
+            params![project_id.as_uuid().as_bytes().to_vec(), format!("b3:{}", "0".repeat(64)), "0".repeat(64)],
+        ).expect("seed project");
+    }
+
+    fn static_scope(component: &str) -> DiscoveryScope {
+        DiscoveryScope {
+            kind: DiscoveryScopeKind::StaticRepository,
+            source_root_key: Some("src-test".to_owned()),
+            module_selector: "default".to_owned(),
+            application_component: component.to_owned(),
+            binding_key: "default".to_owned(),
+            framework_family: "express".to_owned(),
+            producer_family: "local-static-scan".to_owned(),
+            ruleset_digest: ContentHash::of_bytes(b"test-rules"),
+        }
+    }
+
+    fn static_claim(
+        project_id: ProjectId,
+        component: &str,
+        revision: SourceRevisionId,
+        digest: ContentHash,
+    ) -> xtrace_domain::catalog_discovery::ValidatedEndpointClaim {
+        let identity = EndpointIdentity {
+            project_id,
+            application_component: component.to_owned(),
+            transport: Transport::Http,
+            binding_key: "default".to_owned(),
+            method: HttpMethod::Get,
+            route_template: "/orders".to_owned(),
+        };
+        xtrace_domain::catalog_discovery::ValidatedEndpointClaim::new(
+            "st-1".to_owned(),
+            identity,
+            ClaimProvenance::StaticInferred,
+            None,
+            0.9,
+            Vec::new(),
+            vec![ClaimSourceEvidence::StaticSnapshot {
+                source_revision_id: revision,
+                relative_path: "routes.js".to_owned(),
+                recorded_source_digest: digest,
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 2,
+            }],
+        )
+        .expect("valid static claim")
+    }
+
+    fn row_count(store: &SqliteStore, table: &str) -> i64 {
+        store
+            .lock()
+            .expect("database connection")
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .expect("count rows")
+    }
+
+    #[test]
+    fn store_refuses_a_static_claim_citing_a_snapshot_the_selection_did_not_pin() {
+        let shared = SqliteStore::open_in_memory(OpenOptions::default()).expect("store");
+        let scope = static_scope("orders");
+        let pinned = SourceRevisionId::new();
+        let mut selection = test_selection(scope.clone(), CatalogRunNamespace::LocalStaticScanner);
+        selection.source_revision_id = Some(pinned);
+        selection.pinned_source_digest = Some(ContentHash::of_bytes(b"snapshot"));
+        insert_project(&shared, selection.project_id());
+        shared.lock().expect("connection").execute(
+            "INSERT INTO catalog_owner_selections (owner_selection_id, project_id, selection_epoch, current_for_scope, verified_pack_digest, scope_digest, scope_json, source_revision_id, pinned_source_digest, revoked) VALUES (?1, ?2, 1, 1, ?3, ?4, ?5, ?6, ?7, 0)",
+            params![selection.owner_selection_id().to_vec(), selection.project_id().as_uuid().as_bytes().to_vec(), selection.verified_pack_digest().as_bytes().to_vec(), scope.digest().expect("digest").as_bytes().to_vec(), serde_json::to_string(&scope).expect("scope JSON"), pinned.as_uuid().as_bytes().to_vec(), ContentHash::of_bytes(b"snapshot").as_bytes().to_vec()],
+        ).expect("seed pinned selection");
+
+        let adapter = SqliteCatalogDiscoveryStore::new(shared.clone());
+        let run = run_id(
+            adapter.start_run_with_view(&selection, &start_request(&scope, "pin")).expect("start"),
+        );
+        let digest = ContentHash::of_bytes(b"routes");
+        let chunk = |revision| DiscoveryChunk {
+            run_id: run,
+            chunk_index: 0,
+            claims: vec![static_claim(selection.project_id(), "orders", revision, digest)],
+        };
+        assert!(
+            adapter.submit_chunk_with_view(&selection, &chunk(SourceRevisionId::new())).is_err()
+        );
+        assert_eq!(row_count(&shared, "catalog_discovery_claims"), 0);
+        adapter.submit_chunk_with_view(&selection, &chunk(pinned)).expect("pinned snapshot");
+        assert_eq!(row_count(&shared, "catalog_discovery_claims"), 1);
+    }
+
+    struct FixedReader(Option<ContentHash>);
+    impl xtrace_application::catalog_discovery::admission::SourceSnapshotReader for FixedReader {
+        fn digest(&self, _relative_path: &str) -> Option<ContentHash> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn only_a_verified_local_scan_chunk_reaches_the_real_store() {
+        use crate::catalog_admission_store::SqliteCatalogAdmissionStore;
+        use xtrace_application::catalog_discovery::admission::{
+            LocalScanAuthority, LocalScanSelection,
+        };
+        use xtrace_application::{
+            CatalogDiscoveryError, CatalogDiscoveryService, CatalogProducerContext,
+        };
+
+        let shared = SqliteStore::open_in_memory(OpenOptions::default()).expect("store");
+        let project_id = ProjectId::new();
+        insert_project(&shared, project_id);
+        let adapter = Arc::new(SqliteCatalogDiscoveryStore::new(shared.clone()));
+        let scope = static_scope("orders");
+        let recorded = ContentHash::of_bytes(b"routes");
+
+        // The default service has fail-closed admission: it cannot even start a run, so a static
+        // claim has no way to reach the store.
+        let default_service = CatalogDiscoveryService::new(adapter.clone());
+        let context = CatalogProducerContext {
+            project_id,
+            runtime_session_id: xtrace_domain::RuntimeSessionId::new(),
+            verified_pack_digest: ContentHash::of_bytes(b"pack"),
+            protocol_minor: 1,
+            scoped_discovery_negotiated: true,
+            namespace: CatalogRunNamespace::LocalStaticScanner,
+        };
+        let request = start_request(&scope, "scan-1");
+        assert!(matches!(
+            default_service.start_run(context, &request),
+            Err(CatalogDiscoveryError::Refused(_))
+        ));
+        let forged = DiscoveryChunk {
+            run_id: RunId::new(),
+            chunk_index: 0,
+            claims: vec![static_claim(project_id, "orders", SourceRevisionId::new(), recorded)],
+        };
+        assert!(matches!(
+            default_service.submit_chunk(context, &forged),
+            Err(CatalogDiscoveryError::Refused(_))
+        ));
+        assert_eq!(row_count(&shared, "catalog_discovery_runs"), 0);
+        assert_eq!(row_count(&shared, "catalog_discovery_claims"), 0);
+
+        // A local scan whose cited file changed since analysis is refused with zero rows.
+        let revision = SourceRevisionId::new();
+        let selection = LocalScanSelection {
+            project_id,
+            scope: scope.clone(),
+            analyzer_digest: ContentHash::of_bytes(b"analyzer"),
+            source_revision_id: revision,
+            pinned_source_digest: ContentHash::of_bytes(b"snapshot"),
+        };
+        let admission = SqliteCatalogAdmissionStore::new(shared.clone());
+        let stale = LocalScanAuthority::establish(
+            &admission,
+            &selection,
+            Arc::new(FixedReader(Some(ContentHash::of_bytes(b"edited")))),
+        )
+        .expect("establish");
+        let service = CatalogDiscoveryService::for_local_scan(adapter.clone(), &stale);
+        let run = run_id(service.start_run(stale.context(), &request).expect("start"));
+        let chunk = DiscoveryChunk {
+            run_id: run,
+            chunk_index: 0,
+            claims: vec![static_claim(project_id, "orders", revision, recorded)],
+        };
+        assert!(matches!(
+            service.submit_chunk(stale.context(), &chunk),
+            Err(CatalogDiscoveryError::Refused(_))
+        ));
+        assert_eq!(row_count(&shared, "catalog_discovery_claims"), 0);
+
+        // A fresh authority whose reader still sees the recorded bytes persists the chunk.
+        let clean = LocalScanAuthority::establish(
+            &admission,
+            &selection,
+            Arc::new(FixedReader(Some(recorded))),
+        )
+        .expect("establish");
+        let service = CatalogDiscoveryService::for_local_scan(adapter, &clean);
+        let run = run_id(service.start_run(clean.context(), &request).expect("start"));
+        let chunk = DiscoveryChunk {
+            run_id: run,
+            chunk_index: 0,
+            claims: vec![static_claim(project_id, "orders", revision, recorded)],
+        };
+        service.submit_chunk(clean.context(), &chunk).expect("clean chunk");
+        assert_eq!(row_count(&shared, "catalog_discovery_claims"), 1);
     }
 
     #[test]

@@ -333,6 +333,67 @@ mod tests {
         );
     }
 
+    fn loaded_class_claim(digest: ContentHash) -> ValidatedEndpointClaim {
+        let identity = EndpointIdentity {
+            project_id: ProjectId::new(),
+            application_component: "app".to_owned(),
+            transport: Transport::Http,
+            binding_key: "default".to_owned(),
+            method: HttpMethod::Get,
+            route_template: "/a".to_owned(),
+        };
+        ValidatedEndpointClaim::new(
+            "lc-1".to_owned(),
+            identity,
+            ClaimProvenance::StaticInferred,
+            None,
+            0.9,
+            Vec::new(),
+            vec![ClaimSourceEvidence::LoadedClassBound {
+                loaded_class_digest: ContentHash::of_bytes(b"class"),
+                relative_path: "a.js".to_owned(),
+                recorded_source_digest: digest,
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 2,
+            }],
+        )
+        .expect("valid claim")
+    }
+
+    #[test]
+    fn source_proof_refuses_loaded_class_evidence_even_when_the_bytes_match() {
+        let revision = SourceRevisionId::new();
+        let recorded = ContentHash::of_bytes(b"app.get('/a')");
+        let proof = SnapshotSourceProof { reader: Arc::new(Fixed(Some(recorded))) };
+        assert_eq!(
+            proof.verify_claim(&selection(revision), &loaded_class_claim(recorded)),
+            Err(DiscoveryRefusal::SourceSnapshotUnavailable)
+        );
+    }
+
+    #[test]
+    fn source_proof_refuses_a_snapshot_other_than_the_selected_one() {
+        let selected_revision = SourceRevisionId::new();
+        let recorded = ContentHash::of_bytes(b"app.get('/a')");
+        let proof = SnapshotSourceProof { reader: Arc::new(Fixed(Some(recorded))) };
+        assert_eq!(
+            proof.verify_claim(
+                &selection(selected_revision),
+                &claim(SourceRevisionId::new(), recorded)
+            ),
+            Err(DiscoveryRefusal::SourceSnapshotUnavailable)
+        );
+        // A selection without any pinned snapshot cannot vouch for a static claim either.
+        let mut unpinned = selection(selected_revision);
+        unpinned.source_revision_id = None;
+        assert_eq!(
+            proof.verify_claim(&unpinned, &claim(selected_revision, recorded)),
+            Err(DiscoveryRefusal::SourceSnapshotUnavailable)
+        );
+    }
+
     #[test]
     fn admission_never_widens_the_selected_scope() {
         let revision = SourceRevisionId::new();
