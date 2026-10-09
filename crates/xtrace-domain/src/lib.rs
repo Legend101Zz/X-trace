@@ -1,3 +1,4 @@
+// Lane CI proof: comment-only change, never merged.
 //! X-trace domain types.
 //!
 //! The domain is language-neutral, framework-neutral, and IO-free. It owns the
