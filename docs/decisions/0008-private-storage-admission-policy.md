@@ -149,6 +149,8 @@ no memo):
 
 - A verdict is remembered inside one operation only and dropped with it. It is never
   carried between operations, threads or processes and never keyed by path alone.
+  (Amended 2026-10-10: inside one admission scope, operations on the same thread
+  share the memo. See "Amendment 1" at the end.)
 - The key is the directory's state read from the held descriptor: device, inode,
   owner, mode and ctime. Any chmod, chown, ACL or xattr edit, and any child create
   or remove, advances ctime, so a changed directory misses and is probed again.
@@ -202,7 +204,9 @@ Batched probe: to bound cost at depth, a walk lists all of its directories with 
 - Confidentiality against backups, indexers (Spotlight) or snapshot tooling that
   the user runs.
 - Time-of-check windows shorter than one operation: the policy revalidates around
-  each operation, it does not make a file system transaction.
+  each operation, it does not make a file system transaction. (Under Amendment 1 a
+  remembered directory verdict can be reused for up to one admission scope; every
+  use still runs the identity checks.)
 
 ### Pack snapshot cache (Sealed role in use)
 
@@ -294,3 +298,83 @@ Gaps (not yet covered):
   `tools/release/private_roots.py`.
 - Named-file rows in the policy table (file owner, mode, link count, ACL) are not
   yet pinned as a table; they are covered only by the real-entry-point tests.
+
+## Amendment 1 (2026-10-10): admission scope for one store call
+
+- Status: Proposed by the root under the owner's pre-authorization of 2026-10-10
+  for "an ADR 0008 amendment, only if the admission fix needs reuse across
+  operations". Security-reviewed in the run records. Listed for owner
+  ratification; until the owner ratifies it, this amendment may be reverted to
+  the fallback below without any other change.
+- Context (measured on the leased Mac, one recording of 8 commits plus a Spring
+  journey): one `commit_segment` makes 119 admission operations and 326 to 354
+  `/bin/ls` spawns (about 234 batched, 38 single-directory, 55 named-file). Only 15
+  directories and 8 files are touched per commit, and 114 of the 234 batched
+  listings repeat an identical operand list inside the same operation, because
+  every walk re-spawns the batch even when every directory is already remembered.
+  No single operation comes near the 750 ms deadline (the largest seen is 13
+  spawns); the cost is the count. At the hosted runner's spawn latency a commit
+  takes about 2.4 s, which is why recording tests were slow on hosted macOS.
+
+Decision:
+
+1. At most one batched listing per operation or scope, taken lazily: a walk spawns
+   the batch only when a directory on it misses the memo. Batched entries keep
+   every existing rule (operand matching, the (device, inode) binding taken with
+   `lstat` before and after, the 50 ms clock check, and the 20 ms quiet period
+   measured against the moment the batch was taken). A directory that changed
+   after the batch was taken fails the quiet-period rule and is probed alone.
+2. Admission scope. The store opens a scope for the duration of one store call
+   (`begin_recording`, one `persist_segment`, `finish_recording`, and a store lock
+   taken outside them). The scope is a guard on the calling thread; it is neither
+   `Send` nor `Sync`, and a scope opened inside a live scope joins the outer one.
+   While the scope is live, operations on that thread share the directory verdict
+   memo and the batched listing.
+3. What stays per operation, unchanged:
+   - the 750 ms deadline, measured from each public entry point's own start; a
+     scope never extends or pools it;
+   - the identity checks on every use, hit or miss (named `lstat` versus the held
+     descriptor: device, inode, owner and mode);
+   - the role rules for mode and owner;
+   - named-file probes, which are never memoized (the before and after `statat`
+     sandwich and the link-count checks run on every call).
+4. The memo key gains the filesystem identity and mount flags (`statfs` `f_fsid`
+   and `f_flags`) next to device, inode, owner, mode and ctime. Only admit
+   verdicts whose state was unchanged across the probe are stored. Refusals and
+   timeouts are never stored.
+5. The scope has a wall-clock cap of 10 s from its start. After the cap the scope
+   drops its memo and batch, and every later operation in it behaves as in the
+   base ADR (a fresh memo per operation). The cap never extends a deadline.
+6. A verdict is still never carried between threads, between processes, or from
+   one store call to the next. Linux is unchanged: it has no memo.
+
+Consequences:
+
+- Spawns per `commit_segment` are expected to fall from about 327 to roughly
+  40 to 60. The number is an estimate from the measured working set until the
+  spawn-bound test below records the real value.
+- The window between a directory's probe and the reuse of its verdict grows from
+  one operation (milliseconds) to one store call (bounded by the 10 s cap). Any
+  chmod, chown, ACL or xattr edit and any child create or remove advances ctime,
+  so the key misses and the directory is probed again. The actors who could
+  change protection without advancing ctime (root, a privileged remount, kernel
+  or filesystem bugs) were already out of scope; adding `f_fsid` and `f_flags`
+  to the key narrows the remount case further.
+- Fallback if the owner declines this amendment: keep decision 1 only (at most one
+  batch per operation, inside the base ADR), optionally with fewer store-level
+  revalidations, each reviewed as a security change. That gives about 212 spawns
+  per commit (measured from the trace), which is likely not enough for the
+  original recording-test deadlines on hosted macOS.
+
+Test obligations added by this amendment:
+
+- A spawn-bound test: one `commit_segment` on macOS spawns at most the recorded
+  bound, so a regression to per-call batches fails.
+- Inside one scope: a chmod or an ACL entry added between two calls is seen
+  (probed again and refused); a directory replaced under the same name is
+  refused; a symlink swapped in at the leaf or at an ancestor is refused; the
+  hardlink and FIFO negatives for named files still refuse.
+- A scope past its cap probes afresh; an expired deadline inside a live scope
+  refuses before any probe.
+- A memo entry made on one thread is not visible on another; a nested scope joins
+  the outer one; nothing is remembered after the scope's guard is dropped.
