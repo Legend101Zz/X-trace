@@ -183,4 +183,3 @@ export function assertJourney(result: Awaited<ReturnType<typeof scenario>>): voi
     assert.equal(recording.events.filter((event) => event.symbol === "node:http.Server.request" && event.kind === "frame-enter").length, 1, "exactly one root per request");
   }
 }
-
