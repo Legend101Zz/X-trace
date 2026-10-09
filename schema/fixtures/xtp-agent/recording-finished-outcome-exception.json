@@ -1,0 +1,13 @@
+{
+  "bytes_hex": "08011a1011111111111111111111111111111111200f29f70300000000000032046d2d3135da01750a1022222222222222222222222222222222100919e02e0000000000003a20eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee4234080210f4031a280a156170702e4e6f74466f756e64457863657074696f6e120f6f776e6572206e6f7420666f756e642203652d33",
+  "description": "RecordingFinished.outcome = EXCEPTION_PROPAGATED with exception payload and throwing frame id",
+  "message": "xtp.agent.v1.AgentEnvelope",
+  "summary": {
+    "outcome": {
+      "exceptionType": "app.NotFoundException",
+      "httpStatus": 500,
+      "kind": "exception_propagated",
+      "thrownFromEventId": "e-3"
+    }
+  }
+}

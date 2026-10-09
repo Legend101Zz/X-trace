@@ -1,0 +1,12 @@
+{
+  "bytes_hex": "08011a1011111111111111111111111111111111201529fd0300000000000032046d2d3231a2014b0a117874726163652d6a6176612d6167656e741205302e302e318a012e0a0b737072696e672d626f6f741205332e332e341a066661746a617222066469726563742a087374616e64617264",
+  "description": "AdapterHello.runtime_facts (field 17), adapter-reported and outside the HMAC transcript",
+  "message": "xtp.agent.v1.AgentEnvelope",
+  "summary": {
+    "runtimeFacts": {
+      "captureDepth": "standard",
+      "framework": "spring-boot",
+      "launchMode": "direct"
+    }
+  }
+}

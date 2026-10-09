@@ -279,6 +279,7 @@ mod tests {
             protocol_minor_max: 0,
             client_nonce: Bytes::copy_from_slice(&client_nonce),
             hmac: Bytes::copy_from_slice(&adapter_proof),
+            ..Default::default()
         };
         verify_adapter_hello(secret, exporter, session, &hello).expect("verify");
 
@@ -335,6 +336,7 @@ mod tests {
             client_nonce: Bytes::copy_from_slice(&client_nonce),
             // Tampered proof: every byte is one off the correct tag.
             hmac: Bytes::copy_from_slice(&[0u8; 32]),
+            ..Default::default()
         };
         let err = verify_adapter_hello(secret, exporter, session, &hello).unwrap_err();
         assert!(matches!(err, xtrace_protocol::handshake::TranscriptProofError::Mismatch));

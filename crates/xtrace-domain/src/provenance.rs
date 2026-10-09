@@ -157,6 +157,12 @@ pub enum SourceBinding {
     DebugMetadataAbsent,
     /// The source path or range in the build attestation is invalid.
     SourceMetadataInvalid,
+    /// The source file was read when the class loaded; no build attestation vouches for it.
+    ObservedUnattested,
+    /// A generated file was observed and no source map was found.
+    SourceMapAbsent,
+    /// A source map exists but the position could not be resolved through it.
+    SourceMapUnresolved,
 }
 
 impl SourceBinding {
@@ -164,6 +170,34 @@ impl SourceBinding {
     #[must_use]
     pub const fn is_verified(self) -> bool {
         matches!(self, Self::Verified)
+    }
+
+    /// Returns `true` when an event with this binding may carry a source range.
+    #[must_use]
+    pub const fn has_source_claim(self) -> bool {
+        matches!(
+            self,
+            Self::Verified
+                | Self::ObservedUnattested
+                | Self::SourceMapAbsent
+                | Self::SourceMapUnresolved
+        )
+    }
+
+    /// Returns the snake_case wire and JSON string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Verified => "verified",
+            Self::AttestationMissing => "attestation_missing",
+            Self::ClassBytesMismatch => "class_bytes_mismatch",
+            Self::DebugMetadataAbsent => "debug_metadata_absent",
+            Self::SourceMetadataInvalid => "source_metadata_invalid",
+            Self::ObservedUnattested => "observed_unattested",
+            Self::SourceMapAbsent => "source_map_absent",
+            Self::SourceMapUnresolved => "source_map_unresolved",
+        }
     }
 }
 

@@ -2411,6 +2411,9 @@ fn project_persisted_event(
             WireSourceBinding::ClassBytesMismatch => SourceBinding::ClassBytesMismatch,
             WireSourceBinding::DebugMetadataAbsent => SourceBinding::DebugMetadataAbsent,
             WireSourceBinding::SourceMetadataInvalid => SourceBinding::SourceMetadataInvalid,
+            WireSourceBinding::ObservedUnattested => SourceBinding::ObservedUnattested,
+            WireSourceBinding::SourceMapAbsent => SourceBinding::SourceMapAbsent,
+            WireSourceBinding::SourceMapUnresolved => SourceBinding::SourceMapUnresolved,
             WireSourceBinding::Unspecified => SourceBinding::Unspecified,
         },
     );
