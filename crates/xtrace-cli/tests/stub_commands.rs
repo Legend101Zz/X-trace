@@ -27,10 +27,6 @@ fn unimplemented_command_exits_nine_with_stable_message_for_each() {
         (&["catalog", "diff"], "catalog diff"),
         (&["catalog", "conflicts"], "catalog conflicts"),
         (&["catalog", "runs"], "catalog runs"),
-        (&["record"], "record"),
-        (&["stop"], "stop"),
-        (&["restart"], "restart"),
-        (&["doctor"], "doctor"),
         (&["exercise", "approve", "--plan-hash", "abc"], "exercise approve"),
         (&["exercise", "run"], "exercise run"),
         (&["exercise", "show"], "exercise show"),
@@ -47,6 +43,36 @@ fn unimplemented_command_exits_nine_with_stable_message_for_each() {
         assert_eq!(doc["message"], format!("xtrace {name} is not implemented in this build"));
         assert_eq!(doc["details"]["command"], *name);
     }
+}
+
+/// `record`, `stop` and `restart` are implemented: outside an initialized repository they fail with
+/// the directory error (exit 3), never the not-implemented error (exit 9). The success paths are
+/// covered by `lifecycle_journey.rs`.
+#[test]
+fn implemented_lifecycle_commands_refuse_an_uninitialized_directory_with_exit_three() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let project = dir.path().to_str().expect("utf-8 temp path");
+    for name in ["record", "stop", "restart"] {
+        let output = xtrace(&[name, "--project-dir", project]);
+        assert_eq!(output.status.code(), Some(3), "{name}");
+        assert!(output.stdout.is_empty(), "{name} wrote to stdout");
+        let doc: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("error document is JSON");
+        assert_eq!(doc["code"], "XTR-CLI-DIRECTORY", "{name}");
+        assert_ne!(doc["code"], "XTR-CLI-NOT-IMPLEMENTED", "{name}");
+    }
+}
+
+/// `doctor` is implemented: it prints a `doctor_report` document and exits 1 when a check fails.
+#[test]
+fn implemented_doctor_prints_a_report_instead_of_the_stub_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let project = dir.path().to_str().expect("utf-8 temp path");
+    let output = xtrace(&["doctor", "--project-dir", project]);
+    assert_ne!(output.status.code(), Some(9));
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("doctor report is JSON on stdout");
+    assert_eq!(doc["kind"], "doctor_report");
 }
 
 #[test]
