@@ -203,7 +203,17 @@ pub struct Session {
     /// into each other's per-recording state. Dropped on connection
     /// close.
     ingest_validator: IngestValidator,
+    /// Capture mode this session is armed for (CONTRACTS 4.2). Standard unless the launch
+    /// bootstrap's `capture.json` said `capture.mode = focused` (see `arm`).
+    armed_mode: xtrace_domain::CaptureMode,
+    /// Recordings whose adapter claimed the focused policy while this session was not armed;
+    /// each was served under the standard policy and carries `capture_policy_not_armed`.
+    downgraded_claims: Vec<RecordingId>,
 }
+
+/// Stable limitation code attached to a recording whose adapter claimed the focused policy on a
+/// session that was never armed for it (CONTRACTS 4.2: a claim by the adapter is not a grant).
+pub const LIMITATION_CAPTURE_POLICY_NOT_ARMED: &str = "capture_policy_not_armed";
 
 /// Upper bound on the volatile staging buffer. Beyond this bound the
 /// session refuses new envelopes with [`ProtocolErrorCode::SessionSequence`]
@@ -268,7 +278,30 @@ impl Session {
             negotiated: None,
             staged_incoming: std::collections::VecDeque::with_capacity(STAGED_INCOMING_LIMIT),
             ingest_validator: IngestValidator::new(ingest_config),
+            armed_mode: xtrace_domain::CaptureMode::Standard,
+            downgraded_claims: Vec::new(),
         }
+    }
+
+    /// Arms the session for `mode` (CONTRACTS 4.2): from the launch bootstrap's
+    /// `capture.mode`, or when an `ARM_FOCUSED_CAPTURE` command is acknowledged. A session can
+    /// only be armed up; arming standard never lowers a focused session.
+    pub fn arm(&mut self, mode: xtrace_domain::CaptureMode) {
+        if mode == xtrace_domain::CaptureMode::Focused {
+            self.armed_mode = mode;
+        }
+    }
+
+    /// Capture mode this session is armed for.
+    #[must_use]
+    pub fn armed_mode(&self) -> xtrace_domain::CaptureMode {
+        self.armed_mode
+    }
+
+    /// Recordings whose focused policy claim was downgraded because the session was not armed.
+    #[must_use]
+    pub fn downgraded_claims(&self) -> &[RecordingId] {
+        &self.downgraded_claims
     }
 
     /// Returns the underlying [`IngestValidator`] owned by this
@@ -609,25 +642,37 @@ impl Session {
                 // verdict reports the watermark that was already on
                 // file.
                 let default_watermark = self.ingest_validator.highest_contiguous_seq(recording_id);
+                let mode = crate::recording_pipeline::effective_capture_mode(
+                    self.armed_mode,
+                    &started.capture_policy_id,
+                );
+                let claimed_focused =
+                    xtrace_domain::CaptureMode::from_policy_id(&started.capture_policy_id)
+                        == xtrace_domain::CaptureMode::Focused;
+                let downgraded = claimed_focused && mode != xtrace_domain::CaptureMode::Focused;
                 let acceptance = self
                     .ingest_validator
-                    .accept_started(
-                        started,
-                        crate::recording_pipeline::effective_capture_mode(
-                            xtrace_domain::CaptureMode::Standard,
-                            &started.capture_policy_id,
-                        ),
-                    )
+                    .accept_started(started, mode)
                     .map_err(SessionError::with_ingest)?;
+                let mut limitations = Vec::new();
+                if downgraded {
+                    limitations.push(LIMITATION_CAPTURE_POLICY_NOT_ARMED);
+                    if !self.downgraded_claims.contains(&recording_id) {
+                        self.downgraded_claims.push(recording_id);
+                    }
+                }
                 let incoming = IncomingEnvelope::RecordingStarted(started.clone());
-                Ok(self.admit_recording(
+                let mut admission = self.admit_recording(
                     recording_id,
                     incoming,
                     acceptance,
                     default_watermark,
                     staged_seq,
                     next_seq,
-                ))
+                );
+                admission.capture_mode = mode;
+                admission.limitations = limitations;
+                Ok(admission)
             }
             Some(wire::agent_envelope::Payload::EventBatch(batch)) => {
                 let recording_id =
@@ -730,7 +775,13 @@ impl Session {
     ) -> PostHelloAdmission {
         self.stage_committed(staged_seq, incoming.clone(), next_seq);
         let ack = build_ack(next_seq - 1, std::collections::HashMap::new());
-        PostHelloAdmission { incoming, acceptance: None, command: OutgoingCommand::Ack(ack) }
+        PostHelloAdmission {
+            incoming,
+            acceptance: None,
+            command: OutgoingCommand::Ack(ack),
+            capture_mode: self.armed_mode,
+            limitations: Vec::new(),
+        }
     }
 
     /// Commits a recording variant envelope and returns the matching
@@ -755,6 +806,8 @@ impl Session {
             incoming,
             acceptance: Some(acceptance),
             command: OutgoingCommand::Ack(ack),
+            capture_mode: self.armed_mode,
+            limitations: Vec::new(),
         }
     }
 
@@ -1974,6 +2027,62 @@ mod tests {
     fn drive(session: &mut Session, sid: RuntimeSessionId, seq: u64, payload: PayloadOneof) {
         let envelope = envelope_with_payload(sid, seq, payload);
         session.accept_post_hello(&envelope).expect("drive must admit");
+    }
+
+    fn focused_started(seed: u8) -> wire::RecordingStarted {
+        wire::RecordingStarted {
+            capture_policy_id: xtrace_domain::CAPTURE_POLICY_FOCUSED_ID.to_owned(),
+            ..valid_started(seed)
+        }
+    }
+
+    #[test]
+    fn focused_claim_without_arming_is_standard_and_flags_limitation() {
+        let (mut session, sid, _) = session_after_hello();
+        assert_eq!(session.armed_mode(), xtrace_domain::CaptureMode::Standard);
+        let admission = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                1,
+                PayloadOneof::RecordingStarted(focused_started(0x01)),
+            ))
+            .expect("unarmed focused claim is admitted, not rejected");
+        assert_eq!(admission.capture_mode, xtrace_domain::CaptureMode::Standard);
+        assert_eq!(admission.limitations, vec![LIMITATION_CAPTURE_POLICY_NOT_ARMED]);
+        assert_eq!(session.downgraded_claims().len(), 1);
+    }
+
+    #[test]
+    fn armed_session_honours_a_focused_claim_without_a_limitation() {
+        let (mut session, sid, _) = session_after_hello();
+        session.arm(xtrace_domain::CaptureMode::Focused);
+        let admission = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                1,
+                PayloadOneof::RecordingStarted(focused_started(0x01)),
+            ))
+            .expect("armed focused start");
+        assert_eq!(admission.capture_mode, xtrace_domain::CaptureMode::Focused);
+        assert!(admission.limitations.is_empty());
+        assert!(session.downgraded_claims().is_empty());
+    }
+
+    #[test]
+    fn armed_session_keeps_a_standard_claim_standard_and_never_lowers() {
+        let (mut session, sid, _) = session_after_hello();
+        session.arm(xtrace_domain::CaptureMode::Focused);
+        session.arm(xtrace_domain::CaptureMode::Standard);
+        assert_eq!(session.armed_mode(), xtrace_domain::CaptureMode::Focused);
+        let admission = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                1,
+                PayloadOneof::RecordingStarted(valid_started(0x01)),
+            ))
+            .expect("standard start on an armed session");
+        assert_eq!(admission.capture_mode, xtrace_domain::CaptureMode::Standard);
+        assert!(admission.limitations.is_empty());
     }
 
     #[test]

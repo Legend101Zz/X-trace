@@ -605,7 +605,12 @@ mod unix {
             bootstrap_armed: Path::new(&record.bootstrap_path).exists(),
             arming: "single_launch_bootstrap",
             capture_depth: record.capture_depth.clone(),
-            capture_depth_enforced: false,
+            // Enforced only while a private capture.json beside the bootstrap names the recorded
+            // depth, because that file is what arms the daemon session.
+            capture_depth_enforced: crate::capture_args::mode_beside(Path::new(
+                &record.bootstrap_path,
+            ))
+            .is_some_and(|mode| mode.as_str() == record.capture_depth),
             already_running,
             recovered_recordings: recovered,
         }
@@ -708,6 +713,19 @@ mod unix {
             ));
         }
         if let Err(error) = write_record(&state, &record) {
+            abort_child(&mut child);
+            return Err(error);
+        }
+        // Arm the session: the daemon reads this file when the first adapter connects.
+        let armed = crate::capture_args::document(
+            crate::capture_args::CaptureDepth::parse(depth)?,
+            &[],
+            &[],
+        );
+        if let Err(error) =
+            crate::capture_args::write_beside(Path::new(&record.bootstrap_path), &armed)
+        {
+            remove_record(&state);
             abort_child(&mut child);
             return Err(error);
         }

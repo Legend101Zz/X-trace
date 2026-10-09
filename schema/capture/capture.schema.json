@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "xtrace.capture.v1",
+  "title": "X-trace capture.json (capture_schema_version 1)",
+  "description": "Private optional file written beside the bootstrap artifact with mode 0600 (CONTRACTS 10.3). Writer: xtrace run / xtrace record. Readers: the Java agent and the daemon. Unknown fields are ignored by readers; the bootstrap artifact itself stays at schema_version 1.",
+  "type": "object",
+  "required": ["capture_schema_version", "launch", "capture", "application_scope", "launch_grant"],
+  "properties": {
+    "capture_schema_version": { "const": 1 },
+    "launch": {
+      "type": "object",
+      "required": ["kind", "package_manager"],
+      "properties": {
+        "kind": { "enum": ["direct", "maven", "gradle", "package-manager", "supervisor", "attach"] },
+        "package_manager": { "type": ["string", "null"] }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "required": ["mode", "max_line_events", "max_value_bytes", "include_locals"],
+      "properties": {
+        "mode": { "enum": ["standard", "focused"] },
+        "max_line_events": { "type": "integer", "minimum": 0 },
+        "max_value_bytes": { "type": "integer", "minimum": 0 },
+        "include_locals": { "type": "boolean" }
+      }
+    },
+    "application_scope": {
+      "type": "object",
+      "required": ["application_packages", "application_roots", "source_roots", "deny_packages"],
+      "properties": {
+        "application_packages": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 256 } },
+        "application_roots": { "type": "array", "maxItems": 32, "items": { "type": "string" } },
+        "source_roots": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 256, "description": "repo-relative, no leading slash, no .. segment" } },
+        "deny_packages": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 256 } }
+      }
+    },
+    "launch_grant": {
+      "type": "object",
+      "required": ["launch_id", "multi_session"],
+      "properties": {
+        "launch_id": { "type": "string" },
+        "multi_session": { "const": false }
+      }
+    }
+  }
+}

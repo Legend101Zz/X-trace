@@ -85,6 +85,12 @@ pub struct PostHelloAdmission {
     pub acceptance: Option<Acceptance>,
     /// Outbound command the supervisor must serialize next.
     pub command: OutgoingCommand,
+    /// Effective capture mode of the admitted recording (the session's armed mode for
+    /// non-start envelopes). The recording pipeline applies exactly this mode.
+    pub capture_mode: xtrace_domain::CaptureMode,
+    /// Stable limitation codes raised by this admission (for example
+    /// `capture_policy_not_armed` when a focused claim was downgraded).
+    pub limitations: Vec<&'static str>,
 }
 
 /// Outbound command the supervisor wants to emit to the adapter.
