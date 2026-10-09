@@ -259,6 +259,7 @@ fn build_adapter_hello(
         protocol_minor_max,
         client_nonce: prost::bytes::Bytes::copy_from_slice(client_nonce),
         hmac: prost::bytes::Bytes::copy_from_slice(&proof),
+        ..Default::default()
     }
 }
 

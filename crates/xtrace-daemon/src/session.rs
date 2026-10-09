@@ -1069,6 +1069,7 @@ mod tests {
             protocol_minor_max: 0,
             client_nonce: Bytes::copy_from_slice(&client_nonce),
             hmac: Bytes::copy_from_slice(&proof),
+            ..Default::default()
         }
     }
 
@@ -1122,6 +1123,7 @@ mod tests {
             protocol_minor_max: 0,
             client_nonce: Bytes::copy_from_slice(&[0xaa_u8; 32]),
             hmac: Bytes::copy_from_slice(&[0u8; 32]),
+            ..Default::default()
         };
         let envelope = envelope_with_payload(
             session.inputs().runtime_session_id,
@@ -1152,6 +1154,7 @@ mod tests {
             protocol_minor_max: 0,
             client_nonce: Bytes::copy_from_slice(&[0xaa_u8; 16]),
             hmac: Bytes::copy_from_slice(&[0u8; 32]),
+            ..Default::default()
         };
         let envelope = envelope_with_payload(
             session.inputs().runtime_session_id,
@@ -1281,6 +1284,7 @@ mod tests {
             protocol_minor_max: 0,
             client_nonce: Bytes::copy_from_slice(&client_nonce),
             hmac: Bytes::copy_from_slice(&proof),
+            ..Default::default()
         };
         let envelope = envelope_with_payload(
             session.inputs().runtime_session_id,

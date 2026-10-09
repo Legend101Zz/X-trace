@@ -1,0 +1,13 @@
+{
+  "bytes_hex": "08011a1011111111111111111111111111111111201129f90300000000000032046d2d3137d2022e080110022215636f6d2e6578616d706c652e706574636c696e696328033a0572756e2d3140804048808080025001",
+  "description": "ARM_FOCUSED_CAPTURE with max_line_events (8), max_value_bytes (9), include_locals (10) and package_filters",
+  "message": "xtp.agent.v1.AgentEnvelope",
+  "summary": {
+    "includeLocals": true,
+    "maxLineEvents": 8192,
+    "maxValueBytes": 4194304,
+    "packageFilters": [
+      "com.example.petclinic"
+    ]
+  }
+}

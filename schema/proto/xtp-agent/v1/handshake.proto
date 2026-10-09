@@ -44,6 +44,26 @@ message AdapterHello {
     // HMAC over the TLS exporter, runtime session identifier, nonces,
     // and manifest digest.
     bytes hmac = 16;
+    // Adapter-reported runtime and framework facts (not covered by the HMAC).
+    RuntimeFacts runtime_facts = 17;
+}
+
+// Adapter-reported facts about the instrumented runtime. Unauthenticated:
+// consumers label them "adapter-reported".
+message RuntimeFacts {
+    // e.g. `spring-boot`, `express`; empty = not detected.
+    string framework = 1;
+    string framework_version = 2;
+    // classpath|jpms|fatjar|cjs|esm|unknown
+    string module_system = 3;
+    // direct|maven|gradle|package-manager|supervised|attach
+    string launch_mode = 4;
+    // standard|focused
+    string capture_depth = 5;
+    // cjs|esm|empty (Node only)
+    string node_mode = 6;
+    // npm|pnpm|yarn|empty (Node only)
+    string package_manager = 7;
 }
 
 // Identity and accepted protocol reply from the daemon.

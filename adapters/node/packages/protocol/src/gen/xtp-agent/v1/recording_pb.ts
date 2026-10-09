@@ -19,7 +19,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file xtp-agent/v1/recording.proto.
  */
 export const file_xtp_agent_v1_recording: GenFile = /*@__PURE__*/
-  fileDesc("Chx4dHAtYWdlbnQvdjEvcmVjb3JkaW5nLnByb3RvEgx4dHAuYWdlbnQudjEiigMKEFJlY29yZGluZ1N0YXJ0ZWQSFAoMcmVjb3JkaW5nX2lkGAEgASgMEhUKDXJlY29yZGluZ19zZXEYAiABKAQSDgoGbWV0aG9kGAMgASgJEh4KFm1hdGNoZWRfcm91dGVfdGVtcGxhdGUYBCABKAkSEQoJdXJsX3NoYXBlGAUgASgJEj4KFG9wZXJhdGlvbl9jYW5kaWRhdGVzGAYgAygLMiAueHRwLmFnZW50LnYxLk9wZXJhdGlvbkNhbmRpZGF0ZRIaChJzdGFydF9tb25vdG9uaWNfbnMYByABKAYSGQoRdGhyZWFkX29yX3Rhc2tfaWQYCCABKAkSGAoQYXN5bmNfY29udGV4dF9pZBgJIAEoCRIZChFjYXB0dXJlX3BvbGljeV9pZBgKIAEoCRIdChVjYXB0dXJlX3BvbGljeV9kaWdlc3QYCyABKAkSHwoXcmVkYWN0aW9uX3BvbGljeV9kaWdlc3QYDCABKAkSGgoSc291cmNlX3JldmlzaW9uX2lkGA0gASgJIjwKEk9wZXJhdGlvbkNhbmRpZGF0ZRIUCgxvcGVyYXRpb25faWQYASABKAwSEAoIZXZpZGVuY2UYAiABKAkiUAoKRXZlbnRCYXRjaBIUCgxyZWNvcmRpbmdfaWQYASABKAwSLAoGZXZlbnRzGAIgAygLMhwueHRwLmFnZW50LnYxLlJlY29yZGluZ0V2ZW50IsgDCg5SZWNvcmRpbmdFdmVudBIQCghldmVudF9pZBgBIAEoCRIVCg1yZWNvcmRpbmdfc2VxGAIgASgEEhcKD3BhcmVudF9ldmVudF9pZBgDIAEoCRIdChVhc3luY19wYXJlbnRfZXZlbnRfaWQYBCABKAkSFAoMbW9ub3RvbmljX25zGAUgASgGEhAKCHByaW9yaXR5GAYgASgNEi4KBGtpbmQYByABKA4yIC54dHAuYWdlbnQudjEuUmVjb3JkaW5nRXZlbnRLaW5kEg4KBnN5bWJvbBgIIAEoCRIpCgZzb3VyY2UYCSABKAsyGS54dHAuYWdlbnQudjEuU291cmNlUmFuZ2USKgoFdmFsdWUYCiABKAsyGy54dHAuYWdlbnQudjEuQ2FwdHVyZWRWYWx1ZRIuCgtpbnRlcmFjdGlvbhgLIAEoCzIZLnh0cC5hZ2VudC52MS5JbnRlcmFjdGlvbhIxCglleGNlcHRpb24YDCABKAsyHi54dHAuYWdlbnQudjEuRXhjZXB0aW9uUGF5bG9hZBIzCg5zb3VyY2VfYmluZGluZxgNIAEoDjIbLnh0cC5hZ2VudC52MS5Tb3VyY2VCaW5kaW5nIrsCCg1DYXB0dXJlZFZhbHVlEjcKCGNhcHR1cmVkGAEgASgLMiMueHRwLmFnZW50LnYxLkNhcHR1cmVkVmFsdWVDYXB0dXJlZEgAEjcKCHJlZGFjdGVkGAIgASgLMiMueHRwLmFnZW50LnYxLkNhcHR1cmVkVmFsdWVSZWRhY3RlZEgAEjkKCXRydW5jYXRlZBgDIAEoCzIkLnh0cC5hZ2VudC52MS5DYXB0dXJlZFZhbHVlVHJ1bmNhdGVkSAASPQoLdW5hdmFpbGFibGUYBCABKAsyJi54dHAuYWdlbnQudjEuQ2FwdHVyZWRWYWx1ZVVuYXZhaWxhYmxlSAASNQoHZHJvcHBlZBgFIAEoCzIiLnh0cC5hZ2VudC52MS5DYXB0dXJlZFZhbHVlRHJvcHBlZEgAQgcKBXZhbHVlImcKFUNhcHR1cmVkVmFsdWVDYXB0dXJlZBInCgVzaGFwZRgBIAEoDjIYLnh0cC5hZ2VudC52MS5WYWx1ZVNoYXBlEg8KB3ByZXZpZXcYAiABKAkSFAoMY29udGVudF9oYXNoGAMgASgMIlYKFUNhcHR1cmVkVmFsdWVSZWRhY3RlZBIPCgdydWxlX2lkGAEgASgJEiwKCnNoYXBlX2hpbnQYAiABKA4yGC54dHAuYWdlbnQudjEuVmFsdWVTaGFwZSJbChZDYXB0dXJlZFZhbHVlVHJ1bmNhdGVkEg8KB3ByZXZpZXcYASABKAkSIQoZb3JpZ2luYWxfc2l6ZV9sb3dlcl9ib3VuZBgCIAEoBBINCgVsaW1pdBgDIAEoBCJLChhDYXB0dXJlZFZhbHVlVW5hdmFpbGFibGUSLwoGcmVhc29uGAEgASgOMh8ueHRwLmFnZW50LnYxLlVuYXZhaWxhYmxlUmVhc29uIkAKFENhcHR1cmVkVmFsdWVEcm9wcGVkEigKBnJlYXNvbhgBIAEoDjIYLnh0cC5hZ2VudC52MS5Ecm9wUmVhc29uIq4CCgtJbnRlcmFjdGlvbhIrCgRraW5kGAEgASgOMh0ueHRwLmFnZW50LnYxLkludGVyYWN0aW9uS2luZBIOCgZkcml2ZXIYAiABKAkSDgoGc2NoZW1hGAMgASgJEg0KBXRhYmxlGAQgASgJEgwKBGhvc3QYBSABKAkSDgoGbWV0aG9kGAYgASgJEgwKBHBhdGgYByABKAkSNAoPcmVxdWVzdF9zdW1tYXJ5GAggASgLMhsueHRwLmFnZW50LnYxLkNhcHR1cmVkVmFsdWUSNQoQcmVzcG9uc2Vfc3VtbWFyeRgJIAEoCzIbLnh0cC5hZ2VudC52MS5DYXB0dXJlZFZhbHVlEioKBWVycm9yGAogASgLMhsueHRwLmFnZW50LnYxLkNhcHR1cmVkVmFsdWUiWwoQRXhjZXB0aW9uUGF5bG9hZBIWCg5leGNlcHRpb25fdHlwZRgBIAEoCRIZChFzYW5pdGl6ZWRfbWVzc2FnZRgCIAEoCRIUCgxzdGFja19mcmFtZXMYAyADKAki5wIKEVJlY29yZGluZ0ZpbmlzaGVkEhQKDHJlY29yZGluZ19pZBgBIAEoDBIbChNmaW5hbF9yZWNvcmRpbmdfc2VxGAIgASgEEhMKC2R1cmF0aW9uX25zGAMgASgGEjUKEHJlc3BvbnNlX3N1bW1hcnkYBCABKAsyGy54dHAuYWdlbnQudjEuQ2FwdHVyZWRWYWx1ZRJaChdkcm9wX2NvdW50c19ieV9wcmlvcml0eRgFIAMoCzI5Lnh0cC5hZ2VudC52MS5SZWNvcmRpbmdGaW5pc2hlZC5Ecm9wQ291bnRzQnlQcmlvcml0eUVudHJ5EiQKHHVuc3VwcG9ydGVkX2NhcGFiaWxpdHlfY29kZXMYBiADKAkSFAoMZXZlbnRfZGlnZXN0GAcgASgMGjsKGURyb3BDb3VudHNCeVByaW9yaXR5RW50cnkSCwoDa2V5GAEgASgNEg0KBXZhbHVlGAIgASgEOgI4ASrzAQoNU291cmNlQmluZGluZxIeChpTT1VSQ0VfQklORElOR19VTlNQRUNJRklFRBAAEhsKF1NPVVJDRV9CSU5ESU5HX1ZFUklGSUVEEAESJgoiU09VUkNFX0JJTkRJTkdfQVRURVNUQVRJT05fTUlTU0lORxACEicKI1NPVVJDRV9CSU5ESU5HX0NMQVNTX0JZVEVTX01JU01BVENIEAMSKAokU09VUkNFX0JJTkRJTkdfREVCVUdfTUVUQURBVEFfQUJTRU5UEAQSKgomU09VUkNFX0JJTkRJTkdfU09VUkNFX01FVEFEQVRBX0lOVkFMSUQQBSrXBAoSUmVjb3JkaW5nRXZlbnRLaW5kEiQKIFJFQ09SRElOR19FVkVOVF9LSU5EX1VOU1BFQ0lGSUVEEAASJwojUkVDT1JESU5HX0VWRU5UX0tJTkRfUkVRVUVTVF9VUERBVEUQARIkCiBSRUNPUkRJTkdfRVZFTlRfS0lORF9GUkFNRV9FTlRFUhACEiMKH1JFQ09SRElOR19FVkVOVF9LSU5EX0ZSQU1FX0VYSVQQAxIkCiBSRUNPUkRJTkdfRVZFTlRfS0lORF9GUkFNRV9USFJPVxAEEiQKIFJFQ09SRElOR19FVkVOVF9LSU5EX0xJTkVfQ1VSU09SEAUSJwojUkVDT1JESU5HX0VWRU5UX0tJTkRfVkFMVUVfU05BUFNIT1QQBhInCiNSRUNPUkRJTkdfRVZFTlRfS0lORF9EQVRBQkFTRV9TVEFSVBAHEiUKIVJFQ09SRElOR19FVkVOVF9LSU5EX0RBVEFCQVNFX0VORBAIEiwKKFJFQ09SRElOR19FVkVOVF9LSU5EX09VVEJPVU5EX0hUVFBfU1RBUlQQCRIqCiZSRUNPUkRJTkdfRVZFTlRfS0lORF9PVVRCT1VORF9IVFRQX0VORBAKEiMKH1JFQ09SRElOR19FVkVOVF9LSU5EX0FTWU5DX0xJTksQCxIiCh5SRUNPUkRJTkdfRVZFTlRfS0lORF9FWENFUFRJT04QDBIhCh1SRUNPUkRJTkdfRVZFTlRfS0lORF9SRVNQT05TRRANEhwKGFJFQ09SRElOR19FVkVOVF9LSU5EX0dBUBAOKvECCgpWYWx1ZVNoYXBlEhsKF1ZBTFVFX1NIQVBFX1VOU1BFQ0lGSUVEEAASFgoSVkFMVUVfU0hBUEVfU1RSSU5HEAESFwoTVkFMVUVfU0hBUEVfQk9PTEVBThACEhkKFVZBTFVFX1NIQVBFX0lOVEVHRVJfOBADEhoKFlZBTFVFX1NIQVBFX0lOVEVHRVJfMTYQBBIaChZWQUxVRV9TSEFQRV9JTlRFR0VSXzMyEAUSGgoWVkFMVUVfU0hBUEVfSU5URUdFUl82NBAGEhgKFFZBTFVFX1NIQVBFX0ZMT0FUXzMyEAcSGAoUVkFMVUVfU0hBUEVfRkxPQVRfNjQQCBIUChBWQUxVRV9TSEFQRV9OVUxMEAkSFQoRVkFMVUVfU0hBUEVfQllURVMQChIUChBWQUxVRV9TSEFQRV9MSVNUEAsSFgoSVkFMVUVfU0hBUEVfT0JKRUNUEAwSFwoTVkFMVUVfU0hBUEVfVU5LTk9XThANKqMCChFVbmF2YWlsYWJsZVJlYXNvbhIiCh5VTkFWQUlMQUJMRV9SRUFTT05fVU5TUEVDSUZJRUQQABItCilVTkFWQUlMQUJMRV9SRUFTT05fQ0FQQUJJTElUWV9VTlNVUFBPUlRFRBABEiwKKFVOQVZBSUxBQkxFX1JFQVNPTl9ERUJVR19NRVRBREFUQV9BQlNFTlQQAhIvCitVTkFWQUlMQUJMRV9SRUFTT05fQ0FQVFVSRV9CVURHRVRfRVhIQVVTVEVEEAMSLgoqVU5BVkFJTEFCTEVfUkVBU09OX1NPVVJDRV9BUlRJRkFDVF9NSVNTSU5HEAQSLAooVU5BVkFJTEFCTEVfUkVBU09OX1JFQ09SREVSX0RJU0NPTk5FQ1RFRBAFKqcBCgpEcm9wUmVhc29uEhsKF0RST1BfUkVBU09OX1VOU1BFQ0lGSUVEEAASIQodRFJPUF9SRUFTT05fQkFDS1BSRVNTVVJFX1NIRUQQARIaChZEUk9QX1JFQVNPTl9RVUVVRV9GVUxMEAISHAoYRFJPUF9SRUFTT05fU0VRVUVOQ0VfR0FQEAMSHwobRFJPUF9SRUFTT05fQURBUFRFUl9EUk9QUEVEEAQq1wEKD0ludGVyYWN0aW9uS2luZBIgChxJTlRFUkFDVElPTl9LSU5EX1VOU1BFQ0lGSUVEEAASHQoZSU5URVJBQ1RJT05fS0lORF9EQVRBQkFTRRABEiIKHklOVEVSQUNUSU9OX0tJTkRfT1VUQk9VTkRfSFRUUBACEh4KGklOVEVSQUNUSU9OX0tJTkRfTUVTU0FHSU5HEAMSHwobSU5URVJBQ1RJT05fS0lORF9GSUxFU1lTVEVNEAQSHgoaSU5URVJBQ1RJT05fS0lORF9GUkFNRVdPUksQBWIGcHJvdG8z", [file_xtp_agent_v1_capability]);
+  fileDesc("Chx4dHAtYWdlbnQvdjEvcmVjb3JkaW5nLnByb3RvEgx4dHAuYWdlbnQudjEipAMKEFJlY29yZGluZ1N0YXJ0ZWQSFAoMcmVjb3JkaW5nX2lkGAEgASgMEhUKDXJlY29yZGluZ19zZXEYAiABKAQSDgoGbWV0aG9kGAMgASgJEh4KFm1hdGNoZWRfcm91dGVfdGVtcGxhdGUYBCABKAkSEQoJdXJsX3NoYXBlGAUgASgJEj4KFG9wZXJhdGlvbl9jYW5kaWRhdGVzGAYgAygLMiAueHRwLmFnZW50LnYxLk9wZXJhdGlvbkNhbmRpZGF0ZRIaChJzdGFydF9tb25vdG9uaWNfbnMYByABKAYSGQoRdGhyZWFkX29yX3Rhc2tfaWQYCCABKAkSGAoQYXN5bmNfY29udGV4dF9pZBgJIAEoCRIZChFjYXB0dXJlX3BvbGljeV9pZBgKIAEoCRIdChVjYXB0dXJlX3BvbGljeV9kaWdlc3QYCyABKAkSHwoXcmVkYWN0aW9uX3BvbGljeV9kaWdlc3QYDCABKAkSGgoSc291cmNlX3JldmlzaW9uX2lkGA0gASgJEhgKEGV4ZXJjaXNlX2l0ZW1faWQYDiABKAkiPAoST3BlcmF0aW9uQ2FuZGlkYXRlEhQKDG9wZXJhdGlvbl9pZBgBIAEoDBIQCghldmlkZW5jZRgCIAEoCSJQCgpFdmVudEJhdGNoEhQKDHJlY29yZGluZ19pZBgBIAEoDBIsCgZldmVudHMYAiADKAsyHC54dHAuYWdlbnQudjEuUmVjb3JkaW5nRXZlbnQinQQKDlJlY29yZGluZ0V2ZW50EhAKCGV2ZW50X2lkGAEgASgJEhUKDXJlY29yZGluZ19zZXEYAiABKAQSFwoPcGFyZW50X2V2ZW50X2lkGAMgASgJEh0KFWFzeW5jX3BhcmVudF9ldmVudF9pZBgEIAEoCRIUCgxtb25vdG9uaWNfbnMYBSABKAYSEAoIcHJpb3JpdHkYBiABKA0SLgoEa2luZBgHIAEoDjIgLnh0cC5hZ2VudC52MS5SZWNvcmRpbmdFdmVudEtpbmQSDgoGc3ltYm9sGAggASgJEikKBnNvdXJjZRgJIAEoCzIZLnh0cC5hZ2VudC52MS5Tb3VyY2VSYW5nZRIqCgV2YWx1ZRgKIAEoCzIbLnh0cC5hZ2VudC52MS5DYXB0dXJlZFZhbHVlEi4KC2ludGVyYWN0aW9uGAsgASgLMhkueHRwLmFnZW50LnYxLkludGVyYWN0aW9uEjEKCWV4Y2VwdGlvbhgMIAEoCzIeLnh0cC5hZ2VudC52MS5FeGNlcHRpb25QYXlsb2FkEjMKDnNvdXJjZV9iaW5kaW5nGA0gASgOMhsueHRwLmFnZW50LnYxLlNvdXJjZUJpbmRpbmcSLAoIYmluZGluZ3MYDiADKAsyGi54dHAuYWdlbnQudjEuVmFsdWVCaW5kaW5nEiUKA2dhcBgPIAEoCzIYLnh0cC5hZ2VudC52MS5HYXBQYXlsb2FkIqABCgxWYWx1ZUJpbmRpbmcSDAoEbmFtZRgBIAEoCRInCgRyb2xlGAIgASgOMhkueHRwLmFnZW50LnYxLkJpbmRpbmdSb2xlEi0KC25hbWVfb3JpZ2luGAMgASgOMhgueHRwLmFnZW50LnYxLk5hbWVPcmlnaW4SKgoFdmFsdWUYBCABKAsyGy54dHAuYWdlbnQudjEuQ2FwdHVyZWRWYWx1ZSJ9CgpHYXBQYXlsb2FkEicKBnJlYXNvbhgBIAEoDjIXLnh0cC5hZ2VudC52MS5HYXBSZWFzb24SDQoFY291bnQYAiABKAQSGwoTZmlyc3RfcmVjb3JkaW5nX3NlcRgDIAEoBBIaChJsYXN0X3JlY29yZGluZ19zZXEYBCABKAQiuwIKDUNhcHR1cmVkVmFsdWUSNwoIY2FwdHVyZWQYASABKAsyIy54dHAuYWdlbnQudjEuQ2FwdHVyZWRWYWx1ZUNhcHR1cmVkSAASNwoIcmVkYWN0ZWQYAiABKAsyIy54dHAuYWdlbnQudjEuQ2FwdHVyZWRWYWx1ZVJlZGFjdGVkSAASOQoJdHJ1bmNhdGVkGAMgASgLMiQueHRwLmFnZW50LnYxLkNhcHR1cmVkVmFsdWVUcnVuY2F0ZWRIABI9Cgt1bmF2YWlsYWJsZRgEIAEoCzImLnh0cC5hZ2VudC52MS5DYXB0dXJlZFZhbHVlVW5hdmFpbGFibGVIABI1Cgdkcm9wcGVkGAUgASgLMiIueHRwLmFnZW50LnYxLkNhcHR1cmVkVmFsdWVEcm9wcGVkSABCBwoFdmFsdWUiZwoVQ2FwdHVyZWRWYWx1ZUNhcHR1cmVkEicKBXNoYXBlGAEgASgOMhgueHRwLmFnZW50LnYxLlZhbHVlU2hhcGUSDwoHcHJldmlldxgCIAEoCRIUCgxjb250ZW50X2hhc2gYAyABKAwiVgoVQ2FwdHVyZWRWYWx1ZVJlZGFjdGVkEg8KB3J1bGVfaWQYASABKAkSLAoKc2hhcGVfaGludBgCIAEoDjIYLnh0cC5hZ2VudC52MS5WYWx1ZVNoYXBlIlsKFkNhcHR1cmVkVmFsdWVUcnVuY2F0ZWQSDwoHcHJldmlldxgBIAEoCRIhChlvcmlnaW5hbF9zaXplX2xvd2VyX2JvdW5kGAIgASgEEg0KBWxpbWl0GAMgASgEIksKGENhcHR1cmVkVmFsdWVVbmF2YWlsYWJsZRIvCgZyZWFzb24YASABKA4yHy54dHAuYWdlbnQudjEuVW5hdmFpbGFibGVSZWFzb24iQAoUQ2FwdHVyZWRWYWx1ZURyb3BwZWQSKAoGcmVhc29uGAEgASgOMhgueHRwLmFnZW50LnYxLkRyb3BSZWFzb24ikgMKC0ludGVyYWN0aW9uEisKBGtpbmQYASABKA4yHS54dHAuYWdlbnQudjEuSW50ZXJhY3Rpb25LaW5kEg4KBmRyaXZlchgCIAEoCRIOCgZzY2hlbWEYAyABKAkSDQoFdGFibGUYBCABKAkSDAoEaG9zdBgFIAEoCRIOCgZtZXRob2QYBiABKAkSDAoEcGF0aBgHIAEoCRI0Cg9yZXF1ZXN0X3N1bW1hcnkYCCABKAsyGy54dHAuYWdlbnQudjEuQ2FwdHVyZWRWYWx1ZRI1ChByZXNwb25zZV9zdW1tYXJ5GAkgASgLMhsueHRwLmFnZW50LnYxLkNhcHR1cmVkVmFsdWUSKgoFZXJyb3IYCiABKAsyGy54dHAuYWdlbnQudjEuQ2FwdHVyZWRWYWx1ZRIWCg5zdGF0ZW1lbnRfa2luZBgLIAEoCRIOCgZ0YWJsZXMYDCADKAkSFwoPc2FuaXRpemVkX3NoYXBlGA0gASgJEgwKBHBvcnQYDiABKA0SEwoLc3RhdHVzX2NvZGUYDyABKA0iWwoQRXhjZXB0aW9uUGF5bG9hZBIWCg5leGNlcHRpb25fdHlwZRgBIAEoCRIZChFzYW5pdGl6ZWRfbWVzc2FnZRgCIAEoCRIUCgxzdGFja19mcmFtZXMYAyADKAkimAMKEVJlY29yZGluZ0ZpbmlzaGVkEhQKDHJlY29yZGluZ19pZBgBIAEoDBIbChNmaW5hbF9yZWNvcmRpbmdfc2VxGAIgASgEEhMKC2R1cmF0aW9uX25zGAMgASgGEjUKEHJlc3BvbnNlX3N1bW1hcnkYBCABKAsyGy54dHAuYWdlbnQudjEuQ2FwdHVyZWRWYWx1ZRJaChdkcm9wX2NvdW50c19ieV9wcmlvcml0eRgFIAMoCzI5Lnh0cC5hZ2VudC52MS5SZWNvcmRpbmdGaW5pc2hlZC5Ecm9wQ291bnRzQnlQcmlvcml0eUVudHJ5EiQKHHVuc3VwcG9ydGVkX2NhcGFiaWxpdHlfY29kZXMYBiADKAkSFAoMZXZlbnRfZGlnZXN0GAcgASgMEi8KB291dGNvbWUYCCABKAsyHi54dHAuYWdlbnQudjEuUmVjb3JkaW5nT3V0Y29tZRo7ChlEcm9wQ291bnRzQnlQcmlvcml0eUVudHJ5EgsKA2tleRgBIAEoDRINCgV2YWx1ZRgCIAEoBDoCOAEioQEKEFJlY29yZGluZ091dGNvbWUSJwoEa2luZBgBIAEoDjIZLnh0cC5hZ2VudC52MS5PdXRjb21lS2luZBITCgtodHRwX3N0YXR1cxgCIAEoDRIxCglleGNlcHRpb24YAyABKAsyHi54dHAuYWdlbnQudjEuRXhjZXB0aW9uUGF5bG9hZBIcChR0aHJvd25fZnJvbV9ldmVudF9pZBgEIAEoCSquAQoLQmluZGluZ1JvbGUSHAoYQklORElOR19ST0xFX1VOU1BFQ0lGSUVEEAASGQoVQklORElOR19ST0xFX0FSR1VNRU5UEAESFwoTQklORElOR19ST0xFX1JFVFVSThACEhYKEkJJTkRJTkdfUk9MRV9MT0NBTBADEhoKFkJJTkRJTkdfUk9MRV9FWENFUFRJT04QBBIZChVCSU5ESU5HX1JPTEVfUkVDRUlWRVIQBSpgCgpOYW1lT3JpZ2luEhsKF05BTUVfT1JJR0lOX1VOU1BFQ0lGSUVEEAASGAoUTkFNRV9PUklHSU5fREVDTEFSRUQQARIbChdOQU1FX09SSUdJTl9TWU5USEVTSVpFRBACKqUDCglHYXBSZWFzb24SGgoWR0FQX1JFQVNPTl9VTlNQRUNJRklFRBAAEhoKFkdBUF9SRUFTT05fTElORV9CVURHRVQQARIbChdHQVBfUkVBU09OX1ZBTFVFX0JVREdFVBACEhcKE0dBUF9SRUFTT05fVEhST1RUTEUQAxIZChVHQVBfUkVBU09OX1FVRVVFX0ZVTEwQBBIfChtHQVBfUkVBU09OX0NPUlJFTEFUSU9OX0xPU1QQBRIkCiBHQVBfUkVBU09OX0NMQVNTX05PVF9UUkFOU0ZPUk1FRBAGEicKI0dBUF9SRUFTT05fTU9EVUxFX0xPQURFRF9CRUZPUkVfQVJNEAcSIAocR0FQX1JFQVNPTl9TT1VSQ0VfTUFQX0FCU0VOVBAIEisKJ0dBUF9SRUFTT05fSEFORExFRF9FWENFUFRJT05fVU5PQlNFUlZFRBAJEi0KKUdBUF9SRUFTT05fQ0hJTERfUFJPQ0VTU19OT1RfSU5TVFJVTUVOVEVEEAoSIQodR0FQX1JFQVNPTl9CT09UU1RSQVBfQ09OU1VNRUQQCyrrAgoNU291cmNlQmluZGluZxIeChpTT1VSQ0VfQklORElOR19VTlNQRUNJRklFRBAAEhsKF1NPVVJDRV9CSU5ESU5HX1ZFUklGSUVEEAESJgoiU09VUkNFX0JJTkRJTkdfQVRURVNUQVRJT05fTUlTU0lORxACEicKI1NPVVJDRV9CSU5ESU5HX0NMQVNTX0JZVEVTX01JU01BVENIEAMSKAokU09VUkNFX0JJTkRJTkdfREVCVUdfTUVUQURBVEFfQUJTRU5UEAQSKgomU09VUkNFX0JJTkRJTkdfU09VUkNFX01FVEFEQVRBX0lOVkFMSUQQBRImCiJTT1VSQ0VfQklORElOR19PQlNFUlZFRF9VTkFUVEVTVEVEEAYSJAogU09VUkNFX0JJTkRJTkdfU09VUkNFX01BUF9BQlNFTlQQBxIoCiRTT1VSQ0VfQklORElOR19TT1VSQ0VfTUFQX1VOUkVTT0xWRUQQCCrXBAoSUmVjb3JkaW5nRXZlbnRLaW5kEiQKIFJFQ09SRElOR19FVkVOVF9LSU5EX1VOU1BFQ0lGSUVEEAASJwojUkVDT1JESU5HX0VWRU5UX0tJTkRfUkVRVUVTVF9VUERBVEUQARIkCiBSRUNPUkRJTkdfRVZFTlRfS0lORF9GUkFNRV9FTlRFUhACEiMKH1JFQ09SRElOR19FVkVOVF9LSU5EX0ZSQU1FX0VYSVQQAxIkCiBSRUNPUkRJTkdfRVZFTlRfS0lORF9GUkFNRV9USFJPVxAEEiQKIFJFQ09SRElOR19FVkVOVF9LSU5EX0xJTkVfQ1VSU09SEAUSJwojUkVDT1JESU5HX0VWRU5UX0tJTkRfVkFMVUVfU05BUFNIT1QQBhInCiNSRUNPUkRJTkdfRVZFTlRfS0lORF9EQVRBQkFTRV9TVEFSVBAHEiUKIVJFQ09SRElOR19FVkVOVF9LSU5EX0RBVEFCQVNFX0VORBAIEiwKKFJFQ09SRElOR19FVkVOVF9LSU5EX09VVEJPVU5EX0hUVFBfU1RBUlQQCRIqCiZSRUNPUkRJTkdfRVZFTlRfS0lORF9PVVRCT1VORF9IVFRQX0VORBAKEiMKH1JFQ09SRElOR19FVkVOVF9LSU5EX0FTWU5DX0xJTksQCxIiCh5SRUNPUkRJTkdfRVZFTlRfS0lORF9FWENFUFRJT04QDBIhCh1SRUNPUkRJTkdfRVZFTlRfS0lORF9SRVNQT05TRRANEhwKGFJFQ09SRElOR19FVkVOVF9LSU5EX0dBUBAOKvECCgpWYWx1ZVNoYXBlEhsKF1ZBTFVFX1NIQVBFX1VOU1BFQ0lGSUVEEAASFgoSVkFMVUVfU0hBUEVfU1RSSU5HEAESFwoTVkFMVUVfU0hBUEVfQk9PTEVBThACEhkKFVZBTFVFX1NIQVBFX0lOVEVHRVJfOBADEhoKFlZBTFVFX1NIQVBFX0lOVEVHRVJfMTYQBBIaChZWQUxVRV9TSEFQRV9JTlRFR0VSXzMyEAUSGgoWVkFMVUVfU0hBUEVfSU5URUdFUl82NBAGEhgKFFZBTFVFX1NIQVBFX0ZMT0FUXzMyEAcSGAoUVkFMVUVfU0hBUEVfRkxPQVRfNjQQCBIUChBWQUxVRV9TSEFQRV9OVUxMEAkSFQoRVkFMVUVfU0hBUEVfQllURVMQChIUChBWQUxVRV9TSEFQRV9MSVNUEAsSFgoSVkFMVUVfU0hBUEVfT0JKRUNUEAwSFwoTVkFMVUVfU0hBUEVfVU5LTk9XThANKq4DChFVbmF2YWlsYWJsZVJlYXNvbhIiCh5VTkFWQUlMQUJMRV9SRUFTT05fVU5TUEVDSUZJRUQQABItCilVTkFWQUlMQUJMRV9SRUFTT05fQ0FQQUJJTElUWV9VTlNVUFBPUlRFRBABEiwKKFVOQVZBSUxBQkxFX1JFQVNPTl9ERUJVR19NRVRBREFUQV9BQlNFTlQQAhIvCitVTkFWQUlMQUJMRV9SRUFTT05fQ0FQVFVSRV9CVURHRVRfRVhIQVVTVEVEEAMSLgoqVU5BVkFJTEFCTEVfUkVBU09OX1NPVVJDRV9BUlRJRkFDVF9NSVNTSU5HEAQSLAooVU5BVkFJTEFCTEVfUkVBU09OX1JFQ09SREVSX0RJU0NPTk5FQ1RFRBAFEjAKLFVOQVZBSUxBQkxFX1JFQVNPTl9GT0NVU0VEX0NBUFRVUkVfTk9UX0FSTUVEEAYSJwojVU5BVkFJTEFCTEVfUkVBU09OX1VOU0FGRV9UT19SRU5ERVIQBxIuCipVTkFWQUlMQUJMRV9SRUFTT05fQ0xBU1NfTk9UX1RSQU5TRk9STUFCTEUQCCqHAgoKRHJvcFJlYXNvbhIbChdEUk9QX1JFQVNPTl9VTlNQRUNJRklFRBAAEiEKHURST1BfUkVBU09OX0JBQ0tQUkVTU1VSRV9TSEVEEAESGgoWRFJPUF9SRUFTT05fUVVFVUVfRlVMTBACEhwKGERST1BfUkVBU09OX1NFUVVFTkNFX0dBUBADEh8KG0RST1BfUkVBU09OX0FEQVBURVJfRFJPUFBFRBAEEiMKH0RST1BfUkVBU09OX1RIUk9UVExFX1NVUFBSRVNTRUQQBRIbChdEUk9QX1JFQVNPTl9MSU5FX0JVREdFVBAGEhwKGERST1BfUkVBU09OX1ZBTFVFX0JVREdFVBAHKvUBCg9JbnRlcmFjdGlvbktpbmQSIAocSU5URVJBQ1RJT05fS0lORF9VTlNQRUNJRklFRBAAEh0KGUlOVEVSQUNUSU9OX0tJTkRfREFUQUJBU0UQARIiCh5JTlRFUkFDVElPTl9LSU5EX09VVEJPVU5EX0hUVFAQAhIeChpJTlRFUkFDVElPTl9LSU5EX01FU1NBR0lORxADEh8KG0lOVEVSQUNUSU9OX0tJTkRfRklMRVNZU1RFTRAEEh4KGklOVEVSQUNUSU9OX0tJTkRfRlJBTUVXT1JLEAUSHAoYSU5URVJBQ1RJT05fS0lORF9QUk9DRVNTEAYqrAEKC091dGNvbWVLaW5kEhwKGE9VVENPTUVfS0lORF9VTlNQRUNJRklFRBAAEhoKFk9VVENPTUVfS0lORF9SRVNQT05ERUQQARIlCiFPVVRDT01FX0tJTkRfRVhDRVBUSU9OX1BST1BBR0FURUQQAhIfChtPVVRDT01FX0tJTkRfQ0xJRU5UX0FCT1JURUQQAxIbChdPVVRDT01FX0tJTkRfVU5PQlNFUlZFRBAEYgZwcm90bzM", [file_xtp_agent_v1_capability]);
 
 /**
  * Top-level marker that opens a recording aggregate.
@@ -117,6 +117,15 @@ export type RecordingStarted = Message<"xtp.agent.v1.RecordingStarted"> & {
    * @generated from field: string source_revision_id = 13;
    */
   sourceRevisionId: string;
+
+  /**
+   * Exercise plan item the request belongs to. Copied from the
+   * `X-XTrace-Exercise-Item` request header (UUID text); the adapter
+   * drops an invalid value, it is never stored.
+   *
+   * @generated from field: string exercise_item_id = 14;
+   */
+  exerciseItemId: string;
 };
 
 /**
@@ -278,6 +287,20 @@ export type RecordingEvent = Message<"xtp.agent.v1.RecordingEvent"> & {
    * @generated from field: xtp.agent.v1.SourceBinding source_binding = 13;
    */
   sourceBinding: SourceBinding;
+
+  /**
+   * Values observed at this event.
+   *
+   * @generated from field: repeated xtp.agent.v1.ValueBinding bindings = 14;
+   */
+  bindings: ValueBinding[];
+
+  /**
+   * Coalesced gap description; set only when `kind == GAP`.
+   *
+   * @generated from field: xtp.agent.v1.GapPayload gap = 15;
+   */
+  gap?: GapPayload | undefined;
 };
 
 /**
@@ -286,6 +309,82 @@ export type RecordingEvent = Message<"xtp.agent.v1.RecordingEvent"> & {
  */
 export const RecordingEventSchema: GenMessage<RecordingEvent> = /*@__PURE__*/
   messageDesc(file_xtp_agent_v1_recording, 3);
+
+/**
+ * A named value observed at an event.
+ *
+ * @generated from message xtp.agent.v1.ValueBinding
+ */
+export type ValueBinding = Message<"xtp.agent.v1.ValueBinding"> & {
+  /**
+   * Binding name, at most 128 UTF-8 bytes.
+   *
+   * @generated from field: string name = 1;
+   */
+  name: string;
+
+  /**
+   * Role the value plays at the event.
+   *
+   * @generated from field: xtp.agent.v1.BindingRole role = 2;
+   */
+  role: BindingRole;
+
+  /**
+   * Whether the name came from debug metadata or was synthesized.
+   *
+   * @generated from field: xtp.agent.v1.NameOrigin name_origin = 3;
+   */
+  nameOrigin: NameOrigin;
+
+  /**
+   * Never absent; use `unavailable` or `dropped` when not observed.
+   *
+   * @generated from field: xtp.agent.v1.CapturedValue value = 4;
+   */
+  value?: CapturedValue | undefined;
+};
+
+/**
+ * Describes the message xtp.agent.v1.ValueBinding.
+ * Use `create(ValueBindingSchema)` to create a new message.
+ */
+export const ValueBindingSchema: GenMessage<ValueBinding> = /*@__PURE__*/
+  messageDesc(file_xtp_agent_v1_recording, 4);
+
+/**
+ * Coalesced description of events that were not recorded.
+ *
+ * @generated from message xtp.agent.v1.GapPayload
+ */
+export type GapPayload = Message<"xtp.agent.v1.GapPayload"> & {
+  /**
+   * @generated from field: xtp.agent.v1.GapReason reason = 1;
+   */
+  reason: GapReason;
+
+  /**
+   * @generated from field: uint64 count = 2;
+   */
+  count: bigint;
+
+  /**
+   * @generated from field: uint64 first_recording_seq = 3;
+   */
+  firstRecordingSeq: bigint;
+
+  /**
+   * @generated from field: uint64 last_recording_seq = 4;
+   */
+  lastRecordingSeq: bigint;
+};
+
+/**
+ * Describes the message xtp.agent.v1.GapPayload.
+ * Use `create(GapPayloadSchema)` to create a new message.
+ */
+export const GapPayloadSchema: GenMessage<GapPayload> = /*@__PURE__*/
+  messageDesc(file_xtp_agent_v1_recording, 5);
 
 /**
  * Captured value union. Mirrors the domain vocabulary.
@@ -334,7 +433,7 @@ export type CapturedValue = Message<"xtp.agent.v1.CapturedValue"> & {
  * Use `create(CapturedValueSchema)` to create a new message.
  */
 export const CapturedValueSchema: GenMessage<CapturedValue> = /*@__PURE__*/
-  messageDesc(file_xtp_agent_v1_recording, 4);
+  messageDesc(file_xtp_agent_v1_recording, 6);
 
 /**
  * @generated from message xtp.agent.v1.CapturedValueCaptured
@@ -361,7 +460,7 @@ export type CapturedValueCaptured = Message<"xtp.agent.v1.CapturedValueCaptured"
  * Use `create(CapturedValueCapturedSchema)` to create a new message.
  */
 export const CapturedValueCapturedSchema: GenMessage<CapturedValueCaptured> = /*@__PURE__*/
-  messageDesc(file_xtp_agent_v1_recording, 5);
+  messageDesc(file_xtp_agent_v1_recording, 7);
 
 /**
  * @generated from message xtp.agent.v1.CapturedValueRedacted
@@ -383,7 +482,7 @@ export type CapturedValueRedacted = Message<"xtp.agent.v1.CapturedValueRedacted"
  * Use `create(CapturedValueRedactedSchema)` to create a new message.
  */
 export const CapturedValueRedactedSchema: GenMessage<CapturedValueRedacted> = /*@__PURE__*/
-  messageDesc(file_xtp_agent_v1_recording, 6);
+  messageDesc(file_xtp_agent_v1_recording, 8);
 
 /**
  * @generated from message xtp.agent.v1.CapturedValueTruncated
@@ -410,7 +509,7 @@ export type CapturedValueTruncated = Message<"xtp.agent.v1.CapturedValueTruncate
  * Use `create(CapturedValueTruncatedSchema)` to create a new message.
  */
 export const CapturedValueTruncatedSchema: GenMessage<CapturedValueTruncated> = /*@__PURE__*/
-  messageDesc(file_xtp_agent_v1_recording, 7);
+  messageDesc(file_xtp_agent_v1_recording, 9);
 
 /**
  * @generated from message xtp.agent.v1.CapturedValueUnavailable
@@ -427,7 +526,7 @@ export type CapturedValueUnavailable = Message<"xtp.agent.v1.CapturedValueUnavai
  * Use `create(CapturedValueUnavailableSchema)` to create a new message.
  */
 export const CapturedValueUnavailableSchema: GenMessage<CapturedValueUnavailable> = /*@__PURE__*/
-  messageDesc(file_xtp_agent_v1_recording, 8);
+  messageDesc(file_xtp_agent_v1_recording, 10);
 
 /**
  * @generated from message xtp.agent.v1.CapturedValueDropped
@@ -444,7 +543,7 @@ export type CapturedValueDropped = Message<"xtp.agent.v1.CapturedValueDropped"> 
  * Use `create(CapturedValueDroppedSchema)` to create a new message.
  */
 export const CapturedValueDroppedSchema: GenMessage<CapturedValueDropped> = /*@__PURE__*/
-  messageDesc(file_xtp_agent_v1_recording, 9);
+  messageDesc(file_xtp_agent_v1_recording, 11);
 
 /**
  * Interaction payload.
@@ -501,6 +600,41 @@ export type Interaction = Message<"xtp.agent.v1.Interaction"> & {
    * @generated from field: xtp.agent.v1.CapturedValue error = 10;
    */
   error?: CapturedValue | undefined;
+
+  /**
+   * JDBC statement class: select|insert|update|delete|ddl|call|other.
+   *
+   * @generated from field: string statement_kind = 11;
+   */
+  statementKind: string;
+
+  /**
+   * JDBC table names, at most 16 entries of at most 128 bytes.
+   *
+   * @generated from field: repeated string tables = 12;
+   */
+  tables: string[];
+
+  /**
+   * Statement with literals and parameters replaced by `?`, at most 512 bytes.
+   *
+   * @generated from field: string sanitized_shape = 13;
+   */
+  sanitizedShape: string;
+
+  /**
+   * Outbound HTTP port; 0 = not observed.
+   *
+   * @generated from field: uint32 port = 14;
+   */
+  port: number;
+
+  /**
+   * Outbound HTTP response status; 0 = not observed.
+   *
+   * @generated from field: uint32 status_code = 15;
+   */
+  statusCode: number;
 };
 
 /**
@@ -508,7 +642,7 @@ export type Interaction = Message<"xtp.agent.v1.Interaction"> & {
  * Use `create(InteractionSchema)` to create a new message.
  */
 export const InteractionSchema: GenMessage<Interaction> = /*@__PURE__*/
-  messageDesc(file_xtp_agent_v1_recording, 10);
+  messageDesc(file_xtp_agent_v1_recording, 12);
 
 /**
  * Exception payload.
@@ -537,7 +671,7 @@ export type ExceptionPayload = Message<"xtp.agent.v1.ExceptionPayload"> & {
  * Use `create(ExceptionPayloadSchema)` to create a new message.
  */
 export const ExceptionPayloadSchema: GenMessage<ExceptionPayload> = /*@__PURE__*/
-  messageDesc(file_xtp_agent_v1_recording, 11);
+  messageDesc(file_xtp_agent_v1_recording, 13);
 
 /**
  * Top-level marker that closes a recording aggregate.
@@ -594,6 +728,13 @@ export type RecordingFinished = Message<"xtp.agent.v1.RecordingFinished"> & {
    * @generated from field: bytes event_digest = 7;
    */
   eventDigest: Uint8Array;
+
+  /**
+   * Observed request outcome; absent for adapters that do not report one.
+   *
+   * @generated from field: xtp.agent.v1.RecordingOutcome outcome = 8;
+   */
+  outcome?: RecordingOutcome | undefined;
 };
 
 /**
@@ -601,10 +742,192 @@ export type RecordingFinished = Message<"xtp.agent.v1.RecordingFinished"> & {
  * Use `create(RecordingFinishedSchema)` to create a new message.
  */
 export const RecordingFinishedSchema: GenMessage<RecordingFinished> = /*@__PURE__*/
-  messageDesc(file_xtp_agent_v1_recording, 12);
+  messageDesc(file_xtp_agent_v1_recording, 14);
 
 /**
- * Adapter-reported source-attestation outcome. Only VERIFIED events may carry a source range.
+ * How the request ended, as the adapter observed it.
+ *
+ * @generated from message xtp.agent.v1.RecordingOutcome
+ */
+export type RecordingOutcome = Message<"xtp.agent.v1.RecordingOutcome"> & {
+  /**
+   * @generated from field: xtp.agent.v1.OutcomeKind kind = 1;
+   */
+  kind: OutcomeKind;
+
+  /**
+   * 0 = not observed.
+   *
+   * @generated from field: uint32 http_status = 2;
+   */
+  httpStatus: number;
+
+  /**
+   * Set for EXCEPTION_PROPAGATED.
+   *
+   * @generated from field: xtp.agent.v1.ExceptionPayload exception = 3;
+   */
+  exception?: ExceptionPayload | undefined;
+
+  /**
+   * Frame that last observed the throw.
+   *
+   * @generated from field: string thrown_from_event_id = 4;
+   */
+  thrownFromEventId: string;
+};
+
+/**
+ * Describes the message xtp.agent.v1.RecordingOutcome.
+ * Use `create(RecordingOutcomeSchema)` to create a new message.
+ */
+export const RecordingOutcomeSchema: GenMessage<RecordingOutcome> = /*@__PURE__*/
+  messageDesc(file_xtp_agent_v1_recording, 15);
+
+/**
+ * @generated from enum xtp.agent.v1.BindingRole
+ */
+export enum BindingRole {
+  /**
+   * @generated from enum value: BINDING_ROLE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: BINDING_ROLE_ARGUMENT = 1;
+   */
+  ARGUMENT = 1,
+
+  /**
+   * @generated from enum value: BINDING_ROLE_RETURN = 2;
+   */
+  RETURN = 2,
+
+  /**
+   * @generated from enum value: BINDING_ROLE_LOCAL = 3;
+   */
+  LOCAL = 3,
+
+  /**
+   * @generated from enum value: BINDING_ROLE_EXCEPTION = 4;
+   */
+  EXCEPTION = 4,
+
+  /**
+   * @generated from enum value: BINDING_ROLE_RECEIVER = 5;
+   */
+  RECEIVER = 5,
+}
+
+/**
+ * Describes the enum xtp.agent.v1.BindingRole.
+ */
+export const BindingRoleSchema: GenEnum<BindingRole> = /*@__PURE__*/
+  enumDesc(file_xtp_agent_v1_recording, 0);
+
+/**
+ * @generated from enum xtp.agent.v1.NameOrigin
+ */
+export enum NameOrigin {
+  /**
+   * @generated from enum value: NAME_ORIGIN_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: NAME_ORIGIN_DECLARED = 1;
+   */
+  DECLARED = 1,
+
+  /**
+   * @generated from enum value: NAME_ORIGIN_SYNTHESIZED = 2;
+   */
+  SYNTHESIZED = 2,
+}
+
+/**
+ * Describes the enum xtp.agent.v1.NameOrigin.
+ */
+export const NameOriginSchema: GenEnum<NameOrigin> = /*@__PURE__*/
+  enumDesc(file_xtp_agent_v1_recording, 1);
+
+/**
+ * @generated from enum xtp.agent.v1.GapReason
+ */
+export enum GapReason {
+  /**
+   * @generated from enum value: GAP_REASON_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: GAP_REASON_LINE_BUDGET = 1;
+   */
+  LINE_BUDGET = 1,
+
+  /**
+   * @generated from enum value: GAP_REASON_VALUE_BUDGET = 2;
+   */
+  VALUE_BUDGET = 2,
+
+  /**
+   * @generated from enum value: GAP_REASON_THROTTLE = 3;
+   */
+  THROTTLE = 3,
+
+  /**
+   * @generated from enum value: GAP_REASON_QUEUE_FULL = 4;
+   */
+  QUEUE_FULL = 4,
+
+  /**
+   * @generated from enum value: GAP_REASON_CORRELATION_LOST = 5;
+   */
+  CORRELATION_LOST = 5,
+
+  /**
+   * @generated from enum value: GAP_REASON_CLASS_NOT_TRANSFORMED = 6;
+   */
+  CLASS_NOT_TRANSFORMED = 6,
+
+  /**
+   * @generated from enum value: GAP_REASON_MODULE_LOADED_BEFORE_ARM = 7;
+   */
+  MODULE_LOADED_BEFORE_ARM = 7,
+
+  /**
+   * @generated from enum value: GAP_REASON_SOURCE_MAP_ABSENT = 8;
+   */
+  SOURCE_MAP_ABSENT = 8,
+
+  /**
+   * @generated from enum value: GAP_REASON_HANDLED_EXCEPTION_UNOBSERVED = 9;
+   */
+  HANDLED_EXCEPTION_UNOBSERVED = 9,
+
+  /**
+   * Additions beyond ADR 0003 (ADR 0003 addendum): Node process linkage.
+   *
+   * @generated from enum value: GAP_REASON_CHILD_PROCESS_NOT_INSTRUMENTED = 10;
+   */
+  CHILD_PROCESS_NOT_INSTRUMENTED = 10,
+
+  /**
+   * @generated from enum value: GAP_REASON_BOOTSTRAP_CONSUMED = 11;
+   */
+  BOOTSTRAP_CONSUMED = 11,
+}
+
+/**
+ * Describes the enum xtp.agent.v1.GapReason.
+ */
+export const GapReasonSchema: GenEnum<GapReason> = /*@__PURE__*/
+  enumDesc(file_xtp_agent_v1_recording, 2);
+
+/**
+ * Adapter-reported source-attestation outcome. VERIFIED, OBSERVED_UNATTESTED,
+ * SOURCE_MAP_ABSENT and SOURCE_MAP_UNRESOLVED events may carry a source range;
+ * the other bindings must not.
  *
  * @generated from enum xtp.agent.v1.SourceBinding
  */
@@ -650,13 +973,34 @@ export enum SourceBinding {
    * @generated from enum value: SOURCE_BINDING_SOURCE_METADATA_INVALID = 5;
    */
   SOURCE_METADATA_INVALID = 5,
+
+  /**
+   * The source file was read at class load; no build attestation vouches for it.
+   *
+   * @generated from enum value: SOURCE_BINDING_OBSERVED_UNATTESTED = 6;
+   */
+  OBSERVED_UNATTESTED = 6,
+
+  /**
+   * A generated file was observed and no source map was found.
+   *
+   * @generated from enum value: SOURCE_BINDING_SOURCE_MAP_ABSENT = 7;
+   */
+  SOURCE_MAP_ABSENT = 7,
+
+  /**
+   * A source map exists but the position could not be resolved through it.
+   *
+   * @generated from enum value: SOURCE_BINDING_SOURCE_MAP_UNRESOLVED = 8;
+   */
+  SOURCE_MAP_UNRESOLVED = 8,
 }
 
 /**
  * Describes the enum xtp.agent.v1.SourceBinding.
  */
 export const SourceBindingSchema: GenEnum<SourceBinding> = /*@__PURE__*/
-  enumDesc(file_xtp_agent_v1_recording, 0);
+  enumDesc(file_xtp_agent_v1_recording, 3);
 
 /**
  * Event kind discriminator.
@@ -744,7 +1088,7 @@ export enum RecordingEventKind {
  * Describes the enum xtp.agent.v1.RecordingEventKind.
  */
 export const RecordingEventKindSchema: GenEnum<RecordingEventKind> = /*@__PURE__*/
-  enumDesc(file_xtp_agent_v1_recording, 1);
+  enumDesc(file_xtp_agent_v1_recording, 4);
 
 /**
  * Coarse shape classification for a captured value.
@@ -827,7 +1171,7 @@ export enum ValueShape {
  * Describes the enum xtp.agent.v1.ValueShape.
  */
 export const ValueShapeSchema: GenEnum<ValueShape> = /*@__PURE__*/
-  enumDesc(file_xtp_agent_v1_recording, 2);
+  enumDesc(file_xtp_agent_v1_recording, 5);
 
 /**
  * Reason a value was unavailable.
@@ -864,13 +1208,28 @@ export enum UnavailableReason {
    * @generated from enum value: UNAVAILABLE_REASON_RECORDER_DISCONNECTED = 5;
    */
   RECORDER_DISCONNECTED = 5,
+
+  /**
+   * @generated from enum value: UNAVAILABLE_REASON_FOCUSED_CAPTURE_NOT_ARMED = 6;
+   */
+  FOCUSED_CAPTURE_NOT_ARMED = 6,
+
+  /**
+   * @generated from enum value: UNAVAILABLE_REASON_UNSAFE_TO_RENDER = 7;
+   */
+  UNSAFE_TO_RENDER = 7,
+
+  /**
+   * @generated from enum value: UNAVAILABLE_REASON_CLASS_NOT_TRANSFORMABLE = 8;
+   */
+  CLASS_NOT_TRANSFORMABLE = 8,
 }
 
 /**
  * Describes the enum xtp.agent.v1.UnavailableReason.
  */
 export const UnavailableReasonSchema: GenEnum<UnavailableReason> = /*@__PURE__*/
-  enumDesc(file_xtp_agent_v1_recording, 3);
+  enumDesc(file_xtp_agent_v1_recording, 6);
 
 /**
  * Reason a value was dropped.
@@ -902,13 +1261,28 @@ export enum DropReason {
    * @generated from enum value: DROP_REASON_ADAPTER_DROPPED = 4;
    */
   ADAPTER_DROPPED = 4,
+
+  /**
+   * @generated from enum value: DROP_REASON_THROTTLE_SUPPRESSED = 5;
+   */
+  THROTTLE_SUPPRESSED = 5,
+
+  /**
+   * @generated from enum value: DROP_REASON_LINE_BUDGET = 6;
+   */
+  LINE_BUDGET = 6,
+
+  /**
+   * @generated from enum value: DROP_REASON_VALUE_BUDGET = 7;
+   */
+  VALUE_BUDGET = 7,
 }
 
 /**
  * Describes the enum xtp.agent.v1.DropReason.
  */
 export const DropReasonSchema: GenEnum<DropReason> = /*@__PURE__*/
-  enumDesc(file_xtp_agent_v1_recording, 4);
+  enumDesc(file_xtp_agent_v1_recording, 7);
 
 /**
  * Interaction kind discriminator.
@@ -945,10 +1319,54 @@ export enum InteractionKind {
    * @generated from enum value: INTERACTION_KIND_FRAMEWORK = 5;
    */
   FRAMEWORK = 5,
+
+  /**
+   * Process or worker spawn. `driver` = runtime, `method` =
+   * spawn|fork|worker|exec, `symbol` = command basename only.
+   *
+   * @generated from enum value: INTERACTION_KIND_PROCESS = 6;
+   */
+  PROCESS = 6,
 }
 
 /**
  * Describes the enum xtp.agent.v1.InteractionKind.
  */
 export const InteractionKindSchema: GenEnum<InteractionKind> = /*@__PURE__*/
-  enumDesc(file_xtp_agent_v1_recording, 5);
+  enumDesc(file_xtp_agent_v1_recording, 8);
+
+/**
+ * @generated from enum xtp.agent.v1.OutcomeKind
+ */
+export enum OutcomeKind {
+  /**
+   * @generated from enum value: OUTCOME_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: OUTCOME_KIND_RESPONDED = 1;
+   */
+  RESPONDED = 1,
+
+  /**
+   * @generated from enum value: OUTCOME_KIND_EXCEPTION_PROPAGATED = 2;
+   */
+  EXCEPTION_PROPAGATED = 2,
+
+  /**
+   * @generated from enum value: OUTCOME_KIND_CLIENT_ABORTED = 3;
+   */
+  CLIENT_ABORTED = 3,
+
+  /**
+   * @generated from enum value: OUTCOME_KIND_UNOBSERVED = 4;
+   */
+  UNOBSERVED = 4,
+}
+
+/**
+ * Describes the enum xtp.agent.v1.OutcomeKind.
+ */
+export const OutcomeKindSchema: GenEnum<OutcomeKind> = /*@__PURE__*/
+  enumDesc(file_xtp_agent_v1_recording, 9);

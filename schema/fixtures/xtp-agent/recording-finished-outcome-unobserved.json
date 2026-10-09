@@ -1,0 +1,11 @@
+{
+  "bytes_hex": "08011a1011111111111111111111111111111111201029f80300000000000032046d2d3136da01430a1022222222222222222222222222222222100919e02e0000000000003a20eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee42020804",
+  "description": "RecordingFinished.outcome = UNOBSERVED (http_status must be 0)",
+  "message": "xtp.agent.v1.AgentEnvelope",
+  "summary": {
+    "outcome": {
+      "httpStatus": 0,
+      "kind": "unobserved"
+    }
+  }
+}

@@ -79,6 +79,12 @@ message CaptureCommand {
     fixed64 expiry_monotonic_ns = 6;
     // Approval reference (run identifier) backing the command.
     string approval_ref = 7;
+    // Focused capture: maximum line events (default 8192); standard carries 0.
+    uint32 max_line_events = 8;
+    // Focused capture: maximum value bytes per recording.
+    uint64 max_value_bytes = 9;
+    // Focused capture: include local variable bindings.
+    bool include_locals = 10;
 }
 
 enum CaptureCommandKind {

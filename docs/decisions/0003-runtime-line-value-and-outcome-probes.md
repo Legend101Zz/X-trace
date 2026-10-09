@@ -510,3 +510,15 @@ Decided by the root orchestrator under the owner's autonomous v0.01 launch autho
 6. Spring Boot fat jars: `BOOT-INF/classes/` plus the package prefix is sufficient application-root proof for v0.01. The launcher also records the jar digest in recording metadata as provenance only, not as an extra claim.
 
 **Amendment (S0b, 2026-10-08).** The 2,048-event per-recording cap no longer fails the capture and is no longer a SQL CHECK: the `event_count <= 2048` CHECK was removed from migration `v0004` (unreleased), and events past the cap are dropped, counted per their own priority in the finish drop counts (plus `capacity_dropped_events`), and the recording ends Partial. See `crates/xtrace-application/src/recording.rs` (`MAX_RECORDED_EVENTS`, `effective_finish`), `crates/xtrace-ingest/src/validator.rs` (`accept_events`) and `crates/xtrace-store/src/recording_store.rs` (terminal evidence verification). The original text above is kept as written.
+
+**Addendum (wave 1, 2026-10-09): additive wire numbers beyond section 4.** The root approved these additions (plan ruling A5, contracts OPEN-15). They are additive, appear only in `schema/proto/xtp-agent/v1`, and are pinned by `crates/xtrace-protocol/tests/golden_fixtures.rs` (`proto_field_numbers_match_adr_0003`) and the golden envelopes under `schema/fixtures/xtp-agent/`. No existing number is renumbered or repurposed (`proto_baseline_fields_still_present`).
+
+| Message | Field or value | Number | Purpose |
+|---|---|---|---|
+| `GapReason` | `CHILD_PROCESS_NOT_INSTRUMENTED`, `BOOTSTRAP_CONSUMED` | 10, 11 | Node process linkage gaps |
+| `InteractionKind` | `PROCESS` | 6 | process or worker spawn (`symbol` is the command basename only) |
+| `Interaction` | `statement_kind`, `tables`, `sanitized_shape`, `port`, `status_code` | 11 to 15 | JDBC statement class, tables, literal-free shape, outbound HTTP port and status |
+| `RecordingStarted` | `exercise_item_id` | 14 | links a recording to an exercise plan item (from request header `X-XTrace-Exercise-Item`) |
+| `AdapterHello` | `runtime_facts` | 17 | adapter-reported framework and runtime facts; outside the HMAC transcript, so shown as "adapter-reported" |
+
+The standard-mode line budget stays 0 (root decision 1 above supersedes the 1,024 in the budget table); `CaptureBudget::STANDARD.max_line_events` is 0 and ingest enforces it.

@@ -1,0 +1,43 @@
+{
+  "bytes_hex": "08011a1011111111111111111111111111111111200a29f20300000000000032046d2d3130d201ab020a10222222222222222222222222222222221296020a03652d321002298a13000000000000301e380242144f776e6572436f6e74726f6c6c65722e73686f774a4e0a267372632f6d61696e2f6a6176612f6170702f4f776e6572436f6e74726f6c6c65722e6a617661102820283220cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd680672340a02696410011801222a0a280801120234321a20abababababababababababababababababababababababababababababababab72210a0870617373776f7264100118012211120f0a0b6e616d652e7365637265741001721a0a046172673210011802220e1a0c0a046161616110802018800272100a04746869731005180122042202080672110a0565787472611001180122042a020807",
+  "description": "FRAME_ENTER with one binding in each of the five CapturedValue states, roles and name origins",
+  "message": "xtp.agent.v1.AgentEnvelope",
+  "summary": {
+    "bindings": [
+      {
+        "name": "id",
+        "nameOrigin": "declared",
+        "role": "argument",
+        "state": "captured"
+      },
+      {
+        "name": "password",
+        "nameOrigin": "declared",
+        "role": "argument",
+        "state": "redacted"
+      },
+      {
+        "name": "arg2",
+        "nameOrigin": "synthesized",
+        "role": "argument",
+        "state": "truncated"
+      },
+      {
+        "name": "this",
+        "nameOrigin": "declared",
+        "reason": "focused_capture_not_armed",
+        "role": "receiver",
+        "state": "unavailable"
+      },
+      {
+        "name": "extra",
+        "nameOrigin": "declared",
+        "reason": "value_budget",
+        "role": "argument",
+        "state": "dropped"
+      }
+    ],
+    "events": 1,
+    "sourceBinding": "observed_unattested"
+  }
+}
