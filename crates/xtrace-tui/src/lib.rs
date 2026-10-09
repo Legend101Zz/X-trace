@@ -19,7 +19,8 @@ pub mod view;
 
 pub use client::{ClientError, ReplayClient};
 pub use model::{
-    Effect, FrameRow, Key, Message, Model, NavAction, NavResult, RecordingRow, Screen, Status, Window,
+    Effect, FrameRow, Key, Message, Model, NavAction, NavResult, RecordingRow, Screen, Status,
+    Window,
 };
 pub use update::update;
-pub use view::{render, Grid};
+pub use view::{Grid, render};

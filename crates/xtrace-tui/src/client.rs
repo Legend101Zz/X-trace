@@ -12,7 +12,13 @@ pub trait ReplayClient {
     /// Lists recordings, newest first.
     fn list_recordings(&self) -> Result<Vec<RecordingRow>, ClientError>;
     /// Reads an event window, optionally centred on `around_frame`.
-    fn window(&self, recording_id: &str, around_frame: Option<&str>) -> Result<Window, ClientError>;
+    fn window(&self, recording_id: &str, around_frame: Option<&str>)
+    -> Result<Window, ClientError>;
     /// Resolves one navigation action from a frame; the server owns the semantics.
-    fn navigate(&self, recording_id: &str, frame_id: &str, action: NavAction) -> Result<NavResult, ClientError>;
+    fn navigate(
+        &self,
+        recording_id: &str,
+        frame_id: &str,
+        action: NavAction,
+    ) -> Result<NavResult, ClientError>;
 }

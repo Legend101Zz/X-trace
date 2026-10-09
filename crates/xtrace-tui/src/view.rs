@@ -76,7 +76,10 @@ pub fn render(model: &Model) -> Grid {
     if model.width < MIN_WIDTH || model.height < MIN_HEIGHT {
         let mut rows = vec![fit("", width); height];
         if let Some(first) = rows.first_mut() {
-            *first = fit(&format!("Need {MIN_WIDTH}x{MIN_HEIGHT}, have {}x{}", model.width, model.height), width);
+            *first = fit(
+                &format!("Need {MIN_WIDTH}x{MIN_HEIGHT}, have {}x{}", model.width, model.height),
+                width,
+            );
         }
         return Grid { rows, selected_row: None };
     }
@@ -144,35 +147,75 @@ fn window_start(selected: usize, len: usize, height: usize) -> usize {
 fn body_lines(model: &Model, height: usize) -> Body {
     match &model.status {
         Status::Loading if model.recordings.is_empty() && model.window.is_none() => {
-            return Body { lines: vec!["Reading persisted evidence…".to_owned()], offset: 0, selected: None };
+            return Body {
+                lines: vec!["Reading persisted evidence…".to_owned()],
+                offset: 0,
+                selected: None,
+            };
         }
         Status::Failed(text) => {
-            return Body { lines: vec!["Could not load persisted evidence".to_owned(), text.clone(), "Press r to retry.".to_owned()], offset: 0, selected: None };
+            return Body {
+                lines: vec![
+                    "Could not load persisted evidence".to_owned(),
+                    text.clone(),
+                    "Press r to retry.".to_owned(),
+                ],
+                offset: 0,
+                selected: None,
+            };
         }
         _ => {}
     }
     match model.screen {
         Screen::Recordings => {
             if model.recordings.is_empty() {
-                let text = if model.status == Status::Idle { "Press r to load recordings." } else { "No recordings persisted." };
+                let text = if model.status == Status::Idle {
+                    "Press r to load recordings."
+                } else {
+                    "No recordings persisted."
+                };
                 return Body { lines: vec![text.to_owned()], offset: 0, selected: None };
             }
             let start = window_start(model.selected_recording, model.recordings.len(), height);
-            let lines = model.recordings.iter().enumerate().skip(start).take(height).map(|(index, row)| {
-                let marker = if index == model.selected_recording { '>' } else { ' ' };
-                format!("{marker} {}  {}  {} events", row.id, row.completion, row.event_count)
-            }).collect();
+            let lines = model
+                .recordings
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(height)
+                .map(|(index, row)| {
+                    let marker = if index == model.selected_recording { '>' } else { ' ' };
+                    format!("{marker} {}  {}  {} events", row.id, row.completion, row.event_count)
+                })
+                .collect();
             Body { lines, offset: start, selected: Some(model.selected_recording) }
         }
         Screen::Replay => {
             let Some(window) = &model.window else {
-                return Body { lines: vec!["Select a recording.".to_owned()], offset: 0, selected: None };
+                return Body {
+                    lines: vec!["Select a recording.".to_owned()],
+                    offset: 0,
+                    selected: None,
+                };
             };
             if window.frames.is_empty() {
-                return Body { lines: vec!["The persisted recording has no event window to display.".to_owned()], offset: 0, selected: None };
+                return Body {
+                    lines: vec![
+                        "The persisted recording has no event window to display.".to_owned(),
+                    ],
+                    offset: 0,
+                    selected: None,
+                };
             }
             let start = window_start(model.selected_frame, window.frames.len(), height);
-            let lines = window.frames.iter().enumerate().skip(start).take(height).map(|(index, frame)| frame_line(frame, index == model.selected_frame)).collect();
+            let lines = window
+                .frames
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(height)
+                .map(|(index, frame)| frame_line(frame, index == model.selected_frame))
+                .collect();
             Body { lines, offset: start, selected: Some(model.selected_frame) }
         }
     }
@@ -194,7 +237,9 @@ fn nav_line(model: &Model) -> String {
         return "nav: no frame selected".to_owned();
     };
     let mut parts = Vec::new();
-    for action in [NavAction::Previous, NavAction::Next, NavAction::Into, NavAction::Over, NavAction::Out] {
+    for action in
+        [NavAction::Previous, NavAction::Next, NavAction::Into, NavAction::Over, NavAction::Out]
+    {
         let state = match frame.navigation.get(action as usize).and_then(Option::as_ref) {
             Some(NavResult::Target(_)) => "ok",
             Some(NavResult::Boundary(_)) => "boundary",
@@ -211,14 +256,21 @@ fn notice_line(model: &Model) -> String {
         return model.notice.clone();
     }
     match (&model.screen, &model.window) {
-        (Screen::Replay, Some(window)) => format!("{} frames · recording {}", window.frames.len(), window.completion),
+        (Screen::Replay, Some(window)) => {
+            format!("{} frames · recording {}", window.frames.len(), window.completion)
+        }
         _ => String::new(),
     }
 }
 
 fn hint_line(model: &Model) -> String {
     match model.screen {
-        Screen::Recordings => "up/down select · enter open · r refresh · ? help · q quit".to_owned(),
-        Screen::Replay => "up/down select · [ ] prev/next · i o u into/over/out · b back · ? help · q quit".to_owned(),
+        Screen::Recordings => {
+            "up/down select · enter open · r refresh · ? help · q quit".to_owned()
+        }
+        Screen::Replay => {
+            "up/down select · [ ] prev/next · i o u into/over/out · b back · ? help · q quit"
+                .to_owned()
+        }
     }
 }
