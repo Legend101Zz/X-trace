@@ -1,0 +1,389 @@
+{
+ "version": 1,
+ "description": "Shared route-normalizer vectors (PLAN A2, RT-8). Consumed by the Rust domain tests, the Java static analyzer and the Node static analyzer. input is a string, or an array of path parts that are joined before normalizing. Frameworks: spring-mvc, jaxrs, express, fastify, nest, generic. Never edit a case to make an implementation pass.",
+ "cases": [
+  {
+   "name": "root_empty",
+   "framework": "generic",
+   "input": "",
+   "identity": "/",
+   "display": "/",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "root_slashes",
+   "framework": "generic",
+   "input": "///",
+   "identity": "/",
+   "display": "/",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "plain_literal",
+   "framework": "generic",
+   "input": "/orders",
+   "identity": "/orders",
+   "display": "/orders",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "missing_leading_slash",
+   "framework": "generic",
+   "input": "orders/list",
+   "identity": "/orders/list",
+   "display": "/orders/list",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "repeated_separators",
+   "framework": "generic",
+   "input": "//a///b",
+   "identity": "/a/b",
+   "display": "/a/b",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "trailing_slash",
+   "framework": "generic",
+   "input": "/a/b/",
+   "identity": "/a/b",
+   "display": "/a/b",
+   "strictSlash": true,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "colon_param",
+   "framework": "express",
+   "input": "/users/:id",
+   "identity": "/users/{id}",
+   "display": "/users/{id}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "id"
+   ]
+  },
+  {
+   "name": "colon_param_renamed",
+   "framework": "express",
+   "input": "/users/:userId",
+   "identity": "/users/{id}",
+   "display": "/users/{userId}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "userId"
+   ]
+  },
+  {
+   "name": "colon_param_regex",
+   "framework": "express",
+   "input": "/users/:id(\\d+)",
+   "identity": "/users/{id}",
+   "display": "/users/{id}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "id"
+   ]
+  },
+  {
+   "name": "colon_optional",
+   "framework": "express",
+   "input": "/users/:id?",
+   "identity": "/users/{id}",
+   "display": "/users/{id}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "id"
+   ]
+  },
+  {
+   "name": "colon_mixed_segment",
+   "framework": "fastify",
+   "input": "/:file.:ext",
+   "identity": "/{id}.{id}",
+   "display": "/{file}.{ext}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "file",
+    "ext"
+   ]
+  },
+  {
+   "name": "colon_two_params",
+   "framework": "express",
+   "input": "/flights/:from-:to",
+   "identity": "/flights/{id}-{id}",
+   "display": "/flights/{from}-{to}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "from",
+    "to"
+   ]
+  },
+  {
+   "name": "brace_param",
+   "framework": "spring-mvc",
+   "input": "/owners/{ownerId}",
+   "identity": "/owners/{id}",
+   "display": "/owners/{ownerId}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "ownerId"
+   ]
+  },
+  {
+   "name": "brace_regex",
+   "framework": "spring-mvc",
+   "input": "/users/{id:[0-9]+}",
+   "identity": "/users/{id}",
+   "display": "/users/{id}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "id"
+   ]
+  },
+  {
+   "name": "jaxrs_regex_with_space",
+   "framework": "jaxrs",
+   "input": "/users/{ id : [0-9]{1,3} }",
+   "identity": "/users/{id}",
+   "display": "/users/{id}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "id"
+   ]
+  },
+  {
+   "name": "jaxrs_regex_with_slash",
+   "framework": "jaxrs",
+   "input": "/files/{path: .+/[a-z]{2}}/raw",
+   "identity": "/files/{id}/raw",
+   "display": "/files/{path}/raw",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "path"
+   ]
+  },
+  {
+   "name": "angle_param",
+   "framework": "generic",
+   "input": "/users/<id>",
+   "identity": "/users/{id}",
+   "display": "/users/{id}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "id"
+   ]
+  },
+  {
+   "name": "angle_converter",
+   "framework": "generic",
+   "input": "/users/<int:id>",
+   "identity": "/users/{id}",
+   "display": "/users/{id}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "id"
+   ]
+  },
+  {
+   "name": "spring_catch_all",
+   "framework": "spring-mvc",
+   "input": "/static/{*rest}",
+   "identity": "/static/{*}",
+   "display": "/static/{*rest}",
+   "strictSlash": false,
+   "wildcard": true,
+   "params": [
+    "rest"
+   ]
+  },
+  {
+   "name": "star_segment",
+   "framework": "fastify",
+   "input": "/files/*",
+   "identity": "/files/*",
+   "display": "/files/*",
+   "strictSlash": false,
+   "wildcard": true,
+   "params": []
+  },
+  {
+   "name": "named_splat",
+   "framework": "express",
+   "input": "/files/*splat",
+   "identity": "/files/{*}",
+   "display": "/files/{*splat}",
+   "strictSlash": false,
+   "wildcard": true,
+   "params": [
+    "splat"
+   ]
+  },
+  {
+   "name": "encoded_slash_preserved",
+   "framework": "generic",
+   "input": "/a%2fb",
+   "identity": "/a%2Fb",
+   "display": "/a%2Fb",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "unreserved_escape_decoded",
+   "framework": "generic",
+   "input": "/a%41%7e",
+   "identity": "/aA~",
+   "display": "/aA~",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "backslash_escapes_colon",
+   "framework": "express",
+   "input": "/a\\:b",
+   "identity": "/a%3Ab",
+   "display": "/a%3Ab",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "literal_colon_in_spring",
+   "framework": "spring-mvc",
+   "input": "/a:b",
+   "identity": "/a%3Ab",
+   "display": "/a%3Ab",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "joined_class_and_method",
+   "framework": "spring-mvc",
+   "input": [
+    "/owners/{ownerId}",
+    "pets/{petId}/"
+   ],
+   "identity": "/owners/{id}/pets/{id}",
+   "display": "/owners/{ownerId}/pets/{petId}",
+   "strictSlash": true,
+   "wildcard": false,
+   "params": [
+    "ownerId",
+    "petId"
+   ]
+  },
+  {
+   "name": "joined_empty_parts",
+   "framework": "spring-mvc",
+   "input": [
+    "",
+    "/api",
+    ""
+   ],
+   "identity": "/api",
+   "display": "/api",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "joined_express_mount",
+   "framework": "express",
+   "input": [
+    "/api/v1",
+    "/users/:id"
+   ],
+   "identity": "/api/v1/users/{id}",
+   "display": "/api/v1/users/{id}",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": [
+    "id"
+   ]
+  },
+  {
+   "name": "unicode_literal",
+   "framework": "generic",
+   "input": "/café",
+   "identity": "/café",
+   "display": "/café",
+   "strictSlash": false,
+   "wildcard": false,
+   "params": []
+  },
+  {
+   "name": "query_rejected",
+   "framework": "generic",
+   "input": "/a?x=1",
+   "error": "query_or_fragment"
+  },
+  {
+   "name": "fragment_rejected",
+   "framework": "generic",
+   "input": "/a#f",
+   "error": "query_or_fragment"
+  },
+  {
+   "name": "unclosed_brace",
+   "framework": "spring-mvc",
+   "input": "/a/{id",
+   "error": "unbalanced_parameter"
+  },
+  {
+   "name": "stray_close_brace",
+   "framework": "spring-mvc",
+   "input": "/a/id}",
+   "error": "unbalanced_parameter"
+  },
+  {
+   "name": "empty_param_name",
+   "framework": "spring-mvc",
+   "input": "/a/{}",
+   "error": "invalid_parameter_name"
+  },
+  {
+   "name": "bad_param_name",
+   "framework": "spring-mvc",
+   "input": "/a/{bad name}",
+   "error": "invalid_parameter_name"
+  },
+  {
+   "name": "malformed_escape",
+   "framework": "generic",
+   "input": "/a/%zz",
+   "error": "invalid_escape"
+  },
+  {
+   "name": "control_character",
+   "framework": "generic",
+   "input": "/a\u0001b",
+   "error": "control_character"
+  }
+ ]
+}
