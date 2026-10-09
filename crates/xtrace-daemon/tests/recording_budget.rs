@@ -429,6 +429,37 @@ async fn request_257_is_accepted_after_256_finished_recordings() {
         }
     }
 
+    // Acks are staged; read the store back (second read-only connection) until every
+    // recording is durable and finished, so the test proves the persisted outcome too.
+    let database = project_root.path().join("metadata.sqlite3");
+    let wanted = i64::try_from(FINISHED_REQUESTS).expect("fits");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let connection = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("read-only store connection");
+        let total: i64 = connection
+            .query_row("SELECT COUNT(*) FROM recordings", [], |row| row.get(0))
+            .expect("count recordings");
+        let finished: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM recordings WHERE status IN ('complete', 'partial')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count finished recordings");
+        if total == wanted && finished == wanted {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "store never reached {wanted} finished recordings (total {total}, finished {finished})"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
     drop(reader);
     drop(writer);
     drop(tls_stream);

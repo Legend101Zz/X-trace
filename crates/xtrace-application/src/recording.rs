@@ -2086,4 +2086,90 @@ mod tests {
             service.record_events(RecordEvents { recording_id, events: vec![event(3, 2, 0xbb)] });
         assert_eq!(new_event.expect_err("new event rejected").kind(), PortErrorKind::Conflict);
     }
+
+    fn numbered(n: u128) -> BeginRecording {
+        BeginRecording { recording_id: Uuid::from_u128(n).into(), ..begin(wall(1)) }
+    }
+
+    fn begin_and_finish(service: &RecordingCaptureService<FakePort>, n: u128) {
+        let request = numbered(n);
+        let recording_id = request.recording_id;
+        service.begin_recording(request).expect("begin");
+        service
+            .record_events(RecordEvents { recording_id, events: vec![event(2, 1, 0xaa)] })
+            .expect("event");
+        service
+            .finish_recording(FinishRecording::without_digest(recording_id, 2))
+            .expect("finish");
+    }
+
+    #[test]
+    fn finished_recordings_free_the_retained_id_bound() {
+        let port = Arc::new(FakePort::default());
+        let service = RecordingCaptureService::new(
+            Arc::clone(&port),
+            SegmentPolicy::default(),
+            NonZeroUsize::new(1).expect("non-zero recording limit"),
+        );
+        for n in 1..=20u128 {
+            begin_and_finish(&service, n);
+        }
+        service.begin_recording(numbered(100)).expect("next begin after finished recordings");
+    }
+
+    #[test]
+    fn unfinished_recording_still_counts_at_the_bound() {
+        let port = Arc::new(FakePort::default());
+        let service = RecordingCaptureService::new(
+            Arc::clone(&port),
+            SegmentPolicy::default(),
+            NonZeroUsize::new(1).expect("non-zero recording limit"),
+        );
+        begin_and_finish(&service, 1);
+        service.begin_recording(numbered(2)).expect("one unfinished fits");
+        let error = service.begin_recording(numbered(3)).expect_err("second unfinished refused");
+        assert_eq!(error.kind(), PortErrorKind::Resource);
+    }
+
+    #[test]
+    fn terminal_map_is_bounded_by_the_tombstone_ring() {
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        let total = TERMINAL_TOMBSTONE_RING + 5;
+        for n in 1..=total as u128 {
+            begin_and_finish(&service, n);
+        }
+        assert_eq!(service.recordings.lock().expect("recordings").len(), TERMINAL_TOMBSTONE_RING);
+        assert_eq!(service.terminal.lock().expect("terminal").len(), TERMINAL_TOMBSTONE_RING);
+        // The oldest was evicted; the newest is still a tombstone.
+        assert_eq!(
+            service.recording(numbered(1).recording_id).err().map(|e| e.kind()),
+            Some(PortErrorKind::NotFound),
+        );
+        assert!(service.recording(numbered(total as u128).recording_id).is_ok());
+    }
+
+    #[test]
+    fn replays_after_finish_are_duplicates_and_exact_finish_replays() {
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        begin_and_finish(&service, 7);
+        let recording_id = numbered(7).recording_id;
+        // Digests are released at finish: a replayed persisted sequence is a duplicate.
+        let replay = service
+            .record_events(RecordEvents { recording_id, events: vec![event(2, 1, 0xaa)] })
+            .expect("late exact replay");
+        assert_eq!(replay.duplicates, 1);
+        assert_eq!(replay.accepted, 0);
+        // Documented trade-off: a changed payload for a persisted sequence is no longer
+        // detected after the finish, because the digest table is gone.
+        let changed = service
+            .record_events(RecordEvents { recording_id, events: vec![event(2, 1, 0xbb)] })
+            .expect("changed replay counted as duplicate");
+        assert_eq!(changed.duplicates, 1);
+        let again = service
+            .finish_recording(FinishRecording::without_digest(recording_id, 2))
+            .expect("second identical finish");
+        assert!(again.exact_replay);
+    }
 }

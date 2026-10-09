@@ -1973,4 +1973,54 @@ mod tests {
         validator.release_terminal(ids[0]);
         validator.accept_started(&started_with_policy(over, "xtrace.focused.v1"), focused).unwrap();
     }
+
+    #[test]
+    fn finished_focused_tables_stall_new_focused_starts_until_released() {
+        let mut validator =
+            IngestValidator::new(IngestConfig::mode_derived(NonZeroUsize::new(64).unwrap()));
+        let focused = CaptureMode::Focused;
+        let per = focused.event_cap();
+        let fits = MAX_SESSION_RETAINED_DIGESTS / per;
+        assert!(fits <= FINALIZING_DIGEST_WINDOW, "all tables stay inside the digest window");
+        let mut ids = Vec::new();
+        for _ in 0..fits {
+            let id = rid();
+            validator
+                .accept_started(&started_with_policy(id, "xtrace.focused.v1"), focused)
+                .unwrap();
+            // Fill the table to the cap, as a full recording would.
+            let state = validator.recordings.get_mut(&id).unwrap();
+            for seq in 2..u64::try_from(per).unwrap() + 2 {
+                state.event_digests.insert(seq, [0u8; 32]);
+            }
+            validator.accept_finished(&finished(id, 1)).unwrap();
+            ids.push(id);
+        }
+        // Every recording is finished, none is in flight, yet the full tables still count.
+        let next = rid();
+        let err = validator
+            .accept_started(&started_with_policy(next, "xtrace.focused.v1"), focused)
+            .unwrap_err();
+        assert!(matches!(err, IngestError::ActiveCapacityReached { .. }));
+        // Releasing the terminal tables (the daemon calls this after the commit) frees budget.
+        for id in &ids {
+            assert!(validator.release_terminal(*id));
+        }
+        validator.accept_started(&started_with_policy(next, "xtrace.focused.v1"), focused).unwrap();
+    }
+
+    #[test]
+    fn concurrent_standard_recordings_per_session_are_bounded_by_the_digest_budget() {
+        let mut validator =
+            IngestValidator::new(IngestConfig::mode_derived(NonZeroUsize::new(256).unwrap()));
+        let standard = CaptureMode::Standard;
+        let fits = MAX_SESSION_RETAINED_DIGESTS / standard.event_cap();
+        // Pinned: 122 concurrent Standard recordings per session, not the advertised 256.
+        assert_eq!(fits, 122);
+        for _ in 0..fits {
+            validator.accept_started(&started(rid(), "GET"), standard).unwrap();
+        }
+        let err = validator.accept_started(&started(rid(), "GET"), standard).unwrap_err();
+        assert!(matches!(err, IngestError::ActiveCapacityReached { .. }));
+    }
 }
