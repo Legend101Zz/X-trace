@@ -1,10 +1,9 @@
 //! Daemon-side audit redactor (CONTRACTS section 9.3, FR-2).
 //!
-//! A second pass the daemon is meant to run on every accepted event before storage, so a secret
-//! the adapter failed to redact never reaches an immutable XTF segment. NOT WIRED YET: no
-//! production caller exists until the C-surface request Cc-002 lands, so today only the validator's
-//! refusal of `bindings` (without `bindings_audit_active`) protects storage; `sanitized_shape`,
-//! tables, exception text, `event.value` and interaction summaries are persisted unaudited. The audit can only make a value safer:
+//! A second pass the daemon runs on every accepted event batch and finish marker (see
+//! `xtrace-daemon` `session.rs`) before the envelope is translated and encoded into an XTF
+//! segment, so a secret the adapter failed to redact never reaches an immutable segment. The
+//! audit can only make a value safer:
 //! it downgrades `Captured` and `Truncated` values to `Redacted { rule_id: "daemon.audit" }` and
 //! replaces matching free text with a marker. It never upgrades a value, never reads a file and
 //! performs no I/O.
@@ -243,8 +242,15 @@ pub fn audit_event(event: &mut RecordingEvent) -> AuditReport {
             report.redacted_text_fields += 1;
         }
     }
-    if event.exception.as_mut().is_some_and(|e| scrub_text(&mut e.sanitized_message)) {
-        report.redacted_text_fields += 1;
+    if let Some(exception) = event.exception.as_mut() {
+        if scrub_text(&mut exception.sanitized_message) {
+            report.redacted_text_fields += 1;
+        }
+        for frame in &mut exception.stack_frames {
+            if scrub_text(frame) {
+                report.redacted_text_fields += 1;
+            }
+        }
     }
     report
 }
@@ -404,7 +410,7 @@ mod tests {
             exception: Some(wire::ExceptionPayload {
                 exception_type: "E".to_string(),
                 sanitized_message: format!("failed with {JWT}"),
-                stack_frames: Vec::new(),
+                stack_frames: vec![format!("at Svc.call({JWT})"), "at Safe.frame".to_string()],
             }),
             interaction: Some(wire::Interaction {
                 sanitized_shape: "select 'AKIAIOSFODNN7EXAMPLE'".to_string(),
@@ -413,7 +419,9 @@ mod tests {
             ..RecordingEvent::default()
         };
         let report = audit_event(&mut event);
-        assert_eq!(report.redacted_text_fields, 2);
+        assert_eq!(report.redacted_text_fields, 3);
+        assert_eq!(event.exception.as_ref().unwrap().stack_frames[0], AUDIT_TEXT_MARKER);
+        assert_eq!(event.exception.as_ref().unwrap().stack_frames[1], "at Safe.frame");
         assert_eq!(event.exception.as_ref().unwrap().sanitized_message, AUDIT_TEXT_MARKER);
 
         let mut finished = RecordingFinished {

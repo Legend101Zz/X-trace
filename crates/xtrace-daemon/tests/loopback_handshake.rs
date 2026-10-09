@@ -2786,3 +2786,224 @@ async fn capture_over_the_event_cap_ends_partial_with_exact_per_priority_drops()
         .expect("daemon task")
         .expect("serve");
 }
+
+/// A secret-shaped value the adapter failed to redact: CONTRACTS 9.3 requires the daemon audit
+/// to downgrade it before the event is encoded into an XTF segment.
+const AUDIT_CANARY_JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+fn visit_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(root).expect("read dir") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            visit_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canary_absent_from_xtf_bytes_and_sqlite() {
+    use xtrace_protocol::generated::agent as wire;
+
+    let daemon_temp = secure_tempdir("xtrace-audit-daemon-");
+    let bootstrap_path = daemon_temp.path().join("bootstrap.json");
+    let project_root = secure_tempdir("xtrace-audit-project-");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let store =
+        SqliteStore::open(&project_root.path().join("metadata.sqlite3"), OpenOptions::default())
+            .expect("open project SQLite store");
+    #[cfg(unix)]
+    set_owner_only(&project_root.path().join("metadata.sqlite3"), 0o600);
+    let timestamp = WallTime::now();
+    let project = Project {
+        id: project_id,
+        canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/fixture/repo"),
+        display_name: "audit canary project".to_owned(),
+        created_at: timestamp,
+        last_opened_at: timestamp,
+        config_schema_version: 1,
+        effective_config_hash: String::new(),
+        active_capture_policy_id: None,
+        active_redaction_policy_id: None,
+    };
+    store.project_repository().insert_project(&project).expect("insert project");
+    let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), project_root.path()));
+    let capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>> =
+        Arc::new(xtrace_application::recording::RecordingCaptureService::new(
+            adapter,
+            SegmentPolicy::default(),
+            std::num::NonZeroUsize::new(DEFAULT_MAX_RETAINED_RECORDINGS)
+                .expect("non-zero retained recording limit"),
+        ));
+    let (bound, secret, _, _, address, pin) = spawn_daemon_with_capture(
+        bootstrap_path,
+        Duration::from_secs(60),
+        8,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+        capture,
+    )
+    .await
+    .expect("bind SQLite-backed daemon");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+    let mut tls_stream =
+        connect_authenticated(address, &pin, &secret, &session_id, &[0x88; 32]).await;
+    let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    let recording_id_bytes = Bytes::copy_from_slice(&[0x36; 16]);
+    let recording_id = RecordingId::from_uuid(uuid::Uuid::from_bytes([0x36; 16]));
+
+    write_envelope(
+        &mut writer,
+        PayloadOneof::RecordingStarted(RecordingStarted {
+            recording_id: recording_id_bytes.clone(),
+            recording_seq: 1,
+            method: "GET".to_owned(),
+            ..RecordingStarted::default()
+        }),
+        &session_id,
+        1,
+        1,
+    )
+    .await
+    .expect("write start");
+    next_ack(&mut reader, "audit start ACK").await;
+
+    let event = RecordingEvent {
+        event_id: "audit-event-2".to_owned(),
+        recording_seq: 2,
+        monotonic_ns: 23,
+        kind: 2,
+        symbol: "com.example.Service#call".to_owned(),
+        // a content-bearing binding the adapter left as a captured preview
+        bindings: vec![wire::ValueBinding {
+            name: "payload".to_owned(),
+            role: wire::BindingRole::Argument as i32,
+            name_origin: wire::NameOrigin::Declared as i32,
+            value: Some(wire::CapturedValue {
+                value: Some(wire::captured_value::Value::Captured(wire::CapturedValueCaptured {
+                    shape: wire::ValueShape::String as i32,
+                    preview: AUDIT_CANARY_JWT.to_owned(),
+                    content_hash: Bytes::copy_from_slice(
+                        blake3::hash(AUDIT_CANARY_JWT.as_bytes()).as_bytes(),
+                    ),
+                })),
+            }),
+        }],
+        // a secret-shaped sanitized_message must be downgraded, not stored
+        exception: Some(wire::ExceptionPayload {
+            exception_type: "IllegalStateException".to_owned(),
+            sanitized_message: format!("failed with {AUDIT_CANARY_JWT}"),
+            stack_frames: Vec::new(),
+        }),
+        ..RecordingEvent::default()
+    };
+    write_envelope(
+        &mut writer,
+        PayloadOneof::EventBatch(EventBatch {
+            recording_id: recording_id_bytes.clone(),
+            events: vec![event],
+        }),
+        &session_id,
+        2,
+        2,
+    )
+    .await
+    .expect("write batch");
+    next_ack(&mut reader, "audit batch ACK").await;
+
+    write_envelope(
+        &mut writer,
+        PayloadOneof::RecordingFinished(RecordingFinished {
+            recording_id: recording_id_bytes,
+            final_recording_seq: 2,
+            outcome: Some(wire::RecordingOutcome {
+                kind: wire::OutcomeKind::ExceptionPropagated as i32,
+                exception: Some(wire::ExceptionPayload {
+                    exception_type: "IllegalStateException".to_owned(),
+                    sanitized_message: format!("Authorization: Bearer {AUDIT_CANARY_JWT}"),
+                    stack_frames: Vec::new(),
+                }),
+                ..wire::RecordingOutcome::default()
+            }),
+            ..RecordingFinished::default()
+        }),
+        &session_id,
+        3,
+        3,
+    )
+    .await
+    .expect("write finish");
+    next_ack(&mut reader, "audit finish ACK").await;
+    drop(reader);
+    drop(writer);
+    drop(tls_stream);
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("shutdown timed out")
+        .expect("daemon task")
+        .expect("serve");
+
+    // 1. The read surface never shows the canary, and the binding was downgraded.
+    let window = SqliteRecordingReader::new(store.clone(), project_root.path())
+        .show_recording(&ShowWindowRequest {
+            project_id,
+            recording_id,
+            limit: 10,
+            after_sequence: None,
+        })
+        .expect("read back the audited recording");
+    let projected = serde_json::to_string(&window.events).expect("serialize events");
+    assert!(!projected.contains(AUDIT_CANARY_JWT), "{projected}");
+    assert!(projected.contains("daemon.audit"), "binding must be downgraded: {projected}");
+    let outcome = window.outcome.expect("outcome persisted");
+    let message = outcome.exception.and_then(|exception| exception.message).unwrap_or_default();
+    assert!(!message.contains(AUDIT_CANARY_JWT), "{message}");
+
+    // 2. The decoded XTF events carry the marker, not the secret-shaped message.
+    let object_hashes: Vec<Vec<u8>> = {
+        let connection = rusqlite::Connection::open_with_flags(
+            project_root.path().join("metadata.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open metadata read-only");
+        let mut statement = connection
+            .prepare("SELECT object_hash FROM recording_segments")
+            .expect("prepare segments");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("segments")
+            .collect::<Result<_, _>>()
+            .expect("hashes")
+    };
+    assert_eq!(object_hashes.len(), 1);
+    let expected = xtrace_domain::ContentHash::from_digest_bytes(&object_hashes[0])
+        .expect("32-byte object hash");
+    let mut files = Vec::new();
+    visit_files(project_root.path(), &mut files);
+    let mut decoded_any = false;
+    for path in &files {
+        let bytes = std::fs::read(path).expect("read stored file");
+        // 3. No stored byte (SQLite file, WAL, segment object) contains the canary verbatim.
+        assert!(!contains_subslice(&bytes, AUDIT_CANARY_JWT.as_bytes()), "{}", path.display());
+        if let Ok(decoded) = xtrace_store::xtf::decode_compressed_segment(&bytes, expected) {
+            decoded_any = true;
+            let logical = decoded
+                .events()
+                .iter()
+                .map(Message::encode_to_vec)
+                .collect::<Vec<_>>()
+                .concat();
+            assert!(!contains_subslice(&logical, AUDIT_CANARY_JWT.as_bytes()));
+            assert!(contains_subslice(&logical, b"[redacted:daemon.audit]"));
+        }
+    }
+    assert!(decoded_any, "the XTF segment object must be located and decoded");
+}
