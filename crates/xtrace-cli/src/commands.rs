@@ -402,8 +402,10 @@ where
         RecordingCommand::Show { project_dir, recording_id, limit, cursor } => {
             let (project_id, recording_queries, correlation_id) =
                 open_recording_queries(&project_dir, env_reader)?;
-            let detail = recording_queries
-                .show(ShowRecording { project_id, recording_id, limit, cursor }, correlation_id)?;
+            let detail = recording_queries.show(
+                ShowRecording { project_id, recording_id, limit, cursor, around_frame: None },
+                correlation_id,
+            )?;
             let mut stdout = std::io::stdout().lock();
             write_success(&mut stdout, &detail)?;
             Ok(())
