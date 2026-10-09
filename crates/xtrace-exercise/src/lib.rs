@@ -21,7 +21,8 @@ pub mod plan;
 pub mod preview;
 
 pub use candidate::{
-    CandidateOp, CandidateParam, ChangeKind, PlanError, PlanInput, synthesize, validate_target,
+    CandidateOp, CandidateParam, ChangeKind, HostClass, PlanError, PlanInput, classify_target_host,
+    synthesize, validate_target,
 };
 pub use effect::{Effect, classify};
 pub use plan::{ParamValue, Plan, PlanItem, ValueSource};

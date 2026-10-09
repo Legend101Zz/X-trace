@@ -12,5 +12,6 @@ description = "Export formats and bundles (lane W). Skeleton created by C0."
 workspace = true
 
 [dependencies]
+xtrace-domain = { path = "../xtrace-domain" }
 blake3 = { workspace = true }
 serde_json = { workspace = true }

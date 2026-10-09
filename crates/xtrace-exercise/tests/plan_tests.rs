@@ -228,6 +228,7 @@ fn plan_preview_makes_zero_requests() {
     let again = preview(&plan);
     assert_eq!(view, again);
     assert_eq!(view["requests_sent"], 0);
+    assert_eq!(view["target_host_class"], "loopback");
     assert_eq!(view["target"], format!("http://{addr}").as_str());
     let accepted = listener.accept();
     assert!(
@@ -345,4 +346,67 @@ fn selection_reason_does_not_claim_unknown_observation() {
         reasons(ChangeKind::Unchanged, Some(3)),
         (false, "already_observed_and_unchanged".to_owned())
     );
+}
+
+#[test]
+fn target_differentials_rejected() {
+    for (t, why) in [
+        ("http://evil.com\\@127.0.0.1/", "backslash"),
+        ("http://127.0.0.1\\.evil.com/", "backslash"),
+        ("http://host/a\\b", "backslash"),
+        ("http://127.0.0.1%2e.evil/", "percent_encoded_authority"),
+        ("http://%31%32%37.0.0.1/", "percent_encoded_authority"),
+        ("http://[fe80::1%25eth0]/", "percent_encoded_authority"),
+        ("http://127.1/", "malformed_authority"),
+        ("http://0x7f.0.0.1/", "malformed_authority"),
+        ("http://0X7f.1/", "malformed_authority"),
+        ("http://0177.0.0.1/", "malformed_authority"),
+        ("http://127.0.0.01/", "malformed_authority"),
+        ("http://2130706433/", "malformed_authority"),
+        ("http://host:99999/", "malformed_authority"),
+        ("http://host:80a/", "malformed_authority"),
+        ("http://host:80:90/", "malformed_authority"),
+        ("http://host:/", "malformed_authority"),
+        ("http://host:0/", "port_zero"),
+        ("http://[::1/", "malformed_authority"),
+        ("http://[::1]x/", "malformed_authority"),
+        ("http://-bad.example/", "malformed_authority"),
+        ("http://a..b/", "malformed_authority"),
+        ("http://host./", "malformed_authority"),
+        ("http://my_service/", "malformed_authority"),
+        ("http:///host", "missing_host"),
+    ] {
+        let mut i = input();
+        i.target = t.into();
+        assert_eq!(
+            try_synthesize(&i).err(),
+            Some(PlanError::InvalidTarget(why)),
+            "wrong rejection for {t}"
+        );
+    }
+}
+
+#[test]
+fn target_host_classification() {
+    use xtrace_exercise::{HostClass, classify_target_host as c};
+    let cases = [
+        ("http://localhost:8080", HostClass::LoopbackName),
+        ("http://api.localhost/x", HostClass::LoopbackName),
+        ("http://127.0.0.1:3000", HostClass::Loopback),
+        ("http://127.9.9.9", HostClass::Loopback),
+        ("http://[::1]:80/", HostClass::Loopback),
+        ("http://[::ffff:127.0.0.1]/", HostClass::Loopback),
+        ("http://10.1.2.3", HostClass::NonPublicIp),
+        ("http://192.168.0.5", HostClass::NonPublicIp),
+        ("http://169.254.169.254/latest", HostClass::NonPublicIp),
+        ("http://0.0.0.0", HostClass::NonPublicIp),
+        ("http://[fe80::1]", HostClass::NonPublicIp),
+        ("http://[fd00::1]", HostClass::NonPublicIp),
+        ("http://8.8.8.8", HostClass::PublicIp),
+        ("https://api.example.com:8443/base", HostClass::Name),
+    ];
+    for (t, want) in cases {
+        assert_eq!(c(t), Ok(want), "{t}");
+    }
+    assert!(c("http://127.1").is_err());
 }
