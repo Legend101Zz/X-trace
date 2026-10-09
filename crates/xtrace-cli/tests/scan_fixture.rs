@@ -1,6 +1,13 @@
 //! `xtrace scan` journeys against a fake analyzer (a shell script that prints a transcript), so the
 //! CLI plumbing is exercised without a JDK or Node. Real analyzers have their own suites.
 #![cfg(unix)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::unreachable,
+    reason = "integration tests assert on fixed fixtures and checked subprocess output"
+)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -50,8 +57,7 @@ impl Project {
 }
 
 fn json(output: &Output) -> serde_json::Value {
-    serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|error| unreachable!("stdout is JSON: {error}: {:?}", output))
+    serde_json::from_slice(&output.stdout).expect("stdout is JSON")
 }
 
 #[test]

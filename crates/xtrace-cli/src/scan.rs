@@ -508,6 +508,11 @@ fn write_text<W: Write>(out: &mut W, result: &ScanResult) -> std::io::Result<()>
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "unit tests assert on fixed transcripts"
+)]
 mod tests {
     use super::*;
 

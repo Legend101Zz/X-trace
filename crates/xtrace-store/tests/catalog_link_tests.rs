@@ -5,6 +5,12 @@
 //! lane registers the migration (the SQL is applied here) and after (the rebuild is then a
 //! faithful no-op copy).
 
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "integration tests assert on fixed fixtures and checked SQL results"
+)]
+
 use rusqlite::{Connection, params, types::Value};
 use uuid::Uuid;
 use xtrace_private_storage::AdmittedPrivateRoot;
