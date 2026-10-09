@@ -131,3 +131,12 @@ h2 { font-size: 12px; font-weight: 600; }
   .event[aria-current='true'] { animation: selection-in 120ms ease-out; }
   @keyframes selection-in { from { opacity: .72; transform: translateX(3px); } to { opacity: 1; transform: translateX(0); } }
 }
+
+.outcome-banner { margin: 10px 12px; padding: 10px 12px; border: 1px solid var(--line); border-left-width: 3px; background: var(--panel-raised); color: var(--text); font-size: 11px; line-height: 1.45; }
+.outcome-banner strong { display: block; margin-bottom: 4px; }
+.outcome-banner ul { margin: 0; padding-left: 16px; color: var(--muted); }
+.outcome-banner--complete { border-left-color: var(--text); }
+.outcome-banner--partial, .outcome-banner--unavailable { border-left-color: var(--amber); }
+.outcome-banner--invalid { border-left-color: var(--danger); }
+
+.nav-buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }

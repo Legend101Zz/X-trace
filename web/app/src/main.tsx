@@ -310,6 +310,13 @@ export default function App() {
     setAnnouncement(`Event ${detail?.events[index]?.sequence ?? ''} selected`);
   };
 
+  const navigateToFrame = (action: string, frameId: string) => {
+    const index = detail?.events.findIndex((item) => item.frameId === frameId) ?? -1;
+    if (index < 0) return;
+    setSelectedEvent(index);
+    setAnnouncement(`Navigated ${action} to event ${detail?.events[index]?.sequence ?? ''}`);
+  };
+
   return <AppShell activePane={activePane} onPane={setActivePane} announcement={announcement} auth={auth} authError={authError}>
     <CatalogPanel
       active={activePane === 'recordings'}
@@ -343,6 +350,6 @@ export default function App() {
       onPickEvent={pickEvent}
       onNextWindow={nextDetail}
     />
-    <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectedEvent={selectedEvent} eventCount={eventCount} onMoveEvent={moveEvent} />
+    <EvidencePanel active={activePane === 'evidence'} currentStatus={currentStatus} detail={detail} event={event} selectedEvent={selectedEvent} eventCount={eventCount} onMoveEvent={moveEvent} onNavigate={navigateToFrame} />
   </AppShell>;
 }

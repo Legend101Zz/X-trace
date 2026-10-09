@@ -1,5 +1,6 @@
 import type { Detail } from '../../types';
 import { ErrorState } from '../common/ErrorState';
+import { OutcomeBanner } from './OutcomeBanner';
 
 export interface EventsPanelProps {
   active: boolean;
@@ -19,6 +20,7 @@ export function EventsPanel({ active, selectedRecording, detail, detailBusy, det
         <div className="pane-head center-head"><div className="center-title"><div className="eyebrow">Linear event window</div><h1>{selectedRecording || 'Select a recording'}</h1></div><button className="button" onClick={onRefresh} disabled={detailBusy}>Refresh</button></div>
         {detailError ? <ErrorState message={detailError} onRetry={onRefresh} /> : null}
         {!selectedRecording && !detailError ? <div className="empty"><strong>No recording selected</strong><p>Choose a linked or unmatched recording from the left pane.</p></div> : null}
+        {detail ? <OutcomeBanner detail={detail} /> : null}
         {detailBusy && !detail ? <div className="loading">Verifying persisted event window…</div> : null}
         {detail && detail.events.length === 0 ? <div className="empty"><strong>No projected events</strong><p>The persisted recording has no event window to display.</p></div> : null}
         {detail && detail.events.length ? <div className="event-rail">
