@@ -467,6 +467,7 @@ mod tests {
             drop_counts_by_priority: [(1, 0)].into_iter().collect(),
             unsupported_capability_codes: vec!["focused_locals".to_string()],
             capacity_dropped_events: 0,
+            event_cap: 2_048,
             response_summary: Some(CapturedValue::Redacted {
                 rule_id: "unverified-producer-redaction".to_string(),
                 shape_hint: Some(ValueShape::String),
@@ -658,6 +659,7 @@ mod tests {
             drop_counts_by_priority: std::collections::BTreeMap::new(),
             unsupported_capability_codes: Vec::new(),
             capacity_dropped_events: 0,
+            event_cap: 2_048,
             response_summary: Some(CapturedValue::Redacted {
                 rule_id: "unverified-producer-redaction".to_string(),
                 shape_hint: None,
@@ -748,6 +750,7 @@ mod tests {
             drop_counts_by_priority: [(1, 2)].into_iter().collect(),
             unsupported_capability_codes: Vec::new(),
             capacity_dropped_events: 2,
+            event_cap: 2_048,
             response_summary: None,
         };
         assert_eq!(
@@ -797,6 +800,7 @@ mod tests {
                     drop_counts_by_priority: [(1, 1)].into_iter().collect(),
                     unsupported_capability_codes: Vec::new(),
                     capacity_dropped_events: 1,
+                    event_cap: 2_048,
                     response_summary: None,
                 })
                 .expect("finish stores the evidence");
@@ -864,6 +868,7 @@ mod tests {
                 drop_counts_by_priority,
                 unsupported_capability_codes: Vec::new(),
                 capacity_dropped_events: 0,
+                event_cap: 2_048,
                 response_summary: None,
             };
             persistence.begin_recording(&begin(project.id(), recording_id)).expect("begin");
@@ -1449,6 +1454,7 @@ mod tests {
             drop_counts_by_priority: [(6, 2)].into_iter().collect(),
             unsupported_capability_codes: Vec::new(),
             capacity_dropped_events: 0,
+            event_cap: 2_048,
             response_summary: None,
         };
         let receipt = capture.finish_recording(finish.clone()).expect("finish");

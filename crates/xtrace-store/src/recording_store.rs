@@ -18,13 +18,16 @@ use xtrace_application::observed_endpoint_queries::{
     ObservedEndpointKey, ObservedEndpointRecord, ObservedRecordingKey, ObservedRecordingRecord,
 };
 use xtrace_application::recording::{
-    EndpointObservationInput, FinishRecording, MAX_RECORDED_EVENTS, RecordingCompletion,
+    EVENT_CAP_SANITY_BOUND, EndpointObservationInput, FinishRecording, RecordingCompletion,
 };
+
+/// Largest `request_json` accepted for terminal evidence (matches the v7 CHECK).
+const MAX_TERMINAL_REQUEST_JSON_BYTES: usize = 64 * 1024;
 use xtrace_application::recording_queries::{
     FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES,
     NavigationResult, NavigationUnavailable, PersistedEvent, PersistedInteraction, PersistedSource,
-    RecordingCompletionEvidence, RecordingEventWindow, RecordingMetadata, RecordingStatus,
-    ShowWindowRequest, SourceStatus,
+    RecordingCapacity, RecordingCompletionEvidence, RecordingEventWindow, RecordingMetadata,
+    RecordingStatus, ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
@@ -747,6 +750,35 @@ impl SqliteRecordingStore<'_> {
                     .collect()
             })
             .unwrap_or_default();
+        let capacity = match terminal_finish.as_ref() {
+            None => None,
+            Some(finish) => {
+                let stored_event_count: i64 = connection
+                    .query_row(
+                        "SELECT event_count FROM recording_terminal_evidence WHERE recording_id = ?1",
+                        rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        map_store_error(
+                            StoreError::from_rusqlite(error, correlation_id),
+                            correlation_id,
+                        )
+                    })?;
+                Some(RecordingCapacity {
+                    event_cap: u32::try_from(finish.event_cap)
+                        .map_err(|_| recording_query_corrupt_error(correlation_id))?,
+                    event_count: u32::try_from(stored_event_count)
+                        .map_err(|_| recording_query_corrupt_error(correlation_id))?,
+                    capacity_dropped_events: finish.capacity_dropped_events.to_string(),
+                    drops_by_priority: finish
+                        .drop_counts_by_priority
+                        .iter()
+                        .map(|(priority, count)| (*priority, count.to_string()))
+                        .collect(),
+                })
+            }
+        };
 
         let mut statement = connection
             .prepare(
@@ -1068,7 +1100,7 @@ impl SqliteRecordingStore<'_> {
             has_more,
             incomplete_evidence,
             outcome: None,
-            capacity: None,
+            capacity,
             limitations: Vec::new(),
         })
     }
@@ -1395,12 +1427,13 @@ impl SqliteRecordingStore<'_> {
                 matches!(value, xtrace_domain::CapturedValue::Redacted { rule_id, .. }
                     if rule_id != "unverified-producer-redaction")
             })
+            || !event_cap_in_bounds(request.event_cap)
         {
             return Err(terminal_validation_error(correlation_id));
         }
         let request_json = serde_json::to_string(request)
             .map_err(|_| terminal_validation_error(correlation_id))?;
-        if request_json.len() > 16 * 1024 {
+        if request_json.len() > MAX_TERMINAL_REQUEST_JSON_BYTES {
             return Err(terminal_validation_error(correlation_id));
         }
         let _writer = self
@@ -1485,14 +1518,17 @@ impl SqliteRecordingStore<'_> {
         transaction
             .execute(
                 "INSERT INTO recording_terminal_evidence \
-                 (recording_id, request_json, completion, final_recording_seq, event_count) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (recording_id, request_json, completion, final_recording_seq, event_count, \
+                  event_cap) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     request.recording_id.as_uuid().as_bytes().to_vec(),
                     request_json,
                     completion_text,
                     request.final_recording_seq.to_be_bytes().as_slice(),
                     i64::try_from(event_count)
+                        .map_err(|_| terminal_validation_error(correlation_id))?,
+                    i64::try_from(request.event_cap)
                         .map_err(|_| terminal_validation_error(correlation_id))?,
                 ],
             )
@@ -1568,7 +1604,9 @@ impl SqliteRecordingStore<'_> {
             let mut segments = Vec::new();
             let mut declared_event_count = 0_usize;
             let mut declared_input_bytes = 0_usize;
-            for row in rows.take(MAX_RECORDED_EVENTS + 1) {
+            let event_cap = usize::try_from(request.event_cap)
+                .map_err(|_| terminal_validation_error(correlation_id))?;
+            for row in rows.take(event_cap.saturating_add(1)) {
                 let segment = row.map_err(|error| {
                     map_store_error(
                         StoreError::from_rusqlite(error, correlation_id),
@@ -1588,8 +1626,8 @@ impl SqliteRecordingStore<'_> {
                     .checked_add(logical_bytes)
                     .and_then(|total| total.checked_add(compressed_bytes))
                     .ok_or_else(|| object_corrupt_error(correlation_id))?;
-                if segments.len() == MAX_RECORDED_EVENTS
-                    || declared_event_count > MAX_RECORDED_EVENTS
+                if segments.len() == event_cap
+                    || declared_event_count > event_cap
                     || segment_event_count == 0
                 {
                     return Err(object_corrupt_error(correlation_id));
@@ -2182,20 +2220,21 @@ fn load_terminal_finish(
     let Some(request_bytes) = request_bytes else {
         return Ok(None);
     };
-    if !(0..=16_384).contains(&request_bytes) {
+    if !(0..=MAX_TERMINAL_REQUEST_JSON_BYTES as i64).contains(&request_bytes) {
         return Err(recording_query_corrupt_error(correlation_id));
     }
-    let (request_json, raw_final_sequence, stored_completion, stored_event_count): (
+    let (request_json, raw_final_sequence, stored_completion, stored_event_count, stored_cap): (
         String,
         Vec<u8>,
         String,
         i64,
+        i64,
     ) = connection
         .query_row(
-            "SELECT request_json, final_recording_seq, completion, event_count \
+            "SELECT request_json, final_recording_seq, completion, event_count, event_cap \
                  FROM recording_terminal_evidence WHERE recording_id = ?1",
             rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
@@ -2207,7 +2246,9 @@ fn load_terminal_finish(
         .map_err(|_| recording_query_corrupt_error(correlation_id))?;
     if finish.recording_id != recording_id
         || finish.final_recording_seq != final_sequence
-        || event_count > u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
+        || !event_cap_in_bounds(finish.event_cap)
+        || i64::try_from(finish.event_cap).ok() != Some(stored_cap)
+        || event_count > finish.event_cap
         || finish.event_digest.len() > 32
         || finish.drop_counts_by_priority.len() > 256
         || finish.unsupported_capability_codes.len() > 64
@@ -2222,8 +2263,7 @@ fn load_terminal_finish(
         // Capacity drops only happen once the persisted history is full, and the
         // unverifiable adapter digest is withheld; anything else is inconsistent.
         || (finish.capacity_dropped_events > 0
-            && (event_count != u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
-                || !finish.event_digest.is_empty()))
+            && (event_count != finish.event_cap || !finish.event_digest.is_empty()))
         || finish.capacity_dropped_events
             > finish
                 .drop_counts_by_priority
@@ -2241,6 +2281,11 @@ fn load_terminal_finish(
         return Err(recording_query_corrupt_error(correlation_id));
     }
     Ok(Some(finish))
+}
+
+/// An event cap is valid when it is positive and not above the sanity bound.
+fn event_cap_in_bounds(cap: u64) -> bool {
+    cap >= 1 && cap <= EVENT_CAP_SANITY_BOUND as u64
 }
 
 fn completion_label_from_evidence(completion: RecordingCompletionEvidence) -> &'static str {
@@ -2481,7 +2526,12 @@ struct SourceProjectionCache {
 
 enum SourceSnapshot {
     Unavailable,
-    Loaded { hash: ContentHash, text: Option<String> },
+    /// The recorded file does not exist under the source root.
+    Missing,
+    Loaded {
+        hash: ContentHash,
+        text: Option<String>,
+    },
 }
 
 fn project_source(
@@ -2491,12 +2541,7 @@ fn project_source(
 ) -> Option<PersistedSource> {
     let start_line = source.start_line?;
     let path = source.path.as_str();
-    let safe = [
-        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderController.java",
-        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java",
-        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderRepository.java",
-    ];
-    if start_line == 0 || !safe.contains(&path) || source.content_hash.is_none() {
+    if start_line == 0 || !is_safe_repo_relative_path(path) || source.content_hash.is_none() {
         return None;
     }
     let end_line = source.end_line.filter(|end| *end >= start_line);
@@ -2516,6 +2561,16 @@ fn project_source(
     }
     let snapshot = cache.snapshots.get(path)?;
     let SourceSnapshot::Loaded { hash, text } = snapshot else {
+        if matches!(snapshot, SourceSnapshot::Missing) {
+            return Some(PersistedSource {
+                path: path.to_owned(),
+                start_line,
+                end_line,
+                status: SourceStatus::MissingFile,
+                excerpt: None,
+                truncated: false,
+            });
+        }
         return unavailable_source(path, start_line, end_line);
     };
     let recorded_hash = source.content_hash.as_ref()?;
@@ -2570,9 +2625,10 @@ fn load_source_snapshot(root: &Path, path: &str) -> SourceSnapshot {
                 | rustix::fs::OFlags::NOFOLLOW
                 | rustix::fs::OFlags::CLOEXEC
         };
-        let Ok(opened) = rustix::fs::openat(&directory, *part, flags, rustix::fs::Mode::empty())
-        else {
-            return SourceSnapshot::Unavailable;
+        let opened = match rustix::fs::openat(&directory, *part, flags, rustix::fs::Mode::empty()) {
+            Ok(opened) => opened,
+            Err(rustix::io::Errno::NOENT) => return SourceSnapshot::Missing,
+            Err(_) => return SourceSnapshot::Unavailable,
         };
         let file = std::fs::File::from(opened);
         if final_component {
@@ -2636,6 +2692,7 @@ fn project_matching_source(
         if separator_bytes != 0 {
             excerpt.push('\n');
         }
+        let line = redact_source_line(line);
         if line.len() > remaining {
             let mut boundary = remaining.min(line.len());
             while !line.is_char_boundary(boundary) {
@@ -2645,7 +2702,7 @@ fn project_matching_source(
             truncated = true;
             break;
         }
-        excerpt.push_str(line);
+        excerpt.push_str(&line);
     }
     if !found {
         return unavailable_source(path, start_line, end_line);
@@ -2658,6 +2715,89 @@ fn project_matching_source(
         excerpt: Some(excerpt),
         truncated,
     })
+}
+
+/// Source file extensions a recorded path may carry (adapter-supplied hashes prove
+/// nothing about authenticity, so the path gate is the control).
+const SOURCE_EXTENSIONS: [&str; 12] =
+    ["java", "kt", "scala", "groovy", "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
+
+/// True for a repository-relative source path that is safe to read and show:
+/// relative, forward-slash separated, no empty, dot or dot-directory segment
+/// (`.env`, `.git`, `.xtrace`, `..`), no `node_modules` segment, and a known
+/// source extension.
+fn is_safe_repo_relative_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.len() > 256
+        || path.starts_with('/')
+        || path.contains(['\\', '\0', '\n', '\r'])
+    {
+        return false;
+    }
+    let mut segments = path.split('/').peekable();
+    while let Some(segment) = segments.next() {
+        if segment.is_empty() || segment.starts_with('.') || segment == "node_modules" {
+            return false;
+        }
+        if segments.peek().is_none() {
+            let Some((_, extension)) = segment.rsplit_once('.') else {
+                return false;
+            };
+            return SOURCE_EXTENSIONS.contains(&extension);
+        }
+    }
+    false
+}
+
+/// Replacement shown instead of an excerpt line that looks like a credential.
+const SOURCE_LINE_REDACTION: &str = "[redacted by x-trace]";
+
+/// Replaces a whole line that matches the ADR 0003 content patterns (JWT, AWS
+/// access key id, PEM block, bearer token).
+fn redact_source_line(line: &str) -> String {
+    if source_line_has_secret_shape(line) {
+        SOURCE_LINE_REDACTION.to_owned()
+    } else {
+        line.to_owned()
+    }
+}
+
+fn source_line_has_secret_shape(line: &str) -> bool {
+    if line.contains("-----BEGIN ") {
+        return true;
+    }
+    let bytes = line.as_bytes();
+    // AKIA followed by sixteen upper-case letters or digits.
+    for (index, window) in bytes.windows(20).enumerate() {
+        let _ = index;
+        if window.starts_with(b"AKIA")
+            && window[4..].iter().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    // Bearer <token>
+    if let Some(position) = line.find("Bearer ") {
+        let token = &line[position + "Bearer ".len()..];
+        if token.chars().take_while(|ch| !ch.is_whitespace() && *ch != '"').count() >= 8 {
+            return true;
+        }
+    }
+    // JWT: eyJ<base64url>.<base64url>.<base64url?>
+    let mut rest = line;
+    while let Some(position) = rest.find("eyJ") {
+        let candidate = &rest[position..];
+        let token: String = candidate
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+            .collect();
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() >= 3 && parts[0].len() >= 8 && parts[1].len() >= 8 {
+            return true;
+        }
+        rest = &candidate[3..];
+    }
+    false
 }
 
 fn unavailable_source(
@@ -2819,6 +2959,109 @@ mod source_projection_tests {
         let excerpt = projected.excerpt.expect("matched excerpt");
         assert_eq!(excerpt.len(), MAX_SOURCE_EXCERPT_BYTES);
         assert!(projected.truncated);
+    }
+
+    fn write_at(root: &Path, relative: &str, bytes: &[u8]) {
+        let file = root.join(relative);
+        std::fs::create_dir_all(file.parent().expect("parent exists")).expect("directory created");
+        std::fs::write(file, bytes).expect("source written");
+    }
+
+    #[test]
+    fn non_fixture_path_projects_source() {
+        let root = tempdir();
+        let path = "services/petclinic/src/main/java/org/petclinic/OwnerController.java";
+        let bytes = b"package x;\nclass OwnerController {\n  void list() {}\n}\n";
+        write_at(root.path(), path, bytes);
+        let projected = project(&range(path, ContentHash::of_bytes(bytes)), Some(root.path()))
+            .expect("generic source projection");
+        assert_eq!(projected.status, SourceStatus::Matched);
+        assert_eq!(projected.excerpt.as_deref(), Some("class OwnerController {\n  void list() {}"));
+        let ts = "src/routes/users.ts";
+        write_at(root.path(), ts, b"a\nb\nc\n");
+        assert!(
+            project(&range(ts, ContentHash::of_bytes(b"a\nb\nc\n")), Some(root.path())).is_some()
+        );
+    }
+
+    #[test]
+    fn missing_file_status_missing_file() {
+        let root = tempdir();
+        let projected = project(
+            &range("src/main/java/Gone.java", ContentHash::of_bytes(b"x")),
+            Some(root.path()),
+        )
+        .expect("missing file projection");
+        assert_eq!(projected.status, SourceStatus::MissingFile);
+        assert!(projected.excerpt.is_none());
+    }
+
+    #[test]
+    fn path_traversal_and_absolute_paths_rejected() {
+        let root = tempdir();
+        for path in [
+            "../outside/Secret.java",
+            "src/../../Secret.java",
+            "/etc/Passwd.java",
+            "src//Double.java",
+            "src\\Back.java",
+            "",
+        ] {
+            assert!(
+                project(&range(path, ContentHash::of_bytes(b"x")), Some(root.path())).is_none(),
+                "{path:?} must not project"
+            );
+        }
+    }
+
+    #[test]
+    fn dotenv_path_refused() {
+        assert!(!is_safe_repo_relative_path(".env"));
+        assert!(!is_safe_repo_relative_path("config/.env.ts"));
+    }
+
+    #[test]
+    fn git_config_path_refused() {
+        assert!(!is_safe_repo_relative_path(".git/config"));
+        assert!(!is_safe_repo_relative_path(".xtrace/state.ts"));
+        assert!(!is_safe_repo_relative_path(".github/workflows/ci.ts"));
+    }
+
+    #[test]
+    fn config_yml_non_source_extension_refused() {
+        assert!(!is_safe_repo_relative_path("src/main/resources/application.yml"));
+        assert!(!is_safe_repo_relative_path("README.md"));
+        assert!(!is_safe_repo_relative_path("src/Makefile"));
+        assert!(!is_safe_repo_relative_path("node_modules/pkg/index.js"));
+        assert!(is_safe_repo_relative_path("src/main/java/a/B.java"));
+        assert!(is_safe_repo_relative_path("lib/server.mjs"));
+    }
+
+    #[test]
+    fn source_line_with_akia_literal_redacted_in_excerpt() {
+        let root = tempdir();
+        let path = "src/Config.java";
+        let bytes = format!(
+            "header\nString key = \"{}\";\nplain line\nBearer abcdefghijkl\n",
+            ["AKIA", "ABCDEFGHIJKLMNOP"].concat()
+        );
+        write_at(root.path(), path, bytes.as_bytes());
+        let mut source = range(path, ContentHash::of_bytes(bytes.as_bytes()));
+        source.start_line = Some(2);
+        source.end_line = Some(4);
+        let projected = project(&source, Some(root.path())).expect("projection");
+        let excerpt = projected.excerpt.expect("excerpt");
+        assert_eq!(excerpt, "[redacted by x-trace]\nplain line\n[redacted by x-trace]");
+        assert!(!excerpt.contains("ABCDEFGHIJKLMNOP"));
+    }
+
+    #[test]
+    fn jwt_and_pem_lines_are_redacted() {
+        assert!(source_line_has_secret_shape(
+            "token = \"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123_-signature\""
+        ));
+        assert!(source_line_has_secret_shape("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(!source_line_has_secret_shape("String s = \"eyJ\";"));
     }
 
     #[cfg(unix)]
