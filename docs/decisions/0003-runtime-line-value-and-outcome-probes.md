@@ -26,7 +26,10 @@
   absence of an observation is never evidence that a line did not execute.
 - **Mode**: `standard` (default background capture) or `focused` (armed by
   `CaptureCommand.ARM_FOCUSED_CAPTURE` for Java, or chosen at launch for
-  Node, see section 3.6).
+  Node, see section 3.6). (Note 2026-10-10: the daemon has no
+  `ARM_FOCUSED_CAPTURE` path; focused capture is armed from the launch's private
+  `capture.json`, and an unarmed focused claim is recorded as the
+  `capture_policy_not_armed` limitation. See ADR 0011.)
 - **Value state**: exactly one of the five existing `CapturedValue` states
   (`captured`, `redacted`, `truncated`, `unavailable`, `dropped`). No sixth
   state and no empty-string stand-in is introduced.

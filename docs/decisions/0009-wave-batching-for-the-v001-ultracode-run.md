@@ -1,6 +1,6 @@
 # ADR 0009: Wave batching for the v0.01 unattended run
 
-- Status: Accepted (owner authorization, 2026-10-09, for one run only)
+- Status: Accepted (owner authorization, 2026-10-09, for one run only); extended to a second batch by the 2026-10-10 addendum below
 - Date: 2026-10-09
 - Amends: ADR 0006 (v0.01 integration and acceptance mechanics), for the
   duration of one owner-authorized unattended batch. Outside that batch,
@@ -115,3 +115,69 @@ skips, unreached code or synthetic traces never count as a pass.
   the leased floors and macOS-only journeys.
 - A wave that cannot pass acceptance in time stays pushed and unmerged, with
   the reason recorded; the batch never trades correctness for the deadline.
+
+## Addendum (2026-10-10): a second batch
+
+- Status: Accepted (owner authorization, 2026-10-10, for one run only)
+- Date: 2026-10-10
+- Context: the first batch ended without a merge. Linux CI passed on the
+  parent `b7b260f` of its candidate `ultra/rc-2` (run 37963545129). On the
+  candidate heads `85c0d1d` and `4c699ed`, both hosted macOS arm64 jobs failed in
+  the Rust test step, the leased macOS floor on `85c0d1d` failed at gate 18
+  (`rust-workspace`), and the delta review left open majors. The owner authorized a second unattended batch of at most
+  ten hours to finish that candidate, merge it to `main`, and then work toward
+  the exit criteria of issue #3 (S1) and, if time allows, issue #4 (S2).
+
+### Decision
+
+Sections 1 to 5 above apply to the second batch, with these changes.
+
+1. **Scope.** Wave A finishes `ultra/rc-2` as `ultra/rc-3` and merges it to
+   `main`. Wave B works on the exit criteria of #3. Wave C, a stretch goal, works
+   on the exit criteria of #4 and starts only after wave B is merged and green
+   on `main`. Each wave that passes acceptance merges to `main` on its own. No
+   new framework breadth (WebFlux, Servlet/Jersey, Fastify/Nest, interactions)
+   is started.
+2. **Deadline.** A hard stop ten hours after the recorded start, a feature
+   freeze at eight hours thirty minutes, and no merge started after seven hours
+   thirty minutes.
+3. **Names.** Lane branches are `ultra/r2w<N>-<lane>`; candidates continue as
+   `ultra/rc-<n>`.
+4. **Merge-gating campaign jobs.** Wave A: `select`, `package` and
+   `package-verify` (Petclinic is recorded but does not gate). Wave B: Petclinic,
+   green with no `not-implemented` step. Wave C: Petclinic and the scan jobs.
+   Other campaign projects are recorded as expected-red and do not gate.
+   Campaign receipts stay non-release artifacts and are never committed.
+5. **Merge record.** Before each merge, a fresh auditor writes a merge-gate
+   record from raw data: `main` still equals the recorded base, every check run
+   on the exact candidate head succeeded, the leased macOS floor receipt is
+   23/23 for that head and base, the review report digests and the diff digest
+   match, no blocker or major survives, and no closing keyword appears in the
+   merge range. The merge is a `--no-ff` merge made from `origin/main` whose tree
+   is identical to the candidate's, pushed without force.
+6. **After each merge.** `main` CI and a leased macOS floor run on the merge
+   commit, with the pre-merge base for gate 23. If either is red, the fix comes
+   before new feature work; if it cannot be green within sixty minutes, or by
+   thirty minutes before the hard stop, the merge is reverted with
+   `git revert -m 1` and the reason is recorded.
+7. **Phase records.** Each merge gets a phase receipt under
+   `evidence/v0.01/phases/` as ADR 0006 §3 describes. A phase is marked
+   accepted in `evidence/v0.01/workflow.json` only when its receipt is complete
+   and the post-merge checks are green; otherwise it stays pending and the
+   progress entry says why.
+8. **No weakened deadlines.** No test deadline, timeout or product budget is
+   raised to make a candidate pass. If a fix cannot meet the original values,
+   the wave stays pushed and unmerged and the measurements are recorded. The
+   deadlines already raised on `ultra/rc-2` (Express child wait 20 to 90 s,
+   premain recording wait 10 to 60 s, finish acknowledgement 5 to 60 s, scan
+   timeout 1 to 5 s) are restored to their earlier values before `ultra/rc-3`
+   can be a merge candidate; otherwise it stays unmerged.
+9. **Decision records this batch may add**, each with its own security review
+   and each listed for the owner to ratify afterwards: an amendment to ADR 0008,
+   only if the macOS admission fix cannot stay inside it; an addendum that scopes
+   the other-UID broker negative of ADR 0006 §2.3 to the phase where the broker
+   exists (P04) and requires an other-UID private-storage negative on the hosted
+   macOS runner for P01 to P03 instead; and ADR 0011 for the recording
+   limitations contract.
+
+ADR 0006 §2 gates are not waived by this addendum.
