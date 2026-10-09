@@ -267,6 +267,8 @@ impl Operation {
 
     #[cfg(target_os = "macos")]
     fn take_batch(&self, paths: &[std::path::PathBuf]) -> Option<Prefetched> {
+        #[cfg(test)]
+        BATCH_ATTEMPTS.with(|count| count.set(count.get() + 1));
         let names = paths.iter().map(|path| path.to_str()).collect::<Option<Vec<_>>>()?;
         let before =
             paths.iter().map(|path| std::fs::symlink_metadata(path).ok()).collect::<Vec<_>>();
@@ -405,7 +407,9 @@ pub(crate) fn directory_acl_admits(
     if DirectoryState::of(&after, role) == state {
         operation.remember(state);
         if let Some(key) = scope_key {
-            if operation.scope_key(DirectoryState::of(&after, role), directory).as_ref() == Some(&key) {
+            if operation.scope_key(DirectoryState::of(&after, role), directory).as_ref()
+                == Some(&key)
+            {
                 operation.scope_remember(key);
             }
         }
@@ -645,6 +649,13 @@ const BATCH_OUTPUT_LIMIT: usize = 512 * 1024;
 #[cfg(all(target_os = "macos", test))]
 thread_local! {
     static LS_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BATCH_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of batched listings this thread has attempted. Test seam for the lazy-batch rule.
+#[cfg(all(target_os = "macos", test))]
+pub(crate) fn batch_attempt_count() -> usize {
+    BATCH_ATTEMPTS.with(std::cell::Cell::get)
 }
 
 /// Number of `/bin/ls` processes this thread has spawned. Test seam for spawn-count bounds.
@@ -966,6 +977,169 @@ mod tests {
         std::fs::rename(&named, root.path().join("moved")).expect("move original");
         std::os::unix::fs::symlink(root.path().join("moved"), &named).expect("symlink");
         assert!(!judge(&operation, &named, &original));
+    }
+
+    // ---- admission scope (ADR 0008 Amendment 1) ------------------------------------------
+
+    use crate::scope::AdmissionScope;
+
+    #[test]
+    fn operations_in_one_scope_share_a_verdict_and_probe_once() {
+        let root = fixture();
+        let directory = open(root.path());
+        let _scope = AdmissionScope::enter();
+        let before = directory_probe_count();
+        for _ in 0..4 {
+            assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        }
+        assert_eq!(directory_probe_count() - before, 1);
+    }
+
+    #[test]
+    fn nothing_is_remembered_after_the_scope_is_dropped() {
+        let root = fixture();
+        let directory = open(root.path());
+        let before = directory_probe_count();
+        {
+            let _scope = AdmissionScope::enter();
+            assert!(judge(&Operation::memoizing(), root.path(), &directory));
+            assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        }
+        assert_eq!(directory_probe_count() - before, 1);
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        assert_eq!(directory_probe_count() - before, 2, "no scope: a fresh operation probes");
+        // A later scope starts empty too.
+        let _scope = AdmissionScope::enter();
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        assert_eq!(directory_probe_count() - before, 3);
+    }
+
+    #[test]
+    fn a_nested_scope_joins_the_outer_one_and_the_memo_outlives_only_the_outer_guard() {
+        let root = fixture();
+        let directory = open(root.path());
+        let before = directory_probe_count();
+        let outer = AdmissionScope::enter();
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        {
+            let _inner = AdmissionScope::enter();
+            assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        }
+        assert!(judge(&Operation::memoizing(), root.path(), &directory), "inner drop keeps it");
+        assert_eq!(directory_probe_count() - before, 1);
+        drop(outer);
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        assert_eq!(directory_probe_count() - before, 2);
+    }
+
+    #[test]
+    fn an_operation_made_before_the_scope_or_under_a_dropped_one_never_uses_it() {
+        let root = fixture();
+        let directory = open(root.path());
+        let early = Operation::memoizing();
+        let scope = AdmissionScope::enter();
+        let stale = Operation::memoizing();
+        let before = directory_probe_count();
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        assert!(judge(&early, root.path(), &directory), "early op has only its own memo");
+        assert_eq!(directory_probe_count() - before, 2);
+        drop(scope);
+        // A new scope has a new id: an operation made under the old one stays out of it.
+        let _again = AdmissionScope::enter();
+        let before = directory_probe_count();
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        assert!(judge(&stale, root.path(), &directory), "stale-scope op probes for itself");
+        assert_eq!(directory_probe_count() - before, 2);
+    }
+
+    #[test]
+    fn a_scope_verdict_is_not_visible_on_another_thread() {
+        let root = fixture();
+        let directory = open(root.path());
+        let _scope = AdmissionScope::enter();
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        let path = root.path().to_path_buf();
+        let other_thread_probes = std::thread::spawn(move || {
+            let directory = open(&path);
+            let before = directory_probe_count();
+            assert!(judge(&Operation::memoizing(), &path, &directory));
+            assert!(judge(&Operation::memoizing(), &path, &directory));
+            let without_scope = directory_probe_count() - before;
+            // Its own scope starts empty, whatever this thread's scope holds.
+            let _own = AdmissionScope::enter();
+            let before = directory_probe_count();
+            assert!(judge(&Operation::memoizing(), &path, &directory));
+            assert!(judge(&Operation::memoizing(), &path, &directory));
+            (without_scope, directory_probe_count() - before)
+        })
+        .join()
+        .expect("other thread");
+        assert_eq!(other_thread_probes, (2, 1));
+    }
+
+    #[test]
+    fn a_scope_past_its_cap_probes_afresh() {
+        let root = fixture();
+        let directory = open(root.path());
+        let _scope = AdmissionScope::enter_with_cap(Duration::from_millis(150));
+        let waiting = Operation::memoizing();
+        let before = directory_probe_count();
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        assert_eq!(directory_probe_count() - before, 1);
+        std::thread::sleep(Duration::from_millis(200));
+        // Both an operation made before the cap and ones made after it behave as in the base ADR.
+        assert!(judge(&waiting, root.path(), &directory));
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        assert_eq!(directory_probe_count() - before, 4);
+    }
+
+    #[test]
+    fn a_scope_verdict_is_not_served_after_a_mode_change_or_to_another_profile() {
+        let root = fixture();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private mode");
+        let directory = open(root.path());
+        let _scope = AdmissionScope::enter();
+        let before = directory_probe_count();
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        // Same state, a different profile: never served from the Durable verdict.
+        let ephemeral =
+            Operation::memoizing().with_profile(crate::policy::FilesystemProfile::Ephemeral);
+        assert!(judge(&ephemeral, root.path(), &directory));
+        assert_eq!(directory_probe_count() - before, 2);
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        assert_eq!(directory_probe_count() - before, 2, "same profile and state is a hit");
+        // A mode change advances the state: probed again under the new identity.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o750))
+            .expect("loosen mode");
+        assert!(judge(&Operation::memoizing(), root.path(), &directory));
+        assert_eq!(directory_probe_count() - before, 3);
+    }
+
+    #[test]
+    fn the_scope_key_separates_state_filesystem_flags_and_profile() {
+        let root = fixture();
+        let directory = open(root.path());
+        let metadata = directory.metadata().expect("metadata");
+        let state = DirectoryState::of(&metadata, DirectoryRole::Traversed);
+        let durable = FilesystemProfile::Durable;
+        let base = MemoKey::from_parts(state, "fs-a".to_owned(), 0x10, durable);
+        assert_eq!(base, MemoKey::from_parts(state, "fs-a".to_owned(), 0x10, durable));
+        assert_ne!(base, MemoKey::from_parts(state, "fs-b".to_owned(), 0x10, durable), "fsid");
+        assert_ne!(base, MemoKey::from_parts(state, "fs-a".to_owned(), 0x11, durable), "flags");
+        assert_ne!(
+            base,
+            MemoKey::from_parts(state, "fs-a".to_owned(), 0x10, FilesystemProfile::Ephemeral),
+            "profile"
+        );
+        let moved = DirectoryState { ctime_nanoseconds: state.ctime_nanoseconds + 1, ..state };
+        assert_ne!(base, MemoKey::from_parts(moved, "fs-a".to_owned(), 0x10, durable), "ctime");
+        // The real descriptor key is deterministic and carries the descriptor's filesystem.
+        let key = MemoKey::of_descriptor(state, &directory, durable).expect("key from fstatfs");
+        assert_eq!(Some(key), MemoKey::of_descriptor(state, &directory, durable));
     }
 
     #[cfg(target_os = "macos")]
