@@ -351,9 +351,9 @@ fn router<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static>(
         .route("/api/v1/recordings/:recording_id", get(show_recording))
         .route(
             "/api/v1/recordings/:recording_id/frames/:frame_id/navigation",
-            get(replay_not_implemented_frame_navigation),
+            get(frame_navigation_route),
         )
-        .route("/api/v1/recordings/:recording_id/navigate", get(replay_not_implemented_navigate))
+        .route("/api/v1/recordings/:recording_id/navigate", get(navigate_route))
         .route("/api/v1/recordings/:recording_id/frames", get(replay_not_implemented_frames))
         .route("/api/v1/recordings/:recording_id/graph", get(replay_not_implemented_graph))
         .route("/api/v1/endpoints", get(list_observed_endpoints))
@@ -968,26 +968,160 @@ async fn replay_not_implemented_guarded<P>(
     replay_not_implemented_response(request_id)
 }
 
-async fn replay_not_implemented_frame_navigation<P>(
+/// Resolves the viewer guards and the path ids shared by the per-frame routes.
+async fn frame_route_preamble<P>(
+    state: &ViewerState<P>,
+    headers: &HeaderMap,
+    recording_id: &str,
+    request_id: CorrelationId,
+) -> Result<RecordingId, Response> {
+    if let Some(rejection) = viewer_guard_rejection(headers, state, request_id).await {
+        return Err(rejection);
+    }
+    recording_id.parse::<RecordingId>().map_err(|_| {
+        problem_with_id(
+            StatusCode::NOT_FOUND,
+            "XTR-NOT-FOUND-RECORDING",
+            "Recording was not found",
+            request_id,
+        )
+    })
+}
+
+fn frame_not_found(request_id: CorrelationId) -> Response {
+    problem_with_id(
+        StatusCode::NOT_FOUND,
+        "XTR-NOT-FOUND-RECORDING",
+        "Recording frame was not found",
+        request_id,
+    )
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransportFrameNavigation {
+    #[serde(flatten)]
+    view: xtrace_application::FrameNavigationView,
+    request_id: CorrelationId,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransportNavigateResult {
+    frame_id: xtrace_domain::FrameId,
+    action: &'static str,
+    result: xtrace_application::NavigationResult,
+    request_id: CorrelationId,
+}
+
+#[derive(Deserialize)]
+struct NavigateParams {
+    frame: Option<String>,
+    action: Option<String>,
+    kinds: Option<String>,
+    kind: Option<String>,
+    dir: Option<String>,
+}
+
+async fn frame_navigation_route<P>(
     State(state): State<Arc<ViewerState<P>>>,
     headers: HeaderMap,
-    Path((recording_id, _frame_id)): Path<(String, String)>,
+    Path((recording_id, frame_id)): Path<(String, String)>,
 ) -> Response
 where
     P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static,
 {
-    replay_not_implemented_guarded(&state, &headers, &recording_id).await
+    let request_id = CorrelationId::new();
+    let recording_id = match frame_route_preamble(&state, &headers, &recording_id, request_id).await
+    {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let Ok(frame_id) = frame_id.parse::<xtrace_domain::FrameId>() else {
+        return frame_not_found(request_id);
+    };
+    let service = state.recording_service.clone();
+    let project_id = state.project_id;
+    let view = match run_recording_query(&state, request_id, move || {
+        service.frame_navigation(project_id, recording_id, frame_id, request_id)
+    })
+    .await
+    {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    success_json(TransportFrameNavigation { view, request_id }, request_id)
 }
 
-async fn replay_not_implemented_navigate<P>(
+async fn navigate_route<P>(
     State(state): State<Arc<ViewerState<P>>>,
     headers: HeaderMap,
     Path(recording_id): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Response
 where
     P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static,
 {
-    replay_not_implemented_guarded(&state, &headers, &recording_id).await
+    let request_id = CorrelationId::new();
+    let recording_id = match frame_route_preamble(&state, &headers, &recording_id, request_id).await
+    {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let invalid = || {
+        problem_with_id(
+            StatusCode::BAD_REQUEST,
+            "XTR-VALIDATION-RECORDING-QUERY",
+            "Recording query is invalid",
+            request_id,
+        )
+    };
+    let Ok(params) = parse_query::<NavigateParams>(
+        query.as_deref(),
+        &["frame", "action", "kinds", "kind", "dir"],
+    ) else {
+        return problem_with_id(
+            StatusCode::BAD_REQUEST,
+            "XTR-VIEWER-QUERY",
+            "Recording query is invalid",
+            request_id,
+        );
+    };
+    // The kind-filtered step and the gap/error/interaction jump are registered but
+    // not served yet; they are never answered with an unfiltered result.
+    if params.kinds.is_some() || params.kind.is_some() || params.dir.is_some() {
+        return replay_not_implemented_response(request_id);
+    }
+    let Some(action) =
+        params.action.as_deref().and_then(xtrace_application::NavigationAction::parse)
+    else {
+        return invalid();
+    };
+    let Some(frame) = params.frame.as_deref() else {
+        return invalid();
+    };
+    let Ok(frame_id) = frame.parse::<xtrace_domain::FrameId>() else {
+        return frame_not_found(request_id);
+    };
+    let service = state.recording_service.clone();
+    let project_id = state.project_id;
+    let view = match run_recording_query(&state, request_id, move || {
+        service.frame_navigation(project_id, recording_id, frame_id, request_id)
+    })
+    .await
+    {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    success_json(
+        TransportNavigateResult {
+            frame_id: view.frame_id,
+            action: action.as_str(),
+            result: action.select(&view.navigation),
+            request_id,
+        },
+        request_id,
+    )
 }
 
 async fn replay_not_implemented_frames<P>(
@@ -1088,15 +1222,23 @@ where
             request_id,
         );
     };
-    if params.around_frame.is_some() || projection_structure {
+    if projection_structure {
         return replay_not_implemented_response(request_id);
     }
+    let around_frame = match params.around_frame.as_deref() {
+        None => None,
+        Some(raw) => match raw.parse::<xtrace_domain::FrameId>() {
+            Ok(frame_id) => Some(frame_id),
+            Err(_) => return frame_not_found(request_id),
+        },
+    };
     let service = state.recording_service.clone();
     let request = ShowRecording {
         project_id: state.project_id,
         recording_id,
         limit: params.limit.unwrap_or(200),
         cursor: params.cursor,
+        around_frame,
     };
     let detail =
         match run_recording_query(&state, request_id, move || service.show(request, request_id))
@@ -1615,6 +1757,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use xtrace_application::FrameNavigationView;
     use xtrace_application::observed_endpoint_queries::{
         ObservedEndpointKey, ObservedEndpointRecord, ObservedRecordingKey, ObservedRecordingRecord,
     };
@@ -1623,7 +1766,7 @@ mod tests {
         ObservedEndpointReadPort, PortError, PortErrorKind, ProjectRepository,
         RecordingEventWindow, RecordingMetadata, RecordingPersistencePort, ShowWindowRequest,
     };
-    use xtrace_domain::{Project, RepositoryFingerprint, RuntimeSessionId, WallTime};
+    use xtrace_domain::{FrameId, Project, RepositoryFingerprint, RuntimeSessionId, WallTime};
     use xtrace_store::{
         OpenOptions, SqliteRecordingPersistence, SqliteRecordingReader, SqliteStore,
     };
@@ -1651,6 +1794,19 @@ mod tests {
     }
 
     impl RecordingReadPort for ReadFixture {
+        fn frame_navigation(
+            &self,
+            _project_id: ProjectId,
+            _recording_id: RecordingId,
+            _frame_id: FrameId,
+        ) -> Result<FrameNavigationView, PortError> {
+            Err(PortError::new(
+                PortErrorKind::NotFound,
+                "fixture has no frames",
+                CorrelationId::new(),
+            ))
+        }
+
         fn list_recordings(
             &self,
             _project_id: ProjectId,
@@ -1985,19 +2141,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_routes_are_guarded_and_answer_501_until_implemented() {
+    async fn replay_routes_are_guarded_and_unserved_forms_answer_501() {
         let viewer = start().await;
         let recording = RecordingId::new();
         let frame = xtrace_domain::FrameId::new();
-        let paths = [
-            format!("/api/v1/recordings/{recording}/frames/{frame}/navigation"),
-            format!("/api/v1/recordings/{recording}/navigate?frame={frame}&action=next"),
+        let unserved = [
             format!("/api/v1/recordings/{recording}/frames?fromOrdinal=0&limit=10"),
             format!("/api/v1/recordings/{recording}/graph"),
-            format!("/api/v1/recordings/{recording}?aroundFrame={frame}&limit=50"),
             format!("/api/v1/recordings/{recording}?projection=structure&limit=500"),
+            format!("/api/v1/recordings/{recording}/navigate?frame={frame}&kind=gap&dir=next"),
         ];
-        for path in &paths {
+        // The served routes resolve the frame through the read port; the fixture has no frames.
+        let served = [
+            format!("/api/v1/recordings/{recording}/frames/{frame}/navigation"),
+            format!("/api/v1/recordings/{recording}/navigate?frame={frame}&action=next"),
+            format!("/api/v1/recordings/{recording}?aroundFrame={frame}&limit=50"),
+        ];
+        for path in unserved.iter().chain(&served) {
             let unauthenticated = format!(
                 "GET {path} HTTP/1.1\r\n{}Connection: close\r\n\r\n",
                 request_headers(&viewer.host, &viewer.origin)
@@ -2008,25 +2168,36 @@ mod tests {
             );
         }
         let cookie = authenticate(&viewer).await;
-        for path in &paths {
-            let raw = format!(
+        let get = |path: &str| {
+            format!(
                 "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
                 request_headers(&viewer.host, &viewer.origin)
-            );
-            let response = request(&viewer.host, &raw).await;
+            )
+        };
+        for path in &unserved {
+            let response = request(&viewer.host, &get(path)).await;
             assert!(response.starts_with("HTTP/1.1 501"), "{path}: {response}");
             assert!(response.contains("XTR-REPLAY-NOT-IMPLEMENTED"), "{path}: {response}");
+        }
+        for path in &served {
+            let response = request(&viewer.host, &get(path)).await;
+            assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+            assert!(!response.contains("XTR-REPLAY-NOT-IMPLEMENTED"), "{path}: {response}");
         }
         for (path, status) in [
             (format!("/api/v1/recordings/{recording}?cursor=abc&aroundFrame={frame}"), "400"),
             (format!("/api/v1/recordings/{recording}?projection=other"), "400"),
+            (
+                format!("/api/v1/recordings/{recording}/navigate?frame={frame}&action=sideways"),
+                "400",
+            ),
+            (format!("/api/v1/recordings/{recording}/navigate?action=next"), "400"),
+            (format!("/api/v1/recordings/{recording}/frames/not-a-frame/navigation"), "404"),
+            (format!("/api/v1/recordings/{recording}?aroundFrame=not-a-frame"), "404"),
             ("/api/v1/recordings/not-a-recording/graph".to_owned(), "404"),
+            ("/api/v1/recordings/not-a-recording/navigate?frame=x&action=next".to_owned(), "404"),
         ] {
-            let raw = format!(
-                "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
-                request_headers(&viewer.host, &viewer.origin)
-            );
-            let response = request(&viewer.host, &raw).await;
+            let response = request(&viewer.host, &get(&path)).await;
             assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{path}: {response}");
         }
     }

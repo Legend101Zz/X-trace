@@ -25,11 +25,13 @@ use xtrace_application::recording::{
 const MAX_TERMINAL_REQUEST_JSON_BYTES: usize = 64 * 1024;
 use xtrace_application::recording_queries::{
     FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES,
-    NavigationResult, NavigationUnavailable, PersistedEvent, PersistedInteraction,
-    PersistedOutcome, PersistedSource, RecordingCapacity, RecordingCompletionEvidence,
-    RecordingEventWindow, RecordingMetadata, RecordingStatus, ShowWindowRequest, SourceStatus,
+    NavigationResult, NavigationUnavailable, PersistedBinding, PersistedEvent, PersistedGap,
+    PersistedInteraction, PersistedOutcome, PersistedSource, PersistedValue, RecordingCapacity,
+    RecordingCompletionEvidence, RecordingEventWindow, RecordingMetadata, RecordingStatus,
+    ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
+use xtrace_domain::is_projectable_source_path;
 use xtrace_domain::{
     ContentHash, CorrelationId, ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointIdentity, HttpMethod,
     ProjectId, RecordingId, RuntimeSessionId, SourceBinding, SourceRange, Transport, WallTime,
@@ -693,9 +695,15 @@ impl SqliteRecordingStore<'_> {
                 event_cap: terminal
                     .as_ref()
                     .and_then(|finish| u32::try_from(finish.event_cap).ok()),
-                // No adapter outcome is persisted in this build; terminal
-                // evidence without one reads as `unobserved` (CONTRACTS 5).
-                outcome_kind: terminal.as_ref().map(|_| "unobserved".to_owned()),
+                // Terminal evidence without an adapter outcome (every pre-outcome
+                // row) reads `unobserved`; no terminal evidence reads `null` (CONTRACTS 5).
+                outcome_kind: terminal.as_ref().map(|finish| {
+                    finish
+                        .outcome
+                        .as_ref()
+                        .map_or("unobserved", |outcome| outcome.kind.as_str())
+                        .to_owned()
+                }),
             });
         }
         let has_more = recordings.len() > usize::try_from(limit).unwrap_or(usize::MAX);
@@ -703,6 +711,70 @@ impl SqliteRecordingStore<'_> {
             recordings.pop();
         }
         Ok((recordings, has_more))
+    }
+
+    /// Resolves every navigation edge of one indexed frame (CONTRACTS 8.2 `navigation`).
+    ///
+    /// The frame must belong to this project-owned recording; anything else is the same
+    /// not-found as an unknown recording so frame ids of other recordings are not probed.
+    pub(crate) fn read_frame_navigation(
+        &self,
+        project_id: ProjectId,
+        recording_id: RecordingId,
+        frame_id: xtrace_domain::FrameId,
+    ) -> Result<xtrace_application::FrameNavigationView, RecordingStoreError> {
+        let correlation_id = CorrelationId::new();
+        self.binding.revalidate(correlation_id)?;
+        let connection =
+            self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        let row: Option<(Vec<u8>, String)> = connection
+            .query_row(
+                "SELECT project_id, status FROM recordings WHERE recording_id = ?1",
+                rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        let Some((raw_project_id, status)) = row else {
+            return Err(read_not_found_error(correlation_id));
+        };
+        if project_id_from_bytes(&raw_project_id, correlation_id)? != project_id {
+            return Err(read_not_found_error(correlation_id));
+        }
+        let completion = completion_evidence(&connection, recording_id, &status, correlation_id)?;
+        let Some(frame) =
+            load_indexed_frame_by_id(&connection, recording_id, frame_id, correlation_id)?
+        else {
+            return Err(read_not_found_error(correlation_id));
+        };
+        let parent_frame_id = match frame.parent_seq {
+            Some(parent) => load_indexed_frame(&connection, recording_id, parent, correlation_id)?
+                .map(|parent| parent.frame_id),
+            None => None,
+        };
+        let (depth, navigation) = if frame.indexed {
+            (
+                Some(frame.depth),
+                navigate_indexed_frame(
+                    &connection,
+                    recording_id,
+                    &frame,
+                    completion,
+                    correlation_id,
+                )?,
+            )
+        } else {
+            (None, FrameNavigation::UNAVAILABLE)
+        };
+        Ok(xtrace_application::FrameNavigationView {
+            frame_id: frame.frame_id,
+            sequence: frame.sequence.to_string(),
+            depth,
+            parent_frame_id,
+            navigation,
+        })
     }
 
     /// Reads one bounded event window while fully verifying each decoded XTF object.
@@ -809,6 +881,8 @@ impl SqliteRecordingStore<'_> {
         let mut segment_count = 0_u64;
         let mut events: Vec<PersistedEvent> = Vec::new();
         let mut verified_frame_ids = HashMap::new();
+        // Sequence ranges of the segments decoded and verified by this read.
+        let mut decoded_ranges: Vec<(u64, u64)> = Vec::new();
         let event_limit = usize::try_from(request.limit)
             .map_err(|_| recording_query_validation_error(correlation_id))?;
         let mut has_more = false;
@@ -996,6 +1070,7 @@ impl SqliteRecordingStore<'_> {
                 return Err(object_corrupt_error(correlation_id));
             }
             verified_input_bytes = work_if_added.unwrap_or(segment_work);
+            decoded_ranges.push((first_sequence, last_sequence));
             index_verified_segment_frames(
                 &connection,
                 request.recording_id,
@@ -1042,14 +1117,55 @@ impl SqliteRecordingStore<'_> {
                 .sequence
                 .parse::<u64>()
                 .map_err(|_| recording_query_corrupt_error(correlation_id))?;
-            let (frame_id, navigation) = frame_navigation(
-                &connection,
-                request.recording_id,
-                sequence,
-                &verified_frame_ids,
-                completion,
-                correlation_id,
-            )?;
+            let indexed =
+                load_indexed_frame(&connection, request.recording_id, sequence, correlation_id)?
+                    .filter(|row| {
+                        row.indexed && verified_frame_ids.get(&sequence) == Some(&row.frame_id)
+                    });
+            let (frame_id, navigation) = if let Some(row) = &indexed {
+                let navigation = navigate_indexed_frame(
+                    &connection,
+                    request.recording_id,
+                    row,
+                    completion,
+                    correlation_id,
+                )?;
+                event.depth = Some(row.depth);
+                for (parent, slot) in [
+                    (row.parent_seq, &mut event.parent_frame_id),
+                    (row.async_parent_seq, &mut event.async_parent_frame_id),
+                ] {
+                    if let Some(parent) = parent {
+                        *slot = load_indexed_frame(
+                            &connection,
+                            request.recording_id,
+                            parent,
+                            correlation_id,
+                        )?
+                        .map(|parent| parent.frame_id);
+                    }
+                }
+                // A target inside a segment this read decoded must match its verified XTF
+                // event; a corrupt metadata row degrades that edge instead of being trusted.
+                let checked = check_navigation_targets(
+                    &connection,
+                    request.recording_id,
+                    navigation,
+                    &decoded_ranges,
+                    &verified_frame_ids,
+                    correlation_id,
+                )?;
+                (Some(row.frame_id), checked)
+            } else {
+                frame_navigation(
+                    &connection,
+                    request.recording_id,
+                    sequence,
+                    &verified_frame_ids,
+                    completion,
+                    correlation_id,
+                )?
+            };
             event.frame_id = frame_id;
             event.navigation = if frame_id.is_none() && event.kind == "request_update" {
                 // CONTRACTS 8.3: request updates are never frames.
@@ -1122,16 +1238,28 @@ impl SqliteRecordingStore<'_> {
             events,
             has_more,
             incomplete_evidence,
-            // Adapter outcomes are not persisted yet (RecordingOutcome has not
-            // landed), so terminal evidence reads as `unobserved`.
-            outcome: terminal_finish.as_ref().map(|_| PersistedOutcome {
-                kind: "unobserved".to_owned(),
-                http_status: None,
-                exception: None,
-                thrown_from_event_id: None,
+            // CONTRACTS 5: no terminal evidence reads `null`; terminal evidence without an
+            // adapter outcome (every pre-outcome row) reads `unobserved`, never `responded`.
+            outcome: terminal_finish.as_ref().map(|finish| {
+                let outcome = finish
+                    .outcome
+                    .clone()
+                    .unwrap_or_else(xtrace_domain::RecordingOutcome::legacy_unobserved);
+                PersistedOutcome {
+                    kind: outcome.kind.as_str().to_owned(),
+                    http_status: outcome.http_status,
+                    exception: outcome.exception.map(|exception| {
+                        xtrace_application::recording_queries::OutcomeException {
+                            exception_type: exception.exception_type,
+                            message: Some(exception.message).filter(|message| !message.is_empty()),
+                        }
+                    }),
+                    thrown_from_event_id: outcome.thrown_from_event_id,
+                }
             }),
             capacity,
             limitations: Vec::new(),
+            frame_honesty: load_frame_honesty(&connection, request.recording_id, correlation_id)?,
         })
     }
 
@@ -1453,6 +1581,7 @@ impl SqliteRecordingStore<'_> {
             || request.unsupported_capability_codes.len() > 64
             || request.unsupported_capability_codes.iter().any(|code| !stable_capability_code(code))
             || request.response_summary.as_ref().is_some_and(captured_value_has_preview)
+            || request.outcome.as_ref().is_some_and(|outcome| outcome.validate().is_err())
             || request.response_summary.as_ref().is_some_and(|value| {
                 matches!(value, xtrace_domain::CapturedValue::Redacted { rule_id, .. }
                     if rule_id != "unverified-producer-redaction")
@@ -1866,11 +1995,88 @@ fn valid_frame_identity(value: &str) -> bool {
         && value.as_bytes().iter().all(|byte| (0x20..=0x7e).contains(byte))
 }
 
+/// Deepest call depth the index stores; deeper frames saturate and carry
+/// `DEPTH_OVERFLOW` (CONTRACTS 6.2).
+const MAX_INDEXED_DEPTH: u32 = 4096;
+
+/// Wire `RecordingEventKind::Gap`.
+const WIRE_KIND_GAP: i32 = 14;
+
+/// Index facts of an already-indexed parent frame.
+#[derive(Clone, Copy)]
+struct IndexedParent {
+    sequence: u64,
+    depth: u32,
+}
+
+/// Looks up the parent frame by event-id digest: the in-segment map first, then
+/// the unique `(recording_id, event_id_digest)` index for earlier segments.
+fn resolve_indexed_parent(
+    transaction: &rusqlite::Transaction<'_>,
+    recording_id: RecordingId,
+    local: &HashMap<[u8; 32], IndexedParent>,
+    id: &str,
+    correlation_id: CorrelationId,
+) -> Result<Option<IndexedParent>, RecordingStoreError> {
+    if id.is_empty() {
+        return Ok(None);
+    }
+    let digest = *blake3::hash(id.as_bytes()).as_bytes();
+    if let Some(parent) = local.get(&digest) {
+        return Ok(Some(*parent));
+    }
+    let row: Option<(Vec<u8>, i64)> = transaction
+        .query_row(
+            "SELECT recording_seq, depth FROM recording_frame_index \
+             WHERE recording_id = ?1 AND event_id_digest = ?2",
+            rusqlite::params![recording_id.as_uuid().as_bytes().to_vec(), digest.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let Some((sequence, depth)) = row else {
+        return Ok(None);
+    };
+    let sequence = decode_stored_sequence(&sequence, correlation_id)?;
+    let depth = u32::try_from(depth).map_err(|_| recording_query_corrupt_error(correlation_id))?;
+    Ok(Some(IndexedParent { sequence, depth }))
+}
+
+/// Honesty bits derived from the bindings and kind of one event.
+fn frame_honesty_flags(event: &xtrace_protocol::generated::agent::RecordingEvent) -> u32 {
+    use xtrace_domain::honesty_flags as flags;
+    use xtrace_protocol::generated::agent::captured_value::Value as WireValue;
+
+    let mut bits = 0_u32;
+    if event.kind == WIRE_KIND_GAP {
+        bits |= flags::HAS_GAP;
+    }
+    for binding in &event.bindings {
+        bits |= flags::HAS_VALUES;
+        match binding.value.as_ref().and_then(|value| value.value.as_ref()) {
+            Some(WireValue::Redacted(_)) => bits |= flags::HAS_REDACTED,
+            Some(WireValue::Truncated(_)) => bits |= flags::HAS_TRUNCATED,
+            Some(WireValue::Unavailable(_)) | None => bits |= flags::HAS_UNAVAILABLE,
+            Some(WireValue::Dropped(_)) => bits |= flags::HAS_DROPPED,
+            Some(WireValue::Captured(_)) => {}
+        }
+    }
+    bits
+}
+
+/// Populates the v8 frame index for one segment in sequence order. Depth is
+/// `parent.depth + 1` and a parent that was never observed makes the frame a
+/// root flagged `ORPHAN_PARENT` (R3). There is no ancestor walk.
 fn insert_frame_index_rows(
     transaction: &rusqlite::Transaction<'_>,
     request: &SegmentCommitRequest,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    use xtrace_domain::honesty_flags as flags;
+
+    let mut local: HashMap<[u8; 32], IndexedParent> = HashMap::new();
     for (offset, envelope) in request.events.iter().enumerate() {
         let Some(event) = envelope.event.as_ref() else {
             return Err(segment_validation_error(correlation_id));
@@ -1886,12 +2092,44 @@ fn insert_frame_index_rows(
             .then(|| blake3::hash(event.parent_event_id.as_bytes()).as_bytes().to_vec());
         let async_parent_digest = (!event.async_parent_event_id.is_empty())
             .then(|| blake3::hash(event.async_parent_event_id.as_bytes()).as_bytes().to_vec());
+        let parent = resolve_indexed_parent(
+            transaction,
+            request.recording_id,
+            &local,
+            &event.parent_event_id,
+            correlation_id,
+        )?;
+        let async_parent = resolve_indexed_parent(
+            transaction,
+            request.recording_id,
+            &local,
+            &event.async_parent_event_id,
+            correlation_id,
+        )?;
+        let mut honesty = frame_honesty_flags(event);
+        let mut depth = 0_u32;
+        match parent {
+            Some(parent) => {
+                depth = parent.depth.saturating_add(1);
+                if depth > MAX_INDEXED_DEPTH {
+                    depth = MAX_INDEXED_DEPTH;
+                    honesty |= flags::DEPTH_OVERFLOW;
+                }
+            }
+            None if !event.parent_event_id.is_empty() => honesty |= flags::ORPHAN_PARENT,
+            None => {}
+        }
+        local.insert(
+            *event_digest.as_bytes(),
+            IndexedParent { sequence: event.recording_seq, depth },
+        );
         transaction
             .execute(
                 "INSERT INTO recording_frame_index \
                  (recording_id, recording_seq, frame_id, segment_ordinal, event_offset, \
-                  event_id_digest, parent_id_digest, async_parent_digest, monotonic_ns) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  event_id_digest, parent_id_digest, async_parent_digest, monotonic_ns, \
+                  depth, parent_seq, async_parent_seq, kind, honesty_flags, indexed_v) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1)",
                 rusqlite::params![
                     request.recording_id.as_uuid().as_bytes().to_vec(),
                     sequence.as_slice(),
@@ -1902,6 +2140,11 @@ fn insert_frame_index_rows(
                     parent_digest,
                     async_parent_digest,
                     event.monotonic_ns.to_be_bytes().as_slice(),
+                    i64::from(depth),
+                    parent.map(|parent| parent.sequence.to_be_bytes().to_vec()),
+                    async_parent.map(|parent| parent.sequence.to_be_bytes().to_vec()),
+                    i64::from(event.kind),
+                    i64::from(honesty),
                 ],
             )
             .map_err(|error| {
@@ -2303,6 +2546,7 @@ fn load_terminal_finish(
             && event_count.checked_add(1).is_none_or(|last| final_sequence < last))
         || stored_completion != completion_label_from_evidence(completion)
         || finish.response_summary.as_ref().is_some_and(captured_value_has_preview)
+        || finish.outcome.as_ref().is_some_and(|outcome| outcome.validate().is_err())
         || finish.response_summary.as_ref().is_some_and(|value| {
             matches!(value, xtrace_domain::CapturedValue::Redacted { rule_id, .. }
                 if rule_id != "unverified-producer-redaction")
@@ -2390,6 +2634,422 @@ fn frame_navigation(
             out: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
         },
     ))
+}
+
+/// Whole-recording honesty counts from the frame index flags, one SQL aggregate and no
+/// segment reads. `None` when any frame predates the index.
+fn load_frame_honesty(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    correlation_id: CorrelationId,
+) -> Result<Option<xtrace_application::FrameHonestyCounts>, RecordingStoreError> {
+    use xtrace_domain::honesty_flags as flags;
+
+    let counts = connection
+        .query_row(
+            "SELECT count(*), coalesce(sum(indexed_v = 1), 0), \
+             coalesce(sum((honesty_flags & ?2) != 0), 0), coalesce(sum((honesty_flags & ?3) != 0), 0), \
+             coalesce(sum((honesty_flags & ?4) != 0), 0), coalesce(sum((honesty_flags & ?5) != 0), 0), \
+             coalesce(sum((honesty_flags & ?6) != 0), 0), coalesce(sum((honesty_flags & ?7) != 0), 0) \
+             FROM recording_frame_index WHERE recording_id = ?1",
+            rusqlite::params![
+                recording_id.as_uuid().as_bytes().to_vec(),
+                i64::from(flags::HAS_GAP),
+                i64::from(flags::HAS_REDACTED),
+                i64::from(flags::HAS_TRUNCATED),
+                i64::from(flags::HAS_UNAVAILABLE),
+                i64::from(flags::HAS_DROPPED),
+                i64::from(flags::ORPHAN_PARENT),
+            ],
+            |row| {
+                let mut values = [0_i64; 8];
+                for (index, value) in values.iter_mut().enumerate() {
+                    *value = row.get(index)?;
+                }
+                Ok(values)
+            },
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let [total, indexed, gap, redacted, truncated, unavailable, dropped, orphan] = counts;
+    if total != indexed {
+        return Ok(None);
+    }
+    let as_count = |value: i64| u64::try_from(value).unwrap_or(0);
+    Ok(Some(xtrace_application::FrameHonestyCounts {
+        gap: as_count(gap),
+        redacted: as_count(redacted),
+        truncated: as_count(truncated),
+        unavailable: as_count(unavailable),
+        dropped: as_count(dropped),
+        orphan_parent: as_count(orphan),
+    }))
+}
+
+/// Replaces every navigation target that falls inside a segment decoded by this read but
+/// whose frame id is not the one verified against the XTF event with `partial_frontier`.
+fn check_navigation_targets(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    navigation: FrameNavigation,
+    decoded_ranges: &[(u64, u64)],
+    verified_frame_ids: &HashMap<u64, xtrace_domain::FrameId>,
+    correlation_id: CorrelationId,
+) -> Result<FrameNavigation, RecordingStoreError> {
+    let check = |result: NavigationResult| -> Result<NavigationResult, RecordingStoreError> {
+        let NavigationResult::Target { frame_id } = result else {
+            return Ok(result);
+        };
+        let Some(target) =
+            load_indexed_frame_by_id(connection, recording_id, frame_id, correlation_id)?
+        else {
+            return Ok(NavigationResult::unavailable(NavigationUnavailable::PartialFrontier));
+        };
+        let inside =
+            decoded_ranges.iter().any(|(first, last)| (*first..=*last).contains(&target.sequence));
+        if inside && verified_frame_ids.get(&target.sequence) != Some(&frame_id) {
+            return Ok(NavigationResult::unavailable(NavigationUnavailable::PartialFrontier));
+        }
+        Ok(result)
+    };
+    Ok(FrameNavigation {
+        previous: check(navigation.previous)?,
+        next: check(navigation.next)?,
+        into: check(navigation.into)?,
+        over: check(navigation.over)?,
+        out: check(navigation.out)?,
+    })
+}
+
+/// Wire kinds the navigation function distinguishes.
+const WIRE_KIND_REQUEST_UPDATE: i64 = 1;
+const WIRE_KIND_FRAME_EXIT: i64 = 3;
+const WIRE_KIND_FRAME_THROW: i64 = 4;
+
+/// One `recording_frame_index` row as the navigation function sees it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IndexedFrame {
+    pub(crate) sequence: u64,
+    pub(crate) frame_id: xtrace_domain::FrameId,
+    pub(crate) depth: u32,
+    pub(crate) parent_seq: Option<u64>,
+    pub(crate) async_parent_seq: Option<u64>,
+    pub(crate) kind: i64,
+    pub(crate) honesty_flags: u32,
+    pub(crate) indexed: bool,
+}
+
+const INDEX_COLUMNS: &str =
+    "recording_seq, frame_id, depth, parent_seq, async_parent_seq, kind, honesty_flags, indexed_v";
+
+fn indexed_frame_from_row(
+    row: &rusqlite::Row<'_>,
+    correlation_id: CorrelationId,
+) -> Result<IndexedFrame, RecordingStoreError> {
+    let sql = |error: rusqlite::Error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    };
+    let sequence: Vec<u8> = row.get(0).map_err(sql)?;
+    let frame_id: Vec<u8> = row.get(1).map_err(sql)?;
+    let depth: i64 = row.get(2).map_err(sql)?;
+    let parent: Option<Vec<u8>> = row.get(3).map_err(sql)?;
+    let async_parent: Option<Vec<u8>> = row.get(4).map_err(sql)?;
+    let kind: i64 = row.get(5).map_err(sql)?;
+    let flags: i64 = row.get(6).map_err(sql)?;
+    let indexed: i64 = row.get(7).map_err(sql)?;
+    let decode = |bytes: Option<Vec<u8>>| -> Result<Option<u64>, RecordingStoreError> {
+        bytes.map(|bytes| decode_stored_sequence(&bytes, correlation_id)).transpose()
+    };
+    Ok(IndexedFrame {
+        sequence: decode_stored_sequence(&sequence, correlation_id)?,
+        frame_id: frame_id_from_bytes(&frame_id, correlation_id)?,
+        depth: u32::try_from(depth).map_err(|_| recording_query_corrupt_error(correlation_id))?,
+        parent_seq: decode(parent)?,
+        async_parent_seq: decode(async_parent)?,
+        kind,
+        honesty_flags: u32::try_from(flags)
+            .map_err(|_| recording_query_corrupt_error(correlation_id))?,
+        indexed: indexed == 1,
+    })
+}
+
+/// Reads one frame-index row by sequence.
+pub(crate) fn load_indexed_frame(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    sequence: u64,
+    correlation_id: CorrelationId,
+) -> Result<Option<IndexedFrame>, RecordingStoreError> {
+    let mut statement = connection
+        .prepare_cached(&format!(
+            "SELECT {INDEX_COLUMNS} FROM recording_frame_index \
+             WHERE recording_id = ?1 AND recording_seq = ?2"
+        ))
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let mut rows = statement
+        .query(rusqlite::params![
+            recording_id.as_uuid().as_bytes().to_vec(),
+            sequence.to_be_bytes().as_slice()
+        ])
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let Some(row) = rows.next().map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?
+    else {
+        return Ok(None);
+    };
+    indexed_frame_from_row(row, correlation_id).map(Some)
+}
+
+/// Reads one frame-index row by public frame id.
+pub(crate) fn load_indexed_frame_by_id(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    frame_id: xtrace_domain::FrameId,
+    correlation_id: CorrelationId,
+) -> Result<Option<IndexedFrame>, RecordingStoreError> {
+    let mut statement = connection
+        .prepare_cached(&format!(
+            "SELECT {INDEX_COLUMNS} FROM recording_frame_index \
+             WHERE recording_id = ?1 AND frame_id = ?2"
+        ))
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let mut rows = statement
+        .query(rusqlite::params![
+            recording_id.as_uuid().as_bytes().to_vec(),
+            frame_id.as_uuid().as_bytes().to_vec()
+        ])
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let Some(row) = rows.next().map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?
+    else {
+        return Ok(None);
+    };
+    indexed_frame_from_row(row, correlation_id).map(Some)
+}
+
+/// First frame matching `predicate_sql` in the given direction, or `None`.
+fn first_frame_where(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    sequence: u64,
+    forward: bool,
+    predicate_sql: &str,
+    extra: Option<i64>,
+    correlation_id: CorrelationId,
+) -> Result<Option<xtrace_domain::FrameId>, RecordingStoreError> {
+    let (cmp, order) = if forward { (">", "ASC") } else { ("<", "DESC") };
+    let sql = format!(
+        "SELECT frame_id FROM recording_frame_index \
+         WHERE recording_id = ?1 AND recording_seq {cmp} ?2 AND kind != {WIRE_KIND_REQUEST_UPDATE} \
+         AND indexed_v = 1 {predicate_sql} ORDER BY recording_seq {order} LIMIT 1"
+    );
+    let mut statement = connection.prepare_cached(&sql).map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    let id = recording_id.as_uuid().as_bytes().to_vec();
+    let seq = sequence.to_be_bytes();
+    let found: Option<Vec<u8>> = match extra {
+        Some(extra) => statement
+            .query_row(rusqlite::params![id, seq.as_slice(), extra], |row| row.get(0))
+            .optional(),
+        None => {
+            statement.query_row(rusqlite::params![id, seq.as_slice()], |row| row.get(0)).optional()
+        }
+    }
+    .map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    found.map(|bytes| frame_id_from_bytes(&bytes, correlation_id)).transpose()
+}
+
+/// Whether every event up to the finish sequence is persisted, so that "no later
+/// frame" is a real end rather than an unverified frontier.
+fn persisted_frontier_is_final(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    completion: RecordingCompletionEvidence,
+    correlation_id: CorrelationId,
+) -> Result<bool, RecordingStoreError> {
+    if !matches!(
+        completion,
+        RecordingCompletionEvidence::Complete | RecordingCompletionEvidence::Partial
+    ) {
+        return Ok(false);
+    }
+    let Some(finish) = load_terminal_finish(connection, recording_id, completion, correlation_id)?
+    else {
+        return Ok(false);
+    };
+    // A partial recording may end at its last persisted frame only when the finish
+    // digest was verified and nothing was dropped at capacity (a declared-gap partial).
+    if completion == RecordingCompletionEvidence::Partial
+        && (finish.event_digest.len() != 32
+            || finish.event_digest.iter().all(|byte| *byte == 0)
+            || finish.capacity_dropped_events > 0)
+    {
+        return Ok(false);
+    }
+    let last: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT recording_seq FROM recording_frame_index WHERE recording_id = ?1 \
+             ORDER BY recording_seq DESC LIMIT 1",
+            rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let Some(last) = last else {
+        return Ok(false);
+    };
+    Ok(decode_stored_sequence(&last, correlation_id)? == finish.final_recording_seq)
+}
+
+/// CONTRACTS 8.3 as one pure-over-the-index function. `frame` must be an indexed
+/// row (`indexed_v = 1`); legacy rows use [`frame_navigation`].
+///
+/// `into` = first non-closing child, else `next`; `over` = first later frame at the
+/// same or lower depth; `out` = first later frame at lower depth; `previous`/`next`
+/// skip non-navigable events. A missing target is `Boundary` only when the
+/// persisted frontier is proven final.
+pub(crate) fn navigate_indexed_frame(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    frame: &IndexedFrame,
+    completion: RecordingCompletionEvidence,
+    correlation_id: CorrelationId,
+) -> Result<FrameNavigation, RecordingStoreError> {
+    use xtrace_domain::honesty_flags as flags;
+
+    if frame.kind == WIRE_KIND_REQUEST_UPDATE {
+        let not_navigable = NavigationResult::unavailable(NavigationUnavailable::NotNavigable);
+        return Ok(FrameNavigation {
+            previous: not_navigable,
+            next: not_navigable,
+            into: not_navigable,
+            over: not_navigable,
+            out: not_navigable,
+        });
+    }
+    let sequence = frame.sequence;
+    let target = |found: Option<xtrace_domain::FrameId>| {
+        found.map(|frame_id| NavigationResult::Target { frame_id })
+    };
+    let end_of_stream =
+        |connection: &rusqlite::Connection| -> Result<NavigationResult, RecordingStoreError> {
+            Ok(
+                if persisted_frontier_is_final(
+                    connection,
+                    recording_id,
+                    completion,
+                    correlation_id,
+                )? {
+                    NavigationResult::Boundary
+                } else {
+                    NavigationResult::unavailable(NavigationUnavailable::PartialFrontier)
+                },
+            )
+        };
+    let previous = target(first_frame_where(
+        connection,
+        recording_id,
+        sequence,
+        false,
+        "",
+        None,
+        correlation_id,
+    )?)
+    .unwrap_or(NavigationResult::Boundary);
+    let next_found =
+        first_frame_where(connection, recording_id, sequence, true, "", None, correlation_id)?;
+    let next = match target(next_found) {
+        Some(result) => result,
+        None => end_of_stream(connection)?,
+    };
+    if frame.honesty_flags & flags::DEPTH_OVERFLOW != 0 {
+        let overflow = NavigationResult::unavailable(NavigationUnavailable::DepthOverflow);
+        return Ok(FrameNavigation {
+            previous,
+            next,
+            into: overflow,
+            over: overflow,
+            out: overflow,
+        });
+    }
+    // `into`: the smallest-sequence child that is not a closing event; children
+    // are linked by `parent_seq` only, so an async edge is never a child.
+    let child: Option<Vec<u8>> = connection
+        .prepare_cached(&format!(
+            "SELECT frame_id FROM recording_frame_index \
+             WHERE recording_id = ?1 AND parent_seq = ?2 AND indexed_v = 1 \
+             AND kind NOT IN ({WIRE_KIND_REQUEST_UPDATE}, {WIRE_KIND_FRAME_EXIT}, {WIRE_KIND_FRAME_THROW}) \
+             ORDER BY recording_seq ASC LIMIT 1"
+        ))
+        .and_then(|mut statement| {
+            statement
+                .query_row(
+                    rusqlite::params![
+                        recording_id.as_uuid().as_bytes().to_vec(),
+                        sequence.to_be_bytes().as_slice()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let into = match child {
+        Some(bytes) => {
+            NavigationResult::Target { frame_id: frame_id_from_bytes(&bytes, correlation_id)? }
+        }
+        None => next,
+    };
+    let over = match target(first_frame_where(
+        connection,
+        recording_id,
+        sequence,
+        true,
+        "AND depth <= ?3",
+        Some(i64::from(frame.depth)),
+        correlation_id,
+    )?) {
+        Some(result) => result,
+        None => end_of_stream(connection)?,
+    };
+    let out = if frame.depth == 0 {
+        if frame.honesty_flags & flags::ORPHAN_PARENT != 0 {
+            NavigationResult::unavailable(NavigationUnavailable::OrphanParent)
+        } else {
+            NavigationResult::Boundary
+        }
+    } else {
+        match target(first_frame_where(
+            connection,
+            recording_id,
+            sequence,
+            true,
+            "AND depth < ?3",
+            Some(i64::from(frame.depth)),
+            correlation_id,
+        )?) {
+            Some(result) => result,
+            None => end_of_stream(connection)?,
+        }
+    };
+    Ok(FrameNavigation { previous, next, into, over, out })
 }
 
 /// Row shape of `recording_frame_index`: frame id, segment ordinal, event
@@ -2529,12 +3189,94 @@ fn project_persisted_event(
         depth: None,
         parent_frame_id: None,
         async_parent_frame_id: None,
-        line: None,
-        bindings: Vec::new(),
-        gap: None,
+        // R4: a line is shown only for a line cursor, never from a method extent.
+        line: (event.kind == WIRE_KIND_LINE_CURSOR)
+            .then(|| event.source.as_ref().map(|source| source.start_line))
+            .flatten()
+            .filter(|line| *line > 0),
+        bindings: event.bindings.iter().map(project_binding).collect(),
+        gap: (event.kind == WIRE_KIND_GAP).then(|| project_gap(event.gap.as_ref())).flatten(),
     };
     projected.bound_display_fields();
     projected
+}
+
+/// Wire `RecordingEventKind::LineCursor`.
+const WIRE_KIND_LINE_CURSOR: i32 = 5;
+
+fn value_shape_label(shape: i32) -> &'static str {
+    match shape {
+        1 => "string",
+        2 => "boolean",
+        3..=6 => "integer",
+        7 | 8 => "float",
+        9 => "null",
+        10 => "bytes",
+        11 => "list",
+        12 => "object",
+        _ => "unknown",
+    }
+}
+
+/// Projects one stored wire binding; every value state stays distinct and an
+/// unclassifiable value is reported `unavailable`, never defaulted.
+fn project_binding(binding: &xtrace_protocol::generated::agent::ValueBinding) -> PersistedBinding {
+    use xtrace_protocol::generated::agent::captured_value::Value as WireValue;
+    use xtrace_protocol::translate;
+
+    let role = translate::binding_role_from_wire(binding.role)
+        .map_or("unspecified", xtrace_domain::BindingRole::as_str);
+    let name_origin = translate::name_origin_from_wire(binding.name_origin)
+        .map_or("unspecified", xtrace_domain::NameOrigin::as_str);
+    let value = match binding.value.as_ref().and_then(|value| value.value.as_ref()) {
+        Some(WireValue::Captured(captured)) => PersistedValue::Captured {
+            shape: value_shape_label(captured.shape).to_owned(),
+            preview: captured.preview.clone(),
+            content_hash: ContentHash::from_digest_bytes(&captured.content_hash)
+                .map_or_else(String::new, |hash| hash.to_canonical()),
+        },
+        Some(WireValue::Redacted(redacted)) => PersistedValue::Redacted {
+            rule_id: redacted.rule_id.clone(),
+            shape_hint: (redacted.shape_hint != 0)
+                .then(|| value_shape_label(redacted.shape_hint).to_owned()),
+        },
+        Some(WireValue::Truncated(truncated)) => PersistedValue::Truncated {
+            preview: truncated.preview.clone(),
+            original_size_lower_bound: truncated.original_size_lower_bound.to_string(),
+            limit: truncated.limit.to_string(),
+        },
+        Some(WireValue::Unavailable(unavailable)) => PersistedValue::Unavailable {
+            reason: translate::unavailable_reason_from_wire(unavailable.reason)
+                .map_or("unspecified", xtrace_domain::UnavailableReason::as_str)
+                .to_owned(),
+        },
+        Some(WireValue::Dropped(dropped)) => PersistedValue::Dropped {
+            reason: translate::drop_reason_from_wire(dropped.reason)
+                .map_or("unspecified", xtrace_domain::DropReason::as_str)
+                .to_owned(),
+        },
+        None => PersistedValue::Unavailable { reason: "unspecified".to_owned() },
+    };
+    PersistedBinding {
+        name: binding.name.clone(),
+        role: role.to_owned(),
+        name_origin: name_origin.to_owned(),
+        value,
+    }
+}
+
+fn project_gap(
+    gap: Option<&xtrace_protocol::generated::agent::GapPayload>,
+) -> Option<PersistedGap> {
+    let gap = gap?;
+    Some(PersistedGap {
+        reason: xtrace_protocol::translate::gap_reason_from_wire(gap.reason)
+            .map_or("unspecified", xtrace_domain::GapReason::as_str)
+            .to_owned(),
+        count: gap.count.to_string(),
+        first_sequence: gap.first_recording_seq.to_string(),
+        last_sequence: gap.last_recording_seq.to_string(),
+    })
 }
 
 fn source_range_from_wire(
@@ -2768,37 +3510,6 @@ fn project_matching_source(
     })
 }
 
-/// Source file extensions a recorded path may carry (adapter-supplied hashes prove
-/// nothing about authenticity, so the path gate is the control).
-const SOURCE_EXTENSIONS: [&str; 12] =
-    ["java", "kt", "scala", "groovy", "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
-
-/// Write-time gate for a recorded source path (CONTRACTS section 3 rules 6-7): the one domain
-/// function shared with ingest, so the write rules cannot drift between the two.
-pub(crate) use xtrace_domain::is_safe_repo_relative_path;
-
-/// Read-time gate: a path that passes [`is_safe_repo_relative_path`] and may also be
-/// read and shown. No dot-directory segment (`.env`, `.git`, `.xtrace`), no
-/// `node_modules` segment, and a known source extension.
-pub(crate) fn is_projectable_source_path(path: &str) -> bool {
-    if !is_safe_repo_relative_path(path) {
-        return false;
-    }
-    let mut segments = path.split('/').peekable();
-    while let Some(segment) = segments.next() {
-        if segment.starts_with('.') || segment == "node_modules" {
-            return false;
-        }
-        if segments.peek().is_none() {
-            let Some((_, extension)) = segment.rsplit_once('.') else {
-                return false;
-            };
-            return SOURCE_EXTENSIONS.contains(&extension);
-        }
-    }
-    false
-}
-
 /// Replacement shown instead of an excerpt line that looks like a credential.
 const SOURCE_LINE_REDACTION: &str = "[redacted by x-trace]";
 
@@ -2879,6 +3590,7 @@ fn unavailable_source(
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
 mod source_projection_tests {
     use super::*;
+    use xtrace_domain::is_safe_repo_relative_path;
 
     fn tempdir() -> tempfile::TempDir {
         let scratch = PathBuf::from(

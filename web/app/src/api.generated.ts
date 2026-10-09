@@ -114,7 +114,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** @description Resolve one navigation action from a frame (action) or jump to the next or previous gap, error or interaction (kind and dir). */
+        /** @description Resolve one navigation action from a frame (action). The kinds filter and the gap, error or interaction jump (kind and dir) are registered and answer 501 XTR-REPLAY-NOT-IMPLEMENTED until served. */
         get: operations["navigateRecording"];
         put?: never;
         post?: never;
@@ -202,7 +202,7 @@ export interface components {
              * @description Outcome kind from terminal evidence; null when no terminal evidence exists.
              * @enum {string|null}
              */
-            outcomeKind?: "responded" | "exception" | "unobserved" | null;
+            outcomeKind?: "responded" | "exception_propagated" | "client_aborted" | "unobserved" | null;
         };
         ObservedEndpointPage: {
             items: components["schemas"]["ObservedEndpoint"][];
@@ -295,7 +295,7 @@ export interface components {
         };
         Outcome: {
             /** @enum {string} */
-            kind: "responded" | "exception" | "unobserved";
+            kind: "responded" | "exception_propagated" | "client_aborted" | "unobserved";
             httpStatus: number | null;
             exception: null | {
                 exceptionType: string;
@@ -402,6 +402,8 @@ export interface components {
             /** Format: uuid */
             parentFrameId: string | null;
             navigation: components["schemas"]["FrameNavigation"];
+            /** Format: uuid */
+            requestId?: string;
         };
         NavigateDocument: {
             /** Format: uuid */
@@ -409,6 +411,8 @@ export interface components {
             /** @enum {string} */
             action?: "previous" | "next" | "into" | "over" | "out";
             result: components["schemas"]["NavigationResult"];
+            /** Format: uuid */
+            requestId?: string;
         };
         RecordingGraph: {
             nodes: {
@@ -754,7 +758,7 @@ export interface operations {
                 limit?: number;
                 /** @description Opaque project and recording scoped versioned continuation token. */
                 cursor?: string;
-                /** @description Window of limit events centred on this frame. Mutually exclusive with cursor. Registered; answers 501 XTR-REPLAY-NOT-IMPLEMENTED until served. */
+                /** @description Window of limit events centred on this frame. Mutually exclusive with cursor. A frame that is not in this recording answers 404. */
                 aroundFrame?: string;
                 /** @description full (default) returns every event field; structure returns outline fields only. structure answers 501 XTR-REPLAY-NOT-IMPLEMENTED until served. */
                 projection?: "full" | "structure";

@@ -19,53 +19,11 @@ use crate::{PortError, PortErrorKind};
 /// persisted; they are dropped, counted, and the recording degrades to
 /// [`RecordingCompletion::Partial`] instead of failing the capture.
 pub const MAX_RECORDED_EVENTS: usize = 2_048;
-/// Event cap of a recording in the default (standard) capture mode.
-pub const STANDARD_EVENT_CAP: usize = 16_384;
-/// Event cap of a recording captured in focused mode.
-pub const FOCUSED_EVENT_CAP: usize = 131_072;
-/// Hard bound on any event cap or persisted event count; also the SQL CHECK bound.
-pub const EVENT_CAP_SANITY_BOUND: usize = 1_048_576;
-/// Capture policy identifier selecting [`CaptureMode::Standard`].
-pub const CAPTURE_POLICY_STANDARD_ID: &str = "xtrace.standard.v1";
-/// Capture policy identifier selecting [`CaptureMode::Focused`].
-pub const CAPTURE_POLICY_FOCUSED_ID: &str = "xtrace.focused.v1";
-
-/// Capture depth that selects the per-recording event cap.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CaptureMode {
-    /// Method boundaries and request facts within [`STANDARD_EVENT_CAP`].
-    #[default]
-    Standard,
-    /// Armed focused capture within [`FOCUSED_EVENT_CAP`].
-    Focused,
-}
-
-impl CaptureMode {
-    /// Events one recording may persist in this mode.
-    #[must_use]
-    pub const fn event_cap(self) -> usize {
-        match self {
-            Self::Standard => STANDARD_EVENT_CAP,
-            Self::Focused => FOCUSED_EVENT_CAP,
-        }
-    }
-
-    /// Stable capture policy identifier for this mode.
-    #[must_use]
-    pub const fn policy_id(self) -> &'static str {
-        match self {
-            Self::Standard => CAPTURE_POLICY_STANDARD_ID,
-            Self::Focused => CAPTURE_POLICY_FOCUSED_ID,
-        }
-    }
-
-    /// Mode named by a policy identifier; empty or unknown identifiers mean standard.
-    #[must_use]
-    pub fn from_policy_id(id: &str) -> Self {
-        if id == CAPTURE_POLICY_FOCUSED_ID { Self::Focused } else { Self::Standard }
-    }
-}
+// One definition of the capture modes and their caps, shared with ingest (CONTRACTS 4.1).
+pub use xtrace_domain::{
+    CAPTURE_POLICY_FOCUSED_ID, CAPTURE_POLICY_STANDARD_ID, CaptureMode, EVENT_CAP_SANITY_BOUND,
+    FOCUSED_EVENT_CAP, STANDARD_EVENT_CAP,
+};
 
 /// Cap that terminal evidence written before the cap was recorded was under.
 #[must_use]
@@ -353,6 +311,11 @@ pub struct FinishRecording {
     /// Producer-declared response summary; only non-preview states are accepted
     /// until a verified privacy-policy registry exists. This is not outcome proof.
     pub response_summary: Option<xtrace_domain::CapturedValue>,
+    /// Adapter-observed end of the request (CONTRACTS 5). Absent for adapters that
+    /// report none and for every row written before outcome capture; a reader then
+    /// reports `unobserved`. Omitted when serializing so older rows replay byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<xtrace_domain::RecordingOutcome>,
 }
 
 impl FinishRecording {
@@ -370,6 +333,7 @@ impl FinishRecording {
             unsupported_capability_codes: Vec::new(),
             capacity_dropped_events: 0,
             event_cap: legacy_event_cap(),
+            outcome: None,
             response_summary: None,
         }
     }
@@ -426,6 +390,20 @@ pub trait RecordingCapture: Send + Sync {
     /// Returns a typed validation, conflict, resource, or persistence failure.
     fn begin_recording(&self, request: BeginRecording) -> Result<BeginRecordingReceipt, PortError>;
 
+    /// Opens or replays one recording under the event cap of its effective capture mode
+    /// (CONTRACTS 4.2). Implementations that do not track a cap ignore the mode.
+    ///
+    /// # Errors
+    ///
+    /// As [`RecordingCapture::begin_recording`].
+    fn begin_recording_with_mode(
+        &self,
+        request: BeginRecording,
+        _mode: xtrace_domain::CaptureMode,
+    ) -> Result<BeginRecordingReceipt, PortError> {
+        self.begin_recording(request)
+    }
+
     /// Stages admitted events and persists every segment that reaches a seal
     /// boundary.
     ///
@@ -479,6 +457,73 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
     #[must_use]
     pub fn new(port: Arc<P>, policy: SegmentPolicy, max_retained_recordings: NonZeroUsize) -> Self {
         Self { port, policy, max_retained_recordings, recordings: Mutex::new(HashMap::new()) }
+    }
+
+    fn begin_with_cap(
+        &self,
+        request: BeginRecording,
+        event_cap: usize,
+    ) -> Result<BeginRecordingReceipt, PortError> {
+        let recording = {
+            let mut recordings = lock(&self.recordings)?;
+            if let Some(recording) = recordings.get(&request.recording_id) {
+                Arc::clone(recording)
+            } else {
+                if recordings.len() >= self.max_retained_recordings.get() {
+                    return Err(capture_error(
+                        PortErrorKind::Resource,
+                        "recording capture retained-ID capacity is exhausted",
+                    ));
+                }
+                let recording =
+                    Arc::new(Mutex::new(RecordingAssembly::new(request.clone(), event_cap)));
+                recordings.insert(request.recording_id, Arc::clone(&recording));
+                recording
+            }
+        };
+        let mut state = lock(&recording)?;
+        if state.project_id != request.project_id
+            || state.runtime_session_id != request.runtime_session_id
+        {
+            return Err(capture_error(
+                PortErrorKind::Conflict,
+                "recording start conflicts with the accepted identity",
+            ));
+        }
+        let stable = BeginRecording {
+            project_id: state.project_id,
+            recording_id: state.recording_id,
+            runtime_session_id: state.runtime_session_id,
+            opened_at: state.opened_at,
+            endpoint_observation: request.endpoint_observation,
+        };
+        let receipt = match self.port.begin_recording(&stable) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let definitive = matches!(
+                    error.kind(),
+                    PortErrorKind::Validation
+                        | PortErrorKind::AlreadyExists
+                        | PortErrorKind::NotFound
+                        | PortErrorKind::Conflict
+                        | PortErrorKind::Compatibility
+                        | PortErrorKind::Corruption
+                );
+                drop(state);
+                if definitive {
+                    self.release_unbegun_reservation(request.recording_id, &recording)?;
+                }
+                return Err(error);
+            }
+        };
+        if receipt.recording_id != state.recording_id {
+            return Err(capture_error(
+                PortErrorKind::Internal,
+                "recording persistence returned a mismatched begin receipt",
+            ));
+        }
+        state.begun = true;
+        Ok(receipt)
     }
 
     fn recording(&self, recording_id: RecordingId) -> Result<SharedAssembly<P::Event>, PortError> {
@@ -604,65 +649,15 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
     type Event = P::Event;
 
     fn begin_recording(&self, request: BeginRecording) -> Result<BeginRecordingReceipt, PortError> {
-        let recording = {
-            let mut recordings = lock(&self.recordings)?;
-            if let Some(recording) = recordings.get(&request.recording_id) {
-                Arc::clone(recording)
-            } else {
-                if recordings.len() >= self.max_retained_recordings.get() {
-                    return Err(capture_error(
-                        PortErrorKind::Resource,
-                        "recording capture retained-ID capacity is exhausted",
-                    ));
-                }
-                let recording = Arc::new(Mutex::new(RecordingAssembly::new(request.clone())));
-                recordings.insert(request.recording_id, Arc::clone(&recording));
-                recording
-            }
-        };
-        let mut state = lock(&recording)?;
-        if state.project_id != request.project_id
-            || state.runtime_session_id != request.runtime_session_id
-        {
-            return Err(capture_error(
-                PortErrorKind::Conflict,
-                "recording start conflicts with the accepted identity",
-            ));
-        }
-        let stable = BeginRecording {
-            project_id: state.project_id,
-            recording_id: state.recording_id,
-            runtime_session_id: state.runtime_session_id,
-            opened_at: state.opened_at,
-            endpoint_observation: request.endpoint_observation,
-        };
-        let receipt = match self.port.begin_recording(&stable) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                let definitive = matches!(
-                    error.kind(),
-                    PortErrorKind::Validation
-                        | PortErrorKind::AlreadyExists
-                        | PortErrorKind::NotFound
-                        | PortErrorKind::Conflict
-                        | PortErrorKind::Compatibility
-                        | PortErrorKind::Corruption
-                );
-                drop(state);
-                if definitive {
-                    self.release_unbegun_reservation(request.recording_id, &recording)?;
-                }
-                return Err(error);
-            }
-        };
-        if receipt.recording_id != state.recording_id {
-            return Err(capture_error(
-                PortErrorKind::Internal,
-                "recording persistence returned a mismatched begin receipt",
-            ));
-        }
-        state.begun = true;
-        Ok(receipt)
+        self.begin_with_cap(request, MAX_RECORDED_EVENTS)
+    }
+
+    fn begin_recording_with_mode(
+        &self,
+        request: BeginRecording,
+        mode: xtrace_domain::CaptureMode,
+    ) -> Result<BeginRecordingReceipt, PortError> {
+        self.begin_with_cap(request, mode.event_cap().min(EVENT_CAP_SANITY_BOUND))
     }
 
     fn record_events(
@@ -771,11 +766,14 @@ struct RecordingAssembly<E> {
     pending: Option<PendingSegment<E>>,
     finish_intent: Option<FinishRecording>,
     finished: bool,
+    /// Events this recording may persist (mode-derived, or the legacy 2,048).
+    event_cap: usize,
 }
 
 impl<E> RecordingAssembly<E> {
-    fn new(request: BeginRecording) -> Self {
+    fn new(request: BeginRecording, event_cap: usize) -> Self {
         Self {
+            event_cap,
             project_id: request.project_id,
             recording_id: request.recording_id,
             runtime_session_id: request.runtime_session_id,
@@ -868,7 +866,7 @@ fn preflight_events<P: RecordingPersistencePort + ?Sized>(
                 "recording event exceeds a segment or XTF envelope byte limit",
             ));
         }
-        if scratch_digests.len() >= MAX_RECORDED_EVENTS {
+        if scratch_digests.len() >= state.event_cap {
             // Bounded capacity: degrade honestly instead of killing capture.
             // The event is neither persisted nor retained, only counted.
             if !dropped_by_priority.contains_key(&event.priority)
@@ -908,7 +906,7 @@ fn effective_finish<E>(
     let mut effective = request.clone();
     // Derived from the application's own state, never from the caller.
     effective.capacity_dropped_events = state.capacity_dropped;
-    effective.event_cap = legacy_event_cap();
+    effective.event_cap = u64::try_from(state.event_cap).unwrap_or_else(|_| legacy_event_cap());
     if state.capacity_dropped == 0 {
         return Ok(effective);
     }
@@ -1397,7 +1395,8 @@ mod tests {
             NonZeroUsize::new(1).expect("non-zero recording limit"),
         );
         let request = begin(wall(1));
-        let assembly = Arc::new(Mutex::new(RecordingAssembly::new(request.clone())));
+        let assembly =
+            Arc::new(Mutex::new(RecordingAssembly::new(request.clone(), MAX_RECORDED_EVENTS)));
         service
             .recordings
             .lock()
@@ -1730,6 +1729,60 @@ mod tests {
             .iter()
             .flat_map(|segment| segment.events.iter().map(|event| event.recording_seq))
             .collect()
+    }
+
+    #[test]
+    fn mode_cap_governs_drops_and_the_finish_event_cap() {
+        use xtrace_domain::CaptureMode;
+        let run = |mode: CaptureMode, send: u64| {
+            let port = Arc::new(FakePort::default());
+            let service = service(Arc::clone(&port), SegmentPolicy::default());
+            service.begin_recording_with_mode(begin(wall(1)), mode).expect("begin");
+            let recording_id = begin(wall(1)).recording_id;
+            let (mut accepted, mut dropped) = (0, 0);
+            for chunk_start in (2..=send + 1).step_by(1_000) {
+                let chunk_end = (chunk_start + 999).min(send + 1);
+                let receipt = service
+                    .record_events(RecordEvents {
+                        recording_id,
+                        events: capacity_events(chunk_start, chunk_end),
+                    })
+                    .expect("record");
+                accepted += receipt.accepted;
+                dropped += receipt.dropped;
+            }
+            let mut finish = FinishRecording::without_digest(recording_id, send + 1);
+            finish.event_digest = vec![7; 32];
+            service.finish_recording(finish).expect("finish");
+            let event_cap = port.finishes.lock().expect("finishes")[0].event_cap;
+            (accepted, dropped, event_cap)
+        };
+        // Standard keeps 16,384 events and counts the rest; the finish records that cap.
+        assert_eq!(run(CaptureMode::Standard, 16_390), (16_384, 6, 16_384));
+        // The legacy path (no mode) keeps 2,048.
+        let legacy_port = Arc::new(FakePort::default());
+        let legacy = service(Arc::clone(&legacy_port), SegmentPolicy::default());
+        legacy.begin_recording(begin(wall(1))).expect("begin");
+        let receipt = legacy
+            .record_events(RecordEvents {
+                recording_id: begin(wall(1)).recording_id,
+                events: capacity_events(2, 2_060),
+            })
+            .expect("record");
+        assert_eq!((receipt.accepted, receipt.dropped), (MAX_RECORDED_EVENTS, 11));
+    }
+
+    #[test]
+    fn ingest_and_application_caps_agree_with_the_mode() {
+        use xtrace_domain::CaptureMode;
+        for mode in [CaptureMode::Standard, CaptureMode::Focused] {
+            assert_eq!(
+                mode.event_cap(),
+                super::CaptureMode::from_policy_id(mode.policy_id()).event_cap()
+            );
+        }
+        assert_eq!(CaptureMode::Standard.event_cap(), STANDARD_EVENT_CAP);
+        assert_eq!(CaptureMode::Focused.event_cap(), FOCUSED_EVENT_CAP);
     }
 
     #[test]

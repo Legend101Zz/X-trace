@@ -2633,7 +2633,8 @@ async fn malformed_finish_can_replay_on_same_runtime_and_restart_keeps_open_capt
 /// prefix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capture_over_the_event_cap_ends_partial_with_exact_per_priority_drops() {
-    use xtrace_application::recording::MAX_RECORDED_EVENTS;
+    // A launch that never armed focused capture records under the standard-mode cap.
+    use xtrace_application::recording::STANDARD_EVENT_CAP;
     use xtrace_application::recording_queries::RecordingCompletionEvidence;
 
     let daemon_temp = secure_tempdir("xtrace-event-cap-daemon-");
@@ -2702,7 +2703,7 @@ async fn capture_over_the_event_cap_ends_partial_with_exact_per_priority_drops()
     .expect("write start");
     next_ack(&mut reader, "cap start ACK").await;
 
-    let last_kept = 1 + MAX_RECORDED_EVENTS as u64;
+    let last_kept = 1 + STANDARD_EVENT_CAP as u64;
     let last_sent = last_kept + 12;
     let priority_of = |sequence: u64| [1_u32, 5, 9][usize::try_from(sequence % 3).expect("small")];
     let all_sequences = (2..=last_sent).collect::<Vec<_>>();

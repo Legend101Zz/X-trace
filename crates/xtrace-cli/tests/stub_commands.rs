@@ -16,7 +16,19 @@ fn xtrace(args: &[&str]) -> std::process::Output {
 fn version_is_0_0_1() {
     let output = xtrace(&["--version"]);
     assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "xtrace 0.0.1");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(text.lines().next(), Some("xtrace 0.0.1"));
+}
+
+#[test]
+fn version_prints_schema_version_and_protocol() {
+    let output = xtrace(&["--version"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert_eq!(lines[1], "schema-version: 8");
+    assert_eq!(lines[2], "xtp-protocol: 1.0");
 }
 
 #[test]
@@ -30,7 +42,12 @@ fn unimplemented_command_exits_nine_with_stable_message_for_each() {
         (&["exercise", "approve", "--plan-hash", "abc"], "exercise approve"),
         (&["exercise", "run"], "exercise run"),
         (&["exercise", "show"], "exercise show"),
-        (&["tui"], "tui"),
+        (&["retention", "preview"], "retention preview"),
+        (&["retention", "apply", "--preview-digest", "abc"], "retention apply"),
+        (&["store", "backup"], "store backup"),
+        (&["store", "verify"], "store verify"),
+        (&["store", "restore"], "store restore"),
+        (&["store", "migrate", "--dry-run"], "store migrate"),
     ];
     for (args, name) in table {
         let output = xtrace(args);

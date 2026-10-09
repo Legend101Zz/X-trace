@@ -116,3 +116,25 @@ exit 9 with a message; they never exit 0 and never print a success document.
   here: the navigation extras of section 2, the catalog command names of
   section 3 and the whole exit-code list of section 4. Everywhere else the
   approved text stands.
+
+## Addendum: what is served (wave 2, round 1)
+
+- Migration v8 is populated at segment commit. Each new frame-index row carries
+  `depth`, `parent_seq`, `async_parent_seq`, `kind`, `honesty_flags` and
+  `indexed_v = 1`. A parent that was never observed makes the frame a root
+  flagged `ORPHAN_PARENT`; depth saturates at 4,096 with `DEPTH_OVERFLOW`.
+  Rows written before this stay `indexed_v = 0` and read as `legacy_unindexed`.
+- The navigation function runs over the index. It does not read segments:
+  `previous`/`next` skip non-navigable events, `into` is the first non-closing
+  child else `next`, `over` the first later frame at the same or lower depth,
+  `out` the first later frame at lower depth. A missing target is `boundary`
+  only when the finish evidence proves the persisted frontier final (the last
+  persisted sequence equals the verified final sequence, and for a partial
+  recording the digest was verified and nothing was dropped at capacity);
+  otherwise `unavailable{partial_frontier}`.
+- Served routes: `GET /frames/{frameId}/navigation`, `GET /navigate` with
+  `action`, and `?aroundFrame` on the recording route. Still 501: the
+  `kinds`/`kind`/`dir` forms of `navigate`, `/frames`, `/graph` and
+  `projection=structure`.
+- Not done: the `boundaryReason` extra for async roots (an async root's `out`
+  is a plain `boundary`).

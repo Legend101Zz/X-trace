@@ -67,7 +67,15 @@ impl RecordingPipeline {
                     &self.run_observation,
                 )?;
                 let capture = Arc::clone(&self.capture);
-                self.lane.run(shutdown, move || capture.begin_recording(request).map(|_| ())).await
+                let mode = effective_capture_mode(
+                    xtrace_domain::CaptureMode::Standard,
+                    &started.capture_policy_id,
+                );
+                self.lane
+                    .run(shutdown, move || {
+                        capture.begin_recording_with_mode(request, mode).map(|_| ())
+                    })
+                    .await
             }
             IncomingEnvelope::EventBatch(batch) => {
                 let request = translate_batch(batch)?;
@@ -143,6 +151,24 @@ where
     .map_err(RecordingPipelineError::Port)
 }
 
+/// Effective capture mode of one recording (CONTRACTS 4.2): the lower of the session's armed
+/// mode and the mode its claimed policy id names, so a focused claim on a session that was
+/// never armed for focused capture stays standard. Ingest and the application layer both
+/// take this value, so they apply the same cap.
+///
+/// Arming (the launch bootstrap's `capture.mode` and `ARM_FOCUSED_CAPTURE`) is not wired into
+/// the session yet; the armed mode is always standard until it is.
+pub(crate) fn effective_capture_mode(
+    armed: xtrace_domain::CaptureMode,
+    claimed_policy_id: &str,
+) -> xtrace_domain::CaptureMode {
+    use xtrace_domain::CaptureMode::{Focused, Standard};
+    match (armed, xtrace_domain::CaptureMode::from_policy_id(claimed_policy_id)) {
+        (Focused, Focused) => Focused,
+        _ => Standard,
+    }
+}
+
 fn translate_started(
     started: &RecordingStarted,
     project_id: ProjectId,
@@ -206,6 +232,12 @@ fn translate_finished(
             .as_ref()
             .map(captured_value_from_wire)
             .transpose()?,
+        outcome: finished
+            .outcome
+            .as_ref()
+            .map(xtrace_protocol::translate::outcome_from_wire)
+            .transpose()
+            .map_err(|_| RecordingPipelineError::InvalidFinishEvidence)?,
     })
 }
 
@@ -665,5 +697,31 @@ mod tests {
         assert!(
             matches!(failure, Err(RecordingPipelineError::Port(error)) if error.kind() == PortErrorKind::Internal)
         );
+    }
+
+    #[test]
+    fn effective_mode_is_the_lower_of_armed_and_claimed() {
+        use xtrace_domain::CaptureMode::{Focused, Standard};
+        let focused = xtrace_domain::CAPTURE_POLICY_FOCUSED_ID;
+        let standard = xtrace_domain::CAPTURE_POLICY_STANDARD_ID;
+        // an unarmed session never records under the focused cap, however it is claimed
+        assert_eq!(super::effective_capture_mode(Standard, focused), Standard);
+        assert_eq!(super::effective_capture_mode(Standard, standard), Standard);
+        assert_eq!(super::effective_capture_mode(Focused, focused), Focused);
+        assert_eq!(super::effective_capture_mode(Focused, standard), Standard);
+        // unknown and empty policy ids mean standard
+        assert_eq!(super::effective_capture_mode(Focused, ""), Standard);
+        assert_eq!(super::effective_capture_mode(Focused, "xtrace.focused.v2"), Standard);
+    }
+
+    #[test]
+    fn ingest_and_application_caps_agree() {
+        use xtrace_domain::CaptureMode::{Focused, Standard};
+        let ingest = xtrace_ingest::IngestConfig::mode_derived(std::num::NonZeroUsize::MIN);
+        for mode in [Standard, Focused] {
+            assert_eq!(ingest.event_cap(mode), mode.event_cap(), "{mode:?}");
+        }
+        assert_eq!(Standard.event_cap(), 16_384);
+        assert_eq!(Focused.event_cap(), 131_072);
     }
 }

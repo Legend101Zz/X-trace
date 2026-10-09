@@ -75,20 +75,21 @@ pub enum XtraceCommand {
         #[command(subcommand)]
         command: EndpointCommand,
     },
-    /// Scan the repository for endpoints (not implemented yet).
+    /// Scan the repository for endpoints.
     Scan(crate::scan::ScanArgs),
-    /// Read and compare the endpoint catalog (not implemented yet).
+    /// Read and compare the endpoint catalog.
     Catalog {
         #[command(subcommand)]
         command: crate::catalog_cmd::CatalogCommand,
     },
-    /// Start a capture session (not implemented yet).
+    /// Start the project's recording daemon detached and arm one launch (single-use bootstrap).
     Record(crate::lifecycle::RecordArgs),
-    /// Stop a capture session (not implemented yet).
+    /// Stop the recording daemon started by `record`; seals recordings it left open as partial.
     Stop(crate::lifecycle::StopArgs),
-    /// Restart a capture session (not implemented yet).
+    /// Stop (if running) then record again; the store is preserved.
     Restart(crate::lifecycle::RestartArgs),
-    /// Diagnose the local installation (not implemented yet).
+    /// Run read-only diagnostics on the installation and the project store; exits 1 on any
+    /// failed check. `--json` and `--yes` are accepted; output is always JSON.
     Doctor(crate::doctor::DoctorArgs),
     /// Export captured endpoints (not implemented yet).
     Export(crate::export::ExportArgs),
@@ -96,6 +97,16 @@ pub enum XtraceCommand {
     Exercise {
         #[command(subcommand)]
         command: crate::exercise::ExerciseCommand,
+    },
+    /// Preview and apply recording retention (not implemented yet).
+    Retention {
+        #[command(subcommand)]
+        command: crate::retention::RetentionCommand,
+    },
+    /// Back up, verify, restore and migrate the project store (not implemented yet).
+    Store {
+        #[command(subcommand)]
+        command: crate::store_cmd::StoreCommand,
     },
     /// Open the terminal viewer (not implemented yet).
     Tui(crate::tui::TuiArgs),
@@ -272,6 +283,8 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
         XtraceCommand::Doctor(args) => crate::doctor::run(args).await,
         XtraceCommand::Export(args) => crate::export::run(args).await,
         XtraceCommand::Exercise { command } => crate::exercise::run(command).await,
+        XtraceCommand::Retention { command } => crate::retention::run(command).await,
+        XtraceCommand::Store { command } => crate::store_cmd::run(command).await,
         XtraceCommand::Tui(args) => crate::tui::run(args).await,
         XtraceCommand::Daemon { project_dir } => crate::daemon::run(project_dir).await.map(|()| 0),
         #[cfg(unix)]
@@ -389,8 +402,10 @@ where
         RecordingCommand::Show { project_dir, recording_id, limit, cursor } => {
             let (project_id, recording_queries, correlation_id) =
                 open_recording_queries(&project_dir, env_reader)?;
-            let detail = recording_queries
-                .show(ShowRecording { project_id, recording_id, limit, cursor }, correlation_id)?;
+            let detail = recording_queries.show(
+                ShowRecording { project_id, recording_id, limit, cursor, around_frame: None },
+                correlation_id,
+            )?;
             let mut stdout = std::io::stdout().lock();
             write_success(&mut stdout, &detail)?;
             Ok(())
