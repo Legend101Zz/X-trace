@@ -247,6 +247,12 @@ jobs:
           echo "INSTR_DIR=${d}" >> "$GITHUB_ENV"
           python3 -B tools/qa/camp_instr_steps.py instrumented --file "$CAMP_OUT/summary.json" --project petclinic \
             --receipt "${d:-/nonexistent}/receipt.json"
+      - name: Exports of the recorded project (scanned for canaries below)
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          python3 -B tools/qa/camp_exports.py --xtrace "$XCAMP_XTRACE" --project-dir "$CAMP_ROOT/java/petclinic/src" \
+            --out "$RUNNER_TEMP/xt/exports" --file "$CAMP_OUT/summary.json" --project petclinic
       - name: Privacy canary scan (class names only, canaries are never printed)
         if: matrix.project == 'petclinic' && always()
         run: |
@@ -258,6 +264,7 @@ jobs:
               --loc "daemon-log=${INSTR_DIR:-/nonexistent}/viewer.log" \
               --loc "daemon-log=${INSTR_DIR:-/nonexistent}/application.log" \
               --loc "ui-json=${INSTR_DIR:-/nonexistent}/api" \
+              --loc "exports=$RUNNER_TEMP/xt/exports" \
               --loc "receipts=${INSTR_DIR:-/nonexistent}/receipt.json" \
               --loc "ci-output=$RUNNER_TEMP/priv/ci-output.log" \
               --report "$CAMP_OUT/privacy-canary-report.json"
@@ -297,7 +304,7 @@ jobs:
       - name: Record steps whose product feature does not exist for this project yet
         if: matrix.project != 'petclinic' && always()
         run: |
-          for step in instrumented-run instrumented-fingerprints-equal-baseline recordings-per-scenario source-identity \
+          for step in instrumented-run instrumented-fingerprints-equal-baseline recordings-per-scenario source-identity export-formats \
                       browser-journeys-linear browser-journeys-canvas tui-pty-transcript privacy-canary-scan \
                       overhead-measurement campaign-receipt-artifact; do
             python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
