@@ -5,6 +5,8 @@ on:
     branches:
       - main
       - "slice/**"
+      - "ultra/*-integration"
+      - "ultra/rc-*"
   pull_request:
     branches:
       - main

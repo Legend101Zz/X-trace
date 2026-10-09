@@ -6,6 +6,8 @@ on:
   push:
     branches:
       - "slice/v001-**"
+      - "ultra/*-integration"
+      - "ultra/rc-*"
   workflow_dispatch:
 
 permissions:
