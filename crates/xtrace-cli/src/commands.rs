@@ -144,14 +144,13 @@ pub enum XtraceCommand {
             long = "node-adapter",
             value_name = "DIR",
             conflicts_with = "java_agent",
-            required_unless_present = "java_agent",
-            requires = "node_mode"
+            required_unless_present = "java_agent"
         )]
         node_adapter: Option<PathBuf>,
-        /// Explicit Node module mode. Required with --node-adapter.
+        /// Node module mode: auto (default, injects both preloads), cjs or esm.
         #[arg(
             long = "node-mode",
-            value_name = "cjs|esm",
+            value_name = "auto|cjs|esm",
             requires = "node_adapter",
             conflicts_with = "java_agent"
         )]
@@ -300,7 +299,8 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
                     command,
                 )
                 .await
-            } else if let (Some(node_adapter), Some(node_mode)) = (node_adapter, node_mode) {
+            } else if let Some(node_adapter) = node_adapter {
+                let node_mode = node_mode.unwrap_or_else(|| "auto".to_owned());
                 if observed_endpoint_policy.is_some()
                     || application_component.is_some()
                     || binding_key.is_some()
@@ -313,8 +313,7 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
                 crate::run::run_node(project_dir, node_adapter, node_mode, command).await
             } else {
                 Err(CliError::InvalidArgument(
-                    "run requires either --java-agent or --node-adapter with --node-mode"
-                        .to_string(),
+                    "run requires either --java-agent or --node-adapter".to_string(),
                 ))
             }
         }
