@@ -13,8 +13,8 @@ use xtrace_application::recording::{
     RecordEvents, RecordingCapture,
 };
 use xtrace_domain::{
-    CapturedValue, DropReason, ProjectId, RecordingId, RuntimeSessionId, UnavailableReason,
-    ValueShape, WallTime,
+    CapturedValue, ProjectId, RecordingId, RuntimeSessionId, UnavailableReason, ValueShape,
+    WallTime,
 };
 use xtrace_protocol::generated::agent::{EventBatch, RecordingFinished, RecordingStarted};
 use xtrace_protocol::xtf::XtfEventEnvelope;
@@ -240,24 +240,14 @@ fn captured_value_from_wire(
             Ok(CapturedValue::Unavailable { reason: UnavailableReason::PrivacyPolicyUnavailable })
         }
         WireValue::Unavailable(unavailable) => {
-            let reason = match unavailable.reason {
-                1 => UnavailableReason::CapabilityUnsupported,
-                2 => UnavailableReason::DebugMetadataAbsent,
-                3 => UnavailableReason::CaptureBudgetExhausted,
-                4 => UnavailableReason::SourceArtifactMissing,
-                5 => UnavailableReason::RecorderDisconnected,
-                _ => return Err(invalid()),
-            };
+            let reason =
+                xtrace_protocol::translate::unavailable_reason_from_wire(unavailable.reason)
+                    .ok_or_else(invalid)?;
             Ok(CapturedValue::Unavailable { reason })
         }
         WireValue::Dropped(dropped) => {
-            let reason = match dropped.reason {
-                1 => DropReason::BackpressureShed,
-                2 => DropReason::QueueFull,
-                3 => DropReason::SequenceGap,
-                4 => DropReason::AdapterDropped,
-                _ => return Err(invalid()),
-            };
+            let reason = xtrace_protocol::translate::drop_reason_from_wire(dropped.reason)
+                .ok_or_else(invalid)?;
             Ok(CapturedValue::Dropped { reason })
         }
     }

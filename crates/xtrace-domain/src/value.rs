@@ -31,7 +31,15 @@ pub enum UnavailableReason {
     /// Recorder disconnected before sampling completed.
     RecorderDisconnected,
     /// A producer supplied preview text without a verifiable privacy policy.
+    ///
+    /// Internal only: it has no wire counterpart.
     PrivacyPolicyUnavailable,
+    /// Focused capture was requested but the session was not armed for it.
+    FocusedCaptureNotArmed,
+    /// Rendering the value was unsafe (for example a self-referential structure).
+    UnsafeToRender,
+    /// The class could not be transformed, so no value probe exists.
+    ClassNotTransformable,
 }
 
 impl UnavailableReason {
@@ -45,6 +53,9 @@ impl UnavailableReason {
             Self::SourceArtifactMissing => "source_artifact_missing",
             Self::RecorderDisconnected => "recorder_disconnected",
             Self::PrivacyPolicyUnavailable => "privacy_policy_unavailable",
+            Self::FocusedCaptureNotArmed => "focused_capture_not_armed",
+            Self::UnsafeToRender => "unsafe_to_render",
+            Self::ClassNotTransformable => "class_not_transformable",
         }
     }
 }
@@ -67,6 +78,12 @@ pub enum DropReason {
     SequenceGap,
     /// Adapter explicitly reported a drop.
     AdapterDropped,
+    /// The throttle level suppressed the value.
+    ThrottleSuppressed,
+    /// The per-recording line budget was exhausted.
+    LineBudget,
+    /// The per-recording value budget was exhausted.
+    ValueBudget,
 }
 
 impl DropReason {
@@ -78,6 +95,9 @@ impl DropReason {
             Self::QueueFull => "queue_full",
             Self::SequenceGap => "sequence_gap",
             Self::AdapterDropped => "adapter_dropped",
+            Self::ThrottleSuppressed => "throttle_suppressed",
+            Self::LineBudget => "line_budget",
+            Self::ValueBudget => "value_budget",
         }
     }
 }
@@ -213,8 +233,9 @@ pub enum CapturedValue {
         shape: ValueShape,
         /// Already-redacted preview safe to display.
         preview: SafePreview,
-        /// Content hash over the pre-redaction value, used for
-        /// integrity checks and stable references.
+        /// BLAKE3-256 of the EMITTED canonical bytes: the post-redaction,
+        /// post-truncation preview, never the original value (ADR 0003 6.4).
+        /// `Redacted` values carry no hash.
         digest: ContentHash,
     },
     /// The value was redacted by policy.
@@ -252,6 +273,16 @@ impl CapturedValue {
     #[must_use]
     pub const fn has_preview(&self) -> bool {
         matches!(self, Self::Captured { .. } | Self::Truncated { .. })
+    }
+
+    /// Returns the content digest when the variant carries one (`Captured` only; a `Redacted`
+    /// value has no hash by construction).
+    #[must_use]
+    pub const fn digest(&self) -> Option<&ContentHash> {
+        match self {
+            Self::Captured { digest, .. } => Some(digest),
+            _ => None,
+        }
     }
 
     /// Returns the redacted preview when one is present.
@@ -306,6 +337,38 @@ mod tests {
         let redacted = CapturedValue::Redacted { rule_id: "secret".to_string(), shape_hint: None };
         assert!(!redacted.has_preview());
         assert!(redacted.preview().is_none());
+    }
+
+    #[test]
+    fn captured_digest_documented_as_emitted_bytes() {
+        let emitted = "hel";
+        let captured = CapturedValue::Captured {
+            shape: ValueShape::String,
+            preview: SafePreview::from_redacted_unchecked(emitted),
+            digest: ContentHash::of_bytes(emitted.as_bytes()),
+        };
+        assert_eq!(captured.digest(), Some(&ContentHash::of_bytes(b"hel")));
+        assert_ne!(captured.digest(), Some(&ContentHash::of_bytes(b"hello")));
+        let redacted =
+            CapturedValue::Redacted { rule_id: "name.secret".to_string(), shape_hint: None };
+        assert!(redacted.digest().is_none(), "Redacted carries no hash");
+        let truncated = CapturedValue::Truncated {
+            preview: SafePreview::from_redacted_unchecked("ab"),
+            original_size_lower_bound: 10,
+            limit: 2,
+        };
+        assert!(truncated.digest().is_none());
+    }
+
+    #[test]
+    fn new_reasons_have_stable_strings() {
+        assert_eq!(UnavailableReason::FocusedCaptureNotArmed.as_str(), "focused_capture_not_armed");
+        assert_eq!(UnavailableReason::UnsafeToRender.as_str(), "unsafe_to_render");
+        assert_eq!(UnavailableReason::ClassNotTransformable.as_str(), "class_not_transformable");
+        assert_eq!(DropReason::ThrottleSuppressed.as_str(), "throttle_suppressed");
+        assert_eq!(DropReason::LineBudget.as_str(), "line_budget");
+        assert_eq!(DropReason::ValueBudget.as_str(), "value_budget");
+        assert_eq!(serde_json::to_string(&DropReason::ValueBudget).unwrap(), "\"value_budget\"");
     }
 
     #[test]

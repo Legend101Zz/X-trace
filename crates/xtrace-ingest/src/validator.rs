@@ -68,19 +68,19 @@ use std::num::NonZeroUsize;
 use blake3::Hasher;
 use prost::Message as _;
 use uuid::Uuid;
-use xtrace_domain::RecordingId;
+use xtrace_domain::{CaptureBudget, CaptureMode, RecordingId};
 use xtrace_protocol::generated::agent::{
-    EventBatch, RecordingEvent, RecordingFinished, RecordingStarted,
+    EventBatch, RecordingEvent, RecordingEventKind, RecordingFinished, RecordingStarted,
 };
 
 use crate::error::IngestError;
+use crate::event_rules::{
+    event_preview_bytes, normalize_started, validate_event, validate_finished,
+};
 
-/// Approved per-recording event budget.
-///
-/// Matches the default documented in `03-program-design.md` §6 and is
-/// the explicit fallback inside [`IngestConfig::new`]. Tests that need
-/// to exercise the boundary use [`IngestConfig::with_limit`] to lower
-/// the budget without redefining the production default.
+/// Legacy S0b per-recording event budget, kept as the cap [`IngestConfig::new`] applies until the
+/// daemon and application layers adopt the mode-derived caps (`CaptureMode::event_cap`) together
+/// (contracts RC-04, lane C-surface). Use [`IngestConfig::mode_derived`] for the new behaviour.
 pub const DEFAULT_MAX_EVENTS_PER_RECORDING: usize = 2048;
 
 /// BLAKE3 type-domain prefix for the per-event payload digest.
@@ -116,43 +116,68 @@ pub enum RecordingLifecycle {
 /// `max_active_recordings` is mandatory and never defaulted: the
 /// production caller is responsible for sizing the active-recording
 /// budget against the per-recording assembly capacity table in
-/// `03-program-design.md` §6. `max_events_per_recording` is set to
-/// the approved 2,048-event default by [`IngestConfig::new`]; tests
-/// override it through [`IngestConfig::with_limit`].
+/// `03-program-design.md` §6. The per-recording event cap is derived from the recording's
+/// effective [`CaptureMode`] unless `event_cap_override` is set; [`IngestConfig::new`] sets the
+/// legacy 2,048 override, [`IngestConfig::mode_derived`] leaves it unset.
 #[derive(Clone, Debug)]
 pub struct IngestConfig {
     /// Maximum number of recordings the validator will track
     /// concurrently (`Recording` plus `Finalizing`).
     pub max_active_recordings: NonZeroUsize,
-    /// Maximum number of `RecordingEvent` digests retained per
-    /// recording. Further new events are dropped and counted by priority
-    /// instead of failing the capture.
-    pub max_events_per_recording: NonZeroUsize,
+    /// Overrides the mode-derived per-recording event cap. Further new events
+    /// are dropped and counted by priority instead of failing the capture.
+    pub event_cap_override: Option<NonZeroUsize>,
+    /// Whether the daemon audit redactor runs on every event before storage. While `false`, any
+    /// event carrying `bindings` is rejected with [`IngestError::BindingsNotAcceptedYet`].
+    pub bindings_audit_active: bool,
 }
 
 impl IngestConfig {
-    /// Builds a configuration with the approved default event budget.
+    /// Builds a configuration with the legacy 2,048-event budget for every mode.
     ///
     /// `max_active_recordings` is supplied by the caller because the
-    /// active budget depends on the surrounding daemon topology; the
-    /// per-recording event budget is fixed at the approved default
-    /// and falls back to [`NonZeroUsize::MIN`] only if a future edit
-    /// changes [`DEFAULT_MAX_EVENTS_PER_RECORDING`] to `0`, so this
-    /// constructor never panics.
+    /// active budget depends on the surrounding daemon topology. The legacy budget falls back to
+    /// [`NonZeroUsize::MIN`] only if a future edit changes
+    /// [`DEFAULT_MAX_EVENTS_PER_RECORDING`] to `0`, so this constructor never panics.
     #[must_use]
     pub fn new(max_active_recordings: NonZeroUsize) -> Self {
-        let max_events_per_recording =
+        let legacy =
             NonZeroUsize::new(DEFAULT_MAX_EVENTS_PER_RECORDING).unwrap_or(NonZeroUsize::MIN);
-        Self { max_active_recordings, max_events_per_recording }
+        Self {
+            max_active_recordings,
+            event_cap_override: Some(legacy),
+            bindings_audit_active: false,
+        }
+    }
+
+    /// Builds a configuration whose per-recording cap follows the effective capture mode
+    /// (16,384 standard, 131,072 focused).
+    #[must_use]
+    pub const fn mode_derived(max_active_recordings: NonZeroUsize) -> Self {
+        Self { max_active_recordings, event_cap_override: None, bindings_audit_active: false }
     }
 
     /// Overrides the per-recording event budget. Intended for tests
     /// that need to exercise the [`IngestError::EventCapacityReached`]
-    /// boundary without sending the production 2,048-event budget.
+    /// boundary without sending the production event budget.
     #[must_use]
     pub const fn with_limit(mut self, max_events: NonZeroUsize) -> Self {
-        self.max_events_per_recording = max_events;
+        self.event_cap_override = Some(max_events);
         self
+    }
+
+    /// Declares that the daemon audit redactor runs on every event before storage, which lets
+    /// events carrying `bindings` through validation.
+    #[must_use]
+    pub const fn with_bindings_audit_active(mut self) -> Self {
+        self.bindings_audit_active = true;
+        self
+    }
+
+    /// The per-recording event cap in force for `mode`.
+    #[must_use]
+    pub fn event_cap(&self, mode: CaptureMode) -> usize {
+        self.event_cap_override.map_or_else(|| mode.event_cap(), NonZeroUsize::get)
     }
 }
 
@@ -206,6 +231,9 @@ pub enum Acceptance {
 /// Per-recording private state retained by the validator.
 #[derive(Debug)]
 struct RecordingState {
+    /// Effective capture mode, computed by the caller from the armed mode and the claimed policy
+    /// id; it selects the event cap and the per-mode event rules.
+    mode: CaptureMode,
     /// Cloned copy of the first accepted `RecordingStarted`.
     /// Identity-conflict detection compares a retry against this
     /// struct via `PartialEq`, which prost derives field-by-field
@@ -234,6 +262,10 @@ struct RecordingState {
     /// Events dropped at the event capacity, counted under their own
     /// priority. At most [`MAX_DROP_PRIORITY_BUCKETS`] distinct priorities.
     capacity_dropped_by_priority: BTreeMap<u32, u64>,
+    /// Running preview bytes of every retained event (CaptureBudget `max_value_bytes_per_recording`).
+    value_bytes: u64,
+    /// Running count of retained `LINE_CURSOR` events (CaptureBudget `max_line_events`).
+    line_events: u32,
 }
 
 /// Upper bound on distinct priorities tracked for capacity drops of one
@@ -370,7 +402,11 @@ impl IngestValidator {
     pub fn accept_started(
         &mut self,
         started: &RecordingStarted,
+        mode: CaptureMode,
     ) -> Result<Acceptance, IngestError> {
+        // An invalid `exercise_item_id` is cleared, never stored, so retries compare the
+        // normalized form.
+        let started = &normalize_started(started);
         let id = recording_id_from_bytes(&started.recording_id)?;
         if started.recording_seq != 1 {
             return Err(IngestError::InvalidStartSeq {
@@ -395,12 +431,15 @@ impl IngestValidator {
         self.recordings.insert(
             id,
             RecordingState {
+                mode,
                 started: started.clone(),
                 finished: None,
                 highest_contiguous: 1,
                 event_digests: HashMap::new(),
                 first_dropped_seq: None,
                 capacity_dropped_by_priority: BTreeMap::new(),
+                value_bytes: 0,
+                line_events: 0,
             },
         );
         Ok(Acceptance::Started)
@@ -475,14 +514,25 @@ impl IngestValidator {
 
         let is_finalizing = state.finished.is_some();
         let event_digest_count = state.event_digests.len();
-        let max_events = self.config.max_events_per_recording.get();
+        let mode = state.mode;
+        let audit_active = self.config.bindings_audit_active;
+        let max_events = self.config.event_cap(mode);
 
         let mut new_count: usize = 0;
         let mut duplicates: usize = 0;
         let mut candidate_highest: u64 = state.highest_contiguous;
         let mut pending: Vec<(u64, [u8; 32])> = Vec::with_capacity(batch.events.len());
+        let budget = CaptureBudget::for_mode(mode);
+        let mut pending_value_bytes: u64 = 0;
+        let mut pending_lines: u32 = 0;
         let mut drops = state.capacity_dropped_by_priority.clone();
         let mut first_dropped = state.first_dropped_seq;
+
+        // Validate every event before any state changes, so one bad event rejects the whole
+        // batch and the adapter resends a corrected event at the same sequence.
+        for event in &batch.events {
+            validate_event(event, mode, audit_active)?;
+        }
 
         for event in &batch.events {
             let seq = event.recording_seq;
@@ -525,13 +575,29 @@ impl IngestValidator {
                 // watermark, but never retained. Only a drop ledger that
                 // itself would outgrow its bound is refused; that check
                 // happens before mutation so the batch is atomic.
-                if event_digest_count.saturating_add(new_count).saturating_add(1) > max_events {
+                // The per-recording budgets (CaptureBudget) are enforced here as well: an event
+                // that would push the running preview-byte or line-event total over its budget
+                // is dropped and counted under its own priority exactly like a capacity drop.
+                let event_bytes = event_preview_bytes(event);
+                let is_line = event.kind == RecordingEventKind::LineCursor as i32;
+                let over_value_budget = state
+                    .value_bytes
+                    .saturating_add(pending_value_bytes)
+                    .saturating_add(event_bytes)
+                    > budget.max_value_bytes_per_recording;
+                let over_line_budget = is_line
+                    && state.line_events.saturating_add(pending_lines).saturating_add(1)
+                        > budget.max_line_events;
+                if event_digest_count.saturating_add(new_count).saturating_add(1) > max_events
+                    || over_value_budget
+                    || over_line_budget
+                {
                     if !drops.contains_key(&event.priority)
                         && drops.len() >= MAX_DROP_PRIORITY_BUCKETS
                     {
                         return Err(IngestError::EventCapacityReached {
                             recording_id: id,
-                            limit: self.config.max_events_per_recording,
+                            limit: NonZeroUsize::new(max_events).unwrap_or(NonZeroUsize::MIN),
                         });
                     }
                     let bucket = drops.entry(event.priority).or_insert(0);
@@ -541,6 +607,8 @@ impl IngestValidator {
                     continue;
                 }
                 pending.push((seq, digest));
+                pending_value_bytes = pending_value_bytes.saturating_add(event_bytes);
+                pending_lines = pending_lines.saturating_add(u32::from(is_line));
                 new_count += 1;
                 // Advance the local watermark so a contiguous run
                 // such as `[3, 4, 5]` is matched against the latest
@@ -578,6 +646,8 @@ impl IngestValidator {
         for (seq, digest) in pending {
             state.event_digests.insert(seq, digest);
         }
+        state.value_bytes = state.value_bytes.saturating_add(pending_value_bytes);
+        state.line_events = state.line_events.saturating_add(pending_lines);
         state.highest_contiguous = candidate_highest;
         state.capacity_dropped_by_priority = drops;
         state.first_dropped_seq = first_dropped;
@@ -612,6 +682,8 @@ impl IngestValidator {
         let id = recording_id_from_bytes(&finished.recording_id)?;
 
         let state = self.recordings.get_mut(&id).ok_or(IngestError::UnknownRecording(id))?;
+
+        validate_finished(finished, id)?;
 
         if let Some(existing) = &state.finished {
             if existing == finished {
@@ -653,12 +725,15 @@ impl IngestValidator {
         self.recordings.insert(
             id,
             RecordingState {
+                mode: CaptureMode::Standard,
                 started,
                 finished: None,
                 highest_contiguous,
                 event_digests,
                 first_dropped_seq: None,
                 capacity_dropped_by_priority: BTreeMap::new(),
+                value_bytes: 0,
+                line_events: 0,
             },
         );
     }
@@ -684,8 +759,10 @@ mod tests {
     };
 
     use super::{
-        Acceptance, IngestConfig, IngestError, IngestValidator, RecordingLifecycle, event_digest,
+        Acceptance, DEFAULT_MAX_EVENTS_PER_RECORDING, IngestConfig, IngestError, IngestValidator,
+        RecordingLifecycle, event_digest,
     };
+    use xtrace_domain::CaptureMode;
 
     fn rid() -> RecordingId {
         RecordingId::new()
@@ -766,12 +843,18 @@ mod tests {
         let a = rid();
         let b = rid();
 
-        assert_eq!(validator.accept_started(&started(a, "GET")).unwrap(), Acceptance::Started);
+        assert_eq!(
+            validator.accept_started(&started(a, "GET"), CaptureMode::Standard).unwrap(),
+            Acceptance::Started
+        );
         assert_eq!(validator.lifecycle(a), Some(RecordingLifecycle::Recording));
         assert_eq!(validator.highest_contiguous_seq(a), Some(1));
         assert_eq!(validator.len(), 1);
 
-        assert_eq!(validator.accept_started(&started(b, "POST")).unwrap(), Acceptance::Started);
+        assert_eq!(
+            validator.accept_started(&started(b, "POST"), CaptureMode::Standard).unwrap(),
+            Acceptance::Started
+        );
         assert_eq!(validator.len(), 2);
 
         assert_eq!(
@@ -808,7 +891,7 @@ mod tests {
         let id = rid();
         let mut payload = started(id, "GET");
         payload.recording_id = short_bytes();
-        let err = validator.accept_started(&payload).unwrap_err();
+        let err = validator.accept_started(&payload, CaptureMode::Standard).unwrap_err();
         assert!(matches!(err, IngestError::InvalidRecordingId { got: 15 }));
         assert_eq!(validator.len(), 0);
         assert!(validator.is_empty());
@@ -820,7 +903,7 @@ mod tests {
         let id = rid();
         let mut payload = started(id, "GET");
         payload.recording_id = long_bytes();
-        let err = validator.accept_started(&payload).unwrap_err();
+        let err = validator.accept_started(&payload, CaptureMode::Standard).unwrap_err();
         assert!(matches!(err, IngestError::InvalidRecordingId { got: 17 }));
         assert_eq!(validator.len(), 0);
     }
@@ -831,7 +914,7 @@ mod tests {
         let id = rid();
         let mut payload = started(id, "GET");
         payload.recording_seq = 7;
-        let err = validator.accept_started(&payload).unwrap_err();
+        let err = validator.accept_started(&payload, CaptureMode::Standard).unwrap_err();
         assert!(matches!(
             err,
             IngestError::InvalidStartSeq { recording_id: rid_check, got: 7 } if rid_check == id,
@@ -843,7 +926,7 @@ mod tests {
     fn non_monotonic_batch_is_rejected_atomically() {
         let mut validator = fresh_validator();
         let id = rid();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
 
         // Dropping back from seq=3 to seq=2 fails the whole batch
         // and leaves the recording untouched.
@@ -871,7 +954,7 @@ mod tests {
     fn exact_event_replay_is_idempotent() {
         let mut validator = fresh_validator();
         let id = rid();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
 
         let events = vec![event(2, 0xa1), event(3, 0xa2), event(4, 0xa3)];
         assert_eq!(
@@ -890,7 +973,7 @@ mod tests {
     fn changed_replay_payload_is_session_fatal_and_does_not_mutate() {
         let mut validator = fresh_validator();
         let id = rid();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
 
         validator.accept_events(&batch(id, vec![event(2, 0xa1), event(3, 0xa2)])).unwrap();
         assert_eq!(validator.highest_contiguous_seq(id), Some(3));
@@ -914,7 +997,7 @@ mod tests {
     fn forward_gap_is_reported_then_accepted_after_missing_batch() {
         let mut validator = fresh_validator();
         let id = rid();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
 
         let err = validator.accept_events(&batch(id, vec![event(4, 0xa1)])).unwrap_err();
         assert!(matches!(
@@ -937,7 +1020,7 @@ mod tests {
     fn mixed_duplicate_prefix_and_new_suffix_accepted_atomically() {
         let mut validator = fresh_validator();
         let id = rid();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
 
         assert_eq!(
             validator.accept_events(&batch(id, vec![event(2, 0xa1), event(3, 0xa2)])).unwrap(),
@@ -959,7 +1042,7 @@ mod tests {
     fn finish_seq_mismatch_leaves_recording_untouched() {
         let mut validator = fresh_validator();
         let id = rid();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
         validator.accept_events(&batch(id, vec![event(2, 0xa1)])).unwrap();
         let before = validator.highest_contiguous_seq(id);
 
@@ -981,13 +1064,16 @@ mod tests {
         let mut validator = fresh_validator();
         let id = rid();
 
-        assert_eq!(validator.accept_started(&started(id, "GET")).unwrap(), Acceptance::Started);
         assert_eq!(
-            validator.accept_started(&started(id, "GET")).unwrap(),
+            validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap(),
+            Acceptance::Started
+        );
+        assert_eq!(
+            validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap(),
             Acceptance::StartedRetry,
         );
         assert_eq!(
-            validator.accept_started(&started(id, "GET")).unwrap(),
+            validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap(),
             Acceptance::StartedRetry,
         );
 
@@ -998,7 +1084,7 @@ mod tests {
         // After finalization the started retry is still idempotent,
         // never a duplicate-conflict return.
         assert_eq!(
-            validator.accept_started(&started(id, "GET")).unwrap(),
+            validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap(),
             Acceptance::StartedRetry,
         );
     }
@@ -1007,7 +1093,7 @@ mod tests {
     fn changed_started_or_finished_retries_are_session_fatal() {
         let mut validator = fresh_validator();
         let id = rid();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
         validator.accept_events(&batch(id, vec![event(2, 0xa1)])).unwrap();
 
         // Mutating one field of the start marker must trigger the
@@ -1015,7 +1101,7 @@ mod tests {
         // untouched.
         let mut different_start = started(id, "GET");
         different_start.method = "POST".to_string();
-        let err = validator.accept_started(&different_start).unwrap_err();
+        let err = validator.accept_started(&different_start, CaptureMode::Standard).unwrap_err();
         assert!(err.is_session_fatal());
         assert!(matches!(err, IngestError::StartedConflict(rid_check) if rid_check == id));
         assert_eq!(validator.highest_contiguous_seq(id), Some(2));
@@ -1033,7 +1119,7 @@ mod tests {
     fn new_event_after_finalizing_rejected_but_exact_duplicate_batch_accepted() {
         let mut validator = fresh_validator();
         let id = rid();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
         validator.accept_events(&batch(id, vec![event(2, 0xa1), event(3, 0xa2)])).unwrap();
         assert_eq!(validator.accept_finished(&finished(id, 3)).unwrap(), Acceptance::Finalizing);
 
@@ -1078,7 +1164,7 @@ mod tests {
         let a = rid();
         let b = rid();
 
-        validator.accept_started(&started(a, "GET")).unwrap();
+        validator.accept_started(&started(a, "GET"), CaptureMode::Standard).unwrap();
         assert_eq!(
             validator.accept_events(&batch(a, vec![event(2, 0xaa)])).unwrap(),
             Acceptance::Events { accepted: 1, duplicates: 0, highest_contiguous: 2 },
@@ -1086,7 +1172,7 @@ mod tests {
 
         // Active capacity reached; the second start is rejected
         // without disturbing the first recording.
-        let err = validator.accept_started(&started(b, "GET")).unwrap_err();
+        let err = validator.accept_started(&started(b, "GET"), CaptureMode::Standard).unwrap_err();
         assert!(matches!(err, IngestError::ActiveCapacityReached { .. }));
         assert_eq!(validator.len(), 1);
         assert_eq!(validator.highest_contiguous_seq(a), Some(2));
@@ -1098,7 +1184,7 @@ mod tests {
         // reject the batch with EventCapacityReached; it now drops and counts.
         let mut validator = tight_validator(1, 2);
         let id = rid();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
         // Two retained, then 4 dropped in the same batch (priorities 7, 7, 3, 0).
         let accepted = validator
             .accept_events(&batch(
@@ -1167,7 +1253,7 @@ mod tests {
     fn drop_accounting_is_bounded_by_distinct_priorities() {
         let mut validator = tight_validator(1, 1);
         let id = rid();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
         validator.accept_events(&batch(id, vec![event(2, 0)])).unwrap();
         let many = (0..64_u32)
             .map(|priority| event_with_priority(3 + u64::from(priority), 1, priority))
@@ -1187,7 +1273,7 @@ mod tests {
     fn empty_event_batch_is_successful_noop_only_for_known_recording() {
         let mut validator = fresh_validator();
         let id = rid();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
 
         // Empty batch for a known recording reports the current
         // highest contiguous value without mutation.
@@ -1354,7 +1440,7 @@ mod tests {
         // as `FinishedRetry` rather than as a session-fatal
         // conflict.
         let mut validator = fresh_validator();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
         validator.accept_events(&batch(id, vec![event(2, 0xa1)])).unwrap();
         validator.accept_finished(&baseline).unwrap();
         assert_eq!(validator.accept_finished(&reordered).unwrap(), Acceptance::FinishedRetry);
@@ -1382,7 +1468,7 @@ mod tests {
         assert_ne!(baseline, changed);
 
         let mut validator = fresh_validator();
-        validator.accept_started(&started(id, "GET")).unwrap();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
         validator.accept_events(&batch(id, vec![event(2, 0xa1)])).unwrap();
         validator.accept_finished(&baseline).unwrap();
 
@@ -1444,6 +1530,251 @@ mod tests {
         let cap = NonZeroUsize::new(3).unwrap();
         let config = IngestConfig::new(NonZeroUsize::new(2).unwrap()).with_limit(cap);
         assert_eq!(config.max_active_recordings.get(), 2);
-        assert_eq!(config.max_events_per_recording.get(), 3);
+        assert_eq!(config.event_cap_override.map(NonZeroUsize::get), Some(3));
+    }
+
+    // ---- mode-derived caps and event rules (contracts sections 3 and 4) -------------------
+
+    fn mode_validator() -> IngestValidator {
+        IngestValidator::new(IngestConfig::mode_derived(NonZeroUsize::new(8).unwrap()))
+    }
+
+    fn many_events(from: u64, to_inclusive: u64) -> Vec<RecordingEvent> {
+        (from..=to_inclusive).map(|seq| event(seq, 1)).collect()
+    }
+
+    #[test]
+    fn cap_standard_16384_then_partial() {
+        let mut validator = mode_validator();
+        let id = rid();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
+        // 16,400 events after the start marker: events 2..=16_401.
+        for chunk_start in (2..=16_401_u64).step_by(1_000) {
+            let end = (chunk_start + 999).min(16_401);
+            validator.accept_events(&batch(id, many_events(chunk_start, end))).unwrap();
+        }
+        assert_eq!(validator.highest_contiguous_seq(id), Some(16_401));
+        let drops = validator.capacity_drops(id).unwrap();
+        assert_eq!(drops.values().sum::<u64>(), 16, "16 events past the 16,384 cap are counted");
+    }
+
+    #[test]
+    fn cap_focused_131072_accepts_all() {
+        let mut validator = mode_validator();
+        let id = rid();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Focused).unwrap();
+        // Exactly 131,072 events: events 2..=131_073.
+        for chunk_start in (2..=131_073_u64).step_by(4_096) {
+            let end = (chunk_start + 4_095).min(131_073);
+            validator.accept_events(&batch(id, many_events(chunk_start, end))).unwrap();
+        }
+        assert_eq!(validator.highest_contiguous_seq(id), Some(131_073));
+        assert!(validator.capacity_drops(id).unwrap().is_empty(), "nothing dropped at 131,072");
+        validator.accept_events(&batch(id, many_events(131_074, 131_074))).unwrap();
+        assert_eq!(validator.capacity_drops(id).unwrap().values().sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn standard_and_focused_caps_differ_for_the_same_config() {
+        let config = IngestConfig::mode_derived(NonZeroUsize::new(1).unwrap());
+        assert_eq!(config.event_cap(CaptureMode::Standard), 16_384);
+        assert_eq!(config.event_cap(CaptureMode::Focused), 131_072);
+        let legacy = IngestConfig::new(NonZeroUsize::new(1).unwrap());
+        assert_eq!(legacy.event_cap(CaptureMode::Focused), DEFAULT_MAX_EVENTS_PER_RECORDING);
+    }
+
+    #[test]
+    fn invalid_event_rejects_the_whole_batch_and_leaves_state_untouched() {
+        let mut validator = mode_validator();
+        let id = rid();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
+        let good = event(2, 1);
+        let bad = RecordingEvent { kind: 77, ..event(3, 2) };
+        let err = validator.accept_events(&batch(id, vec![good.clone(), bad])).unwrap_err();
+        assert!(matches!(err, IngestError::UnknownEnumValue { .. }));
+        assert!(!err.is_session_fatal());
+        assert_eq!(validator.highest_contiguous_seq(id), Some(1), "nothing was retained");
+        // The adapter resends a corrected event at the same sequence.
+        validator.accept_events(&batch(id, vec![good, event(3, 2)])).unwrap();
+        assert_eq!(validator.highest_contiguous_seq(id), Some(3));
+    }
+
+    #[test]
+    fn line_cursor_follows_the_recordings_effective_mode() {
+        use xtrace_protocol::generated::agent::{
+            RecordingEventKind, SourceBinding as WireBinding, SourceRange,
+        };
+        let line = |seq: u64| RecordingEvent {
+            kind: RecordingEventKind::LineCursor as i32,
+            source: Some(SourceRange {
+                path: "src/A.java".to_string(),
+                start_line: 5,
+                end_line: 5,
+                content_hash: Bytes::from(vec![1_u8; 32]),
+                ..SourceRange::default()
+            }),
+            source_binding: WireBinding::ObservedUnattested as i32,
+            ..event(seq, 1)
+        };
+        let mut validator = mode_validator();
+        let (standard, focused) = (rid(), rid());
+        validator.accept_started(&started(standard, "GET"), CaptureMode::Standard).unwrap();
+        validator.accept_started(&started(focused, "GET"), CaptureMode::Focused).unwrap();
+        assert!(matches!(
+            validator.accept_events(&batch(standard, vec![line(2)])).unwrap_err(),
+            IngestError::LineEventNotAllowedInStandardMode { .. }
+        ));
+        validator.accept_events(&batch(focused, vec![line(2)])).unwrap();
+    }
+
+    #[test]
+    fn per_recording_value_byte_budget_drops_and_counts_by_priority() {
+        use xtrace_protocol::generated::agent::{
+            CapturedValue, CapturedValueTruncated, captured_value::Value,
+        };
+        let big = |seq: u64| RecordingEvent {
+            priority: 7,
+            value: Some(CapturedValue {
+                value: Some(Value::Truncated(CapturedValueTruncated {
+                    preview: "x".repeat(512),
+                    ..CapturedValueTruncated::default()
+                })),
+            }),
+            ..event(seq, 1)
+        };
+        let id = rid();
+        let mut validator = mode_validator();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
+        // Standard budget: 256 KiB of preview bytes = 512 events of 512 bytes.
+        let events: Vec<_> = (2..=601).map(big).collect();
+        let acceptance = validator.accept_events(&batch(id, events)).unwrap();
+        assert!(matches!(acceptance, Acceptance::Events { accepted: 512, .. }));
+        assert_eq!(validator.highest_contiguous_seq(id), Some(601));
+        assert_eq!(validator.capacity_drops(id).unwrap().get(&7), Some(&88));
+        // A dropped sequence replays as a duplicate, not a conflict.
+        let replay = validator.accept_events(&batch(id, vec![big(601)])).unwrap();
+        assert!(matches!(replay, Acceptance::Events { duplicates: 1, .. }));
+    }
+
+    #[test]
+    fn per_recording_line_event_budget_drops_and_counts() {
+        use xtrace_protocol::generated::agent::{
+            RecordingEventKind, SourceBinding as WireBinding, SourceRange,
+        };
+        let line = |seq: u64| RecordingEvent {
+            kind: RecordingEventKind::LineCursor as i32,
+            priority: 3,
+            source: Some(SourceRange {
+                path: "src/A.java".to_string(),
+                start_line: 5,
+                end_line: 5,
+                content_hash: Bytes::from(vec![1_u8; 32]),
+                ..SourceRange::default()
+            }),
+            source_binding: WireBinding::ObservedUnattested as i32,
+            ..event(seq, 1)
+        };
+        let id = rid();
+        let mut validator = mode_validator();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Focused).unwrap();
+        let events: Vec<_> = (2..=8_201).map(line).collect();
+        let acceptance = validator.accept_events(&batch(id, events)).unwrap();
+        assert!(matches!(acceptance, Acceptance::Events { accepted: 8_192, .. }));
+        assert_eq!(validator.capacity_drops(id).unwrap().get(&3), Some(&8));
+    }
+
+    #[test]
+    fn bindings_need_the_audit_flag_on_the_validator() {
+        use xtrace_protocol::generated::agent::{
+            BindingRole, CapturedValue, CapturedValueDropped, DropReason, NameOrigin,
+            RecordingEventKind, ValueBinding, captured_value::Value,
+        };
+        let with_binding = RecordingEvent {
+            kind: RecordingEventKind::FrameEnter as i32,
+            symbol: "A.m".to_string(),
+            bindings: vec![ValueBinding {
+                name: "x".to_string(),
+                role: BindingRole::Argument as i32,
+                name_origin: NameOrigin::Declared as i32,
+                value: Some(CapturedValue {
+                    value: Some(Value::Dropped(CapturedValueDropped {
+                        reason: DropReason::ValueBudget as i32,
+                    })),
+                }),
+            }],
+            ..event(2, 1)
+        };
+        let id = rid();
+        let mut off = mode_validator();
+        off.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
+        assert!(matches!(
+            off.accept_events(&batch(id, vec![with_binding.clone()])).unwrap_err(),
+            IngestError::BindingsNotAcceptedYet { .. }
+        ));
+        let mut on = IngestValidator::new(
+            IngestConfig::mode_derived(NonZeroUsize::new(8).unwrap()).with_bindings_audit_active(),
+        );
+        on.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
+        on.accept_events(&batch(id, vec![with_binding])).unwrap();
+    }
+
+    #[test]
+    fn started_retry_compares_the_normalized_exercise_item_id() {
+        let id = rid();
+        let mut validator = fresh_validator();
+        let invalid =
+            RecordingStarted { exercise_item_id: "not-a-uuid".to_string(), ..started(id, "GET") };
+        assert_eq!(
+            validator.accept_started(&invalid, CaptureMode::Standard).unwrap(),
+            Acceptance::Started
+        );
+        // The invalid link was dropped, so the same marker without it is an exact retry.
+        assert_eq!(
+            validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap(),
+            Acceptance::StartedRetry
+        );
+        let valid_id = rid();
+        let uuid = "6f1c1d0e-8b8e-4c52-9a43-0f6f2d9b7a10";
+        let with =
+            RecordingStarted { exercise_item_id: uuid.to_string(), ..started(valid_id, "GET") };
+        validator.accept_started(&with, CaptureMode::Standard).unwrap();
+        assert!(
+            matches!(
+                validator
+                    .accept_started(&started(valid_id, "GET"), CaptureMode::Standard)
+                    .unwrap_err(),
+                IngestError::StartedConflict(_)
+            ),
+            "a valid link is kept, so dropping it later is a changed start marker"
+        );
+    }
+
+    #[test]
+    fn finished_with_invalid_outcome_is_rejected_and_not_sealed() {
+        use xtrace_protocol::generated::agent::{OutcomeKind, RecordingOutcome};
+        let mut validator = fresh_validator();
+        let id = rid();
+        validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
+        let bad = RecordingFinished {
+            outcome: Some(RecordingOutcome {
+                kind: OutcomeKind::Unobserved as i32,
+                http_status: 200,
+                ..RecordingOutcome::default()
+            }),
+            ..finished(id, 1)
+        };
+        let err = validator.accept_finished(&bad).unwrap_err();
+        assert!(matches!(err, IngestError::OutcomeInvalid { .. }));
+        assert!(!err.is_session_fatal());
+        assert_eq!(validator.lifecycle(id), Some(RecordingLifecycle::Recording));
+        let good = RecordingFinished {
+            outcome: Some(RecordingOutcome {
+                kind: OutcomeKind::Responded as i32,
+                http_status: 204,
+                ..RecordingOutcome::default()
+            }),
+            ..finished(id, 1)
+        };
+        assert_eq!(validator.accept_finished(&good).unwrap(), Acceptance::Finalizing);
     }
 }

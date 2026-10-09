@@ -610,7 +610,7 @@ impl Session {
                 let default_watermark = self.ingest_validator.highest_contiguous_seq(recording_id);
                 let acceptance = self
                     .ingest_validator
-                    .accept_started(started)
+                    .accept_started(started, xtrace_domain::CaptureMode::Standard)
                     .map_err(SessionError::with_ingest)?;
                 let incoming = IncomingEnvelope::RecordingStarted(started.clone());
                 Ok(self.admit_recording(
@@ -955,6 +955,31 @@ fn ingest_variant_name(err: &IngestError) -> &'static str {
         IngestError::FinishedConflict(_) => "finished_conflict",
         IngestError::ActiveCapacityReached { .. } => "active_capacity_reached",
         IngestError::EventCapacityReached { .. } => "event_capacity_reached",
+        IngestError::BindingsOverBudget { .. } => "bindings_over_budget",
+        IngestError::BindingNameTooLong { .. } => "binding_name_too_long",
+        IngestError::BindingNameInvalid { .. } => "binding_name_invalid",
+        IngestError::BindingPreviewTooLong { .. } => "binding_preview_too_long",
+        IngestError::EventValueBytesOverBudget { .. } => "event_value_bytes_over_budget",
+        IngestError::ValueMissing { .. } => "value_missing",
+        IngestError::LineCursorInvalid { .. } => "line_cursor_invalid",
+        IngestError::LineEventNotAllowedInStandardMode { .. } => {
+            "line_event_not_allowed_in_standard_mode"
+        }
+        IngestError::LocalsNotAllowedInStandardMode { .. } => "locals_not_allowed_in_standard_mode",
+        IngestError::GapPayloadInvalid { .. } => "gap_payload_invalid",
+        IngestError::HashOnRedacted { .. } => "hash_on_redacted",
+        IngestError::SourceBindingMismatch { .. } => "source_binding_mismatch",
+        IngestError::SourcePathInvalid { .. } => "source_path_invalid",
+        IngestError::BindingRoleKindMismatch { .. } => "binding_role_kind_mismatch",
+        IngestError::BindingsNotAcceptedYet { .. } => "bindings_not_accepted_yet",
+        IngestError::RedactionRuleIdInvalid { .. } => "redaction_rule_id_invalid",
+        IngestError::InteractionFieldInvalid { .. } => "interaction_field_invalid",
+        IngestError::ContentHashInvalid { .. } => "content_hash_invalid",
+        IngestError::SymbolRequired { .. } => "symbol_required",
+        IngestError::ExceptionFieldInvalid { .. } => "exception_field_invalid",
+        IngestError::RuntimeFactsInvalid { .. } => "runtime_facts_invalid",
+        IngestError::UnknownEnumValue { .. } => "unknown_enum_value",
+        IngestError::OutcomeInvalid { .. } => "outcome_invalid",
     }
 }
 
