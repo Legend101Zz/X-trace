@@ -27,7 +27,7 @@ fn version_prints_schema_version_and_protocol() {
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 3, "{text}");
-    assert_eq!(lines[1], "schema-version: 8");
+    assert_eq!(lines[1], format!("schema-version: {}", xtrace_store::CURRENT_SCHEMA_VERSION));
     assert_eq!(lines[2], "xtp-protocol: 1.0");
 }
 

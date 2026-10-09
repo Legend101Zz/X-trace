@@ -817,7 +817,9 @@ fn preflight_events<P: RecordingPersistencePort + ?Sized>(
     // retained state stays bounded by MAX_RECORDED_EVENTS.
     let persisted_highest = state.highest_contiguous;
     let mut scratch_highest = persisted_highest.saturating_add(state.capacity_dropped);
-    let mut scratch_digests = state.event_digests.clone();
+    // Only this batch's additions are held aside; the retained table is never cloned
+    // (CONTRACTS 4.1 resource budget).
+    let mut batch_digests: BTreeMap<u64, [u8; 32]> = BTreeMap::new();
     let mut previous_input = None;
     let mut duplicates = 0usize;
     let mut dropped = 0usize;
@@ -834,7 +836,11 @@ fn preflight_events<P: RecordingPersistencePort + ?Sized>(
         previous_input = Some(event.recording_seq);
         port.validate_event(event)?;
         let digest = event_digest(&event.canonical_bytes);
-        if let Some(existing) = scratch_digests.get(&event.recording_seq) {
+        if let Some(existing) = state
+            .event_digests
+            .get(&event.recording_seq)
+            .or_else(|| batch_digests.get(&event.recording_seq))
+        {
             if existing != &digest {
                 return Err(capture_error(
                     PortErrorKind::Conflict,
@@ -866,7 +872,7 @@ fn preflight_events<P: RecordingPersistencePort + ?Sized>(
                 "recording event exceeds a segment or XTF envelope byte limit",
             ));
         }
-        if scratch_digests.len() >= state.event_cap {
+        if state.event_digests.len().saturating_add(batch_digests.len()) >= state.event_cap {
             // Bounded capacity: degrade honestly instead of killing capture.
             // The event is neither persisted nor retained, only counted.
             if !dropped_by_priority.contains_key(&event.priority)
@@ -884,7 +890,7 @@ fn preflight_events<P: RecordingPersistencePort + ?Sized>(
             continue;
         }
         scratch_highest = event.recording_seq;
-        scratch_digests.insert(event.recording_seq, digest);
+        batch_digests.insert(event.recording_seq, digest);
         new_events.push(event.clone());
     }
     Ok(Preflight { duplicates, dropped, dropped_by_priority, new_events })

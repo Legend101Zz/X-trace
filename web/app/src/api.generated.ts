@@ -403,7 +403,7 @@ export interface components {
             parentFrameId: string | null;
             navigation: components["schemas"]["FrameNavigation"];
             /** Format: uuid */
-            requestId?: string;
+            requestId: string;
         };
         NavigateDocument: {
             /** Format: uuid */
@@ -412,7 +412,7 @@ export interface components {
             action?: "previous" | "next" | "into" | "over" | "out";
             result: components["schemas"]["NavigationResult"];
             /** Format: uuid */
-            requestId?: string;
+            requestId: string;
         };
         RecordingGraph: {
             nodes: {

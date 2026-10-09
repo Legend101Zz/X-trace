@@ -705,7 +705,7 @@ components:
         lastSequence: { type: string, pattern: '^[0-9]+$' }
     FrameNavigationDocument:
       type: object
-      required: [frameId, sequence, depth, parentFrameId, navigation]
+      required: [frameId, sequence, depth, parentFrameId, navigation, requestId]
       properties:
         frameId: { type: string, format: uuid }
         sequence: { type: string, pattern: '^[0-9]+$' }
@@ -715,7 +715,7 @@ components:
         requestId: { type: string, format: uuid }
     NavigateDocument:
       type: object
-      required: [frameId, result]
+      required: [frameId, result, requestId]
       properties:
         frameId: { type: string, format: uuid }
         action: { type: string, enum: [previous, next, into, over, out] }
