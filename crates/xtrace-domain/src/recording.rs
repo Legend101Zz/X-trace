@@ -522,10 +522,8 @@ impl RecordingOutcome {
     ///
     /// Returns a stable reason string naming the first violated rule.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if let Some(status) = self.http_status {
-            if !(100..=599).contains(&status) {
-                return Err("http_status_out_of_range");
-            }
+        if self.http_status.is_some_and(|status| !(100..=599).contains(&status)) {
+            return Err("http_status_out_of_range");
         }
         if self.exception.is_some() != (self.kind == OutcomeKind::ExceptionPropagated) {
             return Err("exception_presence_mismatch");

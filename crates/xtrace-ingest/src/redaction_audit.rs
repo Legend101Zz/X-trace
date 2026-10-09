@@ -142,9 +142,10 @@ fn contains_bearer(text: &str) -> bool {
         let begin = start + offset + 7;
         let token_len = lower.as_bytes()[begin..]
             .iter()
+            .copied()
             .take_while(|b| {
                 b.is_ascii_alphanumeric()
-                    || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+                    || matches!(*b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
             })
             .count();
         if token_len >= 8 {
@@ -208,24 +209,18 @@ pub fn audit_event(event: &mut RecordingEvent) -> AuditReport {
         if scrub_text(&mut binding.name) {
             // The name itself was a secret; its value cannot be trusted either.
             report.redacted_text_fields += 1;
-            if let Some(value) = binding.value.as_mut() {
-                if audit_value(value, true) {
-                    report.downgraded_values += 1;
-                }
+            if binding.value.as_mut().is_some_and(|value| audit_value(value, true)) {
+                report.downgraded_values += 1;
             }
             continue;
         }
         let secret_name = name_is_secret(&binding.name);
-        if let Some(value) = binding.value.as_mut() {
-            if audit_value(value, secret_name) {
-                report.downgraded_values += 1;
-            }
-        }
-    }
-    if let Some(value) = event.value.as_mut() {
-        if audit_value(value, false) {
+        if binding.value.as_mut().is_some_and(|value| audit_value(value, secret_name)) {
             report.downgraded_values += 1;
         }
+    }
+    if event.value.as_mut().is_some_and(|value| audit_value(value, false)) {
+        report.downgraded_values += 1;
     }
     if let Some(interaction) = event.interaction.as_mut() {
         for summary in [
@@ -244,10 +239,8 @@ pub fn audit_event(event: &mut RecordingEvent) -> AuditReport {
             report.redacted_text_fields += 1;
         }
     }
-    if let Some(exception) = event.exception.as_mut() {
-        if scrub_text(&mut exception.sanitized_message) {
-            report.redacted_text_fields += 1;
-        }
+    if event.exception.as_mut().is_some_and(|e| scrub_text(&mut e.sanitized_message)) {
+        report.redacted_text_fields += 1;
     }
     report
 }
@@ -255,17 +248,12 @@ pub fn audit_event(event: &mut RecordingEvent) -> AuditReport {
 /// Audits a finish marker in place: the response summary and the outcome exception message.
 pub fn audit_finished(finished: &mut RecordingFinished) -> AuditReport {
     let mut report = AuditReport::default();
-    if let Some(summary) = finished.response_summary.as_mut() {
-        if audit_value(summary, false) {
-            report.downgraded_values += 1;
-        }
+    if finished.response_summary.as_mut().is_some_and(|summary| audit_value(summary, false)) {
+        report.downgraded_values += 1;
     }
-    if let Some(outcome) = finished.outcome.as_mut() {
-        if let Some(exception) = outcome.exception.as_mut() {
-            if scrub_text(&mut exception.sanitized_message) {
-                report.redacted_text_fields += 1;
-            }
-        }
+    let outcome_exception = finished.outcome.as_mut().and_then(|o| o.exception.as_mut());
+    if outcome_exception.is_some_and(|e| scrub_text(&mut e.sanitized_message)) {
+        report.redacted_text_fields += 1;
     }
     report
 }
