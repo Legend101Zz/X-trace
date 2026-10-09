@@ -188,6 +188,7 @@ fn journey(fixture: &str) {
             .arg(&adapter_dist)
             .args(["--node-mode", "cjs", "--", "node", "--no-warnings"])
             .arg(&app)
+            .current_dir(app.parent().expect("fixture directory"))
             .env("XTRACE_DATA_HOME", &data_home)
             .env("APP_PORT", port.to_string())
             .stdout(Stdio::piped())
