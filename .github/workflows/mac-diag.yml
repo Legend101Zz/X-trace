@@ -25,6 +25,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/mr/tmp"
           npm ci --prefix adapters/node && npm run build --prefix adapters/node
           (cd adapters/java && ./gradlew --dependency-verification strict installDist agentDist fixtureBootJar)
+      - name: fsync bench
+        env:
+          TMPDIR: ${{ runner.temp }}/mr/tmp
+        run: |
+          cp /dev/null /dev/null
+          rustc -O -o fsb ci_fsb.rs && ./fsb
       - name: five
         env:
           TMPDIR: ${{ runner.temp }}/mr/tmp
