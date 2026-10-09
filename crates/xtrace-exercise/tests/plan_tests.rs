@@ -6,8 +6,8 @@ use std::net::TcpListener;
 
 use xtrace_exercise::canonical::{plan_value, recompute_hash};
 use xtrace_exercise::{
-    CandidateOp, CandidateParam, ChangeKind, Effect, PlanInput, ValueSource, classify, preview,
-    PlanError, synthesize as try_synthesize,
+    CandidateOp, CandidateParam, ChangeKind, Effect, PlanError, PlanInput, ValueSource, classify,
+    preview, synthesize as try_synthesize,
 };
 
 fn synthesize(i: &PlanInput) -> xtrace_exercise::Plan {

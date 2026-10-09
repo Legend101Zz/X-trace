@@ -174,8 +174,8 @@ pub fn gate_with_metadata(value: &Value, metadata: &[&str]) -> Option<String> {
         match value {
             Value::String(s) => {
                 // Free-text descriptions are prose: token shapes only, no name scan.
-                let meta = path.ends_with("/description")
-                    || metadata.iter().any(|m| path.starts_with(m));
+                let meta =
+                    path.ends_with("/description") || metadata.iter().any(|m| path.starts_with(m));
                 let bad = if meta { is_secret_shape(s) } else { is_secret_value(s) };
                 bad.then(|| path.clone())
             }
