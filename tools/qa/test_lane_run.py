@@ -176,6 +176,8 @@ class CountTests(unittest.TestCase):
         self.assertEqual((r["passed"], r["failed"]), (40, 2))
         r = lane_run.parse_output("      Tests  40 passed (40)")
         self.assertEqual((r["passed"], r["failed"]), (40, 0))
+        r = lane_run.parse_output("\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[32m162 passed\x1b[39m\x1b[22m | 2 skipped\x1b[90m (164)\x1b[39m")
+        self.assertEqual((r["passed"], r["failed"]), (162, 0))
 
     def _junit(self, d, tests, failures=0, skipped=0):
         (pathlib.Path(d) / "m" / "build" / "test-results" / "test").mkdir(parents=True, exist_ok=True)

@@ -41,7 +41,8 @@ PY_FAILED = re.compile(r"^FAILED \((?:failures=(\d+))?(?:, )?(?:errors=(\d+))?")
 NODE_PASS = re.compile(r"^\S{0,2}\s*pass (\d+)$")  # node:test spec reporter summary: "ℹ pass 12"
 NODE_FAIL = re.compile(r"^\S{0,2}\s*fail (\d+)$")
 NODE_SKIP = re.compile(r"^\S{0,2}\s*(?:skipped|todo|cancelled) (\d+)$")
-VITEST_TESTS = re.compile(r"^\s*Tests\s+(?:(\d+) failed \| )?(\d+) passed(?: \| (\d+) (?:skipped|todo))*\s*\((\d+)\)")
+VITEST_TESTS = re.compile(r"^\s*Tests\s+(?:.*?(\d+) failed)?.*?(\d+) passed")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 TAP_NOT_OK = re.compile(r"^\s*not ok \d+ - (\S+)\s*$")
 
 
@@ -50,7 +51,7 @@ def parse_output(text: str) -> dict:
     dropped = 0
     passed = failed = ignored = 0
     counted = False
-    for line in text.splitlines():
+    for line in ANSI.sub("", text).splitlines():
         line = line.rstrip()
         cand = None
         if m := CARGO_FAIL.match(line):
