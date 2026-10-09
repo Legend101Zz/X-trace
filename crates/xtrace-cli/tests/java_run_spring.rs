@@ -913,10 +913,9 @@ fn attach_keeps_existing_spring_target_alive_and_persists_real_request() {
         .and_then(|_| serde_json::from_slice(&ready_line).map_err(|error| error.to_string()))
     {
         Ok(ready) => ready,
-        Err(parse_error) => panic!(
-            "{}",
-            attach_failure_report(&mut attach, &mut target, &ready_line, &parse_error)
-        ),
+        Err(parse_error) => {
+            panic!("{}", attach_failure_report(&mut attach, &mut target, &ready_line, &parse_error))
+        }
     };
     assert_eq!(ready["kind"], "java_attach_result");
     assert_eq!(ready["pack_authenticity"], "unsigned_development_pack");
@@ -1700,11 +1699,8 @@ fn attach_failure_report(
             Err(error) => break format!("status unavailable: {error}"),
         }
     };
-    let stderr = attach
-        .stderr
-        .take()
-        .map(|handle| handle.join().unwrap_or_default())
-        .unwrap_or_default();
+    let stderr =
+        attach.stderr.take().map(|handle| handle.join().unwrap_or_default()).unwrap_or_default();
     let target_state = match target.child.try_wait() {
         Ok(None) => "alive".to_string(),
         Ok(Some(status)) => format!("exited: {status}"),
