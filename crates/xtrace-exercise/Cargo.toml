@@ -1,0 +1,12 @@
+[package]
+name = "xtrace-exercise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Exercise plans and runs (lane W). Skeleton created by C0."
+
+[lints]
+workspace = true

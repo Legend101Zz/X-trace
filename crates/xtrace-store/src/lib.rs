@@ -34,7 +34,9 @@
     )
 )]
 
+pub mod catalog_admission_store;
 pub mod catalog_discovery_store;
+pub mod catalog_history_store;
 pub mod connection;
 pub mod error;
 pub mod idempotency_repository;
