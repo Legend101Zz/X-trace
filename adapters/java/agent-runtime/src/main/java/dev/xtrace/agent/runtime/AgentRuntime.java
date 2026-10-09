@@ -104,6 +104,7 @@ public final class AgentRuntime {
                 new dev.xtrace.agent.runtime.line.SiteRegistry());
         lineSink = new LineProbeBridgeSink(sink, lineProbes.registry());
         writer.capturePolicy("xtrace.focused.v1");
+        writer.untransformedCount(lineProbes::skippedCount);
       }
       FixtureInstrumentation.install(
           instrumentation, writer::stopIncomplete, attach, config.scope(), lineProbes);

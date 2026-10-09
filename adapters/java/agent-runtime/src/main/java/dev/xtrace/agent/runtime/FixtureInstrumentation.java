@@ -204,6 +204,24 @@ final class FixtureInstrumentation {
       return registry;
     }
 
+    /**
+     * Methods or classes the wrapper left untouched for a reason that is not by design (bridge and
+     * synthetic methods are never probed on purpose and are not counted).
+     */
+    long skippedCount() {
+      long skipped = 0;
+      for (dev.xtrace.agent.runtime.line.MethodReport report : reports) {
+        if (report.status() != dev.xtrace.agent.runtime.line.MethodReport.Status.SKIPPED) continue;
+        String reason = report.reason();
+        if (dev.xtrace.agent.runtime.line.MethodReport.Reasons.BRIDGE.equals(reason)
+            || dev.xtrace.agent.runtime.line.MethodReport.Reasons.SYNTHETIC.equals(reason)) {
+          continue;
+        }
+        skipped++;
+      }
+      return skipped;
+    }
+
     java.util.List<dev.xtrace.agent.runtime.line.MethodReport> reports() {
       return java.util.List.copyOf(reports);
     }
