@@ -104,10 +104,10 @@ class MergeTests(unittest.TestCase):
 
 
 class RunTests(unittest.TestCase):
-    def run_step(self, cmd, min_passed=0, timeout=60):
+    def run_step(self, cmd, min_passed=0, timeout=60, max_ignored=-1):
         with tempfile.TemporaryDirectory() as d:
             args = type("A", (), {"suite": "meta", "variant": "-", "step": "t", "out": d + "/o", "cwd": "",
-                                  "timeout": timeout, "min_passed": min_passed, "command": ["--"] + cmd})()
+                                  "timeout": timeout, "min_passed": min_passed, "max_ignored": max_ignored, "command": ["--"] + cmd})()
             import os
             os.environ["LANE_PRIVATE_LOG_DIR"] = d
             rc = lane_run.cmd_run(args)
@@ -118,6 +118,25 @@ class RunTests(unittest.TestCase):
         rc, frag = self.run_step([sys.executable, "-c", "print('Ran 0 tests in 0.0s')"], 1)
         self.assertNotEqual(rc, 0)
         self.assertEqual(frag["status"], "fail")
+
+    def test_ignored_tests_fail_a_no_skips_step(self):
+        out = "test result: ok. 5 passed; 0 failed; 2 ignored; 0 measured"
+        rc, frag = self.run_step([sys.executable, "-c", f"print({out!r})"], 1, max_ignored=0)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(frag["status"], "fail")
+        rc, frag = self.run_step([sys.executable, "-c", f"print({out!r})"], 1, max_ignored=2)
+        self.assertEqual((rc, frag["status"]), (0, "pass"))
+
+    def test_panic_sites_keep_only_repo_relative_locations(self):
+        text = "\n".join([
+            "thread 'a' panicked at crates/x/src/lib.rs:12:5:",
+            "thread 'b' panicked at /Users/me/secret/lib.rs:3:1:",
+            "thread 'c' panicked at ../escape.rs:3:1:",
+            "thread 'd' panicked at crates/x/src/lib.rs:12:9:",
+            "boom token=abc"])
+        sites, dropped = lane_run.panic_sites(text)
+        self.assertEqual(sites, ["crates/x/src/lib.rs:12"])
+        self.assertEqual(dropped, 2)
 
     def test_timeout_is_a_failed_step_not_a_traceback(self):
         rc, frag = self.run_step([sys.executable, "-c", "import time; time.sleep(30)"], timeout=1)
@@ -164,6 +183,52 @@ class DiagnosticsTests(unittest.TestCase):
         diags, dropped = lane_run.diagnostics(text)
         self.assertEqual(len(diags), lane_run.MAX_DIAG)
         self.assertEqual(dropped, 39 - lane_run.MAX_DIAG)
+
+
+class CountTests(unittest.TestCase):
+    def test_node_test_summary_counts(self):
+        r = lane_run.parse_output("\u2139 tests 12\n\u2139 pass 11\n\u2139 fail 1\n\u2139 skipped 0")
+        self.assertEqual((r["passed"], r["failed"]), (11, 1))
+
+    def test_vitest_summary_counts(self):
+        r = lane_run.parse_output("      Tests  2 failed | 40 passed (42)")
+        self.assertEqual((r["passed"], r["failed"]), (40, 2))
+        r = lane_run.parse_output("      Tests  40 passed (40)")
+        self.assertEqual((r["passed"], r["failed"]), (40, 0))
+        r = lane_run.parse_output("\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[32m162 passed\x1b[39m\x1b[22m | 2 skipped\x1b[90m (164)\x1b[39m")
+        self.assertEqual((r["passed"], r["failed"]), (162, 0))
+
+    def _junit(self, d, tests, failures=0, skipped=0):
+        (pathlib.Path(d) / "m" / "build" / "test-results" / "test").mkdir(parents=True, exist_ok=True)
+        (pathlib.Path(d) / "m" / "build" / "test-results" / "test" / "TEST-a.xml").write_text(
+            f'<testsuite name="a" tests="{tests}" failures="{failures}" errors="0" skipped="{skipped}"/>')
+
+    def test_junit_counts_and_missing_reports(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(lane_run.junit_counts(pathlib.Path(d), "*/build/test-results/test/*.xml"))
+            self._junit(d, 10, failures=1, skipped=2)
+            self.assertEqual(lane_run.junit_counts(pathlib.Path(d), "*/build/test-results/test/*.xml"),
+                             {"passed": 7, "failed": 1, "ignored": 2})
+
+    def test_zero_tests_below_minimum_is_a_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = pathlib.Path(d) / "out"
+            for tests, want in ((3, "fail"), (0, "fail"), (5, "pass")):
+                self._junit(d, tests)
+                rc = subprocess.run([sys.executable, "-B", "-m", "tools.qa.lane_run", "run", "--suite", "java",
+                                     "--step", "t", "--cwd", d, "--junit-glob", "*/build/test-results/test/*.xml",
+                                     "--min-passed", "5", "--out", str(out), "--", sys.executable, "-c", "pass"],
+                                    cwd=ROOT, capture_output=True, text=True, env={**__import__("os").environ, "RUNNER_TEMP": d}).returncode
+                frag = json.loads((out / "java__-__t.json").read_text())
+                self.assertEqual(frag["status"], want)
+                self.assertEqual(rc == 0, want == "pass")
+
+    def test_countless_step_cannot_satisfy_a_minimum(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc = subprocess.run([sys.executable, "-B", "-m", "tools.qa.lane_run", "run", "--suite", "node", "--step", "t",
+                                 "--min-passed", "1", "--out", d, "--", sys.executable, "-c", "print('hi')"],
+                                cwd=ROOT, capture_output=True, text=True, env={**__import__("os").environ, "RUNNER_TEMP": d}).returncode
+            self.assertNotEqual(rc, 0)
 
 
 if __name__ == "__main__":

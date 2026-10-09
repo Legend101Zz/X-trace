@@ -363,16 +363,16 @@ jobs:
       - name: Format gate (stable rustfmt, no nightly-only keys)
         run: cargo fmt --all --check
       - name: Strict clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Unit and integration tests
-        run: cargo test --workspace --all-features --no-fail-fast
+        run: cargo test --locked --workspace --all-features --no-fail-fast
       - name: Restricted-PATH vendored-protoc build
         # `PATH` excludes any directory that could host a system `protoc`,
         # proving the build script resolves the binary exclusively through
         # `protoc-bin-vendored`.
         run: |
           PATH="/usr/bin:/bin:/usr/local/bin:$HOME/.cargo/bin" \
-            cargo build -p xtrace-protocol --all-features
+            cargo build --locked -p xtrace-protocol --all-features
       - name: CLI integration smoke
         run: |
           set -euo pipefail
@@ -380,13 +380,13 @@ jobs:
           export XTRACE_DATA_HOME="$SMOKE/userdata"
           rm -rf $SMOKE
           mkdir -p $SMOKE/repo
-          cargo build -p xtrace-cli --bin xtrace
+          cargo build --locked -p xtrace-cli --bin xtrace
           # Uninitialized status: must not create the user-data
           # directory or the repository pointer. Capture both stdout
           # and exit code; `set -e` is suspended only around this
           # command so a future bug that exits non-zero still fails
           # the gate.
-          status_output=$(cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir $SMOKE/repo)
+          status_output=$(cargo run --locked -q -p xtrace-cli --bin xtrace -- status --project-dir $SMOKE/repo)
           echo "$status_output"
           if [ -d $SMOKE/userdata/projects ]; then
             echo "FAIL: status on uninit created user-data directory"
@@ -401,9 +401,9 @@ jobs:
             exit 1
           fi
           # init twice with the same canonical input must replay.
-          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Smoke"
+          cargo run --locked -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Smoke"
           first_project=$(ls $SMOKE/userdata/projects | head -n1)
-          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Smoke"
+          cargo run --locked -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Smoke"
           after_replay=$(ls $SMOKE/userdata/projects | wc -l)
           if [ "$after_replay" -ne 1 ]; then
             echo "FAIL: replay created extra project directory"
@@ -415,7 +415,7 @@ jobs:
           # then enforces the contract explicitly rather than relying
           # on `|| true`.
           set +e
-          conflict_output=$(cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Different" 2>&1)
+          conflict_output=$(cargo run --locked -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Different" 2>&1)
           conflict_exit=$?
           set -e
           if [ "$conflict_exit" -eq 0 ]; then
@@ -434,8 +434,158 @@ jobs:
             exit 1
           fi
           # Successful status + open after init.
-          cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir $SMOKE/repo
-          cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir $SMOKE/repo
+          cargo run --locked -q -p xtrace-cli --bin xtrace -- status --project-dir $SMOKE/repo
+          cargo run --locked -q -p xtrace-cli --bin xtrace -- open --project-dir $SMOKE/repo
           test -f $SMOKE/userdata/projects/"$first_project"/metadata.sqlite3
           test -f $SMOKE/repo/.xtrace/config.toml
           grep -q '^project_id = ' $SMOKE/repo/.xtrace/config.toml
+
+  macos-arm64:
+    # ADR 0006 section 2.3: hosted macOS arm64 evidence for cfg(unix), private storage, attach and packaging changes.
+    # Every suite step has its own `if: !cancelled()`, so one failure never hides the others; none may fail and no
+    # ignored or skipped test is accepted (--max-ignored 0). Rust, Java, Node and web steps print only allowlisted
+    # facts (tools.qa.lane_run keeps raw output in a private log). prepare-private-root exports the scratch
+    # environment (TMPDIR, TMP, TEMP, XTRACE_TEST_PRIVATE_SCRATCH, XTRACE_TEST_SCRATCH_ROOT) for every later step.
+    # NOT COVERED at this sha: the ADR 0006 2.3 other-UID broker negative does not exist in the tree, so section
+    # 2.3 is not fully met by this job.
+    needs: release-tool-tests
+    runs-on: macos-15
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tuple: jdk17-node22
+            java-version: 17
+            node-version: 22
+          - tuple: jdk21-node24
+            java-version: 21
+            node-version: 24
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Select private root path
+        run: |
+          root="$RUNNER_TEMP/mr"
+          [ "${#root}" -le 40 ] || { echo "private root path too long"; exit 1; }
+          echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
+      - name: Put Homebrew OpenSSL 3 first on PATH
+        # The macOS system openssl is LibreSSL; the release tooling preflight requires OpenSSL 3.
+        run: |
+          set -euo pipefail
+          prefix="$(brew --prefix openssl@3)"
+          test -x "$prefix/bin/openssl"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+      - name: Verify exact source and architecture
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor preflight-source \
+            --repo "$GITHUB_WORKSPACE" \
+            --phase-metadata evidence/v0.01/workflow.json \
+            --expected-head "$GITHUB_SHA"
+      - name: Admit private scratch before test output
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor prepare-private-root --root "$XTRACE_CI_PRIVATE_ROOT"
+      - name: Run the complete release tooling suite without skips
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          umask 077
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor summarize-tests \
+            --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
+            --log-file "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log"
+          result=$?
+          set -e
+          exit "$result"
+      - name: Node install (exact, npm ci)
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step install --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            npm ci --prefix adapters/node
+      - name: Node protocol generation check
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step generate-check --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            npm run generate:check --prefix adapters/node
+      - name: Node unit tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step test --min-passed 80 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            npm test --prefix adapters/node
+      - name: Web install
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step install --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            bash -ec 'npm ci --prefix web/app && cd web/app && npx playwright install chromium'
+      - name: Web typecheck
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step typecheck --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            npm run typecheck --prefix web/app
+      - name: Web unit tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step unit-tests --min-passed 70 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            npm test --prefix web/app
+      - name: Web check:api
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step check-api --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            npm run check:api --prefix web/app
+      - name: Web check:embedded
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step check-embedded --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            npm run check:embedded --prefix web/app
+      - name: Java strict Gradle build and tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite java --variant "${{ matrix.java-version }}" --step gradle --cwd adapters/java \
+            --junit-glob "*/build/test-results/test/*.xml" --min-passed 170 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
+      - name: cargo build (locked workspace)
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step build --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            cargo build --locked --workspace --all-features
+      - name: cargo test (locked workspace, no ignored tests)
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step test --min-passed 900 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            cargo test --locked --workspace --all-features --no-fail-fast
+      - name: Packaged install journey (unattended)
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite package --variant "${{ matrix.tuple }}" --step journey --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            bash -ec '
+              python3 packaging/build.py --out dist --platform macos-arm64
+              sh packaging/install.sh verify-dist dist/macos-arm64
+              root="$RUNNER_TEMP/xt-install"
+              mkdir -m 700 "$root" "$root/tmp"
+              TMPDIR="$root/tmp" sh packaging/test/install_test.sh dist/macos-arm64
+            '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: xtrace-macos-arm64-frag-${{ matrix.tuple }}
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag
+          if-no-files-found: ignore
+          retention-days: 14

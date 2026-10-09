@@ -154,12 +154,15 @@ jobs:
       - name: Build the Node, web, and Java adapters the Rust tests drive
         # Same prerequisites as the ci.yml gates job: the Rust workspace tests launch the built
         # adapters, the embedded viewer and Chromium.
+        # Run through lane_run so the public log carries only allowlisted facts (SEC-10 / F7); output stays in a private log.
         run: |
-          npm ci --prefix adapters/node
-          npm run build --prefix adapters/node
-          npm ci --prefix web/app
-          (cd web/app && npx playwright install --with-deps chromium)
-          (cd adapters/java && ./gradlew --dependency-verification strict clean testClasses installDist agentDist fixtureBootJar)
+          python3 -B -m tools.qa.lane_run run --suite rust --step prelude-build --out "$RUNNER_TEMP/lane-frag" -- bash -ec '
+            npm ci --prefix adapters/node
+            npm run build --prefix adapters/node
+            npm ci --prefix web/app
+            (cd web/app && npx playwright install --with-deps chromium)
+            (cd adapters/java && ./gradlew --dependency-verification strict clean testClasses installDist agentDist fixtureBootJar)
+          '
       - name: Admit private test scratch before cargo tests
         # Product storage refuses a data directory under a world-writable ancestor such as /tmp, so Rust
         # tests that run `init` need a TMPDIR below the runner's private temp directory (ci.yml shape).
@@ -183,7 +186,7 @@ jobs:
       - name: cargo test
         if: ${{ !cancelled() }}
         run: |
-          python3 -B -m tools.qa.lane_run run --suite rust --step test --min-passed 1 --out "$RUNNER_TEMP/lane-frag" -- \
+          python3 -B -m tools.qa.lane_run run --suite rust --step test --min-passed 900 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- \
             cargo test --locked --workspace --all-features --no-fail-fast
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
@@ -235,7 +238,7 @@ jobs:
           LANE_JDK: ${{ matrix.java-version }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite java --variant "${{ matrix.java-version }}" --step gradle-test \
-            --cwd adapters/java --out "$RUNNER_TEMP/lane-frag" -- \
+            --cwd adapters/java --junit-glob "*/build/test-results/test/*.xml" --min-passed 170 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- \
             ./gradlew --dependency-verification strict "-Porg.gradle.java.installations.paths=$JAVA_HOME_17_X64" \
             -I "$GITHUB_WORKSPACE/tools/qa/lane-test-jdk.init.gradle" clean test
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -282,7 +285,7 @@ jobs:
       - name: Typecheck and unit tests
         run: |
           python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step test \
-            --out "$RUNNER_TEMP/lane-frag" -- npm test --prefix adapters/node
+            --min-passed 80 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- npm test --prefix adapters/node
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
@@ -327,7 +330,7 @@ jobs:
             npm run typecheck --prefix web/app
       - name: Unit tests
         run: |
-          python3 -B -m tools.qa.lane_run run --suite web --step unit-tests --out "$RUNNER_TEMP/lane-frag" -- \
+          python3 -B -m tools.qa.lane_run run --suite web --step unit-tests --min-passed 70 --max-ignored 0 --out "$RUNNER_TEMP/lane-frag" -- \
             npm test --prefix web/app
       - name: API and embedded asset checks
         run: |
