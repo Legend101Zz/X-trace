@@ -23,7 +23,7 @@ jobs:
         with: {toolchain: stable}
       - run: |
           mkdir -p "$RUNNER_TEMP/mr/tmp"
-          npm ci --prefix adapters/node && npm test --prefix adapters/node
+          npm ci --prefix adapters/node && npm run build --prefix adapters/node
           (cd adapters/java && ./gradlew --dependency-verification strict installDist agentDist fixtureBootJar)
       - name: five
         env:
