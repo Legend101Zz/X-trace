@@ -141,3 +141,21 @@ fn unavailable_claims_are_stated_not_guessed() {
     assert!(d["paths"]["/orders"]["post"]["responses"]["default"].is_object());
     let _ = (param("a", "query", "", false), response("200", ""));
 }
+
+#[test]
+fn openapi_carries_observation_markers() {
+    let d = doc(&spring_orders());
+    let mut seen_inferred = false;
+    for (_, methods) in d["paths"].as_object().unwrap() {
+        for (_, o) in methods.as_object().unwrap() {
+            let marker = o["x-xtrace-observation"].as_str().unwrap();
+            let state = o["x-xtrace"]["effective_state"].as_str().unwrap();
+            assert_eq!(marker == "observed", state == "observed", "{state} -> {marker}");
+            seen_inferred |= marker == "inferred";
+            for e in o["x-xtrace"]["examples"].as_array().into_iter().flatten() {
+                assert_eq!(e["x-xtrace-observation"], "inferred");
+            }
+        }
+    }
+    assert!(seen_inferred || !d["paths"].as_object().unwrap().is_empty());
+}

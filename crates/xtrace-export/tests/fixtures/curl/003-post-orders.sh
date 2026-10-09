@@ -7,7 +7,7 @@
 # recipe 003
 set -eu
 : "${BASE_URL:?set BASE_URL, for example http://127.0.0.1:8080}"
-curl --silent --show-error --fail-with-body -X 'POST' \
+curl --silent --show-error --fail-with-body --globoff --proto '=http,https' -X 'POST' \
   -H 'Content-Type: application/json' \
-  --data-binary '{"sku":"A-1","qty":2}' \
+  --data-raw '{"sku":"A-1","qty":2}' \
   "${BASE_URL}"'/orders'

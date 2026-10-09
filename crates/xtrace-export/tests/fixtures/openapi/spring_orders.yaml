@@ -78,10 +78,12 @@ paths:
             origin: "claim"
             target: "param:page"
             value: 1
+            x-xtrace-observation: "inferred"
         operation_id: "op-list"
         provenance:
           - "adapter_registration"
           - "static_analysis"
+      x-xtrace-observation: "inferred"
     post:
       operationId: "postOrders"
       requestBody:
@@ -105,9 +107,11 @@ paths:
             value:
               qty: 2
               sku: "A-1"
+            x-xtrace-observation: "inferred"
         operation_id: "op-create"
         provenance:
           - "static_analysis"
+      x-xtrace-observation: "observed"
   "/orders/{id}":
     delete:
       operationId: "deleteOrdersById"
@@ -129,6 +133,7 @@ paths:
         operation_id: "op-delete"
         provenance:
           - "static_analysis"
+      x-xtrace-observation: "inferred"
     get:
       operationId: "getOrdersById"
       parameters:
@@ -162,6 +167,7 @@ paths:
             origin: "scenario"
             target: "param:id"
             value: 42
+            x-xtrace-observation: "inferred"
         handlers:
           -
             line_end: 31
@@ -171,3 +177,4 @@ paths:
         operation_id: "op-get-one"
         provenance:
           - "static_analysis"
+      x-xtrace-observation: "inferred"

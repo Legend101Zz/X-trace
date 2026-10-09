@@ -35,18 +35,17 @@ fn curl_golden() {
 }
 
 #[test]
-fn curl_all_sh_contains_no_mutating_command() {
+fn curl_all_sh_prints_and_never_executes() {
     let o = out();
     let all = text(o.files.iter().find(|f| f.path == "all.sh").unwrap());
-    assert!(all.contains("sh \"$DIR/001-get-orders.sh\""));
-    assert!(all.contains("sh \"$DIR/004-get-orders-id.sh\""));
-    for mutating in ["003-post-orders.sh", "005-delete-orders-id.sh"] {
-        assert!(all.contains(&format!("# not run (mutating")), "{all}");
-        for line in all.lines().filter(|l| l.contains(mutating)) {
-            assert!(line.starts_with('#'), "mutating recipe invoked: {line}");
-        }
-    }
+    assert!(all.contains("001-get-orders.sh"));
+    assert!(all.contains("MUTATING"));
     assert!(!all.contains("curl"), "all.sh must not contain curl itself");
+    for line in all.lines().filter(|l| !l.starts_with('#') && !l.starts_with("set ")) {
+        assert!(line.starts_with("printf '%s\\n' 'sh "), "all.sh runs something: {line}");
+        assert!(!line.contains("$DIR") && !line.contains('`'), "{line}");
+    }
+    assert!(!all.contains("DIR="), "no directory resolution needed: nothing is executed");
 }
 
 #[test]
@@ -78,7 +77,7 @@ fn curl_no_secret_values() {
     // the credential header is a required environment placeholder, never a value
     let o = out();
     let get = text(o.files.iter().find(|f| f.path == "004-get-orders-id.sh").unwrap());
-    assert!(get.contains("-H \"Authorization: ${XT_HEADER_AUTHORIZATION}\""), "{get}");
+    assert!(get.contains("-H 'Authorization: '\"${XT_HEADER_AUTHORIZATION}\""), "{get}");
     assert!(get.contains(": \"${XT_HEADER_AUTHORIZATION:?set XT_HEADER_AUTHORIZATION}\""));
 }
 

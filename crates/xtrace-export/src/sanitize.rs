@@ -1,4 +1,6 @@
-//! Sanitizer gate: secret-shaped keys and values are never emitted.
+//! Sanitizer gate: a best-effort deny-list. Secret-shaped keys, key/value
+//! text and well-known token shapes are refused. It is NOT proof that no
+//! secret is present; the independent check is the shared Q canary scanner.
 
 use serde_json::Value;
 
@@ -41,9 +43,59 @@ fn has_run(s: &str, prefix: &str, min_tail: usize, ok: impl Fn(char) -> bool) ->
     false
 }
 
+/// Extra names only checked in `name<sep>value` text (short, so they need a
+/// word boundary before them).
+const SHORT_NAME_PARTS: &[&str] = &["pwd", "sig"];
+
+/// True when text contains a secret-shaped name directly followed (after
+/// optional whitespace) by `=`, `:`, `>` or a quote, as in `password: x`,
+/// `apikey=x`, `<token>x` or a truncated JSON `"secret":`.
+#[must_use]
+pub fn has_secret_assignment(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let follows = |end: usize| {
+        lower[end..]
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, '=' | ':' | '>' | '"' | '\''))
+    };
+    for part in SECRET_NAME_PARTS {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(part) {
+            let end = from + pos + part.len();
+            if follows(end) {
+                return true;
+            }
+            from = end;
+        }
+    }
+    for part in SHORT_NAME_PARTS {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(part) {
+            let start = from + pos;
+            let end = start + part.len();
+            let boundary =
+                lower[..start].chars().next_back().is_none_or(|c| !c.is_ascii_alphanumeric());
+            if boundary && follows(end) {
+                return true;
+            }
+            from = end;
+        }
+    }
+    false
+}
+
 /// True when a string value looks like a credential regardless of its key.
 #[must_use]
 pub fn is_secret_value(value: &str) -> bool {
+    is_secret_shape(value) || has_secret_assignment(value)
+}
+
+/// Token shapes, PEM blocks, bearer/basic runs, URL passwords and the
+/// `password=`-style assignments only (no name-followed-by-separator scan).
+#[must_use]
+pub fn is_secret_shape(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     if lower.contains("-----begin") || lower.contains("canary") {
         return true;
@@ -61,6 +113,17 @@ pub fn is_secret_value(value: &str) -> bool {
         || has_run(value, "ghp_", 20, alnum)
         || has_run(value, "xoxb-", 10, alnum)
         || has_run(value, "sk-", 20, alnum)
+        || has_run(value, "sk_live_", 10, alnum)
+        || has_run(value, "sk_test_", 10, alnum)
+        || has_run(value, "rk_live_", 10, alnum)
+        || has_run(value, "AIza", 30, alnum)
+        || has_run(value, "ASIA", 16, |c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        || has_run(value, "github_pat_", 20, alnum)
+        || has_run(value, "gho_", 20, alnum)
+        || has_run(value, "ghs_", 20, alnum)
+        || has_run(value, "ghu_", 20, alnum)
+        || has_run(value, "glpat-", 16, alnum)
+        || ["xoxa-", "xoxp-", "xoxr-", "xoxs-"].iter().any(|p| has_run(value, p, 10, alnum))
     {
         return true;
     }
@@ -97,14 +160,26 @@ pub fn json_has_secret(value: &Value) -> bool {
 /// Returns the path of the first offender (never the value).
 #[must_use]
 pub fn gate(value: &Value) -> Option<String> {
-    fn walk(value: &Value, path: &mut String) -> Option<String> {
+    gate_with_metadata(value, &[])
+}
+
+/// Like [`gate`], but strings under any of the `metadata` JSON-pointer
+/// prefixes (for example the omissions list, which names dropped secret-named
+/// fields on purpose) get the token-shape check only, not the name scan.
+#[must_use]
+pub fn gate_with_metadata(value: &Value, metadata: &[&str]) -> Option<String> {
+    fn walk(value: &Value, path: &mut String, metadata: &[&str]) -> Option<String> {
         match value {
-            Value::String(s) if is_secret_value(s) => Some(path.clone()),
+            Value::String(s) => {
+                let meta = metadata.iter().any(|m| path.starts_with(m));
+                let bad = if meta { is_secret_shape(s) } else { is_secret_value(s) };
+                bad.then(|| path.clone())
+            }
             Value::Array(items) => {
                 for (i, item) in items.iter().enumerate() {
                     let len = path.len();
                     path.push_str(&format!("/{i}"));
-                    if let Some(found) = walk(item, path) {
+                    if let Some(found) = walk(item, path, metadata) {
                         return Some(found);
                     }
                     path.truncate(len);
@@ -119,7 +194,7 @@ pub fn gate(value: &Value) -> Option<String> {
                     path.push('/');
                     path.push_str(key);
                     if let Some(item) = map.get(key) {
-                        if let Some(found) = walk(item, path) {
+                        if let Some(found) = walk(item, path, metadata) {
                             return Some(found);
                         }
                     }
@@ -130,7 +205,7 @@ pub fn gate(value: &Value) -> Option<String> {
             _ => None,
         }
     }
-    walk(value, &mut String::new())
+    walk(value, &mut String::new(), metadata)
 }
 
 #[cfg(test)]
@@ -160,6 +235,58 @@ mod tests {
             assert!(is_secret_value(v), "{v}");
         }
         for v in ["hello", "42", "https://example.com/a?b=c", "Basic", "sk-short"] {
+            assert!(!is_secret_value(v), "{v}");
+        }
+    }
+
+    #[test]
+    fn table_positive_text_forms() {
+        for v in [
+            "password: hunter2",
+            "<password>hunter2</password>",
+            "{\"password\":\"x\",}",
+            "apikey=abc123",
+            "api_key = abc",
+            "passwd=x",
+            "pwd=x",
+            "sig=abcdef",
+            "client_secret: s",
+            "credential=zzz",
+            "authorization: Negotiate abc",
+            "a=1&token=abc&b=2",
+            "<token>abc</token>",
+            "sk_live_abcdefghijklmnop",
+            "rk_live_abcdefghijklmnop",
+            "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+            "ASIAABCDEFGHIJKLMNOP",
+            "github_pat_11ABCDEFG0123456789abc",
+            "gho_abcdefghijklmnopqrstuv",
+            "ghs_abcdefghijklmnopqrstuv",
+            "ghu_abcdefghijklmnopqrstuv",
+            "glpat-abcdefghijklmnopqrst",
+            "xoxp-1234567890-abc",
+            "xoxa-1234567890-abc",
+            "xoxr-1234567890-abc",
+            "xoxs-1234567890-abc",
+            "sk_test_abcdefghijklmnop",
+        ] {
+            assert!(is_secret_value(v), "{v}");
+        }
+    }
+
+    #[test]
+    fn table_negative_text_forms() {
+        for v in [
+            "design: modern",
+            "the session expires soon",
+            "tokens are discussed elsewhere",
+            "/auth/token",
+            "sigma=3",
+            "application/json",
+            "{\"name\":\"Ada\",\"count\":3}",
+            "<name>Ada</name>",
+            "page=2&limit=10",
+        ] {
             assert!(!is_secret_value(v), "{v}");
         }
     }

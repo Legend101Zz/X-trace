@@ -16,6 +16,7 @@
 pub mod candidate;
 pub mod canonical;
 pub mod effect;
+pub mod input_json;
 pub mod plan;
 pub mod preview;
 

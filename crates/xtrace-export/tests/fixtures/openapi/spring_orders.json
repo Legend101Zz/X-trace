@@ -101,7 +101,8 @@
               "label": "first",
               "origin": "claim",
               "target": "param:page",
-              "value": 1
+              "value": 1,
+              "x-xtrace-observation": "inferred"
             }
           ],
           "operation_id": "op-list",
@@ -109,7 +110,8 @@
             "adapter_registration",
             "static_analysis"
           ]
-        }
+        },
+        "x-xtrace-observation": "inferred"
       },
       "post": {
         "operationId": "postOrders",
@@ -140,14 +142,16 @@
               "value": {
                 "qty": 2,
                 "sku": "A-1"
-              }
+              },
+              "x-xtrace-observation": "inferred"
             }
           ],
           "operation_id": "op-create",
           "provenance": [
             "static_analysis"
           ]
-        }
+        },
+        "x-xtrace-observation": "observed"
       }
     },
     "/orders/{id}": {
@@ -177,7 +181,8 @@
           "provenance": [
             "static_analysis"
           ]
-        }
+        },
+        "x-xtrace-observation": "inferred"
       },
       "get": {
         "operationId": "getOrdersById",
@@ -220,7 +225,8 @@
               "label": "typical",
               "origin": "scenario",
               "target": "param:id",
-              "value": 42
+              "value": 42,
+              "x-xtrace-observation": "inferred"
             }
           ],
           "handlers": [
@@ -235,7 +241,8 @@
           "provenance": [
             "static_analysis"
           ]
-        }
+        },
+        "x-xtrace-observation": "inferred"
       }
     }
   }

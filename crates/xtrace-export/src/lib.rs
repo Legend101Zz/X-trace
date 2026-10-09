@@ -2,7 +2,7 @@
 //!
 //! The crate turns a plain, already-read catalog view ([`ExportInput`]) into
 //! deterministic artifacts: an OpenAPI 3.1 document, a set of POSIX `sh`
-//! cURL recipes, and (later) a Postman collection and a bundle. It performs no
+//! cURL recipes, a Postman collection and (later) a bundle. It performs no
 //! I/O of its own: it never opens a network connection, never reads the
 //! store and never executes anything it generates.
 //!
@@ -10,8 +10,9 @@
 //!
 //! - the output depends only on the *set* of input operations, never on their
 //!   order, and is byte-identical across runs;
-//! - secret-shaped keys and values are never emitted; every dropped example is
-//!   listed in the export's omissions;
+//! - secret-shaped keys and values are refused by a best-effort deny-list gate
+//!   (not proof; the independent check is the shared Q canary scanner), and
+//!   every dropped example is listed in the export's omissions;
 //! - generated shell recipes round-trip hostile input through a real `sh`.
 
 #![cfg_attr(
@@ -23,6 +24,7 @@ pub mod canonical;
 pub mod curl;
 pub mod input_json;
 pub mod openapi;
+pub mod postman;
 pub mod projection;
 pub mod request;
 pub mod sanitize;
@@ -46,7 +48,8 @@ pub fn export(input: &ExportInput, request: &ExportRequest) -> Result<ExportOutp
     match request.format {
         ExportFormat::OpenApi => openapi::render(&prepared),
         ExportFormat::Curl => curl::render(&prepared),
-        ExportFormat::Postman | ExportFormat::Bundle => {
+        ExportFormat::Postman => postman::render(&prepared),
+        ExportFormat::Bundle => {
             Err(ExportError::FormatNotImplemented { format: request.format.name() })
         }
     }

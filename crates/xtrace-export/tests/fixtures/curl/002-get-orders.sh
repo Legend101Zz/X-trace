@@ -6,5 +6,5 @@
 # recipe 002
 set -eu
 : "${BASE_URL:?set BASE_URL, for example http://127.0.0.1:8080}"
-curl --silent --show-error --fail-with-body -X 'GET' \
+curl --silent --show-error --fail-with-body --globoff --proto '=http,https' -X 'GET' \
   "${BASE_URL}"'/orders'

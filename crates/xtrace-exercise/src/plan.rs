@@ -49,7 +49,7 @@ pub struct ParamValue {
 /// One planned request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanItem {
-    /// Stable id derived from the operation id.
+    /// UUID text derived from (plan hash, operation id); not part of the hash.
     pub item_id: String,
     /// Operation id.
     pub operation_id: String,

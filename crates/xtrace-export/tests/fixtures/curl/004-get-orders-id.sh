@@ -8,6 +8,6 @@ set -eu
 : "${BASE_URL:?set BASE_URL, for example http://127.0.0.1:8080}"
 : "${XT_PATH_ID:?set XT_PATH_ID}"
 : "${XT_HEADER_AUTHORIZATION:?set XT_HEADER_AUTHORIZATION}"
-curl --silent --show-error --fail-with-body -X 'GET' \
-  -H "Authorization: ${XT_HEADER_AUTHORIZATION}" \
+curl --silent --show-error --fail-with-body --globoff --proto '=http,https' -X 'GET' \
+  -H 'Authorization: '"${XT_HEADER_AUTHORIZATION}" \
   "${BASE_URL}"'/orders/'"${XT_PATH_ID}"

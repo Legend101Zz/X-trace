@@ -264,3 +264,29 @@ fn preview_reports_unresolved_and_credentials() {
     assert_eq!(view["selected_items"], 3);
     assert_eq!(view["items_needing_approval"], 1);
 }
+
+fn is_uuid_text(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.iter().map(|p| p.len()).collect::<Vec<_>>() == [8, 4, 4, 4, 12]
+        && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+#[test]
+fn item_ids_are_uuid_text_and_differ_between_plans() {
+    let a = synthesize(&input());
+    let mut other = input();
+    other.target = "http://127.0.0.1:9999".into();
+    let b = synthesize(&other);
+    assert_ne!(a.plan_hash, b.plan_hash);
+    for item in &a.items {
+        assert!(is_uuid_text(&item.item_id), "{}", item.item_id);
+        let twin = b.items.iter().find(|i| i.operation_id == item.operation_id).unwrap();
+        assert_ne!(item.item_id, twin.item_id, "same operation, different plan");
+    }
+    let again = synthesize(&input());
+    assert_eq!(
+        a.items.iter().map(|i| &i.item_id).collect::<Vec<_>>(),
+        again.items.iter().map(|i| &i.item_id).collect::<Vec<_>>()
+    );
+    assert_eq!(recompute_hash(&a), a.plan_hash);
+}

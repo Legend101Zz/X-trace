@@ -100,7 +100,7 @@ fn export_omissions_listed_for_every_dropped_example() {
 
 #[test]
 fn unimplemented_formats_fail_with_a_typed_error() {
-    for format in [ExportFormat::Postman, ExportFormat::Bundle] {
+    for format in [ExportFormat::Bundle] {
         let err = export(&spring_orders(), &ExportRequest::new(format)).unwrap_err();
         assert!(matches!(err, xtrace_export::ExportError::FormatNotImplemented { .. }));
     }

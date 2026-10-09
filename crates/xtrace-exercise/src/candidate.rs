@@ -136,7 +136,7 @@ pub fn synthesize(input: &PlanInput) -> Plan {
         ))
     });
     ops.dedup_by(|a, b| a.operation_id == b.operation_id);
-    let items: Vec<PlanItem> = ops
+    let mut items: Vec<PlanItem> = ops
         .into_iter()
         .map(|op| {
             let mut params: Vec<ParamValue> = op.params.iter().map(resolve).collect();
@@ -153,14 +153,8 @@ pub fn synthesize(input: &PlanInput) -> Plan {
                 ),
                 None => default_selection(op),
             };
-            let digest = blake3::hash(
-                [b"xtrace.exercise.item.v1\0".as_slice(), op.operation_id.as_bytes()]
-                    .concat()
-                    .as_slice(),
-            )
-            .to_hex();
             PlanItem {
-                item_id: digest.as_str()[..32].to_owned(),
+                item_id: String::new(),
                 operation_id: op.operation_id.clone(),
                 method: op.method.to_ascii_uppercase(),
                 path_template: op.route_template.clone(),
@@ -178,6 +172,9 @@ pub fn synthesize(input: &PlanInput) -> Plan {
         &input.target,
         &items,
     ));
+    for item in &mut items {
+        item.item_id = canonical::item_uuid(&plan_hash, &item.operation_id);
+    }
     Plan {
         revision_id: input.revision_id.clone(),
         catalog_hash: input.catalog_hash.clone(),

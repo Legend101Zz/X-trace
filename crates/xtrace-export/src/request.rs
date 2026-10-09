@@ -7,11 +7,11 @@ use std::fmt;
 pub enum ExportFormat {
     /// OpenAPI 3.1 (JSON or YAML).
     OpenApi,
-    /// Postman collection v2.1 (not implemented in this build).
+    /// Postman collection v2.1.
     Postman,
     /// POSIX `sh` cURL recipes.
     Curl,
-    /// Deterministic archive bundle (not implemented in this build).
+    /// Deterministic archive bundle.
     Bundle,
 }
 

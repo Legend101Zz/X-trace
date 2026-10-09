@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 
 use crate::canonical;
 use crate::projection::{Conflict, Prepared, PreparedOp};
-use crate::request::{ExportError, ExportFile, ExportOutput, Omission};
+use crate::request::{EffectiveState, ExportError, ExportFile, ExportOutput, Omission};
 use crate::{sanitize, validate};
 
 fn schema_for(type_name: Option<&str>) -> Value {
@@ -166,13 +166,19 @@ fn operation_json(op: &PreparedOp, operation_id: &str) -> Value {
                 op.examples
                     .iter()
                     .map(|e| {
+                        // Examples never come from observed bodies (none are retained).
                         json!({"target": e.target, "label": e.label, "origin": e.origin,
+                               "x-xtrace-observation": "inferred",
                                "value": example_value(&e.value)})
                     })
                     .collect(),
             ),
         );
     }
+    // CONTRACTS 9.1 export marker: only an Observed operation is `observed`;
+    // static, registered, conflicted and unknown ones are `inferred`.
+    let observation = if op.state == EffectiveState::Observed { "observed" } else { "inferred" };
+    out.insert("x-xtrace-observation".into(), json!(observation));
     out.insert("x-xtrace".into(), Value::Object(x));
     Value::Object(out)
 }
@@ -238,7 +244,7 @@ pub fn document(prepared: &Prepared) -> (Value, Vec<Omission>) {
 /// finished document.
 pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
     let (doc, omissions) = document(prepared);
-    if let Some(path) = sanitize::gate(&doc) {
+    if let Some(path) = sanitize::gate_with_metadata(&doc, &["/info/x-xtrace/omissions"]) {
         return Err(ExportError::SecretShaped { path });
     }
     let problems = validate::openapi_31(&doc);

@@ -8,5 +8,5 @@
 set -eu
 : "${BASE_URL:?set BASE_URL, for example http://127.0.0.1:8080}"
 : "${XT_PATH_ID:?set XT_PATH_ID}"
-curl --silent --show-error --fail-with-body -X 'DELETE' \
+curl --silent --show-error --fail-with-body --globoff --proto '=http,https' -X 'DELETE' \
   "${BASE_URL}"'/orders/'"${XT_PATH_ID}"
