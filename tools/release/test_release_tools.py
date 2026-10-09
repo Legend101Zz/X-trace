@@ -1912,6 +1912,22 @@ class RunOwnershipWorldTests(unittest.TestCase):
         self.assertTrue(failure.unconfirmed_processes_truncated)
 
 
+def _r2_killpg_created_group(pgid: int) -> None:
+    """SIGKILL a process group this test created; the caller then wait()s to reap.
+
+    On Darwin, killpg on a group whose only members are unreaped zombies fails
+    with EPERM (a fully reaped group gives ESRCH); both mean the group is gone.
+    Any other error, and EPERM elsewhere, still propagates.
+    """
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        if sys.platform != "darwin":
+            raise
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(dir=test_scratch_root())
@@ -2873,10 +2889,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertTrue(owner["ownedProcesses"])
         finally:
             for process in spawned:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _r2_killpg_created_group(process.pid)
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
@@ -3048,7 +3061,7 @@ class RunnerTests(unittest.TestCase):
             calls += 1
             if calls == 1:
                 unrelated = subprocess.Popen(
-                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    [sys.executable, "-c", "import time; time.sleep(600)"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                 )
             return snapshot
@@ -3065,10 +3078,7 @@ class RunnerTests(unittest.TestCase):
             self.assertIsNone(unrelated.poll())
         finally:
             if unrelated is not None:
-                try:
-                    os.killpg(unrelated.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _r2_killpg_created_group(unrelated.pid)
                 try:
                     unrelated.wait(timeout=2)
                 except subprocess.TimeoutExpired:
@@ -3220,10 +3230,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertIn("inspection limit exceeded", owner["terminationStatus"])
         finally:
             if unrelated is not None:
-                try:
-                    os.killpg(unrelated.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _r2_killpg_created_group(unrelated.pid)
                 try:
                     unrelated.wait(timeout=2)
                 except subprocess.TimeoutExpired:
@@ -3271,10 +3278,7 @@ class RunnerTests(unittest.TestCase):
             log_stream.close()
             for child in (closed_stdio, log_fd_child):
                 if process_running(child.pid):
-                    try:
-                        os.killpg(child.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    _r2_killpg_created_group(child.pid)
                 try:
                     child.wait(timeout=2)
                 except subprocess.TimeoutExpired:
