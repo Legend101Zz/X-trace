@@ -1515,12 +1515,12 @@ mod tests {
         let mut validator = mode_validator();
         let id = rid();
         validator.accept_started(&started(id, "GET"), CaptureMode::Standard).unwrap();
-        // Seq 1 is the start marker; events 2..=16_400 are 16_399 events.
-        for chunk_start in (2..=16_400_u64).step_by(1_000) {
-            let end = (chunk_start + 999).min(16_400);
+        // 16,400 events after the start marker: events 2..=16_401.
+        for chunk_start in (2..=16_401_u64).step_by(1_000) {
+            let end = (chunk_start + 999).min(16_401);
             validator.accept_events(&batch(id, many_events(chunk_start, end))).unwrap();
         }
-        assert_eq!(validator.highest_contiguous_seq(id), Some(16_400));
+        assert_eq!(validator.highest_contiguous_seq(id), Some(16_401));
         let drops = validator.capacity_drops(id).unwrap();
         assert_eq!(drops.values().sum::<u64>(), 16, "16 events past the 16,384 cap are counted");
     }
@@ -1530,12 +1530,15 @@ mod tests {
         let mut validator = mode_validator();
         let id = rid();
         validator.accept_started(&started(id, "GET"), CaptureMode::Focused).unwrap();
-        for chunk_start in (2..=131_072_u64).step_by(4_096) {
-            let end = (chunk_start + 4_095).min(131_072);
+        // Exactly 131,072 events: events 2..=131_073.
+        for chunk_start in (2..=131_073_u64).step_by(4_096) {
+            let end = (chunk_start + 4_095).min(131_073);
             validator.accept_events(&batch(id, many_events(chunk_start, end))).unwrap();
         }
-        assert_eq!(validator.highest_contiguous_seq(id), Some(131_072));
+        assert_eq!(validator.highest_contiguous_seq(id), Some(131_073));
         assert!(validator.capacity_drops(id).unwrap().is_empty(), "nothing dropped at 131,072");
+        validator.accept_events(&batch(id, many_events(131_074, 131_074))).unwrap();
+        assert_eq!(validator.capacity_drops(id).unwrap().values().sum::<u64>(), 1);
     }
 
     #[test]

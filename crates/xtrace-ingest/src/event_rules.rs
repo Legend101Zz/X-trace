@@ -589,7 +589,7 @@ mod tests {
         let denied = [
             (R::Argument, K::FrameExit),
             (R::Return, K::FrameEnter),
-            (R::Receiver, K::LineCursor),
+            (R::Receiver, K::FrameExit),
             (R::Exception, K::FrameEnter),
             (R::Argument, K::ValueSnapshot),
         ];
@@ -740,7 +740,8 @@ mod tests {
             let ev = enter_with(vec![binding("a", wire::BindingRole::Argument, redacted(ok))]);
             assert!(check(&ev, STD).is_ok(), "{ok}");
         }
-        for bad in ["", "Upper", "has space", &"x".repeat(65)] {
+        let too_long = "x".repeat(65);
+        for bad in ["", "Upper", "has space", too_long.as_str()] {
             let ev = enter_with(vec![binding("a", wire::BindingRole::Argument, redacted(bad))]);
             assert!(
                 matches!(check(&ev, STD), Err(IngestError::RedactionRuleIdInvalid { .. })),

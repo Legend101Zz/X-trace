@@ -159,9 +159,14 @@ pub struct Frame {
 /// itself is always a [`CapturedValue`] so redaction state is preserved.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValueBinding {
-    /// Stable binding name (`request`, `this`, parameter name, ...).
+    /// Stable binding name (`request`, `this`, parameter name, ...), 1 to 128 UTF-8 bytes.
     pub name: String,
-    /// Captured value with explicit capture state.
+    /// Role the value plays at the event.
+    pub role: BindingRole,
+    /// Whether the name is declared in source or synthesized by the adapter.
+    pub name_origin: NameOrigin,
+    /// Captured value with explicit capture state. Never absent: an unobserved value is
+    /// `Unavailable` or `Dropped`.
     pub value: CapturedValue,
 }
 
@@ -377,19 +382,6 @@ impl NameOrigin {
             Self::Synthesized => "synthesized",
         }
     }
-}
-
-/// A named value observed at an event.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ValueBinding {
-    /// Binding name, 1 to 128 UTF-8 bytes.
-    pub name: String,
-    /// Role the value plays at the event.
-    pub role: BindingRole,
-    /// Whether the name is declared or synthesized.
-    pub name_origin: NameOrigin,
-    /// The value, never absent: an unobserved value is `Unavailable` or `Dropped`.
-    pub value: CapturedValue,
 }
 
 /// Why events were not recorded.
