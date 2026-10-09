@@ -146,7 +146,7 @@ fn standard_run_keeps_the_standard_cap_and_emits_no_line_events() {
 
 #[test]
 fn out_of_scope_app_package_captures_no_application_frames() {
-    let captured = run_fixture(&["--app-package", "com.nonexistent.app"]);
+    let captured = run_fixture_with(&["--app-package", "com.nonexistent.app"], false);
     let order_frames: Vec<&Value> = captured
         .events
         .iter()
@@ -184,6 +184,12 @@ fn invalid_capture_flags_fail_before_any_launch() {
 }
 
 fn run_fixture(flags: &[&str]) -> Captured {
+    run_fixture_with(flags, true)
+}
+
+/// With `require_recording` false, a launch whose scope captures nothing may legitimately persist
+/// no recording at all; the fixture must still have served the request.
+fn run_fixture_with(flags: &[&str], require_recording: bool) -> Captured {
     let root = temp_root();
     let repo = root.path().join("repository with spaces");
     let data_home = root.path().join("data home");
@@ -243,7 +249,7 @@ fn run_fixture(flags: &[&str]) -> Captured {
         "fixture returned {}",
         String::from_utf8_lossy(&response)
     );
-    wait_for_complete_recording(&project_root);
+    let recorded = wait_for_complete_recording(&project_root, require_recording);
 
     let pid = rustix::process::Pid::from_raw(process.child.id() as i32).expect("CLI process ID");
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("signal xtrace run");
@@ -251,6 +257,13 @@ fn run_fixture(flags: &[&str]) -> Captured {
     let _ = process.stdout.take().expect("stdout thread").join();
     let stderr = process.stderr.take().expect("stderr thread").join().expect("join stderr");
 
+    if !recorded {
+        return Captured {
+            detail_pages: Vec::new(),
+            events: Vec::new(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        };
+    }
     let list = cli(&["recording", "list"], &repo, &data_home);
     let list: Value = serde_json::from_slice(&list.stdout).expect("recording list JSON");
     let recording_id =
@@ -288,8 +301,8 @@ fn cli(args: &[&str], repo: &Path, data_home: &Path) -> std::process::Output {
     command.env("XTRACE_DATA_HOME", data_home).output().expect("run xtrace")
 }
 
-fn wait_for_complete_recording(project_root: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+fn wait_for_complete_recording(project_root: &Path, required: bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(if required { 30 } else { 10 });
     loop {
         if let Ok(database) = rusqlite::Connection::open(project_root.join("metadata.sqlite3")) {
             let count: i64 = database
@@ -300,8 +313,11 @@ fn wait_for_complete_recording(project_root: &Path) {
                 )
                 .unwrap_or(0);
             if count >= 1 {
-                return;
+                return true;
             }
+        }
+        if Instant::now() >= deadline && !required {
+            return false;
         }
         assert!(Instant::now() < deadline, "no finished recording was persisted");
         thread::sleep(Duration::from_millis(50));
