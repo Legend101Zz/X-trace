@@ -23,6 +23,9 @@ xtrace-store = { path = "../xtrace-store" }
 xtrace-daemon = { path = "../xtrace-daemon" }
 xtrace-private-storage = { path = "../xtrace-private-storage" }
 xtrace-runtime = { path = "../xtrace-runtime" }
+xtrace-tui = { path = "../xtrace-tui" }
+xtrace-export = { path = "../xtrace-export" }
+xtrace-exercise = { path = "../xtrace-exercise" }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
