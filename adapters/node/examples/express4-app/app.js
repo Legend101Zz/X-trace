@@ -36,8 +36,12 @@ app.get('/boom', function explode() {
 });
 
 app.get('/done', function finish(_request, response) {
-  response.status(200).send('bye');
-  response.on('finish', () => server.close(() => console.log('EXPRESS_SERVER_CLOSED')));
+  // Answer asynchronously (like a real handler) and close after a pause so the capture worker
+  // can flush the tail of this request before the process exits.
+  setTimeout(() => {
+    response.status(200).send('bye');
+    response.on('finish', () => setTimeout(() => server.close(() => console.log('EXPRESS_SERVER_CLOSED')), 1500));
+  }, 20);
 });
 
 // Express error handlers are recognized by their four-argument arity.
