@@ -30,6 +30,12 @@ jobs:
           TMPDIR: ${{ runner.temp }}/mr/tmp
         run: |
           python3 ci_fsb.py
+      - name: express manual
+        env:
+          TMPDIR: ${{ runner.temp }}/mr/tmp
+        run: |
+          cargo build -p xtrace-cli --locked 2>&1 | tail -1
+          bash ci_exp.sh
       - name: five
         env:
           TMPDIR: ${{ runner.temp }}/mr/tmp
@@ -38,4 +44,4 @@ jobs:
           RUST_BACKTRACE: "0"
         run: |
           true || cargo test --locked -p xtrace-cli --test java_premain_spring --test node_express_journey --test lifecycle_journey --test java_synthetic_adapter --no-fail-fast -- --nocapture 2>&1 | tail -150
-          cargo test --locked -p xtrace-daemon --test loopback_handshake --no-fail-fast -- --nocapture 2>&1 | tail -60
+          true || cargo test --locked -p xtrace-daemon --test loopback_handshake --no-fail-fast -- --nocapture 2>&1 | tail -60
