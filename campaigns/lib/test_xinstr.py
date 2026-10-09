@@ -116,6 +116,17 @@ class T(unittest.TestCase):
         good["events"][1]["sourceBinding"] = "verified"
         self.assertTrue(xinstr.analyze({"a": good}, exp)["s"]["passed"])
 
+    def test_silent_viewer_hits_the_deadline(self):
+        import os, stat, tempfile, time
+        with tempfile.TemporaryDirectory() as d:
+            exe = pathlib.Path(d) / "xtrace"
+            exe.write_text("#!/bin/sh\nexec sleep 20\n")
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            t0 = time.time()
+            with self.assertRaises(RuntimeError):
+                xinstr.start_viewer(str(exe), pathlib.Path(d), dict(os.environ), pathlib.Path(d) / "v.log", timeout=2.0)
+            self.assertLess(time.time() - t0, 10)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -126,11 +126,19 @@ class ViewerClient:
 
 def start_viewer(xtrace: str, project_dir: pathlib.Path, env: dict[str, str], log: pathlib.Path,
                  timeout: float = 60.0) -> tuple[subprocess.Popen, dict[str, str]]:
-    proc = subprocess.Popen([xtrace, "open", "--project-dir", str(project_dir), "--viewer", "--no-browser"],
-                            stdout=subprocess.PIPE, stderr=open(log, "wb"), env=env, text=True, start_new_session=True)
+    import select
+    with open(log, "wb") as errlog:  # the child holds its own descriptor; this handle does not leak
+        proc = subprocess.Popen([xtrace, "open", "--project-dir", str(project_dir), "--viewer", "--no-browser"],
+                                stdout=subprocess.PIPE, stderr=errlog, env=env, text=True, start_new_session=True)
     deadline = time.time() + timeout
     assert proc.stdout is not None
     while time.time() < deadline:
+        # select first: a viewer that is alive but silent must not block past the deadline
+        ready_fds, _, _ = select.select([proc.stdout], [], [], 1.0)
+        if not ready_fds:
+            if proc.poll() is not None:
+                raise RuntimeError(f"viewer exited early with {proc.returncode}")
+            continue
         line = proc.stdout.readline()
         if not line:
             if proc.poll() is not None:

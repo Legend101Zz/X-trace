@@ -98,7 +98,9 @@ def overhead_steps(o: dict | None) -> list[tuple[str, str, str]]:
     a = o["aggregate"]
     return [("overhead-measurement", "reported",
              f"p50 {a['baseline']['p50Ms']}->{a['instrumented']['p50Ms']}ms (x{a['p50Ratio']}), "
-             f"p95 {a['baseline']['p95Ms']}->{a['instrumented']['p95Ms']}ms (x{a['p95Ratio']}); not gated")]
+             f"p95 {a['baseline']['p95Ms']}->{a['instrumented']['p95Ms']}ms (x{a['p95Ratio']}); "
+             f"n={a['baseline'].get('n')}/{a['instrumented'].get('n')} requests, warm-up included, p95 is near the maximum; "
+             f"instrumented requests also carry canary headers and the launcher; a ratio below 1 is noise, not a speed-up; not gated")]
 
 
 def main() -> int:
