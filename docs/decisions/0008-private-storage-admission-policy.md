@@ -325,8 +325,8 @@ Decision:
    measured against the moment the batch was taken). A directory that changed
    after the batch was taken fails the quiet-period rule and is probed alone.
 2. Admission scope. The store opens a scope for the duration of one store call
-   (`begin_recording`, one `persist_segment`, `finish_recording`, and a store lock
-   taken outside them). The scope is a guard on the calling thread; it is neither
+   (`begin_recording`, one `persist_segment` and `finish_recording`; the
+   recording path takes no store lock outside these three). The scope is a guard on the calling thread; it is neither
    `Send` nor `Sync`, and a scope opened inside a live scope joins the outer one.
    While the scope is live, operations on that thread share the directory verdict
    memo and the batched listing.
@@ -338,10 +338,15 @@ Decision:
    - the role rules for mode and owner;
    - named-file probes, which are never memoized (the before and after `statat`
      sandwich and the link-count checks run on every call).
-4. The memo key gains the filesystem identity and mount flags (`statfs` `f_fsid`
-   and `f_flags`) next to device, inode, owner, mode and ctime. Only admit
-   verdicts whose state was unchanged across the probe are stored. Refusals and
-   timeouts are never stored.
+4. The memo key gains the filesystem identity, type and mount flags (`statfs`
+   `f_fsid`, `f_fstypename` and `f_flags`) next to device, inode, owner, mode and
+   ctime. Only admit verdicts whose state was unchanged across the probe are
+   stored. Refusals and timeouts are never stored. Sharing within a scope (memo
+   and batched listings) is limited to APFS, whose ctime has nanosecond
+   resolution; on any other admitted filesystem (for example HFS+, with 1 s
+   ctime granularity) every operation probes on its own, as in the base ADR.
+   A batched listing reused later in a scope must pass the realtime/monotonic
+   clock check again at the moment of reuse (same 50 ms tolerance).
 5. The scope has a wall-clock cap of 10 s from its start. After the cap the scope
    drops its memo and batch, and every later operation in it behaves as in the
    base ADR (a fresh memo per operation). The cap never extends a deadline.
@@ -350,9 +355,9 @@ Decision:
 
 Consequences:
 
-- Spawns per `commit_segment` are expected to fall from about 327 to roughly
-  40 to 60. The number is an estimate from the measured working set until the
-  spawn-bound test below records the real value.
+- Measured on the leased Mac after the change: a steady-state `commit_segment`
+  spawns 70 (was about 327), `begin_recording` 9 (was 32) and
+  `finish_recording` 52 (was 277). The spawn-bound test pins 85, 20 and 100.
 - The window between a directory's probe and the reuse of its verdict grows from
   one operation (milliseconds) to one store call (bounded by the 10 s cap). Any
   chmod, chown, ACL or xattr edit and any child create or remove advances ctime,
@@ -368,8 +373,9 @@ Consequences:
 
 Test obligations added by this amendment:
 
-- A spawn-bound test: one `commit_segment` on macOS spawns at most the recorded
-  bound, so a regression to per-call batches fails.
+- A spawn-bound test: on macOS, `begin_recording`, each steady-state
+  `commit_segment` and `finish_recording` spawn at most the recorded bounds, so a
+  regression to per-call batches fails.
 - Inside one scope: a chmod or an ACL entry added between two calls is seen
   (probed again and refused); a directory replaced under the same name is
   refused; a symlink swapped in at the leaf or at an ancestor is refused; the
