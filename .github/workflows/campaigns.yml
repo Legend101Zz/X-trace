@@ -147,19 +147,136 @@ jobs:
           python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
             --step baseline --status not-implemented \
             --note "node harness is bound to linux/arm64 Docker images; no x86_64 path yet"
-      - name: Record steps whose product feature does not exist yet
-        if: always()
+      # ---- instrumented stages (petclinic has the harness; other projects record not-implemented below)
+      - name: Unpack the candidate package
+        id: unpack
+        if: matrix.project == 'petclinic' && always()
         run: |
-          for step in instrumented-scenarios browser-journeys-linear-canvas-320-736-1024 tui-pty-transcripts \
-                      privacy-canary-scan overhead-measurement campaign-receipt; do
+          set -u
+          mkdir -p "$RUNNER_TEMP/xpkg"
+          tar -xzf "$RUNNER_TEMP"/pkg/xtrace-*-linux-x86_64.tar.gz -C "$RUNNER_TEMP/xpkg"
+          top=$(ls -d "$RUNNER_TEMP"/xpkg/xtrace-* | head -n1)
+          echo "XCAMP_XTRACE=$top/bin/xtrace" >> "$GITHUB_ENV"
+          echo "XCAMP_AGENT=$top/share/xtrace/packs/java/agent/xtrace-java-agent.jar" >> "$GITHUB_ENV"
+          sha256sum "$RUNNER_TEMP"/pkg/xtrace-*-linux-x86_64.tar.gz | cut -d' ' -f1 > "$CAMP_OUT/package.sha256"
+          test -x "$top/bin/xtrace"
+          test -f "$top/share/xtrace/packs/java/agent/xtrace-java-agent.jar"
+          "$top/bin/xtrace" --version
+      - name: Private canaries and scanner self-check
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/priv"
+          python3 -B -m unittest discover -s tools/qa -p 'test_*.py' 2>&1 | tail -3
+          python3 -B -m unittest discover -s campaigns/lib -p 'test_*.py' 2>&1 | tail -3
+          python3 -B tools/qa/canary.py probe
+          python3 -B tools/qa/canary.py gen --out "$RUNNER_TEMP/priv/canaries.json"
+      - name: Instrumented scenarios through the packaged xtrace run
+        if: matrix.project == 'petclinic' && always()
+        env:
+          XCAMP_APP_MODE: host
+          XCAMP_PLATFORM: linux/amd64
+        run: |
+          set -o pipefail
+          export XTRACE_CAMPAIGN_ROOT="$CAMP_ROOT"
+          export XCAMP_JAVA="$JAVA_HOME/bin/java"
+          # product storage refuses data under a world-writable ancestor such as /tmp
+          export XCAMP_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          mkdir -p "$XCAMP_DATA_HOME" "$TMPDIR"
+          chmod 700 "$RUNNER_TEMP/xt" "$XCAMP_DATA_HOME" "$TMPDIR"
+          export XCAMP_CANARY_FILE="$RUNNER_TEMP/priv/canaries.json"
+          export XCAMP_BASELINE_RECEIPT="$CAMP_ROOT/java/petclinic/baseline-1/receipt.json"
+          python3 -B campaigns/java/petclinic/harness/run.py instrumented 2>&1 | tee "$RUNNER_TEMP/priv/ci-output.log"
+      - name: Judge the instrumented run
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          d=$(ls -d "$CAMP_ROOT"/java/petclinic/instrumented-* 2>/dev/null | sort -V | tail -n1 || true)
+          echo "INSTR_DIR=${d}" >> "$GITHUB_ENV"
+          python3 -B tools/qa/camp_instr_steps.py instrumented --file "$CAMP_OUT/summary.json" --project petclinic \
+            --receipt "${d:-/nonexistent}/receipt.json"
+      - name: Privacy canary scan (class names only, canaries are never printed)
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project petclinic \
+            --step privacy-canary-scan -- python3 -B tools/qa/canary.py scan \
+              --canaries "$RUNNER_TEMP/priv/canaries.json" \
+              --loc "store=$RUNNER_TEMP/xt" \
+              --loc "project-pointer=$CAMP_ROOT/java/petclinic/src/.xtrace" \
+              --loc "daemon-log=${INSTR_DIR:-/nonexistent}/viewer.log" \
+              --loc "daemon-log=${INSTR_DIR:-/nonexistent}/application.log" \
+              --loc "ui-json=${INSTR_DIR:-/nonexistent}/api" \
+              --loc "receipts=${INSTR_DIR:-/nonexistent}/receipt.json" \
+              --loc "ci-output=$RUNNER_TEMP/priv/ci-output.log" \
+              --report "$CAMP_OUT/privacy-canary-report.json"
+      - name: Browser setup
+        if: matrix.project == 'petclinic' && always()
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Browser journeys, Linear and Canvas at 320, 736 and 1280 px
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          rc=0
+          (npm ci --prefix web/app --ignore-scripts --no-audit --no-fund && cd web/app && npx playwright install --with-deps chromium) \
+            > "$RUNNER_TEMP/browser-setup.log" 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            node tools/qa/browser_journeys.mjs --xtrace "$XCAMP_XTRACE" --project-dir "$CAMP_ROOT/java/petclinic/src" \
+              --out "$CAMP_OUT/browser" --widths 320,736,1280 || true
+          else
+            echo "browser tooling setup failed (exit $rc); last lines:"; tail -n 5 "$RUNNER_TEMP/browser-setup.log"
+          fi
+          python3 -B tools/qa/camp_instr_steps.py browser --file "$CAMP_OUT/summary.json" --project petclinic \
+            --journeys "$CAMP_OUT/browser/journeys.json"
+      - name: TUI PTY transcript
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          python3 -B tools/qa/tui_transcript.py --xtrace "$XCAMP_XTRACE" --project-dir "$CAMP_ROOT/java/petclinic/src" \
+            --out "$CAMP_OUT/tui" || true
+          python3 -B tools/qa/camp_instr_steps.py tui --file "$CAMP_OUT/summary.json" --project petclinic --tui "$CAMP_OUT/tui/tui.json"
+      - name: Overhead, baseline against instrumented (reported)
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          python3 -B tools/qa/camp_overhead.py --baseline "$CAMP_ROOT/java/petclinic/baseline-1/receipt.json" \
+            --instrumented "${INSTR_DIR:-/nonexistent}/receipt.json" --out "$CAMP_OUT/overhead.json" || true
+          python3 -B tools/qa/camp_instr_steps.py overhead --file "$CAMP_OUT/summary.json" --project petclinic --overhead "$CAMP_OUT/overhead.json"
+      - name: Record steps whose product feature does not exist for this project yet
+        if: matrix.project != 'petclinic' && always()
+        run: |
+          for step in instrumented-run instrumented-fingerprints-equal-baseline recordings-per-scenario source-identity \
+                      browser-journeys-linear browser-journeys-canvas tui-pty-transcript privacy-canary-scan \
+                      overhead-measurement campaign-receipt-artifact; do
             python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
-              --step "$step" --status not-implemented --note "required product feature or harness stage not built yet"
+              --step "$step" --status not-implemented --note "no instrumented harness for this project yet"
           done
-      - name: Collect baseline artifacts
+      - name: Collect artifacts (raw logs only when the privacy scan was clean)
         if: always()
         run: |
           mkdir -p "$CAMP_OUT/baseline-raw"
           cp -R "$CAMP_ROOT/$CAMP_KIND/$CAMP_PROJECT"/baseline-* "$CAMP_OUT/baseline-raw/" 2>/dev/null || true
+          cp "$CAMP_ROOT/$CAMP_KIND/$CAMP_PROJECT/baseline-1/receipt.json" "$CAMP_OUT/baseline-receipt.json" 2>/dev/null || true
+          if [ -n "${INSTR_DIR:-}" ] && [ -d "${INSTR_DIR:-}" ]; then
+            cp "$INSTR_DIR/receipt.json" "$CAMP_OUT/instrumented-receipt.json" 2>/dev/null || true
+            if grep -q '"clean": true' "$CAMP_OUT/privacy-canary-report.json" 2>/dev/null; then
+              mkdir -p "$CAMP_OUT/instrumented-raw"
+              cp -R "$INSTR_DIR/api" "$INSTR_DIR/viewer.log" "$INSTR_DIR/application.log" "$CAMP_OUT/instrumented-raw/" 2>/dev/null || true
+            else
+              echo "privacy scan not clean or absent: raw instrumented logs and API JSON are NOT uploaded"
+            fi
+          fi
+      - name: Campaign receipt (NON-RELEASE, unsigned, artifact only)
+        if: always()
+        run: |
+          python3 -B tools/qa/camp_receipt.py --out-dir "$CAMP_OUT" --project "$CAMP_PROJECT" \
+            --requirement "CAMPAIGN-$(echo "$CAMP_PROJECT" | tr a-z A-Z)" --candidate-sha "$(git rev-parse HEAD)" \
+            --campaign "campaigns/$CAMP_KIND/$CAMP_PROJECT/campaign.json" --run-id "$GITHUB_RUN_ID" \
+            --instrumented "$CAMP_OUT/instrumented-receipt.json" --baseline "$CAMP_OUT/baseline-receipt.json" \
+            --package-sha256 "$(cat "$CAMP_OUT/package.sha256" 2>/dev/null || true)" || true
+          if [ -f "$CAMP_OUT/campaign-receipt.NON-RELEASE.json" ]; then
+            python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+              --step campaign-receipt-artifact --status reported --note "NON-RELEASE unsigned receipt written as an artifact"
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
