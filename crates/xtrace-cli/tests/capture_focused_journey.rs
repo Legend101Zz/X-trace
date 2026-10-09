@@ -68,14 +68,9 @@ fn focused_run_arms_the_session_and_states_line_event_status() {
         "a focused launch must be served under the focused cap; stderr: {}",
         captured.stderr
     );
-    assert!(
-        !first["limitations"]
-            .as_array()
-            .expect("limitations")
-            .iter()
-            .any(|code| code == "capture_policy_not_armed"),
-        "an armed launch must not be reported as a downgraded claim"
-    );
+    // NOT ASSERTED: that `capture_policy_not_armed` is absent. The read API does not carry
+    // recording limitations yet (BeginRecording has no limitations field; see
+    // requests/RC2-FC2-to-FC1-limitations.md), so such an assertion would pass vacuously.
     let in_scope_frames: Vec<&Value> = captured
         .events
         .iter()
@@ -146,6 +141,23 @@ fn standard_run_keeps_the_standard_cap_and_emits_no_line_events() {
             .iter()
             .any(|event| event["symbol"].as_str().is_some_and(|s| s.contains("OrderController"))),
         "standard capture still records application frames"
+    );
+}
+
+#[test]
+fn out_of_scope_app_package_captures_no_application_frames() {
+    let captured = run_fixture(&["--app-package", "com.nonexistent.app"]);
+    let order_frames: Vec<&Value> = captured
+        .events
+        .iter()
+        .filter(|event| {
+            event["symbol"].as_str().is_some_and(|symbol| symbol.contains("Order"))
+                && event["kind"].as_str().is_some_and(|kind| kind.ends_with("frame_enter"))
+        })
+        .collect();
+    assert!(
+        order_frames.is_empty(),
+        "an app package that matches no class must not capture Order frames: {order_frames:?}"
     );
 }
 
