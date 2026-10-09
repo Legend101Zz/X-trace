@@ -118,6 +118,21 @@ test("nest_controller_prefix_join", () => {
   assert.equal(claims.filter((c) => JSON.stringify(c.routeParts).includes("nope")).length, 0);
 });
 
+test("nest_versioning_marks_claims_unsupported_mapping", () => {
+  const { claims } = run("nest-versioned", "nest");
+  assert.equal(claims.length, 1);
+  assert.deepEqual(claims[0]?.limitations, ["unsupported_mapping"]);
+  // the plain fixture has no versioning, RouterModule or exclusion and stays unmarked
+  const plain = run("nest-basic", "nest").claims;
+  assert.ok(plain.every((c) => !c.limitations.includes("unsupported_mapping")));
+});
+
+test("name_heuristic_receivers_carry_dynamic_registration", () => {
+  const { claims } = run("express-heuristic", "express");
+  assert.deepEqual(find(claims, "GET", ["/real"]).limitations, []);
+  assert.deepEqual(find(claims, "GET", ["/users"]).limitations, ["dynamic_registration"]);
+});
+
 test("parse_error_makes_the_scan_incomplete_but_keeps_other_claims", () => {
   const { claims, lines } = run("broken", "express");
   find(claims, "GET", ["/good"]);

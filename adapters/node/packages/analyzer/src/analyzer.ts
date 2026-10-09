@@ -448,6 +448,11 @@ class Analysis {
     };
   }
 
+  /** Scopes whose receiver was guessed from a conventional name, not proven to be a framework object. */
+  private readonly heuristicScopes = new Set<string>();
+  /** Scopes created by express()/Router()/fastify() or a plugin function: never downgraded by the name heuristic. */
+  private readonly provenScopes = new Set<string>();
+
   private receiverScope(file: FileInfo, receiver: ts.Expression, at: ts.Node): string | undefined {
     const expr = unwrap(receiver);
     let name: string | undefined;
@@ -461,6 +466,7 @@ class Analysis {
         if (first !== undefined && ts.isIdentifier(first.name) && first.name.text === name && RECEIVER_NAMES.has(name)) {
           const key = fnKey(file.rel, parent as ts.FunctionLikeDeclaration);
           if (!this.scopeKinds.has(key)) this.scopeKinds.set(key, "plugin");
+          this.provenScopes.add(key);
           return key;
         }
       }
@@ -470,11 +476,14 @@ class Analysis {
     if (kind !== undefined) {
       const key = `${file.rel}::${name}`;
       this.scopeKinds.set(key, kind);
+      this.provenScopes.add(key);
       return key;
     }
     // 3. a conventional receiver name in a file that imports the framework
     if (RECEIVER_NAMES.has(name) && file.usesFramework) {
       const key = `${file.rel}::${name}`;
+      // The receiver is only guessed from its name: claims from it carry a limitation.
+      this.heuristicScopes.add(key);
       if (!this.scopeKinds.has(key)) this.scopeKinds.set(key, name === "router" || name === "routes" ? "router" : "unknown");
       return key;
     }
@@ -677,6 +686,7 @@ class Analysis {
         if (unresolved) limitations.add("route_constant_unresolved");
         if (chain.unmounted) limitations.add("mount_unresolved");
         if (route.unconstrained) limitations.add("mapping_method_unconstrained");
+        if (this.heuristicScopes.has(route.scope) && !this.provenScopes.has(route.scope)) limitations.add("dynamic_registration");
         for (const method of route.methods) {
           lines.push(
             claimLine(method, [...prefixes.map((p) => p.text), route.path.text], basis, route.handler, [...limitations].sort(), route.evidence),
@@ -690,15 +700,31 @@ class Analysis {
   // ------------------------------------------------------------------ Nest
 
   private nestGlobalPrefixes: PathValue[] = [];
+  /** True when RouterModule, versioning or a prefix exclusion is present: prefixes may be wrong. */
+  private nestUnsupportedSeen = false;
 
   collectNestPrefixes(): void {
     for (const file of this.files.values()) {
       const visit = (node: ts.Node): void => {
-        if (ts.isCallExpression(node)) this.inspectNestGlobalPrefix(file, node);
+        if (ts.isCallExpression(node)) {
+          this.inspectNestGlobalPrefix(file, node);
+          this.inspectNestUnsupported(node);
+        }
         ts.forEachChild(node, visit);
       };
       visit(file.sf);
     }
+  }
+
+  private inspectNestUnsupported(call: ts.CallExpression): void {
+    const callee = call.expression;
+    if (ts.isIdentifier(callee) && callee.text === "Version") this.nestUnsupportedSeen = true;
+    if (!ts.isPropertyAccessExpression(callee)) return;
+    const member = callee.name.text;
+    const receiver = unwrap(callee.expression);
+    if (member === "enableVersioning") this.nestUnsupportedSeen = true;
+    if (member === "setGlobalPrefix" && call.arguments.length >= 2) this.nestUnsupportedSeen = true;
+    if (ts.isIdentifier(receiver) && receiver.text === "RouterModule") this.nestUnsupportedSeen = true;
   }
 
   private inspectNestGlobalPrefix(file: FileInfo, call: ts.CallExpression): void {
@@ -770,6 +796,7 @@ class Analysis {
             if (prefix.unresolved || methodPath.unresolved || global?.unresolved === true) limitations.add("route_constant_unresolved");
             if (ambiguousGlobal) limitations.add("mount_unresolved");
             if (unconstrained) limitations.add("mapping_method_unconstrained");
+            if (this.nestUnsupportedSeen) limitations.add("unsupported_mapping");
             for (const method of methods) {
               lines.push(claimLine(method, parts, basis, safeHandler(handler), [...limitations].sort(), this.evidence(file, decorator.node, decorator.node)));
             }
