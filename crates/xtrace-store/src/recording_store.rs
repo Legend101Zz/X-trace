@@ -5787,7 +5787,7 @@ mod tests {
         let mut request =
             request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
         request.limitations = vec!["capture_policy_not_armed".to_owned()];
-        let stored = |fixture: &StoreFixture| -> Vec<String> {
+        let stored = |fixture: &Fixture| -> Vec<String> {
             let connection = fixture.store.lock().expect("connection");
             let mut statement = connection
                 .prepare("SELECT code FROM recording_limitations ORDER BY code")
