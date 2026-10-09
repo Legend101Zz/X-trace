@@ -542,6 +542,69 @@ mod tests {
         assert!(error.source().is_none() || !error.source().unwrap().contains("/"));
     }
 
+    /// MEASUREMENT ONLY: admission spawns and Operations per begin / commit_segment / lock / finish.
+    #[test]
+    fn measure_admission_cost_per_commit() {
+        use xtrace_private_storage::admission_counts as counts;
+        let (directory, store, project) = fixture();
+        let recording_id = RecordingId::new();
+        let adapter = SqliteRecordingPersistence::new(store.clone(), directory.path());
+        let report = |label: &str, before: (usize, usize, usize, u64, usize)| {
+            let after = counts();
+            println!(
+                "MEASURE {label} batch={} single={} file={} spawns={} ops={} spawn_ms={:.1}",
+                after.0 - before.0,
+                after.1 - before.1,
+                after.2 - before.2,
+                (after.0 - before.0) + (after.1 - before.1) + (after.2 - before.2),
+                after.4 - before.4,
+                (after.3 - before.3) as f64 / 1e6,
+            );
+        };
+        let before = counts();
+        adapter.begin_recording(&begin(project.id(), recording_id)).expect("begin");
+        report("begin", before);
+        let mut digest_input = String::new();
+        for ordinal in 0_u32..8 {
+            let sequence = u64::from(ordinal) + 2;
+            let name = format!("event-{sequence}");
+            digest_input.push_str(&name);
+            let segment = PersistRecordingSegment {
+                project_id: project.id(),
+                recording_id,
+                segment_ordinal: ordinal,
+                events: vec![event(sequence, &name)],
+            };
+            let before = counts();
+            let started = std::time::Instant::now();
+            adapter.persist_segment(&segment).expect("segment");
+            println!("MEASURE commit_wall_ms={:.1}", started.elapsed().as_secs_f64() * 1e3);
+            report(&format!("commit_segment ordinal={ordinal}"), before);
+        }
+        for round in 0..3 {
+            let before = counts();
+            drop(store.lock().expect("lock"));
+            report(&format!("lock round={round}"), before);
+        }
+        let finish = FinishRecording {
+            recording_id,
+            final_recording_seq: 9,
+            duration_ns: Some(77),
+            event_digest: blake3::hash(digest_input.as_bytes()).as_bytes().to_vec(),
+            drop_counts_by_priority: [(1, 0)].into_iter().collect(),
+            unsupported_capability_codes: vec!["focused_locals".to_string()],
+            capacity_dropped_events: 0,
+            event_cap: 2_048,
+            outcome: None,
+            response_summary: None,
+        };
+        let before = counts();
+        let started = std::time::Instant::now();
+        adapter.finish_recording(&finish).expect("finish");
+        println!("MEASURE finish_wall_ms={:.1}", started.elapsed().as_secs_f64() * 1e3);
+        report("finish", before);
+    }
+
     #[test]
     fn terminal_evidence_and_frame_ids_survive_exact_retry_and_reopen() {
         let (directory, store, project) = fixture();

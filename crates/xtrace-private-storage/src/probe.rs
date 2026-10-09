@@ -74,6 +74,15 @@ pub(crate) struct Operation {
     /// Batched macOS listings taken at the start of an ancestor walk (see `prefetch`).
     #[cfg(target_os = "macos")]
     prefetched: RefCell<Option<Prefetched>>,
+    trace: Option<crate::trace::OpTrace>,
+}
+
+impl Drop for Operation {
+    fn drop(&mut self) {
+        if let Some(trace) = self.trace.take() {
+            crate::trace::operation_ended(&trace);
+        }
+    }
 }
 
 /// Listings for every component of a walk, taken by one `ls` run at `taken_at`.
@@ -117,13 +126,16 @@ impl Operation {
             judged: RefCell::new(Vec::new()),
             #[cfg(target_os = "macos")]
             prefetched: RefCell::new(None),
+            trace: crate::trace::operation_started(),
         }
     }
 
     /// An operation that memoizes on every platform, so the memo logic is testable on Linux.
     #[cfg(test)]
     pub(crate) fn memoizing() -> Self {
-        Self { memoize: true, ..Self::new() }
+        let mut operation = Self::new();
+        operation.memoize = true;
+        operation
     }
 
     /// The same operation judging filesystems under `profile`.
@@ -166,27 +178,37 @@ impl Operation {
         let started = Instant::now();
         let taken_at = std::time::SystemTime::now();
         let operands = paths.iter().map(std::path::PathBuf::as_path).collect::<Vec<_>>();
-        let Some(text) = run_ls("-ldeOi", &operands, self.deadline, BATCH_OUTPUT_LIMIT) else {
+        let Some(text) = run_ls("batch", "-ldeOi", &operands, self.deadline, BATCH_OUTPUT_LIMIT) else {
+            crate::trace::discard("spawn_failed_or_deadline");
             return;
         };
         // A realtime clock that stepped while `ls` ran (or went backwards) makes `taken_at`
         // meaningless for the ctime comparison below: drop the whole batch.
         if !clock_is_consistent(taken_at, std::time::SystemTime::now(), started.elapsed()) {
+            crate::trace::discard("clock_skew");
             return;
         }
-        let Some(parsed) = crate::policy::split_batched_listing(&text, &names) else { return };
+        let Some(parsed) = crate::policy::split_batched_listing(&text, &names) else {
+            crate::trace::discard("parse_ambiguity");
+            return;
+        };
         let mut entries = Vec::new();
         for ((path, listing), before) in paths.iter().zip(parsed).zip(before) {
             // Bind the listing to (device, inode) as `lstat` saw them on both sides of the run;
             // an operand that moved, vanished or disagrees with the listing is simply left out.
             use std::os::unix::fs::MetadataExt as _;
             let after = std::fs::symlink_metadata(path).ok();
-            let (Some(before), Some(after)) = (before, after) else { continue };
+            let (Some(before), Some(after)) = (before, after) else {
+                crate::trace::discard("entry_lstat_missing");
+                continue;
+            };
             if before.dev() == after.dev()
                 && before.ino() == after.ino()
                 && before.ino() == listing.inode
             {
                 entries.push(BatchEntry { path: path.clone(), device: before.dev(), listing });
+            } else {
+                crate::trace::discard("entry_device_inode_mismatch");
             }
         }
         *self.prefetched.borrow_mut() = Some(Prefetched { taken_at, entries });
@@ -317,7 +339,7 @@ fn probe_directory(
     if let Some(verdict) = prefetched_verdict(operation, path, directory) {
         return verdict;
     }
-    let Some(text) = run_acl_listing(path, operation.deadline()) else { return false };
+    let Some(text) = run_acl_listing("single", path, operation.deadline()) else { return false };
     path.to_str()
         .is_some_and(|expected| crate::policy::macos_directory_listing_admits(&text, expected))
 }
@@ -368,8 +390,10 @@ fn batch_entry_describes(
 fn prefetched_verdict(operation: &Operation, path: &Path, directory: &File) -> Option<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
+    crate::trace::set_fallback("no_batch");
     let prefetched = operation.prefetched.borrow();
     let batch = prefetched.as_ref()?;
+    crate::trace::set_fallback("not_in_batch");
     let entry = batch.entries.iter().find(|entry| entry.path == path)?;
     let metadata = directory.metadata().ok()?;
     let ctime = std::time::UNIX_EPOCH
@@ -378,6 +402,13 @@ fn prefetched_verdict(operation: &Operation, path: &Path, directory: &File) -> O
             u32::try_from(metadata.ctime_nsec()).ok()?,
         );
     if !batch_entry_describes(batch.taken_at, entry, metadata.dev(), metadata.ino(), ctime) {
+        let reason = if entry.device != metadata.dev() || entry.listing.inode != metadata.ino() {
+            "devino_mismatch"
+        } else {
+            "ctime_younger_than_20ms"
+        };
+        crate::trace::set_fallback(reason);
+        crate::trace::discard(reason);
         return None;
     }
     Some(path.to_str().is_some_and(|expected| {
@@ -475,7 +506,7 @@ pub(crate) fn acl_admits_file(
 /// Path-based macOS ACL probe for a regular file; never opens the file.
 #[cfg(target_os = "macos")]
 fn file_listing_admits(path: &Path, operation: &Operation) -> bool {
-    let Some(text) = run_acl_listing(path, operation.deadline()) else { return false };
+    let Some(text) = run_acl_listing("file", path, operation.deadline()) else { return false };
     path.to_str().is_some_and(|expected| crate::policy::macos_file_listing_admits(&text, expected))
 }
 
@@ -499,8 +530,8 @@ pub(crate) fn ls_spawn_count() -> usize {
 
 /// Runs `/bin/ls -ldeO <path>` under the deadline and returns its bounded stdout.
 #[cfg(target_os = "macos")]
-fn run_acl_listing(path: &Path, deadline: Instant) -> Option<String> {
-    run_ls("-ldeO", &[path], deadline, LISTING_OUTPUT_LIMIT)
+fn run_acl_listing(kind: &'static str, path: &Path, deadline: Instant) -> Option<String> {
+    run_ls(kind, "-ldeO", &[path], deadline, LISTING_OUTPUT_LIMIT)
 }
 
 /// Runs `/bin/ls <flags> <paths...>` under the deadline and returns its bounded stdout.
@@ -509,12 +540,13 @@ fn run_acl_listing(path: &Path, deadline: Instant) -> Option<String> {
 /// spawn failure, deadline, oversized or non-UTF-8 output, nonzero exit) is `None`, which every
 /// caller treats as a refusal or a fallback to a single-directory probe.
 #[cfg(target_os = "macos")]
-fn run_ls(flags: &str, paths: &[&Path], deadline: Instant, limit: usize) -> Option<String> {
-    use std::io::Read as _;
-    use std::process::{Command, Stdio};
-    use std::sync::mpsc;
-    use std::thread;
-
+fn run_ls(
+    kind: &'static str,
+    flags: &str,
+    paths: &[&Path],
+    deadline: Instant,
+    limit: usize,
+) -> Option<String> {
     if Instant::now() >= deadline
         || paths.iter().any(|path| path.as_os_str().to_string_lossy().chars().any(char::is_control))
     {
@@ -522,6 +554,19 @@ fn run_ls(flags: &str, paths: &[&Path], deadline: Instant, limit: usize) -> Opti
     }
     #[cfg(test)]
     LS_SPAWNS.with(|count| count.set(count.get() + 1));
+    crate::trace::spawn_started(kind);
+    let spawn_began = Instant::now();
+    let result = run_ls_inner(flags, paths, deadline, limit);
+    crate::trace::spawn_finished(kind, paths, spawn_began.elapsed(), result.is_some());
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn run_ls_inner(flags: &str, paths: &[&Path], deadline: Instant, limit: usize) -> Option<String> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
     let Ok(mut child) = Command::new("/bin/ls")
         .arg(flags)
         .args(paths)

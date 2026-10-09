@@ -17,6 +17,10 @@ mod policy;
 #[cfg(unix)]
 mod probe;
 #[cfg(unix)]
+mod trace;
+#[cfg(unix)]
+pub use trace::admission_counts;
+#[cfg(unix)]
 pub use admission::{
     AdmittedPrivateRoot, PrivateStorageError, admit_sealed_directories,
     admit_sealed_directories_with_profile, open_private_directory_descriptor,
