@@ -75,7 +75,7 @@ export async function scenario(fixture: string): Promise<{ byPath: Map<string, S
   module.install({ nodeVersion: process.version, packageVersion: "" });
   const before = expressPatchStatus().patched;
   const express = fixtureRequire("express") as () => {
-    use(...args: unknown[]): void; get(path: string, ...handlers: unknown[]): void; listen(port: number, host: string): http.Server;
+    use(...args: unknown[]): void; get(path: string, ...handlers: unknown[]): void; post(path: string, ...handlers: unknown[]): void; listen(port: number, host: string): http.Server;
   };
   const Router = (express as unknown as { Router(): { get(path: string, ...handlers: unknown[]): void } }).Router;
   assert.equal(expressPatchStatus().patched, before + 1, "the Layer module of this Express was patched exactly once");
