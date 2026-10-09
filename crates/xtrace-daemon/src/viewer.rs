@@ -1092,7 +1092,8 @@ where
     if params.kinds.is_some() || params.kind.is_some() || params.dir.is_some() {
         return replay_not_implemented_response(request_id);
     }
-    let Some(action) = params.action.as_deref().and_then(xtrace_application::NavigationAction::parse)
+    let Some(action) =
+        params.action.as_deref().and_then(xtrace_application::NavigationAction::parse)
     else {
         return invalid();
     };

@@ -26,16 +26,16 @@ const MAX_TERMINAL_REQUEST_JSON_BYTES: usize = 64 * 1024;
 use xtrace_application::recording_queries::{
     FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES,
     NavigationResult, NavigationUnavailable, PersistedBinding, PersistedEvent, PersistedGap,
-    PersistedInteraction, PersistedValue,
-    PersistedOutcome, PersistedSource, RecordingCapacity, RecordingCompletionEvidence,
-    RecordingEventWindow, RecordingMetadata, RecordingStatus, ShowWindowRequest, SourceStatus,
+    PersistedInteraction, PersistedOutcome, PersistedSource, PersistedValue, RecordingCapacity,
+    RecordingCompletionEvidence, RecordingEventWindow, RecordingMetadata, RecordingStatus,
+    ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
-use xtrace_domain::{is_projectable_source_path, is_safe_repo_relative_path};
 use xtrace_domain::{
     ContentHash, CorrelationId, ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointIdentity, HttpMethod,
     ProjectId, RecordingId, RuntimeSessionId, SourceBinding, SourceRange, Transport, WallTime,
 };
+use xtrace_domain::{is_projectable_source_path, is_safe_repo_relative_path};
 use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
 use crate::connection::SqliteStore;
@@ -757,7 +757,13 @@ impl SqliteRecordingStore<'_> {
         let (depth, navigation) = if frame.indexed {
             (
                 Some(frame.depth),
-                navigate_indexed_frame(&connection, recording_id, &frame, completion, correlation_id)?,
+                navigate_indexed_frame(
+                    &connection,
+                    recording_id,
+                    &frame,
+                    completion,
+                    correlation_id,
+                )?,
             )
         } else {
             (None, FrameNavigation::UNAVAILABLE)
@@ -1108,10 +1114,11 @@ impl SqliteRecordingStore<'_> {
                 .sequence
                 .parse::<u64>()
                 .map_err(|_| recording_query_corrupt_error(correlation_id))?;
-            let indexed = load_indexed_frame(&connection, request.recording_id, sequence, correlation_id)?
-                .filter(|row| {
-                    row.indexed && verified_frame_ids.get(&sequence) == Some(&row.frame_id)
-                });
+            let indexed =
+                load_indexed_frame(&connection, request.recording_id, sequence, correlation_id)?
+                    .filter(|row| {
+                        row.indexed && verified_frame_ids.get(&sequence) == Some(&row.frame_id)
+                    });
             let (frame_id, navigation) = if let Some(row) = &indexed {
                 let navigation = navigate_indexed_frame(
                     &connection,
@@ -1126,8 +1133,13 @@ impl SqliteRecordingStore<'_> {
                     (row.async_parent_seq, &mut event.async_parent_frame_id),
                 ] {
                     if let Some(parent) = parent {
-                        *slot = load_indexed_frame(&connection, request.recording_id, parent, correlation_id)?
-                            .map(|parent| parent.frame_id);
+                        *slot = load_indexed_frame(
+                            &connection,
+                            request.recording_id,
+                            parent,
+                            correlation_id,
+                        )?
+                        .map(|parent| parent.frame_id);
                     }
                 }
                 (Some(row.frame_id), navigation)
@@ -2094,7 +2106,10 @@ fn insert_frame_index_rows(
             None if !event.parent_event_id.is_empty() => honesty |= flags::ORPHAN_PARENT,
             None => {}
         }
-        local.insert(*event_digest.as_bytes(), IndexedParent { sequence: event.recording_seq, depth });
+        local.insert(
+            *event_digest.as_bytes(),
+            IndexedParent { sequence: event.recording_seq, depth },
+        );
         transaction
             .execute(
                 "INSERT INTO recording_frame_index \
@@ -2800,9 +2815,9 @@ fn first_frame_where(
         Some(extra) => statement
             .query_row(rusqlite::params![id, seq.as_slice(), extra], |row| row.get(0))
             .optional(),
-        None => statement
-            .query_row(rusqlite::params![id, seq.as_slice()], |row| row.get(0))
-            .optional(),
+        None => {
+            statement.query_row(rusqlite::params![id, seq.as_slice()], |row| row.get(0)).optional()
+        }
     }
     .map_err(|error| {
         map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
@@ -2881,28 +2896,51 @@ pub(crate) fn navigate_indexed_frame(
         });
     }
     let sequence = frame.sequence;
-    let target = |found: Option<xtrace_domain::FrameId>| found.map(|frame_id| NavigationResult::Target { frame_id });
-    let end_of_stream = |connection: &rusqlite::Connection| -> Result<NavigationResult, RecordingStoreError> {
-        Ok(if persisted_frontier_is_final(connection, recording_id, completion, correlation_id)? {
-            NavigationResult::Boundary
-        } else {
-            NavigationResult::unavailable(NavigationUnavailable::PartialFrontier)
-        })
+    let target = |found: Option<xtrace_domain::FrameId>| {
+        found.map(|frame_id| NavigationResult::Target { frame_id })
     };
+    let end_of_stream =
+        |connection: &rusqlite::Connection| -> Result<NavigationResult, RecordingStoreError> {
+            Ok(
+                if persisted_frontier_is_final(
+                    connection,
+                    recording_id,
+                    completion,
+                    correlation_id,
+                )? {
+                    NavigationResult::Boundary
+                } else {
+                    NavigationResult::unavailable(NavigationUnavailable::PartialFrontier)
+                },
+            )
+        };
     let previous = match target(first_frame_where(
-        connection, recording_id, sequence, false, "", None, correlation_id,
+        connection,
+        recording_id,
+        sequence,
+        false,
+        "",
+        None,
+        correlation_id,
     )?) {
         Some(result) => result,
         None => NavigationResult::Boundary,
     };
-    let next_found = first_frame_where(connection, recording_id, sequence, true, "", None, correlation_id)?;
+    let next_found =
+        first_frame_where(connection, recording_id, sequence, true, "", None, correlation_id)?;
     let next = match target(next_found) {
         Some(result) => result,
         None => end_of_stream(connection)?,
     };
     if frame.honesty_flags & flags::DEPTH_OVERFLOW != 0 {
         let overflow = NavigationResult::unavailable(NavigationUnavailable::DepthOverflow);
-        return Ok(FrameNavigation { previous, next, into: overflow, over: overflow, out: overflow });
+        return Ok(FrameNavigation {
+            previous,
+            next,
+            into: overflow,
+            over: overflow,
+            out: overflow,
+        });
     }
     // `into`: the smallest-sequence child that is not a closing event; children
     // are linked by `parent_seq` only, so an async edge is never a child.
@@ -2934,7 +2972,13 @@ pub(crate) fn navigate_indexed_frame(
         None => next,
     };
     let over = match target(first_frame_where(
-        connection, recording_id, sequence, true, "AND depth <= ?3", Some(i64::from(frame.depth)), correlation_id,
+        connection,
+        recording_id,
+        sequence,
+        true,
+        "AND depth <= ?3",
+        Some(i64::from(frame.depth)),
+        correlation_id,
     )?) {
         Some(result) => result,
         None => end_of_stream(connection)?,
@@ -2947,7 +2991,13 @@ pub(crate) fn navigate_indexed_frame(
         }
     } else {
         match target(first_frame_where(
-            connection, recording_id, sequence, true, "AND depth < ?3", Some(i64::from(frame.depth)), correlation_id,
+            connection,
+            recording_id,
+            sequence,
+            true,
+            "AND depth < ?3",
+            Some(i64::from(frame.depth)),
+            correlation_id,
         )?) {
             Some(result) => result,
             None => end_of_stream(connection)?,
@@ -3169,7 +3219,9 @@ fn project_binding(binding: &xtrace_protocol::generated::agent::ValueBinding) ->
     }
 }
 
-fn project_gap(gap: Option<&xtrace_protocol::generated::agent::GapPayload>) -> Option<PersistedGap> {
+fn project_gap(
+    gap: Option<&xtrace_protocol::generated::agent::GapPayload>,
+) -> Option<PersistedGap> {
     let gap = gap?;
     Some(PersistedGap {
         reason: xtrace_protocol::translate::gap_reason_from_wire(gap.reason)

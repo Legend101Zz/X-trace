@@ -1076,15 +1076,12 @@ pub fn show_recording<P: RecordingReadPort>(
     let anchor = request
         .around_frame
         .map(|frame_id| {
-            let view = port
-                .frame_navigation(request.project_id, request.recording_id, frame_id)
-                .map_err(|error| {
-                    crate::application::port_error_to_app_error(error, correlation_id)
-                })?;
-            let sequence = view
-                .sequence
-                .parse::<u64>()
-                .map_err(|_| query_resource_error(correlation_id))?;
+            let view =
+                port.frame_navigation(request.project_id, request.recording_id, frame_id).map_err(
+                    |error| crate::application::port_error_to_app_error(error, correlation_id),
+                )?;
+            let sequence =
+                view.sequence.parse::<u64>().map_err(|_| query_resource_error(correlation_id))?;
             Ok::<_, AppError>((frame_id, sequence))
         })
         .transpose()?;
@@ -1381,7 +1378,13 @@ mod tests {
 
         let detail = service
             .show(
-                ShowRecording { project_id, recording_id, limit: 1, cursor: None, around_frame: None  },
+                ShowRecording {
+                    project_id,
+                    recording_id,
+                    limit: 1,
+                    cursor: None,
+                    around_frame: None,
+                },
                 CorrelationId::new(),
             )
             .expect("show through shared service");
@@ -1418,7 +1421,8 @@ mod tests {
                     project_id,
                     recording_id,
                     sequence: 4,
-                })), around_frame: None,
+                })),
+                around_frame: None,
             },
             CorrelationId::new(),
         )
@@ -1454,7 +1458,7 @@ mod tests {
         for limit in [0, MAX_RECORDING_EVENT_LIMIT + 1] {
             let error = show_recording(
                 &fixture,
-                ShowRecording { project_id, recording_id, limit, cursor: None, around_frame: None  },
+                ShowRecording { project_id, recording_id, limit, cursor: None, around_frame: None },
                 CorrelationId::new(),
             )
             .expect_err("invalid event bound");
@@ -1475,7 +1479,13 @@ mod tests {
         for cursor in tokens {
             let error = show_recording(
                 &fixture,
-                ShowRecording { project_id, recording_id, limit: 10, cursor: Some(cursor), around_frame: None  },
+                ShowRecording {
+                    project_id,
+                    recording_id,
+                    limit: 10,
+                    cursor: Some(cursor),
+                    around_frame: None,
+                },
                 CorrelationId::new(),
             )
             .expect_err("malformed or cross-bound cursor rejected");
@@ -1490,7 +1500,7 @@ mod tests {
         fixture.window.events[0].event_id = Some("relationship-canary".repeat(20));
         let result = show_recording(
             &fixture,
-            ShowRecording { project_id, recording_id, limit: 10, cursor: None, around_frame: None  },
+            ShowRecording { project_id, recording_id, limit: 10, cursor: None, around_frame: None },
             CorrelationId::new(),
         )
         .expect("oversized event is represented within the response budget");

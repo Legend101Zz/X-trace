@@ -81,8 +81,7 @@ impl RecordingReadPort for SqliteRecordingReader {
     ) -> Result<xtrace_application::FrameNavigationView, PortError> {
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
-        view.read_frame_navigation(project_id, recording_id, frame_id)
-            .map_err(map_recording_error)
+        view.read_frame_navigation(project_id, recording_id, frame_id).map_err(map_recording_error)
     }
 
     fn list_recordings(
@@ -1108,7 +1107,8 @@ mod tests {
                 project_id: project.id(),
                 recording_id: first.recording_id,
                 limit: 1,
-                cursor: None, around_frame: None,
+                cursor: None,
+                around_frame: None,
             },
             CorrelationId::new(),
         )
@@ -1142,7 +1142,8 @@ mod tests {
                 project_id: project.id(),
                 recording_id: first.recording_id,
                 limit: 10,
-                cursor: Some(next_cursor), around_frame: None,
+                cursor: Some(next_cursor),
+                around_frame: None,
             },
             CorrelationId::new(),
         )
@@ -1180,7 +1181,8 @@ mod tests {
                 project_id: project.id(),
                 recording_id: request.recording_id,
                 limit: 1,
-                cursor: None, around_frame: None,
+                cursor: None,
+                around_frame: None,
             },
             CorrelationId::new(),
         )
@@ -1193,7 +1195,8 @@ mod tests {
                 project_id: project.id(),
                 recording_id: request.recording_id,
                 limit: 1,
-                cursor: Some(cursor), around_frame: None,
+                cursor: Some(cursor),
+                around_frame: None,
             },
             CorrelationId::new(),
         )
@@ -1226,7 +1229,8 @@ mod tests {
                 project_id: project.id(),
                 recording_id: oversized_id,
                 limit: 1,
-                cursor: None, around_frame: None,
+                cursor: None,
+                around_frame: None,
             },
             CorrelationId::new(),
         )
@@ -1243,7 +1247,8 @@ mod tests {
                 project_id: project.id(),
                 recording_id: oversized_id,
                 limit: 1,
-                cursor: first.next_cursor, around_frame: None,
+                cursor: first.next_cursor,
+                around_frame: None,
             },
             CorrelationId::new(),
         )
@@ -1285,7 +1290,8 @@ mod tests {
                 project_id: project.id(),
                 recording_id: request.recording_id,
                 limit: 100,
-                cursor: None, around_frame: None,
+                cursor: None,
+                around_frame: None,
             },
             CorrelationId::new(),
         )
@@ -1299,7 +1305,8 @@ mod tests {
                 project_id: project.id(),
                 recording_id: request.recording_id,
                 limit: 100,
-                cursor: Some(first_cursor), around_frame: None,
+                cursor: Some(first_cursor),
+                around_frame: None,
             },
             CorrelationId::new(),
         )
@@ -1349,7 +1356,8 @@ mod tests {
                     project_id: project.id(),
                     recording_id: request.recording_id,
                     limit: 1_000,
-                    cursor, around_frame: None,
+                    cursor,
+                    around_frame: None,
                 },
                 CorrelationId::new(),
             )
@@ -1918,9 +1926,7 @@ mod tests {
         window
             .events
             .iter()
-            .map(|event| {
-                (event.sequence.parse().expect("seq"), event.frame_id.expect("frame id"))
-            })
+            .map(|event| (event.sequence.parse().expect("seq"), event.frame_id.expect("frame id")))
             .collect()
     }
 
@@ -1962,7 +1968,11 @@ mod tests {
             ]
         );
         let by_seq = |sequence: u64| {
-            window.events.iter().find(|event| event.sequence == sequence.to_string()).expect("event")
+            window
+                .events
+                .iter()
+                .find(|event| event.sequence == sequence.to_string())
+                .expect("event")
         };
         assert_eq!(by_seq(4).parent_frame_id, Some(ids[&3]));
         assert_eq!(by_seq(2).parent_frame_id, None);
@@ -2001,8 +2011,14 @@ mod tests {
             (7, t(6), t(8), t(8), t(9), t(10)),
             (8, t(7), t(9), t(9), t(9), t(9)),
             // a frame whose parent was never observed
-            (10, t(9), Nav::Boundary, Nav::Boundary, Nav::Boundary,
-                Nav::unavailable(Unav::OrphanParent)),
+            (
+                10,
+                t(9),
+                Nav::Boundary,
+                Nav::Boundary,
+                Nav::Boundary,
+                Nav::unavailable(Unav::OrphanParent),
+            ),
         ];
         for (sequence, previous, next, into, over, out) in table {
             let got = nav_of(&window, sequence);
@@ -2096,7 +2112,8 @@ mod tests {
             )
         };
         let detail = show(Some(ids[&7]), 5).expect("around window");
-        let sequences: Vec<&str> = detail.events.iter().map(|event| event.sequence.as_str()).collect();
+        let sequences: Vec<&str> =
+            detail.events.iter().map(|event| event.sequence.as_str()).collect();
         assert_eq!(sequences, ["5", "6", "7", "8", "9"]);
         assert_eq!(detail.anchor_frame_id, Some(ids[&7]));
         assert_eq!(detail.first_sequence.as_deref(), Some("5"));
@@ -2327,7 +2344,11 @@ mod tests {
         use xtrace_domain::honesty_flags as f;
         assert_eq!(
             flags(2),
-            f::HAS_VALUES | f::HAS_REDACTED | f::HAS_TRUNCATED | f::HAS_UNAVAILABLE | f::HAS_DROPPED
+            f::HAS_VALUES
+                | f::HAS_REDACTED
+                | f::HAS_TRUNCATED
+                | f::HAS_UNAVAILABLE
+                | f::HAS_DROPPED
         );
         assert_eq!(flags(3), 0);
         assert_eq!(flags(4), f::HAS_GAP);

@@ -245,7 +245,8 @@ impl Session {
             NonZeroUsize::new(STAGED_INCOMING_LIMIT).unwrap_or(NonZeroUsize::MIN);
         // The audit redactor runs on every accepted event and finish (the event and finish arms
         // of the post-hello handler), so bindings may be accepted.
-        let ingest_config = IngestConfig::mode_derived(active_recordings).with_bindings_audit_active();
+        let ingest_config =
+            IngestConfig::mode_derived(active_recordings).with_bindings_audit_active();
         Self::new_with_ingest_config(inputs, ingest_config)
     }
 

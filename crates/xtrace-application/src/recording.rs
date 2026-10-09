@@ -475,7 +475,8 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
                         "recording capture retained-ID capacity is exhausted",
                     ));
                 }
-                let recording = Arc::new(Mutex::new(RecordingAssembly::new(request.clone(), event_cap)));
+                let recording =
+                    Arc::new(Mutex::new(RecordingAssembly::new(request.clone(), event_cap)));
                 recordings.insert(request.recording_id, Arc::clone(&recording));
                 recording
             }
@@ -1394,7 +1395,8 @@ mod tests {
             NonZeroUsize::new(1).expect("non-zero recording limit"),
         );
         let request = begin(wall(1));
-        let assembly = Arc::new(Mutex::new(RecordingAssembly::new(request.clone(), MAX_RECORDED_EVENTS)));
+        let assembly =
+            Arc::new(Mutex::new(RecordingAssembly::new(request.clone(), MAX_RECORDED_EVENTS)));
         service
             .recordings
             .lock()
@@ -1774,7 +1776,10 @@ mod tests {
     fn ingest_and_application_caps_agree_with_the_mode() {
         use xtrace_domain::CaptureMode;
         for mode in [CaptureMode::Standard, CaptureMode::Focused] {
-            assert_eq!(mode.event_cap(), super::CaptureMode::from_policy_id(mode.policy_id()).event_cap());
+            assert_eq!(
+                mode.event_cap(),
+                super::CaptureMode::from_policy_id(mode.policy_id()).event_cap()
+            );
         }
         assert_eq!(CaptureMode::Standard.event_cap(), STANDARD_EVENT_CAP);
         assert_eq!(CaptureMode::Focused.event_cap(), FOCUSED_EVENT_CAP);
