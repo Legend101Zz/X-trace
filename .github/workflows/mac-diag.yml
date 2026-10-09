@@ -30,6 +30,12 @@ jobs:
           TMPDIR: ${{ runner.temp }}/mr/tmp
         run: |
           python3 ci_fsb.py
+      - name: express manual
+        env:
+          TMPDIR: ${{ runner.temp }}/mr/tmp
+        run: |
+          cargo build -p xtrace-cli --locked 2>&1 | tail -2
+          bash ci_exp.sh
       - name: five
         env:
           TMPDIR: ${{ runner.temp }}/mr/tmp
