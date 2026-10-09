@@ -24,11 +24,11 @@ use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use uuid::Uuid;
+use xtrace_domain::catalog_discovery::ValidatedEndpointClaim;
 use xtrace_domain::static_claims::{
     ANALYZER_INCOMPLETE_REASONS, AnalyzerLine, StaticClaimContext, StaticClaimError,
     framework_syntax,
 };
-use xtrace_domain::catalog_discovery::ValidatedEndpointClaim;
 use xtrace_domain::{ContentHash, ProjectId, SourceRevisionId};
 
 use crate::error::CliError;
@@ -682,7 +682,7 @@ mod persist {
     use xtrace_application::catalog_discovery::history::{
         CatalogHistoryPort as _, CatalogHistoryService, RevisionEntry, RevisionReconciliation,
     };
-    use xtrace_application::{CatalogDiscoveryService, CatalogChangeKind};
+    use xtrace_application::{CatalogChangeKind, CatalogDiscoveryService};
     use xtrace_domain::catalog_discovery::{
         ClaimSourceEvidence, DiscoveryChunk, DiscoveryCompletion, DiscoveryRunFinish,
         DiscoveryRunGrant, DiscoveryRunStartRequest, DiscoveryScope, DiscoveryScopeKind,
@@ -830,8 +830,16 @@ mod persist {
             out.not_persisted_because = Some("the scan produced no claims to record".to_owned());
             return out;
         }
-        match run_persist(&target, args, project, source, result, claims, source_revision_id, &mut out)
-        {
+        match run_persist(
+            &target,
+            args,
+            project,
+            source,
+            result,
+            claims,
+            source_revision_id,
+            &mut out,
+        ) {
             Ok(()) => {}
             Err(reason) => out.not_persisted_because = Some(reason),
         }
@@ -854,7 +862,9 @@ mod persist {
         for claim in claims {
             for evidence in claim.source_evidence() {
                 if let ClaimSourceEvidence::StaticSnapshot {
-                    relative_path, recorded_source_digest, ..
+                    relative_path,
+                    recorded_source_digest,
+                    ..
                 } = evidence
                 {
                     files.insert(relative_path.clone(), *recorded_source_digest);
@@ -941,15 +951,9 @@ mod persist {
         }
         let accepted: u32 =
             u32::try_from(chunks.iter().map(|c| c.claims.len()).sum::<usize>()).unwrap_or(u32::MAX);
-        let digest = final_digest(
-            run_id,
-            &scope,
-            Some(source_revision_id),
-            &chunks,
-            rejected,
-            completion,
-        )
-        .map_err(|_| "the run digest could not be computed".to_owned())?;
+        let digest =
+            final_digest(run_id, &scope, Some(source_revision_id), &chunks, rejected, completion)
+                .map_err(|_| "the run digest could not be computed".to_owned())?;
         let finish = DiscoveryRunFinish {
             run_id,
             expected_chunk_count: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
@@ -988,7 +992,8 @@ mod persist {
             counts.entry(kind.as_str().to_owned()).or_default();
         }
         out.changes = Some(counts);
-        out.reconciliation = reader.reconcile_with_observations(target.project_id, Some(revision_id)).ok();
+        out.reconciliation =
+            reader.reconcile_with_observations(target.project_id, Some(revision_id)).ok();
         out.revision = Some(entry);
         Ok(())
     }

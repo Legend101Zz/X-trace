@@ -9,8 +9,8 @@ use xtrace_application::catalog_discovery::admission::{
     LocalScanSelection, OwnerSelectionPort, RecordedOwnerSelection,
 };
 use xtrace_application::{PortError, PortErrorKind};
-use xtrace_domain::ids::Id as _;
 use xtrace_domain::CorrelationId;
+use xtrace_domain::ids::Id as _;
 
 use crate::connection::SqliteStore;
 use crate::error::StoreError;
@@ -47,7 +47,8 @@ impl OwnerSelectionPort for SqliteCatalogAdmissionStore {
         selection: &LocalScanSelection,
     ) -> Result<RecordedOwnerSelection, PortError> {
         let correlation_id = CorrelationId::new();
-        let scope_digest = selection.scope.digest().map_err(|_| invalid("scan scope is invalid"))?;
+        let scope_digest =
+            selection.scope.digest().map_err(|_| invalid("scan scope is invalid"))?;
         let scope_json = serde_json::to_string(&selection.scope)
             .map_err(|_| invalid("scan scope could not be encoded"))?;
         let project = selection.project_id.as_uuid().as_bytes().to_vec();
@@ -65,7 +66,8 @@ impl OwnerSelectionPort for SqliteCatalogAdmissionStore {
             .optional()
             .map_err(|error| map_sql(error, correlation_id))?
             .flatten();
-        let epoch = previous.unwrap_or(0).checked_add(1).ok_or_else(|| invalid("epoch overflow"))?;
+        let epoch =
+            previous.unwrap_or(0).checked_add(1).ok_or_else(|| invalid("epoch overflow"))?;
         transaction
             .execute(
                 "UPDATE catalog_owner_selections SET current_for_scope = 0 WHERE project_id = ?1 AND scope_digest = ?2 AND current_for_scope = 1",

@@ -314,9 +314,8 @@ mod tests {
         assert_eq!(same.verify_claim(&selected, &claim(revision, recorded)), Ok(()));
 
         // The file changed between analysis and persistence.
-        let changed = SnapshotSourceProof {
-            reader: Arc::new(Fixed(Some(ContentHash::of_bytes(b"edited")))),
-        };
+        let changed =
+            SnapshotSourceProof { reader: Arc::new(Fixed(Some(ContentHash::of_bytes(b"edited")))) };
         assert_eq!(
             changed.verify_claim(&selected, &claim(revision, recorded)),
             Err(DiscoveryRefusal::SourceSnapshotUnavailable)

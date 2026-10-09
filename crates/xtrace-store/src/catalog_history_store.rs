@@ -303,15 +303,7 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
 type RunRow = (Vec<u8>, String, Vec<u8>, i64, i64, Option<String>, Option<Vec<u8>>);
 
 fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-    ))
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
 }
 
 fn run_entry(row: RunRow) -> Result<RunEntry, PortError> {

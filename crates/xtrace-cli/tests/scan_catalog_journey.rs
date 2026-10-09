@@ -139,10 +139,8 @@ fn operation<'a>(list: &'a Value, method: &str, route: &str) -> &'a Value {
 }
 
 fn golden(name: &str) -> String {
-    fs::read_to_string(
-        repo_root().join("adapters/node/packages/analyzer/golden").join(name),
-    )
-    .expect("golden transcript")
+    fs::read_to_string(repo_root().join("adapters/node/packages/analyzer/golden").join(name))
+        .expect("golden transcript")
 }
 
 fn express_fx() -> (Fx, String) {
@@ -257,7 +255,13 @@ fn express_fixture_scan_persists_an_immutable_revision_and_rescans_diff() {
     assert_eq!(labelled("/api/users"), Some("changed".into()));
 
     // The explicit pair form agrees with the default (parent -> newest).
-    let pair = json(&fx.catalog(&["diff", "--from", &revision_two, "--to", third["catalogRevisionId"].as_str().unwrap()]));
+    let pair = json(&fx.catalog(&[
+        "diff",
+        "--from",
+        &revision_two,
+        "--to",
+        third["catalogRevisionId"].as_str().unwrap(),
+    ]));
     assert_eq!(pair["counts"], diff["counts"]);
 }
 
@@ -305,9 +309,7 @@ fn incomplete_scan_records_a_run_but_never_a_revision_and_removes_nothing() {
     assert_eq!(statuses, ["incomplete", "complete"]);
     // Nothing in the newest revision was marked removed.
     let list = json(&fx.catalog(&["list"]));
-    assert!(
-        list["operations"].as_array().unwrap().iter().all(|op| op["changeKind"] != "removed")
-    );
+    assert!(list["operations"].as_array().unwrap().iter().all(|op| op["changeKind"] != "removed"));
 }
 
 #[test]
@@ -421,8 +423,11 @@ fn catalog_reconcile_reports_an_endpoint_observed_but_not_declared() {
     let fx = fx();
     let sources = repo_root().join("adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture");
     fs::create_dir_all(fx.repo.join("src")).expect("src");
-    fs::copy(sources.join("FixtureAdminController.java"), fx.repo.join("src/FixtureAdminController.java"))
-        .expect("copy source");
+    fs::copy(
+        sources.join("FixtureAdminController.java"),
+        fx.repo.join("src/FixtureAdminController.java"),
+    )
+    .expect("copy source");
     // The scan only declares the admin endpoints; POST /orders is recorded but never declared.
     let transcript = SPRING_TRANSCRIPT
         .lines()

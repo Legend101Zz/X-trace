@@ -85,9 +85,9 @@ fn parse_revision(value: Option<&str>) -> Result<Option<CatalogRevisionId>, CliE
 
 fn map_error(error: HistoryError) -> CliError {
     match error {
-        HistoryError::RevisionNotFound | HistoryError::NoRevisions | HistoryError::ScopeMismatch => {
-            invalid(error.to_string())
-        }
+        HistoryError::RevisionNotFound
+        | HistoryError::NoRevisions
+        | HistoryError::ScopeMismatch => invalid(error.to_string()),
         HistoryError::Port(_) => CliError::StoreUnavailable(error.to_string()),
     }
 }
@@ -95,8 +95,13 @@ fn map_error(error: HistoryError) -> CliError {
 #[cfg(unix)]
 fn open(
     project_dir: &std::path::Path,
-) -> Result<(CatalogHistoryService<xtrace_store::catalog_history_store::SqliteCatalogHistoryStore>, ProjectId), CliError>
-{
+) -> Result<
+    (
+        CatalogHistoryService<xtrace_store::catalog_history_store::SqliteCatalogHistoryStore>,
+        ProjectId,
+    ),
+    CliError,
+> {
     let env_reader = crate::paths::read_env_path;
     let preflight = crate::daemon::preflight_project(project_dir, &env_reader)?;
     let validated = crate::daemon::open_validated_project(preflight)?;
@@ -111,8 +116,13 @@ fn open(
 #[cfg(not(unix))]
 fn open(
     _project_dir: &std::path::Path,
-) -> Result<(CatalogHistoryService<xtrace_store::catalog_history_store::SqliteCatalogHistoryStore>, ProjectId), CliError>
-{
+) -> Result<
+    (
+        CatalogHistoryService<xtrace_store::catalog_history_store::SqliteCatalogHistoryStore>,
+        ProjectId,
+    ),
+    CliError,
+> {
     Err(CliError::StoreUnavailable("the catalog needs the Unix private-storage layer".to_owned()))
 }
 
@@ -131,7 +141,11 @@ fn revision_line(out: &mut dyn Write, entry: &RevisionEntry) -> std::io::Result<
     writeln!(
         out,
         "{}  #{}  {} operations  {}  {}",
-        entry.revision_id, entry.ordinal, entry.operation_count, entry.created_at, entry.pack_status
+        entry.revision_id,
+        entry.ordinal,
+        entry.operation_count,
+        entry.created_at,
+        entry.pack_status
     )
 }
 

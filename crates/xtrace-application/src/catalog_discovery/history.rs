@@ -13,7 +13,9 @@ use serde::Serialize;
 use xtrace_domain::catalog_reconcile::{
     ObservedEndpoint, Reconciliation, StaticEndpoint, reconcile,
 };
-use xtrace_domain::{CatalogRevisionId, ContentHash, OperationId, ProjectId, RunId, SourceRevisionId};
+use xtrace_domain::{
+    CatalogRevisionId, ContentHash, OperationId, ProjectId, RunId, SourceRevisionId,
+};
 
 use super::{CatalogChangeKind, CatalogSourceAvailability};
 use crate::error::PortError;
@@ -146,8 +148,10 @@ pub trait CatalogHistoryPort: Send + Sync {
         revision_id: CatalogRevisionId,
     ) -> Result<Vec<OperationView>, PortError>;
     /// Endpoints with at least one linked recording, from the observed-operation tables.
-    fn observed_operations(&self, project_id: ProjectId)
-    -> Result<Vec<ObservedOperation>, PortError>;
+    fn observed_operations(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<ObservedOperation>, PortError>;
 }
 
 /// Error of a catalog read service.
@@ -262,7 +266,11 @@ impl<P: CatalogHistoryPort> CatalogHistoryService<P> {
     }
 
     /// Revisions, newest first.
-    pub fn history(&self, project: ProjectId, limit: u32) -> Result<Vec<RevisionEntry>, HistoryError> {
+    pub fn history(
+        &self,
+        project: ProjectId,
+        limit: u32,
+    ) -> Result<Vec<RevisionEntry>, HistoryError> {
         Ok(self.port.list_revisions(project, limit.clamp(1, 200))?)
     }
 
@@ -460,7 +468,11 @@ fn diff_operations(
     }
     entries.retain(|entry| entry.change != CatalogChangeKind::Unchanged);
     entries.sort_by(|a, b| {
-        (&a.route_template, &a.method, a.operation_id).cmp(&(&b.route_template, &b.method, b.operation_id))
+        (&a.route_template, &a.method, a.operation_id).cmp(&(
+            &b.route_template,
+            &b.method,
+            b.operation_id,
+        ))
     });
     RevisionDiff {
         from,
@@ -476,7 +488,13 @@ mod tests {
     use super::*;
     use xtrace_domain::ids::Id as _;
 
-    fn view(id: u128, method: &str, route: &str, version: &str, kind: CatalogChangeKind) -> OperationView {
+    fn view(
+        id: u128,
+        method: &str,
+        route: &str,
+        version: &str,
+        kind: CatalogChangeKind,
+    ) -> OperationView {
         OperationView {
             operation_id: OperationId::from_uuid(uuid::Uuid::from_u128(id)),
             operation_version_id: version.to_owned(),
