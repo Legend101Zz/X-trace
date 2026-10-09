@@ -834,7 +834,7 @@ mod persist {
             out.not_persisted_because = Some("the scan produced no claims to record".to_owned());
             return out;
         }
-        match run_persist(
+        if let Err(reason) = run_persist(
             &target,
             args,
             project,
@@ -844,8 +844,7 @@ mod persist {
             source_revision_id,
             &mut out,
         ) {
-            Ok(()) => {}
-            Err(reason) => out.not_persisted_because = Some(reason),
+            out.not_persisted_because = Some(reason);
         }
         out
     }
