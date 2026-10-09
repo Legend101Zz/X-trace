@@ -12,6 +12,11 @@ export const BUILTIN_MODULES: readonly ModuleDescriptor[] = [
     limitationsWhenAbsent: ["http_root_unavailable", "http_status_unavailable"],
   },
   {
+    name: "express",
+    capability: "http.server.route_template",
+    limitationsWhenAbsent: [],
+  },
+  {
     name: "async-context",
     capability: "async_correlation",
     limitationsWhenAbsent: ["async_correlation_unavailable"],

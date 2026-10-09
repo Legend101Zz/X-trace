@@ -48,6 +48,25 @@ export function setCaptureProfile(next: CaptureProfile): void {
   profile = { limitations: [...next.limitations], holdStart: next.holdStart };
 }
 
+/** Resolves a route template from the finished request; framework modules register one each. */
+export type RouteResolver = (request: unknown) => string;
+const routeResolvers: RouteResolver[] = [];
+
+export function registerRouteResolver(resolver: RouteResolver): void {
+  routeResolvers.push(resolver);
+}
+
+/** First resolver that yields a template wins; a throwing resolver never affects the application. */
+export function resolveRoute(request: unknown): string {
+  for (const resolver of routeResolvers) {
+    try {
+      const route = resolver(request);
+      if (route) return route;
+    } catch { /* resolvers are best effort */ }
+  }
+  return "";
+}
+
 const contexts = new AsyncLocalStorage<RecordingContext>();
 const suppression = new AsyncLocalStorage<true>();
 

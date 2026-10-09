@@ -1,5 +1,6 @@
 import { BUILTIN_MODULES } from "./manifest.cjs";
 import { installHttpCapture } from "./http-capture.cjs";
+import { registerRouteResolver } from "./runtime/context.cjs";
 import type { HttpCaptureTransport } from "./runtime/transport.cjs";
 import type { InstallEnvironment, InstrumentationModule, ModuleDescriptor, DetectResult } from "./runtime/registry.cjs";
 
@@ -30,4 +31,40 @@ export function asyncContextModule(): InstrumentationModule {
     detect: supportedNode,
     install() { /* contexts are created by the HTTP root */ },
   };
+}
+
+/**
+ * Express 4 and 5 route template: the matched `req.route.path` once the response finished.
+ * Only a literal string path on an unmounted app/router qualifies; regex or array paths and
+ * mounted routers (whose base URL holds concrete values) stay unresolved, never guessed.
+ */
+export function resolveExpressRoute(request: unknown): string {
+  const candidate = request as { route?: { path?: unknown }; baseUrl?: unknown } | undefined;
+  const path = candidate?.route?.path;
+  if (typeof path !== "string" || !path.startsWith("/") || path.length > 1024) return "";
+  const base = candidate?.baseUrl;
+  if (typeof base === "string" && base !== "") return "";
+  return path;
+}
+
+export function expressModule(resolve: (specifier: string) => string = defaultResolve): InstrumentationModule {
+  return {
+    descriptor: descriptor("express"),
+    detect(environment) {
+      const node = supportedNode(environment);
+      if (!node.supported) return node;
+      try {
+        resolve("express/package.json");
+        return { supported: true };
+      } catch {
+        return { supported: false, reason: "express_not_found" };
+      }
+    },
+    install() { registerRouteResolver(resolveExpressRoute); },
+  };
+}
+
+function defaultResolve(specifier: string): string {
+  const paths = [process.cwd(), ...(require.main?.paths ?? [])];
+  return require.resolve(specifier, { paths });
 }

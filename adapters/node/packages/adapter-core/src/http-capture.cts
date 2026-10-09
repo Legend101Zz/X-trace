@@ -1,7 +1,7 @@
 import http = require("node:http");
 import https = require("node:https");
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { captureSuppressed, createContext, finishContext, recordEvent, runInContext, type RecordingContext } from "./runtime/context.cjs";
+import { captureSuppressed, createContext, finishContext, recordEvent, resolveRoute, runInContext, type RecordingContext } from "./runtime/context.cjs";
 import { events, type CaptureEvent, type CaptureEventKind } from "./runtime/events.cjs";
 import { createHttpCaptureTransport, type HttpCaptureTransport } from "./runtime/transport.cjs";
 
@@ -77,8 +77,8 @@ function captureRequest(_thisArg: unknown, request: IncomingMessage, response: S
   if (!transport.start(context.id, method, startedAtNs, context.holdStart)) return invoke();
 
   return runInContext(context, () => {
-    response.once("finish", () => runInContext(context, () => closeRecording(context, "response-finish", response, transport)));
-    response.once("close", () => runInContext(context, () => closeRecording(context, "response-close", response, transport)));
+    response.once("finish", () => runInContext(context, () => closeRecording(context, "response-finish", response, transport, request)));
+    response.once("close", () => runInContext(context, () => closeRecording(context, "response-close", response, transport, request)));
     context.frameEventId = recordEvent(context, transport, events.frameEnter(ROOT_SYMBOL));
     if (context.frameEventId) context.frameStack.push(context.frameEventId);
     try {
@@ -101,6 +101,7 @@ function closeRecording(
   kind: "response-finish" | "response-close",
   response: ServerResponse,
   transport: HttpCaptureTransport,
+  request: IncomingMessage,
 ): void {
   if (context.finished) return;
   context.finished = true;
@@ -109,6 +110,11 @@ function closeRecording(
   context.outcome = completed ? "responded" : context.threw ? "exception-propagated" : "client-aborted";
   if (context.threw && !completed) context.status = 0;
   recordEvent(context, transport, events.response(kind, context.frameEventId));
+  const route = resolveRoute(request);
+  if (route) {
+    context.route = route;
+    context.limitations.delete("route_unavailable");
+  }
   finishContext(context, transport);
 }
 

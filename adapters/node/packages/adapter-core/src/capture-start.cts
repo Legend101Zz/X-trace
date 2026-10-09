@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { createHttpCaptureTransport } from "./http-capture.cjs";
 import { effectiveLimitations } from "./manifest.cjs";
-import { asyncContextModule, nodeHttpModule } from "./modules.cjs";
+import { asyncContextModule, expressModule, nodeHttpModule } from "./modules.cjs";
 import { setCaptureProfile } from "./runtime/context.cjs";
 import { ModuleRegistry, type InstallEnvironment, type InstrumentationModule } from "./runtime/registry.cjs";
 import type { HttpCaptureTransport } from "./runtime/transport.cjs";
@@ -29,7 +29,7 @@ export function startCaptureFromRequire(): void {
   }
   const environment: InstallEnvironment = { nodeVersion: process.version, packageVersion: "" };
   let transport: HttpCaptureTransport | undefined;
-  const modules: InstrumentationModule[] = [nodeHttpModule(() => transport!), asyncContextModule()];
+  const modules: InstrumentationModule[] = [nodeHttpModule(() => transport!), asyncContextModule(), expressModule()];
   const planned = modules.filter((module) => module.detect(environment).supported).map((module) => module.descriptor.capability);
   const startupBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   let worker: Worker;
@@ -61,7 +61,8 @@ export function startCaptureFromRequire(): void {
     // Recordings carry the limitations that really hold: the baseline plus every module that did not install.
     setCaptureProfile({
       limitations: effectiveLimitations(new Set(registry.statuses().filter((status) => status.state === "installed").map((status) => status.name))),
-      holdStart: false,
+      // The route is only known when the response finishes, so the start is held while a route module is active.
+      holdStart: registry.capabilities().includes("http.server.route_template"),
     });
     worker.unref();
   } catch {
