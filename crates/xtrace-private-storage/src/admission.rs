@@ -2117,6 +2117,9 @@ mod tests {
 
     #[test]
     fn a_mode_change_inside_a_scope_is_seen_by_the_next_call() {
+        // Key invalidation itself (ctime in the memo key) is shown by the probe.rs test
+        // `the_scope_key_separates_state_filesystem_flags_and_profile` and the ctime tests there;
+        // this test shows the end-to-end refusal on whatever platform runs it.
         let (parent, subject) = scoped_subject();
         let _scope = AdmissionScope::enter();
         let held = AdmittedPrivateRoot::open(&subject).expect("admitted first");

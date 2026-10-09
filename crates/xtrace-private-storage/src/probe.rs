@@ -85,6 +85,8 @@ pub(crate) struct MemoKey {
     /// The full `f_fsid` value, rendered (the libc type has no public fields).
     fsid: String,
     flags: u64,
+    /// The filesystem type name (`f_fstypename`); only `apfs` is ever shared across operations.
+    fstype: String,
     profile: FilesystemProfile,
 }
 
@@ -93,9 +95,10 @@ impl MemoKey {
         state: DirectoryState,
         fsid: String,
         flags: u64,
+        fstype: String,
         profile: FilesystemProfile,
     ) -> Self {
-        Self { state, fsid, flags, profile }
+        Self { state, fsid, flags, fstype, profile }
     }
 
     /// The key for `directory` in `state`, read from its held descriptor.
@@ -105,21 +108,46 @@ impl MemoKey {
         profile: FilesystemProfile,
     ) -> Option<Self> {
         let stats = rustix::fs::fstatfs(directory).ok()?;
-        let (fsid, flags) = filesystem_identity(&stats);
-        Some(Self::from_parts(state, fsid, flags, profile))
+        let (fsid, flags, fstype) = filesystem_identity(&stats);
+        // HFS+ stamps ctime with one-second granularity, so a change shortly after a probe can
+        // leave the key equal. Only filesystems with nanosecond ctime share verdicts.
+        scope_shares_filesystem(&fstype)
+            .then(|| Self::from_parts(state, fsid, flags, fstype, profile))
     }
 }
 
+/// Whether verdicts and batched listings of this filesystem type may be reused beyond one
+/// operation. macOS: APFS only (nanosecond ctime). Elsewhere the scope exists for tests alone.
 #[cfg(target_os = "macos")]
-fn filesystem_identity(stats: &rustix::fs::StatFs) -> (String, u64) {
-    (format!("{:?}", stats.f_fsid), u64::from(stats.f_flags))
+fn scope_shares_filesystem(fstype: &str) -> bool {
+    fstype == "apfs"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn scope_shares_filesystem(_fstype: &str) -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn filesystem_identity(stats: &rustix::fs::StatFs) -> (String, u64, String) {
+    let name = stats
+        .f_fstypename
+        .iter()
+        .map(|unit| unit.to_ne_bytes()[0])
+        .take_while(|byte| *byte != 0)
+        .collect::<Vec<u8>>();
+    (
+        format!("{:?}", stats.f_fsid),
+        u64::from(stats.f_flags),
+        String::from_utf8_lossy(&name).into_owned(),
+    )
 }
 
 /// Only macOS memoizes in production; elsewhere the memo exists for tests alone, where the
 /// device number in the state already separates filesystems.
 #[cfg(not(target_os = "macos"))]
-fn filesystem_identity(_stats: &rustix::fs::StatFs) -> (String, u64) {
-    (String::new(), 0)
+fn filesystem_identity(_stats: &rustix::fs::StatFs) -> (String, u64, String) {
+    (String::new(), 0, String::new())
 }
 
 /// One bounded admission operation: a single deadline plus the verdicts earned inside it.
@@ -145,6 +173,8 @@ pub(crate) struct Operation {
 #[cfg(target_os = "macos")]
 pub(crate) struct Prefetched {
     taken_at: std::time::SystemTime,
+    /// Monotonic stamp of the same moment, so reuse can notice the realtime clock stepping.
+    taken_mono: Instant,
     entries: Vec<BatchEntry>,
 }
 
@@ -296,7 +326,7 @@ impl Operation {
                 entries.push(BatchEntry { path: path.clone(), device: before.dev(), listing });
             }
         }
-        Some(Prefetched { taken_at, entries })
+        Some(Prefetched { taken_at, taken_mono: started, entries })
     }
 
     /// The scope-level key for `directory` in `state`, when this operation shares a live scope.
@@ -526,10 +556,37 @@ fn prefetched_verdict(operation: &Operation, path: &Path, directory: &File) -> O
     own.as_ref().and_then(|batch| verdict_from_batch(batch, path, directory))
 }
 
+/// Whether a batch taken at (`taken_at`, `taken_mono`) may still be trusted at (`now`,
+/// `now_mono`): the realtime clock has neither stepped back nor drifted from the monotonic one.
+#[cfg(any(target_os = "macos", test))]
+fn batch_clock_trusted(
+    taken_at: std::time::SystemTime,
+    taken_mono: Instant,
+    now: std::time::SystemTime,
+    now_mono: Instant,
+) -> bool {
+    clock_is_consistent(taken_at, now, now_mono.saturating_duration_since(taken_mono))
+}
+
 #[cfg(target_os = "macos")]
 fn verdict_from_batch(batch: &Prefetched, path: &Path, directory: &File) -> Option<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
+    // A batch is reused for up to a scope (10 s): re-check the realtime clock on every reuse and
+    // fall back to a single probe if it stepped.
+    if !batch_clock_trusted(
+        batch.taken_at,
+        batch.taken_mono,
+        std::time::SystemTime::now(),
+        Instant::now(),
+    ) {
+        return None;
+    }
+    // Batch reuse is APFS-only for the same ctime-granularity reason as the scope memo.
+    let stats = rustix::fs::fstatfs(directory).ok()?;
+    if !scope_shares_filesystem(&filesystem_identity(&stats).2) {
+        return None;
+    }
     let entry = batch.entries.iter().find(|entry| entry.path == path)?;
     let metadata = directory.metadata().ok()?;
     let ctime = std::time::UNIX_EPOCH
@@ -819,6 +876,21 @@ mod tests {
         assert!(!clock_is_consistent(taken, taken - D::from_millis(1), elapsed));
         assert!(!clock_is_consistent(taken, taken + D::from_secs(3_600), elapsed));
         assert!(!clock_is_consistent(taken, taken + D::from_millis(100), elapsed));
+    }
+
+    #[test]
+    fn a_reused_batch_is_refused_when_the_realtime_clock_steps_between_reuses() {
+        use std::time::{Duration as D, UNIX_EPOCH};
+        let mono = Instant::now();
+        let taken = UNIX_EPOCH + D::from_secs(1_000);
+        let later = mono + D::from_secs(5);
+        assert!(batch_clock_trusted(taken, mono, taken + D::from_secs(5), later));
+        assert!(batch_clock_trusted(taken, mono, taken + D::from_millis(5_040), later));
+        // Realtime stepped back, or jumped forward, while the monotonic clock moved 5 s.
+        assert!(!batch_clock_trusted(taken, mono, taken - D::from_secs(1), later));
+        assert!(!batch_clock_trusted(taken, mono, taken + D::from_secs(3_600), later));
+        assert!(!batch_clock_trusted(taken, mono, taken + D::from_millis(5_100), later));
+        assert!(!batch_clock_trusted(taken, mono, taken, later), "frozen realtime clock");
     }
 
     fn identity_of(directory: &File) -> FileIdentity {
@@ -1126,20 +1198,55 @@ mod tests {
         let metadata = directory.metadata().expect("metadata");
         let state = DirectoryState::of(&metadata, DirectoryRole::Traversed);
         let durable = FilesystemProfile::Durable;
-        let base = MemoKey::from_parts(state, "fs-a".to_owned(), 0x10, durable);
-        assert_eq!(base, MemoKey::from_parts(state, "fs-a".to_owned(), 0x10, durable));
-        assert_ne!(base, MemoKey::from_parts(state, "fs-b".to_owned(), 0x10, durable), "fsid");
-        assert_ne!(base, MemoKey::from_parts(state, "fs-a".to_owned(), 0x11, durable), "flags");
+        let base = MemoKey::from_parts(state, "fs-a".to_owned(), 0x10, "apfs".to_owned(), durable);
+        assert_eq!(
+            base,
+            MemoKey::from_parts(state, "fs-a".to_owned(), 0x10, "apfs".to_owned(), durable)
+        );
         assert_ne!(
             base,
-            MemoKey::from_parts(state, "fs-a".to_owned(), 0x10, FilesystemProfile::Ephemeral),
+            MemoKey::from_parts(state, "fs-b".to_owned(), 0x10, "apfs".to_owned(), durable),
+            "fsid"
+        );
+        assert_ne!(
+            base,
+            MemoKey::from_parts(state, "fs-a".to_owned(), 0x11, "apfs".to_owned(), durable),
+            "flags"
+        );
+        assert_ne!(
+            base,
+            MemoKey::from_parts(
+                state,
+                "fs-a".to_owned(),
+                0x10,
+                "apfs".to_owned(),
+                FilesystemProfile::Ephemeral
+            ),
             "profile"
         );
+        assert_ne!(
+            base,
+            MemoKey::from_parts(state, "fs-a".to_owned(), 0x10, "hfs".to_owned(), durable),
+            "filesystem type"
+        );
         let moved = DirectoryState { ctime_nanoseconds: state.ctime_nanoseconds + 1, ..state };
-        assert_ne!(base, MemoKey::from_parts(moved, "fs-a".to_owned(), 0x10, durable), "ctime");
+        assert_ne!(
+            base,
+            MemoKey::from_parts(moved, "fs-a".to_owned(), 0x10, "apfs".to_owned(), durable),
+            "ctime"
+        );
         // The real descriptor key is deterministic and carries the descriptor's filesystem.
-        let key = MemoKey::of_descriptor(state, &directory, durable).expect("key from fstatfs");
-        assert_eq!(Some(key), MemoKey::of_descriptor(state, &directory, durable));
+        let key = MemoKey::of_descriptor(state, &directory, durable);
+        assert_eq!(key, MemoKey::of_descriptor(state, &directory, durable));
+        #[cfg(target_os = "macos")]
+        {
+            // A host that runs these tests on a non-APFS volume stores nothing, by design.
+            let apfs = rustix::fs::fstatfs(&directory)
+                .is_ok_and(|stats| filesystem_identity(&stats).2 == "apfs");
+            assert_eq!(key.is_some(), apfs);
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert!(key.is_some());
     }
 
     #[cfg(target_os = "macos")]

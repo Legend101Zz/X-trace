@@ -19,6 +19,18 @@ static NEXT_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 /// directory verdict memo and the batched listing. It is neither `Send` nor `Sync`; entering
 /// while a scope is live on this thread joins that scope. Dropping the last guard forgets
 /// everything the scope remembered.
+///
+/// Guards are pinned to their thread:
+///
+/// ```compile_fail
+/// fn needs_send<T: Send>(_: T) {}
+/// needs_send(xtrace_private_storage::AdmissionScope::enter());
+/// ```
+///
+/// ```compile_fail
+/// fn needs_sync<T: Sync>(_: &T) {}
+/// needs_sync(&xtrace_private_storage::AdmissionScope::enter());
+/// ```
 #[must_use = "an admission scope ends as soon as its guard is dropped"]
 pub struct AdmissionScope {
     _single_thread: PhantomData<*const ()>,
@@ -134,4 +146,30 @@ pub(crate) fn with_scope<R>(id: u64, f: impl FnOnce(&mut ScopeState) -> R) -> Op
         })
         .ok()
         .flatten()
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests assert on fixture setup and provoke an unwind on purpose"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_inside_a_live_scope_leaves_nothing_behind_for_the_next_scope() {
+        let outcome = std::panic::catch_unwind(|| {
+            let _scope = AdmissionScope::enter();
+            let _joined = AdmissionScope::enter();
+            panic!("store call failed inside a scope");
+        });
+        assert!(outcome.is_err());
+        assert_eq!(live_scope_id(), None, "unwinding dropped every guard");
+        let _fresh = AdmissionScope::enter();
+        let id = live_scope_id().expect("a new scope is live");
+        let (depth, remembered) =
+            with_scope(id, |state| (state.depth, state.memo.len())).expect("scope state");
+        assert_eq!((depth, remembered), (1, 0), "a new scope on this thread starts empty");
+    }
 }
