@@ -116,3 +116,23 @@ test("honest states: invalid map, unmapped position and an authored file outside
     assert.deepEqual([gone.binding, gone.reason], ["source-map-unresolved", "authored_unreadable"]);
   } finally { cleanup(); }
 });
+
+test("a malformed escape in the map reference is an honest absent state, never a throw", () => {
+  const { root, cleanup } = project();
+  try {
+    writeFileSync(join(root, "dist/bad.js"), "x();\n//# sourceMappingURL=foo%.map\n");
+    const found = resolveAuthoredSource(join(root, "dist/bad.js"), 1, 1, { repoRoot: root, hashContent: sha });
+    assert.deepEqual([found.binding, found.reason], ["source-map-absent", "source_map_unreadable"]);
+  } finally { cleanup(); }
+});
+
+test("the last sourceMappingURL comment is the one used", () => {
+  const { root, cleanup } = project();
+  try {
+    writeFileSync(join(root, "dist/two.js"), "function show(id) { return id; }\n//# sourceMappingURL=wrong.js.map\n//# sourceMappingURL=two.js.map\n");
+    writeFileSync(join(root, "dist/two.js.map"), JSON.stringify({ version: 3, file: "two.js", sources: ["../src/app.ts"], names: [], mappings: mappings([[[0, 0, 1, 7]]]) }));
+    const found = resolveAuthoredSource(join(root, "dist/two.js"), 1, 1, { repoRoot: root, hashContent: sha });
+    assert.equal(found.binding, "observed-unattested");
+    assert.equal(found.facts?.path, "src/app.ts");
+  } finally { cleanup(); }
+});

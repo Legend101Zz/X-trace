@@ -88,6 +88,17 @@ export function currentContext(): RecordingContext | undefined {
   return contexts.getStore();
 }
 
+const byRequest = new WeakMap<object, RecordingContext>();
+
+/** Remembers which recording a request belongs to, for callbacks AsyncLocalStorage does not reach (raw `req.on('data')`). */
+export function bindRequest(request: unknown, context: RecordingContext): void {
+  if (request !== null && typeof request === "object") byRequest.set(request, context);
+}
+
+export function contextForRequest(request: unknown): RecordingContext | undefined {
+  return request !== null && typeof request === "object" ? byRequest.get(request) : undefined;
+}
+
 export function runInContext<T>(context: RecordingContext, callback: () => T): T {
   return contexts.run(context, callback);
 }

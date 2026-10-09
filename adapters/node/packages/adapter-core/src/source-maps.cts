@@ -14,7 +14,7 @@ import type { SourceBindingName, SourceFacts } from "./runtime/events.cjs";
 
 const MAX_MAP_BYTES = 8 * 1024 * 1024;
 const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
-const MAP_COMMENT = /\/\/[#@]\s*sourceMappingURL=([^\s'"]+)\s*$/m;
+const MAP_COMMENT = /\/\/[#@]\s*sourceMappingURL=([^\s'"]+)\s*$/gm;
 const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 export interface SourceMapOptions {
@@ -54,7 +54,8 @@ export function resolveAuthoredSource(generatedFile: string, line: number, colum
   } catch {
     return { binding: "source-map-absent", reason: "source_map_unreadable" };
   }
-  const comment = MAP_COMMENT.exec(generatedSource);
+  // The last comment is the one tools honour.
+  const comment = [...generatedSource.matchAll(MAP_COMMENT)].at(-1);
   if (!comment) return { binding: "source-map-absent", reason: "no_source_map_comment" };
   const loaded = loadMap(comment[1]!, generatedFile);
   if (loaded === "unreadable") return { binding: "source-map-absent", reason: "source_map_unreadable" };
@@ -121,8 +122,8 @@ function loadMap(reference: string, generatedFile: string): DecodedMap | undefin
     stamp = `data:${text.length}`;
   } else {
     if (/^[a-z][a-z0-9+.-]*:/i.test(reference)) return "unreadable";
-    const mapFile = resolve(dirname(generatedFile), decodeURIComponent(reference));
     try {
+      const mapFile = resolve(dirname(generatedFile), decodeURIComponent(reference));
       const info = statSync(mapFile);
       if (info.size > MAX_MAP_BYTES) return "unreadable";
       stamp = `${info.size}:${info.mtimeMs}`;

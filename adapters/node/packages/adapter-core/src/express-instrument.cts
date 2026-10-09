@@ -1,6 +1,6 @@
 import nodeModule = require("node:module");
 import { readFileSync } from "node:fs";
-import { announceRoute, currentContext, recordEvent, type RecordingContext } from "./runtime/context.cjs";
+import { announceRoute, contextForRequest, currentContext, runInContext, recordEvent, type RecordingContext } from "./runtime/context.cjs";
 import { events } from "./runtime/events.cjs";
 import type { HttpCaptureTransport } from "./runtime/transport.cjs";
 
@@ -17,9 +17,9 @@ const WRAPPED_HANDLE = Symbol.for("xtrace.node.express.handle.v1");
 
 const EXPRESS4_LAYER = /[\\/]node_modules[\\/]express[\\/]lib[\\/]router[\\/]layer\.js$/;
 const ROUTER2_LAYER = /[\\/]node_modules[\\/]router[\\/]lib[\\/]layer\.js$/;
-/** Characters a mount path may contain and still be treated as a literal-with-params template. */
 /** Express's own built-in layers: not application handlers, so they get no frame. */
 const INTERNAL_LAYERS = new Set(["query", "expressInit"]);
+/** Characters a mount path may contain and still be treated as a literal-with-params template. */
 const TEMPLATE_PATH = /^\/[\w\-./:~@%]*$/;
 
 type AnyFn = (this: unknown, ...args: unknown[]) => unknown;
@@ -105,7 +105,7 @@ function patchLayerModule(module: { exports: unknown }, filename: string): void 
     let forward = next;
     try {
       prepareHandle(this);
-      if (this.route) matched(this, request);
+      if (this.route) withRequestContext(request, () => matched(this, request));
       else if (isRouterMount(this) && typeof next === "function") {
         const stack = mountStack(request);
         stack.push(mountPathOf(this));
@@ -116,12 +116,12 @@ function patchLayerModule(module: { exports: unknown }, filename: string): void 
         };
       }
     } catch { /* instrumentation never changes what the application does */ }
-    return Reflect.apply(originalRequest as AnyFn, this, [request, response, forward]);
+    return withRequestContext(request, () => Reflect.apply(originalRequest as AnyFn, this, [request, response, forward]));
   } as AnyFn);
 
   Layer.prototype[errorName] = tag(function xtraceHandleError(this: LayerLike, error: unknown, request: unknown, response: unknown, next: unknown): unknown {
     try { prepareHandle(this); } catch { /* see above */ }
-    return Reflect.apply(originalError as AnyFn, this, [error, request, response, next]);
+    return withRequestContext(request, () => Reflect.apply(originalError as AnyFn, this, [error, request, response, next]));
   } as AnyFn);
 
   // Remember the path string every layer was created with: Express itself keeps only a compiled matcher.
@@ -135,6 +135,16 @@ function patchLayerModule(module: { exports: unknown }, filename: string): void 
   Object.setPrototypeOf(Wrapped, Original);
   module.exports = Wrapped;
   status.patched += 1;
+}
+
+/**
+ * AsyncLocalStorage is lost in callbacks that bypass async resources (a raw `req.on('data')` handler
+ * calling `next()`): fall back to the recording the root bound to this request object.
+ */
+function withRequestContext<T>(request: unknown, callback: () => T): T {
+  if (currentContext()) return callback();
+  const bound = contextForRequest(request);
+  return bound && !bound.finished ? runInContext(bound, callback) : callback();
 }
 
 function tag(fn: AnyFn): AnyFn {
@@ -181,8 +191,9 @@ export function composeTemplate(routePath: unknown, request: unknown): string {
   const base = (request as RequestLike | undefined)?.baseUrl;
   const baseUrl = typeof base === "string" ? base : "";
   if (!prefixCovers(prefix, baseUrl)) return "";
-  if (prefix === "") return routePath;
-  return routePath === "/" ? prefix : prefix + routePath;
+  const composed = prefix === "" ? routePath : routePath === "/" ? prefix : prefix + routePath;
+  // Never hand the worker something it would cut: a truncated template would be a wrong one.
+  return composed.length > 1024 ? "" : composed;
 }
 
 function prefixCovers(prefix: string, baseUrl: string): boolean {

@@ -45,6 +45,17 @@ async function get(port: number, path: string): Promise<number> {
   });
 }
 
+async function post(port: number, path: string, body: string): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const request = http.request({ host: "127.0.0.1", port, path, method: "POST", agent: false, headers: { "content-length": Buffer.byteLength(body) } }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode ?? 0));
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+}
+
 function frames(recording: Seen): Array<[string, string]> {
   return recording.events.filter((event) => event.kind.startsWith("frame-")).map((event) => [event.kind, event.symbol]);
 }
@@ -56,6 +67,9 @@ export async function scenario(fixture: string): Promise<{ byPath: Map<string, S
   context.setCaptureProfile({ limitations: ["route_unavailable", "values_unavailable"], holdStart: true });
   installHttpCapture(transport);
   const fixtureRequire = createRequire(join(nodeRoot, "examples", fixture, "app.js"));
+  const expectedMajor = fixture.startsWith("express5") ? 5 : 4;
+  const loaded = (fixtureRequire("express/package.json") as { version: string }).version;
+  assert.equal(Number.parseInt(loaded, 10), expectedMajor, `${fixture} must load Express ${expectedMajor}, loaded ${loaded}`);
   const module = modules.expressModule((specifier) => fixtureRequire.resolve(specifier), () => transport);
   assert.deepEqual(module.detect({ nodeVersion: process.version, packageVersion: "" }), { supported: true });
   module.install({ nodeVersion: process.version, packageVersion: "" });
@@ -75,6 +89,11 @@ export async function scenario(fixture: string): Promise<{ byPath: Map<string, S
   const clinic = Router();
   clinic.get("/vets/:vetId", function showVet(_req: unknown, res: http.ServerResponse) { res.end("vet"); });
   app.use("/clinics/:clinicId", clinic);
+  // Reads the body with raw stream callbacks, which AsyncLocalStorage does not follow into.
+  app.post("/upload", function readBody(req: http.IncomingMessage, _res: unknown, next: () => void) {
+    req.on("data", () => undefined);
+    req.on("end", () => next());
+  }, function finishUpload(_req: unknown, res: http.ServerResponse) { res.statusCode = 201; res.end("stored"); });
   app.get("/boom", function explode() { throw new Error("SECRET_CANARY"); });
   app.use(function appErrorHandler(_err: unknown, _req: unknown, res: http.ServerResponse, _next: unknown) { res.statusCode = 500; res.end("failed"); });
 
@@ -87,6 +106,7 @@ export async function scenario(fixture: string): Promise<{ byPath: Map<string, S
     for (const path of ["/owners/42?token=canary", "/api/pets/7", "/clinics/9/vets/3", "/boom", "/missing"]) {
       statuses.set(path, await get(address.port, path));
     }
+    statuses.set("/upload", await post(address.port, "/upload", "payload"));
     await new Promise((resolve) => setTimeout(resolve, 60));
   } finally {
     server.closeAllConnections();
@@ -95,13 +115,14 @@ export async function scenario(fixture: string): Promise<{ byPath: Map<string, S
   }
   const byPath = new Map<string, Seen>();
   const ordered = [...seen.values()];
-  ["/owners/42", "/api/pets/7", "/clinics/9/vets/3", "/boom", "/missing"].forEach((path, index) => byPath.set(path, ordered[index]!));
+  assert.equal(seen.size, 6, "exactly one recording per request, six requests sent");
+  ["/owners/42", "/api/pets/7", "/clinics/9/vets/3", "/boom", "/missing", "/upload"].forEach((path, index) => byPath.set(path, ordered[index]!));
   return { byPath, statuses };
 }
 
 export function assertJourney(result: Awaited<ReturnType<typeof scenario>>): void {
   const { byPath, statuses } = result;
-  assert.equal(byPath.size, 5, "exactly one recording per request");
+  assert.equal(byPath.size, 6);
   assert.equal(statuses.get("/boom"), 500);
   assert.equal(statuses.get("/missing"), 404);
 
@@ -148,6 +169,14 @@ export function assertJourney(result: Awaited<ReturnType<typeof scenario>>): voi
   assert.equal(missing.summary?.httpStatus, 404);
   assert.ok(missing.summary?.limitations?.includes("route_unavailable"), "an unmatched request says its route is unavailable");
   assert.ok(!frames(missing).some(([, symbol]) => symbol.startsWith("express.handler")));
+  const upload = byPath.get("/upload")!;
+  assert.equal(statuses.get("/upload"), 201);
+  assert.deepEqual(upload.routes, ["/upload"]);
+  assert.equal(upload.summary?.httpStatus, 201);
+  const uploadFrames = frames(upload).map(([kind, symbol]) => `${kind}:${symbol}`);
+  for (const wanted of ["frame-enter:express.handler:finishUpload", "frame-exit:express.handler:finishUpload"]) {
+    assert.ok(uploadFrames.includes(wanted), `a handler reached from a raw stream callback keeps its frame (${wanted}); saw ${uploadFrames.join(",")}`);
+  }
   for (const recording of byPath.values()) {
     assert.equal(recording.order.filter((entry) => entry === "start").length, 1);
     assert.equal(recording.order.filter((entry) => entry === "finish").length, 1);
