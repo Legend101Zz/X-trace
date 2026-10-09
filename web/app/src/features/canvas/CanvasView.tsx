@@ -40,6 +40,7 @@ export function CanvasView({ events, selectedFrameId, onSelectFrame, onNavigate 
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const rows = useMemo(() => treeRows(graph, expanded), [graph, expanded]);
   const treeRef = useRef<HTMLUListElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const selectedNode = selectedFrameId ? graph.nodeOfFrame[selectedFrameId] ?? null : null;
   const selectedRow = rows.find((row) => row.frameId === selectedFrameId) ?? rows.find((row) => row.nodeId === selectedNode && !row.isMember) ?? null;
   const focusKey = selectedRow?.key ?? rows[0]?.key ?? null;
@@ -47,12 +48,24 @@ export function CanvasView({ events, selectedFrameId, onSelectFrame, onNavigate 
   const drawnIds = new Set(drawn.map((node) => node.id));
   const width = Math.max(1, Math.ceil(Math.max(0, ...drawn.map((node) => node.column)) + 1)) * (NODE_W + COL_GAP);
   const height = Math.max(1, Math.max(0, ...drawn.map((node) => node.layer)) + 1) * (NODE_H + ROW_GAP);
-  const kindOf = (node: { kind: string }) => (node.kind.toLowerCase() === 'gap' || node.kind.toLowerCase().endsWith(':gap') ? 'gap' : node.kind.toLowerCase().includes('unavailable') ? 'unavailable' : 'frame');
+  const kindOf = (node: { kind: string }) => (node.kind.toLowerCase() === 'gap' || node.kind.toLowerCase().endsWith(':gap') ? 'gap' : 'frame');
   useEffect(() => {
     // Keep the selection visible in the scroll region without moving focus.
     const element = treeRef.current?.querySelector('[aria-selected="true"]');
     (element as (Element & { scrollIntoView?: (options?: object) => void }) | null)?.scrollIntoView?.({ block: 'nearest' });
+    const svgNode = scrollRef.current?.querySelector('[data-selected="true"]');
+    (svgNode as (Element & { scrollIntoView?: (options?: object) => void }) | null)?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
   }, [selectedFrameId]);
+  // Move focus only when the roving focus key changes while focus is already inside the tree;
+  // toggling an Expand button re-renders without changing the key and must not steal focus.
+  const lastFocusKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (lastFocusKey.current !== focusKey && selectedRow && document.activeElement?.closest('.canvas-tree')) {
+      const target = Array.from(treeRef.current?.querySelectorAll<HTMLElement>('[role="treeitem"]') ?? []).find((item) => item.dataset.key === focusKey);
+      target?.focus();
+    }
+    lastFocusKey.current = focusKey;
+  }, [focusKey, selectedRow]);
   const pos = (node: { column: number; layer: number }) => ({ x: node.column * (NODE_W + COL_GAP), y: node.layer * (NODE_H + ROW_GAP) });
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
 
@@ -87,8 +100,9 @@ export function CanvasView({ events, selectedFrameId, onSelectFrame, onNavigate 
   return <div className="canvas-view">
     {!anyParent ? <div className="evidence-state">Parent links were not observed for these frames; they are drawn as one level, not as a call tree.</div> : null}
     {undrawn > 0 ? <div className="evidence-state">{undrawn} events have no frame id and are not drawn.</div> : null}
-    {drawn.length < graph.nodes.length ? <div className="evidence-state">Drawing the first {drawn.length} of {graph.nodes.length} nodes; the tree below lists all of them.</div> : null}
-    <div className="canvas-scroll" role="region" aria-label="Frame graph drawing" tabIndex={0}>
+    {graph.dropped > 0 ? <div className="evidence-state">{graph.dropped} events are not drawn or listed: duplicate frame ids or a parent cycle in the recorded data.</div> : null}
+    {drawn.length < graph.nodes.length ? <div className="evidence-state">Drawing the shallowest {drawn.length} of {graph.nodes.length} nodes; the tree below lists all of them.</div> : null}
+    <div ref={scrollRef} className="canvas-scroll" role="region" aria-label="Frame graph drawing" tabIndex={0}>
       <svg className="canvas-svg" width={width} height={height} viewBox={`0 0 ${width} ${height}`} aria-hidden="true" focusable="false">
         {graph.edges.map((edge) => {
           const from = byId.get(edge.from); const to = byId.get(edge.to);
@@ -105,7 +119,7 @@ export function CanvasView({ events, selectedFrameId, onSelectFrame, onNavigate 
         })}
       </svg>
     </div>
-    <ul ref={treeRef} className="canvas-tree" role="tree" aria-label="Frame graph, one row per drawn node; repeated calls are collapsed and can be expanded" onKeyDown={onKeyDown}>
+    <ul ref={treeRef} className="canvas-tree" role="tree" aria-label="Frame graph, one row per node; repeated calls are collapsed and can be expanded" onKeyDown={onKeyDown}>
       {rows.map((row) => {
         const node = byId.get(row.nodeId)!;
         const kind = kindOf(node);
@@ -113,9 +127,9 @@ export function CanvasView({ events, selectedFrameId, onSelectFrame, onNavigate 
         return <li key={row.key} role="treeitem" data-kind={kind} aria-level={row.level} aria-posinset={row.posInSet} aria-setsize={row.setSize}
           aria-selected={row.key === focusKey && selectedRow !== null} aria-expanded={row.expandable ? row.expanded : undefined}
           tabIndex={row.key === focusKey ? 0 : -1} onClick={() => onSelectFrame(row.frameId)}
-          ref={(element) => { if (element && row.key === focusKey && selectedRow && document.activeElement?.closest('.canvas-tree')) element.focus(); }}>
-          {label}{kind === 'gap' ? ' · evidence gap (events missing here)' : kind === 'unavailable' ? ' · evidence unavailable' : ''}{!row.isMember && node.parentOutsideWindow ? ' · parent outside window' : ''}
-          {row.expandable ? <button type="button" className="tree-expand" aria-label={`${row.expanded ? 'Collapse' : 'Expand'} ${node.count} repeated calls of ${node.symbol}`} onClick={(click) => { click.stopPropagation(); toggle(row.nodeId); }}>{row.expanded ? 'Collapse' : 'Expand'}</button> : null}
+ data-key={row.key}>
+          {label}{kind === 'gap' ? ' · evidence gap (events missing here)'  : ''}{!row.isMember && node.parentOutsideWindow ? ' · parent outside window' : ''}{!row.isMember && node.parentNotObserved ? ' · parent not observed' : ''}
+          {row.expandable ? <button type="button" tabIndex={-1} className="tree-expand" aria-label={`${row.expanded ? 'Collapse' : 'Expand'} ${node.count} repeated calls of ${node.symbol}`} onClick={(click) => { click.stopPropagation(); toggle(row.nodeId); }}>{row.expanded ? 'Collapse' : 'Expand'}</button> : null}
         </li>;
       })}
     </ul>

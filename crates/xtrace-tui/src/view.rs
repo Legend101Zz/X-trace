@@ -56,7 +56,20 @@ impl Grid {
 /// Replaces every control character (ESC, newline, CR, C1, DEL) with U+FFFD. Recorded text is
 /// untrusted: it must never reach the terminal as an escape sequence or change the row count.
 fn sanitize(text: &str) -> String {
-    text.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect()
+    text.chars().map(|c| if c.is_control() || is_format_char(c) { '\u{fffd}' } else { c }).collect()
+}
+
+/// Invisible format characters that can reorder or hide recorded text on screen: zero-width and
+/// directional marks (U+200B-200F), line/paragraph separators and embeddings/overrides
+/// (U+2028-202E), directional isolates (U+2066-2069) and the byte-order mark (U+FEFF).
+/// Wide (CJK or emoji) glyphs are NOT measured: width is counted in chars, as the module doc says.
+fn is_format_char(c: char) -> bool {
+    matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+}
+
+/// The server labels a gap event `recording_event_kind:gap`; accept that and a bare `gap`.
+fn is_gap(kind: &str) -> bool {
+    kind == "gap" || kind.ends_with(":gap")
 }
 
 fn fit(text: &str, width: usize) -> String {
@@ -233,7 +246,7 @@ fn frame_line(frame: &FrameRow, selected: bool) -> String {
     let marker = if selected { '>' } else { ' ' };
     let indent = " ".repeat(frame.depth.map_or(0, |d| usize::try_from(d.min(12)).unwrap_or(0)));
     let symbol = frame.symbol.as_deref().unwrap_or("no symbol persisted");
-    if frame.kind == "gap" {
+    if is_gap(&frame.kind) {
         format!("{marker} {:>5} {indent}GAP: events were not emitted here", frame.sequence)
     } else {
         format!("{marker} {:>5} {indent}{} {symbol}", frame.sequence, frame.kind)

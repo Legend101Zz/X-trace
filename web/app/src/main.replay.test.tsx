@@ -17,7 +17,7 @@ const events = [
   ev(1, null, 'Controller.create', nav({ next: { state: 'target', frameId: 'f2' }, into: { state: 'target', frameId: 'f2' } })),
   ev(2, 'f1', 'Repo.save', nav({ previous: { state: 'target', frameId: 'f1' }, next: { state: 'target', frameId: 'f3' }, out: { state: 'target', frameId: 'f1' } })),
   ev(3, 'f1', 'Audit.log', nav({ previous: { state: 'target', frameId: 'f2' }, next: { state: 'target', frameId: 'f9-outside' }, out: { state: 'target', frameId: 'f1' } })),
-  ev(4, 'f3', 'Audit.write', nav({ previous: { state: 'target', frameId: 'f3' } })),
+  ev(4, 'f3', 'Audit.write', nav({ previous: { state: 'target', frameId: 'f3' }, into: { state: 'target', frameId: 'f9-outside' } })),
 ];
 
 const detail = {
@@ -91,13 +91,36 @@ describe('replay wiring in the app', () => {
     expect(within(inspector()).getByText('event-1')).toBeInTheDocument();
   });
 
-  it('says why a target outside the loaded window cannot be reached, in the inspector and the live region', async () => {
+  it('says why a target outside the loaded window cannot be reached, in the inspector', async () => {
     await openRecording();
     fireEvent.click(screen.getByRole('button', { name: /Audit\.log/ }));
     expect(within(inspector()).getByRole('button', { name: 'Next frame' })).toBeDisabled();
     expect(within(inspector()).getByText(/outside the loaded window/)).toBeInTheDocument();
+  });
+
+  const live = () => screen.getByRole('status', { hidden: true });
+
+  it('announces an out-of-window Canvas key target in the live region', async () => {
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: /Audit\.write/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
     fireEvent.keyDown(screen.getByRole('tree'), { key: 'ArrowRight' });
-    await waitFor(() => expect(screen.getByRole('status', { hidden: true })).toBeDefined());
+    await waitFor(() => expect(live()).toHaveTextContent(/outside the loaded window/));
+  });
+
+  it('announces a boundary in the live region', async () => {
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: /Audit\.log/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.keyDown(screen.getByRole('tree'), { key: 'ArrowRight' });
+    await waitFor(() => expect(live()).toHaveTextContent(/boundary, no further frame in this direction/));
+  });
+
+  it('announces Selected event N after an in-window Canvas key step', async () => {
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: /Controller\.create/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Canvas' }));
+    fireEvent.keyDown(screen.getByRole('tree'), { key: 'ArrowRight' });
+    await waitFor(() => expect(live()).toHaveTextContent('Selected event 2'));
   });
 });

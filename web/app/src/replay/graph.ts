@@ -28,6 +28,8 @@ export interface GraphNode {
   asyncParentId: string | null;
   /** The frame names a parent that is not in this window (or parent flag set without a parent id). */
   parentOutsideWindow: boolean;
+  /** Recorded depth > 0 but no parent frame id was observed, so the node is drawn as a root without a known caller. */
+  parentNotObserved: boolean;
   layer: number;
   /** Horizontal slot in column units; parents are centred over their children. */
   column: number;
@@ -46,6 +48,8 @@ export interface FrameGraph {
   columns: number;
   /** frameId -> id of the node that stands for it. */
   nodeOfFrame: Record<string, string>;
+  /** Input frames that appear in no node: duplicate frame ids and members of parent cycles. */
+  dropped: number;
 }
 
 /** Sequences are decimal strings; a malformed one must not throw, so it sorts after numeric ones. */
@@ -125,6 +129,7 @@ export function projectFrameGraph(input: readonly GraphFrame[]): FrameGraph {
       kind: first.kind, symbol: first.symbol, parentId,
       asyncParentId: first.asyncParentFrameId ?? null,
       parentOutsideWindow: outside.has(first.frameId),
+      parentNotObserved: !first.parentFrameId && (first.depth ?? 0) > 0,
       layer, column: 0,
     };
     nodes.push(node);
@@ -150,7 +155,7 @@ export function projectFrameGraph(input: readonly GraphFrame[]): FrameGraph {
   }
 
   nodes.sort((a, b) => a.layer - b.layer || a.column - b.column || (a.id < b.id ? -1 : 1));
-  return { nodes, edges, layers, columns: nextColumn, nodeOfFrame };
+  return { nodes, edges, layers, columns: nextColumn, nodeOfFrame, dropped: input.length - Object.keys(nodeOfFrame).length };
 }
 
 export interface TreeRow {

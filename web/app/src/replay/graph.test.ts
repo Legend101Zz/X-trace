@@ -79,7 +79,16 @@ describe('frame graph projection', () => {
     expect(graph.nodes.map((node) => node.symbol)).toEqual(['nine', 'ten']);
   });
 
+  it('marks depth>0 frames without a parent link as parent not observed', () => {
+    const graph = projectFrameGraph([f(1, null, 'a', { depth: 2 }), f(2, null, 'b', { depth: 0 })]);
+    expect(graph.nodes.map((node) => node.parentNotObserved)).toEqual([true, false]);
+  });
+  it('counts duplicate frame ids and parent cycles as dropped', () => {
+    const graph = projectFrameGraph([f(1, null), { ...f(2, null), frameId: 'f1' }, f(3, 'f4'), f(4, 'f3')]);
+    expect(graph.dropped).toBe(3);
+    expect(projectFrameGraph(sample).dropped).toBe(0);
+  });
   it('handles an empty window', () => {
-    expect(projectFrameGraph([])).toEqual({ nodes: [], edges: [], layers: 0, columns: 0, nodeOfFrame: {} });
+    expect(projectFrameGraph([])).toEqual({ nodes: [], edges: [], layers: 0, columns: 0, nodeOfFrame: {}, dropped: 0 });
   });
 });

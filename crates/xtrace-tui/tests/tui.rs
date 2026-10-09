@@ -26,14 +26,14 @@ fn nav(
 fn frame(n: u64) -> FrameRow {
     let id = format!("f{n}");
     let prev = if n == 1 {
-        NavResult::Boundary("this is the first frame.".into())
+        NavResult::Boundary(None)
     } else {
         NavResult::Target(format!("f{}", n - 1))
     };
     FrameRow {
         frame_id: Some(id),
         sequence: n,
-        kind: if n % 9 == 0 { "gap".into() } else { "method".into() },
+        kind: if n % 9 == 0 { "recording_event_kind:gap".into() } else { "method".into() },
         symbol: if n % 9 == 0 { None } else { Some(format!("com.example.Service{n}.call")) },
         depth: Some(u32::try_from(n % 4).unwrap_or(0)),
         navigation: nav(
@@ -41,7 +41,7 @@ fn frame(n: u64) -> FrameRow {
             Some(NavResult::Target(format!("f{}", n + 1))),
             Some(NavResult::Target(format!("f{}", n + 1))),
             Some(NavResult::Unavailable("the recording is partial and evidence ends here.".into())),
-            Some(NavResult::Boundary("this frame is at the top level.".into())),
+            Some(NavResult::Boundary(None)),
         ),
     }
 }
@@ -180,7 +180,7 @@ fn navigation_boundary_and_unavailable_state_why() {
     let model = open_replay(80, 24, true);
     let (model, _) = update(model, Message::Key(Key::Nav(NavAction::Previous)));
     assert_eq!(model.selected_frame, 0);
-    assert!(model.notice.contains("boundary, this is the first frame."));
+    assert!(model.notice.contains("boundary, no further frame in this direction"));
     let (model, _) = update(model, Message::Key(Key::Nav(NavAction::Over)));
     assert!(model.notice.contains("unavailable, the recording is partial"));
     assert!(render(&model).to_plain().contains("over unavailable"));
@@ -350,8 +350,19 @@ fn window_without_anchor_keeps_the_previous_selection() {
 }
 
 #[test]
+fn gap_rows_use_the_real_wire_label() {
+    let mut model = open_replay(80, 24, true);
+    let w = model.window.as_mut().expect("window");
+    w.frames[0].kind = "recording_event_kind:gap".into();
+    w.frames[0].symbol = Some("ignored".into());
+    let grid = render(&model);
+    assert!(grid.rows().iter().any(|r| r.contains("GAP: events were not emitted here")));
+    assert!(!grid.rows().iter().any(|r| r.contains("recording_event_kind:gap ignored")));
+}
+
+#[test]
 fn untrusted_recorded_text_never_reaches_the_terminal_as_control_sequences() {
-    let hostile = "a\u{1b}[31mred\u{1b}]52;c;AAAA\u{7}\nnext\r\u{9b}x\u{7f}";
+    let hostile = "a\u{1b}[31mred\u{1b}]52;c;AAAA\u{7}\nnext\r\u{9b}x\u{7f}\u{202e}\u{2066}\u{200b}\u{2028}\u{2029}\u{feff}";
     for plain in [true, false] {
         let mut model = open_replay(80, 24, plain);
         {
@@ -363,6 +374,14 @@ fn untrusted_recorded_text_never_reaches_the_terminal_as_control_sequences() {
         model.recordings[0].id = hostile.into();
         model.recordings[0].completion = hostile.into();
         model.notice = hostile.into();
+        // Ready state first: the hostile frame fields must be rendered (and neutralised) in the rows.
+        assert_fits(&model);
+        let ready = render(&model);
+        assert!(ready.rows().iter().any(|row| row.contains('\u{fffd}')), "hostile frame row was not rendered");
+        for row in ready.rows() {
+            assert!(!row.chars().any(|c| c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')), "unsafe char in row {row:?}");
+        }
+        assert_eq!(ready.output(plain).lines().count(), usize::from(model.height));
         let (model, _) = update(model, Message::WindowLoaded(Err(hostile.into())));
         assert_fits(&model);
         let grid = render(&model);

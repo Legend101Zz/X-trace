@@ -159,3 +159,5 @@ h2 { font-size: 12px; font-weight: 600; }
 .canvas-tree li:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
 .mode-switch { display: inline-flex; gap: 6px; }
 @media (prefers-reduced-motion: reduce) { .canvas-scroll { scroll-behavior: auto; } }
+
+.outcome-banner li, .canvas-tree li, .nav-controls .evidence-state { overflow-wrap: anywhere; min-width: 0; }

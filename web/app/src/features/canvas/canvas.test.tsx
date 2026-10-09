@@ -73,6 +73,15 @@ describe('canvas view', () => {
     expect(members[1]).toHaveAttribute('aria-selected', 'true');
   });
 
+  it('keeps focus on the Expand button after toggling and keeps it out of the tab order', () => {
+    render(<CanvasView events={events} selectedFrameId="f1" onSelectFrame={() => undefined} onNavigate={() => undefined} />);
+    const button = screen.getByRole('button', { name: /Expand 2 repeated calls of Repo\.save/ });
+    expect(button.tabIndex).toBe(-1);
+    button.focus();
+    fireEvent.click(button);
+    expect(document.activeElement).toBe(button);
+  });
+
   it('marks gap frames visibly and in the tree text', () => {
     const gap = [ev(1, null, 'Root'), { ...ev(2, 'f1', 'missing'), kind: 'gap' } as unknown as ReplayEvent];
     render(<CanvasView events={gap} selectedFrameId={null} onSelectFrame={() => undefined} onNavigate={() => undefined} />);

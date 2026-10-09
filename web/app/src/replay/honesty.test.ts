@@ -25,6 +25,16 @@ describe('source binding states render distinct strings', () => {
     const texts = cases.map(([, binding, source]) => sourceStateText(binding, source));
     expect(new Set(texts).size).toBe(cases.length);
   });
+  it('gives generated-path bindings their specific text even when a source object is present', () => {
+    expect(sourceStateText('source_map_absent', { status: 'unavailable' })).toContain('Source map absent');
+    expect(sourceStateText('source_map_unresolved', { status: 'unavailable' })).toContain('did not resolve');
+    expect(sourceStateText('verified', { status: 'unavailable' })).toBe('Current source could not be verified safely');
+  });
+  it('does not claim the binding was unspecified when it is another binding', () => {
+    expect(sourceStateText('attestation_missing', { status: 'matched' })).not.toContain('was not specified');
+    expect(sourceStateText('attestation_missing', { status: 'mismatch' })).not.toContain('was not specified');
+    expect(sourceStateText('unspecified', { status: 'matched' })).toContain('was not specified');
+  });
   it('says what each state means', () => {
     expect(sourceStateText('verified', { status: 'matched' })).toContain('verified build attestation');
     expect(sourceStateText('observed_unattested', { status: 'matched' })).toContain('Source as read when the class loaded');

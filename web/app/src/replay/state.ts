@@ -1,4 +1,4 @@
-/** Shared replay-core state for Linear and Canvas: one selection, one filter, one playback machine. */
+/** Replay-core reducer (selection, filter, playback). Tested in isolation; the App currently dispatches only `set-mode`, selection is still the App's `selectedEvent` index, and filter/playback actions are not wired into production yet. */
 
 export type ReplayMode = 'linear' | 'canvas';
 export type PlaybackSpeed = 0.5 | 1 | 2 | 4;

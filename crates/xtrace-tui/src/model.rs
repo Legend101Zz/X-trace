@@ -67,8 +67,9 @@ impl NavAction {
 pub enum NavResult {
     /// Move to this frame.
     Target(String),
-    /// No further frame; the text says why.
-    Boundary(String),
+    /// No further frame. The wire carries no reason, so the text is optional; the update falls
+    /// back to a neutral core-owned sentence.
+    Boundary(Option<String>),
     /// Not resolvable; the text says why.
     Unavailable(String),
 }
@@ -80,7 +81,8 @@ pub struct FrameRow {
     pub frame_id: Option<String>,
     /// Event sequence.
     pub sequence: u64,
-    /// Event kind, for example `method` or `gap`.
+    /// Event kind, passed verbatim from the server label (for example
+    /// `recording_event_kind:gap`); never normalised by the client adapter.
     pub kind: String,
     /// Symbol, when persisted.
     pub symbol: Option<String>,

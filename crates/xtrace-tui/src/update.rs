@@ -173,7 +173,11 @@ fn apply_navigation(
             }
         }
         Ok(NavResult::Boundary(why)) => {
-            model.notice = format!("{}: boundary, {why}", action.label())
+            model.notice = format!(
+                "{}: boundary, {}",
+                action.label(),
+                why.as_deref().unwrap_or("no further frame in this direction")
+            )
         }
         Ok(NavResult::Unavailable(why)) => {
             model.notice = format!("{}: unavailable, {why}", action.label())

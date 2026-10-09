@@ -1,4 +1,4 @@
-/** Evidence-timed playback rules (CONTRACTS 8.4). Pure; mirrors the shared playback vectors. */
+/** Evidence-timed playback rules (CONTRACTS 8.4). Pure; rules per CONTRACTS 8.4. Shared playback vectors are not yet asserted (schema/fixtures/replay does not exist). */
 import type { PlaybackSpeed } from './state';
 
 export const MAX_DWELL_MS = 2_000;

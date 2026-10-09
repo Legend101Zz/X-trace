@@ -327,7 +327,6 @@ export default function App() {
   const navigateKey = (action: NavAction) => {
     const result = (event?.navigation as Partial<Record<NavAction, { state: string; frameId?: string }>> | undefined)?.[action];
     if (result?.state === 'target' && result.frameId) navigateToFrame(action, result.frameId);
-    else if (result?.state === 'target') setAnnouncement(`${action}: the target frame is outside the loaded window. Load more events to reach it; paging backward is not available yet.`);
     else setAnnouncement(`${action}: ${result?.state === 'boundary' ? 'boundary, no further frame in this direction' : 'unavailable for this frame'}`);
   };
 
