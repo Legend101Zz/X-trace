@@ -154,7 +154,7 @@ jobs:
           npm run build --prefix adapters/node
           npm ci --prefix web/app
           (cd web/app && npx playwright install --with-deps chromium)
-          (cd adapters/java && ./gradlew --dependency-verification strict clean installDist agentDist fixtureBootJar)
+          (cd adapters/java && ./gradlew --dependency-verification strict clean testClasses installDist agentDist fixtureBootJar)
       - name: Admit private test scratch before cargo tests
         # Product storage refuses a data directory under a world-writable ancestor such as /tmp, so Rust
         # tests that run `init` need a TMPDIR below the runner's private temp directory (ci.yml shape).

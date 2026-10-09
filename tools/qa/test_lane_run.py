@@ -23,6 +23,12 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(r["failingTests"], ["a::b::bad"])
         self.assertEqual((r["passed"], r["failed"], r["ignored"]), (3, 2, 1))
 
+    def test_unittest_counts(self):
+        r = lane_run.parse_output("Ran 23 tests in 0.2s\n\nFAILED (failures=2, errors=1)")
+        self.assertEqual((r["passed"], r["failed"]), (20, 3))
+        r = lane_run.parse_output("Ran 5 tests in 0.2s\n\nOK")
+        self.assertEqual((r["passed"], r["failed"]), (5, 0))
+
     def test_gradle_failure_name(self):
         r = lane_run.parse_output("com.example.FooTest > doesThing() FAILED")
         self.assertEqual(r["failingTests"], ["FooTest::doesThing"])

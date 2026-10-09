@@ -36,6 +36,8 @@ CARGO_FAIL = re.compile(r"^test (\S+) \.\.\. FAILED$")
 CARGO_RESULT = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored")
 GRADLE_FAIL = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\(.*\))?(?:\[.*\])? FAILED$")
 PY_FAIL = re.compile(r"^(?:FAIL|ERROR): (\w+) \((?:[\w.]+\.)?(\w+)\.(\w+)\)")
+PY_RAN = re.compile(r"^Ran (\d+) tests? in ")
+PY_FAILED = re.compile(r"^FAILED \((?:failures=(\d+))?(?:, )?(?:errors=(\d+))?")
 TAP_NOT_OK = re.compile(r"^\s*not ok \d+ - (\S+)\s*$")
 
 
@@ -54,6 +56,12 @@ def parse_output(text: str) -> dict:
             cand = f"{m.group(2)}::{m.group(1)}"
         elif m := TAP_NOT_OK.match(line):
             cand = m.group(1)
+        elif m := PY_RAN.match(line):
+            passed += int(m.group(1))
+        elif m := PY_FAILED.match(line):
+            bad = int(m.group(1) or 0) + int(m.group(2) or 0)
+            failed += bad
+            passed -= bad
         elif m := CARGO_RESULT.match(line):
             passed += int(m.group(1))
             failed += int(m.group(2))
