@@ -133,7 +133,8 @@ pub fn assert_golden(rel: &str, actual: &[u8]) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, actual).unwrap();
     }
-    let expected = std::fs::read(&path).unwrap_or_else(|_| panic!("missing golden {rel}"));
+    assert!(path.exists(), "missing golden {rel}");
+    let expected = std::fs::read(&path).unwrap();
     assert_eq!(String::from_utf8_lossy(actual), String::from_utf8_lossy(&expected), "golden {rel}");
 }
 

@@ -148,6 +148,7 @@ pub fn parse(text_in: &str) -> Result<PlanInput, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
 

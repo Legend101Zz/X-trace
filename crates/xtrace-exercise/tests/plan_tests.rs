@@ -225,10 +225,11 @@ fn plan_preview_makes_zero_requests() {
     assert_eq!(view, again);
     assert_eq!(view["requests_sent"], 0);
     assert_eq!(view["target"], format!("http://{addr}").as_str());
-    match listener.accept() {
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-        other => panic!("preview contacted the target: {other:?}"),
-    }
+    let accepted = listener.accept();
+    assert!(
+        matches!(&accepted, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "preview contacted the target: {accepted:?}"
+    );
 }
 
 #[test]

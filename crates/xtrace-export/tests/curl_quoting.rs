@@ -132,10 +132,6 @@ fn nul_cannot_be_quoted() {
 
 /// Runs a generated recipe with `curl` replaced by an argv printer, so the
 /// test sees exactly the arguments curl would receive.
-fn recipe_argv(script: &str, env: &[(&str, &str)]) -> Vec<String> {
-    recipe_argv_in(script, env, std::path::Path::new("."))
-}
-
 fn recipe_argv_in(script: &str, env: &[(&str, &str)], cwd: &std::path::Path) -> Vec<String> {
     let mut wrapped = String::from("curl() { printf '%s\\0' \"$@\"; }\n");
     for (k, v) in env {
@@ -258,7 +254,7 @@ fn hostile_catalog_text_cannot_escape_the_recipe() {
         };
         let script = text(out.files.iter().find(|f| f.path.starts_with("001-")).unwrap());
         let id_value = format!("v{}", rng.hostile());
-        let req_value = rng.hostile().replace(['\r', '\n'], "");
+        let req_value = format!("r{}", rng.hostile()).replace(['\r', '\n'], "");
         let req_var = env_var_for(&req_header);
         let argv = recipe_argv_in(
             script,
