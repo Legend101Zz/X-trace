@@ -311,7 +311,8 @@ ACCEPTED_BINDINGS = ("verified", "observed_unattested")
 
 
 def binding_state(ev: dict) -> str:
-    """`ok` / `bad` / `unreported` for the source binding of one event (the API may name it on the event or its source)."""
+    """`ok` / `bad` / `missing` for the source binding of one event. `sourceBinding` is a required Event field in
+    schema/xtp-client/openapi.yaml, so an absent field is a contract violation, never an acceptable binding."""
     s = ev.get("source") if isinstance(ev.get("source"), dict) else {}
     for holder in (ev, s):
         for key in ("sourceBinding", "binding"):
@@ -319,41 +320,74 @@ def binding_state(ev: dict) -> str:
             if isinstance(v, str):
                 norm = v.lower().replace("source_binding_", "").replace("-", "_")
                 return "ok" if norm in ACCEPTED_BINDINGS else "bad"
-    return "unreported"
+    return "missing"
 
 
-def layer_source_ok(detail: dict, layers: list[str], hints: dict) -> tuple[bool, bool]:
-    """(source on the matched controller/service/repository frame, a binding was reported and unacceptable)."""
+def layer_source_ok(detail: dict, layers: list[str], hints: dict) -> tuple[bool, str | None]:
+    """(a matched source on the layer frame with an acceptable binding, else why not: `unacceptable` | `missing` | None)."""
     frames = [ev for layer in layers for ev in layer_frames(detail, layer, hints.get(layer))]
     if not frames:  # no layer expectation: fall back to any frame event
         frames = [ev for ev in detail.get("events", []) if str(ev.get("kind", "")).endswith("frame_enter")]
-    good = [ev for ev in frames if source_ok(ev) and binding_state(ev) != "bad"]
-    bad = [ev for ev in frames if source_ok(ev) and binding_state(ev) == "bad"]
-    return bool(good), bool(bad) and not good
+    with_src = [ev for ev in frames if source_ok(ev)]
+    if any(binding_state(ev) == "ok" for ev in with_src):
+        return True, None
+    states = {binding_state(ev) for ev in with_src}
+    return False, ("unacceptable" if "bad" in states else "missing" if "missing" in states else None)
+
+
+def _path_matches(path: str, want_route: str, literal_routes: frozenset) -> bool:
+    """Same collision rule as recording_matches, for a concrete request path the harness sent."""
+    p = path.split("?", 1)[0].rstrip("/") or "/"
+    want = want_route.rstrip("/") or "/"
+    if "{" not in want:
+        return p == want
+    if p in literal_routes:
+        return False
+    return bool(route_regex(want_route).match(path))
 
 
 def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
-            windows: dict[str, tuple[float, float]] | None = None, slack: float = 1.0) -> dict[str, Any]:
+            sent: list[tuple[str | None, str, str]] | None = None) -> dict[str, Any]:
     """expectations: scenario id -> [{method, route, status, layers[], minCount}]. Returns a verdict per scenario.
-    With `windows` (scenario id -> (start, end) wall clock) a scenario is judged ONLY on recordings that opened inside its
-    own window; a recording whose time cannot be determined is attributed to nobody."""
+
+    Attribution is by ORDER, never by wall clock (a recording's openedAt tracks ingestion, not the request). `sent` is the
+    harness's ordered request log [(scenario id | None for non-scenario traffic such as the canary requests, method,
+    path)]. For one expectation (method, route) the product must have recorded exactly as many matching recordings as the
+    harness sent matching requests; then recordings sorted by time are consumed in request order and each scenario judges
+    only the recordings of its own requests. Any other count cannot be attributed and is reported as
+    `attribution-ambiguous` (never guessed). Without `sent` every scenario is judged campaign-wide and says so."""
     literal_routes = frozenset((e["route"].rstrip("/") or "/") for exps in expectations.values() for e in exps if "{" not in e["route"])
     verdicts: dict[str, Any] = {}
     for sid, exps in expectations.items():
-        pool = list(details.values())
-        if windows is not None:
-            w = windows.get(sid)
-            if w is None:
-                pool = []
-            else:
-                pool = [d for d in pool if (t := recording_time(d)) is not None and w[0] - slack <= t <= w[1] + slack]
         items = []
+        attributed_total = 0
         for e in exps:
-            matched = [d for d in pool if recording_matches(d, e["method"], e["route"], literal_routes)]
-            with_status = [d for d in matched if recording_http_status(d) == e["status"]]
+            matched_all = [d for d in details.values() if recording_matches(d, e["method"], e["route"], literal_routes)]
             problems: list[str] = []
+            attribution = "campaign-wide"
+            matched = matched_all
+            if sent is not None:
+                attribution = "order"
+                reqs = [r for r in sent if r[1] == e["method"] and _path_matches(r[2], e["route"], literal_routes)]
+                mine = [i for i, r in enumerate(reqs) if r[0] == sid]
+                times = [recording_time(d) for d in matched_all]
+                if not matched_all:
+                    matched = []
+                elif len(matched_all) != len(reqs):
+                    matched = []
+                    problems.append(f"attribution-ambiguous(recordings {len(matched_all)}, requests {len(reqs)})")
+                elif any(t is None for t in times):
+                    matched = []
+                    problems.append("attribution-ambiguous(recording time unknown)")
+                else:
+                    order = sorted(range(len(matched_all)), key=lambda i: (times[i], i))
+                    matched = [matched_all[order[i]] for i in mine]
+            attributed_total += len(matched)
+            with_status = [d for d in matched if recording_http_status(d) == e["status"]]
             need = e.get("minCount", 1)
-            if not matched:
+            if problems:
+                pass
+            elif not matched:
                 problems.append("no-recording-for-route")
             else:
                 seen = sorted({str(recording_http_status(d)) for d in matched})
@@ -372,20 +406,23 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                 if with_status and not have:
                     problems.append(f"no-{layer}-frame")
             hints = e.get("layerHints", {})
-            src, badbind = [], 0
+            src, why = [], set()
             for d in with_status:
-                ok, bad = layer_source_ok(d, e.get("layers", []), hints)
+                ok, w = layer_source_ok(d, e.get("layers", []), hints)
                 if ok:
                     src.append(d)
-                badbind += bad
+                elif w:
+                    why.add(w)
             if with_status and not src:
-                problems.append("source-binding-unacceptable" if badbind else "no-source-file-line")
-            items.append({"method": e["method"], "route": e["route"], "expectedStatus": e["status"],
+                problems.append("source-binding-unacceptable" if "unacceptable" in why else
+                                "source-binding-missing" if "missing" in why else "no-source-file-line")
+            items.append({"method": e["method"], "route": e["route"], "expectedStatus": e["status"], "attribution": attribution,
                           "recordingsMatchingRoute": len(matched), "recordingsWithStatus": len(with_status),
                           "layers": layer_report, "recordingsWithSource": len(src), "problems": problems,
                           "passed": not problems})
         verdicts[sid] = {"passed": all(i["passed"] for i in items), "expectations": items,
-                         "recordingsInWindow": len(pool) if windows is not None else None}
+                         "attribution": "order" if sent is not None else "campaign-wide",
+                         "recordingsAttributed": attributed_total}
     return verdicts
 
 
@@ -456,7 +493,8 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     run_id = out_dir.name.replace("instrumented-", "i") + str(int(time.time()) % 100000)
     stack = make_stack(run_id)
     results: list[dict[str, Any]] = []
-    windows: dict[str, tuple[float, float]] = {}
+    sent_log: list[tuple[str | None, str, str]] = []
+    xcamp.SENT_LOG = []
     started = time.time()
     boot_ms = None
     try:
@@ -464,13 +502,14 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         stack.up()
         boot_ms = round((time.perf_counter() - t0) * 1000)
         for sc in scenarios:
-            w0 = time.time()
+            mark = len(xcamp.SENT_LOG)
             res = xcamp.run_scenario(sc, stack, stack.base, norm_extra)
-            windows[res["id"]] = (w0, time.time())
+            sent_log.extend((res["id"], m, pth) for m, pth in xcamp.SENT_LOG[mark:])
             results.append(res)
             print(f"  [{'PASS' if res['passed'] else 'FAIL'}] {sc.id} {res['semanticEffectFingerprint'][:16]} {res['elapsedMs']}ms", flush=True)
         if canaries:
             notes["canaryRequests"] = send_canary_requests(stack.base, canaries, extra_canary_paths)
+            sent_log.extend((None, m, pth) for m, pth in extra_canary_paths)  # non-scenario traffic, still recorded by the product
     finally:
         stack.down()  # SIGTERM to the launcher we started; `xtrace run` forwards it and drains the daemon
         try:  # after the stop, so the launcher's own closing diagnostics are in the log
@@ -478,6 +517,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         except Exception:
             pass
     xcamp.REQUEST_HOOK = None
+    xcamp.SENT_LOG = None
     notes["launcherExitCode"] = getattr(stack, "launcher_exit", None)
 
     # product lifecycle commands that exist in the CLI surface: exit code 9 means "not implemented yet"
@@ -501,7 +541,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         if viewer is not None:
             stop_process_group(viewer)
     if api["ok"]:
-        verdicts = analyze(api["details"], expectations, windows)
+        verdicts = analyze(api["details"], expectations, sent_log)
 
     baseline_fp: dict[str, str] = {}
     if baseline_receipt and baseline_receipt.exists():
@@ -522,6 +562,8 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         "harnessSha256": {p.name: xcamp.sha256_file(p) for p in harness_files}, "bootMs": boot_ms,
         "durationSeconds": round(time.time() - started, 1), "notes": notes,
         "api": {"ok": api["ok"], "reason": api["reason"], "recordings": len(api["recordings"])},
+        "attribution": "order: recordings consumed in request order per route; unequal counts are attribution-ambiguous",
+        "requestsSent": len(sent_log),
         "problemClasses": problem_classes(verdicts), "scenarios": scen_out,
         "recordingsWithSource": sum(e["recordingsWithSource"] for v in verdicts.values() for e in v["expectations"]),
         "recordingsWithStatus": sum(e["recordingsWithStatus"] for v in verdicts.values() for e in v["expectations"]),

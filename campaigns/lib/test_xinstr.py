@@ -12,7 +12,8 @@ def rec(method, path, status, symbols=("OwnerController.showOwner", "OwnerReposi
     evs = [{"kind": "recording_event_kind:request_update", "symbol": f"http.request {method} {path}", "interaction": {"method": method}, "source": None}]
     for sy in symbols:
         evs.append({"kind": "recording_event_kind:frame_enter", "symbol": sy, "interaction": {},
-                    "source": {"path": "src/main/java/X.java", "startLine": 3, "status": "matched"} if src else None})
+                    "source": {"path": "src/main/java/X.java", "startLine": 3, "status": "matched"} if src else None,
+                    "sourceBinding": "verified"})
     evs.append({"kind": "recording_event_kind:response", "symbol": resp_symbol or f"http.response {status}", "interaction": {}, "source": None})
     return {"events": evs, "outcome": {"kind": kind, "httpStatus": status if kind == "responded" else None}}
 
@@ -85,19 +86,44 @@ class T(unittest.TestCase):
         self.assertEqual(p, ["count-below-minimum(need 5, have 1)"])
         self.assertEqual(xinstr.problem_classes(xinstr.analyze({"a": rec("GET", "/owners/1", 200)}, exp)), {"count-below-minimum": 1})
 
-    def test_other_scenarios_recordings_do_not_leak(self):
-        exp = {"s1": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}],
-               "s2": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}]}
-        a = rec("GET", "/owners/1", 200)
-        a["_openedAt"] = "2026-10-09T10:00:05Z"
-        t0 = xinstr.recording_time(a)
-        v = xinstr.analyze({"a": a}, exp, {"s1": (t0 - 2, t0 + 2), "s2": (t0 + 10, t0 + 20)}, slack=0.5)
-        self.assertTrue(v["s1"]["passed"])
-        self.assertEqual(v["s2"]["expectations"][0]["problems"], ["no-recording-for-route"])
-        # a recording with no determinable time is attributed to nobody
-        u = rec("GET", "/owners/1", 200)
-        v = xinstr.analyze({"u": u}, exp, {"s1": (0, 1e12), "s2": (0, 1e12)})
-        self.assertFalse(v["s1"]["passed"])
+    def test_order_attribution_rejects_neighbour_recordings(self):
+        """Adjacent scenarios (290 ms and 177 ms apart, as in the pushed run): the redirect recorded as 200 belongs to the
+        neighbour's request, so the validation scenario must not be judged on it."""
+        exp = {"validation": [{"method": "POST", "route": "/owners/new", "status": 200, "layers": []}],
+               "roundtrip": [{"method": "POST", "route": "/owners/new", "status": 302, "layers": []}]}
+        a, b = rec("POST", "/owners/new", 200), rec("POST", "/owners/new", 200)  # product bug: the 302 is recorded as 200
+        a["_openedAt"], b["_openedAt"] = "2026-10-09T10:00:00.000Z", "2026-10-09T10:00:00.290Z"
+        sent = [("validation", "POST", "/owners/new"), ("roundtrip", "POST", "/owners/new")]
+        v = xinstr.analyze({"a": a, "b": b}, exp, sent)
+        self.assertTrue(v["validation"]["passed"])
+        self.assertEqual(v["validation"]["expectations"][0]["recordingsMatchingRoute"], 1)
+        self.assertEqual(v["roundtrip"]["expectations"][0]["problems"], ["http-outcome-mismatch(expected 302, saw 200)"])
+        self.assertEqual(v["validation"]["attribution"], "order")
+
+    def test_extra_recordings_for_a_route_are_ambiguous_not_guessed(self):
+        exp = {"validation": [{"method": "POST", "route": "/owners/new", "status": 200, "layers": []}]}
+        a, b = rec("POST", "/owners/new", 200), rec("POST", "/owners/new", 200)
+        a["_openedAt"], b["_openedAt"] = "2026-10-09T10:00:00Z", "2026-10-09T10:00:01Z"
+        v = xinstr.analyze({"a": a, "b": b}, exp, [("validation", "POST", "/owners/new")])
+        self.assertEqual(v["validation"]["expectations"][0]["problems"], ["attribution-ambiguous(recordings 2, requests 1)"])
+        self.assertEqual(xinstr.problem_classes(v), {"attribution-ambiguous": 1})
+        # too few recordings is equally unattributable; zero stays no-recording-for-route
+        v = xinstr.analyze({"a": a}, exp, [("validation", "POST", "/owners/new"), (None, "POST", "/owners/new")])
+        self.assertTrue(v["validation"]["expectations"][0]["problems"][0].startswith("attribution-ambiguous"))
+        self.assertEqual(xinstr.analyze({}, exp, [("validation", "POST", "/owners/new")])["validation"]["expectations"][0]["problems"],
+                         ["no-recording-for-route"])
+
+    def test_non_scenario_canary_traffic_counts_as_a_request(self):
+        exp = {"s": [{"method": "POST", "route": "/owners/new", "status": 200, "layers": []}]}
+        a, b = rec("POST", "/owners/new", 200), rec("POST", "/owners/new", 302)
+        a["_openedAt"], b["_openedAt"] = "2026-10-09T10:00:00Z", "2026-10-09T10:00:01Z"
+        v = xinstr.analyze({"a": a, "b": b}, exp, [("s", "POST", "/owners/new"), (None, "POST", "/owners/new")])
+        self.assertTrue(v["s"]["passed"])
+
+    def test_unknown_recording_time_is_ambiguous(self):
+        exp = {"s": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}]}
+        v = xinstr.analyze({"u": rec("GET", "/owners/1", 200)}, exp, [("s", "GET", "/owners/1")])
+        self.assertEqual(v["s"]["expectations"][0]["problems"], ["attribution-ambiguous(recording time unknown)"])
 
     def test_uuidv7_time(self):
         d = {"recordingId": "0199c1a2-b3c4-7abc-8def-0123456789ab"}
@@ -115,6 +141,8 @@ class T(unittest.TestCase):
         self.assertEqual(xinstr.analyze({"a": good}, exp)["s"]["expectations"][0]["problems"], ["source-binding-unacceptable"])
         good["events"][1]["sourceBinding"] = "verified"
         self.assertTrue(xinstr.analyze({"a": good}, exp)["s"]["passed"])
+        del good["events"][1]["sourceBinding"]  # required by the contract: absent is a violation, not "unreported = fine"
+        self.assertEqual(xinstr.analyze({"a": good}, exp)["s"]["expectations"][0]["problems"], ["source-binding-missing"])
 
     def test_silent_viewer_hits_the_deadline(self):
         import os, stat, tempfile, time

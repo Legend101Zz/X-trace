@@ -24,8 +24,25 @@ class T(unittest.TestCase):
              "notes": {"stopCommand": {"exitCode": 3}, "launcherExitCode": 0}}
         d = by(s.instrumented_steps(r))
         # everything the harness exercised passes; the record+stop flow is not exercised and stays not-implemented
-        self.assertEqual({n for n, v in d.items() if v[0] != "pass"}, {"record-stop-flow"}, d)
-        self.assertEqual(d["record-stop-flow"][0], "not-implemented")
+        gating = {"record-stop-flow", "active-line-frames", "frame-values", "restart-reopen", "partial-recording-reopen"}
+        self.assertEqual({n for n, v in d.items() if v[0] != "pass"}, gating, d)
+        for n in gating:
+            self.assertEqual(d[n][0], "not-implemented", n)
+        self.assertNotIn("executed line)", d["source-identity"][1].replace("not an executed line)", ""))
+        self.assertIn("not an executed line", d["source-identity"][1])
+
+    def test_source_identity_respects_binding_problem_classes(self):
+        for cls in ("source-binding-unacceptable", "source-binding-missing", "no-source-file-line"):
+            r = {"scenarios": [sc("a")], "api": {"ok": True, "recordings": 5}, "problemClasses": {cls: 2}, "recordingsWithSource": 1,
+                 "notes": {"launcherExitCode": 0}}
+            self.assertEqual(by(s.instrumented_steps(r))["source-identity"][0], "fail", cls)
+
+    def test_overhead_needs_five_repeats(self):
+        agg = {"baseline": {"p50Ms": 1, "p95Ms": 2, "n": 14}, "instrumented": {"p50Ms": 2, "p95Ms": 3, "n": 14}, "p50Ratio": 2, "p95Ratio": 1.5}
+        d = by(s.overhead_steps({"aggregate": agg}))
+        self.assertEqual((d["overhead-measurement"][0], d["overhead-repeats-ge-5"][0]), ("reported", "not-implemented"))
+        self.assertEqual(by(s.overhead_steps({"aggregate": agg, "repeats": 5}))["overhead-repeats-ge-5"][0], "pass")
+        self.assertEqual(by(s.overhead_steps(None))["overhead-repeats-ge-5"][0], "fail")
 
     def test_each_failure_is_visible(self):
         r = {"scenarios": [sc("a", eq=False), sc("b", rec=False)], "api": {"ok": True, "recordings": 5},

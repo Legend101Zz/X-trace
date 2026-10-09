@@ -24,7 +24,9 @@ tick it only if what you saw matched the expectation. Anything unclear is a no, 
 
 - A step marked `not-implemented` means the product could not do it; it is not a pass and not a skip.
 - The privacy scan is clean only when every required surface was scanned and found at least one file; the step note
-  lists classes and file counts, never a canary value.
+  records only the exit code. Classes, file counts and hit locations (never a canary value) are in the CI log and in
+  `privacy-canary-report.json`; a second scan of the exact upload tree (`privacy-canary-report-final.json`) runs last, and
+  on any hit CI uploads only the reports and a summary without notes.
 - Receipts uploaded by CI are marked NON-RELEASE and unsigned. They never replace `evidence/v0.01`.
 
 ## Sign-off (owner fills in)

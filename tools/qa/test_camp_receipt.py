@@ -32,6 +32,19 @@ class T(unittest.TestCase):
         self.assertEqual(len(r["checks"]), 1)
         self.assertEqual([x["name"] for x in r["reported"]], ["o"])  # visible, but never a passed check
 
+    def test_result_stays_failed_while_gating_capability_rows_are_not_implemented(self):
+        import camp_instr_steps as ci
+        good = {"id": "a", "scenarioChecksPassed": True, "fingerprintEqualsBaseline": True, "recordingVerdict": {"passed": True}}
+        inst = {"scenarios": [good], "api": {"ok": True, "recordings": 3}, "problemClasses": {}, "recordingsWithSource": 3,
+                "notes": {"launcherExitCode": 0}}
+        agg = {"baseline": {"p50Ms": 1, "p95Ms": 2, "n": 3}, "instrumented": {"p50Ms": 1, "p95Ms": 2, "n": 3}, "p50Ratio": 1, "p95Ratio": 1}
+        steps = [{"step": n, "status": st, "note": note} for n, st, note in
+                 ci.instrumented_steps(inst) + ci.overhead_steps({"aggregate": agg})]
+        r = self.build(steps)
+        self.assertEqual(r["result"], "failed")
+        for n in ("active-line-frames", "frame-values", "restart-reopen", "partial-recording-reopen", "overhead-repeats-ge-5"):
+            self.assertIn(n, r["failedChecks"])
+
     def test_no_steps_is_not_passed(self):
         self.assertEqual(self.build([])["result"], "failed")
 

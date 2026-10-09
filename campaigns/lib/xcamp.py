@@ -172,6 +172,7 @@ def http_request(base: str, method: str, path: str, *, headers: dict[str, str] |
 # ------------------------------------------------------------ scenarios ------
 # Optional (method, path, headers, body) -> (path, headers, body) applied just before sending. Default: none.
 REQUEST_HOOK: Callable[[str, str, dict, Any], tuple] | None = None
+SENT_LOG: list | None = None  # instrumented runs set a list; every scenario request appends (method, original path)
 
 
 @dataclass
@@ -205,6 +206,8 @@ class Ctx:
         send_path, send_hdrs, send_raw = (path, hdrs, raw)
         if REQUEST_HOOK is not None:  # instrumented runs inject privacy canaries here; labels/hashes keep the original request
             send_path, send_hdrs, send_raw = REQUEST_HOOK(method, path, hdrs, raw)
+        if SENT_LOG is not None:
+            SENT_LOG.append((method, path))
         res = http_request(self.base, method, send_path, headers=send_hdrs, body=send_raw)
         text = res["body"].decode("utf-8", "replace")
         ntext = normalize_text(text, (norm or []) + self.norm_extra)

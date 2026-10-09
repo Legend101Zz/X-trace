@@ -27,6 +27,15 @@ def _load(path: str):
         return None
 
 
+NOT_EXERCISED = (
+    ("active-line-frames", "no step checks the executed line of a frame (event.line, REPLAY-LINE); source.startLine is a method-extent "
+                           "lower bound, so source-identity does not cover it"),
+    ("frame-values", "no step checks captured frame values or arguments in the recordings"),
+    ("restart-reopen", "no step restarts the daemon and checks the recordings persist and reopen"),
+    ("partial-recording-reopen", "no step interrupts a recording and checks it reopens as partial"),
+)
+
+
 def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
     if r is None:
         return [("instrumented-run", "fail", "no instrumented receipt (the run did not complete)")]
@@ -55,8 +64,11 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
                     f"{len(v)}/{len(sc)} scenarios meet route, HTTP outcome and controller/repository frame expectations "
                     f"({api.get('recordings', 0)} recordings); problems: {json.dumps(pc, sort_keys=True)}"))
         n_src = r.get("recordingsWithSource", 0)
-        out.append(("source-identity", "pass" if n_src > 0 and not pc.get("no-source-file-line") else "fail",
-                    f"{n_src} recordings carry a matched .java file and line" if n_src > 0 else "no recording frame carried a matched .java file and line"))
+        bad_src = [k for k in ("no-source-file-line", "source-binding-unacceptable", "source-binding-missing") if pc.get(k)]
+        out.append(("source-identity", "pass" if n_src > 0 and not bad_src else "fail",
+                    (f"{n_src} recordings carry a matched .java file and method-range start line with an accepted source binding "
+                     f"(not an executed line)" if n_src > 0 else "no recording frame carried a matched .java file and start line")
+                    + (f"; problems: {','.join(bad_src)}" if bad_src else "")))
         n_rec = api.get("recordings", 0)
         out.append(("api-json-artifact", "pass" if n_rec > 0 else "fail",
                     f"{n_rec} recordings saved as API JSON" if n_rec > 0 else "the read API returned 0 recordings, nothing to save"))
@@ -67,6 +79,9 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
     out.append(("record-stop-flow", "not-implemented",
                 f"harness runs `xtrace run` only; record, launch and `xtrace stop` is not exercised "
                 f"(`xtrace stop` after run exited {stop.get('exitCode')})"))
+    # capabilities the exit target depends on that this harness does not exercise yet: gating rows, never silent
+    for name, why in NOT_EXERCISED:
+        out.append((name, "not-implemented", why))
     out.append(("launcher-exit-after-sigterm", "pass" if r.get("notes", {}).get("launcherExitCode") in (0, 143, -15) else "fail",
                 f"xtrace run exited {r.get('notes', {}).get('launcherExitCode')} after SIGTERM to the launcher pid"))
     return out
@@ -94,13 +109,17 @@ def tui_steps(t: dict | None) -> list[tuple[str, str, str]]:
 
 def overhead_steps(o: dict | None) -> list[tuple[str, str, str]]:
     if o is None:
-        return [("overhead-measurement", "fail", "no overhead.json")]
+        return [("overhead-measurement", "fail", "no overhead.json"), ("overhead-repeats-ge-5", "fail", "no overhead.json")]
     a = o["aggregate"]
+    reps = o.get("repeats", a.get("repeats", 1))
+    reps = reps if isinstance(reps, int) else 1
     return [("overhead-measurement", "reported",
              f"p50 {a['baseline']['p50Ms']}->{a['instrumented']['p50Ms']}ms (x{a['p50Ratio']}), "
              f"p95 {a['baseline']['p95Ms']}->{a['instrumented']['p95Ms']}ms (x{a['p95Ratio']}); "
              f"n={a['baseline'].get('n')}/{a['instrumented'].get('n')} requests, warm-up included, p95 is near the maximum; "
-             f"instrumented requests also carry canary headers and the launcher; a ratio below 1 is noise, not a speed-up; not gated")]
+             f"instrumented requests also carry canary headers and the launcher; a ratio below 1 is noise, not a speed-up; not gated"),
+            ("overhead-repeats-ge-5", "pass" if reps >= 5 else "not-implemented",
+             f"{reps} interleaved baseline/instrumented repeat(s); at least 5 are required before an overhead number can back a claim")]
 
 
 def main() -> int:

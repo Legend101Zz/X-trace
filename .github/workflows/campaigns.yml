@@ -308,7 +308,16 @@ jobs:
           # every surface the run produced is scanned; a required surface that is absent or empty makes the scan NOT clean.
           # The exports surface is required only when `xtrace export` produced files (while it exits 9 the export-formats
           # step is recorded not-implemented and the scan says so instead of counting an empty directory as covered).
-          req="--require store:1 --require daemon-log:2 --require ui-json:1 --require receipts:1 --require ci-output:1 --require browser-dom:1 --require tui-transcript:1"
+          req="--require store:1 --require daemon-log:2 --require ui-json:1 --require receipts:1 --require ci-output:1 --require browser-dom:1"
+          # the TUI surface counts as covered only when the transcript is a real one (verdict pass); a stub that printed an
+          # error is not a covered surface and is recorded as such instead
+          if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("verdict")=="pass" else 1)' "$RUNNER_TEMP/priv/tui/tui.json" 2>/dev/null; then
+            req="$req --require tui-transcript:1"
+          else
+            echo "tui surface: no passing transcript; NOT counted as scanned"
+            python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
+              --step privacy-scan-tui --status not-implemented --note "no real TUI transcript exists to scan (tui verdict is not pass)"
+          fi
           if [ -n "$(ls -A "$RUNNER_TEMP/xt/exports" 2>/dev/null)" ]; then req="$req --require exports:1"; else
             echo "exports surface: no files (xtrace export not implemented in this build); NOT counted as scanned"
             python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
@@ -378,6 +387,27 @@ jobs:
           if [ -f "$CAMP_OUT/campaign-receipt.NON-RELEASE.json" ]; then
             python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
               --step campaign-receipt-artifact --status reported --note "NON-RELEASE unsigned receipt written as an artifact"
+          fi
+      - name: Final privacy re-scan of the exact upload tree (a hit leaves only the reports)
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          set -u
+          if [ ! -f "$RUNNER_TEMP/priv/canaries.json" ]; then
+            echo "no canary file: the upload tree cannot be cleared, purging it"
+            python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
+              --step privacy-canary-final-scan --status fail --note "no canary file to scan the upload tree with"
+            python3 -B tools/qa/camp_purge.py --out-dir "$CAMP_OUT"
+            exit 0
+          fi
+          if python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project petclinic \
+               --step privacy-canary-final-scan -- python3 -B tools/qa/canary.py scan --require upload-tree:1 \
+               --canaries "$RUNNER_TEMP/priv/canaries.json" --loc "upload-tree=$CAMP_OUT" \
+               --report "$RUNNER_TEMP/priv/final-report.json"; then
+            cp "$RUNNER_TEMP/priv/final-report.json" "$CAMP_OUT/privacy-canary-report-final.json"
+          else
+            cp "$RUNNER_TEMP/priv/final-report.json" "$CAMP_OUT/privacy-canary-report-final.json" 2>/dev/null || true
+            echo "final scan not clean: only the privacy reports and a note-free summary are uploaded"
+            python3 -B tools/qa/camp_purge.py --out-dir "$CAMP_OUT"
           fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
