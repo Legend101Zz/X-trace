@@ -2141,19 +2141,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_routes_are_guarded_and_answer_501_until_implemented() {
+    async fn replay_routes_are_guarded_and_unserved_forms_answer_501() {
         let viewer = start().await;
         let recording = RecordingId::new();
         let frame = xtrace_domain::FrameId::new();
-        let paths = [
-            format!("/api/v1/recordings/{recording}/frames/{frame}/navigation"),
-            format!("/api/v1/recordings/{recording}/navigate?frame={frame}&action=next"),
+        let unserved = [
             format!("/api/v1/recordings/{recording}/frames?fromOrdinal=0&limit=10"),
             format!("/api/v1/recordings/{recording}/graph"),
-            format!("/api/v1/recordings/{recording}?aroundFrame={frame}&limit=50"),
             format!("/api/v1/recordings/{recording}?projection=structure&limit=500"),
+            format!("/api/v1/recordings/{recording}/navigate?frame={frame}&kind=gap&dir=next"),
         ];
-        for path in &paths {
+        // The served routes resolve the frame through the read port; the fixture has no frames.
+        let served = [
+            format!("/api/v1/recordings/{recording}/frames/{frame}/navigation"),
+            format!("/api/v1/recordings/{recording}/navigate?frame={frame}&action=next"),
+            format!("/api/v1/recordings/{recording}?aroundFrame={frame}&limit=50"),
+        ];
+        for path in unserved.iter().chain(&served) {
             let unauthenticated = format!(
                 "GET {path} HTTP/1.1\r\n{}Connection: close\r\n\r\n",
                 request_headers(&viewer.host, &viewer.origin)
@@ -2164,25 +2168,36 @@ mod tests {
             );
         }
         let cookie = authenticate(&viewer).await;
-        for path in &paths {
-            let raw = format!(
+        let get = |path: &str| {
+            format!(
                 "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
                 request_headers(&viewer.host, &viewer.origin)
-            );
-            let response = request(&viewer.host, &raw).await;
+            )
+        };
+        for path in &unserved {
+            let response = request(&viewer.host, &get(path)).await;
             assert!(response.starts_with("HTTP/1.1 501"), "{path}: {response}");
             assert!(response.contains("XTR-REPLAY-NOT-IMPLEMENTED"), "{path}: {response}");
+        }
+        for path in &served {
+            let response = request(&viewer.host, &get(path)).await;
+            assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+            assert!(!response.contains("XTR-REPLAY-NOT-IMPLEMENTED"), "{path}: {response}");
         }
         for (path, status) in [
             (format!("/api/v1/recordings/{recording}?cursor=abc&aroundFrame={frame}"), "400"),
             (format!("/api/v1/recordings/{recording}?projection=other"), "400"),
+            (
+                format!("/api/v1/recordings/{recording}/navigate?frame={frame}&action=sideways"),
+                "400",
+            ),
+            (format!("/api/v1/recordings/{recording}/navigate?action=next"), "400"),
+            (format!("/api/v1/recordings/{recording}/frames/not-a-frame/navigation"), "404"),
+            (format!("/api/v1/recordings/{recording}?aroundFrame=not-a-frame"), "404"),
             ("/api/v1/recordings/not-a-recording/graph".to_owned(), "404"),
+            ("/api/v1/recordings/not-a-recording/navigate?frame=x&action=next".to_owned(), "404"),
         ] {
-            let raw = format!(
-                "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
-                request_headers(&viewer.host, &viewer.origin)
-            );
-            let response = request(&viewer.host, &raw).await;
+            let response = request(&viewer.host, &get(&path)).await;
             assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{path}: {response}");
         }
     }
