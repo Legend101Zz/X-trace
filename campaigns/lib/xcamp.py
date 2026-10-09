@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 PREFIX = "xtrace-camp-"
-PLATFORM = "linux/arm64"
+PLATFORM = os.environ.get("XCAMP_PLATFORM", "linux/arm64")  # CI x86_64 runners set linux/amd64
 POSTGRES_IMAGE = "postgres:18.3"
 POSTGRES_DIGEST = "sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
