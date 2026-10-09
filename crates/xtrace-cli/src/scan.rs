@@ -362,6 +362,11 @@ fn hash_source_file(root: &Path, relative: &str) -> Option<ContentHash> {
     if !metadata.is_file() || metadata.len() > MAX_HASHED_FILE_BYTES {
         return None;
     }
+    // An intermediate directory symlink must not lead outside the source root.
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    if !std::fs::canonicalize(&path).ok()?.starts_with(&canonical_root) {
+        return None;
+    }
     let bytes = std::fs::read(&path).ok()?;
     Some(ContentHash::of_bytes(&bytes))
 }
@@ -506,7 +511,7 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
         cited.into_iter().map(|path| (path.clone(), digest(&path))).collect();
     let lookup = |path: &str| digests.get(path).copied().flatten();
 
-    let source_revision_id = SourceRevisionId::new();
+    let source_revision_id = derive_source_revision_id(&digests);
     let target = persist::open_target(&args.project_dir);
     let project_id = target.as_ref().map_or(ProjectId::from_uuid(Uuid::nil()), |t| t.project_id);
     let (mut result, claims) = match process_transcript_claims(
@@ -689,7 +694,6 @@ mod persist {
         MAX_DISCOVERY_CHUNK_BYTES, MAX_DISCOVERY_CHUNK_CLAIMS, MAX_DISCOVERY_RUN_CHUNKS,
         ValidatedEndpointClaim, final_digest, is_discovery_limitation_code,
     };
-    use xtrace_domain::ids::Id as _;
     use xtrace_domain::{ContentHash, ProjectId, RunId, SourceRevisionId};
     use xtrace_store::SqliteStore;
     use xtrace_store::catalog_admission_store::SqliteCatalogAdmissionStore;
@@ -999,6 +1003,35 @@ mod persist {
     }
 }
 
+/// Content-derived source revision id: identical cited bytes give an identical id, so a rescan of
+/// unchanged source yields identical claim digests and the diff reports `unchanged`. A cited file
+/// that changes (or disappears) changes the id, so `changed` means a cited byte changed.
+fn derive_source_revision_id(digests: &HashMap<String, Option<ContentHash>>) -> SourceRevisionId {
+    let ordered: BTreeMap<&str, Option<&ContentHash>> =
+        digests.iter().map(|(path, hash)| (path.as_str(), hash.as_ref())).collect();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"xtrace.scan.source-revision.v1\0");
+    for (path, hash) in ordered {
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        match hash {
+            Some(hash) => {
+                hasher.update(&[1]);
+                hasher.update(hash.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    SourceRevisionId::from_uuid(Uuid::from_bytes(bytes))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -1007,6 +1040,21 @@ mod persist {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_revision_id_is_content_derived_and_uuid_v7_shaped() {
+        use xtrace_domain::ids::Id as _;
+        let mut digests: HashMap<String, Option<ContentHash>> = HashMap::new();
+        digests.insert("a.js".to_owned(), Some(ContentHash::of_bytes(b"one")));
+        digests.insert("b.js".to_owned(), None);
+        let first = derive_source_revision_id(&digests);
+        assert_eq!(first, derive_source_revision_id(&digests.clone()));
+        let uuid = first.as_uuid();
+        assert_eq!(uuid.get_version_num(), 7);
+        assert_eq!(uuid.get_variant(), uuid::Variant::RFC4122);
+        digests.insert("a.js".to_owned(), Some(ContentHash::of_bytes(b"two")));
+        assert_ne!(first, derive_source_revision_id(&digests));
+    }
 
     fn digest(path: &str) -> Option<ContentHash> {
         (path != "missing.js").then(|| ContentHash::of_bytes(path.as_bytes()))

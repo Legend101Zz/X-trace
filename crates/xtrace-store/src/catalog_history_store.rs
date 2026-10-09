@@ -75,10 +75,9 @@ macro_rules! uuid_bytes_impl {
 }
 uuid_bytes_impl!(ProjectId, CatalogRevisionId, RunId);
 
-fn revision_from_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(Vec<u8>, i64, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>, i64, Vec<u8>, String)>
-{
+type RevisionRow = (Vec<u8>, i64, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>, i64, Vec<u8>, String);
+
+fn revision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RevisionRow> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -93,10 +92,7 @@ fn revision_from_row(
 
 const REVISION_COLUMNS: &str = "revision_id, ordinal, parent_revision_id, scope_digest, source_revision_id, operation_count, run_id, created_at";
 
-#[allow(clippy::type_complexity, reason = "one private row tuple")]
-fn revision_entry(
-    row: (Vec<u8>, i64, Option<Vec<u8>>, Vec<u8>, Option<Vec<u8>>, i64, Vec<u8>, String),
-) -> Result<RevisionEntry, PortError> {
+fn revision_entry(row: RevisionRow) -> Result<RevisionEntry, PortError> {
     Ok(RevisionEntry {
         revision_id: id(&row.0)?,
         ordinal: u32::try_from(row.1).map_err(|_| corrupt())?,

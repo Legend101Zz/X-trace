@@ -486,7 +486,6 @@ fn diff_operations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xtrace_domain::ids::Id as _;
 
     fn view(
         id: u128,

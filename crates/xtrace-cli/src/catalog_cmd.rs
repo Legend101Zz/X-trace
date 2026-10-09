@@ -12,7 +12,6 @@ use serde::Serialize;
 use xtrace_application::catalog_discovery::history::{
     CatalogHistoryService, HistoryError, OperationView, RevisionEntry,
 };
-use xtrace_domain::ids::Id as _;
 use xtrace_domain::{CatalogRevisionId, ProjectId};
 
 use crate::error::CliError;
