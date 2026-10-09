@@ -1151,14 +1151,13 @@ pub fn show_recording<P: RecordingReadPort>(
     } else {
         None
     };
-    let honesty = HonestySummary::from_window(
+    let mut honesty = HonestySummary::from_window(
         window.completion,
         &window.incomplete_evidence,
         window.capacity.as_ref(),
         &drop_counts_by_priority,
         &events,
     );
-    let mut honesty = honesty;
     if let Some(counts) = window.frame_honesty {
         honesty.recording.frames_with_gap = Some(counts.gap);
         honesty.recording.frames_with_redacted = Some(counts.redacted);

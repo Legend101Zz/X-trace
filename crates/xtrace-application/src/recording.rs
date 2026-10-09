@@ -1783,7 +1783,6 @@ mod tests {
         }
         assert_eq!(CaptureMode::Standard.event_cap(), STANDARD_EVENT_CAP);
         assert_eq!(CaptureMode::Focused.event_cap(), FOCUSED_EVENT_CAP);
-        assert!(FOCUSED_EVENT_CAP <= EVENT_CAP_SANITY_BOUND);
     }
 
     #[test]

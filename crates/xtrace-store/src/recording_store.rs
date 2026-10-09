@@ -2914,7 +2914,7 @@ pub(crate) fn navigate_indexed_frame(
                 },
             )
         };
-    let previous = match target(first_frame_where(
+    let previous = target(first_frame_where(
         connection,
         recording_id,
         sequence,
@@ -2922,10 +2922,8 @@ pub(crate) fn navigate_indexed_frame(
         "",
         None,
         correlation_id,
-    )?) {
-        Some(result) => result,
-        None => NavigationResult::Boundary,
-    };
+    )?)
+    .unwrap_or(NavigationResult::Boundary);
     let next_found =
         first_frame_where(connection, recording_id, sequence, true, "", None, correlation_id)?;
     let next = match target(next_found) {
