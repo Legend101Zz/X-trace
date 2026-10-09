@@ -130,11 +130,17 @@ exit 9 with a message; they never exit 0 and never print a success document.
   `out` the first later frame at lower depth. A missing target is `boundary`
   only when the finish evidence proves the persisted frontier final (the last
   persisted sequence equals the verified final sequence, and for a partial
-  recording the digest was verified and nothing was dropped at capacity);
-  otherwise `unavailable{partial_frontier}`.
+  recording the finish digest is present, the declared segment bytes were within
+  the finish verification bound so the digest was actually hashed, and nothing
+  was dropped at capacity); otherwise `unavailable{partial_frontier}`.
 - Served routes: `GET /frames/{frameId}/navigation`, `GET /navigate` with
   `action`, and `?aroundFrame` on the recording route. Still 501: the
   `kinds`/`kind`/`dir` forms of `navigate`, `/frames`, `/graph` and
   `projection=structure`.
+- `over` and `out` never land on an async root (`async_parent_seq` set); the
+  residual limitation is that descendants of an async root and other threads'
+  frames are still ranked by depth only (a root/thread column would fix it).
+- An `aroundFrame` page that the 256 KiB byte budget would cut before the anchor
+  restarts nearer the anchor, so `anchorFrameId` always names a frame in the page.
 - Not done: the `boundaryReason` extra for async roots (an async root's `out`
   is a plain `boundary`).
