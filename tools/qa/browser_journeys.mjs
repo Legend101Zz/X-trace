@@ -81,8 +81,8 @@ try {
         await dumpDom(page, `linear-${w}`);
         await page.screenshot({ path: path.join(out, `linear-${w}.png`), fullPage: true });
         row.linearOverflow = await overflow(page);
-        // Linear: an event row of its own, not only text in the inspector
-        const linearShown = await page.locator("[role=tabpanel] :is(li, tr, [role=row], [role=treeitem])").filter({ hasText: /http\.request|frame_enter|frame enter/i }).first().count();
+        // Linear: an event row of the ordered event window (.event-rail), not text elsewhere on the page
+        const linearShown = await page.locator(".event-rail .event .event-symbol").filter({ hasText: /http\.request|frame_enter|frame enter|[A-Za-z]\.[a-z]/i }).first().count();
         row.steps.linear = linearShown
           ? { status: "pass", screenshot: `linear-${w}.png` }
           : { status: "fail", reason: "a recording was opened but the Linear event window shows no request or frame event", screenshot: `linear-${w}.png` };
