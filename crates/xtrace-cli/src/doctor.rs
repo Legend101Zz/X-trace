@@ -202,12 +202,16 @@ fn unix_project_checks(project_dir: &std::path::Path, checks: &mut Vec<Check>) {
     ));
 
     let root = preflight.private_root.path().to_path_buf();
+    let mut lock_held = false;
     match crate::daemon_lock::project_lock_is_held(&preflight.private_root) {
-        Ok(true) => checks.push(Check::new(
-            "daemon_lock",
-            Status::Ok,
-            "a process holds the project daemon lock (a daemon or run is active)",
-        )),
+        Ok(true) => {
+            lock_held = true;
+            checks.push(Check::new(
+                "daemon_lock",
+                Status::Ok,
+                "a process holds the project daemon lock (a daemon or run is active)",
+            ));
+        }
         Ok(false) => {
             checks.push(Check::new("daemon_lock", Status::Ok, "no daemon holds the project lock"))
         }
@@ -291,9 +295,6 @@ fn unix_project_checks(project_dir: &std::path::Path, checks: &mut Vec<Check>) {
             }
         }
     }
-    let lock_held = checks
-        .iter()
-        .any(|check| check.id == "daemon_lock" && check.detail.starts_with("a process holds"));
     checks.push(if open > 0 && !lock_held {
         Check::new(
             "recordings",
