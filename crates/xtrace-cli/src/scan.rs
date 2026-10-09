@@ -781,6 +781,29 @@ mod tests {
         }
     }
 
+    /// Real analyzer output committed as golden files; the analyzer's own test asserts byte
+    /// equality with the same files, so a field rename on either side fails a suite.
+    #[test]
+    fn node_analyzer_golden_transcripts_pass_the_validator() {
+        let express = include_str!(
+            "../../../adapters/node/packages/analyzer/golden/express-basic.transcript.jsonl"
+        );
+        let nest = include_str!(
+            "../../../adapters/node/packages/analyzer/golden/nest-versioned.transcript.jsonl"
+        );
+        let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
+        let result = process_transcript(&lines(express), "app", "default", "express", &digest)
+            .expect("express golden transcript validates");
+        assert_eq!(result.completion, "complete");
+        assert_eq!(result.claim_count, 15);
+        assert_eq!(result.rejected_claims, 0);
+        let result = process_transcript(&lines(nest), "app", "default", "nest", &digest)
+            .expect("nest golden transcript validates");
+        assert_eq!(result.claim_count, 1);
+        assert_eq!(result.operations.len(), 1);
+        assert!(result.operations[0].limitation_codes.contains(&"unsupported_mapping".to_owned()));
+    }
+
     #[test]
     fn contained_join_refuses_escapes() {
         let root = Path::new("/r");

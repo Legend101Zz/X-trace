@@ -133,6 +133,19 @@ test("name_heuristic_receivers_carry_dynamic_registration", () => {
   assert.deepEqual(find(claims, "GET", ["/users"]).limitations, ["dynamic_registration"]);
 });
 
+test("golden_transcripts_are_byte_identical", () => {
+  // The Rust scan tests feed the same files through the transcript validator.
+  const golden = path.resolve(import.meta.dirname, "../../golden");
+  for (const [fixture, framework] of [
+    ["express-basic", "express"],
+    ["nest-versioned", "nest"],
+  ] as const) {
+    const expected = fs.readFileSync(path.join(golden, `${fixture}.transcript.jsonl`), "utf8");
+    const actual = analyze({ root: path.join(FIXTURES, fixture), framework }).join("\n") + "\n";
+    assert.equal(actual, expected, `${fixture} transcript drifted from its golden file`);
+  }
+});
+
 test("parse_error_makes_the_scan_incomplete_but_keeps_other_claims", () => {
   const { claims, lines } = run("broken", "express");
   find(claims, "GET", ["/good"]);

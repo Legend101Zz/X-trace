@@ -34,6 +34,8 @@ function main(argv: string[]): void {
       usage("unknown or incomplete argument " + String(arg));
     }
   }
+  if (!Number.isFinite(maxFiles) || maxFiles < 1) usage("--max-files must be a positive integer");
+  if (!Number.isFinite(maxFileBytes) || maxFileBytes < 1) usage("--max-file-bytes must be a positive integer");
   if (root === undefined) usage("--source-root is required");
   if (framework === undefined) usage("--framework is required");
   const lines = analyze({ root, framework, maxFiles, maxFileBytes });

@@ -10,8 +10,17 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 /// Limitation codes after which a static identity is a guess and must not be auto-linked.
-pub const UNLINKABLE_LIMITATIONS: &[&str] =
-    &["mount_unresolved", "route_constant_unresolved", "route_wildcard"];
+///
+/// `route_wildcard` is listed on purpose even though the runtime normalizes wildcards to the same
+/// token: a static wildcard stands for an unknown set of routes, so a match would overstate what
+/// the scan proved. `route_computed` is listed so that the rule does not depend on every analyzer
+/// pairing it with another unresolved code.
+pub const UNLINKABLE_LIMITATIONS: &[&str] = &[
+    "mount_unresolved",
+    "route_computed",
+    "route_constant_unresolved",
+    "route_wildcard",
+];
 
 /// One operation found by a static scan, in identity form.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +93,9 @@ impl Reconciliation {
 }
 
 /// Compares a static scan with observed endpoints by exact `(method, route)` identity.
+///
+/// Callers pass de-duplicated static operations (a catalog revision holds one operation per
+/// identity); duplicate static identities are reported once per input entry, in input order.
 #[must_use]
 pub fn reconcile(statics: &[StaticEndpoint], observed: &[ObservedEndpoint]) -> Reconciliation {
     let mut observed_by_key: BTreeMap<(&str, &str), usize> = BTreeMap::new();
@@ -204,6 +216,15 @@ mod tests {
     fn unlinkable_limitations_are_in_the_closed_vocabulary() {
         for code in UNLINKABLE_LIMITATIONS {
             assert!(crate::catalog_discovery::is_discovery_limitation_code(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn computed_and_wildcard_statics_are_never_auto_linked() {
+        for limitation in ["route_computed", "route_wildcard"] {
+            let result = reconcile(&[stat("GET", "/x", &[limitation])], &[obs("GET", "/x", 1)]);
+            assert_eq!(result.count(ReconcileStatus::StaticUnresolved), 1, "{limitation}");
+            assert_eq!(result.count(ReconcileStatus::Confirmed), 0, "{limitation}");
         }
     }
 
