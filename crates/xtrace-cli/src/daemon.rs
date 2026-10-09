@@ -644,6 +644,7 @@ mod tests {
                 opened_at,
                 endpoint_observation:
                     xtrace_application::recording::EndpointObservationInput::default(),
+                limitations: Vec::new(),
             })
             .expect("begin anchor");
 

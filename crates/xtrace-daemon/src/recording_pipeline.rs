@@ -65,12 +65,15 @@ impl RecordingPipeline {
             runtime_session_id,
             shutdown,
             xtrace_domain::CaptureMode::Standard,
+            Vec::new(),
         )
         .await
     }
 
     /// Processes one admitted envelope; `armed` is the owning session's armed mode, so a
     /// recording's cap is `min(armed, claimed)` exactly as ingest already computed it.
+    /// `limitations` are the codes the session attached to a `RecordingStarted` admission; they
+    /// are persisted with the recording anchor and ignored for every other envelope.
     pub(crate) async fn process_armed(
         &self,
         incoming: IncomingEnvelope,
@@ -78,6 +81,7 @@ impl RecordingPipeline {
         runtime_session_id: RuntimeSessionId,
         shutdown: crate::daemon::ShutdownSignal,
         armed: xtrace_domain::CaptureMode,
+        limitations: Vec<String>,
     ) -> Result<(), RecordingPipelineError> {
         match incoming {
             IncomingEnvelope::CapabilitySet(_) | IncomingEnvelope::Health(_) => Ok(()),
@@ -87,6 +91,7 @@ impl RecordingPipeline {
                     project_id,
                     runtime_session_id,
                     &self.run_observation,
+                    limitations,
                 )?;
                 let capture = Arc::clone(&self.capture);
                 let mode = effective_capture_mode(armed, &started.capture_policy_id);
@@ -176,7 +181,7 @@ where
 /// take this value, so they apply the same cap.
 ///
 /// `armed` is the session's armed mode (`Session::armed_mode`): the launch bootstrap's
-/// `capture.json` `capture.mode`, or an acknowledged `ARM_FOCUSED_CAPTURE`.
+/// `capture.json` `capture.mode`; the only arming path there is.
 pub(crate) fn effective_capture_mode(
     armed: xtrace_domain::CaptureMode,
     claimed_policy_id: &str,
@@ -193,7 +198,10 @@ fn translate_started(
     project_id: ProjectId,
     runtime_session_id: RuntimeSessionId,
     run_observation: &EndpointObservationInput,
+    mut limitations: Vec<String>,
 ) -> Result<BeginRecording, RecordingPipelineError> {
+    limitations.sort_unstable();
+    limitations.dedup();
     let mut endpoint_observation = run_observation.clone();
     endpoint_observation.method = started.method.clone();
     endpoint_observation.route_template = started.matched_route_template.clone();
@@ -203,6 +211,7 @@ fn translate_started(
         runtime_session_id,
         opened_at: WallTime::now(),
         endpoint_observation,
+        limitations,
     })
 }
 

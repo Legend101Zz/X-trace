@@ -366,6 +366,7 @@ fn record_orders_observation(fx: &Fx) {
                 method: "POST".to_owned(),
                 route_template: "/orders".to_owned(),
             },
+            limitations: Vec::new(),
         })
         .expect("begin recording");
     assert_eq!(receipt.disposition, BeginRecordingDisposition::Inserted);

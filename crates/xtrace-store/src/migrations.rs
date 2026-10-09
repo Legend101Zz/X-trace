@@ -11,7 +11,8 @@
 //! `v0004_recording_terminal_evidence`; P03A appends
 //! `v0005_catalog_discovery` and `v0006_catalog_retry_namespace_expiry`; the
 //! replay contract appends `v0007_recording_event_cap_sanity_bound` and
-//! `v0008_frame_index_depth_async`. Migrations remain append-only: later
+//! `v0008_frame_index_depth_async`; ADR 0011 appends `v0009_recording_limitations`.
+//! Migrations remain append-only: later
 //! slices must add a new record instead of editing an applied one.
 //!
 //! Migrations deliberately avoid statements that cannot be safely
@@ -97,6 +98,11 @@ impl Migrations {
                 version: 8,
                 label: "v0008_frame_index_depth_async",
                 statements: &[FRAME_INDEX_DEPTH_ASYNC_SCHEMA],
+            },
+            MigrationRecord {
+                version: 9,
+                label: "v0009_recording_limitations",
+                statements: &[RECORDING_LIMITATIONS_SCHEMA],
             },
         ]
     }
@@ -418,6 +424,19 @@ ALTER TABLE recording_frame_index ADD COLUMN honesty_flags INTEGER NOT NULL DEFA
 ALTER TABLE recording_frame_index ADD COLUMN indexed_v INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX recording_frame_parent
     ON recording_frame_index(recording_id, parent_seq, recording_seq);
+";
+
+/// Daemon-decided limitation codes of a recording (ADR 0011), written with the anchor. Codes are
+/// bounded lowercase identifiers so the table can never hold free text or a captured value.
+/// Recordings opened before this version have no rows, which reads as "none recorded".
+const RECORDING_LIMITATIONS_SCHEMA: &str = "
+CREATE TABLE recording_limitations (
+    recording_id  BLOB NOT NULL CHECK(length(recording_id) = 16)
+                      REFERENCES recordings(recording_id),
+    code          TEXT NOT NULL CHECK(length(CAST(code AS BLOB)) BETWEEN 1 AND 64
+                      AND code GLOB '[a-z]*' AND code NOT GLOB '*[^a-z0-9_]*'),
+    PRIMARY KEY(recording_id, code)
+) STRICT;
 ";
 
 /// Durable owner-scoped discovery ledger and immutable catalog history.
@@ -1291,6 +1310,79 @@ mod tests {
             )
             .expect("index lookup");
         assert_eq!(index_exists, 1);
+    }
+
+    #[test]
+    fn migration_v9_adds_recording_limitations_and_old_recordings_have_none() {
+        let conn = new_memory();
+        let v8 = Migrations::catalog()[..8].to_vec();
+        assert_eq!(
+            apply_catalog(&conn, "0.1.0-test", CorrelationId::new(), &v8).expect("apply exact v8"),
+            8
+        );
+        let v8_checksum = applied_checksum(&conn);
+        let project = id(0x31);
+        let recording = id(0x41);
+        insert_project(&conn, &project).expect("project");
+        insert_recording(&conn, &recording, &project, &id(0x51), "partial").expect("recording");
+        assert_eq!(
+            apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v9"),
+            Migrations::latest_version()
+        );
+        assert_eq!(Migrations::latest_version(), 9);
+        assert_ne!(applied_checksum(&conn), v8_checksum, "checksum changes with v9");
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM recording_limitations WHERE recording_id = ?1",
+                params![recording],
+                |row| row.get(0),
+            )
+            .expect("legacy rows");
+        assert_eq!(legacy, 0, "recordings opened before v9 read as none recorded");
+        conn.execute(
+            "INSERT INTO recording_limitations (recording_id, code) VALUES (?1, 'capture_policy_not_armed')",
+            params![recording],
+        )
+        .expect("known code");
+        assert!(
+            conn.execute(
+                "INSERT INTO recording_limitations (recording_id, code) \
+                 VALUES (?1, 'capture_policy_not_armed')",
+                params![recording]
+            )
+            .is_err(),
+            "a code is stored once per recording"
+        );
+        let too_long = "a".repeat(65);
+        for bad in ["", "Upper", "has space", "1leading_digit", "a-b", "x\u{e9}", too_long.as_str()]
+        {
+            assert!(
+                conn.execute(
+                    "INSERT INTO recording_limitations (recording_id, code) VALUES (?1, ?2)",
+                    params![recording, bad]
+                )
+                .is_err(),
+                "{bad:?} must not be storable"
+            );
+        }
+        assert!(
+            conn.execute(
+                "INSERT INTO recording_limitations (recording_id, code) VALUES (?1, 'orphan')",
+                params![id(0x99)]
+            )
+            .is_err(),
+            "limitations reference an existing recording"
+        );
+    }
+
+    #[test]
+    fn v0009_prefix_checksum_is_pinned() {
+        // The recording_limitations migration is one commit with this pin; any textual change to
+        // v1-v9 produces a new identity and must be a deliberate, reviewed edit of this value.
+        assert_eq!(
+            Migrations::prefix_checksum(&Migrations::catalog()[..9]),
+            "b3:0affdf3f22d4972b62aca522ea631a850d354a32175921d136f5e44a612c3a3b"
+        );
     }
 
     #[test]

@@ -1513,6 +1513,7 @@ fn add_endpoint_cli_fixture_recordings(
                 runtime_session_id: RuntimeSessionId::new(),
                 opened_at,
                 endpoint_observation: linked_observation.clone(),
+                limitations: Vec::new(),
             })
             .expect("create same-time linked recording");
     }
@@ -1524,6 +1525,7 @@ fn add_endpoint_cli_fixture_recordings(
             runtime_session_id: RuntimeSessionId::new(),
             opened_at,
             endpoint_observation: EndpointObservationInput::default(),
+            limitations: Vec::new(),
         })
         .expect("create unmatched sidecar recording");
     // This sidecar-free row models a historical v4 recording without making
@@ -1539,6 +1541,7 @@ fn add_endpoint_cli_fixture_recordings(
             runtime_session_id: RuntimeSessionId::new(),
             opened_at: historical_opened_at,
             endpoint_observation: EndpointObservationInput::default(),
+            limitations: Vec::new(),
         })
         .expect("create legacy precursor recording");
     let connection = Connection::open(project_root.join("metadata.sqlite3")).expect("SQLite");

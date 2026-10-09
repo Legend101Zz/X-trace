@@ -58,8 +58,18 @@ never creates or deletes the data home, and uninstall leaves it and the pre-upgr
 * **Events not yet written to a segment when the daemon stops.** `stop` seals open recordings as partial but
   in-memory staged events are lost until the daemon flushes on shutdown (request P-002 item 4). This is a data-loss
   limit, not a confidentiality one.
-* **Capture depth.** `record --capture-depth` is accepted and reported but not yet enforced
-  (`capture_depth_enforced: false`).
+* **Capture depth.** `xtrace record` and `xtrace restart` take the same capture inputs as `xtrace run`
+  (`--capture-depth`, `--app-package`, `--source-root`, `--launcher`) and write the resolved scope to a private
+  `capture.json` (mode 0600) beside the single-launch bootstrap. The daemon arms each adapter session from that file
+  and caps every recording at `min(armed depth, depth the adapter claims)`, so an adapter's claim is never a grant.
+  `capture_depth_enforced: true` in the record document means exactly this: the daemon's own reader (private, regular,
+  non-symlink, size-bounded file) yields the recorded depth. It is `false` for a `focused` record whose file is
+  missing, unreadable, non-private or names another mode; the daemon then serves every recording under the
+  standard policy. A focused claim on a session that was not armed is served as standard and the recording carries the
+  persisted limitation `capture_policy_not_armed` (ADR 0011), visible in `recording show` and the read API.
+  What is **not** guaranteed: that the Java agent emits line events or local values. Their presence or a declared gap
+  is read from the recording; `capture_depth_enforced` does not promise them. `record` launches nothing, so without
+  `--app-package` its scope is empty rather than derived from a jar.
 
 ## Known measurement gaps (honest status)
 
