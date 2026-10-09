@@ -55,7 +55,12 @@ jobs:
         run: |
           set -eu
           sh packaging/install.sh verify-dist "dist/${{ matrix.platform }}"
-          sh packaging/test/install_test.sh "dist/${{ matrix.platform }}"
+          # The installed binary runs `init`, and product storage refuses a data directory under a
+          # world-writable ancestor such as /tmp, so the journey's throwaway HOME lives below an
+          # admitted 0700 root inside the runner's private temp directory (same shape as ci.yml).
+          root="${RUNNER_TEMP:?}/xt-install"
+          mkdir -m 700 "$root" "$root/tmp"
+          TMPDIR="$root/tmp" sh packaging/test/install_test.sh "dist/${{ matrix.platform }}"
       - name: Compare archive hash with the reproducibility build
         run: |
           python3 - "dist/${{ matrix.platform }}" "$RUNNER_TEMP/repro/repro.json" <<'PY'
