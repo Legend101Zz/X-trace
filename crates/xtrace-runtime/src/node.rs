@@ -172,13 +172,7 @@ impl NodeLaunch {
                 ));
             }
         }
-        Ok(Self {
-            executable,
-            adapter,
-            mode,
-            arguments: arguments.to_vec(),
-            original_options,
-        })
+        Ok(Self { executable, adapter, mode, arguments: arguments.to_vec(), original_options })
     }
 
     /// Returns the canonical executable selected during preflight.
@@ -1067,7 +1061,9 @@ mod tests {
             launch_for(NodeMode::Auto, Some("--max-old-space-size=64")).node_options().unwrap();
         assert_eq!(options.matches("--require=").count(), 1, "{options}");
         assert_eq!(options.matches("--import=").count(), 1, "{options}");
-        assert!(options.starts_with("--max-old-space-size=64 --require=\"/adapter dir/register.cjs\""));
+        assert!(
+            options.starts_with("--max-old-space-size=64 --require=\"/adapter dir/register.cjs\"")
+        );
         assert!(options.ends_with("--import=file:///adapter%20dir/register.mjs"), "{options}");
     }
 
