@@ -31,11 +31,11 @@ use xtrace_application::recording_queries::{
     ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
+use xtrace_domain::is_projectable_source_path;
 use xtrace_domain::{
     ContentHash, CorrelationId, ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointIdentity, HttpMethod,
     ProjectId, RecordingId, RuntimeSessionId, SourceBinding, SourceRange, Transport, WallTime,
 };
-use xtrace_domain::{is_projectable_source_path, is_safe_repo_relative_path};
 use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
 use crate::connection::SqliteStore;
@@ -3542,6 +3542,7 @@ fn unavailable_source(
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
 mod source_projection_tests {
     use super::*;
+    use xtrace_domain::is_safe_repo_relative_path;
 
     fn tempdir() -> tempfile::TempDir {
         let scratch = PathBuf::from(
