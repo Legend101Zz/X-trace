@@ -30,7 +30,7 @@ export interface CapturePlan {
 export function planCapture(): CapturePlan {
   const environment: InstallEnvironment = { nodeVersion: process.version, packageVersion: "" };
   let transport: HttpCaptureTransport | undefined;
-  const modules: InstrumentationModule[] = [nodeHttpModule(() => transport!), asyncContextModule(), expressModule()];
+  const modules: InstrumentationModule[] = [nodeHttpModule(() => transport!), asyncContextModule(), expressModule(undefined, () => transport!)];
   const planned = modules.filter((module) => module.detect(environment).supported).map((module) => module.descriptor.capability);
   return {
     planned,

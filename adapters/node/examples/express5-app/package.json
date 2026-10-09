@@ -1,0 +1,7 @@
+{
+  "name": "@xtrace/express5-app",
+  "private": true,
+  "type": "commonjs",
+  "engines": { "node": ">=22" },
+  "dependencies": { "express": "5.1.0" }
+}

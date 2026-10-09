@@ -11,6 +11,8 @@ export interface HttpCaptureTransport {
   /** `holdStart` asks the worker to delay RecordingStarted until finish (only when a module can still set the route). */
   start(recordingId: string, method: string, startedAtNs: bigint, holdStart?: boolean): boolean;
   event(recordingId: string, event: CaptureEvent): boolean;
+  /** Optional: announces the route template the moment a framework matches it (releases a held start). */
+  route?(recordingId: string, route: string): boolean;
   finish(recordingId: string, finalSequence: bigint, durationNs: bigint, droppedEvents: number, summary?: RecordingSummary): boolean;
   onFailure(callback: () => void): void;
   close(): void;
@@ -32,7 +34,7 @@ interface WorkerMessage {
 }
 
 interface RecordingMessage {
-  type: "start" | "event" | "finish";
+  type: "start" | "event" | "finish" | "route";
   [key: string]: unknown;
 }
 
@@ -80,6 +82,10 @@ export function createHttpCaptureTransport(worker: Worker): HttpCaptureTransport
     event(recordingId, event) {
       if (pending + reservedFinishes >= MAX_IN_FLIGHT_MESSAGES) return false;
       return post({ type: "event", recordingId, ...event });
+    },
+    route(recordingId, route) {
+      if (pending + reservedFinishes >= MAX_IN_FLIGHT_MESSAGES) return false;
+      return post({ type: "route", recordingId, route });
     },
     finish(recordingId, finalSequence, durationNs, droppedEvents, summary) {
       if (reservedFinishes === 0 || failed) return false;

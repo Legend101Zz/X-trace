@@ -1,7 +1,7 @@
 import http = require("node:http");
 import https = require("node:https");
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { captureSuppressed, createContext, finishContext, recordEvent, resolveRoute, runInContext, type RecordingContext } from "./runtime/context.cjs";
+import { bindRequest, captureSuppressed, createContext, finishContext, recordEvent, resolveRoute, runInContext, type RecordingContext } from "./runtime/context.cjs";
 import { events, type CaptureEvent, type CaptureEventKind } from "./runtime/events.cjs";
 import { createHttpCaptureTransport, type HttpCaptureTransport } from "./runtime/transport.cjs";
 
@@ -67,6 +67,7 @@ function captureRequest(_thisArg: unknown, request: IncomingMessage, response: S
   const context = createContext(method, startedAtNs);
   if (!transport.start(context.id, method, startedAtNs, context.holdStart)) return invoke();
 
+  bindRequest(request, context);
   return runInContext(context, () => {
     // Listener bodies must never throw into the application's response machinery.
     const close = (kind: "response-finish" | "response-close") => {
@@ -109,7 +110,7 @@ function closeRecording(
   context.outcome = completed ? "responded" : context.threw ? "exception-propagated" : "client-aborted";
   if (context.threw && !completed) context.status = 0;
   recordEvent(context, transport, events.response(kind, context.frameEventId));
-  const route = resolveRoute(request);
+  const route = context.route === "" ? resolveRoute(request) : "";
   if (route) {
     context.route = route;
     context.limitations.delete("route_unavailable");

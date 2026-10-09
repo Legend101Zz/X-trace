@@ -69,11 +69,34 @@ export function resolveRoute(request: unknown): string {
   return "";
 }
 
+/**
+ * A framework matched a route while the request ran: remember it, tell the worker (which releases
+ * the held start with the template) and drop `route_unavailable` for this recording only.
+ * First announcement wins; later matches of the same request never change what the start carried.
+ */
+export function announceRoute(context: RecordingContext, transport: HttpCaptureTransport, route: string): void {
+  if (context.route !== "" || context.finished || route === "") return;
+  context.route = route;
+  context.limitations.delete("route_unavailable");
+  try { transport.route?.(context.id, route); } catch { /* best effort */ }
+}
+
 const contexts = new AsyncLocalStorage<RecordingContext>();
 const suppression = new AsyncLocalStorage<true>();
 
 export function currentContext(): RecordingContext | undefined {
   return contexts.getStore();
+}
+
+const byRequest = new WeakMap<object, RecordingContext>();
+
+/** Remembers which recording a request belongs to, for callbacks AsyncLocalStorage does not reach (raw `req.on('data')`). */
+export function bindRequest(request: unknown, context: RecordingContext): void {
+  if (request !== null && typeof request === "object") byRequest.set(request, context);
+}
+
+export function contextForRequest(request: unknown): RecordingContext | undefined {
+  return request !== null && typeof request === "object" ? byRequest.get(request) : undefined;
 }
 
 export function runInContext<T>(context: RecordingContext, callback: () => T): T {

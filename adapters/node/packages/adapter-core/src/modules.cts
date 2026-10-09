@@ -1,5 +1,8 @@
 import { BUILTIN_MODULES } from "./manifest.cjs";
 import { installHttpCapture } from "./http-capture.cjs";
+import { installExpressLayerPatch } from "./express-instrument.cjs";
+import { readFileSync } from "node:fs";
+import { dirname, resolve as resolvePath } from "node:path";
 import { registerRouteResolver } from "./runtime/context.cjs";
 import type { HttpCaptureTransport } from "./runtime/transport.cjs";
 import type { InstallEnvironment, InstrumentationModule, ModuleDescriptor, DetectResult } from "./runtime/registry.cjs";
@@ -47,24 +50,46 @@ export function resolveExpressRoute(request: unknown): string {
   return path;
 }
 
-export function expressModule(resolve: (specifier: string) => string = defaultResolve): InstrumentationModule {
+export function expressModule(
+  resolve: (specifier: string) => string = defaultResolve,
+  transport?: () => HttpCaptureTransport,
+): InstrumentationModule {
   return {
     descriptor: descriptor("express"),
     detect(environment) {
       const node = supportedNode(environment);
       if (!node.supported) return node;
+      let located: string;
       try {
-        resolve("express/package.json");
-        return { supported: true };
+        located = resolve("express/package.json");
       } catch {
         return { supported: false, reason: "express_not_found" };
       }
+      const major = expressMajor(located);
+      return major !== 0 && major !== 4 && major !== 5 ? { supported: false, reason: "express_version_unsupported" } : { supported: true };
     },
-    install() { registerRouteResolver(resolveExpressRoute); },
+    install() {
+      // Finish-time resolution stays as the fallback for shapes the Layer patch does not recognize.
+      registerRouteResolver(resolveExpressRoute);
+      if (transport) installExpressLayerPatch({ transport });
+    },
   };
 }
 
+/** Major version of the resolved express package, or 0 when it cannot be read (then not gated here). */
+function expressMajor(packageJsonPath: string): number {
+  try {
+    const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8")) as { version?: unknown };
+    return typeof parsed.version === "string" ? Number.parseInt(parsed.version, 10) || 0 : 0;
+  } catch {
+    return 0;
+  }
+}
+
 function defaultResolve(specifier: string): string {
-  const paths = [process.cwd(), ...(require.main?.paths ?? [])];
+  // Preloads run before the entry module exists, so `require.main` is unset: the entry script's own
+  // directory (argv[1]) is where an application's node_modules is found when cwd is elsewhere.
+  const entry = process.argv[1];
+  const paths = [process.cwd(), ...(typeof entry === "string" && entry !== "" ? [dirname(resolvePath(entry))] : []), ...(require.main?.paths ?? [])];
   return require.resolve(specifier, { paths });
 }
