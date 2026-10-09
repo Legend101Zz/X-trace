@@ -102,7 +102,7 @@ try {
   await page.getByText(/Adapter reported a compile-time source binding; current source matches the recorded identity/).waitFor();
   const sourceExcerpt = await page.locator('.source-excerpt').textContent();
   assert.ok(sourceExcerpt?.includes('repository.save'), 'browser displays the matched bounded Spring source excerpt');
-  await page.getByText('Values were not projected').waitFor();
+  await page.getByText('No value bindings were recorded for this event').waitFor();
   await page.getByText(/response outcome is not event-verified/i).waitFor();
   await page.setViewportSize({ width: 1280, height: 720 });
   await saveScreenshot('viewer-desktop-genuine-detail.png', 'genuine-recording-detail', 1280, 720);
