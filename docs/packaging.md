@@ -34,8 +34,9 @@ finds it only from the `--analyzer PATH` flag or, when the flag is absent, the e
 `XTRACE_NODE_ANALYZER` (express, fastify, nest) or `XTRACE_JAVA_ANALYZER` (spring-mvc, spring-webflux). There is no
 default lookup: with neither set the command exits with a usage error naming the variable. The Node analyzer is built
 from `adapters/node` (`npm ci && npm run build`; entry `packages/analyzer/dist/main.js`, run with `node`, so point
-`--analyzer` at a small executable wrapper). The Java analyzer is `adapters/java/static-analyzer` and is not yet part
-of the Gradle build. CI proves the Node path end to end with `crates/xtrace-cli/tests/scan_real_node_analyzer.rs`,
+`--analyzer` at a small executable wrapper). The Java analyzer is `adapters/java/static-analyzer`. It is part of the
+Java Gradle build (`adapters/java/settings.gradle.kts`) and has unit tests (`SpringMvcAnalyzerTest`), but it is
+not bundled in the release payload, and no test yet runs `xtrace scan` against the built Java analyzer. CI proves the Node path end to end with `crates/xtrace-cli/tests/scan_real_node_analyzer.rs`,
 which scans the `express-basic` fixture with the built analyzer and reads the catalog back.
 
 ## Install, upgrade, uninstall

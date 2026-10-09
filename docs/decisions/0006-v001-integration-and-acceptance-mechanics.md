@@ -211,3 +211,30 @@ Decided by the root orchestrator under the owner's autonomous v0.01 launch autho
 3. Phase receipts before release keys exist are signed with test keys marked non-release. Release receipts need the owner-authenticated trust configuration (owner input).
 4. Rejected-candidate raw evidence stays in the private cache; only sanitized hashes and summaries are tracked in-tree.
 5. The tooling base is `slice/v001-control-admission`, which absorbs ci-floor and release-control (control lane round 2).
+
+## Addendum (2026-10-10): the other-UID negative before the broker exists
+
+- Status: Accepted for the second unattended batch under the owner's
+  authorization of 2026-10-10; listed for the owner to ratify afterwards.
+- Date: 2026-10-10
+- Context: §2 item 3 asks the hosted macOS job to run "the other-UID broker
+  negative". The broker (ADR 0004) is P04 work, so P01 to P03 candidates have no
+  broker to test, and the job could not run that check. What P01 to P03 do ship on
+  macOS is private storage (ADR 0008), whose security claim is that another local
+  user can neither traverse nor read a project's store.
+
+### Decision
+
+1. For P01, P02 and P03 candidates, the hosted macOS job runs an other-UID
+   private-storage negative in place of the broker negative. After the job has
+   created a real store, a second local user created on the runner must fail to
+   list or traverse the store directory and must fail to read the store database
+   and its object files.
+2. The check fails closed. It fails when the store is missing, when the second
+   user cannot be created, or when the check is skipped: an always-run final step
+   requires the marker that only a passing check writes. Its public output stays
+   within the allowlisted CI grammar.
+3. From P04 onward, when the broker exists, the other-UID broker negative of §2
+   item 3 is required as written, in addition to the private-storage negative.
+4. Nothing else in §2 changes. The broker negative is deferred to the phase that
+   adds the broker; it is not waived.
