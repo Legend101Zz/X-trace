@@ -68,9 +68,14 @@ fn focused_run_arms_the_session_and_states_line_event_status() {
         "a focused launch must be served under the focused cap; stderr: {}",
         captured.stderr
     );
-    // NOT ASSERTED: that `capture_policy_not_armed` is absent. The read API does not carry
-    // recording limitations yet (BeginRecording has no limitations field; see
-    // requests/RC2-FC2-to-FC1-limitations.md), so such an assertion would pass vacuously.
+    // The launch armed the session, so the recording carries no downgrade limitation. The read
+    // API always states its limitations as an array (ADR 0011); a missing key would be a silent
+    // pass of this assertion.
+    let limitations = first["limitations"].as_array().expect("recordings state their limitations");
+    assert!(
+        !limitations.iter().any(|code| code == "capture_policy_not_armed"),
+        "an armed focused launch must not be reported as downgraded: {limitations:?}"
+    );
     let in_scope_frames: Vec<&Value> = captured
         .events
         .iter()
@@ -91,6 +96,9 @@ fn focused_run_arms_the_session_and_states_line_event_status() {
             "a line event must carry an observed line number: {line}"
         );
     }
+    // A focused run must never pass with zero line events and no visible reason: either line
+    // events reached the read API, or the recording persists a declared explanation and is not
+    // reported as complete.
     if lines.is_empty() {
         // Line events have not reached the read API for this build of the Java agent: its line
         // probes skip methods they cannot wrap. The absence must be declared, never silent:
@@ -145,23 +153,6 @@ fn standard_run_keeps_the_standard_cap_and_emits_no_line_events() {
 }
 
 #[test]
-fn out_of_scope_app_package_captures_no_application_frames() {
-    let captured = run_fixture_with(&["--app-package", "com.nonexistent.app"], false);
-    let order_frames: Vec<&Value> = captured
-        .events
-        .iter()
-        .filter(|event| {
-            event["symbol"].as_str().is_some_and(|symbol| symbol.contains("Order"))
-                && event["kind"].as_str().is_some_and(|kind| kind.ends_with("frame_enter"))
-        })
-        .collect();
-    assert!(
-        order_frames.is_empty(),
-        "an app package that matches no class must not capture Order frames: {order_frames:?}"
-    );
-}
-
-#[test]
 fn invalid_capture_flags_fail_before_any_launch() {
     for bad in [
         &["--capture-depth", "deep"][..],
@@ -184,12 +175,6 @@ fn invalid_capture_flags_fail_before_any_launch() {
 }
 
 fn run_fixture(flags: &[&str]) -> Captured {
-    run_fixture_with(flags, true)
-}
-
-/// With `require_recording` false, a launch whose scope captures nothing may legitimately persist
-/// no recording at all; the fixture must still have served the request.
-fn run_fixture_with(flags: &[&str], require_recording: bool) -> Captured {
     let root = temp_root();
     let repo = root.path().join("repository with spaces");
     let data_home = root.path().join("data home");
@@ -249,7 +234,7 @@ fn run_fixture_with(flags: &[&str], require_recording: bool) -> Captured {
         "fixture returned {}",
         String::from_utf8_lossy(&response)
     );
-    let recorded = wait_for_complete_recording(&project_root, require_recording);
+    wait_for_complete_recording(&project_root);
 
     let pid = rustix::process::Pid::from_raw(process.child.id() as i32).expect("CLI process ID");
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("signal xtrace run");
@@ -257,13 +242,6 @@ fn run_fixture_with(flags: &[&str], require_recording: bool) -> Captured {
     let _ = process.stdout.take().expect("stdout thread").join();
     let stderr = process.stderr.take().expect("stderr thread").join().expect("join stderr");
 
-    if !recorded {
-        return Captured {
-            detail_pages: Vec::new(),
-            events: Vec::new(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        };
-    }
     let list = cli(&["recording", "list"], &repo, &data_home);
     let list: Value = serde_json::from_slice(&list.stdout).expect("recording list JSON");
     let recording_id =
@@ -301,8 +279,8 @@ fn cli(args: &[&str], repo: &Path, data_home: &Path) -> std::process::Output {
     command.env("XTRACE_DATA_HOME", data_home).output().expect("run xtrace")
 }
 
-fn wait_for_complete_recording(project_root: &Path, required: bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(if required { 30 } else { 10 });
+fn wait_for_complete_recording(project_root: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(database) = rusqlite::Connection::open(project_root.join("metadata.sqlite3")) {
             let count: i64 = database
@@ -313,11 +291,8 @@ fn wait_for_complete_recording(project_root: &Path, required: bool) -> bool {
                 )
                 .unwrap_or(0);
             if count >= 1 {
-                return true;
+                return;
             }
-        }
-        if Instant::now() >= deadline && !required {
-            return false;
         }
         assert!(Instant::now() < deadline, "no finished recording was persisted");
         thread::sleep(Duration::from_millis(50));

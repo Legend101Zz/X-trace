@@ -73,11 +73,11 @@ pub use recording::{
     CAPTURE_POLICY_FOCUSED_ID, CAPTURE_POLICY_STANDARD_ID, CaptureMode,
     DEFAULT_MAX_RETAINED_RECORDINGS, DEFAULT_SEGMENT_EVENT_BYTES, DEFAULT_SEGMENT_EVENTS,
     DEFAULT_SEGMENT_SPAN_NS, EVENT_CAP_SANITY_BOUND, FOCUSED_EVENT_CAP, FinishRecording,
-    FinishRecordingReceipt, MAX_CAPACITY_DROP_PRIORITIES, MAX_RECORDED_EVENTS,
-    MAX_XTF_EVENT_ENVELOPE_BYTES, PersistRecordingSegment, PersistSegmentDisposition,
-    PersistSegmentReceipt, RecordEvents, RecordEventsReceipt, RecordingCapture,
-    RecordingCaptureService, RecordingCompletion, RecordingPersistencePort, STANDARD_EVENT_CAP,
-    SegmentPolicy, legacy_event_cap,
+    FinishRecordingReceipt, LIMITATION_CAPTURE_POLICY_NOT_ARMED, MAX_CAPACITY_DROP_PRIORITIES,
+    MAX_RECORDED_EVENTS, MAX_XTF_EVENT_ENVELOPE_BYTES, PersistRecordingSegment,
+    PersistSegmentDisposition, PersistSegmentReceipt, RECORDING_LIMITATION_CODES, RecordEvents,
+    RecordEventsReceipt, RecordingCapture, RecordingCaptureService, RecordingCompletion,
+    RecordingPersistencePort, STANDARD_EVENT_CAP, SegmentPolicy, legacy_event_cap,
 };
 pub use recording_queries::{
     DEFAULT_RECORDING_EVENT_LIMIT, DEFAULT_RECORDING_LIST_LIMIT, FieldRepresentation,

@@ -206,14 +206,12 @@ pub struct Session {
     /// Capture mode this session is armed for (CONTRACTS 4.2). Standard unless the launch
     /// bootstrap's `capture.json` said `capture.mode = focused` (see `arm`).
     armed_mode: xtrace_domain::CaptureMode,
-    /// Recordings whose adapter claimed the focused policy while this session was not armed;
-    /// each was served under the standard policy and carries `capture_policy_not_armed`.
-    downgraded_claims: Vec<RecordingId>,
 }
 
 /// Stable limitation code attached to a recording whose adapter claimed the focused policy on a
 /// session that was never armed for it (CONTRACTS 4.2: a claim by the adapter is not a grant).
-pub const LIMITATION_CAPTURE_POLICY_NOT_ARMED: &str = "capture_policy_not_armed";
+/// Defined by the application layer, which persists it (ADR 0011).
+pub use xtrace_application::recording::LIMITATION_CAPTURE_POLICY_NOT_ARMED;
 
 /// Upper bound on the volatile staging buffer. Beyond this bound the
 /// session refuses new envelopes with [`ProtocolErrorCode::SessionSequence`]
@@ -279,13 +277,11 @@ impl Session {
             staged_incoming: std::collections::VecDeque::with_capacity(STAGED_INCOMING_LIMIT),
             ingest_validator: IngestValidator::new(ingest_config),
             armed_mode: xtrace_domain::CaptureMode::Standard,
-            downgraded_claims: Vec::new(),
         }
     }
 
-    /// Arms the session for `mode` (CONTRACTS 4.2): from the launch bootstrap's
-    /// `capture.mode`, or when an `ARM_FOCUSED_CAPTURE` command is acknowledged. A session can
-    /// only be armed up; arming standard never lowers a focused session.
+    /// Arms the session for `mode` (CONTRACTS 4.2) from the launch bootstrap's `capture.mode`.
+    /// A session can only be armed up; arming standard never lowers a focused session.
     pub fn arm(&mut self, mode: xtrace_domain::CaptureMode) {
         if mode == xtrace_domain::CaptureMode::Focused {
             self.armed_mode = mode;
@@ -296,12 +292,6 @@ impl Session {
     #[must_use]
     pub fn armed_mode(&self) -> xtrace_domain::CaptureMode {
         self.armed_mode
-    }
-
-    /// Recordings whose focused policy claim was downgraded because the session was not armed.
-    #[must_use]
-    pub fn downgraded_claims(&self) -> &[RecordingId] {
-        &self.downgraded_claims
     }
 
     /// Returns the underlying [`IngestValidator`] owned by this
@@ -657,9 +647,6 @@ impl Session {
                 let mut limitations = Vec::new();
                 if downgraded {
                     limitations.push(LIMITATION_CAPTURE_POLICY_NOT_ARMED);
-                    if !self.downgraded_claims.contains(&recording_id) {
-                        self.downgraded_claims.push(recording_id);
-                    }
                 }
                 let incoming = IncomingEnvelope::RecordingStarted(started.clone());
                 let mut admission = self.admit_recording(
@@ -2069,7 +2056,6 @@ mod tests {
             .expect("unarmed focused claim is admitted, not rejected");
         assert_eq!(admission.capture_mode, xtrace_domain::CaptureMode::Standard);
         assert_eq!(admission.limitations, vec![LIMITATION_CAPTURE_POLICY_NOT_ARMED]);
-        assert_eq!(session.downgraded_claims().len(), 1);
     }
 
     #[test]
@@ -2085,7 +2071,6 @@ mod tests {
             .expect("armed focused start");
         assert_eq!(admission.capture_mode, xtrace_domain::CaptureMode::Focused);
         assert!(admission.limitations.is_empty());
-        assert!(session.downgraded_claims().is_empty());
     }
 
     #[test]

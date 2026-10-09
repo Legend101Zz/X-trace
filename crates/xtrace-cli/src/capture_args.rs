@@ -13,8 +13,9 @@ use serde_json::json;
 
 use crate::error::CliError;
 
-/// Name of the private capture file beside the bootstrap artifact.
-pub(crate) const CAPTURE_FILE_NAME: &str = "capture.json";
+/// Name of the private capture file beside the bootstrap artifact; owned by the daemon's reader
+/// so writer and reader can never disagree on it.
+pub(crate) const CAPTURE_FILE_NAME: &str = xtrace_daemon::capture_config::CAPTURE_FILE_NAME;
 
 const MAX_SOURCE_ROOTS: usize = 32;
 const MAX_ROOT_BYTES: usize = 256;
@@ -74,6 +75,36 @@ pub(crate) struct CaptureOptions {
     pub(crate) depth: CaptureDepth,
     pub(crate) app_packages: Vec<String>,
     pub(crate) source_roots: Vec<String>,
+}
+
+/// Capture options after scope resolution: exactly what `capture.json` carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedCapture {
+    pub(crate) depth: CaptureDepth,
+    /// Sanitized package prefixes (`xtrace_runtime::java_scope::resolve_scope`).
+    pub(crate) application_packages: Vec<String>,
+    pub(crate) source_roots: Vec<String>,
+}
+
+impl ResolvedCapture {
+    /// The version-1 `capture.json` document for these options.
+    pub(crate) fn document(&self) -> serde_json::Value {
+        document(self.depth, &self.application_packages, &self.source_roots)
+    }
+}
+
+#[cfg(unix)]
+impl CaptureOptions {
+    /// Resolves the application scope the way `xtrace run` does: explicit prefixes, else a
+    /// Spring Boot fat jar's `BOOT-INF/classes` when a `jar` is known, else honestly empty.
+    pub(crate) fn resolve(&self, jar: Option<&Path>) -> ResolvedCapture {
+        let scope = xtrace_runtime::java_scope::resolve_scope(&self.app_packages, jar);
+        ResolvedCapture {
+            depth: self.depth,
+            application_packages: scope.application_packages,
+            source_roots: self.source_roots.clone(),
+        }
+    }
 }
 
 impl CaptureArgs {
@@ -214,21 +245,17 @@ pub(crate) fn write_beside(
     Ok(path)
 }
 
-/// The mode a `capture.json` beside the bootstrap names, if a private, well-formed one exists.
+/// The depth the daemon will arm for a session whose bootstrap sits at `bootstrap_path`.
+///
+/// Delegates to the daemon's own reader (private, regular, non-symlink, size-bounded, same-inode
+/// read), so this answer and the daemon's behaviour cannot drift apart. Anything unreadable is
+/// `standard`, which is also what the daemon serves in that case.
 #[cfg(unix)]
-pub(crate) fn mode_beside(bootstrap_path: &Path) -> Option<CaptureDepth> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let path = bootstrap_path.parent()?.join(CAPTURE_FILE_NAME);
-    let link = std::fs::symlink_metadata(&path).ok()?;
-    if !link.file_type().is_file() || link.len() > 64 * 1024 || link.mode() & 0o077 != 0 {
-        return None;
+pub(crate) fn armed_depth_beside(bootstrap_path: &Path) -> CaptureDepth {
+    match xtrace_daemon::capture_config::armed_mode_beside(bootstrap_path) {
+        xtrace_domain::CaptureMode::Focused => CaptureDepth::Focused,
+        _ => CaptureDepth::Standard,
     }
-    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-    if value.get("capture_schema_version")?.as_u64()? != 1 {
-        return None;
-    }
-    CaptureDepth::parse(value.pointer("/capture/mode")?.as_str()?).ok()
 }
 
 #[cfg(test)]
@@ -303,18 +330,66 @@ mod tests {
         let path = write_beside(&bootstrap, &doc).expect("write");
         let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        assert_eq!(mode_beside(&bootstrap), Some(CaptureDepth::Focused));
+        assert_eq!(armed_depth_beside(&bootstrap), CaptureDepth::Focused);
         assert!(write_beside(&bootstrap, &doc).is_err(), "never overwrite");
     }
 
     #[cfg(unix)]
     #[test]
-    fn mode_beside_ignores_world_readable_files() {
+    fn armed_depth_ignores_world_readable_files() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("dir");
         let bootstrap = dir.path().join("bootstrap.json");
         let path = write_beside(&bootstrap, &document(CaptureDepth::Focused, &[], &[])).expect("w");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        assert_eq!(mode_beside(&bootstrap), None);
+        assert_eq!(
+            armed_depth_beside(&bootstrap),
+            CaptureDepth::Standard,
+            "a non-private file never arms focused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_keeps_depth_and_roots_and_drops_prefixes_that_are_never_application_code() {
+        let options = CaptureOptions {
+            depth: CaptureDepth::Focused,
+            app_packages: vec![
+                "com.example.app".into(),
+                "java.util".into(),
+                "com.example.app".into(),
+            ],
+            source_roots: vec!["src/main/java".into()],
+        };
+        let resolved = options.resolve(None);
+        assert_eq!(resolved.depth, CaptureDepth::Focused);
+        assert_eq!(resolved.application_packages, vec!["com.example.app".to_owned()]);
+        assert_eq!(resolved.source_roots, vec!["src/main/java".to_owned()]);
+        let document = resolved.document();
+        assert_eq!(document["application_scope"]["application_packages"][0], "com.example.app");
+        assert_eq!(document["application_scope"]["source_roots"][0], "src/main/java");
+        let empty = CaptureOptions {
+            depth: CaptureDepth::Standard,
+            app_packages: Vec::new(),
+            source_roots: Vec::new(),
+        }
+        .resolve(None);
+        assert!(empty.application_packages.is_empty(), "no jar and no flag is honestly empty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_reader_arms_exactly_what_this_writer_wrote() {
+        // Golden agreement between the CLI writer and the daemon's hardened reader: the
+        // document `record` and `run` write is the document the daemon arms from.
+        for (depth, mode) in [
+            (CaptureDepth::Focused, xtrace_domain::CaptureMode::Focused),
+            (CaptureDepth::Standard, xtrace_domain::CaptureMode::Standard),
+        ] {
+            let bytes = serde_json::to_vec(&document(depth, &["com.example".into()], &[]))
+                .expect("serialize");
+            assert_eq!(xtrace_daemon::capture_config::parse_armed_mode(&bytes), mode);
+        }
+        assert_eq!(CAPTURE_FILE_NAME, "capture.json");
     }
 }

@@ -33,9 +33,10 @@ pub struct RecordArgs {
     /// Accepted for compatibility; output is always JSON.
     #[arg(long)]
     pub json: bool,
-    /// Capture depth: `standard` or `focused`.
-    #[arg(long = "capture-depth", value_name = "DEPTH", default_value = "standard")]
-    pub capture_depth: String,
+    /// Capture depth, application scope and launcher: the same inputs, with the same validation,
+    /// as `xtrace run` (CONTRACTS 11.2).
+    #[command(flatten)]
+    pub capture: crate::capture_args::CaptureArgs,
 }
 
 /// Arguments for `xtrace stop`.
@@ -61,9 +62,10 @@ pub struct RestartArgs {
     /// Accepted for compatibility; output is always JSON.
     #[arg(long)]
     pub json: bool,
-    /// Capture depth: `standard` or `focused`.
-    #[arg(long = "capture-depth", value_name = "DEPTH", default_value = "standard")]
-    pub capture_depth: String,
+    /// Capture depth, application scope and launcher: the same inputs, with the same validation,
+    /// as `xtrace run` (CONTRACTS 11.2).
+    #[command(flatten)]
+    pub capture: crate::capture_args::CaptureArgs,
 }
 
 /// Runs `xtrace record`.
@@ -75,7 +77,8 @@ pub async fn run_record(args: RecordArgs) -> Result<i32, CliError> {
     }
     #[cfg(unix)]
     {
-        unix::record(args.project_dir, &args.capture_depth)
+        let capture = args.capture.validate()?;
+        unix::record(args.project_dir, &capture)
     }
 }
 
@@ -101,7 +104,8 @@ pub async fn run_restart(args: RestartArgs) -> Result<i32, CliError> {
     }
     #[cfg(unix)]
     {
-        unix::restart(args.project_dir, &args.capture_depth)
+        let capture = args.capture.validate()?;
+        unix::restart(args.project_dir, &capture)
     }
 }
 
@@ -200,7 +204,16 @@ mod unix {
         bootstrap_armed: bool,
         arming: &'static str,
         capture_depth: String,
+        /// True when the daemon, reading the private `capture.json` beside the bootstrap exactly
+        /// as it does for every adapter session, arms the recorded depth. A `focused` record whose
+        /// file is missing, unreadable, non-private or names another mode reports `false`: the
+        /// daemon then serves every recording under the standard policy.
         capture_depth_enforced: bool,
+        /// Application scope this invocation wrote to `capture.json`; empty when no
+        /// `--app-package` was given, because `record` launches nothing and so has no jar to
+        /// derive one from. `null` when a daemon was already running: nothing was rewritten.
+        application_packages: Option<Vec<String>>,
+        source_roots: Option<Vec<String>>,
         already_running: bool,
         recovered_recordings: Vec<RecoveredRecording>,
     }
@@ -236,15 +249,6 @@ mod unix {
             retry,
             CorrelationId::new(),
         ))
-    }
-
-    fn validate_depth(depth: &str) -> Result<(), CliError> {
-        match depth {
-            "standard" | "focused" => Ok(()),
-            _ => Err(CliError::InvalidArgument(
-                "capture depth must be `standard` or `focused`".to_string(),
-            )),
-        }
     }
 
     fn io_unavailable(error: &std::io::Error) -> CliError {
@@ -590,9 +594,10 @@ mod unix {
 
     fn record_document(
         record: &DaemonRecord,
-        already_running: bool,
+        written_scope: Option<&crate::capture_args::ResolvedCapture>,
         recovered: Vec<RecoveredRecording>,
     ) -> RecordDocument {
+        let already_running = written_scope.is_none();
         RecordDocument {
             kind: if already_running { "record_already_running" } else { "record_started" },
             project_id: record.project_id.clone(),
@@ -605,21 +610,25 @@ mod unix {
             bootstrap_armed: Path::new(&record.bootstrap_path).exists(),
             arming: "single_launch_bootstrap",
             capture_depth: record.capture_depth.clone(),
-            // Enforced only while a private capture.json beside the bootstrap names the recorded
-            // depth, because that file is what arms the daemon session.
-            capture_depth_enforced: crate::capture_args::mode_beside(Path::new(
+            // The daemon's own reader decides: `capture_depth_enforced` is what it will arm.
+            capture_depth_enforced: crate::capture_args::armed_depth_beside(Path::new(
                 &record.bootstrap_path,
             ))
-            .is_some_and(|mode| mode.as_str() == record.capture_depth),
+            .as_str()
+                == record.capture_depth,
+            application_packages: written_scope.map(|scope| scope.application_packages.clone()),
+            source_roots: written_scope.map(|scope| scope.source_roots.clone()),
             already_running,
             recovered_recordings: recovered,
         }
     }
 
-    pub(super) fn record(project_dir: PathBuf, depth: &str) -> Result<i32, CliError> {
-        validate_depth(depth)?;
+    pub(super) fn record(
+        project_dir: PathBuf,
+        capture: &crate::capture_args::CaptureOptions,
+    ) -> Result<i32, CliError> {
         let _guard = lifecycle_lock(&project_dir)?;
-        let document = start(project_dir, depth)?;
+        let document = start(project_dir, capture)?;
         write_stdout(&document)?;
         Ok(0)
     }
@@ -630,8 +639,11 @@ mod unix {
         write_success(&mut handle, document).map_err(|error| io_unavailable(&error))
     }
 
-    fn start(project_dir: PathBuf, depth: &str) -> Result<RecordDocument, CliError> {
-        validate_depth(depth)?;
+    fn start(
+        project_dir: PathBuf,
+        capture: &crate::capture_args::CaptureOptions,
+    ) -> Result<RecordDocument, CliError> {
+        let depth = capture.depth.as_str();
         let preflight = preflight_project(&project_dir, &crate::paths::read_env_path)?;
         let state = daemon_state_root(&preflight.private_root)?;
         let project_root = preflight.private_root;
@@ -640,7 +652,7 @@ mod unix {
         if let Some(existing) = read_record(&state)? {
             match verify_identity(&existing) {
                 Identity::Verified if project_lock_is_held(&project_root)? => {
-                    return Ok(record_document(&existing, true, Vec::new()));
+                    return Ok(record_document(&existing, None, Vec::new()));
                 }
                 Identity::Unavailable => return Err(identity_unavailable()),
                 Identity::Verified | Identity::NotRunning | Identity::Mismatch(_) => {
@@ -716,22 +728,20 @@ mod unix {
             abort_child(&mut child);
             return Err(error);
         }
-        // Arm the session: the daemon reads this file when the first adapter connects.
-        let armed = crate::capture_args::document(
-            crate::capture_args::CaptureDepth::parse(depth)?,
-            &[],
-            &[],
-        );
-        if let Err(error) =
-            crate::capture_args::write_beside(Path::new(&record.bootstrap_path), &armed)
-        {
+        // Arm the session and persist the resolved scope: the daemon reads this file when the
+        // first adapter connects, and the Java agent reads the scope from it.
+        let resolved = capture.resolve(None);
+        if let Err(error) = crate::capture_args::write_beside(
+            Path::new(&record.bootstrap_path),
+            &resolved.document(),
+        ) {
             remove_record(&state);
             abort_child(&mut child);
             return Err(error);
         }
         // `child` is intentionally not waited on: the daemon outlives this command.
         drop(child);
-        Ok(record_document(&record, false, recovered))
+        Ok(record_document(&record, Some(&resolved), recovered))
     }
 
     #[derive(Deserialize)]
@@ -961,11 +971,13 @@ mod unix {
         })
     }
 
-    pub(super) fn restart(project_dir: PathBuf, depth: &str) -> Result<i32, CliError> {
-        validate_depth(depth)?;
+    pub(super) fn restart(
+        project_dir: PathBuf,
+        capture: &crate::capture_args::CaptureOptions,
+    ) -> Result<i32, CliError> {
         let _guard = lifecycle_lock(&project_dir)?;
         let stopped = stop_inner(&project_dir, None, false)?;
-        let started = start(project_dir, depth)?;
+        let started = start(project_dir, capture)?;
         let document = RestartDocument {
             kind: "restarted",
             previously_running: stopped.was_running,
@@ -1081,6 +1093,29 @@ mod unix {
         }
 
         #[test]
+        fn capture_depth_enforced_is_true_only_when_the_daemon_will_arm_the_depth() {
+            use std::os::unix::fs::PermissionsExt;
+            const FOCUSED: &str = r#"{"capture_schema_version":1,"capture":{"mode":"focused"}}"#;
+            let dir = tempfile::tempdir().expect("dir");
+            let mut record = record_for(1, "", "");
+            record.bootstrap_path = dir.path().join("bootstrap.json").display().to_string();
+            record.capture_depth = "focused".to_string();
+            // No capture.json beside the bootstrap: the daemon arms standard.
+            assert!(!record_document(&record, None, Vec::new()).capture_depth_enforced);
+            // A group/world-readable capture.json is ignored by the daemon.
+            let file = dir.path().join("capture.json");
+            std::fs::write(&file, FOCUSED).expect("write");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+            assert!(!record_document(&record, None, Vec::new()).capture_depth_enforced);
+            // A private (0600) focused document is armed.
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+            assert!(record_document(&record, None, Vec::new()).capture_depth_enforced);
+            // A standard record is enforced only while the document does not arm focused.
+            record.capture_depth = "standard".to_string();
+            assert!(!record_document(&record, None, Vec::new()).capture_depth_enforced);
+        }
+
+        #[test]
         fn exit_code_is_ten_only_when_a_recording_failed_to_seal() {
             let item = |completion: &'static str| RecoveredRecording {
                 recording_id: String::new(),
@@ -1090,13 +1125,6 @@ mod unix {
             assert_eq!(exit_for(&[]), 0);
             assert_eq!(exit_for(&[item("partial")]), 0);
             assert_eq!(exit_for(&[item("partial"), item("failed")]), 10);
-        }
-
-        #[test]
-        fn depth_validation_accepts_only_the_two_documented_values() {
-            assert!(validate_depth("standard").is_ok());
-            assert!(validate_depth("focused").is_ok());
-            assert!(validate_depth("deep").is_err());
         }
     }
 }

@@ -2563,6 +2563,7 @@ mod tests {
                     method: "POST".to_owned(),
                     route_template: "/orders".to_owned(),
                 },
+                limitations: Vec::new(),
             })
             .expect("persist linked observed recording");
         Connection::open(&database)

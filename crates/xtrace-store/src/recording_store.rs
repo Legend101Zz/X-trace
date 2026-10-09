@@ -40,6 +40,9 @@ use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
 use crate::connection::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
+
+#[path = "recording_limitations.rs"]
+mod recording_limitations;
 use crate::xtf::{
     LogicalXtfSegment, XtfCodecError, XtfSegmentInput, compress_logical_bytes,
     encode_logical_segment, max_compressed_segment_bytes, verify_compressed_segment,
@@ -58,6 +61,9 @@ pub struct BeginRecordingRequest {
     pub opened_at: WallTime,
     /// Run-scoped opt-in and adapter fields for safe endpoint classification.
     pub endpoint_observation: EndpointObservationInput,
+    /// Closed-vocabulary limitation codes persisted with a newly inserted anchor (ADR 0011).
+    /// An exact replay never changes the limitations the recording was opened with.
+    pub limitations: Vec<String>,
 }
 
 /// Successful outcome of [`SqliteRecordingStore::begin_recording`].
@@ -1275,7 +1281,13 @@ impl SqliteRecordingStore<'_> {
                 }
             }),
             capacity,
-            limitations: Vec::new(),
+            limitations: recording_limitations::load(
+                &connection,
+                request.recording_id.as_uuid().as_bytes(),
+            )
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
             frame_honesty: load_frame_honesty(&connection, request.recording_id, correlation_id)?,
         })
     }
@@ -1371,6 +1383,14 @@ impl SqliteRecordingStore<'_> {
             "INSERT INTO recording_endpoint_observations (recording_id, project_id, disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec(), request.project_id.as_uuid().as_bytes().to_vec(), if operation_id.is_some() { "linked" } else { "unmatched" }, disposition.policy_id, operation_id.map(|id| id.as_uuid().as_bytes().to_vec()), disposition.application_component, disposition.binding_key, disposition.method, disposition.route_template, disposition.reason_code],
         ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+        recording_limitations::insert(
+            &transaction,
+            request.recording_id.as_uuid().as_bytes(),
+            &request.limitations,
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         transaction.commit().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })?;
@@ -5759,6 +5779,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn exact_replay_never_changes_the_stored_limitations() {
+        let fixture = on_disk_store("limitations-replay");
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let mut request =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        request.limitations = vec!["capture_policy_not_armed".to_owned()];
+        let stored = |fixture: &Fixture| -> Vec<String> {
+            let connection = fixture.store.lock().expect("connection");
+            let mut statement = connection
+                .prepare("SELECT code FROM recording_limitations ORDER BY code")
+                .expect("prepare");
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows")
+        };
+
+        assert_eq!(
+            view.begin_recording(&request).expect("insert").disposition,
+            BeginRecordingDisposition::Inserted
+        );
+        assert_eq!(stored(&fixture), vec!["capture_policy_not_armed".to_owned()]);
+
+        // The replay arrives with a different (here: empty) list; the anchor keeps its own.
+        let mut replay = request.clone();
+        replay.limitations = Vec::new();
+        assert_eq!(
+            view.begin_recording(&replay).expect("replay").disposition,
+            BeginRecordingDisposition::ExactReplay
+        );
+        assert_eq!(stored(&fixture), vec!["capture_policy_not_armed".to_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn observed_begin_links_exact_fixture_and_replays_only_safe_disposition() {
         let fixture = on_disk_store("observed-start");
         let view = fixture.store.recording_store(&fixture.root).expect("view");
@@ -7529,6 +7587,7 @@ mod tests {
             runtime_session_id,
             opened_at,
             endpoint_observation: EndpointObservationInput::default(),
+            limitations: Vec::new(),
         }
     }
 

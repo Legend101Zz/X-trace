@@ -703,7 +703,8 @@ async fn handle_connection(
                                 warn!(
                                     limitation = *code,
                                     "adapter claimed a capture policy this session is not armed for; \
-                                     the recording is served under the standard policy",
+                                     the recording is served under the standard policy and the \
+                                     limitation is persisted with it",
                                 );
                             }
                             let finished_recording_id = match &admission.incoming {
@@ -722,6 +723,11 @@ async fn handle_connection(
                                         ctx.runtime_session_id,
                                         ctx.shutdown.clone(),
                                         post_hello_session.armed_mode(),
+                                        admission
+                                            .limitations
+                                            .iter()
+                                            .map(|code| (*code).to_owned())
+                                            .collect(),
                                     )
                                     .await
                                 {
