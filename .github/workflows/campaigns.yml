@@ -278,6 +278,8 @@ jobs:
         run: |
           mkdir -p "$CAMP_OUT/baseline-raw"
           cp -R "$CAMP_ROOT/$CAMP_KIND/$CAMP_PROJECT"/baseline-* "$CAMP_OUT/baseline-raw/" 2>/dev/null || true
+          # per-run throwaway database and admin credentials are never part of an artifact
+          find "$CAMP_OUT/baseline-raw" -name 'credentials*' -type f -delete 2>/dev/null || true
           cp "$CAMP_ROOT/$CAMP_KIND/$CAMP_PROJECT/baseline-1/receipt.json" "$CAMP_OUT/baseline-receipt.json" 2>/dev/null || true
           if [ -n "${INSTR_DIR:-}" ] && [ -d "${INSTR_DIR:-}" ]; then
             cp "$INSTR_DIR/receipt.json" "$CAMP_OUT/instrumented-receipt.json" 2>/dev/null || true
