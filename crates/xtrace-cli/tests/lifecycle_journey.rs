@@ -38,7 +38,7 @@ struct Fixture {
     project_id: String,
     // PIDs from CLI documents, kept for assertions only; cleanup goes through the product's
     // identity-checked `xtrace stop`, never a raw signal.
-    daemons: std::cell::RefCell<Vec<u32>>,
+    daemons: std::sync::Mutex<Vec<u32>>,
 }
 
 impl Drop for Fixture {
@@ -87,7 +87,7 @@ fn fixture() -> Fixture {
     assert!(init.status.success(), "init: {}", String::from_utf8_lossy(&init.stderr));
     let doc: Value = serde_json::from_slice(&init.stdout).expect("init JSON");
     let project_id = doc["project_id"].as_str().expect("project_id").to_string();
-    Fixture { root, repo, data_home, project_id, daemons: std::cell::RefCell::new(Vec::new()) }
+    Fixture { root, repo, data_home, project_id, daemons: std::sync::Mutex::new(Vec::new()) }
 }
 
 impl Fixture {
@@ -123,7 +123,7 @@ impl Fixture {
 
     fn track(&self, pid: u64) -> u32 {
         let pid = u32::try_from(pid).expect("pid fits u32");
-        self.daemons.borrow_mut().push(pid);
+        self.daemons.lock().expect("tracked pids").push(pid);
         pid
     }
 
@@ -299,6 +299,28 @@ fn record_stop_restart_persists_and_reopens_a_recorded_session() {
 
     fx.ok_json(&["stop"]);
     wait_gone(new_pid);
+}
+
+#[test]
+fn concurrent_records_are_serialized_and_leave_one_healthy_daemon() {
+    let fx = fixture();
+    let (a, b) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| fx.xtrace(&["record"]));
+        let second = scope.spawn(|| fx.xtrace(&["record"]));
+        (first.join().expect("first"), second.join().expect("second"))
+    });
+    for out in [&a, &b] {
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let docs: Vec<Value> =
+        [&a, &b].iter().map(|o| serde_json::from_slice(&o.stdout).expect("json")).collect();
+    let kinds: Vec<&str> = docs.iter().map(|d| d["kind"].as_str().expect("kind")).collect();
+    assert!(kinds.contains(&"record_started"), "{kinds:?}");
+    assert!(kinds.contains(&"record_already_running"), "{kinds:?}");
+    assert_eq!(docs[0]["pid"], docs[1]["pid"], "both name the one daemon");
+    fx.track(docs[0]["pid"].as_u64().expect("pid"));
+    let stopped = fx.ok_json(&["stop"]);
+    assert_eq!(stopped["kind"], "stopped");
 }
 
 #[test]

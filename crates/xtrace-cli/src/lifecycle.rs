@@ -361,6 +361,63 @@ mod unix {
     }
 
     // ------------------------------------------------------------------
+    // Mutual exclusion between lifecycle commands.
+    // ------------------------------------------------------------------
+
+    const LIFECYCLE_LOCK: &str = "lifecycle.lock";
+    const LIFECYCLE_WAIT: Duration = Duration::from_secs(60);
+
+    /// Serializes `record`, `stop` and `restart` for one project (separate from the project
+    /// lock the daemon holds), so two concurrent invocations cannot unlink each other's
+    /// readiness file. Waits a bounded time; released when dropped.
+    struct LifecycleLock {
+        _file: std::fs::File,
+    }
+
+    fn lifecycle_lock(project_dir: &Path) -> Result<LifecycleLock, CliError> {
+        // Two first-ever invocations race to create `.daemon` and the lock file; a lost
+        // creation race surfaces as an admission error, so retry the setup briefly.
+        let mut attempts = 0_u32;
+        let file = loop {
+            attempts += 1;
+            let opened = (|| {
+                let preflight = preflight_project(project_dir, &crate::paths::read_env_path)?;
+                let state = daemon_state_root(&preflight.private_root)?;
+                state
+                    .open_or_create_private_file(LIFECYCLE_LOCK)
+                    .map_err(|_| CliError::PrivateStorageUnavailable)
+            })();
+            match opened {
+                Ok(file) => break file,
+                Err(CliError::PrivateStorageUnavailable) if attempts < 10 => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let deadline = Instant::now() + LIFECYCLE_WAIT;
+        loop {
+            match fs4::FileExt::try_lock(&file) {
+                Ok(()) => return Ok(LifecycleLock { _file: file }),
+                Err(fs4::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(lifecycle_error(
+                            "XTR-LIFECYCLE-BUSY",
+                            ErrorCategory::Resource,
+                            "another record, stop or restart is still running for this project",
+                            RetryAdvice::AfterDelay { millis: 1_000 },
+                        ));
+                    }
+                    std::thread::sleep(POLL);
+                }
+                Err(fs4::TryLockError::Error(_)) => {
+                    return Err(CliError::PrivateStorageUnavailable);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // State file.
     // ------------------------------------------------------------------
 
@@ -453,24 +510,22 @@ mod unix {
                 _ => break,
             }
         }
+        // Best effort per recording: one recording that cannot be sealed (for example a segment
+        // that fails verification) is reported as `failed` and does not block the others.
         let mut recovered = Vec::new();
         for (recording_id, last, events) in open {
-            let completion = persistence
+            let completion = match persistence
                 .finish_recording(&FinishRecording::without_digest(recording_id, last))
-                .map_err(|error| {
-                    CliError::StoreUnavailable(format!(
-                        "recording store operation failed ({:?})",
-                        error.kind()
-                    ))
-                })?;
+            {
+                Ok(xtrace_application::recording::RecordingCompletion::Complete) => "complete",
+                Ok(xtrace_application::recording::RecordingCompletion::Partial) => "partial",
+                Ok(xtrace_application::recording::RecordingCompletion::Invalid) => "invalid",
+                Err(_) => "failed",
+            };
             recovered.push(RecoveredRecording {
                 recording_id: recording_id.to_string(),
                 persisted_events: events,
-                completion: match completion {
-                    xtrace_application::recording::RecordingCompletion::Complete => "complete",
-                    xtrace_application::recording::RecordingCompletion::Partial => "partial",
-                    xtrace_application::recording::RecordingCompletion::Invalid => "invalid",
-                },
+                completion,
             });
         }
         Ok(recovered)
@@ -504,6 +559,8 @@ mod unix {
     }
 
     pub(super) fn record(project_dir: PathBuf, depth: &str) -> Result<i32, CliError> {
+        validate_depth(depth)?;
+        let _guard = lifecycle_lock(&project_dir)?;
         let document = start(project_dir, depth)?;
         write_stdout(&document)?;
         Ok(0)
@@ -674,9 +731,14 @@ mod unix {
     // ------------------------------------------------------------------
 
     pub(super) fn stop(project_dir: PathBuf, session: Option<String>) -> Result<i32, CliError> {
+        let _guard = lifecycle_lock(&project_dir)?;
         let document = stop_inner(&project_dir, session.as_deref(), true)?;
         write_stdout(&document)?;
-        Ok(0)
+        if !document.was_running && !document.recovered_recordings.is_empty() {
+            // Nothing was running, but store rows changed: the document says which, exit 3.
+            return Ok(3);
+        }
+        Ok(exit_for(&document.recovered_recordings))
     }
 
     fn stop_inner(
@@ -703,7 +765,7 @@ mod unix {
             drop(state);
             drop(project_root);
             let recovered = recover_interrupted(project_dir)?;
-            if not_running_is_error {
+            if not_running_is_error && recovered.is_empty() {
                 return Err(lifecycle_error(
                     "XTR-LIFECYCLE-NOT-RUNNING",
                     ErrorCategory::NotFound,
@@ -747,7 +809,7 @@ mod unix {
                 drop(state);
                 drop(project_root);
                 let recovered = recover_interrupted(project_dir)?;
-                if not_running_is_error {
+                if not_running_is_error && recovered.is_empty() {
                     return Err(lifecycle_error(
                         "XTR-LIFECYCLE-NOT-RUNNING",
                         ErrorCategory::NotFound,
@@ -807,6 +869,7 @@ mod unix {
 
     pub(super) fn restart(project_dir: PathBuf, depth: &str) -> Result<i32, CliError> {
         validate_depth(depth)?;
+        let _guard = lifecycle_lock(&project_dir)?;
         let stopped = stop_inner(&project_dir, None, false)?;
         let started = start(project_dir, depth)?;
         let document = RestartDocument {
@@ -816,7 +879,12 @@ mod unix {
             started,
         };
         write_stdout(&document)?;
-        Ok(0)
+        Ok(exit_for(&document.stopped.recovered_recordings))
+    }
+
+    /// Exit 10 (partial) when any open recording could not be sealed; the document names which.
+    fn exit_for(recovered: &[RecoveredRecording]) -> i32 {
+        if recovered.iter().any(|item| item.completion == "failed") { 10 } else { 0 }
     }
 
     #[cfg(test)]

@@ -82,6 +82,8 @@ request to the CI lane (additive steps in `package.yml`).
   waits for the lock to be released (it never escalates to SIGKILL), then seals recordings the daemon left open as
   partial. Not running is exit 3 (`XTR-LIFECYCLE-NOT-RUNNING`).
 * `restart` is `stop` (not running is fine) then `record`; no data is deleted, but recordings left open are sealed as partial (store rows change).
+* `record`, `stop` and `restart` are serialized per project by `.daemon/lifecycle.lock` (bounded 60 s wait, then `XTR-LIFECYCLE-BUSY`). Recordings are sealed best-effort one by one: a recording that cannot be sealed is listed with completion `failed` and `stop`/`restart` exit 10 (partial); `stop` with nothing running but rows sealed prints the document and exits 3.
+* A start that fails after the daemon was spawned (bad readiness line, state write failure, timeout) terminates the child it spawned, so no unmanaged daemon is left holding the project lock.
 * Identity checks need a procps or BSD `ps` supporting `-o lstart=` and `-o command=` (BusyBox `ps` does not); they run with `LC_ALL=C`. If `ps` is unusable, `record`/`stop` fail with `XTR-LIFECYCLE-IDENTITY-UNAVAILABLE` and change nothing.
 * Limits: events a daemon had staged in memory but not yet written as a segment are lost on SIGTERM/SIGKILL (a
   daemon-side flush on shutdown is requested separately); `--capture-depth` is validated and recorded but not yet
