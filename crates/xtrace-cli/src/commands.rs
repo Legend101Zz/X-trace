@@ -75,6 +75,30 @@ pub enum XtraceCommand {
         #[command(subcommand)]
         command: EndpointCommand,
     },
+    /// Scan the repository for endpoints (not implemented yet).
+    Scan(crate::scan::ScanArgs),
+    /// Read and compare the endpoint catalog (not implemented yet).
+    Catalog {
+        #[command(subcommand)]
+        command: crate::catalog_cmd::CatalogCommand,
+    },
+    /// Start a capture session (not implemented yet).
+    Record(crate::lifecycle::RecordArgs),
+    /// Stop a capture session (not implemented yet).
+    Stop(crate::lifecycle::StopArgs),
+    /// Restart a capture session (not implemented yet).
+    Restart(crate::lifecycle::RestartArgs),
+    /// Diagnose the local installation (not implemented yet).
+    Doctor(crate::doctor::DoctorArgs),
+    /// Export captured endpoints (not implemented yet).
+    Export(crate::export::ExportArgs),
+    /// Plan and run exercises (not implemented yet).
+    Exercise {
+        #[command(subcommand)]
+        command: crate::exercise::ExerciseCommand,
+    },
+    /// Open the terminal viewer (not implemented yet).
+    Tui(crate::tui::TuiArgs),
     /// Run the Unix-only foreground, project-scoped XTP recording ingress daemon.
     ///
     /// This command durably writes sealed event segments and retains the
@@ -241,6 +265,15 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
         XtraceCommand::Endpoint { command } => {
             endpoint(command, &crate::paths::read_env_path).map(|()| 0)
         }
+        XtraceCommand::Scan(args) => crate::scan::run(args).await,
+        XtraceCommand::Catalog { command } => crate::catalog_cmd::run(command).await,
+        XtraceCommand::Record(args) => crate::lifecycle::run_record(args).await,
+        XtraceCommand::Stop(args) => crate::lifecycle::run_stop(args).await,
+        XtraceCommand::Restart(args) => crate::lifecycle::run_restart(args).await,
+        XtraceCommand::Doctor(args) => crate::doctor::run(args).await,
+        XtraceCommand::Export(args) => crate::export::run(args).await,
+        XtraceCommand::Exercise { command } => crate::exercise::run(command).await,
+        XtraceCommand::Tui(args) => crate::tui::run(args).await,
         XtraceCommand::Daemon { project_dir } => crate::daemon::run(project_dir).await.map(|()| 0),
         #[cfg(unix)]
         XtraceCommand::Attach { project_dir, pid, java_pack, json } => {

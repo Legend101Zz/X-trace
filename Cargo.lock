@@ -1546,7 +1546,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-application"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64",
  "blake3",
@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64",
  "blake3",
@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-daemon"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1630,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-domain"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "hex",
@@ -1644,8 +1644,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "xtrace-exercise"
+version = "0.0.1"
+
+[[package]]
+name = "xtrace-export"
+version = "0.0.1"
+
+[[package]]
 name = "xtrace-ingest"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "prost",
@@ -1657,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-private-storage"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "rustix",
  "tempfile",
@@ -1667,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-protocol"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "constant_time_eq 0.3.1",
  "hmac",
@@ -1683,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-runtime"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64",
  "blake3",
@@ -1700,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-store"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "hex",
@@ -1720,6 +1728,10 @@ dependencies = [
  "xtrace-protocol",
  "zstd",
 ]
+
+[[package]]
+name = "xtrace-tui"
+version = "0.0.1"
 
 [[package]]
 name = "yasna"

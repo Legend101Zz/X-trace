@@ -38,11 +38,16 @@
 )]
 
 pub mod catalog;
+pub mod catalog_admission;
 pub mod catalog_discovery;
+pub mod catalog_history;
+pub mod catalog_reconcile;
 pub mod endpoint_identity;
+pub mod endpoint_normalization;
 pub mod error;
 pub mod hash;
 pub mod ids;
+pub mod observation_classifier;
 pub mod project;
 pub mod provenance;
 pub mod recording;

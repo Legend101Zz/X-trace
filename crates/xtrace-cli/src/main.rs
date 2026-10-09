@@ -41,11 +41,16 @@
 
 #[cfg(unix)]
 mod attach;
+mod catalog_cmd;
 mod commands;
 mod daemon;
 #[cfg(unix)]
 mod daemon_lock;
+mod doctor;
 mod error;
+mod exercise;
+mod export;
+mod lifecycle;
 mod output;
 mod paths;
 #[cfg(unix)]
@@ -98,6 +103,8 @@ mod pointer_io {
     }
 }
 mod run;
+mod scan;
+mod tui;
 mod viewer;
 
 use clap::{Parser, error::ErrorKind};
