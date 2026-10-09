@@ -170,6 +170,10 @@ def http_request(base: str, method: str, path: str, *, headers: dict[str, str] |
 
 
 # ------------------------------------------------------------ scenarios ------
+# Optional (method, path, headers, body) -> (path, headers, body) applied just before sending. Default: none.
+REQUEST_HOOK: Callable[[str, str, dict, Any], tuple] | None = None
+
+
 @dataclass
 class Ctx:
     """Per-scenario recorder handed to scenario functions."""
@@ -198,7 +202,10 @@ class Ctx:
             raw = body.encode()
         else:
             raw = body  # type: ignore[assignment]
-        res = http_request(self.base, method, path, headers=hdrs, body=raw)
+        send_path, send_hdrs, send_raw = (path, hdrs, raw)
+        if REQUEST_HOOK is not None:  # instrumented runs inject privacy canaries here; labels/hashes keep the original request
+            send_path, send_hdrs, send_raw = REQUEST_HOOK(method, path, hdrs, raw)
+        res = http_request(self.base, method, send_path, headers=send_hdrs, body=send_raw)
         text = res["body"].decode("utf-8", "replace")
         ntext = normalize_text(text, (norm or []) + self.norm_extra)
         redacted_headers = {k: v for k, v in hdrs.items() if k.lower() not in ("authorization", "cookie")}
