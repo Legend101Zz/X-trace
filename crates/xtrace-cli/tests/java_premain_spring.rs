@@ -133,8 +133,8 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
         repo_root.join("adapters/java/agent-bootstrap/build/agent-dist/xtrace-java-agent.jar");
     let fixture =
         repo_root.join("adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar");
-    assert!(agent.is_file(), "Gradle agentDist must run before this test");
-    assert!(fixture.is_file(), "Gradle fixtureBootJar must run before this test");
+    assert!(agent.is_file(), "Gradle agentDist must run before this test: {}", agent.display());
+    assert!(fixture.is_file(), "Gradle fixtureBootJar must run before this test: {}", fixture.display());
     assert_agent_distribution_is_private(&agent, &fixture);
 
     let mut java_version_command = Command::new("java");
@@ -163,7 +163,7 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let count = http(port, "GET", "/__fixture/count", &[], None);
     assert_eq!(serde_json::from_slice::<Value>(&count.body).unwrap()["count"], 1);
 
-    let recordings = wait_for_recordings(&project_root, 1);
+    let recordings = wait_for_order_recordings(&project_root, 1);
     let (recording_id, object) = &recordings[0];
     let logical = zstd::stream::decode_all(object.as_slice()).expect("decompress stored XTF");
     let events = decode_events(&logical);
@@ -179,7 +179,7 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_eq!(error_response.body, br#"{"status":"failed"}"#);
     let count = http(port, "GET", "/__fixture/count", &[], None);
     assert_eq!(serde_json::from_slice::<Value>(&count.body).unwrap()["count"], 1);
-    let recordings = wait_for_recordings(&project_root, 2);
+    let recordings = wait_for_order_recordings(&project_root, 2);
     let error_logical =
         zstd::stream::decode_all(recordings[1].1.as_slice()).expect("decompress error XTF");
     let error_events = decode_events(&error_logical);
@@ -187,6 +187,9 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_canaries_absent("decoded error XTF", &error_logical);
 
     let database = project_root.join("metadata.sqlite3");
+    // The generic request root also records the journey's own count polls; let the store settle
+    // so only the query commands under test can change it.
+    wait_for_store_quiescence(&project_root);
     let before_query = database_state(&database);
     let pointer = repo.join(".xtrace/config.toml");
     let pointer_before = file_metadata_state(&pointer);
@@ -194,10 +197,26 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert!(listed.status.success(), "recording list failed: {}", text(&listed.stderr));
     let listed_again = run_cli(&["recording", "list", "--project-dir"], &repo, &data_home);
     assert!(listed_again.status.success(), "repeat list failed: {}", text(&listed_again.stderr));
-    assert_eq!(listed.stdout, listed_again.stdout, "list JSON changes across processes");
+    assert_eq!(
+        text(&listed.stdout),
+        text(&listed_again.stdout),
+        "list JSON changes across processes"
+    );
     let list_json: Value = serde_json::from_slice(&listed.stdout).expect("recording list JSON");
-    let rows = list_json["recordings"].as_array().expect("recordings array");
-    assert_eq!(rows.len(), 2, "two completed fixture requests are listed");
+    let order_ids: Vec<String> = recordings
+        .iter()
+        .map(|(recording_hex, _)| recording_hex.replace('-', "").to_ascii_lowercase())
+        .collect();
+    let rows: Vec<&Value> = list_json["recordings"]
+        .as_array()
+        .expect("recordings array")
+        .iter()
+        .filter(|row| {
+            let id = row["recording_id"].as_str().expect("recording ID");
+            order_ids.contains(&id.replace('-', "").to_ascii_lowercase())
+        })
+        .collect();
+    assert_eq!(rows.len(), 2, "two completed POST /orders requests are listed");
     let ids = rows
         .iter()
         .map(|row| row["recording_id"].as_str().expect("recording ID").to_owned())
@@ -315,7 +334,7 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let (mismatch_stdout, mismatch_stderr) = mismatched.stop();
     assert_scanned_clean("class mismatch fixture stdout", &mismatch_stdout);
     assert_scanned_clean("class mismatch fixture stderr", &mismatch_stderr);
-    let mismatch_recordings = wait_for_recordings(&project_root, 3);
+    let mismatch_recordings = wait_for_order_recordings(&project_root, 3);
     let loaded_mismatch_logical = zstd::stream::decode_all(mismatch_recordings[2].1.as_slice())
         .expect("decompress loaded-class mismatch XTF");
     let loaded_mismatch_events = decode_events(&loaded_mismatch_logical);
@@ -343,7 +362,7 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let (mutated_class_stdout, mutated_class_stderr) = mutated_class.stop();
     assert_scanned_clean("mutated class fixture stdout", &mutated_class_stdout);
     assert_scanned_clean("mutated class fixture stderr", &mutated_class_stderr);
-    let class_mutation_recordings = wait_for_recordings(&project_root, 4);
+    let class_mutation_recordings = wait_for_order_recordings(&project_root, 4);
     let class_mutation_recording_id = &class_mutation_recordings[3].0;
     let class_mutation_logical =
         zstd::stream::decode_all(class_mutation_recordings[3].1.as_slice())
@@ -656,7 +675,7 @@ fn post_order(port: u16) -> HttpResponse {
 }
 
 fn post_error(port: u16) -> HttpResponse {
-    let body = br#"{"description":"safe","bodyCanary":"BODY_CANARY_1D3","errorCanary":"ERROR_CANARY_1D3"}"#;
+    let body = br#"{"description":"safe","bodyCanary":"BODY_CANARY_1D3","errorCanary":"token=ERROR_CANARY_1D3"}"#;
     post_fixture_request(port, body)
 }
 
@@ -749,6 +768,52 @@ fn decode_chunked(mut input: &[u8]) -> std::io::Result<Vec<u8>> {
 
 fn free_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
+}
+
+fn wait_for_store_quiescence(project_root: &Path) {
+    let database = project_root.join("metadata.sqlite3");
+    let mut last = (usize::MAX, usize::MAX);
+    let mut stable = 0;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while stable < 6 {
+        let connection = Connection::open(&database).expect("selected-root SQLite");
+        let total: usize = connection
+            .query_row("SELECT COUNT(*) FROM recordings", [], |row| row.get(0))
+            .expect("count recordings");
+        let open: usize = connection
+            .query_row("SELECT COUNT(*) FROM recordings WHERE status != 'complete'", [], |row| {
+                row.get(0)
+            })
+            .expect("count open recordings");
+        stable = if open == 0 && (total, open) == last { stable + 1 } else { 0 };
+        last = (total, open);
+        assert!(Instant::now() < deadline, "store did not quiesce before deadline");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The generic request root also records the fixture's own readiness and count polls, so the
+/// journey selects its recordings by the request they hold, never by persisted ordinal.
+fn wait_for_order_recordings(project_root: &Path, expected_count: usize) -> Vec<(String, Vec<u8>)> {
+    let marker: &[u8] = b"http.request POST /orders";
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let orders: Vec<(String, Vec<u8>)> = wait_for_recordings(project_root, 0)
+            .into_iter()
+            .filter(|(_, object)| {
+                let logical = zstd::stream::decode_all(object.as_slice()).expect("decode XTF");
+                logical.windows(marker.len()).any(|window| window == marker)
+            })
+            .collect();
+        if orders.len() >= expected_count {
+            return orders;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{expected_count} POST /orders recordings were not persisted before deadline"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_for_recordings(project_root: &Path, expected_count: usize) -> Vec<(String, Vec<u8>)> {
