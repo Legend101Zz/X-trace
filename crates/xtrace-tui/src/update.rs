@@ -72,6 +72,8 @@ fn key_pressed(model: &mut Model, key: Key, effects: &mut Vec<Effect>) {
         Key::Help => model.help = !model.help,
         Key::Up | Key::Down => {
             let delta: isize = if key == Key::Up { -1 } else { 1 };
+            // A moved selection makes the last step's message stale.
+            model.notice.clear();
             match model.screen {
                 Screen::Recordings => {
                     model.selected_recording =

@@ -161,3 +161,5 @@ h2 { font-size: 12px; font-weight: 600; }
 @media (prefers-reduced-motion: reduce) { .canvas-scroll { scroll-behavior: auto; } }
 
 .outcome-banner li, .canvas-tree li, .nav-controls .evidence-state { overflow-wrap: anywhere; min-width: 0; }
+
+@media (pointer: coarse) { .canvas-tree li { min-height: 44px; display: flex; align-items: center; gap: 8px; } .nav-buttons .button, .mode-switch .button { min-height: 44px; } }

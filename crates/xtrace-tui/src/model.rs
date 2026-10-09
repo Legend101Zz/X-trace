@@ -33,19 +33,20 @@ pub struct RecordingRow {
     pub event_count: u64,
 }
 
-/// A navigation step resolved by the server.
+/// A navigation step resolved by the server. The explicit discriminants are the slot index in
+/// `FrameRow::navigation`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavAction {
     /// Previous frame.
-    Previous,
+    Previous = 0,
     /// Next frame.
-    Next,
+    Next = 1,
     /// Step into.
-    Into,
+    Into = 2,
     /// Step over.
-    Over,
+    Over = 3,
     /// Step out.
-    Out,
+    Out = 4,
 }
 
 impl NavAction {

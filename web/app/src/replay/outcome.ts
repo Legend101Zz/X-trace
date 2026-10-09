@@ -2,7 +2,8 @@
 
 /** Shape of `RecordingDetail.outcome` (CONTRACTS 5/7.1). Adapter-observed; null when terminal evidence is absent. */
 export interface OutcomeView {
-  kind: 'responded' | 'exception' | 'unobserved';
+  /** Domain vocabulary (CONTRACTS 5); the API enum may be narrower until it is aligned. */
+  kind: 'responded' | 'exception' | 'exception_propagated' | 'client_aborted' | 'unobserved';
   httpStatus: number | null;
   exception: { exceptionType: string; message: string | null } | null;
   thrownFromEventId?: string | null;
@@ -47,7 +48,9 @@ export function outcomeBanner(input: {
     if (outcome.exception) {
       const { exceptionType, message } = outcome.exception;
       lines.push(message == null ? `Exception ${exceptionType}: message not recorded` : `Exception ${exceptionType}: ${message}`);
-    } else if (outcome.kind === 'exception') lines.push('Exception reported without details');
+    } else if (outcome.kind === 'exception' || outcome.kind === 'exception_propagated') lines.push('Exception reported without details');
+    if (outcome.kind === 'exception_propagated') lines.push('The exception propagated out of the handler (as reported by the adapter)');
+    if (outcome.kind === 'client_aborted') lines.push('The client aborted the request before a response was completed (as reported by the adapter)');
   }
   lines.push(input.durationNs != null ? `Adapter-observed duration ${nsToLabel(input.durationNs)} (measured by the adapter, not verified by X-trace)` : 'Duration unavailable for this capture');
   for (const reason of input.incompleteEvidence) lines.push(`Persisted incomplete evidence: ${reason}`);
