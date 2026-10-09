@@ -423,13 +423,11 @@ impl SqliteCatalogDiscoveryStore {
     ) -> Result<(), PortError> {
         let canonical_chunk = chunk.canonical_bytes().map_err(|_| validation_error())?;
         let digest = ContentHash::of_bytes(&canonical_chunk);
-        // Source proof is the application service's decision (`CatalogSourceProofPort`): the
-        // default port refuses every static or class-bound claim, and only the local-scan wiring
-        // supplies a proof that re-reads the pinned bytes. This port persists what the service
-        // admitted and does not second-guess it, so a verified local scan can be recorded.
-        // Cheap independent layer behind the application proof port: a static snapshot claim must
-        // cite exactly the snapshot the owner selection pinned, and a local static scan has no
-        // loaded classes, so a class-bound claim in that namespace is never stored.
+        // The application port (`CatalogSourceProofPort`) is the authority on source proof: the
+        // default refuses every static or class-bound claim and only the local-scan wiring re-reads
+        // the pinned bytes. The store keeps a cheap independent invariant behind it: a static
+        // snapshot claim must cite exactly the snapshot the selection pinned, and a class-bound
+        // claim is never stored in the local-scan namespace (it has no loaded classes).
         if chunk.claims.iter().any(|claim| {
             claim.source_evidence().iter().any(|evidence| match evidence {
                 ClaimSourceEvidence::StaticSnapshot { source_revision_id, .. } => {
@@ -1854,12 +1852,61 @@ mod tests {
             chunk_index: 0,
             claims: vec![static_claim(selection.project_id(), "orders", revision, digest)],
         };
-        assert!(
-            adapter.submit_chunk_with_view(&selection, &chunk(SourceRevisionId::new())).is_err()
-        );
+        let error = adapter
+            .submit_chunk_with_view(&selection, &chunk(SourceRevisionId::new()))
+            .expect_err("wrong snapshot is refused");
+        assert_eq!(error.kind, PortErrorKind::Conflict);
         assert_eq!(row_count(&shared, "catalog_discovery_claims"), 0);
         adapter.submit_chunk_with_view(&selection, &chunk(pinned)).expect("pinned snapshot");
         assert_eq!(row_count(&shared, "catalog_discovery_claims"), 1);
+    }
+
+    #[test]
+    fn store_refuses_a_class_bound_claim_in_the_local_scan_namespace() {
+        let shared = SqliteStore::open_in_memory(OpenOptions::default()).expect("store");
+        let scope = static_scope("orders");
+        let selection = test_selection(scope.clone(), CatalogRunNamespace::LocalStaticScanner);
+        insert_project(&shared, selection.project_id());
+        shared.lock().expect("connection").execute(
+            "INSERT INTO catalog_owner_selections (owner_selection_id, project_id, selection_epoch, current_for_scope, verified_pack_digest, scope_digest, scope_json, revoked) VALUES (?1, ?2, 1, 1, ?3, ?4, ?5, 0)",
+            params![selection.owner_selection_id().to_vec(), selection.project_id().as_uuid().as_bytes().to_vec(), selection.verified_pack_digest().as_bytes().to_vec(), scope.digest().expect("digest").as_bytes().to_vec(), serde_json::to_string(&scope).expect("scope JSON")],
+        ).expect("seed selection");
+        let adapter = SqliteCatalogDiscoveryStore::new(shared.clone());
+        let run = run_id(
+            adapter.start_run_with_view(&selection, &start_request(&scope, "cls")).expect("start"),
+        );
+        let identity = EndpointIdentity {
+            project_id: selection.project_id(),
+            application_component: "orders".to_owned(),
+            transport: Transport::Http,
+            binding_key: "default".to_owned(),
+            method: HttpMethod::Get,
+            route_template: "/orders".to_owned(),
+        };
+        let claim = xtrace_domain::catalog_discovery::ValidatedEndpointClaim::new(
+            "cl-1".to_owned(),
+            identity,
+            ClaimProvenance::StaticInferred,
+            None,
+            0.9,
+            Vec::new(),
+            vec![ClaimSourceEvidence::LoadedClassBound {
+                loaded_class_digest: ContentHash::of_bytes(b"class"),
+                relative_path: "routes.js".to_owned(),
+                recorded_source_digest: ContentHash::of_bytes(b"routes"),
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 2,
+            }],
+        )
+        .expect("valid class-bound claim");
+        let chunk = DiscoveryChunk { run_id: run, chunk_index: 0, claims: vec![claim] };
+        let error = adapter
+            .submit_chunk_with_view(&selection, &chunk)
+            .expect_err("class-bound claim is refused in the local-scan namespace");
+        assert_eq!(error.kind, PortErrorKind::Conflict);
+        assert_eq!(row_count(&shared, "catalog_discovery_claims"), 0);
     }
 
     struct FixedReader(Option<ContentHash>);

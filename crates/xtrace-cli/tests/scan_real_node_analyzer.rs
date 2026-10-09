@@ -4,13 +4,12 @@
 //! The analyzer is the one built by the npm workspace (`npm run build --prefix adapters/node`,
 //! which CI runs before the Rust tests). A thin shell wrapper only supplies the `node` launcher
 //! because `xtrace scan --analyzer` executes a path directly; every byte of the transcript comes
-//! from the live analyzer reading the fixture sources. On CI a missing build is a hard failure.
+//! from the live analyzer reading the fixture sources.  A missing build is a hard failure, never a skip.
 #![cfg(unix)]
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
-    clippy::print_stderr,
     reason = "integration tests assert on fixed fixtures and checked subprocess output"
 )]
 
@@ -38,6 +37,23 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
+struct StopOnDrop {
+    repo: PathBuf,
+    data_home: PathBuf,
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let _ = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+            .args(["stop", "--project-dir"])
+            .arg(&self.repo)
+            .env("XTRACE_DATA_HOME", &self.data_home)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 fn json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|e| panic!("stdout is JSON ({e}): {output:?}"))
@@ -46,17 +62,11 @@ fn json(output: &Output) -> Value {
 #[test]
 fn real_node_analyzer_scan_persists_the_express_basic_catalog() {
     let main_js = repo_root().join("adapters/node/packages/analyzer/dist/main.js");
-    if !main_js.is_file() {
-        let required = std::env::var_os("GITHUB_ACTIONS").is_some()
-            || std::env::var_os("XTRACE_REQUIRE_REAL_ANALYZER").is_some();
-        assert!(
-            !required,
-            "the Node analyzer is not built ({}); run `npm ci --prefix adapters/node && npm run build --prefix adapters/node`",
-            main_js.display()
-        );
-        eprintln!("NOT RUN (not a pass): the Node analyzer is not built at {}", main_js.display());
-        return;
-    }
+    assert!(
+        main_js.is_file(),
+        "build the Node analyzer first: npm run build --prefix adapters/node ({})",
+        main_js.display()
+    );
 
     let base = std::env::temp_dir().canonicalize().expect("canonical temp base");
     let root = tempfile::Builder::new()
@@ -66,6 +76,7 @@ fn real_node_analyzer_scan_persists_the_express_basic_catalog() {
         .expect("temporary root");
     let repo = root.path().join("repo");
     let data_home = root.path().join("data");
+    let _stop = StopOnDrop { repo: repo.clone(), data_home: data_home.clone() };
     fs::create_dir_all(&repo).expect("repo");
     let xtrace = |args: &[&str]| -> Output {
         Command::new(env!("CARGO_BIN_EXE_xtrace"))
@@ -141,12 +152,4 @@ fn real_node_analyzer_scan_persists_the_express_basic_catalog() {
     assert_eq!(show["handlers"], serde_json::json!(["show"]));
     let lonely = find("GET", "/lonely");
     assert!(lonely["limitationCodes"].as_array().unwrap().contains(&"mount_unresolved".into()));
-
-    let _ = Command::new(env!("CARGO_BIN_EXE_xtrace"))
-        .args(["stop", "--project-dir"])
-        .arg(&repo)
-        .env("XTRACE_DATA_HOME", &data_home)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
