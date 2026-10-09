@@ -109,7 +109,7 @@ function closeRecording(
   context.outcome = completed ? "responded" : context.threw ? "exception-propagated" : "client-aborted";
   if (context.threw && !completed) context.status = 0;
   recordEvent(context, transport, events.response(kind, context.frameEventId));
-  const route = resolveRoute(request);
+  const route = context.route === "" ? resolveRoute(request) : "";
   if (route) {
     context.route = route;
     context.limitations.delete("route_unavailable");

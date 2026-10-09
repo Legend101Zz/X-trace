@@ -69,6 +69,18 @@ export function resolveRoute(request: unknown): string {
   return "";
 }
 
+/**
+ * A framework matched a route while the request ran: remember it, tell the worker (which releases
+ * the held start with the template) and drop `route_unavailable` for this recording only.
+ * First announcement wins; later matches of the same request never change what the start carried.
+ */
+export function announceRoute(context: RecordingContext, transport: HttpCaptureTransport, route: string): void {
+  if (context.route !== "" || context.finished || route === "") return;
+  context.route = route;
+  context.limitations.delete("route_unavailable");
+  try { transport.route?.(context.id, route); } catch { /* best effort */ }
+}
+
 const contexts = new AsyncLocalStorage<RecordingContext>();
 const suppression = new AsyncLocalStorage<true>();
 

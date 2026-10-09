@@ -28,7 +28,9 @@ import type { CaptureEventKind, ExceptionFacts, GapFacts, InteractionFacts, Sour
 import type { RecordingSummary } from "./runtime/transport.cjs";
 
 export interface InputMessage {
-  type: "start" | "event" | "finish" | "close";
+  type: "start" | "event" | "finish" | "close" | "route";
+  /** `route` message: the matched route template, known before the response finished. */
+  route?: string;
   recordingId?: string;
   method?: string;
   startedAtNs?: bigint;
@@ -75,6 +77,8 @@ interface RecordingState {
   held: InputMessage[];
   /** Start went out before the response finished, so it carries no route template. */
   routeLost: boolean;
+  /** Route template announced while the request ran (framework match time); wins over the finish summary. */
+  route?: string;
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -90,7 +94,7 @@ const CAPABILITY_CONFIG: Record<string, Record<string, string>> = {
     abort_attribution: "connection-closed-before-finish",
   },
   async_correlation: { mechanism: "AsyncLocalStorage", scope: "request-callback-and-descendant-async-resources" },
-  "http.server.route_template": { source: "express-layer-route-path", scope: "literal-path-on-app-or-unmounted-router", mounted_routers: "unresolved", path_form: "as-authored" },
+  "http.server.route_template": { source: "express-layer-match", express: "4.x-and-5.x", scope: "literal-route-path-composed-with-literal-mount-paths", mounted_routers: "composed-when-literal-else-unresolved", resolved_at: "route-match", path_form: "as-authored" },
 };
 
 const START_KINDS: Record<CaptureEventKind, RecordingEventKind> = {
@@ -255,7 +259,7 @@ export function createRecordingAssembler(
       recordingId: state.bytes,
       recordingSeq: 1n,
       method: state.method,
-      matchedRouteTemplate: summary?.route ?? "",
+      matchedRouteTemplate: state.route ?? summary?.route ?? "",
       urlShape: "",
       startMonotonicNs: state.startedAtNs,
       threadOrTaskId: String(process.pid),
@@ -319,6 +323,15 @@ export function createRecordingAssembler(
       }
       const state = recordings.get(recordingId);
       if (!state) return false;
+      if (message.type === "route") {
+        // The route is known at match time: release the held start now so a long request is visible
+        // with its template. Only the first announcement counts, and only before the start went out.
+        if (typeof message.route === "string" && message.route !== "" && !state.started && state.route === undefined) {
+          state.route = message.route.slice(0, 1024);
+          await release(recordingId, state, { route: state.route });
+        }
+        return true;
+      }
       if (message.type === "event") {
         if (state.started) await sendEvent(recordingId, state, message);
         else if (state.held.length < MAX_HELD_EVENTS) state.held.push(message);
