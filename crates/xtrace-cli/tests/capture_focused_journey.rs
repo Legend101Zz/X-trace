@@ -68,9 +68,14 @@ fn focused_run_arms_the_session_and_states_line_event_status() {
         "a focused launch must be served under the focused cap; stderr: {}",
         captured.stderr
     );
-    // NOT ASSERTED: that `capture_policy_not_armed` is absent. The read API does not carry
-    // recording limitations yet (BeginRecording has no limitations field; see
-    // requests/RC2-FC2-to-FC1-limitations.md), so such an assertion would pass vacuously.
+    // The launch armed the session, so the recording carries no downgrade limitation. The read
+    // API always states its limitations as an array (ADR 0011); a missing key would be a silent
+    // pass of this assertion.
+    let limitations = first["limitations"].as_array().expect("recordings state their limitations");
+    assert!(
+        !limitations.iter().any(|code| code == "capture_policy_not_armed"),
+        "an armed focused launch must not be reported as downgraded: {limitations:?}"
+    );
     let in_scope_frames: Vec<&Value> = captured
         .events
         .iter()
@@ -91,6 +96,9 @@ fn focused_run_arms_the_session_and_states_line_event_status() {
             "a line event must carry an observed line number: {line}"
         );
     }
+    // A focused run must never pass with zero line events and no visible reason: either line
+    // events reached the read API, or the recording persists a declared explanation and is not
+    // reported as complete.
     if lines.is_empty() {
         // Line events have not reached the read API for this build of the Java agent: its line
         // probes skip methods they cannot wrap. The absence must be declared, never silent:
