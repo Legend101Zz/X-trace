@@ -27,7 +27,7 @@ pub struct TuiArgs {
     #[arg(long)]
     pub plain: bool,
     /// With `--plain`, open this recording instead of showing the list.
-    #[arg(long, value_name = "RECORDING_ID", requires = "plain")]
+    #[arg(long, value_name = "RECORDING_ID")]
     pub recording: Option<String>,
     /// Emit the plain screen as one JSON document `{"rows": [...]}`; implies `--plain`.
     #[arg(long)]
@@ -76,7 +76,7 @@ fn completion_label(completion: RecordingCompletionEvidence) -> &'static str {
 fn unavailable_text(reason: NavigationUnavailable) -> &'static str {
     match reason {
         NavigationUnavailable::PartialFrontier => {
-            "the recording is partial; later events may exist that were not verified."
+            "the recording is partial; events beyond the verified window may exist."
         }
         NavigationUnavailable::LegacyUnindexed => {
             "this recording predates the frame index, so no relationship is recorded."
@@ -148,7 +148,16 @@ impl ReplayClient for Facade {
                         "that frame is not in the recording's persisted events".to_owned(),
                     ));
                 }
-                let frames = detail
+                let completion = if detail.next_cursor.is_some() {
+                    format!(
+                        "{}; more events exist beyond the {} shown",
+                        completion_label(detail.completion),
+                        detail.events.len()
+                    )
+                } else {
+                    completion_label(detail.completion).to_owned()
+                };
+                let frames: Vec<FrameRow> = detail
                     .events
                     .into_iter()
                     .map(|e| FrameRow {
@@ -163,7 +172,7 @@ impl ReplayClient for Facade {
                 return Ok(Window {
                     recording_id: recording_id.to_owned(),
                     frames,
-                    completion: completion_label(detail.completion).to_owned(),
+                    completion,
                     anchor_frame_id: around.map(str::to_owned),
                 });
             }
@@ -180,14 +189,25 @@ impl ReplayClient for Facade {
     }
 }
 
+/// An unknown recording is a bad argument; any other failure is a read failure of the store.
+fn read_error(message: String) -> CliError {
+    if message == "that recording is not in this project" {
+        CliError::InvalidArgument(message)
+    } else {
+        CliError::StoreUnavailable(message)
+    }
+}
+
 /// Runs `xtrace tui`.
 pub async fn run(args: TuiArgs) -> Result<i32, CliError> {
     let (project_id, reader, _) = open_recording_reader(&args.project_dir, &read_env_path)?;
     let facade = Facade { project_id, service: RecordingQueryService::new(reader) };
+    if args.recording.is_some() && !(args.plain || args.json) {
+        return Err(CliError::InvalidArgument("--recording needs --plain or --json".to_owned()));
+    }
     if args.plain || args.json {
         let size = terminal_size().unwrap_or(DEFAULT_SIZE);
-        let text = render_plain(&facade, size, args.recording.as_deref())
-            .map_err(CliError::InvalidArgument)?;
+        let text = render_plain(&facade, size, args.recording.as_deref()).map_err(read_error)?;
         if args.json {
             let rows: Vec<&str> = text.lines().collect();
             let mut stdout = std::io::stdout().lock();
@@ -199,6 +219,6 @@ pub async fn run(args: TuiArgs) -> Result<i32, CliError> {
         }
         return Ok(0);
     }
-    run_interactive(&facade).map_err(|error| CliError::InvalidArgument(error.to_string()))?;
+    run_interactive(&facade).map_err(|error| CliError::StoreUnavailable(error.to_string()))?;
     Ok(0)
 }

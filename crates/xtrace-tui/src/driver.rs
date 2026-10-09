@@ -40,9 +40,9 @@ pub fn decode_keys(pending: &mut Vec<u8>, incoming: &[u8]) -> Vec<Key> {
                     index += 2 + end + 1;
                 }
                 Some(_) => {
-                    // Escape followed by another key: treat the escape as "back".
-                    keys.push(Key::Back);
-                    index += 1;
+                    // Escape followed by another byte is an Alt-chord (or `ESC ESC [ A`): drop
+                    // the pair. Only a lone escape, after the quiet interval, means "back".
+                    index += 2;
                 }
             }
             continue;
@@ -150,8 +150,10 @@ fn draw<W: Write>(out: &mut W, model: &Model) -> io::Result<()> {
         if index > 0 {
             out.write_all(b"\r\n")?;
         }
+        // Clear the line first: a row already fills the width, and erasing after writing the
+        // last column can wipe the truncation marker on terminals with pending-wrap.
+        out.write_all(b"\x1b[2K")?;
         out.write_all(row.as_bytes())?;
-        out.write_all(b"\x1b[K")?;
     }
     out.write_all(b"\x1b[J")?;
     out.flush()
@@ -220,12 +222,19 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> Option<Self> {
         let saved = stty(&["-g"])?;
-        stty(&["-icanon", "-echo", "-isig", "-ixon", "min", "1", "time", "0"])?;
+        if stty(&["-icanon", "-echo", "-isig", "-ixon", "min", "1", "time", "0"]).is_none() {
+            let _ = stty(&[saved.trim()]);
+            return None;
+        }
+        let saved = saved.trim().to_owned();
         let mut out = io::stdout();
-        // Alternate screen, hidden cursor.
-        out.write_all(b"\x1b[?1049h\x1b[?25l").ok()?;
-        out.flush().ok()?;
-        Some(Self { saved: saved.trim().to_owned() })
+        // Alternate screen, hidden cursor. If this fails the terminal is already raw: undo it.
+        let entered = out.write_all(b"\x1b[?1049h\x1b[?25l").and_then(|()| out.flush());
+        if entered.is_err() {
+            let _ = stty(&[saved.as_str()]);
+            return None;
+        }
+        Some(Self { saved })
     }
 }
 

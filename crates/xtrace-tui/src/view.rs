@@ -67,10 +67,23 @@ fn sanitize(text: &str) -> String {
 
 /// Invisible format characters that can reorder or hide recorded text on screen: zero-width and
 /// directional marks (U+200B-200F), line/paragraph separators and embeddings/overrides
-/// (U+2028-202E), directional isolates (U+2066-2069) and the byte-order mark (U+FEFF).
+/// (U+2028-202E), directional isolates and invisible operators (U+2060-206F), the soft hyphen, Arabic letter mark,
+/// Mongolian vowel separator, interlinear annotation marks (U+FFF9-FFFB), the tag block
+/// (U+E0000-E007F) and the byte-order mark (U+FEFF).
 /// Wide (CJK or emoji) glyphs are NOT measured: width is counted in chars, as the module doc says.
 fn is_format_char(c: char) -> bool {
-    matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}'
+    )
 }
 
 /// The server labels a gap event `recording_event_kind:gap`; accept that and a bare `gap`.

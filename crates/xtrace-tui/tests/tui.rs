@@ -359,7 +359,7 @@ fn gap_rows_use_the_real_wire_label() {
 
 #[test]
 fn untrusted_recorded_text_never_reaches_the_terminal_as_control_sequences() {
-    let hostile = "a\u{1b}[31mred\u{1b}]52;c;AAAA\u{7}\nnext\r\u{9b}x\u{7f}\u{202e}\u{2066}\u{200b}\u{2028}\u{2029}\u{feff}";
+    let hostile = "a\u{1b}[31mred\u{1b}]52;c;AAAA\u{7}\nnext\r\u{9b}x\u{7f}\u{202e}\u{2066}\u{200b}\u{2028}\u{2029}\u{feff}\u{00ad}\u{061c}\u{2060}\u{206a}\u{fff9}\u{e0041}\u{180e}";
     for plain in [true, false] {
         let mut model = open_replay(80, 24, plain);
         {
@@ -379,7 +379,7 @@ fn untrusted_recorded_text_never_reaches_the_terminal_as_control_sequences() {
             "hostile frame row was not rendered"
         );
         for row in ready.rows() {
-            assert!(!row.chars().any(|c| c.is_control() || matches!(c, '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')), "unsafe char in row {row:?}");
+            assert!(!row.chars().any(|c| c.is_control() || matches!(c, '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}')), "unsafe char in row {row:?}");
         }
         assert_eq!(ready.output(plain).lines().count(), usize::from(model.height));
         let (model, _) = update(model, Message::WindowLoaded(Err(hostile.into())));
@@ -434,6 +434,10 @@ fn key_decoder_maps_arrows_and_keeps_partial_escapes_for_the_next_read() {
     // sequences and unknown bytes are dropped, not guessed.
     assert_eq!(decode_keys(&mut pending, b"\x1b"), vec![]);
     assert_eq!(pending, vec![0x1b]);
+    pending.clear();
+    // Alt-chords and Alt+Up (`ESC ESC [ A`) are dropped, never read as Back.
+    assert_eq!(decode_keys(&mut pending, b"\x1bx\x1b\x1b"), vec![]);
+    assert!(pending.is_empty() || pending == vec![0x1b]);
     pending.clear();
     assert_eq!(decode_keys(&mut pending, b"\x1b[3~zx"), vec![]);
     assert_eq!(
