@@ -30,7 +30,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}/mr/tmp
         run: |
           cp /dev/null /dev/null
-          rustc -O -o fsb ci_fsb.rs && ./fsb
+          python3 ci_fsb.py
       - name: five
         env:
           TMPDIR: ${{ runner.temp }}/mr/tmp
