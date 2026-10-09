@@ -442,8 +442,12 @@ jobs:
 
   macos-arm64:
     # ADR 0006 section 2.3: hosted macOS arm64 evidence for cfg(unix), private storage, attach and packaging changes.
-    # Every step runs, none is skipped or allowed to fail; the Rust, Java, Node and web steps print only allowlisted
-    # facts (tools.qa.lane_run keeps raw output in a private log).
+    # Every suite step has its own `if: !cancelled()`, so one failure never hides the others; none may fail and no
+    # ignored or skipped test is accepted (--max-ignored 0). Rust, Java, Node and web steps print only allowlisted
+    # facts (tools.qa.lane_run keeps raw output in a private log). prepare-private-root exports the scratch
+    # environment (TMPDIR, TMP, TEMP, XTRACE_TEST_PRIVATE_SCRATCH, XTRACE_TEST_SCRATCH_ROOT) for every later step.
+    # NOT COVERED at this sha: the ADR 0006 2.3 other-UID broker negative does not exist in the tree, so section
+    # 2.3 is not fully met by this job.
     needs: release-tool-tests
     runs-on: macos-15
     timeout-minutes: 180
@@ -501,6 +505,7 @@ jobs:
           set -euo pipefail
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor prepare-private-root --root "$XTRACE_CI_PRIVATE_ROOT"
       - name: Run the complete release tooling suite without skips
+        if: ${{ !cancelled() }}
         run: |
           set +e
           umask 077
@@ -510,53 +515,61 @@ jobs:
           result=$?
           set -e
           exit "$result"
-      - name: Install exact Node workspace dependencies
+      - name: Node install (exact, npm ci)
+        if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step install --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm ci --prefix adapters/node
-      - name: Node protocol generation check and unit tests
+      - name: Node protocol generation check
         if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step generate-check --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm run generate:check --prefix adapters/node
-          python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step test --min-passed 20 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+      - name: Node unit tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step test --min-passed 80 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm test --prefix adapters/node
-      - name: Web viewer install, tests and embedded checks
+      - name: Web install
         if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step install --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             bash -ec 'npm ci --prefix web/app && cd web/app && npx playwright install chromium'
+      - name: Web typecheck
+        if: ${{ !cancelled() }}
+        run: |
           python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step typecheck --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm run typecheck --prefix web/app
-          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step unit-tests --min-passed 20 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+      - name: Web unit tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step unit-tests --min-passed 70 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm test --prefix web/app
+      - name: Web check:api
+        if: ${{ !cancelled() }}
+        run: |
           python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step check-api --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm run check:api --prefix web/app
+      - name: Web check:embedded
+        if: ${{ !cancelled() }}
+        run: |
           python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step check-embedded --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm run check:embedded --prefix web/app
       - name: Java strict Gradle build and tests
         if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite java --variant "${{ matrix.java-version }}" --step gradle --cwd adapters/java \
-            --junit-glob "*/build/test-results/test/*.xml" --min-passed 150 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            --junit-glob "*/build/test-results/test/*.xml" --min-passed 170 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
-      - name: Admit private test scratch before cargo tests
-        # Product storage refuses a data directory under a world-writable ancestor; same shape as the Linux jobs.
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/mt"
-          mkdir -m 700 "$root" "$root/tmp" "$root/priv"
-          echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
-          echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: cargo build (locked workspace)
         if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step build --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             cargo build --locked --workspace --all-features
-      - name: cargo test (locked workspace, no skips)
+      - name: cargo test (locked workspace, no ignored tests)
         if: ${{ !cancelled() }}
         run: |
-          python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step test --min-passed 1 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+          python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step test --min-passed 900 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             cargo test --locked --workspace --all-features --no-fail-fast
       - name: Packaged install journey (unattended)
         if: ${{ !cancelled() }}

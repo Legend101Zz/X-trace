@@ -152,6 +152,29 @@ DIAG_PATH_OK = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]{0,200}$")
 DIAG_BAD = re.compile(r"(/home/|/Users/|/Volumes/|/tmp/|/runner|\\|token|secret|password|bearer|authorization|cookie|api[_-]?key)", re.I)
 DIAG_SKIP = re.compile(r"^(warning|error): (\d+ warnings? emitted|aborting due to|could not compile|build failed|unused)", re.I)
 MAX_DIAG = 20
+# Test panics: only the repo-relative source location survives (never the message, which may carry data or paths).
+PANIC_LOC = re.compile(r"panicked at (\S{1,300}?):(\d+):(\d+):?\s*$")
+
+
+def panic_sites(text: str) -> tuple[list[str], int]:
+    out: list[str] = []
+    dropped = 0
+    for raw in text.splitlines():
+        m = PANIC_LOC.search(raw.rstrip())
+        if not m:
+            continue
+        path = m.group(1)
+        site = f"{path}:{m.group(2)}"
+        if (DIAG_BAD.search(path) or ".." in path or not DIAG_PATH_OK.match(path) or path.startswith("/")
+                or site in out):
+            if site not in out:
+                dropped += 1
+            continue
+        if len(out) < MAX_DIAG:
+            out.append(site)
+        else:
+            dropped += 1
+    return out, dropped
 
 
 def diagnostics(text: str) -> tuple[list[str], int]:
@@ -218,6 +241,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     if status == "pass" and args.min_passed and (facts["passed"] or 0) < args.min_passed:
         status = "fail"  # a test step that ran fewer tests than expected is not a pass
         print(f"lane {suite}/{variant}/{step}: fewer than {args.min_passed} tests counted")
+    max_ignored = getattr(args, "max_ignored", -1)
+    if status == "pass" and max_ignored >= 0 and (facts["ignored"] or 0) > max_ignored:
+        status = "fail"  # a skipped or ignored test is not a pass on a no-skips row
+        print(f"lane {suite}/{variant}/{step}: {facts['ignored']} ignored or skipped tests (maximum {max_ignored})")
     frag = {"suite": suite, "variant": variant, "step": step, "status": status,
             "exitCode": proc.returncode, **{k: v for k, v in facts.items() if k != "counted"}}
     (out / f"{suite}__{variant}__{step}.json").write_text(json.dumps(frag, sort_keys=True, indent=1) + "\n")
@@ -231,6 +258,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"lane diagnostic {d}")
         if ddropped:
             print(f"lane diagnostic-overflow dropped={ddropped}")
+        sites, sdropped = panic_sites(text)
+        for site in sites:
+            print(f"lane panic-site {site}")
+        if sdropped:
+            print(f"lane panic-site-overflow dropped={sdropped}")
     if facts["failingTruncated"] or facts["droppedInvalidNames"]:
         print(f"lane failing-test-overflow truncated={facts['failingTruncated']} "
               f"dropped-invalid={facts['droppedInvalidNames']}")
@@ -323,6 +355,7 @@ def main() -> int:
     r.add_argument("--out", required=True)
     r.add_argument("--cwd", default="")
     r.add_argument("--min-passed", type=int, default=0, help="fail a zero-exit step that counted fewer tests")
+    r.add_argument("--max-ignored", type=int, default=-1, help="fail a zero-exit step that ignored or skipped more tests")
     r.add_argument("--junit-glob", default="", help="glob (relative to --cwd) of JUnit XML reports to count")
     r.add_argument("--timeout", type=int, default=3000)
     r.add_argument("command", nargs=argparse.REMAINDER)

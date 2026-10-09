@@ -104,10 +104,10 @@ class MergeTests(unittest.TestCase):
 
 
 class RunTests(unittest.TestCase):
-    def run_step(self, cmd, min_passed=0, timeout=60):
+    def run_step(self, cmd, min_passed=0, timeout=60, max_ignored=-1):
         with tempfile.TemporaryDirectory() as d:
             args = type("A", (), {"suite": "meta", "variant": "-", "step": "t", "out": d + "/o", "cwd": "",
-                                  "timeout": timeout, "min_passed": min_passed, "command": ["--"] + cmd})()
+                                  "timeout": timeout, "min_passed": min_passed, "max_ignored": max_ignored, "command": ["--"] + cmd})()
             import os
             os.environ["LANE_PRIVATE_LOG_DIR"] = d
             rc = lane_run.cmd_run(args)
@@ -118,6 +118,25 @@ class RunTests(unittest.TestCase):
         rc, frag = self.run_step([sys.executable, "-c", "print('Ran 0 tests in 0.0s')"], 1)
         self.assertNotEqual(rc, 0)
         self.assertEqual(frag["status"], "fail")
+
+    def test_ignored_tests_fail_a_no_skips_step(self):
+        out = "test result: ok. 5 passed; 0 failed; 2 ignored; 0 measured"
+        rc, frag = self.run_step([sys.executable, "-c", f"print({out!r})"], 1, max_ignored=0)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(frag["status"], "fail")
+        rc, frag = self.run_step([sys.executable, "-c", f"print({out!r})"], 1, max_ignored=2)
+        self.assertEqual((rc, frag["status"]), (0, "pass"))
+
+    def test_panic_sites_keep_only_repo_relative_locations(self):
+        text = "\n".join([
+            "thread 'a' panicked at crates/x/src/lib.rs:12:5:",
+            "thread 'b' panicked at /Users/me/secret/lib.rs:3:1:",
+            "thread 'c' panicked at ../escape.rs:3:1:",
+            "thread 'd' panicked at crates/x/src/lib.rs:12:9:",
+            "boom token=abc"])
+        sites, dropped = lane_run.panic_sites(text)
+        self.assertEqual(sites, ["crates/x/src/lib.rs:12"])
+        self.assertEqual(dropped, 2)
 
     def test_timeout_is_a_failed_step_not_a_traceback(self):
         rc, frag = self.run_step([sys.executable, "-c", "import time; time.sleep(30)"], timeout=1)
