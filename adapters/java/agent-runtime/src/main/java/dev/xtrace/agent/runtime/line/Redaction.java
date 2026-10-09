@@ -16,8 +16,12 @@ public final class Redaction {
   public static final String RULE_TYPE = "type.sensitive";
   public static final String RULE_CONTENT = "content.secret_pattern";
 
-  /** Only this prefix of a string is scanned for content patterns (bounds regex cost). */
-  public static final int CONTENT_SCAN_CHARS = 8192;
+  /**
+   * Only this prefix of a string is scanned for content patterns (bounds regex cost on the
+   * application thread). It is the largest preview (512) plus 1 KiB, so a secret that starts inside
+   * the preview and runs past it is still seen.
+   */
+  public static final int CONTENT_SCAN_CHARS = 1536;
 
   private static final Pattern NAME =
       Pattern.compile(
@@ -45,7 +49,7 @@ public final class Redaction {
     // Cloud access keys
     Pattern.compile("(AKIA|ASIA)[0-9A-Z]{16}"),
     // Credentials embedded in URLs
-    Pattern.compile("(?i)\\b[a-z][a-z0-9+.-]*://[^\\s/@:]+:[^\\s/@]+@"),
+    Pattern.compile("(?i)\\b[a-z][a-z0-9+.-]{0,31}://[^\\s/@:]+:[^\\s/@]+@"),
     // key=value or key: value where the key names a secret
     Pattern.compile(
         "(?i)\\b(password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|"

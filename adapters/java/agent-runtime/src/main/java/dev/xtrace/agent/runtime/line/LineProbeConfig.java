@@ -22,7 +22,11 @@ public record LineProbeConfig(
     }
   }
 
-  /** Line probes only (the standard-mode shape; the standard line budget itself is 0 at ingest). */
+  /**
+   * Line probes only, no local reads. NOT a standard-mode shape: the standard line budget is 0
+   * (CONTRACTS section 4), so wire probes only in effective focused mode. Useful as the retry shape
+   * after a class's focused instrumentation failed verification.
+   */
   public static LineProbeConfig lineOnly(String probeOwner) {
     return new LineProbeConfig(probeOwner, false, 1024, 0, 0, DEFAULT_MAX_CODE_BYTES);
   }

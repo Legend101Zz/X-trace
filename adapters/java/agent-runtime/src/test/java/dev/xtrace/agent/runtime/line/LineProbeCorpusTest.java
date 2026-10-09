@@ -163,13 +163,12 @@ class LineProbeCorpusTest {
     for (var e : lineOnly.results.entrySet()) {
       for (MethodReport m : e.getValue().methods()) {
         if (m.reason().equals(MethodReport.Reasons.BRIDGE)) bridge = true;
-        if (m.reason().equals(MethodReport.Reasons.SYNTHETIC)) synthetic = true;
+        if (m.reason().equals(MethodReport.Reasons.SYNTHETIC)) synthetic = true; // reported when present
         if (m.name().startsWith("lambda$") && m.status() == MethodReport.Status.INSTRUMENTED) lambda = true;
       }
     }
     assertTrue(bridge, "Pt.compareTo(Object) bridge must be reported");
     assertTrue(lambda, "lambda bodies are instrumented (ADR 0003 2.2)");
-    assertTrue(synthetic || bridge);
   }
 
   @Test

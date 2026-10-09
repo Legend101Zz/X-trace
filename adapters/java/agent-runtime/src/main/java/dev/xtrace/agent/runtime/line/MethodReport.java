@@ -3,7 +3,9 @@ package dev.xtrace.agent.runtime.line;
 /**
  * Honest per-method outcome. {@code status} is INSTRUMENTED or SKIPPED; {@code reason} is a stable
  * machine token (see {@link Reasons}); {@code valuesReason} explains why focused locals were not
- * read although line probes were (empty when values were read or not requested).
+ * read although line probes were (empty when values were read or not requested);
+ * {@code zeroLineEntries} counts LineNumberTable entries with line 0 (non-javac generators) that were
+ * not made sites.
  */
 public record MethodReport(
     String name,
@@ -12,7 +14,19 @@ public record MethodReport(
     String reason,
     int sites,
     int valueCalls,
-    String valuesReason) {
+    String valuesReason,
+    int zeroLineEntries) {
+
+  public MethodReport(
+      String name,
+      String descriptor,
+      Status status,
+      String reason,
+      int sites,
+      int valueCalls,
+      String valuesReason) {
+    this(name, descriptor, status, reason, sites, valueCalls, valuesReason, 0);
+  }
 
   public enum Status {
     INSTRUMENTED,
@@ -34,6 +48,11 @@ public record MethodReport(
     public static final String VALUES_CAPPED = "values_capped_per_site";
     public static final String CLASS_VERSION = "unsupported_class_version";
     public static final String TRANSFORM_ERROR = "transform_error";
+    public static final String LINE_ZERO = "line_number_zero_skipped";
+    /** Class-level: the probe owner does not expose the eight static probe methods. */
+    public static final String PROBE_OWNER = "probe_owner_unavailable";
+    /** Class-level: the class is the probe owner or in an always-deny namespace. */
+    public static final String DENY_SCOPE = "deny_scope";
     public static final String NONE = "";
 
     private Reasons() {}

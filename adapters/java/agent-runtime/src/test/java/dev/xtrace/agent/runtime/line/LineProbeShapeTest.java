@@ -310,7 +310,9 @@ class LineProbeShapeTest {
             }
           });
       try {
+        BoundaryAdvice.entered = 0;
         assertEquals(8, c.getMethod("s_f", int.class).invoke(null, 3)); // b = 4 -> 8
+        assertEquals(1, BoundaryAdvice.entered, "the Advice half must have run");
       } finally {
         LineProbeDispatch.install(null);
       }

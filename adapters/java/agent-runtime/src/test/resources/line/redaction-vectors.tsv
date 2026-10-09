@@ -15,3 +15,8 @@ plain	order 42 shipped to Berlin
 plain	The quick brown fox
 plain	https://example.com/path?x=1
 plain	status: ok
+plain	123e4567-e89b-12d3-a456-426614174000
+plain	abcdefghijklmnopqrstuvwxyz_ABCDEFGHIJKL
+plain	2026-10-09T08:30:00.123Z
+plain	/var/log/app/server.log
+plain	dev.xtrace.agent.runtime.line.ValueSanitizer

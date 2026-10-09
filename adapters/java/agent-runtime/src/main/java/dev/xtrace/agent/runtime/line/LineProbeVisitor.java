@@ -49,6 +49,8 @@ public class LineProbeVisitor extends ClassVisitor {
   /** False once any marker says the class was not produced by javac (LVT precision unknown). */
   private boolean javacLvtTrusted = true;
   private boolean sawJavaSource;
+  /** True for the probe owner and always-deny namespaces: nothing in the class is touched. */
+  private boolean denied;
 
   public LineProbeVisitor(
       ClassVisitor next,
@@ -67,6 +69,11 @@ public class LineProbeVisitor extends ClassVisitor {
   public void visit(
       int version, int access, String name, String signature, String superName, String[] interfaces) {
     this.className = name;
+    denied = name.equals(config.probeOwner()) || isDenyScope(name);
+    if (denied) {
+      reports.add(
+          new MethodReport("<class>", "", Status.SKIPPED, Reasons.DENY_SCOPE, 0, 0, Reasons.NONE));
+    }
     if (interfaces != null) {
       for (String i : interfaces) {
         if (i.equals("groovy/lang/GroovyObject") || i.equals("scala/ScalaObject")) {
@@ -93,6 +100,19 @@ public class LineProbeVisitor extends ClassVisitor {
     return super.visitAnnotation(descriptor, visible);
   }
 
+  /**
+   * Defence in depth behind the scope matcher (ADR 0003 section 2.1): a probe inside the probe
+   * owner, X-trace itself or the JDK would recurse into itself or the runtime.
+   */
+  static boolean isDenyScope(String internalName) {
+    return internalName.startsWith("dev/xtrace/")
+        || internalName.startsWith("java/")
+        || internalName.startsWith("javax/")
+        || internalName.startsWith("jdk/")
+        || internalName.startsWith("sun/")
+        || internalName.startsWith("com/sun/");
+  }
+
   /** Focused value reads rely on javac-precise LocalVariableTable ranges and types. */
   private boolean lvtTrusted() {
     return javacLvtTrusted && sawJavaSource;
@@ -103,6 +123,7 @@ public class LineProbeVisitor extends ClassVisitor {
       int access, String name, String descriptor, String signature, String[] exceptions) {
     MethodVisitor next = super.visitMethod(access, name, descriptor, signature, exceptions);
     if (next == null) return null;
+    if (denied) return next;
     if ((access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) return next;
     if ((access & Opcodes.ACC_BRIDGE) != 0) {
       reports.add(skipped(name, descriptor, Reasons.BRIDGE));
@@ -387,13 +408,45 @@ public class LineProbeVisitor extends ClassVisitor {
 
     // ---- decision + replay ----
 
+    private int zeroLineEntries;
+
+    /** Everything decided before the first byte is emitted. */
+    private record Decision(
+        List<PlannedSite> plan, boolean values, String valuesReason, int[] siteIds, String skip) {}
+
     private void finish() {
+      Decision d;
+      try {
+        d = decide();
+      } catch (RuntimeException e) {
+        // Nothing has been emitted yet: a decision-phase bug must not drop the whole class
+        // transformation (including a composed boundary advice).
+        d = new Decision(List.of(), false, Reasons.NONE, null, Reasons.TRANSFORM_ERROR);
+      }
+      if (d.skip() != null) {
+        replay(List.of(), false, null);
+        reports.add(skipped(name, descriptor, d.skip()));
+        return;
+      }
+      int valueCalls = replay(d.plan(), d.values(), d.siteIds());
+      reports.add(
+          new MethodReport(
+              name,
+              descriptor,
+              Status.INSTRUMENTED,
+              Reasons.NONE,
+              d.plan().size(),
+              valueCalls,
+              d.valuesReason(),
+              zeroLineEntries));
+    }
+
+    private Decision decide() {
       String skip = null;
       if (!hasLine) skip = Reasons.NO_LINE_TABLE;
       else if (hasJsrRet) skip = Reasons.JSR_RET;
 
       List<PlannedSite> plan = skip == null ? plan() : List.of();
-      int valueCalls = 0;
       String valuesReason = Reasons.NONE;
 
       if (skip == null && plan.size() > config.maxSitesPerMethod()) skip = Reasons.SITE_BUDGET;
@@ -432,12 +485,7 @@ public class LineProbeVisitor extends ClassVisitor {
         }
       }
       if (skip == null && !registry.hasRoomFor(plan.size())) skip = Reasons.REGISTRY_FULL;
-
-      if (skip != null) {
-        replay(List.of(), false, null);
-        reports.add(skipped(name, descriptor, skip));
-        return;
-      }
+      if (skip != null) return new Decision(plan, false, valuesReason, null, skip);
 
       if (values) {
         for (PlannedSite site : plan) {
@@ -448,19 +496,17 @@ public class LineProbeVisitor extends ClassVisitor {
         }
       }
       int[] siteIds = new int[plan.size()];
+      java.util.Map<Integer, Integer> ordinals = new java.util.HashMap<>();
       for (int i = 0; i < siteIds.length; i++) {
-        siteIds[i] = registry.addSite(className, classDigest, name, descriptor, plan.get(i).line());
+        int line = plan.get(i).line();
+        int ordinal = ordinals.merge(line, 1, Integer::sum) - 1;
+        siteIds[i] = registry.addSite(className, classDigest, name, descriptor, line, ordinal);
         if (siteIds[i] < 0) {
           // Lost a race for the last registry slots: fall back to the unmodified method.
-          replay(List.of(), false, null);
-          reports.add(skipped(name, descriptor, Reasons.REGISTRY_FULL));
-          return;
+          return new Decision(plan, false, valuesReason, null, Reasons.REGISTRY_FULL);
         }
       }
-      valueCalls = replay(plan, values, siteIds);
-      reports.add(
-          new MethodReport(
-              name, descriptor, Status.INSTRUMENTED, Reasons.NONE, plan.size(), valueCalls, valuesReason));
+      return new Decision(plan, values, valuesReason, siteIds, null);
     }
 
     /** Pending-line walk: one planned site per run of line entries before a real instruction. */
@@ -471,7 +517,11 @@ public class LineProbeVisitor extends ClassVisitor {
         Kind kind = kinds.get(i);
         if (kind == Kind.LINE) {
           pendingLine = lineOf.get(i);
-        } else if (kind == Kind.INSN && pendingLine >= 0) {
+          if (pendingLine <= 0) { // LINE_CURSOR requires line > 0 (CONTRACTS section 3 rule 2)
+            zeroLineEntries++;
+            pendingLine = -1;
+          }
+        } else if (kind == Kind.INSN && pendingLine > 0) {
           plan.add(new PlannedSite(i, pendingLine, config.focusedValues() ? liveAt(i) : List.of()));
           pendingLine = -1;
         }

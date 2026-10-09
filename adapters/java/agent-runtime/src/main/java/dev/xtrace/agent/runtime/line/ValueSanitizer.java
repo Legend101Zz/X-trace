@@ -98,7 +98,8 @@ public final class ValueSanitizer {
       if (Redaction.contentIsSecret(s)) {
         return redacted(name, role, type, origin, shape, Redaction.RULE_CONTENT);
       }
-      return captured(name, role, type, shape, s, origin, limits);
+      // The scan above covers every char the preview can show: do not scan the preview again.
+      return captured(name, role, type, shape, s, origin, limits, true);
     }
     String boxed = boxedText(value);
     if (boxed != null) return captured(name, role, type, shape, boxed, origin, limits);
@@ -160,16 +161,31 @@ public final class ValueSanitizer {
       String text,
       NameOrigin origin,
       Limits limits) {
+    return captured(name, role, type, shape, text, origin, limits, false);
+  }
+
+  private static ValueSnapshot captured(
+      String name,
+      Role role,
+      String type,
+      ValueShape shape,
+      String text,
+      NameOrigin origin,
+      Limits limits,
+      boolean contentAlreadyScanned) {
     int max = limits.maxPreviewBytes();
     boolean tooLong = text.length() > max;
     // Every char is at least one UTF-8 byte, so a char prefix of `max` covers the byte limit.
     // Never end the prefix on a high surrogate whose low half was cut off.
     int cut = max;
     if (tooLong && Character.isHighSurrogate(text.charAt(cut - 1))) cut--;
-    String clean = stripControl(tooLong ? text.substring(0, cut) : text);
+    String seen = tooLong ? text.substring(0, cut) : text;
+    String clean = stripControl(seen, true);
     byte[] bytes = clean.getBytes(StandardCharsets.UTF_8);
-    long lowerBound = bytes.length;
-    if (tooLong) lowerBound += text.length() - cut; // each unseen char is at least one byte
+    // Lower bound of the ORIGINAL size: cleaning turns 1-byte control chars into 3-byte U+FFFD, so
+    // measure the original prefix, plus one byte per unseen char.
+    long lowerBound = seen.getBytes(StandardCharsets.UTF_8).length;
+    if (tooLong) lowerBound += text.length() - cut;
     boolean truncated = tooLong || bytes.length > max;
     String preview = clean;
     if (bytes.length > max) {
@@ -177,7 +193,7 @@ public final class ValueSanitizer {
       bytes = preview.getBytes(StandardCharsets.UTF_8);
     }
     // The content rule runs again on the exact emitted text.
-    if (Redaction.contentIsSecret(preview)) {
+    if (!contentAlreadyScanned && Redaction.contentIsSecret(preview)) {
       return redacted(name, role, type, origin, shape, Redaction.RULE_CONTENT);
     }
     return new ValueSnapshot(
@@ -206,7 +222,8 @@ public final class ValueSanitizer {
   }
 
   private static String boundName(String name, Limits limits) {
-    String n = stripControl(name == null ? "" : name);
+    // Binding names reject every control character (CONTRACTS section 3 rule 1), tab and newline too.
+    String n = stripControl(name == null ? "" : name, false);
     if (n.isEmpty()) n = "_";
     return n.getBytes(StandardCharsets.UTF_8).length > limits.maxNameBytes()
         ? cutUtf8(n, limits.maxNameBytes())
@@ -214,11 +231,11 @@ public final class ValueSanitizer {
   }
 
   /** Replaces control characters and unpaired surrogates (not valid UTF-8) with U+FFFD. */
-  private static String stripControl(String s) {
+  private static String stripControl(String s, boolean keepNewlineTab) {
     StringBuilder b = null;
     for (int i = 0; i < s.length(); i++) {
       char c = s.charAt(i);
-      boolean bad = c == 0 || (Character.isISOControl(c) && c != '\n' && c != '\t');
+      boolean bad = c == 0 || (Character.isISOControl(c) && !(keepNewlineTab && (c == '\n' || c == '\t')));
       boolean pair = false;
       if (Character.isHighSurrogate(c)) {
         pair = i + 1 < s.length() && Character.isLowSurrogate(s.charAt(i + 1));
