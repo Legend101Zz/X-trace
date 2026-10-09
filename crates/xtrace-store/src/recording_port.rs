@@ -2775,7 +2775,11 @@ mod tests {
     /// Upper bound on `/bin/ls` spawns for one steady-state `commit_segment` (ADR 0008
     /// Amendment 1). Measured at 70 with the scope on the leased Mac; a commit spawned about 327 before it.
     const COMMIT_SPAWN_BOUND: u64 = 85;
+    /// Bounds for `begin_recording` (measured 9, 32 unscoped) and `finish_recording` (measured 52, 277 unscoped).
+    const BEGIN_SPAWN_BOUND: u64 = 20;
+    const FINISH_SPAWN_BOUND: u64 = 100;
 
+    // Signal only on macOS: the Linux admission path spawns nothing, so every count is 0 there by design.
     #[test]
     fn a_steady_state_commit_segment_stays_within_the_admission_spawn_bound() {
         use xtrace_private_storage::spawn_counter::ls_spawns_on_this_thread as spawns;
@@ -2821,7 +2825,16 @@ mod tests {
         );
         if cfg!(target_os = "macos") {
             assert!(commits.iter().all(|count| *count > 0), "the macOS probe must be counted");
+            assert!(begin_spawns > 0 && finish_spawns > 0, "the macOS probe must be counted");
         }
+        assert!(
+            begin_spawns <= BEGIN_SPAWN_BOUND,
+            "begin spawned {begin_spawns} probes, bound {BEGIN_SPAWN_BOUND}"
+        );
+        assert!(
+            finish_spawns <= FINISH_SPAWN_BOUND,
+            "finish spawned {finish_spawns} probes, bound {FINISH_SPAWN_BOUND}"
+        );
         // Commit 0 creates the recording's staging directories; the rest are steady state.
         for (ordinal, count) in commits.iter().enumerate().skip(1) {
             assert!(
