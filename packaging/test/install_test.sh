@@ -1,13 +1,25 @@
 #!/bin/sh
 # Install / upgrade / uninstall journey for a built archive, in a throwaway HOME (fresh profile).
 #   packaging/test/install_test.sh dist/<platform>
+# Scratch: $XTRACE_TEST_PRIVATE_SCRATCH (a private 0700 dir) when set, else $TMPDIR; only the self-created, marked work dir is removed.
 # Needs only POSIX sh, tar and sha256sum|shasum. Exits non-zero on the first failed assertion (every check is `cmd && ok || fail`; the final count is
 # asserted so a silently skipped check also fails).
 set -eu
 dist=$(cd "${1:?usage: install_test.sh dist/<platform>}" && pwd)
 archive=$(ls "$dist"/xtrace-*.tar.gz)
-work=$(cd "$(mktemp -d)" && pwd -P)  # physical path: private storage refuses symlinked components (macOS /var)
-trap 'rm -rf "$work"' EXIT
+# Private scratch root: product storage refuses a data dir under a world-writable ancestor (Linux /tmp), so CI points
+# XTRACE_TEST_PRIVATE_SCRATCH at a 0700 directory it created; otherwise fall back to TMPDIR (user-private on macOS).
+scratch_root=${XTRACE_TEST_PRIVATE_SCRATCH:-${TMPDIR:-/tmp}}
+[ -d "$scratch_root" ] || { echo "scratch root $scratch_root is not a directory" >&2; exit 1; }
+work=$(mktemp -d "${scratch_root%/}/xt.XXXXXX") || { echo 'mktemp failed' >&2; exit 1; }
+# physical path: private storage refuses symlinked components (macOS /var)
+work=$(cd "$work" && pwd -P) || { echo 'cannot enter work dir' >&2; exit 1; }
+case $work in ""|/|"$PWD"|"${HOME:-/nonexistent}") echo 'unsafe work dir' >&2; exit 1 ;; esac
+# We only ever delete a directory this script created: it must carry the marker we write right now.
+marker=".xtrace-install-test-owned"
+: > "$work/$marker" || { echo 'cannot write ownership marker' >&2; exit 1; }
+cleanup() { if [ -n "${work:-}" ] && [ -f "$work/$marker" ]; then rm -rf "$work"; fi; }
+trap cleanup EXIT
 export HOME="$work/home"; mkdir -p "$HOME"
 unset XTRACE_DATA_HOME XDG_DATA_HOME XTRACE_PREFIX
 pass=0
