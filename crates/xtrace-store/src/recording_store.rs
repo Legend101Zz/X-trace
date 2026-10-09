@@ -2892,7 +2892,7 @@ fn first_frame_where(
 
 /// Whether the recording's declared segment bytes fit the finish verification bound.
 /// `verify_terminal_evidence` answers Partial WITHOUT hashing when they do not.
-fn declared_bytes_within_verification_bound(
+pub(crate) fn declared_bytes_within_verification_bound(
     connection: &rusqlite::Connection,
     recording_id: RecordingId,
     correlation_id: CorrelationId,

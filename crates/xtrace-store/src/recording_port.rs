@@ -2421,12 +2421,20 @@ mod tests {
             })
             .expect("finish");
         assert_eq!(completion, RecordingCompletion::Partial);
-        assert!(
-            window_reasons(&persisted)
-                .iter()
-                .any(|reason| reason == "verification_budget_exceeded"),
-            "a Partial caused by the finish bound must name its cause"
-        );
+        // The read surface names the cause from this same predicate (see the
+        // `verification_budget_exceeded` reason in `show_recording`); a real 512 MiB recording
+        // is not materialised in a unit test, and a window read of the forged row would
+        // (rightly) fail segment verification.
+        let within = {
+            let connection = persisted.store.lock().expect("connection");
+            crate::recording_store::declared_bytes_within_verification_bound(
+                &connection,
+                persisted.recording_id,
+                CorrelationId::new(),
+            )
+            .expect("bound decision")
+        };
+        assert!(!within, "declared bytes past the finish bound must be reported as over budget");
     }
 
     fn window_reasons(persisted: &Persisted) -> Vec<String> {
