@@ -315,16 +315,20 @@ export default function App() {
 
   const navigateToFrame = (action: string, frameId: string) => {
     const index = detail?.events.findIndex((item) => item.frameId === frameId) ?? -1;
-    if (index < 0) return;
+    if (index < 0) {
+      setAnnouncement(`${action}: the target frame is outside the loaded window. Load more events to reach it; paging backward is not available yet.`);
+      return;
+    }
     setSelectedEvent(index);
-    setAnnouncement(`Navigated ${action} to event ${detail?.events[index]?.sequence ?? ''}`);
+    setAnnouncement(`Selected event ${detail?.events[index]?.sequence ?? ''}`);
   };
 
   const selectFrame = (frameId: string) => navigateToFrame('select', frameId);
   const navigateKey = (action: NavAction) => {
     const result = (event?.navigation as Partial<Record<NavAction, { state: string; frameId?: string }>> | undefined)?.[action];
     if (result?.state === 'target' && result.frameId) navigateToFrame(action, result.frameId);
-    else setAnnouncement(`${action}: ${result?.state === 'boundary' ? 'boundary, no further frame' : 'unavailable for this frame'}`);
+    else if (result?.state === 'target') setAnnouncement(`${action}: the target frame is outside the loaded window. Load more events to reach it; paging backward is not available yet.`);
+    else setAnnouncement(`${action}: ${result?.state === 'boundary' ? 'boundary, no further frame in this direction' : 'unavailable for this frame'}`);
   };
 
   return <AppShell activePane={activePane} onPane={setActivePane} announcement={announcement} auth={auth} authError={authError}>

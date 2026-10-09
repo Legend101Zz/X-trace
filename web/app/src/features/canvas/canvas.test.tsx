@@ -49,4 +49,41 @@ describe('canvas view', () => {
     const { container } = render(<CanvasView events={events} selectedFrameId={null} onSelectFrame={() => undefined} onNavigate={() => undefined} />);
     expect(container.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true');
   });
+
+  it('emits the ARIA tree depth-first: parents precede children and levels never jump', () => {
+    const deep = [ev(1, null, 'A'), ev(2, 'f1', 'B'), ev(3, 'f1', 'C'), ev(4, 'f2', 'D'), ev(5, 'f3', 'E')];
+    render(<CanvasView events={deep} selectedFrameId={null} onSelectFrame={() => undefined} onNavigate={() => undefined} />);
+    const items = screen.getAllByRole('treeitem');
+    expect(items.map((item) => item.textContent?.[0])).toEqual(['A', 'B', 'D', 'C', 'E']);
+    const levels = items.map((item) => Number(item.getAttribute('aria-level')));
+    expect(levels).toEqual([1, 2, 3, 2, 3]);
+    levels.forEach((level, index) => { if (index > 0) expect(level - levels[index - 1]).toBeLessThanOrEqual(1); });
+    expect(items[3]).toHaveAttribute('aria-posinset', '2');
+    expect(items[3]).toHaveAttribute('aria-setsize', '2');
+  });
+
+  it('lets collapsed repeated calls be expanded and each member selected', () => {
+    const select = vi.fn();
+    render(<CanvasView events={events} selectedFrameId="f3" onSelectFrame={select} onNavigate={() => undefined} />);
+    fireEvent.click(screen.getByRole('button', { name: /Expand 2 repeated calls of Repo\.save/ }));
+    const members = screen.getAllByRole('treeitem').filter((item) => /call \d of 2/.test(item.textContent ?? ''));
+    expect(members).toHaveLength(2);
+    fireEvent.click(members[1]);
+    expect(select).toHaveBeenLastCalledWith('f3');
+    expect(members[1]).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('marks gap frames visibly and in the tree text', () => {
+    const gap = [ev(1, null, 'Root'), { ...ev(2, 'f1', 'missing'), kind: 'gap' } as unknown as ReplayEvent];
+    render(<CanvasView events={gap} selectedFrameId={null} onSelectFrame={() => undefined} onNavigate={() => undefined} />);
+    const item = screen.getAllByRole('treeitem')[1];
+    expect(item).toHaveAttribute('data-kind', 'gap');
+    expect(item).toHaveTextContent('evidence gap');
+  });
+
+  it('names the scrollable drawing region and keeps it keyboard focusable', () => {
+    render(<CanvasView events={events} selectedFrameId={null} onSelectFrame={() => undefined} onNavigate={() => undefined} />);
+    const region = screen.getByRole('region', { name: 'Frame graph drawing' });
+    expect(region.tabIndex).toBe(0);
+  });
 });

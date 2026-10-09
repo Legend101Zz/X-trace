@@ -6,7 +6,7 @@ import type { ReplayState } from './state';
 const withFrame: ReplayState = { ...initialReplayState, recordingId: 'r1', frameId: 'f1', sequence: '5' };
 
 describe('replay-core reducer', () => {
-  it('canvas_selection_matches_linear_frame_id: switching mode keeps the selected frame', () => {
+  it('reducer: switching mode leaves the reducer frame untouched (App-level selection sharing is asserted in main.replay.test.tsx)', () => {
     const canvas = replayReducer(withFrame, { type: 'set-mode', mode: 'canvas' });
     expect(canvas.mode).toBe('canvas');
     expect(canvas.frameId).toBe('f1');
@@ -44,7 +44,7 @@ describe('replay-core reducer', () => {
     expect(moved.frameId).toBe('f2');
   });
 
-  it('play_stops_at_gap_and_says_why: stop reason is retained until the next play', () => {
+  it('reducer retains the stop reason until the next play', () => {
     const playing = replayReducer(withFrame, { type: 'play' });
     const stopped = replayReducer(playing, { type: 'playback-stopped', reason: STOP_REASONS.gap });
     expect(stopped.playback).toMatchObject({ status: 'paused', stopReason: STOP_REASONS.gap });

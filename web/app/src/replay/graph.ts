@@ -48,9 +48,17 @@ export interface FrameGraph {
   nodeOfFrame: Record<string, string>;
 }
 
+/** Sequences are decimal strings; a malformed one must not throw, so it sorts after numeric ones. */
+const toBig = (value: string): bigint | null => (/^\d+$/.test(value) ? BigInt(value) : null);
+
 const compareSequence = (a: GraphFrame, b: GraphFrame): number => {
-  const x = BigInt(a.sequence);
-  const y = BigInt(b.sequence);
+  const x = toBig(a.sequence);
+  const y = toBig(b.sequence);
+  if (x === null || y === null) {
+    if (x !== null) return -1;
+    if (y !== null) return 1;
+    return a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1 : 0;
+  }
   return x < y ? -1 : x > y ? 1 : a.frameId < b.frameId ? -1 : a.frameId > b.frameId ? 1 : 0;
 };
 
@@ -143,4 +151,47 @@ export function projectFrameGraph(input: readonly GraphFrame[]): FrameGraph {
 
   nodes.sort((a, b) => a.layer - b.layer || a.column - b.column || (a.id < b.id ? -1 : 1));
   return { nodes, edges, layers, columns: nextColumn, nodeOfFrame };
+}
+
+export interface TreeRow {
+  /** Unique within the tree. */
+  key: string;
+  nodeId: string;
+  /** Frame this row selects. For a collapsed node's own row this is the first member. */
+  frameId: string;
+  level: number;
+  posInSet: number;
+  setSize: number;
+  /** Set only on the row of a collapsed node (count > 1). */
+  expandable: boolean;
+  expanded: boolean;
+  /** Member rows are children of their collapsed node's row. */
+  isMember: boolean;
+}
+
+/**
+ * Depth-first preorder rows for the parallel ARIA tree: a parent always precedes its children and
+ * siblings keep sequence order, so level never jumps by more than +1. Layout order (breadth-first) is not used here.
+ */
+export function treeRows(graph: FrameGraph, expanded: ReadonlySet<string>): TreeRow[] {
+  const children = new Map<string | null, GraphNode[]>();
+  for (const node of graph.nodes) {
+    const list = children.get(node.parentId) ?? [];
+    list.push(node);
+    children.set(node.parentId, list);
+  }
+  const rows: TreeRow[] = [];
+  const visit = (parent: string | null, level: number) => {
+    const siblings = (children.get(parent) ?? []).slice().sort((a, b) => a.column - b.column || (a.id < b.id ? -1 : 1));
+    siblings.forEach((node, index) => {
+      const open = node.count > 1 && expanded.has(node.id);
+      rows.push({ key: node.id, nodeId: node.id, frameId: node.id, level, posInSet: index + 1, setSize: siblings.length, expandable: node.count > 1, expanded: open, isMember: false });
+      if (open) {
+        node.memberFrameIds.forEach((frameId, memberIndex) => rows.push({ key: `${node.id}/${frameId}`, nodeId: node.id, frameId, level: level + 1, posInSet: memberIndex + 1, setSize: node.count, expandable: false, expanded: false, isMember: true }));
+      }
+      visit(node.id, level + 1);
+    });
+  };
+  visit(null, 1);
+  return rows;
 }

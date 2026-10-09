@@ -17,6 +17,9 @@ describe('source binding states render distinct strings', () => {
     ['source_map_absent', 'source_map_absent', null],
     ['source_map_unresolved', 'source_map_unresolved', null],
     ['unspecified', 'unspecified', null],
+    ['unattested mismatch', 'observed_unattested', { status: 'mismatch' }],
+    ['unspecified matched', 'unspecified', { status: 'matched' }],
+    ['unspecified mismatch', 'unspecified', { status: 'mismatch' }],
   ];
   it('gives every state its own sentence', () => {
     const texts = cases.map(([, binding, source]) => sourceStateText(binding, source));
@@ -25,6 +28,8 @@ describe('source binding states render distinct strings', () => {
   it('says what each state means', () => {
     expect(sourceStateText('verified', { status: 'matched' })).toContain('verified build attestation');
     expect(sourceStateText('observed_unattested', { status: 'matched' })).toContain('Source as read when the class loaded');
+    expect(sourceStateText('unspecified', { status: 'matched' })).not.toContain('verified build attestation');
+    expect(sourceStateText('observed_unattested', { status: 'mismatch' })).not.toContain('compile-time');
     expect(sourceStateText('verified', { status: 'mismatch' })).toContain('source changed since recording');
     expect(sourceStateText('verified', { status: 'missing_file' })).toContain('Source file missing');
     expect(sourceStateText('source_map_absent', null)).toContain('Source map absent');
@@ -39,14 +44,25 @@ describe('outcome banner', () => {
     expect(outcomeBanner({ ...base, durationNs: '2500000' }).lines.join('\n')).toContain('2.5 ms');
   });
   it('says so when status and duration were not observed', () => {
-    const lines = outcomeBanner(base).lines;
+    const lines = outcomeBanner({ ...base, outcome: { kind: 'unobserved', httpStatus: null, exception: null } }).lines;
     expect(lines).toContain('Response status was not observed');
     expect(lines).toContain('Duration unavailable for this capture');
   });
-  it('states exception redaction explicitly', () => {
-    const model = outcomeBanner({ ...base, outcome: { httpStatus: 500, exception: { type: 'java.lang.IllegalStateException', message: { state: 'redacted' } } } });
+  it('shows exception type and message verbatim, and says when the message was not recorded', () => {
+    const exception = { exceptionType: 'java.lang.IllegalStateException', message: 'boom' };
+    const model = outcomeBanner({ ...base, outcome: { kind: 'exception', httpStatus: 500, exception } });
     expect(model.lines).toContain('Response status 500 (as reported by the adapter)');
-    expect(model.lines).toContain('Exception java.lang.IllegalStateException: message redacted');
+    expect(model.lines).toContain('Exception java.lang.IllegalStateException: boom');
+    const none = outcomeBanner({ ...base, outcome: { kind: 'exception', httpStatus: null, exception: { ...exception, message: null } } });
+    expect(none.lines).toContain('Exception java.lang.IllegalStateException: message not recorded');
+  });
+  it('uses kind for unobserved and absent outcomes', () => {
+    expect(outcomeBanner({ ...base, outcome: { kind: 'unobserved', httpStatus: null, exception: null } }).lines).toContain('Response status was not observed');
+    expect(outcomeBanner({ ...base, outcome: null }).lines).toContain('Outcome unavailable: no terminal evidence was recorded');
+    expect(outcomeBanner({ ...base, outcome: { kind: 'responded', httpStatus: 204, exception: null } }).lines).toContain('Response status 204 (as reported by the adapter)');
+  });
+  it('does not throw on a non-numeric duration', () => {
+    expect(outcomeBanner({ ...base, durationNs: 'not-a-number' }).lines.join('\n')).toContain('unavailable');
   });
   it('maps completion to a tone and lists persisted incomplete evidence', () => {
     const model = outcomeBanner({ ...base, completion: 'partial', incompleteEvidence: ['gap_event_sequence:123'] });

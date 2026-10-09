@@ -12,9 +12,12 @@ export function sourceStateText(binding: string | undefined, source: SourceInput
     switch (source.status) {
       case 'matched':
         if (binding === 'observed_unattested') return 'Source as read when the class loaded; the current file matches the recorded hash. No build attestation backs this.';
-        return 'Adapter reported a compile-time source binding; current source matches the recorded identity · verified build attestation';
+        if (binding === 'verified') return 'Adapter reported a compile-time source binding; current source matches the recorded identity · verified build attestation';
+        return 'Current source matches the recorded identity; the source binding was not specified, so no attestation is claimed.';
       case 'mismatch':
-        return 'Adapter reported a compile-time source binding; current source differs from the recorded identity · source changed since recording';
+        if (binding === 'observed_unattested') return 'Source as read when the class loaded; the current file differs from the recorded hash · source changed since recording. No build attestation backs this.';
+        if (binding === 'verified') return 'Adapter reported a compile-time source binding; current source differs from the recorded identity · source changed since recording';
+        return 'Current source differs from the recorded identity · source changed since recording; the source binding was not specified.';
       case 'missing_file':
         return 'Source file missing: the recorded path is no longer present, so no source is shown.';
       default:

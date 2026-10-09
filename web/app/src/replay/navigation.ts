@@ -37,10 +37,8 @@ const UNAVAILABLE_REASONS: Record<string, string> = {
   not_navigable: 'this event is not a navigable frame',
 };
 
-const BOUNDARY_REASONS: Record<NavAction, string> = {
-  previous: 'this is the first frame', next: 'this is the last frame',
-  into: 'this is the last frame', over: 'no later frame at this depth', out: 'this frame is at the top level',
-};
+/** Neutral wording: the client never guesses why the server reported a boundary. */
+const BOUNDARY_FALLBACK = 'no further frame in this direction';
 
 export function navigationControls(
   navigation: NavFrameNavigation | null | undefined,
@@ -55,10 +53,10 @@ export function navigationControls(
       const loaded = loadedFrameIds.has(result.frameId);
       return loaded
         ? { action, label, enabled: true, reason: null, targetFrameId: result.frameId, needsWindow: false }
-        : { action, label, enabled: false, reason: 'Target frame is outside the loaded window. Load the adjacent window first.', targetFrameId: result.frameId, needsWindow: true };
+        : { action, label, enabled: false, reason: 'Target frame is outside the loaded window. Load more events to reach it; paging backward is not available yet.', targetFrameId: result.frameId, needsWindow: true };
     }
     if (result.state === 'boundary') {
-      return { action, label, enabled: false, reason: `Boundary: ${result.boundaryReason ?? BOUNDARY_REASONS[action]}.`, targetFrameId: null, needsWindow: false };
+      return { action, label, enabled: false, reason: `Boundary: ${result.boundaryReason ?? BOUNDARY_FALLBACK}.`, targetFrameId: null, needsWindow: false };
     }
     const why = result.reason ? (UNAVAILABLE_REASONS[result.reason] ?? result.reason.replaceAll('_', ' ')) : 'no reason was reported';
     return { action, label, enabled: false, reason: `Unavailable: ${why}.`, targetFrameId: null, needsWindow: false };
