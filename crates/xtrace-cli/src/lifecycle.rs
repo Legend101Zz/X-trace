@@ -12,7 +12,7 @@
 //!   sealed as partial (see [`recover_interrupted`]).
 //! * `stop` signals the daemon with SIGTERM only after proving that the PID in
 //!   the state file still is that daemon (same process start time, same
-//!   executable, a `daemon` command line, and the project lock held). It waits
+//!   executable and a `daemon` command line). It waits
 //!   for the daemon to release its lock, then seals recordings the daemon left
 //!   open as partial.
 //! * `restart` is `stop` (a daemon that is not running is not an error) then
@@ -233,27 +233,46 @@ mod unix {
     // Process identity (PID alone is never trusted).
     // ------------------------------------------------------------------
 
-    fn ps(pid: u32, column: &str) -> Option<String> {
+    /// Answer of the `ps` query: a missing process is distinct from an unusable `ps`.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Ps {
+        Absent,
+        Present(String),
+        Unavailable,
+    }
+
+    /// Needs a procps or BSD `ps` (`-o lstart=`/`command=`); BusyBox `ps` is reported as
+    /// unavailable. Runs with `LC_ALL=C` so the start-time text does not depend on the locale.
+    fn ps(pid: u32, column: &str) -> Ps {
         for binary in ["/bin/ps", "/usr/bin/ps"] {
             let Ok(output) = Command::new(binary)
                 .args(["-o", column, "-p", &pid.to_string()])
+                .env("LC_ALL", "C")
                 .stdin(Stdio::null())
-                .stderr(Stdio::null())
                 .output()
             else {
                 continue;
             };
-            if !output.status.success() {
-                return None;
-            }
             let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            return if text.is_empty() { None } else { Some(text) };
+            if output.status.success() && !text.is_empty() {
+                return Ps::Present(text);
+            }
+            // A missing pid exits 1 with no output on procps and BSD; anything that writes to
+            // stderr is a `ps` we cannot rely on.
+            return if output.stderr.is_empty() && text.is_empty() {
+                Ps::Absent
+            } else {
+                Ps::Unavailable
+            };
         }
-        None
+        Ps::Unavailable
     }
 
     fn process_started(pid: u32) -> Option<String> {
-        ps(pid, "lstart=")
+        match ps(pid, "lstart=") {
+            Ps::Present(text) => Some(text),
+            Ps::Absent | Ps::Unavailable => None,
+        }
     }
 
     /// Why a recorded PID is or is not the recorded daemon.
@@ -262,17 +281,23 @@ mod unix {
         Verified,
         NotRunning,
         Mismatch(&'static str),
+        /// `ps` could not answer; nothing may be inferred (and nothing deleted or signalled).
+        Unavailable,
     }
 
     fn verify_identity(record: &DaemonRecord) -> Identity {
-        let Some(started) = process_started(record.pid) else {
-            return Identity::NotRunning;
+        let started = match ps(record.pid, "lstart=") {
+            Ps::Present(text) => text,
+            Ps::Absent => return Identity::NotRunning,
+            Ps::Unavailable => return Identity::Unavailable,
         };
         if started != record.process_started {
             return Identity::Mismatch("process start time differs from the recorded daemon");
         }
-        let Some(command) = ps(record.pid, "command=") else {
-            return Identity::NotRunning;
+        let command = match ps(record.pid, "command=") {
+            Ps::Present(text) => text,
+            Ps::Absent => return Identity::NotRunning,
+            Ps::Unavailable => return Identity::Unavailable,
         };
         if !command.starts_with(&record.executable) {
             return Identity::Mismatch("process executable differs from the recorded daemon");
@@ -282,6 +307,30 @@ mod unix {
             return Identity::Mismatch("process is not an xtrace daemon");
         }
         Identity::Verified
+    }
+
+    fn identity_unavailable() -> CliError {
+        lifecycle_error(
+            "XTR-LIFECYCLE-IDENTITY-UNAVAILABLE",
+            ErrorCategory::Resource,
+            "`ps` is missing or unusable, so the daemon's identity cannot be verified",
+            RetryAdvice::None,
+        )
+    }
+
+    /// Terminates a child this command spawned itself after a failed start, then reaps it
+    /// within a bounded wait. A child that already exited (and was reaped) is never signalled.
+    fn abort_child(child: &mut std::process::Child) {
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = signal_term(child.id());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return;
+                }
+                std::thread::sleep(POLL);
+            }
+        }
     }
 
     fn signal_term(pid: u32) -> Result<(), CliError> {
@@ -478,8 +527,10 @@ mod unix {
                 Identity::Verified if project_lock_is_held(&project_root)? => {
                     return Ok(record_document(&existing, true, Vec::new()));
                 }
-                Identity::Verified | Identity::NotRunning => remove_record(&state),
-                Identity::Mismatch(_) => remove_record(&state),
+                Identity::Unavailable => return Err(identity_unavailable()),
+                Identity::Verified | Identity::NotRunning | Identity::Mismatch(_) => {
+                    remove_record(&state);
+                }
             }
         }
         if project_lock_is_held(&project_root)? {
@@ -517,7 +568,13 @@ mod unix {
             .map_err(|error| io_unavailable(&error))?;
         let pid = child.id();
 
-        let ready = wait_for_ready(&state, &mut child)?;
+        let ready = match wait_for_ready(&state, &mut child) {
+            Ok(ready) => ready,
+            Err(error) => {
+                abort_child(&mut child);
+                return Err(error);
+            }
+        };
         let record = DaemonRecord {
             schema: STATE_SCHEMA,
             pid,
@@ -532,7 +589,7 @@ mod unix {
             capture_depth: depth.to_string(),
         };
         if record.process_started.is_empty() {
-            let _ = signal_term(pid);
+            abort_child(&mut child);
             return Err(lifecycle_error(
                 "XTR-LIFECYCLE-IDENTITY-UNAVAILABLE",
                 ErrorCategory::Resource,
@@ -540,7 +597,10 @@ mod unix {
                 RetryAdvice::None,
             ));
         }
-        write_record(&state, &record)?;
+        if let Err(error) = write_record(&state, &record) {
+            abort_child(&mut child);
+            return Err(error);
+        }
         // `child` is intentionally not waited on: the daemon outlives this command.
         drop(child);
         Ok(record_document(&record, false, recovered))
@@ -704,14 +764,20 @@ mod unix {
                     recovered_recordings: recovered,
                 });
             }
+            Identity::Unavailable => return Err(identity_unavailable()),
             Identity::Verified => {}
         }
 
         signal_term(record.pid)?;
         let deadline = Instant::now() + STOP_TIMEOUT;
         loop {
-            let gone = verify_identity(&record) == Identity::NotRunning
-                && !project_lock_is_held(&project_root)?;
+            let identity = verify_identity(&record);
+            if identity == Identity::Unavailable {
+                return Err(identity_unavailable());
+            }
+            // Gone = the lock is released and the process is no longer the verified daemon
+            // (absent, or a zombie whose command line no longer matches).
+            let gone = identity != Identity::Verified && !project_lock_is_held(&project_root)?;
             if gone {
                 break;
             }
@@ -780,10 +846,12 @@ mod unix {
 
         #[test]
         fn identity_of_a_live_unrelated_process_is_a_mismatch_never_verified() {
-            // This test process is alive, but is not an `xtrace daemon`.
+            // This test process is alive, but is not an `xtrace daemon`; the recorded
+            // executable is an explicit non-matching path so the verdict does not depend on
+            // this test binary's own arguments.
             let pid = std::process::id();
             let started = process_started(pid).expect("own start time");
-            let exe = std::env::current_exe().expect("exe").to_string_lossy().into_owned();
+            let exe = "/nonexistent/xtrace-test-executable".to_string();
             assert!(matches!(
                 verify_identity(&record_for(pid, &started, &exe)),
                 Identity::Mismatch(_)

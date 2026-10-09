@@ -23,6 +23,19 @@ struct Fx {
     project_id: String,
 }
 
+impl Drop for Fx {
+    fn drop(&mut self) {
+        // Identity-checked product stop; a no-op (ignored error) when nothing is running.
+        let _ = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+            .args(["stop", "--project-dir"])
+            .arg(&self.repo)
+            .env("XTRACE_DATA_HOME", &self.data_home)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 fn fx() -> Fx {
     let base = std::env::temp_dir().canonicalize().expect("canonical temp base");
     let root = tempfile::Builder::new()
@@ -128,4 +141,28 @@ fn a_live_daemon_is_reported_and_bundle_is_refused_not_ignored() {
     assert!(!std::path::Path::new("/nonexistent/never-written.zip").exists());
     let stopped = fx.xtrace(&["stop"]);
     assert!(stopped.status.success(), "{}", String::from_utf8_lossy(&stopped.stderr));
+}
+
+#[test]
+fn a_store_with_an_older_schema_is_a_warning_not_a_failure() {
+    let fx = fx();
+    // Make the (otherwise healthy) store claim to be one migration behind this build.
+    let database = std::fs::read_dir(fx.data_home.join("projects"))
+        .expect("projects dir")
+        .map(|entry| entry.expect("entry").path().join("metadata.sqlite3"))
+        .find(|path| path.is_file())
+        .expect("the initialized project's store");
+    let connection = rusqlite::Connection::open(&database).expect("open store file");
+    let changed = connection
+        .execute(
+            "UPDATE schema_meta SET schema_version = schema_version - 1 WHERE singleton = 1",
+            [],
+        )
+        .expect("lower the recorded schema version");
+    assert_eq!(changed, 1);
+    drop(connection);
+    let out = fx.xtrace(&["doctor"]);
+    let report: Value = serde_json::from_slice(&out.stdout).expect("report JSON");
+    assert_eq!(status_of(&report, "store_schema"), "warn", "{report}");
+    assert_eq!(out.status.code(), Some(0), "a pending migration is not a failure: {report}");
 }

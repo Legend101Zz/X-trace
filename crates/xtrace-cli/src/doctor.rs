@@ -1,8 +1,10 @@
 //! `xtrace doctor` (lane P).
 //!
 //! Read-only diagnostics. Each check reports `ok`, `warn`, `fail` or `unavailable`; a check this build
-//! cannot perform is `unavailable` with the reason, never `ok`. Nothing here writes to the store, takes
-//! the project lock for longer than a probe, or signals a process. `--bundle` (a sanitized support
+//! cannot perform is `unavailable` with the reason, never `ok`. Nothing here writes to the store or signals a
+//! process. The daemon-lock check probes the advisory lock with a momentary try-lock (a daemon start
+//! that overlaps the probe window can see a spurious "already running"), and on a project that never
+//! ran a daemon the probe creates the empty `.daemon/project.lock` file. `--bundle` (a sanitized support
 //! bundle) is not implemented in this build and fails loudly rather than being ignored.
 
 use std::path::PathBuf;
@@ -235,11 +237,19 @@ fn unix_project_checks(project_dir: &std::path::Path, checks: &mut Vec<Check>) {
         }
         Err(error) => {
             let mapped = crate::commands::map_store_error(error);
-            checks.push(Check::new(
-                "store_schema",
-                Status::Fail,
-                format!("the store cannot be opened read-only: {mapped}"),
-            ));
+            // A healthy store from an earlier release is migrated forward on the next write
+            // open; a read-only open cannot (and doctor never opens read-write).
+            let (status, detail) = match &mapped {
+                CliError::StoreSchemaOlder(_) => (
+                    Status::Warn,
+                    format!(
+                        "the store schema is older than this build ({}); it is migrated forward                          on the next write open, so recordings are not listed here",
+                        xtrace_store::CURRENT_SCHEMA_VERSION
+                    ),
+                ),
+                _ => (Status::Fail, format!("the store cannot be opened read-only: {mapped}")),
+            };
+            checks.push(Check::new("store_schema", status, detail));
             return;
         }
     };

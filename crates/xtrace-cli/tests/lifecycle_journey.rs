@@ -36,15 +36,34 @@ struct Fixture {
     repo: PathBuf,
     data_home: PathBuf,
     project_id: String,
-    // Daemon PIDs obtained from CLI documents; killed on drop only if still verified alive.
+    // PIDs from CLI documents, kept for assertions only; cleanup goes through the product's
+    // identity-checked `xtrace stop`, never a raw signal.
     daemons: std::cell::RefCell<Vec<u32>>,
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        for pid in self.daemons.borrow().iter() {
-            // Best effort cleanup of daemons this test started via `xtrace record`.
-            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+        // Best effort cleanup of a daemon this test started via `xtrace record`: the product's
+        // own stop verifies process identity before signalling, so a stale or reused PID is
+        // never touched. Result ignored (already stopped is fine).
+        let _ = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+            .args(["stop", "--project-dir"])
+            .arg(&self.repo)
+            .env("XTRACE_DATA_HOME", &self.data_home)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Kills and reaps a child this test spawned itself if an assertion unwinds first.
+struct ChildGuard(Option<std::process::Child>);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -283,7 +302,32 @@ fn record_stop_restart_persists_and_reopens_a_recorded_session() {
 }
 
 #[test]
-fn restart_after_sigkill_seals_the_open_recording_as_partial_and_reopens_it() {
+fn restart_while_the_daemon_is_running_replaces_it_and_keeps_the_store() {
+    let fx = fixture();
+    let started = fx.ok_json(&["record"]);
+    let first_pid = fx.track(started["pid"].as_u64().expect("pid"));
+    let first_session = started["runtime_session_id"].as_str().expect("session").to_string();
+
+    let restarted = fx.ok_json(&["restart"]);
+    assert_eq!(restarted["previously_running"], true, "{restarted}");
+    let new_pid = fx.track(restarted["started"]["pid"].as_u64().expect("pid"));
+    assert_ne!(new_pid, first_pid, "a new daemon process replaced the old one");
+    assert_ne!(
+        restarted["started"]["runtime_session_id"].as_str().expect("session"),
+        first_session
+    );
+    wait_gone(first_pid);
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(fx.state_file()).expect("state file")).expect("json");
+    assert_eq!(state["pid"].as_u64(), Some(u64::from(new_pid)), "state names the new daemon");
+    let _ = fx.recordings();
+
+    fx.ok_json(&["stop"]);
+    wait_gone(new_pid);
+}
+
+#[test]
+fn restart_seals_a_recording_left_open_and_reopens_it_as_partial() {
     let fx = fixture();
     let started = fx.ok_json(&["record"]);
     let pid = fx.track(started["pid"].as_u64().expect("pid"));
@@ -369,26 +413,34 @@ fn stop_when_not_running_is_clear_nonzero_and_record_validates_depth() {
 #[test]
 fn record_refuses_when_a_foreground_daemon_owns_the_lock_and_never_signals_it() {
     let fx = fixture();
-    let mut foreground = Command::new(env!("CARGO_BIN_EXE_xtrace"))
-        .args(["daemon", "--project-dir"])
-        .arg(&fx.repo)
-        .env("XTRACE_DATA_HOME", &fx.data_home)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn foreground daemon");
+    let mut foreground = ChildGuard(Some(
+        Command::new(env!("CARGO_BIN_EXE_xtrace"))
+            .args(["daemon", "--project-dir"])
+            .arg(&fx.repo)
+            .env("XTRACE_DATA_HOME", &fx.data_home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn foreground daemon"),
+    ));
     let mut line = String::new();
     {
         use std::io::BufRead as _;
-        let mut reader = std::io::BufReader::new(foreground.stdout.take().expect("stdout"));
+        let mut reader = std::io::BufReader::new(
+            foreground.0.as_mut().expect("child").stdout.take().expect("stdout"),
+        );
         reader.read_line(&mut line).expect("readiness");
         assert!(line.contains("daemon_bound"));
         let out = fx.xtrace(&["record"]);
         assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stderr));
         let out = fx.xtrace(&["stop"]);
         assert_eq!(out.status.code(), Some(4), "a daemon we did not start is not signalled");
-        assert!(foreground.try_wait().expect("poll").is_none(), "foreground daemon still alive");
-        foreground.kill().expect("kill own child");
-        foreground.wait().expect("reap own child");
+        assert!(
+            foreground.0.as_mut().expect("child").try_wait().expect("poll").is_none(),
+            "foreground daemon still alive"
+        );
+        let mut own = foreground.0.take().expect("child");
+        own.kill().expect("kill own child");
+        own.wait().expect("reap own child");
     }
 }

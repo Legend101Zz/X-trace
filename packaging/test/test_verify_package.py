@@ -20,7 +20,7 @@ sys.path.insert(0, str(HERE.parent))
 import verify_package as vp  # noqa: E402
 
 FILES = {
-    "bin/xtrace": "#!/bin/sh\ncase \"$1\" in --version) printf 'xtrace 0.0.1\\nschema-version: 6\\nxtp-protocol: 1.1\\n';; tui) exit 0;; esac\n",
+    "bin/xtrace": "#!/bin/sh\ncase \"$1\" in --version) printf 'xtrace 0.0.1\\nschema-version: 6\\nxtp-protocol: 1.1\\n';; tui) [ \"$2\" = --help ] && exit 0; echo real tui needs a terminal >&2; exit 2;; esac\n",
     "install.sh": "#!/bin/sh\n", "uninstall.sh": "#!/bin/sh\n",
     "share/xtrace/web/index.html": "<html></html>", "share/xtrace/web/app.js": "1",
     "share/xtrace/web/assets.sha256": "x",
@@ -136,9 +136,17 @@ class VerifyPackage(unittest.TestCase):
         conn.write_text("pub const CURRENT_SCHEMA_VERSION: u32 = 6;\n")
         report = vp.verify(self.root, repo=repo, run=True)
         v = verdict(report)
-        self.assertTrue(v["binary_version"] and v["schema_version"] and v["tui_entrypoint"], report)
+        self.assertTrue(v["binary_version"] and v["schema_version"] and v["tui_subcommand_registered"] and v["tui_implemented"], report)
         conn.write_text("pub const CURRENT_SCHEMA_VERSION: u32 = 7;\n")
         self.assertFalse(verdict(vp.verify(self.root, repo=repo, run=True))["schema_version"])
+
+    def test_tui_stub_binary_fails_tui_implemented_but_registers_the_subcommand(self):
+        stub = ("#!/bin/sh\ncase \"$1\" in --version) printf 'xtrace 0.0.1\\nschema-version: 6\\n';; "
+                "tui) [ \"$2\" = --help ] && exit 0; echo XTR-CLI-NOT-IMPLEMENTED >&2; exit 9;; esac\n")
+        build(self.root, extra={"bin/xtrace": stub})
+        v = verdict(vp.verify(self.root, run=True))
+        self.assertTrue(v["tui_subcommand_registered"])
+        self.assertFalse(v["tui_implemented"])
 
     def test_binary_that_does_not_report_schema_version_fails(self):
         build(self.root, extra={"bin/xtrace": "#!/bin/sh\necho 'xtrace 0.0.1'\n"})

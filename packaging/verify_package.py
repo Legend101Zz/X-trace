@@ -19,7 +19,10 @@ Checks (names are stable; the tests in packaging/test/test_verify_package.py pin
   binary_version         (--run-binary) `bin/xtrace --version` prints the package version and the
                          store schema version
   schema_version         (--repo) the reported schema version equals the migration catalog's latest
-  tui_entrypoint         (--run-binary) `bin/xtrace tui --help` exits 0 (TUI ships in the one binary)
+  tui_subcommand_registered (--run-binary) `bin/xtrace tui --help` exits 0 (the subcommand exists; says nothing
+                         about a working TUI)
+  tui_implemented        (--run-binary) `bin/xtrace tui` with stdin closed does not exit 9 / report
+                         XTR-CLI-NOT-IMPLEMENTED; RED until the TUI is real
 
 The daemon and TUI are part of the single `xtrace` binary; migrations are compiled into it. The
 report says so in `notes` instead of pretending there are separate files.
@@ -203,9 +206,20 @@ def run_binary(root, expected_version, rep):
             + ("" if out.returncode == 0 else f"; exit {out.returncode}"))
     try:
         tui = subprocess.run([str(exe), "tui", "--help"], capture_output=True, text=True, timeout=30)
-        rep.add("tui_entrypoint", tui.returncode == 0, f"`xtrace tui --help` exit {tui.returncode}")
+        rep.add("tui_subcommand_registered", tui.returncode == 0, f"`xtrace tui --help` exit {tui.returncode}")
     except (OSError, subprocess.TimeoutExpired) as e:
-        rep.add("tui_entrypoint", False, f"cannot run bin/xtrace tui --help: {e}")
+        rep.add("tui_subcommand_registered", False, f"cannot run bin/xtrace tui --help: {e}")
+    try:
+        tui = subprocess.run([str(exe), "tui"], capture_output=True, text=True, timeout=15,
+                             stdin=subprocess.DEVNULL)
+        stub = tui.returncode == 9 or "NOT-IMPLEMENTED" in (tui.stdout + tui.stderr)
+        rep.add("tui_implemented", not stub,
+                "tui not implemented in this build (exit 9 / XTR-CLI-NOT-IMPLEMENTED)" if stub
+                else f"`xtrace tui` without a terminal exit {tui.returncode}")
+    except subprocess.TimeoutExpired:
+        rep.add("tui_implemented", False, "`xtrace tui` with stdin closed did not exit within 15 s")
+    except OSError as e:
+        rep.add("tui_implemented", False, f"cannot run bin/xtrace tui: {e}")
     return int(m.group(1)) if m else None
 
 
