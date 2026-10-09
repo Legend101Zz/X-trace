@@ -19,6 +19,13 @@ public final class BootstrapBridge {
 
   private static final AtomicReference<BridgeSink> SINK = new AtomicReference<>();
   private static final ThreadLocal<RequestContext> CONTEXT = new ThreadLocal<>();
+  private static final AtomicReference<LineSink> LINE_SINK = new AtomicReference<>();
+
+  /** Most line events one request may record (focused budget); the rest are counted as a gap. */
+  static final int MAX_LINE_EVENTS_PER_REQUEST = 8192;
+
+  /** Symbol of the GAP event that records line events withheld by the per-request budget. */
+  public static final String LINE_BUDGET_SYMBOL = "xtrace.capture.gap.line-budget";
 
   private BootstrapBridge() {}
 
@@ -30,6 +37,115 @@ public final class BootstrapBridge {
   /** Disables a failed sink without replacing a newer runtime instance. */
   public static void disable(BridgeSink sink) {
     SINK.compareAndSet(sink, null);
+  }
+
+  /** Installs the focused-mode line sink. Only effective focused arming does this. */
+  public static boolean installLineSink(LineSink sink) {
+    return LINE_SINK.compareAndSet(null, Objects.requireNonNull(sink, "sink"));
+  }
+
+  /** Removes a line sink without replacing a newer one. */
+  public static void disableLineSink(LineSink sink) {
+    LINE_SINK.compareAndSet(sink, null);
+  }
+
+  // ---- Probe owner for instrumented application classes (LineProbeAsmWrapper). The descriptors
+  // are fixed by the wrapper: ProbeOwnerCheck verifies all eight. Every entry point fails open.
+
+  public static void line(int siteId) {
+    try {
+      LineSink sink = LINE_SINK.get();
+      if (sink == null) return;
+      RequestContext context = CONTEXT.get();
+      if (context == null || context.deferred) return;
+      if (context.lineEvents >= MAX_LINE_EVENTS_PER_REQUEST) {
+        context.lineDropped++;
+        return;
+      }
+      context.lineEvents++;
+      context.linePending = true;
+      sink.line(
+          context.recordingId, context.nextEventId(), context.currentParent(), siteId,
+          System.nanoTime());
+    } catch (Throwable ignored) {
+      // fail open: a probe can never break application code
+    }
+  }
+
+  public static void valuesBegin(int siteId) {
+    try {
+      LineSink sink = LINE_SINK.get();
+      if (sink != null) sink.valuesBegin(siteId);
+    } catch (Throwable ignored) {
+      // fail open
+    }
+  }
+
+  public static void valueInt(int slot, int nameId, int value) {
+    try {
+      LineSink sink = LINE_SINK.get();
+      if (sink != null) sink.valueInt(slot, nameId, value);
+    } catch (Throwable ignored) {
+      // fail open
+    }
+  }
+
+  public static void valueLong(int slot, int nameId, long value) {
+    try {
+      LineSink sink = LINE_SINK.get();
+      if (sink != null) sink.valueLong(slot, nameId, value);
+    } catch (Throwable ignored) {
+      // fail open
+    }
+  }
+
+  public static void valueFloat(int slot, int nameId, float value) {
+    try {
+      LineSink sink = LINE_SINK.get();
+      if (sink != null) sink.valueFloat(slot, nameId, value);
+    } catch (Throwable ignored) {
+      // fail open
+    }
+  }
+
+  public static void valueDouble(int slot, int nameId, double value) {
+    try {
+      LineSink sink = LINE_SINK.get();
+      if (sink != null) sink.valueDouble(slot, nameId, value);
+    } catch (Throwable ignored) {
+      // fail open
+    }
+  }
+
+  /** Reference-typed local; the value is passed through untouched (never toString'd here). */
+  public static void valueRef(int nameId, int role, Object value) {
+    try {
+      LineSink sink = LINE_SINK.get();
+      if (sink != null) sink.valueRef(nameId, role, value);
+    } catch (Throwable ignored) {
+      // fail open
+    }
+  }
+
+  public static void valuesEnd() {
+    try {
+      LineSink sink = LINE_SINK.get();
+      if (sink != null) sink.valuesEnd();
+    } catch (Throwable ignored) {
+      // fail open
+    }
+  }
+
+  /** Completes the pending line event of this request before any other event is allocated. */
+  private static void flushLine(RequestContext context) {
+    if (!context.linePending) return;
+    context.linePending = false;
+    try {
+      LineSink sink = LINE_SINK.get();
+      if (sink != null) sink.flush();
+    } catch (Throwable ignored) {
+      // fail open
+    }
   }
 
   /** Opens a request context for one matched route and emits its sanitized request identity. */
@@ -75,6 +191,7 @@ public final class BootstrapBridge {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
     if (context == null || sink == null || !validSymbol(symbol)) return;
+    flushLine(context);
     String eventId = context.nextEventId();
     String parent = context.currentParent();
     boolean accepted = safeMethodEvent(
@@ -96,6 +213,7 @@ public final class BootstrapBridge {
     if (context == null || sink == null || type == null || method == null) return null;
     String symbol = simpleName(type.getName()) + "." + method;
     if (!validSymbol(symbol)) return null;
+    flushLine(context);
     String eventId = context.nextEventId();
     String parent = context.currentParent();
     boolean accepted;
@@ -239,6 +357,7 @@ public final class BootstrapBridge {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
     if (context == null || sink == null || context.frames.isEmpty()) return;
+    flushLine(context);
     Frame frame = context.frames.pop();
     if (!frame.symbol.equals(symbol)) {
       context.dropped++;
@@ -295,6 +414,7 @@ public final class BootstrapBridge {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
     if (context == null || sink == null || context.databaseActive) return;
+    flushLine(context);
     context.databaseActive = true;
     context.databaseEventId = "";
     String eventId = context.nextEventId();
@@ -317,6 +437,7 @@ public final class BootstrapBridge {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
     if (context == null || sink == null || !context.databaseActive) return;
+    flushLine(context);
     String start = context.databaseEventId;
     context.databaseActive = false;
     context.databaseEventId = "";
@@ -348,6 +469,16 @@ public final class BootstrapBridge {
     try {
       BridgeSink sink = SINK.get();
       if (context == null || sink == null) return;
+      flushLine(context);
+      if (context.lineDropped > 0) {
+        long withheld = context.lineDropped;
+        context.lineDropped = 0;
+        if (!safeEvent(
+            sink, context, context.nextEventId(), context.requestEventId, BridgeEventKind.GAP,
+            LINE_BUDGET_SYMBOL, (int) Math.min(Integer.MAX_VALUE, withheld))) {
+          context.dropped++;
+        }
+      }
       int sanitizedStatus = responseStatus >= 100 && responseStatus <= 599 ? responseStatus : 0;
       String eventId = context.nextEventId();
       if (!safeEvent(
@@ -400,6 +531,7 @@ public final class BootstrapBridge {
 
   static void resetForTest() {
     CONTEXT.remove();
+    LINE_SINK.set(null);
     SINK.set(null);
   }
 
@@ -476,6 +608,9 @@ public final class BootstrapBridge {
     private boolean databaseActive;
     private String databaseEventId = "";
     private long dropped;
+    private boolean linePending;
+    private int lineEvents;
+    private long lineDropped;
 
     private RequestContext(String recordingId, long startedMonotonicNs) {
       this.recordingId = recordingId;

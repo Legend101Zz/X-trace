@@ -4,6 +4,7 @@ import dev.xtrace.agent.bootstrap.BridgeEventKind;
 import dev.xtrace.agent.bootstrap.BridgeSink;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -125,6 +126,37 @@ final class RuntimeBridgeSink implements BridgeSink {
         new QueueSignal.Event(
             recordingId, eventId, parentEventId, BridgeEventKind.FRAME_THROW, symbol,
             monotonicNs, 0, null, 0, 0, null, 0, bytes, exceptionType, exceptionMessage),
+        false);
+  }
+
+  /** Offers a focused line cursor with bounded sanitized locals; never blocks. */
+  boolean offerLineEvent(
+      String recordingId,
+      String eventId,
+      String parentEventId,
+      String symbol,
+      long monotonicNs,
+      SourceAttestation.SourceInfo source,
+      java.util.List<dev.xtrace.agent.runtime.line.ValueSnapshot> values) {
+    if (!acceptingExisting.get()
+        || source == null
+        || source.path() == null
+        || source.hash() == null
+        || source.hash().length != 32
+        || !bounded(recordingId, eventId, parentEventId, symbol, source.path())) {
+      return false;
+    }
+    int bytes = estimate(recordingId, eventId, parentEventId, symbol)
+        + source.path().getBytes(StandardCharsets.UTF_8).length + 32;
+    for (dev.xtrace.agent.runtime.line.ValueSnapshot value : values) {
+      bytes += 96 + (value.name() == null ? 0 : value.name().length() * 3)
+          + (value.preview() == null ? 0 : value.preview().length() * 3);
+    }
+    return queue.offer(
+        new QueueSignal.Event(
+            recordingId, eventId, parentEventId, BridgeEventKind.LINE_CURSOR, symbol, monotonicNs,
+            0, source.path(), source.startLine(), source.endLine(), source.hash().clone(),
+            source.binding(), bytes, null, null, List.copyOf(values)),
         false);
   }
 

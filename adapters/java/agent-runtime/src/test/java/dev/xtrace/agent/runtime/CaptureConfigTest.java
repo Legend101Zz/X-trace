@@ -33,6 +33,26 @@ class CaptureConfigTest {
   }
 
   @Test
+  void focusedModeIsOptInAndNeverImplied() {
+    String scope = "\"application_scope\":{\"application_packages\":[\"com.acme\"]}";
+    assertTrue(
+        CaptureConfig.parse(
+                json("{\"capture_schema_version\":1,\"capture\":{\"mode\":\"focused\"}," + scope + "}"))
+            .focused());
+    for (String other :
+        new String[] {
+          "{\"capture_schema_version\":1," + scope + "}",
+          "{\"capture_schema_version\":1,\"capture\":{\"mode\":\"standard\"}," + scope + "}",
+          "{\"capture_schema_version\":1,\"capture\":{\"mode\":\"FOCUSED\"}," + scope + "}",
+          "{\"capture_schema_version\":1,\"capture\":\"focused\"," + scope + "}",
+          "{\"capture_schema_version\":1,\"capture\":{\"mode\":true}," + scope + "}",
+        }) {
+      assertFalse(CaptureConfig.parse(json(other)).focused(), other);
+    }
+    assertFalse(CaptureConfig.defaults().focused());
+  }
+
+  @Test
   void malformedOrWrongVersionYieldsDefaults() {
     for (String bad :
         new String[] {

@@ -29,7 +29,9 @@ import xtp.agent.v1.Recording.RecordingEvent;
 import xtp.agent.v1.Recording.RecordingEventKind;
 import xtp.agent.v1.Recording.RecordingFinished;
 import xtp.agent.v1.Recording.RecordingStarted;
+import xtp.agent.v1.Recording.CapturedValue;
 import xtp.agent.v1.Recording.SourceBinding;
+import xtp.agent.v1.Recording.ValueBinding;
 import xtp.agent.v1.Transport.Ack;
 
 /** Single owner of XTP session order, protobuf encoding, batching, and staged ACK validation. */
@@ -53,6 +55,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   private final Map<String, PendingRecording> recordings = new HashMap<>();
   private final java.util.Set<String> abandoned = new java.util.HashSet<>();
   private volatile long shutdownStartedNs;
+  private volatile String capturePolicyId = "";
 
   RecordingWriter(XtpSession session, BoundedEventQueue queue, RuntimeBridgeSink sink)
       throws ClientException {
@@ -168,6 +171,11 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         || kind == BridgeEventKind.RESPONSE;
   }
 
+  /** Policy the recordings claim; the daemon grants focused only for a session armed focused. */
+  void capturePolicy(String policyId) {
+    this.capturePolicyId = policyId == null ? "" : policyId;
+  }
+
   private void write(PendingRecording pending, QueueSignal.Finish finish) throws ClientException {
     UUID recordingId;
     try {
@@ -188,6 +196,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
                 .setUrlShape(pending.start.route())
                 .setStartMonotonicNs(pending.start.monotonicNs())
                 .setThreadOrTaskId("request-thread")
+                .setCapturePolicyId(capturePolicyId)
                 .build());
     requireRecordingAck(started, recordingId, 1);
 
@@ -391,11 +400,18 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       // The per-recording event cap has no dedicated reason: THROTTLE is the nearest accurate
       // one (events withheld by a configured limit); a dedicated reason is requested from C.
       boolean cap = event.symbol().equals(CAP_GAP_SYMBOL);
+      boolean lines = event.symbol().equals(BootstrapBridge.LINE_BUDGET_SYMBOL);
       builder.setGap(
           GapPayload.newBuilder()
               .setReason(handler ? GapReason.GAP_REASON_CORRELATION_LOST
+                  : lines ? GapReason.GAP_REASON_LINE_BUDGET
                   : cap ? GapReason.GAP_REASON_THROTTLE : GapReason.GAP_REASON_QUEUE_FULL)
               .setCount(handler ? 1 : Math.max(1, event.detail())));
+    }
+    if (event.values() != null) {
+      for (dev.xtrace.agent.runtime.line.ValueSnapshot value : event.values()) {
+        builder.addBindings(binding(value));
+      }
     }
     if (kind == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_THROW
         && event.exceptionType() != null) {
@@ -432,6 +448,51 @@ final class RecordingWriter implements AutoCloseable, Runnable {
               .setMethod("executeUpdate"));
     }
     return builder.build();
+  }
+
+  /** Wire binding for one sanitized local (CAPTURED, TRUNCATED, REDACTED or UNAVAILABLE). */
+  static ValueBinding binding(dev.xtrace.agent.runtime.line.ValueSnapshot value) {
+    CapturedValue.Builder captured = CapturedValue.newBuilder();
+    xtp.agent.v1.Recording.ValueShape shape =
+        xtp.agent.v1.Recording.ValueShape.valueOf("VALUE_SHAPE_" + value.shape().name());
+    switch (value.state()) {
+      case CAPTURED -> captured.setCaptured(
+          xtp.agent.v1.Recording.CapturedValueCaptured.newBuilder()
+              .setShape(shape)
+              .setPreview(value.preview())
+              .setContentHash(ByteString.copyFrom(value.contentHash())));
+      case TRUNCATED -> captured.setTruncated(
+          xtp.agent.v1.Recording.CapturedValueTruncated.newBuilder()
+              .setPreview(value.preview())
+              .setOriginalSizeLowerBound(value.originalSizeLowerBound())
+              .setLimit(value.limit()));
+      case REDACTED -> captured.setRedacted(
+          xtp.agent.v1.Recording.CapturedValueRedacted.newBuilder()
+              .setRuleId(value.ruleId())
+              .setShapeHint(shape));
+      default -> captured.setUnavailable(
+          xtp.agent.v1.Recording.CapturedValueUnavailable.newBuilder()
+              .setReason(
+                  value.reason() == dev.xtrace.agent.runtime.line.ValueSnapshot.Reason.DEBUG_METADATA_ABSENT
+                      ? xtp.agent.v1.Recording.UnavailableReason.UNAVAILABLE_REASON_DEBUG_METADATA_ABSENT
+                      : xtp.agent.v1.Recording.UnavailableReason.UNAVAILABLE_REASON_UNSAFE_TO_RENDER));
+    }
+    return ValueBinding.newBuilder()
+        .setName(value.name())
+        .setRole(
+            switch (value.role()) {
+              case ARGUMENT -> xtp.agent.v1.Recording.BindingRole.BINDING_ROLE_ARGUMENT;
+              case RETURN -> xtp.agent.v1.Recording.BindingRole.BINDING_ROLE_RETURN;
+              case LOCAL -> xtp.agent.v1.Recording.BindingRole.BINDING_ROLE_LOCAL;
+              case EXCEPTION -> xtp.agent.v1.Recording.BindingRole.BINDING_ROLE_EXCEPTION;
+              case RECEIVER -> xtp.agent.v1.Recording.BindingRole.BINDING_ROLE_RECEIVER;
+            })
+        .setNameOrigin(
+            value.nameOrigin() == dev.xtrace.agent.runtime.line.ValueSnapshot.NameOrigin.DECLARED
+                ? xtp.agent.v1.Recording.NameOrigin.NAME_ORIGIN_DECLARED
+                : xtp.agent.v1.Recording.NameOrigin.NAME_ORIGIN_SYNTHESIZED)
+        .setValue(captured)
+        .build();
   }
 
   private void sendCapabilities() throws ClientException {
