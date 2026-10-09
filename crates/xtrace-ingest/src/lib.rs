@@ -62,6 +62,8 @@
 )]
 
 pub mod error;
+pub mod event_rules;
+pub mod redaction_audit;
 pub mod validator;
 
 pub use error::IngestError;

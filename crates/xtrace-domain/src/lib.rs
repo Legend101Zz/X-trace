@@ -37,6 +37,7 @@
     )
 )]
 
+pub mod capture_budget;
 pub mod catalog;
 pub mod catalog_admission;
 pub mod catalog_discovery;
@@ -46,6 +47,7 @@ pub mod endpoint_identity;
 pub mod endpoint_normalization;
 pub mod error;
 pub mod hash;
+pub mod honesty;
 pub mod ids;
 pub mod observation_classifier;
 pub mod project;
@@ -56,6 +58,10 @@ pub mod runtime;
 pub mod time;
 pub mod value;
 
+pub use capture_budget::{
+    CAPTURE_POLICY_FOCUSED_ID, CAPTURE_POLICY_STANDARD_ID, CaptureBudget, CaptureMode,
+    EVENT_CAP_SANITY_BOUND, FOCUSED_EVENT_CAP, STANDARD_EVENT_CAP,
+};
 pub use catalog::{HttpMethod, Transport};
 pub use endpoint_identity::{
     ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointFingerprint, EndpointFingerprintEncodingError,
@@ -63,6 +69,7 @@ pub use endpoint_identity::{
 };
 pub use error::{AppError, ErrorCategory, ErrorCode, Remediation, RetryAdvice, SafeScalar, codes};
 pub use hash::{ContentHash, HashParseError};
+pub use honesty::{HonestyMarker, honesty_flags};
 pub use ids::{
     CatalogRevisionId, ClaimId, CorrelationId, FrameId, InteractionId, OperationId,
     OperationVersionId, PolicyId, ProjectId, RecordingId, RunId, RuntimeSessionId,
@@ -71,6 +78,11 @@ pub use ids::{
 pub use project::{FingerprintParseError, Project, RepositoryFingerprint};
 pub use provenance::{
     EvidenceRef, LimitationCode, ProducerIdentity, ProvenanceKind, SourceBinding, SourceRange,
+    is_safe_repo_relative_path,
+};
+pub use recording::{
+    BindingRole, Gap, GapReason, NameOrigin, OutcomeException, OutcomeKind, RecordingOutcome,
+    ValueBinding,
 };
 pub use run::{Run, RunKind, RunState};
 pub use time::{MonotonicNs, WallTime};

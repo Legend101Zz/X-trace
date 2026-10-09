@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "note": "Human text for every stable honesty code. Clients key behaviour on the code (the object key), never on the text; the code is also exposed in title/aria-label. Wording follows ADR 0003 section 7: absence is 'not observed', never 'did not run'.",
+  "markers": {
+    "redacted": "Value withheld by a redaction rule.",
+    "truncated": "Value cut at its size limit; only the retained prefix is shown.",
+    "dropped": "Value or event was dropped before it was stored.",
+    "gap": "Events were not recorded here; the reason is shown.",
+    "incomplete": "This recording is not complete.",
+    "unavailable": "Not observed; the reason is shown.",
+    "mismatch": "The source file on disk differs from the file the recording saw.",
+    "source_missing": "The source file is not on disk.",
+    "inferred": "Inferred from static analysis, not observed at runtime.",
+    "unmatched": "Not linked to a catalog operation.",
+    "handler_unresolved": "The handler behind this route could not be resolved.",
+    "correlation_gap": "Correlation between events was lost here.",
+    "capacity_dropped_events": "Events past the per-recording capacity were dropped and counted.",
+    "object_unavailable": "A stored object for this recording is missing.",
+    "object_corrupt": "A stored object for this recording failed its checksum.",
+    "orphan_parent": "The parent frame was not observed.",
+    "legacy_unindexed": "Recorded before frame indexing existed; counts are not available."
+  },
+  "sourceBindings": {
+    "unspecified": "No source information was recorded.",
+    "verified": "Source verified against the build attestation.",
+    "attestation_missing": "No build attestation was available for this class.",
+    "class_bytes_mismatch": "The loaded class differs from the build attestation.",
+    "debug_metadata_absent": "The class has no line table.",
+    "source_metadata_invalid": "The build attestation for this source was invalid.",
+    "observed_unattested": "Source as read when the class loaded; no build attestation vouches for it.",
+    "source_map_absent": "Generated file observed; no source map was found.",
+    "source_map_unresolved": "A source map exists but this position could not be resolved."
+  },
+  "unavailableReasons": {
+    "capability_unsupported": "The adapter does not support this capability.",
+    "debug_metadata_absent": "Debug metadata is absent, so this was not observed.",
+    "capture_budget_exhausted": "The capture budget was used up before this was sampled.",
+    "source_artifact_missing": "The source artifact is missing.",
+    "recorder_disconnected": "The recorder disconnected before this was sampled.",
+    "privacy_policy_unavailable": "No verifiable privacy policy covered this value, so it is not shown.",
+    "focused_capture_not_armed": "Focused capture was not armed; relaunch with focused capture to record this.",
+    "unsafe_to_render": "Not safe to render, so not shown.",
+    "class_not_transformable": "The class could not be instrumented."
+  },
+  "dropReasons": {
+    "backpressure_shed": "Shed under backpressure.",
+    "queue_full": "The recorder queue was full.",
+    "sequence_gap": "A sequence gap made this unrecoverable.",
+    "adapter_dropped": "The adapter reported a drop.",
+    "throttle_suppressed": "Suppressed by the throttle.",
+    "line_budget": "The line budget was exhausted.",
+    "value_budget": "The value budget was exhausted."
+  },
+  "gapReasons": {
+    "line_budget": "Line events were not recorded: the line budget was exhausted.",
+    "value_budget": "Values were not recorded: the value budget was exhausted.",
+    "throttle": "Events were not recorded while the daemon throttled the adapter.",
+    "queue_full": "Events were not recorded: the adapter queue was full.",
+    "correlation_lost": "Events were not recorded: correlation was lost.",
+    "class_not_transformed": "Events were not recorded: the class could not be instrumented.",
+    "module_loaded_before_arm": "Events were not recorded: the module loaded before probes were armed.",
+    "source_map_absent": "Positions were not resolved: no source map was found.",
+    "handled_exception_unobserved": "A handled exception cannot be observed here.",
+    "child_process_not_instrumented": "A child process was started and is not instrumented.",
+    "bootstrap_consumed": "The bootstrap material was already used."
+  },
+  "outcomeKinds": {
+    "responded": "A response was produced.",
+    "exception_propagated": "An exception propagated out of the application.",
+    "client_aborted": "The client went away before a response.",
+    "unobserved": "The outcome was not observed."
+  }
+}

@@ -225,30 +225,28 @@ fn validate_xtf_event(
             CorrelationId::new(),
         ));
     }
-    use xtrace_protocol::generated::agent::SourceBinding as WireSourceBinding;
-    let binding = WireSourceBinding::try_from(payload.source_binding).map_err(|_| {
-        PortError::new(
-            PortErrorKind::Validation,
-            "recording source binding is invalid",
-            CorrelationId::new(),
-        )
-    })?;
-    match (binding, payload.source.as_ref()) {
-        (WireSourceBinding::Verified, Some(source)) => {
-            let allowed = [
-                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderController.java",
-                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java",
-                "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderRepository.java",
-            ];
-            let safe_path = allowed.contains(&source.path.as_str())
-                && !source.path.starts_with('/')
-                && !source.path.contains('\\')
-                && source
-                    .path
-                    .split('/')
-                    .all(|part| !part.is_empty() && part != "." && part != "..");
-            if !safe_path
-                || source.content_hash.len() != 32
+    let binding = xtrace_protocol::translate::source_binding_from_wire(payload.source_binding)
+        .ok_or_else(|| {
+            PortError::new(
+                PortErrorKind::Validation,
+                "recording source binding is invalid",
+                CorrelationId::new(),
+            )
+        })?;
+    // Ingest already applied the full source rules (CONTRACTS section 3, rules 6 and 7); this is
+    // the storage-side second line: a source range exists exactly when the binding claims one, the
+    // path is a safe repository-relative path (any repository, not a fixture allowlist), and the
+    // attested bindings carry a 32-byte content hash.
+    match (binding.has_source_claim(), payload.source.as_ref()) {
+        (true, Some(source)) => {
+            let hash_len = source.content_hash.len();
+            let hash_ok = match binding {
+                xtrace_domain::SourceBinding::Verified
+                | xtrace_domain::SourceBinding::ObservedUnattested => hash_len == 32,
+                _ => hash_len == 0 || hash_len == 32,
+            };
+            if !xtrace_domain::is_safe_repo_relative_path(&source.path)
+                || !hash_ok
                 || source.start_line == 0
                 || (source.end_line != 0 && source.end_line < source.start_line)
             {
@@ -259,14 +257,14 @@ fn validate_xtf_event(
                 ));
             }
         }
-        (WireSourceBinding::Verified, None) | (_, Some(_)) => {
+        (true, None) | (false, Some(_)) => {
             return Err(PortError::new(
                 PortErrorKind::Validation,
                 "recording source binding disagrees with source metadata",
                 CorrelationId::new(),
             ));
         }
-        (_, None) => {}
+        (false, None) => {}
     }
     Ok(event.payload.clone())
 }

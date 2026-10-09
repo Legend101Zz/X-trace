@@ -201,6 +201,29 @@ impl SourceBinding {
     }
 }
 
+/// Longest accepted repository-relative path, in bytes.
+pub const MAX_REPO_RELATIVE_PATH_BYTES: usize = 1024;
+
+/// Returns `true` when `path` is a safe repository-relative source path.
+///
+/// One function serves ingest and the read projection. A safe path is 1 to 1024 bytes with no
+/// leading `/`, no backslash, no NUL or other control character, no empty segment, no `.` or `..`
+/// segment and no drive prefix such as `C:`. It does not check that the file exists.
+#[must_use]
+pub fn is_safe_repo_relative_path(path: &str) -> bool {
+    if path.is_empty() || path.len() > MAX_REPO_RELATIVE_PATH_BYTES {
+        return false;
+    }
+    if path.starts_with('/') || path.contains('\\') || path.chars().any(char::is_control) {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
 /// Reference describing how an evidence item was produced.
 ///
 /// `EvidenceRef` is immutable: a downstream layer may evolve it into
@@ -301,6 +324,79 @@ impl fmt::Display for LimitationCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_repo_relative_path_table() {
+        for good in [
+            "a",
+            "src/main/java/app/OwnerController.java",
+            "pkg/sub/file.ts",
+            "dir with space/f.js",
+            "..hidden/file",
+            "a..b/c",
+            ".github/workflows/x.yml",
+            "src/\u{e9}.java",
+        ] {
+            assert!(is_safe_repo_relative_path(good), "{good:?} should be safe");
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            "\\\\server\\share",
+            "a\\b",
+            "../x",
+            "a/../x",
+            "a/./b",
+            "./a",
+            "a//b",
+            "a/",
+            "a/..",
+            "C:/x",
+            "c:x",
+            "a\0b",
+            "a\nb",
+            "a\u{7f}b",
+        ] {
+            assert!(!is_safe_repo_relative_path(bad), "{bad:?} should be rejected");
+        }
+        assert!(is_safe_repo_relative_path(&"a".repeat(1024)));
+        assert!(!is_safe_repo_relative_path(&"a".repeat(1025)));
+    }
+
+    #[test]
+    fn source_binding_claims_and_strings() {
+        use SourceBinding::{
+            AttestationMissing, ClassBytesMismatch, DebugMetadataAbsent, ObservedUnattested,
+            SourceMapAbsent, SourceMapUnresolved, SourceMetadataInvalid, Unspecified, Verified,
+        };
+        for b in [Verified, ObservedUnattested, SourceMapAbsent, SourceMapUnresolved] {
+            assert!(b.has_source_claim(), "{b:?}");
+        }
+        for b in [
+            Unspecified,
+            AttestationMissing,
+            ClassBytesMismatch,
+            DebugMetadataAbsent,
+            SourceMetadataInvalid,
+        ] {
+            assert!(!b.has_source_claim(), "{b:?}");
+        }
+        assert!(Verified.is_verified());
+        assert!(!ObservedUnattested.is_verified(), "only Verified is attested");
+        for b in [
+            Unspecified,
+            Verified,
+            AttestationMissing,
+            ClassBytesMismatch,
+            DebugMetadataAbsent,
+            SourceMetadataInvalid,
+            ObservedUnattested,
+            SourceMapAbsent,
+            SourceMapUnresolved,
+        ] {
+            assert_eq!(serde_json::to_string(&b).unwrap(), format!("\"{}\"", b.as_str()));
+        }
+    }
 
     #[test]
     fn confidence_rejects_out_of_range() {
