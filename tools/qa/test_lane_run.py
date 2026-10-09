@@ -86,6 +86,44 @@ class MergeTests(unittest.TestCase):
         rc, _ = self.merge(plan, [self.frag("meta")], ["meta=failure"])
         self.assertEqual(rc, 1)
 
+    def test_forced_absent_suite_fails(self):
+        plan = {"mode": "x", "suites": {"tui": {"status": "absent", "forced": True}}}
+        rc, s = self.merge(plan, [])
+        self.assertEqual(rc, 1)
+        self.assertEqual(s["suites"][0]["status"], "fail")
+
+    def test_missing_plan_emits_failing_summary(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            args = type("A", (), {"plan": str(d / "none.json"), "frag_dir": str(d), "out": str(d / "s.json"),
+                                  "step_summary": "", "job_result": None})()
+            self.assertEqual(lane_run.cmd_merge(args), 1)
+            doc = json.loads((d / "s.json").read_text())
+            self.assertEqual((doc["overall"], doc["reason"]), ("fail", "plan-unavailable"))
+            self.assertIn("headSha", doc)
+
+
+class RunTests(unittest.TestCase):
+    def run_step(self, cmd, min_passed=0):
+        with tempfile.TemporaryDirectory() as d:
+            args = type("A", (), {"suite": "meta", "variant": "-", "step": "t", "out": d + "/o", "cwd": "",
+                                  "timeout": 60, "min_passed": min_passed, "command": ["--"] + cmd})()
+            import os
+            os.environ["LANE_PRIVATE_LOG_DIR"] = d
+            rc = lane_run.cmd_run(args)
+            frag = json.loads((pathlib.Path(d) / "o/meta__-__t.json").read_text())
+            return rc, frag
+
+    def test_zero_tests_fails_with_min_passed(self):
+        rc, frag = self.run_step([sys.executable, "-c", "print('Ran 0 tests in 0.0s')"], 1)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(frag["status"], "fail")
+
+    def test_uncounted_step_reports_null(self):
+        rc, frag = self.run_step([sys.executable, "-c", "print('hi')"])
+        self.assertEqual(rc, 0)
+        self.assertIsNone(frag["passed"])
+
 
 class LintTests(unittest.TestCase):
     def test_repo_workflows_pass_lint(self):

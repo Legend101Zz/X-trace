@@ -45,6 +45,7 @@ def parse_output(text: str) -> dict:
     failing: list[str] = []
     dropped = 0
     passed = failed = ignored = 0
+    counted = False
     for line in text.splitlines():
         line = line.rstrip()
         cand = None
@@ -58,14 +59,17 @@ def parse_output(text: str) -> dict:
             cand = m.group(1)
         elif m := PY_RAN.match(line):
             passed += int(m.group(1))
+            counted = True
         elif m := PY_FAILED.match(line):
             bad = int(m.group(1) or 0) + int(m.group(2) or 0)
             failed += bad
             passed -= bad
+            counted = True
         elif m := CARGO_RESULT.match(line):
             passed += int(m.group(1))
             failed += int(m.group(2))
             ignored += int(m.group(3))
+            counted = True
         if cand is not None:
             if ci_floor._valid_test_id(cand):
                 if cand not in failing:
@@ -73,7 +77,9 @@ def parse_output(text: str) -> dict:
             else:
                 dropped += 1
     return {
-        "passed": passed, "failed": failed, "ignored": ignored,
+        "counted": counted,
+        "passed": passed if counted else None, "failed": failed if counted else None,
+        "ignored": ignored if counted else None,
         "failingTests": failing[:MAX_FAILING],
         "failingTruncated": max(0, len(failing) - MAX_FAILING),
         "droppedInvalidNames": dropped,
@@ -84,6 +90,10 @@ def _check_name(value: str, what: str) -> str:
     if value != "-" and not SAFE_NAME.fullmatch(value):
         raise SystemExit(f"invalid {what}")
     return value
+
+
+def _fmt(value) -> str:
+    return "n/a" if value is None else str(value)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -105,36 +115,57 @@ def cmd_run(args: argparse.Namespace) -> int:
     text = log_path.read_text(encoding="utf-8", errors="replace")
     facts = parse_output(text)
     status = "pass" if proc.returncode == 0 else "fail"
+    if status == "pass" and args.min_passed and (facts["passed"] or 0) < args.min_passed:
+        status = "fail"  # a test step that ran fewer tests than expected is not a pass
+        print(f"lane {suite}/{variant}/{step}: fewer than {args.min_passed} tests counted")
     frag = {"suite": suite, "variant": variant, "step": step, "status": status,
-            "exitCode": proc.returncode, **facts}
+            "exitCode": proc.returncode, **{k: v for k, v in facts.items() if k != "counted"}}
     (out / f"{suite}__{variant}__{step}.json").write_text(json.dumps(frag, sort_keys=True, indent=1) + "\n")
-    print(f"lane {suite}/{variant}/{step}: {status} exit={proc.returncode} passed={facts['passed']} "
-          f"failed={facts['failed']} ignored={facts['ignored']}")
+    print(f"lane {suite}/{variant}/{step}: {status} exit={proc.returncode} "
+          f"passed={_fmt(facts['passed'])} failed={_fmt(facts['failed'])} ignored={_fmt(facts['ignored'])}")
     for name in facts["failingTests"]:
         print(f"lane failing-test {name}")
     if facts["failingTruncated"] or facts["droppedInvalidNames"]:
         print(f"lane failing-test-overflow truncated={facts['failingTruncated']} "
               f"dropped-invalid={facts['droppedInvalidNames']}")
-    if status == "fail" and os.environ.get("LANE_DIAG") == "scrubbed":
-        # Opt-in (repository variable) scrubbed tail: no paths, env, hex or tokens, 160 chars per line.
-        for line in text.splitlines()[-40:]:
-            print("lane diag| " + ci_floor._scrub_text(line))
-    return proc.returncode
+    return 0 if status == "pass" else (proc.returncode or 1)
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
-    plan = json.loads(pathlib.Path(args.plan).read_text())
-    frags = [json.loads(p.read_text()) for p in sorted(pathlib.Path(args.frag_dir).glob("**/*.json"))]
     results: dict[str, str] = {}
     for item in args.job_result or []:
         name, _, res = item.partition("=")
         results[name] = res
+    try:
+        plan = json.loads(pathlib.Path(args.plan).read_text())
+    except (OSError, ValueError):
+        plan = None
+    if results.get("plan") not in (None, "success"):
+        plan = None
+    meta = {k: os.environ.get(v, "") for k, v in (("headSha", "GITHUB_SHA"), ("runId", "GITHUB_RUN_ID"),
+                                                  ("runAttempt", "GITHUB_RUN_ATTEMPT"), ("ref", "GITHUB_REF"))}
+    if plan is None:
+        # The plan job failed or its artifact is missing: still emit a summary, and never a passing one.
+        doc = {"schemaVersion": 1, **meta, "planMode": None, "overall": "fail", "reason": "plan-unavailable",
+               "suites": []}
+        pathlib.Path(args.out).write_text(json.dumps(doc, sort_keys=True, indent=1) + "\n")
+        text = "lane plan unavailable: no suite was evaluated\n"
+        print(text)
+        if args.step_summary:
+            with open(args.step_summary, "a", encoding="utf-8") as fh:
+                fh.write(text)
+        return 1
+    frags = [json.loads(p.read_text()) for p in sorted(pathlib.Path(args.frag_dir).glob("**/*.json"))]
     suites_out = []
     overall_ok = True
     for name, info in plan["suites"].items():
         entry: dict = {"name": name, "plan": info.get("reason", "")}
         if info["status"] in ("skipped-by-filter", "absent"):
             entry["status"] = info["status"]
+            if info.get("forced"):
+                entry["status"] = "fail"
+                entry["reason"] = "suite explicitly requested but absent"
+                overall_ok = False
             suites_out.append(entry)
             continue
         mine = [f for f in frags if f["suite"] == name]
@@ -150,8 +181,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
             for f in vfr:
                 failing += [f"{variant}:{t}" if variant != "-" else t for t in f["failingTests"]]
             variants.append({"variant": variant, "status": vstatus,
-                             "steps": [{"step": f["step"], "status": f["status"], "passed": f["passed"],
-                                        "failed": f["failed"], "ignored": f["ignored"]} for f in vfr]})
+                             "steps": [{"step": f["step"], "status": f["status"], "passed": f.get("passed"),
+                                        "failed": f.get("failed"), "ignored": f.get("ignored")} for f in vfr]})
         if results.get(name) not in (None, "success"):
             suite_ok = False
         entry["status"] = "pass" if suite_ok else "fail"
@@ -161,7 +192,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
             entry["changedCrates"] = info["changedCrates"]
         overall_ok &= suite_ok
         suites_out.append(entry)
-    doc = {"schemaVersion": 1, "planMode": plan.get("mode"), "overall": "pass" if overall_ok else "fail",
+    doc = {"schemaVersion": 1, **meta, "planMode": plan.get("mode"), "overall": "pass" if overall_ok else "fail",
            "suites": suites_out}
     pathlib.Path(args.out).write_text(json.dumps(doc, sort_keys=True, indent=1) + "\n")
     lines = ["| suite | status | detail |", "|---|---|---|"]
@@ -185,6 +216,7 @@ def main() -> int:
     r.add_argument("--step", required=True)
     r.add_argument("--out", required=True)
     r.add_argument("--cwd", default="")
+    r.add_argument("--min-passed", type=int, default=0, help="fail a zero-exit step that counted fewer tests")
     r.add_argument("--timeout", type=int, default=3000)
     r.add_argument("command", nargs=argparse.REMAINDER)
     m = sub.add_parser("merge")

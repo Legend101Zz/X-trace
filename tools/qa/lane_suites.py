@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Select the lane CI suites for a push (stdlib only).
 
-Diffs the pushed range (or the merge-base with origin/main when the range is unknown, for
-example the first push of a new branch) and prints a JSON suite plan:
+Always plans cumulatively: it diffs the merge-base with origin/main to HEAD, never only the pushed
+range. A per-push range would let a later docs-only push (or a cancelled/failed earlier run) mask a changed
+crate, so green on the lane would not mean HEAD is green. It prints a JSON suite plan:
 
   {"mode": ..., "changed": N, "suites": {"<suite>": {"status": "selected" | "skipped-by-filter" | "absent", ...}}}
 
@@ -26,13 +27,18 @@ CRATE_RE = re.compile(r"^crates/([A-Za-z0-9_-]+)/")
 # Path prefixes (or exact files) that select a suite. "meta" is always selected: it is the cheap
 # smoke suite (workflow lint plus the unit tests of these tools).
 PREFIXES: dict[str, tuple[str, ...]] = {
-    "rust": ("crates/", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/", "schema/"),
+    "rust": ("crates/", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/", "schema/",
+             "rustfmt.toml", ".rustfmt.toml", "clippy.toml", ".clippy.toml", "deny.toml",
+             # xtrace-cli tests drive the built adapters, the embedded viewer and the Playwright journeys.
+             "adapters/", "web/app/"),
     "java": ("adapters/java/", "schema/"),
     "node": ("adapters/node/", "schema/"),
     "web": ("web/app/", "schema/xtp-client/"),
     "tui": ("crates/xtrace-tui/", "Cargo.toml", "Cargo.lock"),
 }
 TUI_DIR = "crates/xtrace-tui"
+# A change to the lane's own definition or tooling can break any job, so it selects every present suite.
+SELECT_ALL = (".github/workflows/lane.yml", "tools/qa/", "tools/release/ci_floor.py")
 
 
 def _git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
@@ -40,12 +46,10 @@ def _git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def changed_files(repo: pathlib.Path, head: str, before: str | None, base_ref: str) -> tuple[str, list[str] | None]:
-    """Return (mode, files); files is None when no diff basis could be established."""
-    if before and SHA_RE.fullmatch(before) and before != ZERO_SHA:
-        if _git(repo, "cat-file", "-e", f"{before}^{{commit}}").returncode == 0:
-            out = _git(repo, "diff", "--name-only", "--no-renames", f"{before}..{head}")
-            if out.returncode == 0:
-                return "push-range", [line for line in out.stdout.splitlines() if line]
+    """Return (mode, files); files is None when no diff basis could be established.
+
+    `before` is accepted for command-line compatibility and ignored: the plan is cumulative.
+    """
     mb = _git(repo, "merge-base", base_ref, head)
     if mb.returncode == 0 and mb.stdout.strip():
         out = _git(repo, "diff", "--name-only", "--no-renames", f"{mb.stdout.strip()}..{head}")
@@ -68,6 +72,8 @@ def plan(files: list[str] | None, force: str, repo: pathlib.Path) -> dict:
             continue
         if name == "tui" and not (repo / TUI_DIR).is_dir():
             suites[name] = {"status": "absent", "reason": "crates/xtrace-tui does not exist"}
+            if name in forced and force != "all":
+                suites[name]["forced"] = True  # an explicit request for an absent suite is not a pass
             continue
         if files is None:
             suites[name] = {"status": "selected", "reason": "no-diff-basis"}
@@ -75,6 +81,8 @@ def plan(files: list[str] | None, force: str, repo: pathlib.Path) -> dict:
             suites[name] = {"status": "selected", "reason": "dispatch"}
         elif any(_matches(f, PREFIXES[name]) for f in files):
             suites[name] = {"status": "selected", "reason": "path-filter"}
+        elif any(_matches(f, SELECT_ALL) for f in files):
+            suites[name] = {"status": "selected", "reason": "lane-definition-changed"}
         else:
             suites[name] = {"status": "skipped-by-filter", "reason": "no matching path changed"}
     crates = sorted({m.group(1) for f in (files or []) if (m := CRATE_RE.match(f))})

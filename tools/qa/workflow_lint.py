@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Structural lint of workflow files (stdlib + system ruby for YAML parsing).
 
-Checks, for every workflow given: parses as YAML; top-level `permissions` present; every `uses:` pinned to a
+Checks, for every workflow given: parses as YAML; top-level `permissions` exactly {contents: read} and no job-level elevation; no github.token/GITHUB_TOKEN; every `uses:` pinned to a
 40-hex SHA; every actions/checkout has `persist-credentials: false`; every job has `timeout-minutes` (only
 enforced for files listed with --strict-timeouts); no `secrets.` references.
 """
@@ -32,8 +32,13 @@ def lint(path: pathlib.Path, strict_timeouts: bool) -> list[str]:
     except (ValueError, OSError):
         return [f"{path.name}: does not parse"]
     text = path.read_text()
-    if "permissions" not in doc:
-        problems.append(f"{path.name}: no top-level permissions")
+    if doc.get("permissions") != {"contents": "read"}:
+        problems.append(f"{path.name}: top-level permissions must be exactly contents: read")
+    for job_id, job in (doc.get("jobs") or {}).items():
+        if "permissions" in job and job["permissions"] != {"contents": "read"}:
+            problems.append(f"{path.name}: job {job_id} elevates permissions")
+    if re.search(r"github\.token|GITHUB_TOKEN", text):
+        problems.append(f"{path.name}: references github.token or GITHUB_TOKEN")
     if re.search(r"\bsecrets\.", text):
         problems.append(f"{path.name}: references secrets")
     for m in re.finditer(r"^\s*-?\s*uses:\s*(\S.*)$", text, re.M):

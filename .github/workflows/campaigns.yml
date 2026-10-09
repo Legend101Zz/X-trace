@@ -134,7 +134,7 @@ jobs:
           export XCAMP_JAVA="$JAVA_HOME/bin/java"
           python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
             --step baseline -- python3 -B "campaigns/java/$CAMP_PROJECT/harness/run.py" baseline
-      - name: Compare with the tracked baseline fingerprints (informational)
+      - name: Compare with the tracked baseline (fingerprints and Postgres digest gate, jar sha is reported)
         if: matrix.kind == 'java' && always()
         run: |
           python3 -B tools/qa/camp_compare.py --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \

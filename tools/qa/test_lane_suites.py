@@ -1,4 +1,5 @@
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,11 +15,22 @@ def status(files, force="", repo=None):
 
 
 class PlanTests(unittest.TestCase):
-    def test_workflow_only_change_selects_meta_only(self):
-        s = status([".github/workflows/lane.yml"])
+    def test_other_workflow_change_selects_meta_only(self):
+        s = status([".github/workflows/campaigns.yml", "docs/a.md"])
         self.assertEqual(s["meta"], "selected")
         for name in ("rust", "java", "node", "web"):
             self.assertEqual(s[name], "skipped-by-filter")
+
+    def test_lane_definition_selects_every_present_suite(self):
+        for path in (".github/workflows/lane.yml", "tools/qa/lane_run.py", "tools/release/ci_floor.py"):
+            s = status([path])
+            for name in ("meta", "rust", "java", "node", "web"):
+                self.assertEqual(s[name], "selected", (path, name))
+
+    def test_rust_config_and_adapters_select_rust(self):
+        for path in ("rustfmt.toml", "clippy.toml", "deny.toml", "adapters/java/x/build.gradle.kts",
+                     "adapters/node/src/a.ts", "web/app/src/a.ts"):
+            self.assertEqual(status([path])["rust"], "selected", path)
 
     def test_crate_change_selects_rust_and_lists_crate(self):
         p = ls.plan(["crates/xtrace-domain/src/lib.rs"], "", pathlib.Path(tempfile.gettempdir()))
@@ -46,6 +58,37 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(status(["adapters/node/package.json"])["node"], "selected")
         self.assertEqual(status(["adapters/node/package.json"])["java"], "skipped-by-filter")
         self.assertEqual(status(["web/app/src/a.ts"])["web"], "selected")
+
+
+def run(*args, cwd):
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args], cwd=cwd,
+                   check=True, capture_output=True)
+
+
+class CumulativeTests(unittest.TestCase):
+    def test_docs_push_after_crate_push_still_selects_rust(self):
+        # Push A touches a crate, push B only docs: the plan for B must still select rust.
+        with tempfile.TemporaryDirectory() as d:
+            repo = pathlib.Path(d)
+            run("init", "-q", "-b", "main", cwd=repo)
+            (repo / "README.md").write_text("x")
+            run("add", ".", cwd=repo)
+            run("commit", "-q", "-m", "base", cwd=repo)
+            run("update-ref", "refs/remotes/origin/main", "HEAD", cwd=repo)
+            run("checkout", "-q", "-b", "ultra/x", cwd=repo)
+            (repo / "crates/xtrace-domain").mkdir(parents=True)
+            (repo / "crates/xtrace-domain/lib.rs").write_text("a")
+            run("add", ".", cwd=repo)
+            run("commit", "-q", "-m", "A", cwd=repo)
+            a = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+            (repo / "docs.md").write_text("b")
+            run("add", ".", cwd=repo)
+            run("commit", "-q", "-m", "B", cwd=repo)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True).stdout.strip()
+            mode, files = ls.changed_files(repo, head, a, "origin/main")
+            self.assertEqual(mode, "merge-base")
+            self.assertIn("crates/xtrace-domain/lib.rs", files)
+            self.assertEqual(ls.plan(files, "", repo)["rust"]["status"], "selected")
 
 
 if __name__ == "__main__":

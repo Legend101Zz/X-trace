@@ -1,0 +1,20 @@
+// Lane CI only (passed with -I): run the Gradle tests on the JDK the matrix leg installed.
+// Every build file pins `toolchain { languageVersion = 17 }`, which would silently run compile and tests on 17 for
+// every matrix leg. Compilation stays on the pinned toolchain; the test JVM becomes the Gradle JVM, and the build
+// fails unless that JVM is the expected one, so a leg can never report a JDK it did not use.
+def expected = System.getProperty("lane.jdk") ?: System.getenv("LANE_JDK")
+if (expected == null || expected.isEmpty()) {
+    throw new GradleException("lane-test-jdk: LANE_JDK is not set")
+}
+def actual = System.getProperty("java.specification.version")
+if (actual != expected) {
+    throw new GradleException("lane-test-jdk: Gradle runs on JDK " + actual + ", expected " + expected)
+}
+allprojects {
+    tasks.withType(Test).configureEach {
+        executable = System.getProperty("java.home") + "/bin/java"
+        doFirst {
+            logger.lifecycle("lane-jdk test-jvm-spec " + actual)
+        }
+    }
+}

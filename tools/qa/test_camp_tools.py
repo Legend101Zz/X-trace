@@ -8,6 +8,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import camp_select as cs  # noqa: E402
 import camp_summary as cu  # noqa: E402
+import camp_compare as cc  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -55,6 +56,39 @@ class GateTests(unittest.TestCase):
             cu.record(f, "p", "baseline", "pass")
             cu.record(f, "p", "compare", "reported", "differs")
             self.assertEqual(cu.gate(f), 0)
+
+
+class CompareTests(unittest.TestCase):
+    def run_compare(self, got_fp, waive=()):
+        import json, tempfile, pathlib
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            pinned = {"pin": {"jarSha256": "a" * 64, "postgresImageDigest": "sha256:" + "1" * 64},
+                      "scenarios": [{"id": "s1", "semanticEffectFingerprint": "f1"}]}
+            receipt = {"pin": {"jarSha256": "b" * 64, "postgresImageDigest": "sha256:" + "1" * 64},
+                       "scenarios": [{"id": "s1", "semanticEffectFingerprint": got_fp}]}
+            (d / "p.json").write_text(json.dumps(pinned))
+            (d / "r.json").write_text(json.dumps(receipt))
+            argv = ["x", "--file", str(d / "s.json"), "--project", "p", "--receipt", str(d / "r.json"),
+                    "--pinned", str(d / "p.json")]
+            for w in waive:
+                argv += ["--waive", w]
+            old = sys.argv
+            sys.argv = argv
+            try:
+                cc.main()
+            finally:
+                sys.argv = old
+            return {s["step"]: s["status"] for s in json.loads((d / "s.json").read_text())["steps"]}
+
+    def test_match_passes_and_jar_difference_is_reported(self):
+        r = self.run_compare("f1")
+        self.assertEqual(r["baseline-fingerprints-vs-pinned"], "pass")
+        self.assertEqual(r["baseline-jar-sha-vs-pinned"], "reported")
+
+    def test_fingerprint_mismatch_gates_unless_waived(self):
+        self.assertEqual(self.run_compare("zz")["baseline-fingerprints-vs-pinned"], "fail")
+        self.assertEqual(self.run_compare("zz", ["s1"])["baseline-fingerprints-vs-pinned"], "pass")
 
 
 if __name__ == "__main__":
