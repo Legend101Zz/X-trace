@@ -800,9 +800,7 @@ fn wait_for_store_quiescence(project_root: &Path) {
 /// journey selects its recordings by the request they hold, never by persisted ordinal.
 fn wait_for_order_recordings(project_root: &Path, expected_count: usize) -> Vec<(String, Vec<u8>)> {
     let marker: &[u8] = b"http.request POST /orders";
-    // Persisting each recording runs macOS private-storage admission (a `/bin/ls` spawn per
-    // admitted directory); on a hosted three-core runner that takes seconds per recording.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let orders: Vec<(String, Vec<u8>)> = wait_for_recordings(project_root, 0)
             .into_iter()

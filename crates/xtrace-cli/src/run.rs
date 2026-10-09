@@ -175,6 +175,20 @@ async fn run_unix(
     // direct JDK and private agent distribution have passed runtime preflight.
     let launch = JavaLaunch::validate(&java_agent, &command).map_err(CliError::Run)?;
     let mut signals = JavaSignals::install().map_err(CliError::Run)?;
+
+    // Scope is resolved before any side effect so the observation policy can be derived from it.
+    let jar = xtrace_runtime::java_scope::jar_from_java_args(&command);
+    let scope = xtrace_runtime::java_scope::resolve_scope(&capture.app_packages, jar.as_deref());
+    // An operator-selected endpoint observation policy attributes routes to application-owned
+    // handlers, so it is only meaningful when application scope is known. `spring-orders-v1` is
+    // itself a fixture literal: the store confines it to the fixture component/binding tuple.
+    if observed_endpoint_policy.is_some() && scope.application_packages.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "--observed-endpoint-policy needs a resolved application scope: pass --app-package \
+             or launch a Spring Boot fat jar whose BOOT-INF/classes names the application packages"
+                .to_string(),
+        ));
+    }
     let run_observation = xtrace_application::recording::EndpointObservationInput {
         policy_id: observed_endpoint_policy,
         application_component,
@@ -192,8 +206,6 @@ async fn run_unix(
     // CONTRACTS 10.3: scope and capture options reach the agent and the daemon through the
     // private capture.json beside the bootstrap. Scope is resolved from the explicit prefixes,
     // else from a Spring Boot fat jar's BOOT-INF/classes, else it is honestly empty.
-    let jar = xtrace_runtime::java_scope::jar_from_java_args(&command);
-    let scope = xtrace_runtime::java_scope::resolve_scope(&capture.app_packages, jar.as_deref());
     let capture_document = crate::capture_args::document(
         capture.depth,
         &scope.application_packages,
