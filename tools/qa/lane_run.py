@@ -96,6 +96,45 @@ def _fmt(value) -> str:
     return "n/a" if value is None else str(value)
 
 
+# Compiler diagnostics shown on failure (Cc-001, J-002): only rustc/clippy headline lines and repo-relative locations,
+# bounded and filtered. Anything that looks like a host path, a user name or a credential is dropped and only counted.
+DIAG_HEAD = re.compile(r"^(error|warning)(\[[A-Z]\d{4}\])?: (.{1,200})$")
+DIAG_LOC = re.compile(r"^\s*--> (\S{1,300}):(\d+):(\d+)$")
+DIAG_PATH_OK = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]{0,200}$")
+DIAG_BAD = re.compile(r"(/home/|/Users/|/Volumes/|/tmp/|/runner|\\|token|secret|password|bearer|authorization|cookie|api[_-]?key)", re.I)
+DIAG_SKIP = re.compile(r"^(warning|error): (\d+ warnings? emitted|aborting due to|could not compile|build failed|unused)", re.I)
+MAX_DIAG = 20
+
+
+def diagnostics(text: str) -> tuple[list[str], int]:
+    """(lines to print, dropped count). Pairs each `error: msg` with the `--> file:line:col` that follows it."""
+    out: list[str] = []
+    dropped = 0
+    pending: str | None = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        m = DIAG_HEAD.match(line)
+        if m:
+            pending = None
+            if m.group(1) != "error" or DIAG_SKIP.match(line):
+                continue
+            if DIAG_BAD.search(line):
+                dropped += 1
+                continue
+            pending = f"{m.group(1)}{m.group(2) or ''}: {m.group(3)}"
+            continue
+        loc = DIAG_LOC.match(line)
+        if loc and pending is not None:
+            if DIAG_BAD.search(loc.group(1)) or ".." in loc.group(1) or not DIAG_PATH_OK.match(loc.group(1)):
+                dropped += 1
+            elif len(out) < MAX_DIAG:
+                out.append(f"{pending} @ {loc.group(1)}:{loc.group(2)}:{loc.group(3)}")
+            else:
+                dropped += 1
+            pending = None
+    return out, dropped
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     suite, variant, step = (_check_name(args.suite, "suite"), _check_name(args.variant, "variant"),
                             _check_name(args.step, "step"))
@@ -110,8 +149,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     log_path = log_dir / f"{suite}-{variant}-{step}.log"
     with open(log_path, "wb") as log:
         os.umask(previous_umask)
-        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=args.cwd or None,
-                              check=False, timeout=args.timeout)
+        try:
+            proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=args.cwd or None,
+                                  check=False, timeout=args.timeout)
+        except subprocess.TimeoutExpired:  # a timeout is a failed step with a fragment, never a traceback with argv
+            proc = subprocess.CompletedProcess(cmd, 124)
+            log.write(f"\nlane: step exceeded its {args.timeout}s timeout\n".encode())
+            print(f"lane {suite}/{variant}/{step}: timeout after {args.timeout}s")
     text = log_path.read_text(encoding="utf-8", errors="replace")
     facts = parse_output(text)
     status = "pass" if proc.returncode == 0 else "fail"
@@ -125,6 +169,12 @@ def cmd_run(args: argparse.Namespace) -> int:
           f"passed={_fmt(facts['passed'])} failed={_fmt(facts['failed'])} ignored={_fmt(facts['ignored'])}")
     for name in facts["failingTests"]:
         print(f"lane failing-test {name}")
+    if status == "fail":
+        diags, ddropped = diagnostics(text)
+        for d in diags:
+            print(f"lane diagnostic {d}")
+        if ddropped:
+            print(f"lane diagnostic-overflow dropped={ddropped}")
     if facts["failingTruncated"] or facts["droppedInvalidNames"]:
         print(f"lane failing-test-overflow truncated={facts['failingTruncated']} "
               f"dropped-invalid={facts['droppedInvalidNames']}")
