@@ -2098,9 +2098,7 @@ mod tests {
         service
             .record_events(RecordEvents { recording_id, events: vec![event(2, 1, 0xaa)] })
             .expect("event");
-        service
-            .finish_recording(FinishRecording::without_digest(recording_id, 2))
-            .expect("finish");
+        service.finish_recording(FinishRecording::without_digest(recording_id, 2)).expect("finish");
     }
 
     #[test]
