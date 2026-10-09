@@ -464,7 +464,7 @@ What the candidate adds on top of `a181a0c`:
   - Store migrations v7 (event-cap bound) and v8 (frame index, populated at commit).
   - Read API v3 with index-based previous, next, into, over and out navigation, an anchored window, and persisted outcomes.
   - `init` and `open` idempotency keys are a fixed-length digest of the canonical repository path, tested with a 200+ character path.
-  - Version `0.0.1` for the Rust workspace and the Java adapter (Node packages still at `0.1.0`, see below).
+  - Version `0.0.1` for the Rust workspace, the Java adapter and the Node packages.
   - ADR 0010: navigation extras, catalog CLI naming and the exit-code table.
 - **Java:**
   - A generic Spring MVC request root.
@@ -493,7 +493,6 @@ Open major findings on the candidate (from the final review):
 - The session and daemon record at most 256 requests and 1,024 recordings for their lifetime, because finished recordings are never evicted.
 - The Java static analyzer is not registered in the Gradle build.
 - Focused-mode arming is not wired: the 131,072-event focused cap and line capture cannot be armed.
-- The Node packages still carry version `0.1.0`.
 - The relocated catalog source-proof gate has no test.
 - The hosted macOS arm64 CI job that ADR 0006 §2.3 asks for is missing.
 - Capture scope and source roots do not reach the Java agent from `xtrace run`.

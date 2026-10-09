@@ -706,6 +706,14 @@ async fn handle_connection(
                                      the recording is served under the standard policy",
                                 );
                             }
+                            let finished_recording_id = match &admission.incoming {
+                                crate::runtime::IncomingEnvelope::RecordingFinished(finished) => {
+                                    uuid::Uuid::from_slice(&finished.recording_id)
+                                        .ok()
+                                        .map(xtrace_domain::RecordingId::from_uuid)
+                                }
+                                _ => None,
+                            };
                             if let Some(pipeline) = ctx.recording_pipeline.as_ref() {
                                 if let Err(err) = pipeline
                                     .process_armed(
@@ -733,6 +741,11 @@ async fn handle_connection(
                                         return Ok(());
                                     }
                                     return Ok(());
+                                }
+                                if let Some(recording_id) = finished_recording_id {
+                                    // The terminal commit succeeded; the digest table is no
+                                    // longer needed for dedupe (CONTRACTS 4.1 item 3).
+                                    post_hello_session.release_terminal(recording_id);
                                 }
                                 if let Err(err) = post_hello_session
                                     .release_staged_front(envelope.session_seq)

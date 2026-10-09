@@ -735,6 +735,14 @@ impl Session {
         }
     }
 
+    /// Drops a finished recording's retained digest table once its terminal evidence is durable.
+    ///
+    /// Returns `false` when the recording is unknown or has not finished; the validator keeps its
+    /// tombstone so exact retries stay idempotent.
+    pub fn release_terminal(&mut self, recording_id: RecordingId) -> bool {
+        self.ingest_validator.release_terminal(recording_id)
+    }
+
     /// Releases exactly the staged queue front for an envelope after its
     /// configured downstream handling succeeds.
     ///
@@ -1707,6 +1715,18 @@ mod tests {
 
         assert_eq!(session.next_expected_seq, 4);
         assert_eq!(session.staged_incoming.len(), 3);
+    }
+
+    #[test]
+    fn release_terminal_only_succeeds_after_the_recording_finished() {
+        let (mut session, sid, _) = session_after_hello();
+        let id =
+            RecordingId::from_uuid(Uuid::from_slice(&valid_started(0x01).recording_id).unwrap());
+        drive(&mut session, sid, 1, PayloadOneof::RecordingStarted(valid_started(0x01)));
+        assert!(!session.release_terminal(id), "an open recording keeps its table");
+        drive(&mut session, sid, 2, PayloadOneof::RecordingFinished(finished(0x01, 1)));
+        assert!(session.release_terminal(id));
+        assert!(!session.release_terminal(RecordingId::from_uuid(Uuid::from_u128(7))));
     }
 
     #[test]
