@@ -71,6 +71,29 @@ class CanaryTests(unittest.TestCase):
         r = self.scan(store=self.root)
         self.assertTrue(any(h["canary"] == "env-var" for h in r["hits"]))
 
+    def test_zstd_member_is_decoded_or_reported_undecodable(self):
+        payload = self.c["json-body-password"].encode()
+        frame = None
+        try:
+            from compression import zstd  # Python 3.14
+            frame = zstd.compress(b"x" * 10 + payload)
+        except Exception:
+            import shutil
+            import subprocess
+            if shutil.which("zstd"):
+                frame = subprocess.run(["zstd", "-c", "-q"], input=b"x" * 10 + payload, capture_output=True).stdout
+        if frame is None:  # no encoder here: hand-built raw-block frame (magic, single-segment header, one raw block)
+            body = b"x" * 10 + payload
+            size = len(body)
+            frame = (canary.ZSTD_MAGIC + bytes([0x20 | 0x00, size]) if size < 256 else b"") + \
+                (((size << 3) | 1).to_bytes(3, "little") + body if size < 256 else b"")
+        (self.root / "o.xtf.zst").write_bytes(frame)
+        r = self.scan(store=self.root)
+        kinds = {h["canary"] for h in r["hits"]}
+        # either the member was opened and the canary found, or the scanner says it could not look: never "clean"
+        self.assertFalse(r["clean"])
+        self.assertTrue("json-body-password" in kinds or "<undecodable-zstd>" in kinds, kinds)
+
     def test_file_name_is_scanned(self):
         (self.root / (self.c["query-token"] + ".txt")).write_text("x")
         r = self.scan(store=self.root)

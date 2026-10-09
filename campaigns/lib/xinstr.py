@@ -18,10 +18,11 @@ import subprocess
 import time
 from typing import Any, Callable
 
+# matched against the class part of a frame symbol such as `OwnerController.findOwner`
 LAYER_PATTERNS = {
-    "controller": re.compile(r"Controller|Resource(?:#|\.|$)|ApiResource"),
+    "controller": re.compile(r"Controller|Resource$"),
     "service": re.compile(r"Service"),
-    "repository": re.compile(r"Repository|\bDao\b|Dao[#.]"),
+    "repository": re.compile(r"Repository|Dao$"),
 }
 
 
@@ -213,38 +214,51 @@ def route_regex(template: str) -> re.Pattern[str]:
     return re.compile("^" + "".join("[^/?#]+" if p.startswith("{") else re.escape(p) for p in parts) + r"/?(?:\?.*)?$")
 
 
-def boundary_facts(detail: dict) -> dict[str, Any]:
-    """Method/route/path strings on the recording boundary plus frame symbols, as the API reports them."""
-    strings: list[str] = []
-    symbols: list[str] = []
+REQUEST_SYMBOL = re.compile(r"^http\.request ([A-Z]+) (\S+)$")
+RESPONSE_SYMBOL = re.compile(r"^http\.response (\d{3})$")
+
+
+def request_info(detail: dict) -> tuple[str, str] | None:
+    """(method, route) from the boundary request event: its symbol reads `http.request GET /owners/{ownerId}`."""
     for ev in detail.get("events", []):
-        strings += _strings(ev.get("interaction"))
-        if ev.get("symbol"):
-            symbols.append(ev["symbol"])
-    return {"strings": strings, "symbols": symbols}
+        m = REQUEST_SYMBOL.match(ev.get("symbol") or "")
+        if m:
+            return m.group(1), m.group(2)
+    return None
+
+
+def response_event_status(detail: dict) -> int | None:
+    """Status printed by the boundary response event (`http.response 200`); `http.response unavailable` gives None."""
+    for ev in detail.get("events", []):
+        m = RESPONSE_SYMBOL.match(ev.get("symbol") or "")
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def layer_frames(detail: dict, layer: str, name_hint: str | None = None) -> list[dict]:
     pat = LAYER_PATTERNS[layer]
     out = []
     for ev in detail.get("events", []):
+        if not str(ev.get("kind", "")).endswith("frame_enter"):
+            continue
         sym = ev.get("symbol") or ""
-        if pat.search(sym) and (name_hint is None or name_hint in sym):
+        if pat.search(sym.split(".", 1)[0]) and (name_hint is None or name_hint in sym):
             out.append(ev)
     return out
 
 
 def recording_http_status(detail: dict) -> int | None:
+    """Adapter-observed outcome if present, else the boundary response event's status (reported as such)."""
     o = detail.get("outcome")
-    return o.get("httpStatus") if isinstance(o, dict) else None
+    if isinstance(o, dict) and isinstance(o.get("httpStatus"), int):
+        return o["httpStatus"]
+    return response_event_status(detail)
 
 
 def recording_matches(detail: dict, method: str, route: str) -> bool:
-    facts = boundary_facts(detail)
-    rx = route_regex(route)
-    has_method = any(s.upper() == method for s in facts["strings"]) or any(
-        s.upper().startswith(method + " ") and rx.match(s[len(method) + 1:].strip()) for s in facts["strings"])
-    return has_method and any(rx.match(s) or rx.match(s.split(" ", 1)[-1]) for s in facts["strings"])
+    info = request_info(detail)
+    return bool(info) and info[0] == method and bool(route_regex(route).match(info[1]))
 
 
 def source_ok(ev: dict) -> bool:
@@ -268,6 +282,9 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]]) -> di
             elif len(with_status) < need:
                 seen = sorted({str(recording_http_status(d)) for d in matched})
                 problems.append(f"http-outcome-mismatch(expected {e['status']}, saw {','.join(seen)})")
+            unobserved = [d for d in with_status if (d.get("outcome") or {}).get("kind") not in ("responded", "exception")]
+            if with_status and unobserved:
+                problems.append("outcome-unobserved")
             layer_report = {}
             for layer in e.get("layers", []):
                 hint = e.get("layerHints", {}).get(layer)
