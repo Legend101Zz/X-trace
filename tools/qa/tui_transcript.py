@@ -45,7 +45,10 @@ def classify(exit_code: int | None, stopped_by_harness: bool, transcript: bytes)
 def run(xtrace: str, project_dir: str, seconds: float, rows: int, cols: int) -> tuple[int | None, bool, bytes]:
     pid, fd = pty.fork()
     if pid == 0:  # child
-        os.execv(xtrace, [xtrace, "tui", "--project-dir", project_dir])
+        try:
+            os.execv(xtrace, [xtrace, "tui", "--project-dir", project_dir])
+        finally:
+            os._exit(127)  # exec failed: never let the child continue as a copy of this harness
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     buf = b""
     deadline = time.time() + seconds

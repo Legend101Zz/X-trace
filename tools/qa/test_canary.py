@@ -41,6 +41,29 @@ class CanaryTests(unittest.TestCase):
         self.assertFalse(r["clean"])
         self.assertFalse(r["scanned"][0]["present"])
 
+    def test_required_class_absent_or_empty_is_not_clean(self):
+        (self.root / "store").mkdir()
+        (self.root / "store" / "a.txt").write_text("hello\n")
+        (self.root / "exports").mkdir()
+        locs = {"store": [self.root / "store"], "exports": [self.root / "exports"],
+                "ui-json": [self.root / "missing"]}
+        self.assertTrue(canary.run_scan(self.c, locs)["clean"])  # without a requirement the old behaviour holds
+        r = canary.run_scan(self.c, locs, {"store": 1, "exports": 1, "ui-json": 1, "daemon-log": 1})
+        self.assertFalse(r["clean"])
+        got = {u["class"]: u["have"] for u in r["uncovered"]}
+        self.assertEqual(got, {"exports": 0, "ui-json": 0, "daemon-log": 0})
+
+    def test_required_minimum_files(self):
+        (self.root / "a.txt").write_text("x")
+        locs = {"store": [self.root]}
+        self.assertTrue(canary.run_scan(self.c, locs, {"store": 1})["clean"])
+        r = canary.run_scan(self.c, locs, {"store": 3})
+        self.assertFalse(r["clean"])
+        self.assertEqual(r["uncovered"], [{"class": "store", "need": 3, "have": 1}])
+
+    def test_parse_require(self):
+        self.assertEqual(canary.parse_require(["store", "exports:2"]), {"store": 1, "exports": 2})
+
     def test_raw_hit_reports_class_not_value(self):
         (self.root / "seg.bin").write_bytes(b"\0\1" + self.c["query-token"].encode() + b"\2")
         r = self.scan(store=self.root)

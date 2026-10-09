@@ -104,10 +104,10 @@ class MergeTests(unittest.TestCase):
 
 
 class RunTests(unittest.TestCase):
-    def run_step(self, cmd, min_passed=0):
+    def run_step(self, cmd, min_passed=0, timeout=60):
         with tempfile.TemporaryDirectory() as d:
             args = type("A", (), {"suite": "meta", "variant": "-", "step": "t", "out": d + "/o", "cwd": "",
-                                  "timeout": 60, "min_passed": min_passed, "command": ["--"] + cmd})()
+                                  "timeout": timeout, "min_passed": min_passed, "command": ["--"] + cmd})()
             import os
             os.environ["LANE_PRIVATE_LOG_DIR"] = d
             rc = lane_run.cmd_run(args)
@@ -118,6 +118,11 @@ class RunTests(unittest.TestCase):
         rc, frag = self.run_step([sys.executable, "-c", "print('Ran 0 tests in 0.0s')"], 1)
         self.assertNotEqual(rc, 0)
         self.assertEqual(frag["status"], "fail")
+
+    def test_timeout_is_a_failed_step_not_a_traceback(self):
+        rc, frag = self.run_step([sys.executable, "-c", "import time; time.sleep(30)"], timeout=1)
+        self.assertEqual(rc, 124)
+        self.assertEqual((frag["status"], frag["exitCode"]), ("fail", 124))
 
     def test_uncounted_step_reports_null(self):
         rc, frag = self.run_step([sys.executable, "-c", "print('hi')"])

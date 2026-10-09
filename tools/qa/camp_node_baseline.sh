@@ -6,14 +6,20 @@
 set -eu
 P="${1:?project}"
 : "${XTRACE_CAMP_NODE_ROOT:?}"
+# CI-only: containers run as root in bind mounts and the build image is tagged per platform. Never run on a developer machine.
+[ "${GITHUB_ACTIONS:-}" = "true" ] || { echo "camp_node_baseline.sh runs only on GitHub Actions runners"; exit 2; }
+case "$XTRACE_CAMP_NODE_ROOT" in "${RUNNER_TEMP:?}"/*) ;; *) echo "XTRACE_CAMP_NODE_ROOT must be under RUNNER_TEMP"; exit 2 ;; esac
 export XCAMP_PLATFORM="${XCAMP_PLATFORM:-linux/amd64}"
 root="$XTRACE_CAMP_NODE_ROOT/$P"
 mkdir -p "$root"
 nv=$(python3 -B -c "import json,sys;print(json.load(open('campaigns/node/$P/campaign.json'))['runtime']['nodeImageVersion'])")
-docker build --platform "$XCAMP_PLATFORM" --build-arg NODE_VERSION="$nv" -t "xtrace-camp-node:$nv" campaigns/node/lib/docker
+plat_tag=$(echo "$XCAMP_PLATFORM" | cut -d/ -f2)
+img="xtrace-camp-node:$nv-$plat_tag"
+docker build --platform "$XCAMP_PLATFORM" --build-arg NODE_VERSION="$nv" -t "$img" campaigns/node/lib/docker
 run="campaigns/node/$P/harness/run.mjs"
 # Containers run as root and leave root-owned files in the bind-mounted workspace; the host harness must read and patch them.
-own() { sudo chown -R "$(id -u):$(id -g)" "$root" 2>/dev/null || true; }
+# No sudo: ownership is repaired inside a throwaway container that is already root.
+own() { docker run --rm --platform "$XCAMP_PLATFORM" -v "$root:/w" --entrypoint chown "$img" -R "$(id -u):$(id -g)" /w >/dev/null 2>&1 || true; }
 case "$P" in
   directus)
     [ -d "$root/upstream" ] || mv "$root/src" "$root/upstream"

@@ -78,9 +78,13 @@ jobs:
         if: steps.verifier.outputs.present == 'true'
         run: |
           set -eu
+          # the report is written OUTSIDE dist/ (the set the owner signs) and uploaded as its own artifact
+          mkdir -p "$RUNNER_TEMP/verify"
           python3 -B packaging/verify_package.py "$(ls dist/${{ matrix.platform }}/xtrace-*-${{ matrix.platform }}.tar.gz)" \
-            --run-binary --repo . --out "dist/${{ matrix.platform }}/package-verification.json"
+            --run-binary --repo . --out "$RUNNER_TEMP/verify/package-verification.json"
       - name: Compare archive hash with the reproducibility build
+        # runs even when the content verifier failed: reproducibility evidence must not vanish with it
+        if: ${{ !cancelled() }}
         run: |
           python3 - "dist/${{ matrix.platform }}" "$RUNNER_TEMP/repro/repro.json" <<'PY'
           import glob, hashlib, json, sys
@@ -93,10 +97,18 @@ jobs:
           print("reproducible; archive sha256", mine)
           PY
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
         with:
           name: xtrace-unsigned-${{ matrix.platform }}
           path: |
             dist/${{ matrix.platform }}/
             ${{ runner.temp }}/repro/repro.json
           if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: xtrace-package-verification-${{ matrix.platform }}
+          path: ${{ runner.temp }}/verify/
+          if-no-files-found: ignore
           retention-days: 30

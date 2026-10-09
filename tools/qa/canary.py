@@ -206,7 +206,8 @@ def scan_location(loc_class: str, target: pathlib.Path, index, hits: dict) -> di
     return {"class": loc_class, "present": True, "files": files, "bytes": bytes_}
 
 
-def run_scan(canaries: dict[str, str], locations: dict[str, list[pathlib.Path]]) -> dict:
+def run_scan(canaries: dict[str, str], locations: dict[str, list[pathlib.Path]],
+             require: dict[str, int] | None = None) -> dict:
     index = build_index(canaries)
     hits: dict = {}
     scanned = []
@@ -219,8 +220,26 @@ def run_scan(canaries: dict[str, str], locations: dict[str, list[pathlib.Path]])
             agg["bytes"] += r["bytes"]
         scanned.append(agg)
     rows = [{"locationClass": c, "canary": n, "encoding": e, "count": cnt} for (c, n, e), cnt in sorted(hits.items())]
+    # a required class that is absent, missing from the call or below its minimum file count was NOT covered:
+    # the scan is then not clean (an unreached surface is never a pass)
+    uncovered = []
+    by_class = {s["class"]: s for s in scanned}
+    for cls, minimum in sorted((require or {}).items()):
+        got = by_class.get(cls)
+        have = got["files"] if got and got["present"] else 0
+        if have < max(1, minimum):
+            uncovered.append({"class": cls, "need": max(1, minimum), "have": have})
     return {"schemaVersion": 1, "canaryKinds": sorted(canaries), "needleCount": len(index),
-            "scanned": scanned, "hits": rows, "clean": not rows and any(s["present"] for s in scanned)}
+            "scanned": scanned, "hits": rows, "uncovered": uncovered,
+            "clean": not rows and not uncovered and any(s["present"] for s in scanned)}
+
+
+def parse_require(items: list[str]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for item in items:
+        cls, _, n = item.partition(":")
+        out[cls] = int(n) if n else 1
+    return out
 
 
 def probe() -> int:
@@ -293,6 +312,8 @@ def main() -> int:
     s.add_argument("--canaries", required=True)
     s.add_argument("--loc", action="append", default=[], metavar="CLASS=PATH",
                    help="location class and a file or directory (repeatable; one class may repeat)")
+    s.add_argument("--require", action="append", default=[], metavar="CLASS[:MIN_FILES]",
+                   help="class that must have been scanned with at least MIN_FILES files (default 1); else not clean")
     s.add_argument("--report", required=True)
     sub.add_parser("probe")
     a = ap.parse_args()
@@ -314,7 +335,7 @@ def main() -> int:
             return 2
         cls, path = item.split("=", 1)
         locs.setdefault(cls, []).append(pathlib.Path(path))
-    report = run_scan(canaries, locs)
+    report = run_scan(canaries, locs, parse_require(a.require))
     pathlib.Path(a.report).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(a.report).write_text(json.dumps(report, indent=1, sort_keys=True) + "\n")
     for s_ in report["scanned"]:
@@ -324,6 +345,8 @@ def main() -> int:
     missing = [s_["class"] for s_ in report["scanned"] if not s_["present"]]
     if missing:
         print("locations absent (nothing scanned): " + ", ".join(missing))
+    for u in report["uncovered"]:
+        print(f"UNCOVERED class={u['class']} need>={u['need']} files, scanned {u['have']}")
     print("canary scan: " + ("clean" if report["clean"] else "NOT CLEAN"))
     return 0 if report["clean"] else 1
 

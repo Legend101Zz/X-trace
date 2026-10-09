@@ -57,12 +57,16 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
         n_src = r.get("recordingsWithSource", 0)
         out.append(("source-identity", "pass" if n_src > 0 and not pc.get("no-source-file-line") else "fail",
                     f"{n_src} recordings carry a matched .java file and line" if n_src > 0 else "no recording frame carried a matched .java file and line"))
-        out.append(("api-json-artifact", "pass", f"{api.get('recordings', 0)} recordings saved as API JSON"))
+        n_rec = api.get("recordings", 0)
+        out.append(("api-json-artifact", "pass" if n_rec > 0 else "fail",
+                    f"{n_rec} recordings saved as API JSON" if n_rec > 0 else "the read API returned 0 recordings, nothing to save"))
     stop = r.get("notes", {}).get("stopCommand", {})
     # `xtrace run` owns its daemon for the life of the JVM, so `xtrace stop` (which ends a `xtrace record` daemon) has nothing
-    # to stop after it. The record+stop flow is not exercised by this harness yet: reported, never a pass for that flow.
-    out.append(("product-stop-command", "reported",
-                f"xtrace stop after `xtrace run` exited {stop.get('exitCode')}; the record+stop flow is not exercised here"))
+    # to stop after it. Until the harness launches the app with `xtrace record`, then `xtrace stop`, the record+stop flow was
+    # never exercised: that is not-implemented (it gates), never a pass and never a quiet `reported`.
+    out.append(("record-stop-flow", "not-implemented",
+                f"harness runs `xtrace run` only; record, launch and `xtrace stop` is not exercised "
+                f"(`xtrace stop` after run exited {stop.get('exitCode')})"))
     out.append(("launcher-exit-after-sigterm", "pass" if r.get("notes", {}).get("launcherExitCode") in (0, 143, -15) else "fail",
                 f"xtrace run exited {r.get('notes', {}).get('launcherExitCode')} after SIGTERM to the launcher pid"))
     return out

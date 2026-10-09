@@ -23,7 +23,9 @@ class T(unittest.TestCase):
         r = {"scenarios": [sc("a"), sc("b")], "api": {"ok": True, "recordings": 5}, "problemClasses": {}, "recordingsWithSource": 3,
              "notes": {"stopCommand": {"exitCode": 3}, "launcherExitCode": 0}}
         d = by(s.instrumented_steps(r))
-        self.assertTrue(all(v[0] in ("pass", "reported") for v in d.values()), d)
+        # everything the harness exercised passes; the record+stop flow is not exercised and stays not-implemented
+        self.assertEqual({n for n, v in d.items() if v[0] != "pass"}, {"record-stop-flow"}, d)
+        self.assertEqual(d["record-stop-flow"][0], "not-implemented")
 
     def test_each_failure_is_visible(self):
         r = {"scenarios": [sc("a", eq=False), sc("b", rec=False)], "api": {"ok": True, "recordings": 5},
@@ -32,7 +34,7 @@ class T(unittest.TestCase):
         self.assertEqual(d["instrumented-fingerprints-equal-baseline"][0], "fail")
         self.assertEqual(d["recordings-per-scenario"][0], "fail")
         self.assertEqual(d["source-identity"][0], "fail")
-        self.assertEqual(d["product-stop-command"][0], "reported")
+        self.assertEqual(d["record-stop-flow"][0], "not-implemented")
         self.assertEqual(d["launcher-exit-after-sigterm"][0], "fail")
 
     def test_zero_recordings_never_pass_source_identity(self):
@@ -41,6 +43,7 @@ class T(unittest.TestCase):
         d = by(s.instrumented_steps(r))
         self.assertEqual(d["source-identity"][0], "fail")
         self.assertEqual(d["recordings-per-scenario"][0], "fail")
+        self.assertEqual(d["api-json-artifact"][0], "fail")  # nothing was saved, so nothing to hand over
 
     def test_no_baseline_is_fail_not_pass(self):
         r = {"scenarios": [{"id": "a", "scenarioChecksPassed": True, "fingerprintEqualsBaseline": None}],

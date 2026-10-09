@@ -33,6 +33,8 @@ def build_receipt(root: pathlib.Path, project: str, requirement: str, candidate_
     checks = [{"name": s["step"], "status": "passed" if s["status"] == "pass" else s["status"],
                "reached": s["status"] in ("pass", "fail"), "note": s.get("note", "")} for s in steps
               if s["status"] != "reported"]
+    # reported rows (jar sha, overhead, ...) never count as passed checks but a reader must still see them
+    reported = [{"name": s["step"], "note": s.get("note", "")} for s in steps if s["status"] == "reported"]
     scenarios = []
     inst_by_id = {s["id"]: s for s in (instrumented or {}).get("scenarios", [])}
     base_by_id = {s["id"]: s for s in (baseline or {}).get("scenarios", [])}
@@ -63,7 +65,7 @@ def build_receipt(root: pathlib.Path, project: str, requirement: str, candidate_
         "candidateSha": candidate_sha,
         "build": {"id": f"ci-run-{run_id}", "sourceSha": candidate_sha},
         "artifacts": [{"path": "package.sha256", "sha256": package_sha256}] if package_sha256 else [],
-        "evidence": evidence, "checks": checks, "failedChecks": [c["name"] for c in failed],
+        "evidence": evidence, "checks": checks, "reported": reported, "failedChecks": [c["name"] for c in failed],
         "attestation": {"project": project, "upstream": campaign.get("upstream"), "tagException": campaign.get("tagException"),
                         "scenarios": scenarios, "artifacts": []},
     }

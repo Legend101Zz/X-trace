@@ -30,6 +30,7 @@ class T(unittest.TestCase):
         self.assertTrue(r["nonRelease"])
         self.assertEqual(r["signatures"], [])
         self.assertEqual(len(r["checks"]), 1)
+        self.assertEqual([x["name"] for x in r["reported"]], ["o"])  # visible, but never a passed check
 
     def test_no_steps_is_not_passed(self):
         self.assertEqual(self.build([])["result"], "failed")

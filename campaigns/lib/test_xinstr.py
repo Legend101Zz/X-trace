@@ -65,6 +65,57 @@ class T(unittest.TestCase):
         two["c"] = rec("GET", "/owners/3", 200)
         self.assertTrue(xinstr.analyze(two, exp)["s"]["passed"])
 
+    def test_literal_recording_does_not_satisfy_template(self):
+        exp = {"a": [{"method": "GET", "route": "/owners/{ownerId}", "status": 200, "layers": []}],
+               "b": [{"method": "GET", "route": "/owners/new", "status": 200, "layers": []}]}
+        v = xinstr.analyze({"x": rec("GET", "/owners/new", 200)}, exp)
+        self.assertEqual(v["a"]["expectations"][0]["problems"], ["no-recording-for-route"])
+        self.assertTrue(v["b"]["passed"])
+
+    def test_recorded_template_matches_by_equality(self):
+        exp = {"a": [{"method": "GET", "route": "/owners/{ownerId}", "status": 200, "layers": []},
+                     {"method": "GET", "route": "/owners/{ownerId}/edit", "status": 200, "layers": []}]}
+        v = xinstr.analyze({"x": rec("GET", "/owners/{ownerId}/edit", 200)}, exp)["a"]["expectations"]
+        self.assertEqual(v[0]["problems"], ["no-recording-for-route"])
+        self.assertEqual(v[1]["problems"], [])
+
+    def test_count_below_minimum_message(self):
+        exp = {"s": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": [], "minCount": 5}]}
+        p = xinstr.analyze({"a": rec("GET", "/owners/1", 200)}, exp)["s"]["expectations"][0]["problems"]
+        self.assertEqual(p, ["count-below-minimum(need 5, have 1)"])
+        self.assertEqual(xinstr.problem_classes(xinstr.analyze({"a": rec("GET", "/owners/1", 200)}, exp)), {"count-below-minimum": 1})
+
+    def test_other_scenarios_recordings_do_not_leak(self):
+        exp = {"s1": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}],
+               "s2": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}]}
+        a = rec("GET", "/owners/1", 200)
+        a["_openedAt"] = "2026-10-09T10:00:05Z"
+        t0 = xinstr.recording_time(a)
+        v = xinstr.analyze({"a": a}, exp, {"s1": (t0 - 2, t0 + 2), "s2": (t0 + 10, t0 + 20)}, slack=0.5)
+        self.assertTrue(v["s1"]["passed"])
+        self.assertEqual(v["s2"]["expectations"][0]["problems"], ["no-recording-for-route"])
+        # a recording with no determinable time is attributed to nobody
+        u = rec("GET", "/owners/1", 200)
+        v = xinstr.analyze({"u": u}, exp, {"s1": (0, 1e12), "s2": (0, 1e12)})
+        self.assertFalse(v["s1"]["passed"])
+
+    def test_uuidv7_time(self):
+        d = {"recordingId": "0199c1a2-b3c4-7abc-8def-0123456789ab"}
+        self.assertEqual(xinstr.recording_time(d), int("0199c1a2b3c4", 16) / 1000.0)
+        self.assertIsNone(xinstr.recording_time({"recordingId": "nope"}))
+
+    def test_source_must_be_on_layer_frame_with_acceptable_binding(self):
+        exp = {"s": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": ["controller"]}]}
+        r = rec("GET", "/owners/1", 200, symbols=("OwnerController.show",), src=False)
+        r["events"].append({"kind": "recording_event_kind:frame_enter", "symbol": "Other.helper", "interaction": {},
+                            "source": {"path": "src/X.java", "startLine": 3, "status": "matched"}})
+        self.assertEqual(xinstr.analyze({"a": r}, exp)["s"]["expectations"][0]["problems"], ["no-source-file-line"])
+        good = rec("GET", "/owners/1", 200, symbols=("OwnerController.show",))
+        good["events"][1]["sourceBinding"] = "SOURCE_BINDING_ATTESTATION_MISSING"
+        self.assertEqual(xinstr.analyze({"a": good}, exp)["s"]["expectations"][0]["problems"], ["source-binding-unacceptable"])
+        good["events"][1]["sourceBinding"] = "verified"
+        self.assertTrue(xinstr.analyze({"a": good}, exp)["s"]["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

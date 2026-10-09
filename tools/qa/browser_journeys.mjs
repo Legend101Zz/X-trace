@@ -6,6 +6,10 @@
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { mkdirSync, writeFileSync } from "node:fs";
+const domDir = () => { const d = path.join(path.resolve(args.out), "dom"); mkdirSync(d, { recursive: true }); return d; };
+// visible text of every step is written here so the privacy scan can cover the DOM (class browser-dom)
+const dumpDom = async (page, name) => { try { writeFileSync(path.join(domDir(), `${name}.txt`), await page.evaluate(() => document.body.innerText)); } catch { /* page gone */ } };
+const overflow = (page) => page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
 import path from "node:path";
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((acc, a, i, arr) => (a.startsWith("--") ? [...acc, [a.slice(2), arr[i + 1]]] : acc), []));
@@ -54,12 +58,14 @@ try {
       const consoleErrors = [];
       page.on("pageerror", (e) => consoleErrors.push(String(e).slice(0, 120)));
       await page.goto(ready.url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForTimeout(1500);
+      await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+      await dumpDom(page, `list-${w}`);
       await page.screenshot({ path: path.join(out, `list-${w}.png`), fullPage: true });
       row.steps.list = { status: "pass", screenshot: `list-${w}.png` };
       // The recordings list lives under the "Unmatched recordings" tab (or under an observed endpoint when one is linked).
       const tab = page.getByRole("button", { name: /unmatched recordings/i }).or(page.getByRole("tab", { name: /unmatched recordings/i })).first();
-      if (await tab.count()) { await tab.click({ timeout: 10000 }); await page.waitForTimeout(1500); }
+      if (await tab.count()) { await tab.click({ timeout: 10000 }); await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {}); }
+      await dumpDom(page, `recordings-${w}`);
       await page.screenshot({ path: path.join(out, `recordings-${w}.png`), fullPage: true });
       const skip = /^(refresh|observed endpoints|unmatched recordings|load more|previous|next)$/i;
       const buttons = await page.getByRole("button").all();
@@ -70,9 +76,13 @@ try {
       }
       if (rowLoc) {
         await rowLoc.click({ timeout: 10000 });
-        await page.waitForTimeout(2000);
+        await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+        await page.waitForTimeout(500);
+        await dumpDom(page, `linear-${w}`);
         await page.screenshot({ path: path.join(out, `linear-${w}.png`), fullPage: true });
-        const linearShown = await page.getByText(/http\.request|frame_enter|frame enter/i).first().count();
+        row.linearOverflow = await overflow(page);
+        // Linear: an event row of its own, not only text in the inspector
+        const linearShown = await page.locator("[role=tabpanel] :is(li, tr, [role=row], [role=treeitem])").filter({ hasText: /http\.request|frame_enter|frame enter/i }).first().count();
         row.steps.linear = linearShown
           ? { status: "pass", screenshot: `linear-${w}.png` }
           : { status: "fail", reason: "a recording was opened but the Linear event window shows no request or frame event", screenshot: `linear-${w}.png` };
@@ -82,15 +92,18 @@ try {
       const canvas = page.getByRole("tab", { name: /canvas/i }).or(page.getByRole("button", { name: /canvas/i })).first();
       if (await canvas.count()) {
         await canvas.click({ timeout: 10000 });
-        await page.waitForTimeout(1500);
+        await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+        await page.waitForTimeout(500);
+        await dumpDom(page, `canvas-${w}`);
         await page.screenshot({ path: path.join(out, `canvas-${w}.png`), fullPage: true });
-        const drawn = await page.getByText(/http\.request/i).first().count();
+        row.canvasOverflow = await overflow(page);
+        const drawn = await page.locator(".canvas-view .canvas-node, .canvas-view [role=tree] [role=treeitem], svg .canvas-node").count();
         row.steps.canvas = drawn ? { status: "pass", screenshot: `canvas-${w}.png` }
           : { status: "fail", reason: "Canvas opened but shows no request or frame node", screenshot: `canvas-${w}.png` };
       } else {
         row.steps.canvas = { status: "not-implemented", reason: "the viewer offers no Canvas control" };
       }
-      row.horizontalOverflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
+      row.horizontalOverflow = Boolean(row.linearOverflow || row.canvasOverflow || await overflow(page));
       row.pageErrors = consoleErrors.length;
       await ctx.close();
     } catch (e) {

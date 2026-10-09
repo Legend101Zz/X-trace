@@ -149,8 +149,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     log_path = log_dir / f"{suite}-{variant}-{step}.log"
     with open(log_path, "wb") as log:
         os.umask(previous_umask)
-        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=args.cwd or None,
-                              check=False, timeout=args.timeout)
+        try:
+            proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=args.cwd or None,
+                                  check=False, timeout=args.timeout)
+        except subprocess.TimeoutExpired:  # a timeout is a failed step with a fragment, never a traceback with argv
+            proc = subprocess.CompletedProcess(cmd, 124)
+            log.write(f"\nlane: step exceeded its {args.timeout}s timeout\n".encode())
+            print(f"lane {suite}/{variant}/{step}: timeout after {args.timeout}s")
     text = log_path.read_text(encoding="utf-8", errors="replace")
     facts = parse_output(text)
     status = "pass" if proc.returncode == 0 else "fail"

@@ -191,6 +191,9 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
                 break
         d = dict(first or {})
         d["events"] = events
+        d.setdefault("recordingId", rid)
+        if rec.get("openedAt") is not None:  # kept for time-window attribution of recordings to scenarios
+            d.setdefault("_openedAt", rec["openedAt"])
         details[rid] = d
         (out_dir / f"recording-{rid}.json").write_text(json.dumps(d, indent=1, sort_keys=True))
     return {"ok": True, "reason": "", "recordings": listing, "details": details}
@@ -256,9 +259,38 @@ def recording_http_status(detail: dict) -> int | None:
     return response_event_status(detail)
 
 
-def recording_matches(detail: dict, method: str, route: str) -> bool:
+def recording_matches(detail: dict, method: str, route: str, literal_routes: frozenset = frozenset()) -> bool:
+    """Method equal and route equal. A recorded template (contains `{`) matches only by equality; a recorded literal path
+    matches a template by pattern unless that literal is itself one of the campaign's literal routes (so a recorded
+    `GET /owners/new` never satisfies `GET /owners/{ownerId}`)."""
     info = request_info(detail)
-    return bool(info) and info[0] == method and bool(route_regex(route).match(info[1]))
+    if not info or info[0] != method:
+        return False
+    recorded = info[1].split("?", 1)[0].rstrip("/") or "/"
+    want = route.rstrip("/") or "/"
+    if "{" in recorded:
+        return recorded == want
+    if "{" not in want:
+        return recorded == want
+    if recorded in literal_routes:
+        return False
+    return bool(route_regex(route).match(info[1]))
+
+
+def recording_time(detail: dict) -> float | None:
+    """Wall-clock seconds the recording opened: `openedAt` (RFC 3339) if the API gave it, else the UUIDv7 millisecond prefix."""
+    import datetime as _dt
+    v = detail.get("_openedAt") or detail.get("openedAt")
+    if isinstance(v, str):
+        try:
+            return _dt.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    rid = str(detail.get("recordingId") or detail.get("_id") or "")
+    m = re.match(r"^(?:rec[-_])?([0-9a-f]{8})-?([0-9a-f]{4})-?7[0-9a-f]{3}-", rid)
+    if m:
+        return int(m.group(1) + m.group(2), 16) / 1000.0
+    return None
 
 
 def source_ok(ev: dict) -> bool:
@@ -267,21 +299,60 @@ def source_ok(ev: dict) -> bool:
         isinstance(s.get("startLine"), int) and s["startLine"] >= 1 and s.get("status") == "matched"
 
 
-def analyze(details: dict[str, dict], expectations: dict[str, list[dict]]) -> dict[str, Any]:
-    """expectations: scenario id -> [{method, route, status, layers[], minCount}]. Returns a verdict per scenario."""
+ACCEPTED_BINDINGS = ("verified", "observed_unattested")
+
+
+def binding_state(ev: dict) -> str:
+    """`ok` / `bad` / `unreported` for the source binding of one event (the API may name it on the event or its source)."""
+    s = ev.get("source") if isinstance(ev.get("source"), dict) else {}
+    for holder in (ev, s):
+        for key in ("sourceBinding", "binding"):
+            v = holder.get(key)
+            if isinstance(v, str):
+                norm = v.lower().replace("source_binding_", "").replace("-", "_")
+                return "ok" if norm in ACCEPTED_BINDINGS else "bad"
+    return "unreported"
+
+
+def layer_source_ok(detail: dict, layers: list[str], hints: dict) -> tuple[bool, bool]:
+    """(source on the matched controller/service/repository frame, a binding was reported and unacceptable)."""
+    frames = [ev for layer in layers for ev in layer_frames(detail, layer, hints.get(layer))]
+    if not frames:  # no layer expectation: fall back to any frame event
+        frames = [ev for ev in detail.get("events", []) if str(ev.get("kind", "")).endswith("frame_enter")]
+    good = [ev for ev in frames if source_ok(ev) and binding_state(ev) != "bad"]
+    bad = [ev for ev in frames if source_ok(ev) and binding_state(ev) == "bad"]
+    return bool(good), bool(bad) and not good
+
+
+def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
+            windows: dict[str, tuple[float, float]] | None = None, slack: float = 1.0) -> dict[str, Any]:
+    """expectations: scenario id -> [{method, route, status, layers[], minCount}]. Returns a verdict per scenario.
+    With `windows` (scenario id -> (start, end) wall clock) a scenario is judged ONLY on recordings that opened inside its
+    own window; a recording whose time cannot be determined is attributed to nobody."""
+    literal_routes = frozenset((e["route"].rstrip("/") or "/") for exps in expectations.values() for e in exps if "{" not in e["route"])
     verdicts: dict[str, Any] = {}
     for sid, exps in expectations.items():
+        pool = list(details.values())
+        if windows is not None:
+            w = windows.get(sid)
+            if w is None:
+                pool = []
+            else:
+                pool = [d for d in pool if (t := recording_time(d)) is not None and w[0] - slack <= t <= w[1] + slack]
         items = []
         for e in exps:
-            matched = [d for d in details.values() if recording_matches(d, e["method"], e["route"])]
+            matched = [d for d in pool if recording_matches(d, e["method"], e["route"], literal_routes)]
             with_status = [d for d in matched if recording_http_status(d) == e["status"]]
             problems: list[str] = []
             need = e.get("minCount", 1)
             if not matched:
                 problems.append("no-recording-for-route")
-            elif len(with_status) < need:
+            else:
                 seen = sorted({str(recording_http_status(d)) for d in matched})
-                problems.append(f"http-outcome-mismatch(expected {e['status']}, saw {','.join(seen)})")
+                if not with_status:
+                    problems.append(f"http-outcome-mismatch(expected {e['status']}, saw {','.join(seen)})")
+                elif len(with_status) < need:
+                    problems.append(f"count-below-minimum(need {need}, have {len(with_status)})")
             unobserved = [d for d in with_status if (d.get("outcome") or {}).get("kind") not in ("responded", "exception")]
             if with_status and unobserved:
                 problems.append("outcome-unobserved")
@@ -292,14 +363,21 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]]) -> di
                 layer_report[layer] = {"recordingsWithFrame": len(have), "of": len(with_status)}
                 if with_status and not have:
                     problems.append(f"no-{layer}-frame")
-            src = [d for d in with_status if any(source_ok(ev) for ev in d.get("events", []))]
+            hints = e.get("layerHints", {})
+            src, badbind = [], 0
+            for d in with_status:
+                ok, bad = layer_source_ok(d, e.get("layers", []), hints)
+                if ok:
+                    src.append(d)
+                badbind += bad
             if with_status and not src:
-                problems.append("no-source-file-line")
+                problems.append("source-binding-unacceptable" if badbind else "no-source-file-line")
             items.append({"method": e["method"], "route": e["route"], "expectedStatus": e["status"],
                           "recordingsMatchingRoute": len(matched), "recordingsWithStatus": len(with_status),
                           "layers": layer_report, "recordingsWithSource": len(src), "problems": problems,
                           "passed": not problems})
-        verdicts[sid] = {"passed": all(i["passed"] for i in items), "expectations": items}
+        verdicts[sid] = {"passed": all(i["passed"] for i in items), "expectations": items,
+                         "recordingsInWindow": len(pool) if windows is not None else None}
     return verdicts
 
 
@@ -370,6 +448,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     run_id = out_dir.name.replace("instrumented-", "i") + str(int(time.time()) % 100000)
     stack = make_stack(run_id)
     results: list[dict[str, Any]] = []
+    windows: dict[str, tuple[float, float]] = {}
     started = time.time()
     boot_ms = None
     try:
@@ -377,7 +456,9 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         stack.up()
         boot_ms = round((time.perf_counter() - t0) * 1000)
         for sc in scenarios:
+            w0 = time.time()
             res = xcamp.run_scenario(sc, stack, stack.base, norm_extra)
+            windows[res["id"]] = (w0, time.time())
             results.append(res)
             print(f"  [{'PASS' if res['passed'] else 'FAIL'}] {sc.id} {res['semanticEffectFingerprint'][:16]} {res['elapsedMs']}ms", flush=True)
         if canaries:
@@ -412,7 +493,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         if viewer is not None:
             stop_process_group(viewer)
     if api["ok"]:
-        verdicts = analyze(api["details"], expectations)
+        verdicts = analyze(api["details"], expectations, windows)
 
     baseline_fp: dict[str, str] = {}
     if baseline_receipt and baseline_receipt.exists():
