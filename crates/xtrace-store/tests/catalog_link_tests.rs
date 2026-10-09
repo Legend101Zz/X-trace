@@ -151,12 +151,16 @@ fn migration_v9_accepts_general_routes_and_links_with_a_bound_tuple() {
     apply_v9(&mut connection);
 
     let operation = uuid7();
-    connection
+    let duplicate = connection
         .execute(
-            "INSERT INTO operations (operation_id, project_id, transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint, created_at) VALUES (?1, ?2, 'http', 'GET', '/owners/{id}', 'petclinic', 'default', 1, zeroblob(32) || x'', 't')",
+            "INSERT INTO operations (operation_id, project_id, transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint, created_at) VALUES (?1, ?2, 'http', 'GET', '/owners/{id}', 'petclinic', 'default', 1, zeroblob(32), 't')",
             params![operation, seed.project],
         )
         .expect_err("a second operation cannot reuse the fingerprint");
+    assert!(
+        duplicate.to_string().contains("UNIQUE"),
+        "rejected by the fingerprint UNIQUE constraint, not by a type error: {duplicate}"
+    );
     connection
         .execute(
             "INSERT INTO operations (operation_id, project_id, transport, method, route_template, application_component, binding_key, fingerprint_format_version, endpoint_fingerprint, created_at) VALUES (?1, ?2, 'http', 'GET', '/owners/{id}', 'petclinic', 'default', 1, randomblob(32), 't')",

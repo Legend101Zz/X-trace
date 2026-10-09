@@ -82,17 +82,13 @@ interface FileInfo {
   usesFramework: boolean;
 }
 
-const SKIPPED_DIRECTORIES = new Set([
-  ".git",
-  ".next",
-  ".nuxt",
-  ".turbo",
-  "build",
-  "coverage",
-  "dist",
-  "node_modules",
-  "out",
-]);
+// Never source: tool caches and dependencies.
+const SKIPPED_DIRECTORIES = new Set([".git", ".next", ".nuxt", ".turbo", "coverage", "node_modules", "__tests__"]);
+// Build output only when the parent is a package/TS project root; elsewhere the name is ordinary source layout.
+const BUILD_OUTPUT_DIRECTORIES = new Set(["build", "dist", "out"]);
+const BUILD_FILES = ["package.json", "tsconfig.json"];
+// Test sources declare test servers, not application routes.
+const TEST_FILE = /\.(test|spec)\.[cm]?[jt]sx?$/;
 const SOURCE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
 const ROUTE_METHODS = new Set(["get", "post", "put", "delete", "patch", "head", "options", "all"]);
 const UNCONSTRAINED = ["GET", "POST", "PUT", "PATCH", "DELETE"];
@@ -145,11 +141,14 @@ class Analysis {
         const full = path.join(dir, entry.name);
         if (entry.isSymbolicLink()) continue;
         if (entry.isDirectory()) {
-          if (!SKIPPED_DIRECTORIES.has(entry.name)) walk(full);
+          const buildOutput =
+            BUILD_OUTPUT_DIRECTORIES.has(entry.name) && BUILD_FILES.some((f) => fs.existsSync(path.join(dir, f)));
+          if (!SKIPPED_DIRECTORIES.has(entry.name) && !buildOutput) walk(full);
         } else if (
           entry.isFile() &&
           SOURCE_EXTENSIONS.some((ext) => entry.name.endsWith(ext)) &&
-          !entry.name.endsWith(".d.ts")
+          !entry.name.endsWith(".d.ts") &&
+          !TEST_FILE.test(entry.name)
         ) {
           if (found.length >= maxFiles) this.incomplete.add("budget_exceeded");
           else found.push(full);
@@ -170,7 +169,9 @@ class Analysis {
         const sf = ts.createSourceFile(abs, text, ts.ScriptTarget.ES2022, true);
         this.filesScanned++;
         const parseDiagnostics = (sf as unknown as { parseDiagnostics?: unknown[] }).parseDiagnostics;
-        if (parseDiagnostics !== undefined && parseDiagnostics.length > 0) {
+        // Internal compiler field: if a future compiler drops it, parse errors cannot be seen, so
+        // the file is not trusted (fail closed).
+        if (parseDiagnostics === undefined || parseDiagnostics.length > 0) {
           this.diagnostics.push(diagnostic("parse_error", rel));
           this.incomplete.add("parse_error");
           continue;
@@ -602,6 +603,7 @@ class Analysis {
       const child = this.resolveScopeRef(file, target);
       if (child === undefined) {
         this.diagnostics.push(diagnostic("unsupported_syntax", file.rel));
+        this.incomplete.add("unsupported_syntax");
         return;
       }
       let prefix = EMPTY_PATH;
@@ -669,6 +671,8 @@ class Analysis {
           unresolved = unresolved || part.unresolved;
         }
         if (prefixes.length > 0) basis = weakest(basis, "concatenated");
+        // A router/plugin that is never mounted has an unknown prefix: do not keep literal confidence.
+        if (chain.unmounted) basis = weakest(basis, "computed");
         const limitations = new Set<string>();
         if (unresolved) limitations.add("route_constant_unresolved");
         if (chain.unmounted) limitations.add("mount_unresolved");

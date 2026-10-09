@@ -156,6 +156,63 @@ fn scan_incomplete_when_analyzer_times_out() {
 }
 
 #[test]
+fn scan_times_out_an_analyzer_that_closes_stdout_and_keeps_running() {
+    let project = Project::new();
+    let analyzer = write_analyzer(project.dir.path(), "exec 1>&-\nexec sleep 30");
+    let started = std::time::Instant::now();
+    let output = project.scan(&analyzer, &project.dir.path().join("src"), &["--timeout-secs", "1"]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "scan hung on child.wait");
+    assert_eq!(output.status.code(), Some(10), "{output:?}");
+    let result = &json(&output)["result"];
+    assert_eq!(result["incompleteReasons"], serde_json::json!(["analyzer_timeout"]));
+}
+
+fn alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn scan_timeout_stops_the_whole_process_group_of_a_forking_wrapper() {
+    let project = Project::new();
+    let pid_file = project.dir.path().join("grandchild.pid");
+    let body = format!("sleep 30 &\necho $! > '{}'\nwait", pid_file.display());
+    let analyzer = write_analyzer(project.dir.path(), &body);
+    let output = project.scan(&analyzer, &project.dir.path().join("src"), &["--timeout-secs", "1"]);
+    assert_eq!(output.status.code(), Some(10), "{output:?}");
+    let pid = fs::read_to_string(&pid_file).expect("grandchild pid recorded");
+    let pid = pid.trim();
+    let mut gone = false;
+    for _ in 0..50 {
+        if !alive(pid) {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(gone, "the forked grandchild {pid} survived the scan timeout");
+}
+
+#[test]
+fn scan_rejects_jaxrs_until_an_analyzer_exists() {
+    let project = Project::new();
+    let analyzer = write_analyzer(project.dir.path(), TRANSCRIPT);
+    let output = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["scan", "--project-dir"])
+        .arg(project.dir.path())
+        .arg("--source")
+        .arg(project.dir.path().join("src"))
+        .args(["--framework", "jaxrs", "--analyzer"])
+        .arg(&analyzer)
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+}
+
+#[test]
 fn scan_marks_a_truncated_transcript_incomplete() {
     let project = Project::new();
     let body = TRANSCRIPT.replace("{\"type\":\"end\",\"claims\":2,\"filesScanned\":1,\"complete\":true,\"incompleteReasons\":[]}\n", "");

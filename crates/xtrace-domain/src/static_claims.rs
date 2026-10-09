@@ -62,7 +62,7 @@ pub const ANALYZER_DIAGNOSTIC_CODES: &[&str] =
 
 /// Closed reasons an analyzer transcript can be incomplete.
 pub const ANALYZER_INCOMPLETE_REASONS: &[&str] =
-    &["budget_exceeded", "file_unreadable", "parse_error", "timeout"];
+    &["budget_exceeded", "file_unreadable", "parse_error", "timeout", "unsupported_syntax"];
 
 /// How the analyzer obtained the route text of a claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

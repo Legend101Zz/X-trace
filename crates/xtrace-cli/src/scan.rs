@@ -22,7 +22,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use uuid::Uuid;
 use xtrace_domain::static_claims::{
-    AnalyzerLine, StaticClaimContext, StaticClaimError, framework_syntax,
+    ANALYZER_INCOMPLETE_REASONS, AnalyzerLine, StaticClaimContext, StaticClaimError, framework_syntax,
 };
 use xtrace_domain::{ContentHash, ProjectId, SourceRevisionId};
 
@@ -68,6 +68,7 @@ pub struct ScanArgs {
 
 /// Why a scan is not a complete picture of the source. Closed vocabulary.
 const CLI_INCOMPLETE_REASONS: &[&str] = &[
+    "analyzer_diagnostic_unreconciled",
     "analyzer_failed",
     "analyzer_timeout",
     "claim_budget_exceeded",
@@ -170,6 +171,9 @@ pub fn process_transcript(
     let mut analyzer_complete = true;
     let mut files_scanned = 0;
     let mut diagnostics = 0;
+    let mut saw_diagnostic = false;
+    let mut lines_of_claims = 0_usize;
+    let mut declared_claims: Option<u32> = None;
     let mut rejected = 0;
     let mut histogram: BTreeMap<String, usize> = BTreeMap::new();
     let mut operations: BTreeMap<(String, String), ScannedOperation> = BTreeMap::new();
@@ -186,6 +190,7 @@ pub fn process_transcript(
             AnalyzerLine::Diagnostic(diagnostic) => {
                 if diagnostic.validate().is_ok() {
                     diagnostics += 1;
+                    saw_diagnostic = true;
                 } else {
                     reasons.insert("transcript_invalid");
                 }
@@ -195,19 +200,26 @@ pub fn process_transcript(
                     reasons.insert("transcript_invalid");
                 }
                 ended = true;
+                declared_claims = Some(end.claims);
                 analyzer_complete = end.complete;
                 files_scanned = end.files_scanned;
                 for reason in &end.incomplete_reasons {
                     // Analyzer reasons are validated by `AnalyzerEnd::validate`; map them on.
-                    let known = ["budget_exceeded", "file_unreadable", "parse_error", "timeout"];
-                    if let Some(found) =
-                        known.into_iter().find(|candidate| *candidate == reason.as_str())
+                    if let Some(found) = ANALYZER_INCOMPLETE_REASONS
+                        .iter()
+                        .copied()
+                        .find(|candidate| *candidate == reason.as_str())
                     {
                         reasons.insert(found);
                     }
                 }
             }
+            AnalyzerLine::Claim(_) if ended => {
+                // Nothing may follow the `end` line.
+                reasons.insert("transcript_invalid");
+            }
             AnalyzerLine::Claim(claim) => {
+                lines_of_claims += 1;
                 if claim_count >= MAX_CLAIMS {
                     reasons.insert("claim_budget_exceeded");
                     continue;
@@ -260,13 +272,21 @@ pub fn process_transcript(
             }
         }
     }
+    if declared_claims.is_some_and(|declared| usize::try_from(declared).ok() != Some(lines_of_claims)) {
+        // The analyzer's own count disagrees with what arrived: lines were lost or invented.
+        reasons.insert("transcript_invalid");
+    }
     if !ended {
         reasons.insert("transcript_truncated");
+    } else if analyzer_complete && saw_diagnostic {
+        // A per-file diagnostic means some source was not understood; an analyzer that still
+        // claims `complete` is overstating, so the scan does not believe it.
+        reasons.insert("analyzer_diagnostic_unreconciled");
     } else if !analyzer_complete && reasons.is_empty() {
         reasons.insert("analyzer_failed");
     }
     debug_assert!(reasons.iter().all(|r| CLI_INCOMPLETE_REASONS.contains(r)
-        || ["budget_exceeded", "file_unreadable", "parse_error", "timeout"].contains(r)));
+        || ANALYZER_INCOMPLETE_REASONS.contains(r)));
 
     let mut operations: Vec<ScannedOperation> = operations.into_values().collect();
     for operation in &mut operations {
@@ -327,11 +347,17 @@ async fn run_analyzer(
     // Node analyzers need the family; the Java analyzer accepts the same flag.
     command.arg("--framework").arg(framework);
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    // Own process group: a forking wrapper (npm, node launcher, non-exec shell) is stopped as a
+    // whole, by the PID this process started, never by pattern.
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command
         .spawn()
         .map_err(|_| invalid("the analyzer could not be started; check --analyzer"))?;
+    let started_pid = child.id();
     let mut stdout = child.stdout.take().ok_or_else(|| invalid("analyzer produced no stdout"))?;
-    let read = async {
+    // One deadline covers reading the transcript and waiting for the analyzer to exit.
+    let work = async {
         let mut buffer = Vec::new();
         let mut chunk = [0_u8; 64 * 1024];
         loop {
@@ -344,25 +370,43 @@ async fn run_analyzer(
             }
             buffer.extend_from_slice(&chunk[..read]);
         }
-        Ok(buffer)
+        let status = child.wait().await?;
+        Ok((buffer, status))
     };
-    let outcome = tokio::time::timeout(timeout, read).await;
+    let outcome = tokio::time::timeout(timeout, work).await;
     let (bytes, problem) = match outcome {
-        Ok(Ok(bytes)) => (bytes, None),
+        Ok(Ok((bytes, status))) => (bytes, if status.success() { None } else { Some("analyzer_failed") }),
         Ok(Err(_)) => (Vec::new(), Some("analyzer_failed")),
         Err(_) => (Vec::new(), Some("analyzer_timeout")),
     };
-    // On timeout or failure the child is killed when dropped; collect partial output not needed.
     if problem.is_some() {
+        // The `work` future (and its borrow of `child`) is gone; stop the whole group, then reap.
+        stop_group(started_pid);
         let _ = child.start_kill();
         let _ = child.wait().await;
-        return Ok((Vec::new(), problem));
+        if problem == Some("analyzer_timeout") || bytes.is_empty() {
+            return Ok((Vec::new(), problem));
+        }
     }
-    let status = child.wait().await.map_err(|_| invalid("analyzer did not exit"))?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let lines = text.lines().map(str::to_owned).collect();
-    Ok((lines, if status.success() { None } else { Some("analyzer_failed") }))
+    Ok((lines, problem))
 }
+
+/// Signals the process group led by the analyzer we started (KILL; it is a scanner, not a service).
+#[cfg(unix)]
+fn stop_group(pid: Option<u32>) {
+    use rustix::process::{Pid, Signal, kill_process_group};
+    let Some(raw) = pid.and_then(|p| i32::try_from(p).ok()) else {
+        return;
+    };
+    if let Some(group) = Pid::from_raw(raw) {
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn stop_group(_pid: Option<u32>) {}
 
 /// Runs `xtrace scan`.
 pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
@@ -375,6 +419,10 @@ pub async fn run(args: ScanArgs) -> Result<i32, CliError> {
     }
     if !source.starts_with(&project) {
         return Err(invalid("source must be inside the project directory"));
+    }
+    // jaxrs is a valid claim vocabulary entry but no analyzer produces it yet.
+    if args.framework == "jaxrs" {
+        return Err(invalid("no jaxrs analyzer exists yet; use spring-mvc, spring-webflux, express, fastify or nest"));
     }
     framework_syntax(&args.framework).map_err(|_| {
         invalid("framework must be spring-mvc, spring-webflux, express, fastify or nest")
@@ -535,6 +583,12 @@ mod tests {
     const END_OK: &str =
         r#"{"type":"end","claims":0,"filesScanned":2,"complete":true,"incompleteReasons":[]}"#;
 
+    fn end_ok(claims: u32) -> String {
+        format!(
+            r#"{{"type":"end","claims":{claims},"filesScanned":2,"complete":true,"incompleteReasons":[]}}"#
+        )
+    }
+
     fn scan(lines: &[String]) -> ScanResult {
         process_transcript(lines, "app", "default", "express", &digest).expect("processes")
     }
@@ -545,7 +599,7 @@ mod tests {
             header("express"),
             claim("GET", r#"["/api","/users/:id"]"#, "a.js", 3, r#""handler":"show","#),
             claim("POST", r#"["/api","/users"]"#, "a.js", 4, ""),
-            END_OK.to_owned(),
+            end_ok(2),
         ]);
         assert_eq!(result.completion, "complete");
         assert_eq!(result.claim_count, 2);
@@ -566,11 +620,52 @@ mod tests {
             header("express"),
             claim("GET", r#"["/u/:id"]"#, "a.js", 1, r#""handler":"one","#),
             claim("GET", r#"["/u/:userId"]"#, "b.js", 2, r#""handler":"two","#),
-            END_OK.to_owned(),
+            end_ok(2),
         ]);
         assert_eq!(result.operations.len(), 1);
         assert_eq!(result.operations[0].claim_count, 2);
         assert!(result.operations[0].handler_conflict);
+    }
+
+    #[test]
+    fn complete_claim_with_a_diagnostic_is_not_believed() {
+        let lines = [
+            header("express"),
+            claim("GET", r#"["/a"]"#, "a.js", 1, ""),
+            r#"{"type":"diagnostic","code":"unsupported_syntax","path":"a.js"}"#.to_owned(),
+            r#"{"type":"end","claims":1,"filesScanned":1,"complete":true,"incompleteReasons":[]}"#
+                .to_owned(),
+        ];
+        let result = scan(&lines);
+        assert_eq!(result.completion, "incomplete");
+        assert_eq!(result.incomplete_reasons, ["analyzer_diagnostic_unreconciled"]);
+        assert_eq!(result.diagnostics, 1);
+    }
+
+    #[test]
+    fn unsupported_syntax_is_an_analyzer_incomplete_reason() {
+        let lines = [
+            header("express"),
+            r#"{"type":"diagnostic","code":"unsupported_syntax","path":"a.js"}"#.to_owned(),
+            r#"{"type":"end","claims":0,"filesScanned":1,"complete":false,"incompleteReasons":["unsupported_syntax"]}"#
+                .to_owned(),
+        ];
+        let result = scan(&lines);
+        assert_eq!(result.incomplete_reasons, ["unsupported_syntax"]);
+    }
+
+    #[test]
+    fn end_count_mismatch_and_lines_after_end_are_invalid() {
+        let mismatch = scan(&[header("express"), claim("GET", r#"["/a"]"#, "a.js", 1, ""), end_ok(5)]);
+        assert_eq!(mismatch.incomplete_reasons, ["transcript_invalid"]);
+        let after = scan(&[
+            header("express"),
+            claim("GET", r#"["/a"]"#, "a.js", 1, ""),
+            end_ok(1),
+            claim("GET", r#"["/b"]"#, "a.js", 2, ""),
+        ]);
+        assert_eq!(after.incomplete_reasons, ["transcript_invalid"]);
+        assert_eq!(after.operations.len(), 1);
     }
 
     #[test]
@@ -612,7 +707,7 @@ mod tests {
                 r#""limitations":["route_constant_unresolved"],"#,
             ),
             claim("GET", r#"["/y"]"#, "a.js", 2, r#""limitations":["made_up"],"#),
-            END_OK.to_owned(),
+            end_ok(2),
         ]);
         assert_eq!(result.limitation_histogram.get("route_constant_unresolved"), Some(&1));
         assert_eq!(result.rejected_claims, 1);

@@ -23,7 +23,7 @@ CREATE TABLE operations_v9 (
     transport                   TEXT NOT NULL CHECK(transport = 'http'),
     method                      TEXT NOT NULL CHECK(method IN
                                     ('GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE', 'CONNECT')),
-    route_template              TEXT NOT NULL CHECK(length(route_template) BETWEEN 1 AND 1024
+    route_template              TEXT NOT NULL CHECK(length(CAST(route_template AS BLOB)) BETWEEN 1 AND 1024
                                     AND substr(route_template, 1, 1) = '/'
                                     AND instr(route_template, '?') = 0
                                     AND instr(route_template, '#') = 0
@@ -73,7 +73,7 @@ CREATE TABLE recording_endpoint_observations_v9 (
     CHECK((disposition = 'linked' AND observation_policy_id IS NOT NULL
            AND operation_id IS NOT NULL AND application_component IS NOT NULL
            AND method IN ('GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE', 'CONNECT')
-           AND route_template IS NOT NULL AND length(route_template) BETWEEN 1 AND 1024
+           AND route_template IS NOT NULL AND length(CAST(route_template AS BLOB)) BETWEEN 1 AND 1024
            AND substr(route_template, 1, 1) = '/'
            AND reason_code IS NULL
            AND (observation_policy_id = 'runtime-route-v1'

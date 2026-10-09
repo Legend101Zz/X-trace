@@ -46,7 +46,8 @@
   "budget_exceeded",
   "file_unreadable",
   "parse_error",
-  "timeout"
+  "timeout",
+  "unsupported_syntax"
  ],
  "routeBasisConfidenceBasisPoints": {
   "literal": 9000,

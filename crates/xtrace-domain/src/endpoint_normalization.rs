@@ -25,9 +25,10 @@
 //!
 //! Catch-all parameters (`{*rest}`, `*rest`) become `{*}`; a bare `*` or `**`
 //! segment stays literal. Both set [`NormalizedRoute::wildcard`] so static
-//! analyzers can attach a limitation code. The same input vectors are shared
-//! with the Java and Node analyzers through
-//! `schema/fixtures/normalizer-vectors.json`.
+//! analyzers can attach a limitation code. The input vectors live in
+//! `schema/fixtures/normalizer-vectors.json`; only the Rust tests read them
+//! today (the Java and Node analyzers send raw route parts and do not
+//! normalize).
 
 use std::fmt;
 

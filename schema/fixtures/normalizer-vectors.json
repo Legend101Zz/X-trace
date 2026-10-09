@@ -1,6 +1,6 @@
 {
  "version": 1,
- "description": "Shared route-normalizer vectors (PLAN A2, RT-8). Consumed by the Rust domain tests, the Java static analyzer and the Node static analyzer. input is a string, or an array of path parts that are joined before normalizing. Frameworks: spring-mvc, jaxrs, express, fastify, nest, generic. Never edit a case to make an implementation pass.",
+ "description": "Shared route-normalizer vectors (PLAN A2, RT-8). Consumed by the Rust domain tests today. The Java and Node static analyzers send raw route parts and do not normalize; they should read this file only if they ever do. input is a string, or an array of path parts that are joined before normalizing. Frameworks: spring-mvc, jaxrs, express, fastify, nest, generic. Never edit a case to make an implementation pass.",
  "cases": [
   {
    "name": "root_empty",

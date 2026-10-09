@@ -78,6 +78,17 @@ test("unmounted_router_is_flagged_not_dropped", () => {
   const { claims } = run("express-basic", "express");
   const lonely = find(claims, "GET", ["/lonely"]);
   assert.deepEqual(lonely.limitations, ["mount_unresolved"]);
+  // an unknown prefix must not keep literal confidence
+  assert.equal(lonely.routeBasis, "computed");
+});
+
+test("unresolvable_fastify_register_makes_the_scan_incomplete", () => {
+  const { claims, lines } = run("fastify-unresolved", "fastify");
+  find(claims, "GET", ["/ping"]);
+  assert.ok(lines.some((l) => l["type"] === "diagnostic" && l["code"] === "unsupported_syntax"));
+  const end = lines[lines.length - 1] as { complete: boolean; incompleteReasons: string[] };
+  assert.equal(end.complete, false);
+  assert.deepEqual(end.incompleteReasons, ["unsupported_syntax"]);
 });
 
 test("fastify_register_prefix_join", () => {
@@ -167,5 +178,42 @@ test("analyzer_sources_contain_no_execution_apis", () => {
     if (!name.endsWith(".ts")) continue;
     const text = fs.readFileSync(path.join(dir, name), "utf8");
     assert.equal(forbidden.test(text.replace(/isRequire|requireTarget|"require"|`require`|require\('x'\)|require\(\)/g, "")), false, name);
+  }
+});
+
+test("workspace_tsc_is_the_pinned_compiler_not_the_parser_alias", () => {
+  // `typescript-parser` (npm alias of typescript@6) also ships a `tsc` bin. If link order ever lets it
+  // own `.bin/tsc`, the whole Node workspace would silently compile with the wrong compiler.
+  const nodeRoot = path.resolve(import.meta.dirname, "../../../..");
+  const tsc = fs.realpathSync(path.join(nodeRoot, "node_modules/.bin/tsc"));
+  assert.ok(!tsc.includes(`${path.sep}typescript-parser${path.sep}`), `tsc resolves to the alias: ${tsc}`);
+  const pkg = JSON.parse(fs.readFileSync(path.join(nodeRoot, "node_modules/typescript/package.json"), "utf8")) as {
+    version: string;
+  };
+  const root = JSON.parse(fs.readFileSync(path.join(nodeRoot, "package.json"), "utf8")) as {
+    devDependencies?: Record<string, string>;
+  };
+  assert.equal(pkg.version, root.devDependencies?.["typescript"]);
+});
+
+test("build_outputs_are_skipped_only_next_to_a_project_file_and_test_sources_are_excluded", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xtrace-analyzer-"));
+  try {
+    const write = (rel: string, body: string): void => {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), body);
+    };
+    const app = "const express = require('express');\nconst app = express();\n";
+    write("package.json", "{}");
+    write("src/dist/routes.js", `${app}app.get('/in-dist-package', h);\n`);
+    write("dist/generated.js", `${app}app.get('/build-output', h);\n`);
+    write("src/users.spec.js", `${app}app.get('/spec', h);\n`);
+    write("src/__tests__/t.js", `${app}app.get('/under-tests', h);\n`);
+    const lines = analyze({ root: dir, framework: "express" }).map((l) => JSON.parse(l) as Record<string, unknown>);
+    const claims = lines.filter((l) => l["type"] === "claim") as unknown as Claim[];
+    const paths = claims.map((c) => JSON.stringify(c.routeParts));
+    assert.deepEqual(paths, ['["/in-dist-package"]']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
