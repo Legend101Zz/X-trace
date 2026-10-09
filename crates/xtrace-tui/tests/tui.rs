@@ -436,13 +436,16 @@ fn key_decoder_maps_arrows_and_keeps_partial_escapes_for_the_next_read() {
     assert_eq!(pending, vec![0x1b]);
     pending.clear();
     assert_eq!(decode_keys(&mut pending, b"\x1b[3~zx"), vec![]);
-    assert_eq!(decode_keys(&mut pending, b"[]iou"), vec![
-        Key::Nav(NavAction::Previous),
-        Key::Nav(NavAction::Next),
-        Key::Nav(NavAction::Into),
-        Key::Nav(NavAction::Over),
-        Key::Nav(NavAction::Out),
-    ]);
+    assert_eq!(
+        decode_keys(&mut pending, b"[]iou"),
+        vec![
+            Key::Nav(NavAction::Previous),
+            Key::Nav(NavAction::Next),
+            Key::Nav(NavAction::Into),
+            Key::Nav(NavAction::Over),
+            Key::Nav(NavAction::Out),
+        ]
+    );
 }
 
 #[test]

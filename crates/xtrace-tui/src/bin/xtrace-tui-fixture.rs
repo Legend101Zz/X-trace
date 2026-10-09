@@ -5,9 +5,7 @@
 use std::process::ExitCode;
 
 use xtrace_tui::driver::{DEFAULT_SIZE, render_plain, run_interactive};
-use xtrace_tui::{
-    ClientError, FrameRow, NavAction, NavResult, RecordingRow, ReplayClient, Window,
-};
+use xtrace_tui::{ClientError, FrameRow, NavAction, NavResult, RecordingRow, ReplayClient, Window};
 
 struct Fixture {
     hostile: bool,
@@ -17,7 +15,11 @@ const REC: &str = "018f0000-0000-7000-8000-000000000011";
 
 impl ReplayClient for Fixture {
     fn list_recordings(&self) -> Result<Vec<RecordingRow>, ClientError> {
-        Ok(vec![RecordingRow { id: REC.to_owned(), completion: "complete".to_owned(), event_count: 6 }])
+        Ok(vec![RecordingRow {
+            id: REC.to_owned(),
+            completion: "complete".to_owned(),
+            event_count: 6,
+        }])
     }
 
     fn window(&self, recording_id: &str, around: Option<&str>) -> Result<Window, ClientError> {

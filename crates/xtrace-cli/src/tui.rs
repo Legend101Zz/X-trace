@@ -10,9 +10,7 @@ use xtrace_application::{
 use xtrace_domain::{CorrelationId, ProjectId, RecordingId};
 use xtrace_store::SqliteRecordingReader;
 use xtrace_tui::driver::{DEFAULT_SIZE, render_plain, run_interactive, terminal_size};
-use xtrace_tui::{
-    ClientError, FrameRow, NavAction, NavResult, RecordingRow, ReplayClient, Window,
-};
+use xtrace_tui::{ClientError, FrameRow, NavAction, NavResult, RecordingRow, ReplayClient, Window};
 
 use crate::commands::open_recording_reader;
 use crate::error::CliError;
@@ -142,10 +140,7 @@ impl ReplayClient for Facade {
         for _ in 0..MAX_SCAN_PAGES {
             let detail = self.page(id, cursor)?;
             let has_target = around.is_none_or(|target| {
-                detail
-                    .events
-                    .iter()
-                    .any(|e| e.frame_id.is_some_and(|f| f.to_string() == target))
+                detail.events.iter().any(|e| e.frame_id.is_some_and(|f| f.to_string() == target))
             });
             if has_target || detail.next_cursor.is_none() {
                 if !has_target {

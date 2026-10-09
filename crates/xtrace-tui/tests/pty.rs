@@ -1,11 +1,7 @@
 //! PTY tests: the real binary-side driver (raw mode, key decoding, redraw, resize, restore) on a
 //! pseudo-terminal created by `tests/pty_harness.py` (python3 standard library only).
 
-#![allow(
-    clippy::expect_used,
-    clippy::panic,
-    reason = "test helpers fail loudly on setup errors"
-)]
+#![allow(clippy::expect_used, clippy::panic, reason = "test helpers fail loudly on setup errors")]
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -27,11 +23,7 @@ fn run(size: &str, script: &serde_json::Value, extra: &[&str]) -> Run {
         .arg(env!("CARGO_BIN_EXE_xtrace-tui-fixture"))
         .args(extra);
     let output = command.output().expect("python3 is required for the PTY tests");
-    assert!(
-        output.status.success(),
-        "harness failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "harness failed: {}", String::from_utf8_lossy(&output.stderr));
     let doc: serde_json::Value = serde_json::from_slice(&output.stdout).expect("harness JSON");
     Run {
         output: doc["output"].as_str().expect("output").to_owned(),
@@ -94,10 +86,10 @@ fn pty_resize_redraws_at_the_new_size() {
 #[test]
 fn pty_quits_on_end_of_input_and_ctrl_c_without_a_signal() {
     for key in ["\u{3}", "\u{4}"] {
-        let script = serde_json::json!([
-            ["wait", "018f0000-0000-7000-8000-000000000011", 5],
-            ["send", key],
-        ]);
+        let script =
+            serde_json::json!(
+                [["wait", "018f0000-0000-7000-8000-000000000011", 5], ["send", key],]
+            );
         let result = run("80x24", &script, &[]);
         assert_eq!(result.exit, 0, "key {key:?}: {result_output}", result_output = result.output);
         assert!(result.output.ends_with("\u{1b}[?25h\u{1b}[?1049l"));
@@ -123,10 +115,8 @@ fn pty_hostile_recorded_text_never_reaches_the_terminal_as_a_sequence() {
         if bytes[index] == 0x1b {
             assert_eq!(bytes.get(index + 1), Some(&b'['), "non-CSI escape at {index}");
             let rest = &bytes[index + 2..];
-            let end = rest
-                .iter()
-                .position(|b| (0x40..=0x7e).contains(b))
-                .expect("unterminated CSI");
+            let end =
+                rest.iter().position(|b| (0x40..=0x7e).contains(b)).expect("unterminated CSI");
             let params = &rest[..end];
             assert!(
                 params.iter().all(|b| b.is_ascii_digit() || *b == b';' || *b == b'?'),
