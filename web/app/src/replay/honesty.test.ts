@@ -66,6 +66,14 @@ describe('outcome banner', () => {
     const none = outcomeBanner({ ...base, outcome: { kind: 'exception', httpStatus: null, exception: { ...exception, message: null } } });
     expect(none.lines).toContain('Exception java.lang.IllegalStateException: message not recorded');
   });
+  it('states client_aborted and exception_propagated in the domain vocabulary', () => {
+    const aborted = outcomeBanner({ ...base, outcome: { kind: 'client_aborted', httpStatus: null, exception: null } }).lines.join('\n');
+    expect(aborted).toContain('client aborted the request');
+    expect(aborted).toContain('Response status was not reported');
+    const propagated = outcomeBanner({ ...base, outcome: { kind: 'exception_propagated', httpStatus: null, exception: null } }).lines.join('\n');
+    expect(propagated).toContain('Exception reported without details');
+    expect(propagated).toContain('propagated out of the handler');
+  });
   it('uses kind for unobserved and absent outcomes', () => {
     expect(outcomeBanner({ ...base, outcome: { kind: 'unobserved', httpStatus: null, exception: null } }).lines).toContain('Response status was not observed');
     expect(outcomeBanner({ ...base, outcome: null }).lines).toContain('Outcome unavailable: no terminal evidence was recorded');
