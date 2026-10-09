@@ -22,6 +22,8 @@ import json
 import os
 import pathlib
 import secrets
+import shutil
+import subprocess
 import sys
 import tempfile
 import urllib.parse
@@ -90,8 +92,41 @@ def build_index(canaries: dict[str, str]) -> list[tuple[str, str, bytes]]:
     return [(name, enc, n) for name, value in canaries.items() for enc, n in needles(value)]
 
 
-def _inflate_variants(data: bytes) -> list[bytes]:
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def zstd_decode(data: bytes) -> bytes | None:
+    """Decompress a zstd frame with whatever is available (Python 3.14 stdlib, `zstandard`, or the zstd CLI); None if none works."""
+    try:
+        from compression import zstd  # type: ignore[import-not-found]  # Python 3.14+
+        return zstd.decompress(data)
+    except Exception:
+        pass
+    try:
+        import zstandard  # type: ignore[import-not-found]
+        return zstandard.ZstdDecompressor().decompressobj().decompress(data)
+    except Exception:
+        pass
+    exe = shutil.which("zstd")
+    if exe:
+        try:
+            r = subprocess.run([exe, "-dc", "--no-progress"], input=data, capture_output=True, timeout=60)
+            if r.returncode == 0:
+                return r.stdout[:MAX_INFLATE]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def _inflate_variants(data: bytes, undecodable: list | None = None) -> list[bytes]:
     variants = []
+    if data[:4] == ZSTD_MAGIC:
+        out = zstd_decode(data)
+        if out is None:
+            if undecodable is not None:
+                undecodable.append(1)
+        else:
+            variants.append(out)
     if data[:2] == b"\x1f\x8b":
         try:
             variants.append(gzip.GzipFile(fileobj=io.BytesIO(data)).read(MAX_INFLATE))
@@ -117,13 +152,17 @@ def _inflate_variants(data: bytes) -> list[bytes]:
 
 
 def scan_bytes(data: bytes, index, hits: dict, loc_class: str, depth: int = 0) -> None:
+    undecodable: list = []
     for name, enc, needle in index:
         n = data.count(needle)
         if n:
             hits[(loc_class, name, enc)] = hits.get((loc_class, name, enc), 0) + n
     if depth < 2:
-        for inner in _inflate_variants(data):
+        for inner in _inflate_variants(data, undecodable):
             scan_bytes(inner, index, hits, loc_class, depth + 1)
+    if undecodable:  # a compressed member the scanner cannot open is never reported as clean
+        key = (loc_class, "<undecodable-zstd>", "scanner-limit")
+        hits[key] = hits.get(key, 0) + len(undecodable)
 
 
 def scan_file(path: pathlib.Path, index, hits: dict, loc_class: str) -> int:
@@ -216,6 +255,24 @@ def probe() -> int:
         if not hits:
             ok = False
             print("probe FAILED: gzip member")
+        enc = None
+        try:
+            from compression import zstd  # type: ignore[import-not-found]
+            enc = zstd.compress
+        except Exception:
+            exe = shutil.which("zstd")
+            if exe:
+                enc = lambda b: subprocess.run([exe, "-c", "-q"], input=b, capture_output=True, check=True).stdout  # noqa: E731
+        if enc is not None:
+            zf = root / "planted.xtf.zst"
+            zf.write_bytes(enc(b"frame " + next(iter(canaries.values())).encode()))
+            hits = {}
+            scan_location("probe", zf, index, hits)
+            if not any(k[1] in canaries for k in hits):
+                ok = False
+                print("probe FAILED: zstd member")
+        else:
+            print("probe note: no zstd encoder here; a zstd member that cannot be decoded is still reported as NOT clean")
         clean = root / "clean.txt"
         clean.write_text("nothing secret here\n")
         hits = {}

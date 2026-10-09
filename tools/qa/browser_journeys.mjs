@@ -57,14 +57,27 @@ try {
       await page.waitForTimeout(1500);
       await page.screenshot({ path: path.join(out, `list-${w}.png`), fullPage: true });
       row.steps.list = { status: "pass", screenshot: `list-${w}.png` };
-      const rowLoc = page.locator('[data-testid*="recording" i], a[href*="recording" i], tr, li, button').filter({ hasText: /GET|POST|PUT|DELETE|owners|vets|oups/i }).first();
-      if (await rowLoc.count()) {
+      // The recordings list lives under the "Unmatched recordings" tab (or under an observed endpoint when one is linked).
+      const tab = page.getByRole("button", { name: /unmatched recordings/i }).or(page.getByRole("tab", { name: /unmatched recordings/i })).first();
+      if (await tab.count()) { await tab.click({ timeout: 10000 }); await page.waitForTimeout(1500); }
+      await page.screenshot({ path: path.join(out, `recordings-${w}.png`), fullPage: true });
+      const skip = /^(refresh|observed endpoints|unmatched recordings|load more|previous|next)$/i;
+      const buttons = await page.getByRole("button").all();
+      let rowLoc = null;
+      for (const b of buttons) {
+        const name = ((await b.innerText().catch(() => "")) || "").trim();
+        if (name && !skip.test(name.split("\n")[0].trim())) { rowLoc = b; break; }
+      }
+      if (rowLoc) {
         await rowLoc.click({ timeout: 10000 });
-        await page.waitForTimeout(1500);
+        await page.waitForTimeout(2000);
         await page.screenshot({ path: path.join(out, `linear-${w}.png`), fullPage: true });
-        row.steps.linear = { status: "pass", screenshot: `linear-${w}.png` };
+        const linearShown = await page.getByText(/http\.request|frame_enter|frame enter/i).first().count();
+        row.steps.linear = linearShown
+          ? { status: "pass", screenshot: `linear-${w}.png` }
+          : { status: "fail", reason: "a recording was opened but the Linear event window shows no request or frame event", screenshot: `linear-${w}.png` };
       } else {
-        row.steps.linear = { status: "fail", reason: "no recording row with a route label found in the list view" };
+        row.steps.linear = { status: "fail", reason: "no recording row found in the recordings list" };
       }
       const canvas = page.getByRole("tab", { name: /canvas/i }).or(page.getByRole("button", { name: /canvas/i })).first();
       if (await canvas.count()) {

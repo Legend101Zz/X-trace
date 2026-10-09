@@ -137,6 +137,17 @@ jobs:
           export XCAMP_DUMP_BODIES="$CAMP_OUT/baseline-bodies"
           python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
             --step baseline -- python3 -B "campaigns/java/$CAMP_PROJECT/harness/run.py" baseline
+      - name: Second baseline run and stability compare (same runner, same jar)
+        if: matrix.kind == 'java' && always()
+        env:
+          XCAMP_APP_MODE: host
+          XCAMP_PLATFORM: linux/amd64
+        run: |
+          export XTRACE_CAMPAIGN_ROOT="$CAMP_ROOT"
+          export XCAMP_JAVA="$JAVA_HOME/bin/java"
+          python3 -B "campaigns/java/$CAMP_PROJECT/harness/run.py" baseline || true
+          python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project "$CAMP_PROJECT" \
+            --step baseline-stability-across-runs -- python3 -B "campaigns/java/$CAMP_PROJECT/harness/run.py" compare
       - name: Compare with the tracked baseline (fingerprints and Postgres digest gate, jar sha is reported)
         if: matrix.kind == 'java' && always()
         run: |
