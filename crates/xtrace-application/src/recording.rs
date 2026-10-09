@@ -137,6 +137,33 @@ pub struct BeginRecording {
     pub opened_at: WallTime,
     /// CLI-selected run context and untrusted adapter endpoint fields.
     pub endpoint_observation: EndpointObservationInput,
+    /// Daemon-decided limitation codes of this recording, drawn from
+    /// [`RECORDING_LIMITATION_CODES`]. Persisted with the anchor so the read API reports
+    /// them; they never carry captured values. Empty for a recording without limitations.
+    pub limitations: Vec<String>,
+}
+
+/// Limitation code of a recording whose adapter claimed the focused capture policy on a
+/// session that was never armed for it (CONTRACTS 4.2: a claim by the adapter is not a grant).
+/// The recording is served under the standard policy.
+pub const LIMITATION_CAPTURE_POLICY_NOT_ARMED: &str = "capture_policy_not_armed";
+
+/// Closed vocabulary of persisted recording limitation codes (ADR 0011). A new code needs an
+/// ADR amendment, because the store and the read API carry exactly this set.
+pub const RECORDING_LIMITATION_CODES: &[&str] = &[LIMITATION_CAPTURE_POLICY_NOT_ARMED];
+
+/// Checks that `limitations` are members of [`RECORDING_LIMITATION_CODES`], sorted and unique.
+fn validate_limitations(limitations: &[String]) -> Result<(), PortError> {
+    let known = limitations.iter().all(|code| RECORDING_LIMITATION_CODES.contains(&code.as_str()));
+    let ordered = limitations.windows(2).all(|pair| pair[0] < pair[1]);
+    if known && ordered {
+        Ok(())
+    } else {
+        Err(capture_error(
+            PortErrorKind::Validation,
+            "recording limitations must be sorted, unique members of the closed vocabulary",
+        ))
+    }
 }
 
 /// Raw start fields plus invocation-scoped operator opt-in. Rejected strings
@@ -477,6 +504,7 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
         request: BeginRecording,
         event_cap: usize,
     ) -> Result<BeginRecordingReceipt, PortError> {
+        validate_limitations(&request.limitations)?;
         let recording = {
             let mut recordings = lock(&self.recordings)?;
             if let Some(recording) = recordings.get(&request.recording_id) {
@@ -510,6 +538,7 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
             runtime_session_id: state.runtime_session_id,
             opened_at: state.opened_at,
             endpoint_observation: request.endpoint_observation,
+            limitations: request.limitations,
         };
         let receipt = match self.port.begin_recording(&stable) {
             Ok(receipt) => receipt,
@@ -1284,6 +1313,7 @@ mod tests {
             runtime_session_id: id(0x33),
             opened_at,
             endpoint_observation: EndpointObservationInput::default(),
+            limitations: Vec::new(),
         }
     }
 
@@ -1303,6 +1333,34 @@ mod tests {
             policy,
             NonZeroUsize::new(DEFAULT_MAX_RETAINED_RECORDINGS).expect("non-zero recording limit"),
         )
+    }
+
+    #[test]
+    fn limitations_are_forwarded_to_the_port_and_must_be_closed_vocabulary() {
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        let limited = BeginRecording {
+            limitations: vec![LIMITATION_CAPTURE_POLICY_NOT_ARMED.to_owned()],
+            ..begin(wall(1))
+        };
+        service.begin_recording(limited).expect("known limitation");
+        assert_eq!(
+            port.snapshot().begins[0].limitations,
+            vec![LIMITATION_CAPTURE_POLICY_NOT_ARMED.to_owned()]
+        );
+        for bad in [
+            vec!["free_text_with_a_value".to_owned()],
+            vec![
+                LIMITATION_CAPTURE_POLICY_NOT_ARMED.to_owned(),
+                LIMITATION_CAPTURE_POLICY_NOT_ARMED.to_owned(),
+            ],
+        ] {
+            let request =
+                BeginRecording { recording_id: id(0x99), limitations: bad, ..begin(wall(1)) };
+            let error = service.begin_recording(request).expect_err("rejected");
+            assert_eq!(error.kind(), PortErrorKind::Validation);
+        }
+        assert_eq!(port.snapshot().begins.len(), 1, "rejected limitations never reach the port");
     }
 
     #[test]

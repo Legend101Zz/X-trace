@@ -160,6 +160,7 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
                 runtime_session_id: request.runtime_session_id,
                 opened_at: request.opened_at,
                 endpoint_observation: request.endpoint_observation.clone(),
+                limitations: request.limitations.clone(),
             })
             .map_err(map_recording_error)?;
         let disposition = match receipt.disposition {
@@ -403,6 +404,7 @@ mod tests {
             opened_at: WallTime::from_parts(2026, 9, 29, 1, 2, 3, 0).expect("timestamp"),
             endpoint_observation: xtrace_application::recording::EndpointObservationInput::default(
             ),
+            limitations: Vec::new(),
         }
     }
 

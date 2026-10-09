@@ -148,6 +148,7 @@ impl Fixture {
                 opened_at: WallTime::now(),
                 endpoint_observation:
                     xtrace_application::recording::EndpointObservationInput::default(),
+                limitations: Vec::new(),
             })
             .expect("begin");
         let payload = XtfEventEnvelope {

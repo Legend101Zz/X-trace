@@ -40,6 +40,9 @@ use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
 use crate::connection::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
+
+#[path = "recording_limitations.rs"]
+mod recording_limitations;
 use crate::xtf::{
     LogicalXtfSegment, XtfCodecError, XtfSegmentInput, compress_logical_bytes,
     encode_logical_segment, max_compressed_segment_bytes, verify_compressed_segment,
@@ -58,6 +61,9 @@ pub struct BeginRecordingRequest {
     pub opened_at: WallTime,
     /// Run-scoped opt-in and adapter fields for safe endpoint classification.
     pub endpoint_observation: EndpointObservationInput,
+    /// Closed-vocabulary limitation codes persisted with a newly inserted anchor (ADR 0011).
+    /// An exact replay never changes the limitations the recording was opened with.
+    pub limitations: Vec<String>,
 }
 
 /// Successful outcome of [`SqliteRecordingStore::begin_recording`].
@@ -1275,7 +1281,13 @@ impl SqliteRecordingStore<'_> {
                 }
             }),
             capacity,
-            limitations: Vec::new(),
+            limitations: recording_limitations::load(
+                &connection,
+                request.recording_id.as_uuid().as_bytes(),
+            )
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
             frame_honesty: load_frame_honesty(&connection, request.recording_id, correlation_id)?,
         })
     }
@@ -1371,6 +1383,14 @@ impl SqliteRecordingStore<'_> {
             "INSERT INTO recording_endpoint_observations (recording_id, project_id, disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec(), request.project_id.as_uuid().as_bytes().to_vec(), if operation_id.is_some() { "linked" } else { "unmatched" }, disposition.policy_id, operation_id.map(|id| id.as_uuid().as_bytes().to_vec()), disposition.application_component, disposition.binding_key, disposition.method, disposition.route_template, disposition.reason_code],
         ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+        recording_limitations::insert(
+            &transaction,
+            request.recording_id.as_uuid().as_bytes(),
+            &request.limitations,
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         transaction.commit().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })?;
@@ -7529,6 +7549,7 @@ mod tests {
             runtime_session_id,
             opened_at,
             endpoint_observation: EndpointObservationInput::default(),
+            limitations: Vec::new(),
         }
     }
 
