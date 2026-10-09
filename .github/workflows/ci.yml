@@ -515,12 +515,14 @@ jobs:
           python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step install --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm ci --prefix adapters/node
       - name: Node protocol generation check and unit tests
+        if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step generate-check --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm run generate:check --prefix adapters/node
           python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step test --min-passed 20 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm test --prefix adapters/node
       - name: Web viewer install, tests and embedded checks
+        if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step install --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             bash -ec 'npm ci --prefix web/app && cd web/app && npx playwright install chromium'
@@ -533,6 +535,7 @@ jobs:
           python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step check-embedded --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm run check:embedded --prefix web/app
       - name: Java strict Gradle build and tests
+        if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite java --variant "${{ matrix.java-version }}" --step gradle --cwd adapters/java \
             --junit-glob "*/build/test-results/test/*.xml" --min-passed 150 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
@@ -546,14 +549,17 @@ jobs:
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: cargo build (locked workspace)
+        if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step build --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             cargo build --locked --workspace --all-features
       - name: cargo test (locked workspace, no skips)
+        if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step test --min-passed 1 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             cargo test --locked --workspace --all-features --no-fail-fast
       - name: Packaged install journey (unattended)
+        if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite package --variant "${{ matrix.tuple }}" --step journey --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             bash -ec '
