@@ -166,7 +166,7 @@ pub fn process_transcript(
     .map(|(result, _claims)| result)
 }
 
-/// Like [`process_transcript`], but cites `source_revision_id` in every claim and also returns the
+/// Like `process_transcript`, but cites `source_revision_id` in every claim and also returns the
 /// validated claims in transcript order, ready to be submitted to a discovery run.
 pub fn process_transcript_claims(
     lines: &[String],
