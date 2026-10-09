@@ -1,6 +1,13 @@
 //! The checked-in honesty strings (`schema/fixtures/replay/honesty-strings.json`) cover exactly the
 //! stable codes the domain defines, so a client can always look up text for a code it receives.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "integration tests assert on fixture data and fail by panicking"
+)]
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 

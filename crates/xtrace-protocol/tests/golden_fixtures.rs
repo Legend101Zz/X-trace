@@ -5,6 +5,13 @@
 //! with the generated types. Create an empty `schema/fixtures/xtp-agent/.regen` marker file to rewrite the files from the Rust
 //! definitions below (the leased runner scrubs environment variables); the default run only verifies.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "integration tests assert on fixture data and fail by panicking"
+)]
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
