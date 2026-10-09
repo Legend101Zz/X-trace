@@ -133,5 +133,33 @@ class LintTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout)
 
 
+class DiagnosticsTests(unittest.TestCase):
+    def test_pairs_error_with_location_and_skips_noise(self):
+        text = (
+            "warning: unused variable: `x`\n  --> crates/a/src/lib.rs:1:1\n"
+            "error: this `panic!` should not be used (clippy::panic)\n   --> crates/xtrace-export/tests/export_core.rs:158:21\n"
+            "error[E0425]: cannot find value `y` in this scope\n --> crates/b/src/main.rs:9:5\n"
+            "error: could not compile `x` (test) due to 2 previous errors\n"
+        )
+        diags, dropped = lane_run.diagnostics(text)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(diags, ["error: this `panic!` should not be used (clippy::panic) @ crates/xtrace-export/tests/export_core.rs:158:21",
+                                 "error[E0425]: cannot find value `y` in this scope @ crates/b/src/main.rs:9:5"])
+
+    def test_host_paths_and_secrets_are_dropped_and_counted(self):
+        text = ("error: boom\n --> /home/runner/work/x/src/lib.rs:1:1\n"
+                "error: leaked token abc\n --> src/lib.rs:2:2\n"
+                "error: fine\n --> ../escape/src/lib.rs:3:3\n")
+        diags, dropped = lane_run.diagnostics(text)
+        self.assertEqual(diags, [])
+        self.assertEqual(dropped, 3)
+
+    def test_bounded(self):
+        text = "".join(f"error: e{i}\n --> src/f.rs:{i}:1\n" for i in range(1, 40))
+        diags, dropped = lane_run.diagnostics(text)
+        self.assertEqual(len(diags), lane_run.MAX_DIAG)
+        self.assertEqual(dropped, 39 - lane_run.MAX_DIAG)
+
+
 if __name__ == "__main__":
     unittest.main()
