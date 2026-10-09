@@ -114,6 +114,38 @@ class VerifyPackage(unittest.TestCase):
         v = verdict(vp.verify(self.root))
         self.assertFalse(v["manifest_hashes"])
 
+    def test_payload_row_drift_is_caught_by_payload_hashes_even_when_the_manifest_agrees(self):
+        build(self.root)
+        p = self.root / "share/xtrace/payload.sha256"
+        rows = p.read_text().splitlines()
+        rows[0] = "0" * 64 + rows[0][64:]
+        p.write_text("\n".join(rows) + "\n")
+        mpath = self.root / vp.MANIFEST_REL
+        manifest = json.loads(mpath.read_text())
+        for entry in manifest["files"]:
+            if entry["path"] == "share/xtrace/payload.sha256":
+                entry["sha256"] = vp.sha256_file(p)
+                entry["size"] = p.stat().st_size
+        mpath.write_text(json.dumps(manifest))
+        v = verdict(vp.verify(self.root))
+        self.assertTrue(v["manifest_hashes"])
+        self.assertFalse(v["payload_hashes"])
+
+    def test_archive_with_a_fifo_member_is_rejected(self):
+        build(self.root)
+        archive = self.tmp / "xtrace-0.0.1-linux-x86_64.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(self.root, arcname=self.root.name)
+            info = tarfile.TarInfo(self.root.name + "/pipe")
+            info.type = tarfile.FIFOTYPE
+            tf.addfile(info)
+        with self.assertRaises(SystemExit):
+            vp.verify(archive)
+
+    def test_binary_without_xtp_protocol_line_fails(self):
+        build(self.root, extra={"bin/xtrace": "#!/bin/sh\nprintf 'xtrace 0.0.1\\nschema-version: 6\\n'\n"})
+        self.assertFalse(verdict(vp.verify(self.root, run=True))["binary_version"])
+
     def test_archive_input_and_unsafe_members(self):
         build(self.root)
         archive = self.tmp / "xtrace-0.0.1-linux-x86_64.tar.gz"

@@ -94,9 +94,12 @@ def resolve_root(package, scratch):
         with tarfile.open(package, "r:gz") as tf:
             for m in tf.getmembers():
                 parts = Path(m.name).parts
-                if m.name.startswith("/") or ".." in parts or m.issym() or m.islnk() or m.isdev():
+                if m.name.startswith("/") or ".." in parts or not (m.isfile() or m.isdir()):
                     raise SystemExit(f"unsafe archive member: {m.name}")
-            tf.extractall(scratch)
+            if hasattr(tarfile, "data_filter"):
+                tf.extractall(scratch, filter="data")
+            else:
+                tf.extractall(scratch)
         tops = [p for p in Path(scratch).iterdir() if p.is_dir()]
         if len(tops) != 1:
             raise SystemExit("archive must have exactly one top-level directory")
@@ -182,6 +185,10 @@ def check_manifest(root, manifest, expected_version, rep):
             if not m:
                 bad.append(f"malformed row {line[:40]!r}")
                 continue
+            row_parts = Path(m.group(2)).parts
+            if m.group(2).startswith("/") or ".." in row_parts:
+                bad.append(f"unsafe row path {m.group(2)[:40]!r}")
+                continue
             target = root / m.group(2)
             if not target.is_file() or sha256_file(target) != m.group(1):
                 bad.append(f"{m.group(2)}: differs")
@@ -200,9 +207,11 @@ def run_binary(root, expected_version, rep):
     text = out.stdout
     first = text.splitlines()[0].strip() if text.splitlines() else ""
     m = re.search(r"^schema-version:\s*(\d+)\s*$", text, re.M)
-    ok = out.returncode == 0 and first == f"xtrace {expected_version}" and m is not None
+    proto = re.search(r"^xtp-protocol:\s*\S+\s*$", text, re.M)
+    ok = out.returncode == 0 and first == f"xtrace {expected_version}" and m is not None and proto is not None
     rep.add("binary_version", ok,
             f"first line {first!r}; schema-version {'reported' if m else 'NOT reported'}"
+            f"; xtp-protocol {'reported' if proto else 'NOT reported'}"
             + ("" if out.returncode == 0 else f"; exit {out.returncode}"))
     try:
         tui = subprocess.run([str(exe), "tui", "--help"], capture_output=True, text=True, timeout=30)

@@ -63,7 +63,7 @@ required components (the single `bin/xtrace` binary is checked only for presence
 daemon or TUI is what the `--run-binary` checks below probe; web assets; Java pack; Node pack; protobuf schemas and OpenAPI; SBOM; licenses; installers),
 per-file size and sha256 against the manifest, no unlisted files, `payload.sha256` rows, and a pack trust of
 `unsigned` or `dev` only (a release claim is rejected, the report always says `release_evidence: false`). With
-`--run-binary` it runs `bin/xtrace --version` and requires `xtrace <version>` plus a `schema-version:` line, and
+`--run-binary` it runs `bin/xtrace --version` and requires `xtrace <version>` plus `schema-version:` and `xtp-protocol:` lines, and
 `xtrace tui --help` (`tui_subcommand_registered`: the subcommand exists) plus `xtrace tui` with stdin closed
 (`tui_implemented`: red while the TUI is the exit-9 skeleton); with `--repo` it requires the reported schema version to equal the migration catalog's latest.
 `packaging/test/test_verify_package.py` pins each check on synthetic layouts (not a product build). CI wiring is a

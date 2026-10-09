@@ -162,7 +162,7 @@ fn packs_check(language: &'static str) -> Check {
                 Status::Warn,
                 "installed pack has no xtrace-pack.json: unsigned layout, publisher not verified",
             ),
-            PackTrustState::Verified => Check::new(
+            PackTrustState::ManifestVerified => Check::new(
                 id,
                 Status::Ok,
                 "pack manifest verifies against the built-in trust table",

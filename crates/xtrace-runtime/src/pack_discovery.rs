@@ -18,8 +18,9 @@ const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 pub enum PackTrustState {
     /// The directory exists but carries no `xtrace-pack.json`: an unsigned layout, never verified.
     UnsignedLayout,
-    /// A manifest exists and verifies against the compiled-in trust table.
-    Verified,
+    /// A manifest exists and its signature verifies against the compiled-in trust table.
+    /// This says nothing about the pack's files: the file inventory is not re-hashed here.
+    ManifestVerified,
     /// A manifest exists but cannot be trusted; the code is stable (`XTR-PACK-*` style, lower snake).
     Untrusted(&'static str),
 }
@@ -38,7 +39,10 @@ pub struct InstalledPack {
 /// Returns `<prefix>/share/xtrace/packs` for an executable at `<prefix>/bin/<name>`.
 #[must_use]
 pub fn packs_root_for_executable(executable: &Path) -> Option<PathBuf> {
-    let bin_dir = executable.parent()?;
+    // Resolve symlinks first so a symlinked invocation path (for example a user-controlled
+    // `~/bin/xtrace`) never selects a pack directory next to the link (ADR 0004: executable only).
+    let resolved = executable.canonicalize().unwrap_or_else(|_| executable.to_path_buf());
+    let bin_dir = resolved.parent()?;
     let prefix = bin_dir.parent()?;
     Some(prefix.join("share").join("xtrace").join("packs"))
 }
@@ -69,7 +73,7 @@ fn trust_of(directory: &Path) -> PackTrustState {
         return PackTrustState::Untrusted("manifest_unreadable");
     };
     match verify_with_installed_trust(&bytes) {
-        Ok(()) => PackTrustState::Verified,
+        Ok(()) => PackTrustState::ManifestVerified,
         Err(error) => PackTrustState::Untrusted(error_code(error)),
     }
 }
@@ -137,6 +141,24 @@ mod tests {
         std::os::unix::fs::symlink(real.path(), prefix.path().join("share/xtrace/packs/java"))
             .unwrap();
         assert!(locate(&prefix.path().join("bin/xtrace"), "java").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_invocation_path_resolves_to_the_real_prefix() {
+        let prefix = prefix_with(&[]);
+        std::fs::create_dir_all(prefix.path().join("bin")).unwrap();
+        let real = prefix.path().join("bin/xtrace");
+        std::fs::write(&real, "x").unwrap();
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        std::fs::create_dir_all(elsewhere.path().join("bin")).unwrap();
+        let link = elsewhere.path().join("bin/xtrace");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = packs_root_for_executable(&link).expect("root");
+        assert_eq!(
+            root,
+            prefix.path().canonicalize().unwrap().join("share").join("xtrace").join("packs")
+        );
     }
 
     #[test]
