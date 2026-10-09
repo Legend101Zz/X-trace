@@ -1,0 +1,17 @@
+# kind<TAB>text. kind is secret or plain. Shared with the Rust audit redactor once C publishes schema/fixtures.
+secret	Authorization: Basic dXNlcjpwYXNz
+secret	jdbc:postgresql://user:pw@db.internal/app
+secret	password=hunter2
+secret	api_key: sk_live_abcdefgh
+secret	Bearer abcdef123456
+secret	AKIAABCDEFGHIJKLMNOP
+secret	-----BEGIN PRIVATE KEY-----\nMIIB
+secret	eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJl
+secret	0123456789abcdef0123456789abcdef
+secret	QWxhZGRpbjpvcGVuIHNlc2FtZVRoaXNJc0FMb25nT3BhcXVlVG9rZW5YWQ
+secret	session_id=abc123
+plain	hello world
+plain	order 42 shipped to Berlin
+plain	The quick brown fox
+plain	https://example.com/path?x=1
+plain	status: ok

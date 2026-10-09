@@ -4,6 +4,7 @@ import dev.xtrace.agent.runtime.line.ValueSnapshot.NameOrigin;
 import dev.xtrace.agent.runtime.line.ValueSnapshot.Reason;
 import dev.xtrace.agent.runtime.line.ValueSnapshot.Role;
 import dev.xtrace.agent.runtime.line.ValueSnapshot.State;
+import dev.xtrace.agent.runtime.line.ValueSnapshot.ValueShape;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -26,48 +27,56 @@ public final class ValueSanitizer {
     char kind = n.descriptor().charAt(0);
     String text;
     String type;
+    ValueShape shape;
     switch (kind) {
       case 'Z' -> {
         text = value != 0 ? "true" : "false";
         type = "boolean";
+        shape = ValueShape.BOOLEAN;
       }
       case 'C' -> {
         text = printableChar((char) value);
         type = "char";
+        shape = ValueShape.STRING;
       }
       case 'B' -> {
         text = Integer.toString((byte) value);
         type = "byte";
+        shape = ValueShape.INTEGER_8;
       }
       case 'S' -> {
         text = Integer.toString((short) value);
         type = "short";
+        shape = ValueShape.INTEGER_16;
       }
       default -> {
         text = Integer.toString(value);
         type = "int";
+        shape = ValueShape.INTEGER_32;
       }
     }
-    return primitive(n.name(), role, type, text, limits);
+    return primitive(n.name(), role, type, shape, text, limits);
   }
 
   public static ValueSnapshot ofLong(SiteRegistry.Name n, long value, Role role, Limits limits) {
-    return primitive(n.name(), role, "long", Long.toString(value), limits);
+    return primitive(n.name(), role, "long", ValueShape.INTEGER_64, Long.toString(value), limits);
   }
 
   public static ValueSnapshot ofFloat(SiteRegistry.Name n, float value, Role role, Limits limits) {
-    return primitive(n.name(), role, "float", Float.toString(value), limits);
+    return primitive(n.name(), role, "float", ValueShape.FLOAT_32, Float.toString(value), limits);
   }
 
   public static ValueSnapshot ofDouble(SiteRegistry.Name n, double value, Role role, Limits limits) {
-    return primitive(n.name(), role, "double", Double.toString(value), limits);
+    return primitive(n.name(), role, "double", ValueShape.FLOAT_64, Double.toString(value), limits);
   }
 
   private static ValueSnapshot primitive(
-      String rawName, Role role, String type, String text, Limits limits) {
+      String rawName, Role role, String type, ValueShape shape, String text, Limits limits) {
     String name = boundName(rawName, limits);
-    if (Redaction.nameIsSecret(name)) return redacted(name, role, type, Redaction.RULE_NAME);
-    return captured(name, role, type, text, limits);
+    if (Redaction.nameIsSecret(name)) {
+      return redacted(name, role, type, NameOrigin.DECLARED, shape, Redaction.RULE_NAME);
+    }
+    return captured(name, role, type, shape, text, NameOrigin.DECLARED, limits);
   }
 
   /** Reference value; {@code declaredName} is the LocalVariableTable (or parameter) name. */
@@ -75,32 +84,52 @@ public final class ValueSanitizer {
       String declaredName, NameOrigin origin, Object value, Role role, Limits limits) {
     String name = boundName(declaredName, limits);
     String type = value == null ? "null" : typeName(value, limits);
-    if (Redaction.nameIsSecret(name)) return redacted(name, role, type, origin, Redaction.RULE_NAME);
-    if (value == null) return captured(name, role, "null", "null", origin, limits);
+    ValueShape shape = shapeOf(value);
+    if (Redaction.nameIsSecret(name)) {
+      return redacted(name, role, type, origin, shape, Redaction.RULE_NAME);
+    }
+    if (value == null) return captured(name, role, "null", ValueShape.NULL, "null", origin, limits);
     if (Redaction.typeIsSensitive(value)) {
-      return redacted(name, role, type, origin, Redaction.RULE_TYPE);
+      return redacted(name, role, type, origin, shape, Redaction.RULE_TYPE);
     }
     Class<?> c = value.getClass();
     if (c == String.class) {
       String s = (String) value;
       if (Redaction.contentIsSecret(s)) {
-        return redacted(name, role, type, origin, Redaction.RULE_CONTENT);
+        return redacted(name, role, type, origin, shape, Redaction.RULE_CONTENT);
       }
-      return captured(name, role, type, s, origin, limits);
+      return captured(name, role, type, shape, s, origin, limits);
     }
     String boxed = boxedText(value);
-    if (boxed != null) return captured(name, role, type, boxed, origin, limits);
+    if (boxed != null) return captured(name, role, type, shape, boxed, origin, limits);
     if (value instanceof Enum<?> e) {
       // Enum.name() is final: no user code runs.
-      return captured(name, role, type, e.name(), origin, limits);
+      return captured(name, role, type, shape, e.name(), origin, limits);
     }
     return unavailable(name, role, type, origin, Reason.UNSAFE_TO_RENDER);
+  }
+
+  /** Wire shape by class identity only (never calls into the value). */
+  private static ValueShape shapeOf(Object v) {
+    if (v == null) return ValueShape.NULL;
+    Class<?> c = v.getClass();
+    if (c == String.class || c == Character.class || v instanceof Enum<?>) return ValueShape.STRING;
+    if (c == Boolean.class) return ValueShape.BOOLEAN;
+    if (c == Byte.class) return ValueShape.INTEGER_8;
+    if (c == Short.class) return ValueShape.INTEGER_16;
+    if (c == Integer.class) return ValueShape.INTEGER_32;
+    if (c == Long.class) return ValueShape.INTEGER_64;
+    if (c == Float.class) return ValueShape.FLOAT_32;
+    if (c == Double.class) return ValueShape.FLOAT_64;
+    if (c == byte[].class) return ValueShape.BYTES;
+    if (c.isArray() || v instanceof java.util.Collection<?>) return ValueShape.LIST;
+    return ValueShape.OBJECT;
   }
 
   /** Unavailable binding for a method that has no LocalVariableTable (synthesized argN name). */
   public static ValueSnapshot noDebugMetadata(int argIndex, Role role) {
     return new ValueSnapshot(
-        State.UNAVAILABLE, "arg" + argIndex, role, NameOrigin.SYNTHESIZED, "", null, null, null,
+        State.UNAVAILABLE, "arg" + argIndex, role, NameOrigin.SYNTHESIZED, "", null, ValueShape.UNKNOWN, 0, 0, null, null,
         Reason.DEBUG_METADATA_ABSENT);
   }
 
@@ -124,43 +153,51 @@ public final class ValueSanitizer {
   }
 
   private static ValueSnapshot captured(
-      String name, Role role, String type, String text, Limits limits) {
-    return captured(name, role, type, text, NameOrigin.DECLARED, limits);
-  }
-
-  private static ValueSnapshot captured(
-      String name, Role role, String type, String text, NameOrigin origin, Limits limits) {
-    boolean tooLong = text.length() > limits.maxPreviewBytes();
-    // every char is at least one UTF-8 byte, so this prefix always covers the byte limit
-    String clean = stripControl(tooLong ? text.substring(0, limits.maxPreviewBytes()) : text);
+      String name,
+      Role role,
+      String type,
+      ValueShape shape,
+      String text,
+      NameOrigin origin,
+      Limits limits) {
+    int max = limits.maxPreviewBytes();
+    boolean tooLong = text.length() > max;
+    // Every char is at least one UTF-8 byte, so a char prefix of `max` covers the byte limit.
+    // Never end the prefix on a high surrogate whose low half was cut off.
+    int cut = max;
+    if (tooLong && Character.isHighSurrogate(text.charAt(cut - 1))) cut--;
+    String clean = stripControl(tooLong ? text.substring(0, cut) : text);
     byte[] bytes = clean.getBytes(StandardCharsets.UTF_8);
-    boolean truncated = tooLong || bytes.length > limits.maxPreviewBytes();
+    long lowerBound = bytes.length;
+    if (tooLong) lowerBound += text.length() - cut; // each unseen char is at least one byte
+    boolean truncated = tooLong || bytes.length > max;
     String preview = clean;
-    if (bytes.length > limits.maxPreviewBytes()) {
-      preview = cutUtf8(clean, limits.maxPreviewBytes());
+    if (bytes.length > max) {
+      preview = cutUtf8(clean, max);
       bytes = preview.getBytes(StandardCharsets.UTF_8);
     }
     // The content rule runs again on the exact emitted text.
     if (Redaction.contentIsSecret(preview)) {
-      return redacted(name, role, type, origin, Redaction.RULE_CONTENT);
+      return redacted(name, role, type, origin, shape, Redaction.RULE_CONTENT);
     }
     return new ValueSnapshot(
         truncated ? State.TRUNCATED : State.CAPTURED,
-        name, role, origin, type, preview, LineProbeInstrumenter.blake3(bytes), null, Reason.NONE);
-  }
-
-  private static ValueSnapshot redacted(String name, Role role, String type, String rule) {
-    return redacted(name, role, type, NameOrigin.DECLARED, rule);
+        name, role, origin, type, preview, shape,
+        truncated ? lowerBound : 0, truncated ? max : 0,
+        LineProbeInstrumenter.blake3(bytes), null, Reason.NONE);
   }
 
   private static ValueSnapshot redacted(
-      String name, Role role, String type, NameOrigin origin, String rule) {
-    return new ValueSnapshot(State.REDACTED, name, role, origin, type, null, null, rule, Reason.NONE);
+      String name, Role role, String type, NameOrigin origin, ValueShape shape, String rule) {
+    return new ValueSnapshot(
+        State.REDACTED, name, role, origin, type, null, shape, 0, 0, null, rule, Reason.NONE);
   }
 
   private static ValueSnapshot unavailable(
       String name, Role role, String type, NameOrigin origin, Reason reason) {
-    return new ValueSnapshot(State.UNAVAILABLE, name, role, origin, type, null, null, null, reason);
+    return new ValueSnapshot(
+        State.UNAVAILABLE, name, role, origin, type, null, ValueShape.UNKNOWN, 0, 0, null, null,
+        reason);
   }
 
   private static String typeName(Object value, Limits limits) {
@@ -176,16 +213,28 @@ public final class ValueSanitizer {
         : n;
   }
 
+  /** Replaces control characters and unpaired surrogates (not valid UTF-8) with U+FFFD. */
   private static String stripControl(String s) {
     StringBuilder b = null;
     for (int i = 0; i < s.length(); i++) {
       char c = s.charAt(i);
       boolean bad = c == 0 || (Character.isISOControl(c) && c != '\n' && c != '\t');
+      boolean pair = false;
+      if (Character.isHighSurrogate(c)) {
+        pair = i + 1 < s.length() && Character.isLowSurrogate(s.charAt(i + 1));
+        bad |= !pair;
+      } else if (Character.isLowSurrogate(c)) {
+        bad = true; // a paired low half is consumed with its high half below
+      }
       if (bad && b == null) {
         b = new StringBuilder(s.length());
         b.append(s, 0, i);
       }
-      if (b != null) b.append(bad ? '�' : c);
+      if (b != null) b.append(bad ? '\uFFFD' : c);
+      if (pair) {
+        i++;
+        if (b != null) b.append(s.charAt(i));
+      }
     }
     return b == null ? s : b.toString();
   }

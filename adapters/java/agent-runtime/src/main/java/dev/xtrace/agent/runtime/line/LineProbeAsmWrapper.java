@@ -46,8 +46,9 @@ public final class LineProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
 
   @Override
   public int mergeReader(int flags) {
-    // frames must reach the writer untouched
-    return flags & ~(net.bytebuddy.jar.asm.ClassReader.SKIP_FRAMES | net.bytebuddy.jar.asm.ClassReader.EXPAND_FRAMES);
+    // Frames must reach the writer. The visitor handles compressed and expanded frames alike, so a
+    // composed Advice wrapper may keep EXPAND_FRAMES; only SKIP_FRAMES is removed.
+    return flags & ~net.bytebuddy.jar.asm.ClassReader.SKIP_FRAMES;
   }
 
   @Override

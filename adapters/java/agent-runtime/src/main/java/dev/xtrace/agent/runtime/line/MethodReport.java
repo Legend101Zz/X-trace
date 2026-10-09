@@ -29,6 +29,7 @@ public record MethodReport(
     public static final String REGISTRY_FULL = "site_registry_full";
     public static final String JSR_RET = "jsr_ret_unsupported";
     public static final String NO_LVT = "no_local_variable_table";
+    public static final String VALUES_NON_JAVAC = "values_skipped_non_javac";
     public static final String VALUE_BUDGET = "value_budget_exceeded";
     public static final String VALUES_CAPPED = "values_capped_per_site";
     public static final String CLASS_VERSION = "unsupported_class_version";

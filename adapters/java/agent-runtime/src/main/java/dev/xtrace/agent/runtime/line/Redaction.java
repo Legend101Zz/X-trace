@@ -10,7 +10,7 @@ import java.util.regex.Pattern;
 /** ADR 0003 section 6 rules: name rule, type rule, content rule. Pattern list version is stamped. */
 public final class Redaction {
   /** Recorded against the redaction policy digest; bump when any pattern changes. */
-  public static final String POLICY_VERSION = "adr0003-s6-v1";
+  public static final String POLICY_VERSION = "adr0003-s6-v2";
 
   public static final String RULE_NAME = "name.secret";
   public static final String RULE_TYPE = "type.sensitive";
@@ -25,12 +25,34 @@ public final class Redaction {
               + "|private[_-]?key|session|bearer",
           Pattern.CASE_INSENSITIVE);
 
+  /** Replacement text used when {@link #replaceSecrets} rewrites a message. */
+  public static final String REDACTED_TEXT = "[redacted]";
+
+  /**
+   * Single source of truth for secret-shaped content (values and exception messages). Keep in step
+   * with the Rust audit redactor through the shared vectors in
+   * {@code src/test/resources/line/redaction-vectors.tsv}.
+   */
   private static final Pattern[] CONTENT = {
+    // PEM blocks, including truncated ones
+    Pattern.compile("-----BEGIN [A-Z0-9 ]+-----[\\s\\S]*"),
     // JWT-shaped; also a lone header segment so truncation cannot hide the token
     Pattern.compile("eyJ[A-Za-z0-9_-]{8,}"),
-    Pattern.compile("AKIA[0-9A-Z]{16}"),
-    Pattern.compile("-----BEGIN [A-Z0-9 ]+-----"),
-    Pattern.compile("(?i)bearer\\s+[^\\s]{4,}")
+    Pattern.compile("eyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]*"),
+    // Authorization-style credentials
+    Pattern.compile("(?i)\\b(bearer|basic)\\s+[A-Za-z0-9._~+/=-]{8,}"),
+    Pattern.compile("(?i)bearer\\s+[^\\s]{4,}"),
+    // Cloud access keys
+    Pattern.compile("(AKIA|ASIA)[0-9A-Z]{16}"),
+    // Credentials embedded in URLs
+    Pattern.compile("(?i)\\b[a-z][a-z0-9+.-]*://[^\\s/@:]+:[^\\s/@]+@"),
+    // key=value or key: value where the key names a secret
+    Pattern.compile(
+        "(?i)\\b(password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|"
+            + "authorization|cookie|session[_-]?id)\\b\\s*[=:]\\s*[^\\s,;&]+"),
+    // Long opaque tokens: 32 or more hex or 40 or more base64url characters
+    Pattern.compile("\\b[A-Fa-f0-9]{32,}\\b"),
+    Pattern.compile("\\b[A-Za-z0-9_-]{40,}\\b"),
   };
 
   private Redaction() {}
@@ -46,6 +68,14 @@ public final class Redaction {
       if (p.matcher(scan).find()) return true;
     }
     return false;
+  }
+
+  /** Replaces every secret-shaped span with {@link #REDACTED_TEXT} (for free-text messages). */
+  public static String replaceSecrets(String text) {
+    if (text == null) return null;
+    String out = text;
+    for (Pattern p : CONTENT) out = p.matcher(out).replaceAll(REDACTED_TEXT);
+    return out;
   }
 
   /** Type rule by instanceof only: never calls into the value. */

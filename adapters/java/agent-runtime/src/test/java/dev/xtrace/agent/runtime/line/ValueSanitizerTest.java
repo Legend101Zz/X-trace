@@ -11,6 +11,7 @@ import dev.xtrace.agent.runtime.line.ValueSnapshot.NameOrigin;
 import dev.xtrace.agent.runtime.line.ValueSnapshot.Reason;
 import dev.xtrace.agent.runtime.line.ValueSnapshot.Role;
 import dev.xtrace.agent.runtime.line.ValueSnapshot.State;
+import dev.xtrace.agent.runtime.line.ValueSnapshot.ValueShape;
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
@@ -121,8 +122,8 @@ class ValueSanitizerTest {
     assertEquals(State.TRUNCATED, s.state());
     byte[] bytes = s.preview().getBytes(StandardCharsets.UTF_8);
     assertTrue(bytes.length <= 256 && bytes.length >= 254, "len " + bytes.length);
-    assertEquals(512, ref("text", "a".repeat(5000), Limits.FOCUSED).preview().length());
-    ValueSnapshot ok = ref("text", "a".repeat(256), Limits.STANDARD);
+    assertEquals(512, ref("text", "ab ".repeat(2000), Limits.FOCUSED).preview().length());
+    ValueSnapshot ok = ref("text", "ab ".repeat(85) + "a", Limits.STANDARD);
     assertEquals(State.CAPTURED, ok.state());
     ValueSnapshot emoji = ref("text", "😀".repeat(100), Limits.STANDARD);
     assertTrue(emoji.preview().getBytes(StandardCharsets.UTF_8).length <= 256);
@@ -183,5 +184,108 @@ class ValueSanitizerTest {
       LineProbeDispatch.install(null);
     }
     assertEquals(LineProbeSink.NOOP, LineProbeDispatch.current());
+  }
+
+  // ---- round 2: wire mapping fields ----
+
+  @Test
+  void shapesFollowTheWireEnumForEveryPrimitiveAndReference() {
+    assertEquals(ValueShape.BOOLEAN, ValueSanitizer.ofInt(n("z", "Z"), 1, Role.LOCAL, Limits.FOCUSED).shape());
+    assertEquals(ValueShape.STRING, ValueSanitizer.ofInt(n("c", "C"), 'q', Role.LOCAL, Limits.FOCUSED).shape());
+    assertEquals(ValueShape.INTEGER_8, ValueSanitizer.ofInt(n("b", "B"), 1, Role.LOCAL, Limits.FOCUSED).shape());
+    assertEquals(ValueShape.INTEGER_16, ValueSanitizer.ofInt(n("s", "S"), 1, Role.LOCAL, Limits.FOCUSED).shape());
+    assertEquals(ValueShape.INTEGER_32, ValueSanitizer.ofInt(n("i", "I"), 1, Role.LOCAL, Limits.FOCUSED).shape());
+    assertEquals(ValueShape.INTEGER_64, ValueSanitizer.ofLong(n("l", "J"), 1, Role.LOCAL, Limits.FOCUSED).shape());
+    assertEquals(ValueShape.FLOAT_32, ValueSanitizer.ofFloat(n("f", "F"), 1, Role.LOCAL, Limits.FOCUSED).shape());
+    assertEquals(ValueShape.FLOAT_64, ValueSanitizer.ofDouble(n("d", "D"), 1, Role.LOCAL, Limits.FOCUSED).shape());
+    assertEquals(ValueShape.STRING, ref("v", "x", Limits.FOCUSED).shape());
+    assertEquals(ValueShape.NULL, ref("v", null, Limits.FOCUSED).shape());
+    assertEquals(ValueShape.INTEGER_64, ref("v", 5L, Limits.FOCUSED).shape());
+    assertEquals(ValueShape.STRING, ref("v", Thread.State.NEW, Limits.FOCUSED).shape());
+    assertEquals(ValueShape.UNKNOWN, ref("v", new Object(), Limits.FOCUSED).shape());
+  }
+
+  @Test
+  void redactedValuesCarryAShapeHint() {
+    ValueSnapshot s = ref("password", "x", Limits.FOCUSED);
+    assertEquals(State.REDACTED, s.state());
+    assertEquals(ValueShape.STRING, s.shape());
+    assertEquals(ValueShape.INTEGER_32, ValueSanitizer.ofInt(n("pwd", "I"), 7, Role.LOCAL, Limits.FOCUSED).shape());
+  }
+
+  @Test
+  void truncatedCarriesOriginalSizeLowerBoundAndLimit() {
+    ValueSnapshot s = ref("text", "é".repeat(400), Limits.STANDARD); // 800 bytes
+    assertEquals(State.TRUNCATED, s.state());
+    assertEquals(256, s.limit());
+    assertTrue(s.originalSizeLowerBound() >= 256 && s.originalSizeLowerBound() <= 800, "" + s.originalSizeLowerBound());
+    ValueSnapshot big = ref("text", "ab ".repeat(2000), Limits.FOCUSED); // 6000 bytes
+    assertEquals(512, big.limit());
+    assertTrue(big.originalSizeLowerBound() > 512 && big.originalSizeLowerBound() <= 6000);
+    ValueSnapshot ok = ref("text", "short", Limits.FOCUSED);
+    assertEquals(0, ok.originalSizeLowerBound());
+    assertEquals(0, ok.limit());
+  }
+
+  @Test
+  void rolesCoverEveryWireBindingRole() {
+    ValueSnapshot ex = ValueSanitizer.ofRef("ex", NameOrigin.DECLARED, "boom", Role.EXCEPTION, Limits.STANDARD);
+    ValueSnapshot rc = ValueSanitizer.ofRef("this", NameOrigin.DECLARED, "r", Role.RECEIVER, Limits.STANDARD);
+    ValueSnapshot rt = ValueSanitizer.ofRef("ret", NameOrigin.SYNTHESIZED, 3, Role.RETURN, Limits.STANDARD);
+    assertEquals(Role.EXCEPTION, ex.role());
+    assertEquals(Role.RECEIVER, rc.role());
+    assertEquals(Role.RETURN, rt.role());
+    assertEquals(5, LineProbeSink.ROLE_RECEIVER);
+    assertEquals(4, LineProbeSink.ROLE_EXCEPTION);
+  }
+
+  @Test
+  void cutBetweenSurrogatePairNeverLeavesALoneSurrogate() {
+    // 255 'a' puts the pair across the 256 limit: char 255 is the high surrogate, 256 the low one.
+    String text = "ab ".repeat(85) + "😀" + "b";
+    ValueSnapshot s = ref("text", text, Limits.STANDARD);
+    assertFalse(Character.isHighSurrogate(s.preview().charAt(s.preview().length() - 1)));
+    assertTrue(s.preview().getBytes(StandardCharsets.UTF_8).length <= 256);
+    // the hash is of bytes that decode back to exactly the preview
+    byte[] bytes = s.preview().getBytes(StandardCharsets.UTF_8);
+    assertEquals(s.preview(), new String(bytes, StandardCharsets.UTF_8));
+    assertArrayEquals(LineProbeInstrumenter.blake3(bytes), s.contentHash());
+    assertFalse(s.preview().contains("?"));
+  }
+
+  @Test
+  void loneSurrogatesInTheInputAreReplacedNotQuestionMarked() {
+    ValueSnapshot s = ref("text", "a\uD83Db\uDE00c", Limits.FOCUSED);
+    assertEquals("a\uFFFDb\uFFFDc", s.preview());
+    byte[] bytes = s.preview().getBytes(StandardCharsets.UTF_8);
+    assertArrayEquals(LineProbeInstrumenter.blake3(bytes), s.contentHash());
+  }
+
+  // ---- round 2: one redaction policy ----
+
+  @Test
+  void sharedVectorsAreRedactedUnderInnocentNames() throws Exception {
+    java.util.List<String> lines =
+        java.nio.file.Files.readAllLines(
+            java.nio.file.Path.of(
+                getClass().getResource("/line/redaction-vectors.tsv").toURI()),
+            StandardCharsets.UTF_8);
+    int checked = 0;
+    for (String line : lines) {
+      if (line.isBlank() || line.startsWith("#")) continue;
+      String[] f = line.split("\t", 2);
+      boolean secret = f[0].equals("secret");
+      String text = f[1].replace("\\n", "\n");
+      assertEquals(secret, Redaction.contentIsSecret(text), line);
+      ValueSnapshot s = ref("note", text, Limits.FOCUSED);
+      assertEquals(secret ? State.REDACTED : State.CAPTURED, s.state(), line);
+      if (secret) {
+        assertFalse(Redaction.replaceSecrets(text).equals(text), line);
+      } else {
+        assertEquals(text, Redaction.replaceSecrets(text), line);
+      }
+      checked++;
+    }
+    assertTrue(checked >= 12, "vectors read: " + checked);
   }
 }

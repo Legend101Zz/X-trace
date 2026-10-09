@@ -25,8 +25,13 @@ public interface LineProbeSink {
 
   default void valuesEnd() {}
 
-  /** Role constant passed to {@link #valueRef}: a local variable. */
+  /** Role constants passed to {@link #valueRef}; numbers equal the wire BindingRole. */
+  int ROLE_ARGUMENT = 1;
+
+  int ROLE_RETURN = 2;
   int ROLE_LOCAL = 3;
+  int ROLE_EXCEPTION = 4;
+  int ROLE_RECEIVER = 5;
 
   /** Sink that ignores everything. */
   LineProbeSink NOOP = new LineProbeSink() {};

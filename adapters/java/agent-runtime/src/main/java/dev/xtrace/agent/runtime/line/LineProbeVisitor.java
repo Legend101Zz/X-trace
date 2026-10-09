@@ -46,6 +46,9 @@ public class LineProbeVisitor extends ClassVisitor {
   private final byte[] classDigest;
   private final List<MethodReport> reports;
   private String className = "";
+  /** False once any marker says the class was not produced by javac (LVT precision unknown). */
+  private boolean javacLvtTrusted = true;
+  private boolean sawJavaSource;
 
   public LineProbeVisitor(
       ClassVisitor next,
@@ -64,7 +67,35 @@ public class LineProbeVisitor extends ClassVisitor {
   public void visit(
       int version, int access, String name, String signature, String superName, String[] interfaces) {
     this.className = name;
+    if (interfaces != null) {
+      for (String i : interfaces) {
+        if (i.equals("groovy/lang/GroovyObject") || i.equals("scala/ScalaObject")) {
+          javacLvtTrusted = false;
+        }
+      }
+    }
     super.visit(version, access, name, signature, superName, interfaces);
+  }
+
+  @Override
+  public void visitSource(String source, String debug) {
+    sawJavaSource = source != null && source.endsWith(".java");
+    super.visitSource(source, debug);
+  }
+
+  @Override
+  public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+    if (descriptor.equals("Lkotlin/Metadata;")
+        || descriptor.startsWith("Lscala/reflect/Scala")
+        || descriptor.startsWith("Lscala/annotation/internal/")) {
+      javacLvtTrusted = false;
+    }
+    return super.visitAnnotation(descriptor, visible);
+  }
+
+  /** Focused value reads rely on javac-precise LocalVariableTable ranges and types. */
+  private boolean lvtTrusted() {
+    return javacLvtTrusted && sawJavaSource;
   }
 
   @Override
@@ -370,7 +401,10 @@ public class LineProbeVisitor extends ClassVisitor {
 
       boolean values = skip == null && config.focusedValues();
       if (values) {
-        if (locals.isEmpty()) {
+        if (!lvtTrusted()) {
+          values = false;
+          valuesReason = Reasons.VALUES_NON_JAVAC;
+        } else if (locals.isEmpty()) {
           values = false;
           valuesReason = Reasons.NO_LVT;
         } else {
@@ -446,19 +480,22 @@ public class LineProbeVisitor extends ClassVisitor {
     }
 
     private List<LocalEntry> liveAt(int opIndex) {
-      List<LocalEntry> live = new ArrayList<>();
+      List<LocalEntry> covering = new ArrayList<>();
+      java.util.Map<Integer, Integer> perSlot = new java.util.HashMap<>();
       boolean isStatic = (access & Opcodes.ACC_STATIC) != 0;
-      boolean[] seen = new boolean[256];
       for (LocalEntry e : locals) {
         Integer s = labelPos.get(e.start());
         Integer en = labelPos.get(e.end());
         if (s == null || en == null) continue;
         if (!(s <= opIndex && opIndex < en)) continue;
+        covering.add(e);
+        perSlot.merge(e.index(), 1, Integer::sum);
+      }
+      List<LocalEntry> live = new ArrayList<>();
+      for (LocalEntry e : covering) {
         if (!isStatic && e.index() == 0) continue; // `this` may be uninitializedThis
-        if (e.index() < seen.length) {
-          if (seen[e.index()]) continue; // overlapping ranges for one slot: never guess
-          seen[e.index()] = true;
-        }
+        // Overlapping entries for one slot (any index): the table is inconsistent, never guess.
+        if (perSlot.get(e.index()) > 1) continue;
         char c = e.descriptor().charAt(0);
         if (c != 'Z' && c != 'B' && c != 'C' && c != 'S' && c != 'I' && c != 'J' && c != 'F'
             && c != 'D' && c != 'L' && c != '[') {
