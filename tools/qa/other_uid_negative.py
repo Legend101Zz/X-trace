@@ -117,6 +117,8 @@ def audit_store(root: pathlib.Path) -> "tuple[list[pathlib.Path], list[pathlib.P
                 files.append(path)
                 if db is None and path.suffix in (".sqlite3", ".sqlite", ".db"):
                     db = path
+            else:
+                raise CheckError("store-special-entry")  # FIFO, socket or device node: never in a real store
     if not files:
         raise CheckError("store-empty")
     if db is None:
@@ -196,6 +198,11 @@ def audit_acls(entries: Sequence[pathlib.Path], reader: AclReader) -> None:
                 raise CheckError("store-acl-allow")
 
 
+def write_control_argv(user: str) -> "list[str]":
+    script = 'd=$(/usr/bin/mktemp -d) && /usr/bin/touch "$d/w" && /bin/rm "$d/w" && /bin/rmdir "$d"'
+    return ["sudo", "-n", "-u", user, "/bin/sh", "-c", script]
+
+
 def write_probes(root: pathlib.Path, db: pathlib.Path) -> "list[list[str]]":
     """Mutations the other user must be denied: create in the store, create beside the db, rename and overwrite db."""
     return [
@@ -232,6 +239,11 @@ def run_negative(root: pathlib.Path, user: str, runner: Runner = default_runner,
         rc, _ = runner(probe_argv(user, kind, control))
         if rc != 0:
             raise CheckError("control-failed")
+    # Positive write control: the other user can create and remove a file in a scratch directory it owns, outside
+    # the store, so a denied write probe below means the store barrier and not a user that can write nothing.
+    rc, _ = runner(write_control_argv(user))
+    if rc != 0:
+        raise CheckError("write-control-failed")
     canary = parent / CANARY_NAME
     try:
         canary.unlink(missing_ok=True)
@@ -248,7 +260,10 @@ def run_negative(root: pathlib.Path, user: str, runner: Runner = default_runner,
     targets, total = choose_targets(root, dirs, files, db)
     if total > len(targets):
         log(f"check targets-capped total={total} kept={len(targets)}")
-    before = _snapshot(root, db)
+    try:
+        before = _snapshot(root, db)
+    except OSError:
+        raise CheckError("store-unreadable") from None
     for kind, path in targets:
         rc, err = runner(probe_argv(user, kind, path))
         _require_denied(rc, err, "other-user-access-allowed")
@@ -292,6 +307,18 @@ def _sh(argv: Sequence[str]) -> "tuple[int, str]":
     return proc.returncode, proc.stdout
 
 
+def created_marker_ok(path: pathlib.Path, run_id: str) -> bool:
+    try:
+        return path.read_text(encoding="ascii") == f"other-uid-created run={run_id}\n"
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _run_id() -> str:
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    return run_id if re.fullmatch(r"[0-9]{1,20}", run_id) else ""
+
+
 def cmd_create_user(args: argparse.Namespace) -> int:
     if not USER_RE.fullmatch(args.user):
         _emit("create-user FAIL bad-user-name")
@@ -303,6 +330,15 @@ def cmd_create_user(args: argparse.Namespace) -> int:
             _sh(["dscl", ".", "-read", f"/Groups/{args.user}", "PrimaryGroupID"])[0] == 0:
         _emit("create-user FAIL account-exists")  # never rewrite an existing account or group
         return 2
+    run_id = _run_id()
+    if not run_id:
+        _emit("create-user FAIL run-id-missing")
+        return 2
+    try:  # recorded before the first write so cleanup removes only what this run created
+        pathlib.Path(args.created_marker).write_text(f"other-uid-created run={run_id}\n", encoding="ascii")
+    except OSError:
+        _emit("create-user FAIL marker-unwritable")
+        return 1
     _, out = _sh(["dscl", ".", "-list", "/Users", "UniqueID"])
     uids = [int(p[-1]) for p in (line.split() for line in out.splitlines()) if p and p[-1].isdigit()]
     uid = pick_uid(uids)
@@ -342,8 +378,17 @@ def cmd_delete_user(args: argparse.Namespace) -> int:
     if not USER_RE.fullmatch(args.user) or not is_hosted_runner():
         _emit("delete-user skipped-cleanup")  # cleanup only; the verdict comes from verify-marker
         return 0
+    run_id = _run_id()
+    created = pathlib.Path(args.created_marker)
+    if not run_id or not created_marker_ok(created, run_id):
+        _emit("delete-user skipped-not-created-by-this-run")  # never delete an account this run did not create
+        return 0
     rc, _ = _sh(["sudo", "-n", "dscl", ".", "-delete", f"/Users/{args.user}"])
     rg, _ = _sh(["sudo", "-n", "dscl", ".", "-delete", f"/Groups/{args.user}"])
+    try:
+        created.unlink()
+    except OSError:
+        pass
     _emit("delete-user ok" if rc == 0 and rg == 0 else "delete-user failed")
     return 0
 
@@ -380,7 +425,10 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_verify_marker(args: argparse.Namespace) -> int:
-    run_id = os.environ.get("GITHUB_RUN_ID") or None
+    run_id = _run_id()
+    if not run_id:
+        _emit("verify-marker FAIL run-id-missing")
+        return 1
     if marker_ok(pathlib.Path(args.marker), run_id):
         _emit("verify-marker ok")
         return 0
@@ -394,6 +442,7 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     for name, fn in (("create-user", cmd_create_user), ("delete-user", cmd_delete_user)):
         p = sub.add_parser(name)
         p.add_argument("--user", required=True)
+        p.add_argument("--created-marker", required=True, help="run-local file recording that this run created the user")
         p.set_defaults(fn=fn)
     p = sub.add_parser("check")
     p.add_argument("--store-root", required=True)
