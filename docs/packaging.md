@@ -41,7 +41,8 @@ copies the data home to `<prefix>/backups/<utc>-pre-<version>/` before the new v
 previous version for rollback, refuses downgrades without `--allow-downgrade`, and refuses a prefix inside the data
 home. Uninstall removes program files only and prints where data and backups are. The product itself runs store
 migrations at first use; the installer cannot migrate (and does not stop a running daemon: stop it first).
-`packaging/test/install_test.sh dist/<platform>` exercises fresh install, upgrade, tamper/downgrade refusal and uninstall.
+`packaging/test/install_test.sh dist/<platform>` exercises fresh install, upgrade, tamper/downgrade refusal and uninstall, and
+the lifecycle on the installed binary (`init`, `record`, `stop`, and `restart` after the upgrade).
 
 ## Signing interfaces (fail clearly without real authority)
 
@@ -104,7 +105,10 @@ project license is MIT (root `LICENSE`, workspace `license = "MIT"`).
 ## Install test scratch
 
 `packaging/test/install_test.sh` creates its work directory under `$XTRACE_TEST_PRIVATE_SCRATCH` (a private 0700 directory the caller
-created; CI sets it from `$RUNNER_TEMP`), falling back to `$TMPDIR`. Product storage refuses data directories below world-writable
-ancestors such as Linux `/tmp`, so the fallback only works where the temp root is user-private (macOS). The script aborts if `mktemp`
-fails, refuses unsafe work directories, and removes only a directory carrying the ownership marker it wrote itself.
-`packaging/test/install_scratch_test.sh` covers those guards.
+created) when set, else `$TMPDIR`. `package.yml` points `TMPDIR` at a 0700 directory below `$RUNNER_TEMP`; `ci.yml` and `lane.yml` set
+`XTRACE_TEST_PRIVATE_SCRATCH`. Product storage refuses data directories below group- or world-writable ancestors such as Linux
+`/tmp`, so the script refuses such a scratch root up front. It aborts if `mktemp` fails, refuses a work directory equal to the starting
+directory (logical or physical) or `$HOME`, refuses one that is not empty when claimed, and on exit stops a leftover daemon (by the
+project's recorded identity) and removes only that directory. `packaging/test/install_scratch_test.sh` asserts these behaviours
+(failing mktemp, missing/open scratch root, cwd and symlinked cwd, foreign non-empty dir, scratch root used and emptied); it needs no
+build. Linux/dash proof comes from running it in CI.
