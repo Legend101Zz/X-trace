@@ -22,7 +22,6 @@ fn version_is_0_0_1() {
 #[test]
 fn unimplemented_command_exits_nine_with_stable_message_for_each() {
     let table: &[(&[&str], &str)] = &[
-        (&["scan"], "scan"),
         (&["catalog", "list"], "catalog list"),
         (&["catalog", "history"], "catalog history"),
         (&["catalog", "diff"], "catalog diff"),
@@ -32,8 +31,6 @@ fn unimplemented_command_exits_nine_with_stable_message_for_each() {
         (&["stop"], "stop"),
         (&["restart"], "restart"),
         (&["doctor"], "doctor"),
-        (&["export"], "export"),
-        (&["exercise", "plan"], "exercise plan"),
         (&["exercise", "approve", "--plan-hash", "abc"], "exercise approve"),
         (&["exercise", "run"], "exercise run"),
         (&["exercise", "show"], "exercise show"),
