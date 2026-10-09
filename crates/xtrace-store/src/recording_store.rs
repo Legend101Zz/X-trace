@@ -881,6 +881,8 @@ impl SqliteRecordingStore<'_> {
         let mut segment_count = 0_u64;
         let mut events: Vec<PersistedEvent> = Vec::new();
         let mut verified_frame_ids = HashMap::new();
+        // Sequence ranges of the segments decoded and verified by this read.
+        let mut decoded_ranges: Vec<(u64, u64)> = Vec::new();
         let event_limit = usize::try_from(request.limit)
             .map_err(|_| recording_query_validation_error(correlation_id))?;
         let mut has_more = false;
@@ -1068,6 +1070,7 @@ impl SqliteRecordingStore<'_> {
                 return Err(object_corrupt_error(correlation_id));
             }
             verified_input_bytes = work_if_added.unwrap_or(segment_work);
+            decoded_ranges.push((first_sequence, last_sequence));
             index_verified_segment_frames(
                 &connection,
                 request.recording_id,
@@ -1142,7 +1145,17 @@ impl SqliteRecordingStore<'_> {
                         .map(|parent| parent.frame_id);
                     }
                 }
-                (Some(row.frame_id), navigation)
+                // A target inside a segment this read decoded must match its verified XTF
+                // event; a corrupt metadata row degrades that edge instead of being trusted.
+                let checked = check_navigation_targets(
+                    &connection,
+                    request.recording_id,
+                    navigation,
+                    &decoded_ranges,
+                    &verified_frame_ids,
+                    correlation_id,
+                )?;
+                (Some(row.frame_id), checked)
             } else {
                 frame_navigation(
                     &connection,
@@ -2672,6 +2685,41 @@ fn load_frame_honesty(
         dropped: as_count(dropped),
         orphan_parent: as_count(orphan),
     }))
+}
+
+/// Replaces every navigation target that falls inside a segment decoded by this read but
+/// whose frame id is not the one verified against the XTF event with `partial_frontier`.
+fn check_navigation_targets(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    navigation: FrameNavigation,
+    decoded_ranges: &[(u64, u64)],
+    verified_frame_ids: &HashMap<u64, xtrace_domain::FrameId>,
+    correlation_id: CorrelationId,
+) -> Result<FrameNavigation, RecordingStoreError> {
+    let check = |result: NavigationResult| -> Result<NavigationResult, RecordingStoreError> {
+        let NavigationResult::Target { frame_id } = result else {
+            return Ok(result);
+        };
+        let Some(target) =
+            load_indexed_frame_by_id(connection, recording_id, frame_id, correlation_id)?
+        else {
+            return Ok(NavigationResult::unavailable(NavigationUnavailable::PartialFrontier));
+        };
+        let inside =
+            decoded_ranges.iter().any(|(first, last)| (*first..=*last).contains(&target.sequence));
+        if inside && verified_frame_ids.get(&target.sequence) != Some(&frame_id) {
+            return Ok(NavigationResult::unavailable(NavigationUnavailable::PartialFrontier));
+        }
+        Ok(result)
+    };
+    Ok(FrameNavigation {
+        previous: check(navigation.previous)?,
+        next: check(navigation.next)?,
+        into: check(navigation.into)?,
+        over: check(navigation.over)?,
+        out: check(navigation.out)?,
+    })
 }
 
 /// Wire kinds the navigation function distinguishes.

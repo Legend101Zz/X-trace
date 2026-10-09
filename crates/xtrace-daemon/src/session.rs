@@ -1916,6 +1916,7 @@ mod tests {
         let preview = "hunter2-canary";
         let mut secret_event = event(2, 0xaa);
         secret_event.kind = wire::RecordingEventKind::FrameEnter as i32;
+        secret_event.symbol = "app.Service.login".to_owned();
         secret_event.bindings = vec![wire::ValueBinding {
             name: "password".to_owned(),
             role: wire::BindingRole::Argument as i32,
