@@ -3168,7 +3168,7 @@ class RunnerTests(unittest.TestCase):
             calls += 1
             if calls == 1:
                 unrelated = subprocess.Popen(
-                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    [sys.executable, "-c", "import time; time.sleep(600)"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                 )
             return snapshot
