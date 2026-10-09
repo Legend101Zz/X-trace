@@ -38,6 +38,10 @@ GRADLE_FAIL = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\(.*\))?(?:\[.*\])? FA
 PY_FAIL = re.compile(r"^(?:FAIL|ERROR): (\w+) \((?:[\w.]+\.)?(\w+)\.(\w+)\)")
 PY_RAN = re.compile(r"^Ran (\d+) tests? in ")
 PY_FAILED = re.compile(r"^FAILED \((?:failures=(\d+))?(?:, )?(?:errors=(\d+))?")
+NODE_PASS = re.compile(r"^\W{0,3}\s*pass (\d+)$")  # node:test spec reporter summary: "ℹ pass 12"
+NODE_FAIL = re.compile(r"^\W{0,3}\s*fail (\d+)$")
+NODE_SKIP = re.compile(r"^\W{0,3}\s*(?:skipped|todo|cancelled) (\d+)$")
+VITEST_TESTS = re.compile(r"^\s*Tests\s+(?:(\d+) failed \| )?(\d+) passed(?: \| (\d+) (?:skipped|todo))*\s*\((\d+)\)")
 TAP_NOT_OK = re.compile(r"^\s*not ok \d+ - (\S+)\s*$")
 
 
@@ -65,6 +69,18 @@ def parse_output(text: str) -> dict:
             failed += bad
             passed -= bad
             counted = True
+        elif m := NODE_PASS.match(line):
+            passed += int(m.group(1))
+            counted = True
+        elif m := NODE_FAIL.match(line):
+            failed += int(m.group(1))
+            counted = True
+        elif m := NODE_SKIP.match(line):
+            ignored += int(m.group(1))
+        elif m := VITEST_TESTS.match(line):
+            failed += int(m.group(1) or 0)
+            passed += int(m.group(2))
+            counted = True
         elif m := CARGO_RESULT.match(line):
             passed += int(m.group(1))
             failed += int(m.group(2))
@@ -84,6 +100,37 @@ def parse_output(text: str) -> dict:
         "failingTruncated": max(0, len(failing) - MAX_FAILING),
         "droppedInvalidNames": dropped,
     }
+
+
+def junit_counts(base: pathlib.Path, pattern: str) -> dict | None:
+    """Sum JUnit XML totals (tests, failures, errors, skipped) under base; None when no report was written.
+
+    Only integers leave this function: no test names, messages or report text are read into public output.
+    """
+    import xml.etree.ElementTree as ET
+    total = failed = skipped = files = 0
+    for path in sorted(base.glob(pattern)):
+        try:
+            root = ET.parse(path).getroot()
+        except (ET.ParseError, OSError):
+            continue
+        if root.tag == "testsuite":
+            suites = [root]
+        elif root.tag == "testsuites":
+            suites = list(root.findall("testsuite"))
+        else:
+            continue
+        files += 1
+        for suite in suites:
+            try:
+                total += int(suite.get("tests", "0"))
+                failed += int(suite.get("failures", "0")) + int(suite.get("errors", "0"))
+                skipped += int(suite.get("skipped", "0"))
+            except ValueError:
+                continue
+    if not files:
+        return None
+    return {"passed": max(0, total - failed - skipped), "failed": failed, "ignored": skipped}
 
 
 def _check_name(value: str, what: str) -> str:
@@ -158,7 +205,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"lane {suite}/{variant}/{step}: timeout after {args.timeout}s")
     text = log_path.read_text(encoding="utf-8", errors="replace")
     facts = parse_output(text)
+    if args.junit_glob:
+        # Gradle prints no totals on success; the JUnit XML reports are the count of record for the Java suite.
+        jc = junit_counts(pathlib.Path(args.cwd or "."), args.junit_glob)
+        if jc is not None:
+            facts.update(jc, counted=True)
     status = "pass" if proc.returncode == 0 else "fail"
+    if status == "pass" and args.min_passed and facts["passed"] is None:
+        status = "fail"  # a count-less pass cannot satisfy a minimum
+        print(f"lane {suite}/{variant}/{step}: no test count found (minimum {args.min_passed})")
     if status == "pass" and args.min_passed and (facts["passed"] or 0) < args.min_passed:
         status = "fail"  # a test step that ran fewer tests than expected is not a pass
         print(f"lane {suite}/{variant}/{step}: fewer than {args.min_passed} tests counted")
@@ -267,6 +322,7 @@ def main() -> int:
     r.add_argument("--out", required=True)
     r.add_argument("--cwd", default="")
     r.add_argument("--min-passed", type=int, default=0, help="fail a zero-exit step that counted fewer tests")
+    r.add_argument("--junit-glob", default="", help="glob (relative to --cwd) of JUnit XML reports to count")
     r.add_argument("--timeout", type=int, default=3000)
     r.add_argument("command", nargs=argparse.REMAINDER)
     m = sub.add_parser("merge")

@@ -166,5 +166,49 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(dropped, 39 - lane_run.MAX_DIAG)
 
 
+class CountTests(unittest.TestCase):
+    def test_node_test_summary_counts(self):
+        r = lane_run.parse_output("\u2139 tests 12\n\u2139 pass 11\n\u2139 fail 1\n\u2139 skipped 0")
+        self.assertEqual((r["passed"], r["failed"]), (11, 1))
+
+    def test_vitest_summary_counts(self):
+        r = lane_run.parse_output("      Tests  2 failed | 40 passed (42)")
+        self.assertEqual((r["passed"], r["failed"]), (40, 2))
+        r = lane_run.parse_output("      Tests  40 passed (40)")
+        self.assertEqual((r["passed"], r["failed"]), (40, 0))
+
+    def _junit(self, d, tests, failures=0, skipped=0):
+        (pathlib.Path(d) / "m" / "build" / "test-results" / "test").mkdir(parents=True, exist_ok=True)
+        (pathlib.Path(d) / "m" / "build" / "test-results" / "test" / "TEST-a.xml").write_text(
+            f'<testsuite name="a" tests="{tests}" failures="{failures}" errors="0" skipped="{skipped}"/>')
+
+    def test_junit_counts_and_missing_reports(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(lane_run.junit_counts(pathlib.Path(d), "*/build/test-results/test/*.xml"))
+            self._junit(d, 10, failures=1, skipped=2)
+            self.assertEqual(lane_run.junit_counts(pathlib.Path(d), "*/build/test-results/test/*.xml"),
+                             {"passed": 7, "failed": 1, "ignored": 2})
+
+    def test_zero_tests_below_minimum_is_a_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = pathlib.Path(d) / "out"
+            for tests, want in ((3, "fail"), (0, "fail"), (5, "pass")):
+                self._junit(d, tests)
+                rc = subprocess.run([sys.executable, "-B", "-m", "tools.qa.lane_run", "run", "--suite", "java",
+                                     "--step", "t", "--cwd", d, "--junit-glob", "*/build/test-results/test/*.xml",
+                                     "--min-passed", "5", "--out", str(out), "--", sys.executable, "-c", "pass"],
+                                    cwd=ROOT, capture_output=True, text=True, env={**__import__("os").environ, "RUNNER_TEMP": d}).returncode
+                frag = json.loads((out / "java__-__t.json").read_text())
+                self.assertEqual(frag["status"], want)
+                self.assertEqual(rc == 0, want == "pass")
+
+    def test_countless_step_cannot_satisfy_a_minimum(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc = subprocess.run([sys.executable, "-B", "-m", "tools.qa.lane_run", "run", "--suite", "node", "--step", "t",
+                                 "--min-passed", "1", "--out", d, "--", sys.executable, "-c", "print('hi')"],
+                                cwd=ROOT, capture_output=True, text=True, env={**__import__("os").environ, "RUNNER_TEMP": d}).returncode
+            self.assertNotEqual(rc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

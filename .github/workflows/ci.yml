@@ -363,16 +363,16 @@ jobs:
       - name: Format gate (stable rustfmt, no nightly-only keys)
         run: cargo fmt --all --check
       - name: Strict clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Unit and integration tests
-        run: cargo test --workspace --all-features --no-fail-fast
+        run: cargo test --locked --workspace --all-features --no-fail-fast
       - name: Restricted-PATH vendored-protoc build
         # `PATH` excludes any directory that could host a system `protoc`,
         # proving the build script resolves the binary exclusively through
         # `protoc-bin-vendored`.
         run: |
           PATH="/usr/bin:/bin:/usr/local/bin:$HOME/.cargo/bin" \
-            cargo build -p xtrace-protocol --all-features
+            cargo build --locked -p xtrace-protocol --all-features
       - name: CLI integration smoke
         run: |
           set -euo pipefail
@@ -380,13 +380,13 @@ jobs:
           export XTRACE_DATA_HOME="$SMOKE/userdata"
           rm -rf $SMOKE
           mkdir -p $SMOKE/repo
-          cargo build -p xtrace-cli --bin xtrace
+          cargo build --locked -p xtrace-cli --bin xtrace
           # Uninitialized status: must not create the user-data
           # directory or the repository pointer. Capture both stdout
           # and exit code; `set -e` is suspended only around this
           # command so a future bug that exits non-zero still fails
           # the gate.
-          status_output=$(cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir $SMOKE/repo)
+          status_output=$(cargo run --locked -q -p xtrace-cli --bin xtrace -- status --project-dir $SMOKE/repo)
           echo "$status_output"
           if [ -d $SMOKE/userdata/projects ]; then
             echo "FAIL: status on uninit created user-data directory"
@@ -401,9 +401,9 @@ jobs:
             exit 1
           fi
           # init twice with the same canonical input must replay.
-          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Smoke"
+          cargo run --locked -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Smoke"
           first_project=$(ls $SMOKE/userdata/projects | head -n1)
-          cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Smoke"
+          cargo run --locked -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Smoke"
           after_replay=$(ls $SMOKE/userdata/projects | wc -l)
           if [ "$after_replay" -ne 1 ]; then
             echo "FAIL: replay created extra project directory"
@@ -415,7 +415,7 @@ jobs:
           # then enforces the contract explicitly rather than relying
           # on `|| true`.
           set +e
-          conflict_output=$(cargo run -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Different" 2>&1)
+          conflict_output=$(cargo run --locked -q -p xtrace-cli --bin xtrace -- init --project-dir $SMOKE/repo --display-name "Different" 2>&1)
           conflict_exit=$?
           set -e
           if [ "$conflict_exit" -eq 0 ]; then
@@ -434,8 +434,132 @@ jobs:
             exit 1
           fi
           # Successful status + open after init.
-          cargo run -q -p xtrace-cli --bin xtrace -- status --project-dir $SMOKE/repo
-          cargo run -q -p xtrace-cli --bin xtrace -- open --project-dir $SMOKE/repo
+          cargo run --locked -q -p xtrace-cli --bin xtrace -- status --project-dir $SMOKE/repo
+          cargo run --locked -q -p xtrace-cli --bin xtrace -- open --project-dir $SMOKE/repo
           test -f $SMOKE/userdata/projects/"$first_project"/metadata.sqlite3
           test -f $SMOKE/repo/.xtrace/config.toml
           grep -q '^project_id = ' $SMOKE/repo/.xtrace/config.toml
+
+  macos-arm64:
+    # ADR 0006 section 2.3: hosted macOS arm64 evidence for cfg(unix), private storage, attach and packaging changes.
+    # Every step runs, none is skipped or allowed to fail; the Rust, Java, Node and web steps print only allowlisted
+    # facts (tools.qa.lane_run keeps raw output in a private log).
+    needs: release-tool-tests
+    runs-on: macos-15
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tuple: jdk17-node22
+            java-version: 17
+            node-version: 22
+          - tuple: jdk21-node24
+            java-version: 21
+            node-version: 24
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Select private root path
+        run: |
+          root="${RUNNER_TEMP:?}/xr"
+          [ "${#root}" -le 40 ] || { echo "private root path too long"; exit 1; }
+          echo "XTRACE_CI_PRIVATE_ROOT=$root" >> "$GITHUB_ENV"
+      - name: Verify exact source and architecture
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor preflight-source \
+            --repo "$GITHUB_WORKSPACE" \
+            --phase-metadata evidence/v0.01/workflow.json \
+            --expected-head "$GITHUB_SHA"
+      - name: Admit private scratch before test output
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor prepare-private-root --root "$XTRACE_CI_PRIVATE_ROOT"
+      - name: Run the complete release tooling suite without skips
+        run: |
+          set +e
+          umask 077
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor summarize-tests \
+            --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
+            --log-file "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log"
+          result=$?
+          set -e
+          exit "$result"
+      - name: Install exact Node workspace dependencies
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step install --out "$RUNNER_TEMP/frag" -- \
+            npm ci --prefix adapters/node
+      - name: Node protocol generation check and unit tests
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step generate-check --out "$RUNNER_TEMP/frag" -- \
+            npm run generate:check --prefix adapters/node
+          python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step test --min-passed 20 --out "$RUNNER_TEMP/frag" -- \
+            npm test --prefix adapters/node
+      - name: Web viewer install, tests and embedded checks
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step install --out "$RUNNER_TEMP/frag" -- \
+            bash -ec 'npm ci --prefix web/app && cd web/app && npx playwright install chromium'
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step typecheck --out "$RUNNER_TEMP/frag" -- \
+            npm run typecheck --prefix web/app
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step unit-tests --min-passed 20 --out "$RUNNER_TEMP/frag" -- \
+            npm test --prefix web/app
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step check-api --out "$RUNNER_TEMP/frag" -- \
+            npm run check:api --prefix web/app
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step check-embedded --out "$RUNNER_TEMP/frag" -- \
+            npm run check:embedded --prefix web/app
+      - name: Java strict Gradle build and tests
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite java --variant "${{ matrix.java-version }}" --step gradle --cwd adapters/java \
+            --junit-glob "*/build/test-results/test/*.xml" --min-passed 150 --out "$RUNNER_TEMP/frag" -- \
+            ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
+      - name: Admit private test scratch before cargo tests
+        # Product storage refuses a data directory under a world-writable ancestor; same shape as the Linux jobs.
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP:?}/xt"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv"
+          echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
+          echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
+      - name: cargo build (locked workspace)
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step build --out "$RUNNER_TEMP/frag" -- \
+            cargo build --locked --workspace --all-features
+      - name: cargo test (locked workspace, no skips)
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step test --min-passed 1 --out "$RUNNER_TEMP/frag" -- \
+            cargo test --locked --workspace --all-features --no-fail-fast
+      - name: Packaged install journey (unattended)
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite package --variant "${{ matrix.tuple }}" --step journey --out "$RUNNER_TEMP/frag" -- \
+            bash -ec '
+              python3 packaging/build.py --out dist --platform macos-arm64
+              sh packaging/install.sh verify-dist dist/macos-arm64
+              root="$RUNNER_TEMP/xt-install"
+              mkdir -m 700 "$root" "$root/tmp"
+              TMPDIR="$root/tmp" sh packaging/test/install_test.sh dist/macos-arm64
+            '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: xtrace-macos-arm64-frag-${{ matrix.tuple }}
+          path: ${{ runner.temp }}/frag
+          if-no-files-found: ignore
+          retention-days: 14
