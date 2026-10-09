@@ -27,6 +27,13 @@ final class LineProbeBridgeSink implements LineSink {
   private final RuntimeBridgeSink events;
   private final SiteRegistry registry;
   private final ThreadLocal<Pending> pending = ThreadLocal.withInitial(Pending::new);
+  /** Per-site source facts: the lookup takes a global lock, so each site pays it once. */
+  private final java.util.concurrent.ConcurrentHashMap<Integer, SourceAttestation.SourceInfo>
+      sources = new java.util.concurrent.ConcurrentHashMap<>();
+
+  private static final SourceAttestation.SourceInfo NO_SOURCE =
+      SourceAttestation.SourceInfo.unavailable(0);
+
   private final AtomicLong withoutSource = new AtomicLong();
   private final AtomicLong rejected = new AtomicLong();
 
@@ -111,9 +118,14 @@ final class LineProbeBridgeSink implements LineSink {
     p.collecting = false;
     SiteRegistry.Site site = registry.site(p.siteId);
     if (site == null) return;
-    SourceAttestation.SourceInfo source =
-        SourceIdentity.lookupLine(site.classInternalName(), site.line());
+    SourceAttestation.SourceInfo source = sources.get(p.siteId);
     if (source == null) {
+      SourceAttestation.SourceInfo found =
+          SourceIdentity.lookupLine(site.classInternalName(), site.line());
+      source = found == null ? NO_SOURCE : found;
+      sources.putIfAbsent(p.siteId, source);
+    }
+    if (source == NO_SOURCE) {
       withoutSource.incrementAndGet();
       return;
     }
