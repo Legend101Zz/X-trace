@@ -19,6 +19,10 @@ import xtp.agent.v1.CapabilityOuterClass.CapabilitySet;
 import xtp.agent.v1.CapabilityOuterClass.SourceRange;
 import xtp.agent.v1.Recording.EventBatch;
 import xtp.agent.v1.Recording.ExceptionPayload;
+import xtp.agent.v1.Recording.GapPayload;
+import xtp.agent.v1.Recording.GapReason;
+import xtp.agent.v1.Recording.OutcomeKind;
+import xtp.agent.v1.Recording.RecordingOutcome;
 import xtp.agent.v1.Recording.Interaction;
 import xtp.agent.v1.Recording.InteractionKind;
 import xtp.agent.v1.Recording.RecordingEvent;
@@ -193,12 +197,37 @@ final class RecordingWriter implements AutoCloseable, Runnable {
             .setDurationNs(duration(finish.startedMonotonicNs(), finish.finishedMonotonicNs()))
             .setEventDigest(ByteString.copyFrom(EventDigest.compute(eventIds)));
     if (droppedEvents > 0) terminal.putDropCountsByPriority(1, droppedEvents);
+    if (finish.outcome() != null) terminal.setOutcome(outcomeProto(finish.outcome()));
     Ack finished =
         session.send(
             pending.start.recordingId() + ":finished",
             pending.start.recordingId(),
             terminal.build());
     requireRecordingAck(finished, recordingId, sequence);
+  }
+
+  /** Maps the bridge outcome to the wire outcome; sanitizes exception text off the app thread. */
+  static RecordingOutcome outcomeProto(BridgeSink.Outcome outcome) {
+    RecordingOutcome.Builder builder = RecordingOutcome.newBuilder();
+    switch (outcome.kind()) {
+      case BridgeSink.Outcome.RESPONDED -> {
+        builder.setKind(OutcomeKind.OUTCOME_KIND_RESPONDED).setHttpStatus(outcome.httpStatus());
+      }
+      case BridgeSink.Outcome.EXCEPTION_PROPAGATED -> {
+        builder.setKind(OutcomeKind.OUTCOME_KIND_EXCEPTION_PROPAGATED);
+        ExceptionPayload.Builder exception = ExceptionPayload.newBuilder();
+        String type = ExceptionSummary.type(outcome.exceptionType());
+        exception.setExceptionType(type == null ? "" : type);
+        String message = ExceptionSummary.message(outcome.exceptionMessage());
+        if (message != null) exception.setSanitizedMessage(message);
+        builder.setException(exception);
+        if (outcome.thrownFromEventId() != null) {
+          builder.setThrownFromEventId(outcome.thrownFromEventId());
+        }
+      }
+      default -> builder.setKind(OutcomeKind.OUTCOME_KIND_UNOBSERVED);
+    }
+    return builder.build();
   }
 
   static List<QueueSignal.Event> withGap(
@@ -212,7 +241,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     boolean inserted = false;
     for (QueueSignal.Event event : events) {
       if (!inserted && event.kind() == BridgeEventKind.RESPONSE) {
-        result.add(gap(event.recordingId(), event.parentEventId(), event.monotonicNs()));
+        result.add(
+            gap(event.recordingId(), event.parentEventId(), event.monotonicNs(), droppedEvents));
         inserted = true;
       }
       result.add(event);
@@ -223,12 +253,13 @@ final class RecordingWriter implements AutoCloseable, Runnable {
           events.isEmpty()
               ? terminalMonotonic(startedMonotonicNs, finishedMonotonicNs)
               : events.get(events.size() - 1).monotonicNs();
-      result.add(gap(recordingId, parent, monotonicNs));
+      result.add(gap(recordingId, parent, monotonicNs, droppedEvents));
     }
     return result;
   }
 
-  private static QueueSignal.Event gap(String recordingId, String parent, long monotonicNs) {
+  private static QueueSignal.Event gap(
+      String recordingId, String parent, long monotonicNs, long droppedEvents) {
     String eventId = recordingId + ":gap";
     return new QueueSignal.Event(
         recordingId,
@@ -237,7 +268,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         RecordingEventKind.RECORDING_EVENT_KIND_GAP.getNumber(),
         "xtrace.capture.gap",
         monotonicNs,
-        0,
+        (int) Math.min(Integer.MAX_VALUE, Math.max(1, droppedEvents)),
         128);
   }
 
@@ -266,6 +297,15 @@ final class RecordingWriter implements AutoCloseable, Runnable {
               .setStartLine(event.sourceStartLine())
               .setEndLine(event.sourceEndLine())
               .setContentHash(ByteString.copyFrom(event.sourceHash())));
+    }
+    if (kind == RecordingEventKind.RECORDING_EVENT_KIND_GAP) {
+      // A gap always states why and how much. Events shed by the bounded queue are QUEUE_FULL
+      // with the shed count; an unresolvable handler is a lost correlation, count one.
+      boolean handler = event.symbol().equals(BootstrapBridge.HANDLER_UNRESOLVED_SYMBOL);
+      builder.setGap(
+          GapPayload.newBuilder()
+              .setReason(handler ? GapReason.GAP_REASON_CORRELATION_LOST : GapReason.GAP_REASON_QUEUE_FULL)
+              .setCount(handler ? 1 : Math.max(1, event.detail())));
     }
     if (kind == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_THROW
         && event.exceptionType() != null) {
@@ -308,7 +348,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     Capability frames =
         Capability.newBuilder()
             .setName("method_frames")
-            .putConfig("scope", "fixture_only")
+            .putConfig("scope", "application_scope")
             .build();
     Capability database =
         Capability.newBuilder().setName("database").putConfig("driver", "h2").build();
