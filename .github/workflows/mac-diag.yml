@@ -29,7 +29,6 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}/mr/tmp
         run: |
-          cp /dev/null /dev/null
           python3 ci_fsb.py
       - name: five
         env:
