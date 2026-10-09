@@ -149,6 +149,51 @@ class RunTests(unittest.TestCase):
         self.assertIsNone(frag["passed"])
 
 
+class ErrorHintTests(unittest.TestCase):
+    def test_allowlisted_codes_and_categories_only(self):
+        text = "\n".join([
+            'Err(Error { code: ErrorCode("XTR-STORE-OBJECT-IO"), category: Resource, message: "at /Users/x" })',
+            'code: ErrorCode("XTR-STORE-OBJECT-IO"), category: Resource,',
+            'code: ErrorCode("xtr-lower"), category: Bogus,',
+            'code: ErrorCode("XTR-/home/me"), category: Internal,',
+            'code: ErrorCode("OTHER-1"), category: Policy,',
+        ])
+        h = lane_run.error_hints(text)
+        self.assertEqual(h["errorCodes"], ["XTR-STORE-OBJECT-IO"])
+        self.assertEqual(h["errorCategories"], ["Resource", "Internal", "Policy"])
+        self.assertEqual(h["droppedInvalid"], 4)
+
+    def test_hints_are_bounded(self):
+        text = "\n".join(f'ErrorCode("XTR-E{i}"), category: Internal,' for i in range(40))
+        h = lane_run.error_hints(text)
+        self.assertEqual(len(h["errorCodes"]), lane_run.MAX_ERROR_HINTS)
+        self.assertEqual(h["truncated"], 40 - lane_run.MAX_ERROR_HINTS)
+
+    def test_failing_step_prints_hints_and_never_the_message(self):
+        with tempfile.TemporaryDirectory() as d:
+            body = ('print("test a::b ... FAILED"); '
+                    'print(\'Err(code: ErrorCode("XTR-STORE-OBJECT-IO"), category: Resource, message: "/Users/me/secret")\'); '
+                    'raise SystemExit(101)')
+            proc = subprocess.run(
+                [sys.executable, "-B", "-m", "tools.qa.lane_run", "run", "--suite", "rust", "--step", "t",
+                 "--out", d, "--", sys.executable, "-c", body],
+                cwd=ROOT, capture_output=True, text=True, env={**__import__("os").environ, "RUNNER_TEMP": d})
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("lane error-code XTR-STORE-OBJECT-IO", proc.stdout)
+            self.assertIn("lane error-category Resource", proc.stdout)
+            self.assertNotIn("/Users", proc.stdout)
+            self.assertNotIn("secret", proc.stdout)
+
+    def test_passing_step_prints_no_hints(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc = subprocess.run(
+                [sys.executable, "-B", "-m", "tools.qa.lane_run", "run", "--suite", "rust", "--step", "t",
+                 "--out", d, "--", sys.executable, "-c", 'print(\'ErrorCode("XTR-A"), category: Internal,\')'],
+                cwd=ROOT, capture_output=True, text=True, env={**__import__("os").environ, "RUNNER_TEMP": d})
+            self.assertEqual(proc.returncode, 0)
+            self.assertNotIn("error-code", proc.stdout)
+
+
 class LintTests(unittest.TestCase):
     def test_repo_workflows_pass_lint(self):
         files = [str(p) for p in (ROOT / ".github/workflows").glob("*.yml")]
@@ -196,7 +241,32 @@ class CountTests(unittest.TestCase):
         r = lane_run.parse_output("      Tests  40 passed (40)")
         self.assertEqual((r["passed"], r["failed"]), (40, 0))
         r = lane_run.parse_output("\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[32m162 passed\x1b[39m\x1b[22m | 2 skipped\x1b[90m (164)\x1b[39m")
-        self.assertEqual((r["passed"], r["failed"]), (162, 0))
+        self.assertEqual((r["passed"], r["failed"], r["ignored"]), (162, 0, 2))
+        r = lane_run.parse_output("      Tests  1 failed | 70 passed | 3 skipped | 1 todo (75)")
+        self.assertEqual((r["passed"], r["failed"], r["ignored"]), (70, 1, 4))
+        r = lane_run.parse_output("      Test Files  1 failed | 5 passed (6)")
+        self.assertFalse(r["counted"])
+
+    def test_unittest_skips_are_ignored_tests(self):
+        r = lane_run.parse_output("Ran 10 tests in 0.1s\n\nOK (skipped=3)")
+        self.assertEqual((r["passed"], r["failed"], r["ignored"]), (7, 0, 3))
+        r = lane_run.parse_output("Ran 10 tests in 0.1s\n\nFAILED (failures=1, skipped=2)")
+        self.assertEqual((r["passed"], r["failed"], r["ignored"]), (7, 1, 2))
+        r = lane_run.parse_output("Ran 10 tests in 0.1s\n\nOK")
+        self.assertEqual((r["passed"], r["failed"], r["ignored"]), (10, 0, 0))
+
+    def test_vitest_skip_fails_a_no_skips_step(self):
+        with tempfile.TemporaryDirectory() as d:
+            for skipped, want in ((0, "pass"), (1, "fail")):
+                out = f"      Tests  70 passed | {skipped} skipped (71)" if skipped else "      Tests  70 passed (70)"
+                proc = subprocess.run(
+                    [sys.executable, "-B", "-m", "tools.qa.lane_run", "run", "--suite", "web", "--step", "u",
+                     "--min-passed", "70", "--max-ignored", "0", "--out", d, "--", sys.executable, "-c",
+                     f"print({out!r})"],
+                    cwd=ROOT, capture_output=True, text=True, env={**__import__("os").environ, "RUNNER_TEMP": d})
+                frag = json.loads((pathlib.Path(d) / "web__-__u.json").read_text())
+                self.assertEqual(frag["status"], want)
+                self.assertEqual(proc.returncode == 0, want == "pass")
 
     def _junit(self, d, tests, failures=0, skipped=0):
         (pathlib.Path(d) / "m" / "build" / "test-results" / "test").mkdir(parents=True, exist_ok=True)

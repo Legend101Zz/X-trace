@@ -233,18 +233,18 @@ jobs:
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: Java client to daemon and selected-root XTF acceptance
-        run: cargo test -p xtrace-cli --test java_synthetic_adapter -- --nocapture
+        run: cargo test --locked -p xtrace-cli --test java_synthetic_adapter -- --nocapture
       - name: Direct JDK runtime validation
-        run: cargo test -p xtrace-runtime
+        run: cargo test --locked -p xtrace-runtime
       - name: Launch-only premain Spring MVC acceptance
-        run: cargo test -p xtrace-cli --test java_premain_spring -- --nocapture
+        run: cargo test --locked -p xtrace-cli --test java_premain_spring -- --nocapture
       - name: Install pinned browser-journey dependency and Chromium
         run: |
           npm ci --prefix web/app
           cd web/app
           npx playwright install --with-deps chromium
       - name: Supervised direct-Java Spring MVC acceptance
-        run: cargo test -p xtrace-cli --test java_run_spring -- --nocapture
+        run: cargo test --locked -p xtrace-cli --test java_run_spring -- --nocapture
 
   node-client:
     runs-on: ubuntu-latest
@@ -289,7 +289,7 @@ jobs:
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: Node client to daemon and selected-root XTF acceptance
-        run: cargo test -p xtrace-cli --test node_synthetic_adapter -- --nocapture
+        run: cargo test --locked -p xtrace-cli --test node_synthetic_adapter -- --nocapture
 
   gates:
     runs-on: ubuntu-latest
@@ -446,8 +446,12 @@ jobs:
     # ignored or skipped test is accepted (--max-ignored 0). Rust, Java, Node and web steps print only allowlisted
     # facts (tools.qa.lane_run keeps raw output in a private log). prepare-private-root exports the scratch
     # environment (TMPDIR, TMP, TEMP, XTRACE_TEST_PRIVATE_SCRATCH, XTRACE_TEST_SCRATCH_ROOT) for every later step.
-    # NOT COVERED at this sha: the ADR 0006 2.3 other-UID broker negative does not exist in the tree, so section
-    # 2.3 is not fully met by this job.
+    # The ADR 0006 2.3 other-UID private-storage substitute (tools.qa.other_uid_negative) creates a second local user
+    # on the runner (sudo is fine inside the hosted job), makes a real store with `xtrace init`, and requires that
+    # the user reaches the store's parent but can neither list, read, write nor replace anything in the store, and
+    # that no store entry has an ACL allow entry. Its ok-marker is checked by an `if: always()` step, so a skipped,
+    # failed or store-less run fails the job.
+    # NOT COVERED until broker code exists: other-UID broker negative (ADR 0006 addendum 2026-10-10, item 3)
     needs: release-tool-tests
     runs-on: macos-15
     timeout-minutes: 180
@@ -528,7 +532,7 @@ jobs:
       - name: Node unit tests
         if: ${{ !cancelled() }}
         run: |
-          python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step test --min-passed 80 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+          python3 -B -m tools.qa.lane_run run --suite node --variant "${{ matrix.node-version }}" --step test --min-passed 85 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm test --prefix adapters/node
       - name: Web install
         if: ${{ !cancelled() }}
@@ -543,7 +547,7 @@ jobs:
       - name: Web unit tests
         if: ${{ !cancelled() }}
         run: |
-          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step unit-tests --min-passed 70 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+          python3 -B -m tools.qa.lane_run run --suite web --variant "${{ matrix.node-version }}" --step unit-tests --min-passed 75 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             npm test --prefix web/app
       - name: Web check:api
         if: ${{ !cancelled() }}
@@ -559,7 +563,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite java --variant "${{ matrix.java-version }}" --step gradle --cwd adapters/java \
-            --junit-glob "*/build/test-results/test/*.xml" --min-passed 170 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            --junit-glob "*/build/test-results/test/*.xml" --min-passed 190 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
       - name: cargo build (locked workspace)
         if: ${{ !cancelled() }}
@@ -569,7 +573,7 @@ jobs:
       - name: cargo test (locked workspace, no ignored tests)
         if: ${{ !cancelled() }}
         run: |
-          python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step test --min-passed 900 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+          python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step test --min-passed 1030 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             cargo test --locked --workspace --all-features --no-fail-fast
       - name: Packaged install journey (unattended)
         if: ${{ !cancelled() }}
@@ -581,7 +585,50 @@ jobs:
               root="$RUNNER_TEMP/xt-install"
               mkdir -m 700 "$root" "$root/tmp"
               TMPDIR="$root/tmp" sh packaging/test/install_test.sh dist/macos-arm64
+              TMPDIR="$root/tmp" sh packaging/test/install_scratch_test.sh
             '
+      - name: Other-UID setup (second local user on the hosted runner)
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.other_uid_negative create-user --user xtrother --created-marker "$XTRACE_CI_PRIVATE_ROOT/other-uid.created"
+      - name: Other-UID store creation (real xtrace init)
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.lane_run run --suite security --variant "${{ matrix.tuple }}" --step other-uid-store --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
+            bash -ec '
+              oid="$XTRACE_CI_PRIVATE_ROOT/oid"
+              mkdir -m 700 "$oid" "$oid/repo"
+              # The data home sits under its own listable and traversable (0755) parent on the ephemeral hosted VM.
+              # The runner home and RUNNER_TEMP are not traversable by other users, so the parent lives under a
+              # root-owned 0755 ancestor chain (never by loosening the runner home). The product creates the store
+              # directory itself, so the other user is first denied at that directory.
+              [ -d /opt ] || sudo -n install -d -o root -g wheel -m 755 /opt
+              sudo -n install -d -o "$(id -un)" -g "$(id -gn)" -m 755 /opt/xt-oid
+              # Every ancestor of the parent must be root-owned with no group/other write and no sticky bit, so the
+              # product admission (ADR 0008) still admits the data home. Anything else fails closed here.
+              p=/opt
+              while :; do
+                set -- $(stat -f "%u %p" "$p")
+                [ "$1" = 0 ] || { echo "other-uid layout FAIL ancestor-not-root-owned"; exit 1; }
+                [ $(( 8#$2 & 8#1022 )) -eq 0 ] || { echo "other-uid layout FAIL ancestor-writable-or-sticky"; exit 1; }
+                [ "$p" = / ] && break
+                p=$(dirname "$p")
+              done
+              XTRACE_DATA_HOME="/opt/xt-oid/userdata" target/debug/xtrace init --project-dir "$oid/repo" --display-name OtherUid
+            '
+      - name: Other-UID private-storage substitute (cannot traverse, read or write the store)
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -B -m tools.qa.other_uid_negative check \
+            --store-root "/opt/xt-oid/userdata" --parent "/opt/xt-oid" --user xtrother --marker "$XTRACE_CI_PRIVATE_ROOT/other-uid.ok"
+      - name: Other-UID negative must have run and passed
+        if: always()
+        run: |
+          python3 -B -m tools.qa.other_uid_negative verify-marker --marker "$XTRACE_CI_PRIVATE_ROOT/other-uid.ok"
+      - name: Other-UID cleanup
+        if: always()
+        run: |
+          python3 -B -m tools.qa.other_uid_negative delete-user --user xtrother --created-marker "$XTRACE_CI_PRIVATE_ROOT/other-uid.created"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
