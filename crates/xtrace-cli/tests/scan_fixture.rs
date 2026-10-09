@@ -175,8 +175,18 @@ fn scan_times_out_an_analyzer_that_closes_stdout_and_keeps_running() {
     assert_eq!(result["incompleteReasons"], serde_json::json!(["analyzer_timeout"]));
 }
 
+/// Alive means running: a zombie (terminated, not yet reaped) is gone. Under a child subreaper
+/// (the release floor runner) orphans of killed children linger as zombies until it reaps them.
 fn alive(pid: &str) -> bool {
-    Command::new("kill").args(["-0", pid]).output().map(|o| o.status.success()).unwrap_or(false)
+    let Ok(output) = Command::new("ps").args(["-o", "stat=", "-p", pid]).output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stat = String::from_utf8_lossy(&output.stdout);
+    let stat = stat.trim_start();
+    !stat.is_empty() && !stat.starts_with('Z')
 }
 
 #[test]

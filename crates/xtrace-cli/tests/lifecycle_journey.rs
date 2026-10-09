@@ -177,13 +177,22 @@ impl Fixture {
     }
 }
 
+/// A process is alive unless it is gone or a zombie. Under a child subreaper (the release
+/// floor runner) the orphans of killed children reparent to a parent that reaps on its own
+/// schedule, so a terminated process can stay in the table as a zombie for a while.
 fn pid_alive(pid: u32) -> bool {
-    Command::new("ps")
-        .args(["-p", &pid.to_string()])
-        .stdout(Stdio::null())
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let stat = String::from_utf8_lossy(&output.stdout);
+            let stat = stat.trim_start();
+            !stat.is_empty() && !stat.starts_with('Z')
+        }
+        _ => false,
+    }
 }
 
 fn wait_gone(pid: u32) {
