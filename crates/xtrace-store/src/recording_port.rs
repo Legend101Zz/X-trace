@@ -2243,7 +2243,7 @@ mod tests {
                 event_cap: if capacity_dropped_events > 0 {
                     u64::try_from(events.len()).expect("fits")
                 } else {
-                    2_048
+                    u64::try_from(events.len()).expect("fits").max(2_048)
                 },
                 outcome,
                 response_summary: None,
@@ -2304,9 +2304,9 @@ mod tests {
         assert!(check(), "a verified gap-only partial ends at its last frame");
         // verify_terminal_evidence answers Partial without hashing once the declared
         // segment bytes pass the verification bound; that digest proves nothing.
-        let over_bound =
-            i64::try_from(xtrace_application::MAX_RECORDING_VERIFIED_INPUT_BYTES).expect("fits")
-                + 1;
+        let over_bound = i64::try_from(xtrace_application::MAX_RECORDING_VERIFIED_INPUT_BYTES)
+            .expect("fits")
+            + 1;
         persisted
             .store
             .lock()
@@ -2317,6 +2317,65 @@ mod tests {
             )
             .expect("simulate an over-budget declaration");
         assert!(!check(), "an unverified digest must not prove the end of the recording");
+    }
+
+    #[test]
+    fn finish_over_verification_bound_is_partial_with_reason() {
+        use xtrace_protocol::generated::agent::{
+            BindingRole, CapturedValue as Wire, CapturedValueTruncated, NameOrigin, ValueBinding,
+            captured_value::Value as V,
+        };
+        // Incompressible-ish payloads so that declared logical + compressed bytes pass the
+        // 16 MiB verification bound: the recording is sealed Partial WITHOUT hashing, and the
+        // read surface must name that cause (never a silent Partial).
+        let heavy = |sequence: u64| {
+            let mut accepted = node(sequence, &format!("h{sequence}"), "", K_ENTER);
+            accepted.payload.event.as_mut().expect("event").bindings = (0..8_u32)
+                .map(|index| {
+                    let mut raw = [0_u8; 250];
+                    blake3::Hasher::new()
+                        .update(&sequence.to_le_bytes())
+                        .update(&index.to_le_bytes())
+                        .finalize_xof()
+                        .fill(&mut raw);
+                    let preview: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
+                    ValueBinding {
+                        name: format!("arg{index}"),
+                        role: BindingRole::Argument as i32,
+                        name_origin: NameOrigin::Declared as i32,
+                        value: Some(Wire {
+                            value: Some(V::Truncated(CapturedValueTruncated {
+                                preview,
+                                original_size_lower_bound: 9_000,
+                                limit: 500,
+                            })),
+                        }),
+                    }
+                })
+                .collect();
+            accepted.canonical_bytes = accepted.payload.encode_to_vec();
+            accepted
+        };
+        let events: Vec<_> = (2..=3_001_u64).map(heavy).collect();
+        let persisted = persist_finished_with(&events, 100, 0, None);
+        let window = window(&persisted, 10, None);
+        assert!(
+            window
+                .incomplete_evidence
+                .iter()
+                .any(|reason| reason == "verification_budget_exceeded"),
+            "{:?}",
+            window.incomplete_evidence
+        );
+        // a normal complete recording carries no such reason
+        let small = persist(&tree(), 4, true);
+        assert!(
+            !window_reasons(&small).iter().any(|reason| reason == "verification_budget_exceeded")
+        );
+    }
+
+    fn window_reasons(persisted: &Persisted) -> Vec<String> {
+        window(persisted, 50, None).incomplete_evidence
     }
 
     #[test]

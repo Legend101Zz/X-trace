@@ -895,6 +895,23 @@ impl SqliteRecordingStore<'_> {
         if status == "partial" || status == "invalid" {
             incomplete_evidence.push(format!("persisted_status:{status}"));
         }
+        // A Partial that carries a real-looking digest but no capacity drops was sealed
+        // without hashing because its declared bytes passed the verification bound; say so
+        // instead of leaving the cause silent.
+        if completion == RecordingCompletionEvidence::Partial
+            && terminal_finish.as_ref().is_some_and(|finish| {
+                finish.event_digest.len() == 32
+                    && finish.event_digest.iter().any(|byte| *byte != 0)
+                    && finish.capacity_dropped_events == 0
+            })
+            && !declared_bytes_within_verification_bound(
+                &connection,
+                request.recording_id,
+                correlation_id,
+            )?
+        {
+            incomplete_evidence.push("verification_budget_exceeded".to_owned());
+        }
 
         while let Some(row) = rows.next().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
@@ -2873,6 +2890,28 @@ fn first_frame_where(
     found.map(|bytes| frame_id_from_bytes(&bytes, correlation_id)).transpose()
 }
 
+/// Whether the recording's declared segment bytes fit the finish verification bound.
+/// `verify_terminal_evidence` answers Partial WITHOUT hashing when they do not.
+fn declared_bytes_within_verification_bound(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    correlation_id: CorrelationId,
+) -> Result<bool, RecordingStoreError> {
+    let declared: Option<i64> = connection
+        .query_row(
+            "SELECT SUM(uncompressed_bytes + compressed_bytes) FROM recording_segments \
+             WHERE recording_id = ?1",
+            rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    Ok(declared
+        .and_then(|total| usize::try_from(total).ok())
+        .is_some_and(|total| total <= MAX_RECORDING_VERIFIED_INPUT_BYTES))
+}
+
 /// Whether every event up to the finish sequence is persisted, so that "no later
 /// frame" is a real end rather than an unverified frontier.
 pub(crate) fn persisted_frontier_is_final(
@@ -2903,23 +2942,10 @@ pub(crate) fn persisted_frontier_is_final(
     // verify_terminal_evidence answers Partial WITHOUT hashing when the declared
     // segment bytes exceed the verification bound, so the digest of such a
     // recording was never checked: its frontier is not proven final.
-    if completion == RecordingCompletionEvidence::Partial {
-        let declared: Option<i64> = connection
-            .query_row(
-                "SELECT SUM(uncompressed_bytes + compressed_bytes) FROM recording_segments \
-                 WHERE recording_id = ?1",
-                rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
-                |row| row.get(0),
-            )
-            .map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-        let within_bound = declared
-            .and_then(|total| usize::try_from(total).ok())
-            .is_some_and(|total| total <= MAX_RECORDING_VERIFIED_INPUT_BYTES);
-        if !within_bound {
-            return Ok(false);
-        }
+    if completion == RecordingCompletionEvidence::Partial
+        && !declared_bytes_within_verification_bound(connection, recording_id, correlation_id)?
+    {
+        return Ok(false);
     }
     let last: Option<Vec<u8>> = connection
         .query_row(

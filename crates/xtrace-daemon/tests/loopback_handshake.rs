@@ -2789,7 +2789,8 @@ async fn capture_over_the_event_cap_ends_partial_with_exact_per_priority_drops()
 
 /// A secret-shaped value the adapter failed to redact: CONTRACTS 9.3 requires the daemon audit
 /// to downgrade it before the event is encoded into an XTF segment.
-const AUDIT_CANARY_JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+const AUDIT_CANARY_JWT: &str =
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|window| window == needle)
@@ -2995,12 +2996,8 @@ async fn canary_absent_from_xtf_bytes_and_sqlite() {
         assert!(!contains_subslice(&bytes, AUDIT_CANARY_JWT.as_bytes()), "{}", path.display());
         if let Ok(decoded) = xtrace_store::xtf::decode_compressed_segment(&bytes, expected) {
             decoded_any = true;
-            let logical = decoded
-                .events()
-                .iter()
-                .map(Message::encode_to_vec)
-                .collect::<Vec<_>>()
-                .concat();
+            let logical =
+                decoded.events().iter().map(Message::encode_to_vec).collect::<Vec<_>>().concat();
             assert!(!contains_subslice(&logical, AUDIT_CANARY_JWT.as_bytes()));
             assert!(contains_subslice(&logical, b"[redacted:daemon.audit]"));
         }
