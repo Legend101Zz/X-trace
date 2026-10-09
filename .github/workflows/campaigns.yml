@@ -78,6 +78,7 @@ jobs:
           path: dist/linux-x86_64/
           if-no-files-found: error
           retention-days: 14
+          overwrite: true
 
   campaign:
     name: campaign (${{ matrix.project }})
@@ -166,6 +167,7 @@ jobs:
           path: ${{ runner.temp }}/camp-out
           if-no-files-found: error
           retention-days: 14
+          overwrite: true
       - name: Gate, an incomplete campaign is never success
         if: always()
         run: python3 -B tools/qa/camp_summary.py gate --file "$CAMP_OUT/summary.json"
