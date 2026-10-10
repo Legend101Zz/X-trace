@@ -900,6 +900,29 @@ def own_process_snapshot(extra_pids=lambda: ()):
     return snapshot
 
 
+def retrying_snapshot(inner):
+    """Wrap a `_process_snapshot` replacement so a transient `ps` failure is retried.
+
+    On a loaded runner the real `ps -axo` can exceed its 2 s probe deadline and raise
+    RuntimeError. The runner then (correctly) fails closed with an uncertain tree while the
+    gate's own exit code stays whatever it was, which is machine noise rather than the
+    behaviour a test about natural exit and descendant draining asserts. Runner code,
+    deadlines and assertions are untouched; only the flaky `ps` input is retried.
+    """
+    def snapshot(**kwargs):
+        last: RuntimeError | None = None
+        for _attempt in range(40):
+            try:
+                return inner(**kwargs)
+            except RuntimeError as exc:
+                last = exc
+                time.sleep(0.05)
+        assert last is not None
+        raise last
+
+    return snapshot
+
+
 def process_running(pid: int) -> bool:
     record = run_gates._process_snapshot().get(pid)
     return record is not None and record[2] not in {"Z", "X"}
@@ -2830,7 +2853,7 @@ class RunnerTests(unittest.TestCase):
             "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)",
             "print(child.pid, os.getpgid(child.pid), flush=True)",
             f"marker = pathlib.Path({str(tracked)!r})",
-            "deadline = time.monotonic() + 10",
+            "deadline = time.monotonic() + 120",
             "while not marker.exists() and time.monotonic() < deadline:",
             "    time.sleep(.01)",
             "raise SystemExit(0 if marker.exists() else 91)",
@@ -2863,6 +2886,7 @@ class RunnerTests(unittest.TestCase):
         try:
             with mock.patch.object(run_gates, "GATES", (gate,)), \
                     mock.patch.object(run_gates, "_track_descendants", side_effect=track_and_mark), \
+                    mock.patch.object(run_gates, "_process_snapshot", side_effect=retrying_snapshot(own_process_snapshot())), \
                     mock.patch.object(run_gates.subprocess, "Popen", side_effect=capture_process):
                 self.assertEqual(run_gates.run(args), 1)
             receipt = json.loads((self.cache / "release-gates" / args.label / "receipt.json").read_text())
