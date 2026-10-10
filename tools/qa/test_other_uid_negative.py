@@ -508,57 +508,5 @@ class CommandSequenceTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
-class WorkflowStructureTests(unittest.TestCase):
-    """Pins the fail-closed shape of the hosted macOS job (ADR 0006 addendum, item 2)."""
-
-    @classmethod
-    def setUpClass(cls):
-        from tools.qa import workflow_lint
-        doc = workflow_lint.load(ROOT / ".github" / "workflows" / "ci.yml")
-        cls.steps = doc["jobs"]["macos-arm64"]["steps"]
-        cls.text = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
-
-    def find(self, sub):
-        hits = [i for i, st in enumerate(self.steps) if sub in str(st.get("run", ""))]
-        self.assertEqual(len(hits), 1, sub)
-        return hits[0]
-
-    def test_marker_verify_runs_always_after_check_with_same_marker(self):
-        check = self.find("other_uid_negative check")
-        verify = self.find("other_uid_negative verify-marker")
-        self.assertGreater(verify, check)
-        self.assertEqual(str(self.steps[verify].get("if", "")).strip(), "always()")
-        marker = re.compile(r"--marker\s+(\S+)")
-        self.assertEqual(marker.search(self.steps[check]["run"]).group(1),
-                         marker.search(self.steps[verify]["run"]).group(1))
-        self.assertLess(self.find("other_uid_negative create-user"), check)
-        self.assertGreater(self.find("other_uid_negative delete-user"), verify)
-
-    def test_store_root_and_parent_layout_are_pinned(self):
-        init = self.steps[self.find("xtrace init")]["run"]
-        check = self.steps[self.find("other_uid_negative check")]["run"]
-        data_home = re.search(r'XTRACE_DATA_HOME="([^"]+)" target/debug/xtrace init', init).group(1)
-        store_root = re.search(r'--store-root\s+"([^"]+)"', check).group(1)
-        parent = re.search(r'--parent\s+"([^"]+)"', check).group(1)
-        self.assertEqual(store_root, data_home)
-        made = re.findall(r'install -d [^\n]*-m 755 (\S+)', init)
-        self.assertIn(parent, made)
-        self.assertEqual(str(pathlib.PurePosixPath(data_home).parent), parent)
-        # root-owned ancestors only: never under the runner home or RUNNER_TEMP, and the walk fails closed
-        self.assertTrue(parent.startswith("/opt/"))
-        self.assertIn("ancestor-not-root-owned", init)
-        self.assertIn("ancestor-writable-or-sticky", init)
-
-    def test_created_marker_is_shared_by_setup_and_cleanup(self):
-        marker = re.compile(r"--created-marker\s+(\S+)")
-        a = marker.search(self.steps[self.find("other_uid_negative create-user")]["run"]).group(1)
-        b = marker.search(self.steps[self.find("other_uid_negative delete-user")]["run"]).group(1)
-        self.assertEqual(a, b)
-
-    def test_not_covered_marker_comment_is_present(self):
-        self.assertIn("# NOT COVERED until broker code exists: other-UID broker negative "
-                      "(ADR 0006 addendum 2026-10-10, item 3)", self.text)
-
-
 if __name__ == "__main__":
     unittest.main()

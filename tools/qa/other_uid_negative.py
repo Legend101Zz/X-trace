@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Other-UID private-storage substitute for the hosted macOS CI job (ADR 0006 section 2.3 and its 2026-10-10 addendum).
+"""Other-UID private-storage substitute written for the hosted macOS CI job (ADR 0006 section 2.3 and its 2026-10-10
+addendum). Not run in CI since 2026-10-10: the owner removed the hosted macOS jobs (ADR 0006, second 2026-10-10
+addendum). Kept, with its unit tests, for a Linux port.
 
 This is the "private-storage substitute" for the other-UID broker negative: it runs only while the tree holds no
 broker code, and it does not replace the broker negative once broker code exists.

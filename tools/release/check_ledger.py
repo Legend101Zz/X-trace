@@ -28,7 +28,7 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 BUILD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 PINNED_CONTRACTS_PATH = pathlib.Path(__file__).resolve().parents[2] / "evidence/v0.01/requirements.json"
-PINNED_CONTRACTS_SHA256 = "ee3ab8c2bb1850e14397019aa2f2d1bb6f654d26be08bfbbdf06e19620f6de8a"
+PINNED_CONTRACTS_SHA256 = "b2c315fc6dde50e57499782e18e08d69519fa00af6f407dcf282266dee8aa3e5"
 REQUIRED_KIND = {
     "CAMPAIGN-": "campaign",
     "HUMAN-USABILITY": "human_usability",

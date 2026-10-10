@@ -1,7 +1,8 @@
 name: package
 
 # Unsigned release-candidate packaging. Produces archives + checksums + SBOM + licenses per platform and runs a
-# reproducibility double-build. No secrets are used; signing/notarization is an owner-held step (packaging/sign-*.sh).
+# reproducibility double-build. No secrets are used. CI builds Linux x86_64 only (owner decision 2026-10-10): the
+# unsigned macOS arm64 package is built locally at release time; there is no macOS signing or notarization.
 on:
   push:
     branches:
@@ -27,8 +28,6 @@ jobs:
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04
-          - platform: macos-arm64
-            runner: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

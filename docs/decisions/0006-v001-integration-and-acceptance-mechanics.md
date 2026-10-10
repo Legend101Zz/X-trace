@@ -2,7 +2,8 @@
 
 - Status: Accepted (root decision 2026-10-04)
 - Amended by: the addendum of 2026-10-10 at the end (the other-UID negative of §2
-  item 3 before the broker exists)
+  item 3 before the broker exists), and the second 2026-10-10 addendum (owner:
+  no hosted macOS CI, no macOS signing or notarization)
 - Date: 2026-10-04
 - Context: Twelve unmerged `slice/v001-*` branches carry overlapping,
   unaccepted preparation (conflict hotspots: `crates/xtrace-cli/src/{error,output}.rs`,
@@ -257,3 +258,40 @@ Decided by the root orchestrator under the owner's autonomous v0.01 launch autho
    may be marked accepted without a broker-negative result in its receipt.
 4. Nothing else in §2 changes. The broker negative is deferred until broker code
    exists; it is not waived.
+
+## Second addendum (2026-10-10, owner): no hosted macOS CI, no macOS notarization
+
+- Status: Owner decision, 2026-10-10 (direct instruction to the root).
+- Context: v0.01 promised signed and notarized macOS arm64 packages, which needs
+  a paid Apple Developer ID the project does not have, and §2 item 3 required a
+  hosted macOS arm64 job in GitHub Actions.
+
+### Decision
+
+1. The hosted macOS arm64 job is removed from `ci.yml` and the macOS entry is
+   removed from `package.yml`. This supersedes §2 item 3, the macOS column of
+   §4a, the macOS part of the §3 phase receipt contents (CI ids are ubuntu
+   only), the test obligation that the macOS job fails if the other-UID test is
+   skipped, and the hosted-macOS part of the first 2026-10-10 addendum.
+2. The macOS arm64 package ships unsigned and not notarized. No Apple Developer
+   ID or notarytool profile is needed. This supersedes the notarization part of
+   root decision 1. The `PLATFORM-MAC` requirement now reads "exact unsigned macOS
+   arm64 artifact fresh-profile acceptance", and the release checker's pinned
+   contract hash is updated with it. `packaging/sign-macos.sh` stays in the tree
+   but is not used for v0.01.
+3. macOS stays a release platform. Its evidence is the leased macOS 23-gate
+   floor (§2 item 1, still mandatory for every merge) and, for `PLATFORM-MAC`, a
+   local fresh-profile install of the exact unsigned package.
+4. The other-UID private-storage negative no longer runs anywhere.
+   `tools/qa/other_uid_negative.py` and its unit tests stay for a Linux port.
+   When broker code exists, the other-UID broker negative (first addendum, item
+   3) is still required and must run where a second local user can be created.
+
+### Consequences
+
+- No clean-machine macOS proof in CI; macOS regressions are caught only by the
+  leased floor on the owner's Mac, which is not a fresh machine.
+- Until the Linux port lands, nothing tests that another local user cannot read
+  the store; the store's own owner-only mode and ACL tests remain.
+- A downloaded unsigned macOS binary may be blocked by Gatekeeper; users clear
+  the quarantine flag themselves.

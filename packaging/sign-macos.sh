@@ -1,5 +1,6 @@
 #!/bin/sh
 # macOS Developer ID codesigning (hardened runtime) + notarization for a built X-trace archive.
+# NOT USED FOR v0.01: the owner dropped macOS signing and notarization on 2026-10-10 (macOS ships unsigned).
 #
 #   sign-macos.sh --check   --identity "Developer ID Application: ..." --notary-profile PROFILE
 #   sign-macos.sh --archive dist/macos-arm64/xtrace-0.0.1-macos-arm64.tar.gz --out-dir signed/
