@@ -185,8 +185,10 @@ following hold for that exact SHA; nothing is carried over from an earlier SHA
 - A script check (extend `tools/release/test_release_tools.py`) proves a phase
   receipt is rejected when: the CI head SHA differs from the candidate; any job is
   missing or skipped; a review's diff digest differs; the macOS job is absent for a
-  phase that requires it; the floor receipt label was reused.
-- CI workflow test: the macOS job fails if the other-UID broker test is skipped.
+  phase that requires it (superseded: no hosted macOS job since the second
+  2026-10-10 addendum); the floor receipt label was reused.
+- (Superseded by the second 2026-10-10 addendum: there is no hosted macOS job.)
+  CI workflow test: the macOS job fails if the other-UID broker test is skipped.
   (Until broker code exists: the macOS job fails if the private-storage
   substitute of the 2026-10-10 addendum is skipped.)
 - The first accepted phase demonstrates the complete receipt end to end (dry run
@@ -212,7 +214,7 @@ following hold for that exact SHA; nothing is carried over from an earlier SHA
 
 Decided by the root orchestrator under the owner's autonomous v0.01 launch authorization. These answers close the open questions above and supersede any conflicting text in this ADR.
 
-1. Hosted macOS arm64 runners are acceptable for platform preparation CI and fresh-profile rehearsal. PLATFORM-MAC acceptance still requires signed/notarized artifacts (owner input).
+1. Hosted macOS arm64 runners are acceptable for platform preparation CI and fresh-profile rehearsal. PLATFORM-MAC acceptance still requires signed/notarized artifacts (owner input). (Superseded by the second 2026-10-10 addendum: no hosted macOS CI; macOS ships unsigned and not notarized.)
 2. Integration merges to `main` per accepted phase. Phases with mutual dependencies may share one integration checkpoint, but each phase keeps its own gate/evidence record.
 3. Phase receipts before release keys exist are signed with test keys marked non-release. Release receipts need the owner-authenticated trust configuration (owner input).
 4. Rejected-candidate raw evidence stays in the private cache; only sanitized hashes and summaries are tracked in-tree.
