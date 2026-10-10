@@ -368,14 +368,18 @@ def _path_matches(path: str, want_route: str, literal_routes: frozenset) -> bool
 
 
 def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
-            sent: list[tuple[str | None, str, str]] | None = None) -> dict[str, Any]:
+            sent: list[tuple[str | None, str, str]] | None = None, burst: frozenset = frozenset()) -> dict[str, Any]:
     """expectations: scenario id -> [{method, route, status, layers[], minCount}]. Returns a verdict per scenario.
 
     Attribution is by ORDER, never by wall clock (a recording's openedAt tracks ingestion, not the request). `sent` is the
     harness's ordered request log [(scenario id | None for non-scenario traffic such as the canary requests, method,
     path)]. For one expectation (method, route) the product must have recorded exactly as many matching recordings as the
     harness sent matching requests; then recordings sorted by time are consumed in request order and each scenario judges
-    only the recordings of its own requests. Any other count cannot be attributed and is reported as
+    only the recordings of its own requests. `burst` names the concurrency scenarios, whose requests are sent unpaced and which
+    the product may record only in part (the agent admits a bounded number of unwritten recordings): the paced requests before
+    the first burst request are attributed by order exactly as above; the recordings left after them belong to the burst scenario
+    (less one per later non-scenario request, so a burst is never credited with a canary's recording) and are judged against its
+    minCount. Any other count cannot be attributed and is reported as
     `attribution-ambiguous` (never guessed). Without `sent` every scenario is judged campaign-wide and says so."""
     literal_routes = frozenset((e["route"].rstrip("/") or "/") for exps in expectations.values() for e in exps if "{" not in e["route"])
     verdicts: dict[str, Any] = {}
@@ -392,11 +396,30 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                 reqs = [r for r in sent if r[1] == e["method"] and _path_matches(r[2], e["route"], literal_routes)]
                 mine = [i for i, r in enumerate(reqs) if r[0] == sid]
                 times = [recording_time(d) for d in matched_all]
-                if not matched_all:
+                first_burst = next((i for i, r in enumerate(reqs) if r[0] in burst), None)
+                n_serial = len(reqs) if first_burst is None else first_burst
+                late_none = 0 if first_burst is None else sum(1 for r in reqs[first_burst:] if r[0] is None)
+                if first_burst is not None and any(r[0] is not None and r[0] not in burst for r in reqs[first_burst:]):
                     matched = []
-                elif len(matched_all) != len(reqs):
+                    problems.append("attribution-ambiguous(paced request sent after a burst request)")
+                elif not matched_all:
+                    matched = []
+                elif first_burst is not None and len(matched_all) >= n_serial and not any(t is None for t in times):
+                    order = sorted(range(len(matched_all)), key=lambda i: (times[i], i))
+                    ordered = [matched_all[i] for i in order]
+                    if sid in burst:
+                        rest = ordered[n_serial:]
+                        matched = rest[:max(0, len(rest) - late_none)]
+                        attribution = "burst"
+                    else:
+                        matched = [ordered[i] for i in mine if i < n_serial]
+                elif len(matched_all) != len(reqs) and first_burst is None:
                     matched = []
                     problems.append(f"attribution-ambiguous(recordings {len(matched_all)}, requests {len(reqs)})")
+                elif first_burst is not None:
+                    matched = []
+                    problems.append(f"attribution-ambiguous(recordings {len(matched_all)}, paced requests {n_serial})"
+                                    if len(matched_all) < n_serial else "attribution-ambiguous(recording time unknown)")
                 elif any(t is None for t in times):
                     matched = []
                     problems.append("attribution-ambiguous(recording time unknown)")
@@ -474,7 +497,10 @@ def canary_hook(canaries: dict[str, str]) -> Callable[..., tuple]:
     return hook
 
 
-def send_canary_requests(base: str, canaries: dict[str, str], paths: list[tuple[str, str]]) -> list[dict]:
+PACE_SECONDS = 0.4  # pause after each paced request: above the agent's per-recording write time (about 285 ms on a hosted runner)
+
+
+def send_canary_requests(base: str, canaries: dict[str, str], paths: list[tuple[str, str]], pace: float = 0.0) -> list[dict]:
     """Extra non-scenario requests carrying a JSON body password; the responses are not judged."""
     import xcamp
     out = []
@@ -487,6 +513,8 @@ def send_canary_requests(base: str, canaries: dict[str, str], paths: list[tuple[
             out.append({"method": method, "path": path, "status": r["status"]})
         except Exception as exc:  # recorded, not fatal: the canary scan decides
             out.append({"method": method, "path": path, "error": type(exc).__name__})
+        if pace:
+            time.sleep(pace)
     return out
 
 
@@ -516,6 +544,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     results: list[dict[str, Any]] = []
     sent_log: list[tuple[str | None, str, str]] = []
     xcamp.SENT_LOG = []
+    xcamp.REQUEST_PACE_S = PACE_SECONDS
     started = time.time()
     boot_ms = None
     try:
@@ -529,7 +558,8 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
             results.append(res)
             print(f"  [{'PASS' if res['passed'] else 'FAIL'}] {sc.id} {res['semanticEffectFingerprint'][:16]} {res['elapsedMs']}ms", flush=True)
         if canaries:
-            notes["canaryRequests"] = send_canary_requests(stack.base, canaries, extra_canary_paths)
+            time.sleep(2.0)  # let the agent's writer drain the burst before the (paced) canary requests
+            notes["canaryRequests"] = send_canary_requests(stack.base, canaries, extra_canary_paths, pace=PACE_SECONDS)
             sent_log.extend((None, m, pth) for m, pth in extra_canary_paths)  # non-scenario traffic, still recorded by the product
     finally:
         stack.down()  # SIGTERM to the launcher we started; `xtrace run` forwards it and drains the daemon
@@ -539,6 +569,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
             pass
     xcamp.REQUEST_HOOK = None
     xcamp.SENT_LOG = None
+    xcamp.REQUEST_PACE_S = 0.0
     notes["launcherExitCode"] = getattr(stack, "launcher_exit", None)
 
     # product lifecycle commands that exist in the CLI surface: exit code 9 means "not implemented yet"
@@ -562,7 +593,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         if viewer is not None:
             stop_process_group(viewer)
     if api["ok"]:
-        verdicts = analyze(api["details"], expectations, sent_log)
+        verdicts = analyze(api["details"], expectations, sent_log, frozenset(sc.id for sc in scenarios if sc.kind == "concurrency"))
 
     baseline_fp: dict[str, str] = {}
     if baseline_receipt and baseline_receipt.exists():

@@ -178,6 +178,30 @@ class T(unittest.TestCase):
     def test_legacy_exception_kind_is_not_a_product_kind(self):
         self.assertNotIn("exception", xinstr.OBSERVED_OUTCOME_KINDS)
 
+    def test_burst_scenario_does_not_break_attribution_of_paced_scenarios(self):
+        exp = {"a": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}],
+               "b": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": [], "minCount": 5}]}
+        # 2 paced requests of `a`, then 5 burst requests of `b`, then one non-scenario request; the product kept 2 + 3 + 1
+        sent = [("a", "GET", "/owners/1"), ("a", "GET", "/owners/2")] + [("b", "GET", f"/owners/{i}") for i in range(5)] \
+            + [(None, "GET", "/owners/9")]
+        d = {f"{i:02d}": rec("GET", f"/owners/{i}", 200) for i in range(6)}
+        for i, det in enumerate(d.values()):
+            det["recordingId"] = f"01a12327-{0x100 + i:04x}-7000-8000-000000000000"
+            det["_openedAt"] = f"2026-10-10T00:00:0{i}Z"
+        v = xinstr.analyze(d, exp, sent, frozenset({"b"}))
+        self.assertTrue(v["a"]["passed"], v["a"])
+        self.assertEqual(v["a"]["expectations"][0]["recordingsMatchingRoute"], 2)
+        self.assertEqual(v["b"]["expectations"][0]["recordingsMatchingRoute"], 3)  # 4 left minus the later non-scenario request
+        self.assertEqual(v["b"]["expectations"][0]["problems"], ["count-below-minimum(need 5, have 3)"])
+
+    def test_burst_with_fewer_recordings_than_paced_requests_is_ambiguous(self):
+        exp = {"a": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}]}
+        sent = [("a", "GET", "/owners/1"), ("a", "GET", "/owners/2"), ("b", "GET", "/owners/3")]
+        d = {"x": rec("GET", "/owners/1", 200)}
+        d["x"]["_openedAt"] = "2026-10-10T00:00:00Z"
+        v = xinstr.analyze(d, exp, sent, frozenset({"b"}))
+        self.assertTrue(v["a"]["expectations"][0]["problems"][0].startswith("attribution-ambiguous"))
+
     def test_silent_viewer_hits_the_deadline(self):
         import os, stat, tempfile, time
         with tempfile.TemporaryDirectory() as d:

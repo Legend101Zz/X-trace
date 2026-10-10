@@ -173,6 +173,10 @@ def http_request(base: str, method: str, path: str, *, headers: dict[str, str] |
 # Optional (method, path, headers, body) -> (path, headers, body) applied just before sending. Default: none.
 REQUEST_HOOK: Callable[[str, str, dict, Any], tuple] | None = None
 SENT_LOG: list | None = None  # instrumented runs set a list; every scenario request appends (method, original path)
+# Instrumented runs set a pause (seconds) after every request of a non-concurrency scenario: the packaged agent writes one recording
+# at a time (about 285 ms each on a hosted runner) and refuses a request past 8 unwritten recordings, so back-to-back requests are
+# never recorded 1:1. The pause changes no request, response or fingerprint. Concurrency scenarios are never paced.
+REQUEST_PACE_S: float = 0.0
 
 
 @dataclass
@@ -186,6 +190,7 @@ class Ctx:
     db: dict[str, Any] = field(default_factory=dict)
     volatile_headers: tuple[str, ...] = ("date", "set-cookie", "etag", "last-modified", "expires", "x-request-id")
     keep_headers: tuple[str, ...] = ("content-type", "location", "www-authenticate", "allow")
+    pace: float = 0.0
     # Lock-free list append is safe in CPython for concurrent scenarios.
 
     def http(self, method: str, path: str, *, headers: dict[str, str] | None = None,
@@ -209,6 +214,8 @@ class Ctx:
         if SENT_LOG is not None:
             SENT_LOG.append((method, path))
         res = http_request(self.base, method, send_path, headers=send_hdrs, body=send_raw)
+        if self.pace:
+            time.sleep(self.pace)
         text = res["body"].decode("utf-8", "replace")
         ntext = normalize_text(text, (norm or []) + self.norm_extra)
         redacted_headers = {k: v for k, v in hdrs.items() if k.lower() not in ("authorization", "cookie")}
@@ -255,7 +262,7 @@ class Scenario:
 
 
 def run_scenario(sc: Scenario, stack: "Stack", base: str, norm_extra: list[tuple[str, str]]) -> dict[str, Any]:
-    ctx = Ctx(stack=stack, base=base, norm_extra=list(norm_extra))
+    ctx = Ctx(stack=stack, base=base, norm_extra=list(norm_extra), pace=0.0 if sc.kind == "concurrency" else REQUEST_PACE_S)
     t0 = time.perf_counter()
     err = None
     try:
