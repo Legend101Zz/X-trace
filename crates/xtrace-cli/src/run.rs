@@ -197,9 +197,8 @@ async fn run_unix(
     };
     // The JVM may be started from any directory, so the repository the operator named is passed
     // to the agent in the private capture file; source roots resolve against it.
-    let source_base = std::fs::canonicalize(&project_dir)
-        .ok()
-        .and_then(|path| path.to_str().map(str::to_owned));
+    let source_base =
+        std::fs::canonicalize(&project_dir).ok().and_then(|path| path.to_str().map(str::to_owned));
     let prepared = crate::daemon::prepare_with_observation(
         project_dir,
         &crate::paths::read_env_path,
