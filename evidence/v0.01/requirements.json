@@ -13,7 +13,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "Unsigned Linux x86_64 and macOS arm64 packages build, are reproducible (rebuild twice from clean exports and compare) and pass checksum verification plus the install/upgrade/uninstall journey (package run 37942590293 on the candidate dffeb8d; also 37941058196 on the parent). packaging/verify_package.py passed all 10 checks on both platforms on the parent (manifest, required components incl. web, Java and Node packs, schemas, SBOM, licenses, binary version 0.0.1, reported schema version 8 equals the migration catalog, `xtrace tui` implemented); the same steps are green in the candidate package run and the campaigns package-verify job. The daemon and TUI are subcommands of the single xtrace binary, so the TUI already ships. Remaining: write xtrace-pack.json and sign packs (ADR 0004 key domain), reshape the Node pack to the ADR 0004 layout, wire pack discovery and verification into the CLI run path. Size L."
+      "stateNote": "Unsigned Linux x86_64 and macOS arm64 packages build, are reproducible (rebuild twice from clean exports and compare) and pass checksum verification plus the install/upgrade/uninstall journey (package run 37942590293 on the candidate dffeb8d; also 37941058196 on the parent). packaging/verify_package.py passed all 10 checks on both platforms on the parent (manifest, required components incl. web, Java and Node packs, schemas, SBOM, licenses, binary version 0.0.1, reported schema version 8 equals the migration catalog, `xtrace tui` implemented); the same steps are green in the candidate package run and the campaigns package-verify job. The daemon and TUI are subcommands of the single xtrace binary, so the TUI already ships. Remaining: write xtrace-pack.json and sign packs (ADR 0004 key domain), reshape the Node pack to the ADR 0004 layout, wire pack discovery and verification into the CLI run path. Size L. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): package 38007602811 green on the candidate (both platforms); the reported schema version is now 9 (migration v9 recording_limitations)."
     },
     {
       "id": "INSTALL-FRESH",
@@ -31,7 +31,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "Spring fixture jar launch and premain journeys pass: the Rust CLI journeys ran on JDK 17 in the lane rust job and on JDK 17 and 21 in the Linux 23-gate floors (rust-cli-spring-journey gate, ci 37942590330); the Java adapter Gradle suite passes on JDK 17/21/25 (lane 37942590270), so JDK 25 has no CLI journey. Remaining: Maven, Gradle and explicit supervisor workflows, argv/signal/exit-code preservation proofs, child cleanup on kill. Size M."
+      "stateNote": "Spring fixture jar launch and premain journeys pass: the Rust CLI journeys ran on JDK 17 in the lane rust job and on JDK 17 and 21 in the Linux 23-gate floors (rust-cli-spring-journey gate, ci 37942590330); the Java adapter Gradle suite passes on JDK 17/21/25 (lane 37942590270), so JDK 25 has no CLI journey. Remaining: Maven, Gradle and explicit supervisor workflows, argv/signal/exit-code preservation proofs, child cleanup on kill. Size M. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): build-tool and wrapper launchers (gradle, mvn, wrappers, env, sh, scripts) are refused with exit 2 before any side effect (test); the premain journey passes with its original 10 s wait on both hosted macOS tuples (ci 38007602839) and on the leased macOS floor R3J-a6ecb76-1."
     },
     {
       "id": "JAVA-ATTACH",
@@ -40,7 +40,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "Attach helper and CLI attach exist; PID/start-identity check is unit-tested and JavaAttachAcceptanceTest runs in the Java Gradle suite on JDK 17/21/25 (lane 37942590270, no per-test counts reported). Remaining: attach receipts for JDK 17/21/25, precise relaunch remediation messages, race tests on identity reuse. Size M."
+      "stateNote": "Attach helper and CLI attach exist; PID/start-identity check is unit-tested and JavaAttachAcceptanceTest runs in the Java Gradle suite on JDK 17/21/25 (lane 37942590270, no per-test counts reported). Remaining: attach receipts for JDK 17/21/25, precise relaunch remediation messages, race tests on identity reuse. Size M. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): a Linux race in the pack-cache state file (a thread spent its bounded retries while another thread's unlink was in flight) is fixed by waiting on the existing bounded lock; reproduced 6/1600 under load before, 0/1600 after."
     },
     {
       "id": "NODE-LAUNCH",
@@ -85,7 +85,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "Link schema (v9 SQL) and pure reconciliation written by the catalog lane, but v9 is not registered in the migration chain (registering it makes 3 store tests fail because their corrupt-row fixtures hit v9's stricter foreign key, per fixer B) and review found weakened link integrity. Remaining: register v9 and rework those fixtures, link multiple projects/endpoints/recordings, prove v4/v7 unmatched history without backfill, executed tests. Size L."
+      "stateNote": "Link schema (v9 SQL) and pure reconciliation written by the catalog lane, but v9 is not registered in the migration chain (registering it makes 3 store tests fail because their corrupt-row fixtures hit v9's stricter foreign key, per fixer B) and review found weakened link integrity. Remaining: register v9 and rework those fixtures, link multiple projects/endpoints/recordings, prove v4/v7 unmatched history without backfill, executed tests. Size L. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): migration v9 is now recording_limitations (ADR 0011); the general endpoint-link schema (still unregistered, file named catalog_v9.sql) must take v10."
     },
     {
       "id": "JAVA-MVC",
@@ -94,7 +94,7 @@
       "mandatory": true,
       "state": "failing",
       "receipts": [],
-      "stateNote": "Spring Boot controller journeys pass in CI, but the candidate Petclinic campaign (run 37942593526 on dffeb8d) is red for this row's own requirement: 14 recordings for 65 requests (0/8 scenarios meet route, HTTP outcome and controller/repository frame expectations), 4 http-outcome-mismatch problems (302 seen as 200, the /oups 500 path with no status), 2 expectations with no Spring Data repository frame, and only 2 of 14 recordings carry an HTTP status. The Java adapter has not changed since J2 db91b7a, so the Q-001 Java findings (status read before the redirect is committed, no repository frames, fewer recordings than requests) are unaddressed. Remaining: fix those in the adapter and re-run the campaign. Size L."
+      "stateNote": "Spring Boot controller journeys pass in CI, but the candidate Petclinic campaign (run 37942593526 on dffeb8d) is red for this row's own requirement: 14 recordings for 65 requests (0/8 scenarios meet route, HTTP outcome and controller/repository frame expectations), 4 http-outcome-mismatch problems (302 seen as 200, the /oups 500 path with no status), 2 expectations with no Spring Data repository frame, and only 2 of 14 recordings carry an HTTP status. The Java adapter has not changed since J2 db91b7a, so the Q-001 Java findings (status read before the redirect is committed, no repository frames, fewer recordings than requests) are unaddressed. Remaining: fix those in the adapter and re-run the campaign. Size L. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): the resolved application scope reaches the agent and the record document; an out-of-scope Spring handler produces no recording by design (journey with an in-scope control). Petclinic recordings-per-scenario is still 0/8 on the candidate campaign (38007604926), so the row stays failing."
     },
     {
       "id": "JAVA-WEBFLUX",
@@ -130,7 +130,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "Built-in HTTP request roots captured; node_run_http and journeys pass on Node 22/24 in CI. Remaining: HTTPS fixture, concurrent-request attribution, kill-mid-request abort cause, async context beyond AsyncLocalStorage-only paths. Size M."
+      "stateNote": "Built-in HTTP request roots captured; node_run_http and journeys pass on Node 22/24 in CI. Remaining: HTTPS fixture, concurrent-request attribution, kill-mid-request abort cause, async context beyond AsyncLocalStorage-only paths. Size M. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): the process-group reap race is fixed (on macOS, killpg EPERM for a zombie-only group is treated as gone)."
     },
     {
       "id": "NODE-EXPRESS",
@@ -139,7 +139,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "Express 4 and 5 route, middleware, handler and error frames are captured in the in-process journeys (the journey now asserts the loaded Express major per cell) and node_express_journey drives the fixtures through the Rust CLI; node CI 37931612217 (w2-node head) and lane 37942590270 pass. Route template and status are asserted in-process only: the daemon does not persist them for Node runs (N-003). Remaining: body-reading middleware loses correlation, route/status in read API, kill-mid-request test. Size M."
+      "stateNote": "Express 4 and 5 route, middleware, handler and error frames are captured in the in-process journeys (the journey now asserts the loaded Express major per cell) and node_express_journey drives the fixtures through the Rust CLI; node CI 37931612217 (w2-node head) and lane 37942590270 pass. Route template and status are asserted in-process only: the daemon does not persist them for Node runs (N-003). Remaining: body-reading middleware loses correlation, route/status in read API, kill-mid-request test. Size M. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): the Express journeys pass with their original 20 s wait on both hosted macOS tuples (ci 38007602839) and on the leased macOS floor."
     },
     {
       "id": "NODE-FASTIFY",
@@ -202,7 +202,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "JVM line probes and their -Xverify:all corpus (61/61 in leased JDK 17/21 runs JB-024/025 on an earlier head, not CI evidence; ROOT-NOTE-2 concerns leased cargo runs, these are Gradle) sit in the agent-runtime Gradle suite, which passes on JDK 17/21/25 in lane 37942590270 (no per-test counts reported). Probes are wired in focused mode only, but focused capture is claimed, not granted (focused arming not wired), so the ingest rejects line events in standard mode and a rejected batch makes the runtime fail closed. The campaign has no active-line step yet (gating row not-implemented), so no executed line has been observed in a product recording. Remaining: daemon arming, value budget, Node lines, campaign proof of executed lines. Size L."
+      "stateNote": "JVM line probes and their -Xverify:all corpus (61/61 in leased JDK 17/21 runs JB-024/025 on an earlier head, not CI evidence; ROOT-NOTE-2 concerns leased cargo runs, these are Gradle) sit in the agent-runtime Gradle suite, which passes on JDK 17/21/25 in lane 37942590270 (no per-test counts reported). Probes are wired in focused mode only, but focused capture is claimed, not granted (focused arming not wired), so the ingest rejects line events in standard mode and a rejected batch makes the runtime fail closed. The campaign has no active-line step yet (gating row not-implemented), so no executed line has been observed in a product recording. Remaining: daemon arming, value budget, Node lines, campaign proof of executed lines. Size L. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): unchanged: focused line events still do not reach the read API for the fixture methods; a declared not-transformed gap is recorded instead."
     },
     {
       "id": "REPLAY-FRAMES",
@@ -256,7 +256,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "Honesty counts, gap and limitation projection, and the A-01 privacy canary fix landed with tests. Remaining: gap reason/count display in web and TUI, Java silent-loss markers (Dropped VALUE_BUDGET), source-map and debug absence labels, journeys. Size L."
+      "stateNote": "Honesty counts, gap and limitation projection, and the A-01 privacy canary fix landed with tests. Remaining: gap reason/count display in web and TUI, Java silent-loss markers (Dropped VALUE_BUDGET), source-map and debug absence labels, journeys. Size L. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): recording limitations are persisted: the daemon records capture_policy_not_armed (migration v9) and the read API returns it in RecordingDetail.limitations (ADR 0011, proposed for owner ratification). The web viewer and TUI do not render it yet."
     },
     {
       "id": "EXPORT-OPENAPI",
@@ -328,7 +328,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "Store migrations, interrupted-recording recovery and the package upgrade test exist (floors green). Remaining: xtrace store backup/verify/restore/migrate are stubs (exit 9), crash-injection and corrupt-object tests, retained-data upgrade proof across versions. Size L."
+      "stateNote": "Store migrations, interrupted-recording recovery and the package upgrade test exist (floors green). Remaining: xtrace store backup/verify/restore/migrate are stubs (exit 9), crash-injection and corrupt-object tests, retained-data upgrade proof across versions. Size L. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): migration v9 (append-only) is pinned by the v1-v9 checksum test."
     },
     {
       "id": "RETENTION-DOCTOR",
@@ -346,7 +346,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "Private storage, TLS pin, auth and daemon command tests exist and pass in CI. Remaining: viewer_security.rs and project_isolation.rs integration tests (CSRF, origin, host, replay) unwritten, offline local-first proof. Size M."
+      "stateNote": "Private storage, TLS pin, auth and daemon command tests exist and pass in CI. Remaining: viewer_security.rs and project_isolation.rs integration tests (CSRF, origin, host, replay) unwritten, offline local-first proof. Size M. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): macOS private-storage admission shares verdicts within one store call (ADR 0008 Amendment 1, proposed; security-reviewed). The hosted macOS job runs an other-UID private-storage negative (a second local user cannot list, read, write or replace the store; no ACL allow entries) and it passes on both tuples (ci 38007602839); the broker negative is deferred until broker code exists (ADR 0006 addendum)."
     },
     {
       "id": "PRIVACY-CANARIES",
@@ -373,7 +373,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "Overhead p50/p95 is reported by the campaign harness but not gated; event cap raised to 16,384 without the full resource budget. Remaining: repeats of 5 or more, approved budgets as gates, 10,000-frame bounds tests, memory budget. Size L."
+      "stateNote": "Overhead p50/p95 is reported by the campaign harness but not gated; event cap raised to 16,384 without the full resource budget. Remaining: repeats of 5 or more, approved budgets as gates, 10,000-frame bounds tests, memory budget. Size L. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): macOS admission cost per segment commit fell from about 327 /bin/ls spawns to 70 (begin 32 to 9, finish 277 to 52), pinned by a spawn-bound test."
     },
     {
       "id": "PLATFORM-MAC",
@@ -409,7 +409,7 @@
       "mandatory": true,
       "state": "in_progress",
       "receipts": [],
-      "stateNote": "JDK 17/21/25 and Node 22/24 Gradle and npm suites pass in CI (lane 37942590270); Rust-driven CLI journeys run only on the floor tuples jdk17-node22 and jdk21-node24. No per-capability receipts. Remaining: attach versions, framework/module/driver/OS receipts, WebFlux, Servlet, Fastify, Nest rows. Size L."
+      "stateNote": "JDK 17/21/25 and Node 22/24 Gradle and npm suites pass in CI (lane 37942590270); Rust-driven CLI journeys run only on the floor tuples jdk17-node22 and jdk21-node24. No per-capability receipts. Remaining: attach versions, framework/module/driver/OS receipts, WebFlux, Servlet, Fastify, Nest rows. Size L. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): both hosted macOS arm64 tuples (jdk17-node22, jdk21-node24) are green on the candidate for the first time (ci 38007602839); Rust 1076 tests there, 1075 on Linux."
     },
     {
       "id": "CAMPAIGN-PETCLINIC",
@@ -418,7 +418,7 @@
       "mandatory": true,
       "state": "failing",
       "receipts": [],
-      "stateNote": "Campaign run 37942593526 on the candidate dffeb8d is red (result failed, non-release): baseline 8/8, instrumented fingerprints 8/8 equal baseline, privacy scan, Linear/Canvas screenshots at 320/736/1280 and lifecycle-record-stop pass; but 14 of 65 requests recorded (0/8 scenarios meet expectations), 4 http-outcome-mismatch problems (302 seen as 200, /oups 500 seen as none), no repository frames, 0 of 14 recordings with source lines and only 2 with a status, tui-pty-transcript fails (names no route), export exits 9, and the baseline jar sha differs from the tracked pin (reported, not a pass). Active-line, frame-values, restart/reopen, partial-reopen, overhead repeats>=5 and record-stop-flow remain not-implemented gating rows. Remaining: fix product gaps, build those harness steps. Size XL."
+      "stateNote": "Campaign run 37942593526 on the candidate dffeb8d is red (result failed, non-release): baseline 8/8, instrumented fingerprints 8/8 equal baseline, privacy scan, Linear/Canvas screenshots at 320/736/1280 and lifecycle-record-stop pass; but 14 of 65 requests recorded (0/8 scenarios meet expectations), 4 http-outcome-mismatch problems (302 seen as 200, /oups 500 seen as none), no repository frames, 0 of 14 recordings with source lines and only 2 with a status, tui-pty-transcript fails (names no route), export exits 9, and the baseline jar sha differs from the tracked pin (reported, not a pass). Active-line, frame-values, restart/reopen, partial-reopen, overhead repeats>=5 and record-stop-flow remain not-implemented gating rows. Remaining: fix product gaps, build those harness steps. Size XL. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): candidate campaign 38007604926: select, package and package-verify pass; the Petclinic job is red (recordings-per-scenario 0/8, source-identity, TUI transcript fail; record-stop-flow, active-line-frames, frame-values, restart-reopen, partial-recording-reopen, export-formats not implemented). Non-release receipts."
     },
     {
       "id": "CAMPAIGN-JHIPSTER",
@@ -490,7 +490,7 @@
       "mandatory": true,
       "state": "blocked",
       "receipts": [],
-      "stateNote": "Needs owner approval to clear dead lease C2-004 for the leased macOS 23-gate floor, and trust config for signed receipts. Done: wave-1 review by Sonnet 5.5 reviewers, not the pinned Sol reviews this row requires (40 survivors: all 6 blockers fixed, about 20 of the 40 not confirmed fixed, list in NEXT-RUN-PROMPT section 6); Linux floors green on the candidate dffeb8d (ci 37942590330) and the parent 1b672dc. The final exact review of dffeb8d was still running when checked. Remaining: pinned Sol reviews of final diff, exact-sha gates incl. the leased macOS floor, post-merge CI. Size M."
+      "stateNote": "Needs owner approval to clear dead lease C2-004 for the leased macOS 23-gate floor, and trust config for signed receipts. Done: wave-1 review by Sonnet 5.5 reviewers, not the pinned Sol reviews this row requires (40 survivors: all 6 blockers fixed, about 20 of the 40 not confirmed fixed, list in NEXT-RUN-PROMPT section 6); Linux floors green on the candidate dffeb8d (ci 37942590330) and the parent 1b672dc. The final exact review of dffeb8d was still running when checked. Remaining: pinned Sol reviews of final diff, exact-sha gates incl. the leased macOS floor, post-merge CI. Size M. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): the leased macOS 23-gate floor runs again (R3J-a6ecb76-1, 23/23 on the candidate); the dead-lease note above is out of date. Exact final release reviews are still pending (P10)."
     },
     {
       "id": "DISTRIBUTED-RECHECK",

@@ -1,0 +1,543 @@
+{
+  "schemaVersion": 1,
+  "phase": "wave-a",
+  "label": "rc3-a6ecb76",
+  "phasesTouched": [
+    "P01",
+    "P02",
+    "P03",
+    "P04",
+    "P05"
+  ],
+  "phaseState": "pending",
+  "nonRelease": true,
+  "phaseBaseSha": "a181a0c9a50d79480f84824d40536060aba58adb",
+  "candidateSha": "a6ecb76c3aff3482d6db85cd918d154bf4a8cf60",
+  "mergeSha": "a558f4db2b07ffad2126927266a730695e1a513d",
+  "diffSha256": "88e5a872063849ca1acf3646be0b018f9dede55abf243513d5243d69b9c05eb3",
+  "mergeGate": {
+    "record": "MERGE-GATE-1.json",
+    "sha256": "cedd52876ddcd7ef0e887ffb32cf45e58f1cb6f40e1a086dbd5a4a9958eb542c",
+    "pass": true
+  },
+  "floorPreMerge": {
+    "label": "R3J-a6ecb76-1",
+    "receiptSha256": "0e7f873bbb174b4383d57e4d21ca57ede000105580c24d31343bd05bab1dd3d2",
+    "decision": "checks_passed_for_review",
+    "phaseBase": "a181a0c9a50d79480f84824d40536060aba58adb",
+    "headBefore": "a6ecb76c3aff3482d6db85cd918d154bf4a8cf60",
+    "headAfter": "a6ecb76c3aff3482d6db85cd918d154bf4a8cf60",
+    "gates": [
+      {
+        "name": "rust-format",
+        "status": "passed"
+      },
+      {
+        "name": "rust-clippy",
+        "status": "passed"
+      },
+      {
+        "name": "rustdoc",
+        "status": "passed"
+      },
+      {
+        "name": "java-strict",
+        "status": "passed"
+      },
+      {
+        "name": "node-install",
+        "status": "passed"
+      },
+      {
+        "name": "node-generate",
+        "status": "passed"
+      },
+      {
+        "name": "node-generate-check",
+        "status": "passed"
+      },
+      {
+        "name": "node-typecheck",
+        "status": "passed"
+      },
+      {
+        "name": "node-tests",
+        "status": "passed"
+      },
+      {
+        "name": "web-install",
+        "status": "passed"
+      },
+      {
+        "name": "web-browser-install",
+        "status": "passed"
+      },
+      {
+        "name": "web-typecheck",
+        "status": "passed"
+      },
+      {
+        "name": "web-tests",
+        "status": "passed"
+      },
+      {
+        "name": "web-api-drift",
+        "status": "passed"
+      },
+      {
+        "name": "web-embedded-assets",
+        "status": "passed"
+      },
+      {
+        "name": "rust-cli-spring-journey",
+        "status": "passed"
+      },
+      {
+        "name": "rust-focused",
+        "status": "passed"
+      },
+      {
+        "name": "rust-workspace",
+        "status": "passed"
+      },
+      {
+        "name": "rust-build",
+        "status": "passed"
+      },
+      {
+        "name": "restricted-build",
+        "status": "passed"
+      },
+      {
+        "name": "working-diff-check",
+        "status": "passed"
+      },
+      {
+        "name": "staged-diff-check",
+        "status": "passed"
+      },
+      {
+        "name": "phase-diff-check",
+        "status": "passed"
+      }
+    ]
+  },
+  "floorPostMerge": {
+    "label": "PM1-a558f4d-1",
+    "receiptSha256": "88465fd3093fac9f3d0674435a611891a72a72d091a6e21a982faa8cacb5b7d2",
+    "decision": "checks_passed_for_review",
+    "phaseBase": "a181a0c9a50d79480f84824d40536060aba58adb",
+    "headBefore": "a558f4db2b07ffad2126927266a730695e1a513d",
+    "headAfter": "a558f4db2b07ffad2126927266a730695e1a513d",
+    "gates": [
+      {
+        "name": "rust-format",
+        "status": "passed"
+      },
+      {
+        "name": "rust-clippy",
+        "status": "passed"
+      },
+      {
+        "name": "rustdoc",
+        "status": "passed"
+      },
+      {
+        "name": "java-strict",
+        "status": "passed"
+      },
+      {
+        "name": "node-install",
+        "status": "passed"
+      },
+      {
+        "name": "node-generate",
+        "status": "passed"
+      },
+      {
+        "name": "node-generate-check",
+        "status": "passed"
+      },
+      {
+        "name": "node-typecheck",
+        "status": "passed"
+      },
+      {
+        "name": "node-tests",
+        "status": "passed"
+      },
+      {
+        "name": "web-install",
+        "status": "passed"
+      },
+      {
+        "name": "web-browser-install",
+        "status": "passed"
+      },
+      {
+        "name": "web-typecheck",
+        "status": "passed"
+      },
+      {
+        "name": "web-tests",
+        "status": "passed"
+      },
+      {
+        "name": "web-api-drift",
+        "status": "passed"
+      },
+      {
+        "name": "web-embedded-assets",
+        "status": "passed"
+      },
+      {
+        "name": "rust-cli-spring-journey",
+        "status": "passed"
+      },
+      {
+        "name": "rust-focused",
+        "status": "passed"
+      },
+      {
+        "name": "rust-workspace",
+        "status": "passed"
+      },
+      {
+        "name": "rust-build",
+        "status": "passed"
+      },
+      {
+        "name": "restricted-build",
+        "status": "passed"
+      },
+      {
+        "name": "working-diff-check",
+        "status": "passed"
+      },
+      {
+        "name": "staged-diff-check",
+        "status": "passed"
+      },
+      {
+        "name": "phase-diff-check",
+        "status": "passed"
+      }
+    ]
+  },
+  "leasedClippy": {
+    "label": "rc3h3-clippy",
+    "receiptSha256": "6706381bab8766c02668b09b68f1134bdf262fd8ebcf2efe8934e25abe84f616",
+    "decision": "passed"
+  },
+  "ciOnCandidate": [
+    {
+      "runId": 38007602839,
+      "workflow": "ci",
+      "headSha": "a6ecb76c3aff3482d6db85cd918d154bf4a8cf60",
+      "attempt": 1,
+      "conclusion": "success",
+      "jobs": [
+        {
+          "name": "node-client",
+          "conclusion": "success"
+        },
+        {
+          "name": "java-client (21)",
+          "conclusion": "success"
+        },
+        {
+          "name": "release-tool-tests",
+          "conclusion": "success"
+        },
+        {
+          "name": "java-client (17)",
+          "conclusion": "success"
+        },
+        {
+          "name": "gates",
+          "conclusion": "success"
+        },
+        {
+          "name": "release-floor-linux-x86_64 (jdk21-node24, 21, 24)",
+          "conclusion": "success"
+        },
+        {
+          "name": "macos-arm64 (jdk21-node24, 21, 24)",
+          "conclusion": "success"
+        },
+        {
+          "name": "release-floor-linux-x86_64 (jdk17-node22, 17, 22)",
+          "conclusion": "success"
+        },
+        {
+          "name": "macos-arm64 (jdk17-node22, 17, 22)",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "runId": 38007602811,
+      "workflow": "package",
+      "headSha": "a6ecb76c3aff3482d6db85cd918d154bf4a8cf60",
+      "attempt": 1,
+      "conclusion": "success",
+      "jobs": [
+        {
+          "name": "package (macos-arm64)",
+          "conclusion": "success"
+        },
+        {
+          "name": "package (linux-x86_64)",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "runId": 38007602873,
+      "workflow": "lane",
+      "headSha": "a6ecb76c3aff3482d6db85cd918d154bf4a8cf60",
+      "attempt": 1,
+      "conclusion": "success",
+      "jobs": [
+        {
+          "name": "plan",
+          "conclusion": "success"
+        },
+        {
+          "name": "node (22)",
+          "conclusion": "success"
+        },
+        {
+          "name": "meta",
+          "conclusion": "success"
+        },
+        {
+          "name": "node (24)",
+          "conclusion": "success"
+        },
+        {
+          "name": "java (17)",
+          "conclusion": "success"
+        },
+        {
+          "name": "java (21)",
+          "conclusion": "success"
+        },
+        {
+          "name": "web",
+          "conclusion": "success"
+        },
+        {
+          "name": "java (25)",
+          "conclusion": "success"
+        },
+        {
+          "name": "tui",
+          "conclusion": "success"
+        },
+        {
+          "name": "rust",
+          "conclusion": "success"
+        },
+        {
+          "name": "summary",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "runId": 38007604926,
+      "workflow": "campaigns",
+      "headSha": "a6ecb76c3aff3482d6db85cd918d154bf4a8cf60",
+      "attempt": 1,
+      "conclusion": "failure",
+      "jobs": [
+        {
+          "name": "select",
+          "conclusion": "success"
+        },
+        {
+          "name": "package",
+          "conclusion": "success"
+        },
+        {
+          "name": "package-verify",
+          "conclusion": "success"
+        },
+        {
+          "name": "campaign (fineract)",
+          "conclusion": "failure"
+        },
+        {
+          "name": "campaign (directus)",
+          "conclusion": "failure"
+        },
+        {
+          "name": "campaign (medusa)",
+          "conclusion": "failure"
+        },
+        {
+          "name": "campaign (jhipster)",
+          "conclusion": "failure"
+        },
+        {
+          "name": "campaign (vendure)",
+          "conclusion": "failure"
+        },
+        {
+          "name": "campaign (petclinic)",
+          "conclusion": "failure"
+        }
+      ]
+    }
+  ],
+  "campaignGating": {
+    "select": "success",
+    "package": "success",
+    "package-verify": "success",
+    "perProjectJobs": "failure (non-gating in wave A)"
+  },
+  "ciPostMerge": {
+    "runId": 38009203163,
+    "workflow": "ci",
+    "headSha": "a558f4db2b07ffad2126927266a730695e1a513d",
+    "attempt": 2,
+    "conclusion": "success",
+    "jobs": [
+      {
+        "name": "macos-arm64 (jdk17-node22, 17, 22)",
+        "conclusion": "success"
+      },
+      {
+        "name": "gates",
+        "conclusion": "success"
+      },
+      {
+        "name": "release-tool-tests",
+        "conclusion": "success"
+      },
+      {
+        "name": "macos-arm64 (jdk21-node24, 21, 24)",
+        "conclusion": "success"
+      },
+      {
+        "name": "release-floor-linux-x86_64 (jdk21-node24, 21, 24)",
+        "conclusion": "success"
+      },
+      {
+        "name": "release-floor-linux-x86_64 (jdk17-node22, 17, 22)",
+        "conclusion": "success"
+      },
+      {
+        "name": "node-client",
+        "conclusion": "success"
+      },
+      {
+        "name": "java-client (17)",
+        "conclusion": "success"
+      },
+      {
+        "name": "java-client (21)",
+        "conclusion": "success"
+      }
+    ]
+  },
+  "postMergeNote": "Attempt 1 of the post-merge ci run failed one job (macos-arm64 jdk17-node22, release-tool test test_completed_owned_descendant_is_drained_after_parent_exits, 0 != 125); attempt 2 (re-run of the failed job only) passed. Under the flake policy this is not a clean pass: the trigger (a slow hosted runner; ps deadline or host noise in a fail-closed path) is not proven and the test is unchanged since the phase base.",
+  "restoredDeadlineRuns": {
+    "labels": [
+      "a3b-pre-1",
+      "a3b-exp-1",
+      "a3b-scan-1",
+      "a3b-loop-1",
+      "a3b-pre-2",
+      "a3b-exp-2",
+      "a3b-scan-2",
+      "a3b-loop-2",
+      "a3b-pre-3",
+      "a3b-exp-3",
+      "a3b-scan-3",
+      "a3b-loop-3"
+    ],
+    "allPassed": true,
+    "ranOn": "046306d57cb37e7004704cc11dcbc9af24f6e126 (Rust identical to the candidate except crates/xtrace-runtime/src/java_attach.rs); each restored-deadline test also passed inside both leased floors"
+  },
+  "reviews": [
+    {
+      "report": "architecture.md",
+      "sha256": "138bde3ba36108534c6063f9aab328b2183bce2179cdddf809a849cfdd77183a",
+      "reviewedHead": "046306d57cb37e7004704cc11dcbc9af24f6e126",
+      "verdict": "approve"
+    },
+    {
+      "report": "security-privacy.md",
+      "sha256": "fcb0c0086207b609de7a1c3a2f19ce69f5503a56ab7c63abae07e4cac61221fc",
+      "reviewedHead": "046306d57cb37e7004704cc11dcbc9af24f6e126",
+      "verdict": "approve_with_fixes"
+    },
+    {
+      "report": "build-integration.md",
+      "sha256": "d6f0bfce7ed5162514513245c8fc5e3fdf4f33d6617e7744ed8284831f502bb0",
+      "reviewedHead": "046306d57cb37e7004704cc11dcbc9af24f6e126",
+      "verdict": "approve_with_fixes"
+    },
+    {
+      "report": "delta-H3-architecture.md",
+      "sha256": "e67fb087336d5860c40c004c78d934aa17b9c9a7a4e9baa003e15c639d62a61b",
+      "reviewedHead": "a6ecb76c3aff3482d6db85cd918d154bf4a8cf60",
+      "verdict": "approve_with_fixes"
+    },
+    {
+      "report": "delta-H3-security-privacy.md",
+      "sha256": "e5aa1426c60ebecfedbaf2ac230f52c5da2e87617ef7cbc06ba30bf2817f4f8b",
+      "reviewedHead": "a6ecb76c3aff3482d6db85cd918d154bf4a8cf60",
+      "verdict": "approve"
+    },
+    {
+      "report": "delta-H3-build-integration.md",
+      "sha256": "0c00d5292b378727dfa9f47d32b800d9c800890d8199b20a3c146d49969676b0",
+      "reviewedHead": "a6ecb76c3aff3482d6db85cd918d154bf4a8cf60",
+      "verdict": "approve"
+    }
+  ],
+  "rootReview": [
+    {
+      "artifact": "root-review-rc2-portion.md",
+      "sha256": "f6be60e14dcd540da69684701dc97d16aa7adcd4ba6c1737ca69b434a20b316a"
+    },
+    {
+      "artifact": "root-delta-review.md",
+      "sha256": "65c12ad95bd69f8fb745438486842999dd6c23845f5c661641f6f6c60a9d9e16"
+    }
+  ],
+  "rowsTouched": [
+    "INSTALL-PACK",
+    "JAVA-LAUNCH",
+    "JAVA-ATTACH",
+    "JAVA-MVC",
+    "NODE-HTTP",
+    "NODE-EXPRESS",
+    "CATALOG-LINKS",
+    "REPLAY-HONESTY",
+    "REPLAY-LINE",
+    "SECURITY-LOCAL",
+    "PERFORMANCE",
+    "MATRIX",
+    "RECOVERY-UPGRADE",
+    "CAMPAIGN-PETCLINIC",
+    "REVIEWS-EXACT"
+  ],
+  "rowsAccepted": [],
+  "decisionRecordsForRatification": [
+    "ADR 0008 Amendment 1",
+    "ADR 0006 addendum 2026-10-10",
+    "ADR 0009 addendum 2026-10-10",
+    "ADR 0011"
+  ],
+  "openDefects": [
+    "BI-F8 family: hosted macOS release-tool process-tree tests can fail on a slow runner (one failed post-merge; 8 more listed with the same exposure)",
+    "Petclinic campaign red (recordings-per-scenario, source-identity, TUI transcript; several steps not implemented)",
+    "Focused line events do not reach the read API for the fixture methods",
+    "Leased-floor-only XTR-STORE-OBJECT-IO (rc-2) cause not established; did not recur on rc-3",
+    "No deterministic test pins the Java pack-cache unlink wait"
+  ]
+}

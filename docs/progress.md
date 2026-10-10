@@ -574,3 +574,22 @@ The owner authorized a second unattended batch of at most ten hours (ADR 0009 ad
 The row notes in `evidence/v0.01/requirements.json` still describe rc-1 and rc-2 heads by SHA; they are updated with rc-3 evidence only after the gates have run on the exact candidate. No row is accepted.
 
 **Decision records for the owner to ratify:** ADR 0008 Amendment 1, the ADR 0006 addendum (other-UID negative before the broker exists), ADR 0011 (recording limitations), and the ADR 0009 addendum (this batch).
+
+### Wave A merged to `main` (2026-10-10 00:28 UTC)
+
+`ultra/rc-3` at `a6ecb76c3aff3482d6db85cd918d154bf4a8cf60` was merged into `main` as `a558f4db2b07ffad2126927266a730695e1a513d` (no-ff, tree identical to the candidate). No requirement row is accepted and no phase is marked accepted; the phases this wave touched stay `pending`.
+
+Two earlier pins were voided before the merge, both found by the gates: `046306d` added a blank line at the end of this file (gate 23 `phase-diff-check` failed on the Linux floors), and `95871cb` hit a pre-existing Linux race in the Java pack cache in the `gates` job. Both were fixed and the candidate was pinned again.
+
+**Evidence on the candidate `a6ecb76`:**
+- CI: ci `38007602839` green on all nine jobs, including both Linux x86_64 23-gate floors and both hosted macOS arm64 tuples (Rust 1075 tests on Linux, 1076 on macOS). package `38007602811` and lane `38007602873` green. Campaigns `38007604926`: `select`, `package` and `package-verify` green; the per-project jobs are red and do not gate this wave.
+- Leased macOS arm64 23-gate floor `R3J-a6ecb76-1`: 23 of 23 passed with base `a181a0c`, plus a separate leased clippy.
+- The restored test deadlines (premain 10 s, Express 20 s, scan 1 s, finish acknowledgement 5 s) passed three dedicated leased runs each, besides passing inside both floors.
+- Reviews: architecture, security/privacy and build/integration reviews of the full delta, then delta reviews of the last re-pin, each blocker or major sent to adversarial refuters. The only majors that survived were the blank line at the end of this file, fixed before the final pin. The root reviewed every changed line.
+- Phase receipt: `evidence/v0.01/phases/wave-a/rc3-a6ecb76/phase-receipt.json` (sha256 `9c1e494bb92cb14060bf8ec5181a962d0db7b9f84d4fb46c47489a09ac0b76a3`).
+
+**After the merge:**
+- Leased macOS floor `PM1-a558f4d-1` on the merge commit with the pre-merge base: 23 of 23 passed.
+- `main` ci `38009203163`: attempt 1 failed one job. On the hosted macOS jdk17 tuple, the release-tool test `test_completed_owned_descendant_is_drained_after_parent_exits` saw exit 0 where it expects 125. Attempt 2, a re-run of that job only, passed, and every other job passed on attempt 1. Under the flake policy this is **not a clean pass**. The tool fails closed (the run reports failure), but on a slow hosted runner its process scan can end in the "uncertain" path; the exact trigger is not proven. The test and the tool are unchanged since `a181a0c`, so the merge did not introduce this, and the identical tree passed the test on both macOS tuples before the merge. A proposed fix (branch `ultra/r2w3-r4`) was not merged: it raised a test deadline and added a retry, and eight more release-tool tests have the same exposure. The next run should fix this family deterministically. The merge was not reverted; if the owner wants it reverted, the command is `git revert -m 1 a558f4db2b07ffad2126927266a730695e1a513d`.
+
+**Not reached in this batch:** issue #3 (wave B) and #4 (wave C). Wave B started after the merge and was paused when the post-merge check went red, as the batch rules require; its branches (`ultra/r2w2-qb`, `ultra/r2w2-xb`, `ultra/r2w2-jb`) are pushed and unmerged, with no review or campaign evidence yet. The Petclinic campaign is still red.
