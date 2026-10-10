@@ -43,7 +43,38 @@ public final class SpringMvcBridge {
         }
       };
 
+  /**
+   * Set once {@code DispatcherServlet#doDispatch} has been observed running. From then on the
+   * response status is read when the dispatch ends, not when the handler returns: a redirect,
+   * an error view or a mapped exception only sets its real status while the view is rendered,
+   * after the handler adapter has returned.
+   */
+  private static volatile boolean dispatchObserved;
+
   private SpringMvcBridge() {}
+
+  /** Called as {@code DispatcherServlet#doDispatch} begins; marks the dispatch hook as live. */
+  public static void dispatchEnter() {
+    dispatchObserved = true;
+  }
+
+  /**
+   * Closes a request root that was kept open past the handler adapter. A dispatch that threw
+   * propagates the exception (the container decides the status later, so none is claimed);
+   * otherwise the response status after view rendering is the observed outcome.
+   */
+  public static void dispatchEnd(Object response, Throwable thrown) {
+    if (!BootstrapBridge.awaitingResolution()) return;
+    if (thrown != null) {
+      BootstrapBridge.requestEnd(0, thrown);
+    } else {
+      BootstrapBridge.requestEnd(status(response), (Throwable) null);
+    }
+  }
+
+  static void resetForTest() {
+    dispatchObserved = false;
+  }
 
   /**
    * Opens the request root for a handler dispatch. Returns false (no recording) when the handler is
@@ -92,6 +123,9 @@ public final class SpringMvcBridge {
       if (!BootstrapBridge.deferRequestEnd(thrown)) BootstrapBridge.requestEnd(0, thrown);
       return;
     }
+    // The handler returned. The status may still change while the view renders (redirects), so
+    // once the dispatch hook is live the root stays open until the dispatch ends.
+    if (dispatchObserved && BootstrapBridge.deferRequestEnd(null)) return;
     BootstrapBridge.requestEnd(status(response), (Throwable) null);
   }
 
@@ -105,6 +139,8 @@ public final class SpringMvcBridge {
     if (thrown != null) {
       BootstrapBridge.requestEnd(0, thrown);
     } else if (resolved != null) {
+      // A resolver produced a view or a status; a view renders after this call returns.
+      if (dispatchObserved) return;
       BootstrapBridge.requestEnd(status(response), (Throwable) null);
     } else {
       BootstrapBridge.requestEnd(0, (Throwable) null);

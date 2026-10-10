@@ -195,6 +195,11 @@ async fn run_unix(
         binding_key,
         ..xtrace_application::recording::EndpointObservationInput::default()
     };
+    // The JVM may be started from any directory, so the repository the operator named is passed
+    // to the agent in the private capture file; source roots resolve against it.
+    let source_base = std::fs::canonicalize(&project_dir)
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_owned));
     let prepared = crate::daemon::prepare_with_observation(
         project_dir,
         &crate::paths::read_env_path,
@@ -206,11 +211,14 @@ async fn run_unix(
     // CONTRACTS 10.3: scope and capture options reach the agent and the daemon through the
     // private capture.json beside the bootstrap. Scope is resolved from the explicit prefixes,
     // else from a Spring Boot fat jar's BOOT-INF/classes, else it is honestly empty.
-    let capture_document = crate::capture_args::document(
+    let mut capture_document = crate::capture_args::document(
         capture.depth,
         &scope.application_packages,
         &capture.source_roots,
     );
+    if let (Some(base), Some(object)) = (source_base, capture_document.as_object_mut()) {
+        object.insert("project_dir".to_owned(), serde_json::Value::String(base));
+    }
     if let Err(error) = crate::capture_args::write_beside(&bootstrap_path, &capture_document) {
         let _ = runtime_dir.cleanup();
         drop(runtime_dir);

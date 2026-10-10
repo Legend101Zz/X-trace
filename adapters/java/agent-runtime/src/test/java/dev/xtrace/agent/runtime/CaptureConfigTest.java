@@ -107,4 +107,24 @@ class CaptureConfigTest {
     Files.createSymbolicLink(directory.resolve("capture.json"), real);
     assertFalse(CaptureConfig.readBeside(directory.resolve("bootstrap.json")).scope().configured());
   }
+
+  @Test
+  void projectDirectoryIsTheSourceBaseWhenItNamesAnExistingAbsoluteDirectory(@TempDir Path directory) {
+    String scope = "\"application_scope\":{\"application_packages\":[\"com.acme\"]}";
+    String escaped = directory.toString().replace("\\", "\\\\");
+    CaptureConfig config =
+        CaptureConfig.parse(
+            json("{\"capture_schema_version\":1,\"project_dir\":\"" + escaped + "\"," + scope + "}"));
+    assertEquals(directory.normalize(), config.scope().sourceBase());
+    for (String bad : new String[] {"relative/dir", "", "/does/not/exist/anywhere", "/tmp\\u0000x"}) {
+      CaptureConfig ignored =
+          CaptureConfig.parse(
+              json("{\"capture_schema_version\":1,\"project_dir\":\"" + bad + "\"," + scope + "}"));
+      assertEquals(
+          Path.of(System.getProperty("user.dir", ".")), ignored.scope().sourceBase(), bad);
+    }
+    assertEquals(
+        Path.of(System.getProperty("user.dir", ".")),
+        CaptureConfig.parse(json("{\"capture_schema_version\":1," + scope + "}")).scope().sourceBase());
+  }
 }
