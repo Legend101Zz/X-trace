@@ -51,6 +51,7 @@ mod doctor;
 mod error;
 mod exercise;
 mod export;
+mod export_cmd;
 mod lifecycle;
 mod output;
 mod paths;

@@ -1,4 +1,4 @@
-//! `xtrace export` (lane W). C0 stub: returns a typed not-implemented error.
+//! `xtrace export` argument surface; the implementation lives in `export_cmd`.
 
 use std::path::PathBuf;
 
@@ -16,8 +16,8 @@ pub struct ExportArgs {
     /// Export format: openapi, postman, curl or bundle.
     #[arg(long, value_name = "FORMAT")]
     pub format: Option<String>,
-    /// Output path.
-    #[arg(long, value_name = "PATH")]
+    /// Output directory (created private, mode 0700, if absent).
+    #[arg(long, value_name = "DIR")]
     pub output: Option<PathBuf>,
     /// Operations to include (repeatable).
     #[arg(long, value_name = "OPERATION")]
@@ -28,9 +28,12 @@ pub struct ExportArgs {
     /// Preview without writing.
     #[arg(long)]
     pub preview: bool,
+    /// Emit OpenAPI as YAML instead of JSON.
+    #[arg(long)]
+    pub yaml: bool,
 }
 
 /// Runs `xtrace export`.
-pub async fn run(_args: ExportArgs) -> Result<i32, CliError> {
-    Err(CliError::NotImplemented { command: "export" })
+pub async fn run(args: ExportArgs) -> Result<i32, CliError> {
+    crate::export_cmd::run(args).await
 }
