@@ -377,12 +377,12 @@
     },
     {
       "id": "PLATFORM-MAC",
-      "requirement": "Exact signed/notarized macOS arm64 artifact fresh-profile acceptance",
+      "requirement": "Exact unsigned macOS arm64 artifact fresh-profile acceptance",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "blocked",
+      "state": "in_progress",
       "receipts": [],
-      "stateNote": "Needs the Apple Developer ID and notarytool profile; none exists. Prepared: unsigned macOS arm64 package builds in CI (package run 37942590293 on the candidate), sign-macos.sh. Leased macOS floor also blocked by the dead lease C2-004. Remaining: sign, notarize, fresh-profile acceptance. Size M."
+      "stateNote": "Owner decision 2026-10-10: macOS arm64 ships unsigned and un-notarized, so no Apple Developer ID or notarytool profile is needed, and the hosted macOS CI jobs were removed (ADR 0006, second 2026-10-10 addendum). Prepared: packaging/build.py builds the unsigned macOS arm64 package (built locally now, not in CI); the leased macOS 23-gate floor passed on the wave A merge (PM1-a558f4d-1). Remaining: build the exact candidate package locally and pass a fresh-profile install and acceptance on macOS arm64. Users may need to clear the quarantine flag of a downloaded unsigned binary."
     },
     {
       "id": "PLATFORM-LINUX",
