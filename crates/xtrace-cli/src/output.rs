@@ -100,6 +100,36 @@ impl ErrorDocument {
                 details: BTreeMapString(std::collections::BTreeMap::new()),
                 exit_code: error.exit_code(),
             },
+            CliError::NotImplemented { command } => Self {
+                kind: "error",
+                code: "XTR-CLI-NOT-IMPLEMENTED".to_string(),
+                category: "internal".to_string(),
+                message: error.to_string(),
+                remediation: Vec::new(),
+                details: BTreeMapString(
+                    std::iter::once((
+                        "command".to_string(),
+                        serde_json::Value::String((*command).to_string()),
+                    ))
+                    .collect(),
+                ),
+                exit_code: error.exit_code(),
+            },
+            CliError::Partial(message) => Self {
+                kind: "error",
+                code: "XTR-CLI-PARTIAL".to_string(),
+                category: "internal".to_string(),
+                message: error.to_string(),
+                remediation: Vec::new(),
+                details: BTreeMapString(
+                    std::iter::once((
+                        "detail".to_string(),
+                        serde_json::Value::String(message.clone()),
+                    ))
+                    .collect(),
+                ),
+                exit_code: error.exit_code(),
+            },
             CliError::ProjectDirectoryMissing(path) => Self {
                 kind: "error",
                 code: "XTR-CLI-DIRECTORY".to_string(),

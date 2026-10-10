@@ -1,12 +1,13 @@
 {
   "name": "@xtrace/local-viewer",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.0.1",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "node scripts/copy-fonts.mjs && vite build",
     "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
     "test": "vitest run && node scripts/check-contrast.mjs",
     "generate:api": "openapi-typescript ../../schema/xtp-client/openapi.yaml -o src/api.generated.ts",
     "check:api": "npm run generate:api && git diff --exit-code -- src/api.generated.ts",

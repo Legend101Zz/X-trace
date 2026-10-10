@@ -196,6 +196,184 @@ pub enum IngestError {
         /// Configured maximum number of events retained.
         limit: NonZeroUsize,
     },
+
+    /// Event {recording_seq} rejected: event carries more bindings than the capture mode allows.
+    #[error("event seq {recording_seq}: event carries more bindings than the capture mode allows")]
+    BindingsOverBudget {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: binding name is longer than 128 bytes.
+    #[error("event seq {recording_seq}: binding name is longer than 128 bytes")]
+    BindingNameTooLong {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: binding name is empty or contains a control character.
+    #[error("event seq {recording_seq}: binding name is empty or contains a control character")]
+    BindingNameInvalid {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: value preview is longer than the capture mode allows.
+    #[error("event seq {recording_seq}: value preview is longer than the capture mode allows")]
+    BindingPreviewTooLong {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: preview and name bytes on one event exceed the capture mode budget.
+    #[error(
+        "event seq {recording_seq}: preview and name bytes on one event exceed the capture mode budget"
+    )]
+    EventValueBytesOverBudget {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: value binding or captured value carries no value.
+    #[error("event seq {recording_seq}: value binding or captured value carries no value")]
+    ValueMissing {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: line cursor needs a source range on a single line greater than zero with a source-claiming binding.
+    #[error(
+        "event seq {recording_seq}: line cursor needs a source range on a single line greater than zero with a source-claiming binding"
+    )]
+    LineCursorInvalid {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: line cursor in a standard-mode recording.
+    #[error("event seq {recording_seq}: line cursor in a standard-mode recording")]
+    LineEventNotAllowedInStandardMode {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: local variable binding in a standard-mode recording.
+    #[error("event seq {recording_seq}: local variable binding in a standard-mode recording")]
+    LocalsNotAllowedInStandardMode {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: gap event payload is missing, misplaced or inconsistent.
+    #[error("event seq {recording_seq}: gap event payload is missing, misplaced or inconsistent")]
+    GapPayloadInvalid {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: redacted value carries a content hash.
+    #[error("event seq {recording_seq}: redacted value carries a content hash")]
+    HashOnRedacted {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: source range and source binding disagree.
+    #[error("event seq {recording_seq}: source range and source binding disagree")]
+    SourceBindingMismatch {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: source path, lines or content hash are invalid.
+    #[error("event seq {recording_seq}: source path, lines or content hash are invalid")]
+    SourcePathInvalid {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: binding role is not legal on this event kind.
+    #[error("event seq {recording_seq}: binding role is not legal on this event kind")]
+    BindingRoleKindMismatch {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: value bindings are not accepted until the daemon audit redactor is active.
+    #[error(
+        "event seq {recording_seq}: value bindings are not accepted until the daemon audit redactor is active"
+    )]
+    BindingsNotAcceptedYet {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: redaction rule id does not match the allowed pattern.
+    #[error("event seq {recording_seq}: redaction rule id does not match the allowed pattern")]
+    RedactionRuleIdInvalid {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: interaction field is outside its allowed vocabulary or bounds.
+    #[error(
+        "event seq {recording_seq}: interaction field is outside its allowed vocabulary or bounds"
+    )]
+    InteractionFieldInvalid {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: captured value content hash is missing or does not match the emitted preview.
+    #[error(
+        "event seq {recording_seq}: captured value content hash is missing or does not match the emitted preview"
+    )]
+    ContentHashInvalid {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: frame event carries no symbol, or any event carries a
+    /// symbol over its byte bound.
+    #[error("event seq {recording_seq}: event symbol is missing or over its bound")]
+    SymbolRequired {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: exception payload field exceeds its bound.
+    #[error("event seq {recording_seq}: exception payload field exceeds its bound")]
+    ExceptionFieldInvalid {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// Event {recording_seq} rejected: runtime facts field exceeds its bound.
+    #[error("event seq {recording_seq}: runtime facts field exceeds its bound")]
+    RuntimeFactsInvalid {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+    },
+
+    /// A wire enum carried an unknown or unspecified number where a specified value is required.
+    ///
+    /// Unknown values are rejected, never coerced.
+    #[error("event seq {recording_seq}: unknown or unspecified enum value in {field}")]
+    UnknownEnumValue {
+        /// Sequence of the offending event.
+        recording_seq: u64,
+        /// Wire field that carried the bad value.
+        field: &'static str,
+    },
+
+    /// `RecordingFinished.outcome` violates the outcome rules.
+    #[error("recording {recording_id}: finished outcome invalid ({reason})")]
+    OutcomeInvalid {
+        /// Recording whose finish marker was rejected.
+        recording_id: RecordingId,
+        /// Stable reason string from the first violated rule.
+        reason: &'static str,
+    },
 }
 
 impl IngestError {

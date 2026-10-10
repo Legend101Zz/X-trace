@@ -35,4 +35,5 @@ prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+blake3 = { workspace = true }
 serde_json = { workspace = true }

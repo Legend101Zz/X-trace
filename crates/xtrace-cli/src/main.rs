@@ -41,11 +41,17 @@
 
 #[cfg(unix)]
 mod attach;
+mod capture_args;
+mod catalog_cmd;
 mod commands;
 mod daemon;
 #[cfg(unix)]
 mod daemon_lock;
+mod doctor;
 mod error;
+mod exercise;
+mod export;
+mod lifecycle;
 mod output;
 mod paths;
 #[cfg(unix)]
@@ -97,7 +103,11 @@ mod pointer_io {
         ))
     }
 }
+mod retention;
 mod run;
+mod scan;
+mod store_cmd;
+mod tui;
 mod viewer;
 
 use clap::{Parser, error::ErrorKind};
@@ -106,11 +116,27 @@ use xtrace_domain::{AppError, CorrelationId, ErrorCategory, ErrorCode, RetryAdvi
 
 pub use error::CliError;
 
+/// `--version` text after the program name (CONTRACTS 11.1): the package version, the
+/// store schema version and the XTP protocol version, one per line.
+fn long_version() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        format!(
+            "{}\nschema-version: {}\nxtp-protocol: {}.{}",
+            env!("CARGO_PKG_VERSION"),
+            xtrace_store::CURRENT_SCHEMA_VERSION,
+            xtrace_protocol::envelope::PROTOCOL_MAJOR,
+            xtrace_protocol::envelope::PROTOCOL_MINOR,
+        )
+    })
+}
+
 /// Top-level CLI surface parsed by [`clap`].
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "xtrace",
     version,
+    long_version = long_version(),
     about = "X-trace: capture, replay, and review for HTTP services.",
     long_about = None,
 )]
@@ -236,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn run_command_requires_explicit_node_mode_and_preserves_node_arguments() {
+    fn run_command_defaults_node_mode_to_auto_and_preserves_node_arguments() {
         let cli = Cli::try_parse_from([
             "xtrace",
             "run",
@@ -258,20 +284,27 @@ mod tests {
             node_adapter: Some(adapter), node_mode: Some(mode), command, java_agent: None, ..
         } if adapter.as_path() == std::path::Path::new("/tmp/adapter dist") && mode == "esm"
             && command == ["node", "--no-warnings", "app with spaces.mjs", "--flag", "value with spaces"]));
-        assert!(
-            Cli::try_parse_from([
-                "xtrace",
-                "run",
-                "--project-dir",
-                "/tmp/project",
-                "--node-adapter",
-                "/tmp/dist",
-                "--",
-                "node",
-                "app.cjs"
-            ])
-            .is_err()
-        );
+        let defaulted = Cli::try_parse_from([
+            "xtrace",
+            "run",
+            "--project-dir",
+            "/tmp/project",
+            "--node-adapter",
+            "/tmp/dist",
+            "--",
+            "node",
+            "app.cjs",
+        ])
+        .expect("Node run without --node-mode parses");
+        assert!(matches!(
+            defaulted.command,
+            commands::XtraceCommand::Run {
+                node_adapter: Some(_),
+                node_mode: None,
+                java_agent: None,
+                ..
+            }
+        ));
         assert!(
             Cli::try_parse_from([
                 "xtrace",

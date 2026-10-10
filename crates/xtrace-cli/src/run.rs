@@ -15,6 +15,7 @@ pub(crate) async fn run(
     observed_endpoint_policy: Option<String>,
     application_component: Option<String>,
     binding_key: Option<String>,
+    capture: crate::capture_args::CaptureOptions,
     command: Vec<OsString>,
 ) -> Result<i32, CliError> {
     #[cfg(not(unix))]
@@ -25,6 +26,7 @@ pub(crate) async fn run(
             observed_endpoint_policy,
             application_component,
             binding_key,
+            capture,
             command,
         );
         Err(CliError::DaemonUnsupportedPlatform)
@@ -37,6 +39,7 @@ pub(crate) async fn run(
             observed_endpoint_policy,
             application_component,
             binding_key,
+            capture,
             command,
         )
         .await
@@ -162,6 +165,7 @@ async fn run_unix(
     observed_endpoint_policy: Option<String>,
     application_component: Option<String>,
     binding_key: Option<String>,
+    capture: crate::capture_args::CaptureOptions,
     command: Vec<OsString>,
 ) -> Result<i32, CliError> {
     use tokio::sync::oneshot;
@@ -171,6 +175,20 @@ async fn run_unix(
     // direct JDK and private agent distribution have passed runtime preflight.
     let launch = JavaLaunch::validate(&java_agent, &command).map_err(CliError::Run)?;
     let mut signals = JavaSignals::install().map_err(CliError::Run)?;
+
+    // Scope is resolved before any side effect so the observation policy can be derived from it.
+    let jar = xtrace_runtime::java_scope::jar_from_java_args(&command);
+    let scope = xtrace_runtime::java_scope::resolve_scope(&capture.app_packages, jar.as_deref());
+    // An operator-selected endpoint observation policy attributes routes to application-owned
+    // handlers, so it is only meaningful when application scope is known. `spring-orders-v1` is
+    // itself a fixture literal: the store confines it to the fixture component/binding tuple.
+    if observed_endpoint_policy.is_some() && scope.application_packages.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "--observed-endpoint-policy needs a resolved application scope: pass --app-package \
+             or launch a Spring Boot fat jar whose BOOT-INF/classes names the application packages"
+                .to_string(),
+        ));
+    }
     let run_observation = xtrace_application::recording::EndpointObservationInput {
         policy_id: observed_endpoint_policy,
         application_component,
@@ -184,6 +202,22 @@ async fn run_unix(
     )
     .await?;
     let crate::daemon::PreparedDaemon { bound, bootstrap_path, mut runtime_dir, lock } = prepared;
+
+    // CONTRACTS 10.3: scope and capture options reach the agent and the daemon through the
+    // private capture.json beside the bootstrap. Scope is resolved from the explicit prefixes,
+    // else from a Spring Boot fat jar's BOOT-INF/classes, else it is honestly empty.
+    let capture_document = crate::capture_args::document(
+        capture.depth,
+        &scope.application_packages,
+        &capture.source_roots,
+    );
+    if let Err(error) = crate::capture_args::write_beside(&bootstrap_path, &capture_document) {
+        let _ = runtime_dir.cleanup();
+        drop(runtime_dir);
+        drop(lock);
+        return Err(error);
+    }
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let mut daemon_task = tokio::spawn(async move {
         bound

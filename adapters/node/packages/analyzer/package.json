@@ -1,0 +1,16 @@
+{
+  "name": "@xtrace/static-analyzer-node",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "bin": { "xtrace-node-static": "./dist/main.js" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/*.test.js"
+  },
+  "dependencies": {
+    "typescript-parser": "npm:typescript@6.0.3"
+  }
+}

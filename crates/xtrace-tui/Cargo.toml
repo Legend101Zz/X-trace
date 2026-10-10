@@ -1,0 +1,15 @@
+[package]
+name = "xtrace-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Terminal viewer library: pure Model/Message/Effect update and a text-grid renderer."
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

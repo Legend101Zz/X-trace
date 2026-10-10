@@ -162,26 +162,29 @@ fn combine_serve_cleanup(
 }
 
 #[cfg(any(unix, test))]
-struct ValidatedProject {
-    store: SqliteStore,
-    project_id: ProjectId,
+pub(crate) struct ValidatedProject {
+    pub(crate) store: SqliteStore,
+    pub(crate) project_id: ProjectId,
     repository_fingerprint: xtrace_domain::RepositoryFingerprint,
-    project_data_root: PathBuf,
-    private_root: AdmittedPrivateRoot,
+    pub(crate) project_data_root: PathBuf,
+    pub(crate) private_root: AdmittedPrivateRoot,
 }
 
 #[cfg(any(unix, test))]
-struct ProjectPreflight {
+pub(crate) struct ProjectPreflight {
     canonical_repo_path: String,
     expected_repository_fingerprint: xtrace_domain::RepositoryFingerprint,
-    project_id: ProjectId,
+    pub(crate) project_id: ProjectId,
     project_data_root: PathBuf,
     database_path: PathBuf,
-    private_root: AdmittedPrivateRoot,
+    pub(crate) private_root: AdmittedPrivateRoot,
 }
 
 #[cfg(any(unix, test))]
-fn preflight_project<F>(project_dir: &Path, env_reader: &F) -> Result<ProjectPreflight, CliError>
+pub(crate) fn preflight_project<F>(
+    project_dir: &Path,
+    env_reader: &F,
+) -> Result<ProjectPreflight, CliError>
 where
     F: Fn(&str) -> Option<PathBuf>,
 {
@@ -214,7 +217,9 @@ where
 }
 
 #[cfg(any(unix, test))]
-fn open_validated_project(preflight: ProjectPreflight) -> Result<ValidatedProject, CliError> {
+pub(crate) fn open_validated_project(
+    preflight: ProjectPreflight,
+) -> Result<ValidatedProject, CliError> {
     let ProjectPreflight {
         canonical_repo_path,
         expected_repository_fingerprint,
@@ -639,6 +644,7 @@ mod tests {
                 opened_at,
                 endpoint_observation:
                     xtrace_application::recording::EndpointObservationInput::default(),
+                limitations: Vec::new(),
             })
             .expect("begin anchor");
 

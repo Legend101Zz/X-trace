@@ -16,6 +16,31 @@ pub enum PrivateStorageError {
     Operation,
 }
 
+/// No-op admission scope: this platform admits nothing, so there is nothing to share.
+///
+/// Guards are pinned to their thread:
+///
+/// ```compile_fail
+/// fn needs_send<T: Send>(_: T) {}
+/// needs_send(xtrace_private_storage::AdmissionScope::enter());
+/// ```
+///
+/// ```compile_fail
+/// fn needs_sync<T: Sync>(_: &T) {}
+/// needs_sync(&xtrace_private_storage::AdmissionScope::enter());
+/// ```
+#[must_use = "an admission scope ends as soon as its guard is dropped"]
+pub struct AdmissionScope {
+    _single_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl AdmissionScope {
+    /// Opens a scope (a no-op on this platform).
+    pub fn enter() -> Self {
+        Self { _single_thread: std::marker::PhantomData }
+    }
+}
+
 /// Platform placeholder that deliberately cannot admit a private root.
 pub struct AdmittedPrivateRoot;
 

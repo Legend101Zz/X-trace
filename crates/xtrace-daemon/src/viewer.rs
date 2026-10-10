@@ -349,6 +349,13 @@ fn router<P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static>(
         .route("/api/v1/auth/exchange", post(exchange))
         .route("/api/v1/recordings", get(list_recordings))
         .route("/api/v1/recordings/:recording_id", get(show_recording))
+        .route(
+            "/api/v1/recordings/:recording_id/frames/:frame_id/navigation",
+            get(frame_navigation_route),
+        )
+        .route("/api/v1/recordings/:recording_id/navigate", get(navigate_route))
+        .route("/api/v1/recordings/:recording_id/frames", get(replay_not_implemented_frames))
+        .route("/api/v1/recordings/:recording_id/graph", get(replay_not_implemented_graph))
         .route("/api/v1/endpoints", get(list_observed_endpoints))
         .route("/api/v1/endpoints/:operation_id/recordings", get(list_operation_recordings))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES))
@@ -890,6 +897,253 @@ where
 struct ShowParams {
     limit: Option<u32>,
     cursor: Option<String>,
+    around_frame: Option<String>,
+    projection: Option<String>,
+}
+
+/// Stable code for replay routes whose behaviour is registered but not yet served.
+const REPLAY_NOT_IMPLEMENTED_CODE: &str = "XTR-REPLAY-NOT-IMPLEMENTED";
+const REPLAY_NOT_IMPLEMENTED_DETAIL: &str = "Replay route is registered but not implemented yet";
+
+fn replay_not_implemented_response(request_id: CorrelationId) -> Response {
+    problem_with_id(
+        StatusCode::NOT_IMPLEMENTED,
+        REPLAY_NOT_IMPLEMENTED_CODE,
+        REPLAY_NOT_IMPLEMENTED_DETAIL,
+        request_id,
+    )
+}
+
+/// Applies the same origin, client and session guards as every other viewer
+/// route; `Some` is the rejection to return.
+async fn viewer_guard_rejection<P>(
+    headers: &HeaderMap,
+    state: &ViewerState<P>,
+    request_id: CorrelationId,
+) -> Option<Response> {
+    if !valid_request_origin(headers, &state.host, &state.origin, true) {
+        return Some(problem_with_id(
+            StatusCode::FORBIDDEN,
+            "XTR-VIEWER-ORIGIN",
+            "Request origin is not accepted",
+            request_id,
+        ));
+    }
+    if !one_header_equals(headers, HeaderName::from_static("x-xtrace-client"), "viewer-v1") {
+        return Some(problem_with_id(
+            StatusCode::FORBIDDEN,
+            "XTR-VIEWER-CLIENT",
+            "Viewer request is not accepted",
+            request_id,
+        ));
+    }
+    if !authorized(headers, state).await {
+        return Some(problem_with_id(
+            StatusCode::UNAUTHORIZED,
+            "XTR-VIEWER-SESSION",
+            "Viewer session is missing or expired",
+            request_id,
+        ));
+    }
+    None
+}
+
+async fn replay_not_implemented_guarded<P>(
+    state: &ViewerState<P>,
+    headers: &HeaderMap,
+    recording_id: &str,
+) -> Response {
+    let request_id = CorrelationId::new();
+    if let Some(rejection) = viewer_guard_rejection(headers, state, request_id).await {
+        return rejection;
+    }
+    if recording_id.parse::<RecordingId>().is_err() {
+        return problem_with_id(
+            StatusCode::NOT_FOUND,
+            "XTR-NOT-FOUND-RECORDING",
+            "Recording was not found",
+            request_id,
+        );
+    }
+    replay_not_implemented_response(request_id)
+}
+
+/// Resolves the viewer guards and the path ids shared by the per-frame routes.
+async fn frame_route_preamble<P>(
+    state: &ViewerState<P>,
+    headers: &HeaderMap,
+    recording_id: &str,
+    request_id: CorrelationId,
+) -> Result<RecordingId, Response> {
+    if let Some(rejection) = viewer_guard_rejection(headers, state, request_id).await {
+        return Err(rejection);
+    }
+    recording_id.parse::<RecordingId>().map_err(|_| {
+        problem_with_id(
+            StatusCode::NOT_FOUND,
+            "XTR-NOT-FOUND-RECORDING",
+            "Recording was not found",
+            request_id,
+        )
+    })
+}
+
+fn frame_not_found(request_id: CorrelationId) -> Response {
+    problem_with_id(
+        StatusCode::NOT_FOUND,
+        "XTR-NOT-FOUND-RECORDING",
+        "Recording frame was not found",
+        request_id,
+    )
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransportFrameNavigation {
+    #[serde(flatten)]
+    view: xtrace_application::FrameNavigationView,
+    request_id: CorrelationId,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransportNavigateResult {
+    frame_id: xtrace_domain::FrameId,
+    action: &'static str,
+    result: xtrace_application::NavigationResult,
+    request_id: CorrelationId,
+}
+
+#[derive(Deserialize)]
+struct NavigateParams {
+    frame: Option<String>,
+    action: Option<String>,
+    kinds: Option<String>,
+    kind: Option<String>,
+    dir: Option<String>,
+}
+
+async fn frame_navigation_route<P>(
+    State(state): State<Arc<ViewerState<P>>>,
+    headers: HeaderMap,
+    Path((recording_id, frame_id)): Path<(String, String)>,
+) -> Response
+where
+    P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static,
+{
+    let request_id = CorrelationId::new();
+    let recording_id = match frame_route_preamble(&state, &headers, &recording_id, request_id).await
+    {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let Ok(frame_id) = frame_id.parse::<xtrace_domain::FrameId>() else {
+        return frame_not_found(request_id);
+    };
+    let service = state.recording_service.clone();
+    let project_id = state.project_id;
+    let view = match run_recording_query(&state, request_id, move || {
+        service.frame_navigation(project_id, recording_id, frame_id, request_id)
+    })
+    .await
+    {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    success_json(TransportFrameNavigation { view, request_id }, request_id)
+}
+
+async fn navigate_route<P>(
+    State(state): State<Arc<ViewerState<P>>>,
+    headers: HeaderMap,
+    Path(recording_id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response
+where
+    P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static,
+{
+    let request_id = CorrelationId::new();
+    let recording_id = match frame_route_preamble(&state, &headers, &recording_id, request_id).await
+    {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let invalid = || {
+        problem_with_id(
+            StatusCode::BAD_REQUEST,
+            "XTR-VALIDATION-RECORDING-QUERY",
+            "Recording query is invalid",
+            request_id,
+        )
+    };
+    let Ok(params) = parse_query::<NavigateParams>(
+        query.as_deref(),
+        &["frame", "action", "kinds", "kind", "dir"],
+    ) else {
+        return problem_with_id(
+            StatusCode::BAD_REQUEST,
+            "XTR-VIEWER-QUERY",
+            "Recording query is invalid",
+            request_id,
+        );
+    };
+    // The kind-filtered step and the gap/error/interaction jump are registered but
+    // not served yet; they are never answered with an unfiltered result.
+    if params.kinds.is_some() || params.kind.is_some() || params.dir.is_some() {
+        return replay_not_implemented_response(request_id);
+    }
+    let Some(action) =
+        params.action.as_deref().and_then(xtrace_application::NavigationAction::parse)
+    else {
+        return invalid();
+    };
+    let Some(frame) = params.frame.as_deref() else {
+        return invalid();
+    };
+    let Ok(frame_id) = frame.parse::<xtrace_domain::FrameId>() else {
+        return frame_not_found(request_id);
+    };
+    let service = state.recording_service.clone();
+    let project_id = state.project_id;
+    let view = match run_recording_query(&state, request_id, move || {
+        service.frame_navigation(project_id, recording_id, frame_id, request_id)
+    })
+    .await
+    {
+        Ok(view) => view,
+        Err(response) => return response,
+    };
+    success_json(
+        TransportNavigateResult {
+            frame_id: view.frame_id,
+            action: action.as_str(),
+            result: action.select(&view.navigation),
+            request_id,
+        },
+        request_id,
+    )
+}
+
+async fn replay_not_implemented_frames<P>(
+    State(state): State<Arc<ViewerState<P>>>,
+    headers: HeaderMap,
+    Path(recording_id): Path<String>,
+) -> Response
+where
+    P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static,
+{
+    replay_not_implemented_guarded(&state, &headers, &recording_id).await
+}
+
+async fn replay_not_implemented_graph<P>(
+    State(state): State<Arc<ViewerState<P>>>,
+    headers: HeaderMap,
+    Path(recording_id): Path<String>,
+) -> Response
+where
+    P: RecordingReadPort + ObservedEndpointReadPort + Clone + 'static,
+{
+    replay_not_implemented_guarded(&state, &headers, &recording_id).await
 }
 
 async fn show_recording<P>(
@@ -926,12 +1180,35 @@ where
             request_id,
         );
     }
-    let params = match parse_query::<ShowParams>(query.as_deref(), &["limit", "cursor"]) {
+    let params = match parse_query::<ShowParams>(
+        query.as_deref(),
+        &["limit", "cursor", "aroundFrame", "projection"],
+    ) {
         Ok(params) => params,
         Err(()) => {
             return problem_with_id(
                 StatusCode::BAD_REQUEST,
                 "XTR-VIEWER-QUERY",
+                "Recording query is invalid",
+                request_id,
+            );
+        }
+    };
+    if params.cursor.is_some() && params.around_frame.is_some() {
+        return problem_with_id(
+            StatusCode::BAD_REQUEST,
+            "XTR-VALIDATION-RECORDING-QUERY",
+            "Recording query is invalid",
+            request_id,
+        );
+    }
+    let projection_structure = match params.projection.as_deref() {
+        None | Some("full") => false,
+        Some("structure") => true,
+        Some(_) => {
+            return problem_with_id(
+                StatusCode::BAD_REQUEST,
+                "XTR-VALIDATION-RECORDING-QUERY",
                 "Recording query is invalid",
                 request_id,
             );
@@ -945,12 +1222,23 @@ where
             request_id,
         );
     };
+    if projection_structure {
+        return replay_not_implemented_response(request_id);
+    }
+    let around_frame = match params.around_frame.as_deref() {
+        None => None,
+        Some(raw) => match raw.parse::<xtrace_domain::FrameId>() {
+            Ok(frame_id) => Some(frame_id),
+            Err(_) => return frame_not_found(request_id),
+        },
+    };
     let service = state.recording_service.clone();
     let request = ShowRecording {
         project_id: state.project_id,
         recording_id,
         limit: params.limit.unwrap_or(200),
         cursor: params.cursor,
+        around_frame,
     };
     let detail =
         match run_recording_query(&state, request_id, move || service.show(request, request_id))
@@ -1200,6 +1488,8 @@ struct TransportRecording {
     first_sequence: Option<String>,
     last_sequence: Option<String>,
     incomplete_evidence: Vec<String>,
+    event_cap: Option<u32>,
+    outcome_kind: Option<String>,
 }
 
 fn to_transport_list(page: RecordingListPage, request_id: CorrelationId) -> TransportList {
@@ -1221,6 +1511,8 @@ fn to_transport_list(page: RecordingListPage, request_id: CorrelationId) -> Tran
                 first_sequence: item.first_sequence,
                 last_sequence: item.last_sequence,
                 incomplete_evidence: item.incomplete_evidence,
+                event_cap: item.event_cap,
+                outcome_kind: item.outcome_kind,
             })
             .collect(),
         next_after: page.next_after,
@@ -1247,6 +1539,15 @@ struct TransportDetail {
     events: Vec<TransportEvent>,
     incomplete_evidence: Vec<String>,
     unavailable: xtrace_application::UnavailableEvidence,
+    outcome: Option<xtrace_application::PersistedOutcome>,
+    capacity: Option<xtrace_application::RecordingCapacity>,
+    limitations: Vec<String>,
+    honesty: xtrace_application::HonestySummary,
+    anchor_frame_id: Option<xtrace_domain::FrameId>,
+    first_sequence: Option<String>,
+    last_sequence: Option<String>,
+    prev_cursor: Option<String>,
+    projection: xtrace_application::Projection,
     request_id: CorrelationId,
 }
 
@@ -1266,6 +1567,12 @@ struct TransportEvent {
     source: Option<xtrace_application::PersistedSource>,
     source_binding: xtrace_domain::SourceBinding,
     field_truncations: Vec<TransportTruncation>,
+    depth: Option<u32>,
+    parent_frame_id: Option<xtrace_domain::FrameId>,
+    async_parent_frame_id: Option<xtrace_domain::FrameId>,
+    line: Option<u32>,
+    bindings: Vec<xtrace_application::PersistedBinding>,
+    gap: Option<xtrace_application::PersistedGap>,
 }
 
 #[derive(Serialize)]
@@ -1306,6 +1613,12 @@ fn to_transport_detail(detail: RecordingDetail, request_id: CorrelationId) -> Tr
                 interaction: item.interaction,
                 source: item.source,
                 source_binding: item.source_binding,
+                depth: item.depth,
+                parent_frame_id: item.parent_frame_id,
+                async_parent_frame_id: item.async_parent_frame_id,
+                line: item.line,
+                bindings: item.bindings,
+                gap: item.gap,
                 field_truncations: item
                     .field_truncations
                     .into_iter()
@@ -1319,6 +1632,15 @@ fn to_transport_detail(detail: RecordingDetail, request_id: CorrelationId) -> Tr
             .collect(),
         incomplete_evidence: detail.incomplete_evidence,
         unavailable: detail.unavailable,
+        outcome: detail.outcome,
+        capacity: detail.capacity,
+        limitations: detail.limitations,
+        honesty: detail.honesty,
+        anchor_frame_id: detail.anchor_frame_id,
+        first_sequence: detail.first_sequence,
+        last_sequence: detail.last_sequence,
+        prev_cursor: detail.prev_cursor,
+        projection: detail.projection,
         request_id,
     }
 }
@@ -1435,6 +1757,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use xtrace_application::FrameNavigationView;
     use xtrace_application::observed_endpoint_queries::{
         ObservedEndpointKey, ObservedEndpointRecord, ObservedRecordingKey, ObservedRecordingRecord,
     };
@@ -1443,7 +1766,7 @@ mod tests {
         ObservedEndpointReadPort, PortError, PortErrorKind, ProjectRepository,
         RecordingEventWindow, RecordingMetadata, RecordingPersistencePort, ShowWindowRequest,
     };
-    use xtrace_domain::{Project, RepositoryFingerprint, RuntimeSessionId, WallTime};
+    use xtrace_domain::{FrameId, Project, RepositoryFingerprint, RuntimeSessionId, WallTime};
     use xtrace_store::{
         OpenOptions, SqliteRecordingPersistence, SqliteRecordingReader, SqliteStore,
     };
@@ -1471,6 +1794,19 @@ mod tests {
     }
 
     impl RecordingReadPort for ReadFixture {
+        fn frame_navigation(
+            &self,
+            _project_id: ProjectId,
+            _recording_id: RecordingId,
+            _frame_id: FrameId,
+        ) -> Result<FrameNavigationView, PortError> {
+            Err(PortError::new(
+                PortErrorKind::NotFound,
+                "fixture has no frames",
+                CorrelationId::new(),
+            ))
+        }
+
         fn list_recordings(
             &self,
             _project_id: ProjectId,
@@ -1748,7 +2084,7 @@ mod tests {
         );
         let list = request(&viewer.host, &valid_list).await;
         assert!(list.starts_with("HTTP/1.1 200"));
-        assert!(list.contains("\"schemaVersion\":2"));
+        assert!(list.contains("\"schemaVersion\":3"));
         assert!(list.contains("\"requestId\""));
         assert!(list.contains("no-store"));
 
@@ -1802,6 +2138,164 @@ mod tests {
         assert!(request(&viewer.host, &duplicate_host).await.starts_with("HTTP/1.1 400"));
         let _ = viewer.shutdown.send(());
         viewer.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_routes_are_guarded_and_unserved_forms_answer_501() {
+        let viewer = start().await;
+        let recording = RecordingId::new();
+        let frame = xtrace_domain::FrameId::new();
+        let unserved = [
+            format!("/api/v1/recordings/{recording}/frames?fromOrdinal=0&limit=10"),
+            format!("/api/v1/recordings/{recording}/graph"),
+            format!("/api/v1/recordings/{recording}?projection=structure&limit=500"),
+            format!("/api/v1/recordings/{recording}/navigate?frame={frame}&kind=gap&dir=next"),
+        ];
+        // The served routes resolve the frame through the read port; the fixture has no frames.
+        let served = [
+            format!("/api/v1/recordings/{recording}/frames/{frame}/navigation"),
+            format!("/api/v1/recordings/{recording}/navigate?frame={frame}&action=next"),
+            format!("/api/v1/recordings/{recording}?aroundFrame={frame}&limit=50"),
+        ];
+        for path in unserved.iter().chain(&served) {
+            let unauthenticated = format!(
+                "GET {path} HTTP/1.1\r\n{}Connection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            );
+            assert!(
+                request(&viewer.host, &unauthenticated).await.starts_with("HTTP/1.1 401"),
+                "{path} must be session guarded"
+            );
+        }
+        let cookie = authenticate(&viewer).await;
+        let get = |path: &str| {
+            format!(
+                "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            )
+        };
+        for path in &unserved {
+            let response = request(&viewer.host, &get(path)).await;
+            assert!(response.starts_with("HTTP/1.1 501"), "{path}: {response}");
+            assert!(response.contains("XTR-REPLAY-NOT-IMPLEMENTED"), "{path}: {response}");
+        }
+        for path in &served {
+            let response = request(&viewer.host, &get(path)).await;
+            assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+            assert!(!response.contains("XTR-REPLAY-NOT-IMPLEMENTED"), "{path}: {response}");
+        }
+        for (path, status) in [
+            (format!("/api/v1/recordings/{recording}?cursor=abc&aroundFrame={frame}"), "400"),
+            (format!("/api/v1/recordings/{recording}?projection=other"), "400"),
+            (
+                format!("/api/v1/recordings/{recording}/navigate?frame={frame}&action=sideways"),
+                "400",
+            ),
+            (format!("/api/v1/recordings/{recording}/navigate?action=next"), "400"),
+            (format!("/api/v1/recordings/{recording}/frames/not-a-frame/navigation"), "404"),
+            (format!("/api/v1/recordings/{recording}?aroundFrame=not-a-frame"), "404"),
+            ("/api/v1/recordings/not-a-recording/graph".to_owned(), "404"),
+            ("/api/v1/recordings/not-a-recording/navigate?frame=x&action=next".to_owned(), "404"),
+        ] {
+            let response = request(&viewer.host, &get(&path)).await;
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{path}: {response}");
+        }
+    }
+
+    /// Every serialized field of the detail and event DTOs must be documented in
+    /// the checked-in OpenAPI schema, and every documented property must exist.
+    #[test]
+    fn openapi_schema_matches_viewer_dto_for_every_event_field() {
+        use xtrace_application::{
+            FrameNavigation, HonestySummary, PersistedEvent, Projection,
+            RecordingCompletionEvidence, RecordingDetail, RecordingStatus,
+        };
+        let yaml = include_str!("../../../schema/xtp-client/openapi.yaml");
+        let section = |name: &str| -> Vec<String> {
+            let header = format!("    {name}:\n");
+            let start = yaml.find(&header).expect("schema present") + header.len();
+            let rest = &yaml[start..];
+            let end = rest
+                .match_indices("\n    ")
+                .find(|(index, _)| {
+                    let after = &rest[index + 1..];
+                    after.starts_with("    ") && !after.starts_with("     ")
+                })
+                .map_or(rest.len(), |(index, _)| index);
+            let block = &rest[..end];
+            let marker = "      properties:\n";
+            let properties = block.find(marker).expect("properties") + marker.len();
+            block[properties..]
+                .lines()
+                .filter(|line| line.starts_with("        ") && !line.starts_with("         "))
+                .filter_map(|line| line.trim().split(':').next().map(str::to_owned))
+                .collect()
+        };
+        let detail = RecordingDetail {
+            schema_version: 3,
+            project_id: ProjectId::new(),
+            recording_id: RecordingId::new(),
+            status: RecordingStatus::Recording,
+            completion: RecordingCompletionEvidence::Unavailable,
+            adapter_summary: None,
+            duration_ns: None,
+            drop_counts_by_priority: std::collections::BTreeMap::new(),
+            limit: 1,
+            cursor: None,
+            next_cursor: None,
+            segment_count: "0".into(),
+            events: vec![PersistedEvent {
+                sequence: "2".into(),
+                frame_id: None,
+                navigation: FrameNavigation::UNAVAILABLE,
+                monotonic_ns: "0".into(),
+                event_id: None,
+                parent_event_id: None,
+                async_parent_event_id: None,
+                kind: "frame_enter".into(),
+                symbol: None,
+                interaction: None,
+                source: None,
+                source_binding: xtrace_domain::SourceBinding::Unspecified,
+                field_truncations: Vec::new(),
+                depth: None,
+                parent_frame_id: None,
+                async_parent_frame_id: None,
+                line: None,
+                bindings: Vec::new(),
+                gap: None,
+            }],
+            incomplete_evidence: Vec::new(),
+            unavailable: xtrace_application::UnavailableEvidence::default(),
+            outcome: None,
+            capacity: None,
+            limitations: Vec::new(),
+            honesty: HonestySummary::from_window(
+                RecordingCompletionEvidence::Unavailable,
+                &[],
+                None,
+                &std::collections::BTreeMap::new(),
+                &[],
+            ),
+            anchor_frame_id: None,
+            first_sequence: None,
+            last_sequence: None,
+            prev_cursor: None,
+            projection: Projection::Full,
+        };
+        let json = serde_json::to_value(to_transport_detail(detail, CorrelationId::new()))
+            .expect("serialize detail");
+        let mut actual: Vec<String> = json.as_object().expect("object").keys().cloned().collect();
+        let mut documented = section("RecordingDetail");
+        actual.sort();
+        documented.sort();
+        assert_eq!(actual, documented, "RecordingDetail DTO drifted from openapi");
+        let mut actual_event: Vec<String> =
+            json["events"][0].as_object().expect("event object").keys().cloned().collect();
+        let mut documented_event = section("Event");
+        actual_event.sort();
+        documented_event.sort();
+        assert_eq!(actual_event, documented_event, "Event DTO drifted from openapi");
     }
 
     #[tokio::test]
@@ -2069,6 +2563,7 @@ mod tests {
                     method: "POST".to_owned(),
                     route_template: "/orders".to_owned(),
                 },
+                limitations: Vec::new(),
             })
             .expect("persist linked observed recording");
         Connection::open(&database)

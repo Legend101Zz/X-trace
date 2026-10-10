@@ -1,16 +1,22 @@
 package dev.xtrace.agent.runtime;
 
+import static net.bytebuddy.matcher.ElementMatchers.isAbstract;
+import static net.bytebuddy.matcher.ElementMatchers.isAnnotatedWith;
+import static net.bytebuddy.matcher.ElementMatchers.isBridge;
 import static net.bytebuddy.matcher.ElementMatchers.isMethod;
+import static net.bytebuddy.matcher.ElementMatchers.isNative;
 import static net.bytebuddy.matcher.ElementMatchers.isSynthetic;
 import static net.bytebuddy.matcher.ElementMatchers.named;
+import static net.bytebuddy.matcher.ElementMatchers.nameMatches;
+import static net.bytebuddy.matcher.ElementMatchers.nameStartsWith;
 import static net.bytebuddy.matcher.ElementMatchers.not;
+import static net.bytebuddy.matcher.ElementMatchers.returns;
 import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
 
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
 import dev.xtrace.adapter.ClientException;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
-import java.lang.reflect.Method;
 import java.security.ProtectionDomain;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -18,10 +24,15 @@ import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.utility.JavaModule;
 
-/** Installs exact fixture-only Spring MVC, application, and H2 transformations. */
+/**
+ * Installs the Spring MVC request root, method boundary probes on in-scope application classes,
+ * and the coarse H2 execute boundary. Attach validation stays fixture-bound until generalized
+ * attach lands.
+ */
 final class FixtureInstrumentation {
   static final String SPRING_ADAPTER =
       "org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter";
+  static final String DISPATCHER = "org.springframework.web.servlet.DispatcherServlet";
   static final String H2_STATEMENT = "org.h2.jdbc.JdbcPreparedStatement";
   static final String CONTROLLER = "dev.xtrace.fixture.OrderController";
   static final String SERVICE = "dev.xtrace.fixture.OrderService";
@@ -57,6 +68,34 @@ final class FixtureInstrumentation {
   }
 
   static void install(Instrumentation instrumentation, Runnable onFailure, boolean attach) {
+    install(instrumentation, onFailure, attach, ApplicationScope.defaultScope());
+  }
+
+  static void install(
+      Instrumentation instrumentation,
+      Runnable onFailure,
+      boolean attach,
+      ApplicationScope scope) {
+    install(instrumentation, onFailure, attach, scope, null);
+  }
+
+  /** Probe owner application classes call; bootstrap-visible, so every loader resolves it. */
+  static final String PROBE_OWNER = "dev/xtrace/agent/bootstrap/BootstrapBridge";
+
+  /** Method reports kept for diagnostics; bounded so a huge application cannot grow it. */
+  static final int MAX_LINE_REPORTS = 4096;
+
+  /**
+   * @param lineProbes non-null only in effective focused mode: in-scope classes then also get the
+   *     line-probe wrapper with LocalVariableTable-gated value reads. Standard mode passes null and
+   *     pays no class-rewrite or verifier risk for evidence it may not record.
+   */
+  static void install(
+      Instrumentation instrumentation,
+      Runnable onFailure,
+      boolean attach,
+      ApplicationScope scope,
+      LineProbes lineProbes) {
     if (!INSTALLED.compareAndSet(false, true)) {
       throw new IllegalStateException("fixture instrumentation is already installed");
     }
@@ -87,6 +126,15 @@ final class FixtureInstrumentation {
           // it is not a hash of the final transformed class bytes.
           SourceAttestation.observe(loader, className, classfileBuffer);
         }
+        if (className != null
+            && scope.isApplication(className.replace('/', '.'), protectionDomain)) {
+          SourceIdentity.observe(
+              loader,
+              className,
+              classfileBuffer,
+              scope.sourceRoots(),
+              java.nio.file.Path.of(System.getProperty("user.dir", ".")));
+        }
         return null;
       }
     }, attach);
@@ -103,33 +151,29 @@ final class FixtureInstrumentation {
                                     .and(named("handleInternal"))
                                     .and(takesArguments(3))
                                     .and(not(isSynthetic())))))
-            .type(named(CONTROLLER))
+            .type(named(DISPATCHER))
             .transform(
                 (target, type, loader, module, domain) ->
                     target.visit(
-                        Advice.to(ControllerAdvice.class)
+                        Advice.to(ExceptionResolutionAdvice.class)
                             .on(
                                 isMethod()
-                                    .and(named("create"))
+                                    .and(named("processHandlerException"))
+                                    .and(takesArguments(4))
                                     .and(not(isSynthetic())))))
-            .type(named(SERVICE))
+            .type(
+                (type, loader, module, redefined, domain) ->
+                    !type.isInterface()
+                        && !type.isEnum()
+                        && !type.isAnnotation()
+                        && !type.isRecord()
+                        && scope.isApplication(type.getName(), domain))
             .transform(
-                (target, type, loader, module, domain) ->
-                    target.visit(
-                        Advice.to(ServiceAdvice.class)
-                            .on(
-                                isMethod()
-                                    .and(named("place"))
-                                    .and(not(isSynthetic())))))
-            .type(named(REPOSITORY))
-            .transform(
-                (target, type, loader, module, domain) ->
-                    target.visit(
-                        Advice.to(RepositoryAdvice.class)
-                            .on(
-                                isMethod()
-                                    .and(named("save"))
-                                    .and(not(isSynthetic())))))
+                (target, type, loader, module, domain) -> {
+                  net.bytebuddy.dynamic.DynamicType.Builder<?> framed =
+                      target.visit(Advice.to(FrameAdvice.class).on(frameMethods()));
+                  return lineProbes == null ? framed : framed.visit(lineProbes.wrapper());
+                })
             .type(named(H2_STATEMENT))
             .transform(
                 (target, type, loader, module, domain) ->
@@ -141,6 +185,63 @@ final class FixtureInstrumentation {
                                     .and(takesArguments(0))
                                     .and(not(isSynthetic())))));
     builder.installOn(instrumentation);
+  }
+
+  /** Focused-mode line probe wiring: one site registry and one thread-safe report sink. */
+  static final class LineProbes {
+    private final dev.xtrace.agent.runtime.line.SiteRegistry registry;
+    private final java.util.concurrent.ConcurrentLinkedQueue<
+            dev.xtrace.agent.runtime.line.MethodReport>
+        reports = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final java.util.concurrent.atomic.AtomicInteger reportCount =
+        new java.util.concurrent.atomic.AtomicInteger();
+
+    LineProbes(dev.xtrace.agent.runtime.line.SiteRegistry registry) {
+      this.registry = java.util.Objects.requireNonNull(registry, "registry");
+    }
+
+    dev.xtrace.agent.runtime.line.SiteRegistry registry() {
+      return registry;
+    }
+
+    /**
+     * Methods or classes the wrapper left untouched for a reason that is not by design (bridge and
+     * synthetic methods are never probed on purpose and are not counted).
+     */
+    long skippedCount() {
+      long skipped = 0;
+      for (dev.xtrace.agent.runtime.line.MethodReport report : reports) {
+        if (report.status() != dev.xtrace.agent.runtime.line.MethodReport.Status.SKIPPED) continue;
+        String reason = report.reason();
+        if (dev.xtrace.agent.runtime.line.MethodReport.Reasons.BRIDGE.equals(reason)
+            || dev.xtrace.agent.runtime.line.MethodReport.Reasons.SYNTHETIC.equals(reason)) {
+          continue;
+        }
+        skipped++;
+      }
+      return skipped;
+    }
+
+    java.util.List<dev.xtrace.agent.runtime.line.MethodReport> reports() {
+      return java.util.List.copyOf(reports);
+    }
+
+    dev.xtrace.agent.runtime.line.LineProbeAsmWrapper wrapper() {
+      return new dev.xtrace.agent.runtime.line.LineProbeAsmWrapper(
+          dev.xtrace.agent.runtime.line.LineProbeConfig.focused(PROBE_OWNER),
+          registry,
+          type -> null,
+          batch -> {
+            for (dev.xtrace.agent.runtime.line.MethodReport report : batch) {
+              if (reportCount.incrementAndGet() > MAX_LINE_REPORTS) {
+                reportCount.decrementAndGet();
+                return;
+              }
+              reports.add(report);
+            }
+          },
+          null);
+    }
   }
 
   static final class SafeListener extends AgentBuilder.Listener.Adapter {
@@ -171,10 +272,35 @@ final class FixtureInstrumentation {
 
   static boolean isExplicitTarget(String typeName) {
     return SPRING_ADAPTER.equals(typeName)
+        || DISPATCHER.equals(typeName)
         || H2_STATEMENT.equals(typeName)
         || APPLICATION_TYPES.contains(typeName);
   }
 
+  /** Methods that get boundary probes: real behavior, not accessors, bridges or Object plumbing. */
+  static net.bytebuddy.matcher.ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription>
+      frameMethods() {
+    return isMethod()
+        .and(not(isSynthetic()))
+        .and(not(isBridge()))
+        .and(not(isAbstract()))
+        .and(not(isNative()))
+        .and(not(nameStartsWith("lambda$")))
+        .and(
+            not(
+                nameMatches("(get|is)\\p{Lu}.*")
+                    .and(takesArguments(0))
+                    .and(not(isAnnotatedWith(nameStartsWith("org.springframework.web.bind.annotation."))))))
+        .and(not(nameMatches("set\\p{Lu}.*").and(takesArguments(1)).and(returns(void.class))))
+        .and(not(named("toString").and(takesArguments(0))))
+        .and(not(named("hashCode").and(takesArguments(0))))
+        .and(not(named("equals").and(takesArguments(1))))
+        .and(not(named("compareTo")))
+        .and(not(named("clone")))
+        .and(not(named("finalize")));
+  }
+
+  /** Kept for the fixture contract: the fixture's own boundary methods are application targets. */
   static boolean isApplicationTarget(String typeName, String methodName) {
     return (CONTROLLER.equals(typeName) && "create".equals(methodName))
         || (SERVICE.equals(typeName) && "place".equals(methodName))
@@ -186,90 +312,61 @@ final class FixtureInstrumentation {
     return APPLICATION_TYPES.contains(internalName.replace('/', '.'));
   }
 
-  /** Request advice uses only fixed fixture identity and the response's numeric status. */
+  /**
+   * Request root advice. It reads the matched route template and method through the bootstrap
+   * bridge, never the request path or query, and records only the numeric response status.
+   */
   public static final class SpringRequestAdvice {
     private SpringRequestAdvice() {}
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static boolean enter(@Advice.Argument(2) Object handlerMethod) {
-      boolean matched = false;
-      if (handlerMethod != null) {
-        try {
-          Method getBeanType = handlerMethod.getClass().getMethod("getBeanType");
-          Method getMethod = handlerMethod.getClass().getMethod("getMethod");
-          Object beanType = getBeanType.invoke(handlerMethod);
-          Object method = getMethod.invoke(handlerMethod);
-          matched =
-              beanType instanceof Class<?> type
-                  && CONTROLLER.equals(type.getName())
-                  && method instanceof Method javaMethod
-                  && "create".equals(javaMethod.getName());
-        } catch (ReflectiveOperationException | RuntimeException ignored) {
-          matched = false;
-        }
-      }
-      if (!matched) return false;
-      return BootstrapBridge.requestStart("POST", "/orders");
+    public static boolean enter(
+        @Advice.Argument(0) Object request, @Advice.Argument(2) Object handlerMethod) {
+      return dev.xtrace.agent.bootstrap.SpringMvcBridge.start(request, handlerMethod);
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void exit(
         @Advice.Enter boolean traced,
+        @Advice.Argument(0) Object request,
         @Advice.Argument(1) Object response,
         @Advice.Thrown Throwable thrown) {
       if (!traced) return;
-      int responseStatus = 0;
-      if (response != null) {
-        try {
-          Object status = response.getClass().getMethod("getStatus").invoke(response);
-          responseStatus = status instanceof Integer value ? value : 0;
-        } catch (ReflectiveOperationException | RuntimeException ignored) {
-          responseStatus = 0;
-        }
-      }
-      BootstrapBridge.requestEnd(responseStatus, thrown != null);
+      dev.xtrace.agent.bootstrap.SpringMvcBridge.end(request, response, thrown);
     }
   }
 
-  public static final class ControllerAdvice {
-    private ControllerAdvice() {}
-
-    @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void enter(@Advice.Origin Method method) {
-      BootstrapBridge.frameEnter("OrderController.create", method);
-    }
+  /**
+   * Reports how the container resolved a handler exception, so a mapped exception is recorded as
+   * the response it produced rather than as a propagated failure.
+   */
+  public static final class ExceptionResolutionAdvice {
+    private ExceptionResolutionAdvice() {}
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
-    public static void exit(@Advice.Thrown Throwable thrown) {
-      BootstrapBridge.frameExit("OrderController.create", thrown != null);
+    public static void exit(
+        @Advice.Argument(1) Object response,
+        @Advice.Return Object resolved,
+        @Advice.Thrown Throwable thrown) {
+      dev.xtrace.agent.bootstrap.SpringMvcBridge.exceptionResolved(response, resolved, thrown);
     }
   }
 
-  public static final class ServiceAdvice {
-    private ServiceAdvice() {}
+  /** Method boundary advice for in-scope application classes. */
+  public static final class FrameAdvice {
+    private FrameAdvice() {}
 
     @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void enter(@Advice.Origin Method method) {
-      BootstrapBridge.frameEnter("OrderService.place", method);
+    public static String enter(
+        @Advice.Origin Class<?> type,
+        @Advice.Origin("#m") String method,
+        @Advice.Origin("#d") String descriptor) {
+      return BootstrapBridge.frameEnter(type, method, descriptor);
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
-    public static void exit(@Advice.Thrown Throwable thrown) {
-      BootstrapBridge.frameExit("OrderService.place", thrown != null);
-    }
-  }
-
-  public static final class RepositoryAdvice {
-    private RepositoryAdvice() {}
-
-    @Advice.OnMethodEnter(suppress = Throwable.class)
-    public static void enter(@Advice.Origin Method method) {
-      BootstrapBridge.frameEnter("OrderRepository.save", method);
-    }
-
-    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
-    public static void exit(@Advice.Thrown Throwable thrown) {
-      BootstrapBridge.frameExit("OrderRepository.save", thrown != null);
+    public static void exit(@Advice.Enter String symbol, @Advice.Thrown Throwable thrown) {
+      if (symbol != null) BootstrapBridge.frameExit(symbol, thrown);
     }
   }
 

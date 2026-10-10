@@ -55,6 +55,13 @@ pub enum CliError {
     /// Direct Node launch or process supervision failed.
     #[cfg(unix)]
     NodeRun(xtrace_runtime::node::LaunchError),
+    /// The command is accepted by the parser but not implemented in this build.
+    NotImplemented {
+        /// Stable command name, for example `scan` or `catalog list`.
+        command: &'static str,
+    },
+    /// The command completed only part of its work.
+    Partial(String),
 }
 
 impl CliError {
@@ -82,6 +89,8 @@ impl CliError {
             #[cfg(unix)]
             Self::Attach { exit_code, .. } => *exit_code,
             Self::NodeRun(err) => err.exit_code(),
+            Self::NotImplemented { .. } => 9,
+            Self::Partial(_) => 10,
         }
     }
 }
@@ -130,6 +139,10 @@ impl std::fmt::Display for CliError {
             #[cfg(unix)]
             Self::Attach { message, .. } => f.write_str(message),
             Self::NodeRun(err) => std::fmt::Display::fmt(err, f),
+            Self::NotImplemented { command } => {
+                write!(f, "xtrace {command} is not implemented in this build")
+            }
+            Self::Partial(message) => write!(f, "partial result: {message}"),
         }
     }
 }

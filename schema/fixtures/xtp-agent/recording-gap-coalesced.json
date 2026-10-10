@@ -1,0 +1,14 @@
+{
+  "bytes_hex": "08011a1011111111111111111111111111111111200c29f40300000000000032046d2d3132d201320a1022222222222222222222222222222222121e0a03652d341004298c130000000000003014380e7a08080110071805200b",
+  "description": "GAP (kind 14) carrying GapPayload{LINE_BUDGET, count 7, seq 5..11}",
+  "message": "xtp.agent.v1.AgentEnvelope",
+  "summary": {
+    "gap": {
+      "count": 7,
+      "firstRecordingSeq": 5,
+      "lastRecordingSeq": 11,
+      "reason": "line_budget"
+    },
+    "kind": 14
+  }
+}

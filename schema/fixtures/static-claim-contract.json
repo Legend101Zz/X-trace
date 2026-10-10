@@ -1,0 +1,117 @@
+{
+ "description": "Shared vocabulary and examples for the static-analyzer JSON-lines contract (ST-2). Mirrors crates/xtrace-domain/src/static_claims.rs; a Rust test keeps both in step. Analyzers read this file in their own tests.",
+ "contractVersion": 1,
+ "frameworkFamilies": [
+  "spring-mvc",
+  "spring-webflux",
+  "jaxrs",
+  "express",
+  "fastify",
+  "nest"
+ ],
+ "limitationCodes": [
+  "backpressure_dropped",
+  "capability_unsupported",
+  "daemon_shed",
+  "debug_metadata_absent",
+  "dynamic_registration",
+  "generated_source_skipped",
+  "handler_unresolved",
+  "mapping_method_unconstrained",
+  "missing_body_schema",
+  "missing_response_schema",
+  "missing_source_map",
+  "mount_unresolved",
+  "no_local_variable_table",
+  "route_computed",
+  "route_constant_unresolved",
+  "route_constraint_unresolved",
+  "route_optional_parameter",
+  "route_wildcard",
+  "scan_budget_exceeded",
+  "session_ended_early",
+  "source_attestation_missing",
+  "source_hash_mismatch",
+  "source_range_unavailable",
+  "unsupported_mapping"
+ ],
+ "diagnosticCodes": [
+  "budget_exceeded",
+  "file_too_large",
+  "file_unreadable",
+  "parse_error",
+  "unsupported_syntax"
+ ],
+ "incompleteReasons": [
+  "budget_exceeded",
+  "file_unreadable",
+  "parse_error",
+  "timeout",
+  "unsupported_syntax"
+ ],
+ "routeBasisConfidenceBasisPoints": {
+  "literal": 9000,
+  "concatenated": 5000,
+  "computed": 3000
+ },
+ "exampleLines": [
+  {
+   "type": "header",
+   "contractVersion": 1,
+   "analyzerName": "xtrace-java-static",
+   "analyzerVersion": "0.0.1",
+   "rulesetId": "spring-mvc-annotations/1",
+   "framework": "spring-mvc"
+  },
+  {
+   "type": "claim",
+   "method": "GET",
+   "routeParts": [
+    "/owners",
+    "/{ownerId}"
+   ],
+   "routeBasis": "literal",
+   "handler": "org.example.OwnerController#showOwner",
+   "limitations": [],
+   "evidence": {
+    "path": "src/OwnerController.java",
+    "startLine": 12,
+    "startColumn": 5,
+    "endLine": 12,
+    "endColumn": 50
+   }
+  },
+  {
+   "type": "claim",
+   "method": "POST",
+   "routeParts": [
+    "/orders"
+   ],
+   "routeBasis": "concatenated",
+   "limitations": [
+    "mapping_method_unconstrained"
+   ],
+   "evidence": {
+    "path": "src/OrderController.java",
+    "startLine": 30,
+    "startColumn": 5,
+    "endLine": 30,
+    "endColumn": 50
+   }
+  },
+  {
+   "type": "diagnostic",
+   "code": "parse_error",
+   "path": "src/Broken.java"
+  },
+  {
+   "type": "end",
+   "claims": 2,
+   "filesScanned": 3,
+   "complete": false,
+   "incompleteReasons": [
+    "parse_error"
+   ]
+  }
+ ]
+}

@@ -70,11 +70,9 @@ use xtrace_domain::ids::Id;
 use xtrace_domain::{ContentHash, ProjectId, RepositoryFingerprint, RuntimeSessionId};
 use xtrace_ingest::{Acceptance, IngestConfig, IngestError, IngestValidator};
 
-// The ingest digest budget and the application persistence bound are one
-// limit seen from two layers; keep them from drifting apart.
-const _: () = assert!(
-    xtrace_ingest::DEFAULT_MAX_EVENTS_PER_RECORDING == xtrace_application::MAX_RECORDED_EVENTS
-);
+// The ingest cap and the application cap are one limit seen from two layers; both derive it
+// from the recording's effective capture mode (see `effective_capture_mode`). The test
+// `ingest_and_application_caps_agree` guards that they do not drift apart.
 // Likewise the drop-priority bucket bound: ingest and application agree.
 const _: () = assert!(
     xtrace_ingest::MAX_DROP_PRIORITY_BUCKETS == xtrace_application::MAX_CAPACITY_DROP_PRIORITIES
@@ -205,7 +203,15 @@ pub struct Session {
     /// into each other's per-recording state. Dropped on connection
     /// close.
     ingest_validator: IngestValidator,
+    /// Capture mode this session is armed for (CONTRACTS 4.2). Standard unless the launch
+    /// bootstrap's `capture.json` said `capture.mode = focused` (see `arm`).
+    armed_mode: xtrace_domain::CaptureMode,
 }
+
+/// Stable limitation code attached to a recording whose adapter claimed the focused policy on a
+/// session that was never armed for it (CONTRACTS 4.2: a claim by the adapter is not a grant).
+/// Defined by the application layer, which persists it (ADR 0011).
+pub use xtrace_application::recording::LIMITATION_CAPTURE_POLICY_NOT_ARMED;
 
 /// Upper bound on the volatile staging buffer. Beyond this bound the
 /// session refuses new envelopes with [`ProtocolErrorCode::SessionSequence`]
@@ -245,7 +251,10 @@ impl Session {
     pub fn new(inputs: HandshakeInputs) -> Self {
         let active_recordings =
             NonZeroUsize::new(STAGED_INCOMING_LIMIT).unwrap_or(NonZeroUsize::MIN);
-        let ingest_config = IngestConfig::new(active_recordings);
+        // The audit redactor runs on every accepted event and finish (the event and finish arms
+        // of the post-hello handler), so bindings may be accepted.
+        let ingest_config =
+            IngestConfig::mode_derived(active_recordings).with_bindings_audit_active();
         Self::new_with_ingest_config(inputs, ingest_config)
     }
 
@@ -267,7 +276,22 @@ impl Session {
             negotiated: None,
             staged_incoming: std::collections::VecDeque::with_capacity(STAGED_INCOMING_LIMIT),
             ingest_validator: IngestValidator::new(ingest_config),
+            armed_mode: xtrace_domain::CaptureMode::Standard,
         }
+    }
+
+    /// Arms the session for `mode` (CONTRACTS 4.2) from the launch bootstrap's `capture.mode`.
+    /// A session can only be armed up; arming standard never lowers a focused session.
+    pub fn arm(&mut self, mode: xtrace_domain::CaptureMode) {
+        if mode == xtrace_domain::CaptureMode::Focused {
+            self.armed_mode = mode;
+        }
+    }
+
+    /// Capture mode this session is armed for.
+    #[must_use]
+    pub fn armed_mode(&self) -> xtrace_domain::CaptureMode {
+        self.armed_mode
     }
 
     /// Returns the underlying [`IngestValidator`] owned by this
@@ -608,19 +632,34 @@ impl Session {
                 // verdict reports the watermark that was already on
                 // file.
                 let default_watermark = self.ingest_validator.highest_contiguous_seq(recording_id);
+                let mode = crate::recording_pipeline::effective_capture_mode(
+                    self.armed_mode,
+                    &started.capture_policy_id,
+                );
+                let claimed_focused =
+                    xtrace_domain::CaptureMode::from_policy_id(&started.capture_policy_id)
+                        == xtrace_domain::CaptureMode::Focused;
+                let downgraded = claimed_focused && mode != xtrace_domain::CaptureMode::Focused;
                 let acceptance = self
                     .ingest_validator
-                    .accept_started(started)
+                    .accept_started(started, mode)
                     .map_err(SessionError::with_ingest)?;
+                let mut limitations = Vec::new();
+                if downgraded {
+                    limitations.push(LIMITATION_CAPTURE_POLICY_NOT_ARMED);
+                }
                 let incoming = IncomingEnvelope::RecordingStarted(started.clone());
-                Ok(self.admit_recording(
+                let mut admission = self.admit_recording(
                     recording_id,
                     incoming,
                     acceptance,
                     default_watermark,
                     staged_seq,
                     next_seq,
-                ))
+                );
+                admission.capture_mode = mode;
+                admission.limitations = limitations;
+                Ok(admission)
             }
             Some(wire::agent_envelope::Payload::EventBatch(batch)) => {
                 let recording_id =
@@ -629,7 +668,13 @@ impl Session {
                     .ingest_validator
                     .accept_events(batch)
                     .map_err(SessionError::with_ingest)?;
-                let incoming = IncomingEnvelope::EventBatch(batch.clone());
+                // CONTRACTS 9.3: the daemon audit redactor is the second pass over every
+                // accepted event, before the batch is translated and encoded into an XTF segment.
+                let mut audited = batch.clone();
+                for event in &mut audited.events {
+                    let _ = xtrace_ingest::redaction_audit::audit_event(event);
+                }
+                let incoming = IncomingEnvelope::EventBatch(audited);
                 Ok(self.admit_recording(
                     recording_id,
                     incoming,
@@ -650,7 +695,9 @@ impl Session {
                     .ingest_validator
                     .accept_finished(finished)
                     .map_err(SessionError::with_ingest)?;
-                let incoming = IncomingEnvelope::RecordingFinished(finished.clone());
+                let mut audited = finished.clone();
+                let _ = xtrace_ingest::redaction_audit::audit_finished(&mut audited);
+                let incoming = IncomingEnvelope::RecordingFinished(audited);
                 Ok(self.admit_recording(
                     recording_id,
                     incoming,
@@ -673,6 +720,14 @@ impl Session {
                 "envelope carried no payload after hello".to_string(),
             )),
         }
+    }
+
+    /// Drops a finished recording's retained digest table once its terminal evidence is durable.
+    ///
+    /// Returns `false` when the recording is unknown or has not finished; the validator keeps its
+    /// tombstone so exact retries stay idempotent.
+    pub fn release_terminal(&mut self, recording_id: RecordingId) -> bool {
+        self.ingest_validator.release_terminal(recording_id)
     }
 
     /// Releases exactly the staged queue front for an envelope after its
@@ -715,7 +770,13 @@ impl Session {
     ) -> PostHelloAdmission {
         self.stage_committed(staged_seq, incoming.clone(), next_seq);
         let ack = build_ack(next_seq - 1, std::collections::HashMap::new());
-        PostHelloAdmission { incoming, acceptance: None, command: OutgoingCommand::Ack(ack) }
+        PostHelloAdmission {
+            incoming,
+            acceptance: None,
+            command: OutgoingCommand::Ack(ack),
+            capture_mode: self.armed_mode,
+            limitations: Vec::new(),
+        }
     }
 
     /// Commits a recording variant envelope and returns the matching
@@ -740,6 +801,8 @@ impl Session {
             incoming,
             acceptance: Some(acceptance),
             command: OutgoingCommand::Ack(ack),
+            capture_mode: self.armed_mode,
+            limitations: Vec::new(),
         }
     }
 
@@ -955,6 +1018,31 @@ fn ingest_variant_name(err: &IngestError) -> &'static str {
         IngestError::FinishedConflict(_) => "finished_conflict",
         IngestError::ActiveCapacityReached { .. } => "active_capacity_reached",
         IngestError::EventCapacityReached { .. } => "event_capacity_reached",
+        IngestError::BindingsOverBudget { .. } => "bindings_over_budget",
+        IngestError::BindingNameTooLong { .. } => "binding_name_too_long",
+        IngestError::BindingNameInvalid { .. } => "binding_name_invalid",
+        IngestError::BindingPreviewTooLong { .. } => "binding_preview_too_long",
+        IngestError::EventValueBytesOverBudget { .. } => "event_value_bytes_over_budget",
+        IngestError::ValueMissing { .. } => "value_missing",
+        IngestError::LineCursorInvalid { .. } => "line_cursor_invalid",
+        IngestError::LineEventNotAllowedInStandardMode { .. } => {
+            "line_event_not_allowed_in_standard_mode"
+        }
+        IngestError::LocalsNotAllowedInStandardMode { .. } => "locals_not_allowed_in_standard_mode",
+        IngestError::GapPayloadInvalid { .. } => "gap_payload_invalid",
+        IngestError::HashOnRedacted { .. } => "hash_on_redacted",
+        IngestError::SourceBindingMismatch { .. } => "source_binding_mismatch",
+        IngestError::SourcePathInvalid { .. } => "source_path_invalid",
+        IngestError::BindingRoleKindMismatch { .. } => "binding_role_kind_mismatch",
+        IngestError::BindingsNotAcceptedYet { .. } => "bindings_not_accepted_yet",
+        IngestError::RedactionRuleIdInvalid { .. } => "redaction_rule_id_invalid",
+        IngestError::InteractionFieldInvalid { .. } => "interaction_field_invalid",
+        IngestError::ContentHashInvalid { .. } => "content_hash_invalid",
+        IngestError::SymbolRequired { .. } => "symbol_required",
+        IngestError::ExceptionFieldInvalid { .. } => "exception_field_invalid",
+        IngestError::RuntimeFactsInvalid { .. } => "runtime_facts_invalid",
+        IngestError::UnknownEnumValue { .. } => "unknown_enum_value",
+        IngestError::OutcomeInvalid { .. } => "outcome_invalid",
     }
 }
 
@@ -1069,6 +1157,7 @@ mod tests {
             protocol_minor_max: 0,
             client_nonce: Bytes::copy_from_slice(&client_nonce),
             hmac: Bytes::copy_from_slice(&proof),
+            ..Default::default()
         }
     }
 
@@ -1122,6 +1211,7 @@ mod tests {
             protocol_minor_max: 0,
             client_nonce: Bytes::copy_from_slice(&[0xaa_u8; 32]),
             hmac: Bytes::copy_from_slice(&[0u8; 32]),
+            ..Default::default()
         };
         let envelope = envelope_with_payload(
             session.inputs().runtime_session_id,
@@ -1152,6 +1242,7 @@ mod tests {
             protocol_minor_max: 0,
             client_nonce: Bytes::copy_from_slice(&[0xaa_u8; 16]),
             hmac: Bytes::copy_from_slice(&[0u8; 32]),
+            ..Default::default()
         };
         let envelope = envelope_with_payload(
             session.inputs().runtime_session_id,
@@ -1281,6 +1372,7 @@ mod tests {
             protocol_minor_max: 0,
             client_nonce: Bytes::copy_from_slice(&client_nonce),
             hmac: Bytes::copy_from_slice(&proof),
+            ..Default::default()
         };
         let envelope = envelope_with_payload(
             session.inputs().runtime_session_id,
@@ -1613,6 +1705,18 @@ mod tests {
     }
 
     #[test]
+    fn release_terminal_only_succeeds_after_the_recording_finished() {
+        let (mut session, sid, _) = session_after_hello();
+        let id =
+            RecordingId::from_uuid(Uuid::from_slice(&valid_started(0x01).recording_id).unwrap());
+        drive(&mut session, sid, 1, PayloadOneof::RecordingStarted(valid_started(0x01)));
+        assert!(!session.release_terminal(id), "an open recording keeps its table");
+        drive(&mut session, sid, 2, PayloadOneof::RecordingFinished(finished(0x01, 1)));
+        assert!(session.release_terminal(id));
+        assert!(!session.release_terminal(RecordingId::from_uuid(Uuid::from_u128(7))));
+    }
+
+    #[test]
     fn staged_release_requires_exact_front_and_errors_do_not_mutate_queue() {
         let (mut session, sid, _) = session_after_hello();
         drive(&mut session, sid, 1, PayloadOneof::CapabilitySet(wire::CapabilitySet::default()));
@@ -1856,6 +1960,54 @@ mod tests {
         }
     }
 
+    #[test]
+    #[allow(clippy::panic, reason = "test asserts the staged payload kind")]
+    fn audit_redactor_downgrades_secret_values_before_they_are_staged() {
+        // CONTRACTS 9.3 / review A-01: the audit runs on every accepted event, so a value under a
+        // secret-looking name never reaches the translator as a captured preview.
+        let (mut session, session_id, _) = session_after_hello();
+        session
+            .accept_post_hello(&envelope_with_payload(
+                session_id,
+                1,
+                PayloadOneof::RecordingStarted(valid_started(0x01)),
+            ))
+            .expect("start");
+        let preview = "hunter2-canary";
+        let mut secret_event = event(2, 0xaa);
+        secret_event.kind = wire::RecordingEventKind::FrameEnter as i32;
+        secret_event.symbol = "app.Service.login".to_owned();
+        secret_event.bindings = vec![wire::ValueBinding {
+            name: "password".to_owned(),
+            role: wire::BindingRole::Argument as i32,
+            name_origin: wire::NameOrigin::Declared as i32,
+            value: Some(wire::CapturedValue {
+                value: Some(wire::captured_value::Value::Captured(wire::CapturedValueCaptured {
+                    shape: wire::ValueShape::String as i32,
+                    preview: preview.to_owned(),
+                    content_hash: blake3::hash(preview.as_bytes()).as_bytes().to_vec().into(),
+                })),
+            }),
+        }];
+        session
+            .accept_post_hello(&envelope_with_payload(
+                session_id,
+                2,
+                PayloadOneof::EventBatch(batch_with(0x01, vec![secret_event])),
+            ))
+            .expect("batch is accepted, then audited");
+        let staged = match session.staged_incoming.back() {
+            Some((_, IncomingEnvelope::EventBatch(batch))) => batch.clone(),
+            other => panic!("expected a staged event batch, got {other:?}"),
+        };
+        let value = staged.events[0].bindings[0].value.as_ref().and_then(|v| v.value.as_ref());
+        assert!(
+            matches!(value, Some(wire::captured_value::Value::Redacted(_))),
+            "secret-named binding must be downgraded to Redacted, got {value:?}"
+        );
+        assert!(!format!("{staged:?}").contains(preview), "the canary preview must not be staged");
+    }
+
     fn batch_with(seed: u8, events: Vec<wire::RecordingEvent>) -> wire::EventBatch {
         wire::EventBatch { recording_id: rid_bytes(seed), events }
     }
@@ -1882,6 +2034,60 @@ mod tests {
     fn drive(session: &mut Session, sid: RuntimeSessionId, seq: u64, payload: PayloadOneof) {
         let envelope = envelope_with_payload(sid, seq, payload);
         session.accept_post_hello(&envelope).expect("drive must admit");
+    }
+
+    fn focused_started(seed: u8) -> wire::RecordingStarted {
+        wire::RecordingStarted {
+            capture_policy_id: xtrace_domain::CAPTURE_POLICY_FOCUSED_ID.to_owned(),
+            ..valid_started(seed)
+        }
+    }
+
+    #[test]
+    fn focused_claim_without_arming_is_standard_and_flags_limitation() {
+        let (mut session, sid, _) = session_after_hello();
+        assert_eq!(session.armed_mode(), xtrace_domain::CaptureMode::Standard);
+        let admission = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                1,
+                PayloadOneof::RecordingStarted(focused_started(0x01)),
+            ))
+            .expect("unarmed focused claim is admitted, not rejected");
+        assert_eq!(admission.capture_mode, xtrace_domain::CaptureMode::Standard);
+        assert_eq!(admission.limitations, vec![LIMITATION_CAPTURE_POLICY_NOT_ARMED]);
+    }
+
+    #[test]
+    fn armed_session_honours_a_focused_claim_without_a_limitation() {
+        let (mut session, sid, _) = session_after_hello();
+        session.arm(xtrace_domain::CaptureMode::Focused);
+        let admission = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                1,
+                PayloadOneof::RecordingStarted(focused_started(0x01)),
+            ))
+            .expect("armed focused start");
+        assert_eq!(admission.capture_mode, xtrace_domain::CaptureMode::Focused);
+        assert!(admission.limitations.is_empty());
+    }
+
+    #[test]
+    fn armed_session_keeps_a_standard_claim_standard_and_never_lowers() {
+        let (mut session, sid, _) = session_after_hello();
+        session.arm(xtrace_domain::CaptureMode::Focused);
+        session.arm(xtrace_domain::CaptureMode::Standard);
+        assert_eq!(session.armed_mode(), xtrace_domain::CaptureMode::Focused);
+        let admission = session
+            .accept_post_hello(&envelope_with_payload(
+                sid,
+                1,
+                PayloadOneof::RecordingStarted(valid_started(0x01)),
+            ))
+            .expect("standard start on an armed session");
+        assert_eq!(admission.capture_mode, xtrace_domain::CaptureMode::Standard);
+        assert!(admission.limitations.is_empty());
     }
 
     #[test]

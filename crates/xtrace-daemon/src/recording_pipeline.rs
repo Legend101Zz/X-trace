@@ -13,8 +13,8 @@ use xtrace_application::recording::{
     RecordEvents, RecordingCapture,
 };
 use xtrace_domain::{
-    CapturedValue, DropReason, ProjectId, RecordingId, RuntimeSessionId, UnavailableReason,
-    ValueShape, WallTime,
+    CapturedValue, ProjectId, RecordingId, RuntimeSessionId, UnavailableReason, ValueShape,
+    WallTime,
 };
 use xtrace_protocol::generated::agent::{EventBatch, RecordingFinished, RecordingStarted};
 use xtrace_protocol::xtf::XtfEventEnvelope;
@@ -50,12 +50,38 @@ impl RecordingPipeline {
         }
     }
 
+    /// Processes one admitted envelope for a session that is not armed for focused capture.
+    #[cfg(test)]
     pub(crate) async fn process(
         &self,
         incoming: IncomingEnvelope,
         project_id: ProjectId,
         runtime_session_id: RuntimeSessionId,
         shutdown: crate::daemon::ShutdownSignal,
+    ) -> Result<(), RecordingPipelineError> {
+        self.process_armed(
+            incoming,
+            project_id,
+            runtime_session_id,
+            shutdown,
+            xtrace_domain::CaptureMode::Standard,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Processes one admitted envelope; `armed` is the owning session's armed mode, so a
+    /// recording's cap is `min(armed, claimed)` exactly as ingest already computed it.
+    /// `limitations` are the codes the session attached to a `RecordingStarted` admission; they
+    /// are persisted with the recording anchor and ignored for every other envelope.
+    pub(crate) async fn process_armed(
+        &self,
+        incoming: IncomingEnvelope,
+        project_id: ProjectId,
+        runtime_session_id: RuntimeSessionId,
+        shutdown: crate::daemon::ShutdownSignal,
+        armed: xtrace_domain::CaptureMode,
+        limitations: Vec<String>,
     ) -> Result<(), RecordingPipelineError> {
         match incoming {
             IncomingEnvelope::CapabilitySet(_) | IncomingEnvelope::Health(_) => Ok(()),
@@ -65,9 +91,15 @@ impl RecordingPipeline {
                     project_id,
                     runtime_session_id,
                     &self.run_observation,
+                    limitations,
                 )?;
                 let capture = Arc::clone(&self.capture);
-                self.lane.run(shutdown, move || capture.begin_recording(request).map(|_| ())).await
+                let mode = effective_capture_mode(armed, &started.capture_policy_id);
+                self.lane
+                    .run(shutdown, move || {
+                        capture.begin_recording_with_mode(request, mode).map(|_| ())
+                    })
+                    .await
             }
             IncomingEnvelope::EventBatch(batch) => {
                 let request = translate_batch(batch)?;
@@ -143,12 +175,33 @@ where
     .map_err(RecordingPipelineError::Port)
 }
 
+/// Effective capture mode of one recording (CONTRACTS 4.2): the lower of the session's armed
+/// mode and the mode its claimed policy id names, so a focused claim on a session that was
+/// never armed for focused capture stays standard. Ingest and the application layer both
+/// take this value, so they apply the same cap.
+///
+/// `armed` is the session's armed mode (`Session::armed_mode`): the launch bootstrap's
+/// `capture.json` `capture.mode`; the only arming path there is.
+pub(crate) fn effective_capture_mode(
+    armed: xtrace_domain::CaptureMode,
+    claimed_policy_id: &str,
+) -> xtrace_domain::CaptureMode {
+    use xtrace_domain::CaptureMode::{Focused, Standard};
+    match (armed, xtrace_domain::CaptureMode::from_policy_id(claimed_policy_id)) {
+        (Focused, Focused) => Focused,
+        _ => Standard,
+    }
+}
+
 fn translate_started(
     started: &RecordingStarted,
     project_id: ProjectId,
     runtime_session_id: RuntimeSessionId,
     run_observation: &EndpointObservationInput,
+    mut limitations: Vec<String>,
 ) -> Result<BeginRecording, RecordingPipelineError> {
+    limitations.sort_unstable();
+    limitations.dedup();
     let mut endpoint_observation = run_observation.clone();
     endpoint_observation.method = started.method.clone();
     endpoint_observation.route_template = started.matched_route_template.clone();
@@ -158,6 +211,7 @@ fn translate_started(
         runtime_session_id,
         opened_at: WallTime::now(),
         endpoint_observation,
+        limitations,
     })
 }
 
@@ -200,11 +254,18 @@ fn translate_finished(
             .collect::<BTreeMap<_, _>>(),
         unsupported_capability_codes: finished.unsupported_capability_codes.clone(),
         capacity_dropped_events: 0,
+        event_cap: xtrace_application::legacy_event_cap(),
         response_summary: finished
             .response_summary
             .as_ref()
             .map(captured_value_from_wire)
             .transpose()?,
+        outcome: finished
+            .outcome
+            .as_ref()
+            .map(xtrace_protocol::translate::outcome_from_wire)
+            .transpose()
+            .map_err(|_| RecordingPipelineError::InvalidFinishEvidence)?,
     })
 }
 
@@ -240,24 +301,14 @@ fn captured_value_from_wire(
             Ok(CapturedValue::Unavailable { reason: UnavailableReason::PrivacyPolicyUnavailable })
         }
         WireValue::Unavailable(unavailable) => {
-            let reason = match unavailable.reason {
-                1 => UnavailableReason::CapabilityUnsupported,
-                2 => UnavailableReason::DebugMetadataAbsent,
-                3 => UnavailableReason::CaptureBudgetExhausted,
-                4 => UnavailableReason::SourceArtifactMissing,
-                5 => UnavailableReason::RecorderDisconnected,
-                _ => return Err(invalid()),
-            };
+            let reason =
+                xtrace_protocol::translate::unavailable_reason_from_wire(unavailable.reason)
+                    .ok_or_else(invalid)?;
             Ok(CapturedValue::Unavailable { reason })
         }
         WireValue::Dropped(dropped) => {
-            let reason = match dropped.reason {
-                1 => DropReason::BackpressureShed,
-                2 => DropReason::QueueFull,
-                3 => DropReason::SequenceGap,
-                4 => DropReason::AdapterDropped,
-                _ => return Err(invalid()),
-            };
+            let reason = xtrace_protocol::translate::drop_reason_from_wire(dropped.reason)
+                .ok_or_else(invalid)?;
             Ok(CapturedValue::Dropped { reason })
         }
     }
@@ -674,5 +725,31 @@ mod tests {
         assert!(
             matches!(failure, Err(RecordingPipelineError::Port(error)) if error.kind() == PortErrorKind::Internal)
         );
+    }
+
+    #[test]
+    fn effective_mode_is_the_lower_of_armed_and_claimed() {
+        use xtrace_domain::CaptureMode::{Focused, Standard};
+        let focused = xtrace_domain::CAPTURE_POLICY_FOCUSED_ID;
+        let standard = xtrace_domain::CAPTURE_POLICY_STANDARD_ID;
+        // an unarmed session never records under the focused cap, however it is claimed
+        assert_eq!(super::effective_capture_mode(Standard, focused), Standard);
+        assert_eq!(super::effective_capture_mode(Standard, standard), Standard);
+        assert_eq!(super::effective_capture_mode(Focused, focused), Focused);
+        assert_eq!(super::effective_capture_mode(Focused, standard), Standard);
+        // unknown and empty policy ids mean standard
+        assert_eq!(super::effective_capture_mode(Focused, ""), Standard);
+        assert_eq!(super::effective_capture_mode(Focused, "xtrace.focused.v2"), Standard);
+    }
+
+    #[test]
+    fn ingest_and_application_caps_agree() {
+        use xtrace_domain::CaptureMode::{Focused, Standard};
+        let ingest = xtrace_ingest::IngestConfig::mode_derived(std::num::NonZeroUsize::MIN);
+        for mode in [Standard, Focused] {
+            assert_eq!(ingest.event_cap(mode), mode.event_cap(), "{mode:?}");
+        }
+        assert_eq!(Standard.event_cap(), 16_384);
+        assert_eq!(Focused.event_cap(), 131_072);
     }
 }

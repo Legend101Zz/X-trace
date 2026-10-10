@@ -38,13 +38,16 @@ class BoundedEventQueueTest {
   }
 
   @Test
-  void sinkBoundsActiveRecordingsAndReleasesCapacityAfterFinish() {
+  void sinkBoundsActiveRecordingsAndReleasesCapacityOnlyWhenTheWriterClosesTheRecording() {
     RuntimeBridgeSink sink = new RuntimeBridgeSink(new BoundedEventQueue(32, 8192));
     for (int index = 0; index < 8; index++) {
       assertTrue(sink.offerStart("recording-" + index, 1, "POST", "/orders"));
     }
     assertFalse(sink.offerStart("recording-overflow", 1, "POST", "/orders"));
     assertTrue(sink.offerFinish("recording-0", 1, 2, 201, 0));
+    // A queued finish does not free the slot: the writer still holds the recording.
+    assertFalse(sink.offerStart("recording-next", 3, "POST", "/orders"));
+    sink.recordingClosed();
     assertTrue(sink.offerStart("recording-next", 3, "POST", "/orders"));
   }
 

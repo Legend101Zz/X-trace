@@ -18,15 +18,20 @@ use xtrace_application::observed_endpoint_queries::{
     ObservedEndpointKey, ObservedEndpointRecord, ObservedRecordingKey, ObservedRecordingRecord,
 };
 use xtrace_application::recording::{
-    EndpointObservationInput, FinishRecording, MAX_RECORDED_EVENTS, RecordingCompletion,
+    EVENT_CAP_SANITY_BOUND, EndpointObservationInput, FinishRecording, RecordingCompletion,
 };
+
+/// Largest `request_json` accepted for terminal evidence (matches the v7 CHECK).
+const MAX_TERMINAL_REQUEST_JSON_BYTES: usize = 64 * 1024;
 use xtrace_application::recording_queries::{
-    FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_VERIFIED_INPUT_BYTES,
-    NavigationResult, PersistedEvent, PersistedInteraction, PersistedSource,
-    RecordingCompletionEvidence, RecordingEventWindow, RecordingMetadata, RecordingStatus,
-    ShowWindowRequest, SourceStatus,
+    FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_FINISH_VERIFIED_BYTES,
+    MAX_RECORDING_VERIFIED_INPUT_BYTES, NavigationResult, NavigationUnavailable, PersistedBinding,
+    PersistedEvent, PersistedGap, PersistedInteraction, PersistedOutcome, PersistedSource,
+    PersistedValue, RecordingCapacity, RecordingCompletionEvidence, RecordingEventWindow,
+    RecordingMetadata, RecordingStatus, ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
+use xtrace_domain::is_projectable_source_path;
 use xtrace_domain::{
     ContentHash, CorrelationId, ENDPOINT_FINGERPRINT_FORMAT_VERSION, EndpointIdentity, HttpMethod,
     ProjectId, RecordingId, RuntimeSessionId, SourceBinding, SourceRange, Transport, WallTime,
@@ -35,6 +40,9 @@ use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
 use crate::connection::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
+
+#[path = "recording_limitations.rs"]
+mod recording_limitations;
 use crate::xtf::{
     LogicalXtfSegment, XtfCodecError, XtfSegmentInput, compress_logical_bytes,
     encode_logical_segment, max_compressed_segment_bytes, verify_compressed_segment,
@@ -53,6 +61,9 @@ pub struct BeginRecordingRequest {
     pub opened_at: WallTime,
     /// Run-scoped opt-in and adapter fields for safe endpoint classification.
     pub endpoint_observation: EndpointObservationInput,
+    /// Closed-vocabulary limitation codes persisted with a newly inserted anchor (ADR 0011).
+    /// An exact replay never changes the limitations the recording was opened with.
+    pub limitations: Vec<String>,
 }
 
 /// Successful outcome of [`SqliteRecordingStore::begin_recording`].
@@ -659,6 +670,12 @@ impl SqliteRecordingStore<'_> {
                 }
                 _ => Vec::new(),
             };
+            // A corrupt terminal row is already reported through `completion`
+            // and `incomplete_evidence`; list metadata then stays null.
+            let terminal =
+                load_terminal_finish(&connection, recording_id, completion, correlation_id)
+                    .ok()
+                    .flatten();
             recordings.push(RecordingMetadata {
                 recording_id,
                 status: lifecycle_status,
@@ -681,6 +698,18 @@ impl SqliteRecordingStore<'_> {
                     .transpose()?
                     .map(|value| value.to_string()),
                 incomplete_evidence,
+                event_cap: terminal
+                    .as_ref()
+                    .and_then(|finish| u32::try_from(finish.event_cap).ok()),
+                // Terminal evidence without an adapter outcome (every pre-outcome
+                // row) reads `unobserved`; no terminal evidence reads `null` (CONTRACTS 5).
+                outcome_kind: terminal.as_ref().map(|finish| {
+                    finish
+                        .outcome
+                        .as_ref()
+                        .map_or("unobserved", |outcome| outcome.kind.as_str())
+                        .to_owned()
+                }),
             });
         }
         let has_more = recordings.len() > usize::try_from(limit).unwrap_or(usize::MAX);
@@ -688,6 +717,70 @@ impl SqliteRecordingStore<'_> {
             recordings.pop();
         }
         Ok((recordings, has_more))
+    }
+
+    /// Resolves every navigation edge of one indexed frame (CONTRACTS 8.2 `navigation`).
+    ///
+    /// The frame must belong to this project-owned recording; anything else is the same
+    /// not-found as an unknown recording so frame ids of other recordings are not probed.
+    pub(crate) fn read_frame_navigation(
+        &self,
+        project_id: ProjectId,
+        recording_id: RecordingId,
+        frame_id: xtrace_domain::FrameId,
+    ) -> Result<xtrace_application::FrameNavigationView, RecordingStoreError> {
+        let correlation_id = CorrelationId::new();
+        self.binding.revalidate(correlation_id)?;
+        let connection =
+            self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        let row: Option<(Vec<u8>, String)> = connection
+            .query_row(
+                "SELECT project_id, status FROM recordings WHERE recording_id = ?1",
+                rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?;
+        let Some((raw_project_id, status)) = row else {
+            return Err(read_not_found_error(correlation_id));
+        };
+        if project_id_from_bytes(&raw_project_id, correlation_id)? != project_id {
+            return Err(read_not_found_error(correlation_id));
+        }
+        let completion = completion_evidence(&connection, recording_id, &status, correlation_id)?;
+        let Some(frame) =
+            load_indexed_frame_by_id(&connection, recording_id, frame_id, correlation_id)?
+        else {
+            return Err(read_not_found_error(correlation_id));
+        };
+        let parent_frame_id = match frame.parent_seq {
+            Some(parent) => load_indexed_frame(&connection, recording_id, parent, correlation_id)?
+                .map(|parent| parent.frame_id),
+            None => None,
+        };
+        let (depth, navigation) = if frame.indexed {
+            (
+                Some(frame.depth),
+                navigate_indexed_frame(
+                    &connection,
+                    recording_id,
+                    &frame,
+                    completion,
+                    correlation_id,
+                )?,
+            )
+        } else {
+            (None, FrameNavigation::UNAVAILABLE)
+        };
+        Ok(xtrace_application::FrameNavigationView {
+            frame_id: frame.frame_id,
+            sequence: frame.sequence.to_string(),
+            depth,
+            parent_frame_id,
+            navigation,
+        })
     }
 
     /// Reads one bounded event window while fully verifying each decoded XTF object.
@@ -745,6 +838,35 @@ impl SqliteRecordingStore<'_> {
                     .collect()
             })
             .unwrap_or_default();
+        let capacity = match terminal_finish.as_ref() {
+            None => None,
+            Some(finish) => {
+                let stored_event_count: i64 = connection
+                    .query_row(
+                        "SELECT event_count FROM recording_terminal_evidence WHERE recording_id = ?1",
+                        rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        map_store_error(
+                            StoreError::from_rusqlite(error, correlation_id),
+                            correlation_id,
+                        )
+                    })?;
+                Some(RecordingCapacity {
+                    event_cap: u32::try_from(finish.event_cap)
+                        .map_err(|_| recording_query_corrupt_error(correlation_id))?,
+                    event_count: u32::try_from(stored_event_count)
+                        .map_err(|_| recording_query_corrupt_error(correlation_id))?,
+                    capacity_dropped_events: finish.capacity_dropped_events.to_string(),
+                    drops_by_priority: finish
+                        .drop_counts_by_priority
+                        .iter()
+                        .map(|(priority, count)| (*priority, count.to_string()))
+                        .collect(),
+                })
+            }
+        };
 
         let mut statement = connection
             .prepare(
@@ -765,6 +887,8 @@ impl SqliteRecordingStore<'_> {
         let mut segment_count = 0_u64;
         let mut events: Vec<PersistedEvent> = Vec::new();
         let mut verified_frame_ids = HashMap::new();
+        // Sequence ranges of the segments decoded and verified by this read.
+        let mut decoded_ranges: Vec<(u64, u64)> = Vec::new();
         let event_limit = usize::try_from(request.limit)
             .map_err(|_| recording_query_validation_error(correlation_id))?;
         let mut has_more = false;
@@ -776,6 +900,23 @@ impl SqliteRecordingStore<'_> {
         let mut source_cache = SourceProjectionCache::default();
         if status == "partial" || status == "invalid" {
             incomplete_evidence.push(format!("persisted_status:{status}"));
+        }
+        // A Partial that carries a real-looking digest but no capacity drops was sealed
+        // without hashing because its declared bytes passed the verification bound; say so
+        // instead of leaving the cause silent.
+        if completion == RecordingCompletionEvidence::Partial
+            && terminal_finish.as_ref().is_some_and(|finish| {
+                finish.event_digest.len() == 32
+                    && finish.event_digest.iter().any(|byte| *byte != 0)
+                    && finish.capacity_dropped_events == 0
+            })
+            && !declared_bytes_within_verification_bound(
+                &connection,
+                request.recording_id,
+                correlation_id,
+            )?
+        {
+            incomplete_evidence.push("verification_budget_exceeded".to_owned());
         }
 
         while let Some(row) = rows.next().map_err(|error| {
@@ -952,6 +1093,7 @@ impl SqliteRecordingStore<'_> {
                 return Err(object_corrupt_error(correlation_id));
             }
             verified_input_bytes = work_if_added.unwrap_or(segment_work);
+            decoded_ranges.push((first_sequence, last_sequence));
             index_verified_segment_frames(
                 &connection,
                 request.recording_id,
@@ -998,16 +1140,70 @@ impl SqliteRecordingStore<'_> {
                 .sequence
                 .parse::<u64>()
                 .map_err(|_| recording_query_corrupt_error(correlation_id))?;
-            let (frame_id, navigation) = frame_navigation(
-                &connection,
-                request.recording_id,
-                sequence,
-                &verified_frame_ids,
-                completion,
-                correlation_id,
-            )?;
+            let indexed =
+                load_indexed_frame(&connection, request.recording_id, sequence, correlation_id)?
+                    .filter(|row| {
+                        row.indexed && verified_frame_ids.get(&sequence) == Some(&row.frame_id)
+                    });
+            let (frame_id, navigation) = if let Some(row) = &indexed {
+                let navigation = navigate_indexed_frame(
+                    &connection,
+                    request.recording_id,
+                    row,
+                    completion,
+                    correlation_id,
+                )?;
+                event.depth = Some(row.depth);
+                for (parent, slot) in [
+                    (row.parent_seq, &mut event.parent_frame_id),
+                    (row.async_parent_seq, &mut event.async_parent_frame_id),
+                ] {
+                    if let Some(parent) = parent {
+                        *slot = load_indexed_frame(
+                            &connection,
+                            request.recording_id,
+                            parent,
+                            correlation_id,
+                        )?
+                        .map(|parent| parent.frame_id);
+                    }
+                }
+                // A target inside a segment this read decoded must match its verified XTF
+                // event; a corrupt metadata row degrades that edge instead of being trusted.
+                let checked = check_navigation_targets(
+                    &connection,
+                    request.recording_id,
+                    navigation,
+                    &decoded_ranges,
+                    &verified_frame_ids,
+                    correlation_id,
+                )?;
+                (Some(row.frame_id), checked)
+            } else {
+                frame_navigation(
+                    &connection,
+                    request.recording_id,
+                    sequence,
+                    &verified_frame_ids,
+                    completion,
+                    correlation_id,
+                )?
+            };
             event.frame_id = frame_id;
-            event.navigation = navigation;
+            event.navigation = if frame_id.is_none() && event.kind == "request_update" {
+                // CONTRACTS 8.3: request updates are never frames.
+                let not_navigable =
+                    NavigationResult::unavailable(NavigationUnavailable::NotNavigable);
+                FrameNavigation {
+                    previous: not_navigable,
+                    next: not_navigable,
+                    into: not_navigable,
+                    over: not_navigable,
+                    out: not_navigable,
+                }
+            } else {
+                navigation
+            };
         }
         // The application layer serializes this entire DTO. Account for the
         // terminal sidecar and the final frame/navigation-enriched events
@@ -1065,6 +1261,34 @@ impl SqliteRecordingStore<'_> {
             events,
             has_more,
             incomplete_evidence,
+            // CONTRACTS 5: no terminal evidence reads `null`; terminal evidence without an
+            // adapter outcome (every pre-outcome row) reads `unobserved`, never `responded`.
+            outcome: terminal_finish.as_ref().map(|finish| {
+                let outcome = finish
+                    .outcome
+                    .clone()
+                    .unwrap_or_else(xtrace_domain::RecordingOutcome::legacy_unobserved);
+                PersistedOutcome {
+                    kind: outcome.kind.as_str().to_owned(),
+                    http_status: outcome.http_status,
+                    exception: outcome.exception.map(|exception| {
+                        xtrace_application::recording_queries::OutcomeException {
+                            exception_type: exception.exception_type,
+                            message: Some(exception.message).filter(|message| !message.is_empty()),
+                        }
+                    }),
+                    thrown_from_event_id: outcome.thrown_from_event_id,
+                }
+            }),
+            capacity,
+            limitations: recording_limitations::load(
+                &connection,
+                request.recording_id.as_uuid().as_bytes(),
+            )
+            .map_err(|error| {
+                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+            })?,
+            frame_honesty: load_frame_honesty(&connection, request.recording_id, correlation_id)?,
         })
     }
 
@@ -1159,6 +1383,14 @@ impl SqliteRecordingStore<'_> {
             "INSERT INTO recording_endpoint_observations (recording_id, project_id, disposition, observation_policy_id, operation_id, application_component, binding_key, method, route_template, reason_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec(), request.project_id.as_uuid().as_bytes().to_vec(), if operation_id.is_some() { "linked" } else { "unmatched" }, disposition.policy_id, operation_id.map(|id| id.as_uuid().as_bytes().to_vec()), disposition.application_component, disposition.binding_key, disposition.method, disposition.route_template, disposition.reason_code],
         ).map_err(|error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id))?;
+        recording_limitations::insert(
+            &transaction,
+            request.recording_id.as_uuid().as_bytes(),
+            &request.limitations,
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         transaction.commit().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })?;
@@ -1386,16 +1618,18 @@ impl SqliteRecordingStore<'_> {
             || request.unsupported_capability_codes.len() > 64
             || request.unsupported_capability_codes.iter().any(|code| !stable_capability_code(code))
             || request.response_summary.as_ref().is_some_and(captured_value_has_preview)
+            || request.outcome.as_ref().is_some_and(|outcome| outcome.validate().is_err())
             || request.response_summary.as_ref().is_some_and(|value| {
                 matches!(value, xtrace_domain::CapturedValue::Redacted { rule_id, .. }
                     if rule_id != "unverified-producer-redaction")
             })
+            || !event_cap_in_bounds(request.event_cap)
         {
             return Err(terminal_validation_error(correlation_id));
         }
         let request_json = serde_json::to_string(request)
             .map_err(|_| terminal_validation_error(correlation_id))?;
-        if request_json.len() > 16 * 1024 {
+        if request_json.len() > MAX_TERMINAL_REQUEST_JSON_BYTES {
             return Err(terminal_validation_error(correlation_id));
         }
         let _writer = self
@@ -1480,14 +1714,17 @@ impl SqliteRecordingStore<'_> {
         transaction
             .execute(
                 "INSERT INTO recording_terminal_evidence \
-                 (recording_id, request_json, completion, final_recording_seq, event_count) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (recording_id, request_json, completion, final_recording_seq, event_count, \
+                  event_cap) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     request.recording_id.as_uuid().as_bytes().to_vec(),
                     request_json,
                     completion_text,
                     request.final_recording_seq.to_be_bytes().as_slice(),
                     i64::try_from(event_count)
+                        .map_err(|_| terminal_validation_error(correlation_id))?,
+                    i64::try_from(request.event_cap)
                         .map_err(|_| terminal_validation_error(correlation_id))?,
                 ],
             )
@@ -1563,7 +1800,9 @@ impl SqliteRecordingStore<'_> {
             let mut segments = Vec::new();
             let mut declared_event_count = 0_usize;
             let mut declared_input_bytes = 0_usize;
-            for row in rows.take(MAX_RECORDED_EVENTS + 1) {
+            let event_cap = usize::try_from(request.event_cap)
+                .map_err(|_| terminal_validation_error(correlation_id))?;
+            for row in rows.take(event_cap.saturating_add(1)) {
                 let segment = row.map_err(|error| {
                     map_store_error(
                         StoreError::from_rusqlite(error, correlation_id),
@@ -1583,8 +1822,8 @@ impl SqliteRecordingStore<'_> {
                     .checked_add(logical_bytes)
                     .and_then(|total| total.checked_add(compressed_bytes))
                     .ok_or_else(|| object_corrupt_error(correlation_id))?;
-                if segments.len() == MAX_RECORDED_EVENTS
-                    || declared_event_count > MAX_RECORDED_EVENTS
+                if segments.len() == event_cap
+                    || declared_event_count > event_cap
                     || segment_event_count == 0
                 {
                     return Err(object_corrupt_error(correlation_id));
@@ -1594,7 +1833,7 @@ impl SqliteRecordingStore<'_> {
             (project_id, segments, declared_event_count, declared_input_bytes)
         };
 
-        if declared_input_bytes > MAX_RECORDING_VERIFIED_INPUT_BYTES {
+        if declared_input_bytes > MAX_RECORDING_FINISH_VERIFIED_BYTES {
             return Ok((
                 RecordingCompletion::Partial,
                 u64::try_from(declared_event_count)
@@ -1793,11 +2032,88 @@ fn valid_frame_identity(value: &str) -> bool {
         && value.as_bytes().iter().all(|byte| (0x20..=0x7e).contains(byte))
 }
 
+/// Deepest call depth the index stores; deeper frames saturate and carry
+/// `DEPTH_OVERFLOW` (CONTRACTS 6.2).
+const MAX_INDEXED_DEPTH: u32 = 4096;
+
+/// Wire `RecordingEventKind::Gap`.
+const WIRE_KIND_GAP: i32 = 14;
+
+/// Index facts of an already-indexed parent frame.
+#[derive(Clone, Copy)]
+struct IndexedParent {
+    sequence: u64,
+    depth: u32,
+}
+
+/// Looks up the parent frame by event-id digest: the in-segment map first, then
+/// the unique `(recording_id, event_id_digest)` index for earlier segments.
+fn resolve_indexed_parent(
+    transaction: &rusqlite::Transaction<'_>,
+    recording_id: RecordingId,
+    local: &HashMap<[u8; 32], IndexedParent>,
+    id: &str,
+    correlation_id: CorrelationId,
+) -> Result<Option<IndexedParent>, RecordingStoreError> {
+    if id.is_empty() {
+        return Ok(None);
+    }
+    let digest = *blake3::hash(id.as_bytes()).as_bytes();
+    if let Some(parent) = local.get(&digest) {
+        return Ok(Some(*parent));
+    }
+    let row: Option<(Vec<u8>, i64)> = transaction
+        .query_row(
+            "SELECT recording_seq, depth FROM recording_frame_index \
+             WHERE recording_id = ?1 AND event_id_digest = ?2",
+            rusqlite::params![recording_id.as_uuid().as_bytes().to_vec(), digest.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let Some((sequence, depth)) = row else {
+        return Ok(None);
+    };
+    let sequence = decode_stored_sequence(&sequence, correlation_id)?;
+    let depth = u32::try_from(depth).map_err(|_| recording_query_corrupt_error(correlation_id))?;
+    Ok(Some(IndexedParent { sequence, depth }))
+}
+
+/// Honesty bits derived from the bindings and kind of one event.
+fn frame_honesty_flags(event: &xtrace_protocol::generated::agent::RecordingEvent) -> u32 {
+    use xtrace_domain::honesty_flags as flags;
+    use xtrace_protocol::generated::agent::captured_value::Value as WireValue;
+
+    let mut bits = 0_u32;
+    if event.kind == WIRE_KIND_GAP {
+        bits |= flags::HAS_GAP;
+    }
+    for binding in &event.bindings {
+        bits |= flags::HAS_VALUES;
+        match binding.value.as_ref().and_then(|value| value.value.as_ref()) {
+            Some(WireValue::Redacted(_)) => bits |= flags::HAS_REDACTED,
+            Some(WireValue::Truncated(_)) => bits |= flags::HAS_TRUNCATED,
+            Some(WireValue::Unavailable(_)) | None => bits |= flags::HAS_UNAVAILABLE,
+            Some(WireValue::Dropped(_)) => bits |= flags::HAS_DROPPED,
+            Some(WireValue::Captured(_)) => {}
+        }
+    }
+    bits
+}
+
+/// Populates the v8 frame index for one segment in sequence order. Depth is
+/// `parent.depth + 1` and a parent that was never observed makes the frame a
+/// root flagged `ORPHAN_PARENT` (R3). There is no ancestor walk.
 fn insert_frame_index_rows(
     transaction: &rusqlite::Transaction<'_>,
     request: &SegmentCommitRequest,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    use xtrace_domain::honesty_flags as flags;
+
+    let mut local: HashMap<[u8; 32], IndexedParent> = HashMap::new();
     for (offset, envelope) in request.events.iter().enumerate() {
         let Some(event) = envelope.event.as_ref() else {
             return Err(segment_validation_error(correlation_id));
@@ -1813,12 +2129,44 @@ fn insert_frame_index_rows(
             .then(|| blake3::hash(event.parent_event_id.as_bytes()).as_bytes().to_vec());
         let async_parent_digest = (!event.async_parent_event_id.is_empty())
             .then(|| blake3::hash(event.async_parent_event_id.as_bytes()).as_bytes().to_vec());
+        let parent = resolve_indexed_parent(
+            transaction,
+            request.recording_id,
+            &local,
+            &event.parent_event_id,
+            correlation_id,
+        )?;
+        let async_parent = resolve_indexed_parent(
+            transaction,
+            request.recording_id,
+            &local,
+            &event.async_parent_event_id,
+            correlation_id,
+        )?;
+        let mut honesty = frame_honesty_flags(event);
+        let mut depth = 0_u32;
+        match parent {
+            Some(parent) => {
+                depth = parent.depth.saturating_add(1);
+                if depth > MAX_INDEXED_DEPTH {
+                    depth = MAX_INDEXED_DEPTH;
+                    honesty |= flags::DEPTH_OVERFLOW;
+                }
+            }
+            None if !event.parent_event_id.is_empty() => honesty |= flags::ORPHAN_PARENT,
+            None => {}
+        }
+        local.insert(
+            *event_digest.as_bytes(),
+            IndexedParent { sequence: event.recording_seq, depth },
+        );
         transaction
             .execute(
                 "INSERT INTO recording_frame_index \
                  (recording_id, recording_seq, frame_id, segment_ordinal, event_offset, \
-                  event_id_digest, parent_id_digest, async_parent_digest, monotonic_ns) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  event_id_digest, parent_id_digest, async_parent_digest, monotonic_ns, \
+                  depth, parent_seq, async_parent_seq, kind, honesty_flags, indexed_v) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1)",
                 rusqlite::params![
                     request.recording_id.as_uuid().as_bytes().to_vec(),
                     sequence.as_slice(),
@@ -1829,6 +2177,11 @@ fn insert_frame_index_rows(
                     parent_digest,
                     async_parent_digest,
                     event.monotonic_ns.to_be_bytes().as_slice(),
+                    i64::from(depth),
+                    parent.map(|parent| parent.sequence.to_be_bytes().to_vec()),
+                    async_parent.map(|parent| parent.sequence.to_be_bytes().to_vec()),
+                    i64::from(event.kind),
+                    i64::from(honesty),
                 ],
             )
             .map_err(|error| {
@@ -2177,20 +2530,21 @@ fn load_terminal_finish(
     let Some(request_bytes) = request_bytes else {
         return Ok(None);
     };
-    if !(0..=16_384).contains(&request_bytes) {
+    if !(0..=MAX_TERMINAL_REQUEST_JSON_BYTES as i64).contains(&request_bytes) {
         return Err(recording_query_corrupt_error(correlation_id));
     }
-    let (request_json, raw_final_sequence, stored_completion, stored_event_count): (
+    let (request_json, raw_final_sequence, stored_completion, stored_event_count, stored_cap): (
         String,
         Vec<u8>,
         String,
         i64,
+        i64,
     ) = connection
         .query_row(
-            "SELECT request_json, final_recording_seq, completion, event_count \
+            "SELECT request_json, final_recording_seq, completion, event_count, event_cap \
                  FROM recording_terminal_evidence WHERE recording_id = ?1",
             rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
@@ -2202,7 +2556,9 @@ fn load_terminal_finish(
         .map_err(|_| recording_query_corrupt_error(correlation_id))?;
     if finish.recording_id != recording_id
         || finish.final_recording_seq != final_sequence
-        || event_count > u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
+        || !event_cap_in_bounds(finish.event_cap)
+        || i64::try_from(finish.event_cap).ok() != Some(stored_cap)
+        || event_count > finish.event_cap
         || finish.event_digest.len() > 32
         || finish.drop_counts_by_priority.len() > 256
         || finish.unsupported_capability_codes.len() > 64
@@ -2217,8 +2573,7 @@ fn load_terminal_finish(
         // Capacity drops only happen once the persisted history is full, and the
         // unverifiable adapter digest is withheld; anything else is inconsistent.
         || (finish.capacity_dropped_events > 0
-            && (event_count != u64::try_from(MAX_RECORDED_EVENTS).unwrap_or(u64::MAX)
-                || !finish.event_digest.is_empty()))
+            && (event_count != finish.event_cap || !finish.event_digest.is_empty()))
         || finish.capacity_dropped_events
             > finish
                 .drop_counts_by_priority
@@ -2228,6 +2583,7 @@ fn load_terminal_finish(
             && event_count.checked_add(1).is_none_or(|last| final_sequence < last))
         || stored_completion != completion_label_from_evidence(completion)
         || finish.response_summary.as_ref().is_some_and(captured_value_has_preview)
+        || finish.outcome.as_ref().is_some_and(|outcome| outcome.validate().is_err())
         || finish.response_summary.as_ref().is_some_and(|value| {
             matches!(value, xtrace_domain::CapturedValue::Redacted { rule_id, .. }
                 if rule_id != "unverified-producer-redaction")
@@ -2236,6 +2592,11 @@ fn load_terminal_finish(
         return Err(recording_query_corrupt_error(correlation_id));
     }
     Ok(Some(finish))
+}
+
+/// An event cap is valid when it is positive and not above the sanity bound.
+fn event_cap_in_bounds(cap: u64) -> bool {
+    (1..=EVENT_CAP_SANITY_BOUND as u64).contains(&cap)
 }
 
 fn completion_label_from_evidence(completion: RecordingCompletionEvidence) -> &'static str {
@@ -2277,26 +2638,26 @@ fn frame_navigation(
         NavigationResult::Boundary
     } else {
         match verified_frame_ids.get(&(sequence - 1)).copied() {
-            Some(frame) => NavigationResult::Target(frame),
-            None => NavigationResult::Unavailable,
+            Some(frame_id) => NavigationResult::Target { frame_id },
+            None => NavigationResult::unavailable(NavigationUnavailable::PartialFrontier),
         }
     };
     let next = if let Some(next_sequence) = sequence.checked_add(1) {
         if let Some(frame) = verified_frame_ids.get(&next_sequence).copied() {
-            NavigationResult::Target(frame)
+            NavigationResult::Target { frame_id: frame }
         } else if completion == RecordingCompletionEvidence::Complete
             && terminal_final_sequence(connection, recording_id, correlation_id)? == Some(sequence)
         {
             NavigationResult::Boundary
         } else {
-            NavigationResult::Unavailable
+            NavigationResult::unavailable(NavigationUnavailable::PartialFrontier)
         }
     } else if completion == RecordingCompletionEvidence::Complete
         && terminal_final_sequence(connection, recording_id, correlation_id)? == Some(sequence)
     {
         NavigationResult::Boundary
     } else {
-        NavigationResult::Unavailable
+        NavigationResult::unavailable(NavigationUnavailable::PartialFrontier)
     };
     Ok((
         Some(frame_id),
@@ -2305,11 +2666,457 @@ fn frame_navigation(
             next,
             // Parent digests are retained for a future verified graph
             // resolver. They do not establish call-stack depth by themselves.
-            into: NavigationResult::Unavailable,
-            over: NavigationResult::Unavailable,
-            out: NavigationResult::Unavailable,
+            into: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+            over: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+            out: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
         },
     ))
+}
+
+/// Whole-recording honesty counts from the frame index flags, one SQL aggregate and no
+/// segment reads. `None` when any frame predates the index.
+fn load_frame_honesty(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    correlation_id: CorrelationId,
+) -> Result<Option<xtrace_application::FrameHonestyCounts>, RecordingStoreError> {
+    use xtrace_domain::honesty_flags as flags;
+
+    let counts = connection
+        .query_row(
+            "SELECT count(*), coalesce(sum(indexed_v = 1), 0), \
+             coalesce(sum((honesty_flags & ?2) != 0), 0), coalesce(sum((honesty_flags & ?3) != 0), 0), \
+             coalesce(sum((honesty_flags & ?4) != 0), 0), coalesce(sum((honesty_flags & ?5) != 0), 0), \
+             coalesce(sum((honesty_flags & ?6) != 0), 0), coalesce(sum((honesty_flags & ?7) != 0), 0) \
+             FROM recording_frame_index WHERE recording_id = ?1",
+            rusqlite::params![
+                recording_id.as_uuid().as_bytes().to_vec(),
+                i64::from(flags::HAS_GAP),
+                i64::from(flags::HAS_REDACTED),
+                i64::from(flags::HAS_TRUNCATED),
+                i64::from(flags::HAS_UNAVAILABLE),
+                i64::from(flags::HAS_DROPPED),
+                i64::from(flags::ORPHAN_PARENT),
+            ],
+            |row| {
+                let mut values = [0_i64; 8];
+                for (index, value) in values.iter_mut().enumerate() {
+                    *value = row.get(index)?;
+                }
+                Ok(values)
+            },
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let [total, indexed, gap, redacted, truncated, unavailable, dropped, orphan] = counts;
+    if total != indexed {
+        return Ok(None);
+    }
+    let as_count = |value: i64| u64::try_from(value).unwrap_or(0);
+    Ok(Some(xtrace_application::FrameHonestyCounts {
+        gap: as_count(gap),
+        redacted: as_count(redacted),
+        truncated: as_count(truncated),
+        unavailable: as_count(unavailable),
+        dropped: as_count(dropped),
+        orphan_parent: as_count(orphan),
+    }))
+}
+
+/// Replaces every navigation target that falls inside a segment decoded by this read but
+/// whose frame id is not the one verified against the XTF event with `partial_frontier`.
+fn check_navigation_targets(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    navigation: FrameNavigation,
+    decoded_ranges: &[(u64, u64)],
+    verified_frame_ids: &HashMap<u64, xtrace_domain::FrameId>,
+    correlation_id: CorrelationId,
+) -> Result<FrameNavigation, RecordingStoreError> {
+    let check = |result: NavigationResult| -> Result<NavigationResult, RecordingStoreError> {
+        let NavigationResult::Target { frame_id } = result else {
+            return Ok(result);
+        };
+        let Some(target) =
+            load_indexed_frame_by_id(connection, recording_id, frame_id, correlation_id)?
+        else {
+            return Ok(NavigationResult::unavailable(NavigationUnavailable::PartialFrontier));
+        };
+        let inside =
+            decoded_ranges.iter().any(|(first, last)| (*first..=*last).contains(&target.sequence));
+        if inside && verified_frame_ids.get(&target.sequence) != Some(&frame_id) {
+            return Ok(NavigationResult::unavailable(NavigationUnavailable::PartialFrontier));
+        }
+        Ok(result)
+    };
+    Ok(FrameNavigation {
+        previous: check(navigation.previous)?,
+        next: check(navigation.next)?,
+        into: check(navigation.into)?,
+        over: check(navigation.over)?,
+        out: check(navigation.out)?,
+    })
+}
+
+/// Wire kinds the navigation function distinguishes.
+const WIRE_KIND_REQUEST_UPDATE: i64 = 1;
+const WIRE_KIND_FRAME_EXIT: i64 = 3;
+const WIRE_KIND_FRAME_THROW: i64 = 4;
+
+/// One `recording_frame_index` row as the navigation function sees it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IndexedFrame {
+    pub(crate) sequence: u64,
+    pub(crate) frame_id: xtrace_domain::FrameId,
+    pub(crate) depth: u32,
+    pub(crate) parent_seq: Option<u64>,
+    pub(crate) async_parent_seq: Option<u64>,
+    pub(crate) kind: i64,
+    pub(crate) honesty_flags: u32,
+    pub(crate) indexed: bool,
+}
+
+const INDEX_COLUMNS: &str =
+    "recording_seq, frame_id, depth, parent_seq, async_parent_seq, kind, honesty_flags, indexed_v";
+
+fn indexed_frame_from_row(
+    row: &rusqlite::Row<'_>,
+    correlation_id: CorrelationId,
+) -> Result<IndexedFrame, RecordingStoreError> {
+    let sql = |error: rusqlite::Error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    };
+    let sequence: Vec<u8> = row.get(0).map_err(sql)?;
+    let frame_id: Vec<u8> = row.get(1).map_err(sql)?;
+    let depth: i64 = row.get(2).map_err(sql)?;
+    let parent: Option<Vec<u8>> = row.get(3).map_err(sql)?;
+    let async_parent: Option<Vec<u8>> = row.get(4).map_err(sql)?;
+    let kind: i64 = row.get(5).map_err(sql)?;
+    let flags: i64 = row.get(6).map_err(sql)?;
+    let indexed: i64 = row.get(7).map_err(sql)?;
+    let decode = |bytes: Option<Vec<u8>>| -> Result<Option<u64>, RecordingStoreError> {
+        bytes.map(|bytes| decode_stored_sequence(&bytes, correlation_id)).transpose()
+    };
+    Ok(IndexedFrame {
+        sequence: decode_stored_sequence(&sequence, correlation_id)?,
+        frame_id: frame_id_from_bytes(&frame_id, correlation_id)?,
+        depth: u32::try_from(depth).map_err(|_| recording_query_corrupt_error(correlation_id))?,
+        parent_seq: decode(parent)?,
+        async_parent_seq: decode(async_parent)?,
+        kind,
+        honesty_flags: u32::try_from(flags)
+            .map_err(|_| recording_query_corrupt_error(correlation_id))?,
+        indexed: indexed == 1,
+    })
+}
+
+/// Reads one frame-index row by sequence.
+pub(crate) fn load_indexed_frame(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    sequence: u64,
+    correlation_id: CorrelationId,
+) -> Result<Option<IndexedFrame>, RecordingStoreError> {
+    let mut statement = connection
+        .prepare_cached(&format!(
+            "SELECT {INDEX_COLUMNS} FROM recording_frame_index \
+             WHERE recording_id = ?1 AND recording_seq = ?2"
+        ))
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let mut rows = statement
+        .query(rusqlite::params![
+            recording_id.as_uuid().as_bytes().to_vec(),
+            sequence.to_be_bytes().as_slice()
+        ])
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let Some(row) = rows.next().map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?
+    else {
+        return Ok(None);
+    };
+    indexed_frame_from_row(row, correlation_id).map(Some)
+}
+
+/// Reads one frame-index row by public frame id.
+pub(crate) fn load_indexed_frame_by_id(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    frame_id: xtrace_domain::FrameId,
+    correlation_id: CorrelationId,
+) -> Result<Option<IndexedFrame>, RecordingStoreError> {
+    let mut statement = connection
+        .prepare_cached(&format!(
+            "SELECT {INDEX_COLUMNS} FROM recording_frame_index \
+             WHERE recording_id = ?1 AND frame_id = ?2"
+        ))
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let mut rows = statement
+        .query(rusqlite::params![
+            recording_id.as_uuid().as_bytes().to_vec(),
+            frame_id.as_uuid().as_bytes().to_vec()
+        ])
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let Some(row) = rows.next().map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?
+    else {
+        return Ok(None);
+    };
+    indexed_frame_from_row(row, correlation_id).map(Some)
+}
+
+/// First frame matching `predicate_sql` in the given direction, or `None`.
+fn first_frame_where(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    sequence: u64,
+    forward: bool,
+    predicate_sql: &str,
+    extra: Option<i64>,
+    correlation_id: CorrelationId,
+) -> Result<Option<xtrace_domain::FrameId>, RecordingStoreError> {
+    let (cmp, order) = if forward { (">", "ASC") } else { ("<", "DESC") };
+    let sql = format!(
+        "SELECT frame_id FROM recording_frame_index \
+         WHERE recording_id = ?1 AND recording_seq {cmp} ?2 AND kind != {WIRE_KIND_REQUEST_UPDATE} \
+         AND indexed_v = 1 {predicate_sql} ORDER BY recording_seq {order} LIMIT 1"
+    );
+    let mut statement = connection.prepare_cached(&sql).map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    let id = recording_id.as_uuid().as_bytes().to_vec();
+    let seq = sequence.to_be_bytes();
+    let found: Option<Vec<u8>> = match extra {
+        Some(extra) => statement
+            .query_row(rusqlite::params![id, seq.as_slice(), extra], |row| row.get(0))
+            .optional(),
+        None => {
+            statement.query_row(rusqlite::params![id, seq.as_slice()], |row| row.get(0)).optional()
+        }
+    }
+    .map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    found.map(|bytes| frame_id_from_bytes(&bytes, correlation_id)).transpose()
+}
+
+/// Whether the recording's declared segment bytes fit the finish verification bound.
+/// `verify_terminal_evidence` answers Partial WITHOUT hashing when they do not.
+pub(crate) fn declared_bytes_within_verification_bound(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    correlation_id: CorrelationId,
+) -> Result<bool, RecordingStoreError> {
+    let declared: Option<i64> = connection
+        .query_row(
+            "SELECT SUM(uncompressed_bytes + compressed_bytes) FROM recording_segments \
+             WHERE recording_id = ?1",
+            rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    Ok(declared
+        .and_then(|total| usize::try_from(total).ok())
+        .is_some_and(|total| total <= MAX_RECORDING_FINISH_VERIFIED_BYTES))
+}
+
+/// Whether every event up to the finish sequence is persisted, so that "no later
+/// frame" is a real end rather than an unverified frontier.
+pub(crate) fn persisted_frontier_is_final(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    completion: RecordingCompletionEvidence,
+    correlation_id: CorrelationId,
+) -> Result<bool, RecordingStoreError> {
+    if !matches!(
+        completion,
+        RecordingCompletionEvidence::Complete | RecordingCompletionEvidence::Partial
+    ) {
+        return Ok(false);
+    }
+    let Some(finish) = load_terminal_finish(connection, recording_id, completion, correlation_id)?
+    else {
+        return Ok(false);
+    };
+    // A partial recording may end at its last persisted frame only when the finish
+    // digest was verified and nothing was dropped at capacity (a declared-gap partial).
+    if completion == RecordingCompletionEvidence::Partial
+        && (finish.event_digest.len() != 32
+            || finish.event_digest.iter().all(|byte| *byte == 0)
+            || finish.capacity_dropped_events > 0)
+    {
+        return Ok(false);
+    }
+    // verify_terminal_evidence answers Partial WITHOUT hashing when the declared
+    // segment bytes exceed the verification bound, so the digest of such a
+    // recording was never checked: its frontier is not proven final.
+    if completion == RecordingCompletionEvidence::Partial
+        && !declared_bytes_within_verification_bound(connection, recording_id, correlation_id)?
+    {
+        return Ok(false);
+    }
+    let last: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT recording_seq FROM recording_frame_index WHERE recording_id = ?1 \
+             ORDER BY recording_seq DESC LIMIT 1",
+            rusqlite::params![recording_id.as_uuid().as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let Some(last) = last else {
+        return Ok(false);
+    };
+    Ok(decode_stored_sequence(&last, correlation_id)? == finish.final_recording_seq)
+}
+
+/// CONTRACTS 8.3 as one pure-over-the-index function. `frame` must be an indexed
+/// row (`indexed_v = 1`); legacy rows use [`frame_navigation`].
+///
+/// `into` = first non-closing child, else `next`; `over` = first later frame at the
+/// same or lower depth; `out` = first later frame at lower depth; `previous`/`next`
+/// skip non-navigable events. A missing target is `Boundary` only when the
+/// persisted frontier is proven final.
+pub(crate) fn navigate_indexed_frame(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    frame: &IndexedFrame,
+    completion: RecordingCompletionEvidence,
+    correlation_id: CorrelationId,
+) -> Result<FrameNavigation, RecordingStoreError> {
+    use xtrace_domain::honesty_flags as flags;
+
+    if frame.kind == WIRE_KIND_REQUEST_UPDATE {
+        let not_navigable = NavigationResult::unavailable(NavigationUnavailable::NotNavigable);
+        return Ok(FrameNavigation {
+            previous: not_navigable,
+            next: not_navigable,
+            into: not_navigable,
+            over: not_navigable,
+            out: not_navigable,
+        });
+    }
+    let sequence = frame.sequence;
+    let target = |found: Option<xtrace_domain::FrameId>| {
+        found.map(|frame_id| NavigationResult::Target { frame_id })
+    };
+    let end_of_stream =
+        |connection: &rusqlite::Connection| -> Result<NavigationResult, RecordingStoreError> {
+            Ok(
+                if persisted_frontier_is_final(
+                    connection,
+                    recording_id,
+                    completion,
+                    correlation_id,
+                )? {
+                    NavigationResult::Boundary
+                } else {
+                    NavigationResult::unavailable(NavigationUnavailable::PartialFrontier)
+                },
+            )
+        };
+    let previous = target(first_frame_where(
+        connection,
+        recording_id,
+        sequence,
+        false,
+        "",
+        None,
+        correlation_id,
+    )?)
+    .unwrap_or(NavigationResult::Boundary);
+    let next_found =
+        first_frame_where(connection, recording_id, sequence, true, "", None, correlation_id)?;
+    let next = match target(next_found) {
+        Some(result) => result,
+        None => end_of_stream(connection)?,
+    };
+    if frame.honesty_flags & flags::DEPTH_OVERFLOW != 0 {
+        let overflow = NavigationResult::unavailable(NavigationUnavailable::DepthOverflow);
+        return Ok(FrameNavigation {
+            previous,
+            next,
+            into: overflow,
+            over: overflow,
+            out: overflow,
+        });
+    }
+    // `into`: the smallest-sequence child that is not a closing event; children
+    // are linked by `parent_seq` only, so an async edge is never a child.
+    let child: Option<Vec<u8>> = connection
+        .prepare_cached(&format!(
+            "SELECT frame_id FROM recording_frame_index \
+             WHERE recording_id = ?1 AND parent_seq = ?2 AND indexed_v = 1 \
+             AND kind NOT IN ({WIRE_KIND_REQUEST_UPDATE}, {WIRE_KIND_FRAME_EXIT}, {WIRE_KIND_FRAME_THROW}) \
+             ORDER BY recording_seq ASC LIMIT 1"
+        ))
+        .and_then(|mut statement| {
+            statement
+                .query_row(
+                    rusqlite::params![
+                        recording_id.as_uuid().as_bytes().to_vec(),
+                        sequence.to_be_bytes().as_slice()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    let into = match child {
+        Some(bytes) => {
+            NavigationResult::Target { frame_id: frame_id_from_bytes(&bytes, correlation_id)? }
+        }
+        None => next,
+    };
+    let over = match target(first_frame_where(
+        connection,
+        recording_id,
+        sequence,
+        true,
+        "AND depth <= ?3 AND async_parent_seq IS NULL",
+        Some(i64::from(frame.depth)),
+        correlation_id,
+    )?) {
+        Some(result) => result,
+        None => end_of_stream(connection)?,
+    };
+    let out = if frame.depth == 0 {
+        if frame.honesty_flags & flags::ORPHAN_PARENT != 0 {
+            NavigationResult::unavailable(NavigationUnavailable::OrphanParent)
+        } else {
+            NavigationResult::Boundary
+        }
+    } else {
+        match target(first_frame_where(
+            connection,
+            recording_id,
+            sequence,
+            true,
+            "AND depth < ?3 AND async_parent_seq IS NULL",
+            Some(i64::from(frame.depth)),
+            correlation_id,
+        )?) {
+            Some(result) => result,
+            None => end_of_stream(connection)?,
+        }
+    };
+    Ok(FrameNavigation { previous, next, into, over, out })
 }
 
 /// Row shape of `recording_frame_index`: frame id, segment ordinal, event
@@ -2411,17 +3218,26 @@ fn project_persisted_event(
             WireSourceBinding::ClassBytesMismatch => SourceBinding::ClassBytesMismatch,
             WireSourceBinding::DebugMetadataAbsent => SourceBinding::DebugMetadataAbsent,
             WireSourceBinding::SourceMetadataInvalid => SourceBinding::SourceMetadataInvalid,
+            WireSourceBinding::ObservedUnattested => SourceBinding::ObservedUnattested,
+            WireSourceBinding::SourceMapAbsent => SourceBinding::SourceMapAbsent,
+            WireSourceBinding::SourceMapUnresolved => SourceBinding::SourceMapUnresolved,
             WireSourceBinding::Unspecified => SourceBinding::Unspecified,
         },
     );
-    let source = if source_binding.is_verified() {
-        event
+    let source = match source_binding {
+        SourceBinding::Verified | SourceBinding::ObservedUnattested => event
             .source
             .as_ref()
             .and_then(source_range_from_wire)
-            .and_then(|source| project_source(&source, source_root, source_cache))
-    } else {
-        None
+            .and_then(|source| project_source(&source, source_root, source_cache)),
+        // CONTRACTS 7.3: a source-map claim is never an excerpt. The mapped path is
+        // shown as unavailable; the file is neither read nor cached.
+        SourceBinding::SourceMapAbsent | SourceBinding::SourceMapUnresolved => event
+            .source
+            .as_ref()
+            .and_then(source_range_from_wire)
+            .and_then(|source| project_unverified_source_map(&source)),
+        _ => None,
     };
     let mut projected = PersistedEvent {
         sequence: event.recording_seq.to_string(),
@@ -2437,9 +3253,97 @@ fn project_persisted_event(
         source,
         source_binding,
         field_truncations: Vec::new(),
+        depth: None,
+        parent_frame_id: None,
+        async_parent_frame_id: None,
+        // R4: a line is shown only for a line cursor, never from a method extent.
+        line: (event.kind == WIRE_KIND_LINE_CURSOR)
+            .then(|| event.source.as_ref().map(|source| source.start_line))
+            .flatten()
+            .filter(|line| *line > 0),
+        bindings: event.bindings.iter().map(project_binding).collect(),
+        gap: (event.kind == WIRE_KIND_GAP).then(|| project_gap(event.gap.as_ref())).flatten(),
     };
     projected.bound_display_fields();
     projected
+}
+
+/// Wire `RecordingEventKind::LineCursor`.
+const WIRE_KIND_LINE_CURSOR: i32 = 5;
+
+fn value_shape_label(shape: i32) -> &'static str {
+    match shape {
+        1 => "string",
+        2 => "boolean",
+        3..=6 => "integer",
+        7 | 8 => "float",
+        9 => "null",
+        10 => "bytes",
+        11 => "list",
+        12 => "object",
+        _ => "unknown",
+    }
+}
+
+/// Projects one stored wire binding; every value state stays distinct and an
+/// unclassifiable value is reported `unavailable`, never defaulted.
+fn project_binding(binding: &xtrace_protocol::generated::agent::ValueBinding) -> PersistedBinding {
+    use xtrace_protocol::generated::agent::captured_value::Value as WireValue;
+    use xtrace_protocol::translate;
+
+    let role = translate::binding_role_from_wire(binding.role)
+        .map_or("unspecified", xtrace_domain::BindingRole::as_str);
+    let name_origin = translate::name_origin_from_wire(binding.name_origin)
+        .map_or("unspecified", xtrace_domain::NameOrigin::as_str);
+    let value = match binding.value.as_ref().and_then(|value| value.value.as_ref()) {
+        Some(WireValue::Captured(captured)) => PersistedValue::Captured {
+            shape: value_shape_label(captured.shape).to_owned(),
+            preview: captured.preview.clone(),
+            content_hash: ContentHash::from_digest_bytes(&captured.content_hash)
+                .map_or_else(String::new, |hash| hash.to_canonical()),
+        },
+        Some(WireValue::Redacted(redacted)) => PersistedValue::Redacted {
+            rule_id: redacted.rule_id.clone(),
+            shape_hint: (redacted.shape_hint != 0)
+                .then(|| value_shape_label(redacted.shape_hint).to_owned()),
+        },
+        Some(WireValue::Truncated(truncated)) => PersistedValue::Truncated {
+            preview: truncated.preview.clone(),
+            original_size_lower_bound: truncated.original_size_lower_bound.to_string(),
+            limit: truncated.limit.to_string(),
+        },
+        Some(WireValue::Unavailable(unavailable)) => PersistedValue::Unavailable {
+            reason: translate::unavailable_reason_from_wire(unavailable.reason)
+                .map_or("unspecified", xtrace_domain::UnavailableReason::as_str)
+                .to_owned(),
+        },
+        Some(WireValue::Dropped(dropped)) => PersistedValue::Dropped {
+            reason: translate::drop_reason_from_wire(dropped.reason)
+                .map_or("unspecified", xtrace_domain::DropReason::as_str)
+                .to_owned(),
+        },
+        None => PersistedValue::Unavailable { reason: "unspecified".to_owned() },
+    };
+    PersistedBinding {
+        name: binding.name.clone(),
+        role: role.to_owned(),
+        name_origin: name_origin.to_owned(),
+        value,
+    }
+}
+
+fn project_gap(
+    gap: Option<&xtrace_protocol::generated::agent::GapPayload>,
+) -> Option<PersistedGap> {
+    let gap = gap?;
+    Some(PersistedGap {
+        reason: xtrace_protocol::translate::gap_reason_from_wire(gap.reason)
+            .map_or("unspecified", xtrace_domain::GapReason::as_str)
+            .to_owned(),
+        count: gap.count.to_string(),
+        first_sequence: gap.first_recording_seq.to_string(),
+        last_sequence: gap.last_recording_seq.to_string(),
+    })
 }
 
 fn source_range_from_wire(
@@ -2458,16 +3362,26 @@ fn source_range_from_wire(
 const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SOURCE_EXCERPT_BYTES: usize = 16 * 1024;
 const MAX_SOURCE_EXCERPT_LINES: u32 = 64;
+/// Distinct source files read for one window query.
+const MAX_SOURCE_FILES_PER_WINDOW: usize = 64;
+/// Total source text kept resident for one window query.
+const MAX_SOURCE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 struct SourceProjectionCache {
     snapshots: HashMap<String, SourceSnapshot>,
     reads: usize,
+    cached_bytes: usize,
 }
 
 enum SourceSnapshot {
     Unavailable,
-    Loaded { hash: ContentHash, text: Option<String> },
+    /// The recorded file does not exist under the source root.
+    Missing,
+    Loaded {
+        hash: ContentHash,
+        text: Option<String>,
+    },
 }
 
 fn project_source(
@@ -2477,12 +3391,7 @@ fn project_source(
 ) -> Option<PersistedSource> {
     let start_line = source.start_line?;
     let path = source.path.as_str();
-    let safe = [
-        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderController.java",
-        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderService.java",
-        "adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture/OrderRepository.java",
-    ];
-    if start_line == 0 || !safe.contains(&path) || source.content_hash.is_none() {
+    if start_line == 0 || !is_projectable_source_path(path) || source.content_hash.is_none() {
         return None;
     }
     let end_line = source.end_line.filter(|end| *end >= start_line);
@@ -2497,11 +3406,31 @@ fn project_source(
         });
     };
     if !cache.snapshots.contains_key(path) {
-        cache.reads += 1;
-        cache.snapshots.insert(path.to_owned(), load_source_snapshot(root, path));
+        let snapshot = if cache.reads >= MAX_SOURCE_FILES_PER_WINDOW
+            || cache.cached_bytes >= MAX_SOURCE_CACHE_BYTES
+        {
+            SourceSnapshot::Unavailable
+        } else {
+            cache.reads += 1;
+            load_source_snapshot(root, path)
+        };
+        if let SourceSnapshot::Loaded { text: Some(text), .. } = &snapshot {
+            cache.cached_bytes = cache.cached_bytes.saturating_add(text.len());
+        }
+        cache.snapshots.insert(path.to_owned(), snapshot);
     }
     let snapshot = cache.snapshots.get(path)?;
     let SourceSnapshot::Loaded { hash, text } = snapshot else {
+        if matches!(snapshot, SourceSnapshot::Missing) {
+            return Some(PersistedSource {
+                path: path.to_owned(),
+                start_line,
+                end_line,
+                status: SourceStatus::MissingFile,
+                excerpt: None,
+                truncated: false,
+            });
+        }
         return unavailable_source(path, start_line, end_line);
     };
     let recorded_hash = source.content_hash.as_ref()?;
@@ -2556,9 +3485,10 @@ fn load_source_snapshot(root: &Path, path: &str) -> SourceSnapshot {
                 | rustix::fs::OFlags::NOFOLLOW
                 | rustix::fs::OFlags::CLOEXEC
         };
-        let Ok(opened) = rustix::fs::openat(&directory, *part, flags, rustix::fs::Mode::empty())
-        else {
-            return SourceSnapshot::Unavailable;
+        let opened = match rustix::fs::openat(&directory, *part, flags, rustix::fs::Mode::empty()) {
+            Ok(opened) => opened,
+            Err(rustix::io::Errno::NOENT) => return SourceSnapshot::Missing,
+            Err(_) => return SourceSnapshot::Unavailable,
         };
         let file = std::fs::File::from(opened);
         if final_component {
@@ -2622,6 +3552,7 @@ fn project_matching_source(
         if separator_bytes != 0 {
             excerpt.push('\n');
         }
+        let line = redact_source_line(line);
         if line.len() > remaining {
             let mut boundary = remaining.min(line.len());
             while !line.is_char_boundary(boundary) {
@@ -2631,7 +3562,7 @@ fn project_matching_source(
             truncated = true;
             break;
         }
-        excerpt.push_str(line);
+        excerpt.push_str(&line);
     }
     if !found {
         return unavailable_source(path, start_line, end_line);
@@ -2644,6 +3575,67 @@ fn project_matching_source(
         excerpt: Some(excerpt),
         truncated,
     })
+}
+
+/// Replacement shown instead of an excerpt line that looks like a credential.
+const SOURCE_LINE_REDACTION: &str = "[redacted by x-trace]";
+
+/// Replaces a whole line that matches the ADR 0003 content patterns (JWT, AWS
+/// access key id, PEM block, bearer token).
+fn redact_source_line(line: &str) -> String {
+    if source_line_has_secret_shape(line) {
+        SOURCE_LINE_REDACTION.to_owned()
+    } else {
+        line.to_owned()
+    }
+}
+
+fn source_line_has_secret_shape(line: &str) -> bool {
+    if line.contains("-----BEGIN ") {
+        return true;
+    }
+    let bytes = line.as_bytes();
+    // AKIA followed by sixteen upper-case letters or digits.
+    for (index, window) in bytes.windows(20).enumerate() {
+        let _ = index;
+        if window.starts_with(b"AKIA")
+            && window[4..].iter().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    // Bearer <token>
+    if let Some(position) = line.find("Bearer ") {
+        let token = &line[position + "Bearer ".len()..];
+        if token.chars().take_while(|ch| !ch.is_whitespace() && *ch != '"').count() >= 8 {
+            return true;
+        }
+    }
+    // JWT: eyJ<base64url>.<base64url>.<base64url?>
+    let mut rest = line;
+    while let Some(position) = rest.find("eyJ") {
+        let candidate = &rest[position..];
+        let token: String = candidate
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+            .collect();
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() >= 3 && parts[0].len() >= 8 && parts[1].len() >= 8 {
+            return true;
+        }
+        rest = &candidate[3..];
+    }
+    false
+}
+
+/// Projects a source-map binding: gated path and extent, status unavailable, no file read.
+fn project_unverified_source_map(source: &SourceRange) -> Option<PersistedSource> {
+    let start_line = source.start_line.filter(|line| *line > 0)?;
+    if !is_projectable_source_path(&source.path) {
+        return None;
+    }
+    let end_line = source.end_line.filter(|end| *end >= start_line);
+    unavailable_source(&source.path, start_line, end_line)
 }
 
 fn unavailable_source(
@@ -2665,6 +3657,7 @@ fn unavailable_source(
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
 mod source_projection_tests {
     use super::*;
+    use xtrace_domain::is_safe_repo_relative_path;
 
     fn tempdir() -> tempfile::TempDir {
         let scratch = PathBuf::from(
@@ -2805,6 +3798,236 @@ mod source_projection_tests {
         let excerpt = projected.excerpt.expect("matched excerpt");
         assert_eq!(excerpt.len(), MAX_SOURCE_EXCERPT_BYTES);
         assert!(projected.truncated);
+    }
+
+    fn write_at(root: &Path, relative: &str, bytes: &[u8]) {
+        let file = root.join(relative);
+        std::fs::create_dir_all(file.parent().expect("parent exists")).expect("directory created");
+        std::fs::write(file, bytes).expect("source written");
+    }
+
+    #[test]
+    fn non_fixture_path_projects_source() {
+        let root = tempdir();
+        let path = "services/petclinic/src/main/java/org/petclinic/OwnerController.java";
+        let bytes = b"package x;\nclass OwnerController {\n  void list() {}\n}\n";
+        write_at(root.path(), path, bytes);
+        let projected = project(&range(path, ContentHash::of_bytes(bytes)), Some(root.path()))
+            .expect("generic source projection");
+        assert_eq!(projected.status, SourceStatus::Matched);
+        assert_eq!(projected.excerpt.as_deref(), Some("class OwnerController {\n  void list() {}"));
+        let ts = "src/routes/users.ts";
+        write_at(root.path(), ts, b"a\nb\nc\n");
+        assert!(
+            project(&range(ts, ContentHash::of_bytes(b"a\nb\nc\n")), Some(root.path())).is_some()
+        );
+    }
+
+    #[test]
+    fn distinct_source_files_per_window_are_bounded() {
+        let root = tempdir();
+        let mut cache = SourceProjectionCache::default();
+        let mut unavailable = 0usize;
+        for index in 0..200 {
+            let path = format!("src/File{index}.java");
+            let bytes = format!("package x;\nclass File{index} {{\n  void run() {{}}\n}}\n");
+            write_at(root.path(), &path, bytes.as_bytes());
+            let projected = project_source(
+                &range(&path, ContentHash::of_bytes(bytes.as_bytes())),
+                Some(root.path()),
+                &mut cache,
+            )
+            .expect("projection");
+            if projected.status == SourceStatus::Unavailable {
+                unavailable += 1;
+            }
+        }
+        assert_eq!(cache.reads, MAX_SOURCE_FILES_PER_WINDOW);
+        assert_eq!(unavailable, 200 - MAX_SOURCE_FILES_PER_WINDOW);
+    }
+
+    #[test]
+    fn verified_and_unattested_events_project_generic_sources_end_to_end() {
+        use xtrace_protocol::generated::agent::{RecordingEvent, SourceBinding as B, SourceRange};
+        let root = tempdir();
+        let path = "services/petclinic/src/main/java/org/p/Owner.java";
+        let bytes = b"package x;\nclass Owner {\n  void list() {}\n}\n";
+        write_at(root.path(), path, bytes);
+        for binding in [B::Verified, B::ObservedUnattested] {
+            let event = RecordingEvent {
+                source_binding: binding as i32,
+                source: Some(SourceRange {
+                    path: path.to_owned(),
+                    start_line: 2,
+                    end_line: 3,
+                    content_hash: ContentHash::of_bytes(bytes).as_bytes().to_vec().into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let projected = project_persisted_event(
+                &event,
+                Some(root.path()),
+                &mut SourceProjectionCache::default(),
+            );
+            let source = projected.source.expect("source claim projected");
+            assert_eq!(source.status, SourceStatus::Matched, "{binding:?}");
+        }
+    }
+
+    #[test]
+    fn missing_file_status_missing_file() {
+        let root = tempdir();
+        let projected = project(
+            &range("src/main/java/Gone.java", ContentHash::of_bytes(b"x")),
+            Some(root.path()),
+        )
+        .expect("missing file projection");
+        assert_eq!(projected.status, SourceStatus::MissingFile);
+        assert!(projected.excerpt.is_none());
+    }
+
+    #[test]
+    fn path_traversal_and_absolute_paths_rejected() {
+        let root = tempdir();
+        for path in [
+            "../outside/Secret.java",
+            "src/../../Secret.java",
+            "/etc/Passwd.java",
+            "src//Double.java",
+            "src\\Back.java",
+            "",
+        ] {
+            assert!(
+                project(&range(path, ContentHash::of_bytes(b"x")), Some(root.path())).is_none(),
+                "{path:?} must not project"
+            );
+        }
+    }
+
+    #[test]
+    fn write_gate_follows_the_contract_path_rules() {
+        for good in ["src/A.java", "a.b/c/D.ts", "x/.hidden/E.java"] {
+            assert!(is_safe_repo_relative_path(good), "{good:?}");
+        }
+        assert!(is_safe_repo_relative_path(&"a".repeat(1024)));
+        for bad in [
+            "",
+            "/abs/A.java",
+            "C:/x/A.java",
+            "c:A.java",
+            "src\\A.java",
+            "src/\u{1b}[2J/A.java",
+            "src/\tA.java",
+            "src/\u{7f}A.java",
+            "src//A.java",
+            "src/./A.java",
+            "../A.java",
+        ] {
+            assert!(!is_safe_repo_relative_path(bad), "{bad:?}");
+        }
+        assert!(!is_safe_repo_relative_path(&"a".repeat(1025)));
+    }
+
+    fn source_map_event(
+        binding: xtrace_protocol::generated::agent::SourceBinding,
+        hash: &[u8],
+        path: &str,
+    ) -> xtrace_protocol::generated::agent::RecordingEvent {
+        xtrace_protocol::generated::agent::RecordingEvent {
+            source_binding: binding as i32,
+            source: Some(xtrace_protocol::generated::agent::SourceRange {
+                path: path.to_owned(),
+                start_line: 1,
+                end_line: 2,
+                content_hash: hash.to_vec().into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn source_map_absent_never_projects_excerpt() {
+        use xtrace_protocol::generated::agent::SourceBinding as Wire;
+        let root = tempdir();
+        let bytes = b"one\ntwo\n";
+        write_source(root.path(), bytes);
+        let hash = ContentHash::of_bytes(bytes);
+        let digest = hash.as_bytes().to_vec();
+        for binding in [Wire::SourceMapAbsent, Wire::SourceMapUnresolved] {
+            let event = source_map_event(binding, &digest, PATH);
+            let mut cache = SourceProjectionCache::default();
+            let projected = project_persisted_event(&event, Some(root.path()), &mut cache);
+            let source = projected.source.expect("path is projected");
+            assert_eq!(source.status, SourceStatus::Unavailable);
+            assert!(source.excerpt.is_none());
+            assert_eq!(cache.reads, 0, "the file must not be read");
+        }
+    }
+
+    #[test]
+    fn source_map_unresolved_empty_hash_projects_unavailable_path() {
+        use xtrace_protocol::generated::agent::SourceBinding as Wire;
+        let event = source_map_event(Wire::SourceMapUnresolved, &[], PATH);
+        let mut cache = SourceProjectionCache::default();
+        let projected = project_persisted_event(&event, None, &mut cache);
+        let source = projected.source.expect("path is projected");
+        assert_eq!(source.path, PATH);
+        assert_eq!(source.status, SourceStatus::Unavailable);
+        assert!(source.excerpt.is_none());
+        let event = source_map_event(Wire::SourceMapUnresolved, &[], ".env");
+        assert!(project_persisted_event(&event, None, &mut cache).source.is_none());
+    }
+
+    #[test]
+    fn dotenv_path_refused() {
+        assert!(!is_projectable_source_path(".env"));
+        assert!(!is_projectable_source_path("config/.env.ts"));
+    }
+
+    #[test]
+    fn git_config_path_refused() {
+        assert!(!is_projectable_source_path(".git/config"));
+        assert!(!is_projectable_source_path(".xtrace/state.ts"));
+        assert!(!is_projectable_source_path(".github/workflows/ci.ts"));
+    }
+
+    #[test]
+    fn config_yml_non_source_extension_refused() {
+        assert!(!is_projectable_source_path("src/main/resources/application.yml"));
+        assert!(!is_projectable_source_path("README.md"));
+        assert!(!is_projectable_source_path("src/Makefile"));
+        assert!(!is_projectable_source_path("node_modules/pkg/index.js"));
+        assert!(is_projectable_source_path("src/main/java/a/B.java"));
+        assert!(is_projectable_source_path("lib/server.mjs"));
+    }
+
+    #[test]
+    fn source_line_with_akia_literal_redacted_in_excerpt() {
+        let root = tempdir();
+        let path = "src/Config.java";
+        let bytes = format!(
+            "header\nString key = \"{}\";\nplain line\nBearer abcdefghijkl\n",
+            ["AKIA", "ABCDEFGHIJKLMNOP"].concat()
+        );
+        write_at(root.path(), path, bytes.as_bytes());
+        let mut source = range(path, ContentHash::of_bytes(bytes.as_bytes()));
+        source.start_line = Some(2);
+        source.end_line = Some(4);
+        let projected = project(&source, Some(root.path())).expect("projection");
+        let excerpt = projected.excerpt.expect("excerpt");
+        assert_eq!(excerpt, "[redacted by x-trace]\nplain line\n[redacted by x-trace]");
+        assert!(!excerpt.contains("ABCDEFGHIJKLMNOP"));
+    }
+
+    #[test]
+    fn jwt_and_pem_lines_are_redacted() {
+        assert!(source_line_has_secret_shape(
+            "token = \"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123_-signature\""
+        ));
+        assert!(source_line_has_secret_shape("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(!source_line_has_secret_shape("String s = \"eyJ\";"));
     }
 
     #[cfg(unix)]
@@ -4155,6 +5378,8 @@ fn recording_metadata_from_row(
             .transpose()?
             .map(|value| value.to_string()),
         incomplete_evidence,
+        event_cap: None,
+        outcome_kind: None,
     })
 }
 
@@ -4550,6 +5775,44 @@ mod tests {
             view.begin_recording(&request).expect("advanced replay").disposition,
             BeginRecordingDisposition::ExactReplay
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_replay_never_changes_the_stored_limitations() {
+        let fixture = on_disk_store("limitations-replay");
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let mut request =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        request.limitations = vec!["capture_policy_not_armed".to_owned()];
+        let stored = |fixture: &Fixture| -> Vec<String> {
+            let connection = fixture.store.lock().expect("connection");
+            let mut statement = connection
+                .prepare("SELECT code FROM recording_limitations ORDER BY code")
+                .expect("prepare");
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows")
+        };
+
+        assert_eq!(
+            view.begin_recording(&request).expect("insert").disposition,
+            BeginRecordingDisposition::Inserted
+        );
+        assert_eq!(stored(&fixture), vec!["capture_policy_not_armed".to_owned()]);
+
+        // The replay arrives with a different (here: empty) list; the anchor keeps its own.
+        let mut replay = request.clone();
+        replay.limitations = Vec::new();
+        assert_eq!(
+            view.begin_recording(&replay).expect("replay").disposition,
+            BeginRecordingDisposition::ExactReplay
+        );
+        assert_eq!(stored(&fixture), vec!["capture_policy_not_armed".to_owned()]);
     }
 
     #[cfg(unix)]
@@ -6324,6 +7587,7 @@ mod tests {
             runtime_session_id,
             opened_at,
             endpoint_observation: EndpointObservationInput::default(),
+            limitations: Vec::new(),
         }
     }
 

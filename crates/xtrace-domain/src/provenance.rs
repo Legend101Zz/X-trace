@@ -157,6 +157,12 @@ pub enum SourceBinding {
     DebugMetadataAbsent,
     /// The source path or range in the build attestation is invalid.
     SourceMetadataInvalid,
+    /// The source file was read when the class loaded; no build attestation vouches for it.
+    ObservedUnattested,
+    /// A generated file was observed and no source map was found.
+    SourceMapAbsent,
+    /// A source map exists but the position could not be resolved through it.
+    SourceMapUnresolved,
 }
 
 impl SourceBinding {
@@ -165,6 +171,86 @@ impl SourceBinding {
     pub const fn is_verified(self) -> bool {
         matches!(self, Self::Verified)
     }
+
+    /// Returns `true` when an event with this binding may carry a source range.
+    #[must_use]
+    pub const fn has_source_claim(self) -> bool {
+        matches!(
+            self,
+            Self::Verified
+                | Self::ObservedUnattested
+                | Self::SourceMapAbsent
+                | Self::SourceMapUnresolved
+        )
+    }
+
+    /// Returns the snake_case wire and JSON string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Verified => "verified",
+            Self::AttestationMissing => "attestation_missing",
+            Self::ClassBytesMismatch => "class_bytes_mismatch",
+            Self::DebugMetadataAbsent => "debug_metadata_absent",
+            Self::SourceMetadataInvalid => "source_metadata_invalid",
+            Self::ObservedUnattested => "observed_unattested",
+            Self::SourceMapAbsent => "source_map_absent",
+            Self::SourceMapUnresolved => "source_map_unresolved",
+        }
+    }
+}
+
+/// Longest accepted repository-relative path, in bytes.
+pub const MAX_REPO_RELATIVE_PATH_BYTES: usize = 1024;
+
+/// Returns `true` when `path` is a safe repository-relative source path.
+///
+/// One function serves ingest and the read projection. A safe path is 1 to 1024 bytes with no
+/// leading `/`, no backslash, no NUL or other control character, no empty segment, no `.` or `..`
+/// segment and no drive prefix such as `C:`. It does not check that the file exists.
+#[must_use]
+pub fn is_safe_repo_relative_path(path: &str) -> bool {
+    if path.is_empty() || path.len() > MAX_REPO_RELATIVE_PATH_BYTES {
+        return false;
+    }
+    if path.starts_with('/') || path.contains('\\') || path.chars().any(char::is_control) {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+/// Source file extensions the read projection may show an excerpt of (CONTRACTS section 7.3).
+pub const PROJECTABLE_SOURCE_EXTENSIONS: [&str; 12] =
+    ["java", "kt", "scala", "groovy", "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
+
+/// Returns `true` when the read projection may read and excerpt `path`: it is a safe
+/// repository-relative path ([`is_safe_repo_relative_path`]) that also has a source extension from
+/// [`PROJECTABLE_SOURCE_EXTENSIONS`], has no dot-directory or dot-file segment (`.env`, `.git`,
+/// `.xtrace`, `.github`) and no `node_modules` segment. Ingest deliberately uses only the
+/// structural function so library frames are never rejected on the wire; this stricter gate decides
+/// what the daemon will open and show. The adapter-supplied hash proves nothing about authenticity,
+/// so this path gate is the control.
+#[must_use]
+pub fn is_projectable_source_path(path: &str) -> bool {
+    if !is_safe_repo_relative_path(path) {
+        return false;
+    }
+    let mut segments = path.split('/');
+    let Some(file) = path.rsplit('/').next() else {
+        return false;
+    };
+    if segments.any(|segment| segment.starts_with('.') || segment == "node_modules") {
+        return false;
+    }
+    file.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty()
+            && PROJECTABLE_SOURCE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+    })
 }
 
 /// Reference describing how an evidence item was produced.
@@ -267,6 +353,106 @@ impl fmt::Display for LimitationCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_repo_relative_path_table() {
+        for good in [
+            "a",
+            "src/main/java/app/OwnerController.java",
+            "pkg/sub/file.ts",
+            "dir with space/f.js",
+            "..hidden/file",
+            "a..b/c",
+            ".github/workflows/x.yml",
+            "src/\u{e9}.java",
+        ] {
+            assert!(is_safe_repo_relative_path(good), "{good:?} should be safe");
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            "\\\\server\\share",
+            "a\\b",
+            "../x",
+            "a/../x",
+            "a/./b",
+            "./a",
+            "a//b",
+            "a/",
+            "a/..",
+            "C:/x",
+            "c:x",
+            "a\0b",
+            "a\nb",
+            "a\u{7f}b",
+        ] {
+            assert!(!is_safe_repo_relative_path(bad), "{bad:?} should be rejected");
+        }
+        assert!(is_safe_repo_relative_path(&"a".repeat(1024)));
+        assert!(!is_safe_repo_relative_path(&"a".repeat(1025)));
+    }
+
+    #[test]
+    fn projectable_source_path_adds_extension_dot_and_node_modules_rules() {
+        for good in
+            ["src/main/java/A.java", "app/Main.kt", "src/index.ts", "lib/x.MJS", "src/\u{e9}.java"]
+        {
+            assert!(is_projectable_source_path(good), "{good:?} should project");
+        }
+        for bad in [
+            ".github/workflows/x.yml",
+            "src/.env",
+            ".git/config",
+            "a/.xtrace/x.java",
+            "node_modules/pkg/index.js",
+            "src/node_modules/pkg/index.js",
+            "src/notes.txt",
+            "src/Makefile",
+            "src/.java",
+            "src/A.pem",
+            "../A.java",
+            "/A.java",
+        ] {
+            assert!(!is_projectable_source_path(bad), "{bad:?} must not project");
+        }
+        // Structural safety alone still admits what ingest must not reject on the wire.
+        assert!(is_safe_repo_relative_path("node_modules/pkg/index.js"));
+    }
+
+    #[test]
+    fn source_binding_claims_and_strings() {
+        use SourceBinding::{
+            AttestationMissing, ClassBytesMismatch, DebugMetadataAbsent, ObservedUnattested,
+            SourceMapAbsent, SourceMapUnresolved, SourceMetadataInvalid, Unspecified, Verified,
+        };
+        for b in [Verified, ObservedUnattested, SourceMapAbsent, SourceMapUnresolved] {
+            assert!(b.has_source_claim(), "{b:?}");
+        }
+        for b in [
+            Unspecified,
+            AttestationMissing,
+            ClassBytesMismatch,
+            DebugMetadataAbsent,
+            SourceMetadataInvalid,
+        ] {
+            assert!(!b.has_source_claim(), "{b:?}");
+        }
+        assert!(Verified.is_verified());
+        assert!(!ObservedUnattested.is_verified(), "only Verified is attested");
+        for b in [
+            Unspecified,
+            Verified,
+            AttestationMissing,
+            ClassBytesMismatch,
+            DebugMetadataAbsent,
+            SourceMetadataInvalid,
+            ObservedUnattested,
+            SourceMapAbsent,
+            SourceMapUnresolved,
+        ] {
+            assert_eq!(serde_json::to_string(&b).unwrap(), format!("\"{}\"", b.as_str()));
+        }
+    }
 
     #[test]
     fn confidence_rejects_out_of_range() {

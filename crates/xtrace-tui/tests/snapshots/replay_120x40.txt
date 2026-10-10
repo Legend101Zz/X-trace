@@ -1,0 +1,40 @@
+X-trace · replay 018f0000-0000-7000-8000-000000000011
+>     1  method com.example.Service1.call
+      2   method com.example.Service2.call
+      3    method com.example.Service3.call
+      4 method com.example.Service4.call
+      5  method com.example.Service5.call
+      6   method com.example.Service6.call
+      7    method com.example.Service7.call
+      8 method com.example.Service8.call
+      9  GAP: events were not emitted here
+     10   method com.example.Service10.call
+     11    method com.example.Service11.call
+     12 method com.example.Service12.call
+     13  method com.example.Service13.call
+     14   method com.example.Service14.call
+     15    method com.example.Service15.call
+     16 method com.example.Service16.call
+     17  method com.example.Service17.call
+     18   GAP: events were not emitted here
+     19    method com.example.Service19.call
+     20 method com.example.Service20.call
+     21  method com.example.Service21.call
+     22   method com.example.Service22.call
+     23    method com.example.Service23.call
+     24 method com.example.Service24.call
+     25  method com.example.Service25.call
+     26   method com.example.Service26.call
+     27    GAP: events were not emitted here
+     28 method com.example.Service28.call
+     29  method com.example.Service29.call
+     30   method com.example.Service30.call
+
+
+
+
+
+
+nav: previous boundary | next ok | into ok | over unavailable | out boundary
+30 frames · recording partial
+up/down select · [ ] prev/next · i o u into/over/out · b back · ? help · q quit

@@ -3,6 +3,9 @@
 import { spawn, spawnSync } from "node:child_process";
 
 export const PREFIX = "xtrace-camp-node-";
+// Docker platform of every campaign container. Default is the owner Mac (Docker Desktop on Apple silicon);
+// x86_64 CI runners set XCAMP_PLATFORM=linux/amd64. Baselines of different platforms are never mixed.
+export const PLATFORM = process.env.XCAMP_PLATFORM || "linux/arm64";
 
 function baseArgs() {
   const a = [];
@@ -74,7 +77,7 @@ export const container = {
   runDetached(name, args) {
     guard(name);
     this.rm(name);
-    return docker(["run", "-d", "--name", name, "--platform", "linux/arm64", "--label", "xtrace-campaign=node", ...args]).stdout.trim();
+    return docker(["run", "-d", "--name", name, "--platform", PLATFORM, "--label", "xtrace-campaign=node", ...args]).stdout.trim();
   },
   exec(name, argv, opts = {}) {
     guard(name);

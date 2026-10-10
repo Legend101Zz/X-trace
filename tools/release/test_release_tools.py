@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -851,9 +852,88 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+
+def own_process_snapshot(extra_pids=lambda: ()):
+    """Return a `_process_snapshot` replacement that only shows this test's own processes.
+
+    The runner's ownership scan is deliberately global, so on a shared machine (a hosted
+    runner or a developer Mac) any unrelated process that starts while a test runs becomes
+    an unknown candidate and makes tests that assert exact candidate counts or a clean
+    rescan flaky. This wrapper keeps the real `ps` snapshot but filters it to the test
+    process, every process ever seen descending from it, and any pid the test names through
+    `extra_pids` (for deliberately detached children that are reparented away). The runner
+    code, its deadlines and its checks are untouched; only the machine-wide noise input is
+    removed.
+    """
+    real_snapshot = run_gates._process_snapshot
+    lock = threading.Lock()
+    mine: dict[int, str] = {}
+
+    def snapshot(*, timeout: float = 2.0) -> dict[int, tuple[int, str, str]]:
+        full = real_snapshot(timeout=timeout)
+        with lock:
+            me = os.getpid()
+            # Identity is (pid, start time): a remembered pid whose start time changed is a
+            # reused pid, i.e. a different process, and must not stay trusted.
+            for pid in [p for p, started in mine.items() if p in full and full[p][1] != started]:
+                del mine[pid]
+            if me in full:
+                mine[me] = full[me][1]
+            for pid in extra_pids():
+                if pid in full:
+                    mine.setdefault(pid, full[pid][1])
+            changed = True
+            while changed:
+                changed = False
+                for pid, (ppid, started_at, _state) in full.items():
+                    if pid in mine:
+                        continue
+                    parent = full.get(ppid)
+                    # A parent absent from this snapshot (it exited) cannot be verified, so
+                    # the child is not adopted: hiding an unattributable process is safe,
+                    # because everything already adopted stays visible by pid and start time.
+                    if parent is not None and mine.get(ppid) == parent[1]:
+                        mine[pid] = started_at
+                        changed = True
+            return {pid: record for pid, record in full.items() if mine.get(pid) == record[1]}
+
+    return snapshot
+
+
 def process_running(pid: int) -> bool:
     record = run_gates._process_snapshot().get(pid)
     return record is not None and record[2] not in {"Z", "X"}
+
+class OwnProcessSnapshotTests(unittest.TestCase):
+    def test_own_process_snapshot_adoption_is_deterministic_and_identity_keyed(self) -> None:
+        me = os.getpid()
+        base = {1: (0, "t0", "S"), me: (1, "m0", "S"), 9000: (1, "u0", "S")}
+        snaps = [
+            {**base, 5001: (me, "c1", "S")},  # child of the test process: adopted
+            {**base, 5001: (me, "c1", "S"), 5002: (5001, "c2", "S"), 9100: (1, "u1", "S")},
+            {**base, 5003: (5002, "c3", "S")},  # parent 5002 absent: no KeyError, not adopted
+            {**base, 5001: (me, "cX", "S"), 5004: (5001, "c4", "S")},  # pid 5001 reused
+            {**base, 7777: (1, "d0", "S")},  # detached, named through extra_pids
+        ]
+        feed = iter(snaps)
+        extra: list[int] = []
+        with mock.patch.object(run_gates, "_process_snapshot", side_effect=lambda **_k: next(feed)):
+            snapshot = own_process_snapshot(lambda: extra)
+            first = snapshot()
+            self.assertEqual({me, 5001}, set(first))
+            second = snapshot()
+            self.assertEqual({me, 5001, 5002}, set(second))  # unrelated 9000/9100 hidden
+            third = snapshot()
+            self.assertEqual({me}, set(third))  # 5003 has an absent parent: hidden, no KeyError
+            fourth = snapshot()
+            # reused pid 5001 (new start time) is a different process, adopted only because
+            # its parent is verified; its child 5004 then follows from it.
+            self.assertEqual("cX", fourth[5001][1])
+            self.assertEqual({me, 5001, 5004}, set(fourth))
+            extra.append(7777)
+            fifth = snapshot()
+            self.assertEqual({me, 7777}, set(fifth))
+
 
 
 class LedgerTests(unittest.TestCase):
@@ -1873,6 +1953,22 @@ class RunOwnershipWorldTests(unittest.TestCase):
         self.assertTrue(failure.unconfirmed_processes_truncated)
 
 
+def _r2_killpg_created_group(pgid: int) -> None:
+    """SIGKILL a process group this test created; the caller then wait()s to reap.
+
+    On Darwin, killpg on a group whose only members are unreaped zombies fails
+    with EPERM (a fully reaped group gives ESRCH); both mean the group is gone.
+    Any other error, and EPERM elsewhere, still propagates.
+    """
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        if sys.platform != "darwin":
+            raise
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(dir=test_scratch_root())
@@ -2834,10 +2930,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertTrue(owner["ownedProcesses"])
         finally:
             for process in spawned:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _r2_killpg_created_group(process.pid)
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
@@ -2887,7 +2980,10 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(commands, "at least git should be available for fast version probes")
         logs = self.cache / "fast-version-logs"
         probes: list[dict[str, object]] = []
-        with mock.patch.object(run_gates, "VERSION_COMMANDS", tuple(commands)):
+        # Real probe processes, but the machine-wide scan sees only this test's own tree, so an
+        # unrelated process starting elsewhere on the host cannot look like unowned churn.
+        with mock.patch.object(run_gates, "VERSION_COMMANDS", tuple(commands)), \
+                mock.patch.object(run_gates, "_process_snapshot", side_effect=own_process_snapshot()):
             versions = REAL_VERSIONS(self.repo, os.environ.copy(), logs, probes)
         self.assertEqual(len(probes), len(commands))
         self.assertTrue(all(probe["status"] == "passed" and probe["exitCode"] == 0 for probe in probes))
@@ -3006,7 +3102,7 @@ class RunnerTests(unittest.TestCase):
             calls += 1
             if calls == 1:
                 unrelated = subprocess.Popen(
-                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    [sys.executable, "-c", "import time; time.sleep(600)"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                 )
             return snapshot
@@ -3023,10 +3119,7 @@ class RunnerTests(unittest.TestCase):
             self.assertIsNone(unrelated.poll())
         finally:
             if unrelated is not None:
-                try:
-                    os.killpg(unrelated.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _r2_killpg_created_group(unrelated.pid)
                 try:
                     unrelated.wait(timeout=2)
                 except subprocess.TimeoutExpired:
@@ -3158,7 +3251,7 @@ class RunnerTests(unittest.TestCase):
             calls += 1
             if calls == 1:
                 unrelated = subprocess.Popen(
-                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    [sys.executable, "-c", "import time; time.sleep(600)"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                 )
             return snapshot
@@ -3178,10 +3271,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertIn("inspection limit exceeded", owner["terminationStatus"])
         finally:
             if unrelated is not None:
-                try:
-                    os.killpg(unrelated.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _r2_killpg_created_group(unrelated.pid)
                 try:
                     unrelated.wait(timeout=2)
                 except subprocess.TimeoutExpired:
@@ -3229,10 +3319,7 @@ class RunnerTests(unittest.TestCase):
             log_stream.close()
             for child in (closed_stdio, log_fd_child):
                 if process_running(child.pid):
-                    try:
-                        os.killpg(child.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    _r2_killpg_created_group(child.pid)
                 try:
                     child.wait(timeout=2)
                 except subprocess.TimeoutExpired:
@@ -3722,6 +3809,7 @@ class RunnerTests(unittest.TestCase):
             "import subprocess,sys,time; time.sleep(.35); "
             "c=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
             "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); "
+            f"open({str(self.root / 'detached-child.pid')!r},'w').write(str(c.pid)); "
             "print(c.pid,flush=True)"
         )
         gate = run_gates.Gate("classified-candidate", (sys.executable, "-c", script))
@@ -3760,9 +3848,18 @@ class RunnerTests(unittest.TestCase):
                 return False
             return True if path == pathlib.Path("/proc") else real_is_dir(path)
 
+        def gate_children() -> list[int]:
+            # The gate records the detached child's pid; it is reparented away from the test
+            # tree, so name it explicitly. Unrelated host processes stay invisible.
+            try:
+                return [int((self.root / "detached-child.pid").read_text())]
+            except (OSError, ValueError):
+                return []
+
         try:
             with mock.patch.object(run_gates, "GATES", (gate,)), \
                     mock.patch.object(run_gates, "_track_descendants", return_value=None), \
+                    mock.patch.object(run_gates, "_process_snapshot", side_effect=own_process_snapshot(gate_children)), \
                     mock.patch.object(run_gates.provenance_module, "Provenance", StubProvenance), \
                     mock.patch.object(pathlib.Path, "is_dir", is_dir):
                 code = run_gates.run(args)

@@ -9,13 +9,17 @@ Stack: eclipse-temurin:17 (java -jar) + postgres:18.3 (profile `postgres`, upstr
 synthetic seed from db/postgres/data.sql), all on a private Docker network, prefix xtrace-camp-.
 """
 import concurrent.futures
+import json
+import os
 import pathlib
 import re
+import shlex
 import sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "lib"))
 import xcamp  # noqa: E402
+import xinstr  # noqa: E402
 
 CAMP, PROJ, SRC = xcamp.load_campaign(__file__)
 HERE = pathlib.Path(__file__).resolve()
@@ -53,6 +57,9 @@ def owner_form(first, last, tel="6085550100", addr="1 Synthetic Way", city="Test
 OWNER_SQL = ("select first_name,last_name,address,city,telephone from owners "
              "where last_name like '{p}%' order by last_name,first_name")
 ID_NORM = [(r"/owners/\d+", "/owners/<ID>")]
+# The upstream visit form renders `min=<tomorrow>` (today + 1 day) on every re-render, so the rejected past-dated visit page
+# changes with the calendar. Root cause of the pet-and-visit-flow fingerprint drift (2026-10-09); normalized, not hidden.
+DATE_NORM = [(r'min="\d{4}-\d{2}-\d{2}"', 'min="<TOMORROW>"')]
 STATE: dict = {}
 
 
@@ -94,7 +101,7 @@ def s_pet_visit(c):
           "join owners o on o.id=p.owner_id where o.last_name='Campaign' order by p.name")
     pet_id = c.stack.psql("select p.id from pets p join owners o on o.id=p.owner_id where o.last_name='Campaign' and p.name='Rex'")[0][0]
     past = c.http("POST", f"{path}/pets/{pet_id}/visits/new", form={"date": "2020-01-05", "description": "past visit"},
-                  label="past-dated visit", norm=ID_NORM + [(r"/pets/\d+", "/pets/<ID>")])
+                  label="past-dated visit", norm=ID_NORM + [(r"/pets/\d+", "/pets/<ID>")] + DATE_NORM)
     c.check("past-dated visit rejected (200 form, no redirect)", past["status"] == 200 and "location" not in past["headers"])
     r = c.http("POST", f"{path}/pets/{pet_id}/visits/new", form={"date": "2099-01-05", "description": "synthetic checkup"},
                norm=ID_NORM + [(r"/pets/\d+", "/pets/<ID>")])
@@ -176,5 +183,66 @@ def baseline(out):
                               adaptations=CAMP["configAdaptations"], harness_files=[HERE])
 
 
+# Per-scenario expectations on the RECORDINGS (route, HTTP outcome, controller/repository frames, source identity).
+# Petclinic has no service layer: its controllers call Spring Data repositories directly, so no `service` frame is required.
+OWN = {"controller": "OwnerController", "repository": "OwnerRepository"}
+EXPECT = {
+    "search-seeded": [
+        {"method": "GET", "route": "/owners", "status": 200, "layers": ["controller", "repository"], "layerHints": OWN},
+        {"method": "GET", "route": "/vets", "status": 200, "layers": ["controller", "repository"],
+         "layerHints": {"controller": "VetController", "repository": "VetRepository"}}],
+    "owner-create-roundtrip": [
+        {"method": "POST", "route": "/owners/new", "status": 302, "layers": ["controller", "repository"], "layerHints": OWN},
+        {"method": "GET", "route": "/owners/{ownerId}", "status": 200, "layers": ["controller", "repository"], "layerHints": OWN}],
+    "owner-validation-error": [
+        {"method": "POST", "route": "/owners/new", "status": 200, "layers": ["controller"], "layerHints": OWN}],
+    "pet-and-visit-flow": [
+        {"method": "POST", "route": "/owners/{ownerId}/pets/new", "status": 302, "layers": ["controller", "repository"],
+         "layerHints": {"controller": "PetController", "repository": "OwnerRepository"}},
+        {"method": "POST", "route": "/owners/{ownerId}/pets/{petId}/visits/new", "status": 302, "layers": ["controller", "repository"],
+         "layerHints": {"controller": "VisitController", "repository": "OwnerRepository"}}],
+    "owner-edit": [
+        {"method": "POST", "route": "/owners/{ownerId}/edit", "status": 302, "layers": ["controller", "repository"], "layerHints": OWN}],
+    "missing-owner-error": [
+        {"method": "GET", "route": "/owners/{ownerId}", "status": 500, "layers": ["controller", "repository"], "layerHints": OWN}],
+    "controller-crash-path": [
+        {"method": "GET", "route": "/oups", "status": 500, "layers": ["controller"], "layerHints": {"controller": "CrashController"}}],
+    "concurrent-isolation": [
+        {"method": "GET", "route": "/owners/{ownerId}", "status": 200, "layers": ["controller"], "layerHints": OWN, "minCount": 30},
+        {"method": "POST", "route": "/owners/new", "status": 302, "layers": ["controller"], "layerHints": OWN, "minCount": 10}],
+}
+
+
+def instrumented() -> int:
+    """One reset-to-finish run with the app launched by the PACKAGED `xtrace run`, then judged through the read API."""
+    need = {k: os.environ.get(k, "") for k in ("XCAMP_XTRACE", "XCAMP_AGENT", "XCAMP_DATA_HOME")}
+    missing = [k for k, v in need.items() if not v]
+    if missing or os.environ.get("XCAMP_APP_MODE") != "host":
+        print("instrumented needs XCAMP_APP_MODE=host and " + ", ".join(missing or ["(all set)"]))
+        return 2
+    xtrace, agent = need["XCAMP_XTRACE"], need["XCAMP_AGENT"]
+    os.environ["XCAMP_LAUNCH_PREFIX"] = " ".join(shlex.quote(x) for x in
+        [xtrace, "run", "--project-dir", str(SRC), "--java-agent", agent, "--"])
+    canaries = None
+    if os.environ.get("XCAMP_CANARY_FILE"):
+        canaries = json.loads(pathlib.Path(os.environ["XCAMP_CANARY_FILE"]).read_text())
+    n = 1
+    while (PROJ / f"instrumented-{n}").exists():
+        n += 1
+    out = PROJ / f"instrumented-{n}"
+    baseline_receipt = pathlib.Path(os.environ["XCAMP_BASELINE_RECEIPT"]) if os.environ.get("XCAMP_BASELINE_RECEIPT") else None
+    r = xinstr.run_instrumented(
+        project="petclinic", pin={**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR), "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
+                                  "postgresImageDigest": xcamp.POSTGRES_DIGEST, "jdkImage": IMAGE},
+        make_stack=make_stack, scenarios=SCENARIOS, out_dir=out, norm_extra=[], expectations=EXPECT, xtrace=xtrace,
+        project_dir=SRC, data_home=pathlib.Path(need["XCAMP_DATA_HOME"]), adaptations=CAMP["configAdaptations"],
+        canaries=canaries, baseline_receipt=baseline_receipt, harness_files=[HERE, pathlib.Path(xinstr.__file__)],
+        extra_canary_paths=[("POST", "/owners/new")])
+    print(json.dumps({"result": r["result"], "api": r["api"], "problemClasses": r["problemClasses"]}))
+    return 0 if r["result"] == "recorded" else 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "instrumented":
+        sys.exit(instrumented())
     sys.exit(xcamp.main_cli("petclinic", build, baseline, PROJ))

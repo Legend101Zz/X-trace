@@ -10,10 +10,13 @@ members = [
     "crates/xtrace-daemon",
     "crates/xtrace-private-storage",
     "crates/xtrace-runtime",
+    "crates/xtrace-tui",
+    "crates/xtrace-export",
+    "crates/xtrace-exercise",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"

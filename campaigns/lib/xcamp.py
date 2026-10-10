@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 PREFIX = "xtrace-camp-"
-PLATFORM = "linux/arm64"
+PLATFORM = os.environ.get("XCAMP_PLATFORM", "linux/arm64")  # CI x86_64 runners set linux/amd64
 POSTGRES_IMAGE = "postgres:18.3"
 POSTGRES_DIGEST = "sha256:7e32e9833a6fb1c92c32552794cb6ed569d51b445a54907d35fc112ef39684db"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -170,6 +170,11 @@ def http_request(base: str, method: str, path: str, *, headers: dict[str, str] |
 
 
 # ------------------------------------------------------------ scenarios ------
+# Optional (method, path, headers, body) -> (path, headers, body) applied just before sending. Default: none.
+REQUEST_HOOK: Callable[[str, str, dict, Any], tuple] | None = None
+SENT_LOG: list | None = None  # instrumented runs set a list; every scenario request appends (method, original path)
+
+
 @dataclass
 class Ctx:
     """Per-scenario recorder handed to scenario functions."""
@@ -198,7 +203,12 @@ class Ctx:
             raw = body.encode()
         else:
             raw = body  # type: ignore[assignment]
-        res = http_request(self.base, method, path, headers=hdrs, body=raw)
+        send_path, send_hdrs, send_raw = (path, hdrs, raw)
+        if REQUEST_HOOK is not None:  # instrumented runs inject privacy canaries here; labels/hashes keep the original request
+            send_path, send_hdrs, send_raw = REQUEST_HOOK(method, path, hdrs, raw)
+        if SENT_LOG is not None:
+            SENT_LOG.append((method, path))
+        res = http_request(self.base, method, send_path, headers=send_hdrs, body=send_raw)
         text = res["body"].decode("utf-8", "replace")
         ntext = normalize_text(text, (norm or []) + self.norm_extra)
         redacted_headers = {k: v for k, v in hdrs.items() if k.lower() not in ("authorization", "cookie")}
@@ -308,6 +318,7 @@ class Stack:
     _proc: Any = None
     _logfile: pathlib.Path | None = None
     db_host_port: int = 0
+    launcher_exit: int | None = None
 
     def _subst(self, value: str) -> str:
         host = self.mode == "host"
@@ -367,13 +378,16 @@ class Stack:
             import signal
             if self._proc.poll() is None:
                 try:
-                    os.killpg(self._proc.pid, signal.SIGTERM)  # only the process group we started
-                    self._proc.wait(timeout=30)
+                    # SIGTERM to the launcher PID we started (not the whole group): under `xtrace run` the launcher forwards
+                    # it to the JVM and then drains the daemon, which a group-wide signal would cut short.
+                    os.kill(self._proc.pid, signal.SIGTERM)
+                    self._proc.wait(timeout=90)
                 except Exception:
                     try:
-                        os.killpg(self._proc.pid, signal.SIGKILL)
+                        os.killpg(self._proc.pid, signal.SIGKILL)  # only the process group we started
                     except Exception:
                         pass
+            self.launcher_exit = self._proc.poll()
             self._proc = None
         rm_container(self.app)
         rm_container(self.db)

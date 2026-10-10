@@ -1,0 +1,23 @@
+{
+  "bytes_hex": "08011a1011111111111111111111111111111111200d29f50300000000000032046d2d3133d201c4010a10222222222222222222222222222222221282010a03652d351005298d13000000000000301e38075a6c080112046a6462631a067075626c696322066f776e6572732a0864622e6c6f63616c320c6578656375746551756572795a0673656c65637462066f776e6572736204706574736a2173656c656374202a2066726f6d206f776e657273207768657265206964203d203f70b82a122b0a03652d361006298e13000000000000301e380a5a15080612046e6f64653205737061776e70bb0378c801",
+  "description": "Interaction fields 11-15 (statement_kind, tables, sanitized_shape, port, status_code) and INTERACTION_KIND_PROCESS",
+  "message": "xtp.agent.v1.AgentEnvelope",
+  "summary": {
+    "events": 2,
+    "first": {
+      "port": 5432,
+      "statementKind": "select",
+      "tables": [
+        "owners",
+        "pets"
+      ]
+    },
+    "second": {
+      "driver": "node",
+      "kind": "process",
+      "method": "spawn",
+      "port": 443,
+      "statusCode": 200
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "bytes_hex": "08011a1011111111111111111111111111111111200e29f60300000000000032046d2d3134da01460a1022222222222222222222222222222222100919e02e0000000000003a20eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee4205080110c801",
+  "description": "RecordingFinished.outcome = RESPONDED with HTTP status 200",
+  "message": "xtp.agent.v1.AgentEnvelope",
+  "summary": {
+    "outcome": {
+      "httpStatus": 200,
+      "kind": "responded"
+    }
+  }
+}

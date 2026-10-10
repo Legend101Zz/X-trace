@@ -8,7 +8,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { dockerLogged, container, docker, net, PREFIX } from "../../lib/docker.mjs";
+import { dockerLogged, container, docker, net, PREFIX, PLATFORM } from "../../lib/docker.mjs";
 import { projectRoot, IMAGE } from "../../lib/paths.mjs";
 import { runBaseline, imageId, randomSecret } from "../../lib/baseline.mjs";
 import { waitHttp, sleep, startPostgres } from "../../lib/stack.mjs";
@@ -28,7 +28,7 @@ async function create() {
   const log = path.join(root, "create.log");
   const code = await dockerLogged(
     [
-      "run", "--rm", "--name", "xtrace-camp-node-vendure-create", "--platform", "linux/arm64",
+      "run", "--rm", "--name", "xtrace-camp-node-vendure-create", "--platform", PLATFORM,
       "-v", `${root}:/work`,
       "-e", "npm_config_cache=/work/.xtrace-npm-cache", "-e", "npm_config_update_notifier=false",
       "-e", "CI=true", "-e", "DO_NOT_TRACK=1", "-e", "NODE_OPTIONS=--max-old-space-size=6144",
@@ -73,7 +73,7 @@ async function build() {
   const log = path.join(root, "build.log");
   console.log("config:", patchConfigForPostgres());
   const code = await dockerLogged(
-    ["run", "--rm", "--name", "xtrace-camp-node-vendure-build", "--platform", "linux/arm64", "-v", `${root}:/work`, "-w", "/work/app",
+    ["run", "--rm", "--name", "xtrace-camp-node-vendure-build", "--platform", PLATFORM, "-v", `${root}:/work`, "-w", "/work/app",
      "-e", "npm_config_cache=/work/.xtrace-npm-cache", "-e", "CI=true", "-e", "DO_NOT_TRACK=1", image,
      "sh", "-c", "(npm ls pg >/dev/null 2>&1 || (npm uninstall better-sqlite3 && npm install --save-exact pg)) && npm run build:server && npm run build:worker && ls -l dist"],
     log,
@@ -92,7 +92,7 @@ async function seed() {
     net.create(names.net);
     await startPostgres({ netName: names.net, dbName: names.db, database: PG_DB, user: PG_USER, password });
     const code = await dockerLogged(
-      ["run", "--rm", "--name", "xtrace-camp-node-vendure-seed", "--platform", "linux/arm64", "--network", names.net, "-v", `${root}:/work`, "-w", "/work/app",
+      ["run", "--rm", "--name", "xtrace-camp-node-vendure-seed", "--platform", PLATFORM, "--network", names.net, "-v", `${root}:/work`, "-w", "/work/app",
        "-e", "DB_HOST=db", "-e", "DB_PORT=5432", "-e", `DB_NAME=${PG_DB}`, "-e", `DB_USERNAME=${PG_USER}`, "-e", `DB_PASSWORD=${password}`, "-e", "DB_SCHEMA=public",
        "-e", "APP_ENV=dev", "-e", "PORT=3000", "-e", "CREATE_ASSETS_DIR=/work/create-assets", "-e", "DO_NOT_TRACK=1", image, "node", "./dist/xtrace-seed-populate.cjs"],
       path.join(root, "seed.log"),
@@ -174,7 +174,7 @@ else if (cmd === "baseline") {
       nodeVersion: NODE_VERSION,
       nodeImage: image,
       nodeImageId: imageId(image),
-      platform: "linux/arm64 (Docker Desktop)",
+      platform: `${PLATFORM} (${process.env.XCAMP_PLATFORM ? "CI runner" : "Docker Desktop"})`,
       database: campaign.runtime.database,
       lockfileSha256: sha256Hex(fs.readFileSync(path.join(appDir, "package-lock.json"))),
       seedSha256: sha256Hex(fs.readFileSync(path.join(appDir, "seed.sql"))),

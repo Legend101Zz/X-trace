@@ -30,12 +30,17 @@ pub const MAX_RECORDING_EVENT_PROJECTION_BYTES: usize = 256 * 1024;
 /// The store may process one codec-bounded segment when that segment alone
 /// crosses this threshold, ensuring a cursor can still make progress.
 pub const MAX_RECORDING_VERIFIED_INPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum declared (logical plus compressed) segment bytes the store verifies when a recording
+/// is finished (CONTRACTS 4.1 item 4). Separate from the per-request read bound above, which
+/// applies to window reads only. Beyond it the recording is sealed Partial and the read surface
+/// names `verification_budget_exceeded`.
+pub const MAX_RECORDING_FINISH_VERIFIED_BYTES: usize = 512 * 1024 * 1024;
 /// Maximum UTF-8 byte length for a projected display field.
 pub const MAX_RECORDING_DISPLAY_FIELD_BYTES: usize = 256;
 /// Maximum UTF-8 byte length for an exact projected relationship identifier.
 pub const MAX_RECORDING_RELATIONSHIP_ID_BYTES: usize = 128;
 /// Version of the stable JSON recording-read projection contract.
-pub const RECORDING_READ_SCHEMA_VERSION: u32 = 2;
+pub const RECORDING_READ_SCHEMA_VERSION: u32 = 3;
 
 fn decimal_u64(value: &str) -> bool {
     value.parse::<u64>().is_ok_and(|parsed| parsed.to_string() == value)
@@ -63,6 +68,9 @@ pub struct ShowRecording {
     pub limit: u32,
     /// Versioned opaque continuation returned by an earlier show response.
     pub cursor: Option<String>,
+    /// Centre the window on this frame instead of paging from a cursor; mutually
+    /// exclusive with `cursor` (CONTRACTS 8.2).
+    pub around_frame: Option<FrameId>,
 }
 
 /// Versioned persisted lifecycle status; a nonterminal state is not completion.
@@ -96,15 +104,48 @@ pub enum RecordingCompletionEvidence {
 }
 
 /// Result of resolving one replay-navigation edge.
+///
+/// Internally tagged: `target` carries `frameId`, `boundary` carries nothing and
+/// `unavailable` carries a stable `reason`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", content = "frameId", rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum NavigationResult {
     /// The adjacent metadata index entry matched its immutable verified XTF event.
-    Target(FrameId),
+    Target {
+        /// Frame the action lands on.
+        frame_id: FrameId,
+    },
     /// The verified sequence or recording boundary has no adjacent frame.
     Boundary,
     /// The relationship cannot be established from available event evidence.
-    Unavailable,
+    Unavailable {
+        /// Why the relationship cannot be established.
+        reason: NavigationUnavailable,
+    },
+}
+
+impl NavigationResult {
+    /// Unavailable with the supplied reason.
+    #[must_use]
+    pub const fn unavailable(reason: NavigationUnavailable) -> Self {
+        Self::Unavailable { reason }
+    }
+}
+
+/// Stable reasons a navigation edge is unavailable (snake_case on the wire).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationUnavailable {
+    /// The persisted frontier is not verified; more events may exist.
+    PartialFrontier,
+    /// The row predates the frame index that records depth and parents.
+    LegacyUnindexed,
+    /// The frame is deeper than the indexed depth bound.
+    DepthOverflow,
+    /// The parent was never observed.
+    OrphanParent,
+    /// The event is not a navigable frame.
+    NotNavigable,
 }
 
 /// Bounded step-navigation facts for one indexed frame.
@@ -126,11 +167,11 @@ pub struct FrameNavigation {
 impl FrameNavigation {
     /// Navigation for legacy or unindexed events.
     pub const UNAVAILABLE: Self = Self {
-        previous: NavigationResult::Unavailable,
-        next: NavigationResult::Unavailable,
-        into: NavigationResult::Unavailable,
-        over: NavigationResult::Unavailable,
-        out: NavigationResult::Unavailable,
+        previous: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+        next: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+        into: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+        over: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
+        out: NavigationResult::unavailable(NavigationUnavailable::LegacyUnindexed),
     };
 }
 
@@ -193,6 +234,87 @@ pub struct PersistedEvent {
     pub source_binding: SourceBinding,
     /// Explicit record of unprojected oversized fields without their contents.
     pub field_truncations: Vec<FieldTruncation>,
+    /// Call depth from the frame index; `None` for legacy or unindexed rows.
+    pub depth: Option<u32>,
+    /// Parent frame, only when the parent was observed.
+    pub parent_frame_id: Option<FrameId>,
+    /// Async parent frame, only when the async parent was observed.
+    pub async_parent_frame_id: Option<FrameId>,
+    /// Observed line; `Some` only for `line_cursor` events, never a method extent.
+    pub line: Option<u32>,
+    /// Observed bindings; an empty list means none were observed.
+    pub bindings: Vec<PersistedBinding>,
+    /// Declared gap; `Some` only for `gap` events.
+    pub gap: Option<PersistedGap>,
+}
+
+/// One observed binding (argument, local, field or return value) at an event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedBinding {
+    /// Binding name as emitted (display-bounded).
+    pub name: String,
+    /// Binding role label (snake_case domain vocabulary).
+    pub role: String,
+    /// Where the name came from (snake_case domain vocabulary).
+    pub name_origin: String,
+    /// Observed value state.
+    pub value: PersistedValue,
+}
+
+/// Value state of one binding; no state is ever a stand-in for another.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum PersistedValue {
+    /// Value preview captured and hashed.
+    Captured {
+        /// Sanitized value shape label.
+        shape: String,
+        /// Bounded sanitized preview.
+        preview: String,
+        /// `b3:<hex>` of the emitted preview bytes.
+        content_hash: String,
+    },
+    /// Value withheld by a redaction rule.
+    Redacted {
+        /// Rule that withheld the value.
+        rule_id: String,
+        /// Optional shape hint safe to display.
+        shape_hint: Option<String>,
+    },
+    /// Value cut at a budget.
+    Truncated {
+        /// Bounded sanitized preview.
+        preview: String,
+        /// Lower bound of the original size, decimal string.
+        original_size_lower_bound: String,
+        /// Limit that applied, decimal string.
+        limit: String,
+    },
+    /// Value could not be observed.
+    Unavailable {
+        /// Snake_case domain reason.
+        reason: String,
+    },
+    /// Value was dropped by a budget.
+    Dropped {
+        /// Snake_case domain reason.
+        reason: String,
+    },
+}
+
+/// Declared gap in the emitted event sequence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedGap {
+    /// Snake_case gap reason.
+    pub reason: String,
+    /// Count of suppressed observations, decimal string.
+    pub count: String,
+    /// Nearest emitted sequence before the suppressed span, decimal string.
+    pub first_sequence: String,
+    /// Nearest emitted sequence after the suppressed span, decimal string.
+    pub last_sequence: String,
 }
 
 /// Bounded source projection for one method event.
@@ -223,6 +345,8 @@ pub enum SourceStatus {
     Mismatch,
     /// Source could not be read safely or usable metadata is absent.
     Unavailable,
+    /// The recorded file is absent from the project source root.
+    MissingFile,
 }
 
 /// Safe metadata describing a display or relationship field that was bounded.
@@ -354,6 +478,10 @@ pub struct RecordingMetadata {
     pub last_sequence: Option<String>,
     /// Persisted incomplete status evidence; no completion is inferred otherwise.
     pub incomplete_evidence: Vec<String>,
+    /// Event cap recorded in terminal evidence, when present.
+    pub event_cap: Option<u32>,
+    /// Outcome kind recorded in terminal evidence, when present.
+    pub outcome_kind: Option<String>,
 }
 
 /// One verified segment window returned by the storage adapter.
@@ -380,6 +508,240 @@ pub struct RecordingEventWindow {
     pub has_more: bool,
     /// Exact incomplete status or observed sequence-gap marker evidence.
     pub incomplete_evidence: Vec<String>,
+    /// Adapter-observed outcome; `None` when terminal evidence is absent.
+    pub outcome: Option<PersistedOutcome>,
+    /// Event capacity facts; `None` when terminal evidence is absent.
+    pub capacity: Option<RecordingCapacity>,
+    /// Stable limitation codes recorded for this recording.
+    pub limitations: Vec<String>,
+    /// Whole-recording frame honesty counts from the frame index; `None` when any frame
+    /// predates the index (counts are then unavailable, never zero-filled).
+    pub frame_honesty: Option<FrameHonestyCounts>,
+}
+
+/// Frames carrying each honesty flag, counted once per frame (CONTRACTS 9.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameHonestyCounts {
+    /// Frames with a gap.
+    pub gap: u64,
+    /// Frames with a redacted binding.
+    pub redacted: u64,
+    /// Frames with a truncated binding.
+    pub truncated: u64,
+    /// Frames with an unavailable binding.
+    pub unavailable: u64,
+    /// Frames with a dropped binding.
+    pub dropped: u64,
+    /// Frames whose parent was never observed.
+    pub orphan_parent: u64,
+}
+
+/// Adapter-observed outcome of the recorded operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedOutcome {
+    /// `responded`, `exception_propagated`, `client_aborted` or `unobserved` (the domain
+    /// `OutcomeKind` vocabulary, snake_case).
+    pub kind: String,
+    /// HTTP status when observed.
+    pub http_status: Option<u16>,
+    /// Propagated exception facts when the outcome is an exception.
+    pub exception: Option<OutcomeException>,
+    /// Event the exception was thrown from, when observed.
+    pub thrown_from_event_id: Option<String>,
+}
+
+/// Sanitized exception facts attached to an outcome.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeException {
+    /// Exception type name, bounded.
+    pub exception_type: String,
+    /// Sanitized message, bounded, when present.
+    pub message: Option<String>,
+}
+
+/// Event capacity facts from terminal evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingCapacity {
+    /// Cap in force for this recording.
+    pub event_cap: u32,
+    /// Events persisted.
+    pub event_count: u32,
+    /// Events dropped at the cap, decimal string.
+    pub capacity_dropped_events: String,
+    /// Dropped-event counts by priority, decimal strings.
+    pub drops_by_priority: BTreeMap<u32, String>,
+}
+
+/// Which event projection a window carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Projection {
+    /// Every event field, including navigation, ids and bindings.
+    #[default]
+    Full,
+    /// Outline fields only.
+    Structure,
+}
+
+/// Server-computed honesty counts; clients render these and never recompute them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HonestySummary {
+    /// Version of this summary shape.
+    pub schema_version: u32,
+    /// Whole-recording facts.
+    pub recording: HonestyRecording,
+    /// Facts about the returned window only.
+    pub window: HonestyWindow,
+}
+
+/// Whole-recording honesty facts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HonestyRecording {
+    /// `complete`, `partial`, `invalid` or `unavailable`.
+    pub completion: String,
+    /// Incomplete-evidence strings.
+    pub incomplete: Vec<String>,
+    /// Events dropped at the cap, decimal string.
+    pub capacity_dropped_events: String,
+    /// Dropped counts by priority, decimal strings.
+    pub drops_by_priority: BTreeMap<u32, String>,
+    /// Frames carrying a gap flag; `None` when counts are unavailable.
+    pub frames_with_gap: Option<u64>,
+    /// Frames carrying a redacted value; `None` when counts are unavailable.
+    pub frames_with_redacted: Option<u64>,
+    /// Frames carrying a truncated value; `None` when counts are unavailable.
+    pub frames_with_truncated: Option<u64>,
+    /// Frames carrying an unavailable value; `None` when counts are unavailable.
+    pub frames_with_unavailable: Option<u64>,
+    /// Frames carrying a dropped value; `None` when counts are unavailable.
+    pub frames_with_dropped: Option<u64>,
+    /// Frames with an unobserved parent; `None` when counts are unavailable.
+    pub frames_with_orphan_parent: Option<u64>,
+    /// False when the frame counts cannot be computed (never zero-filled).
+    pub counts_available: bool,
+}
+
+/// Honesty facts for the returned window.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HonestyWindow {
+    /// Events in the window.
+    pub events: u64,
+    /// Bindings by value state.
+    pub bindings_by_state: BTreeMap<String, u64>,
+    /// Unavailable values by reason.
+    pub unavailable_by_reason: BTreeMap<String, u64>,
+    /// Dropped values by reason.
+    pub dropped_by_reason: BTreeMap<String, u64>,
+    /// Gap events in the window.
+    pub gaps: Vec<WindowGap>,
+    /// Events by source-binding state.
+    pub source_bindings: BTreeMap<String, u64>,
+    /// Projected sources by status.
+    pub source_status: BTreeMap<String, u64>,
+}
+
+/// One gap event in the window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowGap {
+    /// Gap event sequence, decimal string.
+    pub sequence: String,
+    /// Snake_case gap reason.
+    pub reason: String,
+    /// Suppressed observation count, decimal string.
+    pub count: String,
+    /// Bracketing sequence before the span, decimal string.
+    pub first_sequence: String,
+    /// Bracketing sequence after the span, decimal string.
+    pub last_sequence: String,
+}
+
+impl HonestySummary {
+    /// Builds the summary from the facts a window carries; whole-recording frame
+    /// counts stay unavailable until the frame index supplies them.
+    #[must_use]
+    pub fn from_window(
+        completion: RecordingCompletionEvidence,
+        incomplete: &[String],
+        capacity: Option<&RecordingCapacity>,
+        drops_by_priority: &BTreeMap<u32, String>,
+        events: &[PersistedEvent],
+    ) -> Self {
+        let mut window = HonestyWindow { events: events.len() as u64, ..HonestyWindow::default() };
+        for event in events {
+            for binding in &event.bindings {
+                let (state, reason) = match &binding.value {
+                    PersistedValue::Captured { .. } => ("captured", None),
+                    PersistedValue::Redacted { .. } => ("redacted", None),
+                    PersistedValue::Truncated { .. } => ("truncated", None),
+                    PersistedValue::Unavailable { reason } => ("unavailable", Some(reason)),
+                    PersistedValue::Dropped { reason } => ("dropped", Some(reason)),
+                };
+                *window.bindings_by_state.entry(state.to_owned()).or_default() += 1;
+                if let Some(reason) = reason {
+                    let map = if state == "unavailable" {
+                        &mut window.unavailable_by_reason
+                    } else {
+                        &mut window.dropped_by_reason
+                    };
+                    *map.entry(reason.clone()).or_default() += 1;
+                }
+            }
+            if let Some(gap) = &event.gap {
+                window.gaps.push(WindowGap {
+                    sequence: event.sequence.clone(),
+                    reason: gap.reason.clone(),
+                    count: gap.count.clone(),
+                    first_sequence: gap.first_sequence.clone(),
+                    last_sequence: gap.last_sequence.clone(),
+                });
+            }
+            let binding = serde_json::to_value(event.source_binding)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unspecified".to_owned());
+            *window.source_bindings.entry(binding).or_default() += 1;
+            if let Some(source) = &event.source {
+                let status = match source.status {
+                    SourceStatus::Matched => "matched",
+                    SourceStatus::Mismatch => "mismatch",
+                    SourceStatus::Unavailable => "unavailable",
+                    SourceStatus::MissingFile => "missing_file",
+                };
+                *window.source_status.entry(status.to_owned()).or_default() += 1;
+            }
+        }
+        let completion_label = match completion {
+            RecordingCompletionEvidence::Complete => "complete",
+            RecordingCompletionEvidence::Partial => "partial",
+            RecordingCompletionEvidence::Invalid => "invalid",
+            RecordingCompletionEvidence::Unavailable => "unavailable",
+        };
+        Self {
+            schema_version: 1,
+            recording: HonestyRecording {
+                completion: completion_label.to_owned(),
+                incomplete: incomplete.to_vec(),
+                capacity_dropped_events: capacity
+                    .map_or_else(|| "0".to_owned(), |value| value.capacity_dropped_events.clone()),
+                drops_by_priority: drops_by_priority.clone(),
+                frames_with_gap: None,
+                frames_with_redacted: None,
+                frames_with_truncated: None,
+                frames_with_unavailable: None,
+                frames_with_dropped: None,
+                frames_with_orphan_parent: None,
+                counts_available: false,
+            },
+            window,
+        }
+    }
 }
 
 /// Stable JSON list projection.
@@ -435,6 +797,24 @@ pub struct RecordingDetail {
     pub incomplete_evidence: Vec<String>,
     /// Source, value, and completion details absent from this persistence slice.
     pub unavailable: UnavailableEvidence,
+    /// Adapter-observed outcome; `None` when terminal evidence is absent.
+    pub outcome: Option<PersistedOutcome>,
+    /// Event capacity facts; `None` when terminal evidence is absent.
+    pub capacity: Option<RecordingCapacity>,
+    /// Stable limitation codes (for example `capture_policy_not_armed`).
+    pub limitations: Vec<String>,
+    /// Server-computed honesty summary.
+    pub honesty: HonestySummary,
+    /// Anchor frame of an `aroundFrame` window.
+    pub anchor_frame_id: Option<FrameId>,
+    /// First sequence in the returned window, decimal string.
+    pub first_sequence: Option<String>,
+    /// Last sequence in the returned window, decimal string.
+    pub last_sequence: Option<String>,
+    /// Backward-paging cursor, when an earlier window exists.
+    pub prev_cursor: Option<String>,
+    /// Projection the events carry.
+    pub projection: Projection,
 }
 
 /// Explicit representation of details this projection cannot establish.
@@ -458,8 +838,91 @@ impl Default for UnavailableEvidence {
     }
 }
 
+/// Every navigation action for one frame, with the facts a client needs to place it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameNavigationView {
+    /// Frame the facts describe.
+    pub frame_id: FrameId,
+    /// Recording sequence of the frame, decimal string.
+    pub sequence: String,
+    /// Call depth; `None` for legacy or unindexed frames.
+    pub depth: Option<u32>,
+    /// Parent frame, only when the parent was observed.
+    pub parent_frame_id: Option<FrameId>,
+    /// Resolved navigation edges.
+    pub navigation: FrameNavigation,
+}
+
+/// One replay-navigation action (CONTRACTS 8.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavigationAction {
+    /// Nearest earlier navigable frame.
+    Previous,
+    /// Nearest later navigable frame.
+    Next,
+    /// First child frame, else the next frame.
+    Into,
+    /// First later frame at the same or lower depth.
+    Over,
+    /// First later frame at lower depth.
+    Out,
+}
+
+impl NavigationAction {
+    /// Parses the stable query-string spelling.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "previous" => Self::Previous,
+            "next" => Self::Next,
+            "into" => Self::Into,
+            "over" => Self::Over,
+            "out" => Self::Out,
+            _ => return None,
+        })
+    }
+
+    /// The stable query-string spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Previous => "previous",
+            Self::Next => "next",
+            Self::Into => "into",
+            Self::Over => "over",
+            Self::Out => "out",
+        }
+    }
+
+    /// Picks this action's edge out of a frame's navigation.
+    #[must_use]
+    pub const fn select(self, navigation: &FrameNavigation) -> NavigationResult {
+        match self {
+            Self::Previous => navigation.previous,
+            Self::Next => navigation.next,
+            Self::Into => navigation.into,
+            Self::Over => navigation.over,
+            Self::Out => navigation.out,
+        }
+    }
+}
+
 /// Infrastructure contract for bounded persisted-recording reads.
 pub trait RecordingReadPort: Send + Sync {
+    /// Resolves every navigation edge of one frame of a project-owned recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` when the recording is not owned by the project or the
+    /// frame does not belong to it.
+    fn frame_navigation(
+        &self,
+        project_id: ProjectId,
+        recording_id: RecordingId,
+        frame_id: FrameId,
+    ) -> Result<FrameNavigationView, PortError>;
+
     /// Lists one stable, bounded page and reports whether another page exists.
     fn list_recordings(
         &self,
@@ -518,6 +981,37 @@ impl<P: RecordingReadPort> RecordingQueryService<P> {
     ) -> Result<RecordingDetail, AppError> {
         show_recording(&self.port, request, correlation_id)
     }
+
+    /// Resolves every navigation edge of one frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized read-port failure; an unknown frame is not found.
+    pub fn frame_navigation(
+        &self,
+        project_id: ProjectId,
+        recording_id: RecordingId,
+        frame_id: FrameId,
+        correlation_id: CorrelationId,
+    ) -> Result<FrameNavigationView, AppError> {
+        frame_navigation(&self.port, project_id, recording_id, frame_id, correlation_id)
+    }
+}
+
+/// Resolves all navigation edges of one frame (the five-in-one endpoint).
+///
+/// # Errors
+///
+/// Propagates a sanitized read-port failure; an unknown frame is `NotFound`.
+pub fn frame_navigation<P: RecordingReadPort>(
+    port: &P,
+    project_id: ProjectId,
+    recording_id: RecordingId,
+    frame_id: FrameId,
+    correlation_id: CorrelationId,
+) -> Result<FrameNavigationView, AppError> {
+    port.frame_navigation(project_id, recording_id, frame_id)
+        .map_err(|error| crate::application::port_error_to_app_error(error, correlation_id))
 }
 
 /// Lists persisted recordings after validating application-owned bounds.
@@ -579,15 +1073,60 @@ pub fn show_recording<P: RecordingReadPort>(
     }) {
         return Err(cursor_validation_error(correlation_id));
     }
+    if request.around_frame.is_some() && request.cursor.is_some() {
+        return Err(query_validation_error(correlation_id));
+    }
+    // An around-window starts `limit / 2` events before the anchor, clamped to the first
+    // event (sequence 2), so the anchor is the middle element whenever the recording allows.
+    let anchor = request
+        .around_frame
+        .map(|frame_id| {
+            let view =
+                port.frame_navigation(request.project_id, request.recording_id, frame_id).map_err(
+                    |error| crate::application::port_error_to_app_error(error, correlation_id),
+                )?;
+            let sequence =
+                view.sequence.parse::<u64>().map_err(|_| query_resource_error(correlation_id))?;
+            Ok::<_, AppError>((frame_id, sequence))
+        })
+        .transpose()?;
+    let after_sequence_start = match anchor {
+        Some((_, sequence)) => {
+            Some(sequence.saturating_sub(u64::from(request.limit / 2)).max(2).saturating_sub(1))
+        }
+        None => after_sequence.map(|cursor| cursor.sequence),
+    };
     let position = ShowWindowRequest {
         project_id: request.project_id,
         recording_id: request.recording_id,
         limit: request.limit,
-        after_sequence: after_sequence.map(|cursor| cursor.sequence),
+        after_sequence: after_sequence_start,
     };
-    let window = port
+    let mut window = port
         .show_recording(&position)
         .map_err(|error| crate::application::port_error_to_app_error(error, correlation_id))?;
+    if let Some((_, anchor_sequence)) = anchor {
+        // CONTRACTS 8.2: the byte budget trims the far end of the page, but the anchor is
+        // never dropped. When the tail trim cut the anchor off, move the window start
+        // towards the anchor (halving the distance) until the anchor is inside it.
+        let mut start = after_sequence_start.unwrap_or(0);
+        let floor = anchor_sequence.saturating_sub(1);
+        while !window
+            .events
+            .iter()
+            .any(|event| event.sequence.parse::<u64>().ok() == Some(anchor_sequence))
+        {
+            if start >= floor || !window.has_more {
+                return Err(query_resource_error(correlation_id));
+            }
+            start += (floor - start).div_ceil(2);
+            window = port
+                .show_recording(&ShowWindowRequest { after_sequence: Some(start), ..position })
+                .map_err(|error| {
+                    crate::application::port_error_to_app_error(error, correlation_id)
+                })?;
+        }
+    }
     let adapter_summary = window.adapter_summary;
     if window.duration_ns.as_ref().is_some_and(|value| !decimal_u64(value))
         || window.drop_counts_by_priority.len() > 256
@@ -639,6 +1178,24 @@ pub fn show_recording<P: RecordingReadPort>(
     } else {
         None
     };
+    let mut honesty = HonestySummary::from_window(
+        window.completion,
+        &window.incomplete_evidence,
+        window.capacity.as_ref(),
+        &drop_counts_by_priority,
+        &events,
+    );
+    if let Some(counts) = window.frame_honesty {
+        honesty.recording.frames_with_gap = Some(counts.gap);
+        honesty.recording.frames_with_redacted = Some(counts.redacted);
+        honesty.recording.frames_with_truncated = Some(counts.truncated);
+        honesty.recording.frames_with_unavailable = Some(counts.unavailable);
+        honesty.recording.frames_with_dropped = Some(counts.dropped);
+        honesty.recording.frames_with_orphan_parent = Some(counts.orphan_parent);
+        honesty.recording.counts_available = true;
+    }
+    let first_sequence = events.first().map(|event| event.sequence.clone());
+    let last_sequence = events.last().map(|event| event.sequence.clone());
     Ok(RecordingDetail {
         schema_version: RECORDING_READ_SCHEMA_VERSION,
         project_id: request.project_id,
@@ -662,6 +1219,15 @@ pub fn show_recording<P: RecordingReadPort>(
             },
             ..UnavailableEvidence::default()
         },
+        outcome: window.outcome,
+        capacity: window.capacity,
+        limitations: window.limitations,
+        honesty,
+        anchor_frame_id: anchor.map(|(frame_id, _)| frame_id),
+        first_sequence,
+        last_sequence,
+        prev_cursor: None,
+        projection: Projection::Full,
     })
 }
 
@@ -733,6 +1299,7 @@ fn query_resource_error(correlation_id: CorrelationId) -> AppError {
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "fixed query fixtures")]
 mod tests {
     use super::*;
+    use crate::error::PortErrorKind;
 
     #[derive(Clone)]
     struct ReadFixture {
@@ -741,6 +1308,19 @@ mod tests {
     }
 
     impl RecordingReadPort for ReadFixture {
+        fn frame_navigation(
+            &self,
+            _project_id: ProjectId,
+            _recording_id: RecordingId,
+            _frame_id: FrameId,
+        ) -> Result<FrameNavigationView, PortError> {
+            Err(PortError::new(
+                PortErrorKind::NotFound,
+                "fixture has no frames",
+                CorrelationId::new(),
+            ))
+        }
+
         fn list_recordings(
             &self,
             _project_id: ProjectId,
@@ -783,9 +1363,19 @@ mod tests {
                 source: None,
                 source_binding: SourceBinding::Unspecified,
                 field_truncations: Vec::new(),
+                depth: None,
+                parent_frame_id: None,
+                async_parent_frame_id: None,
+                line: None,
+                bindings: Vec::new(),
+                gap: None,
             }],
             has_more: true,
             incomplete_evidence: Vec::new(),
+            outcome: None,
+            capacity: None,
+            limitations: Vec::new(),
+            frame_honesty: None,
         };
         let list = vec![RecordingMetadata {
             recording_id,
@@ -797,6 +1387,8 @@ mod tests {
             first_sequence: Some("2".to_owned()),
             last_sequence: Some(u64::MAX.to_string()),
             incomplete_evidence: vec!["persisted_status:partial".to_owned()],
+            event_cap: None,
+            outcome_kind: None,
         }];
         (project_id, recording_id, ReadFixture { list, window })
     }
@@ -813,7 +1405,13 @@ mod tests {
 
         let detail = service
             .show(
-                ShowRecording { project_id, recording_id, limit: 1, cursor: None },
+                ShowRecording {
+                    project_id,
+                    recording_id,
+                    limit: 1,
+                    cursor: None,
+                    around_frame: None,
+                },
                 CorrelationId::new(),
             )
             .expect("show through shared service");
@@ -851,6 +1449,7 @@ mod tests {
                     recording_id,
                     sequence: 4,
                 })),
+                around_frame: None,
             },
             CorrelationId::new(),
         )
@@ -886,7 +1485,7 @@ mod tests {
         for limit in [0, MAX_RECORDING_EVENT_LIMIT + 1] {
             let error = show_recording(
                 &fixture,
-                ShowRecording { project_id, recording_id, limit, cursor: None },
+                ShowRecording { project_id, recording_id, limit, cursor: None, around_frame: None },
                 CorrelationId::new(),
             )
             .expect_err("invalid event bound");
@@ -907,7 +1506,13 @@ mod tests {
         for cursor in tokens {
             let error = show_recording(
                 &fixture,
-                ShowRecording { project_id, recording_id, limit: 10, cursor: Some(cursor) },
+                ShowRecording {
+                    project_id,
+                    recording_id,
+                    limit: 10,
+                    cursor: Some(cursor),
+                    around_frame: None,
+                },
                 CorrelationId::new(),
             )
             .expect_err("malformed or cross-bound cursor rejected");
@@ -922,7 +1527,7 @@ mod tests {
         fixture.window.events[0].event_id = Some("relationship-canary".repeat(20));
         let result = show_recording(
             &fixture,
-            ShowRecording { project_id, recording_id, limit: 10, cursor: None },
+            ShowRecording { project_id, recording_id, limit: 10, cursor: None, around_frame: None },
             CorrelationId::new(),
         )
         .expect("oversized event is represented within the response budget");

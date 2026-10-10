@@ -1,14 +1,16 @@
 import { createHash } from "node:crypto";
-import { cp, copyFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const source = join(root, "packages/adapter-core/src");
 const target = join(source, "../dist");
-await Promise.all([
-  copyFile(join(source, "node-http-manifest.json"), join(target, "node-http-manifest.json")),
-]);
+// The capability manifest is generated from the compiled module descriptors, never hand-edited.
+const require = createRequire(import.meta.url);
+const { buildManifest } = require(join(target, "manifest.cjs"));
+await writeFile(join(target, "node-capabilities.json"), `${JSON.stringify(buildManifest())}\n`, { mode: 0o644 });
 
 // The launchable dist is self-contained. Copy workspace links by value so the
 // manifest covers every executable dependency and its package metadata.
@@ -38,6 +40,8 @@ async function filesUnder(directory) {
   return files;
 }
 
+// Generated files from older builds must not stay in the hashed, launchable dist.
+await rm(join(target, "node-http-manifest.json"), { force: true });
 const manifestPath = join(target, "manifest.sha256");
 const files = (await filesUnder(target)).filter((path) => path !== manifestPath).sort();
 const lines = [];

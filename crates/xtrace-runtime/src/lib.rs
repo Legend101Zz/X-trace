@@ -15,6 +15,11 @@ pub mod java;
 #[cfg(unix)]
 pub mod java_attach;
 
+#[cfg(unix)]
+pub mod java_scope;
+
+pub mod pack_discovery;
+
 /// Strict signed language-pack manifest parsing and cryptographic primitives.
 pub mod signed_pack;
 

@@ -1,0 +1,12 @@
+{
+  "bytes_hex": "08011a1011111111111111111111111111111111200b29f30300000000000032046d2d3131d20190010a1022222222222222222222222222222222127c0a03652d331003298b130000000000003014380542144f776e6572436f6e74726f6c6c65722e73686f774a4e0a267372632f6d61696e2f6a6176612f6170702f4f776e6572436f6e74726f6c6c65722e6a617661102920293220cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd6806",
+  "description": "LINE_CURSOR (kind 5): start_line == end_line, OBSERVED_UNATTESTED binding, 32-byte content hash",
+  "message": "xtp.agent.v1.AgentEnvelope",
+  "summary": {
+    "contentHashBytes": 32,
+    "endLine": 41,
+    "kind": 5,
+    "sourceBinding": "observed_unattested",
+    "startLine": 41
+  }
+}

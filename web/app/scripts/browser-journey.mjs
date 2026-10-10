@@ -102,7 +102,7 @@ try {
   await page.getByText(/Adapter reported a compile-time source binding; current source matches the recorded identity/).waitFor();
   const sourceExcerpt = await page.locator('.source-excerpt').textContent();
   assert.ok(sourceExcerpt?.includes('repository.save'), 'browser displays the matched bounded Spring source excerpt');
-  await page.getByText('Values were not projected').waitFor();
+  await page.getByText('No value bindings were recorded for this event').waitFor();
   await page.getByText(/response outcome is not event-verified/i).waitFor();
   await page.setViewportSize({ width: 1280, height: 720 });
   await saveScreenshot('viewer-desktop-genuine-detail.png', 'genuine-recording-detail', 1280, 720);
@@ -129,6 +129,46 @@ try {
   assert.deepEqual(eventLayout, { kindFits: true, timeFits: true, overlaps: false }, 'mobile event data must wrap without clipping or overlap');
   await eventKind.evaluate((node, text) => { node.textContent = text; }, originalKind);
   await saveScreenshot('viewer-mobile-genuine-events.png', 'genuine-event-window', 390, 844);
+
+  // Linear and Canvas on the real recording at 320, 736 and 1024 px: no horizontal page scroll,
+  // one shared selection, a single roving tab stop in the tree, keyboard stepping, screenshots.
+  for (const [width, height] of [[320, 640], [736, 900], [1024, 768]]) {
+    await page.setViewportSize({ width, height });
+    const eventsTab = page.getByRole('tab', { name: 'events' });
+    if (await eventsTab.isVisible()) await eventsTab.click();
+    await page.getByRole('tabpanel', { name: 'events' }).waitFor({ state: 'visible' });
+    const noHorizontalScroll = async (view) => {
+      const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+      assert.ok(overflow <= 0, `${view} view scrolls the page horizontally by ${overflow}px at ${width}px`);
+    };
+    await page.getByRole('button', { name: 'Linear', exact: true }).click();
+    await page.locator('.event').first().waitFor();
+    await noHorizontalScroll('linear');
+    await saveScreenshot(`viewer-replay-linear-${width}.png`, 'linear-real-recording', width, height);
+    const selectedLinear = async () => page.locator('.event').evaluateAll((rows) => rows.findIndex((row) => row.getAttribute('aria-current') === 'true'));
+    const startIndex = await selectedLinear();
+    await page.getByRole('button', { name: 'Canvas', exact: true }).click();
+    await page.getByRole('tree').waitFor();
+    const items = page.getByRole('treeitem');
+    const itemCount = await items.count();
+    assert.ok(itemCount >= 1, `canvas tree lists the recording's frames at ${width}px`);
+    assert.equal(await page.locator('.canvas-tree [role="treeitem"][tabindex="0"]').count(), 1, 'tree has exactly one tab stop');
+    assert.equal(await page.locator('.canvas-svg').getAttribute('aria-hidden'), 'true', 'the drawing is decorative; the tree is the accessible form');
+    await noHorizontalScroll('canvas');
+    await saveScreenshot(`viewer-replay-canvas-${width}.png`, 'canvas-real-recording', width, height);
+    if (itemCount > 1) {
+      await page.locator('.canvas-tree [role="treeitem"][tabindex="0"]').focus();
+      await page.keyboard.press('ArrowDown');
+      await page.getByRole('button', { name: 'Linear', exact: true }).click();
+      await page.locator('.event').first().waitFor();
+      assert.notEqual(await selectedLinear(), startIndex, `ArrowDown in Canvas moved the selection Linear shows at ${width}px`);
+    } else {
+      await page.getByRole('button', { name: 'Linear', exact: true }).click();
+    }
+    assert.equal(await page.locator('.event[aria-current="true"]').count(), 1, 'exactly one selected event in Linear');
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('tab', { name: 'events' }).click();
   await page.getByRole('tab', { name: 'evidence' }).click();
   await page.getByRole('tabpanel', { name: 'evidence' }).waitFor({ state: 'visible' });
   await page.getByRole('tab', { name: 'recordings' }).click();

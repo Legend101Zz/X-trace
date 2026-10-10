@@ -23,6 +23,9 @@ use xtrace_domain::{
 
 use crate::error::PortError;
 
+pub mod admission;
+pub mod history;
+
 /// Authenticated transport context supplied by the runtime session manager.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CatalogProducerContext {
@@ -969,6 +972,61 @@ mod tests {
             *selections.lock().expect("read selected owners"),
             [expected_original, expected_original]
         );
+    }
+
+    fn source_claim(
+        evidence: ClaimSourceEvidence,
+    ) -> xtrace_domain::catalog_discovery::ValidatedEndpointClaim {
+        use xtrace_domain::{EndpointIdentity, HttpMethod, Transport};
+        let identity = EndpointIdentity {
+            project_id: ProjectId::new(),
+            application_component: "orders".to_owned(),
+            transport: Transport::Http,
+            binding_key: "default".to_owned(),
+            method: HttpMethod::Get,
+            route_template: "/a".to_owned(),
+        };
+        xtrace_domain::catalog_discovery::ValidatedEndpointClaim::new(
+            "src-1".to_owned(),
+            identity,
+            xtrace_domain::catalog_discovery::ClaimProvenance::StaticInferred,
+            None,
+            0.9,
+            Vec::new(),
+            vec![evidence],
+        )
+        .expect("valid claim")
+    }
+
+    #[test]
+    fn default_source_proof_refuses_static_and_loaded_class_evidence() {
+        let ctx = context(true);
+        let selection = admitted_selection(ctx, Uuid::now_v7(), 1);
+        let digest = ContentHash::of_bytes(b"source");
+        let static_claim = source_claim(ClaimSourceEvidence::StaticSnapshot {
+            source_revision_id: xtrace_domain::SourceRevisionId::new(),
+            relative_path: "a.js".to_owned(),
+            recorded_source_digest: digest,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 2,
+        });
+        let class_claim = source_claim(ClaimSourceEvidence::LoadedClassBound {
+            loaded_class_digest: ContentHash::of_bytes(b"class"),
+            relative_path: "a.js".to_owned(),
+            recorded_source_digest: digest,
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 2,
+        });
+        for claim in [&static_claim, &class_claim] {
+            assert_eq!(
+                RefuseUnboundSourceEvidence.verify_claim(&selection, claim),
+                Err(DiscoveryRefusal::SourceSnapshotUnavailable)
+            );
+        }
     }
 
     struct SummaryReader {

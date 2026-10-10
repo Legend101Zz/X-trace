@@ -159,9 +159,14 @@ pub struct Frame {
 /// itself is always a [`CapturedValue`] so redaction state is preserved.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValueBinding {
-    /// Stable binding name (`request`, `this`, parameter name, ...).
+    /// Stable binding name (`request`, `this`, parameter name, ...), 1 to 128 UTF-8 bytes.
     pub name: String,
-    /// Captured value with explicit capture state.
+    /// Role the value plays at the event.
+    pub role: BindingRole,
+    /// Whether the name is declared in source or synthesized by the adapter.
+    pub name_origin: NameOrigin,
+    /// Captured value with explicit capture state. Never absent: an unobserved value is
+    /// `Unavailable` or `Dropped`.
     pub value: CapturedValue,
 }
 
@@ -325,5 +330,294 @@ mod tests {
             assert_eq!(parsed, kind);
             assert_eq!(kind.as_str(), json.trim_matches('"'));
         }
+    }
+}
+
+/// Role a value plays at the event it is bound to (ADR 0003 section 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingRole {
+    /// A method argument; legal on `FRAME_ENTER`.
+    Argument,
+    /// A method return value; legal on `FRAME_EXIT`.
+    Return,
+    /// A local variable; legal on `LINE_CURSOR` in focused recordings.
+    Local,
+    /// The in-flight exception; legal on `FRAME_THROW` and `EXCEPTION`.
+    Exception,
+    /// The receiver (`this`); legal on `FRAME_ENTER`.
+    Receiver,
+}
+
+impl BindingRole {
+    /// Returns the snake_case string form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Argument => "argument",
+            Self::Return => "return",
+            Self::Local => "local",
+            Self::Exception => "exception",
+            Self::Receiver => "receiver",
+        }
+    }
+}
+
+/// Where a binding's name came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameOrigin {
+    /// Taken from debug metadata (declared in source).
+    Declared,
+    /// Synthesized by the adapter (for example `arg0`).
+    Synthesized,
+}
+
+impl NameOrigin {
+    /// Returns the snake_case string form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Synthesized => "synthesized",
+        }
+    }
+}
+
+/// Why events were not recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GapReason {
+    /// The per-recording line budget was exhausted.
+    LineBudget,
+    /// The per-recording value budget was exhausted.
+    ValueBudget,
+    /// The daemon throttled the adapter.
+    Throttle,
+    /// The adapter queue was full.
+    QueueFull,
+    /// Correlation between events was lost.
+    CorrelationLost,
+    /// The class could not be transformed for probing.
+    ClassNotTransformed,
+    /// The module loaded before probes were armed.
+    ModuleLoadedBeforeArm,
+    /// A generated file was observed with no source map.
+    SourceMapAbsent,
+    /// A handled exception cannot be observed.
+    HandledExceptionUnobserved,
+    /// A child process is not instrumented.
+    ChildProcessNotInstrumented,
+    /// The bootstrap material was already consumed.
+    BootstrapConsumed,
+}
+
+impl GapReason {
+    /// Returns the snake_case string form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LineBudget => "line_budget",
+            Self::ValueBudget => "value_budget",
+            Self::Throttle => "throttle",
+            Self::QueueFull => "queue_full",
+            Self::CorrelationLost => "correlation_lost",
+            Self::ClassNotTransformed => "class_not_transformed",
+            Self::ModuleLoadedBeforeArm => "module_loaded_before_arm",
+            Self::SourceMapAbsent => "source_map_absent",
+            Self::HandledExceptionUnobserved => "handled_exception_unobserved",
+            Self::ChildProcessNotInstrumented => "child_process_not_instrumented",
+            Self::BootstrapConsumed => "bootstrap_consumed",
+        }
+    }
+}
+
+/// A coalesced description of events that were not recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gap {
+    /// Why the events were not recorded.
+    pub reason: GapReason,
+    /// How many events the gap stands for; at least 1.
+    pub count: u64,
+    /// First recording sequence the gap covers; 0 when unknown.
+    pub first_seq: u64,
+    /// Last recording sequence the gap covers; 0 when unknown.
+    pub last_seq: u64,
+}
+
+/// How a request ended, as the adapter observed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeKind {
+    /// A response was produced.
+    Responded,
+    /// An exception propagated out of the application.
+    ExceptionPropagated,
+    /// The client went away before a response.
+    ClientAborted,
+    /// The adapter did not observe the outcome.
+    Unobserved,
+}
+
+impl OutcomeKind {
+    /// Returns the snake_case string form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Responded => "responded",
+            Self::ExceptionPropagated => "exception_propagated",
+            Self::ClientAborted => "client_aborted",
+            Self::Unobserved => "unobserved",
+        }
+    }
+}
+
+/// Sanitized exception carried by an outcome.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeException {
+    /// Exception type name, at most 256 bytes.
+    pub exception_type: String,
+    /// Sanitized message, at most 512 bytes.
+    pub message: String,
+}
+
+/// The observed end of a request. It never overrides completion (honesty rule R7).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingOutcome {
+    /// How the request ended.
+    pub kind: OutcomeKind,
+    /// HTTP status; `None` when not observed.
+    pub http_status: Option<u16>,
+    /// Present exactly when `kind` is `ExceptionPropagated`.
+    pub exception: Option<OutcomeException>,
+    /// Frame that last observed the throw.
+    pub thrown_from_event_id: Option<String>,
+}
+
+impl RecordingOutcome {
+    /// The outcome synthesized for terminal evidence that predates outcome capture (v4..v6 rows).
+    #[must_use]
+    pub const fn legacy_unobserved() -> Self {
+        Self {
+            kind: OutcomeKind::Unobserved,
+            http_status: None,
+            exception: None,
+            thrown_from_event_id: None,
+        }
+    }
+
+    /// Checks the structural rules shared by ingest and terminal-evidence verification: status in
+    /// 100..=599, an exception present iff the kind is `ExceptionPropagated`, and `Unobserved`
+    /// carrying no status.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable reason string naming the first violated rule.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.http_status.is_some_and(|status| !(100..=599).contains(&status)) {
+            return Err("http_status_out_of_range");
+        }
+        if self.exception.is_some() != (self.kind == OutcomeKind::ExceptionPropagated) {
+            return Err("exception_presence_mismatch");
+        }
+        if self.kind == OutcomeKind::Unobserved && self.http_status.is_some() {
+            return Err("unobserved_with_status");
+        }
+        if let Some(ex) = &self.exception {
+            if ex.exception_type.len() > 256 {
+                return Err("exception_type_too_long");
+            }
+            if ex.message.len() > 512 {
+                return Err("exception_message_too_long");
+            }
+        }
+        if self.thrown_from_event_id.as_deref().is_some_and(|id| id.len() > 128) {
+            return Err("thrown_from_event_id_too_long");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod binding_outcome_tests {
+    use super::*;
+
+    fn outcome(kind: OutcomeKind) -> RecordingOutcome {
+        RecordingOutcome { kind, http_status: None, exception: None, thrown_from_event_id: None }
+    }
+
+    #[test]
+    fn outcome_exception_requires_payload() {
+        assert_eq!(
+            outcome(OutcomeKind::ExceptionPropagated).validate(),
+            Err("exception_presence_mismatch")
+        );
+        let mut with = outcome(OutcomeKind::ExceptionPropagated);
+        with.exception =
+            Some(OutcomeException { exception_type: "E".to_string(), message: "m".to_string() });
+        assert_eq!(with.validate(), Ok(()));
+        let mut stray = outcome(OutcomeKind::Responded);
+        stray.exception = with.exception;
+        assert_eq!(stray.validate(), Err("exception_presence_mismatch"));
+    }
+
+    #[test]
+    fn outcome_unobserved_with_status_rejected() {
+        let mut o = outcome(OutcomeKind::Unobserved);
+        o.http_status = Some(200);
+        assert_eq!(o.validate(), Err("unobserved_with_status"));
+        assert_eq!(outcome(OutcomeKind::Unobserved).validate(), Ok(()));
+    }
+
+    #[test]
+    fn outcome_status_range_and_responded_without_status() {
+        let mut o = outcome(OutcomeKind::Responded);
+        assert_eq!(o.validate(), Ok(()), "responded with an unobserved status is legal");
+        o.http_status = Some(99);
+        assert_eq!(o.validate(), Err("http_status_out_of_range"));
+        o.http_status = Some(600);
+        assert_eq!(o.validate(), Err("http_status_out_of_range"));
+        o.http_status = Some(599);
+        assert_eq!(o.validate(), Ok(()));
+    }
+
+    #[test]
+    fn outcome_text_bounds_are_byte_bounds() {
+        let mut o = outcome(OutcomeKind::ExceptionPropagated);
+        o.exception =
+            Some(OutcomeException { exception_type: "E".to_string(), message: "x".repeat(513) });
+        assert_eq!(o.validate(), Err("exception_message_too_long"));
+        o.exception =
+            Some(OutcomeException { exception_type: "E".repeat(257), message: String::new() });
+        assert_eq!(o.validate(), Err("exception_type_too_long"));
+    }
+
+    #[test]
+    fn legacy_outcome_is_unobserved_not_responded() {
+        let legacy = RecordingOutcome::legacy_unobserved();
+        assert_eq!(legacy.kind, OutcomeKind::Unobserved);
+        assert_eq!(legacy.http_status, None);
+        assert_eq!(legacy.validate(), Ok(()));
+    }
+
+    #[test]
+    fn enum_strings_match_serde() {
+        for role in [
+            BindingRole::Argument,
+            BindingRole::Return,
+            BindingRole::Local,
+            BindingRole::Exception,
+            BindingRole::Receiver,
+        ] {
+            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{}\"", role.as_str()));
+        }
+        for reason in [GapReason::LineBudget, GapReason::ChildProcessNotInstrumented] {
+            assert_eq!(serde_json::to_string(&reason).unwrap(), format!("\"{}\"", reason.as_str()));
+        }
+        assert_eq!(
+            serde_json::to_string(&OutcomeKind::ClientAborted).unwrap(),
+            "\"client_aborted\""
+        );
+        assert_eq!(serde_json::to_string(&NameOrigin::Synthesized).unwrap(), "\"synthesized\"");
     }
 }

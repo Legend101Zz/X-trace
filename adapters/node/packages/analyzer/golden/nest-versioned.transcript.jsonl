@@ -1,0 +1,3 @@
+{"type":"header","contractVersion":1,"analyzerName":"xtrace-node-static","analyzerVersion":"0.0.1","rulesetId":"nest-decorators/1","framework":"nest"}
+{"type":"claim","method":"GET","routeParts":["items",""],"routeBasis":"literal","handler":"ItemsController#list","limitations":["unsupported_mapping"],"evidence":{"path":"items.controller.ts","startLine":5,"startColumn":3,"endLine":5,"endColumn":9}}
+{"type":"end","claims":1,"filesScanned":2,"complete":true,"incompleteReasons":[]}

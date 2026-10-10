@@ -11,440 +11,495 @@
       "requirement": "One package bundles CLI/daemon/TUI, web, Java/Node packs, schemas and migrations",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Unsigned Linux x86_64 and macOS arm64 packages build, are reproducible (rebuild twice from clean exports and compare) and pass checksum verification plus the install/upgrade/uninstall journey (package run 37942590293 on the candidate dffeb8d; also 37941058196 on the parent). packaging/verify_package.py passed all 10 checks on both platforms on the parent (manifest, required components incl. web, Java and Node packs, schemas, SBOM, licenses, binary version 0.0.1, reported schema version 8 equals the migration catalog, `xtrace tui` implemented); the same steps are green in the candidate package run and the campaigns package-verify job. The daemon and TUI are subcommands of the single xtrace binary, so the TUI already ships. Remaining: write xtrace-pack.json and sign packs (ADR 0004 key domain), reshape the Node pack to the ADR 0004 layout, wire pack discovery and verification into the CLI run path. Size L."
     },
     {
       "id": "INSTALL-FRESH",
       "requirement": "Fresh-profile packaged init/capability/launch/record/open/stop/restart/reopen",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Installed-binary lifecycle (init, record, stop, restart after upgrade) runs in packaging/test/install_test.sh and passes on both platforms (package run 37942590293 on the candidate); lifecycle journey tests pass in the Linux 23-gate floors and the lane rust job (ci 37942590330, lane 37942590270). In the candidate Petclinic campaign (37942593526) the lifecycle-record-stop step passes (record, live daemon, stop, daemon gone), but record-stop-flow (record, launch, stop) is still not-implemented. Remaining: signed-pack fresh-profile journey, restart-and-reopen and partial-recording reopen steps (still not-implemented gating rows). Size M."
     },
     {
       "id": "JAVA-LAUNCH",
       "requirement": "JAR, Maven, Gradle and explicit supervisor workflows preserve argv/signals/exit/cleanup",
       "approvedSlice": "S1,S3",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Spring fixture jar launch and premain journeys pass: the Rust CLI journeys ran on JDK 17 in the lane rust job and on JDK 17 and 21 in the Linux 23-gate floors (rust-cli-spring-journey gate, ci 37942590330); the Java adapter Gradle suite passes on JDK 17/21/25 (lane 37942590270), so JDK 25 has no CLI journey. Remaining: Maven, Gradle and explicit supervisor workflows, argv/signal/exit-code preservation proofs, child cleanup on kill. Size M."
     },
     {
       "id": "JAVA-ATTACH",
       "requirement": "Validated PID/start identity, attach JDK17/21/25 where applicable, precise relaunch remediation",
       "approvedSlice": "S3",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Attach helper and CLI attach exist; PID/start-identity check is unit-tested and JavaAttachAcceptanceTest runs in the Java Gradle suite on JDK 17/21/25 (lane 37942590270, no per-test counts reported). Remaining: attach receipts for JDK 17/21/25, precise relaunch remediation messages, race tests on identity reuse. Size M."
     },
     {
       "id": "NODE-LAUNCH",
       "requirement": "Native Node, scripts and package managers; CJS/ESM private preloads and child cleanup",
       "approvedSlice": "S4",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Auto mode (--require) plus CJS and ESM entries work: the Rust CLI journeys (node_run_http) ran on Node 22 in the lane and on the Node 22 and 24 floor tuples (ci 37942590330); the in-process node suites pass on Node 22/24 (lane 37942590270). Remaining: npm/pnpm/yarn script launches, ESM capability registry gap from review, child process cleanup, a process dying inside the 250 ms start hold loses that request. Size M."
     },
     {
       "id": "CATALOG-STATIC",
       "requirement": "Static endpoints and inferred path hypotheses, explicit confidence/provenance",
       "approvedSlice": "S2",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "The Node static analyzer is now built and tested by npm build/test on Node 22/24 (lane 37942590270). The Java static analyzer module exists but is not included in adapters/java/settings.gradle.kts, so no CI job compiles or tests it. xtrace scan persists a content-derived revision, but scan_catalog_journey (green in lane rust and the floors on the candidate) feeds canned golden transcripts through a stand-in analyzer script, so scan has never run a real analyzer end to end. Fixer A also removed the store-level refusal of static-snapshot claims; source proof is now enforced only at the application port. Remaining: register the Java analyzer in Gradle with dependency verification, run a real analyzer in a journey, Java golden transcript, confidence/provenance labelling review, stored incomplete-scan reasons, chain-explosion memoization, a store-level negative test for the removed guard. Size M."
     },
     {
       "id": "CATALOG-RUNTIME",
       "requirement": "General runtime registration claims, parameters and handler identity",
       "approvedSlice": "S2,S5",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Express route templates are announced at match time (asserted in-process only; the daemon does not persist the Node route, request N-003) and Spring MVC routes are captured in the Spring fixture journeys; fixtures pass in CI. Remaining: general registration claims beyond Express/Spring, route/status/outcome in the read API for Node (N-003/N-004), parameters and handler identity, migration v9 registration. Size L."
     },
     {
       "id": "CATALOG-HISTORY",
       "requirement": "Reconciliation/conflicts, complete/incomplete scans, immutable revisions and run history",
       "approvedSlice": "S2",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "catalog list/history/diff/conflicts/runs/reconcile commands and immutable revisions landed; scan_catalog_journey (canned analyzer transcripts, not a real analyzer run) is green in lane rust and the floors on the candidate. Remaining: stored incomplete-run reasons are empty, reconciliation observed side only works for one hard-coded fixture until migration v9, store-level admission tests. Size L."
     },
     {
       "id": "CATALOG-LINKS",
       "requirement": "Multiple projects/endpoints/recordings and historical unmatched v4/v7 without backfill/rekey",
       "approvedSlice": "S2",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Link schema (v9 SQL) and pure reconciliation written by the catalog lane, but v9 is not registered in the migration chain (registering it makes 3 store tests fail because their corrupt-row fixtures hit v9's stricter foreign key, per fixer B) and review found weakened link integrity. Remaining: register v9 and rework those fixtures, link multiple projects/endpoints/recordings, prove v4/v7 unmatched history without backfill, executed tests. Size L."
     },
     {
       "id": "JAVA-MVC",
       "requirement": "Spring Boot/MVC real controllers, meaningful intermediate calls and outcomes",
       "approvedSlice": "S1,S5",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "failing",
+      "receipts": [],
+      "stateNote": "Spring Boot controller journeys pass in CI, but the candidate Petclinic campaign (run 37942593526 on dffeb8d) is red for this row's own requirement: 14 recordings for 65 requests (0/8 scenarios meet route, HTTP outcome and controller/repository frame expectations), 4 http-outcome-mismatch problems (302 seen as 200, the /oups 500 path with no status), 2 expectations with no Spring Data repository frame, and only 2 of 14 recordings carry an HTTP status. The Java adapter has not changed since J2 db91b7a, so the Q-001 Java findings (status read before the redirect is committed, no repository frames, fewer recordings than requests) are unaddressed. Remaining: fix those in the adapter and re-run the campaign. Size L."
     },
     {
       "id": "JAVA-WEBFLUX",
       "requirement": "WebFlux/reactive context, concurrency and error correlation",
       "approvedSlice": "S5",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "not_started",
+      "receipts": [],
+      "stateNote": "Only the static analyzer mentions WebFlux; no reactive context propagation, concurrency or error correlation capture exists. Remaining: reactor context instrumentation, WebFlux fixture and journey, matrix receipts. Size L."
     },
     {
       "id": "JAVA-SERVLET",
       "requirement": "javax/jakarta Servlet request/async dispatch and declared container matrix",
       "approvedSlice": "S5",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "not_started",
+      "receipts": [],
+      "stateNote": "Nothing specific to javax/jakarta Servlet roots or async dispatch has landed beyond the Spring MVC bridge. Remaining: servlet request and async-dispatch instrumentation, container matrix fixtures (Tomcat/Jetty) and receipts. Size L."
     },
     {
       "id": "JAVA-INTERACTIONS",
       "requirement": "JDBC and declared outbound clients, exceptions and bounded sanitized values",
       "approvedSlice": "S3,S5",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Fixture-level capture exists in the agent runtime: a coarse H2 execute boundary (FixtureInstrumentation) with tests. The Petclinic campaign runs on Postgres, which this boundary does not cover. Remaining: real JDBC drivers, declared outbound HTTP clients, exception capture, bounded sanitized values with a value budget (review: no per-recording cap), journeys. Size L."
     },
     {
       "id": "NODE-HTTP",
       "requirement": "Built-in HTTP/HTTPS real request roots, concurrency, async context and failures",
       "approvedSlice": "S4",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Built-in HTTP request roots captured; node_run_http and journeys pass on Node 22/24 in CI. Remaining: HTTPS fixture, concurrent-request attribution, kill-mid-request abort cause, async context beyond AsyncLocalStorage-only paths. Size M."
     },
     {
       "id": "NODE-EXPRESS",
       "requirement": "Express route/middleware/handler/error discovery and real capture",
       "approvedSlice": "S4",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Express 4 and 5 route, middleware, handler and error frames are captured in the in-process journeys (the journey now asserts the loaded Express major per cell) and node_express_journey drives the fixtures through the Rust CLI; node CI 37931612217 (w2-node head) and lane 37942590270 pass. Route template and status are asserted in-process only: the daemon does not persist them for Node runs (N-003). Remaining: body-reading middleware loses correlation, route/status in read API, kill-mid-request test. Size M."
     },
     {
       "id": "NODE-FASTIFY",
       "requirement": "Fastify public route/lifecycle hooks with encapsulation identity",
       "approvedSlice": "S5",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "not_started",
+      "receipts": [],
+      "stateNote": "No Fastify runtime instrumentation exists (the Node static analyzer has Fastify analysis only). Remaining: public route and lifecycle hook capture with encapsulation identity, fixture, journeys. Size L."
     },
     {
       "id": "NODE-NEST",
       "requirement": "NestJS on Express/Fastify controller/service identity without duplicate roots",
       "approvedSlice": "S5",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "not_started",
+      "receipts": [],
+      "stateNote": "No NestJS runtime support exists (the Node static analyzer has Nest fixtures only). Remaining: controller/service identity on Express and Fastify without duplicate roots, fixtures, journeys (depends on Fastify). Size L."
     },
     {
       "id": "NODE-SOURCE",
       "requirement": "CJS/ESM and authored TypeScript maps; safe repository-only transformation",
       "approvedSlice": "S4",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Source-map resolver with honest absent/unresolved states is unit-tested but not wired into frames. Remaining: wire into frame source locations, CJS/ESM and authored TypeScript maps, safe repository-only transformation proof, journeys. Size M."
     },
     {
       "id": "NODE-INTERACTIONS",
       "requirement": "Declared database/outbound interactions, exceptions and safe values",
       "approvedSlice": "S4,S5",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "not_started",
+      "receipts": [],
+      "stateNote": "No database or outbound-call interaction capture exists in the Node adapter. Remaining: declared pg/mysql/undici/fetch interactions, exception capture, safe bounded values, journeys. Size L."
     },
     {
       "id": "PROCESS-LINKAGE",
       "requirement": "Supported worker/child runtime sessions and explicit correlation gaps",
       "approvedSlice": "S4,S5",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "not_started",
+      "receipts": [],
+      "stateNote": "Only a correlation-lost gap code is defined; no worker or child runtime session linkage exists. Remaining: parent/child session linking for Node workers and child processes and JVM forks, explicit gaps, journeys. Size L."
     },
     {
       "id": "REPLAY-SOURCE",
       "requirement": "Recorded BLAKE3 source identity bound to runtime code, missing/hash-mismatch handling",
       "approvedSlice": "S1,S2,S6",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "failing",
+      "receipts": [],
+      "stateNote": "Source identity attestation exists in the Java runtime, but the candidate Petclinic campaign (run 37942593526 on dffeb8d) fails its source-identity step: no recording frame carried a matched .java file and line (0 of 14 recordings with source; method-range starts only, no executed line). Remaining: BLAKE3 binding to runtime code, missing/hash-mismatch handling in the read path, re-run campaign. Size M."
     },
     {
       "id": "REPLAY-LINE",
       "requirement": "Observed active file/line distinct from method ranges or inference",
       "approvedSlice": "S1,S3,S6",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "JVM line probes and their -Xverify:all corpus (61/61 in leased JDK 17/21 runs JB-024/025 on an earlier head, not CI evidence; ROOT-NOTE-2 concerns leased cargo runs, these are Gradle) sit in the agent-runtime Gradle suite, which passes on JDK 17/21/25 in lane 37942590270 (no per-test counts reported). Probes are wired in focused mode only, but focused capture is claimed, not granted (focused arming not wired), so the ingest rejects line events in standard mode and a rejected batch makes the runtime fail closed. The campaign has no active-line step yet (gating row not-implemented), so no executed line has been observed in a product recording. Remaining: daemon arming, value budget, Node lines, campaign proof of executed lines. Size L."
     },
     {
       "id": "REPLAY-FRAMES",
       "requirement": "Persisted parent/async graph, frames/stack, arguments/results/locals/deltas within capabilities",
       "approvedSlice": "S1,S3,S6",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "v8 frame index, parent/async parent ids, bindings, depth and gap read model landed with tests (lane rust 998 passed, 0 failed on the candidate). Candidate Petclinic recordings (campaign 37942593526) show controller frames but no repository frames and no source lines. Remaining: recording budget (CONTRACTS 4.1) incomplete, 256-active-recording cap (A-07) not confirmed fixed, argument/result/local deltas end to end. Size L."
     },
     {
       "id": "REPLAY-OUTCOME",
       "requirement": "Actual response/exception, duration and complete/partial lifecycle evidence",
       "approvedSlice": "S1,S3",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "failing",
+      "receipts": [],
+      "stateNote": "Outcome persistence is tested at store and daemon-loopback level (fixer B; lane rust passes on the candidate) and the Java and Node adapters emit outcomes, but no adapter-to-read-API journey asserts one. In the candidate Petclinic campaign (37942593526) only 2 of 14 recordings carry an HTTP status and 4 http-outcome-mismatch problems remain (302 seen as 200, the /oups 500 path with no status); Node runs read unobserved (N-003). Remaining: Java status read after the redirect commits, exception outcomes, duration evidence, Node route/status outcome, a journey asserting the persisted outcome. Size M."
     },
     {
       "id": "REPLAY-NAV",
       "requirement": "Shared previous/next/into/over/out and evidence-timed play/pause",
       "approvedSlice": "S1,S2,S6",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "previous/next/into/over/out served from the frame index, partial-frontier, anchor-trim and async over/out fixes with store-level tests (rc1-fix-c; lane rust passes on the candidate). Remaining: evidence-timed play/pause, web and TUI wiring to the shared navigate API, verified-neighbour reasons. Size M."
     },
     {
       "id": "REPLAY-CANVAS",
       "requirement": "Real Canvas graph/Linear parity, retained selection/filter/playback",
       "approvedSlice": "S2,S6",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Linear and Canvas browser journeys pass at 320/736/1280 in the candidate Petclinic campaign (37942593526; also earlier run 37929608737) over thin recordings (controller frames, no source lines, few values); web unit, a11y and playwright-launch pass in the lane. Remaining: Canvas parity and retained selection/filter/playback on real recordings, the real-recording Playwright block in the lane suite never run. Size M."
     },
     {
       "id": "REPLAY-TUI",
       "requirement": "Shared query/navigation, source/values/gaps; resize/reconnect/plain-mode PTY journeys",
       "approvedSlice": "S2,S6",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "failing",
+      "receipts": [],
+      "stateNote": "xtrace tui is wired to the read facade with plain and json modes, and 30 PTY tests (resize, restore, keys) pass in the tui CI job (lane 37942590270), but per the X2 review they drive a hand-built fixture client, not the CLI. On real recordings the candidate campaign's tui-pty-transcript step FAILS (37942593526): the TUI lists 14 recordings by id only and the transcript names no recorded route; privacy-scan-tui stays not-implemented. Remaining: CLI-level facade tests, route/gap reasons and values display, reconnect journey, list paging and truncation disclosure. Size M."
     },
     {
       "id": "REPLAY-HONESTY",
       "requirement": "Visible redaction/truncation/drop/gap/incomplete/map/debug absence; never infer missing facts",
       "approvedSlice": "S1,S3,S4,S6",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Honesty counts, gap and limitation projection, and the A-01 privacy canary fix landed with tests. Remaining: gap reason/count display in web and TUI, Java silent-loss markers (Dropped VALUE_BUDGET), source-map and debug absence labels, journeys. Size L."
     },
     {
       "id": "EXPORT-OPENAPI",
       "requirement": "Deterministic sanitized OpenAPI3.1, parameters, conflicts and provenance",
       "approvedSlice": "S8",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Deterministic OpenAPI 3.1 generator with sanitizer and golden tests is in the export crate (CI green). Remaining: xtrace export is still a not-implemented stub (exit 9); wire catalog read to export, parameters/conflicts/provenance journey. Size M."
     },
     {
       "id": "EXPORT-POSTMAN",
       "requirement": "Collection2.1 local fallback; explicit authorized test-workspace delivery/open",
       "approvedSlice": "S8",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "blocked",
+      "receipts": [],
+      "stateNote": "Postman 2.1 local fallback exists in the export crate with goldens, CLI still a stub. Workspace delivery needs Postman test-workspace credentials, which do not exist. Remaining: wire CLI (M), authorized delivery and open flow once credentials are supplied. Size M."
     },
     {
       "id": "EXPORT-CURL",
       "requirement": "Safely quoted recipes and nonexecuting index; mutation labels; no secret content",
       "approvedSlice": "S8",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Quoted cURL recipes and non-executing index exist with quoting tests and a sanitizer over-fire fix. Remaining: CLI wiring (stub exits 9), mutation labels in a real journey, secret-content canary on real exports. Size M."
     },
     {
       "id": "EXPORT-BUNDLE",
       "requirement": "Sanitized deterministic bundle with policy/catalog hashes and omissions",
       "approvedSlice": "S8",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Sanitized deterministic bundle builder with policy and catalog hashes exists in the export crate with goldens. Remaining: CLI wiring, omissions report in a real journey, owner-path matcher for free text. Size M."
     },
     {
       "id": "EXERCISE-PLAN",
       "requirement": "No requests in preview; immutable plan hash/effect/credential refs/scope/expiry",
       "approvedSlice": "S7",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Exercise crate builds immutable plans (hash, effect, scope, target validation, preview with no requests) with tests in CI. Remaining: xtrace exercise plan/show/approve are stubs (exit 9); credential refs, expiry, product journey. Size M."
     },
     {
       "id": "EXERCISE-EXEC",
       "requirement": "Exact approved execution, destination/DNS/redirect revalidation, request/resource limits",
       "approvedSlice": "S7",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "not_started",
+      "receipts": [],
+      "stateNote": "No sender exists; target validation is textual only. Remaining: approved-plan executor, DNS and redirect revalidation at connect time, request and resource limits, tests. Size L."
     },
     {
       "id": "EXERCISE-PROVENANCE",
       "requirement": "Explicit ephemeral exercise item/run/recording linkage and failures",
       "approvedSlice": "S7",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "not_started",
+      "receipts": [],
+      "stateNote": "Nothing links exercise items to ephemeral runs or recordings yet. Remaining: item/run/recording linkage in the store, failure records, read API, journey. Size M."
     },
     {
       "id": "RECOVERY-UPGRADE",
       "requirement": "Backup/migration/crash/restart/upgrade retained-data and corrupt-object handling",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Store migrations, interrupted-recording recovery and the package upgrade test exist (floors green). Remaining: xtrace store backup/verify/restore/migrate are stubs (exit 9), crash-injection and corrupt-object tests, retained-data upgrade proof across versions. Size L."
     },
     {
       "id": "RETENTION-DOCTOR",
       "requirement": "Explicit preview/apply retention, local sanitized doctor preview/bundle",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "xtrace doctor works with a journey test. Remaining: doctor --bundle exits 9, retention preview/apply are stubs, sanitized bundle tests. Size M."
     },
     {
       "id": "SECURITY-LOCAL",
       "requirement": "TLS pin/auth replay/CSRF/origin/host/permissions/project isolation/local-first offline",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Private storage, TLS pin, auth and daemon command tests exist and pass in CI. Remaining: viewer_security.rs and project_isolation.rs integration tests (CSRF, origin, host, replay) unwritten, offline local-first proof. Size M."
     },
     {
       "id": "PRIVACY-CANARIES",
       "requirement": "Wire/log/storage/API/client/export/diagnostic canaries for all real journeys",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Petclinic privacy scan was clean on the candidate (campaigns 37942593526; also 37929608737) and the upload tree rescan, but coverage is thinner than 10 classes suggests: the 5 canary kinds (authorization and cookie headers, env var, JSON-body password, query token) only reach HTTP metadata because standard mode captures no locals or values, the exports class held 0 files, and the TUI transcript was list-only (privacy-scan-tui and privacy-scan-exports are recorded not-implemented). A-01 canary fixes landed with a loopback canary test. Remaining: export and TUI classes, Java exception previews, all six campaigns, canary tests for every real journey. Size L."
     },
     {
       "id": "UX-ACCESSIBILITY",
       "requirement": "Responsive web 320/736/1024+, keyboard/screen reader/reduced motion/stale replies",
       "approvedSlice": "S6,S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Web at 320/736/1280 passes Playwright, plus structural a11y, contrast matrix and coarse-pointer tests. Remaining: axe and screen-reader runs, reduced motion, stale-reply handling, long-text reflow stress, real-recording journey. Size M."
     },
     {
       "id": "PERFORMANCE",
       "requirement": "All approved budgets, 10000-frame/operation bounds and measured instrumentation overhead",
       "approvedSlice": "S6,S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Overhead p50/p95 is reported by the campaign harness but not gated; event cap raised to 16,384 without the full resource budget. Remaining: repeats of 5 or more, approved budgets as gates, 10,000-frame bounds tests, memory budget. Size L."
     },
     {
       "id": "PLATFORM-MAC",
       "requirement": "Exact signed/notarized macOS arm64 artifact fresh-profile acceptance",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "blocked",
+      "receipts": [],
+      "stateNote": "Needs the Apple Developer ID and notarytool profile; none exists. Prepared: unsigned macOS arm64 package builds in CI (package run 37942590293 on the candidate), sign-macos.sh. Leased macOS floor also blocked by the dead lease C2-004. Remaining: sign, notarize, fresh-profile acceptance. Size M."
     },
     {
       "id": "PLATFORM-LINUX",
       "requirement": "Exact Linux x86_64 package/signature fresh-profile acceptance",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "blocked",
+      "receipts": [],
+      "stateNote": "Needs Ed25519 release-key custody and an owner trust config; none exists. Prepared: unsigned Linux x86_64 package and both Linux 23-gate floors pass on the candidate dffeb8d (ci 37942590330; floorStatus checks_passed_for_review, releaseAcceptance false, package acceptance not run), sign-detached.sh. Remaining: sign and fresh-profile acceptance of the exact artifact. Size M."
     },
     {
       "id": "SUPPLY-CHAIN",
       "requirement": "Deterministic packages/checksums/SBOM/license/notices/advisories/provenance/signatures",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "Reproducible double build, checksums, SBOM, license inventory and THIRD_PARTY_LICENSES run in package.yml (green on the candidate, run 37942590293). Remaining: advisories audit, provenance, detached signatures (needs release key), exact-artifact verification. Size M."
     },
     {
       "id": "MATRIX",
       "requirement": "Exact JDK17/21 and attach versions; Node22/24; framework/module/driver/OS capability receipts",
       "approvedSlice": "S5,S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "JDK 17/21/25 and Node 22/24 Gradle and npm suites pass in CI (lane 37942590270); Rust-driven CLI journeys run only on the floor tuples jdk17-node22 and jdk21-node24. No per-capability receipts. Remaining: attach versions, framework/module/driver/OS receipts, WebFlux, Servlet, Fastify, Nest rows. Size L."
     },
     {
       "id": "CAMPAIGN-PETCLINIC",
       "requirement": "Pinned current stable Petclinic baseline + five meaningful packaged scenarios + browser/privacy/overhead",
       "approvedSlice": "Campaign",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "failing",
+      "receipts": [],
+      "stateNote": "Campaign run 37942593526 on the candidate dffeb8d is red (result failed, non-release): baseline 8/8, instrumented fingerprints 8/8 equal baseline, privacy scan, Linear/Canvas screenshots at 320/736/1280 and lifecycle-record-stop pass; but 14 of 65 requests recorded (0/8 scenarios meet expectations), 4 http-outcome-mismatch problems (302 seen as 200, /oups 500 seen as none), no repository frames, 0 of 14 recordings with source lines and only 2 with a status, tui-pty-transcript fails (names no route), export exits 9, and the baseline jar sha differs from the tracked pin (reported, not a pass). Active-line, frame-values, restart/reopen, partial-reopen, overhead repeats>=5 and record-stop-flow remain not-implemented gating rows. Remaining: fix product gaps, build those harness steps. Size XL."
     },
     {
       "id": "CAMPAIGN-JHIPSTER",
       "requirement": "Pinned current stable JHipster baseline + five meaningful packaged scenarios + browser/privacy/overhead",
       "approvedSlice": "Campaign",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "A pinned JHipster sample app v9.4.0 baseline runs in the candidate campaign (37942593526): upstream builds, 8/8 baseline scenarios pass, stable across two runs, fingerprints equal the pinned x86_64 baseline, Postgres image digest pinned (result passed_baseline_only; jar sha differs from the tracked pin, reported). The Angular client build is skipped, so there is no JHipster UI for the browser leg. The instrumented leg is not built (every instrumented, browser, privacy and overhead step is not-implemented). Remaining: instrumented harness, five packaged scenarios, browser, privacy and overhead steps. Size XL."
     },
     {
       "id": "CAMPAIGN-FINERACT",
       "requirement": "Pinned current stable Fineract baseline + five meaningful packaged scenarios + browser/privacy/overhead",
       "approvedSlice": "Campaign",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "failing",
+      "receipts": [],
+      "stateNote": "The Fineract campaign job fails at the upstream build (Gradle build exits 1 on the CI runner, candidate run 37942593526), so no baseline exists and the stability and fingerprint steps have nothing to compare; every instrumented, browser, privacy and overhead step is not-implemented. Remaining: fix the upstream build of a pinned stable Fineract, baseline, five packaged scenarios, browser, privacy and overhead steps. Size XL."
     },
     {
       "id": "CAMPAIGN-DIRECTUS",
       "requirement": "Pinned current stable Directus baseline + five meaningful packaged scenarios + browser/privacy/overhead",
       "approvedSlice": "Campaign",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "A first uninstrumented baseline passes on the linux/amd64 CI runner (Directus v12.4.1, candidate campaign 37942593526): one own-check run, no x86_64 pin comparison and no repeat run (baseline-fingerprints-vs-pinned is not-implemented); instrumented scenarios are not implemented. Remaining: pin and repeat the baseline, five packaged Node scenarios, browser, privacy and overhead steps, depends on Express/source/interaction work. Size XL."
     },
     {
       "id": "CAMPAIGN-MEDUSA",
       "requirement": "Pinned current stable Medusa + starter if needed, baseline + five packaged scenarios + browser/privacy/overhead",
       "approvedSlice": "Campaign",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "A first uninstrumented baseline passes on the linux/amd64 CI runner (Medusa v2.21.2, candidate campaign 37942593526): one own-check run, no x86_64 pin comparison and no repeat run; instrumented scenarios are not implemented. Remaining: pin and repeat the baseline, starter if needed, five packaged scenarios, browser, privacy and overhead steps. Size XL."
     },
     {
       "id": "CAMPAIGN-VENDURE",
       "requirement": "Pinned current stable Vendure + starter if needed, baseline + five packaged HTTP/Nest scenarios + browser/privacy/overhead",
       "approvedSlice": "Campaign",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "in_progress",
+      "receipts": [],
+      "stateNote": "A first uninstrumented baseline passes on the linux/amd64 CI runner (Vendure v3.7.3, candidate campaign 37942593526): one own-check run, no x86_64 pin comparison and no repeat run; instrumented scenarios are not implemented and Nest support does not exist. Remaining: pin and repeat the baseline, Nest adapter, five packaged HTTP/Nest scenarios, browser, privacy and overhead steps. Size XL."
     },
     {
       "id": "HUMAN-USABILITY",
       "requirement": "Real new participants: >=80 percent correct observed entry/intermediate/outcome/interactions in <=10min",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "blocked",
+      "receipts": [],
+      "stateNote": "Needs real new participants; none exist. Prepared: session protocol and scoring sheet under docs/usability. Remaining: recruit, run sessions, score at least 80 percent within 10 minutes, usability-scorer receipt. Size M."
     },
     {
       "id": "HUMAN-OWNER",
       "requirement": "Real owner reviews install, Linear/Canvas/TUI, attach failure, partial capture, exercise and exports",
       "approvedSlice": "S9",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "blocked",
+      "receipts": [],
+      "stateNote": "Needs the owner's own hands-on review. Prepared: owner-review protocol under docs/owner-review covering install, Linear/Canvas/TUI, attach failure, partial capture, exercise and exports. Remaining: owner session once exercise and exports work. Size S."
     },
     {
       "id": "REVIEWS-EXACT",
       "requirement": "Pinned separate Sol architecture/security and build/integration reviews; root complete actual diff; all exact gates/CI/postmerge",
       "approvedSlice": "Every phase",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "blocked",
+      "receipts": [],
+      "stateNote": "Needs owner approval to clear dead lease C2-004 for the leased macOS 23-gate floor, and trust config for signed receipts. Done: wave-1 review by Sonnet 5.5 reviewers, not the pinned Sol reviews this row requires (40 survivors: all 6 blockers fixed, about 20 of the 40 not confirmed fixed, list in NEXT-RUN-PROMPT section 6); Linux floors green on the candidate dffeb8d (ci 37942590330) and the parent 1b672dc. The final exact review of dffeb8d was still running when checked. Remaining: pinned Sol reviews of final diff, exact-sha gates incl. the leased macOS floor, post-merge CI. Size M."
     },
     {
       "id": "DISTRIBUTED-RECHECK",
       "requirement": "Fresh profile install exact public artifacts; second clean Java+Node journey; checksums match release",
       "approvedSlice": "Release",
       "mandatory": true,
-      "state": "pending",
-      "receipts": []
+      "state": "blocked",
+      "receipts": [],
+      "stateNote": "Needs a published release with public artifacts; none exists. Prepared: package and checksum tooling. Remaining: fresh-profile install of the public artifacts, second clean Java and Node journey, checksum match. Size S."
     }
   ]
 }

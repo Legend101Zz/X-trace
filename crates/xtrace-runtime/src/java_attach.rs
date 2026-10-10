@@ -547,6 +547,15 @@ impl PackCache {
                     return Err(unopenable());
                 }
                 attempts += 1;
+                // An `nlink == 0` file whose name still resolves is an unlink in flight: on Linux
+                // the link count drops before the directory entry goes, and an unlinker that is
+                // descheduled in between leaves the dying name visible. Every unlinker of a state
+                // file (evictor, reaper) holds its exclusive lock until after the unlink has
+                // returned, so a shared probe lock waits for that unlink to finish; the name is
+                // then gone (or a new file), and the next pass sees the truth instead of burning
+                // the bounded retries in microseconds. The probe is dropped straight away.
+                lock_within_bound(&file, false)?;
+                drop(file);
                 continue;
             }
             if !metadata.is_file()

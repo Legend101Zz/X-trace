@@ -942,18 +942,29 @@ fn validate_ascii_identifier(value: &str, max: usize) -> Result<(), DiscoveryPro
     }
     Ok(())
 }
-const DISCOVERY_LIMITATION_CODES: &[&str] = &[
+/// Closed vocabulary of claim limitation codes. Sorted; additive only. The
+/// static-analyzer codes (`mapping_*`, `mount_unresolved`, `route_*` beyond
+/// `route_constraint_unresolved`, `dynamic_registration`) are mirrored in
+/// `schema/fixtures/static-claim-contract.json`.
+pub const DISCOVERY_LIMITATION_CODES: &[&str] = &[
     "backpressure_dropped",
     "capability_unsupported",
     "daemon_shed",
     "debug_metadata_absent",
+    "dynamic_registration",
     "generated_source_skipped",
     "handler_unresolved",
+    "mapping_method_unconstrained",
     "missing_body_schema",
     "missing_response_schema",
     "missing_source_map",
+    "mount_unresolved",
     "no_local_variable_table",
+    "route_computed",
+    "route_constant_unresolved",
     "route_constraint_unresolved",
+    "route_optional_parameter",
+    "route_wildcard",
     "scan_budget_exceeded",
     "session_ended_early",
     "source_attestation_missing",
@@ -961,6 +972,12 @@ const DISCOVERY_LIMITATION_CODES: &[&str] = &[
     "source_range_unavailable",
     "unsupported_mapping",
 ];
+
+/// Returns whether `code` belongs to the closed claim limitation vocabulary.
+#[must_use]
+pub fn is_discovery_limitation_code(code: &str) -> bool {
+    DISCOVERY_LIMITATION_CODES.contains(&code)
+}
 
 const SOURCE_UNAVAILABLE_REASONS: &[&str] = &[
     "attestation_missing",

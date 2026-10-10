@@ -1546,7 +1546,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-application"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64",
  "blake3",
@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64",
  "blake3",
@@ -1582,16 +1582,19 @@ dependencies = [
  "xtrace-application",
  "xtrace-daemon",
  "xtrace-domain",
+ "xtrace-exercise",
+ "xtrace-export",
  "xtrace-private-storage",
  "xtrace-protocol",
  "xtrace-runtime",
  "xtrace-store",
+ "xtrace-tui",
  "zstd",
 ]
 
 [[package]]
 name = "xtrace-daemon"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1630,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-domain"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "hex",
@@ -1644,11 +1647,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "xtrace-exercise"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "serde_json",
+ "xtrace-export",
+]
+
+[[package]]
+name = "xtrace-export"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "serde_json",
+ "xtrace-domain",
+]
+
+[[package]]
 name = "xtrace-ingest"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "prost",
+ "serde_json",
  "thiserror",
  "uuid",
  "xtrace-domain",
@@ -1657,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-private-storage"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "rustix",
  "tempfile",
@@ -1667,8 +1689,9 @@ dependencies = [
 
 [[package]]
 name = "xtrace-protocol"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
+ "blake3",
  "constant_time_eq 0.3.1",
  "hmac",
  "prost",
@@ -1683,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-runtime"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64",
  "blake3",
@@ -1700,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "xtrace-store"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "hex",
@@ -1719,6 +1742,13 @@ dependencies = [
  "xtrace-private-storage",
  "xtrace-protocol",
  "zstd",
+]
+
+[[package]]
+name = "xtrace-tui"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

@@ -17,7 +17,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file xtp-agent/v1/handshake.proto.
  */
 export const file_xtp_agent_v1_handshake: GenFile = /*@__PURE__*/
-  fileDesc("Chx4dHAtYWdlbnQvdjEvaGFuZHNoYWtlLnByb3RvEgx4dHAuYWdlbnQudjEilAMKDEFkYXB0ZXJIZWxsbxIUCgxhZGFwdGVyX25hbWUYASABKAkSFwoPYWRhcHRlcl92ZXJzaW9uGAIgASgJEhoKEmFkYXB0ZXJfYnVpbGRfaGFzaBgDIAEoCRIYChBzaWduaW5nX2lkZW50aXR5GAQgASgJEhcKD21hbmlmZXN0X2RpZ2VzdBgFIAEoCRIQCghsYW5ndWFnZRgGIAEoCRIUCgxydW50aW1lX25hbWUYByABKAkSFwoPcnVudGltZV92ZXJzaW9uGAggASgJEgsKA3BpZBgJIAEoAxIiChpwcm9jZXNzX3N0YXJ0X21vbm90b25pY19ucxgKIAEoBhIYChBwYXJlbnRfbGF1bmNoX2lkGAsgASgJEh4KFnJlcG9zaXRvcnlfZmluZ2VycHJpbnQYDCABKAkSGgoScHJvdG9jb2xfbWFqb3JfbWF4GA0gASgNEhoKEnByb3RvY29sX21pbm9yX21heBgOIAEoDRIUCgxjbGllbnRfbm9uY2UYDyABKAwSDAoEaG1hYxgQIAEoDCKpAgoLRGFlbW9uSGVsbG8SFgoOcHJvdG9jb2xfbWFqb3IYASABKA0SFgoOcHJvdG9jb2xfbWlub3IYAiABKA0SFgoOZGFlbW9uX3ZlcnNpb24YAyABKAkSFwoPbWFuaWZlc3RfZGlnZXN0GAQgASgJEhQKDHNlcnZlcl9ub25jZRgFIAEoDBIMCgRobWFjGAYgASgMEhoKEm1heF9lbnZlbG9wZV9ieXRlcxgHIAEoDRIYChBtYXhfYmF0Y2hfZXZlbnRzGAggASgNEiEKGWluaXRpYWxfY2FwdHVyZV9wb2xpY3lfaWQYCSABKAkSHwoXcmVkYWN0aW9uX3BvbGljeV9kaWdlc3QYCiABKAkSGwoTc2VydmVyX21vbm90b25pY19ucxgLIAEoBmIGcHJvdG8z");
+  fileDesc("Chx4dHAtYWdlbnQvdjEvaGFuZHNoYWtlLnByb3RvEgx4dHAuYWdlbnQudjEixwMKDEFkYXB0ZXJIZWxsbxIUCgxhZGFwdGVyX25hbWUYASABKAkSFwoPYWRhcHRlcl92ZXJzaW9uGAIgASgJEhoKEmFkYXB0ZXJfYnVpbGRfaGFzaBgDIAEoCRIYChBzaWduaW5nX2lkZW50aXR5GAQgASgJEhcKD21hbmlmZXN0X2RpZ2VzdBgFIAEoCRIQCghsYW5ndWFnZRgGIAEoCRIUCgxydW50aW1lX25hbWUYByABKAkSFwoPcnVudGltZV92ZXJzaW9uGAggASgJEgsKA3BpZBgJIAEoAxIiChpwcm9jZXNzX3N0YXJ0X21vbm90b25pY19ucxgKIAEoBhIYChBwYXJlbnRfbGF1bmNoX2lkGAsgASgJEh4KFnJlcG9zaXRvcnlfZmluZ2VycHJpbnQYDCABKAkSGgoScHJvdG9jb2xfbWFqb3JfbWF4GA0gASgNEhoKEnByb3RvY29sX21pbm9yX21heBgOIAEoDRIUCgxjbGllbnRfbm9uY2UYDyABKAwSDAoEaG1hYxgQIAEoDBIxCg1ydW50aW1lX2ZhY3RzGBEgASgLMhoueHRwLmFnZW50LnYxLlJ1bnRpbWVGYWN0cyKrAQoMUnVudGltZUZhY3RzEhEKCWZyYW1ld29yaxgBIAEoCRIZChFmcmFtZXdvcmtfdmVyc2lvbhgCIAEoCRIVCg1tb2R1bGVfc3lzdGVtGAMgASgJEhMKC2xhdW5jaF9tb2RlGAQgASgJEhUKDWNhcHR1cmVfZGVwdGgYBSABKAkSEQoJbm9kZV9tb2RlGAYgASgJEhcKD3BhY2thZ2VfbWFuYWdlchgHIAEoCSKpAgoLRGFlbW9uSGVsbG8SFgoOcHJvdG9jb2xfbWFqb3IYASABKA0SFgoOcHJvdG9jb2xfbWlub3IYAiABKA0SFgoOZGFlbW9uX3ZlcnNpb24YAyABKAkSFwoPbWFuaWZlc3RfZGlnZXN0GAQgASgJEhQKDHNlcnZlcl9ub25jZRgFIAEoDBIMCgRobWFjGAYgASgMEhoKEm1heF9lbnZlbG9wZV9ieXRlcxgHIAEoDRIYChBtYXhfYmF0Y2hfZXZlbnRzGAggASgNEiEKGWluaXRpYWxfY2FwdHVyZV9wb2xpY3lfaWQYCSABKAkSHwoXcmVkYWN0aW9uX3BvbGljeV9kaWdlc3QYCiABKAkSGwoTc2VydmVyX21vbm90b25pY19ucxgLIAEoBmIGcHJvdG8z");
 
 /**
  * Identity and capabilities of an adapter.
@@ -137,6 +137,13 @@ export type AdapterHello = Message<"xtp.agent.v1.AdapterHello"> & {
    * @generated from field: bytes hmac = 16;
    */
   hmac: Uint8Array;
+
+  /**
+   * Adapter-reported runtime and framework facts (not covered by the HMAC).
+   *
+   * @generated from field: xtp.agent.v1.RuntimeFacts runtime_facts = 17;
+   */
+  runtimeFacts?: RuntimeFacts | undefined;
 };
 
 /**
@@ -145,6 +152,68 @@ export type AdapterHello = Message<"xtp.agent.v1.AdapterHello"> & {
  */
 export const AdapterHelloSchema: GenMessage<AdapterHello> = /*@__PURE__*/
   messageDesc(file_xtp_agent_v1_handshake, 0);
+
+/**
+ * Adapter-reported facts about the instrumented runtime. Unauthenticated:
+ * consumers label them "adapter-reported".
+ *
+ * @generated from message xtp.agent.v1.RuntimeFacts
+ */
+export type RuntimeFacts = Message<"xtp.agent.v1.RuntimeFacts"> & {
+  /**
+   * e.g. `spring-boot`, `express`; empty = not detected.
+   *
+   * @generated from field: string framework = 1;
+   */
+  framework: string;
+
+  /**
+   * @generated from field: string framework_version = 2;
+   */
+  frameworkVersion: string;
+
+  /**
+   * classpath|jpms|fatjar|cjs|esm|unknown
+   *
+   * @generated from field: string module_system = 3;
+   */
+  moduleSystem: string;
+
+  /**
+   * direct|maven|gradle|package-manager|supervised|attach
+   *
+   * @generated from field: string launch_mode = 4;
+   */
+  launchMode: string;
+
+  /**
+   * standard|focused
+   *
+   * @generated from field: string capture_depth = 5;
+   */
+  captureDepth: string;
+
+  /**
+   * cjs|esm|empty (Node only)
+   *
+   * @generated from field: string node_mode = 6;
+   */
+  nodeMode: string;
+
+  /**
+   * npm|pnpm|yarn|empty (Node only)
+   *
+   * @generated from field: string package_manager = 7;
+   */
+  packageManager: string;
+};
+
+/**
+ * Describes the message xtp.agent.v1.RuntimeFacts.
+ * Use `create(RuntimeFactsSchema)` to create a new message.
+ */
+export const RuntimeFactsSchema: GenMessage<RuntimeFacts> = /*@__PURE__*/
+  messageDesc(file_xtp_agent_v1_handshake, 1);
 
 /**
  * Identity and accepted protocol reply from the daemon.
@@ -236,4 +305,4 @@ export type DaemonHello = Message<"xtp.agent.v1.DaemonHello"> & {
  * Use `create(DaemonHelloSchema)` to create a new message.
  */
 export const DaemonHelloSchema: GenMessage<DaemonHello> = /*@__PURE__*/
-  messageDesc(file_xtp_agent_v1_handshake, 1);
+  messageDesc(file_xtp_agent_v1_handshake, 2);

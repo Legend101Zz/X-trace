@@ -12,11 +12,12 @@
 //! 1. **Per-recording lifecycle.** Each `RecordingId` is tracked in
 //!    [`RecordingLifecycle::Recording`] until its matching
 //!    [`RecordingFinished`] arrives, then it transitions to
-//!    [`RecordingLifecycle::Finalizing`]. Finalizing entries and the
-//!    event digests they retain stay in the validator's map for the
-//!    lifetime of the [`IngestValidator`] because this slice does not
-//!    expose a drain or removal API; they are never evicted or silently
-//!    dropped by this crate. Multiple recording IDs interleave
+//!    [`RecordingLifecycle::Finalizing`]. Only unfinished recordings count
+//!    against `max_active_recordings`. Finished recordings move into a
+//!    bounded tombstone ring (start and finish markers kept for idempotent
+//!    replay); their digest tables roll out after a short window or on
+//!    `release_terminal`, and the oldest tombstone is dropped beyond the
+//!    ring bound. Multiple recording IDs interleave
 //!    independently inside one [`IngestValidator`].
 //! 2. **Per-recording sequence ordering.** Strictly ascending
 //!    `recording_seq` values are required inside every batch. Duplicates
@@ -62,10 +63,13 @@
 )]
 
 pub mod error;
+pub mod event_rules;
+pub mod redaction_audit;
 pub mod validator;
 
 pub use error::IngestError;
 pub use validator::{
-    Acceptance, DEFAULT_MAX_EVENTS_PER_RECORDING, IngestConfig, IngestValidator,
-    MAX_DROP_PRIORITY_BUCKETS, RecordingLifecycle,
+    Acceptance, DEFAULT_MAX_EVENTS_PER_RECORDING, FINALIZING_DIGEST_WINDOW,
+    FINISHED_TOMBSTONE_RING, IngestConfig, IngestValidator, MAX_DROP_PRIORITY_BUCKETS,
+    MAX_SESSION_RETAINED_DIGESTS, RecordingLifecycle,
 };

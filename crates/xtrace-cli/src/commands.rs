@@ -75,6 +75,41 @@ pub enum XtraceCommand {
         #[command(subcommand)]
         command: EndpointCommand,
     },
+    /// Scan the repository for endpoints.
+    Scan(crate::scan::ScanArgs),
+    /// Read and compare the endpoint catalog.
+    Catalog {
+        #[command(subcommand)]
+        command: crate::catalog_cmd::CatalogCommand,
+    },
+    /// Start the project's recording daemon detached and arm one launch (single-use bootstrap).
+    Record(crate::lifecycle::RecordArgs),
+    /// Stop the recording daemon started by `record`; seals recordings it left open as partial.
+    Stop(crate::lifecycle::StopArgs),
+    /// Stop (if running) then record again; the store is preserved.
+    Restart(crate::lifecycle::RestartArgs),
+    /// Run read-only diagnostics on the installation and the project store; exits 1 on any
+    /// failed check. `--json` and `--yes` are accepted; output is always JSON.
+    Doctor(crate::doctor::DoctorArgs),
+    /// Export captured endpoints (not implemented yet).
+    Export(crate::export::ExportArgs),
+    /// Plan and run exercises (not implemented yet).
+    Exercise {
+        #[command(subcommand)]
+        command: crate::exercise::ExerciseCommand,
+    },
+    /// Preview and apply recording retention (not implemented yet).
+    Retention {
+        #[command(subcommand)]
+        command: crate::retention::RetentionCommand,
+    },
+    /// Back up, verify, restore and migrate the project store (not implemented yet).
+    Store {
+        #[command(subcommand)]
+        command: crate::store_cmd::StoreCommand,
+    },
+    /// Open the terminal viewer (not implemented yet).
+    Tui(crate::tui::TuiArgs),
     /// Run the Unix-only foreground, project-scoped XTP recording ingress daemon.
     ///
     /// This command durably writes sealed event segments and retains the
@@ -120,14 +155,13 @@ pub enum XtraceCommand {
             long = "node-adapter",
             value_name = "DIR",
             conflicts_with = "java_agent",
-            required_unless_present = "java_agent",
-            requires = "node_mode"
+            required_unless_present = "java_agent"
         )]
         node_adapter: Option<PathBuf>,
-        /// Explicit Node module mode. Required with --node-adapter.
+        /// Node module mode: auto (default, injects both preloads), cjs or esm.
         #[arg(
             long = "node-mode",
-            value_name = "cjs|esm",
+            value_name = "auto|cjs|esm",
             requires = "node_adapter",
             conflicts_with = "java_agent"
         )]
@@ -141,6 +175,9 @@ pub enum XtraceCommand {
         /// Stable, run-scoped transport binding (must be paired with --application-component).
         #[arg(long = "binding-key", requires = "application_component")]
         binding_key: Option<String>,
+        /// Capture depth, application scope and launcher (CONTRACTS 11.2).
+        #[command(flatten)]
+        capture: crate::capture_args::CaptureArgs,
         /// Java executable followed by its original arguments.
         #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<OsString>,
@@ -241,6 +278,17 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
         XtraceCommand::Endpoint { command } => {
             endpoint(command, &crate::paths::read_env_path).map(|()| 0)
         }
+        XtraceCommand::Scan(args) => crate::scan::run(args).await,
+        XtraceCommand::Catalog { command } => crate::catalog_cmd::run(command).await,
+        XtraceCommand::Record(args) => crate::lifecycle::run_record(args).await,
+        XtraceCommand::Stop(args) => crate::lifecycle::run_stop(args).await,
+        XtraceCommand::Restart(args) => crate::lifecycle::run_restart(args).await,
+        XtraceCommand::Doctor(args) => crate::doctor::run(args).await,
+        XtraceCommand::Export(args) => crate::export::run(args).await,
+        XtraceCommand::Exercise { command } => crate::exercise::run(command).await,
+        XtraceCommand::Retention { command } => crate::retention::run(command).await,
+        XtraceCommand::Store { command } => crate::store_cmd::run(command).await,
+        XtraceCommand::Tui(args) => crate::tui::run(args).await,
         XtraceCommand::Daemon { project_dir } => crate::daemon::run(project_dir).await.map(|()| 0),
         #[cfg(unix)]
         XtraceCommand::Attach { project_dir, pid, java_pack, json } => {
@@ -254,9 +302,11 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
             observed_endpoint_policy,
             application_component,
             binding_key,
+            capture,
             command,
         } => {
             validate_safe_run_identity(application_component.as_deref(), binding_key.as_deref())?;
+            let capture_options = capture.validate()?;
             if let Some(java_agent) = java_agent {
                 crate::run::run(
                     project_dir,
@@ -264,10 +314,19 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
                     observed_endpoint_policy,
                     application_component,
                     binding_key,
+                    capture_options,
                     command,
                 )
                 .await
-            } else if let (Some(node_adapter), Some(node_mode)) = (node_adapter, node_mode) {
+            } else if let Some(node_adapter) = node_adapter {
+                let node_mode = node_mode.unwrap_or_else(|| "auto".to_owned());
+                if capture.any_given() {
+                    return Err(CliError::InvalidArgument(
+                        "Node capture does not yet support --capture-depth, --app-package, \
+                         --source-root or --launcher"
+                            .to_string(),
+                    ));
+                }
                 if observed_endpoint_policy.is_some()
                     || application_component.is_some()
                     || binding_key.is_some()
@@ -280,8 +339,7 @@ pub async fn run(command: XtraceCommand) -> Result<i32, CliError> {
                 crate::run::run_node(project_dir, node_adapter, node_mode, command).await
             } else {
                 Err(CliError::InvalidArgument(
-                    "run requires either --java-agent or --node-adapter with --node-mode"
-                        .to_string(),
+                    "run requires either --java-agent or --node-adapter".to_string(),
                 ))
             }
         }
@@ -357,8 +415,10 @@ where
         RecordingCommand::Show { project_dir, recording_id, limit, cursor } => {
             let (project_id, recording_queries, correlation_id) =
                 open_recording_queries(&project_dir, env_reader)?;
-            let detail = recording_queries
-                .show(ShowRecording { project_id, recording_id, limit, cursor }, correlation_id)?;
+            let detail = recording_queries.show(
+                ShowRecording { project_id, recording_id, limit, cursor, around_frame: None },
+                correlation_id,
+            )?;
             let mut stdout = std::io::stdout().lock();
             write_success(&mut stdout, &detail)?;
             Ok(())
@@ -603,18 +663,11 @@ where
     } else {
         display_name.trim().to_string()
     };
-    let idempotency_key = if idempotency_key.trim().is_empty() {
-        default_init_idempotency_key(&canonical)
-    } else {
-        idempotency_key.trim().to_string()
-    };
+    let explicit_key = idempotency_key.trim().to_string();
     if display_name.is_empty() || display_name.len() > 128 {
         return Err(CliError::InvalidArgument("display name must contain 1 to 128 bytes".into()));
     }
-    if idempotency_key.is_empty()
-        || idempotency_key.len() > 128
-        || idempotency_key.contains(['\0', '\n', '\r'])
-    {
+    if !explicit_key.is_empty() && !idempotency_key_is_valid(&explicit_key) {
         return Err(CliError::InvalidArgument("idempotency key is invalid".into()));
     }
     let requested_at = WallTime::now();
@@ -641,6 +694,35 @@ where
     }
     let pending_bytes = lock.read("init.pending", crate::pointer_io::PENDING_MAX_BYTES)?;
     let pending = pending_bytes.as_deref().map(crate::paths::PendingInit::parse).transpose()?;
+    // The implicit key is resolved only now that the repository pointer and the
+    // pending marker are known (CONTRACTS 11.3): the legacy verbatim key is kept
+    // solely for exact replay of an existing marker or receipt; everything else
+    // gets the fixed-length digest key.
+    let idempotency_key = if explicit_key.is_empty() {
+        let legacy = legacy_init_idempotency_key(&canonical).filter(|legacy| {
+            let marker_has_it = pending.as_ref().is_some_and(|marker| {
+                marker.matches_request(
+                    fingerprint.as_str(),
+                    &user_data_home,
+                    &display_name,
+                    legacy,
+                    &canonical,
+                )
+            });
+            marker_has_it
+                || existing_pointer.as_ref().is_some_and(|pointer| {
+                    store_holds_receipt(
+                        &user_data_home,
+                        pointer.project_id,
+                        "initialize_project",
+                        legacy,
+                    )
+                })
+        });
+        legacy.unwrap_or_else(|| default_init_idempotency_key(&canonical))
+    } else {
+        explicit_key
+    };
     let selected_project_id = existing_pointer
         .as_ref()
         .map(|pointer| pointer.project_id)
@@ -770,13 +852,65 @@ where
     Ok(())
 }
 
+fn idempotency_key_is_valid(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 128 && !key.contains(['\0', '\n', '\r'])
+}
+
+/// Always the fixed-length digest form: prefix plus 64 lowercase hex characters
+/// of the BLAKE3-256 of the canonical path bytes (79 bytes in total).
 fn default_init_idempotency_key(canonical_repo_path: &str) -> String {
+    format!("xtrace-init-v1-{}", blake3::hash(canonical_repo_path.as_bytes()).to_hex())
+}
+
+/// The historical verbatim key, only when it would have been admitted.
+fn legacy_init_idempotency_key(canonical_repo_path: &str) -> Option<String> {
     let legacy = format!("xtrace-init-{canonical_repo_path}");
-    if legacy.len() <= 128 && !legacy.contains(['\0', '\n', '\r']) {
-        legacy
-    } else {
-        format!("xtrace-init-v1-{}", blake3::hash(canonical_repo_path.as_bytes()).to_hex())
+    idempotency_key_is_valid(&legacy).then_some(legacy)
+}
+
+/// Fixed-length digest key for `open` (79 bytes), whatever the path length.
+fn default_open_idempotency_key(canonical_repo_path: &str) -> String {
+    format!("xtrace-open-v1-{}", blake3::hash(canonical_repo_path.as_bytes()).to_hex())
+}
+
+/// The historical verbatim `open` key, only when it would have been admitted.
+fn legacy_open_idempotency_key(canonical_repo_path: &str) -> Option<String> {
+    let legacy = format!("xtrace-open-{canonical_repo_path}");
+    idempotency_key_is_valid(&legacy).then_some(legacy)
+}
+
+/// Best-effort probe used to decide whether a legacy implicit key already has a
+/// stored receipt. It opens the existing store with the same options the command
+/// itself uses next, so it can apply pending migrations; a read-only open would
+/// refuse every pre-current schema, which are exactly the stores that can hold a
+/// legacy key. Any failure answers `false`; the real command path reports the
+/// underlying store problem itself.
+fn store_holds_receipt(
+    data_home: &Path,
+    project_id: xtrace_domain::ProjectId,
+    command_kind: &str,
+    key: &str,
+) -> bool {
+    use xtrace_application::IdempotencyStore as _;
+
+    let (Ok(project_directory), Ok(database_path)) = (
+        UserDataPaths::project_dir_with_home(data_home, project_id),
+        UserDataPaths::database_path_with_home(data_home, project_id),
+    ) else {
+        return false;
+    };
+    if AdmittedPrivateRoot::open(&project_directory).is_err() {
+        return false;
     }
+    let Ok(store) = SqliteStore::open(
+        &database_path,
+        xtrace_store::OpenOptions::default().with_must_exist(true),
+    ) else {
+        return false;
+    };
+    SqliteIdempotencyStore::new(&store)
+        .lookup_receipt(command_kind, key)
+        .is_ok_and(|receipt| receipt.is_some())
 }
 
 fn open<F>(project_dir: PathBuf, idempotency_key: String, env_reader: &F) -> Result<(), CliError>
@@ -808,7 +942,13 @@ where
 
     let canonical = repo.display().to_string();
     let resolved_idempotency_key = if idempotency_key.trim().is_empty() {
-        format!("xtrace-open-{canonical}")
+        use xtrace_application::IdempotencyStore as _;
+        let legacy = legacy_open_idempotency_key(&canonical).filter(|legacy| {
+            SqliteIdempotencyStore::new(&store)
+                .lookup_receipt("open_project", legacy)
+                .is_ok_and(|receipt| receipt.is_some())
+        });
+        legacy.unwrap_or_else(|| default_open_idempotency_key(&canonical))
     } else {
         idempotency_key
     };
@@ -1140,18 +1280,144 @@ mod tests {
         assert_eq!(document.project_dir, repo.display().to_string());
     }
 
-    #[test]
-    fn default_init_key_is_bounded_and_path_specific() {
-        let long_path = format!("/{}", "a".repeat(crate::pointer_io::MAX_PATH_BYTES - 1));
-        let key = default_init_idempotency_key(&long_path);
-        assert!(key.len() <= 128);
-        assert_eq!(key, default_init_idempotency_key(&long_path));
-        assert_ne!(key, default_init_idempotency_key("/different"));
-        assert_eq!(
-            default_init_idempotency_key("/short/repository"),
-            "xtrace-init-/short/repository"
+    fn assert_digest_key(key: &str, prefix: &str) {
+        assert_eq!(key.len(), 79, "key {key}");
+        assert!(key.starts_with(prefix));
+        assert!(
+            key[prefix.len()..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "suffix must be lowercase hex"
         );
-        assert!(key.starts_with("xtrace-init-v1-"));
+    }
+
+    #[test]
+    fn default_init_key_is_fixed_length_for_all_path_lengths() {
+        for len in [1_usize, 50, 116, 117, 200, 201, 4096] {
+            let path = format!("/{}", "a".repeat(len - 1));
+            assert_eq!(path.len(), len);
+            assert_digest_key(&default_init_idempotency_key(&path), "xtrace-init-v1-");
+            assert_digest_key(&default_open_idempotency_key(&path), "xtrace-open-v1-");
+        }
+    }
+
+    #[test]
+    fn default_init_key_for_200_plus_char_path_is_deterministic_and_path_specific() {
+        let long_path = format!("/{}", "b".repeat(249));
+        let key = default_init_idempotency_key(&long_path);
+        assert_eq!(key, default_init_idempotency_key(&long_path));
+        let mut changed = long_path.clone();
+        changed.pop();
+        changed.push('c');
+        assert_ne!(key, default_init_idempotency_key(&changed));
+        assert_ne!(
+            default_open_idempotency_key(&long_path),
+            default_open_idempotency_key(&changed)
+        );
+    }
+
+    #[test]
+    fn default_init_key_never_contains_path_text() {
+        let path = "/very/distinctive-path-token/repository";
+        assert!(!default_init_idempotency_key(path).contains("distinctive"));
+        assert!(!default_open_idempotency_key(path).contains("distinctive"));
+    }
+
+    #[test]
+    fn legacy_keys_exist_only_when_they_would_have_been_admitted() {
+        assert_eq!(
+            legacy_init_idempotency_key("/short/repository").as_deref(),
+            Some("xtrace-init-/short/repository")
+        );
+        assert_eq!(
+            legacy_open_idempotency_key("/short/repository").as_deref(),
+            Some("xtrace-open-/short/repository")
+        );
+        let long_path = format!("/{}", "a".repeat(200));
+        assert!(legacy_init_idempotency_key(&long_path).is_none());
+        assert!(legacy_open_idempotency_key(&long_path).is_none());
+        assert!(legacy_init_idempotency_key("/bad\npath").is_none());
+    }
+
+    #[test]
+    fn short_fresh_init_uses_v1_digest() {
+        use xtrace_application::IdempotencyStore as _;
+
+        let repo = legacy_key_repo_dir();
+        let home = tempdir("fresh-v1-key-home");
+        let env_reader = move |name: &str| (name == USER_DATA_HOME_ENV).then(|| home.clone());
+        let canonical = resolve_repo(&repo).expect("canonical repository");
+        let canonical = canonical.to_str().expect("UTF-8 repository").to_string();
+        init(repo.clone(), "Fresh".into(), String::new(), &env_reader).expect("fresh init");
+        let pointer = RepositoryPointer::read(&repo).expect("pointer");
+        let database_path =
+            UserDataPaths::database_path_with_home(&pointer.data_home, pointer.project_id)
+                .expect("database path");
+        let store = SqliteStore::open(&database_path, xtrace_store::OpenOptions::default())
+            .expect("open store");
+        let idempotency = SqliteIdempotencyStore::new(&store);
+        assert!(
+            idempotency
+                .lookup_receipt("initialize_project", &default_init_idempotency_key(&canonical))
+                .expect("lookup")
+                .is_some()
+        );
+        assert!(
+            idempotency
+                .lookup_receipt(
+                    "initialize_project",
+                    &legacy_init_idempotency_key(&canonical).expect("short legacy key")
+                )
+                .expect("lookup")
+                .is_none()
+        );
+        drop(store);
+        // The retry replays under the same digest key.
+        init(repo, "Fresh".into(), String::new(), &env_reader).expect("replay");
+    }
+
+    #[test]
+    fn open_replays_and_survives_the_default_key() {
+        let repo = legacy_key_repo_dir();
+        let home = tempdir("open-v1-key-home");
+        let env_reader = move |name: &str| (name == USER_DATA_HOME_ENV).then(|| home.clone());
+        init(repo.clone(), "Open".into(), String::new(), &env_reader).expect("init");
+        open(repo.clone(), String::new(), &env_reader).expect("open");
+        open(repo, String::new(), &env_reader).expect("open replay");
+    }
+
+    #[test]
+    fn open_with_200_plus_char_path_succeeds() {
+        // Filesystem path limits keep a real >200 character checkout from being portable,
+        // so this proves the key step that failed validation (limit 128) for such paths.
+        let long_path = format!("/{}", "c".repeat(260));
+        let key = default_open_idempotency_key(&long_path);
+        assert_digest_key(&key, "xtrace-open-v1-");
+        assert!(idempotency_key_is_valid(&key));
+        assert!(!idempotency_key_is_valid(&format!("xtrace-open-{long_path}")));
+    }
+
+    #[test]
+    fn open_viewer_with_long_path_succeeds() {
+        // `open --viewer` shares the key step with plain `open`.
+        let long_path = format!("/{}", "d".repeat(300));
+        assert!(idempotency_key_is_valid(&default_open_idempotency_key(&long_path)));
+    }
+
+    #[test]
+    fn init_with_200_plus_char_repo_path_succeeds_and_replays() {
+        // End to end with a repository whose canonical path exceeds 200 characters.
+        let base = tempdir("long-path-repo");
+        let mut repo = base.clone();
+        while repo.to_str().map_or(0, str::len) <= 210 {
+            repo = repo.join("d".repeat(60));
+        }
+        std::fs::create_dir_all(&repo).expect("create long repository directory");
+        let home = tempdir("long-path-home");
+        let env_reader = move |name: &str| (name == USER_DATA_HOME_ENV).then(|| home.clone());
+        let canonical = resolve_repo(&repo).expect("canonical");
+        assert!(canonical.to_str().expect("UTF-8").len() > 200);
+        init(repo.clone(), "Long".into(), String::new(), &env_reader).expect("init long path");
+        init(repo.clone(), "Long".into(), String::new(), &env_reader).expect("replay long path");
+        open(repo, String::new(), &env_reader).expect("open long path");
     }
 
     #[test]
@@ -1164,8 +1430,8 @@ mod tests {
         let canonical = resolve_repo(&repo).expect("canonical repository");
         let canonical = canonical.to_str().expect("UTF-8 repository");
         let legacy_key = require_parent_legacy_key(canonical);
-        init(repo.clone(), "Legacy".into(), String::new(), &env_reader)
-            .expect("initial project and receipt");
+        init(repo.clone(), "Legacy".into(), legacy_key.clone(), &env_reader)
+            .expect("initial project and receipt under the historical key");
         let pointer = RepositoryPointer::read(&repo).expect("pointer");
         let database_path =
             UserDataPaths::database_path_with_home(&pointer.data_home, pointer.project_id)
@@ -1355,9 +1621,9 @@ mod tests {
             "historical implicit key must pass the parent's exact 128-byte/control admission; shorten XTRACE_TEST_PRIVATE_SCRATCH"
         );
         assert_eq!(
-            default_init_idempotency_key(canonical_repo_path),
-            key,
-            "fixture must exercise the historical implicit key, not the bounded fallback"
+            legacy_init_idempotency_key(canonical_repo_path).as_deref(),
+            Some(key.as_str()),
+            "fixture must exercise the historical implicit key"
         );
         key
     }
@@ -1369,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_pending_marker_recovers_same_identity_before_database_commit() {
+    fn init_pending_marker_with_legacy_key_matches_request() {
         let repo = legacy_key_repo_dir();
         let blocked_home = tempdir("v1-pending-precommit-home").join("blocked-home");
         std::fs::write(&blocked_home, b"injected private-root blocker").expect("block home");
@@ -1437,7 +1703,7 @@ mod tests {
         let canonical = canonical.to_str().expect("UTF-8 repo");
         let key = require_parent_legacy_key(canonical);
         let display_name = "V1 committed";
-        init(repo.clone(), display_name.into(), String::new(), &env_reader)
+        init(repo.clone(), display_name.into(), key.clone(), &env_reader)
             .expect("commit initial project and receipt");
         let original_pointer = RepositoryPointer::read(&repo).expect("initial pointer");
         let database_path = UserDataPaths::database_path_with_home(

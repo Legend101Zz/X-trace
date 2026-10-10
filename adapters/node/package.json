@@ -10,9 +10,10 @@
     "build:protocol": "npm run build --workspace @xtrace/protocol",
     "build:core": "npm run build --workspace @xtrace/adapter-core",
     "build:synthetic": "npm run build --workspace @xtrace/synthetic-client",
-    "build": "npm run build:protocol && npm run build:core && npm run build:synthetic",
+    "build:analyzer": "npm run build --workspace @xtrace/static-analyzer-node",
+    "build": "npm run build:protocol && npm run build:core && npm run build:synthetic && npm run build:analyzer",
     "typecheck": "npm run build",
-    "test": "npm run build && node --test packages/adapter-core/dist/test/*.test.js",
+    "test": "npm run build && node --test packages/adapter-core/dist/test/*.test.js && npm test --workspace @xtrace/static-analyzer-node",
     "synthetic": "node examples/synthetic-client/dist/main.js"
   },
   "devDependencies": {

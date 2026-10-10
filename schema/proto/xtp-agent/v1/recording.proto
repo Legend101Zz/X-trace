@@ -39,6 +39,10 @@ message RecordingStarted {
     string redaction_policy_digest = 12;
     // Source revision identifier active when the recording opened.
     string source_revision_id = 13;
+    // Exercise plan item the request belongs to. Copied from the
+    // `X-XTrace-Exercise-Item` request header (UUID text); the adapter
+    // drops an invalid value, it is never stored.
+    string exercise_item_id = 14;
 }
 
 // Candidate operation resolved by the adapter.
@@ -85,9 +89,66 @@ message RecordingEvent {
     ExceptionPayload exception = 12;
     // Records the adapter's source-attestation outcome for the loaded class bytes.
     SourceBinding source_binding = 13;
+    // Values observed at this event.
+    repeated ValueBinding bindings = 14;
+    // Coalesced gap description; set only when `kind == GAP`.
+    GapPayload gap = 15;
 }
 
-// Adapter-reported source-attestation outcome. Only VERIFIED events may carry a source range.
+// A named value observed at an event.
+message ValueBinding {
+    // Binding name, at most 128 UTF-8 bytes.
+    string name = 1;
+    // Role the value plays at the event.
+    BindingRole role = 2;
+    // Whether the name came from debug metadata or was synthesized.
+    NameOrigin name_origin = 3;
+    // Never absent; use `unavailable` or `dropped` when not observed.
+    CapturedValue value = 4;
+}
+
+enum BindingRole {
+    BINDING_ROLE_UNSPECIFIED = 0;
+    BINDING_ROLE_ARGUMENT = 1;
+    BINDING_ROLE_RETURN = 2;
+    BINDING_ROLE_LOCAL = 3;
+    BINDING_ROLE_EXCEPTION = 4;
+    BINDING_ROLE_RECEIVER = 5;
+}
+
+enum NameOrigin {
+    NAME_ORIGIN_UNSPECIFIED = 0;
+    NAME_ORIGIN_DECLARED = 1;
+    NAME_ORIGIN_SYNTHESIZED = 2;
+}
+
+// Coalesced description of events that were not recorded.
+message GapPayload {
+    GapReason reason = 1;
+    uint64 count = 2;
+    uint64 first_recording_seq = 3;
+    uint64 last_recording_seq = 4;
+}
+
+enum GapReason {
+    GAP_REASON_UNSPECIFIED = 0;
+    GAP_REASON_LINE_BUDGET = 1;
+    GAP_REASON_VALUE_BUDGET = 2;
+    GAP_REASON_THROTTLE = 3;
+    GAP_REASON_QUEUE_FULL = 4;
+    GAP_REASON_CORRELATION_LOST = 5;
+    GAP_REASON_CLASS_NOT_TRANSFORMED = 6;
+    GAP_REASON_MODULE_LOADED_BEFORE_ARM = 7;
+    GAP_REASON_SOURCE_MAP_ABSENT = 8;
+    GAP_REASON_HANDLED_EXCEPTION_UNOBSERVED = 9;
+    // Additions beyond ADR 0003 (ADR 0003 addendum): Node process linkage.
+    GAP_REASON_CHILD_PROCESS_NOT_INSTRUMENTED = 10;
+    GAP_REASON_BOOTSTRAP_CONSUMED = 11;
+}
+
+// Adapter-reported source-attestation outcome. VERIFIED, OBSERVED_UNATTESTED,
+// SOURCE_MAP_ABSENT and SOURCE_MAP_UNRESOLVED events may carry a source range;
+// the other bindings must not.
 enum SourceBinding {
     // No source binding facts were recorded for the event.
     SOURCE_BINDING_UNSPECIFIED = 0;
@@ -101,6 +162,12 @@ enum SourceBinding {
     SOURCE_BINDING_DEBUG_METADATA_ABSENT = 4;
     // The bounded build source attestation was malformed or inconsistent.
     SOURCE_BINDING_SOURCE_METADATA_INVALID = 5;
+    // The source file was read at class load; no build attestation vouches for it.
+    SOURCE_BINDING_OBSERVED_UNATTESTED = 6;
+    // A generated file was observed and no source map was found.
+    SOURCE_BINDING_SOURCE_MAP_ABSENT = 7;
+    // A source map exists but the position could not be resolved through it.
+    SOURCE_BINDING_SOURCE_MAP_UNRESOLVED = 8;
 }
 
 // Event kind discriminator.
@@ -184,6 +251,9 @@ enum UnavailableReason {
     UNAVAILABLE_REASON_CAPTURE_BUDGET_EXHAUSTED = 3;
     UNAVAILABLE_REASON_SOURCE_ARTIFACT_MISSING = 4;
     UNAVAILABLE_REASON_RECORDER_DISCONNECTED = 5;
+    UNAVAILABLE_REASON_FOCUSED_CAPTURE_NOT_ARMED = 6;
+    UNAVAILABLE_REASON_UNSAFE_TO_RENDER = 7;
+    UNAVAILABLE_REASON_CLASS_NOT_TRANSFORMABLE = 8;
 }
 
 // Reason a value was dropped.
@@ -193,6 +263,9 @@ enum DropReason {
     DROP_REASON_QUEUE_FULL = 2;
     DROP_REASON_SEQUENCE_GAP = 3;
     DROP_REASON_ADAPTER_DROPPED = 4;
+    DROP_REASON_THROTTLE_SUPPRESSED = 5;
+    DROP_REASON_LINE_BUDGET = 6;
+    DROP_REASON_VALUE_BUDGET = 7;
 }
 
 // Interaction payload.
@@ -207,6 +280,16 @@ message Interaction {
     CapturedValue request_summary = 8;
     CapturedValue response_summary = 9;
     CapturedValue error = 10;
+    // JDBC statement class: select|insert|update|delete|ddl|call|other.
+    string statement_kind = 11;
+    // JDBC table names, at most 16 entries of at most 128 bytes.
+    repeated string tables = 12;
+    // Statement with literals and parameters replaced by `?`, at most 512 bytes.
+    string sanitized_shape = 13;
+    // Outbound HTTP port; 0 = not observed.
+    uint32 port = 14;
+    // Outbound HTTP response status; 0 = not observed.
+    uint32 status_code = 15;
 }
 
 // Interaction kind discriminator.
@@ -217,6 +300,9 @@ enum InteractionKind {
     INTERACTION_KIND_MESSAGING = 3;
     INTERACTION_KIND_FILESYSTEM = 4;
     INTERACTION_KIND_FRAMEWORK = 5;
+    // Process or worker spawn. `driver` = runtime, `method` =
+    // spawn|fork|worker|exec, `symbol` = command basename only.
+    INTERACTION_KIND_PROCESS = 6;
 }
 
 // Exception payload.
@@ -243,4 +329,25 @@ message RecordingFinished {
     repeated string unsupported_capability_codes = 6;
     // Digest over the emitted event IDs in order.
     bytes event_digest = 7;
+    // Observed request outcome; absent for adapters that do not report one.
+    RecordingOutcome outcome = 8;
+}
+
+// How the request ended, as the adapter observed it.
+message RecordingOutcome {
+    OutcomeKind kind = 1;
+    // 0 = not observed.
+    uint32 http_status = 2;
+    // Set for EXCEPTION_PROPAGATED.
+    ExceptionPayload exception = 3;
+    // Frame that last observed the throw.
+    string thrown_from_event_id = 4;
+}
+
+enum OutcomeKind {
+    OUTCOME_KIND_UNSPECIFIED = 0;
+    OUTCOME_KIND_RESPONDED = 1;
+    OUTCOME_KIND_EXCEPTION_PROPAGATED = 2;
+    OUTCOME_KIND_CLIENT_ABORTED = 3;
+    OUTCOME_KIND_UNOBSERVED = 4;
 }

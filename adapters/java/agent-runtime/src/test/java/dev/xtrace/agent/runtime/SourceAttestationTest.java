@@ -73,6 +73,33 @@ class SourceAttestationTest {
     }
   }
 
+  @Test
+  void attestKeepsMismatchAndMalformedButYieldsToSourceIdentityWhenNoAttestationApplies()
+      throws Exception {
+    String desc = Type.getMethodDescriptor(method());
+    byte[] classBytes = "recorded".getBytes(StandardCharsets.UTF_8);
+    try (URLClassLoader loader = loader(manifest(hash(classBytes), "12:14"))) {
+      SourceAttestation.observe(loader, "dev/xtrace/fixture/OrderService",
+                                "changed".getBytes(StandardCharsets.UTF_8));
+      SourceAttestation.SourceInfo tampered =
+          SourceAttestation.attest(loader, "dev.xtrace.fixture.OrderService", "place", desc);
+      assertEquals(3, tampered.binding());
+      assertNull(tampered.path());
+      // another method of the same tampered class is still a mismatch
+      assertEquals(3, SourceAttestation.attest(
+          loader, "dev.xtrace.fixture.OrderService", "other", "()V").binding());
+      // a class the valid manifest does not name has no attestation
+      assertNull(SourceAttestation.attest(loader, "com.acme.Other", "m", "()V"));
+    }
+    try (URLClassLoader absent = new URLClassLoader(new java.net.URL[0], null)) {
+      assertNull(SourceAttestation.attest(absent, "com.acme.Other", "m", "()V"));
+    }
+    try (URLClassLoader malformed = loader("not\ta\tmanifest\n")) {
+      assertEquals(5, SourceAttestation.attest(
+          malformed, "dev.xtrace.fixture.OrderService", "place", desc).binding());
+    }
+  }
+
   private static URLClassLoader loader(String manifest) throws Exception {
     Path root = Files.createTempDirectory("xtrace-source-attestation-");
     Path file = root.resolve("META-INF/xtrace/source-attestation.tsv");
