@@ -204,13 +204,21 @@ EXPECT = {
     "owner-edit": [
         {"method": "POST", "route": "/owners/{ownerId}/edit", "status": 302, "layers": ["controller", "repository"], "layerHints": OWN}],
     "missing-owner-error": [
-        {"method": "GET", "route": "/owners/{ownerId}", "status": 500, "layers": ["controller", "repository"], "layerHints": OWN}],
+        # the unhandled IllegalArgumentException reaches the servlet container, which answers 500; the product records
+        # exception_propagated (no http status), so the expectation names the exception it must have observed
+        {"method": "GET", "route": "/owners/{ownerId}", "status": 500, "exception": "IllegalArgumentException",
+         "layers": ["controller", "repository"], "layerHints": OWN}],
     "controller-crash-path": [
-        {"method": "GET", "route": "/oups", "status": 500, "layers": ["controller"], "layerHints": {"controller": "CrashController"}}],
+        {"method": "GET", "route": "/oups", "status": 500, "exception": "RuntimeException", "layers": ["controller"],
+         "layerHints": {"controller": "CrashController"}}],
     "concurrent-isolation": [
         {"method": "GET", "route": "/owners/{ownerId}", "status": 200, "layers": ["controller"], "layerHints": OWN, "minCount": 30},
         {"method": "POST", "route": "/owners/new", "status": 302, "layers": ["controller"], "layerHints": OWN, "minCount": 10}],
 }
+
+
+APP_PACKAGE = "org.springframework.samples.petclinic"   # petclinic's root package (every controller and repository lives below it)
+SOURCE_ROOT = "src/main/java"                           # repo-relative to the project directory (the pinned checkout)
 
 
 def instrumented() -> int:
@@ -222,7 +230,8 @@ def instrumented() -> int:
         return 2
     xtrace, agent = need["XCAMP_XTRACE"], need["XCAMP_AGENT"]
     os.environ["XCAMP_LAUNCH_PREFIX"] = " ".join(shlex.quote(x) for x in
-        [xtrace, "run", "--project-dir", str(SRC), "--java-agent", agent, "--"])
+        [xtrace, "run", "--project-dir", str(SRC), "--java-agent", agent,
+         "--app-package", APP_PACKAGE, "--source-root", SOURCE_ROOT, "--"])
     canaries = None
     if os.environ.get("XCAMP_CANARY_FILE"):
         canaries = json.loads(pathlib.Path(os.environ["XCAMP_CANARY_FILE"]).read_text())
@@ -242,7 +251,29 @@ def instrumented() -> int:
     return 0 if r["result"] == "recorded" else 1
 
 
+def flows() -> int:
+    """Lifecycle and focused-capture flows (record/stop, restart, interrupted recording, lines, values); writes flows-<n>/flows.json."""
+    need = {k: os.environ.get(k, "") for k in ("XCAMP_XTRACE", "XCAMP_AGENT", "XCAMP_DATA_HOME")}
+    missing = [k for k, v in need.items() if not v]
+    if missing or os.environ.get("XCAMP_APP_MODE") != "host":
+        print("flows needs XCAMP_APP_MODE=host and " + ", ".join(missing or ["(all set)"]))
+        return 2
+    import xflows
+    n = 1
+    while (PROJ / f"flows-{n}").exists():
+        n += 1
+    out = PROJ / f"flows-{n}"
+    out.mkdir(parents=True)
+    results = xflows.Flows(xtrace=need["XCAMP_XTRACE"], agent=need["XCAMP_AGENT"], project_dir=SRC,
+                           data_home=pathlib.Path(need["XCAMP_DATA_HOME"]), out_dir=out, make_stack=make_stack,
+                           app_package=APP_PACKAGE, source_root=SOURCE_ROOT).run_all()
+    (out / "flows.json").write_text(json.dumps({"schemaVersion": 1, "kind": "campaign_flows", "steps": results}, indent=1, sort_keys=True))
+    return 0
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "instrumented":
         sys.exit(instrumented())
+    if len(sys.argv) > 1 and sys.argv[1] == "flows":
+        sys.exit(flows())
     sys.exit(xcamp.main_cli("petclinic", build, baseline, PROJ))

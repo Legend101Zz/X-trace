@@ -2,6 +2,7 @@
 """Turn instrumented-run outputs into campaign summary steps (pass | fail | not-implemented | reported).
 
   camp_instr_steps.py instrumented --file SUMMARY --project P --receipt instrumented-N/receipt.json [--stop-exit-9-is-ni]
+  camp_instr_steps.py flows        --file SUMMARY --project P --flows flows-N/flows.json
   camp_instr_steps.py browser      --file SUMMARY --project P --journeys browser/journeys.json
   camp_instr_steps.py tui          --file SUMMARY --project P --tui tui/tui.json
   camp_instr_steps.py overhead     --file SUMMARY --project P --overhead overhead.json
@@ -27,13 +28,23 @@ def _load(path: str):
         return None
 
 
-NOT_EXERCISED = (
-    ("active-line-frames", "no step checks the executed line of a frame (event.line, REPLAY-LINE); source.startLine is a method-extent "
-                           "lower bound, so source-identity does not cover it"),
-    ("frame-values", "no step checks captured frame values or arguments in the recordings"),
-    ("restart-reopen", "no step restarts the daemon and checks the recordings persist and reopen"),
-    ("partial-recording-reopen", "no step interrupts a recording and checks it reopens as partial"),
-)
+FLOW_STEPS = ("record-stop-flow", "restart-reopen", "partial-recording-reopen", "active-line-frames", "frame-values")
+
+
+def flow_steps(f: dict | None) -> list[tuple[str, str, str]]:
+    """Steps produced by campaigns/lib/xflows.py (`run.py flows`). A missing document, a missing step or an unknown status
+    is a failed step, never a pass and never a quiet skip; a status of not-implemented is accepted only when the flow itself
+    saw the product answer exit 9."""
+    steps = (f or {}).get("steps") if isinstance(f, dict) else None
+    out = []
+    for name in FLOW_STEPS:
+        v = steps.get(name) if isinstance(steps, dict) else None
+        if not isinstance(v, dict) or v.get("status") not in ("pass", "fail", "not-implemented"):
+            out.append((name, "fail", "no result from the flows run (document missing, flow did not complete)" if v is None
+                        else "the flows run reported an unknown status"))
+        else:
+            out.append((name, v["status"], str(v.get("note", ""))[:300]))
+    return out
 
 
 def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
@@ -72,16 +83,7 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
         n_rec = api.get("recordings", 0)
         out.append(("api-json-artifact", "pass" if n_rec > 0 else "fail",
                     f"{n_rec} recordings saved as API JSON" if n_rec > 0 else "the read API returned 0 recordings, nothing to save"))
-    stop = r.get("notes", {}).get("stopCommand", {})
-    # `xtrace run` owns its daemon for the life of the JVM, so `xtrace stop` (which ends a `xtrace record` daemon) has nothing
-    # to stop after it. Until the harness launches the app with `xtrace record`, then `xtrace stop`, the record+stop flow was
-    # never exercised: that is not-implemented (it gates), never a pass and never a quiet `reported`.
-    out.append(("record-stop-flow", "not-implemented",
-                f"harness runs `xtrace run` only; record, launch and `xtrace stop` is not exercised "
-                f"(`xtrace stop` after run exited {stop.get('exitCode')})"))
-    # capabilities the exit target depends on that this harness does not exercise yet: gating rows, never silent
-    for name, why in NOT_EXERCISED:
-        out.append((name, "not-implemented", why))
+    # record-stop-flow, restart-reopen, partial-recording-reopen, active-line-frames and frame-values come from `flows` below
     out.append(("launcher-exit-after-sigterm", "pass" if r.get("notes", {}).get("launcherExitCode") in (0, 143, -15) else "fail",
                 f"xtrace run exited {r.get('notes', {}).get('launcherExitCode')} after SIGTERM to the launcher pid"))
     return out
@@ -124,13 +126,13 @@ def overhead_steps(o: dict | None) -> list[tuple[str, str, str]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("kind", choices=["instrumented", "browser", "tui", "overhead"])
+    ap.add_argument("kind", choices=["instrumented", "flows", "browser", "tui", "overhead"])
     ap.add_argument("--file", required=True)
     ap.add_argument("--project", required=True)
-    for n in ("receipt", "journeys", "tui", "overhead"):
+    for n in ("receipt", "journeys", "tui", "overhead", "flows"):
         ap.add_argument(f"--{n}", default="")
     a = ap.parse_args()
-    src = {"instrumented": (a.receipt, instrumented_steps), "browser": (a.journeys, browser_steps),
+    src = {"instrumented": (a.receipt, instrumented_steps), "flows": (a.flows, flow_steps), "browser": (a.journeys, browser_steps),
            "tui": (a.tui, tui_steps), "overhead": (a.overhead, overhead_steps)}[a.kind]
     for step, status, note in src[1](_load(src[0])):
         cs.record(pathlib.Path(a.file), a.project, step, status, note)

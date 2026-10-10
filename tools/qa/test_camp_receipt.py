@@ -39,11 +39,15 @@ class T(unittest.TestCase):
                 "notes": {"launcherExitCode": 0}}
         agg = {"baseline": {"p50Ms": 1, "p95Ms": 2, "n": 3}, "instrumented": {"p50Ms": 1, "p95Ms": 2, "n": 3}, "p50Ratio": 1, "p95Ratio": 1}
         steps = [{"step": n, "status": st, "note": note} for n, st, note in
-                 ci.instrumented_steps(inst) + ci.overhead_steps({"aggregate": agg})]
+                 ci.instrumented_steps(inst) + ci.overhead_steps({"aggregate": agg})
+                 + ci.flow_steps({"steps": {n: {"status": "not-implemented", "note": "x"} for n in ci.FLOW_STEPS}})]
         r = self.build(steps)
         self.assertEqual(r["result"], "failed")
-        for n in ("active-line-frames", "frame-values", "restart-reopen", "partial-recording-reopen", "overhead-repeats-ge-5"):
+        for n in ("active-line-frames", "frame-values", "restart-reopen", "partial-recording-reopen", "record-stop-flow",
+                  "overhead-repeats-ge-5"):
             self.assertIn(n, r["failedChecks"])
+        missing = self.build([{"step": n, "status": st, "note": note} for n, st, note in ci.flow_steps(None)])
+        self.assertEqual(missing["result"], "failed")  # a flows run that produced no document can never read as green
 
     def test_no_steps_is_not_passed(self):
         self.assertEqual(self.build([])["result"], "failed")

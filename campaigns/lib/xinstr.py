@@ -267,6 +267,27 @@ def recording_http_status(detail: dict) -> int | None:
     return response_event_status(detail)
 
 
+OBSERVED_OUTCOME_KINDS = ("responded", "exception_propagated")  # product kinds: responded, exception_propagated, client_aborted, unobserved
+
+
+def exception_matches(detail: dict, wanted: str | None) -> bool:
+    """True when the recording's outcome is `exception_propagated` and its exception type is the one the scenario expects
+    (compared by simple or qualified name). The servlet container turns the propagated exception into the HTTP 500, which the
+    product cannot see (`http.response unavailable`), so for a 5xx expectation this is the honest observation of the failure."""
+    o = detail.get("outcome")
+    if not wanted or not isinstance(o, dict) or o.get("kind") != "exception_propagated":
+        return False
+    exc = o.get("exception")
+    typ = exc.get("exceptionType") if isinstance(exc, dict) else None
+    return isinstance(typ, str) and (typ == wanted or typ.endswith("." + wanted))
+
+
+def outcome_matches(detail: dict, expectation: dict) -> bool:
+    if recording_http_status(detail) == expectation["status"]:
+        return True
+    return expectation["status"] >= 500 and exception_matches(detail, expectation.get("exception"))
+
+
 def recording_matches(detail: dict, method: str, route: str, literal_routes: frozenset = frozenset()) -> bool:
     """Method equal and route equal. A recorded template (contains `{`) matches only by equality; a recorded literal path
     matches a template by pattern unless that literal is itself one of the campaign's literal routes (so a recorded
@@ -383,19 +404,19 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                     order = sorted(range(len(matched_all)), key=lambda i: (times[i], i))
                     matched = [matched_all[order[i]] for i in mine]
             attributed_total += len(matched)
-            with_status = [d for d in matched if recording_http_status(d) == e["status"]]
+            with_status = [d for d in matched if outcome_matches(d, e)]
             need = e.get("minCount", 1)
             if problems:
                 pass
             elif not matched:
                 problems.append("no-recording-for-route")
             else:
-                seen = sorted({str(recording_http_status(d)) for d in matched})
+                seen = sorted({str(recording_http_status(d) or (d.get("outcome") or {}).get("kind")) for d in matched})
                 if not with_status:
                     problems.append(f"http-outcome-mismatch(expected {e['status']}, saw {','.join(seen)})")
                 elif len(with_status) < need:
                     problems.append(f"count-below-minimum(need {need}, have {len(with_status)})")
-            unobserved = [d for d in with_status if (d.get("outcome") or {}).get("kind") not in ("responded", "exception")]
+            unobserved = [d for d in with_status if (d.get("outcome") or {}).get("kind") not in OBSERVED_OUTCOME_KINDS]
             if with_status and unobserved:
                 problems.append("outcome-unobserved")
             layer_report = {}

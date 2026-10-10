@@ -144,6 +144,40 @@ class T(unittest.TestCase):
         del good["events"][1]["sourceBinding"]  # required by the contract: absent is a violation, not "unreported = fine"
         self.assertEqual(xinstr.analyze({"a": good}, exp)["s"]["expectations"][0]["problems"], ["source-binding-missing"])
 
+    def _exc_rec(self, typ="java.lang.RuntimeException", kind="exception_propagated"):
+        r = rec("GET", "/oups", None, symbols=("CrashController.triggerException",), kind=kind,
+                resp_symbol="http.response unavailable")
+        r["outcome"] = {"kind": kind, "httpStatus": None,
+                        "exception": {"exceptionType": typ, "message": None} if kind == "exception_propagated" else None}
+        return r
+
+    def test_exception_propagated_is_an_observed_outcome(self):
+        exp = {"s": [{"method": "GET", "route": "/oups", "status": 500, "exception": "RuntimeException",
+                      "layers": ["controller"], "layerHints": {"controller": "CrashController"}}]}
+        v = xinstr.analyze({"a": self._exc_rec()}, exp)["s"]["expectations"][0]
+        self.assertEqual(v["problems"], [], v)
+        self.assertEqual(v["recordingsWithStatus"], 1)
+
+    def test_exception_propagated_needs_the_expected_exception_type(self):
+        exp = {"s": [{"method": "GET", "route": "/oups", "status": 500, "exception": "RuntimeException", "layers": []}]}
+        wrong = xinstr.analyze({"a": self._exc_rec("java.lang.IllegalStateException")}, exp)["s"]["expectations"][0]["problems"]
+        self.assertTrue(wrong[0].startswith("http-outcome-mismatch"), wrong)
+        none = {"s": [{"method": "GET", "route": "/oups", "status": 500, "layers": []}]}  # no exception expectation: no match
+        self.assertTrue(xinstr.analyze({"a": self._exc_rec()}, none)["s"]["expectations"][0]["problems"][0]
+                        .startswith("http-outcome-mismatch"))
+        ok200 = {"s": [{"method": "GET", "route": "/oups", "status": 200, "exception": "RuntimeException", "layers": []}]}
+        self.assertTrue(xinstr.analyze({"a": self._exc_rec()}, ok200)["s"]["expectations"][0]["problems"][0]
+                        .startswith("http-outcome-mismatch"))  # an exception never satisfies a 2xx expectation
+
+    def test_client_aborted_and_unobserved_are_not_observed(self):
+        for kind in ("client_aborted", "unobserved"):
+            exp = {"s": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}]}
+            self.assertEqual(xinstr.analyze({"a": rec("GET", "/owners/1", 200, kind=kind)}, exp)["s"]["expectations"][0]["problems"][-1:],
+                             ["outcome-unobserved"] if kind else [])
+
+    def test_legacy_exception_kind_is_not_a_product_kind(self):
+        self.assertNotIn("exception", xinstr.OBSERVED_OUTCOME_KINDS)
+
     def test_silent_viewer_hits_the_deadline(self):
         import os, stat, tempfile, time
         with tempfile.TemporaryDirectory() as d:

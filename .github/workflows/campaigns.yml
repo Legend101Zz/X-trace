@@ -300,6 +300,22 @@ jobs:
           export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
           python3 -B tools/qa/camp_lifecycle.py --xtrace "$XCAMP_XTRACE" --project-dir "$CAMP_ROOT/java/petclinic/src" \
             --file "$CAMP_OUT/summary.json" --project petclinic
+      - name: Product flows, record/stop with a launched application, restart, interrupted recording, focused lines and values
+        if: matrix.project == 'petclinic' && always()
+        env:
+          XCAMP_APP_MODE: host
+          XCAMP_PLATFORM: linux/amd64
+        run: |
+          set -o pipefail
+          export XTRACE_CAMPAIGN_ROOT="$CAMP_ROOT"
+          export XCAMP_JAVA="$JAVA_HOME/bin/java"
+          export XCAMP_DATA_HOME="$RUNNER_TEMP/xt/data" XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          python3 -B campaigns/java/petclinic/harness/run.py flows 2>&1 | tee "$RUNNER_TEMP/priv/ci-flows.log" || true
+          d=$(ls -d "$CAMP_ROOT"/java/petclinic/flows-* 2>/dev/null | sort -V | tail -n1 || true)
+          echo "FLOWS_DIR=${d}" >> "$GITHUB_ENV"
+          python3 -B tools/qa/camp_instr_steps.py flows --file "$CAMP_OUT/summary.json" --project petclinic \
+            --flows "${d:-/nonexistent}/flows.json"
+          if [ -n "${d}" ] && [ -f "$d/flows.json" ]; then cp "$d/flows.json" "$CAMP_OUT/flows.json"; fi
       - name: Privacy canary scan (class names only, canaries are never printed)
         if: matrix.project == 'petclinic' && always()
         run: |
@@ -331,6 +347,8 @@ jobs:
               --loc "daemon-log=$I/viewer.log" \
               --loc "daemon-log=$I/application.log" \
               --loc "ui-json=$I/api" \
+              --loc "ui-json=${FLOWS_DIR:-/nonexistent}" \
+              --loc "ci-output=$RUNNER_TEMP/priv/ci-flows.log" \
               --loc "exports=$RUNNER_TEMP/xt/exports" \
               --loc "receipts=$I/receipt.json" \
               --loc "receipts=$CAMP_OUT/summary.json" \
