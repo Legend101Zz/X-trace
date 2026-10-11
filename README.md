@@ -4,12 +4,14 @@ X-trace is a local-first capture-and-replay tool for HTTP services. The Rust
 workspace provides project storage, authenticated XTP ingestion, and a CLI for
 project setup, the foreground daemon, and an experimental direct-Java launch.
 
-Status (2026-10-11): `main` also carries v0.01 work that is not accepted yet, including
-Node HTTP and Express capture, attach to a running JVM, `scan` and `catalog`,
-`record`/`stop`/`restart`, `doctor`, `tui` and a Canvas view; `export`, `exercise`,
-`retention`, `store` and `doctor --bundle` are still stubs (exit 9). None of it is a support claim: 0 of 55 v0.01 requirement rows are
-accepted. The paragraphs below describe the original Slice 1 tracer bullet. Current
-status: `docs/progress.md`; release specification: `docs/releases/v0.01.md`.
+Status (2026-10-11): `main` also carries v0.01 work that is not accepted yet,
+including Node HTTP and Express capture, attach to a running JVM, `scan` and
+`catalog`, `record`/`stop`/`restart`, `doctor`, `tui` and a Canvas view;
+`export`, `exercise`, `retention`, `store` and `doctor --bundle` are still
+stubs (exit 9). None of it is a support claim: 0 of 55 v0.01 requirement rows
+are accepted. The paragraphs below describe the original Slice 1 tracer
+bullet. Current status: `docs/progress.md`; release specification:
+`docs/releases/v0.01.md`.
 
 The Node 22 workspace under `adapters/node` is a protocol/conformance
 foundation only. Its private synthetic client can authenticate to the local
