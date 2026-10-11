@@ -6,7 +6,8 @@
 
 Produces DIST/<platform>/{xtrace-<ver>-<platform>.tar.gz, SHA256SUMS, sbom.cdx.json, licenses.json,
 THIRD_PARTY_LICENSES, build-info.json}. Every artifact is UNSIGNED; see sign-*.sh for the signing interfaces.
-Dev builds are feedback only. Release acceptance builds come from CI on the real platform runners.
+Dev builds are feedback only. Linux x86_64 acceptance builds come from CI; the macOS arm64 package is built
+locally (owner decision 2026-10-10).
 """
 from __future__ import annotations
 

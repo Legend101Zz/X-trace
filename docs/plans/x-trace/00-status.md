@@ -31,6 +31,9 @@
 
 ## Notes for a fresh session
 
+- v0.01 status lives in `docs/progress.md` (last section), `docs/releases/v0.01.md` and issues #1 to #9; the next
+  session starts from `docs/releases/v0.01-continuation-prompt.md`. The slice checklist in this file is the v1
+  plan and is not updated per wave.
 - Product name is **X-trace**.
 - The product is not a chatbot.
 - The primary experience is a Swagger-like endpoint catalog combined with a read-only debugger replay.

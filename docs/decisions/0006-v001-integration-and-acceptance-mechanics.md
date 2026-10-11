@@ -66,10 +66,9 @@ following hold for that exact SHA; nothing is carried over from an earlier SHA
    produce the floor receipt; hand-run commands do not substitute.
 2. **GitHub CI on ubuntu x86_64.** Every job of `ci.yml` is green on the exact
    head SHA (read from the check-runs of that SHA, never from the branch's latest
-   run), covering Java 17 and 21 and Node 22 and 24 (Node 24 is added; today only
-   Node 22 runs), `gates`, `release-tool-tests`, `java-client`, `node-client`.
+   run), covering Java 17 and 21 and Node 22 and 24 (Node 24 now runs in `ci.yml`), `gates`, `release-tool-tests`, `java-client`, `node-client`.
    `cargo clippy`/`test` in CI use `--locked` to match the floor.
-3. **macOS arm64 CI job (new requirement).** A job on a GitHub-hosted Apple
+3. (Superseded by the second 2026-10-10 addendum: there is no hosted macOS job.) **macOS arm64 CI job (new requirement).** A job on a GitHub-hosted Apple
    silicon runner (`macos-14`, or the then-current arm64 label) runs on every
    phase candidate that touches `cfg(unix)`/macOS-specific code, the broker
    (ADR 0004), private storage, attach, or packaging, and on every candidate from
@@ -103,7 +102,7 @@ following hold for that exact SHA; nothing is carried over from an earlier SHA
 - Per phase and candidate: `evidence/v0.01/phases/<phase>/<label>/` with
   `phase-receipt.json` containing: phase id; phase-base and candidate SHAs;
   `run_gates` receipt SHA-256 and per-gate status; CI run IDs, job names,
-  conclusions and head SHA for ubuntu and macOS; the three review reports' SHA-256
+  conclusions and head SHA for ubuntu (ubuntu only since the second 2026-10-10 addendum); the three review reports' SHA-256
   and verdicts; the root-review artifact SHA-256; requirement row IDs touched;
   commands and results for the phase suites; open defects. `check_ledger.py`
   conventions apply: relative symlink-free paths, SHA-256 referenced, canonical
@@ -112,7 +111,8 @@ following hold for that exact SHA; nothing is carried over from an earlier SHA
   receipts verified by `check_ledger.py` against an owner-authenticated trust
   config; a phase receipt is evidence for a row, not acceptance of it. The
   ledger has no waiver state, so rows needing unavailable authority stay pending
-  (PLATFORM-MAC, SUPPLY-CHAIN signing, HUMAN-*, connected Postman).
+  (PLATFORM-MAC, SUPPLY-CHAIN signing, HUMAN-*, connected Postman). Since
+  the second 2026-10-10 addendum, PLATFORM-MAC no longer needs a signing identity.
 - `docs/progress.md` gets one checkpoint per accepted phase (SHAs, receipt hash,
   CI ids, remaining work), written by root after postmerge verification.
 - A rejected candidate is preserved: its receipt and reviews stay in place and are
@@ -135,6 +135,9 @@ following hold for that exact SHA; nothing is carried over from an earlier SHA
   (M:238-247).
 
 ### 4a. Gate placement per phase (summary)
+
+(The "macOS arm64 CI job" column is superseded by the second 2026-10-10 addendum; the leased floor
+column still applies.)
 
 | Phase | Floor (macOS arm64, leased) | CI ubuntu | macOS arm64 CI job | Reviews |
 |---|---|---|---|---|
@@ -167,7 +170,8 @@ following hold for that exact SHA; nothing is carried over from an earlier SHA
 
 - CI gains a Node 24 matrix entry and a macOS arm64 job; both must be added
   before P04/P05 acceptance and before any claim about macOS in the matrix.
-  Hosted runner minutes become a release dependency.
+  Hosted runner minutes become a release dependency. (macOS job: superseded by
+  the second 2026-10-10 addendum.)
 - The immutable phase base makes `git diff --check <base>...HEAD` (gate 23) and
   review diff digests reproducible; it also means a phase base must never be a
   floating ref.
@@ -227,6 +231,9 @@ Decided by the root orchestrator under the owner's autonomous v0.01 launch autho
   checkpoint); listed for the owner to ratify afterwards. If the owner does not
   ratify it, the substitute lapses: candidates again need the broker negative
   of §2 item 3 as written, and none can be accepted before the broker exists.
+  Since the second 2026-10-10 addendum, items 1 and 2 are moot and this fallback no
+  longer applies; only item 3 (the broker negative once broker code exists)
+  still binds.
 - Date: 2026-10-10
 - Context: §2 item 3 asks the hosted macOS job to run "the other-UID broker
   negative". No broker (ADR 0004) exists in the tree yet, so the job has nothing

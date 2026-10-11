@@ -327,7 +327,7 @@ become `[unavailable]`, with field names and original byte lengths reported
 without source text. Detail includes stable UUIDv7 frame IDs where the index
 matches verified XTF events, and previous/next targets only where adjacent
 immutable events have also been verified. `into`, `over`, and `out` remain
-unavailable until a verified event-graph resolver is implemented. Adapter-
+unavailable until a verified event-graph resolver is implemented. (Since ADR 0010's wave-2 addendum they are served for indexed recordings; legacy unindexed recordings still report them unavailable.) Adapter-
 declared duration and drop counts remain separate from completion. Unexercised
 capability codes remain in the bounded finish evidence but are not projected
 until they can be checked against an adapter manifest. A producer-declared
@@ -444,8 +444,8 @@ to:
 - Unicode-DFS-2016, Unicode-3.0
 - CC0-1.0, Zlib, OpenSSL, MPL-2.0
 
-`cargo deny check` is the recommended local invocation. The CI lane runs it
-before the build so a license drift fails before the slow compilation step.
+`cargo deny check` is the recommended local invocation. No CI workflow runs it
+yet; run it locally before a release build.
 
 ## Coding standards
 

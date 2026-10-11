@@ -1,5 +1,3 @@
-Sonnet 5.5 (model ID claude-sonnet-5-5)
-
 # Java campaigns preparation, round 1 (NOT acceptance)
 
 Branch `slice/v001-campaigns-java` from 3e47895f90e6a78e08b1d808d4498e4595f71a5d. Preparation only: uninstrumented baselines,
