@@ -14,8 +14,9 @@ for at least 80 percent of the questions, within 10 minutes each. At least two p
 ## Setup, per participant
 
 1. A fresh macOS arm64 or Linux x86_64 profile with the exact release package installed from the release artifact
-   set (macOS arm64 ships unsigned and not notarized, owner decision 2026-10-10). A session on a package that is not
-   the release candidate is labelled rehearsal and never enters a receipt.
+   set: Linux x86_64 with its detached signature verified; macOS arm64 unsigned and not notarized (owner decision
+   2026-10-10). Any other package makes the session a rehearsal, which is labelled rehearsal and never enters a
+   receipt.
 2. The petclinic campaign project, instrumented, with at least one recording per scenario route already captured
    (the `campaign-petclinic` CI artifact shows what such a store contains). The participant does not run the app.
 3. Screen and keyboard recording on, with the participant's consent; the recording stays in private storage and only

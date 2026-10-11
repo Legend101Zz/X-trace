@@ -315,8 +315,8 @@ Gaps (not yet covered):
   No single operation comes near the 750 ms deadline (the largest seen is 13
   spawns); the cost is the count. At the hosted runner's spawn latency a commit
   takes about 2.4 s, which is why recording tests were slow on hosted macOS.
-  (Hosted macOS CI was removed on 2026-10-10; these deadlines now bind in the
-  leased macOS floor.)
+  (Hosted macOS CI was removed on 2026-10-10; macOS timing is now exercised only
+  by the leased macOS floor.)
 
 Decision:
 
