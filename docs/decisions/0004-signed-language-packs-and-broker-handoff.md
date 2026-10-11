@@ -199,7 +199,7 @@ separate domain from pack signing and must not share keys with it.
 **Requires a real signing identity (cannot be satisfied by test keys):** the
 Ed25519 release key and its custody/rotation/revocation policy (public key bytes
 into `TRUSTED_RELEASE_KEYS`); macOS Developer ID codesigning and notarization of
-the package; the signed Linux package; ledger signer keys. **Works with test keys:**
+the package (dropped for v0.01: ADR 0006, second 2026-10-10 addendum); the signed Linux package; ledger signer keys. **Works with test keys:**
 every verifier unit test, tamper and rejection matrices, broker tests, daemon join
 tests, and CI journeys on the dev-trust build. Until a release key exists, the
 production path returns `TrustUnavailable` and INSTALL-*, PLATFORM-* and
@@ -261,8 +261,9 @@ bootstrap file path in release mode. A file bootstrap is accepted only under
 
 **Other-UID negative.** A fake broker bound by a different UID in a directory that
 UID owns must be rejected by the target (owner mismatch). This requires a second
-local user: Linux CI uses `sudo -u`; macOS arm64 runs it on the GitHub macOS runner
-(ADR 0006). It cannot be produced on the owner's workstation without privileged user
+local user: Linux CI uses `sudo -u`. There is no hosted macOS runner since the second
+2026-10-10 addendum to ADR 0006, so it must run wherever a second local user can be
+created. It cannot be produced on the owner's workstation without privileged user
 creation and is therefore a CI obligation.
 
 ### 5. Daemon expected-pack session join
@@ -350,7 +351,7 @@ inventory, subset rules, entrypoint equality. Broker: unit tests on both OS for 
 uid/pid/start-time (PID-reuse simulation), deadline, second connection, oversize,
 wrong nonce, symlinked directory, 0770 directory, ACK failure cleanup, residue
 detection; Java and Node consumers each with the other-UID fake broker (Linux x86_64
-and macOS arm64 in CI); direct-reader refusal; fail-open proof that the application
+in CI; no hosted macOS since 2026-10-10); direct-reader refusal; fail-open proof that the application
 still serves traffic and exits with its own code when the broker is refused.
 Daemon join: matrix over each Hello field mismatch; replayed Hello; Hello without
 expected pack; `unsigned_dev` labelling persisted and rendered. Packaged: installed

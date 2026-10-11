@@ -29,7 +29,8 @@
 - No tag, no GitHub release, no package publication and no announcement in
   this batch.
 - Owner-only inputs stay owner-only. Rows that need them (Apple Developer ID
-  and notarization, Ed25519 release-key custody, usability participants, the
+  and notarization, dropped by the owner on 2026-10-10 in ADR 0006's second
+  addendum; Ed25519 release-key custody, usability participants, the
   owner's own review, a published release for the distributed recheck, Postman
   credentials) are prepared and recorded as blocked on the named input. Test
   keys are used only where marked non-release.
@@ -118,7 +119,8 @@ skips, unreached code or synthetic traces never count as a pass.
 
 ## Addendum (2026-10-10): a second batch
 
-- Status: Accepted (owner authorization, 2026-10-10, for one run only)
+- Status: Accepted (owner authorization, 2026-10-10, for one run only);
+  listed for owner ratification
 - Date: 2026-10-10
 - Context: the first batch ended without a merge. Linux CI passed on the
   parent `b7b260f` of its candidate `ultra/rc-2` (run 37963545129). On the
@@ -177,7 +179,8 @@ Sections 1 to 5 above apply to the second batch, with these changes.
    only if the macOS admission fix cannot stay inside it; an addendum that scopes
    the other-UID broker negative of ADR 0006 §2.3 to the phase where the broker
    exists (P04) and requires an other-UID private-storage negative on the hosted
-   macOS runner for P01 to P03 instead; and ADR 0011 for the recording
+   macOS runner for P01 to P03 instead (moot since ADR 0006's second addendum);
+   and ADR 0011 for the recording
    limitations contract.
 
 ADR 0006 §2 gates are not waived by this addendum.

@@ -73,6 +73,8 @@ never creates or deletes the data home, and uninstall leaves it and the pre-upgr
 
 ## Known measurement gaps (honest status)
 
+* No test checks that another local user cannot read the store: `tools/qa/other_uid_negative.py` does not run
+  anywhere until it is ported to Linux (ADR 0006, second 2026-10-10 addendum).
 * Offline proof (no network egress during a full journey) and the permission audit over every created path are not
   built yet; the negative matrix for the viewer lives with lane Q.
 * `xtrace doctor` checks private-storage admission, the daemon lock, store schema (older schema = warning, newer or

@@ -80,8 +80,8 @@ per-file size and sha256 against the manifest, no unlisted files, `payload.sha25
 `--run-binary` it runs `bin/xtrace --version` and requires `xtrace <version>` plus `schema-version:` and `xtp-protocol:` lines, and
 `xtrace tui --help` (`tui_subcommand_registered`: the subcommand exists) plus `xtrace tui` with stdin closed
 (`tui_implemented`: the TUI is wired, so it must not exit 9 or report the old skeleton); with `--repo` it requires the reported schema version to equal the migration catalog's latest.
-`packaging/test/test_verify_package.py` pins each check on synthetic layouts (not a product build). CI wiring is a
-request to the CI lane (additive steps in `package.yml`).
+`packaging/test/test_verify_package.py` pins each check on synthetic layouts (not a product build). `package.yml`
+runs it (Linux x86_64).
 
 ## Daemon lifecycle (`xtrace record | stop | restart`)
 
@@ -110,7 +110,8 @@ request to the CI lane (additive steps in `package.yml`).
 `ubuntu-24.04` (linux-x86_64) only: tool unit checks, reproducibility double build, build, checksum + install journey, the install scratch test, the package content verifier (`packaging/verify_package.py`),
 upload of unsigned artifacts. If the verifier is absent on a branch the step warns and records "NOT RUN" (a skip, not a
 pass). `permissions: contents: read`, no secrets, actions pinned by commit SHA. Since 2026-10-10 the unsigned
-macos-arm64 package is built locally at release time (`packaging/build.py --platform macos-arm64`), not in CI. `ci.yml` (push to `main`, `slice/**`,
+macos-arm64 package is built locally at release time (`python3 packaging/build.py --out dist --platform macos-arm64`), not in CI. On the owner's Mac
+that build must go through the leased runner, which does not admit `packaging/build.py` yet. `ci.yml` (push to `main`, `slice/**`,
 `ultra/*-integration`, `ultra/rc-*`, and pull requests) runs the Linux 23-gate floors (the hosted macOS arm64 job was removed on 2026-10-10; macOS is covered by the
 leased macOS floor);
 `lane.yml` runs per-branch suites on `ultra/**`; `campaigns.yml` runs on `ultra/campaign/**` pushes and manual dispatch.

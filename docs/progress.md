@@ -5,7 +5,9 @@ verification. It is also the execution checkpoint. The active launch mandate
 below supersedes the historical per-phase approval pauses and model assignments
 recorded later in this file; mandatory reviews and verification still apply.
 
-## Active v0.01 autonomous launch authorization (2026-10-04)
+## v0.01 launch authorization (2026-10-04)
+
+> Status note (2026-10-11): this section records the facts of 2026-10-04. Since then the run moved to an Opus 5.5 root with Sonnet 5.5 workers, the same-chat 30-minute continuation was retired, and macOS signing and notarization were dropped (2026-10-10). The current state is the last section of this file; the next session starts from `docs/releases/v0.01-continuation-prompt.md`.
 
 The owner explicitly authorized autonomous implementation through the full v0.01 release gate, feature pushes, independently reviewed no-ff merges and main pushes, and publication only after acceptance. This supersedes older per-phase approval pauses for this launch scope. Use Luna High implementation and separate Sol High architecture/security/build reviews. Root alone merges/releases. Every required gate remains mandatory.
 
@@ -542,7 +544,7 @@ Next: fix macOS private-storage admission cost (one batched or native ACL query 
 
 ## v0.01 second unattended batch: release candidate rc-3 (2026-10-09 20:11 UTC to 2026-10-10)
 
-The owner authorized a second unattended batch of at most ten hours (ADR 0009 addendum of 2026-10-10) to finish `ultra/rc-2`, merge it to `main`, then work on issues #3 and #4. Opus 5.5 ran as root with Sonnet 5.5 workers. This section describes the candidate `ultra/rc-3`; acceptance evidence and the merge record are added after the gates run.
+The owner authorized a second unattended batch of at most ten hours (ADR 0009 addendum of 2026-10-10) to finish `ultra/rc-2`, merge it to `main`, then work on issues #3 and #4. Opus 5.5 ran as root with Sonnet 5.5 workers. This section describes the candidate `ultra/rc-3`; acceptance evidence and the merge record are in "Wave A merged to `main`" below.
 
 **Correction to the rc-2 entry.** The rc-2 entry blamed "about 140 `/bin/ls` spawns per recording commit". Measured on the leased Mac, one segment commit made 119 admission operations and about 327 spawns (begin 32, finish 277), for only 15 directories and 8 files. Every walk re-spawned its batched listing even when every directory was already judged. No single operation came near its 750 ms deadline; the cost was the count.
 
@@ -553,11 +555,11 @@ The owner authorized a second unattended batch of at most ten hours (ADR 0009 ad
 - **Capture scope.** `xtrace record` and `restart` take the same capture flags as `run` and write the resolved scope; `capture_depth_enforced` means the daemon's own reader yields the recorded depth (`docs/security-local.md`). `--observed-endpoint-policy` needs a resolved application scope. Build-tool and wrapper launchers are refused before any side effect. An out-of-scope Spring handler produces no recording, by design; a journey test proves both the in-scope and the out-of-scope case.
 - **Java pack cache:** a Linux race could fail an attach with "the Java pack cache state file could not be opened": a thread that found a state file being unlinked by another thread spent all its bounded retries in microseconds while the dying name was still visible. It now waits, under the existing bounded lock wait, for the unlinker to finish. It was reproduced under load before the fix (6 failures in 1,600 runs) and not after (0 in 1,600). No bound changed.
 - **Node:** the process-group reap race is fixed. On macOS, `killpg` on a group whose members are all zombies returns `EPERM`, which is now treated as "gone" (accepted trade-off: a real `EPERM` on macOS is no longer reported as a cleanup failure).
-- **CI:** the hosted macOS arm64 job runs an other-UID private-storage negative in place of the broker negative until broker code exists (ADR 0006 addendum of 2026-10-10, for owner ratification). A second local user must reach the store's parent but cannot list, read, write or replace anything in the product-created store, and no store entry may carry an ACL allow entry; the job fails if the check is skipped. All cargo steps are `--locked`; minimum test counts were raised from measured values; the install scratch test runs in `package.yml`; failing steps print allowlisted `XTR-*` error codes and categories.
+- **CI:** the hosted macOS arm64 job runs an other-UID private-storage negative in place of the broker negative until broker code exists (ADR 0006 addendum of 2026-10-10, for owner ratification). A second local user must reach the store's parent but cannot list, read, write or replace anything in the product-created store, and no store entry may carry an ACL allow entry; the job fails if the check is skipped. All cargo steps are `--locked`; minimum test counts were raised from measured values; the install scratch test runs in `package.yml`; failing steps print allowlisted `XTR-*` error codes and categories. (Superseded on 2026-10-10: the hosted macOS job was removed; see the owner decision at the end of this file.)
 
 **Open majors from the rc-1 review, as of rc-3:**
 - Closed: lifetime session caps (ARCH-01/BI-F5), Java static analyzer registered (ARCH-02/BI-F1), Node version sweep (ARCH-04/BI-F2), relocated source-proof gate tests (F1).
-- Closed for P01 to P03, pending a green hosted run on the candidate: the hosted macOS arm64 job (BI-F3), with the private-storage substitute for the broker negative.
+- Closed for P01 to P03, pending a green hosted run on the candidate: the hosted macOS arm64 job (BI-F3), with the private-storage substitute for the broker negative. (Superseded on 2026-10-10: the job was removed.)
 - Partly closed: focused-mode arming (ARCH-03): the not-armed limitation is persisted, but line events from focused capture still do not reach the read API for the fixture methods; a declared not-transformed gap is recorded instead. Capture scope (BI-F4): scope reaches the agent and the record document, but the observed-endpoint policy is still the operator-selected fixture literal `spring-orders-v1`, so real-Spring route and outcome rows stay unclaimed.
 
 **Known limits, stated so they can be found:**
@@ -569,9 +571,9 @@ The owner authorized a second unattended batch of at most ten hours (ADR 0009 ad
 - The `dev-trust-table` feature is not enabled by any release build.
 - Two leased-floor-only store failures (`XTR-STORE-OBJECT-IO` in two recording-port tests under full-workspace load on rc-2) have no established cause; they did not reproduce on the leased Mac under heavy load, and the admission change is the only remedy applied.
 - The campaign analysis treats only `responded` and `exception` as observed outcomes, while the product emits `exception_propagated` (to fix in the Petclinic wave).
-- Release-tool process-tree tests flaked on hosted macOS (BI-F8). The tests that count processes now see only their own process tree, test cleanup tolerates the macOS `EPERM` for a group whose only members are zombies, and test fixtures no longer depend on runner speed. No release-tool timeout, bound or assertion changed.
+- Release-tool process-tree tests flaked on hosted macOS (BI-F8). The tests that count processes now see only their own process tree, test cleanup tolerates the macOS `EPERM` for a group whose only members are zombies, and test fixtures no longer depend on runner speed. No release-tool timeout, bound or assertion changed. (Still nondeterministic after the merge; see below.)
 
-The row notes in `evidence/v0.01/requirements.json` still describe rc-1 and rc-2 heads by SHA; they are updated with rc-3 evidence only after the gates have run on the exact candidate. No row is accepted.
+The row notes in `evidence/v0.01/requirements.json` still describe rc-1 and rc-2 heads by SHA; they are updated with rc-3 evidence only after the gates have run on the exact candidate. (They were updated with rc-3 facts in records commit `affd16e`, after the merge.) No row is accepted.
 
 **Decision records for the owner to ratify:** ADR 0008 Amendment 1, the ADR 0006 addendum (other-UID negative before the broker exists), ADR 0011 (recording limitations), and the ADR 0009 addendum (this batch).
 
@@ -597,3 +599,18 @@ Two earlier pins were voided before the merge, both found by the gates: `046306d
 ## Owner decision: macOS ships unsigned, no macOS CI (2026-10-10)
 
 The owner dropped Developer ID signing and notarization of the macOS arm64 package and asked for the macOS jobs to be removed from GitHub CI. The hosted macOS arm64 job is gone from `ci.yml` and the macOS entry from `package.yml`. macOS stays a release platform: the package ships unsigned, the leased macOS 23-gate floor stays mandatory for merges, and `PLATFORM-MAC` now asks for fresh-profile acceptance of the exact unsigned package (row back to `in_progress`; the release checker's pinned contract hash changes with its wording). The other-UID private-storage negative no longer runs anywhere until it is ported to Linux. Recorded as the second 2026-10-10 addendum to ADR 0006.
+
+### Merged to `main`, and the state after it (2026-10-10, recorded 2026-10-11)
+
+The change was merged as `0864d68` (no-ff, tree identical to the candidate `7d719c9`). Before the merge, CI on the candidate was green (ci `38035167337`, package `38035167305`, lane `38035167317`) and the leased macOS 23-gate floor passed 23 of 23 with base `d243c5d`. After the merge, the leased floor on `0864d68` passed 23 of 23 again.
+
+Post-merge `main` ci `38037761572`: attempt 1 failed two Linux jobs, recorded before any re-run: `node_run_http.rs:285` `auto_mode_records_cjs_and_esm_entries_once_each` (`gates` job) and `lifecycle_journey.rs:534` `stale_record_naming_a_zombie_is_cleaned_up_by_stop_and_restart` (Linux jdk21 floor, `rust-focused` gate). Attempt 2, a re-run of those two jobs, passed. The tree is identical to the green candidate and the change touched no Rust or Node code, so both tests are nondeterministic. Under the flake policy this is **not a clean pass**. The release-tool process-tree family (BI-F8) is also still nondeterministic. The merge was not reverted; if the owner wants it reverted, the command is `git revert -m 1 0864d6855ecbdc808e16b8a3d7c33907486bccb0`.
+
+State after the merge:
+- No requirement row is accepted (0 of 55). Issues #1 to #9 are open; each has a comment listing what is done and what is left.
+- Pushed and unmerged: `ultra/r2w2-qb`, `ultra/r2w2-xb` and `ultra/r2w2-jb` (wave B of #3, no review or campaign evidence yet). `ultra/r2w3-r4` is rejected: it raised a test deadline and added a retry.
+- For the owner to ratify: ADR 0008 Amendment 1, the first ADR 0006 addendum of 2026-10-10 (the second is the owner's own decision; only its wording is to be confirmed), the ADR 0009 addendum, ADR 0011, and the migration renumbering (v9 is `recording_limitations`; catalog links take v10).
+- Test-scratch residue (found 2026-10-11): each leased floor leaves about 340 entries in the shared test scratch, which is `TMPDIR` and `XTRACE_TEST_PRIVATE_SCRATCH` for every gate, and the runner's own `<label>-home` there is never removed. `pack_inventory::tests::partial_snapshot_copy_uses_production_cleanup_and_reports_uncertain_replacement` (`crates/xtrace-runtime/src/pack_inventory.rs:1821`) lists that whole scratch under its 4096-entry bound, so once the scratch held more than 4096 entries (4738) the test failed with "private cache listing: Unavailable" in two leased floors on docs-only candidates. (Commit `2f2a19c` first recorded it as nondeterministic; it is deterministic above the bound.) The residue was moved aside, not deleted, and the next floor (`DOC-a45f175-1`) passed 23 of 23. The next session must make every gate, test and the floor runner remove what they create, and make this test list only a directory it owns; the bound stays.
+- `packaging/build.py` runs cargo, npm and Gradle, so on the owner's Mac it must go through the leased runner, and the leased runner admits Python only as `-B -m unittest` or `-B -m tools.release.*`. The local macOS package build therefore needs a reviewed entry point before `PLATFORM-MAC` work.
+
+**Next:** make `main` CI clean (the release-tool family, the two tests above and the test-scratch residue, fixed deterministically, with no retries and no longer deadlines), then issue #3. Each session starts from `docs/releases/v0.01-continuation-prompt.md`.

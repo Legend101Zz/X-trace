@@ -13,7 +13,7 @@ tick it only if what you saw matched the expectation. Anything unclear is a no, 
 
 | Journey id | Do this | Expect | Where CI shows a rehearsal |
 |---|---|---|---|
-| fresh_install | Install the package in a clean profile, `xtrace init`, `xtrace --version`, uninstall | no leftovers outside the install root and data home | package workflow, install journey |
+| fresh_install | Install the package in a clean profile, `xtrace init`, `xtrace --version`, uninstall | no leftovers outside the install root and data home | package workflow, install journey (Linux x86_64 only since 2026-10-10) |
 | linear_canvas_tui | Open the viewer on the petclinic recording; Linear, then Canvas, then `xtrace tui` | the same request, outcome and frames in all three; no horizontal scroll at phone width | campaigns workflow browser screenshots at 320, 736 and 1280 px, TUI PTY transcript |
 | attach_failure | Start the app with a wrong or missing agent path | a clear refusal with a stable error code, the app unharmed | none listed here; check the Rust suites of the lane workflow |
 | partial_capture | Kill the app mid-request | a recording sealed as partial, shown as partial in all views | none listed here; check the Rust suites of the lane workflow |

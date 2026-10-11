@@ -496,7 +496,7 @@ A developer can install one signed X-trace package on a supported platform, use 
 
 ### Included
 
-- Signed/notarized platform packages containing Rust binaries, web assets, Java and Node packs, schemas, and migrations.
+- Signed/notarized platform packages (v0.01: macOS arm64 ships unsigned and not notarized; ADR 0006 second addendum) containing Rust binaries, web assets, Java and Node packs, schemas, and migrations.
 - Fresh install, update, uninstall, and retained-data behavior.
 - Store migrations from every released schema, backup, crash injection, object verification/quarantine, stale daemon/session recovery, retention preview/apply, and `doctor` bundle.
 - TLS pinning/auth replay/CSRF/origin/host/file-permission hardening.
