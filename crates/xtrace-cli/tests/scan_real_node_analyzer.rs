@@ -13,6 +13,8 @@
     reason = "integration tests assert on fixed fixtures and checked subprocess output"
 )]
 
+mod support;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -96,9 +98,10 @@ fn real_node_analyzer_scan_persists_the_express_basic_catalog() {
         &repo.join("src"),
     );
     let wrapper = root.path().join("node-analyzer.sh");
-    fs::write(&wrapper, format!("#!/bin/sh\nexec node '{}' \"$@\"\n", main_js.display()))
-        .expect("wrapper");
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("chmod");
+    support::write_executable(
+        &wrapper,
+        &format!("#!/bin/sh\nexec node '{}' \"$@\"\n", main_js.display()),
+    );
 
     let source = repo.join("src");
     let scan = Command::new(env!("CARGO_BIN_EXE_xtrace"))
