@@ -47,6 +47,14 @@ public final class SpringMvcBridge {
   // assigned at root creation, not at deferral, and remains until that dispatch exits. A tree
   // with an already closed nested root must not record subsequent includes as new requests.
   private static final ThreadLocal<DispatchState> DISPATCH = new ThreadLocal<>();
+  private static final ThreadLocal<ServletState> SERVLET = new ThreadLocal<>();
+
+  private static final class ServletState {
+    private int depth;
+    private boolean recorded;
+    private boolean errorPending;
+    private boolean asyncStarted;
+  }
 
   private static final class DispatchState {
     private int depth;
@@ -55,6 +63,45 @@ public final class SpringMvcBridge {
   }
 
   private SpringMvcBridge() {}
+
+  /** Enters a standard Filter.doFilter or Servlet.service frame on this thread. */
+  public static void servletEnter() {
+    ServletState state = SERVLET.get();
+    if (state == null) {
+      state = new ServletState();
+      SERVLET.set(state);
+    }
+    state.depth++;
+  }
+
+  /** sendError may report committed before the container has rendered its error page. */
+  public static void servletSendError() {
+    ServletState state = SERVLET.get();
+    if (state != null) state.errorPending = true;
+  }
+
+  /** Closes at the outermost standard servlet frame, after all post-chain filter work. */
+  public static void servletEnd(Object request, Object response, Throwable thrown) {
+    ServletState state = SERVLET.get();
+    if (state == null) return;
+    if (--state.depth != 0) return;
+    try {
+      if (state.recorded && BootstrapBridge.hasContext()) {
+        if (state.asyncStarted || (request != null && asyncStarted(request))) {
+          BootstrapBridge.requestEnd(0, (Throwable) null);
+        } else {
+          finish(response, thrown, !state.errorPending && committed(response));
+        }
+      }
+    } finally {
+      SERVLET.remove();
+    }
+  }
+
+  private static void finish(Object response, Throwable thrown, boolean finalStatus) {
+    if (finalStatus) BootstrapBridge.requestEnd(status(response), thrown);
+    else BootstrapBridge.provisionalRequestEnd(status(response), thrown);
+  }
 
   /** Called on entry to each {@code DispatcherServlet#doDispatch} on this thread. */
   public static void dispatchEnter() {
@@ -67,17 +114,16 @@ public final class SpringMvcBridge {
   }
 
   /**
-   * Closes only the root owned by this dispatch. The observed status is the status at dispatcher
-   * exit, after view rendering. Enclosing filters and container error handling can still change
-   * it; this is not evidence of final delivery to the client. On an escaping exception, only a
-   * readable committed response status is used, since an uncommitted default is not an outcome.
+   * Keeps dispatch ownership for nested rendering. An enclosing standard servlet frame owns
+   * completion; without one, this seam can only report a provisional status.
    */
   public static void dispatchEnd(Object response, Throwable thrown) {
     DispatchState state = DISPATCH.get();
     if (state == null) return;
     try {
-      if (state.ownerDepth == state.depth && BootstrapBridge.awaitingResolution()) {
-        BootstrapBridge.requestEnd(observedStatus(response, thrown), thrown);
+      if (SERVLET.get() == null && state.ownerDepth == state.depth
+          && BootstrapBridge.awaitingResolution()) {
+        finish(response, thrown, false);
       }
     } finally {
       if (state.ownerDepth == state.depth) state.ownerDepth = 0;
@@ -87,6 +133,7 @@ public final class SpringMvcBridge {
 
   static void resetForTest() {
     DISPATCH.remove();
+    SERVLET.remove();
   }
 
   /**
@@ -96,8 +143,9 @@ public final class SpringMvcBridge {
    */
   public static boolean start(Object request, Object handlerMethod) {
     DispatchState state = DISPATCH.get();
+    ServletState servlet = SERVLET.get();
     if (request == null || handlerMethod == null || BootstrapBridge.inRequest()
-        || (state != null && state.recorded)) return false;
+        || (state != null && state.recorded) || (servlet != null && servlet.recorded)) return false;
     // ASYNC and container ERROR redispatches continue an existing HTTP request, not a new root.
     if (isContinuationDispatch(request)) return false;
     Class<?> beanType = beanType(handlerMethod);
@@ -109,6 +157,7 @@ public final class SpringMvcBridge {
     // Without a matched pattern the template is unknown; a raw path is never substituted.
     if (template == null) return false;
     if (!BootstrapBridge.requestStart(httpMethod, template)) return false;
+    if (servlet != null) servlet.recorded = true;
     if (state != null) {
       state.ownerDepth = state.depth;
       state.recorded = true;
@@ -118,23 +167,30 @@ public final class SpringMvcBridge {
   }
 
   /**
-   * Closes the request root with the response status, or 0 when the status is not observable.
+   * Defers completion to the enclosing servlet or dispatch frame when present.
    *
    * <p>When the handler threw, the container decides the final status later (an exception
    * resolver may map it to a 4xx), and the response object still carries its pre-error default.
-   * The root therefore stays open until {@link #exceptionResolved} reports the outcome.
+   * The root therefore stays open through exception resolution and view rendering.
    */
   public static void end(Object response, Throwable thrown) {
     end(null, response, thrown);
   }
 
   /**
-   * Defers to the owning dispatcher when present; otherwise observes status at handler return.
+   * Defers to the outer servlet boundary, or the owning dispatcher when no servlet probe exists.
+   * With neither probe, handler-return status is provisional.
    * If the handler started asynchronous processing (Callable, DeferredResult, reactive types),
    * the later status is not observed, so the root closes UNOBSERVED with no status.
    */
   public static void end(Object request, Object response, Throwable thrown) {
     if (thrown == null && request != null && asyncStarted(request)) {
+      ServletState servlet = SERVLET.get();
+      if (servlet != null) {
+        servlet.asyncStarted = true;
+        BootstrapBridge.deferRequestEnd(null);
+        return;
+      }
       BootstrapBridge.requestEnd(0, (Throwable) null);
       return;
     }
@@ -143,11 +199,11 @@ public final class SpringMvcBridge {
       return;
     }
     // A normal handler return proves earlier frame throws were handled. Keep the root until
-    // its owning dispatch exits; another thread's dispatch must never cause deferral here.
+    // the outer servlet exits; another thread's boundary must never cause deferral here.
     DispatchState state = DISPATCH.get();
-    if (state != null && state.ownerDepth == state.depth
+    if ((SERVLET.get() != null || (state != null && state.ownerDepth == state.depth))
         && BootstrapBridge.deferRequestEnd(null)) return;
-    BootstrapBridge.requestEnd(status(response), (Throwable) null);
+    finish(response, null, false);
   }
 
   /**
@@ -164,17 +220,17 @@ public final class SpringMvcBridge {
       }
       return;
     }
+    if (SERVLET.get() != null) {
+      if (thrown == null && resolved != null) BootstrapBridge.deferRequestEnd(null);
+      return;
+    }
     if (thrown != null) {
-      BootstrapBridge.requestEnd(observedStatus(response, thrown), thrown);
+      finish(response, thrown, false);
     } else if (resolved != null) {
-      BootstrapBridge.requestEnd(status(response), (Throwable) null);
+      finish(response, null, false);
     } else {
       BootstrapBridge.requestEnd(0, (Throwable) null);
     }
-  }
-
-  private static int observedStatus(Object response, Throwable thrown) {
-    return thrown == null || committed(response) ? status(response) : 0;
   }
 
   private static boolean committed(Object response) {

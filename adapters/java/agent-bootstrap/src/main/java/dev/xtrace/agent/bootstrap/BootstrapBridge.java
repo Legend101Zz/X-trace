@@ -312,7 +312,7 @@ public final class BootstrapBridge {
   /**
    * Keeps the request open after the handler threw, so the container's exception resolution can
    * report the response it chose, or (null {@code thrown}) until the dispatch completes and the
-   * status at dispatcher exit is observed. Returns false when there is no open request.
+   * status at the outer servlet boundary is observed. Returns false when there is no open request.
    */
   public static boolean deferRequestEnd(Throwable thrown) {
     RequestContext context = CONTEXT.get();
@@ -508,12 +508,26 @@ public final class BootstrapBridge {
   }
 
   /**
-   * Ends the request. A non-null {@code thrown} means an exception left the handler; the observed
-   * outcome is then EXCEPTION_PROPAGATED unless a response status was observed, in which case the
-   * observed status takes precedence (RESPONDED), including an exception after commit. This
-   * does not prove final client delivery. No status and no exception is UNOBSERVED.
+   * Ends the request with an authoritative status supplied by the caller (0 if unobserved).
+   * Without a status, a non-null {@code thrown} means EXCEPTION_PROPAGATED; neither means
+   * UNOBSERVED. Intermediate statuses must use {@link #provisionalRequestEnd} instead.
    */
   public static void requestEnd(int responseStatus, Throwable thrown) {
+    requestEnd(responseStatus, thrown, null);
+  }
+
+  /**
+   * Records an intermediate servlet status as evidence, never as the authoritative outcome or
+   * numeric response interaction. Only a bounded status number enters the explanatory label.
+   */
+  public static void provisionalRequestEnd(int observedStatus, Throwable thrown) {
+    int status = observedStatus >= 100 && observedStatus <= 599 ? observedStatus : 0;
+    requestEnd(0, thrown, "http.response unavailable; final status not observed; "
+        + (status == 0 ? "provisional status unavailable"
+            : "observed status was " + status + " (provisional)"));
+  }
+
+  private static void requestEnd(int responseStatus, Throwable thrown, String responseLabel) {
     RequestContext context = CONTEXT.get();
     try {
       BridgeSink sink = SINK.get();
@@ -536,7 +550,8 @@ public final class BootstrapBridge {
           eventId,
           context.requestEventId,
           BridgeEventKind.RESPONSE,
-          sanitizedStatus == 0 ? "http.response unavailable" : "http.response " + sanitizedStatus,
+          responseLabel != null ? responseLabel
+              : sanitizedStatus == 0 ? "http.response unavailable" : "http.response " + sanitizedStatus,
           sanitizedStatus)) {
         context.dropped++;
       }

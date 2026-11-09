@@ -1,6 +1,6 @@
 //! Real Spring MVC dispatch lifecycle and source identity through the packaged agent:
-//! the recorded HTTP outcome is the status at DispatcherServlet exit (a redirect view sets 302
-//! after the handler adapter returned; enclosing filters and container error handling run later).
+//! committed status is observed at the outer standard servlet boundary, after post-chain filters.
+//! Buffered responses and pending container error handling retain only provisional status evidence.
 //! Application frames carry the matched `.java` source file and line even when the JVM starts
 //! from a directory unrelated to the repository.
 
@@ -104,7 +104,7 @@ fn assert_redirect(captured: Captured) {
     assert_eq!(
         field(outcome, &["httpStatus", "http_status"]).and_then(Value::as_u64),
         Some(302),
-        "the recorded status must be the redirect at dispatcher exit after view rendering: \
+        "the recorded status must be the committed redirect at outer servlet exit: \
          {outcome}"
     );
     let request = captured
@@ -189,8 +189,12 @@ fn forward_and_include_keep_the_outer_root_through_the_rest_of_view_rendering() 
     for (path, status) in [("forward", 202), ("include", 207)] {
         let captured = run_request("GET", &format!("/__fixture/lifecycle/{path}"), status);
         assert_complete_single_recording(&captured);
-        assert_eq!(captured.detail["outcome"]["kind"], "responded");
-        assert_eq!(captured.detail["outcome"]["httpStatus"], status);
+        if path == "forward" {
+            assert_eq!(captured.detail["outcome"]["kind"], "responded");
+            assert_eq!(captured.detail["outcome"]["httpStatus"], status);
+        } else {
+            assert_provisional(&captured, status);
+        }
         for symbol in ["LifecycleController.inner", "LifecycleController.afterNested"] {
             assert!(
                 captured
@@ -221,11 +225,10 @@ fn forward_and_include_keep_the_outer_root_through_the_rest_of_view_rendering() 
 }
 
 #[test]
-fn mapped_exception_records_the_rendered_error_view_status() {
+fn mapped_exception_retains_the_uncommitted_rendered_error_view_status_as_provisional() {
     let captured = run_request("GET", "/__fixture/lifecycle/mapped", 422);
     assert_complete_single_recording(&captured);
-    assert_eq!(captured.detail["outcome"]["kind"], "responded");
-    assert_eq!(captured.detail["outcome"]["httpStatus"], 422);
+    assert_provisional(&captured, 422);
     assert!(captured.events.iter().any(|event| {
         event["symbol"] == "LifecycleController.mapped" && event["kind"] == "frame_throw"
     }));
@@ -240,36 +243,72 @@ fn async_is_one_complete_recording_with_an_unobserved_outcome() {
 }
 
 #[test]
-fn post_chain_filter_demonstrates_status_at_dispatcher_exit_is_not_final_delivery() {
+fn post_chain_filter_status_is_observed_at_outer_servlet_exit_as_provisional() {
     let captured = run_request("GET", "/__fixture/lifecycle/post-filter", 304);
     assert_complete_single_recording(&captured);
-    assert_eq!(captured.detail["outcome"]["kind"], "responded");
-    assert_eq!(
-        captured.detail["outcome"]["httpStatus"], 200,
-        "dispatcher exited with 200 before the filter changed the client response to 304"
-    );
+    assert_provisional(&captured, 304);
 }
 
 #[test]
-fn container_error_handling_does_not_create_a_second_recording() {
+fn pending_container_error_handling_keeps_status_provisional_without_a_second_recording() {
     let captured = run_request("GET", "/__fixture/lifecycle/send-error", 418);
     assert_complete_single_recording(&captured);
-    assert_eq!(captured.detail["outcome"]["kind"], "responded");
-    assert_eq!(
-        captured.detail["outcome"]["httpStatus"], 418,
-        "status observed when the dispatcher returned, before Tomcat's ERROR dispatch"
-    );
+    assert_provisional(&captured, 418);
 }
 
 #[test]
 fn record_session_captures_a_real_mapped_exception_with_the_dispatch_hook_live() {
     let captured = run_request_with_launcher("GET", "/__fixture/lifecycle/mapped", 422, "record");
     assert_complete_single_recording(&captured);
-    assert_eq!(captured.detail["outcome"]["kind"], "responded");
-    assert_eq!(captured.detail["outcome"]["httpStatus"], 422);
+    assert_provisional(&captured, 422);
     assert!(captured.events.iter().any(|event| {
         event["symbol"] == "LifecycleController.mapped" && event["kind"] == "frame_throw"
     }));
+}
+
+fn assert_provisional(captured: &Captured, status: u16) {
+    assert_eq!(captured.detail["outcome"]["kind"], "unobserved");
+    assert!(captured.detail["outcome"]["httpStatus"].is_null());
+    let label = format!(
+        "http.response unavailable; final status not observed; observed status was \
+         {status} (provisional)"
+    );
+    assert!(
+        captured.events.iter().any(|event| event["symbol"] == label),
+        "replay must retain the explicitly provisional observation"
+    );
+    let wire_response = captured
+        .wire_events
+        .iter()
+        .find(|event| event.kind == RecordingEventKind::Response as i32)
+        .expect("persisted response event");
+    assert_eq!(wire_response.symbol, label);
+    assert_eq!(
+        wire_response.interaction.as_ref().expect("response interaction").path,
+        "unavailable"
+    );
+}
+
+#[test]
+fn committed_outer_servlet_status_is_authoritative() {
+    let captured = run_request("GET", "/__fixture/boundary/committed", 209);
+    assert_complete_single_recording(&captured);
+    assert_eq!(captured.detail["outcome"]["kind"], "responded");
+    assert_eq!(captured.detail["outcome"]["httpStatus"], 209);
+}
+
+#[test]
+fn buffered_outer_servlet_status_is_provisional() {
+    let captured = run_request("GET", "/__fixture/boundary/uncommitted", 210);
+    assert_complete_single_recording(&captured);
+    assert_provisional(&captured, 210);
+}
+
+#[test]
+fn later_container_error_page_can_change_the_provisional_status() {
+    let captured = run_request("GET", "/__fixture/boundary/send-error", 451);
+    assert_complete_single_recording(&captured);
+    assert_provisional(&captured, 418);
 }
 
 fn run_redirect(mode: &str) -> Captured {
@@ -525,6 +564,7 @@ fn copy_fixture_sources(repo: &Path) {
         "OrderRepository.java",
         "LifecycleController.java",
         "LifecycleStatusFilter.java",
+        "ServletBoundaryController.java",
     ] {
         fs::copy(source_root.join(name), destination.join(name)).expect("copy fixture source");
     }
