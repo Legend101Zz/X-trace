@@ -40,7 +40,7 @@
 - The original D1 default allowed local unit tests and one test file.
 - Changed by the owner on 2026-11-09: workers and the orchestrator only compile locally; no tests run locally.
   Allowed checks are `cargo check`, `cargo clippy`, `cargo test --no-run`, `cargo fmt --check`, TypeScript
-  typecheck, Gradle `compileJava compileTestJava`, `python3 -B -m py_compile`, `bash -n`, `git diff --check`,
+  typecheck, Gradle `compileJava compileTestJava`, `tools/dev/check.sh py:<module>` (without bytecode), `bash -n`, `git diff --check`,
   and pure static checks such as the web contrast script (`tools/dev/check.sh`).
 - Owner clarification on 2026-11-09: tickets are batched into one pull request per wave; GitHub tests (`ci-ok`, plus
   `macos-ok`) gate that wave merge and release candidates; single tickets do not get their own CI runs.

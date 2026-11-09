@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and publish only a sanitized summary of the v0.01 Linux CI floor."""
+"""Provide CI floor helpers and sanitized summaries for Linux and hosted macOS."""
 
 from __future__ import annotations
 

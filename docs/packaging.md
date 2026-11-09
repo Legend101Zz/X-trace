@@ -110,10 +110,8 @@ runs it (Linux x86_64).
 `ubuntu-24.04` (linux-x86_64) only: tool unit checks, reproducibility double build, build, checksum + install journey, the install scratch test, the package content verifier (`packaging/verify_package.py`),
 upload of unsigned artifacts. If the verifier is absent on a branch the step warns and records "NOT RUN" (a skip, not a
 pass). `permissions: contents: read`, no secrets, actions pinned by commit SHA. Since 2026-10-10 the unsigned
-macos-arm64 package is built locally at release time (`python3 packaging/build.py --out dist --platform macos-arm64`), not in CI. On the owner's Mac
-that build must go through the leased runner, which does not admit `packaging/build.py` yet. `ci.yml` (push to `main`, `slice/**`,
-`ultra/*-integration`, `ultra/rc-*`, and pull requests) runs the Linux 23-gate floors (the hosted macOS arm64 job was removed on 2026-10-10; macOS is covered by the
-leased macOS floor);
+macos-arm64 package is built locally at release time (`python3 packaging/build.py --out dist --platform macos-arm64`), not in CI. `ci.yml` (push to `main`, `slice/**`,
+`ultra/*-integration`, `ultra/rc-*`, and pull requests) runs the Linux 23-gate floors. `macos.yml` runs hosted macOS arm64 jobs on `wave/**` and `ultra/rc-*` pushes and `workflow_dispatch`; `macos-ok` must be green for wave merges and release candidates. The leased macOS floor is no longer a merge requirement;
 `lane.yml` runs per-branch suites on `ultra/**`; `campaigns.yml` runs on `ultra/campaign/**` pushes and manual dispatch.
 
 ## What needs the owner

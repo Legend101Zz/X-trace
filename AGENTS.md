@@ -38,7 +38,7 @@ tools/dev/check.sh rust:<crate>:<test>     # compile one integration test binary
 tools/dev/check.sh java[:<module>]         # Gradle compileJava + compileTestJava, strict verification
 tools/dev/check.sh node                    # generate:check + typecheck
 tools/dev/check.sh web                     # typecheck + contrast; web:<file> is rejected
-tools/dev/check.sh py:<module>             # python3 -B -m py_compile on the module file
+tools/dev/check.sh py:<module>             # compile Python source without writing bytecode
 tools/dev/check.sh fmt                     # cargo fmt --check
 tools/dev/check.sh diff                    # whitespace / end-of-file check (CI gate 23)
 ```
