@@ -165,6 +165,7 @@ def s_concurrent(c):
 
 
 SCENARIOS = [
+    xcamp.Scenario("concurrent-isolation", "30 parallel reads + 10 parallel creates; no cross-association", "concurrency", s_concurrent),
     xcamp.Scenario("search-seeded", "Owner search + vets JSON over seeded database", "business", s_search),
     xcamp.Scenario("owner-create-roundtrip", "Create owner, redirect, reopen, DB row", "db-write-read", s_create),
     xcamp.Scenario("owner-validation-error", "Invalid owner rejected, DB unchanged", "validation", s_validation),
@@ -172,7 +173,6 @@ SCENARIOS = [
     xcamp.Scenario("owner-edit", "Edit owner, effect visible on next request and in DB", "db-write-read", s_edit),
     xcamp.Scenario("missing-owner-error", "Unknown owner id raises -> 500 error page", "error", s_missing),
     xcamp.Scenario("controller-crash-path", "/oups deliberate RuntimeException", "error", s_crash),
-    xcamp.Scenario("concurrent-isolation", "30 parallel reads + 10 parallel creates; no cross-association", "concurrency", s_concurrent),
 ]
 
 
