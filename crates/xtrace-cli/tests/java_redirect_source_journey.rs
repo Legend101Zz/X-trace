@@ -193,10 +193,9 @@ fn forward_and_include_keep_the_outer_root_until_the_final_rendered_status() {
         assert_final_status(&captured, status);
         for symbol in ["LifecycleController.inner", "LifecycleController.afterNested"] {
             assert!(
-                captured
-                    .events
-                    .iter()
-                    .any(|event| { event["symbol"] == symbol && event["kind"] == "frame_enter" }),
+                captured.events.iter().any(|event| {
+                    event["symbol"] == symbol && event["kind"] == "recording_event_kind:frame_enter"
+                }),
                 "{path} must retain {symbol}: {:?}",
                 captured.events
             );
@@ -206,7 +205,7 @@ fn forward_and_include_keep_the_outer_root_until_the_final_rendered_status() {
             .iter()
             .position(|event| {
                 event["symbol"] == "LifecycleController.afterNested"
-                    && event["kind"] == "frame_exit"
+                    && event["kind"] == "recording_event_kind:frame_exit"
             })
             .expect("outer view continued after nested dispatch");
         let response = captured
@@ -226,7 +225,8 @@ fn resolved_exception_has_the_final_buffered_error_view_status() {
     assert_complete_single_recording(&captured);
     assert_final_status(&captured, 422);
     assert!(captured.events.iter().any(|event| {
-        event["symbol"] == "LifecycleController.mapped" && event["kind"] == "frame_throw"
+        event["symbol"] == "LifecycleController.mapped"
+            && event["kind"] == "recording_event_kind:frame_throw"
     }));
 }
 
@@ -259,7 +259,8 @@ fn record_session_captures_the_final_buffered_status_of_a_resolved_exception() {
     assert_complete_single_recording(&captured);
     assert_final_status(&captured, 422);
     assert!(captured.events.iter().any(|event| {
-        event["symbol"] == "LifecycleController.mapped" && event["kind"] == "frame_throw"
+        event["symbol"] == "LifecycleController.mapped"
+            && event["kind"] == "recording_event_kind:frame_throw"
     }));
 }
 
