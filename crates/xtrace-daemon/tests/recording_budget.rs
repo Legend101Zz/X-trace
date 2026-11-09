@@ -633,11 +633,14 @@ async fn finished_recording_budget_journey(abandoned: bool) {
                 }],
             }));
         }
+        // Missing digest is unknown terminal loss, independently of measured drops. Cover a
+        // prefix whose events all arrived and both empty/nonempty prefixes with known drops.
+        let known_drops = if abandoned && request % 3 == 0 { 7 } else { 0 };
         payloads.push(PayloadOneof::RecordingFinished(RecordingFinished {
             recording_id: recording_id.clone(),
             final_recording_seq: if has_prefix { 2 } else { 1 },
-            drop_counts_by_priority: if abandoned {
-                [(1, 1)].into_iter().collect()
+            drop_counts_by_priority: if known_drops > 0 {
+                [(1, known_drops)].into_iter().collect()
             } else {
                 Default::default()
             },
@@ -667,7 +670,12 @@ async fn finished_recording_budget_journey(abandoned: bool) {
             assert_eq!(window.status, RecordingStatus::Partial);
             assert_eq!(window.completion, RecordingCompletionEvidence::Partial);
             assert_eq!(window.events.len(), usize::from(has_prefix));
-            assert_eq!(window.drop_counts_by_priority, [(1, "1".to_owned())].into());
+            let expected_drops = if known_drops > 0 {
+                [(1, known_drops.to_string())].into()
+            } else {
+                Default::default()
+            };
+            assert_eq!(window.drop_counts_by_priority, expected_drops);
             assert!(window.duration_ns.is_none(), "no duration was observed");
             assert!(window.outcome.is_none(), "no terminal outcome was sent");
             assert!(!window.incomplete_evidence.is_empty());

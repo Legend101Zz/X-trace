@@ -10,6 +10,7 @@ import dev.xtrace.agent.bootstrap.BridgeSink;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -280,6 +281,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
 
   private void write(PendingRecording pending, QueueSignal.Finish finish) throws ClientException {
     if (pending.unrecoverable) return;
+    pending.finishObserved = true;
+    pending.queueDrops = finish.droppedEvents();
     long droppedEvents = saturatingAdd(
         finish.droppedEvents(), saturatingAdd(pending.writerDrops, pending.memoryDrops));
     // Metadata-only admission retains the actual identity and terminal observation, but none of
@@ -400,16 +403,25 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     pending.unrecoverable = true;
     incompleteReported.set(true);
     if (pending.started) {
-      // Retire the accepted prefix even when no event/GAP fits. Removing ":started" from
-      // the message ID pays for the drop bucket and the widest allowed recording sequence,
-      // even for a start with no other fields. Omit optional evidence, including the digest.
-      RecordingFinished terminal = RecordingFinished.newBuilder()
+      // An absent digest already seals the prefix as partial: total loss is unknown, including
+      // observations that may arrive after abandonment. The wire counters are exact, so only
+      // include them once Finish supplies the queue loss and closes the observation stream.
+      // Omitted lifecycle detail is not a dropped event. Never invent a count to force Partial,
+      // even when every event was sent and only the finish cannot fit.
+      long knownDrops = saturatingAdd(pending.queueDrops, saturatingAdd(pending.writerDrops,
+          saturatingAdd(pending.memoryDrops, pending.frameEventDrops)));
+      RecordingFinished.Builder terminal = RecordingFinished.newBuilder()
           .setRecordingId(ByteString.copyFrom(uuidBytes(pending.recordingId)))
-          .setFinalRecordingSeq(pending.sequence)
-          .putDropCountsByPriority(1, 1)
-          .build();
-      Ack finished = session.send(pending.start.recordingId(),
-          pending.start.recordingId(), terminal);
+          .setFinalRecordingSeq(pending.sequence);
+      if (pending.finishObserved && knownDrops > 0) {
+        terminal.putDropCountsByPriority(1, knownDrops);
+      }
+      // A compact UUID message ID leaves room for even the widest exact counter and sequence
+      // whenever the Start identity fitted; its lifecycle message IDs contain a suffix.
+      String messageId = Base64.getUrlEncoder().withoutPadding()
+          .encodeToString(uuidBytes(pending.recordingId));
+      Ack finished = session.send(messageId,
+          pending.start.recordingId(), terminal.build());
       requireRecordingAck(finished, pending.recordingId, pending.sequence);
     }
     // Only fixed reasons and the validated UUID belong in diagnostics, never captured fields.
@@ -432,7 +444,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     }
     if (count == 0) return;
     EventBatch.Builder batch = newBatch(uuidBytes(pending.recordingId));
-    for (QueueSignal.Event event : pending.events.subList(0, count)) {
+    for (int index = 0; index < count; index++) {
+      QueueSignal.Event event = pending.events.get(index);
       long sequence = Math.addExact(pending.sequence, 1);
       RecordingEvent proto = toProto(event, sequence);
       batch.addEvents(proto);
@@ -452,11 +465,17 @@ final class RecordingWriter implements AutoCloseable, Runnable {
           batch.setEvents(0, proto);
           if (!fitsBatch(pending, batch)) {
             // The event identity cannot fit even as a GAP; retire only the accepted prefix.
+            long discarded = pending.events.subList(index, pending.events.size()).stream()
+                .filter(buffered -> buffered.kind() != BridgeEventKind.GAP).count();
+            pending.frameEventDrops = saturatingAdd(pending.frameEventDrops, discarded);
             abandon(pending, "frame-limit gap could not be sent");
             batch.clearEvents();
             break;
           }
           pending.frameDrops = saturatingAdd(pending.frameDrops, 1);
+          if (event.kind() != BridgeEventKind.GAP) {
+            pending.frameEventDrops = saturatingAdd(pending.frameEventDrops, 1);
+          }
           // A terminal exception must not claim this gap is an observed throw.
           pending.throwEventIds.remove(event.eventId());
         }
@@ -931,6 +950,10 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     private long writerDrops;
     private long memoryDrops;
     private long frameDrops;
+    private long queueDrops;
+    private boolean finishObserved;
+    // Actual lost observations, excluding synthetic lifecycle and coalesced gap markers.
+    private long frameEventDrops;
     private boolean unrecoverable;
     private boolean started;
     // Buffered non-throw allocations and retained throw allocations are disjoint charges.

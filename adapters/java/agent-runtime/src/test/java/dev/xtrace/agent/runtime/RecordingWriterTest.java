@@ -662,7 +662,9 @@ class RecordingWriterTest {
     assertEquals(RecordingFinished.newBuilder()
         .setRecordingId(transport.starts.get(0).getRecordingId())
         .setFinalRecordingSeq(cap + 1)
-        .putDropCountsByPriority(1, 1)
+        // Fifteen cap drops, one memory drop and one queue drop. Lifecycle reductions and
+        // the untransformed-method count are not dropped events.
+        .putDropCountsByPriority(1, 17)
         .build(), transport.finishes.get(0));
     assertEquals(id(1), FakeTransport.uuid(transport.finishes.get(1).getRecordingId().toByteArray()));
     assertArrayEquals(EventDigest.compute(List.of(id(1) + ":gap-untransformed", "response")),
