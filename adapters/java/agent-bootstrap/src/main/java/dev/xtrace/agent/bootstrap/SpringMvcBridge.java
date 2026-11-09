@@ -32,7 +32,7 @@ public final class SpringMvcBridge {
       new ClassValue<>() {
         @Override
         protected Method[] computeValue(Class<?> type) {
-          return new Method[] {publicMethod(type, "getStatus")};
+          return new Method[] {publicMethod(type, "getStatus"), publicMethod(type, "isCommitted")};
         }
       };
   private static final ClassValue<Method[]> HANDLER_METHODS =
@@ -43,37 +43,50 @@ public final class SpringMvcBridge {
         }
       };
 
-  /**
-   * Set once {@code DispatcherServlet#doDispatch} has been observed running. From then on the
-   * response status is read when the dispatch ends, not when the handler returns: a redirect,
-   * an error view or a mapped exception only sets its real status while the view is rendered,
-   * after the handler adapter has returned.
-   */
-  private static volatile boolean dispatchObserved;
+  // A nested forward/include can run after the outer handler deferred its root. Ownership is
+  // assigned at root creation, not at deferral, and remains until that dispatch exits. A tree
+  // with an already closed nested root must not record subsequent includes as new requests.
+  private static final ThreadLocal<DispatchState> DISPATCH = new ThreadLocal<>();
+
+  private static final class DispatchState {
+    private int depth;
+    private int ownerDepth;
+    private boolean recorded;
+  }
 
   private SpringMvcBridge() {}
 
-  /** Called as {@code DispatcherServlet#doDispatch} begins; marks the dispatch hook as live. */
+  /** Called on entry to each {@code DispatcherServlet#doDispatch} on this thread. */
   public static void dispatchEnter() {
-    dispatchObserved = true;
+    DispatchState state = DISPATCH.get();
+    if (state == null) {
+      state = new DispatchState();
+      DISPATCH.set(state);
+    }
+    state.depth++;
   }
 
   /**
-   * Closes a request root that was kept open past the handler adapter. A dispatch that threw
-   * propagates the exception (the container decides the status later, so none is claimed);
-   * otherwise the response status after view rendering is the observed outcome.
+   * Closes only the root owned by this dispatch. The observed status is the status at dispatcher
+   * exit, after view rendering. Enclosing filters and container error handling can still change
+   * it; this is not evidence of final delivery to the client. On an escaping exception, only a
+   * readable committed response status is used, since an uncommitted default is not an outcome.
    */
   public static void dispatchEnd(Object response, Throwable thrown) {
-    if (!BootstrapBridge.awaitingResolution()) return;
-    if (thrown != null) {
-      BootstrapBridge.requestEnd(0, thrown);
-    } else {
-      BootstrapBridge.requestEnd(status(response), (Throwable) null);
+    DispatchState state = DISPATCH.get();
+    if (state == null) return;
+    try {
+      if (state.ownerDepth == state.depth && BootstrapBridge.awaitingResolution()) {
+        BootstrapBridge.requestEnd(observedStatus(response, thrown), thrown);
+      }
+    } finally {
+      if (state.ownerDepth == state.depth) state.ownerDepth = 0;
+      if (--state.depth == 0) DISPATCH.remove();
     }
   }
 
   static void resetForTest() {
-    dispatchObserved = false;
+    DISPATCH.remove();
   }
 
   /**
@@ -82,9 +95,11 @@ public final class SpringMvcBridge {
    * is already open on this thread (nested or forwarded dispatch).
    */
   public static boolean start(Object request, Object handlerMethod) {
-    if (request == null || handlerMethod == null || BootstrapBridge.inRequest()) return false;
-    // The ASYNC re-dispatch of a request already opened (and closed UNOBSERVED) is not a new root.
-    if (isAsyncDispatch(request)) return false;
+    DispatchState state = DISPATCH.get();
+    if (request == null || handlerMethod == null || BootstrapBridge.inRequest()
+        || (state != null && state.recorded)) return false;
+    // ASYNC and container ERROR redispatches continue an existing HTTP request, not a new root.
+    if (isContinuationDispatch(request)) return false;
     Class<?> beanType = beanType(handlerMethod);
     int scope = BootstrapBridge.scopeOf(beanType);
     if (scope == 0) return false;
@@ -94,6 +109,10 @@ public final class SpringMvcBridge {
     // Without a matched pattern the template is unknown; a raw path is never substituted.
     if (template == null) return false;
     if (!BootstrapBridge.requestStart(httpMethod, template)) return false;
+    if (state != null) {
+      state.ownerDepth = state.depth;
+      state.recorded = true;
+    }
     if (scope < 0) BootstrapBridge.handlerUnresolved();
     return true;
   }
@@ -110,9 +129,9 @@ public final class SpringMvcBridge {
   }
 
   /**
-   * Closes the request root. RESPONDED means the status the response carried when the handler
-   * returned. If the handler started asynchronous processing (Callable, DeferredResult, reactive
-   * types) the real status is not known at return, so the root closes UNOBSERVED with no status.
+   * Defers to the owning dispatcher when present; otherwise observes status at handler return.
+   * If the handler started asynchronous processing (Callable, DeferredResult, reactive types),
+   * the later status is not observed, so the root closes UNOBSERVED with no status.
    */
   public static void end(Object request, Object response, Throwable thrown) {
     if (thrown == null && request != null && asyncStarted(request)) {
@@ -123,27 +142,48 @@ public final class SpringMvcBridge {
       if (!BootstrapBridge.deferRequestEnd(thrown)) BootstrapBridge.requestEnd(0, thrown);
       return;
     }
-    // The handler returned. The status may still change while the view renders (redirects), so
-    // once the dispatch hook is live the root stays open until the dispatch ends.
-    if (dispatchObserved && BootstrapBridge.deferRequestEnd(null)) return;
+    // A normal handler return proves earlier frame throws were handled. Keep the root until
+    // its owning dispatch exits; another thread's dispatch must never cause deferral here.
+    DispatchState state = DISPATCH.get();
+    if (state != null && state.ownerDepth == state.depth
+        && BootstrapBridge.deferRequestEnd(null)) return;
     BootstrapBridge.requestEnd(status(response), (Throwable) null);
   }
 
   /**
-   * Reports the end of {@code DispatcherServlet#processHandlerException}. A resolver that returned
-   * a result mapped the exception to a response, so the observed status is reported as RESPONDED;
-   * an unresolved exception (the method threw) is propagated with no status observed.
+   * Observes exception resolution at {@code DispatcherServlet#processHandlerException}. With
+   * dispatch advice, even a failing resolver must wait for its owning dispatch to exit. Without
+   * it, this seam observes the resolver's status, not a later rendered view or filter response.
    */
   public static void exceptionResolved(Object response, Object resolved, Throwable thrown) {
     if (!BootstrapBridge.awaitingResolution()) return;
+    DispatchState state = DISPATCH.get();
+    if (state != null) {
+      if (state.ownerDepth == state.depth && thrown == null && resolved != null) {
+        BootstrapBridge.deferRequestEnd(null);
+      }
+      return;
+    }
     if (thrown != null) {
-      BootstrapBridge.requestEnd(0, thrown);
+      BootstrapBridge.requestEnd(observedStatus(response, thrown), thrown);
     } else if (resolved != null) {
-      // A resolver produced a view or a status; a view renders after this call returns.
-      if (dispatchObserved) return;
       BootstrapBridge.requestEnd(status(response), (Throwable) null);
     } else {
       BootstrapBridge.requestEnd(0, (Throwable) null);
+    }
+  }
+
+  private static int observedStatus(Object response, Throwable thrown) {
+    return thrown == null || committed(response) ? status(response) : 0;
+  }
+
+  private static boolean committed(Object response) {
+    if (response == null) return false;
+    try {
+      Method method = RESPONSE_METHODS.get(response.getClass())[1];
+      return method != null && Boolean.TRUE.equals(method.invoke(response));
+    } catch (ReflectiveOperationException | RuntimeException ignored) {
+      return false;
     }
   }
 
@@ -156,11 +196,12 @@ public final class SpringMvcBridge {
     }
   }
 
-  static boolean isAsyncDispatch(Object request) {
+  static boolean isContinuationDispatch(Object request) {
     try {
       Method method = REQUEST_METHODS.get(request.getClass())[3];
       Object value = method == null ? null : method.invoke(request);
-      return value instanceof Enum<?> kind && kind.name().equals("ASYNC");
+      return value instanceof Enum<?> kind
+          && (kind.name().equals("ASYNC") || kind.name().equals("ERROR"));
     } catch (ReflectiveOperationException | RuntimeException ignored) {
       return false;
     }

@@ -141,6 +141,276 @@ public class SpringMvcBridgeTest {
   }
 
   @Test
+  void forwardAndIncludeDuringRenderingCannotCloseTheirOwningDispatch() {
+    for (Dispatch kind : new Dispatch[] {Dispatch.FORWARD, Dispatch.INCLUDE}) {
+      SpringMvcBridge.dispatchEnter();
+      Request outer = new Request("GET", "/outer");
+      assertTrue(SpringMvcBridge.start(outer, new Handler(Controller.class)));
+      Response response = new Response(200);
+      SpringMvcBridge.end(outer, response, null);
+      int starts = sink.starts();
+      int finishes = sink.finishes;
+      // The adapter returned; the outer view now enters a nested DispatcherServlet.
+      for (int i = 0; i < 2; i++) {
+        SpringMvcBridge.dispatchEnter();
+        Request nested = new Request("GET", "/inner");
+        nested.dispatcher = kind;
+        assertFalse(SpringMvcBridge.start(nested, new Handler(Controller.class)));
+      }
+      SpringMvcBridge.exceptionResolved(new Response(409), new Object(), null);
+      SpringMvcBridge.dispatchEnd(new Response(202), null);
+      SpringMvcBridge.dispatchEnd(new Response(203), new IllegalStateException("nested"));
+      assertTrue(BootstrapBridge.awaitingResolution(), kind.name());
+      assertEquals(finishes, sink.finishes, "nested dispatch must not emit a finish");
+      // Outer rendering continues after the nested dispatch; these frames must remain captured.
+      String frame = BootstrapBridge.frameEnter(Controller.class, "afterNested", "()V");
+      BootstrapBridge.frameExit(frame, null);
+      response.status = 207;
+      SpringMvcBridge.dispatchEnd(response, null);
+      assertEquals(starts, sink.starts());
+      assertEquals(finishes + 1, sink.finishes);
+      assertEquals(207, sink.outcome.httpStatus());
+      assertTrue(sink.symbols.contains("SpringMvcBridgeTest$Controller.afterNested"));
+      assertFalse(BootstrapBridge.hasContext());
+    }
+  }
+
+  @Test
+  void rootOpenedInANestedDispatchClosesWithThatDispatch() {
+    SpringMvcBridge.dispatchEnter();
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("GET", "/nested-first-handler");
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    SpringMvcBridge.end(request, new Response(200), null);
+    SpringMvcBridge.dispatchEnd(new Response(201), null);
+    assertEquals(1, sink.finishes);
+    assertFalse(BootstrapBridge.hasContext());
+    // A second include in the same outer dispatch tree is still the same HTTP request.
+    SpringMvcBridge.dispatchEnter();
+    assertFalse(SpringMvcBridge.start(
+        new Request("GET", "/second-include"), new Handler(Controller.class)));
+    SpringMvcBridge.dispatchEnd(new Response(202), null);
+    SpringMvcBridge.dispatchEnd(new Response(500), null);
+    assertEquals(1, sink.starts());
+    assertEquals(1, sink.finishes);
+    assertEquals(201, sink.outcome.httpStatus());
+  }
+
+  @Test
+  void dispatchStateIsRemovedEvenWhenNoHandlerWasRecorded() {
+    SpringMvcBridge.dispatchEnter();
+    SpringMvcBridge.dispatchEnd(new Response(200), null);
+    assertTrue(SpringMvcBridge.start(new Request("GET", "/outside"), new Handler(Controller.class)));
+    SpringMvcBridge.end(new Response(204), null);
+    assertFalse(BootstrapBridge.hasContext());
+    assertEquals(204, sink.status);
+  }
+
+  @Test
+  void anotherThreadsLiveDispatchDoesNotDeferThisThreadsHandler() throws Exception {
+    SpringMvcBridge.dispatchEnter();
+    java.util.concurrent.FutureTask<Boolean> isolated = new java.util.concurrent.FutureTask<>(() -> {
+      boolean started = SpringMvcBridge.start(
+          new Request("GET", "/other-thread"), new Handler(Controller.class));
+      SpringMvcBridge.end(new Response(204), null);
+      return started && !BootstrapBridge.hasContext();
+    });
+    Thread thread = new Thread(isolated);
+    thread.start();
+    thread.join();
+    assertTrue(isolated.get());
+    SpringMvcBridge.dispatchEnd(new Response(200), null);
+  }
+
+  @Test
+  void asyncWithLiveDispatchHookClosesOnceUnobservedAndLeavesNoDeferredState() {
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("GET", "/async");
+    request.asyncStarted = true;
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    SpringMvcBridge.end(request, new Response(200), null);
+    assertEquals(BridgeSink.Outcome.UNOBSERVED, sink.outcome.kind());
+    assertFalse(BootstrapBridge.hasContext());
+    SpringMvcBridge.dispatchEnd(new Response(200), null);
+    SpringMvcBridge.dispatchEnter();
+    Request redispatch = new Request("GET", "/async");
+    redispatch.dispatcher = Dispatch.ASYNC;
+    assertFalse(SpringMvcBridge.start(redispatch, new Handler(Controller.class)));
+    SpringMvcBridge.dispatchEnd(new Response(206), null);
+    assertEquals(1, sink.starts());
+    assertEquals(1, sink.finishes);
+    assertTrue(SpringMvcBridge.start(new Request("GET", "/next"), new Handler(Controller.class)));
+    SpringMvcBridge.end(new Response(204), null);
+    assertEquals(2, sink.finishes);
+    assertFalse(BootstrapBridge.hasContext());
+  }
+
+  @Test
+  void normalReturnClearsHandledThrowBeforeAnUnrelatedRenderingFailure() {
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("GET", "/handled");
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    String frame = BootstrapBridge.frameEnter(Controller.class, "caught", "()V");
+    BootstrapBridge.frameExit(frame, new IllegalArgumentException("handled"));
+    SpringMvcBridge.end(request, new Response(200), null);
+    SpringMvcBridge.dispatchEnd(new Response(200), new IllegalStateException("render"));
+    assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+    assertEquals("java.lang.IllegalStateException", sink.outcome.exceptionType());
+    assertEquals(null, sink.outcome.thrownFromEventId());
+  }
+
+  @Test
+  void rejectedThrowEventCannotReuseAnEarlierHandledThrowsIdentity() {
+    assertTrue(BootstrapBridge.requestStart("GET", "/throw-loss"));
+    String frame = BootstrapBridge.frameEnter(Controller.class, "caught", "()V");
+    BootstrapBridge.frameExit(frame, new IllegalArgumentException("handled"));
+    sink.rejectThrow = true;
+    IllegalStateException failure = new IllegalStateException("propagated");
+    frame = BootstrapBridge.frameEnter(Controller.class, "failing", "()V");
+    BootstrapBridge.frameExit(frame, failure);
+    BootstrapBridge.deferRequestEnd(failure);
+    BootstrapBridge.requestEnd(0, failure);
+    assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+    assertEquals("java.lang.IllegalStateException", sink.outcome.exceptionType());
+    assertEquals(null, sink.outcome.thrownFromEventId());
+    assertEquals(1, sink.dropped, "only the rejected event is lost");
+  }
+
+  @Test
+  void staleNormalDeferralNeverPropagatesAHandledThrow() {
+    assertTrue(BootstrapBridge.requestStart("GET", "/first"));
+    String frame = BootstrapBridge.frameEnter(Controller.class, "caught", "()V");
+    BootstrapBridge.frameExit(frame, new IllegalArgumentException("handled"));
+    assertTrue(BootstrapBridge.deferRequestEnd(null));
+    assertTrue(BootstrapBridge.requestStart("GET", "/next"));
+    assertEquals(BridgeSink.Outcome.UNOBSERVED, sink.outcome.kind());
+    assertEquals(null, sink.outcome.exceptionType());
+    assertEquals(null, sink.outcome.thrownFromEventId());
+    BootstrapBridge.requestEnd(204, (Throwable) null);
+  }
+
+  @Test
+  void staleThrowDeferralUsesOnlyTheThrowThatCausedDeferral() {
+    assertTrue(BootstrapBridge.requestStart("GET", "/first"));
+    assertTrue(BootstrapBridge.deferRequestEnd(new IllegalStateException("unresolved")));
+    String frame = BootstrapBridge.frameEnter(Controller.class, "caughtInView", "()V");
+    BootstrapBridge.frameExit(frame, new IllegalArgumentException("handled by view"));
+    assertTrue(BootstrapBridge.requestStart("GET", "/next"));
+    assertEquals("java.lang.IllegalStateException", sink.outcome.exceptionType());
+    assertEquals(null, sink.outcome.thrownFromEventId());
+    BootstrapBridge.requestEnd(204, (Throwable) null);
+  }
+
+  @Test
+  void readableCommittedStatusSurvivesAnExceptionWithoutInventingEventLoss() {
+    for (int status : new int[] {200, 302, 503}) {
+      SpringMvcBridge.dispatchEnter();
+      Request request = new Request("GET", "/committed");
+      assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+      Response response = new Response(status);
+      response.committed = true;
+      SpringMvcBridge.end(request, response, null);
+      SpringMvcBridge.dispatchEnd(response, new IllegalStateException("after commit"));
+      assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+      assertEquals(status, sink.outcome.httpStatus());
+      assertEquals(0, sink.dropped);
+      assertFalse(BootstrapBridge.hasContext());
+    }
+  }
+
+  @Test
+  void handlerThrowAfterCommitKeepsItsReadableStatusAtDispatcherExit() {
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("GET", "/handler-committed");
+    Response response = new Response(201);
+    response.committed = true;
+    IllegalStateException failure = new IllegalStateException("after commit");
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    SpringMvcBridge.end(request, response, failure);
+    SpringMvcBridge.exceptionResolved(response, null, failure);
+    assertTrue(BootstrapBridge.awaitingResolution());
+    SpringMvcBridge.dispatchEnd(response, failure);
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+    assertEquals(201, sink.status);
+    assertEquals(0, sink.dropped);
+  }
+
+  @Test
+  void uncommittedErrorStatusIsNotClaimedWhenTheDispatchThrows() {
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("GET", "/before-commit");
+    Response response = new Response(503);
+    IllegalStateException failure = new IllegalStateException("before commit");
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    String frame = BootstrapBridge.frameEnter(Controller.class, "failing", "()V");
+    BootstrapBridge.frameExit(frame, failure);
+    SpringMvcBridge.end(request, response, failure);
+    SpringMvcBridge.dispatchEnd(response, failure);
+    assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+    assertEquals(0, sink.status);
+    assertTrue(sink.outcome.thrownFromEventId() != null, "same observed throwable retains its link");
+    assertFalse(BootstrapBridge.hasContext());
+  }
+
+  @Test
+  void unavailableCommittedStatusIsNeverGuessed() {
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("GET", "/unreadable");
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    SpringMvcBridge.end(request, new Response(200), null);
+    SpringMvcBridge.dispatchEnd(new UnreadableResponse(), new IllegalStateException("after commit"));
+    assertEquals(0, sink.outcome.httpStatus());
+    assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+  }
+
+  @Test
+  void resolverFailureWaitsForOwningDispatchAndReadsCommittedStatusThere() {
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("GET", "/resolver-failure");
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    IllegalStateException failure = new IllegalStateException("resolver failed");
+    Response response = new Response(200);
+    SpringMvcBridge.end(request, response, failure);
+    SpringMvcBridge.exceptionResolved(response, null, failure);
+    assertTrue(BootstrapBridge.awaitingResolution());
+    response.status = 409;
+    response.committed = true;
+    SpringMvcBridge.dispatchEnd(response, failure);
+    assertEquals(409, sink.outcome.httpStatus());
+    assertEquals(0, sink.dropped);
+  }
+
+  @Test
+  void containerErrorRedispatchDoesNotCreateAnotherRecording() {
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("GET", "/send-error");
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    SpringMvcBridge.end(request, new Response(418), null);
+    SpringMvcBridge.dispatchEnd(new Response(418), null);
+    SpringMvcBridge.dispatchEnter();
+    Request error = new Request("GET", "/error");
+    error.dispatcher = Dispatch.ERROR;
+    assertFalse(SpringMvcBridge.start(error, new Handler(Controller.class)));
+    SpringMvcBridge.dispatchEnd(new Response(500), null);
+    assertEquals(1, sink.starts());
+    assertEquals(1, sink.finishes);
+    assertEquals(418, sink.outcome.httpStatus(), "observed before container error handling");
+  }
+
+  @Test
+  void outcomeIsStatusAtDispatcherExitEvenIfAnEnclosingFilterLaterChangesIt() {
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("GET", "/post-chain-filter");
+    Response response = new Response(200);
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    SpringMvcBridge.end(request, response, null);
+    SpringMvcBridge.dispatchEnd(response, null);
+    response.status = 304;
+    assertEquals(200, sink.outcome.httpStatus(), "status at dispatcher exit, not final delivery");
+    assertEquals(1, sink.finishes);
+  }
+
+  @Test
   void withoutTheDispatchHookTheRootStillClosesWhenTheHandlerReturns() {
     Request request = new Request("GET", "/owners");
     assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
@@ -265,16 +535,15 @@ public class SpringMvcBridgeTest {
   void throwingGetMessageNeverEscapes() {
     assertTrue(BootstrapBridge.requestStart("GET", "/x"));
     BootstrapBridge.frameEnter(Controller.class, "go", "()V");
-    BootstrapBridge.frameExit(
-        "SpringMvcBridgeTest$Controller.go",
-        new RuntimeException() {
-          @Override
-          public String getMessage() {
-            throw new IllegalStateException("hostile getMessage");
-          }
-        });
+    RuntimeException failure = new RuntimeException() {
+      @Override
+      public String getMessage() {
+        throw new IllegalStateException("hostile getMessage");
+      }
+    };
+    BootstrapBridge.frameExit("SpringMvcBridgeTest$Controller.go", failure);
     assertEquals(null, sink.thrownMessage);
-    BootstrapBridge.requestEnd(0, new IllegalStateException("x"));
+    BootstrapBridge.requestEnd(0, failure);
     assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
     assertTrue(sink.outcome.thrownFromEventId() != null);
   }
@@ -330,7 +599,7 @@ public class SpringMvcBridgeTest {
     }
   }
 
-  public enum Dispatch { REQUEST, ASYNC }
+  public enum Dispatch { REQUEST, FORWARD, INCLUDE, ASYNC, ERROR }
 
   public static final class Request {
     boolean asyncStarted;
@@ -360,8 +629,23 @@ public class SpringMvcBridgeTest {
     }
   }
 
+  public static final class UnreadableResponse {
+    public int getStatus() {
+      throw new IllegalStateException("unreadable");
+    }
+
+    public boolean isCommitted() {
+      return true;
+    }
+  }
+
   public static final class Response {
     int status;
+    boolean committed;
+
+    public boolean isCommitted() {
+      return committed;
+    }
 
     Response(int status) {
       this.status = status;
@@ -379,8 +663,11 @@ public class SpringMvcBridgeTest {
     private volatile String method;
     private volatile String route;
     private volatile int status = -1;
+    private volatile int finishes;
+    private volatile long dropped;
     private volatile int scope = 1;
     private volatile BridgeSink.Outcome outcome;
+    private volatile boolean rejectThrow;
     private volatile String thrownType;
     private volatile String thrownMessage;
 
@@ -417,6 +704,7 @@ public class SpringMvcBridgeTest {
     @Override
     public boolean offerThrowEvent(
         String id, String event, String parent, String symbol, long ns, String type, String text) {
+      if (rejectThrow) return false;
       thrownType = type;
       thrownMessage = text;
       symbols.add(symbol);
@@ -439,6 +727,8 @@ public class SpringMvcBridgeTest {
     @Override
     public boolean offerFinish(String id, long started, long finished, int status, long dropped) {
       this.status = status;
+      this.dropped = dropped;
+      finishes++;
       return true;
     }
 
