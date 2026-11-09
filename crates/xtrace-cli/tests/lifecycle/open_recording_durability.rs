@@ -122,6 +122,23 @@ fn assert_readable(fx: &Fixture, recording_id: RecordingId, recovered: bool) {
         }
     );
     assert!(window.duration_ns.is_none(), "no finish duration was observed");
+    if !recovered {
+        assert_eq!(window.segment_count, "0");
+        assert!(window.events.is_empty(), "the durable journal is projected on recovery");
+        assert!(
+            window.incomplete_evidence.iter().any(|reason| reason == "durable_tail_pending:2..3")
+        );
+        let (recordings, _) = reader
+            .list_recordings(fx.project_id.parse().expect("project id"), None, 10)
+            .expect("journal-aware recovery metadata");
+        let recording = recordings
+            .iter()
+            .find(|item| item.recording_id == recording_id)
+            .expect("open recording");
+        assert_eq!(recording.event_count, "2");
+        assert_eq!(recording.last_sequence.as_deref(), Some("3"));
+        return;
+    }
     assert_eq!(window.segment_count, "1");
     assert_eq!(window.events.len(), 2);
     assert_eq!(window.events[0].sequence, "2");
