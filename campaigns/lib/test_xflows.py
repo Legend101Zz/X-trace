@@ -27,6 +27,17 @@ def line_rec(start=10, end=30, lines=(12, 15), fid="f1", with_source=True):
     return {"events": evs}
 
 
+def privacy_details(marker="XTplain.0123456789abcdef"):
+    details = {label: {**rec(method, route), "outcome": {"kind": "responded", "httpStatus": 200}}
+               for label, (method, route) in xflows.FOCUSED_REQUESTS.items()}
+    details["owner"]["events"].extend(line_rec()["events"])
+    details["secret"]["events"].append({"bindings": [{"name": "lastName", "value": {
+        "state": "redacted", "ruleId": "content.secret_pattern", "shapeHint": "string"}}]})
+    details["plain"]["events"].append({"bindings": [{"name": "lastName", "value": {
+        "state": "captured", "preview": marker, "shape": "string", "contentHash": "b3:" + "0" * 64}}]})
+    return details
+
+
 class Judges(unittest.TestCase):
     wanted = [("GET", "/vets"), ("GET", "/owners/{ownerId}")]
 
@@ -181,15 +192,21 @@ class Judges(unittest.TestCase):
         self.assertIsNone(xflows.parse_doc('{"first": 1}\n{"second": 2}\n'))
         self.assertIsNone(xflows.parse_doc('{"items": [\n  "inner"\n'))
 
-    def test_focused_canaries_use_only_secret_locations_and_an_ordinary_search_argument(self):
+    def test_focused_canaries_preserve_metadata_locations_and_add_business_controls(self):
         import xcamp
         import urllib.parse
-        canaries = {k: "canary-" + k for k in ("authorization-header", "cookie-header", "query-token", "json-body-password")}
+        canaries = {k: "canary-" + k for k in ("authorization-header", "cookie-header", "query-token", "json-body-password", "focused-business-secret")}
+        observe = Mock()
+        marker = "XTplain.0123456789abcdef"
         with mock.patch.object(xcamp, "http_request", return_value={"status": 200}) as request:
-            served = xflows.focused_requests("http://127.0.0.1:1234", canaries)
-        self.assertEqual(list(served.values()), [200, 200, 200, 200])
+            served = xflows.focused_requests("http://127.0.0.1:1234", canaries, observe, marker)
+        self.assertEqual(list(served.values()), [200] * 6)
+        self.assertEqual([call.args[:3] for call in observe.call_args_list],
+                         [(label, method, route) for label, (method, route) in xflows.FOCUSED_REQUESTS.items()])
         paths = [call.args[2] for call in request.call_args_list]
         self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(paths[1]).query)["lastName"], ["Davis"])
+        self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(paths[4]).query)["lastName"], [canaries["focused-business-secret"]])
+        self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(paths[5]).query)["lastName"], [marker])
         for call in request.call_args_list:
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(call.args[2]).query)
             self.assertEqual(query["xt_token"], [canaries["query-token"]])
@@ -197,7 +214,7 @@ class Judges(unittest.TestCase):
             self.assertNotIn(canaries["query-token"], query.get("lastName", []))
             self.assertEqual(call.kwargs["headers"]["Authorization"], canaries["authorization-header"])
             self.assertEqual(call.kwargs["headers"]["Cookie"], canaries["cookie-header"])
-        post = request.call_args_list[-1]
+        post = request.call_args_list[3]
         self.assertEqual(post.args[1], "POST")
         self.assertEqual(urllib.parse.urlsplit(post.args[2]).path, "/owners/new")
         self.assertEqual(post.kwargs["headers"]["Content-Type"], "application/x-www-form-urlencoded")
@@ -205,8 +222,77 @@ class Judges(unittest.TestCase):
         self.assertEqual(form["password"], [canaries["json-body-password"]])
         self.assertEqual(form["firstName"], [""])
         self.assertEqual(form["lastName"], ["Invalid"])
-        self.assertTrue(all(call.kwargs["body"] is None for call in request.call_args_list[:-1]))
+        self.assertTrue(all(call.kwargs["body"] is None for i, call in enumerate(request.call_args_list) if i != 3))
         self.assertNotIn("canary-", str(served), "flow receipt must not itself save the injected values")
+
+    def test_canary_recordings_require_every_request_including_successful_post(self):
+        details = privacy_details()
+        served = dict.fromkeys(xflows.FOCUSED_REQUESTS, 200)
+        attributed = {label: label for label in served}
+        judge = lambda ds, ids=attributed, responses=served: xflows.judge_canary_recordings(responses, ids, ds, xflows.FOCUSED_REQUESTS)[0]
+        self.assertEqual(judge(details), "pass")
+        for label in served:
+            with self.subTest(missing=label):
+                self.assertEqual(judge({k: d for k, d in details.items() if k != label}), "fail")
+                self.assertEqual(judge(details, {k: rid for k, rid in attributed.items() if k != label}), "fail")
+        self.assertEqual(judge({**details, "form": {**details["form"], "completion": "partial"}}), "fail")
+        self.assertEqual(judge(details, {**attributed, "secret": "search"}), "fail")
+        self.assertEqual(judge(details, responses={**served, "form": None}), "fail")
+        self.assertEqual(judge({**details, "form": {**details["form"], "outcome": {"httpStatus": 500}}}), "fail")
+
+    def test_redaction_needs_the_business_binding_rule_and_no_raw_secret(self):
+        detail = privacy_details()["secret"]
+        canaries = {"focused-business-secret": "Bearer XTCANARY.bound.0123456789abcdef"}
+        self.assertEqual(xflows.judge_redaction(detail, canaries)[0], "pass")
+        self.assertEqual(xflows.judge_redaction(rec(), canaries)[0], "fail")
+        for field, value in (("state", "unavailable"), ("ruleId", "name.secret")):
+            candidate = json.loads(json.dumps(detail))
+            candidate["events"][-1]["bindings"][0]["value"][field] = value
+            self.assertEqual(xflows.judge_redaction(candidate, canaries)[0], "fail")
+        candidate = json.loads(json.dumps(detail))
+        candidate["events"][-1]["bindings"][0]["name"] = "password"
+        self.assertEqual(xflows.judge_redaction(candidate, canaries)[0], "fail")
+        detail["leak"] = canaries["focused-business-secret"]
+        self.assertEqual(xflows.judge_redaction(detail, canaries)[0], "fail")
+
+    def test_plain_control_is_captured_only_in_its_binding_and_standard_has_no_bindings(self):
+        marker = "XTplain.0123456789abcdef"
+        details = privacy_details(marker)
+        self.assertEqual(xflows.judge_value_control(details, "plain", marker)[0], "pass")
+        self.assertEqual(xflows.judge_value_control(details, "search", marker)[0], "fail")
+        missing = {k: d for k, d in details.items() if k != "plain"}
+        self.assertEqual(xflows.judge_value_control(missing, "plain", marker)[0], "fail")
+        details["owner"]["leak"] = marker
+        self.assertEqual(xflows.judge_value_control(details, "plain", marker)[0], "fail")
+        canaries = {"query-token": "XTCANARYqt0123456789abcdef"}
+        standard = {"standard": rec("GET", "/owners")}
+        self.assertEqual(xflows.judge_standard_values(standard, canaries)[0], "pass")
+        self.assertEqual(xflows.judge_standard_values({}, canaries)[0], "fail")
+        standard["standard"]["leak"] = canaries["query-token"]
+        self.assertEqual(xflows.judge_standard_values(standard, canaries)[0], "fail")
+        for state in ("captured", "redacted", "unavailable"):
+            self.assertEqual(xflows.judge_standard_values({"s": {"events": [{"bindings": [{"value": {"state": state}}]}]}}, {})[0], "fail")
+
+    def test_canary_wait_requires_new_unambiguous_complete_recording_and_obeys_deadline(self):
+        detail = privacy_details()["form"]
+        client = Mock()
+        snapshots = [{"ok": True, "details": {"old": detail}},
+                     {"ok": True, "details": {"old": detail, "new": {**detail, "completion": "open"}}},
+                     {"ok": True, "details": {"old": detail, "new": detail}}]
+        with patch.object(xflows.xinstr, "collect_api", side_effect=snapshots), patch.object(xflows.time, "monotonic", return_value=0):
+            rid, details = xflows.wait_canary_recording(client, pathlib.Path("unused"), {"old": detail}, "POST", "/owners/new", 30)
+        self.assertEqual(rid, "new")
+        self.assertEqual(details["new"], detail)
+        self.assertIsNone(client.deadline)
+        for snapshot in ({"ok": True, "details": {"a": detail, "b": detail}},
+                         {"ok": True, "details": {"a": {**detail, "completion": "partial"}}}, {"ok": False}):
+            with self.subTest(snapshot=snapshot), patch.object(xflows.xinstr, "collect_api", return_value=snapshot), \
+                 patch.object(xflows.time, "monotonic", return_value=0), self.assertRaises(RuntimeError):
+                xflows.wait_canary_recording(client, pathlib.Path("unused"), {}, "POST", "/owners/new", 30)
+        with patch.object(xflows.xinstr, "collect_api", return_value={"ok": True, "details": {}}), \
+             patch.object(xflows.time, "monotonic", side_effect=[0, 31]), self.assertRaises(RuntimeError):
+            xflows.wait_canary_recording(client, pathlib.Path("unused"), {}, "POST", "/owners/new", 30)
+        self.assertIsNone(client.deadline)
 
     def test_focused_without_canaries_fails_before_launching(self):
         import os
@@ -255,28 +341,41 @@ class Drivers(unittest.TestCase):
         from tools.qa import canary
         flow = self.flow()
         canaries = canary.make_canaries()
+        details = privacy_details()
         with tempfile.TemporaryDirectory() as td:
             flow.out_dir = pathlib.Path(td) / "flows"
             path = pathlib.Path(td) / "canaries.json"
             path.write_text(json.dumps(canaries))
             def read_api(*args):
                 dest = args[-1]
-                dest.mkdir(parents=True)
+                dest.mkdir(parents=True, exist_ok=True)
                 # Simulate an observed leak in a focused binding: it must remain a scan failure.
                 (dest / "recording-new.json").write_text(json.dumps({"preview": canaries["query-token"]}))
-                return self.api({"new": line_rec()})
+                return self.api(details)
+            def requests(base, injected, observe, marker):
+                self.assertEqual(marker, "XTplain.0123456789abcdef")
+                for label, (method, route) in xflows.FOCUSED_REQUESTS.items():
+                    observe(label, method, route, 30)
+                return dict.fromkeys(xflows.FOCUSED_REQUESTS, 200)
             with patch.dict(os.environ, {"XCAMP_CANARY_FILE": str(path)}), \
                  patch.object(xflows, "list_ids", return_value={"old"}), \
-                 patch.object(xflows, "focused_requests", return_value={"focused-request-0": 200}) as requests, \
+                 patch.object(xflows.secrets, "token_hex", return_value="0123456789abcdef"), \
+                 patch.object(xflows.xinstr, "start_viewer", return_value=(Mock(), {"origin": "http://127.0.0.1:9000", "url": "unused"})), \
+                 patch.object(xflows.xinstr, "ViewerClient"), patch.object(xflows.xinstr, "stop_process_group"), \
+                 patch.object(xflows.xinstr, "collect_api", return_value=self.api({})), \
+                 patch.object(xflows, "wait_canary_recording", side_effect=[(label, details) for label in xflows.FOCUSED_REQUESTS]) as wait, \
+                 patch.object(xflows, "focused_requests", side_effect=requests) as send, \
                  patch.object(xflows, "read_api", side_effect=read_api) as read:
                 flow.focused()
                 self.assertEqual(os.environ["XTRACE_CANARY_ENV"], canaries["env-var"])
-            requests.assert_called_once_with(flow._stack.return_value.base, canaries)
+            self.assertEqual(send.call_args.args[:2], (flow._stack.return_value.base, canaries))
+            self.assertEqual(wait.call_count, 6)
             self.assertIn("--capture-depth focused", flow._stack.call_args.args[0])
             self.assertEqual(read.call_args.args[-1], flow.out_dir / "api-focused")
             self.assertEqual(flow.results["focused-canary-injection"]["status"], "pass")
-            self.assertEqual(flow.results["focused-canary-injection"]["note"],
-                             "focused canary locations: " + json.dumps(xflows.xinstr.CANARY_LOCATIONS, sort_keys=True))
+            self.assertIn("6 canary requests", flow.results["focused-canary-injection"]["note"])
+            for step in ("active-line-frames", "frame-values", "focused-redaction-control", "focused-value-control"):
+                self.assertEqual(flow.results[step]["status"], "pass", flow.results[step])
             self.assertEqual(set(xflows.xinstr.CANARY_LOCATIONS), set(canaries))
             self.assertEqual(flow._stack.return_value.up.call_count, 1)
             flow._stack.return_value.down.assert_called_once()
@@ -294,12 +393,65 @@ class Drivers(unittest.TestCase):
             path.write_text('{"env-var": "synthetic"}')
             with patch.dict(os.environ, {"XCAMP_CANARY_FILE": str(path)}), \
                  patch.object(xflows, "list_ids", return_value=set()), \
+                 patch.object(xflows.xinstr, "start_viewer", return_value=(Mock(), {"origin": "http://127.0.0.1:9000", "url": "unused"})), \
+                 patch.object(xflows.xinstr, "ViewerClient"), patch.object(xflows.xinstr, "stop_process_group"), \
+                 patch.object(xflows.xinstr, "collect_api", return_value=self.api({})), \
                  patch.object(xflows, "focused_requests", return_value={"focused-request-0": None}), \
                  patch.object(xflows, "read_api", return_value=self.api({})) as read:
                 flow.focused()
             self.assertEqual(read.call_count, 1)
             for step in ("focused-canary-injection", "active-line-frames", "frame-values"):
                 self.assertEqual(flow.results[step]["status"], "fail")
+
+    def test_http_200_post_without_recording_fails_focused_flow_and_controls(self):
+        import os
+        flow = self.flow()
+        details = privacy_details()
+        details.pop("form")
+        served = dict.fromkeys(xflows.FOCUSED_REQUESTS, 200)
+        with patch.dict(os.environ, {"XCAMP_CANARY_FILE": "unused"}), \
+             patch.object(xflows.pathlib.Path, "read_text", return_value='{"env-var":"synthetic"}'), \
+             patch.object(flow, "_privacy_capture", return_value=(served, {label: label for label in details}, details, "")):
+            flow.focused()
+        for step in ("focused-canary-injection", "focused-redaction-control", "focused-value-control", "active-line-frames", "frame-values"):
+            self.assertEqual(flow.results[step]["status"], "fail", step)
+
+    def test_standard_probe_sends_canary_as_business_parameter_and_requires_capture(self):
+        import os
+        import urllib.parse
+        import xcamp
+        from tools.qa import canary
+        flow = self.flow()
+        canaries = canary.make_canaries()
+        details = {"standard": {**rec("GET", "/owners"), "outcome": {"kind": "responded", "httpStatus": 200}}}
+        with tempfile.TemporaryDirectory() as td:
+            flow.out_dir = pathlib.Path(td) / "flow"
+            path = pathlib.Path(td) / "canaries.json"
+            path.write_text(json.dumps(canaries))
+            with patch.dict(os.environ, {"XCAMP_CANARY_FILE": str(path)}), \
+                 patch.object(xflows, "list_ids", return_value=set()), \
+                 patch.object(xflows.xinstr, "start_viewer", return_value=(Mock(), {"origin": "http://127.0.0.1:9000", "url": "unused"})), \
+                 patch.object(xflows.xinstr, "ViewerClient"), patch.object(xflows.xinstr, "stop_process_group"), \
+                 patch.object(xflows.xinstr, "collect_api", return_value=self.api({})), \
+                 patch.object(xcamp, "http_request", return_value={"status": 200}) as request, \
+                 patch.object(xflows, "wait_canary_recording", return_value=("standard", details)) as wait, \
+                 patch.object(xflows, "read_api", return_value=self.api(details)) as read:
+                flow.standard()
+            self.assertIn("--capture-depth standard", flow._stack.call_args.args[0])
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.call_args.args[2]).query)
+            self.assertEqual(query["lastName"], [canaries["query-token"]])
+            self.assertEqual(query["xt_token"], [canaries["query-token"]])
+            self.assertEqual(request.call_args.args[:2], (flow._stack.return_value.base, "GET"))
+            self.assertEqual(wait.call_args.args[3:5], ("GET", "/owners"))
+            self.assertEqual(read.call_args.args[-1], flow.out_dir / "api-standard")
+            self.assertEqual(flow.results["standard-no-values"]["status"], "pass")
+            self.assertNotIn(canaries["query-token"], json.dumps(flow.results))
+
+        for attributed, new in (({}, details), ({"standard": "standard"}, {})):
+            with patch.object(flow, "_canaries", return_value=canaries), \
+                 patch.object(flow, "_privacy_capture", return_value=({"standard": 200}, attributed, new, "")):
+                flow.standard()
+            self.assertEqual(flow.results["standard-no-values"]["status"], "fail")
 
     def test_record_and_restart_parse_one_whole_pretty_document(self):
         flow = self.flow()

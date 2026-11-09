@@ -28,7 +28,8 @@ def _load(path: str):
         return None
 
 
-FLOW_STEPS = ("record-stop-flow", "restart-reopen", "partial-recording-reopen", "active-line-frames", "frame-values", "focused-canary-injection")
+FLOW_STEPS = ("record-stop-flow", "restart-reopen", "partial-recording-reopen", "active-line-frames", "frame-values",
+              "focused-canary-injection", "focused-redaction-control", "focused-value-control", "standard-no-values")
 
 
 def flow_steps(f: dict | None) -> list[tuple[str, str, str]]:
@@ -47,6 +48,9 @@ def flow_steps(f: dict | None) -> list[tuple[str, str, str]]:
     accommodation = steps.get("flow-accommodations") if isinstance(steps, dict) else None
     if isinstance(accommodation, dict):
         out.append(("flow-accommodations", "reported", str(accommodation.get("note", ""))))
+    scope = steps.get("privacy-scope") if isinstance(steps, dict) else None
+    if isinstance(scope, dict):
+        out.append(("privacy-scope", "reported", str(scope.get("note", ""))))
     return out
 
 

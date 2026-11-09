@@ -59,6 +59,8 @@ class T(unittest.TestCase):
         self.assertEqual(d["tui-navigation-accommodation"][0], "reported")
         self.assertIn("detail", d["tui-navigation-accommodation"][1])
         self.assertIn("focused-canary-injection", s.FLOW_STEPS)
+        for name in ("focused-redaction-control", "focused-value-control", "standard-no-values"):
+            self.assertIn(name, s.FLOW_STEPS)
 
     def test_each_failure_is_visible(self):
         r = {"scenarios": [sc("a", eq=False), sc("b", rec=False)], "api": {"ok": True, "recordings": 5},
@@ -80,6 +82,13 @@ class T(unittest.TestCase):
         self.assertEqual(d["frame-values"], ("fail", "no captured binding"))
         self.assertEqual(d["restart-reopen"][0], "fail")
         self.assertEqual(d["partial-recording-reopen"][0], "fail")
+
+    def test_privacy_scope_is_visible_without_becoming_a_pass(self):
+        doc = {"steps": {"privacy-scope": {"status": "reported", "note": "focused ordinary Strings are captured"}}}
+        steps = by(s.flow_steps(doc))
+        self.assertEqual(steps["privacy-scope"], ("reported", "focused ordinary Strings are captured"))
+        self.assertEqual(steps["focused-redaction-control"][0], "fail")
+        self.assertEqual(steps["standard-no-values"][0], "fail")
 
     def test_zero_recordings_never_pass_source_identity(self):
         r = {"scenarios": [sc("a", rec=False)], "api": {"ok": True, "recordings": 0}, "problemClasses": {"no-recording-for-route": 1},
