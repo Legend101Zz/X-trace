@@ -1,6 +1,8 @@
 //! Application recording-persistence port backed by the SQLite/XTF store.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use prost::Message as _;
 use xtrace_application::observed_endpoint_queries::{
@@ -26,6 +28,11 @@ use crate::recording_store::{
     SegmentCommitDisposition, SegmentCommitRequest,
 };
 
+type JournalCheckpoints = HashMap<
+    xtrace_domain::RecordingId,
+    Option<crate::recording_store::recording_journal::Checkpoint>,
+>;
+
 /// SQLite implementation of the application recording-persistence port.
 ///
 /// The project data root is explicit so recording objects are bound to the same
@@ -36,13 +43,18 @@ use crate::recording_store::{
 pub struct SqliteRecordingPersistence {
     store: SqliteStore,
     project_data_root: PathBuf,
+    journal_checkpoints: Arc<Mutex<JournalCheckpoints>>,
 }
 
 impl SqliteRecordingPersistence {
     /// Creates an adapter bound to one project data directory.
     #[must_use]
     pub fn new(store: SqliteStore, project_data_root: impl Into<PathBuf>) -> Self {
-        Self { store, project_data_root: project_data_root.into() }
+        Self {
+            store,
+            project_data_root: project_data_root.into(),
+            journal_checkpoints: Arc::default(),
+        }
     }
 }
 
@@ -187,6 +199,19 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
         Ok(PortBeginReceipt { recording_id: receipt.recording_id, disposition })
     }
 
+    fn begin_recording_with_cap(
+        &self,
+        request: &BeginRecording,
+        event_cap: usize,
+    ) -> Result<PortBeginReceipt, PortError> {
+        let receipt = self.begin_recording(request)?;
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
+        let view =
+            self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
+        view.persist_capture_cap(request.recording_id, event_cap).map_err(map_recording_error)?;
+        Ok(receipt)
+    }
+
     fn persist_segment(
         &self,
         request: &PersistRecordingSegment<Self::Event>,
@@ -205,6 +230,15 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
                 events,
             })
             .map_err(map_recording_error)?;
+        if view
+            .clear_segment_journal(request.recording_id, request.segment_ordinal)
+            .map_err(map_recording_error)?
+        {
+            self.journal_checkpoints
+                .lock()
+                .map_err(|_| journal_lock_error())?
+                .remove(&request.recording_id);
+        }
         let disposition = match receipt.disposition {
             SegmentCommitDisposition::Inserted => PortSegmentDisposition::Inserted,
             SegmentCommitDisposition::ExactReplay => PortSegmentDisposition::ExactReplay,
@@ -216,6 +250,27 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
         })
     }
 
+    fn persist_tail(
+        &self,
+        request: &PersistRecordingSegment<Self::Event>,
+        prefix_events: usize,
+    ) -> Result<bool, PortError> {
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
+        for event in &request.events {
+            validate_xtf_event(event)?;
+        }
+        let view =
+            self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
+        let mut checkpoints = self.journal_checkpoints.lock().map_err(|_| journal_lock_error())?;
+        view.journal_tail(
+            request,
+            prefix_events,
+            checkpoints.entry(request.recording_id).or_default(),
+        )
+        .map_err(map_recording_error)?;
+        Ok(true)
+    }
+
     fn finish_recording(
         &self,
         request: &FinishRecording,
@@ -224,8 +279,21 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
-        view.finish_recording(request).map_err(map_recording_error)
+        let result = view.finish_recording(request).map_err(map_recording_error)?;
+        self.journal_checkpoints
+            .lock()
+            .map_err(|_| journal_lock_error())?
+            .remove(&request.recording_id);
+        Ok(result)
     }
+}
+
+fn journal_lock_error() -> PortError {
+    PortError::new(
+        PortErrorKind::Internal,
+        "recording journal lock is poisoned",
+        CorrelationId::new(),
+    )
 }
 
 fn validate_xtf_event(
@@ -352,6 +420,7 @@ fn map_recording_error(error: RecordingStoreError) -> PortError {
 mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
 
     use prost::Message as _;
     use xtrace_application::PortErrorKind;
@@ -1544,11 +1613,11 @@ mod tests {
             })
             .expect("corrected events at the same sequences remain admissible");
         assert_eq!(retry.accepted, 2);
-        assert_eq!(retry.persisted_segments, 1, "corrected batch is durable before finish");
+        assert_eq!(retry.persisted_segments, 0, "corrected batch is journaled before finish");
         let finished = capture
             .finish_recording(FinishRecording::without_digest(begin.recording_id, 3))
             .expect("finish reuses the corrected segment");
-        assert_eq!(finished.persisted_segments, 0);
+        assert_eq!(finished.persisted_segments, 1);
 
         let durable_replay = adapter
             .persist_segment(&PersistRecordingSegment {
@@ -1562,6 +1631,337 @@ mod tests {
             durable_replay.disposition,
             xtrace_application::recording::PersistSegmentDisposition::ExactReplay
         );
+    }
+
+    #[test]
+    fn singleton_acknowledgements_at_focused_cap_recover_with_bounded_segments_and_pages() {
+        journaled_singletons_recover(xtrace_application::recording::FOCUSED_EVENT_CAP, true);
+    }
+
+    #[test]
+    fn two_thousand_forty_eight_singleton_batches_publish_only_two_segments() {
+        journaled_singletons_recover(2_048, false);
+    }
+
+    #[test]
+    fn java_sized_batches_coalesce_and_finish_with_the_original_digest() {
+        use crate::recording_store::recording_journal::take_sync_count;
+        let (directory, store, project) = fixture();
+        let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
+        let capture = RecordingCaptureService::new(
+            Arc::clone(&adapter),
+            SegmentPolicy::default(),
+            std::num::NonZeroUsize::new(1).expect("retention"),
+        );
+        let anchor = begin(project.id(), RecordingId::new());
+        let recording_id = anchor.recording_id;
+        capture.begin_recording(anchor).expect("begin");
+        let events: Vec<_> =
+            (2..=2_049).map(|sequence| event(sequence, &format!("event-{sequence}"))).collect();
+        let mut hasher = blake3::Hasher::new();
+        for event in &events {
+            hasher.update(event.payload.event.as_ref().expect("event").event_id.as_bytes());
+        }
+        take_sync_count();
+        let mut segments = 0;
+        for batch in events.chunks(200) {
+            let receipt = capture
+                .record_events(RecordEvents { recording_id, events: batch.to_vec() })
+                .expect("ack");
+            assert_eq!(receipt.accepted, batch.len());
+            segments += receipt.persisted_segments;
+        }
+        assert_eq!(segments, 1, "200-event batches coalesce at the 2000-event boundary");
+        assert_eq!(take_sync_count(), 10, "one sync for each batch with a tail");
+        let mut finish = FinishRecording::without_digest(recording_id, 2_049);
+        finish.event_digest = hasher.finalize().as_bytes().to_vec();
+        let finished = capture.finish_recording(finish.clone()).expect("verified finish");
+        assert_eq!(finished.completion, RecordingCompletion::Complete);
+        assert_eq!(finished.persisted_segments, 1);
+        let mut changed_cap = finish.clone();
+        changed_cap.event_cap = xtrace_application::recording::FOCUSED_EVENT_CAP as u64;
+        assert_eq!(
+            adapter
+                .finish_recording(&changed_cap)
+                .expect_err("changed finish cap is not an exact replay")
+                .kind(),
+            PortErrorKind::Conflict
+        );
+        assert!(capture.finish_recording(finish).expect("immutable finish retry").exact_replay);
+        let page = SqliteRecordingReader::new(store, directory.path())
+            .show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id,
+                limit: 10,
+                after_sequence: None,
+            })
+            .expect("read completed capture");
+        assert_eq!(page.segment_count, "2");
+        assert_eq!(
+            page.completion,
+            xtrace_application::recording_queries::RecordingCompletionEvidence::Complete
+        );
+    }
+
+    #[test]
+    fn replaying_an_older_immutable_segment_keeps_the_newer_journal() {
+        use xtrace_application::recording::{DEFAULT_SEGMENT_EVENT_BYTES, DEFAULT_SEGMENT_SPAN_NS};
+        let (directory, store, project) = fixture();
+        let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
+        let capture = RecordingCaptureService::new(
+            Arc::clone(&adapter),
+            SegmentPolicy::new(2, DEFAULT_SEGMENT_EVENT_BYTES, DEFAULT_SEGMENT_SPAN_NS)
+                .expect("policy"),
+            std::num::NonZeroUsize::new(1).expect("retention"),
+        );
+        let anchor = begin(project.id(), RecordingId::new());
+        let recording_id = anchor.recording_id;
+        capture.begin_recording(anchor).expect("begin");
+        let first = vec![event(2, "event-2"), event(3, "event-3")];
+        capture
+            .record_events(RecordEvents { recording_id, events: first.clone() })
+            .expect("first segment");
+        capture
+            .record_events(RecordEvents { recording_id, events: vec![event(4, "event-4")] })
+            .expect("newer journal acknowledgement");
+        assert_eq!(
+            adapter
+                .persist_segment(&PersistRecordingSegment {
+                    project_id: project.id(),
+                    recording_id,
+                    segment_ordinal: 0,
+                    events: first
+                })
+                .expect("older exact retry")
+                .disposition,
+            xtrace_application::recording::PersistSegmentDisposition::ExactReplay
+        );
+        drop(capture);
+        drop(adapter);
+        let recovery = SqliteRecordingPersistence::new(store.clone(), directory.path());
+        assert_eq!(
+            recovery
+                .finish_recording(&FinishRecording::without_digest(recording_id, 4))
+                .expect("recover newer tail"),
+            RecordingCompletion::Partial
+        );
+        let page = SqliteRecordingReader::new(store, directory.path())
+            .show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id,
+                limit: 10,
+                after_sequence: None,
+            })
+            .expect("read recovered tail");
+        assert_eq!(
+            page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+            ["2", "3", "4"]
+        );
+    }
+
+    #[test]
+    fn sparse_acknowledged_batches_hit_admission_before_becoming_unreadable() {
+        use xtrace_application::recording::{DEFAULT_SEGMENT_EVENT_BYTES, MAX_RECORDING_SEGMENTS};
+        use xtrace_application::recording_queries::RecordingCompletionEvidence;
+
+        let (directory, store, project) = fixture();
+        let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
+        // Every adjacent pair crosses the ordinary two-second span boundary.
+        let capture = RecordingCaptureService::new(
+            Arc::clone(&adapter),
+            SegmentPolicy::new(2_000, DEFAULT_SEGMENT_EVENT_BYTES, 2_000_000_000).expect("policy"),
+            std::num::NonZeroUsize::new(1).expect("retention"),
+        );
+        let anchor = begin(project.id(), RecordingId::new());
+        let recording_id = anchor.recording_id;
+        capture
+            .begin_recording_with_mode(anchor, xtrace_domain::CaptureMode::Focused)
+            .expect("focused begin");
+        let sparse_event = |sequence| {
+            let mut event = event(sequence, &format!("sparse-{sequence}"));
+            event.monotonic_ns = sequence * 2_000_000_000;
+            event.payload.event.as_mut().expect("event").monotonic_ns = event.monotonic_ns;
+            event.canonical_bytes = event.payload.encode_to_vec();
+            event
+        };
+        let last = u64::from(MAX_RECORDING_SEGMENTS) + 1;
+        for sequence in 2..=last {
+            let receipt = capture
+                .record_events(RecordEvents { recording_id, events: vec![sparse_event(sequence)] })
+                .expect("sparse acknowledgement");
+            assert_eq!((receipt.accepted, receipt.dropped), (1, 0));
+        }
+        let rejected = capture
+            .record_events(RecordEvents { recording_id, events: vec![sparse_event(last + 1)] })
+            .expect_err("no acknowledgement beyond the readable ceiling");
+        assert_eq!(rejected.kind(), PortErrorKind::Resource);
+        drop(capture);
+        drop(adapter);
+        drop(store);
+        let reopened = SqliteStore::open(
+            &directory.path().join("metadata.sqlite3"),
+            OpenOptions::default().with_must_exist(true),
+        )
+        .expect("reopen");
+        let recovery = SqliteRecordingPersistence::new(reopened.clone(), directory.path());
+        assert_eq!(
+            recovery
+                .finish_recording(&FinishRecording::without_digest(recording_id, last))
+                .expect("recover last admitted tail"),
+            RecordingCompletion::Partial
+        );
+        let reader = SqliteRecordingReader::new(reopened, directory.path());
+        let mut next = 2;
+        loop {
+            let page = reader
+                .show_recording(&ShowWindowRequest {
+                    project_id: project.id(),
+                    recording_id,
+                    limit: 317,
+                    after_sequence: Some(next - 1),
+                })
+                .expect("even the first page scans exactly the readable maximum");
+            assert_eq!(page.segment_count, MAX_RECORDING_SEGMENTS.to_string());
+            assert_eq!(page.completion, RecordingCompletionEvidence::Partial);
+            assert!(!page.events.is_empty());
+            for event in &page.events {
+                assert_eq!(event.sequence, next.to_string());
+                next += 1;
+            }
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(
+            next,
+            last + 1,
+            "all acknowledged sparse events survived, rejected suffix absent"
+        );
+    }
+
+    fn journaled_singletons_recover(count: usize, focused: bool) {
+        use crate::recording_store::recording_journal::take_sync_count;
+        use xtrace_application::recording::DEFAULT_SEGMENT_EVENTS;
+        use xtrace_application::recording_queries::{RecordingCompletionEvidence, RecordingStatus};
+
+        let (directory, store, project) = fixture();
+        let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
+        let capture = RecordingCaptureService::new(
+            Arc::clone(&adapter),
+            SegmentPolicy::default(),
+            std::num::NonZeroUsize::new(1).expect("retention"),
+        );
+        let anchor = begin(project.id(), RecordingId::new());
+        let recording_id = anchor.recording_id;
+        if focused {
+            capture
+                .begin_recording_with_mode(anchor, xtrace_domain::CaptureMode::Focused)
+                .expect("focused begin");
+        } else {
+            capture.begin_recording(anchor).expect("legacy begin");
+        }
+        take_sync_count();
+        let mut published = 0;
+        for index in 0..count {
+            let sequence = index as u64 + 2;
+            let receipt = capture
+                .record_events(RecordEvents {
+                    recording_id,
+                    events: vec![event(sequence, &format!("event-{sequence}"))],
+                })
+                .expect("singleton acknowledgement");
+            assert_eq!((receipt.accepted, receipt.dropped), (1, 0));
+            published += receipt.persisted_segments;
+        }
+        assert_eq!(published, count / DEFAULT_SEGMENT_EVENTS);
+        assert_eq!(
+            take_sync_count(),
+            count - count / DEFAULT_SEGMENT_EVENTS,
+            "one journal sync per non-boundary batch, rather than an XTF installation"
+        );
+        let last = count as u64 + 1;
+        let duplicate = capture
+            .record_events(RecordEvents {
+                recording_id,
+                events: vec![event(last, &format!("event-{last}"))],
+            })
+            .expect("duplicate");
+        assert_eq!((duplicate.duplicates, duplicate.persisted_segments), (1, 0));
+        capture.record_events(RecordEvents { recording_id, events: vec![] }).expect("empty");
+        assert_eq!(take_sync_count(), 0, "empty and duplicate batches do no persistence");
+        // Lose every volatile assembler/checkpoint and use a new SQLite connection.
+        drop(capture);
+        drop(adapter);
+        drop(store);
+        let reopened = SqliteStore::open(
+            &directory.path().join("metadata.sqlite3"),
+            OpenOptions::default().with_must_exist(true),
+        )
+        .expect("reopen");
+        let reader = SqliteRecordingReader::new(reopened.clone(), directory.path());
+        let (metadata, more) =
+            reader.list_recordings(project.id(), None, 10).expect("recovery metadata");
+        assert!(!more);
+        assert_eq!(metadata[0].event_count, count.to_string());
+        assert_eq!(metadata[0].last_sequence.as_deref(), Some(last.to_string().as_str()));
+        let pending = reader
+            .show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id,
+                limit: 1,
+                after_sequence: None,
+            })
+            .expect("readable before recovery");
+        assert_eq!(pending.status, RecordingStatus::Recording);
+        assert!(
+            pending
+                .incomplete_evidence
+                .iter()
+                .any(|reason| reason.starts_with("durable_tail_pending:"))
+        );
+        let recovery = SqliteRecordingPersistence::new(reopened.clone(), directory.path());
+        // Exactly the lifecycle recovery call, including its legacy default cap.
+        let finish = FinishRecording::without_digest(recording_id, last);
+        assert_eq!(
+            recovery.finish_recording(&finish).expect("recover journal"),
+            RecordingCompletion::Partial
+        );
+        assert_eq!(
+            recovery.finish_recording(&finish).expect("immutable recovery retry"),
+            RecordingCompletion::Partial
+        );
+        let expected_segments = count.div_ceil(DEFAULT_SEGMENT_EVENTS);
+        assert!(expected_segments < xtrace_application::recording::MAX_RECORDING_SEGMENTS as usize);
+        let mut after_sequence = None;
+        let mut next = 2;
+        loop {
+            let page = reader
+                .show_recording(&ShowWindowRequest {
+                    project_id: project.id(),
+                    recording_id,
+                    limit: 137,
+                    after_sequence,
+                })
+                .expect("paginated read remains openable");
+            assert_eq!(page.completion, RecordingCompletionEvidence::Partial);
+            assert_eq!(page.segment_count, expected_segments.to_string());
+            assert_eq!(
+                page.capacity.as_ref().expect("recovered capacity").event_cap as usize,
+                count
+            );
+            assert!(!page.events.is_empty());
+            for event in &page.events {
+                assert_eq!(event.sequence, next.to_string());
+                assert_eq!(event.event_id.as_deref(), Some(format!("event-{next}").as_str()));
+                next += 1;
+            }
+            if !page.has_more {
+                break;
+            }
+            after_sequence = Some(next - 1);
+        }
+        assert_eq!(next, last + 1, "every acknowledged event survived recovery in order");
+        assert!(!directory.path().join("journals").join(format!("{recording_id}.tail")).exists());
     }
 
     #[test]
@@ -1692,7 +2092,7 @@ mod tests {
                 events: vec![original.clone()],
             })
             .expect("accept original");
-        assert_eq!(accepted.persisted_segments, 1, "original is durable before any replay");
+        assert_eq!(accepted.persisted_segments, 0, "original is journaled before any replay");
 
         let mut malformed_duplicate = original.clone();
         malformed_duplicate.payload.event.as_mut().expect("nested event").recording_seq = 3;
@@ -1717,7 +2117,7 @@ mod tests {
         let finished = capture
             .finish_recording(FinishRecording::without_digest(begin.recording_id, 2))
             .expect("finish reuses the original event");
-        assert_eq!(finished.persisted_segments, 0);
+        assert_eq!(finished.persisted_segments, 1);
         let durable_replay = adapter
             .persist_segment(&PersistRecordingSegment {
                 project_id: project.id(),
