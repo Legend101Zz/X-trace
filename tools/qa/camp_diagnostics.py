@@ -234,7 +234,11 @@ def proxy_diagnostics(path: pathlib.Path, needles: list[bytes]) -> dict:
             rows.append(row)
         else:
             result["rowsOmitted"] += 1
-    result["producerMayBeCapped"] = observed >= 128
+    # Startup transformations and request-time resolutions each have a reserved
+    # producer allowance. Either can fill without reaching the total row cap.
+    transformations = sum(row["result"] in ("transformed", "transform_failed") for row in rows)
+    resolutions = sum(row["result"] in ("resolved", "no_declaration", "resolution_failed") for row in rows)
+    result["producerMayBeCapped"] = observed >= 128 or transformations >= 64 or resolutions >= 64
     return result
 
 

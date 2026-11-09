@@ -324,6 +324,32 @@ class Judges(unittest.TestCase):
             with self.assertRaisesRegex(xflows.CanaryEvidenceError, "within its request budget"):
                 xflows.wait_canary_recording(Mock(), pathlib.Path("unused"), {}, "GET", "/owners/{ownerId}", 30)
 
+    def test_terminal_canary_failure_names_observed_loss_without_echoing_private_fields(self):
+        detail = {**privacy_details()["owner"], "status": "partial", "completion": "partial"}
+        detail["events"] = [*detail["events"], {
+            "kind": "recording_event_kind:gap", "symbol": "private.symbol",
+            "gap": {"reason": "class_not_transformed", "count": "12", "message": "private value"}}]
+        client = Mock()
+        with patch.object(xflows.time, "monotonic", return_value=0), \
+                patch.object(xflows.xinstr, "collect_api", return_value={"ok": True, "details": {"new": detail}}) as collect:
+            with self.assertRaises(xflows.CanaryEvidenceError) as caught:
+                xflows.wait_canary_recording(client, pathlib.Path("unused"), {}, "GET", "/owners/{ownerId}", 30)
+        self.assertEqual(str(caught.exception),
+                         "canary request recording is not complete (status=partial; observed gaps: class_not_transformed=12)")
+        self.assertEqual(collect.call_count, 1)
+        self.assertIsNone(client.deadline)
+
+    def test_canary_loss_note_masks_unknown_text_and_rejects_unbounded_counts(self):
+        detail = {"status": "private status", "events": [
+            {"kind": "gap", "gap": {"reason": "private reason", "count": "1"}},
+            {"kind": "gap", "gap": {"reason": "queue_full", "count": "9" * 21}},
+            {"kind": "gap", "gap": {"reason": "queue_full", "count": "private count"}},
+            {"kind": "gap", "gap": {"reason": ["private"], "count": "1"}}]}
+        note = xflows.canary_incomplete_note(detail)
+        self.assertEqual(note,
+                         "canary request recording is not complete (status=unrecognized; observed gaps: unrecognized=2)")
+        self.assertNotIn("private", note)
+
     def test_focused_without_canaries_fails_before_launching(self):
         import os
         flow = xflows.Flows.__new__(xflows.Flows)

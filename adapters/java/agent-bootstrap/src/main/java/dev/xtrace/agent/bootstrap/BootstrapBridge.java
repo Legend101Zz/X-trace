@@ -594,6 +594,21 @@ public final class BootstrapBridge {
     return CONTEXT.get() != null;
   }
 
+  /** Names a missing focused probe only when that method actually runs in this request. */
+  public static void methodEntered(Class<?> type, String method, String descriptor) {
+    try {
+      RequestContext context = CONTEXT.get();
+      BridgeSink sink = SINK.get();
+      if (context == null || context.deferred || sink == null
+          || !sink.lineProbeUnavailable(type, method, descriptor)) return;
+      flushLine(context);
+      if (!safeEvent(sink, context, context.nextEventId(), context.currentParent(),
+          BridgeEventKind.GAP, "xtrace.capture.gap.not-transformed", 1)) context.dropped++;
+    } catch (Throwable ignored) {
+      // Limitation probes cannot affect application behavior.
+    }
+  }
+
   static void resetForTest() {
     CONTEXT.remove();
     LINE_SINK.set(null);

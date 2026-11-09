@@ -26,7 +26,7 @@ class ProxyCaptureTest {
   void productionTransformerCapturesActualJdkProxiesAcrossTheCorpus() throws Exception {
     ProbeResult result = runProbe();
     assertEquals(0, result.exitCode(), result.text());
-    assertTrue(result.text().contains("proxy-capture-cases=18"), result.text());
+    assertTrue(result.text().contains("proxy-capture-cases=20"), result.text());
     assertTrue(result.text().contains("\"result\":\"transformed\""), result.text());
     assertTrue(result.text().contains("\"result\":\"resolved\""), result.text());
   }
@@ -36,7 +36,7 @@ class ProxyCaptureTest {
     ProbeResult result = runProbe(true);
     assertEquals(0, result.exitCode(), result.text());
     assertTrue(result.text().contains("preloaded-proxy-capture-cases=1"), result.text());
-    assertTrue(result.text().contains("proxy-capture-cases=18"), result.text());
+    assertTrue(result.text().contains("proxy-capture-cases=20"), result.text());
   }
 
   @Test

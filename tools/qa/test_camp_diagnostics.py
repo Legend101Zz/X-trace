@@ -45,6 +45,20 @@ def summary(path, failed=()):
 
 
 class Projection(unittest.TestCase):
+    def test_either_reserved_producer_allowance_can_be_capped_below_the_total_limit(self):
+        for result in ("transformed", "resolved"):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as td:
+                path = pathlib.Path(td) / "application.log"
+                row = {"code": "XTR-JAVA-PROXY-DIAGNOSTIC", "result": result,
+                       "proxyHash": "sha256:" + "a" * 64}
+                line = (json.dumps(row, separators=(",", ":")) + "\n").encode()
+                path.write_bytes(line * 63)
+                self.assertFalse(cd.proxy_diagnostics(path, [])["producerMayBeCapped"])
+                path.write_bytes(line * 64)
+                report = cd.proxy_diagnostics(path, [])
+                self.assertEqual(len(report["rows"]), 64)
+                self.assertTrue(report["producerMayBeCapped"])
+
     def test_proxy_diagnostics_copy_only_hashes_and_fixed_codes_from_application_log(self):
         row = {"code": "XTR-JAVA-PROXY-DIAGNOSTIC", "proxyHash": "sha256:" + "a" * 64,
                "invocationHash": "sha256:" + "b" * 64, "declarationHash": "private symbol", "result": "resolved",

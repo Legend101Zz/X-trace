@@ -438,10 +438,34 @@ def wait_canary_recording(client: xinstr.ViewerClient, out_dir: pathlib.Path, be
                         and time.monotonic() <= deadline:
                     return rid, api["details"]
                 if not pending and completion_of(detail) in ("partial", "invalid", "unavailable"):
-                    raise CanaryEvidenceError("canary request recording is not complete")
+                    raise CanaryEvidenceError(canary_incomplete_note(detail))
     finally:
         client.deadline = None
     raise CanaryEvidenceError("canary request has no attributable completed recording within its request budget")
+
+
+def canary_incomplete_note(detail: dict) -> str:
+    """Explain terminal loss using bounded protocol facts, never symbols, messages or values."""
+    reasons = {"class_not_transformed", "queue_full", "line_budget", "value_budget", "throttle", "correlation_lost"}
+    counts: dict[str, int] = {}
+    for event in detail.get("events", [])[:1000]:
+        if not str(event.get("kind", "")).endswith("gap"):
+            continue
+        gap = event.get("gap")
+        if not isinstance(gap, dict):
+            continue
+        reason = gap.get("reason")
+        if not isinstance(reason, str) or reason not in reasons:
+            reason = "unrecognized"
+        count = gap.get("count")
+        if isinstance(count, str) and len(count) <= 20 and count.isascii() and count.isdecimal() \
+                and int(count) < 1 << 64:
+            counts[reason] = min((1 << 64) - 1, counts.get(reason, 0) + int(count))
+    status = detail.get("status")
+    if status not in ("recording", "finalizing", "complete", "partial", "invalid"):
+        status = "unrecognized"
+    losses = ", ".join(f"{reason}={count}" for reason, count in sorted(counts.items())) or "none in snapshot"
+    return f"canary request recording is not complete (status={status}; observed gaps: {losses})"
 
 
 def _fail(exc: BaseException) -> tuple[str, str]:

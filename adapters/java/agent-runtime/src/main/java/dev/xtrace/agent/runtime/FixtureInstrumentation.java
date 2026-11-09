@@ -181,7 +181,9 @@ final class FixtureInstrumentation {
                 (target, type, loader, module, domain) -> {
                   net.bytebuddy.dynamic.DynamicType.Builder<?> framed =
                       target.visit(Advice.to(FrameAdvice.class).on(frameMethods()));
-                  return lineProbes == null ? framed : framed.visit(lineProbes.wrapper());
+                  return lineProbes == null ? framed : framed
+                      .visit(Advice.to(LineGapAdvice.class).on(lineGapMethods()))
+                      .visit(lineProbes.wrapper(type.getName(), loader, null));
                 })
             .type(named(H2_STATEMENT))
             .transform(
@@ -205,6 +207,9 @@ final class FixtureInstrumentation {
         reports = new java.util.concurrent.ConcurrentLinkedQueue<>();
     private final java.util.concurrent.atomic.AtomicInteger reportCount =
         new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.Map<ClassLoader, java.util.Map<String, java.util.Set<String>>> missing =
+        new java.util.WeakHashMap<>();
+    private volatile boolean reportsOverflowed;
 
     LineProbes(dev.xtrace.agent.runtime.line.SiteRegistry registry) {
       this.registry = java.util.Objects.requireNonNull(registry, "registry");
@@ -214,43 +219,58 @@ final class FixtureInstrumentation {
       return registry;
     }
 
-    /**
-     * Methods or classes the wrapper left untouched for a reason that is not by design (bridge and
-     * synthetic methods are never probed on purpose and are not counted).
-     */
-    long skippedCount() {
-      long skipped = 0;
-      for (dev.xtrace.agent.runtime.line.MethodReport report : reports) {
-        if (report.status() != dev.xtrace.agent.runtime.line.MethodReport.Status.SKIPPED) continue;
-        String reason = report.reason();
-        if (dev.xtrace.agent.runtime.line.MethodReport.Reasons.BRIDGE.equals(reason)
-            || dev.xtrace.agent.runtime.line.MethodReport.Reasons.SYNTHETIC.equals(reason)) {
-          continue;
-        }
-        skipped++;
+    boolean unavailable(Class<?> type, String method, String descriptor) {
+      if (reportsOverflowed) return true;
+      synchronized (missing) {
+        var classes = missing.get(type.getClassLoader());
+        var methods = classes == null ? null : classes.get(type.getName());
+        return methods != null && (methods.contains("<class>") || methods.contains(method + descriptor));
       }
-      return skipped;
     }
 
     java.util.List<dev.xtrace.agent.runtime.line.MethodReport> reports() {
       return java.util.List.copyOf(reports);
     }
 
-    dev.xtrace.agent.runtime.line.LineProbeAsmWrapper wrapper() {
+    dev.xtrace.agent.runtime.line.LineProbeAsmWrapper wrapper(
+        String type, ClassLoader applicationLoader, ClassLoader ownerLoader) {
       return new dev.xtrace.agent.runtime.line.LineProbeAsmWrapper(
           dev.xtrace.agent.runtime.line.LineProbeConfig.focused(PROBE_OWNER),
           registry,
-          type -> null,
+          ignored -> null,
           batch -> {
             for (dev.xtrace.agent.runtime.line.MethodReport report : batch) {
               if (reportCount.incrementAndGet() > MAX_LINE_REPORTS) {
                 reportCount.decrementAndGet();
+                reportsOverflowed = true;
                 return;
               }
               reports.add(report);
+              if (report.status() == dev.xtrace.agent.runtime.line.MethodReport.Status.SKIPPED
+                  && !dev.xtrace.agent.runtime.line.MethodReport.Reasons.BRIDGE.equals(report.reason())
+                  && !dev.xtrace.agent.runtime.line.MethodReport.Reasons.SYNTHETIC.equals(report.reason())) {
+                synchronized (missing) {
+                  missing.computeIfAbsent(applicationLoader, ignored -> new java.util.HashMap<>())
+                      .computeIfAbsent(type, ignored -> new java.util.HashSet<>())
+                      .add(report.name().equals("<class>") ? "<class>" : report.name() + report.descriptor());
+                }
+              }
             }
           },
-          null);
+          ownerLoader);
+    }
+  }
+
+  static net.bytebuddy.matcher.ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription>
+      lineGapMethods() {
+    return not(isAbstract()).and(not(isNative())).and(not(isBridge())).and(not(isSynthetic()));
+  }
+
+  public static final class LineGapAdvice {
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static void enter(@Advice.Origin Class<?> type, @Advice.Origin("#m") String method,
+        @Advice.Origin("#d") String descriptor) {
+      BootstrapBridge.methodEntered(type, method, descriptor);
     }
   }
 
