@@ -2,8 +2,6 @@ package dev.xtrace.agent.runtime;
 
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -29,6 +27,12 @@ final class ProxyInterfaceSources {
   private ProxyInterfaceSources() {}
 
   static void observe(ClassLoader loader, String name, byte[] bytes, ApplicationScope scope) {
+    observe(loader, name, bytes, scope, () -> {});
+  }
+
+  /** Per-observation seam for a source change between identity and declaration reads. */
+  static void observe(ClassLoader loader, String name, byte[] bytes, ApplicationScope scope,
+      Runnable afterIdentity) {
     if (loader == null || bytes.length > 8 * 1024 * 1024) return;
     try {
       ClassReader reader = new ClassReader(bytes);
@@ -36,11 +40,11 @@ final class ProxyInterfaceSources {
       SourceIdentity.ClassFacts facts = SourceIdentity.parse(name, bytes);
       facts.resolve(scope.sourceRoots(), scope.sourceBase());
       if (facts.path() == null || facts.hash() == null) return;
-      Path file = locate(scope.sourceBase(), facts.path());
-      if (file == null || Files.size(file) > 1024 * 1024) return;
-      byte[] content = Files.readAllBytes(file);
-      if (content.length > 1024 * 1024
-          || !java.util.Arrays.equals(facts.hash(), SourceAttestation.blake3Of(content))) return;
+      afterIdentity.run();
+      ConfinedSourceFiles.Source source = ConfinedSourceFiles.read(scope.sourceBase(), facts.path());
+      if (source == null) return;
+      byte[] content = source.bytes();
+      if (!java.util.Arrays.equals(facts.hash(), SourceAttestation.blake3Of(content))) return;
       Map<String, SourceAttestation.SourceInfo> methods = new HashMap<>();
       String text = new String(content, StandardCharsets.UTF_8);
       List<Token> tokens = tokenize(text);
@@ -85,15 +89,6 @@ final class ProxyInterfaceSources {
       var methods = classes == null ? null : classes.get(method.getDeclaringClass().getName());
       return methods == null ? debug : methods.getOrDefault(method.getName() + descriptor, debug);
     }
-  }
-
-  private static Path locate(Path base, String relative) {
-    for (Path dir = base.toAbsolutePath().normalize(); dir != null; dir = dir.getParent()) {
-      Path file = dir.resolve(relative).normalize();
-      if (file.startsWith(dir) && Files.isRegularFile(file, java.nio.file.LinkOption.NOFOLLOW_LINKS))
-        return file;
-    }
-    return null;
   }
 
   private record Token(String text, int line) {}

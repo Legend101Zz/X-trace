@@ -144,6 +144,96 @@ class SourceIdentityTest {
   }
 
   @Test
+  void fileSwappedForExternalSymlinkAfterValidationIsUnavailable(@TempDir Path directory)
+      throws Exception {
+    Path external = sourceTree(directory.resolve("external"), 200);
+    Path project = directory.resolve("project");
+    Path file = sourceTree(project, 200);
+    sourceTree(project.resolve("fallback"), 200);
+    boolean[] swapped = {false};
+    SourceIdentity.observe(SampleService.class.getClassLoader(), INTERNAL, classBytes(),
+        List.of("src/main/java", "fallback/src/main/java"), project, validated -> {
+          assertEquals(file.toRealPath(), validated);
+          Files.delete(file);
+          Files.createSymbolicLink(file, external);
+          swapped[0] = true;
+        });
+    assertTrue(swapped[0], "swap must occur between validation and opening");
+    assertSourceUnavailable();
+  }
+
+  @Test
+  void directorySwappedForExternalSymlinkAfterValidationIsUnavailable(@TempDir Path directory)
+      throws Exception {
+    Path external = sourceTree(directory.resolve("external"), 200);
+    Path project = directory.resolve("project");
+    Path file = sourceTree(project, 200);
+    sourceTree(project.resolve("fallback"), 200);
+    boolean[] swapped = {false};
+    SourceIdentity.observe(SampleService.class.getClassLoader(), INTERNAL, classBytes(),
+        List.of("src/main/java", "fallback/src/main/java"), project, validated -> {
+          Path parent = file.getParent();
+          Files.move(parent, parent.resolveSibling("saved-testapp"));
+          Files.createSymbolicLink(parent, external.getParent());
+          swapped[0] = true;
+        });
+    assertTrue(swapped[0], "the opened parent must be replaced during the read");
+    assertSourceUnavailable();
+  }
+
+  @Test
+  void sameSizedFileReplacementAfterValidationIsUnavailable(@TempDir Path project)
+      throws Exception {
+    Path file = sourceTree(project, 200);
+    boolean[] swapped = {false};
+    SourceIdentity.observe(SampleService.class.getClassLoader(), INTERNAL, classBytes(),
+        List.of("src/main/java"), project, validated -> {
+          // Keep the original inode alive, and preserve size/mtime: fileKey must catch this.
+          Path original = Files.move(file, file.resolveSibling("original.java"));
+          Files.copy(original, file, java.nio.file.StandardCopyOption.COPY_ATTRIBUTES);
+          swapped[0] = true;
+        });
+    assertTrue(swapped[0]);
+    assertSourceUnavailable();
+  }
+
+  @Test
+  void fileGrowthAfterValidationIsUnavailable(@TempDir Path project) throws Exception {
+    Path file = sourceTree(project, 200);
+    boolean[] edited = {false};
+    SourceIdentity.observe(SampleService.class.getClassLoader(), INTERNAL, classBytes(),
+        List.of("src/main/java"), project, validated -> {
+          Files.writeString(file, "// growth\n", java.nio.file.StandardOpenOption.APPEND);
+          edited[0] = true;
+        });
+    assertTrue(edited[0]);
+    assertSourceUnavailable();
+  }
+
+  @Test
+  void oversizedSourceIsMetadataInvalid(@TempDir Path project) throws Exception {
+    Path file = sourceTree(project, 200);
+    Files.write(file, new byte[1024 * 1024 + 1]);
+    observe(project, List.of("src/main/java"));
+    SourceAttestation.SourceInfo info = SourceIdentity.lookup(SampleService.class, "place", PLACE);
+    assertEquals(5, info.binding());
+    assertNull(info.path());
+    assertNull(info.hash());
+  }
+
+  @Test
+  void sourceDirectoryAliasWithinProjectKeepsTheHappyPath(@TempDir Path project)
+      throws Exception {
+    Path file = sourceTree(project, 200);
+    Files.createSymbolicLink(project.resolve("sources"), project.resolve("src/main/java"));
+    observe(project, List.of("sources"));
+    SourceAttestation.SourceInfo info = SourceIdentity.lookup(SampleService.class, "place", PLACE);
+    assertEquals(SourceIdentity.OBSERVED_UNATTESTED, info.binding());
+    assertEquals(SOURCE, info.path());
+    assertArrayEquals(SourceAttestation.blake3Of(Files.readAllBytes(file)), info.hash());
+  }
+
+  @Test
   void sourceRootCannotTraverseOrNameAnAbsoluteOutsidePath(@TempDir Path directory)
       throws Exception {
     Path external = directory.resolve("external");

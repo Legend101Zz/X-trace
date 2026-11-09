@@ -1,8 +1,6 @@
 package dev.xtrace.agent.runtime;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
@@ -36,7 +34,6 @@ final class SourceIdentity {
   private static final int ATTESTATION_MISSING = 2;
   private static final int DEBUG_METADATA_ABSENT = 4;
   private static final int SOURCE_METADATA_INVALID = 5;
-  private static final long MAX_SOURCE_BYTES = 1024 * 1024;
   private static final int MAX_CLASS_BYTES = 8 * 1024 * 1024;
   private static final int MAX_CLASSES_PER_LOADER = 20_000;
 
@@ -51,11 +48,21 @@ final class SourceIdentity {
       byte[] classBytes,
       List<String> sourceRoots,
       Path workingDirectory) {
+    observe(loader, internalName, classBytes, sourceRoots, workingDirectory, file -> {});
+  }
+
+  static void observe(
+      ClassLoader loader,
+      String internalName,
+      byte[] classBytes,
+      List<String> sourceRoots,
+      Path workingDirectory,
+      ConfinedSourceFiles.BeforeOpen beforeOpen) {
     if (loader == null || internalName == null || classBytes == null) return;
     if (classBytes.length > MAX_CLASS_BYTES) return;
     try {
       ClassFacts facts = parse(internalName, classBytes);
-      facts.resolve(sourceRoots, workingDirectory);
+      facts.resolve(sourceRoots, workingDirectory, beforeOpen);
       synchronized (LOADERS) {
         Map<String, ClassFacts> classes = LOADERS.computeIfAbsent(loader, key -> new HashMap<>());
         if (classes.size() < MAX_CLASSES_PER_LOADER) {
@@ -167,6 +174,11 @@ final class SourceIdentity {
     }
 
     void resolve(List<String> sourceRoots, Path workingDirectory) {
+      resolve(sourceRoots, workingDirectory, file -> {});
+    }
+
+    private void resolve(List<String> sourceRoots, Path workingDirectory,
+        ConfinedSourceFiles.BeforeOpen beforeOpen) {
       if (sourceFile == null || !simpleSourceName(sourceFile)) {
         fileProblem = sourceFile == null ? DEBUG_METADATA_ABSENT : SOURCE_METADATA_INVALID;
         return;
@@ -180,22 +192,22 @@ final class SourceIdentity {
         }
         Path base = workingDirectory.toRealPath();
         for (String root : sourceRoots) {
-          Path found = locate(base, root + "/" + packagePath + sourceFile);
+          ConfinedSourceFiles.Source found = ConfinedSourceFiles.read(
+              base, root + "/" + packagePath + sourceFile, beforeOpen);
           if (found == null) continue;
-          if (!found.getFileName().toString().equals(sourceFile)) {
+          if (!found.path().getFileName().toString().equals(sourceFile)) {
             fileProblem = SOURCE_METADATA_INVALID;
             return;
           }
-          if (Files.size(found) > MAX_SOURCE_BYTES) {
-            fileProblem = SOURCE_METADATA_INVALID;
-            return;
-          }
-          byte[] bytes = Files.readAllBytes(found);
+          byte[] bytes = found.bytes();
           hash = SourceAttestation.blake3Of(bytes);
           fileLines = countLines(bytes);
-          path = base.relativize(found).toString().replace('\\', '/');
+          path = found.path().toString().replace('\\', '/');
           return;
         }
+      } catch (ConfinedSourceFiles.TooLarge invalid) {
+        fileProblem = SOURCE_METADATA_INVALID;
+        return;
       } catch (IOException unavailable) {
         // An unsafe or unreadable path must not fall through to a different source root.
       }
@@ -237,24 +249,6 @@ final class SourceIdentity {
       if (c == '/' || c == '\\' || c < ' ' || c == 0x7f || c == ':') return false;
     }
     return !name.equals(".java") && !name.startsWith(".");
-  }
-
-  /** Missing files allow another declared root; an escaping path stops resolution entirely. */
-  private static Path locate(Path base, String relative) throws IOException {
-    Path suffix = Path.of(relative);
-    if (suffix.isAbsolute()) throw new IOException("source path is outside the project");
-    Path current = base;
-    for (Path part : suffix) {
-      // Do not normalize away a traversal or a symlink before checking its destination.
-      if (part.toString().equals("..")) {
-        throw new IOException("source path contains a parent segment");
-      }
-      current = current.resolve(part);
-      if (!Files.exists(current, LinkOption.NOFOLLOW_LINKS)) return null;
-      current = current.toRealPath();
-      if (!current.startsWith(base)) throw new IOException("source path is outside the project");
-    }
-    return Files.isRegularFile(current, LinkOption.NOFOLLOW_LINKS) ? current : null;
   }
 
   static int countLines(byte[] bytes) {
