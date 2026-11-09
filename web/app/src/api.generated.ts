@@ -455,6 +455,8 @@ export interface components {
             interaction?: {
                 [key: string]: string | null;
             } | null;
+            /** @description Persisted exception type only; null when no payload was recorded. Messages and stack text are withheld. Cause chains are not recorded by the current agent protocol and must not be inferred from other events. */
+            exception: null | components["schemas"]["EventException"];
             /**
              * @description Adapter-reported compile-time class-to-source binding result.
              * @enum {string}
@@ -494,6 +496,10 @@ export interface components {
             /** @description Empty means none observed. */
             bindings: components["schemas"]["Binding"][];
             gap: null | components["schemas"]["Gap"];
+        };
+        EventException: {
+            /** @description Recorded type name; null when not observed. Oversized legacy names use a truncation marker recorded in fieldTruncations. */
+            exceptionType: string | null;
         };
         /** @enum {string} */
         Completion: "complete" | "partial" | "invalid" | "unavailable";

@@ -1567,6 +1567,7 @@ struct TransportEvent {
     kind: String,
     symbol: Option<String>,
     interaction: Option<xtrace_application::PersistedInteraction>,
+    exception: Option<xtrace_application::recording_queries::PersistedException>,
     source: Option<xtrace_application::PersistedSource>,
     source_binding: xtrace_domain::SourceBinding,
     field_truncations: Vec<TransportTruncation>,
@@ -1614,6 +1615,7 @@ fn to_transport_detail(detail: RecordingDetail, request_id: CorrelationId) -> Tr
                 kind: item.kind,
                 symbol: item.symbol,
                 interaction: item.interaction,
+                exception: item.exception,
                 source: item.source,
                 source_binding: item.source_binding,
                 depth: item.depth,
@@ -2259,6 +2261,7 @@ mod tests {
                 kind: "frame_enter".into(),
                 symbol: None,
                 interaction: None,
+                exception: None,
                 source: None,
                 source_binding: xtrace_domain::SourceBinding::Unspecified,
                 field_truncations: Vec::new(),
@@ -2692,6 +2695,144 @@ mod tests {
             assert_eq!(event["source"]["startLine"], 5);
             assert_eq!(event["source"]["endLine"], 15);
         }
+        let _ = viewer.shutdown.send(());
+        viewer.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stored_throw_type_reaches_http_without_message_or_stack_text() {
+        use xtrace_protocol::generated::agent::{
+            ExceptionPayload, RecordingEvent, RecordingEventKind,
+        };
+        use xtrace_protocol::xtf::XtfEventEnvelope;
+        use xtrace_store::SegmentCommitRequest;
+
+        let scratch = std::path::PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
+            .expect("admitted private test scratch");
+        let root = tempfile::Builder::new()
+            .prefix("viewer-throw-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir_in(scratch)
+            .expect("temporary project root");
+        let database = root.path().join("metadata.sqlite3");
+        let store = SqliteStore::open(&database, OpenOptions::default()).expect("open store");
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .expect("secure database");
+        let timestamp = WallTime::from_parts(2026, 10, 3, 1, 2, 3, 0).expect("fixture time");
+        let project = Project {
+            id: ProjectId::new(),
+            canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/fixture/repo"),
+            display_name: "fixture".into(),
+            created_at: timestamp,
+            last_opened_at: timestamp,
+            config_schema_version: 1,
+            effective_config_hash: String::new(),
+            active_capture_policy_id: None,
+            active_redaction_policy_id: None,
+        };
+        store.project_repository().insert_project(&project).expect("insert project");
+        let recording_id = RecordingId::new();
+        SqliteRecordingPersistence::new(store.clone(), root.path())
+            .begin_recording(&BeginRecording {
+                project_id: project.id(),
+                recording_id,
+                runtime_session_id: RuntimeSessionId::new(),
+                opened_at: timestamp,
+                endpoint_observation: EndpointObservationInput::default(),
+                limitations: Vec::new(),
+            })
+            .expect("begin recording");
+        store
+            .recording_store(root.path())
+            .expect("recording store")
+            .commit_segment(&SegmentCommitRequest {
+                project_id: project.id(),
+                recording_id,
+                segment_ordinal: 0,
+                events: [
+                    (2, Some("org.example.ApplicationException")),
+                    (3, Some("jakarta.servlet.ServletException")),
+                    (4, None),
+                ]
+                .into_iter()
+                .map(|(sequence, exception_type)| XtfEventEnvelope {
+                    recording_seq: sequence,
+                    event: Some(RecordingEvent {
+                        event_id: format!("event-{sequence}"),
+                        recording_seq: sequence,
+                        kind: RecordingEventKind::FrameThrow as i32,
+                        exception: exception_type.map(|exception_type| ExceptionPayload {
+                            exception_type: exception_type.into(),
+                            // Bypass ingest deliberately: legacy persisted text must never
+                            // become public merely because its field is called sanitized.
+                            sanitized_message: "private-message-canary password=do-not-display"
+                                .into(),
+                            stack_frames: vec!["Caused by: private-stack-canary".into()],
+                        }),
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+            })
+            .expect("persist real XTF segment");
+        let reader = SqliteRecordingReader::new(store, root.path());
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(reader.clone()),
+            ObservedEndpointQueryService::new(reader),
+            project.id(),
+        )
+        .await
+        .expect("bind viewer");
+        let ready = bound.readiness();
+        let host = ready.origin.strip_prefix("http://").expect("loopback origin").to_owned();
+        let token = ready.url.rsplit_once("token=").expect("bootstrap token").1.to_owned();
+        let query_lane = bound.state.query_lane.clone();
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(bound.serve(async move {
+            let _ = receiver.await;
+        }));
+        let viewer = RunningViewer {
+            host,
+            origin: ready.origin,
+            token,
+            observed_calls: Arc::new(AtomicUsize::new(0)),
+            query_lane,
+            shutdown,
+            task,
+        };
+        let cookie = authenticate(&viewer).await;
+        let raw = format!(
+            "GET /api/v1/recordings/{recording_id} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        let response = request(&viewer.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!response.contains("private-message-canary"));
+        assert!(!response.contains("do-not-display"));
+        assert!(!response.contains("private-stack-canary"));
+        let body: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").expect("HTTP body").1)
+                .expect("recording JSON");
+        let events = body["events"].as_array().expect("events");
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0]["exception"],
+            serde_json::json!({
+                "exceptionType": "org.example.ApplicationException",
+            })
+        );
+        assert_eq!(
+            events[1]["exception"],
+            serde_json::json!({
+                "exceptionType": "jakarta.servlet.ServletException",
+            })
+        );
+        assert!(events[2]["exception"].is_null(), "never infer a missing payload");
+        assert!(body["outcome"].is_null(), "never infer a recording outcome from a throw");
         let _ = viewer.shutdown.send(());
         viewer.task.await.unwrap().unwrap();
     }
