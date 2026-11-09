@@ -83,7 +83,7 @@
     "Docker Linux aarch64 dependencies available; Linux x86_64 packaged acceptance unrun",
     "Postman connected credentials unavailable; local export fallback remains mandatory"
   ],
-  "next": "Finish reviewed release-control gate tooling, exact local floor and CI; integrate source and Node preparation after their own exact gates; finish attach/shared replay and every mandatory product/release requirement.",
+  "next": "Finish reviewed release-control gate tooling and exact GitHub-hosted verification under ADR 0012; integrate source and Node preparation after their own exact gates; finish attach/shared replay and every mandatory product/release requirement.",
   "decisions": [
     {
       "date": "2026-10-04",

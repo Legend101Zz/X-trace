@@ -575,12 +575,13 @@ Parallel lanes use isolated fixtures and branches. They may propose shared chang
 Every bounded implementation phase follows `Phase -> Implement -> Review ->
 Verify -> Status -> user approval -> Next phase`. The main orchestrator owns
 decomposition, shared architecture, independent review, and independent testing.
-GPT-5.6 Terra and Luna agents may be used for implementation, review, debugging,
-or architecture checks at Medium or High reasoning according to the phase's
-complexity.
+Agent and tool authorization follows [ADR 0012](../../decisions/0012-agent-workforce-and-github-verification.md).
+Workers implement and may review work written by a different model; review
+and merge checks scale to risk as specified there.
 
-Workers commit coherent branch changes but do not merge or push `main`. After a
-phase is reviewed and verified, the orchestrator stops and reports completed
+Workers leave coherent uncommitted diffs; the orchestrator alone commits, pushes,
+merges and releases. After a phase is reviewed and verified, the orchestrator
+stops and reports completed
 work, changes, verification, issues or decisions, remaining work, and the exact
 next proposed phase. The next phase, merge, push, or any background continuation
 requires explicit user approval; no automation may cross that boundary.
