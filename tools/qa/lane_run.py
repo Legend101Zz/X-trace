@@ -285,11 +285,44 @@ def _encoded(value) -> bytes:
     return json.dumps(value, sort_keys=True, ensure_ascii=True).encode("utf-8")
 
 
-def _private(text: str, index) -> bool:
+def _private(text: str, index, *, structured: bool = False) -> bool:
     hits: dict = {}
     canary.scan_bytes(text.encode("utf-8"), index, hits, "ci-excerpt")
-    return bool(hits or DIAG_BAD.search(text) or PRIVATE_TEXT.search(text)
+    # The scanner still sees placeholders; only the legacy keyword guard needs
+    # to distinguish our literal <token> from an observed credential label.
+    guarded = text.replace("<token>", "") if structured else text
+    return bool(hits or DIAG_BAD.search(guarded) or PRIVATE_TEXT.search(text)
                 or any(ord(c) < 32 and c not in "\n\t" for c in text))
+
+
+MESSAGE_LITERAL = re.compile(
+    r"(?P<str>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`[^`]*`|[\"'`].*$)"
+    r"|(?P<url>\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"'`]+)"
+    r"|(?P<path>(?:[A-Za-z]:[\\/]|[~.]?[\\/])[^\s<>\"'`]*"
+    r"|\b[\w.-]+(?:[\\/][\w.:-]+)+|\b[\w.-]+\.[A-Za-z][A-Za-z0-9]*(?::\d+)*\b)"
+)
+MESSAGE_VALUE = re.compile(r"(?P<label>\b(?:left|right)\s*:|\b(?:expected|actual)\b(?:\s*:)?|=+)\s*(?P<value>.+)$", re.I)
+MESSAGE_TOKEN = re.compile(r"<str>|<num>|<path>|<url>|<token>|\S{17,}|\d{7,}")
+
+
+def _value_placeholder(value: str) -> str:
+    value = value.strip()
+    if value in {"<str>", "<num>", "<path>", "<url>", "<token>"}:
+        return value
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", value):
+        return "<num>"
+    return "<token>"
+
+
+def _message_structure(text: str) -> str:
+    """Keep diagnostic syntax; values never inherit the source-site/name exemptions.
+
+    Value labels consume the remainder of a line, including compound values. This
+    deliberately loses some detail rather than guessing where captured data ends.
+    """
+    text = MESSAGE_LITERAL.sub(lambda m: f"<{m.lastgroup}>", text)
+    text = MESSAGE_VALUE.sub(lambda m: m["label"] + " " + _value_placeholder(m["value"]), text)
+    return MESSAGE_TOKEN.sub(lambda m: _value_placeholder(m[0]), text)
 
 
 def _failure_blocks(text: str):
@@ -324,8 +357,8 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
                     index=None) -> dict | None:
     """Extract only observed failure locations/messages and harness progress.
 
-    Scan whole failure blocks before truncation, so a secret past the excerpt cap
-    withholds the entire excerpt. No scanner hit or private value is ever serialized.
+    Scan whole failure blocks before truncation, then redact message values and scan
+    every output field again. A scanner hit past the cap still withholds the excerpt.
     """
     index = CANARY_INDEX if index is None else index
     failures = {name: {"test": name, "location": "not observed", "message": ["not observed"]}
@@ -356,7 +389,7 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
                     row["location"] = m.group(1)
             elif line.strip() and not line.lstrip().startswith(("at ", "note:", "stack backtrace:")):
                 if after_panic or kind == "gradle":
-                    message.append(line.strip())
+                    message.append(_message_structure(line.strip()))
                     if m := GRADLE_SHORT_SITE.fullmatch(line.strip()):
                         row["location"] = m.group(1)
         if not message:
@@ -369,8 +402,10 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             row["message"][-1] = row["message"][-1][:-max(1, overflow // 6)]
             if not row["message"][-1]:
                 row["message"].pop()
-    # Names are scanned too: a syntactically valid test id can contain a canary.
-    rows = [row if not _private(row["test"], index) else {"excerpt": WITHHELD}
+    # Scan all serialized fields after redaction too, including names and locations.
+    rows = [row if not _private("\n".join([row["test"], row.get("location", ""),
+                                         *row.get("message", []), row.get("excerpt", "")]),
+                               index, structured=True) else {"excerpt": WITHHELD}
             for row in failures.values()]
     result: dict = {"failures": rows, "omitted": 0}
     if timed_out:

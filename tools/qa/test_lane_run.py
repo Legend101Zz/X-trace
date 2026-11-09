@@ -58,7 +58,7 @@ class FailureDetailsTests(unittest.TestCase):
         detail = lane_run.failure_details(self.cargo(), False)
         self.assertEqual(detail["failures"], [{
             "test": "journey::fails", "location": "crates/example/tests/journey.rs:42:7",
-            "message": ["assertion `left == right` failed", "left: 1", "right: 2"], "truncated": False,
+            "message": ["assertion <str> failed", "left: <num>", "right: <num>"], "truncated": False,
         }])
 
     def test_cargo_nocapture_panics_are_associated_with_their_own_tests(self):
@@ -72,8 +72,10 @@ class FailureDetailsTests(unittest.TestCase):
         self.assertNotIn("unrelated", json.dumps(rows))
 
     def test_gradle_full_and_short_failure_formats(self):
-        for exception in ("org.opentest4j.AssertionFailedError: expected: <200> but was: <500>",
-                          "java.lang.AssertionError: expected status 200"):
+        for exception, structure in (
+                ("org.opentest4j.AssertionFailedError: expected: <200> but was: <500>",
+                 "<path>: expected: <token>"),
+                ("java.lang.AssertionError: expected status 200", "<path>: expected <token>")):
             text = ("  com.example.HttpTest > finalStatus() FAILED\n"
                     f"    {exception}\n"
                     "        at org.junit.AssertionFailureBuilder.build(AssertionFailureBuilder.java:100)\n"
@@ -82,7 +84,7 @@ class FailureDetailsTests(unittest.TestCase):
             with self.subTest(exception=exception):
                 rows = lane_run.failure_details(text, False)["failures"]
                 self.assertEqual(rows, [{"test": "HttpTest::finalStatus", "location": "HttpTest.java:81",
-                                         "message": [exception], "truncated": False}])
+                                         "message": [structure], "truncated": False}])
         text = ("HttpTest > finalStatus() FAILED\n"
                 "    org.opentest4j.AssertionFailedError at HttpTest.java:81\n")
         self.assertEqual(lane_run.failure_details(text, False)["failures"][0]["location"], "HttpTest.java:81")
@@ -113,7 +115,7 @@ class FailureDetailsTests(unittest.TestCase):
         self.assertEqual(row["message"], ["not observed"])
 
     def test_per_test_line_and_serialized_byte_caps(self):
-        messages = ("\n".join(f"assertion line {i}" for i in range(30)), "é" * 10000)
+        messages = ("\n".join(f"assertion line {i}" for i in range(30)), "é " * 10000)
         for message in messages:
             with self.subTest(message_length=len(message)):
                 row = lane_run.failure_details(self.cargo(message=message), False)["failures"][0]
@@ -123,7 +125,7 @@ class FailureDetailsTests(unittest.TestCase):
                 self.assertTrue(row["message"][0])
 
     def test_job_cap_and_omitted_count(self):
-        text = "".join(self.cargo(name=f"case{i}", message="x" * 3000) for i in range(32))
+        text = "".join(self.cargo(name=f"case{i}", message="x " * 3000) for i in range(32))
         detail = lane_run.failure_details(text, False)
         self.assertLessEqual(len(lane_run._encoded(detail)), lane_run.MAX_JOB_EXCERPT_BYTES)
         self.assertGreater(detail["omitted"], 0)
@@ -135,6 +137,46 @@ class FailureDetailsTests(unittest.TestCase):
         row = lane_run.failure_details(text, False)["failures"][0]
         self.assertEqual(row, {"test": "journey::fails", "excerpt": "withheld: privacy scan"})
         self.assertNotIn("safe assertion", json.dumps(row))
+
+    def test_unmarked_values_are_masked_but_test_and_source_site_survive(self):
+        values = ["left: ghp_abc123", "right: account balance", "expected: customer-record",
+                  "actual customer-record", "result=customer-record"]
+        for value in values:
+            with self.subTest(value=value):
+                self.assertFalse(lane_run._private(value, lane_run.CANARY_INDEX))
+                row = lane_run.failure_details(self.cargo(message=value), False)["failures"][0]
+                self.assertEqual(row["test"], "journey::fails")
+                self.assertEqual(row["location"], "crates/example/tests/journey.rs:42:7")
+                label = value.split(":", 1)[0] + ":" if ":" in value else value.split()[0]
+                if "=" in value:
+                    label = "result="
+                self.assertEqual(row["message"], [label + " <token>"])
+                self.assertNotIn(value, json.dumps(row))
+
+    def test_structure_masks_literals_paths_urls_long_tokens_and_numbers(self):
+        cases = [
+            ('message "business value" and \'other value\' and `expression`',
+             "message <str> and <str> and <str>"),
+            ('message "escaped \\\" quote"', "message <str>"),
+            ('message "unterminated', "message <str>"),
+            ("read relative/data.txt and data.txt:42", "read <path> and <path>"),
+            (r"read C:\work\data.txt", "read <path>"),
+            ("visit https://example.test/data", "visit <url>"),
+            ("value abcdefghijklmnopq", "value <token>"),
+            ("value 1234567 and 123456", "value <num> and 123456"),
+            ("value 12345678901234567", "value <num>"),
+            ("left: 200", "left: <num>"),
+            ('actual: "short"', "actual: <str>"),
+        ]
+        for message, structure in cases:
+            with self.subTest(message=message):
+                self.assertEqual(lane_run._message_structure(message), structure)
+
+    def test_redacted_fields_are_scanned_as_a_second_gate(self):
+        index = [*lane_run.CANARY_INDEX, *lane_run.canary.build_index({"redacted": "<str>"})]
+        row = lane_run.failure_details(self.cargo(message='assertion "value"'), False,
+                                       index=index)["failures"][0]
+        self.assertEqual(row, {"excerpt": lane_run.WITHHELD})
 
     def test_private_canaries_use_existing_scanner_encodings(self):
         values = {"assertion": "synthetic-value-31fe"}
@@ -337,7 +379,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual(rc, 101)
         self.assertFalse(frag["timedOut"])
         self.assertEqual(frag["failureDetails"]["failures"][0]["message"][0],
-                         "assertion `left == right` failed")
+                         "assertion <str> failed")
         self.assertNotIn("left == right", public.getvalue())
         rc, frag = self.run_step([sys.executable, "-c",
                                   f"print({FailureDetailsTests.cargo(message='BODY_CANARY_123')!r}); raise SystemExit(101)"])
@@ -367,7 +409,7 @@ class RunTests(unittest.TestCase):
 
     def test_fragments_share_job_cap_across_failed_steps(self):
         import os
-        text = "".join(FailureDetailsTests.cargo(name=f"case{i}", message="x" * 3000) for i in range(32))
+        text = "".join(FailureDetailsTests.cargo(name=f"case{i}", message="x " * 3000) for i in range(32))
 
         def failed(cmd, *, stdout, **kwargs):
             stdout.write(text.encode())
