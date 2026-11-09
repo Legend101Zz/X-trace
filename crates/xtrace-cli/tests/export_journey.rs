@@ -10,6 +10,8 @@
     reason = "integration tests assert on fixed fixtures and checked subprocess output"
 )]
 
+mod support;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -63,9 +65,7 @@ impl Fx {
     fn write_analyzer(&self, transcript: &str) -> PathBuf {
         fs::write(self.repo.join("transcript.jsonl"), transcript).expect("transcript");
         let path = self.repo.join("analyzer.sh");
-        fs::write(&path, "#!/bin/sh\ncat \"$(dirname \"$0\")/transcript.jsonl\"\n")
-            .expect("analyzer");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        support::write_executable(&path, "#!/bin/sh\ncat \"$(dirname \"$0\")/transcript.jsonl\"\n");
         path
     }
 
