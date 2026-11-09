@@ -9,9 +9,38 @@ import dev.xtrace.fixture.OrderService;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Proxy;
 import java.util.concurrent.atomic.AtomicBoolean;
+import net.bytebuddy.jar.asm.ClassWriter;
+import net.bytebuddy.jar.asm.Opcodes;
 import org.junit.jupiter.api.Test;
 
 class FixtureInstrumentationTest {
+  @Test
+  void gapOwnerRequiresTheActualBridgeEvenWhenAShadowHasLineGap() {
+    assertTrue(FixtureInstrumentation.gapOwnerAvailable(getClass().getClassLoader()));
+    String name = FixtureInstrumentation.PROBE_OWNER.replace('/', '.');
+    ClassWriter bytes = new ClassWriter(0);
+    bytes.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, FixtureInstrumentation.PROBE_OWNER,
+        null, "java/lang/Object", null);
+    var gap = bytes.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "lineGap", "()V", null, null);
+    gap.visitCode();
+    gap.visitInsn(Opcodes.RETURN);
+    gap.visitMaxs(0, 0);
+    gap.visitEnd();
+    bytes.visitEnd();
+    byte[] shadow = bytes.toByteArray();
+    ClassLoader loader = new ClassLoader(getClass().getClassLoader()) {
+      @Override
+      protected Class<?> loadClass(String requested, boolean resolve) throws ClassNotFoundException {
+        if (!name.equals(requested)) return super.loadClass(requested, resolve);
+        Class<?> owner = findLoadedClass(requested);
+        if (owner == null) owner = defineClass(requested, shadow, 0, shadow.length);
+        if (resolve) resolveClass(owner);
+        return owner;
+      }
+    };
+    assertFalse(FixtureInstrumentation.gapOwnerAvailable(loader));
+  }
+
   @Test
   void matchersExcludeAgentFrameworkProxiesAndUnrelatedApplicationTypes() {
     assertTrue(

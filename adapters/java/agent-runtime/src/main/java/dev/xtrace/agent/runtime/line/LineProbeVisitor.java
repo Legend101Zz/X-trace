@@ -47,6 +47,7 @@ public class LineProbeVisitor extends ClassVisitor {
   private final byte[] classDigest;
   private final List<MethodReport> reports;
   private String className = "";
+  private int classVersion;
   /** False once any marker says the class was not produced by javac (LVT precision unknown). */
   private boolean javacLvtTrusted = true;
   private boolean sawJavaSource;
@@ -70,6 +71,7 @@ public class LineProbeVisitor extends ClassVisitor {
   public void visit(
       int version, int access, String name, String signature, String superName, String[] interfaces) {
     this.className = name;
+    classVersion = version & 0xffff;
     denied = name.equals(config.probeOwner()) || isDenyScope(name);
     if (denied) {
       reports.add(
@@ -144,6 +146,15 @@ public class LineProbeVisitor extends ClassVisitor {
   /** Emits an optional, stack-neutral entry probe after an eligible method's skip decision. */
   protected void skippedMethodEntry(MethodVisitor method) {}
 
+  /** Conservative byte bound for the optional call, excluding its caller-side suppression. */
+  protected int skippedMethodEntryBytes() { return 0; }
+
+  /** Reports that invocation attribution is unavailable even though the method is preserved. */
+  protected void skippedMethodEntryUnavailable() {}
+
+  /** A class-level owner failure still uses the buffered, size-checked skipped-method path. */
+  protected String classSkipReason() { return null; }
+
   // ---------------------------------------------------------------------------------------------
 
   private enum Kind {
@@ -151,6 +162,7 @@ public class LineProbeVisitor extends ClassVisitor {
     LABEL,
     LINE,
     FRAME,
+    TRY_CATCH,
     INSN
   }
 
@@ -175,6 +187,7 @@ public class LineProbeVisitor extends ClassVisitor {
     private boolean hasLine;
     private boolean hasJsrRet;
     private int estimatedBytes;
+    private int tryCatchBlocks;
 
     Buffer(MethodVisitor out, int access, String name, String descriptor) {
       super(ASM, null);
@@ -341,7 +354,8 @@ public class LineProbeVisitor extends ClassVisitor {
 
     @Override
     public void visitTryCatchBlock(Label start, Label end, Label handler, String type) {
-      add(Kind.OTHER, mv -> mv.visitTryCatchBlock(start, end, handler, type));
+      tryCatchBlocks++;
+      add(Kind.TRY_CATCH, mv -> mv.visitTryCatchBlock(start, end, handler, type));
     }
 
     @Override
@@ -430,8 +444,25 @@ public class LineProbeVisitor extends ClassVisitor {
       if (d.skip() != null) {
         // Keep the entry probe outside the original labels so a back edge never repeats it.
         ops.get(0).accept(out); // visitCode
-        skippedMethodEntry(out);
-        for (int i = 1; i < ops.size(); i++) ops.get(i).accept(out);
+        // Append the guard after the original exception table so type-annotation indexes keep
+        // referring to the same application handlers. None of those handlers covers our call.
+        for (int i = 1; i < ops.size(); i++) {
+          if (kinds.get(i) == Kind.TRY_CATCH) ops.get(i).accept(out);
+        }
+        int probeBytes = skippedMethodEntryBytes();
+        if (probeBytes > 0) {
+          // Estimates already include worst-case switch padding and jump widening. The guard
+          // adds a short goto and pop; never risk losing healthy siblings for this gap call.
+          if ((long) estimatedBytes + probeBytes + 4 > 65_535
+              || tryCatchBlocks == 65_535 || hasJsrRet) {
+            skippedMethodEntryUnavailable();
+          } else {
+            guardedSkippedEntry();
+          }
+        }
+        for (int i = 1; i < ops.size(); i++) {
+          if (kinds.get(i) != Kind.TRY_CATCH) ops.get(i).accept(out);
+        }
         reports.add(skipped(name, descriptor, d.skip()));
         return;
       }
@@ -449,9 +480,11 @@ public class LineProbeVisitor extends ClassVisitor {
     }
 
     private Decision decide() {
-      String skip = null;
-      if (!hasLine) skip = Reasons.NO_LINE_TABLE;
-      else if (hasJsrRet) skip = Reasons.JSR_RET;
+      String skip = classSkipReason();
+      if (skip == null) {
+        if (!hasLine) skip = Reasons.NO_LINE_TABLE;
+        else if (hasJsrRet) skip = Reasons.JSR_RET;
+      }
 
       List<PlannedSite> plan = skip == null ? plan() : List.of();
       String valuesReason = Reasons.NONE;
@@ -514,6 +547,47 @@ public class LineProbeVisitor extends ClassVisitor {
         }
       }
       return new Decision(plan, values, valuesReason, siteIds, null);
+    }
+
+    private void guardedSkippedEntry() {
+      Label start = new Label();
+      Label end = new Label();
+      Label handler = new Label();
+      Label resume = new Label();
+      out.visitTryCatchBlock(start, end, handler, "java/lang/Throwable");
+      out.visitLabel(start);
+      skippedMethodEntry(out);
+      out.visitLabel(end);
+      out.visitJumpInsn(Opcodes.GOTO, resume);
+      out.visitLabel(handler);
+      Object[] initial = initialLocals();
+      if (classVersion >= Opcodes.V1_6) {
+        out.visitFrame(Opcodes.F_NEW, initial.length, initial, 1,
+            new Object[] {"java/lang/Throwable"});
+      }
+      out.visitInsn(Opcodes.POP);
+      out.visitLabel(resume);
+      if (classVersion >= Opcodes.V1_6) {
+        out.visitFrame(Opcodes.F_NEW, initial.length, initial, 0, new Object[0]);
+      }
+    }
+
+    private Object[] initialLocals() {
+      List<Object> initial = new ArrayList<>();
+      if ((access & Opcodes.ACC_STATIC) == 0) {
+        initial.add(name.equals("<init>") ? Opcodes.UNINITIALIZED_THIS : className);
+      }
+      for (Type argument : Type.getArgumentTypes(descriptor)) {
+        initial.add(switch (argument.getSort()) {
+          case Type.BOOLEAN, Type.BYTE, Type.CHAR, Type.SHORT, Type.INT -> Opcodes.INTEGER;
+          case Type.FLOAT -> Opcodes.FLOAT;
+          case Type.LONG -> Opcodes.LONG;
+          case Type.DOUBLE -> Opcodes.DOUBLE;
+          case Type.ARRAY -> argument.getDescriptor();
+          default -> argument.getInternalName();
+        });
+      }
+      return initial.toArray();
     }
 
     /** Pending-line walk: one planned site per run of line entries before a real instruction. */
