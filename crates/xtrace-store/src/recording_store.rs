@@ -1696,6 +1696,9 @@ impl SqliteRecordingStore<'_> {
             }
         };
         if let Some(completion) = terminal {
+            let connection =
+                self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+            checkpoint_terminal_evidence(&connection, correlation_id)?;
             return Ok(completion);
         }
 
@@ -1744,6 +1747,7 @@ impl SqliteRecordingStore<'_> {
         transaction.commit().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })?;
+        checkpoint_terminal_evidence(&connection, correlation_id)?;
         Ok(completion)
     }
 
@@ -4184,6 +4188,36 @@ fn terminal_conflict_error(correlation_id: CorrelationId) -> RecordingStoreError
         "recording finish conflicts with immutable terminal evidence",
         correlation_id,
     )
+}
+
+// NORMAL WAL commits make terminal evidence visible without syncing it. Finish
+// must cross a durability barrier before the daemon acknowledges it. Also run
+// this on exact replay: a previous attempt may have committed but failed here.
+fn checkpoint_terminal_evidence(
+    connection: &rusqlite::Connection,
+    correlation_id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    connection.pragma_update(None, "checkpoint_fullfsync", true).map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })?;
+    let (busy, frames, checkpointed): (i64, i64, i64) = connection
+        .query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
+    // SQLite reports an incomplete FULL checkpoint as a result row, not an
+    // error. In-memory stores report (-1, -1) and have no WAL to flush.
+    if busy != 0 || frames != checkpointed {
+        return Err(RecordingStoreError::new(
+            RecordingStoreErrorKind::Transport,
+            "XTR-STORE-TERMINAL-DURABILITY",
+            "recording terminal evidence checkpoint could not be completed",
+            correlation_id,
+        ));
+    }
+    Ok(())
 }
 
 fn completion_label(completion: RecordingCompletion) -> &'static str {
@@ -7779,6 +7813,91 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_requires_a_complete_wal_checkpoint_including_on_exact_replay() {
+        let fixture = on_disk_store("terminal-checkpoint");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        view.journal_tail(&journal_request(project_id, anchor.recording_id, &[2, 3]), 0, &mut None)
+            .expect("acknowledged tail");
+        // Pin the WAL before Finish writes terminal evidence. A zero busy
+        // timeout makes the real incomplete checkpoint observable immediately.
+        fixture
+            .store
+            .lock()
+            .expect("writer")
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("nonblocking checkpoint fixture");
+        let pinned = rusqlite::Connection::open_with_flags(
+            &fixture.database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("independent read-only connection");
+        pinned.execute_batch("BEGIN").expect("pin snapshot");
+        let status: String = pinned
+            .query_row("SELECT status FROM recordings", [], |row| row.get(0))
+            .expect("read old status");
+        assert_eq!(status, "recording");
+        let mut finish = FinishRecording::without_digest(anchor.recording_id, 3);
+        finish.event_digest = blake3::hash(b"event-2event-3").as_bytes().to_vec();
+        let error =
+            view.finish_recording(&finish).expect_err("no Finish success before durability");
+        assert_eq!(error.kind(), RecordingStoreErrorKind::Transport);
+        assert_eq!(error.code(), "XTR-STORE-TERMINAL-DURABILITY");
+        let replay =
+            view.finish_recording(&finish).expect_err("replay must cross the same barrier");
+        assert_eq!(replay.code(), "XTR-STORE-TERMINAL-DURABILITY");
+        pinned.execute_batch("ROLLBACK").expect("release pinned snapshot");
+        assert_eq!(
+            view.finish_recording(&finish).expect("durable exact replay"),
+            RecordingCompletion::Complete
+        );
+        let connection = fixture.store.lock().expect("writer");
+        let (frames, checkpointed): (i64, i64) = connection
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| Ok((row.get(1)?, row.get(2)?)))
+            .expect("checkpoint state");
+        assert!(frames > 0);
+        assert_eq!(frames, checkpointed, "Finish leaves no uncheckpointed terminal evidence");
+        assert_eq!(
+            connection
+                .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .expect("normal write policy"),
+            1
+        );
+        drop(connection);
+        let reader = SqliteStore::open(
+            &fixture.database,
+            OpenOptions::default().with_must_exist(true).with_read_only(true),
+        )
+        .expect("fresh read-only store");
+        let read_view = reader.recording_store(&fixture.root).expect("read view");
+        let (items, more) = read_view.list_recording_metadata(project_id, None, 10).expect("list");
+        assert!(!more);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, xtrace_application::RecordingStatus::Complete);
+        assert_eq!(items[0].completion, RecordingCompletionEvidence::Complete);
+        let detail = read_view
+            .read_recording_window(
+                &ShowWindowRequest {
+                    project_id,
+                    recording_id: anchor.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                },
+                None,
+            )
+            .expect("detail at Finish success");
+        assert_eq!(detail.status, xtrace_application::RecordingStatus::Complete);
+        assert_eq!(detail.completion, RecordingCompletionEvidence::Complete);
+        assert_eq!(detail.events.len(), 2);
+        assert!(!detail.has_more);
+        assert!(detail.incomplete_evidence.is_empty());
     }
 
     #[cfg(unix)]
