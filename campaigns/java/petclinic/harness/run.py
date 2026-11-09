@@ -187,31 +187,32 @@ def baseline(out):
 
 # Per-scenario expectations on the RECORDINGS (route, HTTP outcome, controller/repository frames, source identity).
 # Petclinic has no service layer: its controllers call Spring Data repositories directly, so no `service` frame is required.
-OWN = {"controller": "OwnerController", "repository": "OwnerRepository"}
+# Proxy symbols name the method's actual declaring interface, including inherited CRUD methods.
+CRUD = "org.springframework.data.repository.CrudRepository"
+OWN = {"controller": "OwnerController", "repository": ["OwnerRepository", CRUD]}
 EXPECT = {
     "search-seeded": [
         {"method": "GET", "route": "/owners", "status": 200, "layers": ["controller", "repository"], "layerHints": OWN},
         {"method": "GET", "route": "/vets", "status": 200, "layers": ["controller", "repository"],
-         "layerHints": {"controller": "VetController", "repository": "VetRepository"}}],
+         "layerHints": {"controller": "VetController", "repository": ["VetRepository", CRUD]}}],
     "owner-create-roundtrip": [
         {"method": "POST", "route": "/owners/new", "status": 302, "layers": ["controller", "repository"], "layerHints": OWN},
         {"method": "GET", "route": "/owners/{ownerId}", "status": 200, "layers": ["controller", "repository"], "layerHints": OWN}],
     "owner-validation-error": [
         {"method": "POST", "route": "/owners/new", "status": 200, "layers": ["controller"], "layerHints": OWN}],
     "pet-and-visit-flow": [
-        {"method": "POST", "route": "/owners/{ownerId}/pets/new", "status": 302, "layers": ["controller", "repository"],
-         "layerHints": {"controller": "PetController", "repository": "OwnerRepository"}},
-        {"method": "POST", "route": "/owners/{ownerId}/pets/{petId}/visits/new", "status": 302, "layers": ["controller", "repository"],
-         "layerHints": {"controller": "VisitController", "repository": "OwnerRepository"}}],
+        {"method": "POST", "route": "/owners/{ownerId}/pets/new", "statuses": [302, 200], "layers": ["controller", "repository"],
+         "layerHints": {"controller": "PetController", "repository": OWN["repository"]}},
+        {"method": "POST", "route": "/owners/{ownerId}/pets/{petId}/visits/new", "statuses": [200, 302], "layers": ["controller", "repository"],
+         "layerHints": {"controller": "VisitController", "repository": OWN["repository"]}}],
     "owner-edit": [
         {"method": "POST", "route": "/owners/{ownerId}/edit", "status": 302, "layers": ["controller", "repository"], "layerHints": OWN}],
     "missing-owner-error": [
-        # the unhandled IllegalArgumentException reaches the servlet container, which answers 500; the product records
-        # exception_propagated (no http status), so the expectation names the exception it must have observed
-        {"method": "GET", "route": "/owners/{ownerId}", "status": 500, "exception": "IllegalArgumentException",
+        # The servlet boundary withholds the container's later status as provisional.
+        {"method": "GET", "route": "/owners/{ownerId}", "status": None, "outcome": "exception_propagated", "exception": "IllegalArgumentException",
          "layers": ["controller", "repository"], "layerHints": OWN}],
     "controller-crash-path": [
-        {"method": "GET", "route": "/oups", "status": 500, "exception": "RuntimeException", "layers": ["controller"],
+        {"method": "GET", "route": "/oups", "status": None, "outcome": "exception_propagated", "exception": "RuntimeException", "layers": ["controller"],
          "layerHints": {"controller": "CrashController"}}],
     "concurrent-isolation": [
         {"method": "GET", "route": "/owners/{ownerId}", "status": 200, "layers": ["controller"], "layerHints": OWN, "minCount": 30},

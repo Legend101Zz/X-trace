@@ -327,13 +327,16 @@ def focused_requests(base: str, canaries: dict[str, str]) -> dict[str, int | Non
     import urllib.parse
     import xcamp
     hook = xinstr.canary_hook(canaries)
-    paths = ["/owners/1", "/owners?lastName=" + urllib.parse.quote(canaries["query-token"], safe=""), "/vets"]
+    requests = [("GET", path, {}, None) for path in ("/owners/1", "/owners?lastName=Davis", "/vets")]
+    # Invalid ordinary business fields re-render the form without creating an owner.
+    form = urllib.parse.urlencode({"firstName": "", "lastName": "Invalid", "address": "123 Test St",
+                                   "city": "Testville", "telephone": "abc"}).encode()
+    requests.append(("POST", "/owners/new", {"Content-Type": "application/x-www-form-urlencoded"}, form))
     served = {}
-    for index, path in enumerate(paths):
-        path += ("&" if "?" in path else "?") + "password=" + urllib.parse.quote(canaries["json-body-password"], safe="")
-        path, headers, body = hook("GET", path, {}, None)
+    for index, (method, path, headers, body) in enumerate(requests):
+        path, headers, body = hook(method, path, headers, body)
         try:
-            served[f"focused-request-{index}"] = xcamp.http_request(base, "GET", path, headers=headers, body=body, timeout=30)["status"]
+            served[f"focused-request-{index}"] = xcamp.http_request(base, method, path, headers=headers, body=body, timeout=30)["status"]
         except Exception:
             served[f"focused-request-{index}"] = None
     return served
@@ -536,7 +539,7 @@ class Flows:
             stack.up()
             served = focused_requests(stack.base, canaries)
             self._set("focused-canary-injection", ("pass" if all(s == 200 for s in served.values()) else "fail",
-                                                   "focused requests carry Authorization, Cookie, query and password canaries; owner search binds a canary argument"))
+                                                   "focused canary locations: " + json.dumps(xinstr.CANARY_LOCATIONS, sort_keys=True)))
         finally:
             stack.down()
         api = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-focused")

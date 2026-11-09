@@ -181,19 +181,31 @@ class Judges(unittest.TestCase):
         self.assertIsNone(xflows.parse_doc('{"first": 1}\n{"second": 2}\n'))
         self.assertIsNone(xflows.parse_doc('{"items": [\n  "inner"\n'))
 
-    def test_focused_requests_inject_canaries_into_an_argument_and_password(self):
+    def test_focused_canaries_use_only_secret_locations_and_an_ordinary_search_argument(self):
         import xcamp
+        import urllib.parse
         canaries = {k: "canary-" + k for k in ("authorization-header", "cookie-header", "query-token", "json-body-password")}
         with mock.patch.object(xcamp, "http_request", return_value={"status": 200}) as request:
             served = xflows.focused_requests("http://127.0.0.1:1234", canaries)
-        self.assertEqual(list(served.values()), [200, 200, 200])
+        self.assertEqual(list(served.values()), [200, 200, 200, 200])
         paths = [call.args[2] for call in request.call_args_list]
-        self.assertIn("lastName=canary-query-token", paths[1])
+        self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(paths[1]).query)["lastName"], ["Davis"])
         for call in request.call_args_list:
-            self.assertIn("password=canary-json-body-password", call.args[2])
-            self.assertIn("xt_token=canary-query-token", call.args[2])
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(call.args[2]).query)
+            self.assertEqual(query["xt_token"], [canaries["query-token"]])
+            self.assertNotIn("password", query)
+            self.assertNotIn(canaries["query-token"], query.get("lastName", []))
             self.assertEqual(call.kwargs["headers"]["Authorization"], canaries["authorization-header"])
             self.assertEqual(call.kwargs["headers"]["Cookie"], canaries["cookie-header"])
+        post = request.call_args_list[-1]
+        self.assertEqual(post.args[1], "POST")
+        self.assertEqual(urllib.parse.urlsplit(post.args[2]).path, "/owners/new")
+        self.assertEqual(post.kwargs["headers"]["Content-Type"], "application/x-www-form-urlencoded")
+        form = urllib.parse.parse_qs(post.kwargs["body"].decode(), keep_blank_values=True)
+        self.assertEqual(form["password"], [canaries["json-body-password"]])
+        self.assertEqual(form["firstName"], [""])
+        self.assertEqual(form["lastName"], ["Invalid"])
+        self.assertTrue(all(call.kwargs["body"] is None for call in request.call_args_list[:-1]))
         self.assertNotIn("canary-", str(served), "flow receipt must not itself save the injected values")
 
     def test_focused_without_canaries_fails_before_launching(self):
@@ -258,10 +270,15 @@ class Drivers(unittest.TestCase):
                  patch.object(xflows, "focused_requests", return_value={"focused-request-0": 200}) as requests, \
                  patch.object(xflows, "read_api", side_effect=read_api) as read:
                 flow.focused()
+                self.assertEqual(os.environ["XTRACE_CANARY_ENV"], canaries["env-var"])
             requests.assert_called_once_with(flow._stack.return_value.base, canaries)
             self.assertIn("--capture-depth focused", flow._stack.call_args.args[0])
             self.assertEqual(read.call_args.args[-1], flow.out_dir / "api-focused")
             self.assertEqual(flow.results["focused-canary-injection"]["status"], "pass")
+            self.assertEqual(flow.results["focused-canary-injection"]["note"],
+                             "focused canary locations: " + json.dumps(xflows.xinstr.CANARY_LOCATIONS, sort_keys=True))
+            self.assertEqual(set(xflows.xinstr.CANARY_LOCATIONS), set(canaries))
+            self.assertEqual(flow._stack.return_value.up.call_count, 1)
             flow._stack.return_value.down.assert_called_once()
             report = canary.run_scan(canaries, {"focused-artifacts": [flow.out_dir / "api-focused"]}, {"focused-artifacts": 1})
             self.assertFalse(report["clean"])

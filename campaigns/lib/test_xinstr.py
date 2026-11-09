@@ -61,6 +61,68 @@ class T(unittest.TestCase):
         self.assertEqual(xinstr.analyze({"a": rec("GET", "/owners/new", 302)}, exp)["s"]["expectations"][0]["problems"],
                          ["no-recording-for-route"])
 
+    def test_layers_use_the_declaring_class_not_the_package_or_method(self):
+        symbols = ("org.springframework.samples.petclinic.owner.OwnerController.showOwner",
+                   "org.springframework.samples.petclinic.owner.OwnerRepository.findById",
+                   "org.springframework.data.repository.CrudRepository.save",
+                   "org.example.Other.OwnerRepository", "org.example.RepositoryTools.helper",
+                   "org.example.DataDao.find", "org.example.OwnerResource.show")
+        detail = rec("GET", "/owners/1", 200, symbols=symbols)
+        for layer, hint, expected in (
+                ("controller", "OwnerController", symbols[:1]),
+                ("repository", "OwnerRepository", symbols[1:2]),
+                ("repository", ["OwnerRepository", "org.springframework.data.repository.CrudRepository"], symbols[1:3]),
+                ("repository", "DataDao", symbols[5:6]),
+                ("controller", "OwnerResource", symbols[6:7])):
+            with self.subTest(layer=layer, hint=hint):
+                self.assertEqual([ev["symbol"] for ev in xinstr.layer_frames(detail, layer, hint)], list(expected))
+        # Neither a method named like a repository nor a package segment proves that layer.
+        self.assertEqual(xinstr.layer_frames(rec("GET", "/", 200, symbols=(symbols[3],)), "repository"), [])
+        self.assertEqual(xinstr.layer_frames(rec("GET", "/", 200, symbols=("org.Repository.Helper.work",)), "repository"), [])
+        self.assertEqual(xinstr.layer_frames(detail, "repository", "UnrelatedRepository"), [])
+
+    def test_inherited_repository_frame_keeps_its_observed_symbol_and_missing_source(self):
+        symbol = "org.springframework.data.repository.CrudRepository.save"
+        detail = rec("POST", "/owners/new", 302, symbols=(symbol,), src=False)
+        expectation = {"s": [{"method": "POST", "route": "/owners/new", "status": 302,
+                              "layers": ["repository"], "layerHints": {"repository": ["OwnerRepository", symbol.rsplit(".", 1)[0]]}}]}
+        verdict = xinstr.analyze({"r": detail}, expectation)["s"]
+        self.assertEqual(verdict["expectations"][0]["layers"]["repository"]["recordingsWithFrame"], 1)
+        self.assertEqual(verdict["expectations"][0]["problems"], ["no-source-file-line"])
+        self.assertEqual(verdict["frameSymbols"], [symbol])
+
+    def test_exact_outcome_multiset_rejects_missing_extra_duplicate_and_wrong_statuses(self):
+        exp = {"s": [{"method": "POST", "route": "/owners/{id}/pets/new", "statuses": [302, 200], "layers": []}]}
+        for statuses, passed in (([302, 200], True), ([200, 302], True), ([302], False), ([200], False),
+                                 ([302, 302], False), ([200, 200], False), ([302, 200, 200], False),
+                                 ([302, 500], False), ([302, None], False)):
+            with self.subTest(statuses=statuses):
+                details = {str(i): rec("POST", "/owners/1/pets/new", s) for i, s in enumerate(statuses)}
+                verdict = xinstr.analyze(details, exp)["s"]
+                self.assertEqual(verdict["passed"], passed, verdict)
+                self.assertEqual(verdict["expectations"][0]["expectedStatuses"], [302, 200])
+                if not passed:
+                    self.assertTrue(verdict["expectations"][0]["problems"][0].startswith("http-outcome-multiset-mismatch"))
+
+    def test_outcome_multiset_still_requires_observed_kinds_layers_and_source(self):
+        exp = {"s": [{"method": "POST", "route": "/pets/new", "statuses": [302, 200], "layers": ["controller"]}]}
+        for changes, problem in (({"kind": "unobserved"}, "outcome-unobserved"),
+                                 ({"symbols": ()}, "no-controller-frame"), ({"src": False}, "no-source-file-line")):
+            details = {str(i): rec("POST", "/pets/new", status, **changes) for i, status in enumerate((302, 200))}
+            self.assertIn(problem, xinstr.analyze(details, exp)["s"]["expectations"][0]["problems"])
+
+    def test_outcome_multisets_are_compared_after_serial_attribution(self):
+        exp = {"pet": [{"method": "POST", "route": "/pets/new", "statuses": [302, 200], "layers": []}],
+               "other": [{"method": "POST", "route": "/pets/new", "status": 500, "layers": []}]}
+        details = {str(i): {**rec("POST", "/pets/new", status), "_openedAt": f"2026-10-10T00:00:0{i}Z",
+                            "completion": "complete"} for i, status in enumerate((302, 200, 500))}
+        sent = [(sid, "POST", "/pets/new") for sid in ("pet", "pet", "other")]
+        boundary = xinstr.burst_accounting(details, sent, exp, {})
+        for serial in (None, boundary):
+            verdict = xinstr.analyze(details, exp, sent, serial_boundary=serial)
+            self.assertTrue(all(v["passed"] for v in verdict.values()), verdict)
+            self.assertEqual(verdict["pet"]["recordingsAttributed"], 2)
+
     def test_min_count(self):
         exp = {"s": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": [], "minCount": 3}]}
         two = {"a": rec("GET", "/owners/1", 200), "b": rec("GET", "/owners/2", 200)}
@@ -170,6 +232,22 @@ class T(unittest.TestCase):
         ok200 = {"s": [{"method": "GET", "route": "/oups", "status": 200, "exception": "RuntimeException", "layers": []}]}
         self.assertTrue(xinstr.analyze({"a": self._exc_rec()}, ok200)["s"]["expectations"][0]["problems"][0]
                         .startswith("http-outcome-mismatch"))  # an exception never satisfies a 2xx expectation
+
+    def test_explicit_propagated_outcome_requires_no_final_status_and_the_expected_type(self):
+        exp = {"s": [{"method": "GET", "route": "/oups", "status": None,
+                      "outcome": "exception_propagated", "exception": "RuntimeException", "layers": ["controller"]}]}
+        verdict = xinstr.analyze({"r": self._exc_rec()}, exp)["s"]["expectations"][0]
+        self.assertTrue(verdict["passed"], verdict)
+        self.assertIsNone(verdict["expectedStatus"])
+        self.assertEqual(verdict["expectedOutcome"], "exception_propagated")
+        for detail in (self._exc_rec("java.lang.IllegalStateException"), self._exc_rec(kind="unobserved"),
+                       rec("GET", "/oups", 500), self._exc_rec("jakarta.servlet.ServletException")):
+            with self.subTest(detail=detail):
+                self.assertFalse(xinstr.analyze({"r": detail}, exp)["s"]["passed"])
+        # Even a matching exception cannot make an observed final status into a withheld one.
+        detail = self._exc_rec()
+        detail["outcome"]["httpStatus"] = 500
+        self.assertFalse(xinstr.analyze({"r": detail}, exp)["s"]["passed"])
 
     def test_client_aborted_and_unobserved_are_not_observed(self):
         for kind in ("client_aborted", "unobserved"):
@@ -472,6 +550,8 @@ class T(unittest.TestCase):
         import tempfile
         import xcamp
         from types import SimpleNamespace
+        from tools.qa import canary
+        canaries = canary.make_canaries()
         stack = mock.Mock(launcher_exit=0)
         stack.logs.return_value = ""
         scenario = SimpleNamespace(id="s", kind="business")
@@ -489,7 +569,8 @@ class T(unittest.TestCase):
             receipt = xinstr.run_instrumented(project="petclinic", pin={}, make_stack=lambda tag: stack,
                 scenarios=[scenario], out_dir=pathlib.Path(td) / "out", norm_extra=[], expectations={}, xtrace="xtrace",
                 project_dir=pathlib.Path(td), data_home=pathlib.Path(td) / "data", adaptations=[],
-                canaries=None, baseline_receipt=None, extra_canary_paths=[], harness_files=[])
+                canaries=canaries, baseline_receipt=None, extra_canary_paths=[], harness_files=[])
+            self.assertEqual(os.environ["XTRACE_CANARY_ENV"], canaries["env-var"])
         self.assertEqual(receipt["api"]["recordings"], 1)
         self.assertEqual(receipt["scenarios"][0]["frameSymbols"], ["OwnerController.show"])
         self.assertEqual(set(analyze.call_args.args[0]), {"new"})
@@ -497,6 +578,13 @@ class T(unittest.TestCase):
         self.assertEqual(receipt["notes"]["accommodations"]["drain_seconds"], 0)
         self.assertIn("8 unwritten", receipt["notes"]["accommodations"]["reason"])
         self.assertEqual(receipt["notes"]["accommodations"]["correlationGap"], xinstr.REQUEST_CORRELATION_GAP)
+        self.assertEqual(receipt["notes"]["canaryLocations"], {
+            "authorization-header": "Authorization header", "cookie-header": "Cookie header",
+            "query-token": "unread query parameter xt_token", "json-body-password": "request body field password",
+            "env-var": "application environment variable XTRACE_CANARY_ENV"})
+        self.assertEqual(set(receipt["notes"]["canaryLocations"]), set(canaries))
+        for value in canaries.values():
+            self.assertNotIn(value, str(receipt))
         self.assertIsNone(xcamp.REQUEST_HOOK)
         self.assertIsNone(xcamp.SENT_LOG)
         self.assertEqual(xcamp.REQUEST_PACE_S, 0)

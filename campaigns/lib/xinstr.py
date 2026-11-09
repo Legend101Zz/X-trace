@@ -16,6 +16,7 @@ import re
 import signal
 import subprocess
 import time
+from collections import Counter
 from typing import Any, Callable
 
 # matched against the class part of a frame symbol such as `OwnerController.findOwner`
@@ -281,14 +282,18 @@ def response_event_status(detail: dict) -> int | None:
     return None
 
 
-def layer_frames(detail: dict, layer: str, name_hint: str | None = None) -> list[dict]:
+def layer_frames(detail: dict, layer: str, name_hint: str | list[str] | None = None) -> list[dict]:
+    """Match observed declaring classes; hints may name alternative inherited declarations."""
     pat = LAYER_PATTERNS[layer]
     out = []
     for ev in detail.get("events", []):
         if not str(ev.get("kind", "")).endswith("frame_enter"):
             continue
         sym = ev.get("symbol") or ""
-        if pat.search(sym.split(".", 1)[0]) and (name_hint is None or name_hint in sym):
+        declaring, separator, _ = sym.rpartition(".")
+        simple = declaring.rsplit(".", 1)[-1]
+        hints = [name_hint] if isinstance(name_hint, str) else name_hint
+        if separator and pat.search(simple) and (hints is None or any(h in (declaring, simple) for h in hints)):
             out.append(ev)
     return out
 
@@ -317,6 +322,10 @@ def exception_matches(detail: dict, wanted: str | None) -> bool:
 
 
 def outcome_matches(detail: dict, expectation: dict) -> bool:
+    if expectation.get("outcome") == "exception_propagated":
+        return recording_http_status(detail) is None and exception_matches(detail, expectation.get("exception"))
+    if "statuses" in expectation:
+        return recording_http_status(detail) in expectation["statuses"]
     if recording_http_status(detail) == expectation["status"]:
         return True
     return expectation["status"] >= 500 and exception_matches(detail, expectation.get("exception"))
@@ -509,7 +518,7 @@ def scenario_frame_symbols(details: dict[str, dict], sent: list, burst: frozense
 def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             sent: list[tuple[str | None, str, str]] | None = None, burst: frozenset = frozenset(),
             boundary: dict[str, Any] | None = None, serial_boundary: dict[str, Any] | None = None) -> dict[str, Any]:
-    """expectations: scenario id -> [{method, route, status, layers[], minCount}]. Returns a verdict per scenario.
+    """Expect a status or an exact `statuses` multiset per route, plus layers and source evidence.
 
     A verified serial boundary partitions serial IDs from the later burst. Without a boundary,
     routes shared with a burst remain ambiguous. Serial routes retain exact counts in either case.
@@ -621,8 +630,12 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                 problems.append("no-recording-for-route")
             else:
                 seen = sorted({str(recording_http_status(d) or (d.get("outcome") or {}).get("kind")) for d in matched})
-                if not with_status:
-                    problems.append(f"http-outcome-mismatch(expected {e['status']}, saw {','.join(seen)})")
+                expected = e.get("outcome", e.get("status"))
+                if "statuses" in e and Counter(recording_http_status(d) for d in matched) != Counter(e["statuses"]):
+                    observed = sorted((recording_http_status(d) for d in matched), key=str)
+                    problems.append(f"http-outcome-multiset-mismatch(expected {e['statuses']}, saw {observed})")
+                elif not with_status:
+                    problems.append(f"http-outcome-mismatch(expected {expected}, saw {','.join(seen)})")
                 elif (boundary is not None or serial_boundary is not None) and len(with_status) != len(matched):
                     problems.append(f"http-outcome-count-mismatch(expected {len(matched)}, observed {len(with_status)})")
                 elif len(with_status) < need:
@@ -650,7 +663,8 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             if with_status and not src:
                 problems.append("source-binding-unacceptable" if "unacceptable" in why else
                                 "source-binding-missing" if "missing" in why else "no-source-file-line")
-            items.append({"method": e["method"], "route": e["route"], "expectedStatus": e["status"], "attribution": attribution,
+            items.append({"method": e["method"], "route": e["route"], "expectedStatus": e.get("status"),
+                          "expectedStatuses": e.get("statuses"), "expectedOutcome": e.get("outcome"), "attribution": attribution,
                           "recordingsMatchingRoute": len(matched), "recordingsWithStatus": len(with_status),
                           "layers": layer_report, "recordingsWithSource": len(src), "problems": problems,
                           "passed": not problems})
@@ -673,6 +687,15 @@ def problem_classes(verdicts: dict[str, Any]) -> dict[str, int]:
 
 
 # ------------------------------------------------------------ canaries -------
+CANARY_LOCATIONS = {
+    "authorization-header": "Authorization header",
+    "cookie-header": "Cookie header",
+    "query-token": "unread query parameter xt_token",
+    "json-body-password": "request body field password",
+    "env-var": "application environment variable XTRACE_CANARY_ENV",
+}
+
+
 def canary_hook(canaries: dict[str, str]) -> Callable[..., tuple]:
     """REQUEST_HOOK adding Authorization, Cookie, a query token and a form password to every scenario request."""
     import urllib.parse
@@ -734,6 +757,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         raise RuntimeError(f"xtrace init failed with exit {init.returncode}")
     before_ids = list_recording_ids(xtrace, project_dir, env)
     if canaries:
+        notes["canaryLocations"] = dict(CANARY_LOCATIONS)
         xcamp.REQUEST_HOOK = canary_hook(canaries)
         os.environ["XTRACE_CANARY_ENV"] = canaries["env-var"]
     os.environ["XTRACE_DATA_HOME"] = str(data_home)
