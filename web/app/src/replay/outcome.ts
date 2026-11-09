@@ -1,4 +1,12 @@
 /** OUT-4: outcome banner text. Everything here is adapter-observed or absent; nothing is inferred. */
+import type { SessionContext } from '../types';
+
+/** A session report describes requests outside this recording, never its completion. */
+export function sessionContextText(context: SessionContext): string {
+  const scope = `Session capture context (session ${context.runtimeSessionId})`;
+  if (context.rejectedRequests == null) return `${scope}: agent capacity rejections not observed`;
+  return `${scope}: ${context.rejectedRequests} requests were not recorded due to agent capacity (cumulative as last reported)`;
+}
 
 /** Shape of `RecordingDetail.outcome` (CONTRACTS 5/7.1). Adapter-observed; null when terminal evidence is absent. */
 export interface OutcomeView {
@@ -33,6 +41,7 @@ function nsToLabel(ns: string): string {
 export function outcomeBanner(input: {
   completion: string;
   incompleteEvidence: readonly string[];
+  sessionContext?: SessionContext;
   durationNs: string | null;
   outcome?: OutcomeView | null;
 }): OutcomeBannerModel {
@@ -54,5 +63,6 @@ export function outcomeBanner(input: {
   }
   lines.push(input.durationNs != null ? `Adapter-observed duration ${nsToLabel(input.durationNs)} (measured by the adapter, not verified by X-trace)` : 'Duration unavailable for this capture');
   for (const reason of input.incompleteEvidence) lines.push(`Persisted incomplete evidence: ${reason}`);
+  if (input.sessionContext) lines.push(sessionContextText(input.sessionContext));
   return { tone, headline: COMPLETION_HEADLINE[tone], lines };
 }

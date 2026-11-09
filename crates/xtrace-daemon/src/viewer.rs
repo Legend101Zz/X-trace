@@ -1488,6 +1488,7 @@ struct TransportRecording {
     first_sequence: Option<String>,
     last_sequence: Option<String>,
     incomplete_evidence: Vec<String>,
+    session_context: xtrace_application::recording_queries::SessionContext,
     event_cap: Option<u32>,
     outcome_kind: Option<String>,
 }
@@ -1511,6 +1512,7 @@ fn to_transport_list(page: RecordingListPage, request_id: CorrelationId) -> Tran
                 first_sequence: item.first_sequence,
                 last_sequence: item.last_sequence,
                 incomplete_evidence: item.incomplete_evidence,
+                session_context: item.session_context,
                 event_cap: item.event_cap,
                 outcome_kind: item.outcome_kind,
             })
@@ -1538,6 +1540,7 @@ struct TransportDetail {
     segment_count: String,
     events: Vec<TransportEvent>,
     incomplete_evidence: Vec<String>,
+    session_context: xtrace_application::recording_queries::SessionContext,
     unavailable: xtrace_application::UnavailableEvidence,
     outcome: Option<xtrace_application::PersistedOutcome>,
     capacity: Option<xtrace_application::RecordingCapacity>,
@@ -1631,6 +1634,7 @@ fn to_transport_detail(detail: RecordingDetail, request_id: CorrelationId) -> Tr
             })
             .collect(),
         incomplete_evidence: detail.incomplete_evidence,
+        session_context: detail.session_context,
         unavailable: detail.unavailable,
         outcome: detail.outcome,
         capacity: detail.capacity,
@@ -2266,6 +2270,10 @@ mod tests {
                 gap: None,
             }],
             incomplete_evidence: Vec::new(),
+            session_context: xtrace_application::recording_queries::SessionContext {
+                runtime_session_id: RuntimeSessionId::new(),
+                rejected_requests: None,
+            },
             unavailable: xtrace_application::UnavailableEvidence::default(),
             outcome: None,
             capacity: None,
@@ -2290,6 +2298,12 @@ mod tests {
         actual.sort();
         documented.sort();
         assert_eq!(actual, documented, "RecordingDetail DTO drifted from openapi");
+        let mut actual_session: Vec<String> =
+            json["sessionContext"].as_object().expect("session context").keys().cloned().collect();
+        let mut documented_session = section("SessionContext");
+        actual_session.sort();
+        documented_session.sort();
+        assert_eq!(actual_session, documented_session, "SessionContext DTO drifted from openapi");
         let mut actual_event: Vec<String> =
             json["events"][0].as_object().expect("event object").keys().cloned().collect();
         let mut documented_event = section("Event");
@@ -2780,16 +2794,17 @@ mod tests {
         viewer.task.await.unwrap().unwrap();
     }
 
-    async fn health_api_evidence(count: Option<u64>) {
+    async fn health_api_evidence(count: Option<u64>, partial: bool) {
         let fixture = crate::session_health_tests::HealthFixture::new();
         fixture.begin();
+        fixture.finish(partial);
         if let Some(count) = count {
             fixture
                 .persistence()
                 .record_session_rejections(fixture.project_id, fixture.session_id, count)
                 .expect("session Health report");
         }
-        // Another session must never supply the selected recording's missing evidence.
+        // Another session must never supply the selected recording's missing report.
         fixture
             .persistence()
             .record_session_rejections(fixture.project_id, RuntimeSessionId::new(), 99)
@@ -2819,10 +2834,15 @@ mod tests {
             task,
         };
         let cookie = authenticate(&viewer).await;
-        let expected = count.map_or_else(
-            || format!("Agent capacity rejections: not observed (session {})", fixture.session_id),
-            |count| format!("{count} requests were not recorded: agent capacity (session {}, cumulative as last reported)", fixture.session_id),
-        );
+        let expected_context = serde_json::json!({
+            "runtimeSessionId": fixture.session_id,
+            "rejectedRequests": count.map(|count| count.to_string()),
+        });
+        let expected_incomplete = if partial {
+            serde_json::json!(["persisted_status:partial"])
+        } else {
+            serde_json::json!([])
+        };
         for (path, detail) in [
             (format!("/api/v1/recordings/{}?limit=10", fixture.recording_id), true),
             ("/api/v1/recordings?limit=10".to_owned(), false),
@@ -2837,12 +2857,12 @@ mod tests {
                 serde_json::from_str(response.split_once("\r\n\r\n").expect("HTTP body").1)
                     .expect("JSON");
             let recording = if detail { &body } else { &body["recordings"][0] };
-            assert_eq!(recording["incompleteEvidence"], serde_json::json!([expected]));
+            assert_eq!(recording["sessionContext"], expected_context);
+            assert_eq!(recording["incompleteEvidence"], expected_incomplete);
+            assert_eq!(recording["completion"], if partial { "partial" } else { "complete" });
+            assert_eq!(recording["status"], if partial { "partial" } else { "complete" });
             if detail {
-                assert_eq!(
-                    body["honesty"]["recording"]["incomplete"],
-                    serde_json::json!([expected])
-                );
+                assert_eq!(body["honesty"]["recording"]["incomplete"], expected_incomplete);
                 assert_eq!(body["events"], serde_json::json!([]), "no synthetic request or event");
             }
         }
@@ -2851,18 +2871,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_rejections_appear_in_read_api_and_replay_evidence() {
-        health_api_evidence(Some(7)).await;
+    async fn health_rejections_are_session_context_without_changing_recording_completion() {
+        health_api_evidence(Some(7), false).await;
     }
 
     #[tokio::test]
     async fn no_health_report_reads_as_not_observed() {
-        health_api_evidence(None).await;
+        health_api_evidence(None, false).await;
     }
 
     #[tokio::test]
     async fn explicitly_observed_zero_is_distinct_from_no_health_report() {
-        health_api_evidence(Some(0)).await;
+        health_api_evidence(Some(0), false).await;
+    }
+
+    #[tokio::test]
+    async fn session_context_preserves_real_recording_incompleteness() {
+        health_api_evidence(Some(7), true).await;
+        health_api_evidence(Some(0), true).await;
+        health_api_evidence(None, true).await;
+    }
+
+    #[tokio::test]
+    async fn session_context_preserves_counts_above_javascript_integer_precision() {
+        health_api_evidence(Some(i64::MAX as u64), false).await;
     }
 
     #[tokio::test]

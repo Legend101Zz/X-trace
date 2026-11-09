@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     AppError, CapturedValue, CorrelationId, ErrorCategory, ErrorCode, FrameId, ProjectId,
-    RecordingId, RetryAdvice, SourceBinding,
+    RecordingId, RetryAdvice, RuntimeSessionId, SourceBinding,
 };
 
 use crate::PortError;
@@ -457,6 +457,17 @@ fn bound_display(value: &mut Option<String>, field: &str, changed: &mut Vec<Fiel
     });
 }
 
+/// Latest agent report for the recording's session, independent of recording completion.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionContext {
+    /// Session that owns this recording; reports from other sessions never apply.
+    pub runtime_session_id: RuntimeSessionId,
+    /// Cumulative rejected request starts, as last reported. `None` means not observed;
+    /// `Some("0")` is an explicit zero. Decimal strings preserve the full stored count.
+    pub rejected_requests: Option<String>,
+}
+
 /// Recording facts read from durable metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingMetadata {
@@ -478,6 +489,8 @@ pub struct RecordingMetadata {
     pub last_sequence: Option<String>,
     /// Persisted incomplete status evidence; no completion is inferred otherwise.
     pub incomplete_evidence: Vec<String>,
+    /// Session capture context; this does not establish a gap in this recording.
+    pub session_context: SessionContext,
     /// Event cap recorded in terminal evidence, when present.
     pub event_cap: Option<u32>,
     /// Outcome kind recorded in terminal evidence, when present.
@@ -508,6 +521,8 @@ pub struct RecordingEventWindow {
     pub has_more: bool,
     /// Exact incomplete status or observed sequence-gap marker evidence.
     pub incomplete_evidence: Vec<String>,
+    /// Session capture context; this does not establish a gap in this recording.
+    pub session_context: SessionContext,
     /// Adapter-observed outcome; `None` when terminal evidence is absent.
     pub outcome: Option<PersistedOutcome>,
     /// Event capacity facts; `None` when terminal evidence is absent.
@@ -795,6 +810,8 @@ pub struct RecordingDetail {
     pub events: Vec<PersistedEvent>,
     /// Evidence that this persisted recording is incomplete.
     pub incomplete_evidence: Vec<String>,
+    /// Session capture context; this does not establish a gap in this recording.
+    pub session_context: SessionContext,
     /// Source, value, and completion details absent from this persistence slice.
     pub unavailable: UnavailableEvidence,
     /// Adapter-observed outcome; `None` when terminal evidence is absent.
@@ -1211,6 +1228,7 @@ pub fn show_recording<P: RecordingReadPort>(
         segment_count: window.segment_count,
         events,
         incomplete_evidence: window.incomplete_evidence,
+        session_context: window.session_context,
         unavailable: UnavailableEvidence {
             completion: if window.completion == RecordingCompletionEvidence::Unavailable {
                 "unavailable".to_owned()
@@ -1372,6 +1390,10 @@ mod tests {
             }],
             has_more: true,
             incomplete_evidence: Vec::new(),
+            session_context: SessionContext {
+                runtime_session_id: RuntimeSessionId::new(),
+                rejected_requests: None,
+            },
             outcome: None,
             capacity: None,
             limitations: Vec::new(),
@@ -1387,6 +1409,10 @@ mod tests {
             first_sequence: Some("2".to_owned()),
             last_sequence: Some(u64::MAX.to_string()),
             incomplete_evidence: vec!["persisted_status:partial".to_owned()],
+            session_context: SessionContext {
+                runtime_session_id: RuntimeSessionId::new(),
+                rejected_requests: Some("0".to_owned()),
+            },
             event_cap: None,
             outcome_kind: None,
         }];
@@ -1396,12 +1422,15 @@ mod tests {
     #[test]
     fn shared_recording_query_service_uses_the_same_bounded_contract() {
         let (project_id, recording_id, fixture) = fixture();
+        let list_context = fixture.list[0].session_context.clone();
+        let detail_context = fixture.window.session_context.clone();
         let service = RecordingQueryService::new(fixture);
         let list = service
             .list(ListRecordings { project_id, limit: 1, after: None }, CorrelationId::new())
             .expect("list through shared service");
         assert_eq!(list.schema_version, RECORDING_READ_SCHEMA_VERSION);
         assert_eq!(list.project_id, project_id);
+        assert_eq!(list.recordings[0].session_context, list_context);
 
         let detail = service
             .show(
@@ -1417,6 +1446,7 @@ mod tests {
             .expect("show through shared service");
         assert_eq!(detail.recording_id, recording_id);
         assert_eq!(detail.events.len(), 1);
+        assert_eq!(detail.session_context, detail_context);
     }
 
     #[test]

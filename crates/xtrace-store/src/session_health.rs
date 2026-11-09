@@ -31,10 +31,10 @@ pub(crate) fn persist(
 
 /// Session reports have no position inside a recording. Keep them as contextual evidence,
 /// never as synthetic events with invented sequence numbers, timing or request identities.
-pub(crate) fn recording_evidence(
+pub(crate) fn recording_context(
     connection: &Connection,
     recording_id: RecordingId,
-) -> rusqlite::Result<String> {
+) -> rusqlite::Result<xtrace_application::recording_queries::SessionContext> {
     let (session, count): (Vec<u8>, Option<i64>) = connection.query_row(
         "SELECT r.runtime_session_id, h.rejected_requests FROM recordings r
          LEFT JOIN session_health h ON h.project_id = r.project_id
@@ -44,10 +44,12 @@ pub(crate) fn recording_evidence(
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let session = uuid::Uuid::from_slice(&session).map_err(|_| rusqlite::Error::InvalidQuery)?;
-    Ok(match count {
-        Some(count) => format!(
-            "{count} requests were not recorded: agent capacity (session {session}, cumulative as last reported)"
-        ),
-        None => format!("Agent capacity rejections: not observed (session {session})"),
+    let rejected_requests = count
+        .map(|count| u64::try_from(count).map(|count| count.to_string()))
+        .transpose()
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok(xtrace_application::recording_queries::SessionContext {
+        runtime_session_id: RuntimeSessionId::from_uuid(session),
+        rejected_requests,
     })
 }

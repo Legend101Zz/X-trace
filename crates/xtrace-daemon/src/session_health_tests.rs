@@ -5,15 +5,18 @@
 use std::sync::Arc;
 use xtrace_application::ProjectRepository;
 use xtrace_application::recording::{
-    BeginRecording, EndpointObservationInput, RecordingCaptureService, RecordingPersistencePort,
-    SegmentPolicy,
+    BeginRecording, EndpointObservationInput, FinishRecording, RecordingCaptureService,
+    RecordingCompletion, RecordingPersistencePort, SegmentPolicy,
+};
+use xtrace_application::{
+    ObservedEndpointReadPort, RecordingCompletionEvidence, RecordingReadPort, ShowWindowRequest,
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     Project, ProjectId, RecordingId, RepositoryFingerprint, RuntimeSessionId, WallTime,
 };
 use xtrace_protocol::generated::agent::Health;
-use xtrace_store::{OpenOptions, SqliteRecordingPersistence, SqliteStore};
+use xtrace_store::{OpenOptions, SqliteRecordingPersistence, SqliteRecordingReader, SqliteStore};
 
 pub(crate) struct HealthFixture {
     pub(crate) root: tempfile::TempDir,
@@ -75,6 +78,96 @@ impl HealthFixture {
                 limitations: Vec::new(),
             })
             .expect("recording");
+    }
+
+    pub(crate) fn finish(&self, partial: bool) {
+        // An empty stream still needs verified terminal evidence to be complete.
+        let mut finish = FinishRecording::without_digest(self.recording_id, 1);
+        if !partial {
+            finish.event_digest = blake3::hash(&[]).as_bytes().to_vec();
+        }
+        assert_eq!(
+            self.persistence().finish_recording(&finish).expect("finish recording"),
+            if partial { RecordingCompletion::Partial } else { RecordingCompletion::Complete }
+        );
+    }
+}
+
+#[test]
+fn session_context_tracks_latest_reports_only_for_recordings_of_that_session() {
+    let fixture = HealthFixture::new();
+    fixture.begin();
+    fixture.finish(false);
+    let same_session_recording = RecordingId::new();
+    let other_session_recording = RecordingId::new();
+    let other_session = RuntimeSessionId::new();
+    let persistence = fixture.persistence();
+    for (recording_id, runtime_session_id) in
+        [(same_session_recording, fixture.session_id), (other_session_recording, other_session)]
+    {
+        persistence
+            .begin_recording(&BeginRecording {
+                project_id: fixture.project_id,
+                recording_id,
+                runtime_session_id,
+                opened_at: WallTime::now(),
+                endpoint_observation: EndpointObservationInput::default(),
+                limitations: Vec::new(),
+            })
+            .expect("another recording");
+    }
+    persistence
+        .record_session_rejections(fixture.project_id, other_session, 99)
+        .expect("other session report");
+    let reader = SqliteRecordingReader::new(fixture.store.clone(), fixture.root.path());
+    for (report, expected) in
+        [(None, None), (Some(0), Some("0")), (Some(7), Some("7")), (Some(3), Some("7"))]
+    {
+        if let Some(count) = report {
+            persistence
+                .record_session_rejections(fixture.project_id, fixture.session_id, count)
+                .expect("session report after recording finished");
+        }
+        let (recordings, more) =
+            reader.list_recordings(fixture.project_id, None, 10).expect("recording list");
+        let (unmatched, unmatched_more) =
+            reader.list_unmatched_recordings(fixture.project_id, None, 10).expect("unmatched list");
+        assert!(!more);
+        assert!(!unmatched_more);
+        assert_eq!(recordings.len(), 3);
+        assert_eq!(unmatched.len(), 3);
+        for metadata in &recordings {
+            let other = metadata.recording_id == other_session_recording;
+            assert_eq!(
+                metadata.session_context.runtime_session_id,
+                if other { other_session } else { fixture.session_id }
+            );
+            assert_eq!(
+                metadata.session_context.rejected_requests.as_deref(),
+                if other { Some("99") } else { expected }
+            );
+            assert!(metadata.incomplete_evidence.is_empty());
+            let observed = unmatched
+                .iter()
+                .find(|row| row.metadata.recording_id == metadata.recording_id)
+                .expect("same recording in unmatched projection");
+            assert_eq!(observed.metadata.session_context, metadata.session_context);
+            assert!(observed.metadata.incomplete_evidence.is_empty());
+            let window = reader
+                .show_recording(&ShowWindowRequest {
+                    project_id: fixture.project_id,
+                    recording_id: metadata.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                })
+                .expect("recording window");
+            assert_eq!(window.session_context, metadata.session_context);
+            assert!(window.incomplete_evidence.is_empty());
+            if metadata.recording_id == fixture.recording_id {
+                assert_eq!(metadata.completion, RecordingCompletionEvidence::Complete);
+                assert_eq!(window.completion, RecordingCompletionEvidence::Complete);
+            }
+        }
     }
 }
 

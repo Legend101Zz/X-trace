@@ -459,9 +459,19 @@ components:
           items: { $ref: '#/components/schemas/Recording' }
         unavailable: { $ref: '#/components/schemas/Unavailable' }
         requestId: { type: string, format: uuid }
+    SessionContext:
+      type: object
+      description: Latest report for this recording's session. Rejected requests were not recorded; this does not establish that the selected recording is incomplete.
+      required: [runtimeSessionId, rejectedRequests]
+      properties:
+        runtimeSessionId: { type: string, format: uuid }
+        rejectedRequests:
+          type: [string, 'null']
+          pattern: '^[0-9]+$'
+          description: Cumulative rejected request starts as last reported. Null means not observed; '0' is an explicitly reported zero. Decimal strings preserve the full stored count.
     Recording:
       type: object
-      required: [recordingId, status, completion, openedAt, segmentCount, eventCount, incompleteEvidence]
+      required: [recordingId, status, completion, openedAt, segmentCount, eventCount, incompleteEvidence, sessionContext]
       properties:
         recordingId: { type: string, format: uuid }
         status: { type: string, enum: [recording, finalizing, complete, partial, invalid] }
@@ -472,6 +482,7 @@ components:
         firstSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
         lastSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
         incompleteEvidence: { type: array, items: { type: string } }
+        sessionContext: { $ref: '#/components/schemas/SessionContext' }
         eventCap: { type: [integer, 'null'], minimum: 1, description: Event cap recorded in terminal evidence. }
         outcomeKind:
           type: [string, 'null']
@@ -518,7 +529,7 @@ components:
         nextCursor: { type: [string, 'null'], maxLength: 2048 }
     ObservedRecording:
       type: object
-      required: [recordingId, status, completion, openedAt, segmentCount, eventCount, firstSequence, lastSequence, incompleteEvidence, operationId, observationPolicy, unmatchedReason]
+      required: [recordingId, status, completion, openedAt, segmentCount, eventCount, firstSequence, lastSequence, incompleteEvidence, sessionContext, operationId, observationPolicy, unmatchedReason]
       properties:
         recordingId: { type: string, format: uuid }
         status: { type: string, enum: [recording, finalizing, complete, partial, invalid] }
@@ -529,6 +540,7 @@ components:
         firstSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
         lastSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
         incompleteEvidence: { type: array, items: { type: string } }
+        sessionContext: { $ref: '#/components/schemas/SessionContext' }
         operationId: { type: [string, 'null'], format: uuid }
         observationPolicy: { type: [string, 'null'], enum: [spring-orders-v1, null] }
         unmatchedReason:
@@ -536,7 +548,7 @@ components:
           enum: [observation_policy_missing, observation_policy_invalid, identity_context_missing, identity_context_invalid, method_unsupported, route_unapproved, null]
     RecordingDetail:
       type: object
-      required: [schemaVersion, projectId, recordingId, status, completion, adapterSummary, durationNs, dropCountsByPriority, limit, cursor, nextCursor, segmentCount, events, incompleteEvidence, unavailable, outcome, capacity, limitations, honesty, anchorFrameId, firstSequence, lastSequence, prevCursor, projection, requestId]
+      required: [schemaVersion, projectId, recordingId, status, completion, adapterSummary, durationNs, dropCountsByPriority, limit, cursor, nextCursor, segmentCount, events, incompleteEvidence, sessionContext, unavailable, outcome, capacity, limitations, honesty, anchorFrameId, firstSequence, lastSequence, prevCursor, projection, requestId]
       properties:
         schemaVersion: { type: integer, const: 3 }
         projectId: { type: string, format: uuid }
@@ -559,6 +571,7 @@ components:
         segmentCount: { type: string, pattern: '^[0-9]+$' }
         events: { type: array, items: { $ref: '#/components/schemas/Event' } }
         incompleteEvidence: { type: array, items: { type: string } }
+        sessionContext: { $ref: '#/components/schemas/SessionContext' }
         unavailable: { $ref: '#/components/schemas/Unavailable' }
         outcome:
           description: Adapter-observed outcome; null when terminal evidence is absent. Nothing is synthesized.
