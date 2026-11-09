@@ -5,14 +5,14 @@
           (suite/variant/step, status, exit code, counts, allowlisted failing test ids).
   merge : combine per-step fragments and the plan into summary.json plus a sanitized step summary.
 
-Public output is limited to values that match the release tooling grammars (test ids per
-tools.release.ci_floor._valid_test_id); invalid candidates are dropped and only counted.
-Fragments also carry bounded, privacy-scanned failure excerpts; raw logs stay private.
+Counts and diagnostics use the release tooling grammars. Public test names and
+failure locations require checkout metadata; raw logs and message prose stay private.
 Run from the repository root:  python3 -B -m tools.qa.lane_run <run|merge> ...
 """
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import pathlib
@@ -261,7 +261,6 @@ def diagnostics(text: str) -> tuple[list[str], int]:
 # Limits count serialized UTF-8 bytes, including JSON escaping and field names. The job
 # budget is shared by every step writing to the same fragment directory.
 MAX_EXCERPT_BYTES = 2048
-MAX_EXCERPT_LINES = 6
 MAX_JOB_EXCERPT_BYTES = 24 * 1024
 MAX_PROGRESS_LINES = 12
 WITHHELD = "withheld: privacy scan"
@@ -273,13 +272,7 @@ GRADLE_STATE = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\((?P<params>[^\n]*)\
                           r"(?:\[(?P<index>[^\n]*)\])? (?P<status>STARTED|PASSED|FAILED|SKIPPED)$")
 JAVA_SITE = re.compile(r"^\s*at [\w.$]+\((\w+\.java:\d+)\)\s*$")
 GRADLE_SHORT_SITE = re.compile(r"^[\w.$]+ at (\w+\.java:\d+)$")
-SEMVER_NUMBER = r"(?:0|[1-9][0-9]*)"
-SEMVER_PRERELEASE = rf"(?:{SEMVER_NUMBER}|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
-CARGO_COMPILE = re.compile(
-    rf"^Compiling ([A-Za-z_][A-Za-z0-9_-]{{0,63}}) v({SEMVER_NUMBER}\.{SEMVER_NUMBER}\.{SEMVER_NUMBER}"
-    rf"(?:-{SEMVER_PRERELEASE}(?:\.{SEMVER_PRERELEASE})*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)"
-    r"(?: .*)?$")
-LIBTEST_ASSERTION_FIELD = re.compile(r"^(?:  (?P<left>left)| (?P<right>right)): .*$")
+UNVERIFIED = "<unverified>"
 # Reuse the canary scanner's encoded needles, including recognisable marker families
 # when no private canary file was supplied. DIAG_BAD also guards host paths/credentials.
 CANARY_INDEX = canary.build_index({"marker": "CANARY", "mixed-marker": "canary"})
@@ -298,226 +291,312 @@ def _private(text: str, index) -> bool:
                 or any(ord(c) < 32 and c not in "\n\t" for c in text))
 
 
-MESSAGE_LITERAL = re.compile(
-    r"(?P<str>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`[^`]*`|[\"'`].*$)"
-    r"|(?P<url>\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"'`]+)"
-    r"|(?P<path>(?:[A-Za-z]:[\\/]|[~.]?[\\/])[^\s<>\"'`]*"
-    r"|\b[\w.-]+(?:[\\/][\w.:-]+)+|\b[\w.-]+\.[A-Za-z][A-Za-z0-9]*(?::\d+)*\b)"
-)
-# A reviewed vocabulary, never learned from log output or formatted arguments.
-# The final phrase is literal diagnostic text in java_premain_spring.rs; the
-# request method, route and count are deliberately absent. A static vocabulary
-# also fails closed when a source file or its message template cannot be read.
-MESSAGE_WORDS = frozenset((
-    "assertion left right failed expected actual but was panicked at timed out "
-    "recordings were not persisted before deadline"
-).split())
-MESSAGE_VALUE = re.compile(
-    r"(?P<prefix>(?:[\w.$]+:\s*)?)(?P<label>(?:left|right)\s*:|(?:expected|actual)\b(?:\s*:)?)"
-    r"\s*(?P<value>.*)", re.I
-)
-MESSAGE_TOKEN = re.compile(
-    MESSAGE_LITERAL.pattern
-    + r"|(?P<syntax>==|!=|<=|>=|[=:<>()\[\]{},;])|(?P<space>\s+)"
-    + r"|(?P<word>[^\s=:<>()\[\]{},;\"'`]+)|(?P<other>.)"
-)
-ASSERTION_EXPRESSION = re.compile(r"`(.+?)\s*(==|!=|<=|>=|<|>)\s*(.+?)`")
+# Strip comments and literals before finding declarations, so examples and captured
+# strings in test source cannot create trusted function names. Preserve offsets.
+SOURCE_LITERAL = re.compile(
+    r'/\*.*?\*/|//[^\n]*|r(?P<hash>\#*)".*?"(?P=hash)'
+    r'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`', re.S)
 
 
-def _value_placeholder(value: str) -> str:
-    value = value.strip()
-    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", value):
-        return "<num>"
-    if MESSAGE_LITERAL.fullmatch(value) or re.fullmatch(r"[\w-]+", value):
-        return "<str>"
-    return "<value>"
+def _source_mask(source: str) -> str:
+    masked = list(source)
+    offset = 0
+    while match := SOURCE_LITERAL.search(source, offset):
+        end = match.end()
+        if match[0].startswith("/*"):
+            # Rust permits nested block comments. A regex ending at the first
+            # terminator could otherwise attest a declaration still in a comment.
+            depth = 1
+            cursor = match.start() + 2
+            while depth:
+                delimiter = re.search(r"/\*|\*/", source[cursor:])
+                if delimiter is None:
+                    cursor = len(source)
+                    break
+                cursor += delimiter.end()
+                depth += 1 if delimiter[0] == "/*" else -1
+            end = cursor
+        masked[match.start():end] = ["\n" if c == "\n" else " " for c in source[match.start():end]]
+        offset = end
+    return "".join(masked)
 
 
-def _message_tokens(text: str) -> str:
-    out = []
-    for token in MESSAGE_TOKEN.finditer(text):
-        value = token[0]
-        if token.lastgroup in {"space", "syntax"} or (token.lastgroup == "word" and value in MESSAGE_WORDS):
-            out.append(value)
-        elif (token.lastgroup == "str" and text[:token.start()].rstrip() == "assertion"
-              and (expression := ASSERTION_EXPRESSION.fullmatch(value))):
-            left, operator, right = expression.groups()
-            # Rust's symbolic operands are syntax, other operands are values.
-            left = "left" if left.strip() == "left" else _value_placeholder(left)
-            right = "right" if right.strip() == "right" else _value_placeholder(right)
-            out.append(f"`{left} {operator} {right}`")
-        else:
-            out.append("<str>" if token.lastgroup in {"str", "path", "url"} else _value_placeholder(value))
-    return "".join(out)
+class CheckoutMetadata:
+    """Only tracked, readable files contained in this checkout can attest facts."""
+
+    def __init__(self, root: pathlib.Path, tracked: list[str]):
+        self.root = root.resolve()
+        self.files: dict[str, int] = {}
+        self.tests: set[str] = set()
+        self.java_files: dict[str, list[str]] = {}
+        for name in tracked:
+            path = pathlib.PurePosixPath(name)
+            if path.is_absolute() or ".." in path.parts or "\\" in name:
+                continue
+            local = self.root / path
+            try:
+                if any(parent.is_symlink() for parent in (local, *local.parents)
+                       if parent != self.root and self.root in parent.parents):
+                    continue
+                if not local.resolve().is_relative_to(self.root) or not local.is_file():
+                    continue
+                source = local.read_text(encoding="utf-8")
+            except (OSError, UnicodeError, ValueError):
+                continue
+            self.files[name] = len(source.splitlines())
+            if path.suffix == ".java":
+                self.java_files.setdefault(path.name, []).append(name)
+            self._read_tests(path, source)
+
+    def _read_tests(self, path: pathlib.PurePosixPath, source: str) -> None:
+        test_path = bool(set(path.parts) & {"test", "tests", "__tests__"})
+        js_test = path.suffix in {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"} and (
+            test_path or re.search(r"\.(?:test|spec)\.", path.name))
+        if not (path.suffix == ".rs" and path.parts[0] == "crates"
+                or path.suffix == ".java" and test_path or js_test
+                or path.suffix == ".py" and path.name.startswith("test_")):
+            return
+        masked = _source_mask(source)
+        if path.suffix == ".rs" and path.parts[0] == "crates":
+            # Requiring a test attribute also excludes helper functions in tests/.
+            self.tests.update(re.findall(
+                r"#\[(?:[A-Za-z_]\w*::)?test(?:\([^]]*\))?\]\s*"
+                r"(?:#\[[^]]*\]\s*)*(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(", masked))
+        elif path.suffix == ".java" and test_path:
+            methods = re.findall(
+                r"@(?:Test|ParameterizedTest|RepeatedTest|Case)\b(?:\([^)]*\))?\s*"
+                r"(?:@[^\n]+\s*)*(?:(?:public|protected|private|static|final)\s+)*"
+                r"void\s+([A-Za-z_]\w*)\s*\(", masked)
+            self.tests.update(f"{path.stem}::{method}" for method in methods)
+        elif js_test:
+            for call in re.finditer(r"\b(?:test|it)(?:\.(?:only|skip))?\s*\(", masked):
+                literal = re.match(r"\s*(['\"])([^\n\\]*?)\1", source[call.end():])
+                if literal:
+                    self.tests.add(literal[2])
+        elif path.suffix == ".py" and path.name.startswith("test_"):
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                return
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    self.tests.update(f"{node.name}::{method.name}" for method in node.body
+                                      if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                      and method.name.startswith("test_"))
+
+    def test(self, candidate: str, index) -> str:
+        # Rust module prefixes are captured output too. Publish the declared
+        # function name, never a prefix that the source metadata did not attest.
+        name = candidate if candidate in self.tests else candidate.rsplit("::", 1)[-1]
+        return name if name in self.tests and not _private(name, index) else UNVERIFIED
+
+    def location(self, candidate: str, index, *, java: bool = False) -> str:
+        path, sep, line = candidate.rpartition(":")
+        if not sep or not line.isascii() or not line.isdigit() or len(line) > 9:
+            return UNVERIFIED
+        if java and "/" not in path:
+            matches = self.java_files.get(path, [])
+            if len(matches) != 1:
+                return UNVERIFIED
+            path = matches[0]
+        if (not path or path.startswith("/") or ".." in pathlib.PurePosixPath(path).parts
+                or "\\" in path or not 1 <= int(line) <= self.files.get(path, 0)):
+            return UNVERIFIED
+        site = f"{path}:{int(line)}"
+        return UNVERIFIED if _private(site, index) else site
 
 
-def _message_structure(text: str) -> str:
-    """Rebuild fixed syntax, masking every other token regardless of length.
+def _checkout_metadata() -> CheckoutMetadata:
+    root = pathlib.Path(__file__).resolve().parents[2]
+    try:
+        # Use the index, never paths learned from captured command output. Popen
+        # keeps this lookup separate from the wrapped command's run/timeout path.
+        with subprocess.Popen(["git", "-C", str(root), "ls-files", "--cached", "-z"],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
+            output, _ = proc.communicate()
+            tracked = output.decode("utf-8").split("\0") if proc.returncode == 0 else []
+    except (OSError, UnicodeError):
+        tracked = []
+    return CheckoutMetadata(root, [name for name in tracked if name])
 
-    Known assertion fields consume their entire operand, including compound Debug
-    values. Only the first message line may pass through this sanitizer.
+
+def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], int | None]], list[str]]:
+    """Separate harness observations from failure bodies once, before extraction.
+
+    Open quoted or compound values cannot introduce harness boundaries. Body lines
+    are never rescanned for timeout progress, even when they look like build output.
     """
-    if field := MESSAGE_VALUE.fullmatch(text):
-        return (_message_tokens(field["prefix"]) + field["label"].lower()
-                + " " + _value_placeholder(field["value"]))
-    return _message_tokens(text)
-
-
-def _timeout_progress(line: str) -> str | None:
-    """Rebuild harness facts; no parameter values or free-text suffixes survive."""
-    if state := CARGO_STATE.fullmatch(line):
-        name, status = state.groups()
-        if status is not None and ci_floor._valid_test_id(name):
-            return f"test {name} ... {status}"
-    elif gradle := GRADLE_STATE.fullmatch(line):
-        name = f"{gradle.group(1)}::{gradle.group(2)}"
-        status = gradle["status"]
-        if status != "SKIPPED" and ci_floor._valid_test_id(name):
-            params = "<params masked>" if gradle["params"] or gradle["index"] else ""
-            return f"{gradle.group(1)} > {gradle.group(2)}({params}) {status}"
-    elif compile_line := CARGO_COMPILE.fullmatch(line):
-        return f"Compiling {compile_line.group(1)} v{compile_line.group(2)}"
-    elif re.fullmatch(r"Finished(?: .*)?", line):
-        return "Finished"
-    return None
-
-
-def _failure_blocks(text: str):
-    """Yield harness-delimited blocks, never attach unrelated stdout to a test."""
+    blocks = []
+    harness = []
     name = None
     kind = "cargo"
     captured = False
     lines: list[str] = []
+    panic_line = None
+    quote = None
+    depth = 0
     for line in ANSI.sub("", text).splitlines():
-        section = CARGO_SECTION.fullmatch(line)
-        panic = CARGO_PANIC.match(line)
-        gradle = GRADLE_FAIL.fullmatch(line.strip())
-        next_name = (section.group(1) if section else
-                     f"{gradle.group(1)}::{gradle.group(2)}" if gradle else
-                     panic.group(1) if panic and not captured and panic.group(1) != name else None)
-        boundary = (next_name is not None or CARGO_STATE.fullmatch(line)
-                    or CARGO_RESULT.match(line) or line == "failures:"
-                    or line.startswith("> Task ") or GRADLE_STATE.fullmatch(line.strip()))
+        section = CARGO_SECTION.fullmatch(line) if not quote and not depth else None
+        panic = CARGO_PANIC.match(line) if not quote and not depth else None
+        gradle = GRADLE_FAIL.fullmatch(line.strip()) if not quote and not depth else None
+        next_name = (section[1] if section else f"{gradle[1]}::{gradle[2]}" if gradle else
+                     panic[1] if panic and not captured and panic[1] != name else None)
+        boundary = not quote and not depth and (
+            next_name is not None or CARGO_STATE.fullmatch(line) or CARGO_RUNNING.fullmatch(line)
+            or CARGO_RESULT.match(line) or line == "failures:" or line.startswith("> Task ")
+            or GRADLE_STATE.fullmatch(line.strip()))
         if boundary:
             if name is not None:
-                yield name, kind, lines
+                blocks.append((name, kind, lines, panic_line))
             name, lines = next_name, []
+            panic_line = None
             kind = "gradle" if gradle else "cargo"
             captured = section is not None
-        if name is not None and not section and not gradle:
-            lines.append(line)
+        if name is not None:
+            if not section and not gradle:
+                if panic and panic_line is None:
+                    panic_line = len(lines)
+                lines.append(line)
+                # Panic headers contain the thread name, not a message operand.
+                if not panic:
+                    escaped = False
+                    for char in line:
+                        if escaped:
+                            escaped = False
+                        elif char == "\\":
+                            escaped = True
+                        elif quote:
+                            if char == quote:
+                                quote = None
+                        elif char in {'"', '`'}:
+                            quote = char
+                        elif char in "{[":
+                            depth += 1
+                        elif char in "}]":
+                            depth = max(0, depth - 1)
+        else:
+            harness.append(line)
+        # Gradle FAILED both starts a body and reports a harness observation.
+        if gradle:
+            harness.append(line.strip())
     if name is not None:
-        yield name, kind, lines
+        blocks.append((name, kind, lines, panic_line))
+    return blocks, harness
+
+
+def _timeout_progress(line: str) -> tuple[str, str] | None:
+    if state := CARGO_STATE.fullmatch(line):
+        name, status = state.groups()
+        return name, {None: "running", "ok": "ok", "FAILED": "failed"}.get(status, "ignored")
+    if long := CARGO_RUNNING.fullmatch(line):
+        return long[1], "running"
+    if gradle := GRADLE_STATE.fullmatch(line):
+        return f"{gradle[1]}::{gradle[2]}", {
+            "STARTED": "running", "PASSED": "ok", "FAILED": "failed", "SKIPPED": "ignored"}[gradle["status"]]
+    return None
 
 
 def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT_BYTES,
-                    index=None) -> dict | None:
-    """Extract only observed failure locations/messages and harness progress.
-
-    Scan whole failure blocks before truncation, then redact message values and scan
-    every output field again. A scanner hit past the cap still withholds the excerpt.
-    """
+                    index=None, metadata: CheckoutMetadata | None = None) -> dict | None:
+    """Publish verified names/sites, fixed kinds and counts; never message prose."""
     index = CANARY_INDEX if index is None else index
-    failures = {name: {"test": name, "location": "not observed", "message": ["not observed"]}
-                for name in parse_output(text)["failingTests"]}
-    for name, kind, lines in _failure_blocks(text):
+    metadata = _checkout_metadata() if metadata is None else metadata
+    blocks, harness = _output_parts(text)
+    failures: dict[str, dict] = {}
+
+    def failure(name: str) -> dict:
+        return failures.setdefault(name, {"test": metadata.test(name, index), "location": UNVERIFIED,
+                                          "kind": "unknown", "withheldLines": 0})
+
+    for line in harness:
+        if m := CARGO_FAIL.fullmatch(line):
+            failure(m[1])["kind"] = "exit"
+        elif m := GRADLE_FAIL.fullmatch(line.strip()):
+            failure(f"{m[1]}::{m[2]}")["kind"] = "exit"
+        elif m := PY_FAIL.match(line):
+            failure(f"{m[2]}::{m[1]}")["kind"] = "exit"
+        elif m := re.fullmatch(r"\s*not ok \d+ - (.+)", line):
+            failure(m[1])["kind"] = "exit"
+    for name, framework, lines, panic_line in blocks:
+        # A panic can belong to a passing should_panic test. A failure block
+        # enriches a reported failure; it cannot declare a new failed test.
         if name not in failures:
             continue
         row = failures[name]
-        block = "\n".join([name, *lines])
-        if row.get("excerpt") == WITHHELD:
-            continue
-        if _private(block, index):
-            row.clear()
-            row.update(test=name, excerpt=WITHHELD)
-            continue
-        message = []
-        withheld_lines = 0
         after_panic = False
-        for line in lines:
-            if kind == "cargo" and line.lstrip().startswith(("note:", "stack backtrace:")):
-                break
-            if m := PANIC_LOC.search(line.rstrip()):
-                if ci_floor._valid_panic_site(f"{m.group(1)}:{m.group(2)}"):
-                    row["location"] = f"{m.group(1)}:{m.group(2)}:{m.group(3)}"
+        first_message = True
+        java_frames = False
+        for line_number, line in enumerate(lines):
+            if not line.strip():
+                continue
+            if framework == "cargo" and line_number == panic_line:
                 after_panic = True
-            elif m := JAVA_SITE.fullmatch(line):
+                row["kind"] = "panic"
+                if site := PANIC_LOC.search(line):
+                    row["location"] = metadata.location(f"{site[1]}:{site[2]}", index)
+                continue
+            if first_message and (after_panic or framework == "gradle"):
+                first_message = False
+                if line.strip().startswith(("assertion ", "java.lang.AssertionError", "org.opentest4j.AssertionFailedError")):
+                    row["kind"] = "assertion"
+                if framework == "gradle":
+                    if site := GRADLE_SHORT_SITE.fullmatch(line.strip()):
+                        row["location"] = metadata.location(site[1], index, java=True)
+                    # Only an immediate stack following a single-line exception
+                    # headline is eligible. Never search a continuation for sites.
+                    java_frames = bool(re.fullmatch(r"[\w.$]+(?:Error|Exception)(?:: [^\"`{}\[\]]*)?", line.strip()))
+            elif java_frames and (site := JAVA_SITE.fullmatch(line)):
                 test_file = name.split("::")[0].split("$")[0] + ".java:"
-                if row["location"] == "not observed" or m.group(1).startswith(test_file):
-                    row["location"] = m.group(1)
-            elif (line.strip() or message) and not line.lstrip().startswith(("at ", "note:", "stack backtrace:")):
-                if after_panic or kind == "gradle":
-                    if not message:
-                        message.append(_message_structure(line.strip()))
-                    elif (kind == "cargo" and (field := LIBTEST_ASSERTION_FIELD.fullmatch(line))
-                          and len(message) < MAX_EXCERPT_LINES - 1):
-                        label = "left" if field["left"] else "right"
-                        message.append(f"{label}: <value>")
-                    else:
-                        withheld_lines += 1
-                    if m := GRADLE_SHORT_SITE.fullmatch(line.strip()):
-                        row["location"] = m.group(1)
-        if not message:
-            continue
-        if withheld_lines:
-            message.append(f"<{withheld_lines} more lines withheld>")
-        row["message"] = message[:MAX_EXCERPT_LINES]
-        row["truncated"] = bool(withheld_lines) or len(message) > MAX_EXCERPT_LINES
-        while len(_encoded(row)) > MAX_EXCERPT_BYTES and row["message"]:
-            row["truncated"] = True
-            overflow = len(_encoded(row)) - MAX_EXCERPT_BYTES
-            # Preserve complete assertion frames and the withholding count at the byte cap.
-            row["message"][0] = row["message"][0][:-max(1, overflow // 6)]
-            if not row["message"][0]:
-                row["message"].pop(0)
-    # Scan all serialized fields after redaction too, including names and locations.
-    rows = [row if not _private("\n".join([row["test"], row.get("location", ""),
-                                         *row.get("message", []), row.get("excerpt", "")]),
-                               index) else {"excerpt": WITHHELD}
-            for row in failures.values()]
-    result: dict = {"failures": rows, "omitted": 0}
+                if site[1].startswith(test_file):
+                    row["location"] = metadata.location(site[1], index, java=True)
+                continue
+            else:
+                java_frames = False
+            row["withheldLines"] += 1
+    rows = list(failures.values())
+    for row in rows:
+        # Names and locations have independent provenance; scanning can only
+        # remove them. It never rebuilds or copies any part of a message.
+        if len(_encoded(row)) > MAX_EXCERPT_BYTES:
+            row.update(test=UNVERIFIED, location=UNVERIFIED)
+    result: dict = {"failures": rows[:MAX_FAILING], "omitted": max(0, len(rows) - MAX_FAILING)}
     if timed_out:
         running: dict[str, None] = {}
-        progress: deque[str] = deque(maxlen=MAX_PROGRESS_LINES)
-        withheld = 0
-        progress_omitted = 0
-        for line in ANSI.sub("", text).splitlines():
+        unverified_running: set[str] = set()
+        progress: deque[dict] = deque(maxlen=MAX_PROGRESS_LINES)
+        withheld = progress_omitted = 0
+        for line in harness:
             line = line.strip()
             if CARGO_RESULT.match(line) or re.fullmatch(r"running \d+ tests?", line):
                 running.clear()
-            state = CARGO_STATE.fullmatch(line)
-            long = CARGO_RUNNING.fullmatch(line)
-            gradle = GRADLE_STATE.fullmatch(line)
-            name = None
-            active = False
-            if state or long:
-                name = (state or long).group(1)
-                active = bool(long or state.group(2) is None)
-            elif gradle:
-                name = f"{gradle.group(1)}::{gradle.group(2)}"
-                active = gradle["status"] == "STARTED"
-            if name is not None and ci_floor._valid_test_id(name):
-                if active:
-                    running[name] = None
+                unverified_running.clear()
+            observation = _timeout_progress(line)
+            if observation is None:
+                continue
+            candidate, state = observation
+            name = metadata.test(candidate, index)
+            if name == UNVERIFIED:
+                withheld += 1
+                if state == "running":
+                    unverified_running.add(candidate)
                 else:
-                    running.pop(name, None)
-            if state or long or gradle or line.split(" ", 1)[0] in {"Compiling", "Finished"}:
-                if _private(line, index):
-                    withheld += 1
-                else:
-                    rebuilt = _timeout_progress(line)
-                    if rebuilt is None:
-                        continue
-                    if _private(rebuilt, index):
-                        withheld += 1
-                    elif len(_encoded(rebuilt)) <= MAX_EXCERPT_BYTES:
-                        progress_omitted += int(len(progress) == MAX_PROGRESS_LINES)
-                        progress.append(rebuilt)
-                    else:
-                        progress_omitted += 1
-        names = [n for n in running if not _private(n, index)]
+                    unverified_running.discard(candidate)
+                continue
+            if state == "running":
+                running[name] = None
+            else:
+                running.pop(name, None)
+            if state == "ignored":
+                continue
+            rebuilt = {"test": name, "state": state}
+            if len(_encoded(rebuilt)) > MAX_EXCERPT_BYTES:
+                progress_omitted += 1
+                continue
+            progress_omitted += int(len(progress) == MAX_PROGRESS_LINES)
+            progress.append(rebuilt)
+        names = list(running)
         result["timeout"] = {"runningTests": names[:MAX_FAILING],
-                             "runningOmitted": len(running) - min(len(names), MAX_FAILING),
+                             "runningOmitted": len(unverified_running) + max(0, len(names) - MAX_FAILING),
                              "basis": "last harness observation; other running tests not observed",
                              "progress": list(progress), "progressWithheld": withheld,
                              "progressOmitted": progress_omitted}
@@ -610,14 +689,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     if status == "pass" and max_ignored >= 0 and (facts["ignored"] or 0) > max_ignored:
         status = "fail"  # a skipped or ignored test is not a pass on a no-skips row
         print(f"lane {suite}/{variant}/{step}: {facts['ignored']} ignored or skipped tests (maximum {max_ignored})")
+    index = _excerpt_index(getattr(args, "canaries", ""))
+    metadata = _checkout_metadata() if status == "fail" or facts["failingTests"] else None
+    if facts["failingTests"]:
+        # The older summary field is part of the same public fragment. It must
+        # not bypass the provenance checks applied to failureDetails.
+        facts["failingTests"] = [metadata.test(name, index) if index is not None else UNVERIFIED
+                                 for name in facts["failingTests"]]
     frag = {"suite": suite, "variant": variant, "step": step, "status": status,
             "exitCode": proc.returncode, **{k: v for k, v in facts.items() if k != "counted"}}
     fragment_path = out / f"{suite}__{variant}__{step}.json"
     if status == "fail":
         frag["timedOut"] = timed_out
-        index = _excerpt_index(getattr(args, "canaries", ""))
         frag["failureDetails"] = (failure_details(
-            text, timed_out, budget=_remaining_excerpt_budget(out, fragment_path), index=index)
+            text, timed_out, budget=_remaining_excerpt_budget(out, fragment_path), index=index, metadata=metadata)
             if index is not None else None)
         if frag["failureDetails"] is None:
             frag["failureDetailsUnavailable"] = WITHHELD if index is None else "job excerpt cap"
