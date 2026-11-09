@@ -13,8 +13,9 @@ import java.nio.file.Path;
 import java.util.List;
 import net.bytebuddy.jar.asm.ClassWriter;
 import net.bytebuddy.jar.asm.Opcodes;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class ProxyInterfaceSourcesTest {
   private static final String INTERNAL = "example/Repository";
@@ -45,13 +46,14 @@ class ProxyInterfaceSourcesTest {
     return Files.writeString(source, TEXT, StandardCharsets.UTF_8);
   }
 
-  private static SourceAttestation.SourceInfo observe(Path project, Runnable afterIdentity)
-      throws Exception {
+  private static SourceAttestation.SourceInfo observe(
+      Path project, Runnable afterIdentity, boolean forceFallback) throws Exception {
     Loader loader = new Loader();
     byte[] bytes = classBytes();
     Class<?> type = loader.define(bytes);
     ProxyInterfaceSources.observe(loader, INTERNAL, bytes,
-        new ApplicationScope(List.of("example"), List.of("src/main/java"), project), afterIdentity);
+        new ApplicationScope(List.of("example"), List.of("src/main/java"), project), afterIdentity,
+        (base, relative) -> ConfinedSourceFiles.read(base, relative, file -> {}, forceFallback));
     return ProxyInterfaceSources.lookup(type.getMethod("save", String.class));
   }
 
@@ -63,10 +65,12 @@ class ProxyInterfaceSourcesTest {
     assertEquals(0, info.endLine());
   }
 
-  @Test
-  void unchangedInterfaceSourceHasItsObservedDeclaration(@TempDir Path project) throws Exception {
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void unchangedInterfaceSourceHasItsObservedDeclaration(
+      boolean forceFallback, @TempDir Path project) throws Exception {
     Path source = sourceTree(project);
-    SourceAttestation.SourceInfo info = observe(project, () -> {});
+    SourceAttestation.SourceInfo info = observe(project, () -> {}, forceFallback);
     assertEquals(SourceIdentity.OBSERVED_UNATTESTED, info.binding());
     assertEquals(SOURCE, info.path());
     assertEquals(3, info.startLine());
@@ -74,16 +78,19 @@ class ProxyInterfaceSourcesTest {
     assertArrayEquals(SourceAttestation.blake3Of(Files.readAllBytes(source)), info.hash());
   }
 
-  @Test
-  void missingInterfaceSourceNeverUsesAnAncestorDecoy(@TempDir Path ancestor) throws Exception {
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void missingInterfaceSourceNeverUsesAnAncestorDecoy(
+      boolean forceFallback, @TempDir Path ancestor) throws Exception {
     sourceTree(ancestor);
     Path project = Files.createDirectory(ancestor.resolve("project"));
-    unavailable(observe(project, () -> {}));
+    unavailable(observe(project, () -> {}, forceFallback));
   }
 
-  @Test
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
   void deletedInterfaceSourceCannotFallBackToIdenticalAncestorAfterIdentityRead(
-      @TempDir Path ancestor) throws Exception {
+      boolean forceFallback, @TempDir Path ancestor) throws Exception {
     sourceTree(ancestor); // Same hash: the old hash gate alone cannot reject this decoy.
     Path project = ancestor.resolve("project");
     Path source = sourceTree(project);
@@ -95,14 +102,15 @@ class ProxyInterfaceSourcesTest {
       } catch (IOException failure) {
         throw new UncheckedIOException(failure);
       }
-    });
+    }, forceFallback);
     assertTrue(deleted[0], "identity resolution must succeed before removing local source");
     unavailable(info);
   }
 
-  @Test
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
   void interfaceSourceSwappedToIdenticalExternalDirectoryIsUnavailable(
-      @TempDir Path directory) throws Exception {
+      boolean forceFallback, @TempDir Path directory) throws Exception {
     Path external = sourceTree(directory.resolve("external"));
     Path project = directory.resolve("project");
     Path source = sourceTree(project);
@@ -116,13 +124,15 @@ class ProxyInterfaceSourcesTest {
       } catch (IOException failure) {
         throw new UncheckedIOException(failure);
       }
-    });
+    }, forceFallback);
     assertTrue(swapped[0]);
     unavailable(info);
   }
 
-  @Test
-  void changedInterfaceContentCannotReuseTheObservedHash(@TempDir Path project) throws Exception {
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void changedInterfaceContentCannotReuseTheObservedHash(
+      boolean forceFallback, @TempDir Path project) throws Exception {
     Path source = sourceTree(project);
     boolean[] edited = {false};
     SourceAttestation.SourceInfo info = observe(project, () -> {
@@ -133,7 +143,7 @@ class ProxyInterfaceSourcesTest {
       } catch (IOException failure) {
         throw new UncheckedIOException(failure);
       }
-    });
+    }, forceFallback);
     assertTrue(edited[0]);
     unavailable(info);
   }
