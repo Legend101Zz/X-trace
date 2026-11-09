@@ -13,7 +13,6 @@ import net.bytebuddy.implementation.Implementation;
 import net.bytebuddy.jar.asm.ClassVisitor;
 import net.bytebuddy.jar.asm.ClassWriter;
 import net.bytebuddy.jar.asm.MethodVisitor;
-import net.bytebuddy.jar.asm.Opcodes;
 import net.bytebuddy.pool.TypePool;
 
 /**
@@ -31,8 +30,7 @@ public class LineProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
 
   /**
    * Resolves the probe owner through this wrapper's own class loader (fine for tests; production
-   * passes the loader application code sees, {@code null} for the bootstrap loader, via the
-   * five-argument constructor).
+   * passes the application's defining loader via the five-argument constructor).
    */
   public LineProbeAsmWrapper(
       LineProbeConfig config,
@@ -79,8 +77,19 @@ public class LineProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
             | net.bytebuddy.jar.asm.ClassReader.SKIP_DEBUG);
   }
 
-  /** Optional gap probe; the caller must guarantee its owner is visible and fail-open. */
+  /** Optional gap call, emitted inside a size-checked caller-side Throwable guard. */
   protected void skippedMethodEntry(MethodVisitor method) {}
+
+  /** Conservative call byte bound; zero disables the optional gap call. */
+  protected int skippedMethodEntryBytes() { return 0; }
+
+  /** Called when the method cannot safely carry the guarded entry call. */
+  protected void skippedMethodEntryUnavailable() {}
+
+  /** May additionally check an independently supplied gap owner's identity and entry point. */
+  protected String probeOwnerProblem() {
+    return ProbeOwnerCheck.problem(config.probeOwner(), ownerLoader);
+  }
 
   @Override
   public ClassVisitor wrap(
@@ -92,8 +101,9 @@ public class LineProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
       MethodList<?> methods,
       int writerFlags,
       int readerFlags) {
+    String skipReason = null;
     if (!ownerVerified) {
-      String problem = ProbeOwnerCheck.problem(config.probeOwner(), ownerLoader);
+      String problem = probeOwnerProblem();
       if (problem != null) {
         if (reportSink != null) {
           reportSink.accept(
@@ -102,48 +112,38 @@ public class LineProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
                       "<class>", "", MethodReport.Status.SKIPPED,
                       MethodReport.Reasons.PROBE_OWNER, 0, 0, MethodReport.Reasons.NONE)));
         }
-        // A caller's independent gap probe can still name the missing line-probe owner.
-        return new ClassVisitor(Opcodes.ASM9, classVisitor) {
-          private boolean denied;
-
-          @Override
-          public void visit(int version, int access, String name, String signature,
-              String superName, String[] interfaces) {
-            denied = name.equals(config.probeOwner()) || LineProbeVisitor.isDenyScope(name);
-            super.visit(version, access, name, signature, superName, interfaces);
-          }
-
-          @Override
-          public MethodVisitor visitMethod(int access, String name, String descriptor,
-              String signature, String[] exceptions) {
-            MethodVisitor next = super.visitMethod(access, name, descriptor, signature, exceptions);
-            if (next == null || denied
-                || (access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE | Opcodes.ACC_BRIDGE)) != 0
-                || ((access & Opcodes.ACC_SYNTHETIC) != 0 && !name.startsWith("lambda$"))) return next;
-            return new MethodVisitor(Opcodes.ASM9, next) {
-              @Override
-              public void visitCode() {
-                super.visitCode();
-                skippedMethodEntry(mv);
-              }
-            };
-          }
-        };
+        if (skippedMethodEntryBytes() == 0) return classVisitor;
+        skipReason = MethodReport.Reasons.PROBE_OWNER;
+      } else {
+        ownerVerified = true;
       }
-      ownerVerified = true;
     }
     byte[] digest = digestResolver == null ? null : digestResolver.apply(instrumentedType);
     List<MethodReport> reports = new ArrayList<>();
+    String classSkip = skipReason;
     return new LineProbeVisitor(classVisitor, config, registry, digest, reports) {
+      @Override
+      protected String classSkipReason() { return classSkip; }
+
       @Override
       protected void skippedMethodEntry(MethodVisitor method) {
         LineProbeAsmWrapper.this.skippedMethodEntry(method);
       }
 
       @Override
+      protected int skippedMethodEntryBytes() {
+        return LineProbeAsmWrapper.this.skippedMethodEntryBytes();
+      }
+
+      @Override
+      protected void skippedMethodEntryUnavailable() {
+        LineProbeAsmWrapper.this.skippedMethodEntryUnavailable();
+      }
+
+      @Override
       public void visitEnd() {
         super.visitEnd();
-        if (reportSink != null) reportSink.accept(reports);
+        if (reportSink != null && classSkip == null) reportSink.accept(reports);
       }
     };
   }

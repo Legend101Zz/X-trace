@@ -52,7 +52,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   /** Event-cap slots reserved for closing events; gap space and the memory bound still apply. */
   static final int CLOSING_RESERVE = 64;
   static final String CAP_GAP_SYMBOL = "xtrace.capture.gap.recording-cap";
-  /** Focused mode: methods or classes the line-probe wrapper could not instrument. */
+  /** Missing application coverage, from an entered skipped method or unavailable invocation probes. */
   static final String UNTRANSFORMED_GAP_SYMBOL = "xtrace.capture.gap.not-transformed";
   static final String ADMISSION_GAP_SYMBOL = "xtrace.capture.gap.recording-admission";
   static final String MEMORY_GAP_SYMBOL = "xtrace.capture.gap.writer-memory";
@@ -226,7 +226,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         || kind == BridgeEventKind.RESPONSE;
   }
 
-  /** Count of methods or classes that could not be line-instrumented (focused mode only). */
+  /** Count of probe installations whose missing invocation coverage cannot be attributed. */
   void untransformedCount(java.util.function.LongSupplier supplier) {
     this.untransformed = java.util.Objects.requireNonNull(supplier, "supplier");
   }

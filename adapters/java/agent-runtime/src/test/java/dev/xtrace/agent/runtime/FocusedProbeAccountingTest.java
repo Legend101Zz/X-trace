@@ -6,6 +6,8 @@ import com.google.protobuf.Message;
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
 import dev.xtrace.agent.bootstrap.BridgeEventKind;
 import dev.xtrace.agent.runtime.line.MethodReport;
+import dev.xtrace.agent.runtime.line.LineProbeAsmWrapper;
+import dev.xtrace.agent.runtime.line.LineProbeConfig;
 import dev.xtrace.agent.runtime.line.SiteRegistry;
 import java.nio.ByteBuffer;
 import java.time.Duration;
@@ -17,13 +19,16 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.asm.Advice;
+import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.dynamic.ClassFileLocator;
 import net.bytebuddy.jar.asm.ClassReader;
 import net.bytebuddy.jar.asm.ClassVisitor;
 import net.bytebuddy.jar.asm.ClassWriter;
+import net.bytebuddy.jar.asm.Handle;
 import net.bytebuddy.jar.asm.Label;
 import net.bytebuddy.jar.asm.MethodVisitor;
 import net.bytebuddy.jar.asm.Opcodes;
+import net.bytebuddy.jar.asm.Type;
 import net.bytebuddy.pool.TypePool;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -39,8 +44,10 @@ import xtp.agent.v1.Transport.AckDurability;
 class FocusedProbeAccountingTest {
   private final BoundedEventQueue queue = new BoundedEventQueue(1024, 1024 * 1024);
   private final RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+  private final FixtureInstrumentation.CaptureLimitations limitations =
+      new FixtureInstrumentation.CaptureLimitations();
   private final FixtureInstrumentation.LineProbes probes =
-      new FixtureInstrumentation.LineProbes(new SiteRegistry());
+      new FixtureInstrumentation.LineProbes(new SiteRegistry(), limitations);
   private final Map<Class<?>, byte[]> transformedClasses = new ConcurrentHashMap<>();
 
   @BeforeEach
@@ -66,27 +73,38 @@ class FocusedProbeAccountingTest {
   }
 
   private Class<?> load(String name, byte[] bytes) {
-    return load(name, bytes, getClass().getClassLoader());
+    return load(name, bytes, null, false);
   }
 
-  private Class<?> load(String name, byte[] bytes, ClassLoader ownerLoader) {
+  private Class<?> load(String name, byte[] bytes, LineProbeAsmWrapper wrapper, boolean rejectBridge) {
     ClassLoader parent = getClass().getClassLoader();
     var locator = new ClassFileLocator.Compound(ClassFileLocator.Simple.of(name, bytes),
         ClassFileLocator.ForClassLoader.of(parent));
     class Isolated extends ClassLoader {
       Isolated() { super(parent); }
       Class<?> define(byte[] transformed) { return defineClass(name, transformed, 0, transformed.length); }
+      @Override
+      protected Class<?> loadClass(String requested, boolean resolve) throws ClassNotFoundException {
+        if (rejectBridge && requested.startsWith("dev.xtrace.agent.bootstrap.")) {
+          throw new ClassNotFoundException("bootstrap bridge filtered");
+        }
+        return super.loadClass(requested, resolve);
+      }
     }
     Isolated loader = new Isolated();
     byte[] transformed = new ByteBuddy().redefine(TypePool.Default.of(locator).describe(name).resolve(), locator)
         .visit(Advice.to(FixtureInstrumentation.FrameAdvice.class).on(FixtureInstrumentation.frameMethods()))
-        .visit(probes.wrapper(ownerLoader)).make().getBytes();
+        .visit(wrapper == null ? probes.wrapper(loader) : wrapper).make().getBytes();
     Class<?> type = loader.define(transformed);
     transformedClasses.put(type, transformed);
     return type;
   }
 
   private int gapProbes(Class<?> type, String method, String descriptor) {
+    return probeCalls(type, method, descriptor, "lineGap");
+  }
+
+  private int probeCalls(Class<?> type, String method, String descriptor, String probe) {
     int[] count = {0};
     new ClassReader(transformedClasses.get(type)).accept(new ClassVisitor(Opcodes.ASM9) {
       @Override
@@ -96,7 +114,7 @@ class FocusedProbeAccountingTest {
         return new MethodVisitor(Opcodes.ASM9) {
           @Override
           public void visitMethodInsn(int opcode, String owner, String name, String desc, boolean itf) {
-            if (owner.equals(FixtureInstrumentation.PROBE_OWNER) && name.equals("lineGap")) count[0]++;
+            if (owner.equals(FixtureInstrumentation.PROBE_OWNER) && name.equals(probe)) count[0]++;
           }
         };
       }
@@ -304,8 +322,20 @@ class FocusedProbeAccountingTest {
     byte[] bytes = ClassFileLocator.ForClassLoader.of(getClass().getClassLoader()).locate(name).resolve();
     // Simulate an unavailable line owner while the independently supplied bootstrap gap probe
     // remains visible to the application loader.
-    Class<?> type = load(name, bytes, new ClassLoader(null) {});
-    assertTrue(probes.reports().stream().anyMatch(report -> report.name().equals("<class>")
+    List<MethodReport> reports = new ArrayList<>();
+    var wrapper = new LineProbeAsmWrapper(LineProbeConfig.focused("missing/LineOwner"),
+        probes.registry(), ignored -> null, reports::addAll, getClass().getClassLoader()) {
+      @Override
+      protected int skippedMethodEntryBytes() { return 3; }
+
+      @Override
+      protected void skippedMethodEntry(MethodVisitor method) {
+        method.visitMethodInsn(Opcodes.INVOKESTATIC, FixtureInstrumentation.PROBE_OWNER,
+            "lineGap", "()V", false);
+      }
+    };
+    Class<?> type = load(name, bytes, wrapper, false);
+    assertTrue(reports.stream().anyMatch(report -> report.name().equals("<class>")
         && report.reason().equals(MethodReport.Reasons.PROBE_OWNER)));
     Object instance = type.getConstructor().newInstance();
     assertTrue(events().isEmpty());
@@ -315,6 +345,259 @@ class FocusedProbeAccountingTest {
     var gaps = events().stream().filter(event -> event.kind() == BridgeEventKind.GAP).toList();
     assertEquals(2, gaps.size());
     assertTrue(gaps.stream().allMatch(gap -> gap.symbol().equals(RecordingWriter.UNTRANSFORMED_GAP_SYMBOL)));
+  }
+
+  @Test
+  void nearLimitSyntheticLambdaPreservesHealthySiblingAndPersistsTheLimitation() throws Exception {
+    String name = "demo.probe.NearLimitLambda";
+    ClassWriter bytes = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+    bytes.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, name.replace('.', '/'), null, "java/lang/Object", null);
+    MethodVisitor lambda = bytes.visitMethod(Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
+        "lambda$large$0", "()I", null, null);
+    lambda.visitCode();
+    Label line = new Label();
+    lambda.visitLabel(line);
+    lambda.visitLineNumber(1, line);
+    // Exactly 65,535 original code bytes: even an unguarded invokestatic cannot fit.
+    for (int i = 0; i < 65_533; i++) lambda.visitInsn(Opcodes.NOP);
+    lambda.visitInsn(Opcodes.ICONST_5);
+    lambda.visitInsn(Opcodes.IRETURN);
+    lambda.visitMaxs(0, 0);
+    lambda.visitEnd();
+    MethodVisitor sibling = bytes.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+        "healthy", "()I", null, null);
+    sibling.visitCode();
+    Label siblingLine = new Label();
+    sibling.visitLabel(siblingLine);
+    sibling.visitLineNumber(2, siblingLine);
+    sibling.visitInsn(Opcodes.ICONST_3);
+    sibling.visitInsn(Opcodes.IRETURN);
+    sibling.visitMaxs(0, 0);
+    sibling.visitEnd();
+    MethodVisitor factory = bytes.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+        "supplier", "()Ljava/util/function/IntSupplier;", null, null);
+    factory.visitCode();
+    Label factoryLine = new Label();
+    factory.visitLabel(factoryLine);
+    factory.visitLineNumber(3, factoryLine);
+    factory.visitInvokeDynamicInsn("getAsInt", "()Ljava/util/function/IntSupplier;",
+        new Handle(Opcodes.H_INVOKESTATIC, "java/lang/invoke/LambdaMetafactory", "metafactory",
+            "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;"
+                + "Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)"
+                + "Ljava/lang/invoke/CallSite;", false),
+        Type.getMethodType("()I"),
+        new Handle(Opcodes.H_INVOKESTATIC, name.replace('.', '/'), "lambda$large$0", "()I", false),
+        Type.getMethodType("()I"));
+    factory.visitInsn(Opcodes.ARETURN);
+    factory.visitMaxs(0, 0);
+    factory.visitEnd();
+    bytes.visitEnd();
+    Class<?> type = load(name, bytes.toByteArray());
+    assertTrue(type.getDeclaredMethod("lambda$large$0").isSynthetic());
+    assertEquals(0, gapProbes(type, "lambda$large$0", "()I"));
+    assertEquals(1, probeCalls(type, "healthy", "()I", "line"));
+    assertTrue(probes.reports().stream().anyMatch(report -> report.name().equals("lambda$large$0")
+        && report.reason().equals(MethodReport.Reasons.TOO_LARGE)));
+    assertTrue(probes.reports().stream().anyMatch(report -> report.name().equals("healthy")
+        && report.status() == MethodReport.Status.INSTRUMENTED));
+    assertEquals(1, limitations.count());
+    var supplier = (java.util.function.IntSupplier) type.getMethod("supplier").invoke(null);
+    assertTrue(BootstrapBridge.requestStart("GET", "/near-limit"));
+    assertEquals(5, supplier.getAsInt());
+    assertEquals(3, type.getMethod("healthy").invoke(null));
+    BootstrapBridge.requestEnd(200, false);
+    assertPersistedPartial(1);
+  }
+
+  @Test
+  void skippedMethodDuringDeferredExceptionResolutionPersistsPartialWithoutLeaking() throws Exception {
+    Class<?> type = load("demo.probe.Orders", true);
+    Object instance = type.getConstructor().newInstance();
+    assertTrue(BootstrapBridge.requestStart("POST", "/exception"));
+    assertTrue(BootstrapBridge.deferRequestEnd(new IllegalStateException("handled")));
+    assertTrue(BootstrapBridge.awaitingResolution());
+    assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+    BootstrapBridge.requestEnd(422, false);
+    // The ended context cannot receive later gaps or contaminate the next recording.
+    BootstrapBridge.lineGap();
+    assertFalse(BootstrapBridge.hasContext());
+    assertTrue(BootstrapBridge.requestStart("GET", "/next"));
+    BootstrapBridge.requestEnd(200, false);
+    CapturedRecording transport = assertPersistedPartial(2, 2);
+    assertEquals(2, persistedGaps(transport, 0));
+    assertEquals(0, persistedGaps(transport, 1));
+  }
+
+  @Test
+  void fullExceptionTableOmitsTheGuardAndPersistsACaptureLimitation() throws Exception {
+    String name = "demo.probe.FullExceptionTable";
+    ClassWriter bytes = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+    bytes.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, name.replace('.', '/'), null, "java/lang/Object", null);
+    MethodVisitor method = bytes.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
+        "lambda$handlers$0", "()I", null, null);
+    method.visitCode();
+    Label start = new Label();
+    Label end = new Label();
+    Label handler = new Label();
+    for (int i = 0; i < 65_535; i++) method.visitTryCatchBlock(start, end, handler, "java/lang/Throwable");
+    method.visitLabel(start);
+    method.visitInsn(Opcodes.ICONST_5);
+    method.visitInsn(Opcodes.IRETURN);
+    method.visitLabel(end);
+    method.visitLabel(handler);
+    method.visitInsn(Opcodes.POP);
+    method.visitInsn(Opcodes.ICONST_0);
+    method.visitInsn(Opcodes.IRETURN);
+    method.visitMaxs(0, 0);
+    method.visitEnd();
+    bytes.visitEnd();
+    Class<?> type = load(name, bytes.toByteArray());
+    assertEquals(0, gapProbes(type, "lambda$handlers$0", "()I"));
+    assertEquals(1, limitations.count());
+    assertTrue(BootstrapBridge.requestStart("GET", "/handler-limit"));
+    assertEquals(5, type.getMethod("lambda$handlers$0").invoke(null));
+    BootstrapBridge.requestEnd(200, false);
+    assertPersistedPartial(1);
+  }
+
+  @Test
+  void staleDeferralCannotAttributeGapsToTheNextRequest() throws Exception {
+    assertTrue(BootstrapBridge.requestStart("GET", "/stale"));
+    assertTrue(BootstrapBridge.deferRequestEnd(new IllegalStateException("unresolved")));
+    assertTrue(BootstrapBridge.requestStart("GET", "/next"));
+    BootstrapBridge.requestEnd(200, false);
+    assertTrue(events().stream().noneMatch(event -> event.kind() == BridgeEventKind.GAP));
+  }
+
+  @Test
+  void definingLoaderRejectingBridgePreservesApplicationAndPersistsLimitation() throws Exception {
+    String name = "demo.probe.Orders";
+    byte[] bytes = ClassFileLocator.ForClassLoader.of(getClass().getClassLoader()).locate(name).resolve();
+    ClassWriter stripped = new ClassWriter(0);
+    new ClassReader(bytes).accept(stripped, ClassReader.SKIP_DEBUG);
+    Class<?> type = load(name, stripped.toByteArray(), null, true);
+    assertThrows(ClassNotFoundException.class,
+        () -> type.getClassLoader().loadClass(BootstrapBridge.class.getName()));
+    assertFalse(FixtureInstrumentation.gapOwnerAvailable(type.getClassLoader()));
+    assertEquals(0, gapProbes(type, null, null));
+    assertTrue(probes.reports().stream().anyMatch(report -> report.reason().equals(MethodReport.Reasons.PROBE_OWNER)));
+    Object instance = type.getConstructor().newInstance();
+    assertTrue(BootstrapBridge.requestStart("POST", "/filtered-loader"));
+    assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+    BootstrapBridge.requestEnd(200, false);
+    assertPersistedPartial(1);
+  }
+
+  @Test
+  void gapCallResolutionFailureIsSuppressedAtTheCaller() throws Exception {
+    String name = "demo.probe.Orders";
+    byte[] bytes = ClassFileLocator.ForClassLoader.of(getClass().getClassLoader()).locate(name).resolve();
+    // An independent gap owner is deliberately unreachable at execution. This exercises the
+    // guard itself rather than production preflight's omission of unreachable bridge calls.
+    var wrapper = new LineProbeAsmWrapper(LineProbeConfig.focused("missing/LineOwner"),
+        probes.registry(), ignored -> null, ignored -> {}, getClass().getClassLoader()) {
+      @Override
+      protected int skippedMethodEntryBytes() { return 3; }
+
+      @Override
+      protected void skippedMethodEntry(MethodVisitor method) {
+        method.visitMethodInsn(Opcodes.INVOKESTATIC, FixtureInstrumentation.PROBE_OWNER,
+            "lineGap", "()V", false);
+      }
+    };
+    Class<?> type = load(name, bytes, wrapper, true);
+    assertEquals(1, gapProbes(type, "create", "(Ljava/lang/String;)Ljava/lang/String;"));
+    Object instance = type.getConstructor().newInstance();
+    assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+    var failure = assertThrows(java.lang.reflect.InvocationTargetException.class,
+        () -> type.getMethod("create", String.class).invoke(instance, (Object) null));
+    assertInstanceOf(NullPointerException.class, failure.getCause());
+
+    // Expanded guard frames must preserve wide arguments and array locals as well as constructors.
+    String wideName = "demo.probe.WideGapArguments";
+    ClassWriter wide = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+    wide.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, wideName.replace('.', '/'), null, "java/lang/Object", null);
+    MethodVisitor method = wide.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
+        "lambda$wide$0", "(JD[Ljava/lang/Object;)J", null, null);
+    method.visitCode();
+    method.visitVarInsn(Opcodes.LLOAD, 0);
+    method.visitInsn(Opcodes.LRETURN);
+    method.visitMaxs(0, 0);
+    method.visitEnd();
+    wide.visitEnd();
+    Class<?> wideType = load(wideName, wide.toByteArray(), wrapper, true);
+    assertEquals(42L, wideType.getMethod("lambda$wide$0", long.class, double.class, Object[].class)
+        .invoke(null, 42L, 1.5, new Object[0]));
+  }
+
+  @Test
+  void ordinaryApplicationTransformationFailureMarksOpenAndFutureRecordingsPartial() throws Exception {
+    String name = "demo.probe.Orders";
+    ClassLoader parent = getClass().getClassLoader();
+    byte[] bytes = ClassFileLocator.ForClassLoader.of(parent).locate(name).resolve();
+    class Isolated extends ClassLoader {
+      Isolated() { super(parent); }
+      Class<?> define(byte[] original) { return defineClass(name, original, 0, original.length); }
+    }
+    Isolated loader = new Isolated();
+    assertTrue(BootstrapBridge.requestStart("GET", "/open"));
+    var listener = new FixtureInstrumentation.SafeListener(
+        () -> fail("ordinary application failure must preserve the runtime"),
+        new ApplicationScope(List.of("demo.probe"), List.of()), limitations);
+    var transformer = new AgentBuilder.Default().with(listener)
+        .type(net.bytebuddy.matcher.ElementMatchers.named(name))
+        .transform((builder, type, definingLoader, module, domain) -> {
+          throw new IllegalStateException("transformation failed");
+        }).makeRaw();
+    assertNull(transformer.transform(loader, name.replace('.', '/'), null, null, bytes));
+    Class<?> type = loader.define(bytes);
+    Object instance = type.getConstructor().newInstance();
+    assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+    BootstrapBridge.requestEnd(200, false);
+    assertTrue(BootstrapBridge.requestStart("GET", "/later"));
+    BootstrapBridge.requestEnd(200, false);
+    CapturedRecording transport = assertPersistedPartial(2, 2);
+    assertEquals(1, persistedGaps(transport, 0));
+    assertEquals(1, persistedGaps(transport, 1));
+    listener.onError("org.example.Framework", getClass().getClassLoader(), null, false,
+        new IllegalStateException("out of scope"));
+    assertEquals(1, limitations.count());
+  }
+
+  private static long persistedGaps(CapturedRecording transport, int recording) {
+    var id = transport.starts.get(recording).getRecordingId();
+    return transport.batches.stream().filter(batch -> batch.getRecordingId().equals(id))
+        .flatMap(batch -> batch.getEventsList().stream()).filter(event -> event.hasGap()).count();
+  }
+
+  private CapturedRecording assertPersistedPartial(int expectedGaps) throws Exception {
+    return assertPersistedPartial(expectedGaps, 1);
+  }
+
+  private CapturedRecording assertPersistedPartial(int expectedGaps, int expectedRecordings) throws Exception {
+    CapturedRecording transport = new CapturedRecording();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofMillis(100));
+    writer.capturePolicy("xtrace.focused.v1");
+    writer.untransformedCount(limitations::count);
+    writer.start();
+    writer.close();
+    assertFalse(writer.incompleteWasReported());
+    assertEquals(expectedRecordings, transport.starts.size());
+    assertEquals(expectedRecordings, transport.finishes.size());
+    var recorded = transport.batches.stream().flatMap(batch -> batch.getEventsList().stream()).toList();
+    var gaps = recorded.stream().filter(event -> event.hasGap()).toList();
+    assertEquals(expectedGaps, gaps.size());
+    assertTrue(gaps.stream().allMatch(event -> event.getGap().getReason()
+        == GapReason.GAP_REASON_CLASS_NOT_TRANSFORMED));
+    assertTrue(gaps.stream().allMatch(event -> event.getGap().getCount() > 0));
+    for (var finish : transport.finishes) {
+      var recording = transport.batches.stream()
+          .filter(batch -> batch.getRecordingId().equals(finish.getRecordingId()))
+          .flatMap(batch -> batch.getEventsList().stream()).toList();
+      assertArrayEquals(EventDigest.compute(recording.stream().map(event -> event.getEventId()).toList()),
+          finish.getEventDigest().toByteArray());
+    }
+    return transport;
   }
 
   private static final class CapturedRecording implements RecordingWriter.Transport {

@@ -79,7 +79,7 @@ final class FixtureInstrumentation {
     install(instrumentation, onFailure, attach, scope, null);
   }
 
-  /** Probe owner application classes call; bootstrap-visible, so every loader resolves it. */
+  /** Probe owner application classes call, subject to their defining loader's visibility. */
   static final String PROBE_OWNER = "dev/xtrace/agent/bootstrap/BootstrapBridge";
 
   /** Method reports kept for diagnostics; bounded so a huge application cannot grow it. */
@@ -96,6 +96,17 @@ final class FixtureInstrumentation {
       boolean attach,
       ApplicationScope scope,
       LineProbes lineProbes) {
+    install(instrumentation, onFailure, attach, scope, lineProbes,
+        lineProbes == null ? new CaptureLimitations() : lineProbes.limitations);
+  }
+
+  static void install(
+      Instrumentation instrumentation,
+      Runnable onFailure,
+      boolean attach,
+      ApplicationScope scope,
+      LineProbes lineProbes,
+      CaptureLimitations limitations) {
     if (!INSTALLED.compareAndSet(false, true)) {
       throw new IllegalStateException("fixture instrumentation is already installed");
     }
@@ -106,7 +117,7 @@ final class FixtureInstrumentation {
                 attach
                     ? AgentBuilder.RedefinitionStrategy.RETRANSFORMATION
                     : AgentBuilder.RedefinitionStrategy.DISABLED)
-            .with(new SafeListener(onFailure))
+            .with(new SafeListener(onFailure, scope, limitations))
             .ignore(
                 named("dev.xtrace.agent.bootstrap.XTraceAgent")
                     .or(named("dev.xtrace.agent.bootstrap.BootstrapBridge"))
@@ -179,10 +190,14 @@ final class FixtureInstrumentation {
                         && scope.isApplication(type.getName(), domain))
             .transform(
                 (target, type, loader, module, domain) -> {
+                  if (lineProbes == null && !gapOwnerAvailable(loader)) {
+                    limitations.report();
+                    return target;
+                  }
                   net.bytebuddy.dynamic.DynamicType.Builder<?> framed =
                       target.visit(Advice.to(FrameAdvice.class).on(frameMethods()));
                   return lineProbes == null ? framed : framed
-                      .visit(lineProbes.wrapper(null));
+                      .visit(lineProbes.wrapper(loader));
                 })
             .type(named(H2_STATEMENT))
             .transform(
@@ -201,6 +216,7 @@ final class FixtureInstrumentation {
   /** Focused-mode line probe wiring: one site registry and one thread-safe report sink. */
   static final class LineProbes {
     private final dev.xtrace.agent.runtime.line.SiteRegistry registry;
+    private final CaptureLimitations limitations;
     private final java.util.concurrent.ConcurrentLinkedQueue<
             dev.xtrace.agent.runtime.line.MethodReport>
         reports = new java.util.concurrent.ConcurrentLinkedQueue<>();
@@ -208,7 +224,12 @@ final class FixtureInstrumentation {
         new java.util.concurrent.atomic.AtomicInteger();
 
     LineProbes(dev.xtrace.agent.runtime.line.SiteRegistry registry) {
+      this(registry, new CaptureLimitations());
+    }
+
+    LineProbes(dev.xtrace.agent.runtime.line.SiteRegistry registry, CaptureLimitations limitations) {
       this.registry = java.util.Objects.requireNonNull(registry, "registry");
+      this.limitations = java.util.Objects.requireNonNull(limitations, "limitations");
     }
 
     dev.xtrace.agent.runtime.line.SiteRegistry registry() {
@@ -220,6 +241,8 @@ final class FixtureInstrumentation {
     }
 
     dev.xtrace.agent.runtime.line.LineProbeAsmWrapper wrapper(ClassLoader ownerLoader) {
+      boolean gapAvailable = gapOwnerAvailable(ownerLoader);
+      if (!gapAvailable) limitations.report();
       return new dev.xtrace.agent.runtime.line.LineProbeAsmWrapper(
           dev.xtrace.agent.runtime.line.LineProbeConfig.focused(PROBE_OWNER),
           registry,
@@ -235,6 +258,17 @@ final class FixtureInstrumentation {
           },
           ownerLoader) {
         @Override
+        protected String probeOwnerProblem() {
+          return gapAvailable ? super.probeOwnerProblem() : "bootstrap gap bridge unavailable";
+        }
+
+        @Override
+        protected int skippedMethodEntryBytes() { return gapAvailable ? 3 : 0; }
+
+        @Override
+        protected void skippedMethodEntryUnavailable() { limitations.report(); }
+
+        @Override
         protected void skippedMethodEntry(net.bytebuddy.jar.asm.MethodVisitor method) {
           // The decision travels with this method's bytecode, including lambda bodies. No loader
           // registry or diagnostic-buffer capacity can change attribution at request time.
@@ -245,11 +279,53 @@ final class FixtureInstrumentation {
     }
   }
 
+  /** Do not trust a child loader's same-named bridge, or a bridge without the gap entry point. */
+  static boolean gapOwnerAvailable(ClassLoader loader) {
+    try {
+      Class<?> owner = Class.forName(PROBE_OWNER.replace('/', '.'), false, loader);
+      if (owner != BootstrapBridge.class) return false;
+      java.lang.reflect.Method gap = owner.getDeclaredMethod("lineGap");
+      return java.lang.reflect.Modifier.isPublic(gap.getModifiers())
+          && java.lang.reflect.Modifier.isStatic(gap.getModifiers())
+          && gap.getReturnType() == void.class;
+    } catch (Throwable unavailable) {
+      return false;
+    }
+  }
+
+  /**
+   * Sticky process coverage limitation. Without invocation probes, affected requests cannot be
+   * identified, so every later recording conservatively names CLASS_NOT_TRANSFORMED. The count
+   * describes failed probe installations, never an invented number of missed invocations.
+   */
+  static final class CaptureLimitations {
+    private final java.util.concurrent.atomic.AtomicLong count =
+        new java.util.concurrent.atomic.AtomicLong();
+
+    void report() {
+      long previous = count.getAndUpdate(value -> value == Long.MAX_VALUE ? value : value + 1);
+      if (previous == 0) {
+        System.err.println(
+            "{\"code\":\"XTR-JAVA-INSTRUMENTATION\",\"message\":\"application invocation probes unavailable; recordings remain partial; application continues\"}");
+      }
+    }
+
+    long count() { return count.get(); }
+  }
+
   static final class SafeListener extends AgentBuilder.Listener.Adapter {
     private final Runnable onFailure;
+    private final ApplicationScope scope;
+    private final CaptureLimitations limitations;
 
     SafeListener(Runnable onFailure) {
+      this(onFailure, ApplicationScope.defaultScope(), new CaptureLimitations());
+    }
+
+    SafeListener(Runnable onFailure, ApplicationScope scope, CaptureLimitations limitations) {
       this.onFailure = java.util.Objects.requireNonNull(onFailure, "onFailure");
+      this.scope = scope;
+      this.limitations = limitations;
     }
 
     @Override
@@ -259,10 +335,13 @@ final class FixtureInstrumentation {
         JavaModule module,
         boolean loaded,
         Throwable throwable) {
+      // The error callback has no ProtectionDomain. With default Boot scope an unknown origin
+      // might be application code; conservatively disclose the failure rather than lose it.
+      if (scope.verdict(typeName, null) != ApplicationScope.NOT_APPLICATION) limitations.report();
       if (isExplicitTarget(typeName)) {
         try {
           onFailure.run();
-        } catch (RuntimeException | LinkageError ignored) {
+        } catch (Throwable ignored) {
           // An agent failure callback must not escape into application class loading.
         }
         System.err.println(

@@ -96,6 +96,9 @@ public final class AgentRuntime {
       sink = new RuntimeBridgeSink(queue);
       sink.useScope(config.scope());
       writer = new RecordingWriter(session, queue, sink);
+      FixtureInstrumentation.CaptureLimitations limitations =
+          new FixtureInstrumentation.CaptureLimitations();
+      writer.untransformedCount(limitations::count);
       permanent = true;
       // Line probes and all value reads, including proxy arguments/returns, are focused-only
       // (ADR 0003 root decision 3). The daemon honours the focused claim only when armed.
@@ -103,7 +106,7 @@ public final class AgentRuntime {
       if (config.focused()) {
         lineProbes =
             new FixtureInstrumentation.LineProbes(
-                new dev.xtrace.agent.runtime.line.SiteRegistry());
+                new dev.xtrace.agent.runtime.line.SiteRegistry(), limitations);
         lineSink = new LineProbeBridgeSink(sink, lineProbes.registry());
         writer.capturePolicy("xtrace.focused.v1");
       }
@@ -113,7 +116,7 @@ public final class AgentRuntime {
       }
       ProxyInstrumentation.install(instrumentation, writer::stopIncomplete, attach);
       FixtureInstrumentation.install(
-          instrumentation, writer::stopIncomplete, attach, config.scope(), lineProbes);
+          instrumentation, writer::stopIncomplete, attach, config.scope(), lineProbes, limitations);
       if (lineSink != null && !BootstrapBridge.installLineSink(lineSink)) {
         throw new ClientException("XTR-JAVA-AGENT", "line sink is already active");
       }

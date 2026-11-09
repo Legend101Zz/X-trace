@@ -599,7 +599,9 @@ public final class BootstrapBridge {
     try {
       RequestContext context = CONTEXT.get();
       BridgeSink sink = SINK.get();
-      if (context == null || context.deferred || sink == null) return;
+      // Deferred exception resolution still belongs to this open recording. requestEnd removes
+      // the context, and requestStart retires stale deferrals before admitting another request.
+      if (context == null || sink == null) return;
       flushLine(context);
       if (!safeEvent(sink, context, context.nextEventId(), context.currentParent(),
           BridgeEventKind.GAP, "xtrace.capture.gap.not-transformed", 1)) context.dropped++;
