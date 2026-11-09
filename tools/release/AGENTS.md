@@ -7,5 +7,6 @@
   `private_roots.py` admit only private roots on volumes with ownership enabled.
 - `test_release_tools.py` is about 5,900 lines; CI runs its classes with `XTRACE_TEST_SCRATCH_ROOT` from
   `tools/dev/env.sh`.
-- The `RunnerTests` process-tree tests are known to be nondeterministic on slow runners (`docs/STATE.md`). Fix them
-  with injected process snapshots and clocks, never with retries or longer deadlines.
+- `RunnerTests` use pipe handshakes, an injected clock and injected process snapshots (#15), plus real-process probe
+  tests on the real clock. Keep it that way: every harness wait is bounded, cleanup never signals a reaped pid, and
+  no handshake may sit inside a budget the test measures. Never fix them with retries or longer deadlines.

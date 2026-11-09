@@ -10,5 +10,5 @@
 - `java_run_spring` must run with `--test-threads=1`.
 - Tests that run `init` panic without `XTRACE_TEST_PRIVATE_SCRATCH` ("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is
   required"). Source `tools/dev/env.sh` first.
-- Known nondeterministic tests here: `node_run_http.rs` `auto_mode_records_cjs_and_esm_entries_once_each` and
-  `lifecycle_journey.rs` `stale_record_naming_a_zombie_is_cleaned_up_by_stop_and_restart` (see `docs/STATE.md`).
+- Known nondeterministic test here: `lifecycle_journey.rs`
+  `stale_record_naming_a_zombie_is_cleaned_up_by_stop_and_restart` (#14; see `docs/STATE.md`).

@@ -32,10 +32,8 @@ Epic: #2. Close an issue only when every box is ticked with evidence on merged `
 
 ## Next work, in order
 
-1. **Make main's CI clean.** Fix the nondeterministic tests below deterministically: inject clocks and process
-   snapshots, have tests remove their own scratch, and have the `pack_inventory` test list only a directory it owns.
-   Prove each fix with at least three CI runs on the exact head.
-2. **#3:** finish the three pushed, unmerged branches. Merge `origin/main` into each; never rebase pushed history.
+1. **Wave 2 = #3:** finish the three pushed, unmerged branches. Merge `origin/main` into each; never rebase pushed
+   history.
    - `ultra/r2w2-qb`: real Petclinic harness flows and product outcome kinds.
    - `ultra/r2w2-xb`: `xtrace export` for OpenAPI/Postman/cURL.
    - `ultra/r2w2-jb`: final HTTP status read after view rendering, and source roots relative to the project. Not yet
@@ -44,27 +42,27 @@ Epic: #2. Close an issue only when every box is ticked with evidence on merged `
    Then the product gaps: Spring Data repository frames (JDK proxies), the agent's limit of 8 unwritten
    recordings, TUI rows showing only ids, line events not reaching the read API. Done when the Petclinic campaign
    is green with zero not-implemented steps.
-3. **#4**, then **#5** and **#6** in parallel, then **#7** (the UI is built from the new design handoff), **#8**,
+2. **#4**, then **#5** and **#6** in parallel, then **#7** (the UI is built from the new design handoff), **#8**,
    then **#9**.
+
+Wave 1 (#18, PR #20, merged as `931f917`) removed the races behind the scan, Node HTTP, release-tool runner,
+`pack_inventory` and Spring fixture test failures (#12, #13, #15, #16, #21), recorded the owner's ADR 0012 answers
+(#17) and added the hosted macOS workflow (#19). Its head passed `ci-ok` on three runs and `macos-ok`.
 
 ## Known nondeterministic tests (fix; never retry to green)
 
-- `tools/release/test_release_tools.py` `RunnerTests` process-tree tests (slow runners).
-- `crates/xtrace-cli/tests/node_run_http.rs` `auto_mode_records_cjs_and_esm_entries_once_each`.
-- `crates/xtrace-cli/tests/lifecycle_journey.rs` `stale_record_naming_a_zombie_is_cleaned_up_by_stop_and_restart`.
-- `crates/xtrace-cli/tests/scan_fixture.rs` `scan_timeout_stops_the_whole_process_group_of_a_forking_wrapper`: its
-  warm-up exec of a freshly written analyzer script failed with ETXTBSY ("Text file busy") on Linux in post-merge
-  main CI run 42592007042 (gates job). This is the write-then-exec race while another test thread forks; the
-  product's own exec of a just-written analyzer has the same exposure.
-- `crates/xtrace-runtime/src/pack_inventory.rs`
-  `partial_snapshot_copy_uses_production_cleanup_and_reports_uncertain_replacement`: it lists the whole shared test
-  scratch under a 4,096-entry bound, so it fails once leftover scratch from other tests passes that bound.
+- `crates/xtrace-cli/tests/lifecycle_journey.rs` `stale_record_naming_a_zombie_is_cleaned_up_by_stop_and_restart`
+  (#14): the test now waits for the zombie state and its failure message shows the exit code and stderr, but the
+  2026-10-10 failure's cause is unproven. If it recurs, read that message first.
+- `adapters/java/attach-helper` `JavaAttachAcceptanceTest` still picks a free port before starting the Spring
+  fixture, the race fixed in #21 for the Rust journeys (#22).
 
 ## Branches
 
 - On 2026-11-09, with the owner's approval, about 130 merged or throwaway remote branches were deleted. Only
-  `main` and the unmerged keepers `ultra/r2w2-qb`, `ultra/r2w2-xb`, `ultra/r2w2-jb` remain.
-- `ultra/r2w3-r4` is gone; it raised a test deadline and added a retry.
+  `main` and the unmerged keepers `ultra/r2w2-qb`, `ultra/r2w2-xb`, `ultra/r2w2-jb` remain. `ultra/r2w3-r4` is
+  gone; it raised a test deadline and added a retry.
+- Wave branches (`wave/<n>`) are deleted after their merge and a green post-merge `main`.
 
 ## Waiting for the owner
 
