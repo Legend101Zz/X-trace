@@ -18,12 +18,14 @@ public class SpringMvcBridgeTest {
   @BeforeEach
   void install() {
     BootstrapBridge.resetForTest();
+    SpringMvcBridge.resetForTest();
     assertTrue(BootstrapBridge.install(sink));
   }
 
   @AfterEach
   void reset() {
     BootstrapBridge.resetForTest();
+    SpringMvcBridge.resetForTest();
   }
 
   @Test
@@ -117,6 +119,68 @@ public class SpringMvcBridgeTest {
     assertFalse(SpringMvcBridge.start(new Request("GET", "/b"), new Handler(Controller.class)));
     SpringMvcBridge.end(new Response(200), null);
     assertEquals(1, sink.starts());
+  }
+
+  @Test
+  void redirectStatusSetWhileTheViewRendersIsTheRecordedOutcome() {
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("POST", "/owners/new");
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    Response response = new Response(200);
+    SpringMvcBridge.end(request, response, null);
+    // The handler returned with the default status; the redirect view has not run yet.
+    assertTrue(BootstrapBridge.awaitingResolution());
+    assertEquals(1, sink.symbols.size(), "no response event before the dispatch ends");
+    response.status = 302;
+    SpringMvcBridge.dispatchEnd(response, null);
+    assertFalse(BootstrapBridge.hasContext());
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+    assertEquals(302, sink.outcome.httpStatus());
+    assertEquals("http.response 302", sink.symbols.get(1));
+    assertEquals(1, sink.starts());
+  }
+
+  @Test
+  void withoutTheDispatchHookTheRootStillClosesWhenTheHandlerReturns() {
+    Request request = new Request("GET", "/owners");
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    SpringMvcBridge.end(request, new Response(200), null);
+    assertFalse(BootstrapBridge.hasContext());
+    assertEquals(200, sink.outcome.httpStatus());
+  }
+
+  @Test
+  void dispatchThatThrowsAfterTheHandlerReturnedPropagatesTheExceptionWithoutAStatus() {
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("GET", "/owners/{ownerId}");
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    SpringMvcBridge.end(request, new Response(200), null);
+    SpringMvcBridge.dispatchEnd(new Response(200), new IllegalStateException("render failed"));
+    assertFalse(BootstrapBridge.hasContext());
+    assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+    assertEquals(0, sink.status);
+  }
+
+  @Test
+  void mappedExceptionWaitsForTheErrorViewStatusWhenTheDispatchHookIsLive() {
+    SpringMvcBridge.dispatchEnter();
+    Request request = new Request("GET", "/owners/{ownerId}");
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    IllegalArgumentException failure = new IllegalArgumentException("no owner");
+    SpringMvcBridge.end(request, new Response(200), failure);
+    Response response = new Response(200);
+    SpringMvcBridge.exceptionResolved(response, new Object(), null);
+    assertTrue(BootstrapBridge.awaitingResolution(), "the error view has not rendered yet");
+    response.status = 404;
+    SpringMvcBridge.dispatchEnd(response, null);
+    assertFalse(BootstrapBridge.hasContext());
+    assertEquals(404, sink.outcome.httpStatus());
+  }
+
+  @Test
+  void dispatchEndWithoutAnOpenRootIsIgnored() {
+    SpringMvcBridge.dispatchEnd(new Response(200), null);
+    assertTrue(sink.symbols.isEmpty());
   }
 
   @Test
@@ -297,7 +361,7 @@ public class SpringMvcBridgeTest {
   }
 
   public static final class Response {
-    private final int status;
+    int status;
 
     Response(int status) {
       this.status = status;

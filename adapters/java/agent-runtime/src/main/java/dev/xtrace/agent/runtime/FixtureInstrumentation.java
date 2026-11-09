@@ -133,7 +133,7 @@ final class FixtureInstrumentation {
               className,
               classfileBuffer,
               scope.sourceRoots(),
-              java.nio.file.Path.of(System.getProperty("user.dir", ".")));
+              scope.sourceBase());
         }
         return null;
       }
@@ -154,13 +154,21 @@ final class FixtureInstrumentation {
             .type(named(DISPATCHER))
             .transform(
                 (target, type, loader, module, domain) ->
-                    target.visit(
-                        Advice.to(ExceptionResolutionAdvice.class)
-                            .on(
-                                isMethod()
-                                    .and(named("processHandlerException"))
-                                    .and(takesArguments(4))
-                                    .and(not(isSynthetic())))))
+                    target
+                        .visit(
+                            Advice.to(ExceptionResolutionAdvice.class)
+                                .on(
+                                    isMethod()
+                                        .and(named("processHandlerException"))
+                                        .and(takesArguments(4))
+                                        .and(not(isSynthetic()))))
+                        .visit(
+                            Advice.to(DispatchAdvice.class)
+                                .on(
+                                    isMethod()
+                                        .and(named("doDispatch"))
+                                        .and(takesArguments(2))
+                                        .and(not(isSynthetic())))))
             .type(
                 (type, loader, module, redefined, domain) ->
                     !type.isInterface()
@@ -349,6 +357,25 @@ final class FixtureInstrumentation {
         @Advice.Return Object resolved,
         @Advice.Thrown Throwable thrown) {
       dev.xtrace.agent.bootstrap.SpringMvcBridge.exceptionResolved(response, resolved, thrown);
+    }
+  }
+
+  /**
+   * Brackets {@code DispatcherServlet#doDispatch}. The response status of a redirect or an error
+   * view only exists after the view renders, which is after the handler adapter returned, so the
+   * request root closes here with the status the response finally carried.
+   */
+  public static final class DispatchAdvice {
+    private DispatchAdvice() {}
+
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static void enter() {
+      dev.xtrace.agent.bootstrap.SpringMvcBridge.dispatchEnter();
+    }
+
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void exit(@Advice.Argument(1) Object response, @Advice.Thrown Throwable thrown) {
+      dev.xtrace.agent.bootstrap.SpringMvcBridge.dispatchEnd(response, thrown);
     }
   }
 

@@ -35,10 +35,32 @@ final class ApplicationScope {
 
   private final List<String> packages;
   private final List<String> sourceRoots;
+  private final java.nio.file.Path projectDirectory;
 
   ApplicationScope(List<String> packages, List<String> sourceRoots) {
+    this(packages, sourceRoots, null);
+  }
+
+  /**
+   * @param projectDirectory the repository the operator named with {@code --project-dir}; source
+   *     roots resolve against it. Null means the application's working directory.
+   */
+  ApplicationScope(
+      List<String> packages, List<String> sourceRoots, java.nio.file.Path projectDirectory) {
     this.packages = sanitizePackages(packages);
     this.sourceRoots = List.copyOf(sourceRoots);
+    this.projectDirectory = projectDirectory;
+  }
+
+  /**
+   * Directory source files are looked up from: the declared project directory when the launcher
+   * named one, else the working directory of the application. The application may be started from
+   * anywhere, so the working directory alone does not identify the repository.
+   */
+  java.nio.file.Path sourceBase() {
+    return projectDirectory != null
+        ? projectDirectory
+        : java.nio.file.Path.of(System.getProperty("user.dir", "."));
   }
 
   /** Scope used when the launcher supplied none: fat-jar application classes only. */

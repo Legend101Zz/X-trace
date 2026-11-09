@@ -75,9 +75,30 @@ final class CaptureConfig {
       if (top.get("capture") instanceof Map<?, ?> capture) {
         focused = "focused".equals(capture.get("mode"));
       }
-      return new CaptureConfig(new ApplicationScope(packages, safeRoots), focused);
+      java.nio.file.Path projectDir = projectDirectory(top.get("project_dir"));
+      return new CaptureConfig(new ApplicationScope(packages, safeRoots, projectDir), focused);
     } catch (RuntimeException invalid) {
       return defaults();
+    }
+  }
+
+  /**
+   * The absolute, existing project directory the launcher recorded in the private capture file;
+   * anything else (relative, control characters, not a directory) is ignored and the working
+   * directory is used.
+   */
+  static java.nio.file.Path projectDirectory(Object value) {
+    if (!(value instanceof String text) || text.isEmpty() || text.length() > 1024) return null;
+    for (int i = 0; i < text.length(); i++) {
+      char c = text.charAt(i);
+      if (c < ' ' || c == 0x7f) return null;
+    }
+    try {
+      java.nio.file.Path path = Path.of(text);
+      if (!path.isAbsolute() || !Files.isDirectory(path)) return null;
+      return path.normalize();
+    } catch (RuntimeException invalid) {
+      return null;
     }
   }
 

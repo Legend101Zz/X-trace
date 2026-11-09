@@ -270,13 +270,14 @@ public final class BootstrapBridge {
 
   /**
    * Keeps the request open after the handler threw, so the container's exception resolution can
-   * report the response it chose. Returns false when there is no open request.
+   * report the response it chose, or (null {@code thrown}) until the dispatch completes and the
+   * final response status is known. Returns false when there is no open request.
    */
   public static boolean deferRequestEnd(Throwable thrown) {
     RequestContext context = CONTEXT.get();
     if (context == null) return false;
     context.deferred = true;
-    context.lastThrown = thrown;
+    if (thrown != null) context.lastThrown = thrown;
     return true;
   }
 
