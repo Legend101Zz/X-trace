@@ -235,6 +235,150 @@ class T(unittest.TestCase):
         v = xinstr.analyze(d, exp, sent, frozenset({"b"}))
         self.assertTrue(v["a"]["expectations"][0]["problems"][0].startswith("attribution-ambiguous"))
 
+    def boundary_fixture(self):
+        exp = {"burst": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}],
+               "serial": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}]}
+        sent = [("burst", "GET", "/owners/1"), ("burst", "GET", "/owners/2")]
+        details = {str(i): rec("GET", "/owners/{id}", 200) for i in range(2)}
+        for d in details.values():
+            d["completion"] = "complete"
+        return exp, sent, details
+
+    def test_boundary_records_exact_ids_counts_and_verification_time(self):
+        exp, sent, details = self.boundary_fixture()
+        with mock.patch.object(xinstr.time, "time", return_value=123):
+            boundary = xinstr.burst_accounting(details, sent, exp, {})
+        self.assertTrue(boundary["verified"])
+        self.assertEqual(boundary["verifiedAt"], 123)
+        self.assertEqual(boundary["recordingIds"], ["0", "1"])
+        self.assertEqual(boundary["recordingCount"], 2)
+        verdict = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
+        self.assertTrue(verdict["burst"]["passed"], verdict)
+        details["0"]["outcome"]["httpStatus"] = 500
+        verdict = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
+        self.assertEqual(verdict["burst"]["expectations"][0]["problems"],
+                         ["http-outcome-count-mismatch(expected 2, observed 1)"])
+
+    def test_partial_accounting_polls_state_and_expiry_reports_exact_numbers(self):
+        exp, sent, details = self.boundary_fixture()
+        client = mock.Mock()
+        with mock.patch.object(xinstr.time, "monotonic", side_effect=[0, 1, 2]), \
+             mock.patch.object(xinstr, "collect_api", side_effect=[
+                 {"ok": True, "details": {"0": details["0"]}}, {"ok": True, "details": details}]) as collect:
+            boundary = xinstr.wait_burst_boundary(client, pathlib.Path("unused"), sent, exp, {}, 3)
+        self.assertTrue(boundary["verified"])
+        self.assertEqual(collect.call_count, 2)
+        self.assertIsNone(client.deadline)
+        with mock.patch.object(xinstr.time, "monotonic", side_effect=[0, 3]), \
+             mock.patch.object(xinstr, "collect_api", return_value={"ok": True, "details": {"0": details["0"]}}):
+            boundary = xinstr.wait_burst_boundary(client, pathlib.Path("unused"), sent, exp, {}, 3)
+        self.assertFalse(boundary["verified"])
+        self.assertIsNone(boundary["verifiedAt"])
+        v = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
+        self.assertEqual(v["burst"]["expectations"][0]["problems"],
+                         ["burst-unaccounted(requests 2, recordings 1, capacity drops 0, unaccounted 1)"])
+        self.assertFalse(v["serial"]["passed"])
+
+    def test_snapshot_finishing_after_budget_does_not_verify(self):
+        exp, sent, details = self.boundary_fixture()
+        with mock.patch.object(xinstr.time, "monotonic", side_effect=[0, 4, 4]), \
+             mock.patch.object(xinstr, "collect_api", return_value={"ok": True, "details": details}):
+            boundary = xinstr.wait_burst_boundary(mock.Mock(), pathlib.Path("unused"), sent, exp, {}, 3)
+        self.assertFalse(boundary["verified"])
+        self.assertIsNone(boundary["verifiedAt"])
+
+    def test_late_recording_after_boundary_cannot_inflate_serial_counts(self):
+        exp, sent, details = self.boundary_fixture()
+        boundary = xinstr.burst_accounting(details, sent, exp, {})
+        sent.append(("serial", "GET", "/owners/3"))
+        details["serial"] = rec("GET", "/owners/{id}", 200)
+        details["serial"]["_openedAt"] = "2026-10-10T00:00:00Z"
+        v = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
+        self.assertTrue(v["serial"]["passed"], v)
+        details["serial"]["completion"] = "partial"
+        v = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
+        self.assertIn("partial-recording", v["serial"]["expectations"][0]["problems"])
+        details["serial"]["completion"] = "complete"
+        details["late"] = rec("GET", "/owners/{id}", 200)
+        details["late"]["_openedAt"] = "2026-10-10T00:00:01Z"
+        v = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
+        self.assertEqual(v["serial"]["expectations"][0]["problems"],
+                         ["serial-count-mismatch(recordings 2, requests 1)"])
+        self.assertEqual(v["burst"]["recordingsAttributed"], 2)
+        del details["serial"]
+        del details["late"]
+        v = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
+        self.assertEqual(v["serial"]["expectations"][0]["problems"],
+                         ["serial-count-mismatch(recordings 0, requests 1)"])
+
+    def test_capacity_drops_are_deduplicated_and_partials_still_fail(self):
+        exp, sent, details = self.boundary_fixture()
+        evidence = "1 requests were not recorded: agent capacity (session s, cumulative as last reported)"
+        details["0"]["incompleteEvidence"] = [evidence]
+        details["1"]["incompleteEvidence"] = [evidence]
+        self.assertEqual(xinstr.capacity_counts(details), {"s": 1})
+        # One admitted forced drop and one refused request fully account for the burst, but fail it.
+        details.pop("1")
+        details["0"]["completion"] = "partial"
+        boundary = xinstr.burst_accounting(details, sent, exp, {})
+        self.assertTrue(boundary["verified"])
+        self.assertEqual(boundary["capacityDrops"], 1)
+        self.assertEqual(boundary["partialRecordingIds"], ["0"])
+        v = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
+        self.assertEqual(v["burst"]["expectations"][0]["problems"], ["burst-drops(capacity 1, partial 1)"])
+        before = {"old": {"incompleteEvidence": [evidence]}}
+        self.assertFalse(xinstr.burst_accounting(details, sent, exp, before)["verified"])
+
+    def test_open_and_excess_route_recordings_do_not_verify_boundary(self):
+        exp, sent, details = self.boundary_fixture()
+        details["0"]["completion"] = "open"
+        self.assertFalse(xinstr.burst_accounting(details, sent, exp, {})["verified"])
+        details["0"]["completion"] = "complete"
+        details["extra"] = dict(details["0"])
+        self.assertFalse(xinstr.burst_accounting(details, sent, exp, {})["verified"])
+
+    def test_orchestration_waits_before_serial_and_stops_when_unaccounted(self):
+        import tempfile
+        import xcamp
+        from types import SimpleNamespace
+        for verified in (True, False):
+            with self.subTest(verified=verified), tempfile.TemporaryDirectory() as td:
+                events = []
+                stack = mock.Mock(launcher_exit=0, base="http://127.0.0.1:1234")
+                stack.logs.return_value = ""
+                def run(sc, *args):
+                    events.append(sc.id)
+                    xcamp.SENT_LOG.append(("GET", "/owners/1"))
+                    return {"id": sc.id, "passed": True, "semanticEffectFingerprint": "fp", "requests": [], "elapsedMs": 1}
+                exp, sent, details = self.boundary_fixture()
+                boundary = xinstr.burst_accounting(details, sent, exp, {})
+                boundary["verified"] = verified
+                def wait(*args):
+                    events.append("boundary")
+                    return boundary
+                api = {"ok": True, "reason": "", "recordings": [], "details": {}}
+                with mock.patch.object(xinstr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "")), \
+                     mock.patch.object(xinstr, "list_recording_ids", return_value=set()), \
+                     mock.patch.object(xinstr, "start_viewer", return_value=(object(), {"origin": stack.base, "url": "http://x/#" + "A" * 43})), \
+                     mock.patch.object(xinstr, "ViewerClient"), \
+                     mock.patch.object(xinstr, "stop_process_group"), \
+                     mock.patch.object(xinstr, "collect_api", return_value=api), \
+                     mock.patch.object(xinstr, "wait_burst_boundary", side_effect=wait), \
+                     mock.patch.object(xcamp, "run_scenario", side_effect=run):
+                    receipt = xinstr.run_instrumented(
+                        project="p", pin={}, make_stack=lambda _: stack,
+                        scenarios=[SimpleNamespace(id="serial", kind="business"), SimpleNamespace(id="burst", kind="concurrency")],
+                        out_dir=pathlib.Path(td) / "out", norm_extra=[], expectations=exp, xtrace="xtrace",
+                        project_dir=pathlib.Path(td), data_home=pathlib.Path(td) / "data", adaptations=[],
+                        canaries=None, baseline_receipt=None, extra_canary_paths=[], harness_files=[])
+                self.assertEqual(events, ["burst", "boundary", "serial"] if verified else ["burst", "boundary"])
+                self.assertEqual(receipt["notes"]["burstBoundary"], boundary)
+                stack.down.assert_called_once()
+                if not verified:
+                    serial = next(s for s in receipt["scenarios"] if s["id"] == "serial")
+                    self.assertFalse(serial["scenarioChecksPassed"])
+                    self.assertEqual(serial["notRunReason"], "burst boundary was not verified")
+
     def test_recording_snapshot_requires_valid_paginated_cli_evidence(self):
         with mock.patch.object(xinstr.subprocess, "run", side_effect=[
             subprocess.CompletedProcess([], 0, '{"recordings":[{"recording_id":"old"}],"next_after":"next"}'),
