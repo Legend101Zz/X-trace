@@ -45,6 +45,23 @@ class OverheadHarness(unittest.TestCase):
                 self.assertEqual(expectation["outcome"], "exception_propagated")
                 self.assertEqual(expectation["exception"], typ)
 
+    def test_pet_repository_judge_accepts_observed_inherited_jpa_declaration_only_where_used(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = self.load(td)
+        import xinstr
+        event = {"kind": "recording_event_kind:frame_enter",
+                 "symbol": "org.springframework.data.jpa.repository.JpaRepository.saveAndFlush"}
+        detail = {"events": [event]}
+        pet = harness.EXPECT["pet-and-visit-flow"][0]
+        self.assertEqual(xinstr.layer_frames(detail, "repository", pet["layerHints"]["repository"]), [event])
+        # PetTypeRepository observations cannot stand in for the owner's write.
+        detail["events"] = [{**event, "symbol": "org.springframework.samples.petclinic.owner.PetTypeRepository.findPetTypes"}]
+        self.assertEqual(xinstr.layer_frames(detail, "repository", pet["layerHints"]["repository"]), [])
+        detail["events"] = [event]
+        owner_read = harness.EXPECT["owner-create-roundtrip"][1]
+        self.assertEqual(xinstr.layer_frames(detail, "repository", owner_read["layerHints"]["repository"]), [])
+        self.assertEqual(xinstr.layer_frames({"events": []}, "repository", pet["layerHints"]["repository"]), [])
+
     def test_exactly_five_interleaved_pairs_record_real_intervals_and_pair_paths(self):
         with tempfile.TemporaryDirectory() as td:
             harness = self.load(td)

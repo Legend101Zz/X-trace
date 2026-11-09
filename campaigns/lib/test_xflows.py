@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 import pathlib
 import subprocess
 import sys
@@ -294,6 +295,35 @@ class Judges(unittest.TestCase):
             xflows.wait_canary_recording(client, pathlib.Path("unused"), {}, "POST", "/owners/new", 30)
         self.assertIsNone(client.deadline)
 
+    def test_open_partial_prefix_is_polled_until_terminal_proof_without_sleeping(self):
+        detail = privacy_details()["owner"]
+        snapshots = [{"ok": True, "details": {"new": {**detail, "status": status, "completion": "partial"}}}
+                     for status in ("recording", "finalizing")]
+        snapshots.append({"ok": True, "details": {"new": {**detail, "status": "complete"}}})
+        client = Mock()
+        with patch.object(xflows.xinstr, "collect_api", side_effect=snapshots) as collect, \
+                patch.object(xflows.time, "monotonic", return_value=0), patch.object(xflows.time, "sleep") as sleep:
+            rid, details = xflows.wait_canary_recording(client, pathlib.Path("unused"), {}, "GET", "/owners/{ownerId}", 30)
+        self.assertEqual(rid, "new")
+        self.assertEqual(details["new"]["status"], "complete")
+        self.assertEqual(collect.call_count, 3)
+        sleep.assert_not_called()
+        self.assertIsNone(client.deadline)
+        for status, completion in (("partial", "partial"), ("invalid", "invalid")):
+            with self.subTest(status=status), patch.object(xflows.time, "monotonic", return_value=0), \
+                    patch.object(xflows.xinstr, "collect_api", return_value={
+                        "ok": True, "details": {"new": {**detail, "status": status, "completion": completion}}}) as collect:
+                with self.assertRaisesRegex(xflows.CanaryEvidenceError, "not complete"):
+                    xflows.wait_canary_recording(client, pathlib.Path("unused"), {}, "GET", "/owners/{ownerId}", 30)
+                self.assertEqual(collect.call_count, 1)
+
+    def test_open_recording_does_not_extend_the_request_budget(self):
+        detail = {**privacy_details()["owner"], "status": "recording", "completion": "partial"}
+        with patch.object(xflows.time, "monotonic", side_effect=[0, 30]), \
+                patch.object(xflows.xinstr, "collect_api", return_value={"ok": True, "details": {"new": detail}}):
+            with self.assertRaisesRegex(xflows.CanaryEvidenceError, "within its request budget"):
+                xflows.wait_canary_recording(Mock(), pathlib.Path("unused"), {}, "GET", "/owners/{ownerId}", 30)
+
     def test_focused_without_canaries_fails_before_launching(self):
         import os
         flow = xflows.Flows.__new__(xflows.Flows)
@@ -317,10 +347,13 @@ class Drivers(unittest.TestCase):
     def flow(self):
         flow = object.__new__(xflows.Flows)
         flow.xtrace, flow.project_dir = "xtrace", pathlib.Path("/project")
-        flow.agent, flow.out_dir = "agent.jar", pathlib.Path("/flow-artifacts")
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        flow.agent, flow.out_dir = "agent.jar", pathlib.Path(scratch.name)
         flow.app_package, flow.source_root = "com.example.app", "src/main/java"
         flow.env, flow.results = {}, {}
         flow._stack = Mock(return_value=Mock(base="http://127.0.0.1:8000", host_port=8000))
+        flow._stack.return_value.hold_owner_writes = Mock(side_effect=nullcontext)
         flow._stop_daemon_quietly = Mock()
         return flow
 
@@ -476,7 +509,7 @@ class Drivers(unittest.TestCase):
         flow = self.flow()
         details = {"a": rec("GET", "/owners"), "b": rec("GET", "/vets"), "c": rec("GET", "/owners/{ownerId}")}
         with patch.object(xflows.subprocess, "run", side_effect=[self.result(self.armed()), self.result({"kind": "stopped"})]), \
-                patch.object(xflows, "_paced_gets", return_value={"/vets": 200}), \
+                patch.object(flow, "_recorded_gets", return_value={"/vets": 200}) as requests, \
                 patch.object(xflows, "wait_gone", return_value=True) as gone, \
                 patch.object(xflows, "read_api", side_effect=[self.api({}), self.api(details)]):
             reopened = flow.record_stop()
@@ -484,6 +517,38 @@ class Drivers(unittest.TestCase):
         self.assertEqual(set(reopened), set(details))
         flow._stack.assert_called_once_with("", ["-javaagent:agent.jar=/bootstrap.json"])
         gone.assert_called_once_with(71)
+        self.assertEqual(requests.call_args.args[1], ["/owners?lastName=Davis", "/vets", "/owners/1"])
+
+    def test_record_stop_observes_each_completed_capture_before_stopping_and_still_judges_readback(self):
+        import xcamp
+        for persisted in (True, False):
+            flow = self.flow()
+            order = []
+            routes = [("GET", "/owners"), ("GET", "/vets"), ("GET", "/owners/{ownerId}")]
+            details = {str(i): rec(*route) for i, route in enumerate(routes)}
+            def record(command="record", **kwargs):
+                order.append(command)
+                return 0, self.armed(), "/bootstrap.json"
+            def observe(client, dest, before, method, route, deadline):
+                order.append(route)
+                self.assertEqual(deadline, 30)
+                return "observed", details
+            flow._record = Mock(side_effect=record)
+            with self.subTest(persisted=persisted), \
+                    patch.object(xflows.xinstr, "start_viewer", return_value=(Mock(), {"origin": "o", "url": "u"})), \
+                    patch.object(xflows.xinstr, "ViewerClient"), patch.object(xflows.xinstr, "bootstrap_token"), \
+                    patch.object(xflows.xinstr, "collect_api", return_value=self.api({})), \
+                    patch.object(xflows.xinstr, "stop_process_group"), \
+                    patch.object(xcamp, "http_request", return_value={"status": 200}) as http, \
+                    patch.object(xflows, "wait_canary_recording", side_effect=observe), \
+                    patch.object(xflows.time, "monotonic", return_value=0), patch.object(xflows.time, "sleep") as sleep, \
+                    patch.object(xflows, "wait_gone", return_value=True), \
+                    patch.object(xflows, "read_api", side_effect=[self.api({}), self.api(details if persisted else {})]):
+                flow.record_stop()
+            self.assertEqual(order, ["record", "/owners", "/vets", "/owners/{ownerId}", "stop"])
+            self.assertEqual(http.call_count, 3)
+            sleep.assert_not_called()
+            self.assertEqual(flow.results["record-stop-flow"]["status"], "pass" if persisted else "fail")
 
     def test_restart_reopen_checks_started_pid_inside_pretty_document(self):
         flow = self.flow()
@@ -519,7 +584,7 @@ class Drivers(unittest.TestCase):
 
                 part = rec("POST", "/owners/new", "partial", evidence=["interrupted"])
                 details = {"control": rec(), reopened_id: part}
-                with patch.object(xflows, "_paced_gets"), patch.object(xflows.socket, "create_connection"), \
+                with patch.object(xflows, "_paced_gets"), patch.object(xflows.socket, "create_connection") as connect, \
                         patch.object(xflows.subprocess, "run", side_effect=show), \
                         patch.object(xflows.time, "monotonic", side_effect=[0, 0, 0, 0.05]), \
                         patch.object(xflows.time, "sleep") as sleep, \
@@ -527,6 +592,11 @@ class Drivers(unittest.TestCase):
                         patch.object(xflows, "read_api", side_effect=[self.api({}), self.api(details)]):
                     flow.partial()
                 self.assertEqual(order, ["control", "held", "kill"])
+                flow._stack.return_value.hold_owner_writes.assert_called_once_with()
+                payload = connect.return_value.sendall.call_args.args[0]
+                headers, body = payload.split(b"\r\n\r\n", 1)
+                self.assertIn(f"Content-Length: {len(body)}".encode(), headers)
+                self.assertIn(b"telephone=0123456789", body)
                 sleep.assert_called_once_with(0.05)
                 self.assertEqual(flow.results["partial-recording-reopen"]["status"], "pass" if reopened_id == "held" else "fail")
                 proc.wait.assert_called_once_with(timeout=30)

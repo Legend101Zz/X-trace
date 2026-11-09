@@ -1,4 +1,5 @@
 import pathlib
+import io
 import subprocess
 import sys
 import tempfile
@@ -78,6 +79,47 @@ class Ports(unittest.TestCase):
             ctx = xcamp.Ctx(stack=self.stack(), base="http://127.0.0.1:1234", pace=0.4)
             ctx.http("GET", "/vets")
         self.assertEqual(events, [("pace", 0.4), ("request", "/vets")])
+
+    def test_owner_write_barrier_requires_lock_acknowledgement_and_releases_on_error(self):
+        stack = self.stack(db_name="petclinic")
+        for acknowledged in (True, False):
+            proc = mock.Mock(stdin=mock.Mock(), stdout=io.BytesIO(b"1\n" if acknowledged else b""))
+            entered = False
+            with self.subTest(acknowledged=acknowledged), mock.patch.object(xcamp.subprocess, "Popen", return_value=proc) as launch, \
+                    mock.patch("select.select", return_value=([proc.stdout], [], [])), mock.patch.object(xcamp.time, "sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "probe interrupted" if acknowledged else "not acknowledged"):
+                    with stack.hold_owner_writes():
+                        entered = True
+                        proc.stdin.close.assert_not_called()
+                        raise RuntimeError("probe interrupted")
+                self.assertEqual(entered, acknowledged)
+                self.assertEqual(launch.call_args.args[0][:4], ["docker", "exec", "-i", stack.db])
+                proc.stdin.write.assert_called_once_with(b"BEGIN; LOCK TABLE owners IN SHARE MODE; SELECT 1;\n")
+                proc.stdin.flush.assert_called_once()
+                proc.stdin.close.assert_called_once()
+                proc.wait.assert_called_once_with(timeout=10)
+                self.assertTrue(proc.stdout.closed)
+                sleep.assert_not_called()
+
+    def test_owner_write_barrier_silence_never_admits_a_request(self):
+        stack = self.stack(db_name="petclinic")
+        proc = mock.Mock()
+        with mock.patch.object(xcamp.subprocess, "Popen", return_value=proc), \
+                mock.patch("select.select", return_value=([], [], [])):
+            with self.assertRaisesRegex(RuntimeError, "not acknowledged"):
+                with stack.hold_owner_writes():
+                    self.fail("an unobserved lock must not admit the request")
+        proc.stdout.readline.assert_not_called()
+        proc.stdin.close.assert_called_once()
+
+    def test_owner_write_barrier_rejects_other_campaign_databases(self):
+        stack = self.stack(db_name="petclinic")
+        stack.project = "other"
+        with mock.patch.object(xcamp.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(RuntimeError, "requires the Petclinic"):
+                with stack.hold_owner_writes():
+                    self.fail("wrong database")
+        launch.assert_not_called()
 
 
 if __name__ == "__main__":
