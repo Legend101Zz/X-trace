@@ -1451,7 +1451,16 @@ impl SqliteRecordingStore<'_> {
         commit_failpoint("before-logical-write", correlation_id, false)?;
         validate_managed_tree(&self.binding.root, &staging.directory, correlation_id)?;
         validate_managed_file(&staging.logical, correlation_id, true)?;
-        write_synced_file(&staging.logical, logical.logical_bytes(), correlation_id)?;
+        // The logical file is scratch, never an acknowledged object. Flush it
+        // to the filesystem here; the compressed file's device barrier below
+        // makes both durable before publication. Avoid a second F_FULLFSYNC
+        // per segment on Apple without changing the segment or Finish promise.
+        write_synced_file(
+            &staging.logical,
+            logical.logical_bytes(),
+            FileSync::Filesystem,
+            correlation_id,
+        )?;
         sync_directory(&staging.directory, correlation_id, "XTR-STORE-OBJECT-IO")?;
         commit_failpoint("after-logical-sync", correlation_id, false)?;
         self.binding.revalidate(correlation_id)?;
@@ -1463,7 +1472,7 @@ impl SqliteRecordingStore<'_> {
             .map_err(|_| segment_validation_error(correlation_id))?;
         validate_managed_tree(&self.binding.root, &staging.directory, correlation_id)?;
         validate_managed_file(&staging.compressed, correlation_id, true)?;
-        write_synced_file(&staging.compressed, &compressed, correlation_id)?;
+        write_synced_file(&staging.compressed, &compressed, FileSync::Device, correlation_id)?;
         sync_directory(&staging.directory, correlation_id, "XTR-STORE-OBJECT-IO")?;
         commit_failpoint("after-compressed-sync", correlation_id, false)?;
 
@@ -4336,9 +4345,34 @@ fn ensure_owner_only_directory(
     current.revalidate().map_err(|_| object_io_error(correlation_id))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileSync {
+    Filesystem,
+    Device,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FILE_SYNCS: std::cell::RefCell<Vec<FileSync>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn sync_recording_file(file: &std::fs::File, kind: FileSync) -> std::io::Result<()> {
+    match kind {
+        #[cfg(unix)]
+        FileSync::Filesystem => rustix::fs::fsync(file).map_err(std::io::Error::from)?,
+        #[cfg(not(unix))]
+        FileSync::Filesystem => file.sync_all()?,
+        FileSync::Device => file.sync_all()?,
+    }
+    #[cfg(test)]
+    FILE_SYNCS.with(|syncs| syncs.borrow_mut().push(kind));
+    Ok(())
+}
+
 fn write_synced_file(
     path: &Path,
     bytes: &[u8],
+    sync: FileSync,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
     note_staging_write();
@@ -4351,7 +4385,7 @@ fn write_synced_file(
     let mut file = root.create_private_file(name).map_err(|_| object_io_error(correlation_id))?;
     file.write_all(bytes).map_err(|_| object_io_error(correlation_id))?;
     file.flush().map_err(|_| object_io_error(correlation_id))?;
-    file.sync_all().map_err(|_| object_io_error(correlation_id))?;
+    sync_recording_file(&file, sync).map_err(|_| object_io_error(correlation_id))?;
     root.validate_file_binding(name, &file, true).map_err(|_| object_io_error(correlation_id))?;
     root.sync().map_err(|_| object_io_error(correlation_id))
 }
@@ -6676,7 +6710,8 @@ mod tests {
             CorrelationId::new(),
         )
         .expect("object parent");
-        write_synced_file(&destination, &alternate, CorrelationId::new()).expect("preplace");
+        write_synced_file(&destination, &alternate, FileSync::Device, CorrelationId::new())
+            .expect("preplace");
         sync_directory(
             destination.parent().expect("parent"),
             CorrelationId::new(),
@@ -6772,8 +6807,13 @@ mod tests {
             CorrelationId::new(),
         )
         .expect("parent");
-        write_synced_file(&destination, encoded.compressed_bytes(), CorrelationId::new())
-            .expect("object");
+        write_synced_file(
+            &destination,
+            encoded.compressed_bytes(),
+            FileSync::Device,
+            CorrelationId::new(),
+        )
+        .expect("object");
         let connection = fixture.store.lock().expect("connection");
         connection
             .execute(
@@ -6938,8 +6978,10 @@ mod tests {
         let left = fixture.root.join("race-left.zst");
         let right = fixture.root.join("race-right.zst");
         let destination = fixture.root.join("race-destination.zst");
-        write_synced_file(&left, &compressed, CorrelationId::new()).expect("left staging");
-        write_synced_file(&right, &compressed, CorrelationId::new()).expect("right staging");
+        write_synced_file(&left, &compressed, FileSync::Device, CorrelationId::new())
+            .expect("left staging");
+        write_synced_file(&right, &compressed, FileSync::Device, CorrelationId::new())
+            .expect("right staging");
         let barrier = std::sync::Barrier::new(3);
         let (left_result, right_result) = std::thread::scope(|scope| {
             let left_barrier = &barrier;
@@ -7781,6 +7823,69 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_checkpoint_and_segment_scratch_share_their_data_device_barrier() {
+        let fixture = on_disk_store("grouped-syncs");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        FILE_SYNCS.with(|syncs| syncs.borrow_mut().clear());
+        let mut checkpoint = None;
+        for (sequence, prefix) in [(2, 0), (3, 1)] {
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[sequence]),
+                prefix,
+                &mut checkpoint,
+            )
+            .expect("durable batch");
+            FILE_SYNCS.with(|syncs| {
+                assert_eq!(
+                    std::mem::take(&mut *syncs.borrow_mut()),
+                    [FileSync::Filesystem, FileSync::Device],
+                    "flush the unpublished checkpoint before one shared device barrier"
+                );
+            });
+        }
+        // Lose the volatile checkpoint before publishing and completing: the
+        // grouped barrier must still leave a fully recoverable journal prefix.
+        drop(checkpoint);
+        let mut finish = FinishRecording::without_digest(anchor.recording_id, 3);
+        finish.event_digest = blake3::hash(b"event-2event-3").as_bytes().to_vec();
+        assert_eq!(view.finish_recording(&finish).expect("Finish"), RecordingCompletion::Complete);
+        FILE_SYNCS.with(|syncs| {
+            assert_eq!(
+                std::mem::take(&mut *syncs.borrow_mut()),
+                [FileSync::Filesystem, FileSync::Device],
+                "logical scratch must not add a device flush per sealed segment"
+            );
+        });
+        let reopened = SqliteStore::open(
+            &fixture.database,
+            OpenOptions::default().with_must_exist(true).with_read_only(true),
+        )
+        .expect("fresh reader at Finish success");
+        let page = reopened
+            .recording_store(&fixture.root)
+            .expect("read view")
+            .read_recording_window(
+                &ShowWindowRequest {
+                    project_id,
+                    recording_id: anchor.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                },
+                None,
+            )
+            .expect("complete readback");
+        assert_eq!(page.status, RecordingStatus::Complete);
+        assert_eq!(page.completion, RecordingCompletionEvidence::Complete);
+        assert_eq!(page.events.len(), 2);
+        assert!(page.incomplete_evidence.is_empty());
     }
 
     #[cfg(unix)]
@@ -8793,7 +8898,7 @@ mod tests {
         assert_eq!(take_directory_sync_count(), 1, "one directory barrier publishes both names");
         assert_eq!(
             take_sync_order(),
-            [SyncKind::Journal, SyncKind::Checkpoint, SyncKind::Directory]
+            [SyncKind::Checkpoint, SyncKind::Journal, SyncKind::Directory]
         );
         assert_eq!(
             view.journal_summary(anchor.recording_id, 1).expect("durable prefix"),

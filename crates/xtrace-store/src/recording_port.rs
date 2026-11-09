@@ -1960,13 +1960,13 @@ mod tests {
                 vec![SyncKind::Directory, SyncKind::Directory]
             } else if index % DEFAULT_SEGMENT_EVENTS == 0 {
                 vec![
+                    SyncKind::Checkpoint,
                     SyncKind::Journal,
                     SyncKind::Directory,
-                    SyncKind::Checkpoint,
                     SyncKind::Directory,
                 ]
             } else {
-                vec![SyncKind::Journal, SyncKind::Checkpoint, SyncKind::Directory]
+                vec![SyncKind::Checkpoint, SyncKind::Journal, SyncKind::Directory]
             };
             assert_eq!(
                 take_sync_order(),
