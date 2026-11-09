@@ -16,6 +16,8 @@ import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class SourceIdentityTest {
   private static final String CLASS_NAME = "dev.xtrace.agent.runtime.testapp.SampleService";
@@ -45,12 +47,15 @@ class SourceIdentityTest {
     return file;
   }
 
-  @Test
-  void observedUnattestedHashEqualsBlake3OfTheSourceFile(@TempDir Path repo) throws Exception {
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void observedUnattestedHashEqualsBlake3OfTheSourceFile(
+      boolean forceFallback, @TempDir Path repo) throws Exception {
     Path file = sourceTree(repo, 200);
     SourceIdentity.observe(
         SampleService.class.getClassLoader(), INTERNAL, classBytes(),
-        List.of("src/main/java"), repo);
+        List.of("src/main/java"), repo,
+        (base, relative) -> ConfinedSourceFiles.read(base, relative, fileToOpen -> {}, forceFallback));
     SourceAttestation.SourceInfo info = SourceIdentity.lookup(SampleService.class, "place", PLACE);
     assertEquals(SourceIdentity.OBSERVED_UNATTESTED, info.binding());
     assertEquals(

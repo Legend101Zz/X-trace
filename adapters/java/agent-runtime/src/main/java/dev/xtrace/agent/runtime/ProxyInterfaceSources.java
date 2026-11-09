@@ -33,15 +33,20 @@ final class ProxyInterfaceSources {
   /** Per-observation seam for a source change between identity and declaration reads. */
   static void observe(ClassLoader loader, String name, byte[] bytes, ApplicationScope scope,
       Runnable afterIdentity) {
+    observe(loader, name, bytes, scope, afterIdentity, ConfinedSourceFiles::read);
+  }
+
+  static void observe(ClassLoader loader, String name, byte[] bytes, ApplicationScope scope,
+      Runnable afterIdentity, ConfinedSourceFiles.Reader sourceReader) {
     if (loader == null || bytes.length > 8 * 1024 * 1024) return;
     try {
       ClassReader reader = new ClassReader(bytes);
       if ((reader.getAccess() & Opcodes.ACC_INTERFACE) == 0) return;
       SourceIdentity.ClassFacts facts = SourceIdentity.parse(name, bytes);
-      facts.resolve(scope.sourceRoots(), scope.sourceBase());
+      facts.resolve(scope.sourceRoots(), scope.sourceBase(), sourceReader);
       if (facts.path() == null || facts.hash() == null) return;
       afterIdentity.run();
-      ConfinedSourceFiles.Source source = ConfinedSourceFiles.read(scope.sourceBase(), facts.path());
+      ConfinedSourceFiles.Source source = sourceReader.read(scope.sourceBase(), facts.path());
       if (source == null) return;
       byte[] content = source.bytes();
       if (!java.util.Arrays.equals(facts.hash(), SourceAttestation.blake3Of(content))) return;

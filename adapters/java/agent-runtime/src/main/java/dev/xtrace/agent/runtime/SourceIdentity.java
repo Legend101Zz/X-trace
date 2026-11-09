@@ -58,11 +58,22 @@ final class SourceIdentity {
       List<String> sourceRoots,
       Path workingDirectory,
       ConfinedSourceFiles.BeforeOpen beforeOpen) {
+    observe(loader, internalName, classBytes, sourceRoots, workingDirectory,
+        (base, relative) -> ConfinedSourceFiles.read(base, relative, beforeOpen));
+  }
+
+  static void observe(
+      ClassLoader loader,
+      String internalName,
+      byte[] classBytes,
+      List<String> sourceRoots,
+      Path workingDirectory,
+      ConfinedSourceFiles.Reader reader) {
     if (loader == null || internalName == null || classBytes == null) return;
     if (classBytes.length > MAX_CLASS_BYTES) return;
     try {
       ClassFacts facts = parse(internalName, classBytes);
-      facts.resolve(sourceRoots, workingDirectory, beforeOpen);
+      facts.resolve(sourceRoots, workingDirectory, reader);
       synchronized (LOADERS) {
         Map<String, ClassFacts> classes = LOADERS.computeIfAbsent(loader, key -> new HashMap<>());
         if (classes.size() < MAX_CLASSES_PER_LOADER) {
@@ -174,11 +185,11 @@ final class SourceIdentity {
     }
 
     void resolve(List<String> sourceRoots, Path workingDirectory) {
-      resolve(sourceRoots, workingDirectory, file -> {});
+      resolve(sourceRoots, workingDirectory, ConfinedSourceFiles::read);
     }
 
-    private void resolve(List<String> sourceRoots, Path workingDirectory,
-        ConfinedSourceFiles.BeforeOpen beforeOpen) {
+    void resolve(List<String> sourceRoots, Path workingDirectory,
+        ConfinedSourceFiles.Reader reader) {
       if (sourceFile == null || !simpleSourceName(sourceFile)) {
         fileProblem = sourceFile == null ? DEBUG_METADATA_ABSENT : SOURCE_METADATA_INVALID;
         return;
@@ -192,8 +203,8 @@ final class SourceIdentity {
         }
         Path base = workingDirectory.toRealPath();
         for (String root : sourceRoots) {
-          ConfinedSourceFiles.Source found = ConfinedSourceFiles.read(
-              base, root + "/" + packagePath + sourceFile, beforeOpen);
+          ConfinedSourceFiles.Source found = reader.read(
+              base, root + "/" + packagePath + sourceFile);
           if (found == null) continue;
           if (!found.path().getFileName().toString().equals(sourceFile)) {
             fileProblem = SOURCE_METADATA_INVALID;
@@ -210,6 +221,8 @@ final class SourceIdentity {
         return;
       } catch (IOException unavailable) {
         // An unsafe or unreadable path must not fall through to a different source root.
+        // Provider capability failures also emit XTR-JAVA-SOURCE-UNVERIFIABLE once; the wire
+        // binding vocabulary has no platform-unverifiable value.
       }
       fileProblem = ATTESTATION_MISSING;
     }
