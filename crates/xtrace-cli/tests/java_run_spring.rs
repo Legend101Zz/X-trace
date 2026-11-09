@@ -7,6 +7,8 @@
     reason = "controlled fixture processes and temporary project data are asserted directly"
 )]
 
+mod support;
+
 use std::fs;
 use std::io::BufRead as _;
 use std::io::{Read, Write as _};
@@ -1063,11 +1065,7 @@ fn run_preserves_nonzero_java_exit_and_rejects_non_java_before_side_effects() {
     let fake_bin = root.path().join("fake-bin");
     fs::create_dir_all(&fake_bin).expect("fake bin");
     let fake_java = fake_bin.join("java");
-    fs::write(&fake_java, b"#!/bin/sh\nprintf 'openjdk version fake\\n' >&2\n")
-        .expect("fake Java script");
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(&fake_java, fs::Permissions::from_mode(0o755))
-        .expect("fake Java executable");
+    support::write_executable(&fake_java, "#!/bin/sh\nprintf 'openjdk version fake\\n' >&2\n");
     let fake_launcher = Command::new(env!("CARGO_BIN_EXE_xtrace"))
         .args(["run", "--project-dir"])
         .arg(&repo)

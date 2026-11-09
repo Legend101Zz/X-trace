@@ -621,7 +621,30 @@ fn sha256_file(path: &Path, expected: FileIdentity) -> Result<String, LaunchErro
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests use constructed launch inputs")]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Command, Stdio};
+
+    fn write_executable(path: &Path, script: &str) {
+        let staging = path.with_extension("staging");
+        // Only this child opens the executable inode for writing. Other test threads can fork
+        // freely: the parent holds only a pipe, so their children cannot inherit that descriptor.
+        // Replacing the shell with cat leaves no descendants holding the file after wait returns.
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "exec /bin/cat > \"$1\"", "xtrace-test-writer"])
+            .arg(&staging)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("start script writer");
+        let written =
+            writer.stdin.take().expect("script writer stdin").write_all(script.as_bytes());
+        let status = writer.wait().expect("wait for script writer");
+        written.expect("send script to writer");
+        assert!(status.success(), "script writer failed: {status}");
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+        std::fs::rename(&staging, path).expect("publish script");
+    }
 
     fn distribution(root: &Path) -> PathBuf {
         let agent_dir = root.join("agent space");
@@ -720,10 +743,7 @@ mod tests {
         let bin = root.path().join("fake-bin");
         std::fs::create_dir_all(&bin).expect("fake bin");
         let fake_java = bin.join("java");
-        std::fs::write(&fake_java, b"#!/bin/sh\nprintf 'openjdk version fake\\n' >&2\n")
-            .expect("script");
-        std::fs::set_permissions(&fake_java, std::fs::Permissions::from_mode(0o755))
-            .expect("executable mode");
+        write_executable(&fake_java, "#!/bin/sh\nprintf 'openjdk version fake\\n' >&2\n");
         let path = std::env::join_paths([&bin]).expect("path");
         assert!(matches!(
             JavaLaunch::validate_with_path(&agent, &[OsString::from("java")], Some(&path)),
