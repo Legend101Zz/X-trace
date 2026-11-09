@@ -332,7 +332,9 @@ declared duration and drop counts remain separate from completion. Unexercised
 capability codes remain in the bounded finish evidence but are not projected
 until they can be checked against an adapter manifest. A producer-declared
 summary is exposed only in a non-preview privacy state and is not proof of a
-captured response outcome. Event values and full source replay remain
+captured response outcome. For Java/Spring, a recorded HTTP status is the status
+at `DispatcherServlet` exit; later filters or error handling may change what the
+client receives. Event values and full source replay remain
 unavailable; bounded source excerpts are limited to the attested fixture
 methods.
 Read-only SQLite access keeps normal WAL visibility and may create SQLite

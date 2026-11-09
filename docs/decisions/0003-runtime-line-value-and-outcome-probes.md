@@ -525,3 +525,5 @@ Decided by the root orchestrator under the owner's autonomous v0.01 launch autho
 | `AdapterHello` | `runtime_facts` | 17 | adapter-reported framework and runtime facts; outside the HMAC transcript, so shown as "adapter-reported" |
 
 The standard-mode line budget stays 0 (root decision 1 above supersedes the 1,024 in the budget table); `CaptureBudget::STANDARD.max_line_events` is 0 and ingest enforces it.
+
+**Amendment (2026-11-09).** For Java/Spring, the recorded HTTP status is the status at `DispatcherServlet` exit; later filters or error handling may change what the client receives. Java source lookup is confined to the project directory (or the application's working directory), with no ancestor search or symlink escapes.
