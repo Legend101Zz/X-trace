@@ -197,6 +197,10 @@ pub fn gate_with_metadata(value: &Value, metadata: &[&str]) -> Option<String> {
                     let len = path.len();
                     path.push('/');
                     path.push_str(key);
+                    // An object key (an OpenAPI path template, say) can carry a token shape.
+                    if is_secret_shape(key) {
+                        return Some(path.clone());
+                    }
                     if let Some(item) = map.get(key) {
                         if let Some(found) = walk(item, path, metadata) {
                             return Some(found);
@@ -224,6 +228,14 @@ mod tests {
         for n in ["id", "page", "Content-Type", "X-Request-Id"] {
             assert!(!is_secret_name(n), "{n}");
         }
+    }
+
+    #[test]
+    fn token_shaped_object_keys_fail_the_gate() {
+        let leaky = serde_json::json!({"paths": {"/keys/sk-abcdefghijklmnopqrstuvwxyz0123": {}}});
+        assert!(gate(&leaky).is_some());
+        let fine = serde_json::json!({"paths": {"/auth/token": {}, "/orders/{id}": {}}});
+        assert_eq!(gate(&fine), None);
     }
 
     #[test]
