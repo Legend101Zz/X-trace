@@ -70,7 +70,7 @@ Wave 1 (#18, PR #20, merged as `931f917`) removed the races behind the scan, Nod
 - D3 answered 2026-11-09: risk-scaled merge reviews accepted; full ADR 0006 protocol only for release candidates.
 - D2 answered 2026-11-09: hosted `macos.yml` replaces the leased Mac merge floor; `ci-ok` and `macos-ok` gate wave merges and release candidates, not single tickets.
 - Ratify: ADR 0008 Amendment 1, the first ADR 0006 addendum of 2026-10-10, the ADR 0009 addendum, ADR 0011, and the
-  migration renumbering (v9 = `recording_limitations`, catalog links = v10).
+  migration renumbering (v9 = `recording_limitations`, v10 = `session_health`, catalog links take the next free version).
 - Usability question Q5 asks which Canvas node "took the longest", but the product records no per-node time
   (honesty rule R2). Either change the question or add real per-frame timing.
 - For the release: an Ed25519 release/ledger key and trust configuration, at least two usability participants plus a
