@@ -1593,6 +1593,8 @@ impl SqliteRecordingStore<'_> {
     /// Verifies the persisted V1 event-ID digest and commits terminal evidence.
     ///
     /// The terminal row and lifecycle status share one SQLite transaction.
+    /// Writer connections use synchronous=FULL, so its commit syncs terminal
+    /// evidence to the WAL without a checkpoint or waiting for readers.
     /// Existing rows without terminal evidence remain unverified and are never
     /// promoted by this operation.
     pub fn finish_recording(
@@ -7779,6 +7781,100 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_and_exact_replay_succeed_with_a_pinned_wal_reader() {
+        let fixture = on_disk_store("terminal-durable");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        view.journal_tail(&journal_request(project_id, anchor.recording_id, &[2, 3]), 0, &mut None)
+            .expect("acknowledged tail");
+        // Pin the WAL before Finish writes terminal evidence. A zero busy
+        // timeout makes any accidental checkpoint barrier fail immediately.
+        {
+            let connection = fixture.store.lock().expect("Finish writer");
+            connection
+                .busy_timeout(std::time::Duration::ZERO)
+                .expect("nonblocking checkpoint fixture");
+            for (pragma, expected) in [
+                ("PRAGMA synchronous", 2_i64),
+                ("PRAGMA fullfsync", 1),
+                ("PRAGMA checkpoint_fullfsync", 1),
+            ] {
+                let actual: i64 = connection.query_row(pragma, [], |row| row.get(0)).expect(pragma);
+                assert_eq!(actual, expected, "Finish writer durability: {pragma}");
+            }
+        }
+        let pinned = rusqlite::Connection::open_with_flags(
+            &fixture.database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("independent read-only connection");
+        pinned.execute_batch("BEGIN").expect("pin snapshot");
+        let status: String = pinned
+            .query_row("SELECT status FROM recordings", [], |row| row.get(0))
+            .expect("read old status");
+        assert_eq!(status, "recording");
+        let mut finish = FinishRecording::without_digest(anchor.recording_id, 3);
+        finish.event_digest = blake3::hash(b"event-2event-3").as_bytes().to_vec();
+        assert_eq!(
+            view.finish_recording(&finish).expect("durable Finish with pinned reader"),
+            RecordingCompletion::Complete
+        );
+        assert_eq!(
+            view.finish_recording(&finish).expect("exact replay with pinned reader"),
+            RecordingCompletion::Complete
+        );
+        let status: String = pinned
+            .query_row("SELECT status FROM recordings", [], |row| row.get(0))
+            .expect("snapshot remains pinned after Finish and replay");
+        assert_eq!(status, "recording");
+        let connection = fixture.store.lock().expect("writer");
+        let (frames, checkpointed): (i64, i64) = connection
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| Ok((row.get(1)?, row.get(2)?)))
+            .expect("checkpoint state");
+        assert!(frames > 0);
+        assert!(frames > checkpointed, "pinned reader prevents checkpointing terminal evidence");
+        assert_eq!(
+            connection
+                .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .expect("durable write policy"),
+            2
+        );
+        drop(connection);
+        let reader = SqliteStore::open(
+            &fixture.database,
+            OpenOptions::default().with_must_exist(true).with_read_only(true),
+        )
+        .expect("fresh read-only store");
+        let read_view = reader.recording_store(&fixture.root).expect("read view");
+        let (items, more) = read_view.list_recording_metadata(project_id, None, 10).expect("list");
+        assert!(!more);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, xtrace_application::RecordingStatus::Complete);
+        assert_eq!(items[0].completion, RecordingCompletionEvidence::Complete);
+        let detail = read_view
+            .read_recording_window(
+                &ShowWindowRequest {
+                    project_id,
+                    recording_id: anchor.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                },
+                None,
+            )
+            .expect("detail at Finish success");
+        assert_eq!(detail.status, xtrace_application::RecordingStatus::Complete);
+        assert_eq!(detail.completion, RecordingCompletionEvidence::Complete);
+        assert_eq!(detail.events.len(), 2);
+        assert!(!detail.has_more);
+        assert!(detail.incomplete_evidence.is_empty());
+        pinned.execute_batch("ROLLBACK").expect("release pinned snapshot");
     }
 
     #[cfg(unix)]

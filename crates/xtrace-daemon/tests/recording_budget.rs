@@ -494,27 +494,42 @@ async fn streamed_recording_journey(focused: bool) {
             assert_eq!(item.segment_count, "0", "small batches stay in the journal until Finish");
         }
     }
-    let window = persisted
-        .show_recording(&ShowWindowRequest {
-            project_id,
-            recording_id,
-            limit: 500,
-            after_sequence: None,
-        })
-        .expect("complete detail");
-    assert_eq!(window.status, RecordingStatus::Complete);
-    assert_eq!(window.completion, RecordingCompletionEvidence::Complete);
-    assert_eq!(
-        window.capacity.as_ref().expect("terminal capacity").event_cap,
-        if focused {
-            xtrace_domain::FOCUSED_EVENT_CAP as u32
-        } else {
-            xtrace_domain::STANDARD_EVENT_CAP as u32
+    // The count limit is also bounded by the 256 KiB projection budget.
+    // Read every page immediately after ACK, without waiting for more ingest.
+    let mut observed = Vec::new();
+    let mut after_sequence = None;
+    loop {
+        let window = persisted
+            .show_recording(&ShowWindowRequest {
+                project_id,
+                recording_id,
+                limit: 500,
+                after_sequence,
+            })
+            .expect("complete detail");
+        assert_eq!(window.status, RecordingStatus::Complete);
+        assert_eq!(window.completion, RecordingCompletionEvidence::Complete);
+        assert_eq!(
+            window.capacity.as_ref().expect("terminal capacity").event_cap,
+            if focused {
+                xtrace_domain::FOCUSED_EVENT_CAP as u32
+            } else {
+                xtrace_domain::STANDARD_EVENT_CAP as u32
+            }
+        );
+        assert!(window.incomplete_evidence.is_empty());
+        assert!(!window.events.is_empty(), "every page makes progress");
+        let last = window.events.last().unwrap().sequence.parse::<u64>().expect("sequence");
+        assert!(after_sequence.is_none_or(|previous| last > previous));
+        after_sequence = Some(last);
+        observed.extend(window.events);
+        assert!(observed.len() <= events.len(), "no duplicated or invented events");
+        if !window.has_more {
+            break;
         }
-    );
-    assert!(window.incomplete_evidence.is_empty());
-    assert_eq!(window.events.len(), events.len());
-    for (actual, sent) in window.events.iter().zip(&events) {
+    }
+    assert_eq!(observed.len(), events.len());
+    for (actual, sent) in observed.iter().zip(&events) {
         assert_eq!(actual.sequence, sent.recording_seq.to_string());
         assert_eq!(actual.event_id.as_deref(), Some(sent.event_id.as_str()));
     }
