@@ -32,7 +32,8 @@ import net.bytebuddy.jar.asm.TypePath;
  *   <li>No field, method or class is added (retransformation-safe).
  *   <li>Bridge and non-lambda synthetic methods, methods without a LineNumberTable, methods using
  *       JSR/RET, and methods that would exceed the code-size or site budgets are left byte-for-byte
- *       equivalent and reported as SKIPPED with a reason.
+ *       equivalent and reported as SKIPPED with a reason. A caller may add a gap entry probe to
+ *       eligible skipped methods through {@link #skippedMethodEntry(MethodVisitor)}.
  * </ul>
  *
  * <p>Local reads (focused mode) are gated by the LocalVariableTable range covering the probe, and
@@ -139,6 +140,9 @@ public class LineProbeVisitor extends ClassVisitor {
   private static MethodReport skipped(String name, String descriptor, String reason) {
     return new MethodReport(name, descriptor, Status.SKIPPED, reason, 0, 0, Reasons.NONE);
   }
+
+  /** Emits an optional, stack-neutral entry probe after an eligible method's skip decision. */
+  protected void skippedMethodEntry(MethodVisitor method) {}
 
   // ---------------------------------------------------------------------------------------------
 
@@ -424,7 +428,10 @@ public class LineProbeVisitor extends ClassVisitor {
         d = new Decision(List.of(), false, Reasons.NONE, null, Reasons.TRANSFORM_ERROR);
       }
       if (d.skip() != null) {
-        replay(List.of(), false, null);
+        // Keep the entry probe outside the original labels so a back edge never repeats it.
+        ops.get(0).accept(out); // visitCode
+        skippedMethodEntry(out);
+        for (int i = 1; i < ops.size(); i++) ops.get(i).accept(out);
         reports.add(skipped(name, descriptor, d.skip()));
         return;
       }

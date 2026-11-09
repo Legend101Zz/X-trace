@@ -28,22 +28,11 @@ final class RuntimeBridgeSink implements BridgeSink {
   private final AtomicInteger inFlightStartAdmissions = new AtomicInteger();
   private final AtomicInteger incompleteKind = new AtomicInteger();
   private volatile ApplicationScope scope = ApplicationScope.defaultScope();
-  private volatile FixtureInstrumentation.LineProbes lineProbes;
   private final Runnable afterStartIncrement;
   private final Runnable beforeStartDecrement;
 
   RuntimeBridgeSink(BoundedEventQueue queue) {
     this(queue, () -> {}, () -> {});
-  }
-
-  void useLineProbes(FixtureInstrumentation.LineProbes probes) {
-    lineProbes = probes;
-  }
-
-  @Override
-  public boolean lineProbeUnavailable(Class<?> type, String method, String descriptor) {
-    FixtureInstrumentation.LineProbes probes = lineProbes;
-    return probes != null && probes.unavailable(type, method, descriptor);
   }
 
   RuntimeBridgeSink(
