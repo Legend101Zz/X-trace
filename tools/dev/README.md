@@ -50,7 +50,10 @@ tools/dev/check.sh diff
 the script. Rust runs cargo check and clippy, or compiles a named test with
 `--no-run`. Java compiles main and test sources with strict verification. Node
 checks generation and types. Web checks types and contrast; `web:<file>` is
-rejected. Python compiles the named module file. Network is for lockfile fetches
+rejected. Python compiles source without writing bytecode: `py:a.b` selects
+`a/b.py`, or `a/b/__init__.py` for a regular package. For a namespace package
+without an initializer, it compiles the immediate `.py` files in the directory.
+A missing module or empty namespace package is an error. Network is for lockfile fetches
 only; new or upgraded dependencies require a ticket.
 
 `tools/dev/clean.sh` previews orphan removal; `--apply` deletes orphans, never active worktree entries.

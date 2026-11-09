@@ -331,6 +331,10 @@ class DevToolsTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         for name in ("check.sh", "env.sh", "devid.py"):
             shutil.copyfile(SCRIPTS / name, scripts / name)
+        (scripts / "test_dev_tools.py").write_text("value = 1\n")
+        package = self.worktree / "sample_package"
+        package.mkdir()
+        (package / "__init__.py").write_text("value = 1\n")
         bin_dir = self.base / "commands"
         bin_dir.mkdir()
         log = self.base / "commands.jsonl"
@@ -343,7 +347,7 @@ import json
 import os
 from pathlib import Path
 import sys
-if Path(sys.argv[0]).name == "python3" and sys.argv[1:3] != ["-B", "-m"]:
+if Path(sys.argv[0]).name == "python3" and sys.argv[1:3] != ["-B", "-c"]:
     os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
 record = {
     "command": [Path(sys.argv[0]).name, *sys.argv[1:]],
@@ -363,6 +367,7 @@ sys.exit(37 if sys.argv[1:2] == [os.environ.get("XTRACE_FAIL_COMMAND")] else 0)
         gradle.parent.mkdir(parents=True)
         gradle.write_text(stub)
         gradle.chmod(0o700)
+        compile_code = 'import sys; [compile(open(path, "rb").read(), path, "exec") for path in sys.argv[1:]]'
         cases = [
             ("rust:demo", [], [
                 ["cargo", "check", "-p", "demo", "--all-targets", "--all-features", "--locked"],
@@ -385,7 +390,9 @@ sys.exit(37 if sys.argv[1:2] == [os.environ.get("XTRACE_FAIL_COMMAND")] else 0)
                 ["npm", "run", "typecheck", "--prefix", "web/app"],
                 ["node", "web/app/scripts/check-contrast.mjs"],
             ]),
-            ("py:tools.dev.test_dev_tools", [], [["python3", "-B", "-m", "py_compile", "tools/dev/test_dev_tools.py"]]),
+            ("py:tools.dev.test_dev_tools", [], [["python3", "-B", "-c", compile_code, "tools/dev/test_dev_tools.py"]]),
+            ("py:sample_package", [], [["python3", "-B", "-c", compile_code, "sample_package/__init__.py"]]),
+            ("py:tools.dev", [], [["python3", "-B", "-c", compile_code, "tools/dev/devid.py", "tools/dev/test_dev_tools.py"]]),
             ("fmt", [], [["cargo", "fmt", "--all", "--check"]]),
         ]
         for part, extra, expected in cases:
@@ -409,6 +416,12 @@ sys.exit(37 if sys.argv[1:2] == [os.environ.get("XTRACE_FAIL_COMMAND")] else 0)
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("not supported", result.stderr)
+        result = subprocess.run(
+            ["bash", str(scripts / "check.sh"), "py:missing.module"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("No Python source found for module: missing.module", result.stderr)
         env["XTRACE_FAIL_COMMAND"] = "clippy"
         result = subprocess.run(
             ["bash", str(scripts / "check.sh"), "rust:demo"],
@@ -417,6 +430,34 @@ sys.exit(37 if sys.argv[1:2] == [os.environ.get("XTRACE_FAIL_COMMAND")] else 0)
         self.assertEqual(result.returncode, 37)
         records = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual([record["command"][1] for record in records], ["check", "clippy"])
+
+    def test_python_compile_checks_source_without_bytecode(self):
+        env = dict(self.environ, XTRACE_DEV_SCRATCH=str(self.short_scratch()))
+        scripts = self.worktree / "tools" / "dev"
+        scripts.mkdir(parents=True)
+        for name in ("check.sh", "env.sh", "devid.py"):
+            shutil.copyfile(SCRIPTS / name, scripts / name)
+        package = self.worktree / "sample_package"
+        package.mkdir()
+        source = package / "__init__.py"
+        source.write_text("value = 1\n")
+        for module in ("sample_package", "tools.dev", "tools.dev.devid"):
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    ["bash", str(scripts / "check.sh"), f"py:{module}"],
+                    env=env, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(self.worktree.rglob("__pycache__")), [])
+        self.assertEqual(list(self.worktree.rglob("*.pyc")), [])
+        source.write_text("value =\n")
+        result = subprocess.run(
+            ["bash", str(scripts / "check.sh"), "py:sample_package"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SyntaxError", result.stderr)
+        self.assertEqual(list(self.worktree.rglob("*.pyc")), [])
 
 
 class WorktreeIdTests(unittest.TestCase):

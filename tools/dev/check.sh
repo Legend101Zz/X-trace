@@ -62,7 +62,19 @@ case "$part" in
     py:*)
         module=${part#py:}
         [[ -n $module ]] || { usage >&2; exit 2; }
-        run python3 -B -m py_compile "${module//./\/}.py" "$@"
+        path=${module//./\/}
+        if [[ -f $path.py ]]; then
+            sources=("$path.py")
+        elif [[ -f $path/__init__.py ]]; then
+            sources=("$path/__init__.py")
+        elif [[ -d $path ]]; then
+            sources=("$path"/*.py)
+            [[ -f ${sources[0]} ]] || { printf 'No Python source found for module: %s\n' "$module" >&2; exit 2; }
+        else
+            printf 'No Python source found for module: %s\n' "$module" >&2
+            exit 2
+        fi
+        run python3 -B -c 'import sys; [compile(open(path, "rb").read(), path, "exec") for path in sys.argv[1:]]' "${sources[@]}" "$@"
         ;;
     fmt) run cargo fmt --all --check "$@" ;;
     diff)
