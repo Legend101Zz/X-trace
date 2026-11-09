@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write as _};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -62,6 +62,7 @@ struct CapturedProcess {
     child: ManagedChild,
     stdout: thread::JoinHandle<ScannedOutput>,
     stderr: thread::JoinHandle<ScannedOutput>,
+    stdout_lines: std::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 impl CapturedProcess {
@@ -72,10 +73,14 @@ impl CapturedProcess {
         }));
         let mut stdout = child.stdout.take().expect("captured child stdout");
         let mut stderr = child.stderr.take().expect("captured child stderr");
+        let (lines_tx, stdout_lines) = std::sync::mpsc::channel();
         Self {
             child,
-            stdout: thread::spawn(move || drain_scanned(&mut stdout, 256 * 1024)),
+            stdout: thread::spawn(move || {
+                drain_scanned_with_lines(&mut stdout, 256 * 1024, Some(lines_tx))
+            }),
             stderr: thread::spawn(move || drain_scanned(&mut stderr, 256 * 1024)),
+            stdout_lines,
         }
     }
 
@@ -151,9 +156,8 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
         "local proof requires JDK 17 or 21, got: {version_text}"
     );
 
-    let port = free_port();
-    let valid = launch_fixture(&agent, &fixture, &bootstrap, port);
-    wait_for_fixture(port);
+    let valid = launch_fixture(&agent, &fixture, &bootstrap);
+    let port = wait_for_fixture(&valid.stdout_lines);
     let isolation = http(port, "GET", "/__fixture/isolation", &[], None);
     assert_eq!(isolation.status, 200);
     let isolation_json: Value = serde_json::from_slice(&isolation.body).expect("isolation JSON");
@@ -330,10 +334,8 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let mut mismatch_daemon = start_quiet_daemon(&repo, &data_home);
     let mismatch_bootstrap = mismatch_daemon.1.clone();
     let manifest_mismatched_fixture = tamper_fixture_class_attestation(root.path(), &fixture);
-    let mismatch_port = free_port();
-    let mismatched =
-        launch_fixture(&agent, &manifest_mismatched_fixture, &mismatch_bootstrap, mismatch_port);
-    wait_for_fixture(mismatch_port);
+    let mismatched = launch_fixture(&agent, &manifest_mismatched_fixture, &mismatch_bootstrap);
+    let mismatch_port = wait_for_fixture(&mismatched.stdout_lines);
     assert_eq!(post_order(mismatch_port).status, 201);
     let (mismatch_stdout, mismatch_stderr) = mismatched.stop();
     assert_scanned_clean("class mismatch fixture stdout", &mismatch_stdout);
@@ -354,14 +356,8 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let mut mutated_class_daemon = start_quiet_daemon(&repo, &data_home);
     let mutated_class_bootstrap = mutated_class_daemon.1.clone();
     let mutated_class_fixture = mutate_fixture_classfile(root.path(), &fixture);
-    let mutated_class_port = free_port();
-    let mutated_class = launch_fixture(
-        &agent,
-        &mutated_class_fixture,
-        &mutated_class_bootstrap,
-        mutated_class_port,
-    );
-    wait_for_fixture(mutated_class_port);
+    let mutated_class = launch_fixture(&agent, &mutated_class_fixture, &mutated_class_bootstrap);
+    let mutated_class_port = wait_for_fixture(&mutated_class.stdout_lines);
     assert_eq!(post_order(mutated_class_port).status, 201, "mutated class remains loadable");
     let (mutated_class_stdout, mutated_class_stderr) = mutated_class.stop();
     assert_scanned_clean("mutated class fixture stdout", &mutated_class_stdout);
@@ -395,17 +391,15 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_canaries_absent("actual classfile mutation CLI", &class_mutation_show.stdout);
     signal_and_wait(&mut mutated_class_daemon.0, "-INT");
 
-    let unavailable_port = free_port();
-    let unavailable = launch_fixture(&agent, &fixture, &unavailable_bootstrap, unavailable_port);
-    wait_for_fixture(unavailable_port);
+    let unavailable = launch_fixture(&agent, &fixture, &unavailable_bootstrap);
+    let unavailable_port = wait_for_fixture(&unavailable.stdout_lines);
     assert_eq!(post_order(unavailable_port).status, 201);
     let (unavailable_stdout, unavailable_stderr) = unavailable.stop();
     assert!(text(&unavailable_stderr.sample).contains("XTR-JAVA-AGENT-UNAVAILABLE"));
 
-    let invalid_port = free_port();
     let invalid_path = root.path().join("missing private bootstrap.json");
-    let invalid = launch_fixture(&agent, &fixture, &invalid_path, invalid_port);
-    wait_for_fixture(invalid_port);
+    let invalid = launch_fixture(&agent, &fixture, &invalid_path);
+    let invalid_port = wait_for_fixture(&invalid.stdout_lines);
     assert_eq!(post_order(invalid_port).status, 201);
     let (invalid_stdout, invalid_stderr) = invalid.stop();
     assert!(text(&invalid_stderr.sample).contains("XTR-JAVA-AGENT-UNAVAILABLE"));
@@ -649,22 +643,41 @@ fn copy_private_bootstrap(root: &Path, source: &Path) -> PathBuf {
     target
 }
 
-fn launch_fixture(agent: &Path, fixture: &Path, bootstrap: &Path, port: u16) -> CapturedProcess {
+fn launch_fixture(agent: &Path, fixture: &Path, bootstrap: &Path) -> CapturedProcess {
     let mut command = Command::new("java");
     command
         .arg(format!("-javaagent:{}={}", agent.display(), bootstrap.display()))
         .args(["-jar"])
         .arg(fixture)
-        .arg(format!("--server.port={port}"));
+        .arg("--server.port=0")
+        // The fixture defaults to WARN; enable only the bound-port startup signal.
+        .arg("--logging.level.org.springframework.boot.tomcat.TomcatWebServer=INFO");
     CapturedProcess::spawn(command, "Spring fixture")
 }
 
-fn wait_for_fixture(port: u16) {
+fn wait_for_fixture(lines: &std::sync::mpsc::Receiver<Vec<u8>>) -> u16 {
     let deadline = Instant::now() + Duration::from_secs(30);
+    let port = loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .expect("Spring fixture readiness deadline elapsed");
+        let line = lines
+            .recv_timeout(remaining)
+            .expect("Spring fixture did not report its bound port before the readiness deadline");
+        // Boot 4.1.1 logs the connector's local port only after it has started.
+        let line = String::from_utf8_lossy(&line);
+        if let Some((_, address)) = line.split_once("Tomcat started on port ") {
+            if let Some((port, _)) = address.split_once(" (http)") {
+                let port = port.parse::<u16>().expect("Spring fixture bound port");
+                assert_ne!(port, 0, "Spring fixture must report its actual bound port");
+                break port;
+            }
+        }
+    };
     loop {
         if let Ok(response) = try_http(port, "GET", "/__fixture/count", &[], None) {
             if response.status == 200 {
-                return;
+                return port;
             }
         }
         assert!(Instant::now() < deadline, "Spring fixture did not become ready");
@@ -768,10 +781,6 @@ fn decode_chunked(mut input: &[u8]) -> std::io::Result<Vec<u8>> {
         output.extend_from_slice(&input[..length]);
         input = &input[length + 2..];
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
 }
 
 fn wait_for_store_quiescence(project_root: &Path) {
@@ -1002,6 +1011,15 @@ fn read_files(root: &Path) -> Vec<Vec<u8>> {
 }
 
 fn drain_scanned(reader: &mut impl Read, limit: usize) -> ScannedOutput {
+    drain_scanned_with_lines(reader, limit, None)
+}
+
+fn drain_scanned_with_lines(
+    reader: &mut impl Read,
+    limit: usize,
+    lines: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+) -> ScannedOutput {
+    let mut pending_line = Vec::new();
     let mut kept = Vec::new();
     let mut leaked_canaries = Vec::new();
     let mut tail = Vec::new();
@@ -1010,6 +1028,14 @@ fn drain_scanned(reader: &mut impl Read, limit: usize) -> ScannedOutput {
         let count = reader.read(&mut buffer).expect("drain child output");
         if count == 0 {
             break;
+        }
+        // Forward complete stdout lines without changing the full-stream privacy scan.
+        if let Some(lines) = &lines {
+            pending_line.extend_from_slice(&buffer[..count]);
+            while let Some(end) = pending_line.iter().position(|byte| *byte == b'\n') {
+                let line = pending_line.drain(..=end).collect();
+                let _ = lines.send(line);
+            }
         }
         let remaining = limit.saturating_sub(kept.len());
         kept.extend_from_slice(&buffer[..count.min(remaining)]);
