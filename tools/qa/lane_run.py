@@ -285,13 +285,10 @@ def _encoded(value) -> bytes:
     return json.dumps(value, sort_keys=True, ensure_ascii=True).encode("utf-8")
 
 
-def _private(text: str, index, *, structured: bool = False) -> bool:
+def _private(text: str, index) -> bool:
     hits: dict = {}
     canary.scan_bytes(text.encode("utf-8"), index, hits, "ci-excerpt")
-    # The scanner still sees placeholders; only the legacy keyword guard needs
-    # to distinguish our literal <token> from an observed credential label.
-    guarded = text.replace("<token>", "") if structured else text
-    return bool(hits or DIAG_BAD.search(guarded) or PRIVATE_TEXT.search(text)
+    return bool(hits or DIAG_BAD.search(text) or PRIVATE_TEXT.search(text)
                 or any(ord(c) < 32 and c not in "\n\t" for c in text))
 
 
@@ -301,28 +298,65 @@ MESSAGE_LITERAL = re.compile(
     r"|(?P<path>(?:[A-Za-z]:[\\/]|[~.]?[\\/])[^\s<>\"'`]*"
     r"|\b[\w.-]+(?:[\\/][\w.:-]+)+|\b[\w.-]+\.[A-Za-z][A-Za-z0-9]*(?::\d+)*\b)"
 )
-MESSAGE_VALUE = re.compile(r"(?P<label>\b(?:left|right)\s*:|\b(?:expected|actual)\b(?:\s*:)?|=+)\s*(?P<value>.+)$", re.I)
-MESSAGE_TOKEN = re.compile(r"<str>|<num>|<path>|<url>|<token>|\S{17,}|\d{7,}")
+# A reviewed vocabulary, never learned from log output or formatted arguments.
+# The final phrase is literal diagnostic text in java_premain_spring.rs; the
+# request method, route and count are deliberately absent. A static vocabulary
+# also fails closed when a source file or its message template cannot be read.
+MESSAGE_WORDS = frozenset((
+    "assertion left right failed expected actual but was panicked at timed out "
+    "recordings were not persisted before deadline"
+).split())
+MESSAGE_VALUE = re.compile(
+    r"(?P<prefix>(?:[\w.$]+:\s*)?)(?P<label>(?:left|right)\s*:|(?:expected|actual)\b(?:\s*:)?)"
+    r"\s*(?P<value>.*)", re.I
+)
+MESSAGE_TOKEN = re.compile(
+    MESSAGE_LITERAL.pattern
+    + r"|(?P<syntax>==|!=|<=|>=|[=:<>()\[\]{},;])|(?P<space>\s+)"
+    + r"|(?P<word>[^\s=:<>()\[\]{},;\"'`]+)|(?P<other>.)"
+)
+ASSERTION_EXPRESSION = re.compile(r"`(.+?)\s*(==|!=|<=|>=|<|>)\s*(.+?)`")
 
 
 def _value_placeholder(value: str) -> str:
     value = value.strip()
-    if value in {"<str>", "<num>", "<path>", "<url>", "<token>"}:
-        return value
-    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", value):
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", value):
         return "<num>"
-    return "<token>"
+    if MESSAGE_LITERAL.fullmatch(value) or re.fullmatch(r"[\w-]+", value):
+        return "<str>"
+    return "<value>"
 
 
-def _message_structure(text: str) -> str:
-    """Keep diagnostic syntax; values never inherit the source-site/name exemptions.
+def _message_tokens(text: str) -> str:
+    out = []
+    for token in MESSAGE_TOKEN.finditer(text):
+        value = token[0]
+        if token.lastgroup in {"space", "syntax"} or (token.lastgroup == "word" and value in MESSAGE_WORDS):
+            out.append(value)
+        elif (token.lastgroup == "str" and text[:token.start()].rstrip() == "assertion"
+              and (expression := ASSERTION_EXPRESSION.fullmatch(value))):
+            left, operator, right = expression.groups()
+            # Rust's symbolic operands are syntax, other operands are values.
+            left = "left" if left.strip() == "left" else _value_placeholder(left)
+            right = "right" if right.strip() == "right" else _value_placeholder(right)
+            out.append(f"`{left} {operator} {right}`")
+        else:
+            out.append("<str>" if token.lastgroup in {"str", "path", "url"} else _value_placeholder(value))
+    return "".join(out)
 
-    Value labels consume the remainder of a line, including compound values. This
-    deliberately loses some detail rather than guessing where captured data ends.
+
+def _message_structure(text: str, *, continuation: bool = False) -> str:
+    """Rebuild fixed syntax, masking every other token regardless of length.
+
+    Known assertion fields consume their entire operand, including compound Debug
+    values. All other continuation lines are withheld unless already pure syntax;
+    an interior line of a quoted string or Debug value cannot become prose.
     """
-    text = MESSAGE_LITERAL.sub(lambda m: f"<{m.lastgroup}>", text)
-    text = MESSAGE_VALUE.sub(lambda m: m["label"] + " " + _value_placeholder(m["value"]), text)
-    return MESSAGE_TOKEN.sub(lambda m: _value_placeholder(m[0]), text)
+    if field := MESSAGE_VALUE.fullmatch(text):
+        return (_message_tokens(field["prefix"]) + field["label"].lower()
+                + " " + _value_placeholder(field["value"]))
+    structure = _message_tokens(text)
+    return "<value>" if continuation and structure != text else structure
 
 
 def _failure_blocks(text: str):
@@ -389,7 +423,7 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
                     row["location"] = m.group(1)
             elif line.strip() and not line.lstrip().startswith(("at ", "note:", "stack backtrace:")):
                 if after_panic or kind == "gradle":
-                    message.append(_message_structure(line.strip()))
+                    message.append(_message_structure(line.strip(), continuation=bool(message)))
                     if m := GRADLE_SHORT_SITE.fullmatch(line.strip()):
                         row["location"] = m.group(1)
         if not message:
@@ -405,7 +439,7 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
     # Scan all serialized fields after redaction too, including names and locations.
     rows = [row if not _private("\n".join([row["test"], row.get("location", ""),
                                          *row.get("message", []), row.get("excerpt", "")]),
-                               index, structured=True) else {"excerpt": WITHHELD}
+                               index) else {"excerpt": WITHHELD}
             for row in failures.values()]
     result: dict = {"failures": rows, "omitted": 0}
     if timed_out:
