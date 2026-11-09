@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import hashlib
 import json
 import pathlib
 import re
@@ -34,6 +35,15 @@ KINDS = frozenset("unspecified request_update frame_enter frame_exit frame_throw
                   "database_start database_end outbound_http_start outbound_http_end async_link exception response gap".split())
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 JAVA_SYMBOL = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.(?:[A-Za-z_$][\w$]*|<init>|<clinit>)", re.ASCII)
+# Package boundaries are significant: lookalike prefixes are private too.
+# Keep this inventory specific to the pinned Petclinic campaign.
+SYMBOL_PACKAGES = (
+    "org.springframework.samples.petclinic",
+    "java", "javax", "jdk",
+    "org.springframework", "org.hibernate",
+    "org.apache.catalina", "org.apache.coyote", "org.apache.tomcat",
+    "jakarta",
+)
 REQUEST = re.compile(r"http\.request (?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) (.+)")
 RESPONSE = re.compile(r"http\.response (?:[1-5][0-9]{2}|unavailable)")
 
@@ -87,7 +97,14 @@ def safe_symbol(value):
     request = REQUEST.fullmatch(value)
     if request:
         return value if request[1] in ROUTES else None
-    return value if JAVA_SYMBOL.fullmatch(value) or RESPONSE.fullmatch(value) else None
+    if RESPONSE.fullmatch(value):
+        return value
+    if JAVA_SYMBOL.fullmatch(value):
+        declaring_class = value.rsplit(".", 1)[0]
+        if any(declaring_class.startswith(package + ".") for package in SYMBOL_PACKAGES):
+            return value
+        return "withheld:sha256:" + hashlib.sha256(value.encode()).hexdigest()[:16]
+    return None
 
 
 def recording(doc: dict) -> dict:

@@ -25,10 +25,10 @@ def detail(rid=RID, completion="partial"):
             "events": [
                 {"kind": "recording_event_kind:request_update", "symbol": "http.request GET /owners/{ownerId}", "sequence": "1"},
                 {"kind": "recording_event_kind:frame_enter", "sequence": "2", "frameId": FRAME, "parentFrameId": PARENT,
-                 "symbol": "org.example.OwnerController.showOwner", "line": 99,
+                 "symbol": "org.springframework.samples.petclinic.owner.OwnerController.showOwner", "line": 99,
                  "source": {"path": "/private/source/Owner.java", "startLine": 99, "excerpt": "private source text"}},
                 {"kind": "recording_event_kind:line_cursor", "sequence": "3", "frameId": FRAME, "parentFrameId": PARENT,
-                 "symbol": "OwnerController.showOwner", "line": 103,
+                 "symbol": "org.springframework.samples.petclinic.owner.OwnerController.showOwner", "line": 103,
                  "bindings": [{"name": "lastName", "value": "private binding text"}]}]}
 
 
@@ -58,11 +58,33 @@ class Projection(unittest.TestCase):
         for event in row["events"]:
             self.assertEqual(set(event), {"kind", "sequence", "frameId", "parentFrameId", "symbol", "line"})
         self.assertEqual(row["events"][1], {"kind": "frame_enter", "sequence": "2", "frameId": FRAME,
-                                          "parentFrameId": PARENT, "symbol": "org.example.OwnerController.showOwner", "line": None})
+                                          "parentFrameId": PARENT,
+                                          "symbol": "org.springframework.samples.petclinic.owner.OwnerController.showOwner", "line": None})
         self.assertEqual(row["events"][2]["line"], 103)
         text = json.dumps(row)
         for forbidden in ("private", "headers", "body", "source", "bindings", "message"):
             self.assertNotIn(forbidden, text)
+
+    def test_only_explicit_campaign_packages_publish_java_symbols(self):
+        for symbol in (
+            "org.springframework.samples.petclinic.owner.OwnerController.showOwner",
+            "java.lang.String.length", "javax.sql.DataSource.getConnection",
+            "jdk.proxy1.$Proxy0.findById", "org.springframework.web.servlet.DispatcherServlet.doDispatch",
+            "org.hibernate.Session.find", "org.apache.catalina.core.ApplicationFilterChain.doFilter",
+            "org.apache.coyote.Request.getMethod", "org.apache.tomcat.util.buf.MessageBytes.toString",
+            "jakarta.servlet.http.HttpServlet.service", "java.lang.Object.<init>", "java.lang.String.<clinit>",
+        ):
+            with self.subTest(symbol=symbol):
+                self.assertEqual(cd.safe_symbol(symbol), symbol)
+        for symbol in ("alice.smith", "com.acme.customer.AliceSmith",
+                       "org.springframeworkPrivate.AliceSmith.read", "javaPrivate.AliceSmith.read",
+                       "org.apache.unlisted.AliceSmith.read", "OwnerController.showOwner"):
+            with self.subTest(symbol=symbol):
+                withheld = cd.safe_symbol(symbol)
+                self.assertRegex(withheld, r"^withheld:sha256:[0-9a-f]{16}$")
+                self.assertEqual(withheld, cd.safe_symbol(symbol))
+                self.assertNotIn(symbol, withheld)
+        self.assertNotEqual(cd.safe_symbol("alice.smith"), cd.safe_symbol("alice.jones"))
 
     def test_unavailable_and_untrusted_metadata_are_not_inferred(self):
         doc = {"recordingId": "user-data", "status": "secret", "completion": "secret", "outcome": {"kind": "secret", "httpStatus": True},
@@ -93,6 +115,28 @@ class Projection(unittest.TestCase):
 
 
 class Artifacts(unittest.TestCase):
+    def test_non_canary_private_symbols_are_withheld_in_scanned_artifacts(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            doc = detail()
+            private_symbol = "alice.smith"
+            doc["events"] = [{"kind": kind, "symbol": private_symbol} for kind in sorted(cd.KINDS)]
+            save(root, doc, "instrumented/api")
+            summary(root / "summary.json", ("recordings-per-scenario",))
+            canaries = canary.make_canaries(lambda: "0123456789abcdef")
+            out = root / "out"
+            cd.write_failures(root / "summary.json", root / "instrumented", root, out, canaries)
+            report = json.loads((out / "recordings-per-scenario.json").read_text())
+            events = report["recordings"][0]["events"]
+            self.assertEqual(len(events), len(cd.KINDS))
+            for event in events:
+                self.assertRegex(event["symbol"], r"^withheld:sha256:[0-9a-f]{16}$")
+                self.assertEqual(event["symbol"], cd.safe_symbol(private_symbol))
+            for path in out.glob("*.json"):
+                self.assertNotIn(private_symbol, path.read_text())
+            scan = canary.run_scan(canaries, {"recording-diagnostics": [out]}, {"recording-diagnostics": 1})
+            self.assertTrue(scan["clean"])
+
     def test_every_failed_recording_judge_gets_a_skeleton_and_passing_steps_do_not(self):
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td)
@@ -177,7 +221,7 @@ class Artifacts(unittest.TestCase):
             root = pathlib.Path(td)
             doc = detail()
             # A canary is valid Java identifier text; syntax checks alone cannot protect this field.
-            doc["events"][2]["symbol"] = "org.example." + canaries["query-token"]
+            doc["events"][2]["symbol"] = "org.springframework.samples.petclinic.Owner." + canaries["query-token"]
             for event in doc["events"]:
                 event["bindings"] = [{"value": v} for v in canaries.values()]
                 event["interaction"] = {"headers": list(canaries.values()), "path": "/private/user/data"}
