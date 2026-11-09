@@ -15,14 +15,13 @@ use std::path::{Component, Path, PathBuf};
 use serde::Serialize;
 use xtrace_application::CatalogChangeKind;
 use xtrace_application::catalog_discovery::history::{
-    CatalogHistoryService, HistoryError, OperationView, RevisionEntry,
+    CatalogHistoryPort, CatalogHistoryService, HistoryError, OperationView, RevisionEntry,
 };
-use xtrace_domain::catalog_reconcile::ReconcileStatus;
 use xtrace_domain::{
     AppError, CatalogRevisionId, CorrelationId, ErrorCategory, ErrorCode, ProjectId, RetryAdvice,
 };
 use xtrace_export::{
-    ClaimInput, EffectiveState, ExportError, ExportFormat, ExportInput, ExportOutput,
+    CatalogSummaryInput, EffectiveState, ExportError, ExportFormat, ExportInput, ExportOutput,
     ExportRequest, HandlerInput, OperationInput, RevisionInput,
 };
 
@@ -34,20 +33,26 @@ fn invalid(message: impl Into<String>) -> CliError {
     CliError::InvalidArgument(message.into())
 }
 
+fn not_found(message: impl Into<String>) -> CliError {
+    CliError::App(AppError::new(
+        ErrorCode::new("XTR-EXPORT-NOT-FOUND"),
+        ErrorCategory::NotFound,
+        message.into(),
+        RetryAdvice::None,
+        CorrelationId::new(),
+    ))
+}
+
 fn map_history(error: HistoryError) -> CliError {
     match error {
-        HistoryError::RevisionNotFound
-        | HistoryError::NoRevisions
-        | HistoryError::ScopeMismatch => invalid(error.to_string()),
+        HistoryError::RevisionNotFound | HistoryError::NoRevisions => not_found(error.to_string()),
+        HistoryError::ScopeMismatch => invalid(error.to_string()),
         HistoryError::Port(_) => CliError::StoreUnavailable(error.to_string()),
     }
 }
 
 fn map_export(error: &ExportError, format: ExportFormat) -> CliError {
     match error {
-        ExportError::FormatNotImplemented { .. } => {
-            CliError::NotImplemented { command: "export --format bundle" }
-        }
         // The offending path is not repeated: object keys can be the secret-shaped text.
         ExportError::SecretShaped { .. } => CliError::App(AppError::new(
             ErrorCode::new("XTR-EXPORT-SECRET-SHAPED"),
@@ -74,27 +79,28 @@ fn map_export(error: &ExportError, format: ExportFormat) -> CliError {
 }
 
 #[cfg(unix)]
-type Service =
-    CatalogHistoryService<xtrace_store::catalog_history_store::SqliteCatalogHistoryStore>;
+type Store = xtrace_store::catalog_history_store::SqliteCatalogHistoryStore;
 
 #[cfg(unix)]
-fn open(project_dir: &Path) -> Result<(Service, ProjectId), CliError> {
+fn open(project_dir: &Path) -> Result<(Store, ProjectId), CliError> {
     let env_reader = crate::paths::read_env_path;
     let preflight = crate::daemon::preflight_project(project_dir, &env_reader)?;
     let validated = crate::daemon::open_validated_project(preflight)?;
-    Ok((
-        CatalogHistoryService::new(
-            xtrace_store::catalog_history_store::SqliteCatalogHistoryStore::new(validated.store),
-        ),
-        validated.project_id,
-    ))
+    Ok((Store::new(validated.store), validated.project_id))
 }
 
-fn state_of(view: &OperationView, confirmed: &BTreeSet<(String, String)>) -> EffectiveState {
+type OperationIdentity = (String, String, String, String);
+
+fn state_of(view: &OperationView, confirmed: &BTreeSet<OperationIdentity>) -> EffectiveState {
     if view.change_kind == CatalogChangeKind::Unknown {
         return EffectiveState::Unknown;
     }
-    if confirmed.contains(&(view.method.clone(), view.route_template.clone())) {
+    if confirmed.contains(&(
+        view.application_component.clone(),
+        view.binding_key.clone(),
+        view.method.clone(),
+        view.route_template.clone(),
+    )) {
         return EffectiveState::Observed;
     }
     if view.provenance.iter().all(|p| p == "static_inferred") {
@@ -104,29 +110,16 @@ fn state_of(view: &OperationView, confirmed: &BTreeSet<(String, String)>) -> Eff
     }
 }
 
-/// One export claim per catalog operation, built only from what the catalog read model keeps.
-fn operation_input(view: &OperationView, confirmed: &BTreeSet<(String, String)>) -> OperationInput {
+/// The read port exposes aggregates, not individual claims. Keep that boundary explicit:
+/// neither the first source nor the maximum confidence belongs to an arbitrary handler.
+fn operation_input(
+    view: &OperationView,
+    confirmed: &BTreeSet<OperationIdentity>,
+) -> OperationInput {
     let operation_id = serde_json::to_value(view.operation_id)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_default();
-    let handler = match (view.handlers.first(), &view.source_path) {
-        (Some(symbol), Some(path)) => Some(HandlerInput {
-            symbol: symbol.clone(),
-            path: path.clone(),
-            line_start: view.source_line.unwrap_or(0),
-            line_end: view.source_line.unwrap_or(0),
-        }),
-        _ => None,
-    };
-    let claim = ClaimInput {
-        claim_id: format!("{operation_id}:{}", view.operation_version_id),
-        provenance: view.provenance.join("+"),
-        confidence_basis_points: Some(view.confidence_basis_points),
-        limitation_codes: view.limitation_codes.clone(),
-        handler,
-        ..Default::default()
-    };
     OperationInput {
         operation_id,
         method: view.method.clone(),
@@ -134,15 +127,39 @@ fn operation_input(view: &OperationView, confirmed: &BTreeSet<(String, String)>)
         application_component: view.application_component.clone(),
         binding_key: view.binding_key.clone(),
         effective_state: state_of(view, confirmed),
-        claims_available: view.claim_count > 0,
-        claims: vec![claim],
+        claims_available: false,
+        claims: Vec::new(),
+        catalog_summary: Some(CatalogSummaryInput {
+            claim_count: view.claim_count,
+            handler_symbols: view.handlers.clone(),
+            handler_conflict: view.handler_conflict,
+            single_claim_handler: match (
+                view.claim_count,
+                view.handlers.as_slice(),
+                &view.source_path,
+                view.source_line,
+            ) {
+                (1, [symbol], Some(path), Some(line)) if !view.handler_conflict => {
+                    Some(HandlerInput {
+                        symbol: symbol.clone(),
+                        path: path.clone(),
+                        line_start: line,
+                        line_end: None,
+                    })
+                }
+                _ => None,
+            },
+            highest_confidence_basis_points: view.confidence_basis_points,
+            provenance: view.provenance.clone(),
+            limitation_codes: view.limitation_codes.clone(),
+        }),
     }
 }
 
 fn export_input(
     entry: &RevisionEntry,
     views: &[OperationView],
-    confirmed: &BTreeSet<(String, String)>,
+    confirmed: &BTreeSet<OperationIdentity>,
 ) -> ExportInput {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"xtrace.export.catalog.v1\0");
@@ -150,8 +167,12 @@ fn export_input(
         .iter()
         .map(|v| {
             format!(
-                "{}\0{}\0{}\0{}",
-                v.method, v.route_template, v.application_component, v.operation_version_id
+                "{}\0{}\0{}\0{}\0{}",
+                v.method,
+                v.route_template,
+                v.application_component,
+                v.binding_key,
+                v.operation_version_id
             )
         })
         .collect();
@@ -202,7 +223,7 @@ fn ensure_private_dir(path: &Path, create_parents: bool) -> Result<(), CliError>
                 return Err(invalid("the output path exists and is not a directory"));
             }
             if meta.uid() != rustix::process::getuid().as_raw()
-                || meta.permissions().mode() & 0o077 != 0
+                || meta.permissions().mode() & 0o777 != 0o700
             {
                 return Err(invalid(
                     "the output directory must be owned by you and private (mode 0700)",
@@ -224,38 +245,62 @@ fn ensure_private_dir(path: &Path, create_parents: bool) -> Result<(), CliError>
 #[cfg(unix)]
 fn write_files(dir: &Path, output: &ExportOutput) -> Result<(), CliError> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     // Validate every path before the first byte is written.
     let relative: Vec<PathBuf> =
         output.files.iter().map(|f| checked_relative(&f.path)).collect::<Result<_, _>>()?;
-    ensure_private_dir(dir, false)?;
-    for (file, rel) in output.files.iter().zip(&relative) {
-        let target = dir.join(rel);
-        if let Some(parent) = target.parent() {
-            let mut walk = dir.to_path_buf();
-            for part in parent.strip_prefix(dir).unwrap_or(Path::new("")).components() {
-                walk.push(part);
-                ensure_private_dir(&walk, false)?;
+    check_destination(dir)?;
+    let parent = dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(invalid("the output directory's parent must exist"));
+    }
+    let staging = parent.join(format!(".xtrace-export-{}.tmp", uuid::Uuid::now_v7()));
+    // One fresh sibling holds the entire format. The destination changes only at rename.
+    // On Unix rename cannot replace a non-empty directory, even if it appeared mid-write.
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    let result = (|| -> Result<(), CliError> {
+        for (file, rel) in output.files.iter().zip(&relative) {
+            let target = staging.join(rel);
+            if let Some(parent) = target.parent() {
+                let mut walk = staging.to_path_buf();
+                for part in parent.strip_prefix(&staging).unwrap_or(Path::new("")).components() {
+                    walk.push(part);
+                    ensure_private_dir(&walk, false)?;
+                }
             }
-        }
-        let name = target
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .ok_or_else(|| invalid("the export produced an unsafe file path"))?;
-        let temp = target.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-        let result = (|| -> std::io::Result<()> {
-            let mut handle =
-                std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp)?;
+            let mut handle = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&target)?;
             handle.write_all(&file.bytes)?;
             handle.sync_all()?;
-            std::fs::rename(&temp, &target)
-        })();
-        if let Err(error) = result {
-            let _ = std::fs::remove_file(&temp);
-            return Err(CliError::from(error));
         }
+        check_destination(dir)?;
+        std::fs::rename(&staging, dir)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        std::fs::remove_dir_all(&staging)?;
     }
-    Ok(())
+    result
+}
+
+#[cfg(unix)]
+fn check_destination(dir: &Path) -> Result<(), CliError> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {
+            ensure_private_dir(dir, false)?;
+            if std::fs::read_dir(dir)?.next().transpose()?.is_some() {
+                return Err(invalid(
+                    "the output directory must be empty; choose a fresh directory",
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[derive(Serialize)]
@@ -314,18 +359,17 @@ pub async fn run(args: ExportArgs) -> Result<i32, CliError> {
                 .map_err(|_| invalid("a revision id is a UUID"))
         })
         .transpose()?;
-    let (service, project) = open(&args.project_dir)?;
-    let (entry, views) = service.operations(project, revision).map_err(map_history)?;
-    let reconciliation = service
-        .reconcile_with_observations(project, Some(entry.revision_id))
-        .map_err(map_history)?;
-    let confirmed: BTreeSet<(String, String)> = reconciliation
-        .reconciliation
-        .rows
-        .iter()
-        .filter(|row| row.status == ReconcileStatus::Confirmed)
-        .map(|row| (row.method.clone(), row.route_template.clone()))
+    let (port, project) = open(&args.project_dir)?;
+    // Read the full identities directly: reconciliation rows lose scope after joining routes.
+    let confirmed: BTreeSet<OperationIdentity> = port
+        .observed_operations(project)
+        .map_err(|error| map_history(HistoryError::Port(error)))?
+        .into_iter()
+        .filter(|row| row.recording_count > 0)
+        .map(|row| (row.application_component, row.binding_key, row.method, row.route_template))
         .collect();
+    let service = CatalogHistoryService::new(port);
+    let (entry, views) = service.operations(project, revision).map_err(map_history)?;
     let input = export_input(&entry, &views, &confirmed);
 
     let selection = if args.operations.is_empty() {
@@ -334,7 +378,7 @@ pub async fn run(args: ExportArgs) -> Result<i32, CliError> {
         let known: BTreeSet<&str> =
             input.operations.iter().map(|o| o.operation_id.as_str()).collect();
         if let Some(missing) = args.operations.iter().find(|id| !known.contains(id.as_str())) {
-            return Err(invalid(format!(
+            return Err(not_found(format!(
                 "operation {missing} is not in catalog revision {}",
                 entry.revision_id
             )));
@@ -360,7 +404,7 @@ pub async fn run(args: ExportArgs) -> Result<i32, CliError> {
         written,
         revision_id: entry.revision_id.to_string(),
         revision_ordinal: entry.ordinal,
-        operation_count: request.operation_ids.as_ref().map_or(input.operations.len(), Vec::len),
+        operation_count: output.operation_count,
         content_hash: output.content_hash.clone(),
         output_dir: if written {
             args.output.as_ref().map(|p| p.display().to_string())
@@ -385,8 +429,9 @@ pub async fn run(args: ExportArgs) -> Result<i32, CliError> {
                 reason: o.reason.clone(),
             })
             .collect(),
-        note: "built from catalog claims only: no request or response body was observed or retained, \
-               and nothing was sent anywhere",
+        note: "built from catalog summaries and linked endpoint observations; missing source \
+               extents and per-claim confidence are explicit; no request or response body was \
+               observed or retained, and nothing was sent anywhere",
     };
     let mut stdout = std::io::stdout().lock();
     if args.json {
@@ -425,4 +470,35 @@ pub async fn run(args: ExportArgs) -> Result<i32, CliError> {
 #[cfg(not(unix))]
 pub async fn run(_args: ExportArgs) -> Result<i32, CliError> {
     Err(CliError::StoreUnavailable("export needs the Unix private-storage layer".to_owned()))
+}
+
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, reason = "fixed file-write failure fixtures")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_staging_failure_publishes_nothing_and_removes_partial_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("output");
+        // The second file collides with the first after one successful write.
+        let file = xtrace_export::ExportFile {
+            path: "same.json".to_owned(),
+            mode: 0o644,
+            bytes: b"partial".to_vec(),
+        };
+        let output = ExportOutput {
+            operation_count: 1,
+            files: vec![file.clone(), file],
+            omissions: Vec::new(),
+            content_hash: String::new(),
+        };
+        assert!(write_files(&dir, &output).is_err());
+        assert!(!dir.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        ensure_private_dir(&dir, false).unwrap();
+        assert!(write_files(&dir, &output).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
 }

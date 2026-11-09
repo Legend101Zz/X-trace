@@ -114,6 +114,7 @@ pub fn parse(doc: &Value) -> Result<ExportInput, String> {
             effective_state: state(&s(o, "effective_state", &at)?, &at)?,
             claims_available: b(o, "claims_available", true, &at)?,
             claims,
+            catalog_summary: None,
         });
     }
     Ok(ExportInput { revision: rev, operations, truncated: b(root, "truncated", false, "$")? })
@@ -179,7 +180,9 @@ fn claim(v: &Value, at: &str) -> Result<ClaimInput, String> {
             symbol: s(ho, "symbol", &a)?,
             path: s(ho, "path", &a)?,
             line_start: line("line_start")?,
-            line_end: line("line_end")?,
+            line_end: n(ho, "line_end", &a)?
+                .map(|n| u32::try_from(n).map_err(|_| format!("{a}.line_end: too large")))
+                .transpose()?,
         });
     }
     Ok(out)

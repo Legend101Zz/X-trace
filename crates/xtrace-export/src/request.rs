@@ -11,7 +11,7 @@ pub enum ExportFormat {
     Postman,
     /// POSIX `sh` cURL recipes.
     Curl,
-    /// Deterministic archive bundle.
+    /// Deterministic developer directory bundle.
     Bundle,
 }
 
@@ -174,8 +174,8 @@ pub struct HandlerInput {
     pub path: String,
     /// First line.
     pub line_start: u32,
-    /// Last line.
-    pub line_end: u32,
+    /// Last line, absent when the read port does not retain the extent.
+    pub line_end: Option<u32>,
 }
 
 /// One claim about an operation.
@@ -201,6 +201,26 @@ pub struct ClaimInput {
     pub request_body_media_type: Option<String>,
 }
 
+/// Facts retained by a summary-only catalog read port. These are not a claim:
+/// locations and confidence must never be attributed to an arbitrary handler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogSummaryInput {
+    /// Number of underlying claims, whose individual projections are unavailable.
+    pub claim_count: usize,
+    /// All distinct handler symbols, without inferred locations.
+    pub handler_symbols: Vec<String>,
+    /// Whether the catalog reports conflicting handlers.
+    pub handler_conflict: bool,
+    /// Location attributable to a handler only when exactly one claim exists.
+    pub single_claim_handler: Option<HandlerInput>,
+    /// Highest confidence across claims, not an individual claim's confidence.
+    pub highest_confidence_basis_points: u16,
+    /// Distinct provenance labels.
+    pub provenance: Vec<String>,
+    /// Union of claim limitations.
+    pub limitation_codes: Vec<String>,
+}
+
 /// One catalog operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationInput {
@@ -220,6 +240,8 @@ pub struct OperationInput {
     pub claims_available: bool,
     /// Claims.
     pub claims: Vec<ClaimInput>,
+    /// Explicitly labelled aggregate facts when individual claims cannot be read.
+    pub catalog_summary: Option<CatalogSummaryInput>,
 }
 
 /// Everything an export reads. Built by an adapter over the catalog read port.
@@ -258,6 +280,8 @@ pub struct ExportFile {
 /// Result of an export.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExportOutput {
+    /// Distinct operations represented by the rendered format, after omissions.
+    pub operation_count: usize,
     /// Files, sorted by path.
     pub files: Vec<ExportFile>,
     /// Omissions, sorted.
@@ -269,11 +293,6 @@ pub struct ExportOutput {
 /// Export failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExportError {
-    /// The format exists in the CLI vocabulary but is not built yet.
-    FormatNotImplemented {
-        /// Format name.
-        format: &'static str,
-    },
     /// The finished document contained a secret-shaped value; nothing is emitted.
     SecretShaped {
         /// JSON pointer-like path to the offender (value is never included).
@@ -289,9 +308,6 @@ pub enum ExportError {
 impl fmt::Display for ExportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::FormatNotImplemented { format } => {
-                write!(f, "export format {format} is not implemented in this build")
-            }
             Self::SecretShaped { path } => {
                 write!(f, "refusing to emit a secret-shaped value at {path}")
             }

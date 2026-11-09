@@ -7,11 +7,37 @@ project setup, the foreground daemon, and an experimental direct-Java launch.
 Status (2026-10-11): `main` also carries v0.01 work that is not accepted yet,
 including Node HTTP and Express capture, attach to a running JVM, `scan` and
 `catalog`, `record`/`stop`/`restart`, `doctor`, `tui` and a Canvas view;
-`export`, `exercise`, `retention`, `store` and `doctor --bundle` are still
+`export` writes OpenAPI, Postman, cURL and developer bundles from the persisted
+catalog. `exercise`, `retention`, `store` and `doctor --bundle` are still
 stubs (exit 9). None of it is a support claim: 0 of 55 v0.01 requirement rows
 are accepted. The paragraphs below describe the original Slice 1 tracer
 bullet. Current status: `docs/STATE.md`; release specification:
 `docs/releases/v0.01.md`.
+
+`xtrace export --format openapi|postman|curl|bundle --output <DIR>` reads the
+latest catalog revision; use `--revision <UUID>` or repeat `--operations <ID>`
+to select entries. `--preview` renders and lists files without writing.
+OpenAPI 3.1 declares routes and required path parameters (`--yaml` selects YAML).
+Postman v2.1 contains requests with an empty `baseUrl` variable. cURL contains
+shell recipes with unresolved values as variables; `all.sh` only prints commands.
+A bundle contains `openapi.yaml`, the collection, `curl/`, a manifest with hashes
+and counts per format, and a README explaining provenance and omissions.
+
+Exports distinguish declarations from observations using component, binding,
+method and route. All known handler symbols and conflicts are retained. The
+catalog read port exposes summaries. Single-claim handlers keep their source
+start line; end lines, multi-claim locations and individual confidence are
+listed as unavailable. Highest confidence is named explicitly.
+OpenAPI lists duplicate method/path omissions; its count includes only the
+operations represented. No observed request or response bodies are exported.
+An unavailable policy digest is null in the bundle manifest with an omission.
+
+The output parent must exist. A destination must be absent or empty, owned by
+the caller and private (0700); non-empty directories and symlinks are refused.
+Files are staged in a private sibling directory and published by one rename.
+Files use mode 0600, directories 0700. Nothing is sent or executed. Missing
+revisions or operation IDs exit 3, usage errors exit 2, and a secret-shaped
+value exits 8 before any output is written. All four formats are implemented.
 
 The Node 22 workspace under `adapters/node` is a protocol/conformance
 foundation only. Its private synthetic client can authenticate to the local

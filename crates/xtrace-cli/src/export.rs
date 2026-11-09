@@ -16,7 +16,7 @@ pub struct ExportArgs {
     /// Export format: openapi, postman, curl or bundle.
     #[arg(long, value_name = "FORMAT")]
     pub format: Option<String>,
-    /// Output directory (created private, mode 0700, if absent).
+    /// Fresh or empty private output directory (mode 0700); non-empty paths are refused.
     #[arg(long, value_name = "DIR")]
     pub output: Option<PathBuf>,
     /// Operations to include (repeatable).

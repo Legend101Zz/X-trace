@@ -18,7 +18,21 @@ tick it only if what you saw matched the expectation. Anything unclear is a no, 
 | attach_failure | Start the app with a wrong or missing agent path | a clear refusal with a stable error code, the app unharmed | none listed here; check the Rust suites of the lane workflow |
 | partial_capture | Kill the app mid-request | a recording sealed as partial, shown as partial in all views | none listed here; check the Rust suites of the lane workflow |
 | exercise | Run `xtrace exercise` | exercised routes listed, recordings produced | not yet automated here |
-| exports | Export every format and open the results in the target tools | files open; no secret appears in them | `export-formats` and the privacy scan in the campaigns workflow |
+| exports | Export OpenAPI, Postman, cURL and a developer bundle; open the results in the target tools | routes and path parameters in OpenAPI; placeholder requests in Postman; shell recipes in cURL; all three plus hashes, counts and omissions in the bundle; no secret appears | `export-formats` and the privacy scan in the campaigns workflow |
+
+For exports, use `xtrace export --format <FORMAT> --preview` first, then
+`--output <DIR>` with a fresh or empty private directory (0700). Non-empty
+destinations are refused. Publication uses one directory rename; files are 0600.
+Check that a route is observed only in its recorded component and binding.
+All known handler symbols and conflicts must be visible. Single-claim handlers
+keep their source start line. End lines, multi-claim locations and individual
+confidence are unavailable through the read port and must appear as gaps,
+with the highest confidence named explicitly.
+OpenAPI cannot hold two operations at the same method/path: inspect its
+omissions and count. Postman and cURL retain both scopes. The bundle manifest
+has counts per format and a null policy digest with an omission when unavailable.
+No format includes observed bodies. Missing revisions or operations exit 3;
+invalid usage exits 2; a secret-shaped value exits 8 without writing output.
 
 ## Reading a campaigns run honestly
 

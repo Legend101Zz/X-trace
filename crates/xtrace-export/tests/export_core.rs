@@ -99,9 +99,35 @@ fn export_omissions_listed_for_every_dropped_example() {
 }
 
 #[test]
-fn unimplemented_formats_fail_with_a_typed_error() {
-    let err = export(&spring_orders(), &ExportRequest::new(ExportFormat::Bundle)).unwrap_err();
-    assert!(matches!(err, xtrace_export::ExportError::FormatNotImplemented { .. }));
+fn bundle_composes_the_formats_and_preserves_format_specific_omissions() {
+    let input = spring_orders();
+    let out = export(&input, &ExportRequest::new(ExportFormat::Bundle)).unwrap();
+    assert_eq!(out.operation_count, 5);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &out.files.iter().find(|f| f.path == "manifest.json").unwrap().bytes,
+    )
+    .unwrap();
+    assert_eq!(manifest["policy_digest"], input.revision.policy_digest);
+    assert_eq!(manifest["catalog_hash"], input.revision.catalog_hash);
+    for (format, prefix, yaml) in [
+        (ExportFormat::OpenApi, "", true),
+        (ExportFormat::Postman, "", false),
+        (ExportFormat::Curl, "curl/", false),
+    ] {
+        let mut request = ExportRequest::new(format);
+        request.yaml = yaml;
+        let rendered = export(&input, &request).unwrap();
+        for file in rendered.files {
+            let path = format!("{prefix}{}", file.path);
+            assert_eq!(out.files.iter().find(|f| f.path == path).unwrap().bytes, file.bytes);
+        }
+    }
+    assert!(out.omissions.iter().any(|o| o.operation_id == "op-zdup"
+        && o.what == "openapi:operation"
+        && o.reason.starts_with("duplicate_method_path_of:")));
+    let mut reordered = input.clone();
+    reordered.operations.reverse();
+    assert_eq!(out, export(&reordered, &ExportRequest::new(ExportFormat::Bundle)).unwrap());
 }
 
 #[test]
