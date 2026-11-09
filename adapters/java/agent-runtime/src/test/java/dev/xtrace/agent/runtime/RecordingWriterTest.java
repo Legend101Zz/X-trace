@@ -734,6 +734,12 @@ class RecordingWriterTest {
     }
 
     @Override
+    public boolean fitsEnvelope(String messageId, String correlationToken, Message payload) {
+      // Same conservative envelope allowance enforced by this peer's send assertions.
+      return payload.getSerializedSize() <= 1024 * 1024 - 4096;
+    }
+
+    @Override
     public Ack send(String messageId, String correlationToken, Message payload)
         throws ClientException {
       assertTrue(messageIds.add(messageId), "each streamed batch needs a distinct message identity");

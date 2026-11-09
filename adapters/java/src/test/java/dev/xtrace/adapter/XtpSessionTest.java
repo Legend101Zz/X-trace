@@ -77,6 +77,42 @@ final class XtpSessionTest {
   }
 
   @Test
+  void oversizedSupportedPayloadWritesNothingAndLeavesTheNextSequenceUsable() throws Exception {
+    MemorySocket socket = new MemorySocket(daemon(1).setAck(staged(1)).build());
+    Health oversized = Health.newBuilder().setStatus("x".repeat(LIMIT)).build();
+    try (XtpSession session = session(socket)) {
+      assertFalse(session.fitsEnvelope("oversized", "", oversized));
+      ClientException failure = assertThrows(ClientException.class,
+          () -> session.send("oversized", "", oversized));
+      assertEquals("XTR-JAVA-FRAME", failure.code());
+      assertEquals(0, socket.written.size());
+      assertFalse(socket.closed);
+      assertTrue(session.fitsEnvelope("health", "", Health.getDefaultInstance()));
+      assertEquals(staged(1), session.send("health", "", Health.getDefaultInstance()));
+      ByteArrayInputStream frames = new ByteArrayInputStream(socket.written.toByteArray());
+      AgentEnvelope sent = Framing.read(frames, LIMIT);
+      assertEquals(1, sent.getSessionSeq());
+      assertEquals("health", sent.getMessageId());
+      assertEquals(0, frames.available());
+    }
+  }
+
+  @Test
+  void envelopeOverheadAloneCanExceedTheNegotiatedLimitWithoutClosingTheSession() throws Exception {
+    MemorySocket socket = new MemorySocket(daemon(1).setAck(staged(1)).build());
+    try (XtpSession session = session(socket)) {
+      Health payload = Health.newBuilder().setStatus("x".repeat(LIMIT - 16)).build();
+      assertTrue(payload.getSerializedSize() < LIMIT);
+      assertFalse(session.fitsEnvelope("oversized", "correlation", payload));
+      assertEquals("XTR-JAVA-FRAME", assertThrows(ClientException.class,
+          () -> session.send("oversized", "correlation", payload)).code());
+      assertFalse(socket.closed);
+      assertEquals(0, socket.written.size());
+      assertEquals(staged(1), session.send("health", "", Health.getDefaultInstance()));
+    }
+  }
+
+  @Test
   void healthRejectsWrongSequenceDurabilityAndRejectionsJustLikeOtherPayloads() throws Exception {
     for (Ack invalid : new Ack[] {
         staged(2),

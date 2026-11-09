@@ -55,6 +55,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   static final String UNTRANSFORMED_GAP_SYMBOL = "xtrace.capture.gap.not-transformed";
   static final String ADMISSION_GAP_SYMBOL = "xtrace.capture.gap.recording-admission";
   static final String MEMORY_GAP_SYMBOL = "xtrace.capture.gap.writer-memory";
+  static final String FRAME_GAP_SYMBOL = "xtrace.capture.gap.frame-limit";
 
   private final Transport session;
   private final BoundedEventQueue queue;
@@ -177,7 +178,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       int cap = eventCap(capturePolicyId);
       int limit = closing(event.kind()) ? cap - GAP_RESERVE : cap - CLOSING_RESERVE;
       long bytes = Math.max(128, event.estimatedBytes());
-      if (recording.start.metadataOnly() || recording.acceptedEvents >= limit) {
+      if (recording.start.metadataOnly() || recording.gapUnreportable
+          || recording.acceptedEvents >= limit) {
         recording.writerDrops = saturatingAdd(recording.writerDrops, 1);
       } else if (pendingEventBytes <= maxPendingEventBytes - bytes) {
         recording.events.add(event);
@@ -258,6 +260,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   }
 
   private void write(PendingRecording pending, QueueSignal.Finish finish) throws ClientException {
+    if (pending.gapUnreportable) return;
     long droppedEvents = saturatingAdd(
         finish.droppedEvents(), saturatingAdd(pending.writerDrops, pending.memoryDrops));
     // Metadata-only admission retains the actual identity and terminal observation, but none of
@@ -288,6 +291,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     pending.events.clear();
     pending.events.addAll(ordered);
     flush(pending, true);
+    if (pending.gapUnreportable) return;
+    droppedEvents = saturatingAdd(droppedEvents, pending.frameDrops);
     if (pending.sequence == 1) {
       throw new ClientException("XTR-JAVA-RECORDING", "recording contains no accepted events");
     }
@@ -330,31 +335,49 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     }
     if (count == 0) return;
     EventBatch.Builder batch = newBatch(uuidBytes(pending.recordingId));
-    int inBatch = 0;
-    int batchBytes = 0;
     for (QueueSignal.Event event : pending.events.subList(0, count)) {
       long sequence = Math.addExact(pending.sequence, 1);
       RecordingEvent proto = toProto(event, sequence);
-      int size = proto.getSerializedSize() + 8;
-      if (size > MAX_BATCH_BYTES) {
-        throw new ClientException("XTR-JAVA-RECORDING", "one event exceeds the batch byte bound");
-      }
-      if (inBatch > 0 && (inBatch >= MAX_BATCH_EVENTS || batchBytes + size > MAX_BATCH_BYTES)) {
-        sendChunk(pending, pending.recordingId, batch, pending.chunk++, pending.sequence);
-        batch = newBatch(uuidBytes(pending.recordingId));
-        inBatch = 0;
-        batchBytes = 0;
-      }
       batch.addEvents(proto);
-      inBatch++;
-      batchBytes += size;
+      if (!fitsBatch(pending, batch)) {
+        batch.removeEvents(batch.getEventsCount() - 1);
+        if (batch.getEventsCount() > 0) {
+          sendChunk(pending, pending.recordingId, batch, pending.chunk++, pending.sequence);
+        }
+        batch = newBatch(uuidBytes(pending.recordingId));
+        batch.addEvents(proto);
+        if (!fitsBatch(pending, batch)) {
+          // Keep this observation's identity, order and clock, but make none of its discarded
+          // source/value/frame claims. Children still refer to the observed slot, now a gap.
+          proto = toProto(new QueueSignal.Event(event.recordingId(), event.eventId(),
+              event.parentEventId(), BridgeEventKind.GAP, FRAME_GAP_SYMBOL,
+              event.monotonicNs(), 1, 128), sequence);
+          batch.setEvents(0, proto);
+          if (!fitsBatch(pending, batch)) {
+            // A negotiated limit may be too small even for the bounded gap identity. Leave
+            // this stream unfinished rather than claiming completeness or closing other streams.
+            pending.gapUnreportable = true;
+            incompleteReported.set(true);
+            System.err.println("{\"code\":\"XTR-JAVA-CAPTURE-INCOMPLETE\","
+                + "\"message\":\"X-trace frame-limit gap could not be sent; affected recording remains incomplete\","
+                + "\"recordingId\":\"" + pending.recordingId + "\"}");
+            batch.clearEvents();
+            break;
+          }
+          pending.frameDrops = saturatingAdd(pending.frameDrops, 1);
+          // A terminal exception must not claim this gap is an observed throw.
+          pending.throwEventIds.remove(event.eventId());
+        }
+      }
       pending.sequence = sequence;
       pending.lastEventId = event.eventId();
       pending.lastMonotonicNs = event.monotonicNs();
       byte[] id = event.eventId().getBytes(StandardCharsets.UTF_8);
       pending.digest.update(id, 0, id.length);
     }
-    sendChunk(pending, pending.recordingId, batch, pending.chunk++, pending.sequence);
+    if (batch.getEventsCount() > 0) {
+      sendChunk(pending, pending.recordingId, batch, pending.chunk++, pending.sequence);
+    }
     if (!finishing) {
       for (QueueSignal.Event event : pending.events.subList(0, count)) {
         if (event.kind() != BridgeEventKind.FRAME_THROW) {
@@ -504,6 +527,14 @@ final class RecordingWriter implements AutoCloseable, Runnable {
 
   static final int MAX_BATCH_BYTES = 256 * 1024;
 
+  private boolean fitsBatch(PendingRecording pending, EventBatch.Builder batch)
+      throws ClientException {
+    EventBatch payload = batch.build();
+    return payload.getEventsCount() <= MAX_BATCH_EVENTS
+        && payload.getSerializedSize() <= MAX_BATCH_BYTES
+        && session.fitsEnvelope(chunkId(pending, pending.chunk), pending.start.recordingId(), payload);
+  }
+
   private static EventBatch.Builder newBatch(byte[] recordingBytes) {
     return EventBatch.newBuilder().setRecordingId(ByteString.copyFrom(recordingBytes));
   }
@@ -511,9 +542,13 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   private void sendChunk(
       PendingRecording pending, UUID recordingId, EventBatch.Builder batch, int chunk, long lastSeq)
       throws ClientException {
-    String id = pending.start.recordingId() + ":events" + (chunk == 0 ? "" : ":" + chunk);
+    String id = chunkId(pending, chunk);
     Ack ack = session.send(id, pending.start.recordingId(), batch.build());
     requireRecordingAck(ack, recordingId, lastSeq);
+  }
+
+  private static String chunkId(PendingRecording pending, int chunk) {
+    return pending.start.recordingId() + ":events" + (chunk == 0 ? "" : ":" + chunk);
   }
 
   static RecordingEvent toProto(QueueSignal.Event event, long sequence)
@@ -551,6 +586,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       boolean cap = event.symbol().equals(CAP_GAP_SYMBOL);
       boolean admission = event.symbol().equals(ADMISSION_GAP_SYMBOL);
       boolean memory = event.symbol().equals(MEMORY_GAP_SYMBOL);
+      boolean frame = event.symbol().equals(FRAME_GAP_SYMBOL);
       boolean lines = event.symbol().equals(BootstrapBridge.LINE_BUDGET_SYMBOL);
       boolean untransformed = event.symbol().equals(UNTRANSFORMED_GAP_SYMBOL);
       builder.setGap(
@@ -558,7 +594,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
               .setReason(handler ? GapReason.GAP_REASON_CORRELATION_LOST
                   : lines ? GapReason.GAP_REASON_LINE_BUDGET
                   : untransformed ? GapReason.GAP_REASON_CLASS_NOT_TRANSFORMED
-                  : cap || admission || memory
+                  : cap || admission || memory || frame
                       ? GapReason.GAP_REASON_THROTTLE : GapReason.GAP_REASON_QUEUE_FULL)
               .setCount(handler ? 1 : Math.max(1, event.detail())));
     }
@@ -800,6 +836,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     private long batchBytes;
     private long writerDrops;
     private long memoryDrops;
+    private long frameDrops;
+    private boolean gapUnreportable;
     // Buffered non-throw allocations and retained throw allocations are disjoint charges.
     private long eventBytes;
     private long retainedThrowBytes;
@@ -811,6 +849,9 @@ final class RecordingWriter implements AutoCloseable, Runnable {
 
   interface Transport {
     Ack send(String messageId, String correlationToken, Message payload) throws ClientException;
+
+    boolean fitsEnvelope(String messageId, String correlationToken, Message payload)
+        throws ClientException;
 
     void close() throws ClientException;
   }
@@ -824,6 +865,12 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     public Ack send(String messageId, String correlationToken, Message payload)
         throws ClientException {
       return session.send(messageId, correlationToken, payload);
+    }
+
+    @Override
+    public boolean fitsEnvelope(String messageId, String correlationToken, Message payload)
+        throws ClientException {
+      return session.fitsEnvelope(messageId, correlationToken, payload);
     }
 
     @Override
