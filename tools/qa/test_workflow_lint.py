@@ -179,6 +179,20 @@ class MacosWorkflowTests(unittest.TestCase):
                 self.assertEqual(step["if"], "${{ !cancelled() }}")
         self.assertEqual(floors, {"node": 85, "web": 75, "java": 190, "rust": 1030})
 
+    def test_uploads_only_fragment_json_and_linux_floor_keeps_its_separate_sanitizer(self):
+        steps = self.workflow["jobs"]["macos-arm64"]["steps"]
+        uploads = [s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@")]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0]["if"], "always()")
+        self.assertEqual(uploads[0]["with"]["path"], "${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json")
+        linux = workflow_lint.load(ROOT / ".github/workflows/ci.yml")
+        steps = linux["jobs"]["release-floor-linux-x86_64"]["steps"]
+        self.assertTrue(any("tools.release.ci_floor sanitize-floor" in s.get("run", "") for s in steps))
+        self.assertFalse(any("tools.qa.lane_run" in s.get("run", "") for s in steps))
+        uploads = [s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@")]
+        self.assertEqual([s["with"]["path"] for s in uploads],
+                         ["${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json"])
+
     def test_aggregator_covers_every_job_and_rejects_each_non_success(self):
         jobs = self.workflow["jobs"]
         aggregator = jobs["macos-ok"]

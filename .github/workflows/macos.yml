@@ -259,7 +259,8 @@ jobs:
         if: always()
         with:
           name: xtrace-macos-arm64-frag-${{ matrix.tuple }}
-          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag
+          # Fragments include bounded, privacy-scanned excerpts. Never upload the private logs.
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
           if-no-files-found: ignore
           retention-days: 14
 

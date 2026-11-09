@@ -7,6 +7,7 @@
 
 Public output is limited to values that match the release tooling grammars (test ids per
 tools.release.ci_floor._valid_test_id); invalid candidates are dropped and only counted.
+Fragments also carry bounded, privacy-scanned failure excerpts; raw logs stay private.
 Run from the repository root:  python3 -B -m tools.qa.lane_run <run|merge> ...
 """
 from __future__ import annotations
@@ -18,7 +19,9 @@ import pathlib
 import re
 import subprocess
 import sys
+from collections import deque
 
+from tools.qa import canary
 from tools.release import ci_floor
 
 MAX_FAILING = 32
@@ -60,7 +63,7 @@ def parse_output(text: str) -> dict:
         cand = None
         if m := CARGO_FAIL.match(line):
             cand = m.group(1)
-        elif m := GRADLE_FAIL.match(line):
+        elif m := GRADLE_FAIL.match(line.strip()):
             cand = f"{m.group(1)}::{m.group(2)}"
         elif m := PY_FAIL.match(line):
             cand = f"{m.group(2)}::{m.group(1)}"
@@ -255,6 +258,208 @@ def diagnostics(text: str) -> tuple[list[str], int]:
     return out, dropped
 
 
+# Limits count serialized UTF-8 bytes, including JSON escaping and field names. The job
+# budget is shared by every step writing to the same fragment directory.
+MAX_EXCERPT_BYTES = 2048
+MAX_EXCERPT_LINES = 6
+MAX_JOB_EXCERPT_BYTES = 24 * 1024
+MAX_PROGRESS_LINES = 12
+WITHHELD = "withheld: privacy scan"
+CARGO_SECTION = re.compile(r"^---- (\S+) (?:stdout|stderr) ----$")
+CARGO_PANIC = re.compile(r"^thread '([^']+)' panicked at ")
+CARGO_STATE = re.compile(r"^test (\S+) \.\.\.(?: (ok|FAILED|ignored))?$")
+CARGO_RUNNING = re.compile(r"^test (\S+) has been running for over \d+ seconds$")
+GRADLE_STATE = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\([^\n]*\))?(?:\[[^\n]*\])? (STARTED|PASSED|FAILED|SKIPPED)$")
+JAVA_SITE = re.compile(r"^\s*at [\w.$]+\((\w+\.java:\d+)\)\s*$")
+GRADLE_SHORT_SITE = re.compile(r"^[\w.$]+ at (\w+\.java:\d+)$")
+PROGRESS = re.compile(r"^(?:running \d+ tests?|test result: .+|> Task :[\w:.-]+(?: [A-Z-]+)?|"
+                      r"(?:Compiling|Finished) .+)$")
+# Reuse the canary scanner's encoded needles, including recognisable marker families
+# when no private canary file was supplied. DIAG_BAD also guards host paths/credentials.
+CANARY_INDEX = canary.build_index({"marker": "CANARY", "mixed-marker": "canary"})
+PRIVATE_TEXT = re.compile(r"(?:(?<![A-Za-z0-9_./-])/[A-Za-z0-9_.-]+/|[A-Za-z]:\\|https?://|\b[\w.+-]+@[\w.-]+\.[A-Za-z]+|"
+                          r"\b(?:passwd|credential|api[_-]?key)\b|\bprivate[_-])", re.I)
+
+
+def _encoded(value) -> bytes:
+    return json.dumps(value, sort_keys=True, ensure_ascii=True).encode("utf-8")
+
+
+def _private(text: str, index) -> bool:
+    hits: dict = {}
+    canary.scan_bytes(text.encode("utf-8"), index, hits, "ci-excerpt")
+    return bool(hits or DIAG_BAD.search(text) or PRIVATE_TEXT.search(text)
+                or any(ord(c) < 32 and c not in "\n\t" for c in text))
+
+
+def _failure_blocks(text: str):
+    """Yield harness-delimited blocks, never attach unrelated stdout to a test."""
+    name = None
+    kind = "cargo"
+    captured = False
+    lines: list[str] = []
+    for line in ANSI.sub("", text).splitlines():
+        section = CARGO_SECTION.fullmatch(line)
+        panic = CARGO_PANIC.match(line)
+        gradle = GRADLE_FAIL.fullmatch(line.strip())
+        next_name = (section.group(1) if section else
+                     f"{gradle.group(1)}::{gradle.group(2)}" if gradle else
+                     panic.group(1) if panic and not captured and panic.group(1) != name else None)
+        boundary = (next_name is not None or CARGO_STATE.fullmatch(line)
+                    or CARGO_RESULT.match(line) or line == "failures:"
+                    or line.startswith("> Task ") or GRADLE_STATE.fullmatch(line.strip()))
+        if boundary:
+            if name is not None:
+                yield name, kind, lines
+            name, lines = next_name, []
+            kind = "gradle" if gradle else "cargo"
+            captured = section is not None
+        if name is not None and not section and not gradle:
+            lines.append(line)
+    if name is not None:
+        yield name, kind, lines
+
+
+def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT_BYTES,
+                    index=None) -> dict | None:
+    """Extract only observed failure locations/messages and harness progress.
+
+    Scan whole failure blocks before truncation, so a secret past the excerpt cap
+    withholds the entire excerpt. No scanner hit or private value is ever serialized.
+    """
+    index = CANARY_INDEX if index is None else index
+    failures = {name: {"test": name, "location": "not observed", "message": ["not observed"]}
+                for name in parse_output(text)["failingTests"]}
+    for name, kind, lines in _failure_blocks(text):
+        if name not in failures:
+            continue
+        row = failures[name]
+        block = "\n".join([name, *lines])
+        if row.get("excerpt") == WITHHELD:
+            continue
+        if _private(block, index):
+            row.clear()
+            row.update(test=name, excerpt=WITHHELD)
+            continue
+        message = []
+        after_panic = False
+        for line in lines:
+            if kind == "cargo" and line.lstrip().startswith(("note:", "stack backtrace:")):
+                break
+            if m := PANIC_LOC.search(line.rstrip()):
+                if ci_floor._valid_panic_site(f"{m.group(1)}:{m.group(2)}"):
+                    row["location"] = f"{m.group(1)}:{m.group(2)}:{m.group(3)}"
+                after_panic = True
+            elif m := JAVA_SITE.fullmatch(line):
+                test_file = name.split("::")[0].split("$")[0] + ".java:"
+                if row["location"] == "not observed" or m.group(1).startswith(test_file):
+                    row["location"] = m.group(1)
+            elif line.strip() and not line.lstrip().startswith(("at ", "note:", "stack backtrace:")):
+                if after_panic or kind == "gradle":
+                    message.append(line.strip())
+                    if m := GRADLE_SHORT_SITE.fullmatch(line.strip()):
+                        row["location"] = m.group(1)
+        if not message:
+            continue
+        row["message"] = message[:MAX_EXCERPT_LINES]
+        row["truncated"] = len(message) > MAX_EXCERPT_LINES
+        while len(_encoded(row)) > MAX_EXCERPT_BYTES and row["message"]:
+            row["truncated"] = True
+            overflow = len(_encoded(row)) - MAX_EXCERPT_BYTES
+            row["message"][-1] = row["message"][-1][:-max(1, overflow // 6)]
+            if not row["message"][-1]:
+                row["message"].pop()
+    # Names are scanned too: a syntactically valid test id can contain a canary.
+    rows = [row if not _private(row["test"], index) else {"excerpt": WITHHELD}
+            for row in failures.values()]
+    result: dict = {"failures": rows, "omitted": 0}
+    if timed_out:
+        running: dict[str, None] = {}
+        progress: deque[str] = deque(maxlen=MAX_PROGRESS_LINES)
+        withheld = 0
+        progress_omitted = 0
+        for line in ANSI.sub("", text).splitlines():
+            line = line.strip()
+            if CARGO_RESULT.match(line) or re.fullmatch(r"running \d+ tests?", line):
+                running.clear()
+            state = CARGO_STATE.fullmatch(line)
+            long = CARGO_RUNNING.fullmatch(line)
+            gradle = GRADLE_STATE.fullmatch(line)
+            name = None
+            active = False
+            if state or long:
+                name = (state or long).group(1)
+                active = bool(long or state.group(2) is None)
+            elif gradle:
+                name = f"{gradle.group(1)}::{gradle.group(2)}"
+                active = gradle.group(3) == "STARTED"
+            if name is not None and ci_floor._valid_test_id(name):
+                if active:
+                    running[name] = None
+                else:
+                    running.pop(name, None)
+            if state or long or gradle or PROGRESS.fullmatch(line):
+                if _private(line, index):
+                    withheld += 1
+                elif len(_encoded(line)) <= MAX_EXCERPT_BYTES:
+                    progress_omitted += int(len(progress) == MAX_PROGRESS_LINES)
+                    progress.append(line)
+                else:
+                    progress_omitted += 1
+        names = [n for n in running if not _private(n, index)]
+        result["timeout"] = {"runningTests": names[:MAX_FAILING],
+                             "runningOmitted": len(running) - min(len(names), MAX_FAILING),
+                             "basis": "last harness observation; other running tests not observed",
+                             "progress": list(progress), "progressWithheld": withheld,
+                             "progressOmitted": progress_omitted}
+    # Preserve the timeout envelope when space runs short; drop failure rows first.
+    while len(_encoded(result)) > budget:
+        if result["failures"]:
+            result["failures"].pop()
+            result["omitted"] += 1
+        elif result.get("timeout", {}).get("progress"):
+            result["timeout"]["progress"].pop(0)
+            result["timeout"]["progressOmitted"] += 1
+        elif result.get("timeout", {}).get("runningTests"):
+            result["timeout"]["runningTests"].pop()
+            result["timeout"]["runningOmitted"] += 1
+        else:
+            return None
+    if failures and not result["failures"] and not timed_out:
+        return None
+    return result
+
+
+def _remaining_excerpt_budget(out: pathlib.Path, current: pathlib.Path) -> int:
+    used = 0
+    for path in out.glob("*.json"):
+        if path == current:
+            continue
+        try:
+            previous = json.loads(path.read_text())
+            if not isinstance(previous, dict):
+                return 0
+            detail = previous.get("failureDetails")
+        except (OSError, ValueError):
+            return 0  # never reset the job budget when prior fragments cannot be read
+        if detail is not None:
+            used += len(_encoded(detail))
+    return max(0, MAX_JOB_EXCERPT_BYTES - used)
+
+
+def _excerpt_index(path: str):
+    if not path:
+        return CANARY_INDEX
+    try:
+        values = json.loads(pathlib.Path(path).read_text())
+        if not isinstance(values, dict) or not values or not all(
+                isinstance(v, str) and v for v in values.values()):
+            return None
+        return [*CANARY_INDEX, *canary.build_index(values)]
+    except (OSError, ValueError):
+        return None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     suite, variant, step = (_check_name(args.suite, "suite"), _check_name(args.variant, "variant"),
                             _check_name(args.step, "step"))
@@ -267,12 +472,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not cmd:
         raise SystemExit("no command")
     log_path = log_dir / f"{suite}-{variant}-{step}.log"
+    timed_out = False
     with open(log_path, "wb") as log:
         os.umask(previous_umask)
         try:
             proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=args.cwd or None,
                                   check=False, timeout=args.timeout)
         except subprocess.TimeoutExpired:  # a timeout is a failed step with a fragment, never a traceback with argv
+            timed_out = True
             proc = subprocess.CompletedProcess(cmd, 124)
             log.write(f"\nlane: step exceeded its {args.timeout}s timeout\n".encode())
             print(f"lane {suite}/{variant}/{step}: timeout after {args.timeout}s")
@@ -296,7 +503,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"lane {suite}/{variant}/{step}: {facts['ignored']} ignored or skipped tests (maximum {max_ignored})")
     frag = {"suite": suite, "variant": variant, "step": step, "status": status,
             "exitCode": proc.returncode, **{k: v for k, v in facts.items() if k != "counted"}}
-    (out / f"{suite}__{variant}__{step}.json").write_text(json.dumps(frag, sort_keys=True, indent=1) + "\n")
+    fragment_path = out / f"{suite}__{variant}__{step}.json"
+    if status == "fail":
+        frag["timedOut"] = timed_out
+        index = _excerpt_index(getattr(args, "canaries", ""))
+        frag["failureDetails"] = (failure_details(
+            text, timed_out, budget=_remaining_excerpt_budget(out, fragment_path), index=index)
+            if index is not None else None)
+        if frag["failureDetails"] is None:
+            frag["failureDetailsUnavailable"] = WITHHELD if index is None else "job excerpt cap"
+    fragment_path.write_bytes(_encoded(frag) + b"\n")
     print(f"lane {suite}/{variant}/{step}: {status} exit={proc.returncode} "
           f"passed={_fmt(facts['passed'])} failed={_fmt(facts['failed'])} ignored={_fmt(facts['ignored'])}")
     for name in facts["failingTests"]:
@@ -414,6 +630,7 @@ def main() -> int:
     r.add_argument("--max-ignored", type=int, default=-1, help="fail a zero-exit step that ignored or skipped more tests")
     r.add_argument("--junit-glob", default="", help="glob (relative to --cwd) of JUnit XML reports to count")
     r.add_argument("--timeout", type=int, default=3000)
+    r.add_argument("--canaries", default="", help="optional private canary JSON; unreadable files withhold excerpts")
     r.add_argument("command", nargs=argparse.REMAINDER)
     m = sub.add_parser("merge")
     m.add_argument("--plan", required=True)
