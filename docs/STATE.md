@@ -52,6 +52,10 @@ Epic: #2. Close an issue only when every box is ticked with evidence on merged `
 - `tools/release/test_release_tools.py` `RunnerTests` process-tree tests (slow runners).
 - `crates/xtrace-cli/tests/node_run_http.rs` `auto_mode_records_cjs_and_esm_entries_once_each`.
 - `crates/xtrace-cli/tests/lifecycle_journey.rs` `stale_record_naming_a_zombie_is_cleaned_up_by_stop_and_restart`.
+- `crates/xtrace-cli/tests/scan_fixture.rs` `scan_timeout_stops_the_whole_process_group_of_a_forking_wrapper`: its
+  warm-up exec of a freshly written analyzer script failed with ETXTBSY ("Text file busy") on Linux in post-merge
+  main CI run 42592007042 (gates job). This is the write-then-exec race while another test thread forks; the
+  product's own exec of a just-written analyzer has the same exposure.
 - `crates/xtrace-runtime/src/pack_inventory.rs`
   `partial_snapshot_copy_uses_production_cleanup_and_reports_uncertain_replacement`: it lists the whole shared test
   scratch under a 4,096-entry bound, so it fails once leftover scratch from other tests passes that bound.
