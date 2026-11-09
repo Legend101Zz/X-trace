@@ -463,8 +463,8 @@ pub trait RecordingCapture: Send + Sync {
         self.begin_recording(request)
     }
 
-    /// Stages admitted events and persists every segment that reaches a seal
-    /// boundary.
+    /// Persists admitted events, including the buffered tail, before returning
+    /// success. No later event, idle timer, or finish is needed for durability.
     ///
     /// # Errors
     ///
@@ -788,6 +788,12 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
         for event in preflight.new_events {
             receipt.persisted_segments += self.stage_new_event(&mut state, event)?;
         }
+        // A batch acknowledgement is the durability bound, including for an
+        // unfinished request that goes idle. Count/byte/span boundaries still
+        // split large batches; this adds at most one tail segment per batch.
+        // Replays and empty batches do not create empty segments. Failed writes
+        // retain the immutable pending segment for the existing exact retry.
+        receipt.persisted_segments += self.seal_current(&mut state)?;
         // Counted only after staging succeeded so a retried batch recomputes
         // the same drops instead of double counting them.
         state.capacity_dropped = state.capacity_dropped.saturating_add(preflight.dropped as u64);
@@ -1652,7 +1658,7 @@ mod tests {
             })
             .expect("original remains replayable");
         assert_eq!(retry.duplicates, 1);
-        assert!(port.snapshot().segments.is_empty());
+        assert_eq!(port.snapshot().segments.len(), 1, "replays must not write extra segments");
     }
 
     #[test]
@@ -1672,18 +1678,23 @@ mod tests {
         let gap = service
             .record_events(RecordEvents { recording_id, events: vec![event(4, u64::MAX, 0xa4)] });
         assert_eq!(gap.expect_err("gap rejected").kind(), PortErrorKind::Conflict);
-        assert!(port.snapshot().segments.is_empty(), "gap must not seal or mutate");
+        assert_eq!(port.snapshot().segments.len(), 1, "gap must not write another segment");
+        assert_eq!(persisted_sequences(&port), [2], "gap must not mutate persisted events");
 
         let accepted = service
             .record_events(RecordEvents { recording_id, events: vec![event(3, u64::MAX, 0xa3)] })
             .expect("contiguous event at max clock");
         assert_eq!(accepted.accepted, 1);
-        assert_eq!(accepted.persisted_segments, 0);
+        assert_eq!(accepted.persisted_segments, 1);
         service.finish_recording(FinishRecording::without_digest(recording_id, 3)).expect("finish");
         let segments = port.snapshot().segments;
-        assert_eq!(segments.len(), 1);
+        assert_eq!(segments.len(), 2);
         assert_eq!(
-            segments[0].events.iter().map(|event| event.payload.sequence).collect::<Vec<_>>(),
+            segments
+                .iter()
+                .flat_map(|segment| &segment.events)
+                .map(|event| event.payload.sequence)
+                .collect::<Vec<_>>(),
             [2, 3]
         );
     }
@@ -1734,6 +1745,66 @@ mod tests {
     }
 
     #[test]
+    fn small_batch_tail_is_durable_on_return_without_a_later_event_or_finish() {
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        let recording_id = begin(wall(1)).recording_id;
+        service.begin_recording(begin(wall(1))).expect("begin");
+
+        for (ordinal, sequences) in [(0, vec![2, 3]), (1, vec![4])] {
+            let receipt = service
+                .record_events(RecordEvents {
+                    recording_id,
+                    events: sequences.iter().map(|&seq| event(seq, 0, 7)).collect(),
+                })
+                .expect("batch acknowledgement");
+            assert_eq!(receipt.accepted, sequences.len());
+            assert_eq!(receipt.persisted_segments, 1);
+            let snapshot = port.snapshot();
+            assert_eq!(snapshot.segments.len(), ordinal + 1);
+            assert_eq!(snapshot.segments[ordinal].segment_ordinal as usize, ordinal);
+            assert_eq!(
+                snapshot.segments[ordinal]
+                    .events
+                    .iter()
+                    .map(|event| event.recording_seq)
+                    .collect::<Vec<_>>(),
+                sequences
+            );
+        }
+        assert!(port.finishes.lock().expect("finishes").is_empty(), "recording remains open");
+        let empty = service
+            .record_events(RecordEvents { recording_id, events: vec![] })
+            .expect("empty batch");
+        assert_eq!(empty.persisted_segments, 0);
+        assert_eq!(port.snapshot().segments.len(), 2, "no empty segments");
+    }
+
+    #[test]
+    fn small_batch_tail_failure_prevents_success_and_retries_the_immutable_segment() {
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        let recording_id = begin(wall(1)).recording_id;
+        service.begin_recording(begin(wall(1))).expect("begin");
+        port.fail_next_segment_after_record.store(true, Ordering::SeqCst);
+        let request = RecordEvents { recording_id, events: vec![event(2, 0, 7)] };
+        let failed = service.record_events(request.clone()).expect_err("tail is not acknowledged");
+        assert_eq!(failed.kind(), PortErrorKind::Transport);
+        let receipt = service.record_events(request).expect("exact retry");
+        assert_eq!((receipt.accepted, receipt.duplicates, receipt.persisted_segments), (0, 1, 1));
+        let snapshot = port.snapshot();
+        assert_eq!(snapshot.segments.len(), 2);
+        assert_eq!(snapshot.segments[0].segment_ordinal, 0);
+        assert_eq!(snapshot.segments[1].segment_ordinal, 0);
+        assert_eq!(snapshot.segments[0].events, snapshot.segments[1].events);
+        let next = service
+            .record_events(RecordEvents { recording_id, events: vec![event(3, 0, 8)] })
+            .expect("next batch");
+        assert_eq!(next.persisted_segments, 1);
+        assert_eq!(port.snapshot().segments[2].segment_ordinal, 1);
+    }
+
+    #[test]
     fn default_policy_seals_at_two_thousand_events_and_two_seconds() {
         let count_port = Arc::new(FakePort::default());
         let count_service = service(Arc::clone(&count_port), SegmentPolicy::default());
@@ -1744,8 +1815,9 @@ mod tests {
             .collect();
         count_service.record_events(RecordEvents { recording_id, events }).expect("events");
         let count_segments = count_port.snapshot().segments;
-        assert_eq!(count_segments.len(), 1);
+        assert_eq!(count_segments.len(), 2);
         assert_eq!(count_segments[0].events.len(), DEFAULT_SEGMENT_EVENTS);
+        assert_eq!(count_segments[1].events.len(), 1, "tail is durable before finish");
 
         count_service
             .finish_recording(FinishRecording::without_digest(recording_id, 2_002))
@@ -1764,8 +1836,9 @@ mod tests {
             })
             .expect("span boundary");
         let span_segments = span_port.snapshot().segments;
-        assert_eq!(span_segments.len(), 1);
+        assert_eq!(span_segments.len(), 2);
         assert_eq!(span_segments[0].events[0].recording_seq, 2);
+        assert_eq!(span_segments[1].events[0].recording_seq, 3, "tail is durable before finish");
         span_service
             .finish_recording(FinishRecording::without_digest(recording_id, 3))
             .expect("finish");
@@ -2083,7 +2156,7 @@ mod tests {
         let finished = service
             .finish_recording(FinishRecording::without_digest(recording_id, 3))
             .expect("declared finish gap persists terminal evidence");
-        assert_eq!(finished.persisted_segments, 1);
+        assert_eq!(finished.persisted_segments, 0);
         assert_eq!(finished.completion, RecordingCompletion::Partial);
         assert!(!port.snapshot().segments.is_empty());
         let conflicting =
@@ -2165,7 +2238,8 @@ mod tests {
         let finish = service
             .finish_recording(FinishRecording::without_digest(recording_id, 2))
             .expect("finish");
-        assert_eq!(finish.persisted_segments, 1);
+        assert_eq!(finish.persisted_segments, 0);
+        assert_eq!(port.snapshot().segments.len(), 1, "finish must not rewrite the durable tail");
         assert!(!finish.exact_replay);
         let replay = service
             .finish_recording(FinishRecording::without_digest(recording_id, 2))

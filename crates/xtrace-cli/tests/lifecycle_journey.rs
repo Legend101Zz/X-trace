@@ -31,6 +31,9 @@ use xtrace_protocol::generated::agent::RecordingEvent;
 use xtrace_protocol::xtf::XtfEventEnvelope;
 use xtrace_store::{OpenOptions, SqliteRecordingPersistence, SqliteStore};
 
+#[path = "lifecycle/open_recording_durability.rs"]
+mod open_recording_durability;
+
 struct Fixture {
     root: TempDir,
     repo: PathBuf,

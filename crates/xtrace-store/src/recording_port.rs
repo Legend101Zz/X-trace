@@ -1551,10 +1551,11 @@ mod tests {
             })
             .expect("corrected events at the same sequences remain admissible");
         assert_eq!(retry.accepted, 2);
+        assert_eq!(retry.persisted_segments, 1, "corrected batch is durable before finish");
         let finished = capture
             .finish_recording(FinishRecording::without_digest(begin.recording_id, 3))
-            .expect("finish persists the corrected segment");
-        assert_eq!(finished.persisted_segments, 1);
+            .expect("finish reuses the corrected segment");
+        assert_eq!(finished.persisted_segments, 0);
 
         let durable_replay = adapter
             .persist_segment(&PersistRecordingSegment {
@@ -1692,12 +1693,13 @@ mod tests {
         capture.begin_recording(begin.clone()).expect("begin");
 
         let original = event(2, "event-2");
-        capture
+        let accepted = capture
             .record_events(RecordEvents {
                 recording_id: begin.recording_id,
                 events: vec![original.clone()],
             })
             .expect("accept original");
+        assert_eq!(accepted.persisted_segments, 1, "original is durable before any replay");
 
         let mut malformed_duplicate = original.clone();
         malformed_duplicate.payload.event.as_mut().expect("nested event").recording_seq = 3;
@@ -1721,8 +1723,8 @@ mod tests {
 
         let finished = capture
             .finish_recording(FinishRecording::without_digest(begin.recording_id, 2))
-            .expect("finish persists the original event");
-        assert_eq!(finished.persisted_segments, 1);
+            .expect("finish reuses the original event");
+        assert_eq!(finished.persisted_segments, 0);
         let durable_replay = adapter
             .persist_segment(&PersistRecordingSegment {
                 project_id: project.id(),
