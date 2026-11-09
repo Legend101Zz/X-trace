@@ -2,7 +2,7 @@
 set -euo pipefail
 
 apply=0
-keep_days=7
+keep_days=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --apply) apply=1; shift ;;
@@ -22,7 +22,6 @@ done
 XTRACE_DEV_TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" python3 -B - "$apply" "$keep_days" <<'PY'
 import os
 from pathlib import Path
-import re
 import shutil
 import stat
 import subprocess
@@ -51,11 +50,7 @@ def root(name):
 
 
 sys.path.insert(0, os.environ["XTRACE_DEV_TOOLS"])
-from devid import worktree_id as _worktree_id  # noqa: E402
-
-
-def worktree_id(path):
-    return _worktree_id(Path(path).name)
+from devid import worktree_id  # noqa: E402
 
 
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -82,6 +77,7 @@ def inspect_tree(parent_fd, name, path, device, remove=False):
         raise ValueError(f"symlinked entry refused: {path}")
     if info.st_dev != device:
         raise ValueError(f"mounted entry refused: {path}")
+    newest = info.st_mtime
     if stat.S_ISDIR(info.st_mode):
         descriptor = os.open(name, DIRECTORY_FLAGS, dir_fd=parent_fd)
         try:
@@ -89,14 +85,15 @@ def inspect_tree(parent_fd, name, path, device, remove=False):
             if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
                 raise ValueError(f"entry changed during cleanup: {path}")
             for child in os.listdir(descriptor):
-                inspect_tree(descriptor, child, path / child, device, remove)
+                _, child_newest = inspect_tree(descriptor, child, path / child, device, remove)
+                newest = max(newest, child_newest)
         finally:
             os.close(descriptor)
         if remove:
             os.rmdir(name, dir_fd=parent_fd)
     elif remove:
         os.unlink(name, dir_fd=parent_fd)
-    return info
+    return info, newest
 
 
 descriptors = []
@@ -118,7 +115,8 @@ try:
         worktree_id(os.fsdecode(line[len(b"worktree "):]))
         for line in listing.split(b"\0") if line.startswith(b"worktree ")
     }
-    cutoff = time.time() - int(sys.argv[2]) * 86400
+    keep_days = int(sys.argv[2])
+    cutoff = time.time() - keep_days * 86400
     candidates = []
     parents = [(scratch, scratch_fd)]
     if target.exists():
@@ -132,8 +130,8 @@ try:
             raise ValueError(f"mounted entry refused: {parent}")
         for name in sorted(os.listdir(parent_fd)):
             entry = parent / name
-            info = inspect_tree(parent_fd, name, entry, device)
-            if stat.S_ISDIR(info.st_mode) and (name not in active or info.st_mtime < cutoff):
+            info, newest = inspect_tree(parent_fd, name, entry, device)
+            if stat.S_ISDIR(info.st_mode) and name not in active and (keep_days == 0 or newest < cutoff):
                 candidates.append((parent_fd, name, entry, device))
 
     def sizes():

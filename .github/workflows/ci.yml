@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -308,6 +308,15 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Test dev tools and workflow lint
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP:?}/d"
+          mkdir -m 700 "$root"
+          # The env tests also need an owner-only ancestor within the 24-byte scratch cap.
+          chmod 700 "$RUNNER_TEMP"
+          XTRACE_DEV_TEST_ROOT="$root" XTRACE_DEV_SCRATCH="$RUNNER_TEMP" TMPDIR="$root" \
+            python3 -B -m unittest tools.dev.test_dev_tools tools.qa.test_workflow_lint
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -452,6 +461,7 @@ jobs:
     needs: [release-tool-tests, release-floor-linux-x86_64, java-client, node-client, gates]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Require every job to succeed
         env:

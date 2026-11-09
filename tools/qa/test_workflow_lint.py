@@ -62,7 +62,7 @@ class CiPullRequestTests(unittest.TestCase):
 
     def test_concurrency_cancels_only_pull_requests(self):
         self.assertEqual(self.workflow["concurrency"], {
-            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
             "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
         })
 
