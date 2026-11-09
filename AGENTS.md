@@ -72,6 +72,7 @@ needs the network and runs outside any agent sandbox.
 
 ## Rules
 
+- **Writing**: Claude only orchestrates and reviews; Codex workers write all code, tests, docs, ADRs and merge-conflict resolutions (ADR 0012).
 - **Never weaken a test, gate, budget, timeout or CI job**: no deleting or loosening assertions, `#[ignore]`,
   `test.skip`, quarantines, retries or raised deadlines. A skipped or unreached step is never a pass. If a task needs
   any of that, stop and report it as infeasible.

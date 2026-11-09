@@ -57,6 +57,7 @@
 - `CURRENT_SCHEMA_VERSION` is 9. The migration, the constant and the pinned
   prefix-checksum test (`v0009_prefix_checksum_is_pinned`) land in one commit.
   `lane_sql/catalog_v9.sql` is untouched and becomes v10 in a later wave.
+- Amendment 2026-11-09: v10 is `session_health` (#35); the catalog-links lane takes the next free migration version when it lands.
 - Rows are inserted in the same transaction as the recording anchor and are
   never updated. A replayed `begin_recording` keeps the limitations the
   recording was first opened with.

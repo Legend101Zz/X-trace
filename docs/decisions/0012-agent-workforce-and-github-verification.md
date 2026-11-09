@@ -22,6 +22,8 @@
   `gpt-6.1-terra` (documentation, mechanical edits, reviews of Sol-written code). The owner may change this split.
 - **The orchestrator** is a Claude Code session (Opus). It writes tickets, launches workers, reviews every diff,
   commits, opens pull requests, reads CI and merges. Workers never push, merge, tag, publish or write issues.
+- Owner amendment 2026-11-09: Claude only orchestrates and reviews; Codex workers do all code, test, docs, ADR and merge-conflict writing (`gpt-6.1-sol` for code, `gpt-6.1-terra` for docs). The orchestrator writes tickets, commits reviewed worker diffs under the owner's identity, opens pull requests, watches CI, merges and closes issues.
+- Owner amendment 2026-11-09: the identity rule applies to new commits; commits before this date keep their original `opencode` author and old trailers. Pushed history is never rewritten.
 - Workers run under a locked-down launcher: the owner's personal Codex configuration is not loaded, memories,
   sub-agents, plugins, apps, MCP servers and web search are off, and the sandbox is
   `workspace-write`, limited to the ticket's worktree plus the build-cache volume. The sandbox also blocks
