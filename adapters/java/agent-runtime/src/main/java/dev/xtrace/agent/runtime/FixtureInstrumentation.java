@@ -363,7 +363,8 @@ final class FixtureInstrumentation {
   /**
    * Brackets {@code DispatcherServlet#doDispatch}. The response status of a redirect or an error
    * view only exists after the view renders, which is after the handler adapter returned, so the
-   * request root closes here with the status the response finally carried.
+   * owning request root closes here with the status at dispatcher exit. Enclosing filters and
+   * container error handling run outside this seam; final delivery to the client is not observed.
    */
   public static final class DispatchAdvice {
     private DispatchAdvice() {}

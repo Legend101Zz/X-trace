@@ -156,8 +156,9 @@ public final class BootstrapBridge {
   public static boolean requestStart(String method, String route) {
     RequestContext stale = CONTEXT.get();
     // A request whose end was deferred for exception resolution but never resolved on this
-    // thread is closed as unobserved so it cannot block or leak into the next request.
-    if (stale != null && stale.deferred) requestEnd(0, stale.lastThrown);
+    // thread is closed without a status so it cannot leak into the next request. Only the
+    // exception that caused deferral can propagate, never a handled frame throw.
+    if (stale != null && stale.deferred) requestEnd(0, stale.deferredThrown);
     if (CONTEXT.get() != null || !validMethod(method) || !validRoute(route)) return false;
     BridgeSink sink = SINK.get();
     if (sink == null) return false;
@@ -271,13 +272,15 @@ public final class BootstrapBridge {
   /**
    * Keeps the request open after the handler threw, so the container's exception resolution can
    * report the response it chose, or (null {@code thrown}) until the dispatch completes and the
-   * final response status is known. Returns false when there is no open request.
+   * status at dispatcher exit is observed. Returns false when there is no open request.
    */
   public static boolean deferRequestEnd(Throwable thrown) {
     RequestContext context = CONTEXT.get();
     if (context == null) return false;
     context.deferred = true;
-    if (thrown != null) context.lastThrown = thrown;
+    context.deferredThrown = thrown;
+    if (thrown == null || thrown != context.lastThrown) context.lastThrowEventId = "";
+    context.lastThrown = thrown;
     return true;
   }
 
@@ -376,7 +379,7 @@ public final class BootstrapBridge {
       accepted = safeEvent(sink, context, eventId, parent, BridgeEventKind.FRAME_EXIT, symbol, 0);
     } else {
       accepted = safeThrow(sink, context, eventId, parent, symbol, thrown);
-      if (accepted) context.lastThrowEventId = eventId;
+      context.lastThrowEventId = accepted ? eventId : "";
       context.lastThrown = thrown;
     }
     if (!accepted) context.dropped++;
@@ -467,7 +470,8 @@ public final class BootstrapBridge {
   /**
    * Ends the request. A non-null {@code thrown} means an exception left the handler; the observed
    * outcome is then EXCEPTION_PROPAGATED unless a response status was observed, in which case the
-   * exception was mapped to that response (RESPONDED). No status and no exception is UNOBSERVED.
+   * observed status takes precedence (RESPONDED), including an exception after commit. This
+   * does not prove final client delivery. No status and no exception is UNOBSERVED.
    */
   public static void requestEnd(int responseStatus, Throwable thrown) {
     RequestContext context = CONTEXT.get();
@@ -496,8 +500,8 @@ public final class BootstrapBridge {
           sanitizedStatus)) {
         context.dropped++;
       }
-      boolean threw = thrown != null;
-      if (threw && sanitizedStatus != 0 && sanitizedStatus < 500) context.dropped++;
+      // A readable committed status can coexist with an escaping exception. This is an
+      // observation, not a dropped event or proof that exception resolution succeeded.
       safeFinish(sink, context, sanitizedStatus, outcome(context, sanitizedStatus, thrown));
     } finally {
       CONTEXT.remove();
@@ -506,9 +510,10 @@ public final class BootstrapBridge {
 
   private static BridgeSink.Outcome outcome(
       RequestContext context, int status, Throwable thrown) {
-    String thrownFrom = context.lastThrowEventId;
+    String thrownFrom = thrown == UNKNOWN_THROWABLE || thrown == context.lastThrown
+        ? context.lastThrowEventId : "";
     if (status != 0) {
-      // A status was observed. A mapped exception is a response, not a propagated failure.
+      // A status was observed at the caller's seam, even if an exception escaped after commit.
       return new BridgeSink.Outcome(BridgeSink.Outcome.RESPONDED, status, null, null, null);
     }
     if (thrown == null) {
@@ -607,6 +612,7 @@ public final class BootstrapBridge {
     private int nextEvent = 1;
     private String requestEventId = "";
     private boolean deferred;
+    private Throwable deferredThrown;
     private boolean unresolvedReported;
     private String lastThrowEventId = "";
     private Throwable lastThrown;
