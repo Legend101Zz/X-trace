@@ -135,6 +135,8 @@ fn assert_readable(fx: &Fixture, recording_id: RecordingId, recovered: bool) {
             .iter()
             .find(|item| item.recording_id == recording_id)
             .expect("open recording");
+        assert_eq!(recording.status, RecordingStatus::Recording);
+        assert_eq!(recording.completion, RecordingCompletionEvidence::Unavailable);
         assert_eq!(recording.event_count, "2");
         assert_eq!(recording.last_sequence.as_deref(), Some("3"));
         return;
@@ -147,6 +149,26 @@ fn assert_readable(fx: &Fixture, recording_id: RecordingId, recovered: bool) {
     assert_eq!(window.events[1].event_id.as_deref(), Some("unfinished-child"));
     assert!(window.events[0].frame_id.is_some());
     assert_eq!(window.events[1].parent_frame_id, window.events[0].frame_id);
+}
+
+#[test]
+fn stop_while_a_request_is_open_recovers_its_acknowledged_events_as_partial() {
+    let fx = fixture();
+    let started = fx.ok_json(&["record"]);
+    let pid = fx.track(started["pid"].as_u64().expect("daemon pid"));
+    let bootstrap = Path::new(started["bootstrap_path"].as_str().expect("bootstrap"));
+    let (client, recording_id) = unfinished_client(bootstrap);
+    assert_readable(&fx, recording_id, false);
+    let stopped = fx.ok_json(&["stop"]);
+    assert_eq!(stopped["was_running"], true);
+    assert_recovery(&stopped, recording_id);
+    assert!(!pid_alive(pid), "stop must release its daemon before recovery");
+    assert_readable(&fx, recording_id, true);
+    let shown = fx.ok_json(&["recording", "show", &recording_id.to_string()]);
+    assert_eq!(shown["status"], "partial");
+    assert_eq!(shown["completion"], "partial");
+    assert_eq!(shown["events"].as_array().expect("events").len(), 2);
+    drop(client);
 }
 
 #[test]
