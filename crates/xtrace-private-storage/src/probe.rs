@@ -4,19 +4,23 @@
 //! this directory carry an ACL" is a `/bin/ls -ldeO` subprocess. A single operation (one
 //! `revalidate`, one `create_private_child`, ...) used to spawn it several times per component. An
 //! [`Operation`] bounds one such operation with a single deadline and remembers which directory
-//! *states* it has already judged acceptable, so each distinct state is probed once.
+//! *states* it has already judged acceptable, so eligible states are probed once while space
+//! remains. File validation revalidates its parent before and after checking the file, so directory
+//! reuse also avoids repeated subprocesses on those file-validation paths.
 //!
-//! # Why the memo cannot admit a changed directory
+//! # Threat model and reuse
 //!
-//! A remembered verdict is keyed by the directory's complete observable state, read from the
-//! opened descriptor: device, inode, owner, mode, **and ctime** (plus the policy class that was
-//! judged). Every chmod, chown, ACL edit, or extended-attribute edit bumps ctime, and creating or
-//! removing a child bumps the ctime of the directory that changed. So a hit proves that the
-//! descriptor still shows exactly the state that was probed, and any change misses and is probed
-//! again. A hit is additionally gated by the same stat-based checks as a fresh probe: the named
-//! path must still resolve to the same directory (not a symlink) with the identity the caller
-//! expects, and the descriptor must match that identity. A fresh probe admits and remembers only
-//! an unchanged state across the listing, including when it uses a batch or falls back from one.
+//! An owner or another process may edit an ACL between any two reads. Both operation-local and
+//! scope verdicts are APFS-only: HFS+ ctime has one-second granularity and cannot distinguish
+//! same-second edits. Keys bind device, inode, owner, mode, ctime, policy class, filesystem
+//! identity, mount flags and profile. On APFS a chmod, chown, ACL or xattr edit advances ctime;
+//! creating or removing a child also changes its directory's ctime. Every hit rereads both the
+//! descriptor and named path and requires their complete states to equal the lookup state,
+//! including ctime; an identity check alone cannot detect an ACL edit. A change fails admission
+//! closed. Fresh probes apply the same checks across the listing, including batch fallbacks.
+//! Only positive, unchanged verdicts are stored, and each memo is bounded to 1024 entries.
+//! This does not defend against root forging filesystem metadata, or changes after the final
+//! state read; the capability's later uses still revalidate it.
 //! The memo lives inside one [`Operation`]
 //! (one bounded 750 ms budget) and is dropped with it; it is never shared across threads or
 //! processes. Outside an admission scope it is never shared across operations either.
@@ -24,7 +28,7 @@
 //! # Admission scope (ADR 0008 Amendment 1)
 //!
 //! An operation created on a thread with a live, un-expired [`crate::AdmissionScope`] shares the
-//! scope's memo and batched listing instead. Its key additionally carries the filesystem
+//! scope's memo and batched listing as well. Every memo key carries the filesystem
 //! identity and mount flags of the held descriptor (`f_fsid`, `f_flags`) and the operation's
 //! filesystem profile, so a verdict judged under one profile never serves another. The identity
 //! checks and the per-operation deadline are unchanged. Regular files use the same
@@ -39,7 +43,7 @@ use crate::admission::FileIdentity;
 use crate::policy::{DirectoryRole, FilesystemProfile};
 use crate::scope;
 
-/// Most verdicts one scope remembers; beyond it new verdicts are simply not stored.
+/// Most verdicts one operation or scope remembers; beyond it new verdicts are not stored.
 const SCOPE_MEMO_LIMIT: usize = 1024;
 
 /// Total time one admission operation may spend, ACL probes included.
@@ -67,7 +71,7 @@ struct DirectoryState {
 impl DirectoryState {
     fn of(metadata: &std::fs::Metadata, role: DirectoryRole) -> Self {
         use std::os::unix::fs::MetadataExt as _;
-        Self {
+        let state = Self {
             device: metadata.dev(),
             inode: metadata.ino(),
             owner: metadata.uid(),
@@ -76,7 +80,13 @@ impl DirectoryState {
             ctime_nanoseconds: metadata.ctime_nsec(),
             strict: cfg!(not(target_os = "macos"))
                 && matches!(role, DirectoryRole::PrivateLeaf | DirectoryRole::Sealed { .. }),
+        };
+        // Deterministically model two directory ACL edits within one HFS+ ctime tick.
+        #[cfg(all(target_os = "macos", test))]
+        if metadata.is_dir() && COARSE_FILESYSTEM.with(std::cell::Cell::get) {
+            return Self { ctime_seconds: 1, ctime_nanoseconds: 0, ..state };
         }
+        state
     }
 }
 
@@ -88,7 +98,7 @@ pub(crate) struct MemoKey {
     /// The full `f_fsid` value, rendered (the libc type has no public fields).
     fsid: String,
     flags: u64,
-    /// The filesystem type name (`f_fstypename`); only `apfs` is ever shared across operations.
+    /// The filesystem type name (`f_fstypename`); macOS reuses only `apfs` verdicts.
     fstype: String,
     profile: FilesystemProfile,
 }
@@ -113,14 +123,14 @@ impl MemoKey {
         let stats = rustix::fs::fstatfs(directory).ok()?;
         let (fsid, flags, fstype) = filesystem_identity(&stats);
         // HFS+ stamps ctime with one-second granularity, so a change shortly after a probe can
-        // leave the key equal. Only filesystems with nanosecond ctime share verdicts.
+        // leave the key equal. This gates operation-local reuse as well as scope reuse.
         scope_shares_filesystem(&fstype)
             .then(|| Self::from_parts(state, fsid, flags, fstype, profile))
     }
 }
 
-/// Whether verdicts and batched listings of this filesystem type may be reused beyond one
-/// operation. macOS: APFS only (nanosecond ctime). Elsewhere the scope exists for tests alone.
+/// Whether verdicts and batched listings of this filesystem type may be reused at all.
+/// macOS: APFS only (nanosecond ctime). Elsewhere the memo exists for tests alone.
 #[cfg(target_os = "macos")]
 fn scope_shares_filesystem(fstype: &str) -> bool {
     fstype == "apfs"
@@ -139,11 +149,11 @@ fn filesystem_identity(stats: &rustix::fs::StatFs) -> (String, u64, String) {
         .map(|unit| unit.to_ne_bytes()[0])
         .take_while(|byte| *byte != 0)
         .collect::<Vec<u8>>();
-    (
-        format!("{:?}", stats.f_fsid),
-        u64::from(stats.f_flags),
-        String::from_utf8_lossy(&name).into_owned(),
-    )
+    let fstype = String::from_utf8_lossy(&name).into_owned();
+    #[cfg(test)]
+    let fstype =
+        if COARSE_FILESYSTEM.with(std::cell::Cell::get) { "hfs".to_owned() } else { fstype };
+    (format!("{:?}", stats.f_fsid), u64::from(stats.f_flags), fstype)
 }
 
 /// Only macOS memoizes in production; elsewhere the memo exists for tests alone, where the
@@ -158,7 +168,7 @@ pub(crate) struct Operation {
     deadline: Instant,
     profile: crate::policy::FilesystemProfile,
     memoize: bool,
-    judged: RefCell<Vec<DirectoryState>>,
+    judged: RefCell<Vec<MemoKey>>,
     #[cfg(target_os = "macos")]
     file_judged: RefCell<Vec<MemoKey>>,
     /// The admission scope that was live on the creating thread when this operation was made.
@@ -338,10 +348,11 @@ impl Operation {
         Some(Prefetched { taken_at, taken_mono: started, entries })
     }
 
-    /// The scope-level key for `directory` in `state`, when this operation shares a live scope.
-    fn scope_key(&self, state: DirectoryState, directory: &File) -> Option<MemoKey> {
-        let id = self.scope_id?;
-        scope::with_scope(id, |_| ())?;
+    /// Every directory memo, even without a scope, requires an eligible filesystem key.
+    fn directory_key(&self, state: DirectoryState, directory: &File) -> Option<MemoKey> {
+        if !self.memoize {
+            return None;
+        }
         MemoKey::of_descriptor(state, directory, self.profile)
     }
 
@@ -364,17 +375,20 @@ impl Operation {
         }
     }
 
-    fn already_judged(&self, state: &DirectoryState) -> bool {
-        self.memoize && self.judged.borrow().contains(state)
+    fn already_judged(&self, key: &MemoKey) -> bool {
+        self.memoize && self.judged.borrow().contains(key)
     }
 
-    fn remember(&self, state: DirectoryState) {
+    fn remember(&self, key: MemoKey) {
         if !self.memoize {
             return;
         }
         let mut judged = self.judged.borrow_mut();
-        if !judged.contains(&state) {
-            judged.push(state);
+        let remembered = judged.len();
+        #[cfg(target_os = "macos")]
+        let remembered = remembered + self.file_judged.borrow().len();
+        if remembered < SCOPE_MEMO_LIMIT && !judged.contains(&key) {
+            judged.push(key);
         }
     }
 }
@@ -399,19 +413,24 @@ pub(crate) fn directory_probe_count() -> usize {
     DIRECTORY_PROBES.with(std::cell::Cell::get)
 }
 
-fn directory_is_expected(path: &Path, expected: FileIdentity, opened: &std::fs::Metadata) -> bool {
+fn directory_is_expected(
+    path: &Path,
+    expected: FileIdentity,
+    opened: &std::fs::Metadata,
+    role: DirectoryRole,
+) -> bool {
     let Ok(named) = std::fs::symlink_metadata(path) else { return false };
     !named.file_type().is_symlink()
         && named.is_dir()
         && expected.same_directory(FileIdentity::from_metadata(&named))
         && expected.same_directory(FileIdentity::from_metadata(opened))
+        && DirectoryState::of(&named, role) == DirectoryState::of(opened, role)
 }
 
-/// Judges a directory's ACL for `role`, probing at most once per directory state per operation.
+/// Judges a directory's ACL for `role`, with bounded APFS verdict reuse.
 ///
-/// The named-path and descriptor identity checks run on every call, hit or miss, and again after
-/// a fresh probe; only the ACL query itself is skipped on a hit. See the module documentation for
-/// why a hit cannot admit a directory whose state changed.
+/// Both states are checked again after every hit or probe. Only an unchanged, APFS-qualified
+/// positive verdict may be reused, in either the operation or its scope.
 pub(crate) fn directory_acl_admits(
     operation: &Operation,
     role: DirectoryRole,
@@ -419,28 +438,31 @@ pub(crate) fn directory_acl_admits(
     directory: &File,
     expected: FileIdentity,
 ) -> bool {
+    if operation.expired() {
+        return false;
+    }
     let Ok(before) = directory.metadata() else { return false };
-    if !directory_is_expected(path, expected, &before) {
+    if !directory_is_expected(path, expected, &before, role) {
         return false;
     }
     let state = DirectoryState::of(&before, role);
-    if operation.already_judged(&state) {
-        return true;
-    }
-    let scope_key = operation.scope_key(state, directory);
-    if scope_key.as_ref().is_some_and(|key| operation.scope_has(key)) {
-        return true;
-    }
-    #[cfg(test)]
-    {
-        DIRECTORY_PROBES.with(|count| count.set(count.get() + 1));
-        PROBED_PATHS.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
-    }
-    if !probe_directory(operation, role, path, directory) {
-        return false;
+    let key = operation.directory_key(state, directory);
+    #[cfg(all(target_os = "macos", test))]
+    run_initial_state_hook(path);
+    let remembered =
+        key.as_ref().is_some_and(|key| operation.already_judged(key) || operation.scope_has(key));
+    if !remembered {
+        #[cfg(test)]
+        {
+            DIRECTORY_PROBES.with(|count| count.set(count.get() + 1));
+            PROBED_PATHS.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
+        }
+        if !probe_directory(operation, role, path, directory) {
+            return false;
+        }
     }
     let Ok(after) = directory.metadata() else { return false };
-    if !directory_is_expected(path, expected, &after) {
+    if operation.expired() || !directory_is_expected(path, expected, &after, role) {
         return false;
     }
     // A changed state invalidates admission itself, not just memoization: the listing may
@@ -448,13 +470,15 @@ pub(crate) fn directory_acl_admits(
     if DirectoryState::of(&after, role) != state {
         return false;
     }
-    if let Some(key) = scope_key {
-        if operation.scope_key(state, directory).as_ref() != Some(&key) {
+    if let Some(key) = key {
+        if operation.directory_key(state, directory).as_ref() != Some(&key) {
             return false;
         }
-        operation.scope_remember(key);
+        if !remembered {
+            operation.scope_remember(key.clone());
+            operation.remember(key);
+        }
     }
-    operation.remember(state);
     true
 }
 
@@ -742,6 +766,8 @@ fn file_listing_admits(
     };
     let Some(before) = state() else { return false };
     let key = MemoKey::of_descriptor(before, filesystem_descriptor, operation.profile());
+    #[cfg(test)]
+    run_initial_state_hook(path);
     let remembered = key.as_ref().is_some_and(|key| {
         operation.file_judged.borrow().contains(key)
             || operation
@@ -773,7 +799,7 @@ fn file_listing_admits(
         }
         if !remembered {
             let mut judged = operation.file_judged.borrow_mut();
-            if judged.len() < SCOPE_MEMO_LIMIT {
+            if operation.judged.borrow().len() + judged.len() < SCOPE_MEMO_LIMIT {
                 judged.push(key.clone());
             }
             if let Some(id) = operation.scope_id {
@@ -802,6 +828,20 @@ thread_local! {
     static LS_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BATCH_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AFTER_LISTING: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
+    static AFTER_INITIAL_STATE: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
+    /// Test-only HFS+ facts: coarse directory ctime and a filesystem ineligible for reuse.
+    static COARSE_FILESYSTEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(target_os = "macos", test))]
+fn run_initial_state_hook(path: &Path) {
+    let hook = AFTER_INITIAL_STATE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|hook| hook.path == path) { slot.take() } else { None }
+    });
+    if let Some(hook) = hook {
+        (hook.action)();
+    }
 }
 
 /// One-shot mutation after stdout is captured and before any post-listing state read.
@@ -1035,9 +1075,9 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn change_acl_after_listing(path: &Path, entry: &'static str) {
+    fn acl_edit_hook(path: &Path, entry: &'static str) -> AfterListing {
         let path = path.to_path_buf();
-        let hook = AfterListing {
+        AfterListing {
             path: path.clone(),
             action: Box::new(move || {
                 let before = std::fs::symlink_metadata(&path).expect("before ACL edit");
@@ -1051,8 +1091,257 @@ mod tests {
                 let after = DirectoryState::of(&after, DirectoryRole::PrivateLeaf);
                 assert_ne!(before, after, "the ACL edit must invalidate the state key");
             }),
-        };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn change_acl_after_listing(path: &Path, entry: &'static str) {
+        let hook = acl_edit_hook(path, entry);
         AFTER_LISTING.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directory_cache_hits_refuse_acl_edits_after_the_initial_state_read() {
+        for scoped in [false, true] {
+            for entry in ["group:everyone allow read", "group:everyone deny write"] {
+                let root = fixture();
+                let path = root.path();
+                let directory = open(path);
+                edit_acl(path, "+a", "group:everyone deny delete");
+                let _scope = scoped.then(AdmissionScope::enter);
+                let priming = Operation::new();
+                assert!(judge(&priming, path, &directory));
+                assert_eq!(priming.judged.borrow().len(), 1, "prime an APFS verdict");
+                let operation = if scoped { Operation::new() } else { priming };
+                if scoped {
+                    assert!(operation.judged.borrow().is_empty(), "exercise only the scope hit");
+                    let id = operation.scope_id.expect("live scope");
+                    assert_eq!(scope::with_scope(id, |state| state.memo.len()), Some(1));
+                }
+                let hook = acl_edit_hook(path, entry);
+                AFTER_INITIAL_STATE.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+                let before = ls_spawn_count();
+                assert!(!judge(&operation, path, &directory), "a changed cache hit fails closed");
+                AFTER_INITIAL_STATE.with(|slot| assert!(slot.borrow().is_none(), "hook ran"));
+                assert_eq!(ls_spawn_count(), before, "the stale lookup reached the hit path");
+                assert_eq!(judge(&operation, path, &directory), entry.contains(" deny "));
+                assert_eq!(ls_spawn_count() - before, 1, "the changed state needs a fresh probe");
+                if entry.contains(" allow ") {
+                    assert!(!judge(&operation, path, &directory));
+                    assert_eq!(ls_spawn_count() - before, 2, "negative verdicts are never cached");
+                }
+                edit_acl(path, "-a", entry);
+                edit_acl(path, "-a", "group:everyone deny delete");
+            }
+        }
+    }
+
+    /// Restore the thread-local filesystem seam even if an assertion unwinds.
+    #[cfg(target_os = "macos")]
+    struct CoarseFilesystem;
+
+    #[cfg(target_os = "macos")]
+    impl CoarseFilesystem {
+        fn enter() -> Self {
+            COARSE_FILESYSTEM.with(|coarse| assert!(!coarse.replace(true)));
+            Self
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for CoarseFilesystem {
+        fn drop(&mut self) {
+            COARSE_FILESYSTEM.with(|coarse| coarse.set(false));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn coarse_ctime_non_apfs_directories_never_reuse_positive_verdicts() {
+        for scoped in [false, true] {
+            let root = fixture();
+            let path = root.path();
+            let directory = open(path);
+            edit_acl(path, "+a", "group:everyone deny delete");
+            let _coarse = CoarseFilesystem::enter();
+            let _scope = scoped.then(AdmissionScope::enter);
+            let priming = Operation::new();
+            let state = DirectoryState::of(
+                &directory.metadata().expect("metadata"),
+                DirectoryRole::Traversed,
+            );
+            assert!(MemoKey::of_descriptor(state, &directory, priming.profile()).is_none());
+            let before = ls_spawn_count();
+            assert!(judge(&priming, path, &directory));
+            assert!(judge(&priming, path, &directory));
+            assert_eq!(ls_spawn_count() - before, 2, "even unchanged non-APFS states are listed");
+            assert!(priming.judged.borrow().is_empty(), "no operation-local insertion");
+            let operation = if scoped { Operation::new() } else { priming };
+            if let Some(id) = operation.scope_id {
+                assert_eq!(scope::with_scope(id, |scope| scope.memo.is_empty()), Some(true));
+            }
+            let changed_path = path.to_path_buf();
+            let hook = AfterListing {
+                path: changed_path.clone(),
+                action: Box::new(move || {
+                    edit_acl(&changed_path, "+a", "group:everyone allow read")
+                }),
+            };
+            AFTER_INITIAL_STATE.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+            assert!(!judge(&operation, path, &directory), "a fresh listing must see the grant");
+            AFTER_INITIAL_STATE.with(|slot| assert!(slot.borrow().is_none(), "hook ran"));
+            assert_eq!(
+                state,
+                DirectoryState::of(
+                    &directory.metadata().expect("metadata after ACL edit"),
+                    DirectoryRole::Traversed
+                ),
+                "the simulated coarse ctime hides the edit"
+            );
+            assert_eq!(ls_spawn_count() - before, 3);
+            assert!(!judge(&operation, path, &directory));
+            assert_eq!(ls_spawn_count() - before, 4, "negative verdicts are not cached either");
+            assert!(operation.judged.borrow().is_empty());
+            if let Some(id) = operation.scope_id {
+                assert_eq!(scope::with_scope(id, |scope| scope.memo.is_empty()), Some(true));
+            }
+            edit_acl(path, "-a", "group:everyone allow read");
+            edit_acl(path, "-a", "group:everyone deny delete");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn file_cache_hits_refuse_acl_edits_after_the_initial_state_read() {
+        for scoped in [false, true] {
+            for descriptor_backed in [false, true] {
+                for entry in ["group:everyone allow read", "group:everyone deny write"] {
+                    let root = fixture();
+                    let directory = open(root.path());
+                    let path = root.path().join("private-file");
+                    let file = File::create(&path).expect("fixture file");
+                    edit_acl(&path, "+a", "group:everyone deny delete");
+                    let _scope = scoped.then(AdmissionScope::enter);
+                    let identity = identity_of(&file);
+                    let admits = |operation: &Operation| {
+                        if descriptor_backed {
+                            acl_admits_file(&path, &file, identity, operation)
+                        } else {
+                            named_file_acl_admits(&path, &directory, identity, operation)
+                        }
+                    };
+                    let priming = Operation::new();
+                    assert!(admits(&priming));
+                    assert_eq!(priming.file_judged.borrow().len(), 1);
+                    let operation = if scoped { Operation::new() } else { priming };
+                    if scoped {
+                        assert!(operation.file_judged.borrow().is_empty());
+                        let id = operation.scope_id.expect("live scope");
+                        assert_eq!(scope::with_scope(id, |scope| scope.file_memo.len()), Some(1));
+                    }
+                    let hook = acl_edit_hook(&path, entry);
+                    AFTER_INITIAL_STATE
+                        .with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+                    let before = ls_spawn_count();
+                    assert!(!admits(&operation), "a file cache hit must recheck its state");
+                    AFTER_INITIAL_STATE.with(|slot| assert!(slot.borrow().is_none(), "hook ran"));
+                    assert_eq!(ls_spawn_count(), before);
+                    assert_eq!(admits(&operation), entry.contains(" deny "));
+                    assert_eq!(ls_spawn_count() - before, 1);
+                    edit_acl(&path, "-a", entry);
+                    edit_acl(&path, "-a", "group:everyone deny delete");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn non_apfs_files_never_cache_positive_or_negative_verdicts() {
+        for scoped in [false, true] {
+            for descriptor_backed in [false, true] {
+                let root = fixture();
+                let directory = open(root.path());
+                let path = root.path().join("private-file");
+                let file = File::create(&path).expect("fixture file");
+                edit_acl(&path, "+a", "group:everyone deny delete");
+                let _coarse = CoarseFilesystem::enter();
+                let _scope = scoped.then(AdmissionScope::enter);
+                let operation = Operation::new();
+                let identity = identity_of(&file);
+                let admits = |operation: &Operation| {
+                    if descriptor_backed {
+                        acl_admits_file(&path, &file, identity, operation)
+                    } else {
+                        named_file_acl_admits(&path, &directory, identity, operation)
+                    }
+                };
+                let before = ls_spawn_count();
+                assert!(admits(&operation));
+                assert!(admits(&operation));
+                assert!(admits(&Operation::new()));
+                assert_eq!(ls_spawn_count() - before, 3, "no operation or scope reuse");
+                assert_no_file_verdicts(&operation);
+                edit_acl(&path, "+a", "group:everyone allow read");
+                assert!(!admits(&operation));
+                assert!(!admits(&operation));
+                assert_eq!(ls_spawn_count() - before, 5);
+                assert_no_file_verdicts(&operation);
+                edit_acl(&path, "-a", "group:everyone allow read");
+                edit_acl(&path, "-a", "group:everyone deny delete");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn operation_and_scope_memos_are_bounded_across_directory_and_file_verdicts() {
+        for file_entries in [0, SCOPE_MEMO_LIMIT] {
+            let root = fixture();
+            let directory = open(root.path());
+            let path = root.path().join("private-file");
+            let file = File::create(&path).expect("fixture file");
+            let _scope = AdmissionScope::enter();
+            let operation = Operation::new();
+            let id = operation.scope_id.expect("live scope");
+            let state = DirectoryState::of(
+                &directory.metadata().expect("metadata"),
+                DirectoryRole::Traversed,
+            );
+            let base = operation.directory_key(state, &directory).expect("APFS fixture");
+            for index in 0..=SCOPE_MEMO_LIMIT {
+                let mut key = base.clone();
+                key.state.device = state.device.wrapping_add(1);
+                key.state.inode = index as u64;
+                if index < file_entries {
+                    operation.file_judged.borrow_mut().push(key.clone());
+                    scope::with_scope(id, |scope| scope.file_memo.push(key.clone()));
+                } else {
+                    operation.remember(key.clone());
+                    operation.scope_remember(key);
+                }
+            }
+            let directory_entries = SCOPE_MEMO_LIMIT - file_entries;
+            assert_eq!(operation.judged.borrow().len(), directory_entries);
+            assert_eq!(scope::with_scope(id, |scope| scope.memo.len()), Some(directory_entries));
+            let before = ls_spawn_count();
+            assert!(judge(&operation, root.path(), &directory));
+            assert!(judge(&operation, root.path(), &directory));
+            assert!(judge(&Operation::new(), root.path(), &directory));
+            assert_eq!(ls_spawn_count() - before, 3, "a full memo still probes directories");
+            let identity = identity_of(&file);
+            assert!(acl_admits_file(&path, &file, identity, &operation));
+            assert!(acl_admits_file(&path, &file, identity, &operation));
+            assert!(acl_admits_file(&path, &file, identity, &Operation::new()));
+            assert_eq!(ls_spawn_count() - before, 6, "a full memo still probes files");
+            assert_eq!(operation.judged.borrow().len(), directory_entries);
+            assert_eq!(operation.file_judged.borrow().len(), file_entries);
+            assert_eq!(
+                scope::with_scope(id, |scope| scope.memo.len() + scope.file_memo.len()),
+                Some(SCOPE_MEMO_LIMIT)
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
