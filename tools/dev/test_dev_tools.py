@@ -377,10 +377,10 @@ sys.exit(37 if sys.argv[1:2] == [os.environ.get("XTRACE_FAIL_COMMAND")] else 0)
                 ["cargo", "test", "-p", "demo", "--test", "integration", "--no-run", "--locked"],
             ]),
             ("java:attach-helper", [], [
-                ["gradlew", "-p", "adapters/java", "--dependency-verification", "strict", ":attach-helper:compileJava", ":attach-helper:compileTestJava"],
+                ["gradlew", "-p", "adapters/java", "--no-daemon", "--dependency-verification", "strict", ":attach-helper:compileJava", ":attach-helper:compileTestJava"],
             ]),
             ("java", [], [
-                ["gradlew", "-p", "adapters/java", "--dependency-verification", "strict", "compileJava", "compileTestJava"],
+                ["gradlew", "-p", "adapters/java", "--no-daemon", "--dependency-verification", "strict", "compileJava", "compileTestJava"],
             ]),
             ("node", [], [
                 ["npm", "run", "generate:check", "--prefix", "adapters/node"],
