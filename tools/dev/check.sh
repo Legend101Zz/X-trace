@@ -70,6 +70,7 @@ case "$part" in
         else
             run npx --prefix web/app vitest run --root web/app "$@"
         fi
+        run node web/app/scripts/check-contrast.mjs
         ;;
     py:*)
         module=${part#py:}

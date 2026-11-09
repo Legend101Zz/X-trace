@@ -18,7 +18,7 @@ _xtrace_dev_env() {
         return 2
     fi
     root=$(git rev-parse --show-toplevel) || return
-    id=$(python3 -B "$_xtrace_dev_tools/devid.py" "${1:-${root##*/}}") || return
+    id=$(python3 -B "$_xtrace_dev_tools/devid.py" "${1:-$root}") || return
     python3 -B - "$id" <<'PY' || return
 import os
 from pathlib import Path
