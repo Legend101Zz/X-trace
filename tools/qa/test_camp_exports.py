@@ -123,7 +123,7 @@ class T(unittest.TestCase):
                 else:
                     dest.mkdir()
                     (dest / "payload").write_text("export")
-                return subprocess.CompletedProcess(args, 0, json.dumps({"data": {"written": True, "operation_count": 1}}, indent=2))
+                return subprocess.CompletedProcess(args, 0, json.dumps({"data": {"written": True, "operationCount": 1}}, indent=2))
             with mock.patch.object(ce.subprocess, "run", side_effect=execute):
                 steps = {n: st for n, st, _ in ce.run_exports("xtrace", "project", "analyzer", pathlib.Path(td))}
             self.assertEqual(len(calls), 5)
@@ -144,6 +144,59 @@ class T(unittest.TestCase):
             for changes in (None, {}, {"added": True}, {"added": -1}):
                 self.assertEqual(ce.judge_bundle(dest, {**catalog, "changes": changes}, COUNTS)[0], "fail")
             self.assertEqual(ce.judge_bundle(dest, {**catalog, "changes": {"added": 1, "unknown": 1}}, COUNTS)[0], "fail")
+
+    def test_cli_counts_match_bundle_renderers_after_openapi_route_collision(self):
+        counts = {"openapi": 1, "postman": 2, "curl": 2}
+        catalog = {**CATALOG, "changes": {"added": 2}}
+        with tempfile.TemporaryDirectory() as td:
+            def execute(args, **kwargs):
+                if args[1] == "scan":
+                    return subprocess.CompletedProcess(args, 0, json.dumps({"data": catalog}))
+                fmt = args[args.index("--format") + 1]
+                dest = pathlib.Path(args[-1])
+                if fmt == "bundle":
+                    write_bundle(dest)
+                    (dest / "collection.postman.json").write_text(json.dumps({"item": [{"request": {}}, {"request": {}}]}))
+                    recipe = dest / "curl/get-vets-other-scope.sh"
+                    recipe.write_text((dest / "curl/get-vets.sh").read_text())
+
+                    def amend(m):
+                        m["operation_count"] = 2
+                        m["formats"] = [{"format": f, "operation_count": n} for f, n in counts.items()]
+                        omission = {"operation_id": "other-scope", "what": "operation", "reason": "duplicate_method_path_of:first"}
+                        m["formats"][0]["omissions"] = [omission]
+                        m["omissions"] = [{**omission, "what": "openapi:operation"}]
+                        m["files"].append({"path": "curl/" + recipe.name, "bytes": recipe.stat().st_size, "blake3": "0" * 64})
+                        refresh_sizes(m, dest)
+                    update_manifest(dest, amend)
+                else:
+                    dest.mkdir()
+                    (dest / "payload").write_text("export")
+                # The CLI's bundle-wide count is 2, but OpenAPI rendered just 1.
+                return subprocess.CompletedProcess(args, 0, json.dumps({"data": {"written": True, "operationCount": counts.get(fmt, 2)}}))
+            with mock.patch.object(ce.subprocess, "run", side_effect=execute):
+                steps = {n: st for n, st, _ in ce.run_exports("xtrace", "project", "analyzer", pathlib.Path(td))}
+            self.assertEqual(steps["export-bundle"], "pass")
+            self.assertEqual(steps["export-formats"], "pass")
+
+    def test_missing_noninteger_or_unwritten_cli_count_cannot_pass_bundle_comparison(self):
+        for report in ({"written": True}, {"written": True, "operationCount": True},
+                       {"written": True, "operationCount": "1"}, {"written": False, "operationCount": 1}):
+            with self.subTest(report=report), tempfile.TemporaryDirectory() as td:
+                def execute(args, **kwargs):
+                    if args[1] == "scan":
+                        return subprocess.CompletedProcess(args, 0, json.dumps(CATALOG))
+                    dest = pathlib.Path(args[-1])
+                    if args[args.index("--format") + 1] == "bundle":
+                        write_bundle(dest)
+                    else:
+                        dest.mkdir()
+                        (dest / "payload").write_text("export")
+                    return subprocess.CompletedProcess(args, 0, json.dumps(report))
+                with mock.patch.object(ce.subprocess, "run", side_effect=execute):
+                    steps = {n: st for n, st, _ in ce.run_exports("xtrace", "project", "analyzer", pathlib.Path(td))}
+                self.assertEqual(steps["export-bundle"], "fail")
+                self.assertEqual(steps["export-formats"], "fail")
 
     def test_bundle_failure_names_the_failed_contract_without_payload_values(self):
         with tempfile.TemporaryDirectory() as td:
@@ -181,7 +234,7 @@ class T(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, json.dumps(CATALOG))
                 self.assertNotIn("bundle", args)
                 pathlib.Path(args[-1]).write_text("export")
-                return subprocess.CompletedProcess(args, 0, '{"written":true,"operation_count":1}')
+                return subprocess.CompletedProcess(args, 0, '{"written":true,"operationCount":1}')
             with mock.patch.object(ce.subprocess, "run", side_effect=execute) as run:
                 steps = {n: st for n, st, _ in ce.run_exports("xtrace", "project", "analyzer", out)}
             self.assertEqual(run.call_count, 4)
@@ -233,7 +286,7 @@ class T(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, json.dumps(CATALOG))
                 pathlib.Path(args[-1]).mkdir()
                 (pathlib.Path(args[-1]) / "junk").write_text("not a bundle")
-                return subprocess.CompletedProcess(args, 0, '{"written":true,"operation_count":1}')
+                return subprocess.CompletedProcess(args, 0, '{"written":true,"operationCount":1}')
             with mock.patch.object(ce.subprocess, "run", side_effect=execute):
                 steps = {n: st for n, st, _ in ce.run_exports("xtrace", "project", "analyzer", pathlib.Path(td))}
             self.assertEqual(steps["export-bundle"], "fail")

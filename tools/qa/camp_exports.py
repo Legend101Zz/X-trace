@@ -84,6 +84,8 @@ def judge_bundle(dest: pathlib.Path, catalog: dict, counts: dict[str, int]) -> t
                not re.fullmatch(r"[0-9a-f]{64}", f["blake3"]) for f in payloads):
             raise BundleMismatch("bundle manifest has incorrect sizes or missing file hashes")
         rows = manifest["formats"]
+        # The bundle-wide count is the selected catalog inventory. Compare CLI
+        # counts only with these renderer counts: OpenAPI may omit collisions.
         declared = {row["format"]: row["operation_count"] for row in rows}
         if len(rows) != len(FORMATS) or set(declared) != set(FORMATS) or declared != counts:
             raise BundleMismatch("bundle format counts differ from the individual exports")
@@ -148,8 +150,10 @@ def run_exports(xtrace: str, project_dir: str, analyzer: str, out: pathlib.Path)
                     try:
                         report = json.loads(r.stdout)
                         report = report.get("data", report)
-                        if type(report.get("operation_count")) is int and report.get("written") is True:
-                            counts[fmt] = report["operation_count"]
+                        # ExportDoc uses camelCase; the bundle manifest uses snake_case.
+                        # Both counts come from the same per-format renderer, after omissions.
+                        if type(report.get("operationCount")) is int and report.get("written") is True:
+                            counts[fmt] = report["operationCount"]
                     except (ValueError, AttributeError):
                         pass  # the bundle comparison fails if an individual count was not observed
             except (OSError, subprocess.SubprocessError):

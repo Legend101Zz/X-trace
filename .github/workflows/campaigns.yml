@@ -339,6 +339,14 @@ jobs:
           python3 -B tools/qa/camp_instr_steps.py flows --file "$CAMP_OUT/summary.json" --project petclinic \
             --flows "${d:-/nonexistent}/flows.json"
           if [ -n "${d}" ] && [ -f "$d/flows.json" ]; then cp "$d/flows.json" "$CAMP_OUT/flows.json"; fi
+      - name: Recording skeletons for failed judges (no captured values)
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project petclinic \
+            --step recording-diagnostics -- python3 -B tools/qa/camp_diagnostics.py \
+              --summary "$CAMP_OUT/summary.json" --instrumented "${INSTR_DIR:-/nonexistent}" \
+              --flows "${FLOWS_DIR:-/nonexistent}" --out "$CAMP_OUT/recording-diagnostics" \
+              --canaries "$RUNNER_TEMP/priv/canaries.json"
       - name: Privacy canary scan (class names only, canaries are never printed)
         if: matrix.project == 'petclinic' && always()
         run: |
@@ -346,7 +354,7 @@ jobs:
           I="${INSTR_DIR:-/nonexistent}"
           # every surface the run produced is scanned; a required surface that is absent or empty makes the scan NOT clean.
           # Exports and focused artifacts are required independently; empty or missing output fails coverage.
-          req="--require store:1 --require daemon-log:2 --require ui-json:1 --require receipts:1 --require ci-output:1 --require browser-dom:1 --require exports:3 --require bundle-files:6 --require focused-artifacts:1 --require standard-artifacts:1 --require overhead-artifacts:1"
+          req="--require store:1 --require daemon-log:2 --require ui-json:1 --require receipts:1 --require ci-output:1 --require browser-dom:1 --require exports:3 --require bundle-files:6 --require focused-artifacts:1 --require standard-artifacts:1 --require overhead-artifacts:1 --require recording-diagnostics:1"
           # the TUI surface counts as covered only when the transcript is a real one (verdict pass); a stub that printed an
           # error is not a covered surface and is recorded as such instead
           if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("verdict")=="pass" else 1)' "$RUNNER_TEMP/priv/tui/tui.json" 2>/dev/null; then
@@ -369,6 +377,7 @@ jobs:
               --loc "focused-artifacts=${FLOWS_DIR:-/nonexistent}/api-focused" \
               --loc "standard-artifacts=${FLOWS_DIR:-/nonexistent}/api-standard" \
               --loc "overhead-artifacts=$CAMP_ROOT/java/petclinic/overhead" \
+              --loc "recording-diagnostics=$CAMP_OUT/recording-diagnostics" \
               --loc "ci-output=$RUNNER_TEMP/priv/ci-overhead.log" \
               --loc "ci-output=$RUNNER_TEMP/priv/ci-flows.log" \
               --loc "exports=$RUNNER_TEMP/xt/exports" \

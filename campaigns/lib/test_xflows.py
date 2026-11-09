@@ -561,7 +561,9 @@ class Drivers(unittest.TestCase):
         self.assertIn("no observed open recording", flow.results["partial-recording-reopen"]["note"])
         sleep.assert_not_called()
         kill.assert_not_called()
-        api.assert_called_once()
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual([call.args[-1] for call in api.call_args_list],
+                         [flow.out_dir / "api-before-partial", flow.out_dir / "api-partial"])
 
     def test_failed_snapshot_does_not_arm_capture(self):
         for command, step in (("record_stop", "record-stop-flow"), ("partial", "partial-recording-reopen")):

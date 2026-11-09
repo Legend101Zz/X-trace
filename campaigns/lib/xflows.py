@@ -606,10 +606,12 @@ class Flows:
             self._set("partial-recording-reopen", judge_partial(record_rc=rc, stop_rc=stop_rc, stop_doc=stop_doc,
                                                                 control_details=[], new_details={}, stalled=("POST", "/owners/new")))
             return
+        # Save the readback even when the held request was not observed. The
+        # failed judge still needs structural evidence of what capture produced.
+        api = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-partial")
         if observation_error:
             self._set("partial-recording-reopen", ("fail", observation_error))
             return
-        api = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-partial")
         if not api["ok"]:
             self._set("partial-recording-reopen", ("fail", f"read API unavailable after the interruption: {api['reason']}"))
             return
