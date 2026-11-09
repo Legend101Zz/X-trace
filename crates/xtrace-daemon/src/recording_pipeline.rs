@@ -84,7 +84,18 @@ impl RecordingPipeline {
         limitations: Vec<String>,
     ) -> Result<(), RecordingPipelineError> {
         match incoming {
-            IncomingEnvelope::CapabilitySet(_) | IncomingEnvelope::Health(_) => Ok(()),
+            IncomingEnvelope::CapabilitySet(_) => Ok(()),
+            IncomingEnvelope::Health(health) => {
+                let Some(count) = rejected_starts(&health.status) else {
+                    return Ok(());
+                };
+                let capture = Arc::clone(&self.capture);
+                self.lane
+                    .run(shutdown, move || {
+                        capture.record_session_rejections(project_id, runtime_session_id, count)
+                    })
+                    .await
+            }
             IncomingEnvelope::RecordingStarted(started) => {
                 let request = translate_started(
                     &started,
@@ -113,6 +124,14 @@ impl RecordingPipeline {
             }
         }
     }
+}
+
+/// RecordingWriter reports the Java sink's saturating, cumulative signed-long counter.
+/// Do not retain arbitrary Health status text or interpret generic health as a zero count.
+pub(crate) fn rejected_starts(status: &str) -> Option<u64> {
+    let decimal = status.strip_prefix("recording-starts-rejected=")?;
+    let count = decimal.parse::<u64>().ok()?;
+    (count <= i64::MAX as u64 && count.to_string() == decimal).then_some(count)
 }
 
 struct BlockingLane {

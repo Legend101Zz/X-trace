@@ -2780,6 +2780,91 @@ mod tests {
         viewer.task.await.unwrap().unwrap();
     }
 
+    async fn health_api_evidence(count: Option<u64>) {
+        let fixture = crate::session_health_tests::HealthFixture::new();
+        fixture.begin();
+        if let Some(count) = count {
+            fixture
+                .persistence()
+                .record_session_rejections(fixture.project_id, fixture.session_id, count)
+                .expect("session Health report");
+        }
+        // Another session must never supply the selected recording's missing evidence.
+        fixture
+            .persistence()
+            .record_session_rejections(fixture.project_id, RuntimeSessionId::new(), 99)
+            .expect("unrelated session");
+        let reader = SqliteRecordingReader::new(fixture.store.clone(), fixture.root.path());
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(reader.clone()),
+            ObservedEndpointQueryService::new(reader),
+            fixture.project_id,
+        )
+        .await
+        .expect("viewer");
+        let ready = bound.readiness();
+        let query_lane = bound.state.query_lane.clone();
+        let token = ready.url.rsplit_once("token=").expect("token").1.to_owned();
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(bound.serve(async move {
+            let _ = receiver.await;
+        }));
+        let viewer = RunningViewer {
+            host: ready.origin.strip_prefix("http://").expect("origin").to_owned(),
+            origin: ready.origin,
+            token,
+            observed_calls: Arc::new(AtomicUsize::new(0)),
+            query_lane,
+            shutdown,
+            task,
+        };
+        let cookie = authenticate(&viewer).await;
+        let expected = count.map_or_else(
+            || format!("Agent capacity rejections: not observed (session {})", fixture.session_id),
+            |count| format!("{count} requests were not recorded: agent capacity (session {}, cumulative as last reported)", fixture.session_id),
+        );
+        for (path, detail) in [
+            (format!("/api/v1/recordings/{}?limit=10", fixture.recording_id), true),
+            ("/api/v1/recordings?limit=10".to_owned(), false),
+        ] {
+            let raw = format!(
+                "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin),
+            );
+            let response = request(&viewer.host, &raw).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            let body: serde_json::Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").expect("HTTP body").1)
+                    .expect("JSON");
+            let recording = if detail { &body } else { &body["recordings"][0] };
+            assert_eq!(recording["incompleteEvidence"], serde_json::json!([expected]));
+            if detail {
+                assert_eq!(
+                    body["honesty"]["recording"]["incomplete"],
+                    serde_json::json!([expected])
+                );
+                assert_eq!(body["events"], serde_json::json!([]), "no synthetic request or event");
+            }
+        }
+        let _ = viewer.shutdown.send(());
+        viewer.task.await.expect("viewer task").expect("serve");
+    }
+
+    #[tokio::test]
+    async fn health_rejections_appear_in_read_api_and_replay_evidence() {
+        health_api_evidence(Some(7)).await;
+    }
+
+    #[tokio::test]
+    async fn no_health_report_reads_as_not_observed() {
+        health_api_evidence(None).await;
+    }
+
+    #[tokio::test]
+    async fn explicitly_observed_zero_is_distinct_from_no_health_report() {
+        health_api_evidence(Some(0)).await;
+    }
+
     #[tokio::test]
     async fn query_lane_offloads_bounds_saturation_and_drains_on_shutdown() {
         let lane = QueryLane::new(1);
