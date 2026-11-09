@@ -1,7 +1,6 @@
 # Local agent tools
 
-Run these Bash scripts from the worktree. They support macOS and Linux and
-need Python 3 and Git. They do not need just, sccache, or shellcheck.
+Run these Bash scripts from the worktree on macOS or Linux. They need Python 3 and Git, not just, sccache, or shellcheck.
 
 Set two machine-local variables before use:
 
@@ -32,29 +31,33 @@ Prep fetches locked Cargo dependencies, installs both npm workspaces, and
 resolves Java dependencies with strict verification. `--adapters` builds Node,
 Java distributions and test classes, and checks the built viewer against its
 committed embedded assets. `--browsers` installs Playwright Chromium.
-CLI integration tests need these artifacts; most local work needs only units.
+CLI integration tests on GitHub need these artifacts.
 
-Run **checks inside the sandbox**, offline:
+Run **compile-only checks inside the sandbox**. Tests run on GitHub:
 
 ```bash
 tools/dev/check.sh rust:xtrace-domain
 tools/dev/check.sh rust:xtrace-cli:doctor_journey
-tools/dev/check.sh java:attach-helper 'io.xtrace.attach.AttachCommandsTest'
+tools/dev/check.sh java:attach-helper
 tools/dev/check.sh node
-tools/dev/check.sh web:src/main.test.tsx
+tools/dev/check.sh web
 tools/dev/check.sh py:tools.dev.test_dev_tools
 tools/dev/check.sh fmt
 tools/dev/check.sh diff
 ```
 
 `check.sh help` lists parts. Commands are printed and the first failure stops
-the script. Rust crate checks compile, run library tests, then run clippy.
+the script. Rust runs cargo check and clippy, or compiles a named test with
+`--no-run`. Java compiles main and test sources with strict verification. Node
+checks generation and types. Web checks types and contrast; `web:<file>` is
+rejected. Python compiles source without writing bytecode: `py:a.b` selects
+`a/b.py`, or `a/b/__init__.py` for a regular package. For a namespace package
+without an initializer, it compiles the immediate `.py` files in the directory.
+A missing module or empty namespace package is an error. Network is for lockfile fetches
+only; new or upgraded dependencies require a ticket.
 
 `tools/dev/clean.sh` previews orphan removal; `--apply` deletes orphans, never active worktree entries.
 `--keep-days N` retains orphans with any mtime within N days (default 0: remove all orphans).
 Only cache `target/*` and scratch `*` entries are eligible.
 Symlinks and nested mounts are refused before deletion.
 Dependency caches stay intact; cache maintenance commands are suggestions only.
-
-Run tool tests with a private temporary base beneath your scratch root:
-`TMPDIR="$XTRACE_DEV_SCRATCH" python3 -B -m unittest tools.dev.test_dev_tools`.

@@ -317,23 +317,38 @@ class DevToolsTests(unittest.TestCase):
         self.assertIn("Usage:", result.stderr)
         self.assertNotIn("env.sh:", result.stderr)
 
-    def test_check_dispatch_is_offline_and_stops_at_first_failure(self):
+    def test_check_help_lists_no_test_running_part(self):
+        result = self.run_script("check.sh", "help")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Compile-only", result.stdout)
+        for command in ("npm test", "vitest", "unittest", "Gradle test"):
+            self.assertNotIn(command, result.stdout)
+
+    def test_check_dispatch_is_compile_only_and_stops_at_first_failure(self):
         scratch = self.short_scratch()
         env = dict(self.environ, XTRACE_DEV_SCRATCH=str(scratch))
         scripts = self.worktree / "tools" / "dev"
         scripts.mkdir(parents=True)
         for name in ("check.sh", "env.sh", "devid.py"):
             shutil.copyfile(SCRIPTS / name, scripts / name)
+        (scripts / "test_dev_tools.py").write_text("value = 1\n")
+        package = self.worktree / "sample_package"
+        package.mkdir()
+        (package / "__init__.py").write_text("value = 1\n")
         bin_dir = self.base / "commands"
         bin_dir.mkdir()
         log = self.base / "commands.jsonl"
         env["PATH"] = str(bin_dir) + os.pathsep + os.environ["PATH"]
         env["XTRACE_COMMAND_LOG"] = str(log)
-        stub = '''#!/usr/bin/env python3
+        env.pop("CARGO_NET_OFFLINE", None)
+        env.pop("NPM_CONFIG_OFFLINE", None)
+        stub = '''#!INTERPRETER
 import json
 import os
 from pathlib import Path
 import sys
+if Path(sys.argv[0]).name == "python3" and sys.argv[1:3] != ["-B", "-c"]:
+    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
 record = {
     "command": [Path(sys.argv[0]).name, *sys.argv[1:]],
     "cwd": os.getcwd(),
@@ -343,8 +358,8 @@ record = {
 with open(os.environ["XTRACE_COMMAND_LOG"], "a") as output:
     output.write(json.dumps(record) + "\\n")
 sys.exit(37 if sys.argv[1:2] == [os.environ.get("XTRACE_FAIL_COMMAND")] else 0)
-'''
-        for name in ("cargo", "npm", "npx", "node"):
+'''.replace("INTERPRETER", os.sys.executable)
+        for name in ("cargo", "npm", "node", "python3"):
             path = bin_dir / name
             path.write_text(stub)
             path.chmod(0o700)
@@ -352,35 +367,32 @@ sys.exit(37 if sys.argv[1:2] == [os.environ.get("XTRACE_FAIL_COMMAND")] else 0)
         gradle.parent.mkdir(parents=True)
         gradle.write_text(stub)
         gradle.chmod(0o700)
+        compile_code = 'import sys; [compile(open(path, "rb").read(), path, "exec") for path in sys.argv[1:]]'
         cases = [
             ("rust:demo", [], [
                 ["cargo", "check", "-p", "demo", "--all-targets", "--all-features", "--locked"],
-                ["cargo", "test", "-p", "demo", "--lib", "--all-features", "--locked"],
                 ["cargo", "clippy", "-p", "demo", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"],
             ]),
-            ("rust:demo:integration", ["--", "filter"], [
-                ["cargo", "test", "-p", "demo", "--test", "integration", "--locked", "--", "filter"],
+            ("rust:demo:integration", [], [
+                ["cargo", "test", "-p", "demo", "--test", "integration", "--no-run", "--locked"],
             ]),
-            ("java:attach-helper", ["io.xtrace.attach.AttachCommandsTest"], [
-                ["gradlew", "-p", "adapters/java", "--offline", "--dependency-verification", "strict", ":attach-helper:test", "--tests", "io.xtrace.attach.AttachCommandsTest"],
+            ("java:attach-helper", [], [
+                ["gradlew", "-p", "adapters/java", "--dependency-verification", "strict", ":attach-helper:compileJava", ":attach-helper:compileTestJava"],
             ]),
             ("java", [], [
-                ["gradlew", "-p", "adapters/java", "--offline", "--dependency-verification", "strict", "test"],
+                ["gradlew", "-p", "adapters/java", "--dependency-verification", "strict", "compileJava", "compileTestJava"],
             ]),
             ("node", [], [
                 ["npm", "run", "generate:check", "--prefix", "adapters/node"],
-                ["npm", "test", "--prefix", "adapters/node"],
-            ]),
-            ("web:src/main.test.tsx", [], [
-                ["npm", "run", "typecheck", "--prefix", "web/app"],
-                ["npx", "--prefix", "web/app", "vitest", "run", "--root", "web/app", "src/main.test.tsx"],
-                ["node", "web/app/scripts/check-contrast.mjs"],
+                ["npm", "run", "typecheck", "--prefix", "adapters/node"],
             ]),
             ("web", [], [
                 ["npm", "run", "typecheck", "--prefix", "web/app"],
-                ["npx", "--prefix", "web/app", "vitest", "run", "--root", "web/app"],
                 ["node", "web/app/scripts/check-contrast.mjs"],
             ]),
+            ("py:tools.dev.test_dev_tools", [], [["python3", "-B", "-c", compile_code, "tools/dev/test_dev_tools.py"]]),
+            ("py:sample_package", [], [["python3", "-B", "-c", compile_code, "sample_package/__init__.py"]]),
+            ("py:tools.dev", [], [["python3", "-B", "-c", compile_code, "tools/dev/devid.py", "tools/dev/test_dev_tools.py"]]),
             ("fmt", [], [["cargo", "fmt", "--all", "--check"]]),
         ]
         for part, extra, expected in cases:
@@ -394,18 +406,58 @@ sys.exit(37 if sys.argv[1:2] == [os.environ.get("XTRACE_FAIL_COMMAND")] else 0)
                 records = [json.loads(line) for line in log.read_text().splitlines()]
                 self.assertEqual([record["command"] for record in records], expected)
                 self.assertTrue(all(record["cwd"] == str(self.worktree) for record in records))
-                self.assertTrue(all(record["cargo_offline"] == "true" for record in records))
-                self.assertTrue(all(record["npm_offline"] == "true" for record in records))
+                self.assertTrue(all(record["cargo_offline"] is None for record in records))
+                self.assertTrue(all(record["npm_offline"] is None for record in records))
                 self.assertEqual(len([line for line in result.stdout.splitlines() if line.startswith("+")]), len(expected))
         log.write_text("")
-        env["XTRACE_FAIL_COMMAND"] = "test"
+        result = subprocess.run(
+            ["bash", str(scripts / "check.sh"), "web:src/main.test.tsx"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not supported", result.stderr)
+        result = subprocess.run(
+            ["bash", str(scripts / "check.sh"), "py:missing.module"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("No Python source found for module: missing.module", result.stderr)
+        env["XTRACE_FAIL_COMMAND"] = "clippy"
         result = subprocess.run(
             ["bash", str(scripts / "check.sh"), "rust:demo"],
             env=env, capture_output=True, text=True,
         )
         self.assertEqual(result.returncode, 37)
         records = [json.loads(line) for line in log.read_text().splitlines()]
-        self.assertEqual([record["command"][1] for record in records], ["check", "test"])
+        self.assertEqual([record["command"][1] for record in records], ["check", "clippy"])
+
+    def test_python_compile_checks_source_without_bytecode(self):
+        env = dict(self.environ, XTRACE_DEV_SCRATCH=str(self.short_scratch()))
+        scripts = self.worktree / "tools" / "dev"
+        scripts.mkdir(parents=True)
+        for name in ("check.sh", "env.sh", "devid.py"):
+            shutil.copyfile(SCRIPTS / name, scripts / name)
+        package = self.worktree / "sample_package"
+        package.mkdir()
+        source = package / "__init__.py"
+        source.write_text("value = 1\n")
+        for module in ("sample_package", "tools.dev", "tools.dev.devid"):
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    ["bash", str(scripts / "check.sh"), f"py:{module}"],
+                    env=env, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(self.worktree.rglob("__pycache__")), [])
+        self.assertEqual(list(self.worktree.rglob("*.pyc")), [])
+        source.write_text("value =\n")
+        result = subprocess.run(
+            ["bash", str(scripts / "check.sh"), "py:sample_package"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SyntaxError", result.stderr)
+        self.assertEqual(list(self.worktree.rglob("*.pyc")), [])
 
 
 class WorktreeIdTests(unittest.TestCase):

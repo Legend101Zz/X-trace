@@ -8,10 +8,10 @@
 )]
 
 use std::io::{BufRead as _, Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -229,7 +229,7 @@ const server = http.createServer(async (_request, response) => {
   completed += 1;
   if (completed === 2) server.close(() => console.log('NODE_HTTP_SERVER_CLOSED'));
 });
-server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => console.log('NODE_HTTP_READY'));
+server.listen(0, '127.0.0.1', () => console.log('NODE_HTTP_READY ' + server.address().port));
 "#
     } else {
         r#"import http from 'node:http';
@@ -241,11 +241,10 @@ const server = http.createServer(async (_request, response) => {
   completed += 1;
   if (completed === 2) server.close(() => console.log('NODE_HTTP_SERVER_CLOSED'));
 });
-server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => console.log('NODE_HTTP_READY'));
+server.listen(0, '127.0.0.1', () => console.log('NODE_HTTP_READY ' + server.address().port));
 "#
     };
     std::fs::write(&app, source).expect("write direct Node HTTP app");
-    let port = free_port();
     let mut child = RunChild(
         cli()
             .args(["run", "--project-dir"])
@@ -255,7 +254,6 @@ server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => console.log('NODE
             .args(["--node-mode", launch_mode, "--", "node", "--no-warnings"])
             .arg(&app)
             .env("XTRACE_DATA_HOME", data_home)
-            .env("APP_PORT", port.to_string())
             .env("NODE_OPTIONS", "--trace-warnings")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -277,13 +275,51 @@ server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => console.log('NODE
         }
     });
     let stderr = child.stderr.take().expect("xtrace stderr");
+    let stderr_capture = Arc::new(Mutex::new(Vec::new()));
+    let captured_stderr = Arc::clone(&stderr_capture);
+    let (stderr_done_sender, stderr_done_receiver) = mpsc::channel();
     let stderr_reader = thread::spawn(move || {
         let mut bytes = Vec::new();
-        std::io::BufReader::new(stderr).read_to_end(&mut bytes).expect("drain xtrace stderr");
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut buffer = [0; 1024];
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result.expect("drain xtrace stderr"),
+            };
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            let mut captured = captured_stderr.lock().expect("capture xtrace stderr");
+            let remaining = 8192 - captured.len();
+            captured.extend_from_slice(&buffer[..count.min(remaining)]);
+        }
+        let _ = stderr_done_sender.send(());
         bytes
     });
-    let ready = line_receiver.recv_timeout(Duration::from_secs(10)).expect("Node app readiness");
-    assert_eq!(ready.trim(), "NODE_HTTP_READY", "unexpected child output: {ready}");
+    let ready = line_receiver.recv_timeout(Duration::from_secs(10));
+    let port = ready.as_ref().ok().and_then(|line| {
+        line.trim().strip_prefix("NODE_HTTP_READY ")?.parse::<u16>().ok().filter(|port| *port != 0)
+    });
+    let port = port.unwrap_or_else(|| {
+        // Reuse the normal exit budget, including for draining stderr. A live child is
+        // terminated by the same bounded cleanup as a timeout on the successful path.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (status, timed_out) = match wait_for_child_status(&mut child, Duration::from_secs(15)) {
+            Ok(status) => (status, false),
+            Err(status) => (status, true),
+        };
+        let drained = stderr_done_receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_ok();
+        let stderr = stderr_capture.lock().expect("read captured xtrace stderr");
+        panic!(
+            "Node app readiness: {ready:?}; child exit status: {status}; deadline exceeded: {timed_out}; \
+             stderr (drained: {drained}, first 8192 bytes):\n{}",
+            String::from_utf8_lossy(&stderr)
+        );
+    });
     let canary = format!("NODE_PRIVATE_CANARY_{launch_mode}_{mode}_4a7");
     let first = canary.clone();
     let second = canary.clone();
@@ -411,19 +447,19 @@ fn assert_recording_evidence(page: &Value, repo: &Path, data_home: &Path) {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind ephemeral local port")
-        .local_addr()
-        .expect("port address")
-        .port()
+fn wait_for_child(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+    wait_for_child_status(child, timeout)
+        .unwrap_or_else(|_| panic!("xtrace Node run exceeded its deadline"))
 }
 
-fn wait_for_child(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+fn wait_for_child_status(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait().expect("poll xtrace child") {
-            return status;
+            return Ok(status);
         }
         if Instant::now() >= deadline {
             if let Ok(pid) = i32::try_from(child.id()) {
@@ -445,11 +481,11 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> std::process::ExitSta
             {
                 thread::sleep(Duration::from_millis(10));
             }
-            if child.try_wait().expect("poll supervisor before SIGKILL").is_none() {
-                child.kill().expect("kill timed out supervisor");
-                child.wait().expect("reap timed out supervisor");
+            if let Some(status) = child.try_wait().expect("poll supervisor before SIGKILL") {
+                return Err(status);
             }
-            panic!("xtrace Node run exceeded its deadline");
+            child.kill().expect("kill timed out supervisor");
+            return Err(child.wait().expect("reap timed out supervisor"));
         }
         thread::sleep(Duration::from_millis(10));
     }

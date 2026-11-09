@@ -204,6 +204,49 @@ fn wait_gone(pid: u32) {
     }
 }
 
+fn wait_zombie(pid: u32) {
+    // Setup precondition, not a product deadline: return as soon as the child is a zombie
+    // (exited, not reaped). Same bound as `wait_gone`; the old code slept 300 ms and assumed it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        #[cfg(target_os = "linux")]
+        let state = {
+            let stat =
+                std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child stat");
+            // comm can contain spaces and parentheses; the state follows its final ')'.
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .and_then(|state| state.chars().next())
+                .expect("child process state")
+        };
+        #[cfg(not(target_os = "linux"))]
+        let state = {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("query child state");
+            assert!(
+                output.status.success(),
+                "ps failed ({:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .chars()
+                .next()
+                .expect("child process state")
+        };
+        if state == 'Z' {
+            return;
+        }
+        assert!(Instant::now() < deadline, "process {pid} did not become a zombie (state {state})");
+        thread::sleep(
+            deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(20)),
+        );
+    }
+}
+
 fn run_node_client(bootstrap: &Path) -> Value {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let client = repo_root.join("adapters/node/examples/synthetic-client/dist/main.js");
@@ -525,20 +568,31 @@ fn stale_record_naming_a_live_bystander_is_cleaned_up_by_stop_and_restart() {
 fn stale_record_naming_a_zombie_is_cleaned_up_by_stop_and_restart() {
     let fx = fixture();
     // Exits immediately and is deliberately not waited on: a zombie until the end of the test.
-    let mut zombie = Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().expect("spawn zombie");
-    let zombie_pid = zombie.id();
-    thread::sleep(Duration::from_millis(300));
+    let mut zombie = ChildGuard(Some(
+        Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().expect("spawn zombie"),
+    ));
+    let zombie_pid = zombie.0.as_ref().expect("child").id();
+    wait_zombie(zombie_pid);
     forge_stale_record(&fx, zombie_pid);
 
     let out = fx.xtrace(&["stop"]);
-    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stop exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let error: Value = serde_json::from_slice(&out.stderr).expect("error JSON");
+    assert_eq!(error["code"], "XTR-LIFECYCLE-NOT-RUNNING");
     assert!(!fx.state_file().exists());
 
     forge_stale_record(&fx, zombie_pid);
     let restarted = fx.ok_json(&["restart"]);
+    assert_eq!(restarted["previously_running"], false);
     fx.track(restarted["started"]["pid"].as_u64().expect("pid"));
     fx.ok_json(&["stop"]);
-    zombie.wait().expect("reap zombie");
+    zombie.0.take().expect("child").wait().expect("reap zombie");
 }
 
 #[test]

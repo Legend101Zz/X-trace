@@ -1471,10 +1471,18 @@ mod tests {
     use crate::signed_pack::{ArtifactDigest, build_hash};
     use std::os::unix::fs::PermissionsExt as _;
 
-    fn private_scratch() -> AdmittedPrivateRoot {
+    fn private_cache() -> (tempfile::TempDir, AdmittedPrivateRoot) {
         let path = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
             .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required");
-        AdmittedPrivateRoot::open(Path::new(&path)).expect("admitted private test scratch")
+        // Keep bounded cache listings and panic cleanup confined to this test's own tree.
+        let directory = tempfile::Builder::new()
+            .prefix("pack-cache-test-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(path)
+            .expect("private cache fixture directory");
+        let cache =
+            AdmittedPrivateRoot::open(directory.path()).expect("admitted private test cache");
+        (directory, cache)
     }
 
     fn unique_name(stem: &str) -> String {
@@ -1728,7 +1736,7 @@ mod tests {
 
     #[test]
     fn copied_snapshot_reopens_same_descriptor_and_enforces_aggregate_budget_and_deadline() {
-        let cache = private_scratch();
+        let (_cache_directory, cache) = private_cache();
         let payload = b"authenticated snapshot fixture";
         let (_source, inspected) = public_fixture(payload);
         let (snapshot_name, snapshot, directories) = private_snapshot(&cache, &inspected.manifest);
@@ -1781,7 +1789,7 @@ mod tests {
 
     #[test]
     fn partial_snapshot_copy_uses_production_cleanup_and_reports_uncertain_replacement() {
-        let cache = private_scratch();
+        let (_cache_directory, cache) = private_cache();
         let payload = vec![0x5a; 70 * 1024];
         let (_source, inspected) = public_fixture(&payload);
 
