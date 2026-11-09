@@ -2,6 +2,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 from unittest.mock import Mock, patch
@@ -119,6 +120,33 @@ class Judges(unittest.TestCase):
         detail["events"][0]["kind"] = "recording_event_kind:frame_exit"
         self.assertEqual(xflows.judge_active_line([detail])[0], "fail")
 
+    def test_line_parent_diagnostics_distinguish_missing_non_method_and_unavailable_extent(self):
+        details = [line_rec(fid=str(i)) for i in range(3)]
+        details[0]["events"].pop(0)
+        details[1]["events"][0]["kind"] = "recording_event_kind:request_update"
+        details[2]["events"][0]["source"] = None
+        expected = {"parent-not-observed": 2, "parent-is-not-method-entry": 2, "parent-method-extent-unavailable": 2}
+        self.assertEqual(xflows.line_parent_gaps(details), expected)
+        status, note = xflows.judge_active_line(details)
+        self.assertEqual(status, "fail")
+        self.assertIn("6 line events", note)
+        for reason in expected:
+            self.assertIn(reason, note)
+
+    def test_parent_method_can_be_on_an_earlier_api_page(self):
+        detail = line_rec()
+        client = Mock()
+        client.get.side_effect = [
+            (200, {"recordings": [{"recordingId": "r"}], "nextAfter": None}),
+            (200, {"events": detail["events"][:1], "nextCursor": "page-two"}),
+            (200, {"events": detail["events"][1:], "nextCursor": None}),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            api = xflows.xinstr.collect_api(client, pathlib.Path(td))
+        self.assertTrue(api["ok"])
+        self.assertIn("cursor=page-two", client.get.call_args.args[0])
+        self.assertEqual(xflows.judge_active_line(list(api["details"].values()))[0], "pass")
+
     def test_distinct_method_starts_are_not_evidence_of_an_executed_line_within_a_method(self):
         self.assertEqual(xflows.judge_active_line([line_rec(start=10, lines=(10,)),
                                                   line_rec(start=20, lines=(20,))])[0], "fail")
@@ -153,19 +181,31 @@ class Judges(unittest.TestCase):
         self.assertIsNone(xflows.parse_doc('{"first": 1}\n{"second": 2}\n'))
         self.assertIsNone(xflows.parse_doc('{"items": [\n  "inner"\n'))
 
-    def test_focused_requests_inject_canaries_into_an_argument_and_password(self):
+    def test_focused_canaries_use_only_secret_locations_and_an_ordinary_search_argument(self):
         import xcamp
+        import urllib.parse
         canaries = {k: "canary-" + k for k in ("authorization-header", "cookie-header", "query-token", "json-body-password")}
         with mock.patch.object(xcamp, "http_request", return_value={"status": 200}) as request:
             served = xflows.focused_requests("http://127.0.0.1:1234", canaries)
-        self.assertEqual(list(served.values()), [200, 200, 200])
+        self.assertEqual(list(served.values()), [200, 200, 200, 200])
         paths = [call.args[2] for call in request.call_args_list]
-        self.assertIn("lastName=canary-query-token", paths[1])
+        self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(paths[1]).query)["lastName"], ["Davis"])
         for call in request.call_args_list:
-            self.assertIn("password=canary-json-body-password", call.args[2])
-            self.assertIn("xt_token=canary-query-token", call.args[2])
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(call.args[2]).query)
+            self.assertEqual(query["xt_token"], [canaries["query-token"]])
+            self.assertNotIn("password", query)
+            self.assertNotIn(canaries["query-token"], query.get("lastName", []))
             self.assertEqual(call.kwargs["headers"]["Authorization"], canaries["authorization-header"])
             self.assertEqual(call.kwargs["headers"]["Cookie"], canaries["cookie-header"])
+        post = request.call_args_list[-1]
+        self.assertEqual(post.args[1], "POST")
+        self.assertEqual(urllib.parse.urlsplit(post.args[2]).path, "/owners/new")
+        self.assertEqual(post.kwargs["headers"]["Content-Type"], "application/x-www-form-urlencoded")
+        form = urllib.parse.parse_qs(post.kwargs["body"].decode(), keep_blank_values=True)
+        self.assertEqual(form["password"], [canaries["json-body-password"]])
+        self.assertEqual(form["firstName"], [""])
+        self.assertEqual(form["lastName"], ["Invalid"])
+        self.assertTrue(all(call.kwargs["body"] is None for call in request.call_args_list[:-1]))
         self.assertNotIn("canary-", str(served), "flow receipt must not itself save the injected values")
 
     def test_focused_without_canaries_fails_before_launching(self):
@@ -209,6 +249,57 @@ class Drivers(unittest.TestCase):
 
     def api(self, details):
         return {"ok": True, "reason": "", "details": details}
+
+    def test_focused_uses_stack_port_reads_artifacts_and_does_not_hide_canary_leaks(self):
+        import os
+        from tools.qa import canary
+        flow = self.flow()
+        canaries = canary.make_canaries()
+        with tempfile.TemporaryDirectory() as td:
+            flow.out_dir = pathlib.Path(td) / "flows"
+            path = pathlib.Path(td) / "canaries.json"
+            path.write_text(json.dumps(canaries))
+            def read_api(*args):
+                dest = args[-1]
+                dest.mkdir(parents=True)
+                # Simulate an observed leak in a focused binding: it must remain a scan failure.
+                (dest / "recording-new.json").write_text(json.dumps({"preview": canaries["query-token"]}))
+                return self.api({"new": line_rec()})
+            with patch.dict(os.environ, {"XCAMP_CANARY_FILE": str(path)}), \
+                 patch.object(xflows, "list_ids", return_value={"old"}), \
+                 patch.object(xflows, "focused_requests", return_value={"focused-request-0": 200}) as requests, \
+                 patch.object(xflows, "read_api", side_effect=read_api) as read:
+                flow.focused()
+                self.assertEqual(os.environ["XTRACE_CANARY_ENV"], canaries["env-var"])
+            requests.assert_called_once_with(flow._stack.return_value.base, canaries)
+            self.assertIn("--capture-depth focused", flow._stack.call_args.args[0])
+            self.assertEqual(read.call_args.args[-1], flow.out_dir / "api-focused")
+            self.assertEqual(flow.results["focused-canary-injection"]["status"], "pass")
+            self.assertEqual(flow.results["focused-canary-injection"]["note"],
+                             "focused canary locations: " + json.dumps(xflows.xinstr.CANARY_LOCATIONS, sort_keys=True))
+            self.assertEqual(set(xflows.xinstr.CANARY_LOCATIONS), set(canaries))
+            self.assertEqual(flow._stack.return_value.up.call_count, 1)
+            flow._stack.return_value.down.assert_called_once()
+            report = canary.run_scan(canaries, {"focused-artifacts": [flow.out_dir / "api-focused"]}, {"focused-artifacts": 1})
+            self.assertFalse(report["clean"])
+            self.assertEqual(report["uncovered"], [])
+            self.assertEqual({hit["locationClass"] for hit in report["hits"]}, {"focused-artifacts"})
+            self.assertNotIn(canaries["query-token"], json.dumps(report))
+
+    def test_failed_focused_request_still_reads_artifacts_and_fails_both_judges(self):
+        import os
+        flow = self.flow()
+        with tempfile.TemporaryDirectory() as td:
+            path = pathlib.Path(td) / "canaries.json"
+            path.write_text('{"env-var": "synthetic"}')
+            with patch.dict(os.environ, {"XCAMP_CANARY_FILE": str(path)}), \
+                 patch.object(xflows, "list_ids", return_value=set()), \
+                 patch.object(xflows, "focused_requests", return_value={"focused-request-0": None}), \
+                 patch.object(xflows, "read_api", return_value=self.api({})) as read:
+                flow.focused()
+            self.assertEqual(read.call_count, 1)
+            for step in ("focused-canary-injection", "active-line-frames", "frame-values"):
+                self.assertEqual(flow.results[step]["status"], "fail")
 
     def test_record_and_restart_parse_one_whole_pretty_document(self):
         flow = self.flow()

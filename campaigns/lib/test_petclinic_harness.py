@@ -19,6 +19,32 @@ class OverheadHarness(unittest.TestCase):
             spec.loader.exec_module(module)
         return module
 
+    def test_scenario_order_matches_the_pinned_baseline_and_burst_runs_last(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = self.load(td)
+            pinned = json.loads((ROOT / "campaigns/java/petclinic/baseline-summary.json").read_text())
+            self.assertEqual([sc.id for sc in harness.SCENARIOS], [sc["id"] for sc in pinned["scenarios"]])
+            self.assertEqual(harness.SCENARIOS[-1].kind, "concurrency")
+            self.assertTrue(all(sc.kind != "concurrency" for sc in harness.SCENARIOS[:-1]))
+
+    def test_pet_and_visit_expectations_pin_both_submission_outcomes(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = self.load(td)
+        self.assertEqual([(e["route"], e["statuses"]) for e in harness.EXPECT["pet-and-visit-flow"]],
+                         [("/owners/{ownerId}/pets/new", [302, 200]),
+                          ("/owners/{ownerId}/pets/{petId}/visits/new", [200, 302])])
+        self.assertEqual(harness.OWN["repository"], ["OwnerRepository", "org.springframework.data.repository.CrudRepository"])
+
+    def test_error_expectations_name_propagation_without_claiming_a_final_500(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = self.load(td)
+        for sid, typ in (("missing-owner-error", "IllegalArgumentException"), ("controller-crash-path", "RuntimeException")):
+            with self.subTest(scenario=sid):
+                expectation = harness.EXPECT[sid][0]
+                self.assertIsNone(expectation["status"])
+                self.assertEqual(expectation["outcome"], "exception_propagated")
+                self.assertEqual(expectation["exception"], typ)
+
     def test_exactly_five_interleaved_pairs_record_real_intervals_and_pair_paths(self):
         with tempfile.TemporaryDirectory() as td:
             harness = self.load(td)

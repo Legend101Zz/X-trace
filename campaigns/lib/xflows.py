@@ -237,6 +237,27 @@ def _line_events(details: list[dict]) -> list[tuple[dict, dict]]:
     return out
 
 
+def line_parent_gaps(details: list[dict]) -> dict[str, int]:
+    """Count observed parent failures without guessing a method from cursor source or symbols."""
+    counts: dict[str, int] = {}
+    for detail in details:
+        by_id = {ev["frameId"]: ev for ev in detail.get("events", []) if ev.get("frameId")}
+        for ev in detail.get("events", []):
+            if not str(ev.get("kind", "")).endswith("line_cursor"):
+                continue
+            parent = by_id.get(ev.get("parentFrameId"))
+            if parent is None:
+                reason = "parent-not-observed"
+            elif not str(parent.get("kind", "")).endswith("frame_enter"):
+                reason = "parent-is-not-method-entry"
+            elif not isinstance(parent.get("source"), dict) or type(parent["source"].get("startLine")) is not int or parent["source"]["startLine"] < 1:
+                reason = "parent-method-extent-unavailable"
+            else:
+                continue
+            counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
 def judge_active_line(details: list[dict]) -> tuple[str, str]:
     if not details:
         return "fail", "no focused recording was read back"
@@ -250,7 +271,8 @@ def judge_active_line(details: list[dict]) -> tuple[str, str]:
         return "fail", f"{len(bad)} line_cursor events carry no observed line number"
     with_extent = [(ev, src) for ev, src in lines if type(src.get("startLine")) is int and src["startLine"] >= 1]
     if len(with_extent) != len(lines):
-        return "fail", f"{len(lines) - len(with_extent)} line events have no enclosing method extent through parentFrameId"
+        return "fail", (f"{len(lines) - len(with_extent)} line events have no enclosing method extent through parentFrameId; "
+                        + json.dumps(line_parent_gaps(details), sort_keys=True))
     outside = [ev for ev, src in with_extent if ev["line"] < src["startLine"] or
                (type(src.get("endLine")) is int and ev["line"] > src["endLine"])]
     moving = [ev for ev, src in with_extent if ev["line"] != src["startLine"]]
@@ -305,13 +327,16 @@ def focused_requests(base: str, canaries: dict[str, str]) -> dict[str, int | Non
     import urllib.parse
     import xcamp
     hook = xinstr.canary_hook(canaries)
-    paths = ["/owners/1", "/owners?lastName=" + urllib.parse.quote(canaries["query-token"], safe=""), "/vets"]
+    requests = [("GET", path, {}, None) for path in ("/owners/1", "/owners?lastName=Davis", "/vets")]
+    # Invalid ordinary business fields re-render the form without creating an owner.
+    form = urllib.parse.urlencode({"firstName": "", "lastName": "Invalid", "address": "123 Test St",
+                                   "city": "Testville", "telephone": "abc"}).encode()
+    requests.append(("POST", "/owners/new", {"Content-Type": "application/x-www-form-urlencoded"}, form))
     served = {}
-    for index, path in enumerate(paths):
-        path += ("&" if "?" in path else "?") + "password=" + urllib.parse.quote(canaries["json-body-password"], safe="")
-        path, headers, body = hook("GET", path, {}, None)
+    for index, (method, path, headers, body) in enumerate(requests):
+        path, headers, body = hook(method, path, headers, body)
         try:
-            served[f"focused-request-{index}"] = xcamp.http_request(base, "GET", path, headers=headers, body=body, timeout=30)["status"]
+            served[f"focused-request-{index}"] = xcamp.http_request(base, method, path, headers=headers, body=body, timeout=30)["status"]
         except Exception:
             served[f"focused-request-{index}"] = None
     return served
@@ -514,7 +539,7 @@ class Flows:
             stack.up()
             served = focused_requests(stack.base, canaries)
             self._set("focused-canary-injection", ("pass" if all(s == 200 for s in served.values()) else "fail",
-                                                   "focused requests carry Authorization, Cookie, query and password canaries; owner search binds a canary argument"))
+                                                   "focused canary locations: " + json.dumps(xinstr.CANARY_LOCATIONS, sort_keys=True)))
         finally:
             stack.down()
         api = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-focused")

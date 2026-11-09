@@ -16,6 +16,7 @@ import re
 import signal
 import subprocess
 import time
+from collections import Counter
 from typing import Any, Callable
 
 # matched against the class part of a frame symbol such as `OwnerController.findOwner`
@@ -281,14 +282,18 @@ def response_event_status(detail: dict) -> int | None:
     return None
 
 
-def layer_frames(detail: dict, layer: str, name_hint: str | None = None) -> list[dict]:
+def layer_frames(detail: dict, layer: str, name_hint: str | list[str] | None = None) -> list[dict]:
+    """Match observed declaring classes; hints may name alternative inherited declarations."""
     pat = LAYER_PATTERNS[layer]
     out = []
     for ev in detail.get("events", []):
         if not str(ev.get("kind", "")).endswith("frame_enter"):
             continue
         sym = ev.get("symbol") or ""
-        if pat.search(sym.split(".", 1)[0]) and (name_hint is None or name_hint in sym):
+        declaring, separator, _ = sym.rpartition(".")
+        simple = declaring.rsplit(".", 1)[-1]
+        hints = [name_hint] if isinstance(name_hint, str) else name_hint
+        if separator and pat.search(simple) and (hints is None or any(h in (declaring, simple) for h in hints)):
             out.append(ev)
     return out
 
@@ -317,6 +322,10 @@ def exception_matches(detail: dict, wanted: str | None) -> bool:
 
 
 def outcome_matches(detail: dict, expectation: dict) -> bool:
+    if expectation.get("outcome") == "exception_propagated":
+        return recording_http_status(detail) is None and exception_matches(detail, expectation.get("exception"))
+    if "statuses" in expectation:
+        return recording_http_status(detail) in expectation["statuses"]
     if recording_http_status(detail) == expectation["status"]:
         return True
     return expectation["status"] >= 500 and exception_matches(detail, expectation.get("exception"))
@@ -445,7 +454,7 @@ def burst_accounting(details: dict[str, dict], sent: list[tuple[str | None, str,
 
 
 def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list, expectations: dict,
-                        before: dict, deadline: float) -> dict[str, Any]:
+                        before: dict, deadline: float, *, require_complete: bool = False) -> dict[str, Any]:
     """Poll observable read state within the caller's remaining scenario budget; no drain sleep."""
     boundary = burst_accounting({}, sent, expectations, before)
     client.deadline = deadline
@@ -457,6 +466,9 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
                 break
             boundary = burst_accounting(api["details"], sent, expectations, before)
             if boundary["verified"] and time.monotonic() <= deadline:
+                if require_complete and (boundary["capacityDrops"] or boundary["partialRecordingIds"]):
+                    boundary["verified"] = False
+                    boundary["verifiedAt"] = None
                 return boundary
     except (TimeoutError, OSError) as exc:
         boundary["readError"] = str(exc)
@@ -467,20 +479,59 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
     return boundary
 
 
+def scenario_frame_symbols(details: dict[str, dict], sent: list, burst: frozenset,
+                           boundary: dict | None, serial_boundary: dict) -> dict[str, list[str]]:
+    """Inventory every attributable request, including routes without a scenario expectation."""
+    names: dict[str, set[str]] = {}
+    if not serial_boundary["verified"]:
+        return {}
+    routes = {info for d in details.values() if (info := request_info(d)) is not None}
+    literals = frozenset(route for _, route in routes if "{" not in route)
+    phases = [(False, set(serial_boundary["recordingIds"]))]
+    if boundary is not None:
+        phases.append((True, set(boundary["recordingIds"]) - set(serial_boundary["snapshotIds"])))
+    for concurrent, ids in phases:
+        for method, route in routes:
+            requests = [r for r in sent if r[0] is not None and (r[0] in burst) == concurrent
+                        and r[1] == method and _path_matches(r[2], route, literals)]
+            recordings = [d for rid, d in details.items() if rid in ids and request_info(d) == (method, route)]
+            if not requests or not recordings:
+                continue
+            if concurrent:
+                owners = {r[0] for r in requests}
+                if len(owners) != 1:
+                    continue  # Shared concurrent routes have no per-request correlation.
+                attributed = [(requests[0][0], d) for d in recordings]
+            else:
+                times = [recording_time(d) for d in recordings]
+                if len(recordings) != len(requests) or any(t is None for t in times) or len(set(times)) != len(times):
+                    continue
+                order = sorted(range(len(recordings)), key=lambda i: times[i])
+                attributed = [(r[0], recordings[order[i]]) for i, r in enumerate(requests)]
+            for sid, detail in attributed:
+                names.setdefault(sid, set()).update(ev["symbol"] for ev in detail.get("events", [])
+                                                   if str(ev.get("kind", "")).endswith("frame_enter")
+                                                   and isinstance(ev.get("symbol"), str) and ev["symbol"])
+    return {sid: sorted(symbols) for sid, symbols in names.items()}
+
+
 def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             sent: list[tuple[str | None, str, str]] | None = None, burst: frozenset = frozenset(),
-            boundary: dict[str, Any] | None = None) -> dict[str, Any]:
-    """expectations: scenario id -> [{method, route, status, layers[], minCount}]. Returns a verdict per scenario.
+            boundary: dict[str, Any] | None = None, serial_boundary: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Expect a status or an exact `statuses` multiset per route, plus layers and source evidence.
 
-    A verified boundary partitions burst IDs from later serial recordings. Without a boundary,
+    A verified serial boundary partitions serial IDs from the later burst. Without a boundary,
     routes shared with a burst remain ambiguous. Serial routes retain exact counts in either case.
     Without `sent`, results are explicitly campaign-wide.
     """
     literal_routes = frozenset((e["route"].rstrip("/") or "/") for exps in expectations.values() for e in exps if "{" not in e["route"])
     verdicts: dict[str, Any] = {}
+    inventory = scenario_frame_symbols(details, sent, burst, boundary, serial_boundary) \
+        if sent is not None and serial_boundary is not None else None
     for sid, exps in expectations.items():
         items = []
         attributed_total = 0
+        symbols: set[str] = set()
         for e in exps:
             matched_all = [d for d in details.values() if recording_matches(d, e["method"], e["route"], literal_routes)]
             problems: list[str] = []
@@ -492,7 +543,35 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                 mine = [i for i, r in enumerate(reqs) if r[0] == sid]
                 times = [recording_time(d) for d in matched_all]
                 first_burst = next((i for i, r in enumerate(reqs) if r[0] in burst), None)
-                if boundary is not None:
+                if serial_boundary is not None:
+                    attribution = "verified-boundary"
+                    serial_ids = set(serial_boundary["recordingIds"])
+                    matched = []
+                    if not serial_boundary["verified"]:
+                        problems.append("serial-boundary-not-verified")
+                    elif sid in burst:
+                        if boundary is None or not boundary["verified"]:
+                            problems.append("burst-boundary-not-verified")
+                        if boundary is not None:
+                            matched = [d for rid, d in details.items() if rid in set(boundary["recordingIds"])
+                                       and rid not in serial_ids
+                                       and recording_matches(d, e["method"], e["route"], literal_routes)]
+                            if boundary["capacityDrops"] or boundary["partialRecordingIds"]:
+                                problems.append(f"burst-drops(capacity {boundary['capacityDrops']}, partial {len(boundary['partialRecordingIds'])})")
+                    else:
+                        serial_reqs = [r for r in reqs if r[0] is not None and r[0] not in burst]
+                        mine = [i for i, r in enumerate(serial_reqs) if r[0] == sid]
+                        serial = [d for rid, d in details.items() if rid in serial_ids
+                                  and recording_matches(d, e["method"], e["route"], literal_routes)]
+                        times = [recording_time(d) for d in serial]
+                        if len(serial) != len(serial_reqs):
+                            problems.append(f"serial-count-mismatch(recordings {len(serial)}, requests {len(serial_reqs)})")
+                        elif any(t is None for t in times) or len(set(times)) != len(times):
+                            problems.append("attribution-ambiguous(recording time unknown or tied)")
+                        else:
+                            order = sorted(range(len(serial)), key=lambda i: times[i])
+                            matched = [serial[order[i]] for i in mine]
+                elif boundary is not None:
                     attribution = "verified-boundary"
                     burst_ids = set(boundary["recordingIds"])
                     snapshot_ids = set(boundary["snapshotIds"])
@@ -540,6 +619,9 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             if any(p.startswith("attribution-ambiguous") for p in problems):
                 attribution = "ambiguous"
             attributed_total += len(matched)
+            symbols.update(ev["symbol"] for d in matched for ev in d.get("events", [])
+                           if str(ev.get("kind", "")).endswith("frame_enter")
+                           and isinstance(ev.get("symbol"), str) and ev["symbol"])
             with_status = [d for d in matched if outcome_matches(d, e)]
             need = e.get("minCount", 1)
             if problems:
@@ -548,13 +630,17 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                 problems.append("no-recording-for-route")
             else:
                 seen = sorted({str(recording_http_status(d) or (d.get("outcome") or {}).get("kind")) for d in matched})
-                if not with_status:
-                    problems.append(f"http-outcome-mismatch(expected {e['status']}, saw {','.join(seen)})")
-                elif boundary is not None and len(with_status) != len(matched):
+                expected = e.get("outcome", e.get("status"))
+                if "statuses" in e and Counter(recording_http_status(d) for d in matched) != Counter(e["statuses"]):
+                    observed = sorted((recording_http_status(d) for d in matched), key=str)
+                    problems.append(f"http-outcome-multiset-mismatch(expected {e['statuses']}, saw {observed})")
+                elif not with_status:
+                    problems.append(f"http-outcome-mismatch(expected {expected}, saw {','.join(seen)})")
+                elif (boundary is not None or serial_boundary is not None) and len(with_status) != len(matched):
                     problems.append(f"http-outcome-count-mismatch(expected {len(matched)}, observed {len(with_status)})")
                 elif len(with_status) < need:
                     problems.append(f"count-below-minimum(need {need}, have {len(with_status)})")
-            if boundary is not None and sid not in burst and any(d.get("completion") == "partial" for d in matched):
+            if (boundary is not None or serial_boundary is not None) and sid not in burst and any(d.get("completion") == "partial" for d in matched):
                 problems.append("partial-recording")
             unobserved = [d for d in with_status if (d.get("outcome") or {}).get("kind") not in OBSERVED_OUTCOME_KINDS]
             if with_status and unobserved:
@@ -577,14 +663,16 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             if with_status and not src:
                 problems.append("source-binding-unacceptable" if "unacceptable" in why else
                                 "source-binding-missing" if "missing" in why else "no-source-file-line")
-            items.append({"method": e["method"], "route": e["route"], "expectedStatus": e["status"], "attribution": attribution,
+            items.append({"method": e["method"], "route": e["route"], "expectedStatus": e.get("status"),
+                          "expectedStatuses": e.get("statuses"), "expectedOutcome": e.get("outcome"), "attribution": attribution,
                           "recordingsMatchingRoute": len(matched), "recordingsWithStatus": len(with_status),
                           "layers": layer_report, "recordingsWithSource": len(src), "problems": problems,
                           "passed": not problems})
         verdicts[sid] = {"passed": all(i["passed"] for i in items), "expectations": items,
                          "attribution": "ambiguous" if any(i["attribution"] == "ambiguous" for i in items)
-                         else "verified-boundary" if boundary is not None else "order" if sent is not None else "campaign-wide",
-                         "recordingsAttributed": attributed_total}
+                         else "verified-boundary" if boundary is not None or serial_boundary is not None else "order" if sent is not None else "campaign-wide",
+                         "recordingsAttributed": attributed_total,
+                         "frameSymbols": inventory.get(sid, []) if inventory is not None else sorted(symbols)}
     return verdicts
 
 
@@ -599,6 +687,15 @@ def problem_classes(verdicts: dict[str, Any]) -> dict[str, int]:
 
 
 # ------------------------------------------------------------ canaries -------
+CANARY_LOCATIONS = {
+    "authorization-header": "Authorization header",
+    "cookie-header": "Cookie header",
+    "query-token": "unread query parameter xt_token",
+    "json-body-password": "request body field password",
+    "env-var": "application environment variable XTRACE_CANARY_ENV",
+}
+
+
 def canary_hook(canaries: dict[str, str]) -> Callable[..., tuple]:
     """REQUEST_HOOK adding Authorization, Cookie, a query token and a form password to every scenario request."""
     import urllib.parse
@@ -650,7 +747,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     notes: dict[str, Any] = {"accommodations": {
         "pace_seconds": PACE_SECONDS, "drain_seconds": 0,
         "reason": "serial requests paced because the agent admits at most 8 unwritten recordings; burst remains unpaced",
-        "attribution": "burst runs first; serial traffic starts only after verified read-API accounting",
+        "attribution": "serial scenarios run in pinned order; burst starts only after every serial request has a complete recording",
         "correlationGap": REQUEST_CORRELATION_GAP,
     }}
     init = subprocess.run([xtrace, "init", "--project-dir", str(project_dir), "--display-name", "campaign"],
@@ -660,6 +757,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         raise RuntimeError(f"xtrace init failed with exit {init.returncode}")
     before_ids = list_recording_ids(xtrace, project_dir, env)
     if canaries:
+        notes["canaryLocations"] = dict(CANARY_LOCATIONS)
         xcamp.REQUEST_HOOK = canary_hook(canaries)
         os.environ["XTRACE_CANARY_ENV"] = canaries["env-var"]
     os.environ["XTRACE_DATA_HOME"] = str(data_home)
@@ -670,6 +768,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     xcamp.SENT_LOG = []
     xcamp.REQUEST_PACE_S = PACE_SECONDS
     boundary = None
+    serial_boundary = None
     live_viewer = None
     started = time.time()
     boot_ms = None
@@ -677,7 +776,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         t0 = time.perf_counter()
         stack.up()
         boot_ms = round((time.perf_counter() - t0) * 1000)
-        ordered = sorted(scenarios, key=lambda sc: sc.kind != "concurrency")
+        ordered = sorted(scenarios, key=lambda sc: sc.kind == "concurrency")
         burst = frozenset(sc.id for sc in scenarios if sc.kind == "concurrency")
         if burst:
             live_viewer, ready = start_viewer(xtrace, project_dir, env, out_dir / "boundary-viewer.log")
@@ -685,18 +784,32 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
             live_client.exchange(bootstrap_token(ready["url"]))
             initial = collect_api(live_client, out_dir / "boundary-before")
             if not initial["ok"]:
-                raise RuntimeError("cannot snapshot recordings before burst: " + initial["reason"])
-            # Reuse the existing 60-second HTTP/read budget, including time spent sending the burst.
+                raise RuntimeError("cannot snapshot recordings before scenarios: " + initial["reason"])
+            # One existing 60-second HTTP/read budget covers both phases and their accounting.
             burst_deadline = time.monotonic() + 60.0
+            if ordered[0].id in burst:
+                serial_boundary = burst_accounting(initial["details"], [], expectations, initial["details"])
+            burst_before = initial["details"]
         for index, sc in enumerate(ordered):
             mark = len(xcamp.SENT_LOG)
             res = xcamp.run_scenario(sc, stack, stack.base, norm_extra)
             sent_log.extend((res["id"], m, pth) for m, pth in xcamp.SENT_LOG[mark:])
             results.append(res)
             print(f"  [{'PASS' if res['passed'] else 'FAIL'}] {sc.id} {res['semanticEffectFingerprint'][:16]} {res['elapsedMs']}ms", flush=True)
-            if sc.id in burst and (index + 1 == len(ordered) or ordered[index + 1].id not in burst):
-                boundary = wait_burst_boundary(live_client, out_dir / "boundary-api", sent_log, expectations,
-                                               initial["details"], burst_deadline)
+            if burst and sc.id not in burst and index + 1 < len(ordered) and ordered[index + 1].id in burst:
+                serial_boundary = wait_burst_boundary(live_client, out_dir / "serial-boundary-api", sent_log, expectations,
+                                                      initial["details"], burst_deadline, require_complete=True)
+                notes["serialBoundary"] = serial_boundary
+                if not serial_boundary["verified"]:
+                    break
+                # Serial verification forbids capacity drops, so its counters equal the initial snapshot.
+                # Only IDs are needed to exclude all traffic observed before the burst.
+                burst_before = {**initial["details"], **{rid: {} for rid in serial_boundary["snapshotIds"]
+                                                       if rid not in initial["details"]}}
+            if sc.id in burst and index + 1 == len(ordered):
+                boundary = wait_burst_boundary(live_client, out_dir / "boundary-api",
+                                               [r for r in sent_log if r[0] in burst], expectations,
+                                               burst_before, burst_deadline)
                 notes["burstBoundary"] = boundary
                 if not boundary["verified"]:
                     break
@@ -739,7 +852,8 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         if viewer is not None:
             stop_process_group(viewer)
     if api["ok"]:
-        verdicts = analyze(api["details"], expectations, sent_log, frozenset(sc.id for sc in scenarios if sc.kind == "concurrency"), boundary)
+        verdicts = analyze(api["details"], expectations, sent_log, frozenset(sc.id for sc in scenarios if sc.kind == "concurrency"),
+                           boundary, serial_boundary)
 
     baseline_fp: dict[str, str] = {}
     if baseline_receipt and baseline_receipt.exists():
@@ -750,6 +864,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         scen_out.append({
             "id": r["id"], "scenarioChecksPassed": r["passed"], "semanticEffectFingerprint": r["semanticEffectFingerprint"],
             "baselineFingerprint": baseline_fp.get(r["id"]),
+            "frameSymbols": v["frameSymbols"] if v else [],
             "fingerprintEqualsBaseline": baseline_fp.get(r["id"]) == r["semanticEffectFingerprint"] if baseline_fp else None,
             "recordingVerdict": v, "requests": [{"label": q["label"], "status": q["response"]["status"], "elapsedMs": q["elapsedMs"]}
                                                 for q in r["requests"]],
@@ -758,15 +873,16 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     for sc in scenarios:
         if sc.id not in completed_ids:
             scen_out.append({"id": sc.id, "scenarioChecksPassed": False, "requests": [],
+                             "frameSymbols": [],
                              "recordingVerdict": verdicts.get(sc.id), "elapsedMs": 0,
-                             "notRunReason": "burst boundary was not verified"})
+                             "notRunReason": "serial boundary was not verified"})
     receipt = {
         "schemaVersion": 1, "kind": "instrumented_campaign_non_release", "project": project, "releaseAcceptance": False,
         "instrumented": True, "signed": False, "pin": pin, "syntheticDataOnly": True, "configurationAdaptations": adaptations,
         "harnessSha256": {p.name: xcamp.sha256_file(p) for p in harness_files}, "bootMs": boot_ms,
         "durationSeconds": round(time.time() - started, 1), "notes": notes,
         "api": {"ok": api["ok"], "reason": api["reason"], "recordings": len(api["recordings"])},
-        "attribution": "burst isolated by verified recording IDs; serial routes require exact counts after the boundary",
+        "attribution": "serial routes require exact counts before the verified boundary; burst uses only later recording IDs",
         "requestsSent": len(sent_log),
         "problemClasses": problem_classes(verdicts), "scenarios": scen_out,
         "recordingsWithSource": sum(e["recordingsWithSource"] for v in verdicts.values() for e in v["expectations"]),
