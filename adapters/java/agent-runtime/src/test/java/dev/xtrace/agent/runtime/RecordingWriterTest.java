@@ -9,12 +9,15 @@ import com.google.protobuf.Message;
 import dev.xtrace.adapter.ClientException;
 import dev.xtrace.agent.bootstrap.BridgeEventKind;
 import dev.xtrace.agent.bootstrap.BridgeSink;
+import dev.xtrace.agent.runtime.line.ValueSanitizer;
+import dev.xtrace.agent.runtime.line.ValueSnapshot;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
@@ -162,6 +165,198 @@ class RecordingWriterTest {
   }
 
   private static final String REC = "00000000-0000-4000-8000-0000000000aa";
+
+  @Test
+  void unfinishedQuietRequestSendsItsStartAndEventsWithoutWaitingForABatchOrFinish()
+      throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofMillis(100));
+    try {
+      writer.start();
+      assertTrue(sink.offerStart(REC, 1, "GET", "/waiting"));
+      RecordingStarted start = transport.await(RecordingStarted.class);
+      assertEquals(1, start.getRecordingSeq());
+      assertEquals("/waiting", start.getMatchedRouteTemplate());
+      // The start itself must be sent even before the first event is enqueued.
+      assertTrue(transport.batches.isEmpty());
+      assertTrue(sink.offerEvent(REC, "request", "", BridgeEventKind.REQUEST_UPDATE,
+          "http.request GET /waiting", 2, 0));
+      EventBatch batch = transport.await(EventBatch.class);
+      assertEquals(start.getRecordingId(), batch.getRecordingId());
+      assertEquals(1, batch.getEventsCount());
+      assertEquals("request", batch.getEvents(0).getEventId());
+      assertEquals(2, batch.getEvents(0).getRecordingSeq());
+      assertTrue(transport.finishes.isEmpty());
+      assertEquals(1, sink.activeRecordings(), "streaming must not release admission");
+    } finally {
+      writer.stopIncomplete();
+      writer.close();
+    }
+  }
+
+  @Test
+  void interruptionLeavesAnOpenStreamWithObservedEventsAndNoInventedTerminalEvidence()
+      throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(1024, 1024L * 1024);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofMillis(100));
+    offerTree(sink, 450);
+    try {
+      writer.start();
+      transport.await(RecordingStarted.class);
+      int seen = 0;
+      while (seen < 451) seen += transport.await(EventBatch.class).getEventsCount();
+      writer.stopIncomplete();
+    } finally {
+      writer.close();
+    }
+    assertTrue(transport.closed.get());
+    assertTrue(writer.incompleteWasReported());
+    assertEquals(1, transport.starts.size());
+    assertTrue(transport.finishes.isEmpty(), "recovery must receive no digest or complete outcome");
+    var events = transport.batches.stream().flatMap(b -> b.getEventsList().stream()).toList();
+    assertEquals(451, events.size());
+    for (int i = 0; i < events.size(); i++) {
+      assertEquals(i + 2, events.get(i).getRecordingSeq());
+      assertEquals(i == 0 ? "" : REC + ":0", events.get(i).getParentEventId());
+      assertEquals(i == 0 ? REC + ":0" : REC + ":e" + i, events.get(i).getEventId());
+      assertFalse(events.get(i).getKind() == RecordingEventKind.RECORDING_EVENT_KIND_RESPONSE);
+    }
+    assertTrue(transport.batches.size() > 2);
+  }
+
+  @Test
+  void unfinishedValueHeavyRequestStreamsBatchesBelowTheByteBound() throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(128, 4L * 1024 * 1024);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofMillis(100));
+    writer.capturePolicy("xtrace.focused.v1");
+    List<ValueSnapshot> values = new java.util.ArrayList<>();
+    for (int i = 0; i < 24; i++) {
+      values.add(ValueSanitizer.ofRef("field" + i, ValueSnapshot.NameOrigin.DECLARED,
+          "x ".repeat(256), ValueSnapshot.Role.LOCAL, ValueSanitizer.Limits.FOCUSED));
+    }
+    var source = new SourceAttestation.SourceInfo("src/Handler.java", 10, 10, new byte[32], 2);
+    assertTrue(sink.offerStart(REC, 1, "GET", "/values"));
+    for (int i = 0; i < 50; i++) {
+      assertTrue(sink.offerLineEvent(REC, "line" + i, "", "handler", i + 2, source, values));
+    }
+    try {
+      writer.start();
+      int seen = 0;
+      while (seen < 50) seen += transport.await(EventBatch.class).getEventsCount();
+      assertTrue(transport.finishes.isEmpty());
+      assertTrue(transport.batches.size() >= 3, "byte bound must split fewer than 200 events");
+      assertTrue(transport.batches.stream().allMatch(b -> b.getEventsCount() < 50));
+      assertTrue(sink.offerFinish(REC, 1, 52, 0, 0));
+      writer.close();
+    } finally {
+      writer.close();
+    }
+    var all = transport.batches.stream().flatMap(b -> b.getEventsList().stream()).toList();
+    assertEquals(50, all.size());
+    for (int i = 0; i < all.size(); i++) assertEquals(i + 2, all.get(i).getRecordingSeq());
+    assertArrayEquals(EventDigest.compute(all.stream().map(e -> e.getEventId()).toList()),
+        transport.finishes.get(0).getEventDigest().toByteArray());
+    assertFalse(writer.incompleteWasReported());
+  }
+
+  @Test
+  void finishAfterStreamingKeepsDigestThrowIdentityAndGapsBeforeTheResponse() throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofMillis(100));
+    try {
+      assertTrue(sink.offerStart(REC, 1, "GET", "/error"));
+      assertTrue(sink.offerThrowEvent(REC, "throw", "", "handler", 2,
+          "java.lang.IllegalStateException", "password=private"));
+      writer.start();
+      transport.await(EventBatch.class);
+      assertTrue(sink.offerEvent(REC, "response", "", BridgeEventKind.RESPONSE,
+          "http.response 500", 3, 500));
+      assertTrue(sink.offerFinishWithOutcome(REC, 1, 4, 500, 7,
+          new BridgeSink.Outcome(BridgeSink.Outcome.EXCEPTION_PROPAGATED, 0,
+              "java.lang.IllegalStateException", "password=private", "throw")));
+      writer.close();
+    } finally {
+      writer.close();
+    }
+    var all = transport.batches.stream().flatMap(b -> b.getEventsList().stream()).toList();
+    assertEquals(List.of("throw", REC + ":gap", "response"),
+        all.stream().map(e -> e.getEventId()).toList());
+    for (int i = 0; i < all.size(); i++) assertEquals(i + 2, all.get(i).getRecordingSeq());
+    assertEquals(7, all.get(1).getGap().getCount());
+    assertFalse(all.get(0).getException().getSanitizedMessage().contains("private"));
+    var finish = transport.finishes.get(0);
+    assertEquals("throw", finish.getOutcome().getThrownFromEventId());
+    assertEquals(7, finish.getDropCountsByPriorityOrDefault(1, 0));
+    assertEquals(4, finish.getFinalRecordingSeq());
+    assertArrayEquals(EventDigest.compute(all.stream().map(e -> e.getEventId()).toList()),
+        finish.getEventDigest().toByteArray());
+    assertFalse(writer.incompleteWasReported());
+  }
+
+  @Test
+  void finishWithAnAlreadyStreamedTailUsesItsSequenceAndDigestWithoutAnEmptyBatch()
+      throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofMillis(100));
+    try {
+      assertTrue(sink.offerStart(REC, 1, "GET", "/waiting"));
+      assertTrue(sink.offerEvent(REC, "request", "", BridgeEventKind.REQUEST_UPDATE,
+          "http.request GET /waiting", 2, 0));
+      writer.start();
+      transport.await(EventBatch.class);
+      assertTrue(sink.offerFinish(REC, 1, 3, 0, 0));
+      writer.close();
+    } finally {
+      writer.close();
+    }
+    assertEquals(1, transport.batches.size());
+    assertEquals(1, transport.finishes.size());
+    assertEquals(2, transport.finishes.get(0).getFinalRecordingSeq());
+    assertArrayEquals(EventDigest.compute(List.of("request")),
+        transport.finishes.get(0).getEventDigest().toByteArray());
+    assertFalse(writer.incompleteWasReported());
+  }
+
+  @Test
+  void streamingReleasesBufferedMemoryBeforeFinishAndKeepsTheGapFrontier() throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofMillis(100), 256);
+    try {
+      assertTrue(sink.offerStart(REC, 1, "GET", "/waiting"));
+      writer.start();
+      for (int i = 0; i < 3; i++) {
+        assertTrue(sink.offerEvent(REC, "event" + i, "", BridgeEventKind.FRAME_ENTER,
+            "handler", 2 + i, 0));
+        assertEquals("event" + i, transport.await(EventBatch.class).getEvents(0).getEventId());
+      }
+      assertTrue(sink.offerFinish(REC, 1, 5, 0, 1));
+      writer.close();
+    } finally {
+      writer.close();
+    }
+    var all = transport.batches.stream().flatMap(b -> b.getEventsList().stream()).toList();
+    assertEquals(List.of("event0", "event1", "event2", REC + ":gap"),
+        all.stream().map(e -> e.getEventId()).toList());
+    assertEquals("event2", all.get(3).getParentEventId());
+    assertEquals(4, all.get(3).getMonotonicNs());
+    var finish = transport.finishes.get(0);
+    assertEquals(1, finish.getDropCountsByPriorityOrDefault(1, 0));
+    assertArrayEquals(EventDigest.compute(all.stream().map(e -> e.getEventId()).toList()),
+        finish.getEventDigest().toByteArray());
+    assertFalse(writer.incompleteWasReported());
+  }
 
   private static void offerTree(RuntimeBridgeSink sink, int frames) {
     assertTrue(sink.offerStart(REC, 1, "GET", "/big"));
@@ -525,10 +720,23 @@ class RecordingWriterTest {
     private final List<RecordingStarted> starts = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final List<RecordingFinished> finishes = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final List<Health> health = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private final LinkedBlockingQueue<Message> sent = new LinkedBlockingQueue<>();
+    private final java.util.Set<String> messageIds = new java.util.HashSet<>();
+
+    private <T extends Message> T await(Class<T> type) throws InterruptedException {
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      Message payload;
+      while ((payload = sent.poll(Math.max(0, deadline - System.nanoTime()),
+          TimeUnit.NANOSECONDS)) != null) {
+        if (type.isInstance(payload)) return type.cast(payload);
+      }
+      throw new AssertionError("writer did not send " + type.getSimpleName());
+    }
 
     @Override
     public Ack send(String messageId, String correlationToken, Message payload)
         throws ClientException {
+      assertTrue(messageIds.add(messageId), "each streamed batch needs a distinct message identity");
       Ack.Builder ack =
           Ack.newBuilder()
               .setDurability(AckDurability.ACK_DURABILITY_STAGED)
@@ -540,6 +748,8 @@ class RecordingWriterTest {
         // Daemon-advertised limits: 256 events per batch, 1 MiB per envelope.
         assertTrue(batch.getEventsCount() <= 256, "batch event bound");
         assertTrue(batch.getSerializedSize() <= 1024 * 1024 - 4096, "batch byte bound");
+        assertTrue(batch.getEventsCount() <= RecordingWriter.MAX_BATCH_EVENTS);
+        assertTrue(batch.getSerializedSize() <= RecordingWriter.MAX_BATCH_BYTES);
         batches.add(batch);
         long sequence = batch.getEvents(batch.getEventsCount() - 1).getRecordingSeq();
         ack.putHighestContiguousRecordingSeq(uuid(batch.getRecordingId().toByteArray()), sequence);
@@ -552,6 +762,7 @@ class RecordingWriterTest {
       } else if (!(payload instanceof CapabilitySet)) {
         throw new ClientException("XTR-JAVA-TEST", "unexpected payload");
       }
+      sent.add(payload);
       return ack.build();
     }
 
