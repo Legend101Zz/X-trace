@@ -29,7 +29,7 @@ public class SpringMvcBridgeTest {
   }
 
   @Test
-  void outerFilterSeesPostChainStatusAndOwnsCompletionAcrossNestedServlets() {
+  void outerFilterFinalizesBufferedPostChain304AfterNestedServletsExit() {
     Request request = new Request("GET", "/post-chain");
     Response response = new Response(200);
     SpringMvcBridge.servletEnter(); // outer filter
@@ -44,7 +44,7 @@ public class SpringMvcBridgeTest {
     SpringMvcBridge.servletEnd(request, response, null);
     assertEquals(0, sink.finishes, "inner service and filter must not close the root");
     response.status = 304;
-    response.committed = true;
+    assertFalse(response.isCommitted());
     SpringMvcBridge.servletEnd(request, response, null);
     assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
     assertEquals(304, sink.outcome.httpStatus());
@@ -55,7 +55,7 @@ public class SpringMvcBridgeTest {
   }
 
   @Test
-  void uncommittedOuterStatusIsProvisionalEvenOnNormalReturn() {
+  void bufferedOuterStatusIsFinalOnNormalReturnWithoutPendingError() {
     Request request = new Request("GET", "/buffered");
     Response response = new Response(210);
     SpringMvcBridge.servletEnter();
@@ -63,9 +63,13 @@ public class SpringMvcBridgeTest {
     SpringMvcBridge.end(request, response, null);
     assertEquals(0, sink.finishes);
     SpringMvcBridge.servletEnd(request, response, null);
-    assertProvisional(210);
+    assertFalse(response.isCommitted());
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+    assertEquals(210, sink.outcome.httpStatus());
+    assertEquals(210, sink.status);
+    assertEquals("http.response 210", sink.symbols.get(1));
     assertEquals(1, sink.finishes);
-    assertEquals(0, sink.dropped, "an unobserved outcome is not event loss");
+    assertEquals(0, sink.dropped, "a buffered response is not event loss");
   }
 
   @Test
@@ -88,6 +92,32 @@ public class SpringMvcBridgeTest {
     assertEquals(1, sink.starts());
     assertEquals(1, sink.finishes);
     assertProvisional(418);
+  }
+
+  @Test
+  void handledInnerServletExceptionDoesNotMakeNormalOuterReturnProvisional() {
+    Request request = new Request("GET", "/handled-inner");
+    Response response = new Response(200);
+    IllegalStateException failure = new IllegalStateException("handled by outer filter");
+    SpringMvcBridge.servletEnter();
+    SpringMvcBridge.servletEnter();
+    SpringMvcBridge.dispatchEnter();
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    SpringMvcBridge.end(request, response, failure);
+    SpringMvcBridge.dispatchEnd(response, failure);
+    SpringMvcBridge.servletEnd(request, response, failure);
+    assertEquals(0, sink.finishes);
+    assertTrue(BootstrapBridge.hasContext());
+    response.status = 409;
+    SpringMvcBridge.servletEnd(request, response, null);
+    assertFalse(response.isCommitted());
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+    assertEquals(409, sink.outcome.httpStatus());
+    assertEquals(409, sink.status);
+    assertEquals("http.response 409", sink.symbols.get(1));
+    assertEquals(1, sink.finishes);
+    assertEquals(0, sink.dropped);
+    assertFalse(BootstrapBridge.hasContext());
   }
 
   @Test
@@ -153,13 +183,16 @@ public class SpringMvcBridgeTest {
   }
 
   @Test
-  void unreadableCommitStateCannotMakeAStatusFinal() {
+  void normalOuterReturnFinalizesReadableStatusWithoutACommitProbe() {
     Request request = new Request("GET", "/unknown-commit");
     SpringMvcBridge.servletEnter();
     assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
     SpringMvcBridge.end(request, new Response(200), null);
     SpringMvcBridge.servletEnd(request, new MissingCommitResponse(), null);
-    assertProvisional(209);
+    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
+    assertEquals(209, sink.outcome.httpStatus());
+    assertEquals(209, sink.status);
+    assertEquals("http.response 209", sink.symbols.get(1));
     assertEquals(1, sink.finishes);
   }
 
@@ -180,6 +213,7 @@ public class SpringMvcBridgeTest {
     SpringMvcBridge.servletEnd(request, response, null);
     assertEquals(BridgeSink.Outcome.UNOBSERVED, sink.outcome.kind());
     assertEquals(0, sink.status);
+    assertProvisional(200);
     assertEquals(1, sink.finishes);
     assertFalse(BootstrapBridge.hasContext());
   }
@@ -471,7 +505,7 @@ public class SpringMvcBridgeTest {
   }
 
   @Test
-  void readableCommittedStatusSurvivesAnExceptionWithoutInventingEventLoss() {
+  void committedStatusStaysProvisionalWhenAnExceptionEscapesTheOuterServlet() {
     for (int status : new int[] {200, 302, 503}) {
       SpringMvcBridge.servletEnter();
       SpringMvcBridge.dispatchEnter();
@@ -482,15 +516,17 @@ public class SpringMvcBridgeTest {
       SpringMvcBridge.end(request, response, null);
       SpringMvcBridge.dispatchEnd(response, new IllegalStateException("after commit"));
       SpringMvcBridge.servletEnd(request, response, new IllegalStateException("after commit"));
-      assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
-      assertEquals(status, sink.outcome.httpStatus());
+      assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+      assertEquals(0, sink.outcome.httpStatus());
+      assertEquals(0, sink.status);
+      assertTrue(sink.symbols.contains(provisionalLabel(status)));
       assertEquals(0, sink.dropped);
       assertFalse(BootstrapBridge.hasContext());
     }
   }
 
   @Test
-  void handlerThrowAfterCommitKeepsItsReadableStatusAtServletExit() {
+  void handlerThrowAfterCommitRemainsProvisionalWhenItEscapesTheOuterServlet() {
     SpringMvcBridge.servletEnter();
     SpringMvcBridge.dispatchEnter();
     Request request = new Request("GET", "/handler-committed");
@@ -503,13 +539,15 @@ public class SpringMvcBridgeTest {
     assertTrue(BootstrapBridge.awaitingResolution());
     SpringMvcBridge.dispatchEnd(response, failure);
     SpringMvcBridge.servletEnd(request, response, failure);
-    assertEquals(BridgeSink.Outcome.RESPONDED, sink.outcome.kind());
-    assertEquals(201, sink.status);
+    assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+    assertEquals(0, sink.status);
+    assertEquals(0, sink.outcome.httpStatus());
+    assertTrue(sink.symbols.contains(provisionalLabel(201)));
     assertEquals(0, sink.dropped);
   }
 
   @Test
-  void uncommittedErrorStatusIsNotClaimedWhenTheOuterServletThrows() {
+  void bufferedErrorStatusStaysProvisionalWhenAnExceptionEscapesTheOuterServlet() {
     SpringMvcBridge.servletEnter();
     SpringMvcBridge.dispatchEnter();
     Request request = new Request("GET", "/before-commit");
@@ -524,6 +562,7 @@ public class SpringMvcBridgeTest {
     SpringMvcBridge.servletEnd(request, response, failure);
     assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
     assertEquals(0, sink.status);
+    assertEquals(0, sink.outcome.httpStatus());
     assertTrue(sink.symbols.contains(provisionalLabel(503)));
     assertTrue(sink.outcome.thrownFromEventId() != null, "same observed throwable retains its link");
     assertFalse(BootstrapBridge.hasContext());
@@ -541,7 +580,7 @@ public class SpringMvcBridgeTest {
   }
 
   @Test
-  void resolverFailureWaitsForOwningDispatchAndReadsCommittedStatusThere() {
+  void resolverFailureWaitsForOuterServletExitAndKeepsCommittedStatusProvisional() {
     SpringMvcBridge.servletEnter();
     SpringMvcBridge.dispatchEnter();
     Request request = new Request("GET", "/resolver-failure");
@@ -555,7 +594,10 @@ public class SpringMvcBridgeTest {
     response.committed = true;
     SpringMvcBridge.dispatchEnd(response, failure);
     SpringMvcBridge.servletEnd(request, response, failure);
-    assertEquals(409, sink.outcome.httpStatus());
+    assertEquals(0, sink.outcome.httpStatus());
+    assertEquals(0, sink.status);
+    assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+    assertTrue(sink.symbols.contains(provisionalLabel(409)));
     assertEquals(0, sink.dropped);
   }
 

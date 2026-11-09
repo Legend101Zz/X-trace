@@ -1,6 +1,7 @@
 //! Real Spring MVC dispatch lifecycle and source identity through the packaged agent:
-//! committed status is observed at the outer standard servlet boundary, after post-chain filters.
-//! Buffered responses and pending container error handling retain only provisional status evidence.
+//! Final status is observed at normal outer standard servlet exit, after post-chain filters,
+//! even for buffered responses. Pending container errors, escaping exceptions and asynchronous
+//! responses retain only provisional status evidence.
 //! Application frames carry the matched `.java` source file and line even when the JVM starts
 //! from a directory unrelated to the repository.
 
@@ -185,16 +186,11 @@ fn assert_complete_single_recording(captured: &Captured) {
 }
 
 #[test]
-fn forward_and_include_keep_the_outer_root_through_the_rest_of_view_rendering() {
+fn forward_and_include_keep_the_outer_root_until_the_final_rendered_status() {
     for (path, status) in [("forward", 202), ("include", 207)] {
         let captured = run_request("GET", &format!("/__fixture/lifecycle/{path}"), status);
         assert_complete_single_recording(&captured);
-        if path == "forward" {
-            assert_eq!(captured.detail["outcome"]["kind"], "responded");
-            assert_eq!(captured.detail["outcome"]["httpStatus"], status);
-        } else {
-            assert_provisional(&captured, status);
-        }
+        assert_final_status(&captured, status);
         for symbol in ["LifecycleController.inner", "LifecycleController.afterNested"] {
             assert!(
                 captured
@@ -225,10 +221,10 @@ fn forward_and_include_keep_the_outer_root_through_the_rest_of_view_rendering() 
 }
 
 #[test]
-fn mapped_exception_retains_the_uncommitted_rendered_error_view_status_as_provisional() {
+fn resolved_exception_has_the_final_buffered_error_view_status() {
     let captured = run_request("GET", "/__fixture/lifecycle/mapped", 422);
     assert_complete_single_recording(&captured);
-    assert_provisional(&captured, 422);
+    assert_final_status(&captured, 422);
     assert!(captured.events.iter().any(|event| {
         event["symbol"] == "LifecycleController.mapped" && event["kind"] == "frame_throw"
     }));
@@ -240,13 +236,14 @@ fn async_is_one_complete_recording_with_an_unobserved_outcome() {
     assert_complete_single_recording(&captured);
     assert_eq!(captured.detail["outcome"]["kind"], "unobserved");
     assert!(captured.detail["outcome"]["httpStatus"].is_null());
+    assert_provisional(&captured, 200);
 }
 
 #[test]
-fn post_chain_filter_status_is_observed_at_outer_servlet_exit_as_provisional() {
+fn post_chain_filter_status_is_final_304_at_outer_servlet_exit() {
     let captured = run_request("GET", "/__fixture/lifecycle/post-filter", 304);
     assert_complete_single_recording(&captured);
-    assert_provisional(&captured, 304);
+    assert_final_status(&captured, 304);
 }
 
 #[test]
@@ -257,13 +254,33 @@ fn pending_container_error_handling_keeps_status_provisional_without_a_second_re
 }
 
 #[test]
-fn record_session_captures_a_real_mapped_exception_with_the_dispatch_hook_live() {
+fn record_session_captures_the_final_buffered_status_of_a_resolved_exception() {
     let captured = run_request_with_launcher("GET", "/__fixture/lifecycle/mapped", 422, "record");
     assert_complete_single_recording(&captured);
-    assert_provisional(&captured, 422);
+    assert_final_status(&captured, 422);
     assert!(captured.events.iter().any(|event| {
         event["symbol"] == "LifecycleController.mapped" && event["kind"] == "frame_throw"
     }));
+}
+
+fn assert_final_status(captured: &Captured, status: u16) {
+    assert_eq!(captured.detail["outcome"]["kind"], "responded");
+    assert_eq!(captured.detail["outcome"]["httpStatus"], status);
+    let label = format!("http.response {status}");
+    assert!(
+        captured.events.iter().any(|event| event["symbol"] == label),
+        "replay must retain the final response status"
+    );
+    let wire_response = captured
+        .wire_events
+        .iter()
+        .find(|event| event.kind == RecordingEventKind::Response as i32)
+        .expect("persisted response event");
+    assert_eq!(wire_response.symbol, label);
+    assert_eq!(
+        wire_response.interaction.as_ref().expect("response interaction").path,
+        status.to_string()
+    );
 }
 
 fn assert_provisional(captured: &Captured, status: u16) {
@@ -298,10 +315,10 @@ fn committed_outer_servlet_status_is_authoritative() {
 }
 
 #[test]
-fn buffered_outer_servlet_status_is_provisional() {
+fn buffered_outer_servlet_status_is_final_on_normal_return_without_pending_error() {
     let captured = run_request("GET", "/__fixture/boundary/uncommitted", 210);
     assert_complete_single_recording(&captured);
-    assert_provisional(&captured, 210);
+    assert_final_status(&captured, 210);
 }
 
 #[test]

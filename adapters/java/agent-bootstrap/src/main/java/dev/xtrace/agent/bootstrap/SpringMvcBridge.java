@@ -28,11 +28,11 @@ public final class SpringMvcBridge {
           };
         }
       };
-  private static final ClassValue<Method[]> RESPONSE_METHODS =
+  private static final ClassValue<Method> RESPONSE_STATUS =
       new ClassValue<>() {
         @Override
-        protected Method[] computeValue(Class<?> type) {
-          return new Method[] {publicMethod(type, "getStatus"), publicMethod(type, "isCommitted")};
+        protected Method computeValue(Class<?> type) {
+          return publicMethod(type, "getStatus");
         }
       };
   private static final ClassValue<Method[]> HANDLER_METHODS =
@@ -80,7 +80,11 @@ public final class SpringMvcBridge {
     if (state != null) state.errorPending = true;
   }
 
-  /** Closes at the outermost standard servlet frame, after all post-chain filter work. */
+  /**
+   * Closes after all post-chain filter work at the outermost standard servlet frame. A buffered
+   * status is final on normal return unless sendError is pending. Escaping exceptions and
+   * asynchronous processing leave only provisional evidence, regardless of commit state.
+   */
   public static void servletEnd(Object request, Object response, Throwable thrown) {
     ServletState state = SERVLET.get();
     if (state == null) return;
@@ -88,9 +92,9 @@ public final class SpringMvcBridge {
     try {
       if (state.recorded && BootstrapBridge.hasContext()) {
         if (state.asyncStarted || (request != null && asyncStarted(request))) {
-          BootstrapBridge.requestEnd(0, (Throwable) null);
+          BootstrapBridge.provisionalRequestEnd(status(response), null);
         } else {
-          finish(response, thrown, !state.errorPending && committed(response));
+          finish(response, thrown, !state.errorPending && thrown == null);
         }
       }
     } finally {
@@ -233,16 +237,6 @@ public final class SpringMvcBridge {
     }
   }
 
-  private static boolean committed(Object response) {
-    if (response == null) return false;
-    try {
-      Method method = RESPONSE_METHODS.get(response.getClass())[1];
-      return method != null && Boolean.TRUE.equals(method.invoke(response));
-    } catch (ReflectiveOperationException | RuntimeException ignored) {
-      return false;
-    }
-  }
-
   static boolean asyncStarted(Object request) {
     try {
       Method method = REQUEST_METHODS.get(request.getClass())[2];
@@ -296,7 +290,7 @@ public final class SpringMvcBridge {
   static int status(Object response) {
     if (response == null) return 0;
     try {
-      Method method = RESPONSE_METHODS.get(response.getClass())[0];
+      Method method = RESPONSE_STATUS.get(response.getClass());
       Object value = method == null ? null : method.invoke(response);
       return value instanceof Integer status ? status : 0;
     } catch (ReflectiveOperationException | RuntimeException ignored) {

@@ -555,8 +555,8 @@ public final class BootstrapBridge {
           sanitizedStatus)) {
         context.dropped++;
       }
-      // A readable committed status can coexist with an escaping exception. This is an
-      // observation, not a dropped event or proof that exception resolution succeeded.
+      // The caller decides whether a status is final. Pending container error handling or an
+      // escaping servlet exception supplies only provisional evidence, not a dropped event.
       safeFinish(sink, context, sanitizedStatus, outcome(context, sanitizedStatus, thrown));
     } finally {
       CONTEXT.remove();
@@ -568,7 +568,7 @@ public final class BootstrapBridge {
     String thrownFrom = thrown == UNKNOWN_THROWABLE || thrown == context.lastThrown
         ? context.lastThrowEventId : "";
     if (status != 0) {
-      // A status was observed at the caller's seam, even if an exception escaped after commit.
+      // The caller supplied a final status, including buffered responses at normal servlet exit.
       return new BridgeSink.Outcome(BridgeSink.Outcome.RESPONDED, status, null, null, null);
     }
     if (thrown == null) {
