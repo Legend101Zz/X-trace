@@ -12,7 +12,7 @@ ALLOW = [
     "kill 1234", "kill $PID", 'kill -TERM "$pid"',
     'git commit -m "ban sudo and pkill"', "grep -rn pkill docs/",
     'echo "rm -rf /"', "git push origin fix-f", "git push -u origin agent-ready",
-    "rm -rf target/foo", "rm -rf /Volumes/XTraceCache/xt/target/abc",
+    "rm -rf target/foo", "rm -rf /Volumes/Cache/xt/target/abc",
     "cargo test -p xtrace-domain", "cat > f <<'EOF'\ndon't\nEOF",
     'echo ";" pkill x', 'echo "|" sudo ls', 'echo "\n" killall Dock',
     r"echo \; pkill x", 'printf "%s" "$(pgrep x)"',

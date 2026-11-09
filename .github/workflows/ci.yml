@@ -311,7 +311,7 @@ jobs:
       - name: Test dev tools, command guard and workflow lint
         run: |
           set -euo pipefail
-          root="${RUNNER_TEMP:?}/d"
+          root="${RUNNER_TEMP:?}/xd"
           mkdir -m 700 "$root"
           # The env tests also need an owner-only ancestor within the 24-byte scratch cap.
           chmod 700 "$RUNNER_TEMP"
