@@ -10,9 +10,9 @@
       "implementationOwner": "root",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     },
@@ -22,12 +22,12 @@
       "dependencies": [
         "P00"
       ],
-      "implementationOwner": "Luna High Java/shared lane",
+      "implementationOwner": "worker Java/shared lane",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     },
@@ -37,12 +37,12 @@
       "dependencies": [
         "P01"
       ],
-      "implementationOwner": "Luna High shared lane",
+      "implementationOwner": "worker shared lane",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     },
@@ -52,12 +52,12 @@
       "dependencies": [
         "P02"
       ],
-      "implementationOwner": "Luna High shared/catalog lane",
+      "implementationOwner": "worker shared/catalog lane",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     },
@@ -67,12 +67,12 @@
       "dependencies": [
         "P03"
       ],
-      "implementationOwner": "Luna High Java lane",
+      "implementationOwner": "worker Java lane",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     },
@@ -82,12 +82,12 @@
       "dependencies": [
         "P03"
       ],
-      "implementationOwner": "Luna High Node lane",
+      "implementationOwner": "worker Node lane",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     },
@@ -98,12 +98,12 @@
         "P04",
         "P05"
       ],
-      "implementationOwner": "Luna High experience lane",
+      "implementationOwner": "worker experience lane",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     },
@@ -113,12 +113,12 @@
       "dependencies": [
         "P06"
       ],
-      "implementationOwner": "Luna High workflow lane",
+      "implementationOwner": "worker workflow lane",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     },
@@ -131,12 +131,12 @@
         "P06",
         "P07"
       ],
-      "implementationOwner": "Luna High packaging lane",
+      "implementationOwner": "worker packaging lane",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     },
@@ -146,12 +146,12 @@
       "dependencies": [
         "P07B"
       ],
-      "implementationOwner": "Luna High campaign lanes",
+      "implementationOwner": "worker campaign lanes",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     },
@@ -161,12 +161,12 @@
       "dependencies": [
         "P08"
       ],
-      "implementationOwner": "Luna High release lane",
+      "implementationOwner": "worker release lane",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     },
@@ -179,9 +179,9 @@
       "implementationOwner": "root",
       "state": "pending",
       "reviewers": [
-        "GPT-6 Sol High architecture",
-        "GPT-6 Sol High security/privacy",
-        "GPT-6 Sol High build/integration"
+        "independent architecture reviewer (different model from the writer)",
+        "independent security/privacy reviewer (different model from the writer)",
+        "independent build/integration reviewer (different model from the writer)"
       ],
       "acceptanceRequired": true
     }
@@ -262,7 +262,7 @@
     "Restricted build requires fresh target, restricted PATH and verified absent system protoc.",
     "Gradle working directory is adapters/java.",
     "Entire committed diff is checked against pinned phase base, never floating origin/main after merge.",
-    "Each phase adds applicable exact web/Node/schema/conformance/real journey/privacy/failure gates.",
+    "Each phase adds applicable exact web/Node/schema/conformance/real journey/privacy/failure gates on GitHub Actions under ADR 0012; local checks stay fast. Review coverage and merge checks scale to risk under ADR 0012; listed reviewer roles apply when required, with full coverage for release candidates.",
     "Preparation may proceed in isolated language ownership; acceptance respects dependencies."
   ]
 }

@@ -485,12 +485,12 @@
     },
     {
       "id": "REVIEWS-EXACT",
-      "requirement": "Pinned separate Sol architecture/security and build/integration reviews; root complete actual diff; all exact gates/CI/postmerge",
+      "requirement": "Independent architecture/security and build/integration reviews of exact release candidate, each by a model other than the writer; orchestrator complete diff review; all exact gates/CI/postmerge",
       "approvedSlice": "Every phase",
       "mandatory": true,
       "state": "blocked",
       "receipts": [],
-      "stateNote": "Needs owner approval to clear dead lease C2-004 for the leased macOS 23-gate floor, and trust config for signed receipts. Done: wave-1 review by Sonnet 5.5 reviewers, not the pinned Sol reviews this row requires (40 survivors: all 6 blockers fixed, about 20 of the 40 not confirmed fixed, list in NEXT-RUN-PROMPT section 6); Linux floors green on the candidate dffeb8d (ci 37942590330) and the parent 1b672dc. The final exact review of dffeb8d was still running when checked. Remaining: pinned Sol reviews of final diff, exact-sha gates incl. the leased macOS floor, post-merge CI. Size M. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): the leased macOS 23-gate floor runs again (R3J-a6ecb76-1, 23/23 on the candidate); the dead-lease note above is out of date. Exact final release reviews are still pending (P10)."
+      "stateNote": "Needs owner approval to clear dead lease C2-004 for the leased macOS 23-gate floor, and trust config for signed receipts. Done: wave-1 review by Sonnet 5.5 reviewers, not the pinned Sol reviews this row requires (40 survivors: all 6 blockers fixed, about 20 of the 40 not confirmed fixed, list in NEXT-RUN-PROMPT section 6); Linux floors green on the candidate dffeb8d (ci 37942590330) and the parent 1b672dc. The final exact review of dffeb8d was still running when checked. Remaining: pinned Sol reviews of final diff, exact-sha gates incl. the leased macOS floor, post-merge CI. Size M. rc-3 (merged to main as a558f4d, candidate a6ecb76, 2026-10-10): the leased macOS 23-gate floor runs again (R3J-a6ecb76-1, 23/23 on the candidate); the dead-lease note above is out of date. Exact final release reviews are still pending (P10). 2026-11-09: ADR 0012 replaced the pinned Sol reviews with independent reviews by a model other than the writer, and dropped the leased macOS floor as a merge requirement."
     },
     {
       "id": "DISTRIBUTED-RECHECK",

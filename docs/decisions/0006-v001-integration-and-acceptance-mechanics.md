@@ -1,6 +1,7 @@
 # ADR 0006: v0.01 integration and acceptance mechanics
 
 - Status: Accepted (root decision 2026-10-04)
+- Amended by: ADR 0012 (2026-11-09): merge rules scaled to risk; the leased macOS floor is no longer a merge requirement.
 - Amended by: the addendum of 2026-10-10 at the end (the other-UID negative of §2
   item 3 before the broker exists), and the second 2026-10-10 addendum (owner:
   no hosted macOS CI, no macOS signing or notarization)
