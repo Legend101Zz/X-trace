@@ -48,6 +48,25 @@ describe('source binding states render distinct strings', () => {
 
 describe('outcome banner', () => {
   const base = { completion: 'complete', incompleteEvidence: [], durationNs: null };
+  const runtimeSessionId = '018f0000-0000-7000-8000-000000000021';
+  it.each([
+    [null, 'agent capacity rejections not observed'],
+    ['0', '0 requests were not recorded due to agent capacity (cumulative as last reported)'],
+    ['18446744073709551615', '18446744073709551615 requests were not recorded due to agent capacity (cumulative as last reported)'],
+  ])('keeps session count %s separate from recording completion', (rejectedRequests, message) => {
+    const model = outcomeBanner({ ...base, sessionContext: { runtimeSessionId, rejectedRequests } });
+    expect(model.tone).toBe('complete');
+    expect(model.headline).toBe('Recording complete: finish evidence was verified.');
+    expect(model.lines).toContain(`Session capture context (session ${runtimeSessionId}): ${message}`);
+    expect(model.lines.some((line) => line.startsWith('Persisted incomplete evidence:'))).toBe(false);
+  });
+  it('preserves recording gaps separately from positive session rejections', () => {
+    const model = outcomeBanner({ ...base, completion: 'partial', incompleteEvidence: ['gap_event_sequence:123'], sessionContext: { runtimeSessionId, rejectedRequests: '7' } });
+    expect(model.tone).toBe('partial');
+    expect(model.lines).toContain('Persisted incomplete evidence: gap_event_sequence:123');
+    expect(model.lines).toContain(`Session capture context (session ${runtimeSessionId}): 7 requests were not recorded due to agent capacity (cumulative as last reported)`);
+    expect(model.lines.filter((line) => line.startsWith('Persisted incomplete evidence:'))).toHaveLength(1);
+  });
   it('labels duration as adapter-observed, never as verified', () => {
     const model = outcomeBanner({ ...base, durationNs: '20' });
     expect(model.lines.join('\n')).toContain('Adapter-observed duration 20 ns (measured by the adapter, not verified by X-trace)');

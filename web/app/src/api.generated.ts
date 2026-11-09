@@ -254,6 +254,7 @@ export interface components {
             firstSequence: string | null;
             lastSequence: string | null;
             incompleteEvidence: string[];
+            sessionContext: components["schemas"]["SessionContext"];
             /** Format: uuid */
             operationId: string | null;
             /** @enum {string|null} */

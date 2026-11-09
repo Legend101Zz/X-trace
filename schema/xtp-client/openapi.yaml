@@ -529,7 +529,7 @@ components:
         nextCursor: { type: [string, 'null'], maxLength: 2048 }
     ObservedRecording:
       type: object
-      required: [recordingId, status, completion, openedAt, segmentCount, eventCount, firstSequence, lastSequence, incompleteEvidence, operationId, observationPolicy, unmatchedReason]
+      required: [recordingId, status, completion, openedAt, segmentCount, eventCount, firstSequence, lastSequence, incompleteEvidence, sessionContext, operationId, observationPolicy, unmatchedReason]
       properties:
         recordingId: { type: string, format: uuid }
         status: { type: string, enum: [recording, finalizing, complete, partial, invalid] }
@@ -540,6 +540,7 @@ components:
         firstSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
         lastSequence: { type: [string, 'null'], pattern: '^[0-9]+$' }
         incompleteEvidence: { type: array, items: { type: string } }
+        sessionContext: { $ref: '#/components/schemas/SessionContext' }
         operationId: { type: [string, 'null'], format: uuid }
         observationPolicy: { type: [string, 'null'], enum: [spring-orders-v1, null] }
         unmatchedReason:
