@@ -2287,7 +2287,10 @@ class _RunnerProcesses:
         # children may belong to launchd now; never signal their numeric pids.
         for fixture in self.fixtures.values():
             for (_start_r, start_w), _ready, _exit_pipe in fixture["channels"]:
-                self.close_fd(start_w)
+                try:
+                    self.close_fd(start_w)
+                except BaseException as exc:
+                    errors.append(exc)
         for pid, process in self.processes.items():
             try:
                 if owned_unreaped(process):
@@ -3871,29 +3874,38 @@ class RunnerTests(unittest.TestCase):
             ])
 
     def real_lsof_probe(self, *, oversized: bool) -> tuple[run_gates.LsofProbe, subprocess.Popen]:
-        """Run the production probe with real pipes/signals, after an explicit handshake."""
+        """Run the production probe with real pipes/signals.
+
+        The oversized probe writes only after an explicit handshake. The stalled probe
+        has no handshake: as on origin/main, nothing may block inside its 0.15 s budget.
+        """
         ready_r, ready_w = self.processes.pipe()
         release_r, release_w = self.processes.pipe()
-        script = "\n".join((
-            "import os, select, signal, sys",
-            f"signal.alarm({int(_RUNNER_SAFETY_SECONDS)})",
+        handshake = [
             f"os.write({ready_w}, b'r')", f"os.close({ready_w})",
             f"assert select.select([{release_r}], [], [], {_RUNNER_SAFETY_SECONDS})[0]",
             f"assert os.read({release_r}, 1) == b'x'", f"os.close({release_r})",
-            "sys.stdout.buffer.write(b'x' * 2000000); sys.stdout.buffer.flush()" if oversized else "pass",
+            "sys.stdout.buffer.write(b'x' * 2000000); sys.stdout.buffer.flush()",
+        ] if oversized else []
+        script = "\n".join([
+            "import os, select, signal, sys",
+            f"signal.alarm({int(_RUNNER_SAFETY_SECONDS)})",
+            *handshake,
             "signal.pause()",
-        ))
+        ])
         spawned: list[subprocess.Popen] = []
 
         def launch(argv: Any, **kwargs: Any) -> subprocess.Popen:
-            kwargs["pass_fds"] = (ready_w, release_r)
+            if oversized:
+                kwargs["pass_fds"] = (ready_w, release_r)
             process = self.processes.launch(argv, **kwargs)
-            spawned.append(process)  # Also registered centrally, before the readiness read.
+            spawned.append(process)  # Also registered centrally, before any readiness read.
             self.processes.close_fd(ready_w)
             self.processes.close_fd(release_r)
-            self.assertEqual(self.processes.byte(ready_r), b'r')
+            if oversized:
+                self.assertEqual(self.processes.byte(ready_r), b'r')
+                os.write(release_w, b'x')
             self.processes.close_fd(ready_r)
-            os.write(release_w, b'x')
             self.processes.close_fd(release_w)
             return process
 
