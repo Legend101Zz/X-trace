@@ -7,13 +7,17 @@ import dev.xtrace.adapter.XtpSession;
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
 import dev.xtrace.agent.bootstrap.BridgeEventKind;
 import dev.xtrace.agent.bootstrap.BridgeSink;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.bouncycastle.crypto.digests.Blake3Digest;
 import xtp.agent.v1.CapabilityOuterClass.Capability;
 import xtp.agent.v1.CapabilityOuterClass.CapabilitySet;
 import xtp.agent.v1.CapabilityOuterClass.SourceRange;
@@ -116,6 +120,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   @Override
   public void run() {
     try {
+      int signalsSinceFlush = 0;
       while (!stopping.get()) {
         observeIncompleteSignal();
         reportRejectedStarts();
@@ -126,6 +131,12 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         }
         QueueSignal signal = queue.poll(POLL_INTERVAL);
         if (signal != null) accept(signal);
+        // A quiet request must not wait for Finish or for its own batch to fill. Bound the
+        // drain too, so traffic from other requests cannot indefinitely delay its events.
+        if (signal == null || ++signalsSinceFlush >= MAX_BATCH_EVENTS) {
+          for (PendingRecording recording : recordings.values()) flush(recording, false);
+          signalsSinceFlush = 0;
+        }
       }
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
@@ -155,7 +166,9 @@ final class RecordingWriter implements AutoCloseable, Runnable {
           + BoundedEventQueue.MAX_METADATA_RECORDINGS) {
         throw new ClientException("XTR-JAVA-RECORDING", "recording admission invariant violated");
       }
-      recordings.put(start.recordingId(), new PendingRecording(start));
+      PendingRecording recording = new PendingRecording(start);
+      recordings.put(start.recordingId(), recording);
+      sendStart(recording);
     } else if (signal instanceof QueueSignal.Event event) {
       PendingRecording recording = recordings.get(event.recordingId());
       if (recording == null) {
@@ -164,12 +177,22 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       int cap = eventCap(capturePolicyId);
       int limit = closing(event.kind()) ? cap - GAP_RESERVE : cap - CLOSING_RESERVE;
       long bytes = Math.max(128, event.estimatedBytes());
-      if (recording.start.metadataOnly() || recording.events.size() >= limit) {
+      if (recording.start.metadataOnly() || recording.acceptedEvents >= limit) {
         recording.writerDrops = saturatingAdd(recording.writerDrops, 1);
       } else if (pendingEventBytes <= maxPendingEventBytes - bytes) {
         recording.events.add(event);
-        recording.eventBytes += bytes;
+        if (event.kind() != BridgeEventKind.FRAME_THROW) recording.eventBytes += bytes;
         pendingEventBytes += bytes;
+        recording.acceptedEvents++;
+        // Retain only throw identities needed by terminal outcomes, charging their original
+        // allocation against the same global budget even after their payloads are sent.
+        if (event.kind() == BridgeEventKind.FRAME_THROW) {
+          recording.throwEventIds.add(event.eventId());
+          recording.retainedThrowBytes += bytes;
+        }
+        recording.batchBytes += toProto(event, 2).getSerializedSize() + 8;
+        if (recording.events.size() >= MAX_BATCH_EVENTS
+            || recording.batchBytes >= MAX_BATCH_BYTES) flush(recording, false);
       } else {
         recording.memoryDrops = saturatingAdd(recording.memoryDrops, 1);
       }
@@ -181,7 +204,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       try {
         write(recording, finish);
       } finally {
-        pendingEventBytes -= recording.eventBytes;
+        pendingEventBytes -= recording.eventBytes + recording.retainedThrowBytes;
         sink.recordingClosed(recording.start);
       }
     }
@@ -208,7 +231,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     this.capturePolicyId = policyId == null ? "" : policyId;
   }
 
-  private void write(PendingRecording pending, QueueSignal.Finish finish) throws ClientException {
+  private void sendStart(PendingRecording pending) throws ClientException {
     UUID recordingId;
     try {
       recordingId = UUID.fromString(pending.start.recordingId());
@@ -216,6 +239,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       throw new ClientException("XTR-JAVA-RECORDING", "recording identity is invalid", invalid);
     }
     byte[] recordingBytes = uuidBytes(recordingId);
+    pending.recordingId = recordingId;
     Ack started =
         session.send(
             pending.start.recordingId() + ":started",
@@ -231,13 +255,16 @@ final class RecordingWriter implements AutoCloseable, Runnable {
                 .setCapturePolicyId(capturePolicyId)
                 .build());
     requireRecordingAck(started, recordingId, 1);
+  }
 
+  private void write(PendingRecording pending, QueueSignal.Finish finish) throws ClientException {
     long droppedEvents = saturatingAdd(
         finish.droppedEvents(), saturatingAdd(pending.writerDrops, pending.memoryDrops));
     // Metadata-only admission retains the actual identity and terminal observation, but none of
     // the request's event stream. Count at least its missing request observation, even for a
     // caller that supplies no shed count. No response, parent link or timing is reconstructed.
     if (pending.start.metadataOnly()) droppedEvents = Math.max(1, droppedEvents);
+    long skippedTransforms = pending.start.metadataOnly() ? 0 : untransformed.getAsLong();
     List<QueueSignal.Event> ordered =
         pending.start.metadataOnly()
             ? List.of(gap(pending.start.recordingId(), "",
@@ -248,51 +275,35 @@ final class RecordingWriter implements AutoCloseable, Runnable {
             pending.events,
             finish.droppedEvents(),
             pending.writerDrops,
-            untransformed.getAsLong(),
+            skippedTransforms,
             pending.memoryDrops,
             pending.start.monotonicNs(),
             finish.finishedMonotonicNs());
-    if (ordered.isEmpty()) {
+    if (!pending.start.metadataOnly() && pending.events.isEmpty() && pending.sequence > 1) {
+      // Preserve the same gap frontier even when its preceding event was already sent.
+      ordered = new ArrayList<>();
+      addGaps(ordered, pending.start.recordingId(), pending.lastEventId, pending.lastMonotonicNs,
+          finish.droppedEvents(), pending.writerDrops, skippedTransforms, pending.memoryDrops);
+    }
+    pending.events.clear();
+    pending.events.addAll(ordered);
+    flush(pending, true);
+    if (pending.sequence == 1) {
       throw new ClientException("XTR-JAVA-RECORDING", "recording contains no accepted events");
     }
-    List<String> eventIds = new ArrayList<>(ordered.size());
-    long sequence = 1;
-    EventBatch.Builder batch = newBatch(recordingBytes);
-    int inBatch = 0;
-    int batchBytes = 0;
-    int chunk = 0;
-    for (QueueSignal.Event event : ordered) {
-      sequence = Math.addExact(sequence, 1);
-      RecordingEvent proto = toProto(event, sequence);
-      int size = proto.getSerializedSize() + 8;
-      if (size > MAX_BATCH_BYTES) {
-        throw new ClientException("XTR-JAVA-RECORDING", "one event exceeds the batch byte bound");
-      }
-      if (inBatch > 0 && (inBatch >= MAX_BATCH_EVENTS || batchBytes + size > MAX_BATCH_BYTES)) {
-        sendChunk(pending, recordingId, batch, chunk++, sequence - 1);
-        batch = newBatch(recordingBytes);
-        inBatch = 0;
-        batchBytes = 0;
-      }
-      batch.addEvents(proto);
-      inBatch++;
-      batchBytes += size;
-      eventIds.add(event.eventId());
-    }
-    sendChunk(pending, recordingId, batch, chunk, sequence);
-
+    byte[] digest = new byte[32];
+    pending.digest.doFinal(digest, 0);
     RecordingFinished.Builder terminal =
         RecordingFinished.newBuilder()
-            .setRecordingId(ByteString.copyFrom(recordingBytes))
-            .setFinalRecordingSeq(sequence)
+            .setRecordingId(ByteString.copyFrom(uuidBytes(pending.recordingId)))
+            .setFinalRecordingSeq(pending.sequence)
             .setDurationNs(duration(finish.startedMonotonicNs(), finish.finishedMonotonicNs()))
-            .setEventDigest(ByteString.copyFrom(EventDigest.compute(eventIds)));
+            .setEventDigest(ByteString.copyFrom(digest));
     if (droppedEvents > 0) terminal.putDropCountsByPriority(1, droppedEvents);
     if (finish.outcome() != null) {
       RecordingOutcome outcome = outcomeProto(finish.outcome());
       String thrownFrom = outcome.getThrownFromEventId();
-      if (!thrownFrom.isEmpty()
-          && pending.events.stream().noneMatch(event -> event.eventId().equals(thrownFrom))) {
+      if (!thrownFrom.isEmpty() && !pending.throwEventIds.contains(thrownFrom)) {
         // A throw's event identity belongs to the discarded stream, not to this gap marker.
         outcome = outcome.toBuilder().clearThrownFromEventId().build();
       }
@@ -303,7 +314,58 @@ final class RecordingWriter implements AutoCloseable, Runnable {
             pending.start.recordingId() + ":finished",
             pending.start.recordingId(),
             terminal.build());
-    requireRecordingAck(finished, recordingId, sequence);
+    requireRecordingAck(finished, pending.recordingId, pending.sequence);
+  }
+
+  /** Sends the buffered prefix; the response stays behind terminal gap accounting until Finish. */
+  private void flush(PendingRecording pending, boolean finishing) throws ClientException {
+    int count = pending.events.size();
+    if (!finishing) {
+      for (int i = 0; i < count; i++) {
+        if (pending.events.get(i).kind() == BridgeEventKind.RESPONSE) {
+          count = i;
+          break;
+        }
+      }
+    }
+    if (count == 0) return;
+    EventBatch.Builder batch = newBatch(uuidBytes(pending.recordingId));
+    int inBatch = 0;
+    int batchBytes = 0;
+    for (QueueSignal.Event event : pending.events.subList(0, count)) {
+      long sequence = Math.addExact(pending.sequence, 1);
+      RecordingEvent proto = toProto(event, sequence);
+      int size = proto.getSerializedSize() + 8;
+      if (size > MAX_BATCH_BYTES) {
+        throw new ClientException("XTR-JAVA-RECORDING", "one event exceeds the batch byte bound");
+      }
+      if (inBatch > 0 && (inBatch >= MAX_BATCH_EVENTS || batchBytes + size > MAX_BATCH_BYTES)) {
+        sendChunk(pending, pending.recordingId, batch, pending.chunk++, pending.sequence);
+        batch = newBatch(uuidBytes(pending.recordingId));
+        inBatch = 0;
+        batchBytes = 0;
+      }
+      batch.addEvents(proto);
+      inBatch++;
+      batchBytes += size;
+      pending.sequence = sequence;
+      pending.lastEventId = event.eventId();
+      pending.lastMonotonicNs = event.monotonicNs();
+      byte[] id = event.eventId().getBytes(StandardCharsets.UTF_8);
+      pending.digest.update(id, 0, id.length);
+    }
+    sendChunk(pending, pending.recordingId, batch, pending.chunk++, pending.sequence);
+    if (!finishing) {
+      for (QueueSignal.Event event : pending.events.subList(0, count)) {
+        if (event.kind() != BridgeEventKind.FRAME_THROW) {
+          long bytes = Math.max(128, event.estimatedBytes());
+          pending.eventBytes -= bytes;
+          pendingEventBytes -= bytes;
+        }
+      }
+    }
+    pending.events.subList(0, count).clear();
+    pending.batchBytes = 0;
   }
 
   /** Maps the bridge outcome to the wire outcome; sanitizes exception text off the app thread. */
@@ -719,9 +781,20 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   private static final class PendingRecording {
     private final QueueSignal.Start start;
     private final List<QueueSignal.Event> events = new ArrayList<>();
+    private final Set<String> throwEventIds = new HashSet<>();
+    private final Blake3Digest digest = new Blake3Digest(256);
+    private UUID recordingId;
+    private long sequence = 1;
+    private String lastEventId = "";
+    private long lastMonotonicNs;
+    private int chunk;
+    private int acceptedEvents;
+    private long batchBytes;
     private long writerDrops;
     private long memoryDrops;
+    // Buffered non-throw allocations and retained throw allocations are disjoint charges.
     private long eventBytes;
+    private long retainedThrowBytes;
 
     private PendingRecording(QueueSignal.Start start) {
       this.start = start;
