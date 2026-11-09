@@ -46,7 +46,42 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(r["failingTruncated"], 8)
 
 
-class FailureDetailsTests(unittest.TestCase):
+class CheckoutFixture(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.checkout = pathlib.Path(temporary.name)
+        names = ["fails", "first", "second", "journey", "completed", "waiting", "also_waiting",
+                 "done", "bad", "skip", "old", *[f"case{i}" for i in range(40)]]
+        self.sources = {
+            "crates/example/tests/journey.rs": "\n" * 40 + "\n".join(
+                f"#[test]\nfn {name}() {{}}" for name in names),
+            "crates/a.rs": "#[test]\nfn first() {}\n",
+            "crates/b.rs": "#[test]\nfn second() {}\n",
+            "adapters/java/tests/HttpTest.java": "class HttpTest {\n@Test\nvoid finalStatus() {}\n}\n" + "\n" * 90,
+            "adapters/java/tests/FooTest.java": "class FooTest {\n" + "\n".join(
+                f"@Test\nvoid {name}() {{}}" for name in ("check", "done", "waiting", "skip")) + "\n}\n",
+            "web/app/src/example.test.ts": 'test("checkout JS test", () => {});\n',
+            "tools/qa/test_example.py": "class ExampleTests:\n    def test_example(self): pass\n",
+        }
+        for name, source in self.sources.items():
+            path = self.checkout / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source)
+        self.metadata = lane_run.CheckoutMetadata(self.checkout, list(self.sources))
+        patcher = mock.patch.object(lane_run, "_checkout_metadata", return_value=self.metadata)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def assert_facts_only(self, row):
+        self.assertEqual(set(row), {"test", "location", "kind", "withheldLines"})
+        self.assertIn(row["kind"], {"assertion", "panic", "timeout", "exit", "unknown"})
+        self.assertIsInstance(row["withheldLines"], int)
+        self.assertGreaterEqual(row["withheldLines"], 0)
+        self.assertLessEqual(len(lane_run._encoded(row)), lane_run.MAX_EXCERPT_BYTES)
+
+
+class FailureDetailsTests(CheckoutFixture):
     @staticmethod
     def cargo(name="journey::fails", message="assertion `left == right` failed\n  left: 1\n right: 2",
               site="crates/example/tests/journey.rs:42:7"):
@@ -55,12 +90,14 @@ class FailureDetailsTests(unittest.TestCase):
                 f"{message}\nnote: run with RUST_BACKTRACE=1\n\nfailures:\n    {name}\n"
                 "test result: FAILED. 0 passed; 1 failed; 0 ignored\n")
 
-    def test_cargo_captured_failure_has_name_location_and_first_assertion_lines(self):
+    def test_cargo_captured_failure_has_only_verified_facts_and_line_counts(self):
         detail = lane_run.failure_details(self.cargo(), False)
-        self.assertEqual(detail["failures"], [{
-            "test": "journey::fails", "location": "crates/example/tests/journey.rs:42:7",
-            "message": ["assertion `left == right` failed", "left: <value>", "right: <value>"], "truncated": False,
-        }])
+        row = detail["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual((row["test"], row["location"], row["kind"]),
+                         ("fails", "crates/example/tests/journey.rs:42", "assertion"))
+        self.assertEqual(row["withheldLines"], 4)
+        self.assertNotIn("left == right", json.dumps(detail))
 
     def test_cargo_nocapture_panics_are_associated_with_their_own_tests(self):
         text = ("unrelated stdout\n"
@@ -69,216 +106,208 @@ class FailureDetailsTests(unittest.TestCase):
                 "thread 'second' panicked at crates/b.rs:3:4:\nsecond assertion\n"
                 "test second ... FAILED\n")
         rows = lane_run.failure_details(text, False)["failures"]
-        self.assertEqual([r["message"] for r in rows], [["<str> assertion"], ["<str> assertion"]])
-        self.assertEqual([(r["test"], r["location"]) for r in rows],
-                         [("first", "crates/a.rs:1:2"), ("second", "crates/b.rs:3:4")])
-        self.assertNotIn("unrelated", json.dumps(rows))
+        self.assertEqual([(r["test"], r["location"], r["kind"]) for r in rows],
+                         [("first", "crates/a.rs:1", "panic"), ("second", "crates/b.rs:3", "panic")])
+        for row in rows:
+            self.assert_facts_only(row)
+        for value in ("unrelated", "first assertion", "second assertion"):
+            self.assertNotIn(value, json.dumps(rows))
 
     def test_gradle_full_and_short_failure_formats(self):
-        for exception, structure in (
-                ("org.opentest4j.AssertionFailedError: expected: <200> but was: <500>",
-                 "<str>: expected: <value>"),
-                ("java.lang.AssertionError: expected status 200", "<str>: expected <value>")):
+        for exception in ("org.opentest4j.AssertionFailedError: expected: <200> but was: <500>",
+                          "java.lang.AssertionError: expected status 200"):
             text = ("  com.example.HttpTest > finalStatus() FAILED\n"
                     f"    {exception}\n"
                     "        at org.junit.AssertionFailureBuilder.build(AssertionFailureBuilder.java:100)\n"
                     "        at com.example.HttpTest.finalStatus(HttpTest.java:81)\n"
                     "> Task :agent:test FAILED\n")
             with self.subTest(exception=exception):
-                rows = lane_run.failure_details(text, False)["failures"]
-                self.assertEqual(rows, [{"test": "HttpTest::finalStatus", "location": "HttpTest.java:81",
-                                         "message": [structure], "truncated": False}])
+                row = lane_run.failure_details(text, False)["failures"][0]
+                self.assert_facts_only(row)
+                self.assertEqual((row["test"], row["location"], row["kind"]),
+                                 ("HttpTest::finalStatus", "adapters/java/tests/HttpTest.java:81", "assertion"))
+                self.assertNotIn(exception, json.dumps(row))
         text = ("HttpTest > finalStatus() FAILED\n"
                 "    org.opentest4j.AssertionFailedError at HttpTest.java:81\n")
-        self.assertEqual(lane_run.failure_details(text, False)["failures"][0]["location"], "HttpTest.java:81")
+        self.assertEqual(lane_run.failure_details(text, False)["failures"][0]["location"],
+                         "adapters/java/tests/HttpTest.java:81")
 
-    def test_backtrace_is_excluded_and_secondary_capture_does_not_erase_message(self):
+    def test_backtrace_and_secondary_capture_cannot_erase_verified_location(self):
         text = ("test fails ... FAILED\n---- fails stdout ----\n"
                 "thread 'fails' panicked at crates/a.rs:1:2:\nfirst assertion\n"
                 "stack backtrace:\n0: irrelevant stack\n"
                 "---- fails stderr ----\nother output\n")
         row = lane_run.failure_details(text, False)["failures"][0]
-        self.assertEqual(row["message"], ["<str> assertion"])
-        self.assertEqual(row["location"], "crates/a.rs:1:2")
+        self.assert_facts_only(row)
+        self.assertEqual(row["location"], "crates/a.rs:1")
+        for value in ("first assertion", "irrelevant", "other output"):
+            self.assertNotIn(value, json.dumps(row))
 
     def test_captured_worker_panic_belongs_to_the_harness_test_section(self):
         text = ("test journey ... FAILED\n---- journey stdout ----\n"
                 "thread 'worker' panicked at crates/a.rs:1:2:\nworker assertion\n")
         row = lane_run.failure_details(text, False)["failures"][0]
-        self.assertEqual(row["test"], "journey")
-        self.assertEqual(row["message"], ["<str> assertion"])
+        self.assert_facts_only(row)
+        self.assertEqual((row["test"], row["location"], row["kind"]), ("journey", "crates/a.rs:1", "panic"))
+        self.assertNotIn("worker", json.dumps(row))
 
     def test_unsafe_panic_location_is_never_published_as_a_source_site(self):
-        text = self.cargo().replace("crates/example/tests/journey.rs", "../escape.rs")
-        self.assertEqual(lane_run.failure_details(text, False)["failures"][0]["location"], "not observed")
+        for path in ("../escape.rs", "/absolute/file.rs", "crates/missing.rs",
+                     "crates/example/tests/../journey.rs", "crates/example/tests/journey.rs/extra"):
+            with self.subTest(path=path):
+                row = lane_run.failure_details(self.cargo(site=f"{path}:1:2"), False)["failures"][0]
+                self.assertEqual(row["location"], lane_run.UNVERIFIED)
+                self.assertNotIn(path, json.dumps(row))
+        for line in (0, 100000):
+            row = lane_run.failure_details(self.cargo(site=f"crates/a.rs:{line}:2"), False)["failures"][0]
+            self.assertEqual(row["location"], lane_run.UNVERIFIED)
 
-    def test_missing_failure_output_is_named_as_not_observed(self):
+    def test_missing_failure_output_is_unverified(self):
         row = lane_run.failure_details("test missing ... FAILED\n", False)["failures"][0]
-        self.assertEqual(row["location"], "not observed")
-        self.assertEqual(row["message"], ["not observed"])
+        self.assertEqual(row, {"test": lane_run.UNVERIFIED, "location": lane_run.UNVERIFIED,
+                               "kind": "exit", "withheldLines": 0})
+        self.assertNotIn("missing", json.dumps(row))
 
     def test_per_test_line_and_serialized_byte_caps(self):
-        messages = ("\n".join(f"assertion line {i}" for i in range(30)), "é " * 10000)
-        for message in messages:
+        for message in ("\n".join(f"assertion line {i}" for i in range(30)), "é " * 10000):
             with self.subTest(message_length=len(message)):
                 row = lane_run.failure_details(self.cargo(message=message), False)["failures"][0]
-                self.assertLessEqual(len(row["message"]), lane_run.MAX_EXCERPT_LINES)
-                self.assertLessEqual(len(lane_run._encoded(row)), lane_run.MAX_EXCERPT_BYTES)
-                self.assertTrue(row["truncated"])
-                self.assertTrue(row["message"][0])
+                self.assert_facts_only(row)
+                self.assertGreater(row["withheldLines"], 0)
+                self.assertNotIn(message, json.dumps(row))
 
-    def test_byte_cap_preserves_the_continuation_withholding_marker(self):
+    def test_byte_cap_preserves_the_continuation_withholding_count(self):
         row = lane_run.failure_details(self.cargo(message="é " * 10000 + "\nright"), False)["failures"][0]
-        self.assertLessEqual(len(lane_run._encoded(row)), lane_run.MAX_EXCERPT_BYTES)
-        self.assertEqual(row["message"][-1], "<1 more lines withheld>")
-        self.assertTrue(row["truncated"])
+        self.assert_facts_only(row)
+        self.assertEqual(row["withheldLines"], 3)
         self.assertNotIn("right", json.dumps(row))
 
     def test_job_cap_and_omitted_count(self):
         text = "".join(self.cargo(name=f"case{i}", message="x " * 3000) for i in range(32))
-        detail = lane_run.failure_details(text, False)
-        self.assertLessEqual(len(lane_run._encoded(detail)), lane_run.MAX_JOB_EXCERPT_BYTES)
+        # Rows no longer grow with prose; exercise the same cap with a smaller
+        # caller-supplied budget rather than depending on retained message bytes.
+        detail = lane_run.failure_details(text, False, budget=2048)
+        self.assertLessEqual(len(lane_run._encoded(detail)), 2048)
         self.assertGreater(detail["omitted"], 0)
         self.assertEqual(len(detail["failures"]) + detail["omitted"], 32)
         self.assertIsNone(lane_run.failure_details(text, False, budget=0))
 
-    def test_canary_anywhere_in_block_withholds_the_whole_excerpt(self):
+    def test_canary_anywhere_in_block_is_absent_from_failure_facts(self):
         text = self.cargo(message="safe assertion\n" + "safe line\n" * 20 + "BODY_CANARY_123")
         row = lane_run.failure_details(text, False)["failures"][0]
-        self.assertEqual(row, {"test": "journey::fails", "excerpt": "withheld: privacy scan"})
-        self.assertNotIn("safe assertion", json.dumps(row))
+        self.assert_facts_only(row)
+        self.assertEqual((row["test"], row["location"]), ("fails", "crates/example/tests/journey.rs:42"))
+        for value in ("safe assertion", "safe line", "BODY_CANARY_123"):
+            self.assertNotIn(value, json.dumps(row))
 
-    def test_unmarked_values_are_masked_but_test_and_source_site_survive(self):
-        values = [("left: ghp_abc123", "left: <str>"),
-                  ("right: account balance", "right: <value>"),
-                  ("expected: customer-record", "expected: <str>"),
-                  ("actual customer-record", "actual <str>"),
-                  ("result=customer-record", "<str>=<str>")]
-        for value, structure in values:
+    def test_unmarked_values_are_absent_but_test_and_source_site_survive(self):
+        for value in ("left: ghp_abc123", "right: account balance", "expected: customer-record",
+                      "actual customer-record", "result=customer-record"):
             with self.subTest(value=value):
                 self.assertFalse(lane_run._private(value, lane_run.CANARY_INDEX))
                 row = lane_run.failure_details(self.cargo(message=value), False)["failures"][0]
-                self.assertEqual(row["test"], "journey::fails")
-                self.assertEqual(row["location"], "crates/example/tests/journey.rs:42:7")
-                self.assertEqual(row["message"], [structure])
+                self.assert_facts_only(row)
+                self.assertEqual((row["test"], row["location"]), ("fails", "crates/example/tests/journey.rs:42"))
                 self.assertNotIn(value, json.dumps(row))
 
-    def test_structure_masks_literals_paths_urls_long_tokens_and_numbers(self):
-        cases = [
-            ('message "business value" and \'other value\' and `expression`',
-             "<str> <str> <str> <str> <str> <str>"),
-            ('message "escaped \\\" quote"', "<str> <str>"),
-            ('message "unterminated', "<str> <str>"),
-            ("read relative/data.txt and data.txt:42", "<str> <str> <str> <str>"),
-            (r"read C:\work\data.txt", "<str> <str>"),
-            ("visit https://example.test/data", "<str> <str>"),
-            ("value abcdefghijklmnopq", "<str> <str>"),
-            ("value 1234567 and 123456", "<str> <num> <str> <num>"),
-            ("value 12345678901234567", "<str> <num>"),
-            ("left: 200", "left: <num>"),
-            ('actual: "short"', "actual: <str>"),
-        ]
-        for message, structure in cases:
+    def test_literals_paths_urls_long_tokens_and_numbers_are_absent(self):
+        cases = ['message "business value" and \'other value\' and `expression`',
+                 'message "escaped \\\" quote"', 'message "unterminated',
+                 "read relative/data.txt and data.txt:42", r"read C:\work\data.txt",
+                 "visit https://example.test/data", "value abcdefghijklmnopq",
+                 "value 1234567 and 123456", "value 12345678901234567", "left: 200", 'actual: "short"']
+        for message in cases:
             with self.subTest(message=message):
-                self.assertEqual(lane_run._message_structure(message), structure)
+                row = lane_run.failure_details(self.cargo(message=message), False)["failures"][0]
+                self.assert_facts_only(row)
+                self.assertNotIn(message, json.dumps(row))
+        for removed in ("MESSAGE_WORDS", "MESSAGE_LITERAL", "_message_structure", "_value_placeholder"):
+            self.assertFalse(hasattr(lane_run, removed))
 
-    def test_short_unlabelled_values_and_json_are_masked_end_to_end(self):
-        cases = [
-            ("account balance 123456", ["account", "balance", "123456"], "<str> <str> <num>"),
-            ("received ghp_abc123", ["received", "ghp_abc123"], "<str> <str>"),
-            ("customer Ada owes 7", ["customer", "Ada", "owes", "7"], "<str> <str> <str> <num>"),
-            ("balance -12.5", ["balance", "-12.5"], "<str> <num>"),
-            ("balance 2e3", ["balance", "2e3"], "<str> <num>"),
-            ('{"balance": 42}', ["balance", "42"], "{<str>: <num>}"),
-        ]
-        for message, private, structure in cases:
+    def test_short_unlabelled_values_and_json_are_absent_end_to_end(self):
+        for message, private in (("account balance 123456", ["account", "balance", "123456"]),
+                                 ("received ghp_abc123", ["received", "ghp_abc123"]),
+                                 ("customer Ada owes 7", ["customer", "Ada", "owes", "7"]),
+                                 ("balance -12.5", ["balance", "-12.5"]),
+                                 ("balance 2e3", ["balance", "2e3"]),
+                                 ('{"balance": 42}', ["balance", "42"])):
             with self.subTest(message=message):
-                self.assertFalse(lane_run._private(message, lane_run.CANARY_INDEX))
-                site = "crates/example/tests/journey.rs:88:6"
-                detail = lane_run.failure_details(self.cargo(message=message, site=site), False)
-                row = detail["failures"][0]
-                self.assertEqual(row["message"], [structure])
-                self.assertEqual(row["test"], "journey::fails")
-                self.assertEqual(row["location"], site)
+                detail = lane_run.failure_details(self.cargo(message=message,
+                                                            site="crates/example/tests/journey.rs:88:6"), False)
+                self.assert_facts_only(detail["failures"][0])
                 for value in private:
                     self.assertNotIn(value, json.dumps(detail))
 
     def test_multiline_debug_and_quoted_values_are_withheld_end_to_end(self):
-        cases = [
-            ("left:\nAccount {\n balance: 42,\n}", ["Account", "balance", "42"],
-             ["left: <value>", "<3 more lines withheld>"]),
-            ("left: Account {\n balance: 42,\n}", ["Account", "balance", "42"],
-             ["left: <value>", "<2 more lines withheld>"]),
-            ('left: "Ada\nshort ghp_abc123\n123456\n"', ["Ada", "short", "ghp_abc123", "123456"],
-             ["left: <str>", "<3 more lines withheld>"]),
-            ('"Ada\nshort ghp_abc123\n123456\n"', ["Ada", "short", "ghp_abc123", "123456"],
-             ["<str>", "<3 more lines withheld>"]),
-        ]
-        for message, private, structure in cases:
+        cases = [("left:\nAccount {\n balance: 42,\n}", ["Account", "balance", "42"]),
+                 ("left: Account {\n balance: 42,\n}", ["Account", "balance", "42"]),
+                 ('left: "Ada\nshort ghp_abc123\n123456\n"', ["Ada", "short", "ghp_abc123", "123456"]),
+                 ('"Ada\nshort ghp_abc123\n123456\n"', ["Ada", "short", "ghp_abc123", "123456"])]
+        for message, private in cases:
             with self.subTest(message=message):
-                self.assertFalse(lane_run._private(message, lane_run.CANARY_INDEX))
                 detail = lane_run.failure_details(self.cargo(message=message,
                                                             site="crates/example/tests/journey.rs:88:6"), False)
-                self.assertEqual(detail["failures"][0]["message"], structure)
-                self.assertTrue(detail["failures"][0]["truncated"])
+                self.assert_facts_only(detail["failures"][0])
+                self.assertGreater(detail["failures"][0]["withheldLines"], 1)
                 for value in private:
                     self.assertNotIn(value, json.dumps(detail))
 
-    def test_assertion_operators_survive_while_operands_are_masked_end_to_end(self):
+    def test_assertion_operators_and_operands_are_absent_end_to_end(self):
         for operator in ("==", "!="):
-            for left, right, operands in (("left", "right", "left {op} right"),
-                                         ("Ada", "Bob", "<str> {op} <str>"),
-                                         ("expected", "actual", "<str> {op} <str>"),
-                                         ("42", "7", "<num> {op} <num>")):
+            for left, right in (("left", "right"), ("Ada", "Bob"), ("expected", "actual"), ("42", "7")):
                 with self.subTest(operator=operator, left=left):
                     message = f"assertion `{left} {operator} {right}` failed"
-                    detail = lane_run.failure_details(self.cargo(message=message), False)
-                    self.assertEqual(detail["failures"][0]["message"],
-                                     [f"assertion `{operands.format(op=operator)}` failed"])
-                    if left != "left":
-                        self.assertNotIn(left, detail["failures"][0]["message"][0])
-                        self.assertNotIn(right, detail["failures"][0]["message"][0])
+                    row = lane_run.failure_details(self.cargo(message=message,
+                                                             site="crates/example/tests/journey.rs:88:6"), False)["failures"][0]
+                    self.assert_facts_only(row)
+                    self.assertEqual(row["kind"], "assertion")
+                    self.assertNotIn(message, json.dumps(row))
+                    self.assertNotIn(operator, json.dumps(row))
+                    self.assertNotIn(left, json.dumps(row))
+                    self.assertNotIn(right, json.dumps(row))
 
-    def test_fixed_deadline_diagnostic_masks_request_values_end_to_end(self):
+    def test_fixed_deadline_diagnostic_and_request_values_are_absent_end_to_end(self):
         message = "3 POST /orders recordings were not persisted before deadline"
-        detail = lane_run.failure_details(self.cargo(message=message), False)
-        self.assertEqual(detail["failures"][0]["message"],
-                         ["<num> <str> <str> recordings were not persisted before deadline"])
-        for value in ("3", "POST", "/orders"):
+        detail = lane_run.failure_details(self.cargo(message=message,
+                                                    site="crates/example/tests/journey.rs:88:6"), False)
+        self.assert_facts_only(detail["failures"][0])
+        for value in ("3", "POST", "/orders", "recordings", "not persisted", "deadline"):
             self.assertNotIn(value, json.dumps(detail))
 
     def test_even_pure_diagnostic_continuations_are_withheld(self):
         message = "timed out\nassertion `left != right` failed\nshort 42\nright: 7"
-        row = lane_run.failure_details(self.cargo(message=message), False)["failures"][0]
-        self.assertEqual(row["message"], ["timed out", "<3 more lines withheld>"])
-        self.assertTrue(row["truncated"])
+        row = lane_run.failure_details(self.cargo(message=message,
+                                                 site="crates/example/tests/journey.rs:88:6"), False)["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual(row["withheldLines"], 5)
+        for value in ("timed out", "left != right", "short", "right"):
+            self.assertNotIn(value, json.dumps(row))
 
-    def test_only_fixed_libtest_assertion_frames_can_follow_the_first_line(self):
+    def test_libtest_assertion_frames_are_never_published(self):
         message = ('assertion `left == right` failed\n  left: Account { balance: 42 }\n'
                    ' right: "Ada"\nexpected: 7\n}\n')
-        detail = lane_run.failure_details(self.cargo(message=message,
-                                                    site="crates/example/tests/journey.rs:88:6"), False)
-        row = detail["failures"][0]
-        self.assertEqual(row["message"], ["assertion `left == right` failed", "left: <value>",
-                                         "right: <value>", "<3 more lines withheld>"])
-        self.assertTrue(row["truncated"])
-        for value in ("Account", "balance", "42", "Ada", "expected", "7"):
-            self.assertNotIn(value, json.dumps(detail))
+        row = lane_run.failure_details(self.cargo(message=message,
+                                                 site="crates/example/tests/journey.rs:88:6"), False)["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual(row["kind"], "assertion")
+        for value in ("Account", "balance", "42", "Ada", "expected", "7", "left", "right"):
+            self.assertNotIn(value, json.dumps(row))
 
     def test_gradle_continuations_cannot_use_the_libtest_frame_exception(self):
         text = ('FooTest > check() FAILED\njava.lang.AssertionError: timed out\n'
                 ' right: not persisted\nright\n')
-        detail = lane_run.failure_details(text, False)
-        self.assertEqual(detail["failures"][0]["message"], ["<str>: timed out", "<2 more lines withheld>"])
-        self.assertTrue(detail["failures"][0]["truncated"])
-        for value in ("right", "not persisted"):
-            self.assertNotIn(value, json.dumps(detail))
+        row = lane_run.failure_details(text, False)["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual(row["withheldLines"], 3)
+        for value in ("right", "not persisted", "timed out"):
+            self.assertNotIn(value, json.dumps(row))
 
-    def test_redacted_fields_are_scanned_as_a_second_gate(self):
-        index = [*lane_run.CANARY_INDEX, *lane_run.canary.build_index({"redacted": "<str>"})]
-        row = lane_run.failure_details(self.cargo(message='assertion "value"'), False,
-                                       index=index)["failures"][0]
-        self.assertEqual(row, {"excerpt": lane_run.WITHHELD})
+    def test_verified_names_are_still_scanned_for_private_canaries(self):
+        index = [*lane_run.CANARY_INDEX, *lane_run.canary.build_index({"name": "fails"})]
+        row = lane_run.failure_details(self.cargo(message='assertion "value"'), False, index=index)["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual(row["test"], lane_run.UNVERIFIED)
+        self.assertNotIn("fails", json.dumps(row))
 
     def test_private_canaries_use_existing_scanner_encodings(self):
         values = {"assertion": "synthetic-value-31fe"}
@@ -286,19 +315,23 @@ class FailureDetailsTests(unittest.TestCase):
         for encoding, needle in lane_run.canary.needles(values["assertion"]):
             with self.subTest(encoding=encoding):
                 detail = lane_run.failure_details(self.cargo(message=needle.decode()), False, index=index)
-                self.assertEqual(detail["failures"][0]["excerpt"], lane_run.WITHHELD)
+                self.assert_facts_only(detail["failures"][0])
                 self.assertNotIn(needle.decode(), json.dumps(detail))
 
-    def test_paths_credentials_and_terminal_controls_withhold_excerpts(self):
+    def test_paths_credentials_and_terminal_controls_are_absent(self):
         for value in ("/Users/example/data", "/home/runner/data", "/opt/local/data", "token=123",
                       "Authorization: value", "Cookie: value", "unexpected\x00value"):
             with self.subTest(value=value):
                 row = lane_run.failure_details(self.cargo(message=value), False)["failures"][0]
-                self.assertEqual(row["excerpt"], lane_run.WITHHELD)
+                self.assert_facts_only(row)
+                self.assertNotIn(value, json.dumps(row))
 
     def test_syntactically_valid_canary_test_id_is_withheld(self):
         detail = lane_run.failure_details(self.cargo(name="BODY_CANARY"), False)
-        self.assertEqual(detail["failures"], [{"excerpt": lane_run.WITHHELD}])
+        row = detail["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual(row["test"], lane_run.UNVERIFIED)
+        self.assertNotIn("BODY_CANARY", json.dumps(detail))
 
     def test_timeout_tracks_only_unfinished_observed_tests_and_safe_progress(self):
         text = ("running 4 tests\n"
@@ -312,63 +345,61 @@ class FailureDetailsTests(unittest.TestCase):
         timeout = detail["timeout"]
         self.assertEqual(timeout["runningTests"], ["waiting", "also_waiting"])
         self.assertEqual(timeout["runningOmitted"], 1)
-        self.assertEqual(timeout["progressWithheld"], 2)
-        rendered = json.dumps(detail)
-        for value in ("BODY_CANARY", "token=123", "unstructured output"):
-            self.assertNotIn(value, rendered)
+        self.assertEqual(timeout["progressWithheld"], 1)
+        self.assertEqual(timeout["progress"], [
+            {"test": "completed", "state": "running"}, {"test": "completed", "state": "ok"},
+            {"test": "waiting", "state": "running"}, {"test": "also_waiting", "state": "running"}])
+        for value in ("BODY_CANARY", "token=123", "unstructured output", "Compiling"):
+            self.assertNotIn(value, json.dumps(detail))
         self.assertNotIn("timeout", lane_run.failure_details(text, False))
 
     def test_timeout_progress_keeps_last_n_safe_harness_lines(self):
         lines = [f"test case{i} ... ok" for i in range(30)]
         timeout = lane_run.failure_details("\n".join(lines), True)["timeout"]
-        self.assertEqual(timeout["progress"], lines[-lane_run.MAX_PROGRESS_LINES:])
+        self.assertEqual(timeout["progress"], [{"test": f"case{i}", "state": "ok"}
+                                              for i in range(30 - lane_run.MAX_PROGRESS_LINES, 30)])
         self.assertEqual(timeout["progressOmitted"], 30 - lane_run.MAX_PROGRESS_LINES)
         self.assertEqual(timeout["runningTests"], [])
 
     def test_timeout_job_cap_preserves_running_names_before_progress(self):
         text = "\n".join(["test waiting has been running for over 60 seconds",
-                          *["Finished " + "x" * 1000 for _ in range(20)]])
+                          *[f"test case{i} ... ok" for i in range(20)]])
         baseline = lane_run.failure_details("test waiting ...", True)
-        baseline["timeout"]["progressOmitted"] = 20
+        baseline["timeout"]["progress"] = []
+        baseline["timeout"]["progressOmitted"] = 21
         budget = len(lane_run._encoded(baseline))
         detail = lane_run.failure_details(text, True, budget=budget)
         self.assertLessEqual(len(lane_run._encoded(detail)), budget)
         self.assertEqual(detail["timeout"]["runningTests"], ["waiting"])
         self.assertEqual(detail["timeout"]["progress"], [])
-        self.assertEqual(detail["timeout"]["progressOmitted"], 20)
+        self.assertEqual(detail["timeout"]["progressOmitted"], 21)
 
     def test_timeout_progress_rebuilds_only_validated_fields(self):
-        lines = [
-            "test suite::done ... ok", "test suite::bad ... FAILED", "test suite::skip ... ignored",
-            "com.example.FooTest > check() STARTED", "FooTest > check(balance 42) PASSED",
-            "FooTest > check(ghp_abc123)[balance 42] FAILED",
-            "Compiling crate_name v1.2.3", "Compiling crate-name v1.2.3-rc.1+build.2 (balance 42)",
-            "Finished", "Finished balance 42",
-        ]
+        lines = ["test suite::done ... ok", "test suite::bad ... FAILED", "test suite::skip ... ignored",
+                 "com.example.FooTest > check() STARTED", "FooTest > check(balance 42) PASSED",
+                 "FooTest > check(ghp_abc123)[balance 42] FAILED",
+                 "Compiling crate_name v1.2.3", "Compiling crate-name v1.2.3-rc.1+build.2 (balance 42)",
+                 "Finished", "Finished balance 42"]
         detail = lane_run.failure_details("\n".join(lines), True)
         self.assertEqual(detail["timeout"]["progress"], [
-            "test suite::done ... ok", "test suite::bad ... FAILED", "test suite::skip ... ignored",
-            "FooTest > check() STARTED", "FooTest > check(<params masked>) PASSED",
-            "FooTest > check(<params masked>) FAILED", "Compiling crate_name v1.2.3",
-            "Compiling crate-name v1.2.3-rc.1+build.2", "Finished", "Finished",
-        ])
-        for value in ("balance", "42", "ghp_abc123"):
+            {"test": "done", "state": "ok"}, {"test": "bad", "state": "failed"},
+            {"test": "FooTest::check", "state": "running"}, {"test": "FooTest::check", "state": "ok"},
+            {"test": "FooTest::check", "state": "failed"}])
+        for value in ("balance", "ghp_abc123", "Compiling", "Finished", "params"):
             self.assertNotIn(value, json.dumps(detail))
 
     def test_timeout_progress_drops_invalid_or_unapproved_harness_lines(self):
-        lines = [
-            "test invalid-name ... ok", "test café ... FAILED", "test waiting ...",
-            "test waiting has been running for over 60 seconds", "running 2 tests",
-            "test result: ok. balance 42", "> Task :balance42 PASSED",
-            "FööTest > check() STARTED", "FooTest > chéck() PASSED", "FooTest > skip() SKIPPED",
-            "Compiling balance 42", "Compiling crate_name v01.2.3", "Compiling crate_name v1.2",
-            "Compiling crate_name v1.2.3-01", "Compiling crate_name v1.2.3balance42",
-            "Finishedbalance42", "balance 42",
-        ]
+        lines = ["test invalid-name ... ok", "test café ... FAILED", "test unknown ...",
+                 "test unknown has been running for over 60 seconds", "running 2 tests",
+                 "test result: ok. balance 42", "> Task :balance42 PASSED",
+                 "FööTest > check() STARTED", "FooTest > chéck() PASSED", "FooTest > skip() SKIPPED",
+                 "Compiling balance 42", "Compiling crate_name v01.2.3", "Compiling crate_name v1.2",
+                 "Compiling crate_name v1.2.3-01", "Compiling crate_name v1.2.3balance42",
+                 "Finishedbalance42", "balance 42"]
         detail = lane_run.failure_details("\n".join(lines), True)
         self.assertEqual(detail["timeout"]["progress"], [])
-        self.assertNotIn("balance", json.dumps(detail))
-        self.assertNotIn("42", json.dumps(detail))
+        for value in ("balance", "42", "invalid-name", "café", "unknown", "chéck"):
+            self.assertNotIn(value, json.dumps(detail))
 
     def test_timeout_gradle_started_and_completed_and_unknown_tests(self):
         text = ("FooTest > done() STARTED\nFooTest > done() PASSED\n"
@@ -406,6 +437,106 @@ class FailureDetailsTests(unittest.TestCase):
                 self.assertIsNone(lane_run._excerpt_index(str(path)))
             path.write_text(json.dumps({"a": "synthetic-value-31fe"}))
             self.assertGreater(len(lane_run._excerpt_index(str(path))), len(lane_run.CANARY_INDEX))
+
+    def test_trusted_metadata_recognizes_each_source_language(self):
+        for candidate in ("fails", "HttpTest::finalStatus", "checkout JS test", "ExampleTests::test_example"):
+            with self.subTest(candidate=candidate):
+                self.assertEqual(self.metadata.test(candidate, lane_run.CANARY_INDEX), candidate)
+        detail = lane_run.failure_details("not ok 1 - checkout JS test\n", False)
+        self.assertEqual(detail["failures"][0]["test"], "checkout JS test")
+
+    def test_comments_literals_and_helpers_cannot_attest_names(self):
+        name = "crates/example/tests/declarations.rs"
+        source = ('/* outer /* inner */ #[test]\nfn comment_value() {} */\n'
+                  'const VALUE: &str = r###"#[test]\nfn literal_value() {}"###;\n'
+                  'fn helper_value() {}\n#[test]\nfn actual_test() {}\n')
+        (self.checkout / name).write_text(source)
+        metadata = lane_run.CheckoutMetadata(self.checkout, [name])
+        self.assertEqual(metadata.tests, {"actual_test"})
+        for candidate in ("comment_value", "literal_value", "helper_value", "ghp_abc123"):
+            self.assertEqual(metadata.test(candidate, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
+
+    def test_untracked_and_symlinked_files_cannot_attest_names_or_locations(self):
+        directory = self.checkout / "crates/example/tests"
+        (directory / "untracked.rs").write_text("#[test]\nfn untracked_value() {}\n")
+        (directory / "alias.rs").symlink_to(directory / "untracked.rs")
+        tracked = [*self.sources, "crates/example/tests/alias.rs"]
+        metadata = lane_run.CheckoutMetadata(self.checkout, tracked)
+        for name in ("untracked_value", "alias"):
+            self.assertEqual(metadata.test(name, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
+        for path in ("crates/example/tests/untracked.rs:1", "crates/example/tests/alias.rs:1"):
+            self.assertEqual(metadata.location(path, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
+        outside = directory / "outside.rs"
+        outside.symlink_to(ROOT / "crates/xtrace-domain/tests/honesty_strings.rs")
+        metadata = lane_run.CheckoutMetadata(self.checkout, ["crates/example/tests/outside.rs"])
+        self.assertEqual(metadata.tests, set())
+        self.assertEqual(metadata.location("crates/example/tests/outside.rs:1", lane_run.CANARY_INDEX),
+                         lane_run.UNVERIFIED)
+
+    def test_java_locations_require_a_unique_tracked_file_and_valid_line(self):
+        for site in ("HttpTest.java:0", "HttpTest.java:10000", "ghp_abc123.java:7"):
+            self.assertEqual(self.metadata.location(site, lane_run.CANARY_INDEX, java=True), lane_run.UNVERIFIED)
+        duplicate = "adapters/java/tests/other/HttpTest.java"
+        (self.checkout / duplicate).parent.mkdir()
+        (self.checkout / duplicate).write_text(self.sources["adapters/java/tests/HttpTest.java"])
+        metadata = lane_run.CheckoutMetadata(self.checkout, [*self.sources, duplicate])
+        self.assertEqual(metadata.location("HttpTest.java:3", lane_run.CANARY_INDEX, java=True), lane_run.UNVERIFIED)
+
+    def test_java_continuations_cannot_supply_even_a_tracked_location(self):
+        for continuation in ("Error at HttpTest.java:7", "        at example.HttpTest.finalStatus(HttpTest.java:7)"):
+            text = ('HttpTest > finalStatus() FAILED\njava.lang.AssertionError: "Ada\n'
+                    f'{continuation}\n"\n')
+            row = lane_run.failure_details(text, False)["failures"][0]
+            self.assert_facts_only(row)
+            self.assertEqual(row["location"], lane_run.UNVERIFIED)
+            self.assertNotIn("Ada", json.dumps(row))
+            self.assertNotIn("HttpTest.java", json.dumps(row))
+
+    def test_cargo_quoted_stdout_cannot_supply_a_panic_location(self):
+        text = ('test fails ... FAILED\n---- fails stdout ----\n"Ada\n'
+                "thread 'fails' panicked at crates/a.rs:1:2:\n"
+                '"\n')
+        row = lane_run.failure_details(text, False)["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual(row["location"], lane_run.UNVERIFIED)
+        self.assertNotIn("crates/a.rs", json.dumps(row))
+
+    def test_a_panic_in_a_passing_test_is_not_a_failure(self):
+        text = ("thread 'waiting' panicked at crates/a.rs:1:2:\nexpected panic\n"
+                "test waiting ... ok\n" + self.cargo())
+        detail = lane_run.failure_details(text, False)
+        self.assertEqual(len(detail["failures"]), 1)
+        self.assertEqual(detail["failures"][0]["test"], "fails")
+        self.assertNotIn("waiting", json.dumps(detail))
+
+
+class CheckoutLookupTests(unittest.TestCase):
+    def test_real_checkout_failing_test_name_and_location_survive_the_command_path(self):
+        name = "honesty_strings_cover_every_stable_code"
+        path = "crates/xtrace-domain/tests/honesty_strings.rs"
+        lines = (ROOT / path).read_text().splitlines()
+        line = next(i for i, text in enumerate(lines, 1) if text.startswith(f"fn {name}("))
+        text = FailureDetailsTests.cargo(name=name, site=f"{path}:{line}:1", message="not persisted")
+        with tempfile.TemporaryDirectory() as temporary:
+            proc = subprocess.run(
+                [sys.executable, "-B", "-m", "tools.qa.lane_run", "run", "--suite", "rust", "--step", "t",
+                 "--out", temporary, "--", sys.executable, "-c", f"print({text!r}); raise SystemExit(101)"],
+                cwd=ROOT, capture_output=True, text=True,
+                env={**__import__("os").environ, "LANE_PRIVATE_LOG_DIR": temporary})
+            frag = json.loads((pathlib.Path(temporary) / "rust__-__t.json").read_text())
+        self.assertEqual(proc.returncode, 101)
+        row = frag["failureDetails"]["failures"][0]
+        self.assertEqual((row["test"], row["location"], row["kind"]), (name, f"{path}:{line}", "panic"))
+        self.assertEqual(set(row), {"test", "location", "kind", "withheldLines"})
+        self.assertEqual(frag["failingTests"], [name])
+        self.assertNotIn("not persisted", json.dumps(frag))
+
+    def test_unavailable_tracked_file_metadata_fails_closed(self):
+        with mock.patch.object(lane_run.subprocess, "Popen", side_effect=OSError):
+            detail = lane_run.failure_details(FailureDetailsTests.cargo(), False)
+        row = detail["failures"][0]
+        self.assertEqual((row["test"], row["location"]), (lane_run.UNVERIFIED, lane_run.UNVERIFIED))
+        self.assertNotIn("journey", json.dumps(detail))
 
 
 class MergeTests(unittest.TestCase):
@@ -466,7 +597,7 @@ class MergeTests(unittest.TestCase):
             self.assertIn("headSha", doc)
 
 
-class RunTests(unittest.TestCase):
+class RunTests(CheckoutFixture):
     def run_step(self, cmd, min_passed=0, timeout=60, max_ignored=-1, canaries=""):
         with tempfile.TemporaryDirectory() as d:
             args = type("A", (), {"suite": "meta", "variant": "-", "step": "t", "out": d + "/o", "cwd": "",
@@ -507,7 +638,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual(rc, 124)
         self.assertEqual((frag["status"], frag["exitCode"]), ("fail", 124))
 
-    def test_failed_command_writes_scanned_excerpt_only_to_fragment(self):
+    def test_failed_command_writes_only_verified_facts_to_fragment(self):
         import contextlib
         import io
         public = io.StringIO()
@@ -516,13 +647,16 @@ class RunTests(unittest.TestCase):
                                       f"print({FailureDetailsTests.cargo()!r}); raise SystemExit(101)"])
         self.assertEqual(rc, 101)
         self.assertFalse(frag["timedOut"])
-        self.assertEqual(frag["failureDetails"]["failures"][0]["message"][0],
-                         "assertion `left == right` failed")
+        row = frag["failureDetails"]["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual((row["test"], row["location"], row["kind"]),
+                         ("fails", "crates/example/tests/journey.rs:42", "assertion"))
         self.assertNotIn("left == right", public.getvalue())
+        self.assertNotIn("left == right", json.dumps(frag))
         rc, frag = self.run_step([sys.executable, "-c",
                                   f"print({FailureDetailsTests.cargo(message='BODY_CANARY_123')!r}); raise SystemExit(101)"])
         self.assertEqual(rc, 101)
-        self.assertEqual(frag["failureDetails"]["failures"][0]["excerpt"], lane_run.WITHHELD)
+        self.assert_facts_only(frag["failureDetails"]["failures"][0])
         self.assertNotIn("BODY_CANARY_123", json.dumps(frag))
 
     def test_failure_fragment_never_serializes_short_or_multiline_values(self):
@@ -539,71 +673,34 @@ class RunTests(unittest.TestCase):
                 rc, frag = self.run_step([sys.executable, "-c", f"print({text!r}); raise SystemExit(101)"])
                 self.assertEqual(rc, 101)
                 row = frag["failureDetails"]["failures"][0]
-                self.assertEqual(row["test"], "journey::fails")
-                self.assertEqual(row["location"], "crates/example/tests/journey.rs:88:6")
-                self.assertTrue(row["message"])
+                self.assertEqual(row["test"], "fails")
+                self.assertEqual(row["location"], "crates/example/tests/journey.rs:88")
+                self.assert_facts_only(row)
                 for value in private:
                     self.assertNotIn(value, json.dumps(frag))
 
     def test_failure_fragment_withholds_allowlisted_words_in_multiline_values(self):
         cases = [
-            ('left: "secret\nnot persisted\n"', ["secret", "not persisted"], None),
-            ('left: "Ada\nright\n"', ["Ada", "right"], ["left: <str>", "<2 more lines withheld>"]),
-            ('left: "Ada\nnot persisted\n"', ["Ada", "not persisted"],
-             ["left: <str>", "<2 more lines withheld>"]),
-            ("left: Account {\nnot persisted\nright\n}", ["Account", "not persisted", "right"],
-             ["left: <value>", "<3 more lines withheld>"]),
+            ('left: "secret\nnot persisted\n"', ["secret", "not persisted"]),
+            ('left: "Ada\nright\n"', ["Ada", "right"]),
+            ('left: "Ada\nnot persisted\n"', ["Ada", "not persisted"]),
+            ("left: Account {\nnot persisted\nright\n}", ["Account", "not persisted", "right"]),
         ]
-        for message, private, structure in cases:
+        for message, private in cases:
             with self.subTest(message=message):
                 text = FailureDetailsTests.cargo(message=message, site="crates/example/tests/journey.rs:88:6")
                 rc, frag = self.run_step([sys.executable, "-c", f"print({text!r}); raise SystemExit(101)"])
                 self.assertEqual(rc, 101)
                 row = frag["failureDetails"]["failures"][0]
-                if structure is None:
-                    # The exact reviewer example also triggers the pre-existing block scan on "secret".
-                    self.assertEqual(row, {"test": "journey::fails", "excerpt": lane_run.WITHHELD})
-                else:
-                    self.assertEqual(row["message"], structure)
-                    self.assertEqual(row["test"], "journey::fails")
-                    self.assertEqual(row["location"], "crates/example/tests/journey.rs:88:6")
-                    self.assertTrue(row["truncated"])
+                self.assert_facts_only(row)
+                self.assertEqual((row["test"], row["location"]), ("fails", "crates/example/tests/journey.rs:88"))
+                self.assertGreater(row["withheldLines"], 1)
                 for value in private:
                     self.assertNotIn(value, json.dumps(frag))
 
-    def test_timeout_fragment_never_serializes_progress_values(self):
-        cases = [
-            ("Finished ghp_abc123\n", ["ghp_abc123"], ["Finished"], []),
-            ("Finished balance 42\n", ["balance", "42"], ["Finished"], []),
-            ("Compiling balance 42\n", ["balance", "42"], [], []),
-            ("Compiling example v1.2.3 balance 42\n", ["balance", "42"],
-             ["Compiling example v1.2.3"], []),
-            ("FooTest > check(ghp_abc123) STARTED\n", ["ghp_abc123"],
-             ["FooTest > check(<params masked>) STARTED"], ["FooTest::check"]),
-            ("FooTest > check(balance 42) STARTED\n", ["balance", "42"],
-             ["FooTest > check(<params masked>) STARTED"], ["FooTest::check"]),
-            ("balance 42\n", ["balance", "42"], [], []),
-        ]
-        for text, private, progress, running in cases:
-            with self.subTest(text=text):
-                def timeout(cmd, *, stdout, **kwargs):
-                    stdout.write(text.encode())
-                    stdout.flush()
-                    raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-
-                with mock.patch.object(lane_run.subprocess, "run", side_effect=timeout):
-                    rc, frag = self.run_step(["unused-command"], timeout=3000)
-                self.assertEqual(rc, 124)
-                self.assertTrue(frag["timedOut"])
-                self.assertEqual(frag["status"], "fail")
-                self.assertEqual(frag["failureDetails"]["timeout"]["progress"], progress)
-                self.assertEqual(frag["failureDetails"]["timeout"]["runningTests"], running)
-                for value in private:
-                    self.assertNotIn(value, json.dumps(frag))
-
-    def test_timeout_fragment_uses_output_written_before_timeout(self):
+    def timed_out_step(self, text):
         def timeout(cmd, *, stdout, **kwargs):
-            stdout.write(b"test waiting has been running for over 60 seconds\n")
+            stdout.write(text.encode())
             stdout.flush()
             raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
 
@@ -611,7 +708,94 @@ class RunTests(unittest.TestCase):
             rc, frag = self.run_step(["unused-command"], timeout=3000)
         self.assertEqual(rc, 124)
         self.assertTrue(frag["timedOut"])
+        self.assertEqual(frag["status"], "fail")
+        return frag
+
+    def test_timeout_fragment_never_serializes_progress_values(self):
+        cases = [
+            ("Finished ghp_abc123\n", ["ghp_abc123"], [], []),
+            ("Finished balance 42\n", ["balance", "42"], [], []),
+            ("Compiling balance 42\n", ["balance", "42"], [], []),
+            ("Compiling example v1.2.3 balance 42\n", ["balance", "42"], [], []),
+            ("FooTest > check(ghp_abc123) STARTED\n", ["ghp_abc123"],
+             [{"test": "FooTest::check", "state": "running"}], ["FooTest::check"]),
+            ("FooTest > check(balance 42) STARTED\n", ["balance", "42"],
+             [{"test": "FooTest::check", "state": "running"}], ["FooTest::check"]),
+            ("balance 42\n", ["balance", "42"], [], []),
+        ]
+        for text, private, progress, running in cases:
+            with self.subTest(text=text):
+                frag = self.timed_out_step(text)
+                self.assertEqual(frag["failureDetails"]["timeout"]["progress"], progress)
+                self.assertEqual(frag["failureDetails"]["timeout"]["runningTests"], running)
+                for value in private:
+                    self.assertNotIn(value, json.dumps(frag))
+
+    def test_timeout_fragment_uses_output_written_before_timeout(self):
+        frag = self.timed_out_step("test waiting has been running for over 60 seconds\n")
         self.assertEqual(frag["failureDetails"]["timeout"]["runningTests"], ["waiting"])
+        self.assertEqual(frag["failureDetails"]["timeout"]["progress"], [{"test": "waiting", "state": "running"}])
+
+    def test_review_panic_allowlisted_words_publish_no_prose(self):
+        text = FailureDetailsTests.cargo(message="not persisted")
+        rc, frag = self.run_step([sys.executable, "-c", f"print({text!r}); raise SystemExit(101)"])
+        self.assertEqual(rc, 101)
+        self.assertNotIn("not persisted", json.dumps(frag))
+        row = frag["failureDetails"]["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual((row["test"], row["location"], row["kind"]),
+                         ("fails", "crates/example/tests/journey.rs:42", "panic"))
+
+    def test_review_cargo_build_metadata_never_reaches_timeout_progress(self):
+        frag = self.timed_out_step("Compiling example v1.2.3+customer42\n")
+        self.assertEqual(frag["failureDetails"]["timeout"]["progress"], [])
+        for value in ("Compiling", "example", "v1.2.3", "customer42"):
+            self.assertNotIn(value, json.dumps(frag))
+
+    def test_review_location_shaped_panic_continuation_is_not_a_location(self):
+        message = 'left: "Ada\nError at ghp_abc123.java:7\n"'
+        text = FailureDetailsTests.cargo(message=message)
+        rc, frag = self.run_step([sys.executable, "-c", f"print({text!r}); raise SystemExit(101)"])
+        self.assertEqual(rc, 101)
+        self.assertEqual(frag["failureDetails"]["failures"][0]["location"], "crates/example/tests/journey.rs:42")
+        for value in ("Ada", "Error at", "ghp_abc123.java:7", "ghp_abc123"):
+            self.assertNotIn(value, json.dumps(frag))
+
+    def test_review_timeout_does_not_rescan_quoted_panic_progress(self):
+        message = 'left: "Ada\nCompiling ghp_abc123 v1.2.3\n"'
+        frag = self.timed_out_step(FailureDetailsTests.cargo(message=message))
+        self.assertEqual(frag["failureDetails"]["timeout"]["progress"], [{"test": "fails", "state": "failed"}])
+        for value in ("Ada", "Compiling", "ghp_abc123", "v1.2.3"):
+            self.assertNotIn(value, json.dumps(frag))
+
+    def test_verified_names_inside_quoted_values_are_not_harness_progress(self):
+        message = ('left: "Ada\ntest waiting ...\n'
+                   'FooTest > check(ghp_abc123) STARTED\n'
+                   '---- waiting stdout ----\n'
+                   "thread 'waiting' panicked at crates/b.rs:1:2:\n"
+                   'Error at HttpTest.java:7\n"')
+        frag = self.timed_out_step(FailureDetailsTests.cargo(message=message))
+        detail = frag["failureDetails"]
+        self.assertEqual(len(detail["failures"]), 1)
+        self.assertEqual(detail["failures"][0]["location"], "crates/example/tests/journey.rs:42")
+        self.assertEqual(detail["timeout"]["progress"], [{"test": "fails", "state": "failed"}])
+        self.assertEqual(detail["timeout"]["runningTests"], [])
+        for value in ("Ada", "ghp_abc123", "HttpTest.java", "crates/b.rs", "waiting"):
+            self.assertNotIn(value, json.dumps(frag))
+
+    def test_unverified_names_never_leave_the_fragment(self):
+        for name in ("ghp_abc123", "customer42::fails"):
+            with self.subTest(name=name):
+                text = FailureDetailsTests.cargo(name=name)
+                rc, frag = self.run_step([sys.executable, "-c", f"print({text!r}); raise SystemExit(101)"])
+                self.assertEqual(rc, 101)
+                self.assertNotIn(name, json.dumps(frag))
+                self.assertEqual(frag["failureDetails"]["failures"][0]["test"],
+                                 "fails" if name.endswith("::fails") else lane_run.UNVERIFIED)
+        frag = self.timed_out_step("test ghp_abc123 ...\n")
+        self.assertEqual(frag["failureDetails"]["timeout"]["progress"], [])
+        self.assertEqual(frag["failureDetails"]["timeout"]["runningTests"], [])
+        self.assertNotIn("ghp_abc123", json.dumps(frag))
 
     def test_requested_unreadable_canary_file_withholds_all_failure_details(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -634,11 +818,11 @@ class RunTests(unittest.TestCase):
                 mock.patch.object(lane_run.subprocess, "run", side_effect=failed):
             args = type("A", (), {"suite": "rust", "variant": "-", "step": "first", "out": temporary + "/o",
                                   "cwd": "", "timeout": 3000, "min_passed": 0, "command": ["unused-command"]})()
-            for step in ("first", "second", "third"):
+            for step in ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"):
                 args.step = step
                 self.assertEqual(lane_run.cmd_run(args), 101)
             fragments = [json.loads(p.read_text()) for p in pathlib.Path(args.out).glob("*.json")]
-            self.assertEqual(len(fragments), 3)
+            self.assertEqual(len(fragments), 8)
             self.assertLessEqual(sum(len(lane_run._encoded(f["failureDetails"])) for f in fragments
                                      if f["failureDetails"] is not None), lane_run.MAX_JOB_EXCERPT_BYTES)
             self.assertTrue(any(f.get("failureDetailsUnavailable") == "job excerpt cap" for f in fragments))
