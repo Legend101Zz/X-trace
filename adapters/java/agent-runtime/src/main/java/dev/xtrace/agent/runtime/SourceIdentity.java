@@ -1,7 +1,6 @@
 package dev.xtrace.agent.runtime;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -25,6 +24,10 @@ import net.bytebuddy.jar.asm.Opcodes;
  * binding is therefore {@code OBSERVED_UNATTESTED}; a file that is missing, whose name disagrees
  * with the class's {@code SourceFile}, or whose length cannot contain the method's lines is shown
  * as such and never as a match.
+ *
+ * <p>The canonical source base is the confinement boundary: the explicit project directory, or
+ * the application's working directory when none was supplied. Neither case searches ancestors.
+ * Every path component must remain inside that boundary, including after following symlinks.
  */
 final class SourceIdentity {
   /** Wire value of {@code SOURCE_BINDING_OBSERVED_UNATTESTED}. */
@@ -170,10 +173,19 @@ final class SourceIdentity {
       }
       int slash = internalName.lastIndexOf('/');
       String packagePath = slash < 0 ? "" : internalName.substring(0, slash + 1);
-      for (String root : sourceRoots) {
-        Path found = locate(workingDirectory, root + "/" + packagePath + sourceFile);
-        if (found == null) continue;
-        try {
+      try {
+        if (workingDirectory == null) {
+          fileProblem = ATTESTATION_MISSING;
+          return;
+        }
+        Path base = workingDirectory.toRealPath();
+        for (String root : sourceRoots) {
+          Path found = locate(base, root + "/" + packagePath + sourceFile);
+          if (found == null) continue;
+          if (!found.getFileName().toString().equals(sourceFile)) {
+            fileProblem = SOURCE_METADATA_INVALID;
+            return;
+          }
           if (Files.size(found) > MAX_SOURCE_BYTES) {
             fileProblem = SOURCE_METADATA_INVALID;
             return;
@@ -181,12 +193,11 @@ final class SourceIdentity {
           byte[] bytes = Files.readAllBytes(found);
           hash = SourceAttestation.blake3Of(bytes);
           fileLines = countLines(bytes);
-          path = repoRelative(found, workingDirectory);
-          return;
-        } catch (IOException unreadable) {
-          fileProblem = ATTESTATION_MISSING;
+          path = base.relativize(found).toString().replace('\\', '/');
           return;
         }
+      } catch (IOException unavailable) {
+        // An unsafe or unreadable path must not fall through to a different source root.
       }
       fileProblem = ATTESTATION_MISSING;
     }
@@ -228,31 +239,22 @@ final class SourceIdentity {
     return !name.equals(".java") && !name.startsWith(".");
   }
 
-  /** Finds the file by climbing from the working directory; each probe is a plain regular file. */
-  private static Path locate(Path workingDirectory, String relative) {
-    if (workingDirectory == null) return null;
-    Path base = workingDirectory.toAbsolutePath().normalize();
-    for (int depth = 0; depth < 8 && base != null; depth++, base = base.getParent()) {
-      Path candidate = base.resolve(relative).normalize();
-      if (!candidate.startsWith(base)) return null;
-      if (Files.isRegularFile(candidate, LinkOption.NOFOLLOW_LINKS)) return candidate;
-    }
-    return null;
-  }
-
-  /** Path relative to the nearest ancestor holding {@code .git}, else to the working directory. */
-  static String repoRelative(Path file, Path workingDirectory) {
-    Path root = null;
-    for (Path dir = file.getParent(); dir != null; dir = dir.getParent()) {
-      if (Files.exists(dir.resolve(".git"), LinkOption.NOFOLLOW_LINKS)) {
-        root = dir;
-        break;
+  /** Missing files allow another declared root; an escaping path stops resolution entirely. */
+  private static Path locate(Path base, String relative) throws IOException {
+    Path suffix = Path.of(relative);
+    if (suffix.isAbsolute()) throw new IOException("source path is outside the project");
+    Path current = base;
+    for (Path part : suffix) {
+      // Do not normalize away a traversal or a symlink before checking its destination.
+      if (part.toString().equals("..")) {
+        throw new IOException("source path contains a parent segment");
       }
+      current = current.resolve(part);
+      if (!Files.exists(current, LinkOption.NOFOLLOW_LINKS)) return null;
+      current = current.toRealPath();
+      if (!current.startsWith(base)) throw new IOException("source path is outside the project");
     }
-    if (root == null) root = workingDirectory.toAbsolutePath().normalize();
-    if (!file.startsWith(root)) return file.getFileName().toString();
-    String relative = root.relativize(file).toString().replace('\\', '/');
-    return new String(relative.getBytes(StandardCharsets.UTF_8), StandardCharsets.UTF_8);
+    return Files.isRegularFile(current, LinkOption.NOFOLLOW_LINKS) ? current : null;
   }
 
   static int countLines(byte[] bytes) {
