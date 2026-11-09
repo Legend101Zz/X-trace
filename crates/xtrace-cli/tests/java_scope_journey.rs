@@ -12,7 +12,7 @@
 )]
 
 use std::fs;
-use std::io::{Read, Write as _};
+use std::io::{BufRead as _, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -179,7 +179,6 @@ fn run_out_of_scope(flags: &[&str]) -> OutOfScope {
         workspace.join("adapters/java/spring-fixture/build/libs/xtrace-spring-fixture.jar");
     assert!(agent.is_file(), "Gradle agentDist must run before this test");
     assert!(fixture.is_file(), "Gradle fixtureBootJar must run before this test");
-    let port = free_port();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_xtrace"))
         .args(["run", "--project-dir"])
@@ -191,7 +190,9 @@ fn run_out_of_scope(flags: &[&str]) -> OutOfScope {
         .arg("java")
         .arg("-jar")
         .arg(&fixture)
-        .arg(format!("--server.port={port}"))
+        .arg("--server.port=0")
+        // The fixture defaults to WARN; enable only the bound-port startup signal.
+        .arg("--logging.level.org.springframework.boot.tomcat.TomcatWebServer=INFO")
         .env("XTRACE_DATA_HOME", &data_home)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -199,13 +200,14 @@ fn run_out_of_scope(flags: &[&str]) -> OutOfScope {
         .expect("start xtrace run");
     let stdout = child.stdout.take().expect("xtrace stdout");
     let stderr = child.stderr.take().expect("xtrace stderr");
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel();
     let mut process = RunProcess {
         child,
-        stdout: Some(thread::spawn(move || drain(stdout))),
+        stdout: Some(thread::spawn(move || drain_fixture_stdout(stdout, lines_tx))),
         stderr: Some(thread::spawn(move || drain(stderr))),
     };
 
-    wait_for_fixture(port);
+    let port = wait_for_fixture(&lines_rx);
     let response = post_order(port);
     assert!(
         response.starts_with(b"HTTP/1.1 201"),
@@ -249,14 +251,6 @@ fn temp_root() -> TempDir {
         .expect("temporary test root")
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("port address")
-        .port()
-}
-
 fn copy_fixture_sources(repo: &Path) {
     let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../adapters/java/spring-fixture/src/main/java/dev/xtrace/fixture");
@@ -267,14 +261,24 @@ fn copy_fixture_sources(repo: &Path) {
     }
 }
 
-fn wait_for_fixture(port: u16) {
+fn wait_for_fixture(lines: &std::sync::mpsc::Receiver<Vec<u8>>) -> u16 {
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .expect("Spring fixture readiness deadline elapsed");
+        let line = lines
+            .recv_timeout(remaining)
+            .expect("Spring fixture did not report its bound port before the readiness deadline");
+        // Boot 4.1.1 logs the connector's local port only after it has started.
+        let line = String::from_utf8_lossy(&line);
+        if let Some((_, address)) = line.split_once("Tomcat started on port ") {
+            if let Some((port, _)) = address.split_once(" (http)") {
+                let port = port.parse::<u16>().expect("Spring fixture bound port");
+                assert_ne!(port, 0, "Spring fixture must report its actual bound port");
+                return port;
+            }
         }
-        assert!(Instant::now() < deadline, "Spring fixture did not become ready");
-        thread::sleep(Duration::from_millis(30));
     }
 }
 
@@ -293,6 +297,20 @@ fn post_order(port: u16) -> Vec<u8> {
     let mut response = Vec::new();
     stream.read_to_end(&mut response).expect("read response");
     response
+}
+
+fn drain_fixture_stdout(reader: impl Read, lines: std::sync::mpsc::Sender<Vec<u8>>) -> Vec<u8> {
+    let mut reader = std::io::BufReader::new(reader);
+    let mut bytes = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        if reader.read_until(b'\n', &mut line).expect("read fixture stdout") == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&line);
+        let _ = lines.send(line);
+    }
+    bytes
 }
 
 fn drain(mut reader: impl Read) -> Vec<u8> {
