@@ -26,7 +26,15 @@ class ProxyCaptureTest {
   void productionTransformerCapturesActualJdkProxiesAcrossTheCorpus() throws Exception {
     ProbeResult result = runProbe();
     assertEquals(0, result.exitCode(), result.text());
-    assertTrue(result.text().contains("proxy-capture-cases=17"), result.text());
+    assertTrue(result.text().contains("proxy-capture-cases=18"), result.text());
+  }
+
+  @Test
+  void attachRetransformsSpringStyleProxyCreatedBeforeTheTransformerWasInstalled() throws Exception {
+    ProbeResult result = runProbe(true);
+    assertEquals(0, result.exitCode(), result.text());
+    assertTrue(result.text().contains("preloaded-proxy-capture-cases=1"), result.text());
+    assertTrue(result.text().contains("proxy-capture-cases=18"), result.text());
   }
 
   @Test
@@ -61,10 +69,15 @@ class ProxyCaptureTest {
   private record ProbeResult(int exitCode, String text) {}
 
   private ProbeResult runProbe(String... arguments) throws Exception {
+    return runProbe(false, arguments);
+  }
+
+  private ProbeResult runProbe(boolean attach, String... arguments) throws Exception {
     Path agent = scratch.resolve("proxy-probe-agent.jar");
     Manifest manifest = new Manifest();
     manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
     manifest.getMainAttributes().putValue("Premain-Class", ProxyProbeAgent.class.getName());
+    manifest.getMainAttributes().putValue("Can-Retransform-Classes", "true");
     try (JarOutputStream jar = new JarOutputStream(Files.newOutputStream(agent), manifest)) {
       String resource = ProxyProbeAgent.class.getName().replace('.', '/') + ".class";
       jar.putNextEntry(new JarEntry(resource));
@@ -79,6 +92,7 @@ class ProxyCaptureTest {
     List<String> command = new ArrayList<>(List.of(
         Path.of(System.getProperty("java.home"), "bin", "java").toString(),
         "-Xverify:all", "-Xbootclasspath/a:" + bridge, "-javaagent:" + agent,
+        "-Dxtrace.proxy.probe.attach=" + attach,
         "-cp", System.getProperty("java.class.path"), ProxyCaptureProbe.class.getName()));
     command.addAll(List.of(arguments));
     Process process = new ProcessBuilder(command)
