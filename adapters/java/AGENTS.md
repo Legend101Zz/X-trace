@@ -9,5 +9,5 @@
   conformance client.
 - The Rust CLI tests consume the built outputs of `installDist agentDist fixtureBootJar`. After changing the agent,
   the Rust journey tests on CI are the real check.
-- Fast check: `tools/dev/check.sh java:<module>` (offline; needs `tools/dev/prep.sh` once).
+- Fast check: `tools/dev/check.sh java:<module>` (strict dependency verification).
 - Runtime targets are Java 17 and 21 (CI also runs 25). Do not use APIs newer than 17 in agent code.

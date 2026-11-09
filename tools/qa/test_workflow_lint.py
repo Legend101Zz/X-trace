@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 import unittest
@@ -95,6 +96,96 @@ class CiPullRequestTests(unittest.TestCase):
         needed = aggregator["needs"]
         self.assertEqual(set(needed), set(jobs) - {"ci-ok"})
         self.assertEqual(aggregator["if"], "always()")
+        self.assertEqual(len(aggregator["steps"]), 1)
+        step = aggregator["steps"][0]
+        self.assertNotIn("uses", step)
+        self.assertEqual(step["env"], {"NEEDS_JSON": "${{ toJSON(needs) }}"})
+        results = {job: {"result": "success"} for job in needed}
+
+        def run_check():
+            return subprocess.run(
+                ["bash", "-e", "-c", step["run"]],
+                env={**os.environ, "NEEDS_JSON": json.dumps(results)},
+                capture_output=True, text=True, check=False,
+            ).returncode
+
+        self.assertEqual(run_check(), 0)
+        for job in needed:
+            for result in ("failure", "skipped", "cancelled", ""):
+                with self.subTest(job=job, result=result):
+                    results[job]["result"] = result
+                    self.assertNotEqual(run_check(), 0)
+            results[job]["result"] = "success"
+
+
+class MacosWorkflowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.path = ROOT / ".github/workflows/macos.yml"
+        cls.workflow = workflow_lint.load(cls.path)
+
+    def test_only_manual_and_wave_or_release_candidate_pushes_trigger(self):
+        # Ruby's YAML 1.1 parser represents the unquoted `on` key as JSON's "true".
+        triggers = self.workflow.get("on", self.workflow.get("true"))
+        self.assertEqual(triggers, {
+            "workflow_dispatch": None,
+            "push": {"branches": ["wave/**", "ultra/rc-*"]},
+        })
+        self.assertEqual(self.workflow["concurrency"], {
+            "group": "${{ github.workflow }}-${{ github.ref }}",
+            "cancel-in-progress": False,
+        })
+        self.assertEqual(workflow_lint.lint(self.path, True), [])
+
+    def test_source_jobs_use_the_exact_head(self):
+        jobs = self.workflow["jobs"]
+        self.assertEqual(set(jobs), {"release-tool-tests", "macos-arm64", "macos-ok"})
+        expected = "${{ github.event.pull_request.head.sha || github.sha }}"
+        self.assertEqual(self.workflow["env"]["XTRACE_CI_SOURCE_SHA"], expected)
+        for job_id in ("release-tool-tests", "macos-arm64"):
+            with self.subTest(job=job_id):
+                steps = jobs[job_id]["steps"]
+                checkouts = [step for step in steps if step.get("uses", "").startswith("actions/checkout@")]
+                self.assertEqual(len(checkouts), 1)
+                self.assertEqual(checkouts[0]["with"], {
+                    "ref": expected, "fetch-depth": 0, "persist-credentials": False,
+                })
+                for step in steps:
+                    run = step.get("run", "")
+                    self.assertNotIn("$GITHUB_SHA", run)
+                    for line in run.splitlines():
+                        if "--expected-head" in line or "--source-sha" in line:
+                            self.assertIn('"$XTRACE_CI_SOURCE_SHA"', line)
+
+    def test_original_matrix_timeout_and_test_floors_are_preserved(self):
+        job = self.workflow["jobs"]["macos-arm64"]
+        self.assertEqual(job["needs"], "release-tool-tests")
+        self.assertEqual(job["runs-on"], "macos-15")
+        self.assertEqual(job["timeout-minutes"], 180)
+        self.assertEqual(job["strategy"], {
+            "fail-fast": False,
+            "matrix": {"include": [
+                {"tuple": "jdk17-node22", "java-version": 17, "node-version": 22},
+                {"tuple": "jdk21-node24", "java-version": 21, "node-version": 24},
+            ]},
+        })
+        floors = {}
+        for step in job["steps"]:
+            run = step.get("run", "")
+            if "--min-passed" in run:
+                suite = re.search(r"--suite (\w+)", run).group(1)
+                floors[suite] = int(re.search(r"--min-passed (\d+)", run).group(1))
+                self.assertIn("--max-ignored 0", run)
+                self.assertEqual(step["if"], "${{ !cancelled() }}")
+        self.assertEqual(floors, {"node": 85, "web": 75, "java": 190, "rust": 1030})
+
+    def test_aggregator_covers_every_job_and_rejects_each_non_success(self):
+        jobs = self.workflow["jobs"]
+        aggregator = jobs["macos-ok"]
+        needed = aggregator["needs"]
+        self.assertEqual(set(needed), set(jobs) - {"macos-ok"})
+        self.assertEqual(aggregator["if"], "always()")
+        self.assertEqual(aggregator["timeout-minutes"], 5)
         self.assertEqual(len(aggregator["steps"]), 1)
         step = aggregator["steps"][0]
         self.assertNotIn("uses", step)

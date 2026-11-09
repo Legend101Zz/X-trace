@@ -30,21 +30,22 @@ honesty: it shows only what was observed and names every gap. Current state: `do
 
 ## Commands
 
-Fast checks (local, offline, seconds to ~2 minutes). Run the ones for what you touched:
+Local checks are compile-only. Run the checks for what you touched; all tests run on GitHub:
 
 ```bash
-tools/dev/check.sh rust:<crate>            # cargo check + lib unit tests + clippy -D warnings for one crate
-tools/dev/check.sh rust:<crate>:<test>     # one integration test binary
-tools/dev/check.sh java[:<module>]         # Gradle tests (offline, strict dependency verification)
-tools/dev/check.sh node                    # generate:check + node tests
-tools/dev/check.sh web[:<file>]            # typecheck + vitest (one file if given)
-tools/dev/check.sh py:<module>             # python3 -B -m unittest <module>
+tools/dev/check.sh rust:<crate>            # cargo check + clippy for one crate
+tools/dev/check.sh rust:<crate>:<test>     # compile one integration test binary (--no-run)
+tools/dev/check.sh java[:<module>]         # Gradle compileJava + compileTestJava, strict verification
+tools/dev/check.sh node                    # generate:check + typecheck
+tools/dev/check.sh web                     # typecheck + contrast; web:<file> is rejected
+tools/dev/check.sh py:<module>             # python3 -B -m py_compile on the module file
 tools/dev/check.sh fmt                     # cargo fmt --check
 tools/dev/check.sh diff                    # whitespace / end-of-file check (CI gate 23)
 ```
 
-Heavy suites run on GitHub Actions only (ADR 0012): the full workspace tests, CLI journey tests that need built
-adapters, the 23-gate floors, packaging, campaigns and browser runs. Read CI with
+All tests run on GitHub Actions at wave merges and release candidates, not per ticket (ADR 0012).
+Heavy suites include: the full workspace tests, CLI journey tests that need built adapters, the 23-gate floors,
+packaging, campaigns, browser runs and hosted macOS arm64 in `macos.yml` (D2; `macos-ok` required). Read CI with
 `gh -R Legend101Zz/X-trace run view <id> --log-failed`. `tools/dev/prep.sh` (fetch dependencies, build adapters)
 needs the network and runs outside any agent sandbox.
 
@@ -55,7 +56,7 @@ needs the network and runs outside any agent sandbox.
   gives admission errors that look like product bugs. `tools/dev/env.sh` sets this up. Never set them by hand.
 - **CLI integration tests need built adapters.** 10 of 16 `crates/xtrace-cli/tests/*.rs` binaries use the built
   Java agent/fixture, the Node packages and Playwright Chromium. A bare `cargo test --workspace` on a fresh
-  checkout fails. Leave those to CI unless `tools/dev/prep.sh --adapters` has run.
+  checkout fails. Leave those to CI.
 - **Generated and embedded files change together.** OpenAPI → `web/app/src/api.generated.ts` (`npm run
   check:api`); Protobuf → `adapters/node/packages/protocol/src/gen` (`npm run generate:check`); web app →
   `crates/xtrace-daemon/assets/ui/` (`npm run embed`, `check:embedded`). Never hand-edit generated files.
@@ -80,8 +81,10 @@ needs the network and runs outside any agent sandbox.
   navigation change only in a ticket that says so, with an ADR when semantics change.
 - **Git**: work in your own worktree and branch. Workers do not commit, push or merge; the orchestrator reviews,
   commits and opens the pull request. Every change reaches `main` through a PR whose required check `ci-ok` is
-  green on the exact head, with current `main` merged in (ADR 0012 §5). No closing keywords (`fixes #N`,
-  `closes #N`) in commits, PR titles or PR bodies.
+  green on the exact head, plus `macos-ok` for wave merges and release candidates, with current `main` merged in
+  (ADR 0012 §5). Small docs-only PRs still need `ci-ok`. No closing keywords (`fixes #N`,
+  `closes #N`) in commits, PR titles or PR bodies. Every ticket has an issue; use `Refs #N` in PRs and a tracking
+  issue with a checklist for each wave (ADR 0012 §5).
 - **Forbidden commands**: `pkill`, `killall`, kill by pattern, `kill $(pgrep ...)`, `sudo`, `diskutil`,
   `docker ... prune`, `rm -rf` outside your worktree or the dev cache. Signal only PIDs you started.
 - **Public repository**: never commit secrets, captured values, owner-specific absolute paths or raw logs.
@@ -94,6 +97,6 @@ needs the network and runs outside any agent sandbox.
 
 ## Definition of done (for a ticket)
 
-The ticket's acceptance criteria are met; the fast checks for every touched area pass; generated and embedded
+The ticket's acceptance criteria are met; compile-only checks for every touched area pass; generated and embedded
 files are regenerated; `tools/dev/check.sh diff` is clean; your report lists every command you ran with its real
-result. CI on the pull request is the final verdict.
+result. Tests run on GitHub; CI on the pull request is the final verdict.
