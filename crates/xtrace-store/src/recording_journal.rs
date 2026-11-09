@@ -3,7 +3,7 @@
 //! XTF objects remain immutable. Only the current tail is appendable: each
 //! envelope has a length and digest. A separate, atomically replaced checkpoint
 //! names the synced prefix; bytes beyond it never participate in recovery or live
-//! reads. Acknowledgement follows data sync, checkpoint sync and directory sync.
+//! reads. Acknowledgement follows a grouped data/checkpoint sync and directory sync.
 
 use std::io::{Seek as _, SeekFrom};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -278,15 +278,17 @@ fn read_boundary(
     Ok(Some(bytes))
 }
 
-/// The caller has synced the journal first. Never overwrite the old checkpoint:
-/// after a crash, rename exposes either the old synced boundary or the new one.
-fn publish_boundary(
+/// Flush the unpublished checkpoint to the filesystem before the journal's
+/// device barrier. Both files are in this same admitted directory: on Apple,
+/// the following journal F_FULLFSYNC drains their shared device cache once.
+/// Linux fsync already makes each file durable. No reader uses this temporary.
+fn prepare_boundary(
     root: &AdmittedPrivateRoot,
     recording_id: RecordingId,
     header: &[u8],
     length: u64,
     id: CorrelationId,
-) -> Result<(), RecordingStoreError> {
+) -> Result<std::fs::File, RecordingStoreError> {
     let name = boundary_name(recording_id);
     let pending = format!("{name}-next");
     let mut bytes = header.to_vec();
@@ -296,8 +298,23 @@ fn publish_boundary(
     file.set_len(0).map_err(|_| object_io_error(id))?;
     file.write_all(&bytes).map_err(|_| object_io_error(id))?;
     commit_failpoint("journal-checkpoint-before-sync", id, false)?;
-    durable_sync(SyncKind::Checkpoint, || file.sync_all()).map_err(|_| object_io_error(id))?;
+    durable_sync(SyncKind::Checkpoint, || sync_recording_file(&file, FileSync::Filesystem))
+        .map_err(|_| object_io_error(id))?;
     root.validate_file_binding(&pending, &file, true).map_err(|_| object_io_error(id))?;
+    Ok(file)
+}
+
+/// The caller has made both files durable with the journal's device barrier.
+/// Never overwrite the old checkpoint: rename exposes an entirely durable old
+/// or new prefix even if power is lost before this batch is acknowledged.
+fn publish_boundary(
+    root: &AdmittedPrivateRoot,
+    recording_id: RecordingId,
+    file: &std::fs::File,
+    id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    let name = boundary_name(recording_id);
+    let pending = format!("{name}-next");
     commit_failpoint("journal-checkpoint-before-rename", id, false)?;
     #[cfg(test)]
     BEFORE_PUBLICATION.with(|hook| {
@@ -315,7 +332,7 @@ fn publish_boundary(
         // as rename_replace, with an explicit full directory sync on Apple.
         let directory = xtrace_private_storage::open_private_directory_descriptor(root.path())
             .map_err(|_| object_io_error(id))?;
-        root.validate_file_binding(&pending, &file, false).map_err(|_| object_io_error(id))?;
+        root.validate_file_binding(&pending, file, false).map_err(|_| object_io_error(id))?;
         if root.validate_optional_private_file(&name).map_err(|_| object_io_error(id))? {
             let target = root.open_regular_file(&name).map_err(|_| object_io_error(id))?;
             root.validate_file_binding(&name, &target, false).map_err(|_| object_io_error(id))?;
@@ -323,7 +340,7 @@ fn publish_boundary(
         root.revalidate().map_err(|_| object_io_error(id))?;
         rustix::fs::renameat(&directory, pending.as_str(), &directory, name.as_str())
             .map_err(|_| object_io_error(id))?;
-        root.validate_file_binding(&name, &file, false).map_err(|_| object_io_error(id))?;
+        root.validate_file_binding(&name, file, false).map_err(|_| object_io_error(id))?;
         sync_directory_descriptor(&directory).map_err(|_| object_io_error(id))?;
         root.revalidate().map_err(|_| object_io_error(id))
     }
@@ -689,8 +706,11 @@ impl SqliteRecordingStore<'_> {
             && &known.header[..8] == LEGACY_MAGIC
             && read_boundary(&root, request.recording_id, id)?.is_none()
         {
-            durable_sync(SyncKind::Journal, || file.sync_all()).map_err(|_| object_io_error(id))?;
-            publish_boundary(&root, request.recording_id, &known.header, known.length, id)?;
+            let boundary =
+                prepare_boundary(&root, request.recording_id, &known.header, known.length, id)?;
+            durable_sync(SyncKind::Journal, || sync_recording_file(&file, FileSync::Device))
+                .map_err(|_| object_io_error(id))?;
+            publish_boundary(&root, request.recording_id, &boundary, id)?;
         }
         let lock = snapshot_lock(&root, request.recording_id, id)?;
         let mutation = lock.write().map_err(|_| object_io_error(id))?;
@@ -715,6 +735,8 @@ impl SqliteRecordingStore<'_> {
         #[cfg(unix)]
         drop(file_mutation);
         drop(mutation);
+        let boundary =
+            prepare_boundary(&root, request.recording_id, &known.header, final_length, id)?;
         #[cfg(test)]
         BEFORE_SYNC.with(|hook| {
             if let Some(hook) = hook.borrow().as_ref() {
@@ -722,7 +744,8 @@ impl SqliteRecordingStore<'_> {
             }
         });
         commit_failpoint("journal-before-sync", id, false)?;
-        durable_sync(SyncKind::Journal, || file.sync_all()).map_err(|_| object_io_error(id))?;
+        durable_sync(SyncKind::Journal, || sync_recording_file(&file, FileSync::Device))
+            .map_err(|_| object_io_error(id))?;
         root.validate_file_binding(&name, &file, true).map_err(|_| object_io_error(id))?;
         if !cached {
             AdmittedPrivateRoot::open(&self.binding.root)
@@ -731,7 +754,7 @@ impl SqliteRecordingStore<'_> {
         }
         // The publication directory barrier covers both the tail's creation
         // and checkpoint rename; a cold writer also persisted its parent.
-        publish_boundary(&root, request.recording_id, &known.header, final_length, id)?;
+        publish_boundary(&root, request.recording_id, &boundary, id)?;
         commit_failpoint("journal-after-sync", id, false)?;
         known.length = final_length;
         known.digests.extend_from_slice(&digests[overlap..]);

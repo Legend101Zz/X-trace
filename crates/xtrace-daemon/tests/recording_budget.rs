@@ -692,7 +692,13 @@ async fn finished_recording_budget_journey(abandoned: bool) {
             };
             assert_eq!(window.drop_counts_by_priority, expected_drops);
             assert!(window.duration_ns.is_none(), "no duration was observed");
-            assert!(window.outcome.is_none(), "no terminal outcome was sent");
+            // A minimal Finish is terminal evidence. The read contract exposes an
+            // unobserved outcome for it; null is reserved for no Finish at all.
+            let outcome = window.outcome.expect("minimal Finish has unobserved terminal evidence");
+            assert_eq!(outcome.kind, "unobserved");
+            assert!(outcome.http_status.is_none(), "no HTTP status was observed");
+            assert!(outcome.exception.is_none(), "no exception was observed");
+            assert!(outcome.thrown_from_event_id.is_none(), "no throw link was observed");
             assert!(!window.incomplete_evidence.is_empty());
         }
     }
@@ -707,6 +713,7 @@ async fn finished_recording_budget_journey(abandoned: bool) {
             })
             .expect("companion remained active across abandoned requests");
         assert_eq!(companion.status, RecordingStatus::Recording);
+        assert!(companion.outcome.is_none(), "the active companion has no Finish evidence");
         let later_id = RecordingId::new();
         let later_bytes = Bytes::copy_from_slice(later_id.as_uuid().as_bytes());
         // A subsequent recording and the still-active companion both finish as verified complete.
