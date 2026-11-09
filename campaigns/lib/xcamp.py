@@ -18,7 +18,6 @@ import os
 import pathlib
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -132,10 +131,19 @@ def rm_network(name: str) -> None:
     docker("network", "rm", name, check=False)
 
 
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def published_port(container: str, port: int) -> int:
+    """Read Docker's loopback port allocation after the container has bound it."""
+    bound = docker("port", container, f"{port}/tcp").stdout.strip()
+    match = re.fullmatch(r"127\.0\.0\.1:(\d+)", bound)
+    if not match or not 0 < int(match[1]) < 65536:
+        raise RuntimeError("Docker did not report one loopback port binding")
+    return int(match[1])
+
+
+def spring_bound_port(log: str) -> int | None:
+    """Spring's started message reports the actual OS-assigned listening port."""
+    matches = re.findall(r"(?:Tomcat|Netty|Undertow) started on port(?:\(s\))?:? (\d+)", log)
+    return int(matches[-1]) if matches and 0 < int(matches[-1]) < 65536 else None
 
 
 def image_id(ref: str) -> str:
@@ -173,7 +181,7 @@ def http_request(base: str, method: str, path: str, *, headers: dict[str, str] |
 # Optional (method, path, headers, body) -> (path, headers, body) applied just before sending. Default: none.
 REQUEST_HOOK: Callable[[str, str, dict, Any], tuple] | None = None
 SENT_LOG: list | None = None  # instrumented runs set a list; every scenario request appends (method, original path)
-# Instrumented runs set a pause (seconds) after every request of a non-concurrency scenario: the packaged agent writes one recording
+# Instrumented runs pace before each request of a non-concurrency scenario: the packaged agent writes one recording
 # at a time (about 285 ms each on a hosted runner) and refuses a request past 8 unwritten recordings, so back-to-back requests are
 # never recorded 1:1. The pause changes no request, response or fingerprint. Concurrency scenarios are never paced.
 REQUEST_PACE_S: float = 0.0
@@ -213,9 +221,9 @@ class Ctx:
             send_path, send_hdrs, send_raw = REQUEST_HOOK(method, path, hdrs, raw)
         if SENT_LOG is not None:
             SENT_LOG.append((method, path))
-        res = http_request(self.base, method, send_path, headers=send_hdrs, body=send_raw)
         if self.pace:
             time.sleep(self.pace)
+        res = http_request(self.base, method, send_path, headers=send_hdrs, body=send_raw)
         text = res["body"].decode("utf-8", "replace")
         ntext = normalize_text(text, (norm or []) + self.norm_extra)
         redacted_headers = {k: v for k, v in hdrs.items() if k.lower() not in ("authorization", "cookie")}
@@ -337,18 +345,19 @@ class Stack:
     def up(self) -> None:
         self.down()
         docker("network", "create", self.net)
-        self.host_port = free_port()
+        self.host_port = 0
         if self.db_name:
             publish = []
             if self.mode == "host":
-                self.db_host_port = free_port()
-                publish = ["-p", f"127.0.0.1:{self.db_host_port}:5432"]
+                publish = ["-p", "127.0.0.1::5432"]
             docker("run", "-d", "--name", self.db, "--platform", PLATFORM, "--network", self.net, "--network-alias", "db",
                    *publish,
                    "-e", f"POSTGRES_USER={self.db_user}", "-e", f"POSTGRES_PASSWORD={self.db_password}",
                    "-e", f"POSTGRES_DB={self.db_name}", "--tmpfs", "/var/lib/postgresql:rw,size=1g",
                    POSTGRES_IMAGE, "-c", "fsync=off", "-c", "max_connections=200", "-c", "timezone=UTC",
                    "-c", "log_timezone=UTC")
+            if self.mode == "host":
+                self.db_host_port = published_port(self.db, 5432)
             self._wait_db()
             for sql in self.extra_db_init:
                 self.psql(sql, db="postgres")
@@ -371,13 +380,14 @@ class Stack:
                     stdout=fh, stderr=subprocess.STDOUT, env=child_env, start_new_session=True)
         else:
             cmd = ["run", "-d", "--name", self.app, "--platform", PLATFORM, "--network", self.net, "--memory", self.app_mem,
-                   "-p", f"127.0.0.1:{self.host_port}:{self.app_port}",
+                   "-p", f"127.0.0.1::{self.app_port}",
                    "-v", f"{self.jar.parent}:/app:ro", "-w", "/app", "-e", "TZ=UTC"]
             for k, v in env.items():
                 cmd += ["-e", f"{k}={v}"]
             cmd += [self.jdk_image, "java", "-Duser.timezone=UTC", "-Dfile.encoding=UTF-8", *self.java_opts,
                     "-jar", f"/app/{self.jar.name}", *args]
             docker(*cmd)
+            self.host_port = published_port(self.app, self.app_port)
         self._wait_ready()
 
     def down(self) -> None:
@@ -411,19 +421,16 @@ class Stack:
         while time.time() < deadline:
             p = docker("exec", self.db, "pg_isready", "-U", self.db_user, "-d", self.db_name or "postgres", check=False)
             if p.returncode == 0:
-                # pg_isready can pass during init restart; require a real query twice
-                q = docker("exec", self.db, "psql", "-U", self.db_user, "-d", self.db_name or "postgres", "-Atc", "select 1", check=False)
-                if q.stdout.strip() == "1":
-                    time.sleep(1.5)
-                    q = docker("exec", self.db, "psql", "-U", self.db_user, "-d", self.db_name or "postgres", "-Atc", "select 1", check=False)
-                    if q.stdout.strip() == "1":
-                        return
+                # The init server accepts only a Unix socket. TCP proves the final server is listening.
+                q = docker("exec", "-e", f"PGPASSWORD={self.db_password}", self.db, "psql", "-h", "127.0.0.1", "-U", self.db_user,
+                           "-d", self.db_name or "postgres", "-Atc", "select 1", check=False)
+                if q.returncode == 0 and q.stdout.strip() == "1":
+                    return
             time.sleep(1)
         raise RuntimeError("database did not become ready")
 
     def _wait_ready(self) -> None:
         deadline = time.time() + self.ready_timeout
-        base = f"http://127.0.0.1:{self.host_port}"
         last = ""
         while time.time() < deadline:
             if self.mode == "host":
@@ -432,8 +439,13 @@ class Stack:
                 st = docker("inspect", "--format", "{{.State.Running}}", self.app, check=False).stdout.strip()
             if st != "true":
                 raise RuntimeError("application container exited during startup:\n" + self.logs()[-3000:])
+            if self.mode == "host" and not self.host_port:
+                self.host_port = spring_bound_port(self.logs()) or 0
+                if not self.host_port:
+                    time.sleep(0.1)  # poll the bound-port observation, never infer readiness from elapsed time
+                    continue
             try:
-                r = http_request(base, "GET", self.ready_path, timeout=5)
+                r = http_request(self.base, "GET", self.ready_path, timeout=5)
                 if self.ready_ok(r["status"], r["body"].decode("utf-8", "replace")):
                     return
                 last = f"status {r['status']}"

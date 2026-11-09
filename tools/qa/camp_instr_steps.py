@@ -28,7 +28,7 @@ def _load(path: str):
         return None
 
 
-FLOW_STEPS = ("record-stop-flow", "restart-reopen", "partial-recording-reopen", "active-line-frames", "frame-values")
+FLOW_STEPS = ("record-stop-flow", "restart-reopen", "partial-recording-reopen", "active-line-frames", "frame-values", "focused-canary-injection")
 
 
 def flow_steps(f: dict | None) -> list[tuple[str, str, str]]:
@@ -44,6 +44,9 @@ def flow_steps(f: dict | None) -> list[tuple[str, str, str]]:
                         else "the flows run reported an unknown status"))
         else:
             out.append((name, v["status"], str(v.get("note", ""))[:300]))
+    accommodation = steps.get("flow-accommodations") if isinstance(steps, dict) else None
+    if isinstance(accommodation, dict):
+        out.append(("flow-accommodations", "reported", str(accommodation.get("note", ""))))
     return out
 
 
@@ -86,6 +89,11 @@ def instrumented_steps(r: dict | None) -> list[tuple[str, str, str]]:
     # record-stop-flow, restart-reopen, partial-recording-reopen, active-line-frames and frame-values come from `flows` below
     out.append(("launcher-exit-after-sigterm", "pass" if r.get("notes", {}).get("launcherExitCode") in (0, 143, -15) else "fail",
                 f"xtrace run exited {r.get('notes', {}).get('launcherExitCode')} after SIGTERM to the launcher pid"))
+    accommodations = r.get("notes", {}).get("accommodations")
+    if accommodations:
+        out.append(("unpaced-load-not-exercised", "reported",
+                    f"pace_seconds={accommodations.get('pace_seconds')}; drain_seconds={accommodations.get('drain_seconds')}; "
+                    + str(accommodations.get("reason", ""))))
     return out
 
 
@@ -106,22 +114,41 @@ def tui_steps(t: dict | None) -> list[tuple[str, str, str]]:
     if t is None:
         return [("tui-pty-transcript", "fail", "no tui.json")]
     v = t.get("verdict")
-    return [("tui-pty-transcript", v if v in ("pass", "not-implemented") else "fail", str(t.get("reason", ""))[:160])]
+    out = [("tui-pty-transcript", v if v in ("pass", "not-implemented") else "fail", str(t.get("reason", ""))[:160])]
+    observed = t.get("observations", {})
+    if observed.get("accommodation"):
+        out.append(("tui-navigation-accommodation", "reported",
+                    f"open_after={observed.get('open_after')}; listObserved={observed.get('listObserved')}; "
+                    + str(observed["accommodation"])))
+    return out
 
 
 def overhead_steps(o: dict | None) -> list[tuple[str, str, str]]:
     if o is None:
         return [("overhead-measurement", "fail", "no overhead.json"), ("overhead-repeats-ge-5", "fail", "no overhead.json")]
-    a = o["aggregate"]
-    reps = o.get("repeats", a.get("repeats", 1))
-    reps = reps if isinstance(reps, int) else 1
+    a = o.get("aggregate", {})
+    reps = o.get("repeats", 0)
+    eligible = (type(reps) is int and reps >= 5 and o.get("interleaved") is True
+                and o.get("eligibleForClaim") is True and not o.get("errors")
+                and len(o.get("runs", [])) == 2 * reps)
+    previous_end = 0
+    for index, run in enumerate(o.get("runs", [])):
+        start, end = run.get("startedNs"), run.get("finishedNs")
+        ordered = type(start) is int and type(end) is int and previous_end <= start < end
+        eligible = (eligible and ordered
+                    and run.get("mode") == ("baseline" if index % 2 == 0 else "instrumented")
+                    and run.get("repeat") == index // 2 and run.get("exitCode") == 0
+                    and len(run.get("canonicalReceiptSha256", "")) == 64)
+        if ordered:
+            previous_end = end
+    if not eligible or not a.get("baseline", {}).get("n") or not a.get("instrumented", {}).get("n"):
+        return [("overhead-measurement", "fail", "no qualified overhead number: five successful interleaved workload pairs required"),
+                ("overhead-repeats-ge-5", "fail", f"{reps} pairs reported; ordered run evidence is missing, insufficient or failed")]
     return [("overhead-measurement", "reported",
              f"p50 {a['baseline']['p50Ms']}->{a['instrumented']['p50Ms']}ms (x{a['p50Ratio']}), "
              f"p95 {a['baseline']['p95Ms']}->{a['instrumented']['p95Ms']}ms (x{a['p95Ratio']}); "
-             f"n={a['baseline'].get('n')}/{a['instrumented'].get('n')} requests, warm-up included, p95 is near the maximum; "
-             f"instrumented requests also carry canary headers and the launcher; a ratio below 1 is noise, not a speed-up; not gated"),
-            ("overhead-repeats-ge-5", "pass" if reps >= 5 else "not-implemented",
-             f"{reps} interleaved baseline/instrumented repeat(s); at least 5 are required before an overhead number can back a claim")]
+             "warm-up, canaries and launcher included; paced serial load, capture drops may affect measurements; no budget"),
+            ("overhead-repeats-ge-5", "pass", f"{reps} successful interleaved baseline/instrumented pairs with observed run intervals")]
 
 
 def main() -> int:

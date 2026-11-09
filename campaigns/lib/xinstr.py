@@ -124,6 +124,29 @@ class ViewerClient:
             return st, {"_nonJson": True, "bytes": len(data)}
 
 
+def list_recording_ids(xtrace: str, project_dir: pathlib.Path, env: dict[str, str]) -> set[str]:
+    """Snapshot persisted ids before launching, so repeated measurements judge only their own new recordings."""
+    ids = set()
+    after = None
+    for _ in range(20):
+        args = [xtrace, "recording", "list", "--project-dir", str(project_dir), "--limit", "200"]
+        if after:
+            args += ["--after", after]
+        result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            raise RuntimeError(f"recording list before launch exited {result.returncode}")
+        doc = json.loads(result.stdout)
+        doc = doc.get("data", doc)
+        rows = doc.get("recordings")
+        if not isinstance(rows, list) or any(not isinstance(r, dict) or not r.get("recording_id") for r in rows):
+            raise RuntimeError("recording list before launch returned invalid rows")
+        ids.update(r["recording_id"] for r in rows)
+        after = doc.get("next_after")
+        if not after:
+            return ids
+    raise RuntimeError("recording snapshot exceeded the pagination bound")
+
+
 def start_viewer(xtrace: str, project_dir: pathlib.Path, env: dict[str, str], log: pathlib.Path,
                  timeout: float = 60.0) -> tuple[subprocess.Popen, dict[str, str]]:
     import select
@@ -371,16 +394,11 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
             sent: list[tuple[str | None, str, str]] | None = None, burst: frozenset = frozenset()) -> dict[str, Any]:
     """expectations: scenario id -> [{method, route, status, layers[], minCount}]. Returns a verdict per scenario.
 
-    Attribution is by ORDER, never by wall clock (a recording's openedAt tracks ingestion, not the request). `sent` is the
-    harness's ordered request log [(scenario id | None for non-scenario traffic such as the canary requests, method,
-    path)]. For one expectation (method, route) the product must have recorded exactly as many matching recordings as the
-    harness sent matching requests; then recordings sorted by time are consumed in request order and each scenario judges
-    only the recordings of its own requests. `burst` names the concurrency scenarios, whose requests are sent unpaced and which
-    the product may record only in part (the agent admits a bounded number of unwritten recordings): the paced requests before
-    the first burst request are attributed by order exactly as above; the recordings left after them belong to the burst scenario
-    (less one per later non-scenario request, so a burst is never credited with a canary's recording) and are judged against its
-    minCount. Any other count cannot be attributed and is reported as
-    `attribution-ambiguous` (never guessed). Without `sent` every scenario is judged campaign-wide and says so."""
+    Serial routes retain exact request/recording counts. Any route touched by an uncorrelated burst is
+    ambiguous, including its earlier serial requests: ingestion order cannot prove request identity when
+    recordings may be dropped. `openedAt` is ingestion time, not a verified request boundary.
+    Without `sent`, results are explicitly campaign-wide.
+    """
     literal_routes = frozenset((e["route"].rstrip("/") or "/") for exps in expectations.values() for e in exps if "{" not in e["route"])
     verdicts: dict[str, Any] = {}
     for sid, exps in expectations.items():
@@ -397,35 +415,23 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                 mine = [i for i, r in enumerate(reqs) if r[0] == sid]
                 times = [recording_time(d) for d in matched_all]
                 first_burst = next((i for i, r in enumerate(reqs) if r[0] in burst), None)
-                n_serial = len(reqs) if first_burst is None else first_burst
-                late_none = 0 if first_burst is None else sum(1 for r in reqs[first_burst:] if r[0] is None)
-                if first_burst is not None and any(r[0] is not None and r[0] not in burst for r in reqs[first_burst:]):
+                if first_burst is not None:
                     matched = []
-                    problems.append("attribution-ambiguous(paced request sent after a burst request)")
+                    attribution = "ambiguous"
+                    problems.append("attribution-ambiguous(burst shares route without request correlation or verified boundary)")
                 elif not matched_all:
                     matched = []
-                elif first_burst is not None and len(matched_all) >= n_serial and not any(t is None for t in times):
-                    order = sorted(range(len(matched_all)), key=lambda i: (times[i], i))
-                    ordered = [matched_all[i] for i in order]
-                    if sid in burst:
-                        rest = ordered[n_serial:]
-                        matched = rest[:max(0, len(rest) - late_none)]
-                        attribution = "burst"
-                    else:
-                        matched = [ordered[i] for i in mine if i < n_serial]
-                elif len(matched_all) != len(reqs) and first_burst is None:
+                elif len(matched_all) != len(reqs):
                     matched = []
                     problems.append(f"attribution-ambiguous(recordings {len(matched_all)}, requests {len(reqs)})")
-                elif first_burst is not None:
-                    matched = []
-                    problems.append(f"attribution-ambiguous(recordings {len(matched_all)}, paced requests {n_serial})"
-                                    if len(matched_all) < n_serial else "attribution-ambiguous(recording time unknown)")
                 elif any(t is None for t in times):
                     matched = []
                     problems.append("attribution-ambiguous(recording time unknown)")
                 else:
                     order = sorted(range(len(matched_all)), key=lambda i: (times[i], i))
                     matched = [matched_all[order[i]] for i in mine]
+            if any(p.startswith("attribution-ambiguous") for p in problems):
+                attribution = "ambiguous"
             attributed_total += len(matched)
             with_status = [d for d in matched if outcome_matches(d, e)]
             need = e.get("minCount", 1)
@@ -465,7 +471,8 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                           "layers": layer_report, "recordingsWithSource": len(src), "problems": problems,
                           "passed": not problems})
         verdicts[sid] = {"passed": all(i["passed"] for i in items), "expectations": items,
-                         "attribution": "order" if sent is not None else "campaign-wide",
+                         "attribution": "ambiguous" if any(i["attribution"] == "ambiguous" for i in items)
+                         else "order" if sent is not None else "campaign-wide",
                          "recordingsAttributed": attributed_total}
     return verdicts
 
@@ -497,7 +504,7 @@ def canary_hook(canaries: dict[str, str]) -> Callable[..., tuple]:
     return hook
 
 
-PACE_SECONDS = 0.4  # pause after each paced request: above the agent's per-recording write time (about 285 ms on a hosted runner)
+PACE_SECONDS = 0.4  # disclosed accommodation for the agent's bounded queue; never a completion wait
 
 
 def send_canary_requests(base: str, canaries: dict[str, str], paths: list[tuple[str, str]], pace: float = 0.0) -> list[dict]:
@@ -505,6 +512,8 @@ def send_canary_requests(base: str, canaries: dict[str, str], paths: list[tuple[
     import xcamp
     out = []
     for method, path in paths:
+        if pace:
+            time.sleep(pace)
         body = json.dumps({"username": "xt-canary-user", "password": canaries["json-body-password"]}).encode()
         try:
             r = xcamp.http_request(base, method, path, headers={"Content-Type": "application/json",
@@ -513,8 +522,6 @@ def send_canary_requests(base: str, canaries: dict[str, str], paths: list[tuple[
             out.append({"method": method, "path": path, "status": r["status"]})
         except Exception as exc:  # recorded, not fatal: the canary scan decides
             out.append({"method": method, "path": path, "error": type(exc).__name__})
-        if pace:
-            time.sleep(pace)
     return out
 
 
@@ -529,12 +536,17 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
     out_dir.mkdir(parents=True, exist_ok=False)
     env = {**os.environ, "XTRACE_DATA_HOME": str(data_home)}
     data_home.mkdir(parents=True, exist_ok=True)
-    notes: dict[str, Any] = {}
+    notes: dict[str, Any] = {"accommodations": {
+        "pace_seconds": PACE_SECONDS, "drain_seconds": 0,
+        "reason": "serial requests paced because the agent admits at most 8 unwritten recordings; burst remains unpaced",
+        "attribution": "routes shared with the burst fail as ambiguous without per-request correlation",
+    }}
     init = subprocess.run([xtrace, "init", "--project-dir", str(project_dir), "--display-name", "campaign"],
                           env=env, capture_output=True, text=True, timeout=120)
     notes["init"] = {"exitCode": init.returncode}
     if init.returncode != 0:
         raise RuntimeError(f"xtrace init failed with exit {init.returncode}")
+    before_ids = list_recording_ids(xtrace, project_dir, env)
     if canaries:
         xcamp.REQUEST_HOOK = canary_hook(canaries)
         os.environ["XTRACE_CANARY_ENV"] = canaries["env-var"]
@@ -558,7 +570,6 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
             results.append(res)
             print(f"  [{'PASS' if res['passed'] else 'FAIL'}] {sc.id} {res['semanticEffectFingerprint'][:16]} {res['elapsedMs']}ms", flush=True)
         if canaries:
-            time.sleep(2.0)  # let the agent's writer drain the burst before the (paced) canary requests
             notes["canaryRequests"] = send_canary_requests(stack.base, canaries, extra_canary_paths, pace=PACE_SECONDS)
             sent_log.extend((None, m, pth) for m, pth in extra_canary_paths)  # non-scenario traffic, still recorded by the product
     finally:
@@ -567,9 +578,9 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
             (out_dir / "application.log").write_text(stack.logs())
         except Exception:
             pass
-    xcamp.REQUEST_HOOK = None
-    xcamp.SENT_LOG = None
-    xcamp.REQUEST_PACE_S = 0.0
+        xcamp.REQUEST_HOOK = None
+        xcamp.SENT_LOG = None
+        xcamp.REQUEST_PACE_S = 0.0
     notes["launcherExitCode"] = getattr(stack, "launcher_exit", None)
 
     # product lifecycle commands that exist in the CLI surface: exit code 9 means "not implemented yet"
@@ -587,6 +598,8 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
             raise RuntimeError("no bootstrap token in viewer url")
         client.exchange(token)
         api = collect_api(client, out_dir / "api")
+        api["recordings"] = [r for r in api["recordings"] if r["recordingId"] not in before_ids]
+        api["details"] = {rid: d for rid, d in api["details"].items() if rid not in before_ids}
     except Exception as exc:
         api = {"ok": False, "reason": f"{type(exc).__name__}: {str(exc)[:200]}", "recordings": [], "details": {}}
     finally:
@@ -614,7 +627,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         "harnessSha256": {p.name: xcamp.sha256_file(p) for p in harness_files}, "bootMs": boot_ms,
         "durationSeconds": round(time.time() - started, 1), "notes": notes,
         "api": {"ok": api["ok"], "reason": api["reason"], "recordings": len(api["recordings"])},
-        "attribution": "order: recordings consumed in request order per route; unequal counts are attribution-ambiguous",
+        "attribution": "serial routes require exact counts; routes shared with uncorrelated bursts are attribution-ambiguous",
         "requestsSent": len(sent_log),
         "problemClasses": problem_classes(verdicts), "scenarios": scen_out,
         "recordingsWithSource": sum(e["recordingsWithSource"] for v in verdicts.values() for e in v["expectations"]),
