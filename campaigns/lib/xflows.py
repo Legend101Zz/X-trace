@@ -34,12 +34,7 @@ STEP_NAMES = ("record-stop-flow", "restart-reopen", "partial-recording-reopen", 
 
 # ------------------------------------------------------------------ helpers --
 def parse_doc(text: str) -> Any:
-    """The last JSON document in `text` (the CLI prints one document); None when there is none."""
-    for line in reversed([ln for ln in text.splitlines() if ln.strip()]):
-        try:
-            return json.loads(line)
-        except ValueError:
-            continue
+    """Parse the CLI's single JSON document; never mistake an inner scalar for the response."""
     try:
         return json.loads(text)
     except ValueError:
@@ -231,11 +226,14 @@ def judge_partial(*, record_rc: int, stop_rc: int | None, stop_doc: Any, control
 def _line_events(details: list[dict]) -> list[tuple[dict, dict]]:
     out = []
     for d in details:
-        sources = {ev.get("frameId"): ev.get("source") for ev in d.get("events", [])
-                   if str(ev.get("kind", "")).endswith("frame_enter") and isinstance(ev.get("source"), dict)}
+        sources = {ev["frameId"]: ev.get("source") for ev in d.get("events", [])
+                   if ev.get("frameId") and str(ev.get("kind", "")).endswith("frame_enter")}
         for ev in d.get("events", []):
             if str(ev.get("kind", "")).endswith("line_cursor"):
-                out.append((ev, sources.get(ev.get("frameId")) or ev.get("source") or {}))
+                # Every cursor has its own frame id and one-line source range. Only its
+                # observed parent method's FRAME_ENTER supplies a method extent.
+                source = sources.get(ev.get("parentFrameId"))
+                out.append((ev, source if isinstance(source, dict) else {}))
     return out
 
 
@@ -247,24 +245,21 @@ def judge_active_line(details: list[dict]) -> tuple[str, str]:
         gaps = sum(1 for d in details for ev in d.get("events", []) if str(ev.get("symbol") or "").endswith("gap.not-transformed"))
         return "fail", (f"{len(details)} focused recordings carry no line_cursor event"
                         + (f"; the product declares gap.not-transformed {gaps} time(s)" if gaps else "; no gap is declared either"))
-    bad = [ev for ev, _ in lines if not (isinstance(ev.get("line"), int) and ev["line"] >= 1)]
+    bad = [ev for ev, _ in lines if not (type(ev.get("line")) is int and ev["line"] >= 1)]
     if bad:
         return "fail", f"{len(bad)} line_cursor events carry no observed line number"
-    with_extent = [(ev, src) for ev, src in lines if isinstance(src.get("startLine"), int)]
-    if with_extent:
-        outside = [ev for ev, src in with_extent if isinstance(src.get("endLine"), int)
-                   and not src["startLine"] <= ev["line"] <= src["endLine"]]
-        moving = [ev for ev, src in with_extent if ev["line"] != src["startLine"]]
-        if outside:
-            return "fail", f"{len(outside)} observed lines fall outside their frame's method extent"
-        if not moving:
-            return "fail", f"all {len(with_extent)} line events equal the method start line (an extent, not an executed line)"
-        return "pass", (f"{len(lines)} line_cursor events with observed lines; {len(moving)} differ from their method start line "
-                        f"and stay inside the extent")
-    distinct = {ev["line"] for ev, _ in lines}
-    if len(distinct) < 2:
-        return "fail", "line events carry one distinct line and no method extent to compare it with"
-    return "pass", f"{len(lines)} line_cursor events with {len(distinct)} distinct observed lines (no method extent on the frames)"
+    with_extent = [(ev, src) for ev, src in lines if type(src.get("startLine")) is int and src["startLine"] >= 1]
+    if len(with_extent) != len(lines):
+        return "fail", f"{len(lines) - len(with_extent)} line events have no enclosing method extent through parentFrameId"
+    outside = [ev for ev, src in with_extent if ev["line"] < src["startLine"] or
+               (type(src.get("endLine")) is int and ev["line"] > src["endLine"])]
+    moving = [ev for ev, src in with_extent if ev["line"] != src["startLine"]]
+    if outside:
+        return "fail", f"{len(outside)} observed lines fall outside their frame's method extent"
+    if not moving:
+        return "fail", f"all {len(with_extent)} line events equal the method start line (an extent, not an executed line)"
+    return "pass", (f"{len(lines)} line_cursor events with observed lines; {len(moving)} differ from their method start line "
+                    f"and stay inside the available extent bounds")
 
 
 def judge_frame_values(details: list[dict]) -> tuple[str, str]:
@@ -360,15 +355,13 @@ class Flows:
             pass
 
     def _record(self, command: str = "record", *, timeout: float = 120.0) -> tuple[int, Any, str]:
-        # Lifecycle commands print ONE pretty JSON document. A bare array element is valid
-        # JSON too, so the shared line-oriented parser can mistake it for the whole response.
         args = [command, "--project-dir", str(self.project_dir), "--json"]
         if command in ("record", "restart"):
             args += self._capture_flags()
         result = subprocess.run([self.xtrace, *args], env=self.env, capture_output=True, text=True, timeout=timeout)
         rc = result.returncode
         body = result.stdout if result.stdout.strip() else result.stderr
-        doc = json.loads(body) if body.strip() else None
+        doc = parse_doc(body)
         return rc, doc, str(find_key(doc, "bootstrap_path") or "")
 
     # -- flow A --

@@ -53,11 +53,7 @@ def alive(pid: int) -> bool:
 
 
 def parse_json(text: str):
-    for line in reversed(text.splitlines()):
-        try:
-            return json.loads(line)
-        except ValueError:
-            continue
+    """Lifecycle commands emit one JSON document, which can span several lines."""
     try:
         return json.loads(text)
     except ValueError:
