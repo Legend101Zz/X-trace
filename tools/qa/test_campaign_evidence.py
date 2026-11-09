@@ -14,6 +14,8 @@ class WorkflowEvidence(unittest.TestCase):
         self.assertIn("analyzer is not shipped", text)
         self.assertIn("--require exports:3", text)
         self.assertIn('--loc "exports=$RUNNER_TEMP/xt/exports"', text)
+        self.assertIn("--require bundle-files:6", text)
+        self.assertIn('--loc "bundle-files=$RUNNER_TEMP/xt/exports/export-bundle"', text)
         self.assertNotIn("xtrace export exits 9", text)
         self.assertNotIn("while it exits 9", text)
 

@@ -210,6 +210,23 @@ class T(unittest.TestCase):
         v = xinstr.analyze(d, exp, sent, frozenset({"b"}))
         self.assertEqual(v["a"]["expectations"][0]["problems"], ["attribution-ambiguous(recordings 1, requests 2)"])
 
+    def test_template_only_burst_reports_the_missing_product_correlation(self):
+        exp = {"burst": [{"method": "GET", "route": "/owners/{ownerId}", "status": 200, "layers": []}]}
+        # Unique concrete resources still become the same request template in the Spring MVC read API.
+        sent = [("burst", "GET", "/owners/1"), ("burst", "GET", "/owners/2")]
+        details = {str(i): rec("GET", "/owners/{ownerId}", 200) for i in range(2)}
+        for i, detail in enumerate(details.values()):
+            detail["recordingId"] = f"01a12327-{0x100 + i:04x}-7000-8000-000000000000"
+            detail["_openedAt"] = f"2026-10-10T00:00:0{i}Z"
+        verdict = xinstr.analyze(details, exp, sent, frozenset({"burst"}))["burst"]
+        self.assertFalse(verdict["passed"])
+        self.assertEqual(verdict["attribution"], "ambiguous")
+        self.assertEqual(verdict["recordingsAttributed"], 0)
+        problem = verdict["expectations"][0]["problems"][0]
+        self.assertIn("allowlisted non-secret request marker", problem)
+        self.assertIn("recording id returned to the requester", problem)
+        self.assertIn("without concrete path, query or headers", problem)
+
     def test_burst_with_fewer_recordings_than_paced_requests_is_ambiguous(self):
         exp = {"a": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}]}
         sent = [("a", "GET", "/owners/1"), ("a", "GET", "/owners/2"), ("b", "GET", "/owners/3")]
@@ -257,6 +274,7 @@ class T(unittest.TestCase):
         self.assertEqual(receipt["notes"]["accommodations"]["pace_seconds"], 0.4)
         self.assertEqual(receipt["notes"]["accommodations"]["drain_seconds"], 0)
         self.assertIn("8 unwritten", receipt["notes"]["accommodations"]["reason"])
+        self.assertEqual(receipt["notes"]["accommodations"]["correlationGap"], xinstr.REQUEST_CORRELATION_GAP)
         self.assertIsNone(xcamp.REQUEST_HOOK)
         self.assertIsNone(xcamp.SENT_LOG)
         self.assertEqual(xcamp.REQUEST_PACE_S, 0)

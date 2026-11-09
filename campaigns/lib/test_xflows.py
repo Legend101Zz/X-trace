@@ -20,7 +20,9 @@ def rec(method="GET", route="/vets", completion="complete", events=4, evidence=(
 def line_rec(start=10, end=30, lines=(12, 15), fid="f1", with_source=True):
     evs = [{"kind": "recording_event_kind:frame_enter", "frameId": fid,
             "source": {"path": "A.java", "startLine": start, "endLine": end, "status": "matched"} if with_source else None}]
-    evs += [{"kind": "recording_event_kind:line_cursor", "frameId": fid, "line": n, "source": None} for n in lines]
+    evs += [{"kind": "recording_event_kind:line_cursor", "frameId": f"{fid}-cursor-{i}", "parentFrameId": fid,
+             "line": n, "source": {"path": "A.java", "startLine": n, "endLine": n, "status": "matched"}}
+            for i, n in enumerate(lines)]
     return {"events": evs}
 
 
@@ -89,13 +91,37 @@ class Judges(unittest.TestCase):
         self.assertIn("method start", note)
         self.assertEqual(xflows.judge_active_line([line_rec(lines=(99,))])[0], "fail")
         self.assertEqual(xflows.judge_active_line([line_rec(lines=(0,))])[0], "fail")
-        self.assertEqual(xflows.judge_active_line([line_rec(with_source=False, lines=(3, 4))])[0], "pass")
+        self.assertEqual(xflows.judge_active_line([line_rec(lines=(True,))])[0], "fail")
+        self.assertEqual(xflows.judge_active_line([line_rec(end=None, lines=(9, 12))])[0], "fail")
+        self.assertEqual(xflows.judge_active_line([line_rec(with_source=False, lines=(3, 4))])[0], "fail")
         self.assertEqual(xflows.judge_active_line([line_rec(with_source=False, lines=(3,))])[0], "fail")
         gap = {"events": [{"kind": "recording_event_kind:gap", "symbol": "gap.not-transformed"}]}
         st, note = xflows.judge_active_line([gap])
         self.assertEqual(st, "fail")
         self.assertIn("gap.not-transformed", note)
         self.assertEqual(xflows.judge_active_line([])[0], "fail")
+
+    def test_line_extent_comes_only_from_parent_method_in_the_same_recording(self):
+        detail = line_rec()
+        lines = xflows._line_events([detail])
+        self.assertEqual([(ev["line"], src["startLine"], src["endLine"]) for ev, src in lines], [(12, 10, 30), (15, 10, 30)])
+        for ev in detail["events"][1:]:
+            ev["parentFrameId"] = "missing"
+        status, note = xflows.judge_active_line([detail, line_rec(fid="other")])
+        self.assertEqual(status, "fail")
+        self.assertIn("parentFrameId", note)
+        # A different recording with a coincident frame id cannot supply the missing parent.
+        self.assertEqual(xflows.judge_active_line([{"events": detail["events"][1:]}, line_rec(fid="missing")])[0], "fail")
+
+    def test_cursor_range_cannot_hide_a_line_outside_its_parent_method(self):
+        detail = line_rec(lines=(12, 99))
+        self.assertEqual(xflows.judge_active_line([detail])[0], "fail")
+        detail["events"][0]["kind"] = "recording_event_kind:frame_exit"
+        self.assertEqual(xflows.judge_active_line([detail])[0], "fail")
+
+    def test_distinct_method_starts_are_not_evidence_of_an_executed_line_within_a_method(self):
+        self.assertEqual(xflows.judge_active_line([line_rec(start=10, lines=(10,)),
+                                                  line_rec(start=20, lines=(20,))])[0], "fail")
 
     def test_frame_values(self):
         cap = {"events": [{"kind": "k", "bindings": [{"name": "ownerId", "role": "argument", "nameOrigin": "x",
@@ -111,8 +137,21 @@ class Judges(unittest.TestCase):
     def test_helpers(self):
         self.assertEqual(xflows.find_key({"a": [{"b": {"pid": 7}}]}, "pid"), 7)
         self.assertIsNone(xflows.find_key({"a": 1}, "pid"))
-        self.assertEqual(xflows.parse_doc("noise\n{\"x\": 1}\n"), {"x": 1})
+        self.assertEqual(xflows.parse_doc('{"x": 1}\n'), {"x": 1})
+        self.assertIsNone(xflows.parse_doc("noise\n{\"x\": 1}\n"))
         self.assertIsNone(xflows.parse_doc("none"))
+
+    def test_parse_doc_keeps_the_whole_pretty_document(self):
+        for value in ("src/main/java", 7, True, None, {"pid": 71}):
+            doc = {"data": {"pid": 71, "bootstrap_path": "/bootstrap.json", "items": [value]}}
+            text = json.dumps(doc, indent=2)
+            self.assertEqual(xflows.parse_doc(text), doc)
+            for rc in (0, 2):
+                result = subprocess.CompletedProcess([], rc, stdout=text if rc == 0 else "", stderr=text if rc else "")
+                with mock.patch.object(xflows.subprocess, "run", return_value=result):
+                    self.assertEqual(xflows.cli("xtrace", ["record"], {}), (rc, doc))
+        self.assertIsNone(xflows.parse_doc('{"first": 1}\n{"second": 2}\n'))
+        self.assertIsNone(xflows.parse_doc('{"items": [\n  "inner"\n'))
 
     def test_focused_requests_inject_canaries_into_an_argument_and_password(self):
         import xcamp

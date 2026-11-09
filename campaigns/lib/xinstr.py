@@ -43,7 +43,7 @@ def latency_summary(values: list[float]) -> dict[str, Any]:
 
 # --------------------------------------------------------------- viewer ------
 def parse_readiness(line_or_text: str) -> dict[str, str] | None:
-    """Find the viewer readiness document (origin + url) in the CLI's stdout, wrapped or not."""
+    """Read the viewer's explicit line-delimited readiness stream, wrapped or not (not lifecycle JSON)."""
     for raw in line_or_text.splitlines():
         raw = raw.strip()
         if not raw.startswith("{"):
@@ -250,6 +250,13 @@ def route_regex(template: str) -> re.Pattern[str]:
 
 REQUEST_SYMBOL = re.compile(r"^http\.request ([A-Z]+) (\S+)$")
 RESPONSE_SYMBOL = re.compile(r"^http\.response (\d{3})$")
+REQUEST_CORRELATION_GAP = (
+    "Spring MVC records method and route template only, without concrete path, query or headers; "
+    "standard capture has no argument bindings; focused Owner form objects are unavailable. "
+    "Need an allowlisted non-secret request marker "
+    "retained per recording and known to the harness, or the recording id returned to the requester. "
+    "Recording UUID and openedAt are not request correlations"
+)
 
 
 def request_info(detail: dict) -> tuple[str, str] | None:
@@ -418,7 +425,8 @@ def analyze(details: dict[str, dict], expectations: dict[str, list[dict]],
                 if first_burst is not None:
                     matched = []
                     attribution = "ambiguous"
-                    problems.append("attribution-ambiguous(burst shares route without request correlation or verified boundary)")
+                    problems.append("attribution-ambiguous(burst shares route without request correlation or verified boundary; "
+                                    + REQUEST_CORRELATION_GAP + ")")
                 elif not matched_all:
                     matched = []
                 elif len(matched_all) != len(reqs):
@@ -540,6 +548,7 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         "pace_seconds": PACE_SECONDS, "drain_seconds": 0,
         "reason": "serial requests paced because the agent admits at most 8 unwritten recordings; burst remains unpaced",
         "attribution": "routes shared with the burst fail as ambiguous without per-request correlation",
+        "correlationGap": REQUEST_CORRELATION_GAP,
     }}
     init = subprocess.run([xtrace, "init", "--project-dir", str(project_dir), "--display-name", "campaign"],
                           env=env, capture_output=True, text=True, timeout=120)
