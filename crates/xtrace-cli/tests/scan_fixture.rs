@@ -10,14 +10,14 @@
 )]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
 fn write_analyzer(dir: &Path, body: &str) -> PathBuf {
     let path = dir.join("analyzer.sh");
-    fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write analyzer");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod analyzer");
+    support::write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
     path
 }
 

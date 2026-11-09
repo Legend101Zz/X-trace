@@ -23,6 +23,8 @@ use std::process::{Command, Output, Stdio};
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod support;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().expect("repo root")
 }
@@ -85,9 +87,7 @@ impl Fx {
     fn write_analyzer(&self, transcript: &str) -> PathBuf {
         fs::write(self.repo.join("transcript.jsonl"), transcript).expect("transcript");
         let path = self.repo.join("analyzer.sh");
-        fs::write(&path, "#!/bin/sh\ncat \"$(dirname \"$0\")/transcript.jsonl\"\n")
-            .expect("analyzer");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        support::write_executable(&path, "#!/bin/sh\ncat \"$(dirname \"$0\")/transcript.jsonl\"\n");
         path
     }
 
@@ -467,8 +467,10 @@ fn scan_in_an_uninitialized_project_still_analyzes_and_says_why_it_did_not_persi
     fs::create_dir(dir.path().join("src")).expect("src");
     fs::write(dir.path().join("src/app.js"), "x\n").expect("source");
     let analyzer = dir.path().join("analyzer.sh");
-    fs::write(&analyzer, "#!/bin/sh\ncat <<'EOF'\n{\"type\":\"header\",\"contractVersion\":1,\"analyzerName\":\"f\",\"analyzerVersion\":\"1\",\"rulesetId\":\"r/1\",\"framework\":\"express\"}\n{\"type\":\"claim\",\"method\":\"GET\",\"routeParts\":[\"/a\"],\"routeBasis\":\"literal\",\"limitations\":[],\"evidence\":{\"path\":\"app.js\",\"startLine\":1,\"startColumn\":1,\"endLine\":1,\"endColumn\":2}}\n{\"type\":\"end\",\"claims\":1,\"filesScanned\":1,\"complete\":true,\"incompleteReasons\":[]}\nEOF\n").expect("analyzer");
-    fs::set_permissions(&analyzer, fs::Permissions::from_mode(0o755)).expect("chmod");
+    support::write_executable(
+        &analyzer,
+        "#!/bin/sh\ncat <<'EOF'\n{\"type\":\"header\",\"contractVersion\":1,\"analyzerName\":\"f\",\"analyzerVersion\":\"1\",\"rulesetId\":\"r/1\",\"framework\":\"express\"}\n{\"type\":\"claim\",\"method\":\"GET\",\"routeParts\":[\"/a\"],\"routeBasis\":\"literal\",\"limitations\":[],\"evidence\":{\"path\":\"app.js\",\"startLine\":1,\"startColumn\":1,\"endLine\":1,\"endColumn\":2}}\n{\"type\":\"end\",\"claims\":1,\"filesScanned\":1,\"complete\":true,\"incompleteReasons\":[]}\nEOF\n",
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_xtrace"))
         .args(["scan", "--project-dir"])
         .arg(dir.path())
