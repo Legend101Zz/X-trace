@@ -39,9 +39,26 @@ class T(unittest.TestCase):
     def test_overhead_needs_five_repeats(self):
         agg = {"baseline": {"p50Ms": 1, "p95Ms": 2, "n": 14}, "instrumented": {"p50Ms": 2, "p95Ms": 3, "n": 14}, "p50Ratio": 2, "p95Ratio": 1.5}
         d = by(s.overhead_steps({"aggregate": agg}))
-        self.assertEqual((d["overhead-measurement"][0], d["overhead-repeats-ge-5"][0]), ("reported", "not-implemented"))
-        self.assertEqual(by(s.overhead_steps({"aggregate": agg, "repeats": 5}))["overhead-repeats-ge-5"][0], "pass")
+        self.assertEqual((d["overhead-measurement"][0], d["overhead-repeats-ge-5"][0]), ("fail", "fail"))
+        self.assertEqual(by(s.overhead_steps({"aggregate": agg, "repeats": 5}))["overhead-repeats-ge-5"][0], "fail")
+        from test_camp_overhead import paired_runs
+        import camp_overhead
+        valid = camp_overhead.compare_interleaved(paired_runs())
+        self.assertEqual(by(s.overhead_steps(valid))["overhead-repeats-ge-5"][0], "pass")
+        self.assertEqual(by(s.overhead_steps(valid))["overhead-measurement"][0], "reported")
+        valid["runs"][1]["startedNs"] = valid["runs"][0]["startedNs"]
+        self.assertEqual(by(s.overhead_steps(valid))["overhead-repeats-ge-5"][0], "fail")
         self.assertEqual(by(s.overhead_steps(None))["overhead-repeats-ge-5"][0], "fail")
+
+    def test_accommodations_are_visible_and_never_product_passes(self):
+        r = {"scenarios": [], "notes": {"accommodations": {"pace_seconds": 0.4, "drain_seconds": 0, "reason": "writer bound"}}}
+        d = by(s.instrumented_steps(r))
+        self.assertEqual(d["unpaced-load-not-exercised"][0], "reported")
+        self.assertIn("pace_seconds", d["unpaced-load-not-exercised"][1])
+        d = by(s.tui_steps({"verdict": "pass", "observations": {"accommodation": "route read from detail", "open_after": 0.1}}))
+        self.assertEqual(d["tui-navigation-accommodation"][0], "reported")
+        self.assertIn("detail", d["tui-navigation-accommodation"][1])
+        self.assertIn("focused-canary-injection", s.FLOW_STEPS)
 
     def test_each_failure_is_visible(self):
         r = {"scenarios": [sc("a", eq=False), sc("b", rec=False)], "api": {"ok": True, "recordings": 5},

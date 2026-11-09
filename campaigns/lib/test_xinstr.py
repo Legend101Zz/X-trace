@@ -1,6 +1,8 @@
 import pathlib
 import sys
 import unittest
+from unittest import mock
+import subprocess
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -178,7 +180,7 @@ class T(unittest.TestCase):
     def test_legacy_exception_kind_is_not_a_product_kind(self):
         self.assertNotIn("exception", xinstr.OBSERVED_OUTCOME_KINDS)
 
-    def test_burst_scenario_does_not_break_attribution_of_paced_scenarios(self):
+    def test_burst_without_correlation_never_credits_serial_or_burst_requests(self):
         exp = {"a": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}],
                "b": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": [], "minCount": 5}]}
         # 2 paced requests of `a`, then 5 burst requests of `b`, then one non-scenario request; the product kept 2 + 3 + 1
@@ -189,10 +191,24 @@ class T(unittest.TestCase):
             det["recordingId"] = f"01a12327-{0x100 + i:04x}-7000-8000-000000000000"
             det["_openedAt"] = f"2026-10-10T00:00:0{i}Z"
         v = xinstr.analyze(d, exp, sent, frozenset({"b"}))
-        self.assertTrue(v["a"]["passed"], v["a"])
-        self.assertEqual(v["a"]["expectations"][0]["recordingsMatchingRoute"], 2)
-        self.assertEqual(v["b"]["expectations"][0]["recordingsMatchingRoute"], 3)  # 4 left minus the later non-scenario request
-        self.assertEqual(v["b"]["expectations"][0]["problems"], ["count-below-minimum(need 5, have 3)"])
+        for sid in ("a", "b"):
+            self.assertFalse(v[sid]["passed"])
+            self.assertEqual(v[sid]["attribution"], "ambiguous")
+            self.assertEqual(v[sid]["expectations"][0]["recordingsMatchingRoute"], 0)
+            self.assertIn("attribution-ambiguous", v[sid]["expectations"][0]["problems"][0])
+        # Losing a serial request while retaining a later burst recording must never turn serial green.
+        one_serial = [("a", "GET", "/owners/1"), ("b", "GET", "/owners/2")]
+        v = xinstr.analyze({"burst-only": d["02"]}, exp, one_serial, frozenset({"b"}))
+        self.assertFalse(v["a"]["passed"])
+        self.assertEqual(v["a"]["recordingsAttributed"], 0)
+
+    def test_unrelated_burst_does_not_relax_strict_counts(self):
+        exp = {"a": [{"method": "GET", "route": "/vets", "status": 200, "layers": []}]}
+        d = {"x": rec("GET", "/vets", 200)}
+        d["x"]["_openedAt"] = "2026-10-10T00:00:00Z"
+        sent = [("a", "GET", "/vets"), ("a", "GET", "/vets"), ("b", "GET", "/owners/1")]
+        v = xinstr.analyze(d, exp, sent, frozenset({"b"}))
+        self.assertEqual(v["a"]["expectations"][0]["problems"], ["attribution-ambiguous(recordings 1, requests 2)"])
 
     def test_burst_with_fewer_recordings_than_paced_requests_is_ambiguous(self):
         exp = {"a": [{"method": "GET", "route": "/owners/{id}", "status": 200, "layers": []}]}
@@ -201,6 +217,59 @@ class T(unittest.TestCase):
         d["x"]["_openedAt"] = "2026-10-10T00:00:00Z"
         v = xinstr.analyze(d, exp, sent, frozenset({"b"}))
         self.assertTrue(v["a"]["expectations"][0]["problems"][0].startswith("attribution-ambiguous"))
+
+    def test_recording_snapshot_requires_valid_paginated_cli_evidence(self):
+        with mock.patch.object(xinstr.subprocess, "run", side_effect=[
+            subprocess.CompletedProcess([], 0, '{"recordings":[{"recording_id":"old"}],"next_after":"next"}'),
+            subprocess.CompletedProcess([], 0, '{"recordings":[{"recording_id":"older"}],"next_after":null}')
+        ]) as run:
+            self.assertEqual(xinstr.list_recording_ids("xtrace", pathlib.Path("project"), {}), {"old", "older"})
+            self.assertIn("--after", run.call_args.args[0])
+        with mock.patch.object(xinstr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, '{}')):
+            with self.assertRaises(RuntimeError):
+                xinstr.list_recording_ids("xtrace", pathlib.Path("project"), {})
+
+    def test_receipt_discloses_pacing_and_counts_only_new_recordings(self):
+        import os
+        import tempfile
+        import xcamp
+        from types import SimpleNamespace
+        stack = mock.Mock(launcher_exit=0)
+        stack.logs.return_value = ""
+        scenario = SimpleNamespace(id="s", kind="business")
+        result = {"id": "s", "passed": True, "semanticEffectFingerprint": "fp", "requests": [], "elapsedMs": 1}
+        api = {"ok": True, "reason": "", "recordings": [{"recordingId": "old"}, {"recordingId": "new"}],
+               "details": {"old": {}, "new": {}}}
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {}), \
+             mock.patch.object(xinstr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "")), \
+             mock.patch.object(xinstr, "list_recording_ids", return_value={"old"}), \
+             mock.patch.object(xinstr, "start_viewer", return_value=(object(), {"origin": "http://127.0.0.1:1234", "url": "http://x/#" + "A" * 43})), \
+             mock.patch.object(xinstr, "ViewerClient"), mock.patch.object(xinstr, "stop_process_group"), \
+             mock.patch.object(xinstr, "collect_api", return_value=api), \
+             mock.patch.object(xcamp, "run_scenario", return_value=result), \
+             mock.patch.object(xinstr, "analyze", return_value={}) as analyze:
+            receipt = xinstr.run_instrumented(project="petclinic", pin={}, make_stack=lambda tag: stack,
+                scenarios=[scenario], out_dir=pathlib.Path(td) / "out", norm_extra=[], expectations={}, xtrace="xtrace",
+                project_dir=pathlib.Path(td), data_home=pathlib.Path(td) / "data", adaptations=[],
+                canaries=None, baseline_receipt=None, extra_canary_paths=[], harness_files=[])
+        self.assertEqual(receipt["api"]["recordings"], 1)
+        self.assertEqual(set(analyze.call_args.args[0]), {"new"})
+        self.assertEqual(receipt["notes"]["accommodations"]["pace_seconds"], 0.4)
+        self.assertEqual(receipt["notes"]["accommodations"]["drain_seconds"], 0)
+        self.assertIn("8 unwritten", receipt["notes"]["accommodations"]["reason"])
+        self.assertIsNone(xcamp.REQUEST_HOOK)
+        self.assertIsNone(xcamp.SENT_LOG)
+        self.assertEqual(xcamp.REQUEST_PACE_S, 0)
+
+    def test_canary_pacing_never_adds_a_final_drain_sleep(self):
+        import xcamp
+        events = []
+        canaries = {k: "canary" for k in ("json-body-password", "authorization-header", "cookie-header")}
+        with mock.patch.object(xinstr.time, "sleep", side_effect=lambda seconds: events.append(("pace", seconds))), \
+             mock.patch.object(xcamp, "http_request", side_effect=lambda *a, **kw: events.append(("request", a[2])) or {"status": 200}):
+            sent = xinstr.send_canary_requests("http://127.0.0.1:1234", canaries, [("POST", "/owners/new")], pace=0.4)
+        self.assertEqual(sent[0]["status"], 200)
+        self.assertEqual(events, [("pace", 0.4), ("request", "/owners/new")])
 
     def test_silent_viewer_hits_the_deadline(self):
         import os, stat, tempfile, time

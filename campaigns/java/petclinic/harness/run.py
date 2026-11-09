@@ -15,6 +15,7 @@ import pathlib
 import re
 import shlex
 import sys
+import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "lib"))
@@ -43,7 +44,7 @@ def build() -> int:
 def make_stack(run_id: str) -> xcamp.Stack:
     return xcamp.Stack(
         project="petclinic", jdk_image=IMAGE, jar=JAR, run_id=run_id, app_port=8080,
-        app_args=["--server.port={APPPORT}"],
+        app_args=["--server.port={APPPORT}", "--server.address={BINDADDR}"],
         env={"SPRING_PROFILES_ACTIVE": "postgres", "POSTGRES_URL": "jdbc:postgresql://{DBHOST}:{DBPORT}/petclinic",
              "POSTGRES_USER": "petclinic", "POSTGRES_PASS": "petclinic"},
         java_opts=["-Xmx768m"], db_name="petclinic", db_user="petclinic", db_password="petclinic",
@@ -176,6 +177,7 @@ SCENARIOS = [
 
 
 def baseline(out):
+    os.environ.pop("XCAMP_LAUNCH_PREFIX", None)
     return xcamp.run_baseline(project="petclinic", pin={**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR),
                               "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
                               "postgresImageDigest": xcamp.POSTGRES_DIGEST, "jdkImage": IMAGE},
@@ -221,7 +223,7 @@ APP_PACKAGE = "org.springframework.samples.petclinic"   # petclinic's root packa
 SOURCE_ROOT = "src/main/java"                           # repo-relative to the project directory (the pinned checkout)
 
 
-def instrumented() -> int:
+def instrumented(out: pathlib.Path | None = None, baseline_receipt: pathlib.Path | None = None) -> int:
     """One reset-to-finish run with the app launched by the PACKAGED `xtrace run`, then judged through the read API."""
     need = {k: os.environ.get(k, "") for k in ("XCAMP_XTRACE", "XCAMP_AGENT", "XCAMP_DATA_HOME")}
     missing = [k for k, v in need.items() if not v]
@@ -238,8 +240,8 @@ def instrumented() -> int:
     n = 1
     while (PROJ / f"instrumented-{n}").exists():
         n += 1
-    out = PROJ / f"instrumented-{n}"
-    baseline_receipt = pathlib.Path(os.environ["XCAMP_BASELINE_RECEIPT"]) if os.environ.get("XCAMP_BASELINE_RECEIPT") else None
+    out = out or PROJ / f"instrumented-{n}"
+    baseline_receipt = baseline_receipt or (pathlib.Path(os.environ["XCAMP_BASELINE_RECEIPT"]) if os.environ.get("XCAMP_BASELINE_RECEIPT") else None)
     r = xinstr.run_instrumented(
         project="petclinic", pin={**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR), "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
                                   "postgresImageDigest": xcamp.POSTGRES_DIGEST, "jdkImage": IMAGE},
@@ -249,6 +251,30 @@ def instrumented() -> int:
         extra_canary_paths=[("POST", "/owners/new")])
     print(json.dumps({"result": r["result"], "api": r["api"], "problemClasses": r["problemClasses"]}))
     return 0 if r["result"] == "recorded" else 1
+
+
+def overhead() -> int:
+    """Five fresh baseline/instrumented pairs, in that order; no retry of a failed repeat."""
+    root = pathlib.Path(os.environ["XCAMP_OVERHEAD_DIR"])
+    root.mkdir(parents=True, exist_ok=False)
+    runs = []
+    manifest = root / "runs.json"
+    for repeat in range(5):
+        baseline_receipt = root / f"baseline-{repeat}" / "receipt.json"
+        for mode in ("baseline", "instrumented"):
+            dest = root / f"{mode}-{repeat}"
+            started = time.time_ns()
+            if mode == "baseline":
+                result = baseline(dest)
+                rc = 0 if result["result"] == "passed_baseline_only" else 1
+            else:
+                rc = instrumented(dest, baseline_receipt)
+            runs.append({"mode": mode, "repeat": repeat, "startedNs": started, "finishedNs": time.time_ns(),
+                         "receiptPath": str((dest / "receipt.json").resolve()), "exitCode": rc})
+            manifest.write_text(json.dumps({"runs": runs}, indent=1, sort_keys=True) + "\n")
+            if rc != 0:
+                return rc
+    return 0
 
 
 def flows() -> int:
@@ -272,6 +298,8 @@ def flows() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "overhead":
+        sys.exit(overhead())
     if len(sys.argv) > 1 and sys.argv[1] == "instrumented":
         sys.exit(instrumented())
     if len(sys.argv) > 1 and sys.argv[1] == "flows":

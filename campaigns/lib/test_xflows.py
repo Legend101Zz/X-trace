@@ -1,6 +1,7 @@
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -99,6 +100,39 @@ class Judges(unittest.TestCase):
         self.assertIsNone(xflows.find_key({"a": 1}, "pid"))
         self.assertEqual(xflows.parse_doc("noise\n{\"x\": 1}\n"), {"x": 1})
         self.assertIsNone(xflows.parse_doc("none"))
+
+    def test_focused_requests_inject_canaries_into_an_argument_and_password(self):
+        import xcamp
+        canaries = {k: "canary-" + k for k in ("authorization-header", "cookie-header", "query-token", "json-body-password")}
+        with mock.patch.object(xcamp, "http_request", return_value={"status": 200}) as request:
+            served = xflows.focused_requests("http://127.0.0.1:1234", canaries)
+        self.assertEqual(list(served.values()), [200, 200, 200])
+        paths = [call.args[2] for call in request.call_args_list]
+        self.assertIn("lastName=canary-query-token", paths[1])
+        for call in request.call_args_list:
+            self.assertIn("password=canary-json-body-password", call.args[2])
+            self.assertIn("xt_token=canary-query-token", call.args[2])
+            self.assertEqual(call.kwargs["headers"]["Authorization"], canaries["authorization-header"])
+            self.assertEqual(call.kwargs["headers"]["Cookie"], canaries["cookie-header"])
+        self.assertNotIn("canary-", str(served), "flow receipt must not itself save the injected values")
+
+    def test_focused_without_canaries_fails_before_launching(self):
+        import os
+        flow = xflows.Flows.__new__(xflows.Flows)
+        flow.results = {}
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(flow, "_stack") as stack:
+            flow.focused()
+        stack.assert_not_called()
+        for name in ("active-line-frames", "frame-values", "focused-canary-injection"):
+            self.assertEqual(flow.results[name]["status"], "fail")
+
+    def test_control_pacing_has_no_final_drain_sleep(self):
+        events = []
+        with mock.patch.object(xflows.time, "sleep", side_effect=lambda gap: events.append(("pace", gap))), \
+             mock.patch.object(xflows, "_get", side_effect=lambda base, path: events.append(("request", path)) or 200):
+            served = xflows._paced_gets("http://127.0.0.1:1234", ["/vets", "/owners"])
+        self.assertEqual(served, {"/vets": 200, "/owners": 200})
+        self.assertEqual(events, [("pace", 0.6), ("request", "/vets"), ("pace", 0.6), ("request", "/owners")])
 
 
 if __name__ == "__main__":

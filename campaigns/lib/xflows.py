@@ -295,9 +295,26 @@ def _get(base: str, path: str) -> int | None:
 def _paced_gets(base: str, paths: list[str], gap: float = 0.6) -> dict[str, int | None]:
     out = {}
     for p in paths:
-        out[p] = _get(base, p)
         time.sleep(gap)
+        out[p] = _get(base, p)
     return out
+
+
+def focused_requests(base: str, canaries: dict[str, str]) -> dict[str, int | None]:
+    """Exercise focused bindings with the campaign canaries; never persist the injected request values here."""
+    import urllib.parse
+    import xcamp
+    hook = xinstr.canary_hook(canaries)
+    paths = ["/owners/1", "/owners?lastName=" + urllib.parse.quote(canaries["query-token"], safe=""), "/vets"]
+    served = {}
+    for index, path in enumerate(paths):
+        path += ("&" if "?" in path else "?") + "password=" + urllib.parse.quote(canaries["json-body-password"], safe="")
+        path, headers, body = hook("GET", path, {}, None)
+        try:
+            served[f"focused-request-{index}"] = xcamp.http_request(base, "GET", path, headers=headers, body=body, timeout=30)["status"]
+        except Exception:
+            served[f"focused-request-{index}"] = None
+    return served
 
 
 def _fail(exc: BaseException) -> tuple[str, str]:
@@ -432,6 +449,13 @@ class Flows:
 
     # -- flow D --
     def focused(self) -> None:
+        canary_file = os.environ.get("XCAMP_CANARY_FILE")
+        if not canary_file:
+            for step in ("active-line-frames", "frame-values", "focused-canary-injection"):
+                self._set(step, ("fail", "focused capture requires the campaign canary file"))
+            return
+        canaries = json.loads(pathlib.Path(canary_file).read_text())
+        os.environ["XTRACE_CANARY_ENV"] = canaries["env-var"]
         before_ids = list_ids(self.xtrace, self.project_dir, self.env)
         prefix = " ".join(shlex.quote(x) for x in
                           [self.xtrace, "run", "--project-dir", str(self.project_dir), "--java-agent", self.agent,
@@ -439,7 +463,9 @@ class Flows:
         stack = self._stack(prefix, [])
         try:
             stack.up()
-            served = _paced_gets(stack.base, ["/owners/1", "/owners?lastName=Davis", "/vets"])
+            served = focused_requests(stack.base, canaries)
+            self._set("focused-canary-injection", ("pass" if all(s == 200 for s in served.values()) else "fail",
+                                                   "focused requests carry Authorization, Cookie, query and password canaries; owner search binds a canary argument"))
         finally:
             stack.down()
         api = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-focused")
@@ -461,6 +487,8 @@ class Flows:
                 for step in ("active-line-frames", "frame-values") if name == "focused" else (name,):
                     if step not in self.results:
                         self._set(step, _fail(exc))
+        self._set("flow-accommodations", ("reported", "pace_seconds=0.6 between lifecycle control requests: agent admits at most 8 unwritten recordings; focused requests are unpaced"))
+        self.results.setdefault("focused-canary-injection", {"status": "fail", "note": "focused canary requests did not complete"})
         for step in STEP_NAMES:
             self.results.setdefault(step, {"status": "fail", "note": "flow did not run"})
         return self.results
