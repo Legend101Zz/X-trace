@@ -40,6 +40,8 @@ import xtp.agent.v1.Handshake.DaemonHello;
 import xtp.agent.v1.Recording.EventBatch;
 import xtp.agent.v1.Recording.GapReason;
 import xtp.agent.v1.Recording.RecordingEventKind;
+import xtp.agent.v1.Recording.RecordingFinished;
+import xtp.agent.v1.Recording.RecordingStarted;
 import xtp.agent.v1.Transport.Ack;
 import xtp.agent.v1.Transport.AckDurability;
 import xtp.agent.v1.Transport.Health;
@@ -168,6 +170,7 @@ final class RecordingWriterSessionTest {
       boolean started, boolean identityTooLarge, int frameLimit)
       throws Exception {
     boolean incomplete = identityTooLarge || frameLimit == 256;
+    boolean startAccepted = !(started && identityTooLarge);
     BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
     RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
     AcknowledgingSocket peer = new AcknowledgingSocket(frameLimit);
@@ -195,7 +198,7 @@ final class RecordingWriterSessionTest {
             "http.response 200", 5, 200));
         assertTrue(sink.offerFinishWithOutcome(COMPANION, 1, 6, 200, 0,
             new BridgeSink.Outcome(BridgeSink.Outcome.RESPONDED, 200, "", "", "")));
-        if (!incomplete) {
+        if (startAccepted) {
           assertEquals(FIRST, uuid(peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED)
               .getRecordingFinished().getRecordingId()));
         }
@@ -223,8 +226,14 @@ final class RecordingWriterSessionTest {
     assertEquals(0, sink.activeRecordings(), "abandoned recordings must release their admission");
     var finishes = peer.frames.stream().filter(AgentEnvelope::hasRecordingFinished)
         .map(AgentEnvelope::getRecordingFinished).toList();
-    assertEquals(incomplete ? List.of(COMPANION, LATER) : List.of(FIRST, COMPANION, LATER),
+    assertEquals(startAccepted ? List.of(FIRST, COMPANION, LATER) : List.of(COMPANION, LATER),
         finishes.stream().map(finish -> uuid(finish.getRecordingId())).toList());
+    assertEquals(startAccepted, peer.frames.stream().filter(AgentEnvelope::hasRecordingStarted)
+        .anyMatch(frame -> uuid(frame.getRecordingStarted().getRecordingId()).equals(FIRST)),
+        "an unsendable start never reserves daemon capacity");
+    if (incomplete && startAccepted) {
+      assertMinimalFinish(finishes.get(0), started ? 1 : 2);
+    }
     for (var finish : finishes) {
       String id = uuid(finish.getRecordingId());
       if (id.equals(FIRST)) continue;
@@ -355,7 +364,7 @@ final class RecordingWriterSessionTest {
   }
 
   @Test
-  void aLimitTooSmallForTheGapLeavesOnlyThatRecordingUnfinishedAndReportsWhy() throws Exception {
+  void aLimitTooSmallForTheGapFinishesOnlyThatRecordingAsIncompleteAndReportsWhy() throws Exception {
     ByteArrayOutputStream diagnostics = new ByteArrayOutputStream();
     PrintStream previous = System.err;
     BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
@@ -374,6 +383,8 @@ final class RecordingWriterSessionTest {
             "http.response 201", 5, 201));
         assertTrue(sink.offerFinish(LATER, 4, 6, 201, 0));
         writer.start();
+        assertEquals(FIRST, uuid(peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED)
+            .getRecordingFinished().getRecordingId()));
         peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED);
         assertFalse(peer.closed);
       } finally {
@@ -386,14 +397,96 @@ final class RecordingWriterSessionTest {
     assertTrue(writer.incompleteWasReported());
     assertEquals(0, sink.activeRecordings());
     var finishes = peer.frames.stream().filter(AgentEnvelope::hasRecordingFinished).toList();
-    assertEquals(1, finishes.size());
-    assertEquals(LATER, uuid(finishes.get(0).getRecordingFinished().getRecordingId()));
-    assertEquals(0, finishes.get(0).getRecordingFinished().getDropCountsByPriorityCount());
+    assertEquals(2, finishes.size());
+    assertMinimalFinish(finishes.get(0).getRecordingFinished(), 1);
+    assertEquals(LATER, uuid(finishes.get(1).getRecordingFinished().getRecordingId()));
+    assertEquals(0, finishes.get(1).getRecordingFinished().getDropCountsByPriorityCount());
     String output = diagnostics.toString(StandardCharsets.UTF_8);
     assertTrue(output.contains("frame-limit gap could not be sent"));
     assertTrue(output.contains("\"recordingId\":\"" + FIRST + "\""));
     assertEquals(1, output.lines().count());
     assertFalse(output.contains("private-canary"));
+  }
+
+  private static void assertMinimalFinish(RecordingFinished finish, long sequence) {
+    assertEquals(RecordingFinished.newBuilder()
+        .setRecordingId(finish.getRecordingId())
+        .setFinalRecordingSeq(sequence)
+        .putDropCountsByPriority(1, 1)
+        .build(), finish, "an abandoned recording sends only identity, watermark and loss marker");
+  }
+
+  @Test
+  void repeatedAbandonmentReleasesPeerCapacityWhileACompanionRemainsActive() throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    AcknowledgingSocket peer = new AcknowledgingSocket(256, 2);
+    RecordingWriter writer = new RecordingWriter(peer.session(), queue, sink);
+    ByteArrayOutputStream diagnostics = new ByteArrayOutputStream();
+    PrintStream previous = System.err;
+    try (PrintStream capture = new PrintStream(diagnostics, true, StandardCharsets.UTF_8)) {
+      System.setErr(capture);
+      try {
+        assertTrue(sink.offerStart(COMPANION, 1, "GET", "/companion"));
+        writer.start();
+        peer.await(AgentEnvelope.PayloadCase.RECORDING_STARTED);
+        // Cross the real validator's 2,000,000 / 16,384 digest commitment boundary too.
+        for (int i = 0; i < 130; i++) {
+          String id = new UUID(0, 100 + i).toString();
+          boolean reducedStart = i % 4 == 0;
+          boolean unsendableEvent = i % 4 == 3;
+          assertTrue(sink.offerStart(id, 2, "GET", reducedStart
+              ? "/private-canary/" + "r".repeat(240) : "/first"));
+          assertTrue(sink.offerEvent(id, unsendableEvent ? "e".repeat(256) : "response",
+              "", unsendableEvent ? BridgeEventKind.FRAME_ENTER : BridgeEventKind.RESPONSE,
+              "http.response 500", 3, 500));
+          assertTrue(sink.offerFinishWithOutcome(id, 2, 4, 500, 0,
+              new BridgeSink.Outcome(BridgeSink.Outcome.EXCEPTION_PROPAGATED, 0,
+                  i % 4 == 2 ? "E".repeat(256) : "java.lang.IllegalStateException",
+                  "private-canary " + "sanitized ".repeat(50), "")));
+          var terminal = peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED);
+          var finish = terminal.getRecordingFinished();
+          assertEquals(id, uuid(finish.getRecordingId()));
+          assertMinimalFinish(finish, reducedStart || unsendableEvent ? 1 : 2);
+          // Compare the actual terminal envelope at the widest sequences with a start that
+          // contains only identity. Optional start fields can only increase this allowance.
+          var widestTerminal = terminal.toBuilder().setSessionSeq(Long.MAX_VALUE)
+              .setRecordingFinished(finish.toBuilder()
+                  .setFinalRecordingSeq(RecordingWriter.MAX_FOCUSED_EVENTS_PER_RECORDING + 1))
+              .build();
+          var smallestStart = terminal.toBuilder().setSessionSeq(Long.MAX_VALUE)
+              .setMessageId(id + ":started")
+              .setRecordingStarted(RecordingStarted.newBuilder()
+                  .setRecordingId(finish.getRecordingId()).setRecordingSeq(1))
+              .build();
+          assertTrue(widestTerminal.getSerializedSize() <= smallestStart.getSerializedSize(),
+              "the minimal finish must fit whenever the start identity fit");
+          assertFalse(peer.closed);
+          assertFalse(writer.isStopping());
+        }
+        assertTrue(sink.offerStart(LATER, 5, "GET", "/later"));
+        assertTrue(sink.offerEvent(LATER, "later-response", "", BridgeEventKind.RESPONSE,
+            "http.response 201", 6, 201));
+        assertTrue(sink.offerFinish(LATER, 5, 7, 201, 0));
+        assertEquals(LATER, uuid(peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED)
+            .getRecordingFinished().getRecordingId()));
+        assertTrue(sink.offerEvent(COMPANION, "companion-response", "", BridgeEventKind.RESPONSE,
+            "http.response 200", 8, 200));
+        assertTrue(sink.offerFinish(COMPANION, 1, 9, 200, 0));
+        assertEquals(COMPANION, uuid(peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED)
+            .getRecordingFinished().getRecordingId()));
+      } finally {
+        writer.close();
+      }
+    } finally {
+      System.setErr(previous);
+    }
+    assertFalse(writer.isStopping());
+    assertTrue(writer.incompleteWasReported());
+    assertEquals(0, sink.activeRecordings());
+    assertTrue(peer.activeRecordings.isEmpty());
+    assertEquals(130, diagnostics.toString(StandardCharsets.UTF_8).lines().count());
+    assertFalse(diagnostics.toString(StandardCharsets.UTF_8).contains("private-canary"));
   }
 
   private static void exerciseWriter(boolean unsupportedHealth) throws Exception {
@@ -489,6 +582,8 @@ final class RecordingWriterSessionTest {
   /** Synchronous framed peer: every write produces the exact staged session/recording ACK. */
   private static final class AcknowledgingSocket extends Socket {
     private final int limit;
+    private final int maxActiveRecordings;
+    private final Set<String> activeRecordings = new HashSet<>();
     private final List<AgentEnvelope> frames = new ArrayList<>();
     private final Map<String, Long> recordingSequences = new HashMap<>();
     private final Set<String> messageIds = new HashSet<>();
@@ -510,11 +605,15 @@ final class RecordingWriterSessionTest {
           if (frame.hasRecordingStarted()) {
             var start = frame.getRecordingStarted();
             assertEquals(1, start.getRecordingSeq());
+            assertTrue(activeRecordings.add(uuid(start.getRecordingId())));
+            assertTrue(activeRecordings.size() <= maxActiveRecordings,
+                "unfinished recordings exhausted peer capacity");
             recordingSequences.put(uuid(start.getRecordingId()), 1L);
             ack.putHighestContiguousRecordingSeq(uuid(start.getRecordingId()), start.getRecordingSeq());
           } else if (frame.hasEventBatch()) {
             var batch = frame.getEventBatch();
             String recordingId = uuid(batch.getRecordingId());
+            assertTrue(activeRecordings.contains(recordingId), "no events after a terminal marker");
             long sequence = recordingSequences.get(recordingId);
             for (var event : batch.getEventsList()) {
               assertEquals(++sequence, event.getRecordingSeq());
@@ -524,6 +623,7 @@ final class RecordingWriterSessionTest {
                 batch.getEvents(batch.getEventsCount() - 1).getRecordingSeq());
           } else if (frame.hasRecordingFinished()) {
             var finish = frame.getRecordingFinished();
+            assertTrue(activeRecordings.remove(uuid(finish.getRecordingId())));
             assertEquals(recordingSequences.get(uuid(finish.getRecordingId())).longValue(),
                 finish.getFinalRecordingSeq());
             ack.putHighestContiguousRecordingSeq(uuid(finish.getRecordingId()), finish.getFinalRecordingSeq());
@@ -547,7 +647,12 @@ final class RecordingWriterSessionTest {
     }
 
     private AcknowledgingSocket(int limit) {
+      this(limit, Integer.MAX_VALUE);
+    }
+
+    private AcknowledgingSocket(int limit, int maxActiveRecordings) {
       this.limit = limit;
+      this.maxActiveRecordings = maxActiveRecordings;
     }
 
     private XtpSession session() throws Exception {

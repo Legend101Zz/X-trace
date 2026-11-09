@@ -658,10 +658,15 @@ class RecordingWriterTest {
         .flatMap(batch -> batch.getEventsList().stream()).toList();
     assertEquals(cap, events.size());
     assertEquals(5, events.stream().filter(event -> event.hasGap()).count());
-    assertEquals(1, transport.finishes.size());
-    assertEquals(id(1), FakeTransport.uuid(transport.finishes.get(0).getRecordingId().toByteArray()));
+    assertEquals(2, transport.finishes.size());
+    assertEquals(RecordingFinished.newBuilder()
+        .setRecordingId(transport.starts.get(0).getRecordingId())
+        .setFinalRecordingSeq(cap + 1)
+        .putDropCountsByPriority(1, 1)
+        .build(), transport.finishes.get(0));
+    assertEquals(id(1), FakeTransport.uuid(transport.finishes.get(1).getRecordingId().toByteArray()));
     assertArrayEquals(EventDigest.compute(List.of(id(1) + ":gap-untransformed", "response")),
-        transport.finishes.get(0).getEventDigest().toByteArray());
+        transport.finishes.get(1).getEventDigest().toByteArray());
   }
 
   @Test

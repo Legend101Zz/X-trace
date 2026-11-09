@@ -531,6 +531,15 @@ async fn streamed_recording_journey(focused: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_257_is_accepted_after_256_finished_recordings() {
+    finished_recording_budget_journey(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_recordings_release_capacity_and_read_as_partial_with_an_active_companion() {
+    finished_recording_budget_journey(true).await;
+}
+
+async fn finished_recording_budget_journey(abandoned: bool) {
     let daemon_temp = secure_tempdir("xtrace-budget-daemon-");
     let bootstrap_path = daemon_temp.path().join("bootstrap.json");
     let project_root = secure_tempdir("xtrace-budget-data-");
@@ -553,14 +562,14 @@ async fn request_257_is_accepted_after_256_finished_recordings() {
         active_redaction_policy_id: None,
     };
     store.project_repository().insert_project(&project).expect("insert project");
-    let adapter = Arc::new(SqliteRecordingPersistence::new(store, project_root.path()));
+    let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), project_root.path()));
     // A retained-ID bound far below the request count proves the application layer also stops
     // counting finished recordings.
     let capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>> =
         Arc::new(xtrace_application::recording::RecordingCaptureService::new(
             adapter,
             SegmentPolicy::default(),
-            std::num::NonZeroUsize::new(16).expect("non-zero"),
+            std::num::NonZeroUsize::new(if abandoned { 2 } else { 16 }).expect("non-zero"),
         ));
     let (bound, secret, _, _, address, pin) = spawn_daemon_with_capture(
         bootstrap_path,
@@ -577,23 +586,64 @@ async fn request_257_is_accepted_after_256_finished_recordings() {
     let mut tls_stream =
         connect_authenticated(address, &pin, &secret, &session_id, &[0x85; 32]).await;
     let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    let persisted = SqliteRecordingReader::new(store, project_root.path());
+    let companion_id = RecordingId::new();
+    let companion_bytes = Bytes::copy_from_slice(companion_id.as_uuid().as_bytes());
 
     let mut session_seq = 1_u64;
-    for request in 1..=FINISHED_REQUESTS {
-        let recording_id = Bytes::copy_from_slice(&(0x0100_0000_u128 + request).to_be_bytes());
-        for payload in [
+    if abandoned {
+        write_envelope(
+            &mut writer,
             PayloadOneof::RecordingStarted(RecordingStarted {
-                recording_id: recording_id.clone(),
+                recording_id: companion_bytes.clone(),
                 recording_seq: 1,
                 method: "GET".to_owned(),
                 ..RecordingStarted::default()
             }),
-            PayloadOneof::RecordingFinished(RecordingFinished {
+            &session_id,
+            session_seq,
+            session_seq,
+        )
+        .await
+        .expect("start active companion");
+        let ack = next_ack(&mut reader, "companion start").await;
+        assert!(ack.rejected.is_empty());
+        session_seq += 1;
+    }
+    for request in 1..=FINISHED_REQUESTS {
+        let recording_id = Bytes::copy_from_slice(&(0x0100_0000_u128 + request).to_be_bytes());
+        let mut payloads = vec![PayloadOneof::RecordingStarted(RecordingStarted {
+            recording_id: recording_id.clone(),
+            recording_seq: 1,
+            method: "GET".to_owned(),
+            ..RecordingStarted::default()
+        })];
+        // Exercise abandonment immediately after Start and after an acknowledged event.
+        let has_prefix = abandoned && request % 2 == 0;
+        if has_prefix {
+            payloads.push(PayloadOneof::EventBatch(EventBatch {
                 recording_id: recording_id.clone(),
-                final_recording_seq: 1,
-                ..RecordingFinished::default()
-            }),
-        ] {
+                events: vec![RecordingEvent {
+                    event_id: "observed-prefix".to_owned(),
+                    recording_seq: 2,
+                    monotonic_ns: 10,
+                    kind: RecordingEventKind::FrameEnter as i32,
+                    symbol: "fixture.handler".to_owned(),
+                    ..RecordingEvent::default()
+                }],
+            }));
+        }
+        payloads.push(PayloadOneof::RecordingFinished(RecordingFinished {
+            recording_id: recording_id.clone(),
+            final_recording_seq: if has_prefix { 2 } else { 1 },
+            drop_counts_by_priority: if abandoned {
+                [(1, 1)].into_iter().collect()
+            } else {
+                Default::default()
+            },
+            ..RecordingFinished::default()
+        }));
+        for payload in payloads {
             write_envelope(&mut writer, payload, &session_id, session_seq, session_seq)
                 .await
                 .expect("write recording envelope");
@@ -603,12 +653,88 @@ async fn request_257_is_accepted_after_256_finished_recordings() {
             assert_eq!(ack.durability, AckDurability::Staged as i32);
             session_seq += 1;
         }
+        if abandoned {
+            let window = persisted
+                .show_recording(&ShowWindowRequest {
+                    project_id,
+                    recording_id: RecordingId::from_uuid(
+                        uuid::Uuid::from_slice(&recording_id).expect("recording UUID"),
+                    ),
+                    limit: 10,
+                    after_sequence: None,
+                })
+                .expect("abandoned recording reads at finish ACK");
+            assert_eq!(window.status, RecordingStatus::Partial);
+            assert_eq!(window.completion, RecordingCompletionEvidence::Partial);
+            assert_eq!(window.events.len(), usize::from(has_prefix));
+            assert_eq!(window.drop_counts_by_priority, [(1, "1".to_owned())].into());
+            assert!(window.duration_ns.is_none(), "no duration was observed");
+            assert!(window.outcome.is_none(), "no terminal outcome was sent");
+            assert!(!window.incomplete_evidence.is_empty());
+        }
+    }
+
+    if abandoned {
+        let companion = persisted
+            .show_recording(&ShowWindowRequest {
+                project_id,
+                recording_id: companion_id,
+                limit: 10,
+                after_sequence: None,
+            })
+            .expect("companion remained active across abandoned requests");
+        assert_eq!(companion.status, RecordingStatus::Recording);
+        let later_id = RecordingId::new();
+        let later_bytes = Bytes::copy_from_slice(later_id.as_uuid().as_bytes());
+        // A subsequent recording and the still-active companion both finish as verified complete.
+        for payload in [
+            PayloadOneof::RecordingStarted(RecordingStarted {
+                recording_id: later_bytes.clone(),
+                recording_seq: 1,
+                method: "GET".to_owned(),
+                ..RecordingStarted::default()
+            }),
+            PayloadOneof::RecordingFinished(RecordingFinished {
+                recording_id: later_bytes,
+                final_recording_seq: 1,
+                event_digest: Bytes::copy_from_slice(blake3::hash(&[]).as_bytes()),
+                ..RecordingFinished::default()
+            }),
+            PayloadOneof::RecordingFinished(RecordingFinished {
+                recording_id: companion_bytes,
+                final_recording_seq: 1,
+                event_digest: Bytes::copy_from_slice(blake3::hash(&[]).as_bytes()),
+                ..RecordingFinished::default()
+            }),
+        ] {
+            write_envelope(&mut writer, payload, &session_id, session_seq, session_seq)
+                .await
+                .expect("later recording and companion completion");
+            let ack = next_ack(&mut reader, "completion after repeated abandonment").await;
+            assert_eq!(ack.highest_contiguous_session_seq, session_seq);
+            assert!(ack.rejected.is_empty());
+            session_seq += 1;
+        }
+        for recording_id in [later_id, companion_id] {
+            let window = persisted
+                .show_recording(&ShowWindowRequest {
+                    project_id,
+                    recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                })
+                .expect("verified complete recording");
+            assert_eq!(window.status, RecordingStatus::Complete);
+            assert_eq!(window.completion, RecordingCompletionEvidence::Complete);
+            assert!(window.incomplete_evidence.is_empty());
+            assert_eq!(window.duration_ns.as_deref(), Some("0"));
+        }
     }
 
     // Acks are staged; read the store back (second read-only connection) until every
     // recording is durable and finished, so the test proves the persisted outcome too.
     let database = project_root.path().join("metadata.sqlite3");
-    let wanted = i64::try_from(FINISHED_REQUESTS).expect("fits");
+    let wanted = i64::try_from(FINISHED_REQUESTS + if abandoned { 2 } else { 0 }).expect("fits");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let connection = rusqlite::Connection::open_with_flags(

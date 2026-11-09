@@ -273,6 +273,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
             pending.start.recordingId(),
             start.build());
     requireRecordingAck(started, recordingId, 1);
+    pending.started = true;
     if (reduced) sendLifecycleGap(pending, "started", pending.start.monotonicNs(),
         START_FRAME_GAP_SYMBOL);
   }
@@ -394,9 +395,23 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     return true;
   }
 
-  private void abandon(PendingRecording pending, String reason) {
+  private void abandon(PendingRecording pending, String reason) throws ClientException {
+    if (pending.unrecoverable) return;
     pending.unrecoverable = true;
     incompleteReported.set(true);
+    if (pending.started) {
+      // Retire the accepted prefix even when no event/GAP fits. Removing ":started" from
+      // the message ID pays for the drop bucket and the widest allowed recording sequence,
+      // even for a start with no other fields. Omit optional evidence, including the digest.
+      RecordingFinished terminal = RecordingFinished.newBuilder()
+          .setRecordingId(ByteString.copyFrom(uuidBytes(pending.recordingId)))
+          .setFinalRecordingSeq(pending.sequence)
+          .putDropCountsByPriority(1, 1)
+          .build();
+      Ack finished = session.send(pending.start.recordingId(),
+          pending.start.recordingId(), terminal);
+      requireRecordingAck(finished, pending.recordingId, pending.sequence);
+    }
     // Only fixed reasons and the validated UUID belong in diagnostics, never captured fields.
     System.err.println("{\"code\":\"XTR-JAVA-CAPTURE-INCOMPLETE\","
         + "\"message\":\"X-trace " + reason + "; affected recording remains incomplete\","
@@ -405,6 +420,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
 
   /** Sends the buffered prefix; the response stays behind terminal gap accounting until Finish. */
   private void flush(PendingRecording pending, boolean finishing) throws ClientException {
+    if (pending.unrecoverable) return;
     int count = pending.events.size();
     if (!finishing) {
       for (int i = 0; i < count; i++) {
@@ -435,8 +451,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
               event.monotonicNs(), 1, 128), sequence);
           batch.setEvents(0, proto);
           if (!fitsBatch(pending, batch)) {
-            // A negotiated limit may be too small even for the bounded gap identity. Leave
-            // this stream unfinished rather than claiming completeness or closing other streams.
+            // The event identity cannot fit even as a GAP; retire only the accepted prefix.
             abandon(pending, "frame-limit gap could not be sent");
             batch.clearEvents();
             break;
@@ -917,6 +932,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     private long memoryDrops;
     private long frameDrops;
     private boolean unrecoverable;
+    private boolean started;
     // Buffered non-throw allocations and retained throw allocations are disjoint charges.
     private long eventBytes;
     private long retainedThrowBytes;
