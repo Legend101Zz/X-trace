@@ -188,8 +188,8 @@ public final class XtpSession implements AutoCloseable {
 
   /**
    * Sends one payload in invocation order and waits for its exact contiguous Staged ACK. More than
-   * 64 concurrent callers are rejected rather than queued without bound. Unsupported payloads fail
-   * before writing or consuming a sequence; the session remains usable.
+   * 64 concurrent callers are rejected rather than queued without bound. Unsupported or oversized
+   * payloads fail before writing or consuming a sequence; the session remains usable.
    */
   public Ack send(String messageId, String correlationToken, Message payload)
       throws ClientException {
@@ -220,21 +220,50 @@ public final class XtpSession implements AutoCloseable {
             .setSentMonotonicNs(System.nanoTime())
             .setMessageId(messageId)
             .setCorrelationToken(correlationToken == null ? "" : correlationToken);
-        Framing.write(output, builder.build(), maxEnvelopeBytes);
-        AgentEnvelope response = nextNonHealth();
-        validateAck(response, sequence);
-        nextSequence = sequence + 1;
-        return response.getAck();
-      } catch (ClientException | RuntimeException error) {
-        failClosed();
-        if (error instanceof ClientException clientError) throw clientError;
-        throw new ClientException("XTR-JAVA-TRANSPORT", "XTP send failed safely", error);
+        AgentEnvelope envelope = builder.build();
+        if (envelope.getSerializedSize() > maxEnvelopeBytes) {
+          throw new ClientException("XTR-JAVA-FRAME", "outgoing envelope length is invalid");
+        }
+        // Only failures after entering I/O can make delivery ambiguous. Size rejection above
+        // cannot consume a sequence, close the connection, or discard an unread ACK.
+        try {
+          Framing.write(output, envelope, maxEnvelopeBytes);
+          AgentEnvelope response = nextNonHealth();
+          validateAck(response, sequence);
+          nextSequence = sequence + 1;
+          return response.getAck();
+        } catch (ClientException | RuntimeException error) {
+          failClosed();
+          if (error instanceof ClientException clientError) throw clientError;
+          throw new ClientException("XTR-JAVA-TRANSPORT", "XTP send failed safely", error);
+        }
       } finally {
         sendLock.unlock();
       }
     } finally {
       pending.release();
     }
+  }
+
+  /**
+   * Checks a payload against the negotiated envelope limit, including IDs and protobuf overhead.
+   * Reserves the widest sequence and timestamp encodings so a later send remains within the limit
+   * even if other callers send first. Does not perform I/O or consume a sequence.
+   */
+  public boolean fitsEnvelope(String messageId, String correlationToken, Message payload)
+      throws ClientException {
+    AgentEnvelope.Builder builder = AgentEnvelope.newBuilder();
+    setPayload(builder, payload);
+    return builder
+        .setProtocolMajor(protocolMajor)
+        .setProtocolMinor(protocolMinor)
+        .setRuntimeSessionId(ByteString.copyFrom(runtimeSessionId))
+        .setSessionSeq(Long.MAX_VALUE)
+        .setSentMonotonicNs(-1L)
+        .setMessageId(messageId)
+        .setCorrelationToken(correlationToken == null ? "" : correlationToken)
+        .build()
+        .getSerializedSize() <= maxEnvelopeBytes;
   }
 
   private static void setPayload(AgentEnvelope.Builder envelope, Message payload)
