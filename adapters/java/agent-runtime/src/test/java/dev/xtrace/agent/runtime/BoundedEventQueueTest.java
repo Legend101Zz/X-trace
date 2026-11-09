@@ -39,7 +39,7 @@ class BoundedEventQueueTest {
 
   @Test
   void sinkBoundsActiveRecordingsAndReleasesCapacityOnlyWhenTheWriterClosesTheRecording() {
-    RuntimeBridgeSink sink = new RuntimeBridgeSink(new BoundedEventQueue(32, 8192));
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(new BoundedEventQueue(32, 8192), 8, 0);
     for (int index = 0; index < 8; index++) {
       assertTrue(sink.offerStart("recording-" + index, 1, "POST", "/orders"));
     }
@@ -49,6 +49,55 @@ class BoundedEventQueueTest {
     assertFalse(sink.offerStart("recording-next", 3, "POST", "/orders"));
     sink.recordingClosed();
     assertTrue(sink.offerStart("recording-next", 3, "POST", "/orders"));
+  }
+
+  @Test
+  void lifecycleAllowancePreservesOrderWhenBothEventBoundsAreFull() throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(16, 4096);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    for (int i = 0; i < 8; i++) assertTrue(queue.offer(event("filler", "e" + i, 256), false));
+    assertFalse(queue.offer(event("filler", "overflow", 128), false));
+    for (int i = 0; i < 50; i++) {
+      assertTrue(sink.offerStart("r" + i, 1, "GET", "/owners/{id}"));
+      assertTrue(sink.offerFinish("r" + i, 1, 2, 200, 1));
+    }
+    assertEquals(50, sink.activeRecordings());
+    for (int i = 0; i < 8; i++) assertTrue(queue.poll(Duration.ZERO) instanceof QueueSignal.Event);
+    for (int i = 0; i < 50; i++) {
+      assertEquals("r" + i, ((QueueSignal.Start) queue.poll(Duration.ZERO)).recordingId());
+      assertEquals("r" + i, ((QueueSignal.Finish) queue.poll(Duration.ZERO)).recordingId());
+    }
+    assertTrue(queue.isEmpty());
+    assertEquals(0, queue.size());
+    assertEquals(0, queue.bytes());
+  }
+
+  @Test
+  void pendingRecordingConfigurationHasTestedDefaultsAndAHardUpperBound() {
+    assertEquals(64, RuntimeBridgeSink.pendingRecordings(null));
+    assertEquals(50, RuntimeBridgeSink.pendingRecordings("50"));
+    assertEquals(256, RuntimeBridgeSink.pendingRecordings("256"));
+    for (String invalid : new String[] {"", "invalid", "0", "-1", "257", "2147483648"}) {
+      assertEquals(64, RuntimeBridgeSink.pendingRecordings(invalid));
+    }
+    assertEquals(16_384, RecordingWriter.eventCap(""));
+    assertEquals(131_072, RecordingWriter.eventCap("xtrace.focused.v1"));
+    assertEquals(16_384, RecordingWriter.eventCap("unknown"));
+  }
+
+  @Test
+  void lifecycleAllowanceAlsoHasFixedSlotAndPerSignalByteBounds() throws Exception {
+    BoundedEventQueue queue = new BoundedEventQueue(16, 4096);
+    assertFalse(queue.offerLifecycle(new QueueSignal.Start("large", 1, "GET", "/", 4097)));
+    int slots = 2 * (BoundedEventQueue.MAX_PENDING_RECORDINGS
+        + BoundedEventQueue.MAX_METADATA_RECORDINGS);
+    for (int i = 0; i < slots; i++) assertTrue(queue.offerLifecycle(start("r" + i)));
+    assertFalse(queue.offerLifecycle(start("overflow")));
+    assertEquals(slots, queue.size());
+    assertEquals(slots * 128L, queue.bytes());
+    for (int i = 0; i < slots; i++) queue.poll(Duration.ZERO);
+    assertEquals(0, queue.size());
+    assertEquals(0, queue.bytes());
   }
 
   @Test
