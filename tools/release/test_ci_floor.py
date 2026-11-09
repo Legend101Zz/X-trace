@@ -146,6 +146,49 @@ class CiFloorEvidenceTests(unittest.TestCase):
             with self.assertRaises(ci_floor.FloorInputError):
                 ci_floor._read_phase_base(pathlib.Path("/public/repo"), metadata)
 
+    def test_explicit_event_head_preserves_exact_source_and_phase_base_checks(self) -> None:
+        merge_sha = "d" * 40
+        cases = (
+            ("pull_request", merge_sha, self.source_sha, "", 0, True),
+            ("push", self.source_sha, self.source_sha, "", 0, True),
+            ("pull_request", merge_sha, merge_sha, "", 0, False),
+            ("push", self.source_sha, merge_sha, "", 0, False),
+            ("pull_request", merge_sha, self.source_sha, " M tracked-file\n", 0, False),
+            ("pull_request", merge_sha, self.source_sha, "", 1, False),
+        )
+        for event, github_sha, checkout_sha, status, ancestry_code, succeeds in cases:
+            with self.subTest(event=event, checkout=checkout_sha, status=status, ancestry=ancestry_code), \
+                    tempfile.TemporaryDirectory(dir=self._scratch_root()) as temporary:
+                repo = pathlib.Path(temporary)
+                metadata = repo / "phase.json"
+                metadata.write_text(json.dumps({"baselineSha": self.phase_base}), encoding="utf-8")
+                env_file = repo / "github-env"
+                outputs = {
+                    ("git", "rev-parse", "HEAD"): (0, checkout_sha + "\n"),
+                    ("git", "status", "--porcelain=v1", "--untracked-files=all"): (0, status),
+                    ("git", "cat-file", "-e", f"{self.phase_base}^{{commit}}"): (0, ""),
+                    ("git", "merge-base", "--is-ancestor", self.phase_base, "HEAD"): (ancestry_code, ""),
+                }
+
+                def git(argv, *, cwd):
+                    self.assertEqual(cwd, repo)
+                    code, stdout = outputs[tuple(argv)]
+                    return ci_floor.subprocess.CompletedProcess(argv, code, stdout, "")
+
+                with mock.patch.dict(os.environ, {
+                    "GITHUB_EVENT_NAME": event, "GITHUB_SHA": github_sha, "GITHUB_ENV": str(env_file),
+                }), mock.patch.object(ci_floor, "_run", side_effect=git):
+                    if succeeds:
+                        self.assertEqual(ci_floor._identity(repo, metadata, self.source_sha),
+                                         (self.source_sha, self.phase_base))
+                        self.assertEqual(env_file.read_text(),
+                                         f"XTRACE_PHASE_BASE_SHA={self.phase_base}\n"
+                                         f"XTRACE_EXPECTED_HEAD_SHA={self.source_sha}\n")
+                    else:
+                        with self.assertRaises(ci_floor.FloorInputError):
+                            ci_floor._identity(repo, metadata, self.source_sha)
+                        self.assertFalse(env_file.exists())
+
     def test_full_twenty_three_gate_receipt_uses_finite_ci_specific_json_budget(self) -> None:
         settle = {
             "eligible": True,
