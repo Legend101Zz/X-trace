@@ -1583,6 +1583,136 @@ mod tests {
     }
 
     #[test]
+    fn a_small_held_request_is_replayable_from_its_durable_journal_before_finish() {
+        use xtrace_application::recording_queries::{RecordingCompletionEvidence, RecordingStatus};
+
+        let (directory, store, project) = fixture();
+        let persistence = Arc::new(SqliteRecordingPersistence::new(store, directory.path()));
+        let capture = RecordingCaptureService::new(
+            persistence,
+            SegmentPolicy::default(),
+            std::num::NonZeroUsize::new(1).expect("retention"),
+        );
+        let anchor = begin(project.id(), RecordingId::new());
+        capture.begin_recording(anchor.clone()).expect("begin held request");
+        let mut request = event(2, "request-identity");
+        let observed = request.payload.event.as_mut().expect("event");
+        observed.kind = K_REQUEST_UPDATE;
+        observed.symbol = "http.request POST /owners/new".to_owned();
+        request.canonical_bytes = request.payload.encode_to_vec();
+        let mut enter = event(3, "held-handler");
+        let observed = enter.payload.event.as_mut().expect("event");
+        observed.kind = K_ENTER;
+        observed.symbol = "OwnerController.processCreationForm".to_owned();
+        observed.exception = Some(ExceptionPayload {
+            exception_type: "ObservedException".to_owned(),
+            sanitized_message: "JOURNAL_VALUE_CANARY".to_owned(),
+            stack_frames: vec!["JOURNAL_STACK_CANARY".to_owned()],
+        });
+        enter.canonical_bytes = enter.payload.encode_to_vec();
+        let events = vec![request, enter];
+        let receipt = capture
+            .record_events(RecordEvents {
+                recording_id: anchor.recording_id,
+                events: events.clone(),
+            })
+            .expect("acknowledge a prefix smaller than a segment");
+        assert_eq!(receipt.accepted, 2);
+        assert_eq!(receipt.persisted_segments, 0);
+
+        // Reopen SQLite while the capture service still holds the unfinished request.
+        let reader = SqliteRecordingReader::new(
+            SqliteStore::open(
+                &directory.path().join("metadata.sqlite3"),
+                OpenOptions::default().with_must_exist(true),
+            )
+            .expect("independent reader"),
+            directory.path(),
+        );
+        let (listed, more) = reader.list_recordings(project.id(), None, 10).expect("live list");
+        assert!(!more);
+        assert_eq!(listed[0].status, RecordingStatus::Recording);
+        assert_eq!(listed[0].segment_count, "0");
+        assert_eq!(listed[0].event_count, "2");
+        let show = |cursor| {
+            xtrace_application::show_recording(
+                &reader,
+                ShowRecording {
+                    project_id: project.id(),
+                    recording_id: anchor.recording_id,
+                    limit: 1,
+                    cursor,
+                    around_frame: None,
+                },
+                CorrelationId::new(),
+            )
+            .expect("live journal page")
+        };
+        let first = show(None);
+        assert_eq!(first.status, RecordingStatus::Recording);
+        assert_eq!(first.completion, RecordingCompletionEvidence::Unavailable);
+        assert_eq!(first.incomplete_evidence, ["durable_tail_pending:2..3"]);
+        assert!(first.adapter_summary.is_none());
+        assert!(first.duration_ns.is_none());
+        assert!(first.capacity.is_none());
+        assert!(!first.honesty.recording.counts_available);
+        assert!(first.honesty.recording.frames_with_gap.is_none());
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].sequence, "2");
+        assert_eq!(first.events[0].kind, "request_update");
+        assert_eq!(first.events[0].symbol.as_deref(), Some("http.request POST /owners/new"));
+        assert!(first.events[0].frame_id.is_none());
+        assert!(first.events[0].line.is_none());
+        let second = show(Some(first.next_cursor.expect("journal continuation")));
+        assert_eq!(second.status, RecordingStatus::Recording);
+        assert_eq!(second.completion, RecordingCompletionEvidence::Unavailable);
+        assert!(!second.honesty.recording.counts_available);
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].sequence, "3");
+        assert_eq!(second.events[0].event_id.as_deref(), Some("held-handler"));
+        assert!(
+            second.events[0].frame_id.is_none(),
+            "journal events have no durable frame index yet"
+        );
+        assert!(second.events[0].line.is_none(), "method entry cannot invent an active line");
+        assert!(second.next_cursor.is_none());
+        let json = serde_json::to_string(&second).expect("projected journal JSON");
+        assert!(!json.contains("JOURNAL_VALUE_CANARY"));
+        assert!(!json.contains("JOURNAL_STACK_CANARY"));
+        let mut cross_project = ShowWindowRequest {
+            project_id: ProjectId::new(),
+            recording_id: anchor.recording_id,
+            limit: 10,
+            after_sequence: None,
+        };
+        assert_eq!(
+            reader.show_recording(&cross_project).expect_err("project boundary").kind(),
+            PortErrorKind::NotFound
+        );
+
+        capture
+            .finish_recording(FinishRecording {
+                recording_id: anchor.recording_id,
+                final_recording_seq: 3,
+                duration_ns: Some(100),
+                event_digest: digest_of(&events),
+                drop_counts_by_priority: Default::default(),
+                unsupported_capability_codes: Vec::new(),
+                capacity_dropped_events: 0,
+                event_cap: xtrace_domain::STANDARD_EVENT_CAP as u64,
+                outcome: None,
+                response_summary: None,
+            })
+            .expect("finish acknowledged prefix");
+        cross_project.project_id = project.id();
+        let complete = reader.show_recording(&cross_project).expect("sealed events");
+        assert_eq!(complete.status, RecordingStatus::Complete);
+        assert_eq!(complete.completion, RecordingCompletionEvidence::Complete);
+        assert_eq!(complete.events.len(), 2);
+        assert!(complete.incomplete_evidence.is_empty());
+    }
+
+    #[test]
     fn capture_preflights_the_complete_batch_before_accepting_or_persisting_events() {
         let (directory, store, project) = fixture();
         let adapter = std::sync::Arc::new(SqliteRecordingPersistence::new(store, directory.path()));
@@ -1810,6 +1940,35 @@ mod tests {
                 .disposition,
             xtrace_application::recording::PersistSegmentDisposition::ExactReplay
         );
+        let reader = SqliteRecordingReader::new(store.clone(), directory.path());
+        let page = reader
+            .show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id,
+                limit: 2,
+                after_sequence: None,
+            })
+            .expect("sealed prefix followed by a journal tail");
+        assert_eq!(
+            page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+            ["2", "3"]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.incomplete_evidence, ["durable_tail_pending:4..4"]);
+        let tail = reader
+            .show_recording(&ShowWindowRequest {
+                project_id: project.id(),
+                recording_id,
+                limit: 2,
+                after_sequence: Some(3),
+            })
+            .expect("continue into the live tail");
+        assert_eq!(
+            tail.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+            ["4"]
+        );
+        assert!(!tail.has_more);
+        assert_eq!(tail.status, xtrace_application::recording_queries::RecordingStatus::Recording);
         drop(capture);
         drop(adapter);
         let recovery = SqliteRecordingPersistence::new(store.clone(), directory.path());

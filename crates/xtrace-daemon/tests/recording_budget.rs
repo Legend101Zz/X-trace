@@ -492,6 +492,23 @@ async fn streamed_recording_journey(focused: bool) {
         assert_eq!(item.event_count, expected_events.to_string());
         if !finishing {
             assert_eq!(item.segment_count, "0", "small batches stay in the journal until Finish");
+            let live = persisted
+                .show_recording(&ShowWindowRequest {
+                    project_id,
+                    recording_id,
+                    limit: 100,
+                    after_sequence: None,
+                })
+                .expect("acknowledged events are readable while open");
+            assert_eq!(live.status, RecordingStatus::Recording);
+            assert_eq!(live.completion, RecordingCompletionEvidence::Unavailable);
+            assert_eq!(live.events.len(), expected_events.min(100));
+            assert!(live.adapter_summary.is_none());
+            assert!(live.duration_ns.is_none());
+            for (actual, sent) in live.events.iter().zip(&events) {
+                assert_eq!(actual.sequence, sent.recording_seq.to_string());
+                assert_eq!(actual.event_id.as_deref(), Some(sent.event_id.as_str()));
+            }
         }
     }
     // The count limit is also bounded by the 256 KiB projection budget.

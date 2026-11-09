@@ -823,6 +823,10 @@ impl SqliteRecordingStore<'_> {
             }
         };
 
+        // Read the checkpoint before the segment snapshot: publication commits the
+        // segment before removing its journal. Thus a concurrent publication can
+        // overlap these snapshots, but cannot hide the acknowledged prefix from both.
+        let journal = self.journal_events(stored_project_id, request.recording_id)?;
         let mut statement = connection
             .prepare(
                 "SELECT segment_ordinal, object_hash, first_recording_seq, last_recording_seq, \
@@ -849,31 +853,20 @@ impl SqliteRecordingStore<'_> {
         let mut has_more = false;
         let mut projection_bytes = 2_usize;
         let mut projection_byte_limit_reached = false;
-        let mut verified_input_bytes = 0_usize;
+        // The journal has no compression stage, so count each verified envelope
+        // once, including its length and digest. Its loader also bounds total bytes.
+        let mut verified_input_bytes = journal.as_ref().map_or(0, |(_, tail)| {
+            tail.iter().map(|event| prost::Message::encoded_len(event) + 36).sum::<usize>()
+        });
         let mut verified_work_limit_reached = false;
         let mut incomplete_evidence = Vec::new();
         let mut source_cache = SourceProjectionCache::default();
         if status == "partial" || status == "invalid" {
             incomplete_evidence.push(format!("persisted_status:{status}"));
         }
+        let pending_evidence_index = incomplete_evidence.len();
         let session_context = session_context(&connection, request.recording_id, correlation_id)?;
-        let sealed_last: Option<Vec<u8>> = connection
-            .query_row(
-                "SELECT MAX(last_recording_seq) FROM recording_segments WHERE recording_id = ?1",
-                rusqlite::params![request.recording_id.as_uuid().as_bytes().to_vec()],
-                |row| row.get(0),
-            )
-            .map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-        let sealed_last = sealed_last
-            .as_deref()
-            .map(|bytes| decode_stored_sequence(bytes, correlation_id))
-            .transpose()?
-            .unwrap_or(1);
-        if let Some((first, last, _)) = self.journal_summary(request.recording_id, sealed_last)? {
-            incomplete_evidence.push(format!("durable_tail_pending:{first}..{last}"));
-        }
+        let mut sealed_last = 1;
         // A Partial that carries a real-looking digest but no capacity drops was sealed
         // without hashing because its declared bytes passed the verification bound; say so
         // instead of leaving the cause silent.
@@ -944,6 +937,7 @@ impl SqliteRecordingStore<'_> {
                 .checked_add(1)
                 .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
             expected_sequence = last_sequence.checked_add(1);
+            sealed_last = last_sequence;
             segment_count = segment_count
                 .checked_add(1)
                 .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
@@ -1108,6 +1102,62 @@ impl SqliteRecordingStore<'_> {
                 events.push(projected);
             }
         }
+        let mut has_journal_tail = false;
+        if let Some((ordinal, tail)) = journal {
+            // Use the boundary from the same row snapshot that was decoded,
+            // including rows beyond this page, to avoid repeating a published tail.
+            let tail: Vec<_> =
+                tail.into_iter().filter(|event| event.recording_seq > sealed_last).collect();
+            has_journal_tail = !tail.is_empty();
+            if !tail.is_empty() && ordinal != expected_ordinal {
+                return Err(object_corrupt_error(correlation_id));
+            }
+            if let (Some(first), Some(last)) = (tail.first(), tail.last()) {
+                if sealed_last.checked_add(1) != Some(first.recording_seq) {
+                    return Err(object_corrupt_error(correlation_id));
+                }
+                incomplete_evidence.insert(
+                    pending_evidence_index,
+                    format!("durable_tail_pending:{}..{}", first.recording_seq, last.recording_seq),
+                );
+            }
+            // Journal envelopes have already passed checkpoint, digest, canonical
+            // encoding and sequence checks. Project them exactly like XTF events;
+            // they supply neither terminal proof nor an invented frame identity.
+            for envelope in &tail {
+                let event =
+                    envelope.event.as_ref().ok_or_else(|| object_corrupt_error(correlation_id))?;
+                if event.recording_seq <= request.after_sequence.unwrap_or(0) {
+                    continue;
+                }
+                if events.len() == event_limit
+                    || projection_byte_limit_reached
+                    || verified_work_limit_reached
+                {
+                    has_more = true;
+                    break;
+                }
+                let projected = project_persisted_event(event, source_root, &mut source_cache);
+                let projected_size = projected
+                    .serialized_size_with_separator()
+                    .map_err(|_| recording_query_resource_error(correlation_id))?;
+                if projected_size > MAX_RECORDING_EVENT_PROJECTION_BYTES {
+                    return Err(recording_query_resource_error(correlation_id));
+                }
+                if projection_bytes
+                    .checked_add(projected_size)
+                    .is_none_or(|total| total > MAX_RECORDING_EVENT_PROJECTION_BYTES)
+                {
+                    has_more = true;
+                    break;
+                }
+                if event.kind == WIRE_KIND_GAP {
+                    incomplete_evidence.push(format!("gap_event_sequence:{}", event.recording_seq));
+                }
+                projection_bytes += projected_size;
+                events.push(projected);
+            }
+        }
         for event in &mut events {
             let sequence = event
                 .sequence
@@ -1262,7 +1312,13 @@ impl SqliteRecordingStore<'_> {
             .map_err(|error| {
                 map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
             })?,
-            frame_honesty: load_frame_honesty(&connection, request.recording_id, correlation_id)?,
+            // Journal events have no frame-index rows yet. Counts over only the
+            // sealed prefix cannot claim to describe the whole recording.
+            frame_honesty: if has_journal_tail {
+                None
+            } else {
+                load_frame_honesty(&connection, request.recording_id, correlation_id)?
+            },
         })
     }
 
@@ -8329,6 +8385,20 @@ mod tests {
                 RecordingStoreErrorKind::Corruption
             );
             assert_eq!(
+                view.read_recording_window(
+                    &ShowWindowRequest {
+                        project_id,
+                        recording_id: anchor.recording_id,
+                        limit: 10,
+                        after_sequence: None,
+                    },
+                    None
+                )
+                .expect_err("live events must reject checkpointed corruption")
+                .kind(),
+                RecordingStoreErrorKind::Corruption
+            );
+            assert_eq!(
                 view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 3))
                     .expect_err("recovery reports committed corruption")
                     .kind(),
@@ -8403,6 +8473,11 @@ mod tests {
                                     )
                                     .expect("live detail");
                                 assert_eq!(page.incomplete_evidence, expected);
+                                assert_eq!(
+                                    page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+                                    if with_prefix { vec!["2", "3"] } else { vec![] },
+                                    "a pending append must expose only the previously checkpointed events"
+                                );
                             })
                             .join()
                             .expect("reader thread")
@@ -9002,6 +9077,22 @@ mod tests {
             view.journal_summary(anchor.recording_id, 1).expect("stale journal retained"),
             Some((2, 3, 2))
         );
+        let page = view
+            .read_recording_window(
+                &ShowWindowRequest {
+                    project_id,
+                    recording_id: anchor.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                },
+                None,
+            )
+            .expect("read after publication before journal cleanup");
+        assert_eq!(
+            page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+            ["2", "3", "4"]
+        );
+        assert!(page.incomplete_evidence.is_empty(), "the old journal prefix is already sealed");
         assert_eq!(
             view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 4))
                 .expect("verified prefix recovery"),

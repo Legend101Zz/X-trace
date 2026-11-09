@@ -2,7 +2,7 @@
 //!
 //! See ADR 0008 Amendment 1. The scope never extends an operation's deadline and never
 //! replaces an identity check; it only lets operations created on this thread while the scope
-//! is live reuse directory verdicts and the batched listing, until the scope is dropped or its
+//! is live reuse directory/file verdicts and the batched listing, until the scope is dropped or its
 //! wall-clock cap passes.
 
 use std::cell::RefCell;
@@ -16,7 +16,7 @@ pub(crate) const ADMISSION_SCOPE_CAP: Duration = Duration::from_secs(10);
 static NEXT_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Guard for one store call. Operations created on this thread while it is live share the
-/// directory verdict memo and the batched listing. It is neither `Send` nor `Sync`; entering
+/// directory/file verdict memos and the batched listing. It is neither `Send` nor `Sync`; entering
 /// while a scope is live on this thread joins that scope. Dropping the last guard forgets
 /// everything the scope remembered.
 ///
@@ -45,6 +45,9 @@ pub(crate) struct ScopeState {
     lapsed: bool,
     /// Directory verdicts earned under this scope.
     pub(crate) memo: Vec<crate::probe::MemoKey>,
+    /// Regular-file verdicts, separate from directory traversal policy.
+    #[cfg(target_os = "macos")]
+    pub(crate) file_memo: Vec<crate::probe::MemoKey>,
     /// The scope's single batched listing, once taken.
     #[cfg(target_os = "macos")]
     pub(crate) batch: Option<crate::probe::Prefetched>,
@@ -61,6 +64,7 @@ impl ScopeState {
             #[cfg(target_os = "macos")]
             {
                 self.batch = None;
+                self.file_memo.clear();
             }
         }
     }
@@ -95,6 +99,8 @@ impl AdmissionScope {
                     cap,
                     lapsed: false,
                     memo: Vec::new(),
+                    #[cfg(target_os = "macos")]
+                    file_memo: Vec::new(),
                     #[cfg(target_os = "macos")]
                     batch: None,
                     #[cfg(target_os = "macos")]
