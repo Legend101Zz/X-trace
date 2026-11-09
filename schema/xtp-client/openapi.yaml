@@ -759,7 +759,7 @@ components:
               relation: { type: string, enum: [parent, async_parent] }
     Event:
       type: object
-      required: [sequence, frameId, navigation, monotonicNs, kind, sourceBinding, fieldTruncations, depth, parentFrameId, asyncParentFrameId, line, bindings, gap]
+      required: [sequence, frameId, navigation, monotonicNs, kind, exception, sourceBinding, fieldTruncations, depth, parentFrameId, asyncParentFrameId, line, bindings, gap]
       properties:
         sequence: { type: string, pattern: '^[0-9]+$' }
         frameId:
@@ -776,6 +776,14 @@ components:
         interaction:
           type: [object, 'null']
           additionalProperties: { type: [string, 'null'] }
+        exception:
+          description: >-
+            Persisted exception type only; null when no payload was recorded.
+            Messages and stack text are withheld. Cause chains are not recorded
+            by the current agent protocol and must not be inferred from other events.
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/EventException'
         sourceBinding:
           type: string
           description: Adapter-reported compile-time class-to-source binding result.
@@ -822,6 +830,15 @@ components:
           oneOf:
             - type: 'null'
             - $ref: '#/components/schemas/Gap'
+    EventException:
+      type: object
+      additionalProperties: false
+      required: [exceptionType]
+      properties:
+        exceptionType:
+          type: [string, 'null']
+          maxLength: 256
+          description: Recorded type name; null when not observed. Oversized legacy names use a truncation marker recorded in fieldTruncations.
     Completion:
       type: string
       enum: [complete, partial, invalid, unavailable]

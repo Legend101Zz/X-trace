@@ -13,7 +13,7 @@ const linked = { items: [{ recordingId: recordingA, status: 'complete', completi
 
 const none = { state: 'boundary' };
 const nav = (over: Record<string, unknown>) => ({ previous: none, next: none, into: none, over: none, out: none, ...over });
-const ev = (n: number, parent: string | null, symbol: string, navigation: object) => ({ sequence: String(n), frameId: `f${n}`, eventId: `event-${n}`, navigation, monotonicNs: String(n * 10), kind: 'method', symbol, parentFrameId: parent, sourceBinding: 'unspecified', fieldTruncations: [] });
+const ev = (n: number, parent: string | null, symbol: string, navigation: object) => ({ sequence: String(n), frameId: `f${n}`, eventId: `event-${n}`, navigation, monotonicNs: String(n * 10), kind: 'method', symbol, parentFrameId: parent, sourceBinding: 'unspecified', fieldTruncations: [], exception: null as { exceptionType: string | null } | null });
 
 const events = [
   ev(1, null, 'Controller.create', nav({ next: { state: 'target', frameId: 'f2' }, into: { state: 'target', frameId: 'f2' } })),
@@ -83,6 +83,40 @@ describe('replay wiring in the app', () => {
     const banner = screen.getByRole('region', { name: 'Recording outcome' });
     expect(within(banner).getByText('Response status 500 (as reported by the adapter)')).toBeInTheDocument();
     expect(within(banner).getByText('Exception java.lang.IllegalStateException: boom')).toBeInTheDocument();
+  });
+
+  it('shows the selected throw type separately from the framework outcome wrapper', async () => {
+    responseDetail = {
+      ...detail,
+      outcome: { ...detail.outcome, exception: { exceptionType: 'jakarta.servlet.ServletException', message: 'wrapper' } },
+      events: events.map((event, index) => index === 1 ? {
+        ...event,
+        kind: 'recording_event_kind:frame_throw',
+        exception: {
+          exceptionType: 'org.example.ApplicationException',
+          message: 'private-message-canary',
+          stackFrames: ['private-stack-canary'],
+        },
+      } : event),
+    };
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: /Repo\.save/ }));
+    expect(within(inspector()).getByText('org.example.ApplicationException')).toBeInTheDocument();
+    expect(within(inspector()).getByText(/cause chain not observed/)).toBeInTheDocument();
+    expect(within(inspector()).queryByText(/jakarta.servlet.ServletException/)).not.toBeInTheDocument();
+    expect(within(inspector()).queryByText(/private-message-canary|private-stack-canary/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Controller\.create/ }));
+    expect(within(inspector()).queryByText(/Thrown exception:/)).not.toBeInTheDocument();
+  });
+
+  it('names a missing throw type without substituting the recording outcome', async () => {
+    responseDetail = { ...detail, events: events.map((event, index) => index === 1 ? {
+      ...event, kind: 'recording_event_kind:frame_throw', exception: { exceptionType: null },
+    } : event) };
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: /Repo\.save/ }));
+    expect(within(inspector()).getByText('type not observed')).toBeInTheDocument();
+    expect(within(inspector()).queryByText(/java.lang.IllegalStateException/)).not.toBeInTheDocument();
   });
 
   it('keeps one selection across Linear -> Canvas -> inspector -> Linear', async () => {

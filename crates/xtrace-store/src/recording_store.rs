@@ -26,9 +26,9 @@ const MAX_TERMINAL_REQUEST_JSON_BYTES: usize = 64 * 1024;
 use xtrace_application::recording_queries::{
     FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_FINISH_VERIFIED_BYTES,
     MAX_RECORDING_VERIFIED_INPUT_BYTES, NavigationResult, NavigationUnavailable, PersistedBinding,
-    PersistedEvent, PersistedGap, PersistedInteraction, PersistedOutcome, PersistedSource,
-    PersistedValue, RecordingCapacity, RecordingCompletionEvidence, RecordingEventWindow,
-    RecordingMetadata, RecordingStatus, ShowWindowRequest, SourceStatus,
+    PersistedEvent, PersistedException, PersistedGap, PersistedInteraction, PersistedOutcome,
+    PersistedSource, PersistedValue, RecordingCapacity, RecordingCompletionEvidence,
+    RecordingEventWindow, RecordingMetadata, RecordingStatus, ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::is_projectable_source_path;
@@ -3343,6 +3343,11 @@ fn project_persisted_event(
         kind: recording_event_kind_label(event.kind),
         symbol: nonempty(&event.symbol),
         interaction,
+        // Only type identity crosses the read boundary. Neither a field called
+        // sanitized_message nor stack text proves that legacy stored text is safe.
+        exception: event.exception.as_ref().map(|exception| PersistedException {
+            exception_type: nonempty(&exception.exception_type),
+        }),
         source,
         source_binding,
         field_truncations: Vec::new(),
@@ -7721,6 +7726,92 @@ mod tests {
                 ..RecordingEvent::default()
             }),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_exceptions_project_only_the_recorded_type_without_message_or_stack_text() {
+        use xtrace_protocol::generated::agent::{ExceptionPayload, RecordingEventKind};
+
+        let fixture = on_disk_store("exception-projection");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        let mut segment = segment_request(project_id, anchor.recording_id, 0, &[2, 3, 4]);
+        for (envelope, kind) in segment.events.iter_mut().zip([
+            RecordingEventKind::FrameThrow,
+            RecordingEventKind::Exception,
+            RecordingEventKind::FrameThrow,
+        ]) {
+            let event = envelope.event.as_mut().expect("event");
+            event.kind = kind as i32;
+            if event.recording_seq != 4 {
+                event.exception = Some(ExceptionPayload {
+                    exception_type: "org.example.ApplicationException".into(),
+                    sanitized_message: "private-message-canary password=do-not-display".into(),
+                    stack_frames: vec!["Caused by: private-stack-canary".into()],
+                });
+            }
+        }
+        view.commit_segment(&segment).expect("persist XTF");
+        let page = view
+            .read_recording_window(
+                &ShowWindowRequest {
+                    project_id,
+                    recording_id: anchor.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                },
+                None,
+            )
+            .expect("read persisted events");
+        assert_eq!(page.events.len(), 3);
+        for event in &page.events[..2] {
+            let exception = event.exception.as_ref().expect("persisted exception");
+            assert_eq!(
+                exception.exception_type.as_deref(),
+                Some("org.example.ApplicationException")
+            );
+        }
+        assert!(page.events[2].exception.is_none(), "never infer a missing throw payload");
+        let json = serde_json::to_string(&page.events).expect("serialize projection");
+        assert!(!json.contains("private-message-canary"));
+        assert!(!json.contains("do-not-display"));
+        assert!(!json.contains("private-stack-canary"));
+    }
+
+    #[test]
+    fn exception_projection_bounds_legacy_types_and_preserves_missing_type() {
+        use xtrace_protocol::generated::agent::ExceptionPayload;
+
+        let mut event = RecordingEvent {
+            exception: Some(ExceptionPayload {
+                exception_type: "x".repeat(257),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let projected =
+            project_persisted_event(&event, None, &mut SourceProjectionCache::default());
+        assert_eq!(
+            projected.exception.expect("payload").exception_type.as_deref(),
+            Some("[truncated]")
+        );
+        assert_eq!(
+            projected.field_truncations,
+            vec![xtrace_application::FieldTruncation {
+                field: "exception.exceptionType".into(),
+                original_bytes: "257".into(),
+                representation: xtrace_application::FieldRepresentation::Truncated,
+            }]
+        );
+        event.exception.as_mut().expect("payload").exception_type.clear();
+        let projected =
+            project_persisted_event(&event, None, &mut SourceProjectionCache::default());
+        assert!(projected.exception.expect("payload").exception_type.is_none());
+        assert!(projected.field_truncations.is_empty());
     }
 
     #[cfg(unix)]

@@ -228,6 +228,9 @@ pub struct PersistedEvent {
     pub symbol: Option<String>,
     /// Persisted interaction projection, if present.
     pub interaction: Option<PersistedInteraction>,
+    /// Persisted exception facts, if present; no message or stack text is exposed.
+    #[serde(default)]
+    pub exception: Option<PersistedException>,
     /// Compile-attested source location, if the loaded class was verified.
     pub source: Option<PersistedSource>,
     /// Runtime source-binding result persisted with the event.
@@ -246,6 +249,15 @@ pub struct PersistedEvent {
     pub bindings: Vec<PersistedBinding>,
     /// Declared gap; `Some` only for `gap` events.
     pub gap: Option<PersistedGap>,
+}
+
+/// Type identity from a persisted exception payload. Causes are not recorded by
+/// the current wire protocol and must never be inferred from stack text or frames.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedException {
+    /// Display-bounded recorded type name; `None` means the type was not observed.
+    pub exception_type: Option<String>,
 }
 
 /// One observed binding (argument, local, field or return value) at an event.
@@ -389,6 +401,13 @@ impl PersistedEvent {
             &mut self.field_truncations,
         );
         bound_display(&mut self.symbol, "symbol", &mut self.field_truncations);
+        if let Some(exception) = &mut self.exception {
+            bound_display(
+                &mut exception.exception_type,
+                "exception.exceptionType",
+                &mut self.field_truncations,
+            );
+        }
         if let Some(interaction) = &mut self.interaction {
             bound_display(
                 &mut interaction.driver,
@@ -1378,6 +1397,7 @@ mod tests {
                 kind: "unknown:2147483647".to_owned(),
                 symbol: None,
                 interaction: None,
+                exception: None,
                 source: None,
                 source_binding: SourceBinding::Unspecified,
                 field_truncations: Vec::new(),
