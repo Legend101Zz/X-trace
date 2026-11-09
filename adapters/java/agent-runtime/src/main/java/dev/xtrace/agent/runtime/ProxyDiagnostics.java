@@ -9,17 +9,29 @@ import java.util.concurrent.atomic.AtomicInteger;
 /** Opt-in, bounded metadata for diagnosing missing proxy boundaries; never reads call values. */
 final class ProxyDiagnostics {
   private static final boolean ENABLED = Boolean.getBoolean("xtrace.agent.recordingDiagnostics");
-  private static final AtomicInteger ROWS = new AtomicInteger();
+  private static final Budget BUDGET = new Budget();
   private static final int MAX_ROWS = 128;
 
   private ProxyDiagnostics() {}
 
   static void report(String proxy, String invocation, String declaration, String result) {
-    if (!ENABLED || ROWS.getAndUpdate(count -> Math.min(MAX_ROWS, count + 1)) >= MAX_ROWS) return;
+    if (!ENABLED || !BUDGET.admit(result)) return;
     try {
       System.err.println(row(proxy, invocation, declaration, result));
     } catch (RuntimeException | LinkageError ignored) {
       // Diagnostics must not affect transformation or capture.
+    }
+  }
+
+  /** Startup transformations cannot consume the allowance for request-time resolution evidence. */
+  static final class Budget {
+    private final AtomicInteger transformations = new AtomicInteger();
+    private final AtomicInteger resolutions = new AtomicInteger();
+
+    boolean admit(String result) {
+      AtomicInteger rows = result.equals("transformed") || result.equals("transform_failed")
+          ? transformations : resolutions;
+      return rows.getAndUpdate(count -> Math.min(MAX_ROWS / 2, count + 1)) < MAX_ROWS / 2;
     }
   }
 

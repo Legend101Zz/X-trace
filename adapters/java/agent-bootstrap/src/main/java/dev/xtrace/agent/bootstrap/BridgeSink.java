@@ -4,6 +4,11 @@ import java.lang.reflect.Method;
 
 /** JDK-only handoff from inlined advice to the private agent runtime. */
 public interface BridgeSink {
+  /** Whether this observed method entry lacks the requested focused line probes. */
+  default boolean lineProbeUnavailable(Class<?> type, String method, String descriptor) {
+    return false;
+  }
+
   /** A complete request recording could not be admitted. */
   int INCOMPLETE_START_REJECTED = 1;
 

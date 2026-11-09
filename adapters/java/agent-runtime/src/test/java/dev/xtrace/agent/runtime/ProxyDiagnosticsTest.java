@@ -9,6 +9,17 @@ import org.junit.jupiter.api.Test;
 
 class ProxyDiagnosticsTest {
   @Test
+  void startupCannotExhaustRequestResolutionDiagnosticsAndBothRemainBounded() {
+    var budget = new ProxyDiagnostics.Budget();
+    for (int i = 0; i < 64; i++) assertTrue(budget.admit("transformed"));
+    assertFalse(budget.admit("transformed"));
+    for (int i = 0; i < 64; i++) assertTrue(budget.admit("resolved"));
+    assertFalse(budget.admit("no_declaration"));
+    assertFalse(budget.admit("resolution_failed"));
+    assertFalse(budget.admit("transform_failed"));
+  }
+
+  @Test
   void onlyHashesAndFixedResultsLeaveTheRuntime() throws Exception {
     String declaration = "org.springframework.samples.petclinic.owner.OwnerRepository.findById";
     String expected = "sha256:" + HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")

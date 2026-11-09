@@ -16,6 +16,14 @@ public final class RepositoryProxyFactory {
     T save(T entity);
   }
 
+  public interface Finder<T, ID> {
+    java.util.Optional<T> findById(ID id);
+  }
+
+  public interface CovariantFinder {
+    Object read();
+  }
+
   public interface SpringProxy {}
 
   public interface Advised {
@@ -53,6 +61,9 @@ public final class RepositoryProxyFactory {
       if (method.getDeclaringClass() == DecoratingProxy.class) return repository;
       BootstrapBridge.databaseStart();
       BootstrapBridge.databaseEnd(false);
+      if (method.getName().equals("findById")) {
+        return ((Integer) arguments[0]) == 1 ? java.util.Optional.of("found") : java.util.Optional.empty();
+      }
       return arguments[0];
     }
   }

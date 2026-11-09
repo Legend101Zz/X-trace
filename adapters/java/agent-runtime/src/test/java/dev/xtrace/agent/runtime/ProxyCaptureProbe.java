@@ -160,6 +160,39 @@ public class ProxyCaptureProbe {
   }
 
   @Case(focused = false)
+  void inheritedGenericFinderRecordsFoundAndMissingOwnerReads() throws Exception {
+    var repository = (demo.proxy.SpringRepository)
+        demo.framework.RepositoryProxyFactory.create(demo.proxy.SpringRepository.class);
+    assertTrue(BootstrapBridge.requestStart("GET", "/owners/{ownerId}"));
+    assertEquals(java.util.Optional.of("found"), repository.findById(1));
+    assertEquals(java.util.Optional.empty(), repository.findById(999999));
+    BootstrapBridge.requestEnd(200, false);
+    var frames = drain().stream().filter(e -> e.kind() == BridgeEventKind.FRAME_ENTER
+        || e.kind() == BridgeEventKind.FRAME_EXIT).toList();
+    assertEquals(List.of(2, 3, 2, 3), frames.stream().map(QueueSignal.Event::kind).toList());
+    for (var frame : frames) {
+      assertEquals("demo.framework.RepositoryProxyFactory$Finder.findById", frame.symbol());
+      assertNull(frame.sourcePath(), "framework declarations must not borrow application source");
+    }
+  }
+
+  @Case(focused = false)
+  void covariantProxyReturnDescriptorsEachGetTheirOwnBoundary() throws Exception {
+    Object repository = Proxy.newProxyInstance(getClass().getClassLoader(),
+        new Class<?>[] {demo.proxy.CovariantRepository.class}, (instance, method, args) -> "found");
+    assertTrue(BootstrapBridge.requestStart("GET", "/repositories"));
+    assertEquals("found", ((demo.proxy.CovariantRepository) repository).read());
+    assertEquals("found", ((demo.framework.RepositoryProxyFactory.CovariantFinder) repository).read());
+    BootstrapBridge.requestEnd(200, false);
+    var frames = drain().stream().filter(e -> e.kind() == BridgeEventKind.FRAME_ENTER
+        || e.kind() == BridgeEventKind.FRAME_EXIT).toList();
+    assertEquals(List.of(2, 3, 2, 3), frames.stream().map(QueueSignal.Event::kind).toList());
+    assertTrue(frames.stream().allMatch(e -> e.symbol().equals("demo.proxy.CovariantRepository.read")));
+    assertEquals(frames.get(0).eventId(), frames.get(1).parentEventId());
+    assertEquals(frames.get(2).eventId(), frames.get(3).parentEventId());
+  }
+
+  @Case(focused = false)
   void springStyleInfrastructureInterfacesAndFrameworkHandlerDoNotHideRepositoryCalls()
       throws Exception {
     assertSpringStyleRepository(

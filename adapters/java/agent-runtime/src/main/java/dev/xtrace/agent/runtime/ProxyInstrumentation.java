@@ -37,7 +37,10 @@ final class ProxyInstrumentation {
   }
 
   static void install(Instrumentation instrumentation, Consumer<Throwable> onFailure, boolean attach) {
-    new AgentBuilder.Default()
+    // A JDK proxy implements erased JVM descriptors, including covariant bridge variants.
+    // A Java generic method graph can hide one of those concrete proxy methods.
+    new AgentBuilder.Default(new net.bytebuddy.ByteBuddy().with(
+        net.bytebuddy.dynamic.scaffold.MethodGraph.Compiler.ForDeclaredMethods.INSTANCE))
         .disableClassFormatChanges()
         .with(attach ? AgentBuilder.RedefinitionStrategy.RETRANSFORMATION
             : AgentBuilder.RedefinitionStrategy.DISABLED)
