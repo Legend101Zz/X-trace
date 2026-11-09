@@ -23,6 +23,8 @@ class WorkflowEvidence(unittest.TestCase):
         text = (ROOT / ".github/workflows/campaigns.yml").read_text()
         self.assertIn("--require focused-artifacts:1", text)
         self.assertIn('--loc "focused-artifacts=${FLOWS_DIR:-/nonexistent}/api-focused"', text)
+        self.assertIn("--require standard-artifacts:1", text)
+        self.assertIn('--loc "standard-artifacts=${FLOWS_DIR:-/nonexistent}/api-standard"', text)
         self.assertIn("--require overhead-artifacts:1", text)
         self.assertIn('--loc "overhead-artifacts=$CAMP_ROOT/java/petclinic/overhead"', text)
         flows = text[text.index("      - name: Product flows,"):text.index("      - name: Privacy canary scan")]

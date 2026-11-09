@@ -309,26 +309,35 @@ def recording_http_status(detail: dict) -> int | None:
 OBSERVED_OUTCOME_KINDS = ("responded", "exception_propagated")  # product kinds: responded, exception_propagated, client_aborted, unobserved
 
 
-def exception_matches(detail: dict, wanted: str | None) -> bool:
-    """True when the recording's outcome is `exception_propagated` and its exception type is the one the scenario expects
-    (compared by simple or qualified name). The servlet container turns the propagated exception into the HTTP 500, which the
-    product cannot see (`http.response unavailable`), so for a 5xx expectation this is the honest observation of the failure."""
+def exception_matches(detail: dict, wanted: str | None, controller_hint: str | list[str] | None = None) -> bool:
+    """Require propagation plus an observed application throw of the expected type.
+
+    The boundary outcome may name a servlet wrapper. Only a typed FRAME_THROW on
+    an observed application method establishes the application's own exception.
+    """
     o = detail.get("outcome")
     if not wanted or not isinstance(o, dict) or o.get("kind") != "exception_propagated":
         return False
-    exc = o.get("exception")
-    typ = exc.get("exceptionType") if isinstance(exc, dict) else None
-    return isinstance(typ, str) and (typ == wanted or typ.endswith("." + wanted))
+    symbols = {ev.get("symbol") for ev in layer_frames(detail, "controller", controller_hint)}
+    for ev in detail.get("events", []):
+        if not str(ev.get("kind", "")).endswith("frame_throw"):
+            continue
+        exc = ev.get("exception")
+        typ = exc.get("exceptionType") if isinstance(exc, dict) else None
+        if ev.get("symbol") in symbols and isinstance(typ, str) and (typ == wanted or typ.endswith("." + wanted)):
+            return True
+    return False
 
 
 def outcome_matches(detail: dict, expectation: dict) -> bool:
+    hint = expectation.get("layerHints", {}).get("controller")
     if expectation.get("outcome") == "exception_propagated":
-        return recording_http_status(detail) is None and exception_matches(detail, expectation.get("exception"))
+        return recording_http_status(detail) is None and exception_matches(detail, expectation.get("exception"), hint)
     if "statuses" in expectation:
         return recording_http_status(detail) in expectation["statuses"]
     if recording_http_status(detail) == expectation["status"]:
         return True
-    return expectation["status"] >= 500 and exception_matches(detail, expectation.get("exception"))
+    return expectation["status"] >= 500 and exception_matches(detail, expectation.get("exception"), hint)
 
 
 def recording_matches(detail: dict, method: str, route: str, literal_routes: frozenset = frozenset()) -> bool:
@@ -414,11 +423,12 @@ def capacity_counts(details: dict[str, dict]) -> dict[str, int]:
     """Session counters are repeated on recordings; never sum their copies."""
     counts: dict[str, int] = {}
     for detail in details.values():
-        for evidence in detail.get("incompleteEvidence", []):
-            match = re.fullmatch(r"(\d+) requests were not recorded: agent capacity \(session ([^ ,)]+), cumulative as last reported\)", evidence)
-            if match:
-                count, session = match.groups()
-                counts[session] = max(counts.get(session, 0), int(count))
+        context = detail.get("sessionContext")
+        if not isinstance(context, dict):
+            continue
+        session, count = context.get("runtimeSessionId"), context.get("rejectedRequests")
+        if isinstance(session, str) and session and isinstance(count, str) and re.fullmatch(r"[0-9]+", count):
+            counts[session] = max(counts.get(session, 0), int(count))
     return counts
 
 
@@ -690,9 +700,10 @@ def problem_classes(verdicts: dict[str, Any]) -> dict[str, int]:
 CANARY_LOCATIONS = {
     "authorization-header": "Authorization header",
     "cookie-header": "Cookie header",
-    "query-token": "unread query parameter xt_token",
+    "query-token": "unread query parameter xt_token; also lastName during the standard flows probe",
     "json-body-password": "request body field password",
     "env-var": "application environment variable XTRACE_CANARY_ENV",
+    "focused-business-secret": "focused owner search business parameter lastName (content redaction control)",
 }
 
 

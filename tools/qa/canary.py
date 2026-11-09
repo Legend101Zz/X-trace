@@ -30,7 +30,7 @@ import urllib.parse
 import zipfile
 import zlib
 
-KINDS = ("authorization-header", "cookie-header", "query-token", "json-body-password", "env-var")
+KINDS = ("authorization-header", "cookie-header", "query-token", "json-body-password", "env-var", "focused-business-secret")
 CHUNK = 1 << 20
 MAX_INFLATE = 256 << 20
 
@@ -44,6 +44,8 @@ def make_canaries(rng_hex=None) -> dict[str, str]:
         "query-token": f"XTCANARYqt{rng_hex()}",
         "json-body-password": f"XTcanary-Pw!{rng_hex()}",
         "env-var": f"XTCANARY/env/{rng_hex()}",
+        # Redaction.CONTENT matches Bearer plus at least eight credential characters.
+        "focused-business-secret": f"Bearer XTCANARY.bound.{rng_hex()}",
     }
 
 

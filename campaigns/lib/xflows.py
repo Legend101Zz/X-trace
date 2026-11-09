@@ -12,6 +12,13 @@ observation fails with the reason.
   active-line-frames / frame-values
                             `xtrace run --capture-depth focused`; line_cursor events carry an observed line distinct from
                             the method extent, and frame events carry captured bindings.
+  focused-canary-injection / focused-redaction-control / focused-value-control / standard-no-values
+                            each request has its own completed recording. Secret-shaped lastName values must be redacted;
+                            ordinary lastName Strings are captured only in focused mode. Standard capture records no values.
+
+Focused capture records ordinary String arguments and locals, including business parameters, when neither their names nor
+their contents match the redaction rules. Exception messages receive content-pattern redaction only. Metadata exclusion
+and a clean secret-canary scan alone do not prove value redaction; the separate business controls must pass too.
 
 The judge_* functions are pure and unit-tested (test_xflows.py); the run_* functions drive real processes.
 """
@@ -20,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import secrets
 import shlex
 import signal
 import socket
@@ -29,7 +37,19 @@ from typing import Any, Callable
 
 import xinstr
 
-STEP_NAMES = ("record-stop-flow", "restart-reopen", "partial-recording-reopen", "active-line-frames", "frame-values")
+PRIVACY_STEPS = ("focused-canary-injection", "focused-redaction-control", "focused-value-control", "standard-no-values")
+STEP_NAMES = ("record-stop-flow", "restart-reopen", "partial-recording-reopen", "active-line-frames", "frame-values", *PRIVACY_STEPS)
+
+# Labels and route templates contain no injected values. The two search controls
+# share a route, so each must finish persisting before the next request is sent.
+FOCUSED_REQUESTS = {
+    "owner": ("GET", "/owners/{ownerId}"), "search": ("GET", "/owners"), "vets": ("GET", "/vets"),
+    "form": ("POST", "/owners/new"), "secret": ("GET", "/owners"), "plain": ("GET", "/owners"),
+}
+
+
+class CanaryEvidenceError(RuntimeError):
+    """A probe lacks recording evidence; messages contain no request values."""
 
 
 # ------------------------------------------------------------------ helpers --
@@ -305,6 +325,54 @@ def judge_frame_values(details: list[dict]) -> tuple[str, str]:
                     f"states: {json.dumps(states, sort_keys=True)}")
 
 
+def judge_canary_recordings(served: dict, attributed: dict[str, str], details: dict[str, dict], wanted: dict) -> tuple[str, str]:
+    """Every probe needs its own completed recording, still readable after shutdown."""
+    if set(served) != set(wanted) or set(attributed) != set(wanted) or len(set(attributed.values())) != len(wanted):
+        return "fail", "not every canary request has a distinct attributed recording"
+    for label, (method, route) in wanted.items():
+        detail = details.get(attributed[label], {})
+        if served[label] != 200 or completion_of(detail) != "complete" or not xinstr.recording_matches(detail, method, route) \
+                or xinstr.recording_http_status(detail) != 200:
+            return "fail", f"{label}: request or attributed completed recording unavailable"
+    return "pass", f"all {len(wanted)} canary requests have distinct completed recordings, including the form POST when focused"
+
+
+def judge_redaction(detail: dict, canaries: dict[str, str]) -> tuple[str, str]:
+    if any(value in json.dumps(detail) for value in canaries.values()):
+        return "fail", "raw secret canary observed in focused recording"
+    bindings = [b for ev in detail.get("events", []) for b in ev.get("bindings") or []]
+    if not any(str(b.get("name", "")).lower() == "lastname" and b.get("value", {}).get("state") == "redacted"
+               and b["value"].get("ruleId") == "content.secret_pattern" for b in bindings):
+        return "fail", "lastName content redaction was not observed in the secret probe recording"
+    return "pass", "lastName is redacted by content.secret_pattern; strict secret-canary scan is also required"
+
+
+def judge_value_control(details: dict[str, dict], recording_id: str, marker: str) -> tuple[str, str]:
+    # Permit the marker only in captured lastName previews in its own recording.
+    # Removing those slots lets us detect a marker echoed into unrelated API fields.
+    rest = json.loads(json.dumps(details))
+    observed = 0
+    for rid, detail in rest.items():
+        for ev in detail.get("events", []):
+            for binding in ev.get("bindings") or []:
+                value = binding.get("value", {})
+                if rid == recording_id and str(binding.get("name", "")).lower() == "lastname" \
+                        and value.get("state") == "captured" and value.get("preview") == marker:
+                    observed += 1
+                    value["preview"] = ""
+    if not observed or marker in json.dumps(rest):
+        return "fail", "plain business marker must appear only as a captured lastName binding in its own focused recording"
+    return "pass", "plain lastName marker observed only as captured bindings; focused Strings that match no redaction rule are recorded"
+
+
+def judge_standard_values(details: dict[str, dict], canaries: dict[str, str]) -> tuple[str, str]:
+    if not details or any(ev.get("bindings") for d in details.values() for ev in d.get("events", [])):
+        return "fail", "standard probe has no recording or contains value bindings"
+    if any(value in json.dumps(details) for value in canaries.values()):
+        return "fail", "raw canary observed during standard capture"
+    return "pass", "standard business-parameter probe has no value bindings; strict zero-hit canary scan is also required"
+
+
 # ------------------------------------------------------------------ drivers --
 def _get(base: str, path: str) -> int | None:
     import xcamp
@@ -322,24 +390,54 @@ def _paced_gets(base: str, paths: list[str], gap: float = 0.6) -> dict[str, int 
     return out
 
 
-def focused_requests(base: str, canaries: dict[str, str]) -> dict[str, int | None]:
+def focused_requests(base: str, canaries: dict[str, str], observe: Callable[[str, str, str, float], None],
+                     marker: str) -> dict[str, int | None]:
     """Exercise focused bindings with the campaign canaries; never persist the injected request values here."""
     import urllib.parse
     import xcamp
     hook = xinstr.canary_hook(canaries)
-    requests = [("GET", path, {}, None) for path in ("/owners/1", "/owners?lastName=Davis", "/vets")]
+    requests = [(label, "GET", path, {}, None) for label, path in
+                (("owner", "/owners/1"), ("search", "/owners?lastName=Davis"), ("vets", "/vets"))]
     # Invalid ordinary business fields re-render the form without creating an owner.
     form = urllib.parse.urlencode({"firstName": "", "lastName": "Invalid", "address": "123 Test St",
                                    "city": "Testville", "telephone": "abc"}).encode()
-    requests.append(("POST", "/owners/new", {"Content-Type": "application/x-www-form-urlencoded"}, form))
+    requests.append(("form", "POST", "/owners/new", {"Content-Type": "application/x-www-form-urlencoded"}, form))
+    for label, value in (("secret", canaries["focused-business-secret"]), ("plain", marker)):
+        requests.append((label, "GET", "/owners?" + urllib.parse.urlencode({"lastName": value}), {}, None))
     served = {}
-    for index, (method, path, headers, body) in enumerate(requests):
+    for label, method, path, headers, body in requests:
         path, headers, body = hook(method, path, headers, body)
+        deadline = time.monotonic() + 30.0  # HTTP and persistence share the existing request budget
         try:
-            served[f"focused-request-{index}"] = xcamp.http_request(base, method, path, headers=headers, body=body, timeout=30)["status"]
+            served[label] = xcamp.http_request(base, method, path, headers=headers, body=body, timeout=30)["status"]
         except Exception:
-            served[f"focused-request-{index}"] = None
+            served[label] = None
+        observe(label, method, FOCUSED_REQUESTS[label][1], deadline)
     return served
+
+
+def wait_canary_recording(client: xinstr.ViewerClient, out_dir: pathlib.Path, before: dict, method: str, route: str,
+                          deadline: float) -> tuple[str, dict]:
+    """Observe one newly completed route before admitting the next probe; never retry a request."""
+    client.deadline = deadline
+    try:
+        while time.monotonic() < deadline:
+            api = xinstr.collect_api(client, out_dir)
+            if not api["ok"]:
+                raise CanaryEvidenceError("canary recording read failed")
+            hits = {rid: d for rid, d in api["details"].items() if rid not in before and xinstr.recording_matches(d, method, route)}
+            if len(hits) > 1:
+                raise CanaryEvidenceError("canary request recording is ambiguous")
+            if len(hits) == 1:
+                rid, detail = next(iter(hits.items()))
+                if completion_of(detail) == "complete" and xinstr.recording_http_status(detail) == 200 \
+                        and time.monotonic() <= deadline:
+                    return rid, api["details"]
+                if completion_of(detail) in ("partial", "invalid", "unavailable"):
+                    raise CanaryEvidenceError("canary request recording is not complete")
+    finally:
+        client.deadline = None
+    raise CanaryEvidenceError("canary request has no attributable completed recording within its request budget")
 
 
 def _fail(exc: BaseException) -> tuple[str, str]:
@@ -522,46 +620,103 @@ class Flows:
                                                             new_details=new, stalled=("POST", "/owners/new"), stalled_id=stalled_id))
 
     # -- flow D --
-    def focused(self) -> None:
-        canary_file = os.environ.get("XCAMP_CANARY_FILE")
-        if not canary_file:
-            for step in ("active-line-frames", "frame-values", "focused-canary-injection"):
-                self._set(step, ("fail", "focused capture requires the campaign canary file"))
-            return
-        canaries = json.loads(pathlib.Path(canary_file).read_text())
+    def _privacy_capture(self, mode: str, canaries: dict[str, str], marker: str = "") -> tuple[dict, dict, dict, str]:
+        import urllib.parse
+        import xcamp
         os.environ["XTRACE_CANARY_ENV"] = canaries["env-var"]
         before_ids = list_ids(self.xtrace, self.project_dir, self.env)
         prefix = " ".join(shlex.quote(x) for x in
                           [self.xtrace, "run", "--project-dir", str(self.project_dir), "--java-agent", self.agent,
-                           "--capture-depth", "focused", *self._capture_flags(), "--"])
+                           "--capture-depth", mode, *self._capture_flags(), "--"])
         stack = self._stack(prefix, [])
+        viewer, served, attributed, error = None, {}, {}, ""
+        dest = self.out_dir / f"api-{mode}"
         try:
             stack.up()
-            served = focused_requests(stack.base, canaries)
-            self._set("focused-canary-injection", ("pass" if all(s == 200 for s in served.values()) else "fail",
-                                                   "focused canary locations: " + json.dumps(xinstr.CANARY_LOCATIONS, sort_keys=True)))
+            dest.mkdir(parents=True, exist_ok=True)
+            viewer, ready = xinstr.start_viewer(self.xtrace, self.project_dir, self.env, dest / "boundary-viewer.log")
+            client = xinstr.ViewerClient(ready["origin"])
+            client.exchange(xinstr.bootstrap_token(ready["url"]))
+            initial = xinstr.collect_api(client, dest / "before")
+            if not initial["ok"]:
+                raise CanaryEvidenceError("cannot snapshot recordings before privacy probes")
+            before = initial["details"]
+
+            def observe(label: str, method: str, route: str, deadline: float) -> None:
+                nonlocal before
+                rid, before = wait_canary_recording(client, dest / label, before, method, route, deadline)
+                attributed[label] = rid
+
+            if mode == "focused":
+                served = focused_requests(stack.base, canaries, observe, marker)
+            else:
+                path = "/owners?" + urllib.parse.urlencode({"lastName": canaries["query-token"]})
+                path, headers, body = xinstr.canary_hook(canaries)("GET", path, {}, None)
+                deadline = time.monotonic() + 30.0
+                served["standard"] = xcamp.http_request(stack.base, "GET", path, headers=headers, body=body, timeout=30)["status"]
+                observe("standard", "GET", "/owners", deadline)
+        except CanaryEvidenceError as exc:
+            error = str(exc)
+        except Exception as exc:
+            error = f"privacy capture failed: {type(exc).__name__}"  # exception text could contain a probe value
         finally:
-            stack.down()
-        api = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-focused")
-        if not api["ok"] or any(s != 200 for s in served.values()):
-            why = f"read API unavailable: {api['reason']}" if not api["ok"] else f"requests not answered 200: {json.dumps(served)}"
-            for step in ("active-line-frames", "frame-values"):
-                self._set(step, ("fail", why))
+            try:
+                stack.down()
+            finally:
+                if viewer is not None:
+                    xinstr.stop_process_group(viewer)
+        api = read_api(self.xtrace, self.project_dir, self.env, dest)
+        if not api["ok"]:
+            error = "privacy capture read API unavailable"
+        new = {k: d for k, d in api["details"].items() if k not in before_ids}
+        return served, attributed, new, error
+
+    def _canaries(self, steps: tuple[str, ...]) -> dict | None:
+        path = os.environ.get("XCAMP_CANARY_FILE")
+        if not path:
+            for step in steps:
+                self._set(step, ("fail", "privacy capture requires the campaign canary file"))
+            return None
+        return json.loads(pathlib.Path(path).read_text())
+
+    def focused(self) -> None:
+        steps = ("active-line-frames", "frame-values", *PRIVACY_STEPS[:3])
+        canaries = self._canaries(steps)
+        if canaries is None:
             return
-        new = [d for k, d in api["details"].items() if k not in before_ids]
-        self._set("active-line-frames", judge_active_line(new))
-        self._set("frame-values", judge_frame_values(new))
+        marker = "XTplain." + secrets.token_hex(8)  # ordinary String; deliberately outside the secret-canary set
+        served, attributed, new, error = self._privacy_capture("focused", canaries, marker)
+        verdict = ("fail", error) if error else judge_canary_recordings(served, attributed, new, FOCUSED_REQUESTS)
+        self._set("focused-canary-injection", verdict)
+        if verdict[0] != "pass":
+            for step in steps:
+                if step != "focused-canary-injection":
+                    self._set(step, verdict)
+            return
+        self._set("active-line-frames", judge_active_line(list(new.values())))
+        self._set("frame-values", judge_frame_values(list(new.values())))
+        self._set("focused-redaction-control", judge_redaction(new[attributed["secret"]], canaries))
+        self._set("focused-value-control", judge_value_control(new, attributed["plain"], marker))
+
+    def standard(self) -> None:
+        canaries = self._canaries(("standard-no-values",))
+        if canaries is None:
+            return
+        served, attributed, new, error = self._privacy_capture("standard", canaries)
+        verdict = ("fail", error) if error else judge_canary_recordings(served, attributed, new, {"standard": ("GET", "/owners")})
+        self._set("standard-no-values", judge_standard_values(new, canaries) if verdict[0] == "pass" else verdict)
 
     def run_all(self) -> dict[str, dict[str, str]]:
         for name, fn in (("record-stop-flow", self.record_stop), ("restart-reopen", self.restart_reopen),
-                         ("partial-recording-reopen", self.partial), ("focused", self.focused)):
+                         ("partial-recording-reopen", self.partial), ("focused", self.focused), ("standard-no-values", self.standard)):
             try:
                 fn()
             except Exception as exc:
                 for step in ("active-line-frames", "frame-values") if name == "focused" else (name,):
                     if step not in self.results:
                         self._set(step, _fail(exc))
-        self._set("flow-accommodations", ("reported", "pace_seconds=0.6 between lifecycle control requests: agent admits at most 8 unwritten recordings; focused requests are unpaced"))
+        self._set("flow-accommodations", ("reported", "pace_seconds=0.6 between lifecycle control requests; privacy requests wait for observable completed recordings within each request budget"))
+        self._set("privacy-scope", ("reported", "focused capture records ordinary String arguments and locals, including business parameters, unless name, type or content rules redact them; exception messages use content-pattern redaction only; metadata exclusion alone does not prove value redaction"))
         self.results.setdefault("focused-canary-injection", {"status": "fail", "note": "focused canary requests did not complete"})
         for step in STEP_NAMES:
             self.results.setdefault(step, {"status": "fail", "note": "flow did not run"})

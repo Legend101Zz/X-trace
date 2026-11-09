@@ -213,7 +213,30 @@ class T(unittest.TestCase):
                 resp_symbol="http.response unavailable")
         r["outcome"] = {"kind": kind, "httpStatus": None,
                         "exception": {"exceptionType": typ, "message": None} if kind == "exception_propagated" else None}
+        r["events"].append({"kind": "recording_event_kind:frame_throw", "symbol": "CrashController.triggerException",
+                            "exception": {"exceptionType": typ}})
         return r
+
+    def test_application_throw_type_is_distinct_from_the_boundary_wrapper(self):
+        detail = self._exc_rec()
+        detail["outcome"]["exception"]["exceptionType"] = "jakarta.servlet.ServletException"
+        detail["events"].append({"kind": "recording_event_kind:frame_throw", "symbol": "FrameworkFilter.doFilter",
+                                 "exception": {"exceptionType": "jakarta.servlet.ServletException"}})
+        exp = {"outcome": "exception_propagated", "exception": "RuntimeException", "status": None,
+               "layerHints": {"controller": "CrashController"}}
+        self.assertTrue(xinstr.outcome_matches(detail, exp))
+        for change in ({"exception": None}, {"exception": {"exceptionType": None}},
+                       {"exception": {"exceptionType": "java.lang.IllegalStateException"}},
+                       {"kind": "recording_event_kind:frame_exit"}, {"symbol": "FrameworkFilter.doFilter"}):
+            with self.subTest(change=change):
+                candidate = {**detail, "events": [*detail["events"][:-2], {**detail["events"][-2], **change}, detail["events"][-1]]}
+                self.assertFalse(xinstr.outcome_matches(candidate, exp))
+        # An outcome type alone cannot replace the typed application throw.
+        detail = self._exc_rec()
+        detail["events"].pop()
+        self.assertFalse(xinstr.outcome_matches(detail, exp))
+        detail = self._exc_rec()
+        self.assertFalse(xinstr.outcome_matches(detail, {**exp, "exception": "ServletException"}))
 
     def test_exception_propagated_is_an_observed_outcome(self):
         exp = {"s": [{"method": "GET", "route": "/oups", "status": 500, "exception": "RuntimeException",
@@ -391,9 +414,9 @@ class T(unittest.TestCase):
 
     def test_capacity_drops_are_deduplicated_and_partials_still_fail(self):
         exp, sent, details = self.boundary_fixture()
-        evidence = "1 requests were not recorded: agent capacity (session s, cumulative as last reported)"
-        details["0"]["incompleteEvidence"] = [evidence]
-        details["1"]["incompleteEvidence"] = [evidence]
+        context = {"runtimeSessionId": "s", "rejectedRequests": "1"}
+        details["0"]["sessionContext"] = context
+        details["1"]["sessionContext"] = context
         self.assertEqual(xinstr.capacity_counts(details), {"s": 1})
         # One admitted forced drop and one refused request fully account for the burst, but fail it.
         details.pop("1")
@@ -404,8 +427,39 @@ class T(unittest.TestCase):
         self.assertEqual(boundary["partialRecordingIds"], ["0"])
         v = xinstr.analyze(details, exp, sent, frozenset({"burst"}), boundary)
         self.assertEqual(v["burst"]["expectations"][0]["problems"], ["burst-drops(capacity 1, partial 1)"])
-        before = {"old": {"incompleteEvidence": [evidence]}}
+        before = {"old": {"sessionContext": context}}
         self.assertFalse(xinstr.burst_accounting(details, sent, exp, before)["verified"])
+
+    def test_capacity_context_null_zero_maxima_and_independent_sessions(self):
+        details = {str(i): {"sessionContext": context} for i, context in enumerate([
+            None, {}, {"runtimeSessionId": "unreported", "rejectedRequests": None},
+            {"runtimeSessionId": "zero", "rejectedRequests": "0"},
+            {"runtimeSessionId": "s", "rejectedRequests": "12"},
+            {"runtimeSessionId": "s", "rejectedRequests": "2"},
+            {"runtimeSessionId": "t", "rejectedRequests": "3"},
+            *({"runtimeSessionId": "invalid", "rejectedRequests": v} for v in (-1, 1, "-1", "1.0", "", "１２")),
+        ])}
+        self.assertEqual(xinstr.capacity_counts(details), {"zero": 0, "s": 12, "t": 3})
+
+    def test_real_shaped_list_and_detail_capacity_accounting(self):
+        import tempfile
+        exp, sent, details = self.boundary_fixture()
+        context = {"runtimeSessionId": "session-a", "rejectedRequests": "8"}
+        detail = {**details["0"], "recordingId": "0", "sessionContext": context, "incompleteEvidence": []}
+        client = mock.Mock()
+        client.get.side_effect = [
+            (200, {"recordings": [{"recordingId": "0", "completion": "complete", "sessionContext": context,
+                                      "incompleteEvidence": []}], "nextAfter": None}),
+            (200, {**detail, "nextCursor": None}),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            api = xinstr.collect_api(client, pathlib.Path(td))
+        self.assertTrue(api["ok"])
+        before = {"old": {"sessionContext": {**context, "rejectedRequests": "7"}}}
+        boundary = xinstr.burst_accounting(api["details"], sent, exp, before)
+        self.assertTrue(boundary["verified"], boundary)
+        self.assertEqual(boundary["capacityDrops"], 1)
+        self.assertEqual(boundary["unaccounted"], 0)
 
     def test_open_and_excess_route_recordings_do_not_verify_boundary(self):
         exp, sent, details = self.boundary_fixture()
@@ -418,8 +472,8 @@ class T(unittest.TestCase):
     def test_serial_boundary_requires_one_complete_recording_per_request(self):
         exp, sent, details = self.boundary_fixture()
         details.pop("1")
-        evidence = "1 requests were not recorded: agent capacity (session s, cumulative as last reported)"
-        cases = [{"0": {**details["0"], "incompleteEvidence": [evidence]}},
+        context = {"runtimeSessionId": "s", "rejectedRequests": "1"}
+        cases = [{"0": {**details["0"], "sessionContext": context}},
                  {"0": {**details["0"], "completion": "partial"}, "1": details["0"]}]
         for snapshot in cases:
             with self.subTest(snapshot=snapshot), mock.patch.object(xinstr.time, "monotonic", return_value=0), \
@@ -580,8 +634,10 @@ class T(unittest.TestCase):
         self.assertEqual(receipt["notes"]["accommodations"]["correlationGap"], xinstr.REQUEST_CORRELATION_GAP)
         self.assertEqual(receipt["notes"]["canaryLocations"], {
             "authorization-header": "Authorization header", "cookie-header": "Cookie header",
-            "query-token": "unread query parameter xt_token", "json-body-password": "request body field password",
-            "env-var": "application environment variable XTRACE_CANARY_ENV"})
+            "query-token": "unread query parameter xt_token; also lastName during the standard flows probe",
+            "json-body-password": "request body field password",
+            "env-var": "application environment variable XTRACE_CANARY_ENV",
+            "focused-business-secret": "focused owner search business parameter lastName (content redaction control)"})
         self.assertEqual(set(receipt["notes"]["canaryLocations"]), set(canaries))
         for value in canaries.values():
             self.assertNotIn(value, str(receipt))
