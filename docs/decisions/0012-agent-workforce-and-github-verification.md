@@ -1,9 +1,9 @@
 # ADR 0012: Agent workforce, GitHub-hosted verification and risk-scaled merges
 
-- Status: Accepted where it records the owner's instructions of 2026-11-09: Codex workers with a Claude orchestrator
-  (decision 1), heavy tests on GitHub only (decision 2), builds on the SSD with cleanup (decision 3). The local
-  unit-test allowance in decision 2 and decisions 4–6 are defaults adopted the same day, pending owner
-  confirmation; until the owner changes them, they apply.
+- Status: On 2026-11-09 the owner accepted decisions 1–3 and D3 (decision 5, risk-scaled reviews), and changed
+  D1 (decision 2) to compile only locally. D2 (decision 4, hosted macOS replacing the leased floor as a merge
+  requirement) remains a default pending owner confirmation. Decision 6 remains a default pending owner confirmation;
+  defaults apply until changed.
 - Date: 2026-11-09
 - Amends: ADR 0006 (integration and acceptance mechanics) and ADR 0009 (wave batching): the merge protocol and
   the leased macOS floor requirement. Supersedes every rule that limits which agents or models may work on this
@@ -24,9 +24,12 @@
 - **The orchestrator** is a Claude Code session (Opus). It writes tickets, launches workers, reviews every diff,
   commits, opens pull requests, reads CI and merges. Workers never push, merge, tag, publish or write issues.
 - Workers run under a locked-down launcher: the owner's personal Codex configuration is not loaded, memories,
-  sub-agents, plugins, apps, MCP servers, web search and network access are off, and the sandbox is
+  sub-agents, plugins, apps, MCP servers and web search are off, and the sandbox is
   `workspace-write`, limited to the ticket's worktree plus the build-cache volume. The sandbox also blocks
   `git commit`, so the orchestrator commits each reviewed diff under the owner's identity.
+- Changed by the owner on 2026-11-09: workers may use network access inside the sandbox only to fetch dependencies
+  from lockfiles (`cargo fetch --locked`, `npm ci`, or Gradle with strict verification). No new or upgraded
+  dependencies are allowed unless the ticket says so. Web search remains off.
 - Each ticket has an owned path set, frozen acceptance tests the worker may read but not edit, and an explicit
   "infeasible" exit. A diff that edits a frozen test, adds `#[ignore]`/`test.skip`/a quarantine, raises a deadline
   or weakens an assertion is rejected without review.
@@ -35,10 +38,14 @@
 
 - Heavy verification runs only on GitHub Actions: integration and journey tests, the 23-gate floors, packaging,
   campaigns and browser runs.
-- Locally, agents run only fast checks: compiling, the unit tests of the crate or package they touched, one test file, and
-  type checks (`tools/dev/check.sh`). This is a default (owner question D1). If the owner says compile only,
-  `check.sh` drops the unit tests.
-- Every change reaches `main` through a pull request whose CI is green on the exact head commit.
+- The original D1 default allowed local unit tests and one test file.
+- Changed by the owner on 2026-11-09: workers and the orchestrator only compile locally; no tests run locally.
+  Allowed checks are `cargo check`, `cargo clippy`, `cargo test --no-run`, `cargo fmt --check`, TypeScript
+  typecheck, Gradle `compileJava compileTestJava`, `python3 -B -m py_compile`, `bash -n`, `git diff --check`,
+  and pure static checks such as the web contrast script (`tools/dev/check.sh`).
+- Every pull request gets the automatic `ci.yml` run; `ci-ok` must be green on the exact head before merge.
+  Heavy GitHub suites (`lane.yml`, `package.yml`, campaign branches) run at release-candidate merges, and otherwise
+  only when a ticket's acceptance needs them, such as a campaign fix, at the orchestrator's choice.
 
 ### 3. Where builds live (owner instruction)
 
@@ -62,7 +69,10 @@
 - PLATFORM-MAC acceptance still requires a fresh-profile install of the exact unsigned release package on a real
   Mac (ADR 0006, second addendum of 2026-10-10).
 
-### 5. Merge rules scaled to risk (default, owner question D3)
+### 5. Merge rules scaled to risk (accepted, owner answer D3)
+
+The owner accepted D3 on 2026-11-09: reviews scale with risk as below; the full ADR 0006 protocol applies only
+at release candidates.
 
 | Change | Required before merge |
 |---|---|
@@ -71,10 +81,16 @@
 | Shared contracts (Protobuf/OpenAPI schemas, SQLite migrations, XTF, redaction vocabulary, replay navigation), security or privacy paths, release tooling, CI workflows | as above, with two independent reviews |
 | Release candidate (`ultra/rc-*`) | the full ADR 0006 protocol, with the leased macOS floor replaced as in decision 4 |
 
-- "CI green" means the `ci-ok` check of `ci.yml` on the exact head, plus any workflow the ticket names. Trigger
-  the others on the branch when the change touches them: `gh workflow run lane.yml --ref <branch> -f suite=<suite>`
-  (adapters, web, TUI suites), `gh workflow run package.yml --ref <branch>` (packaging), and an
-  `ultra/campaign/<project>` branch push for campaigns (capture semantics).
+- The original default triggered the other workflows when a change touched them.
+- Changed by the owner on 2026-11-09: "CI green" means the `ci-ok` check of `ci.yml` on the exact head, plus
+  any workflow the ticket names. Run `lane.yml`, `package.yml` and campaign branches at release-candidate merges,
+  and otherwise only when ticket acceptance needs them, at the orchestrator's choice. Trigger them with
+  `gh workflow run lane.yml --ref <branch> -f suite=<suite>`, `gh workflow run package.yml --ref <branch>`,
+  or an `ultra/campaign/<project>` branch push, respectively.
+- Every ticket has a GitHub issue labeled `agent-ticket`, plus `flaky-test` where it fits. Each wave has a tracking
+  issue with a checklist (Wave 1 is #18). Pull requests use `Refs #N`, never closing keywords. The orchestrator closes
+  an issue only after the fix is merged and post-merge `main` CI is green, with a comment naming the merge commit
+  and CI run.
 - Before merging, the branch must contain the current `main` (merge `origin/main` into it, never rebase pushed
   history), and CI must be green on that head, so the tested tree is the merged tree.
 - After every merge, `main` CI must be green before new feature work. A red `main` that cannot be fixed within 60

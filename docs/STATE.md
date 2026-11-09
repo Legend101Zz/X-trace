@@ -11,7 +11,7 @@ The one place for "where are we". Rewrite it (do not append) at the end of every
 - Blocked rows: EXPORT-POSTMAN (credentials), PLATFORM-LINUX (release key), HUMAN-USABILITY (participants),
   HUMAN-OWNER, REVIEWS-EXACT, DISTRIBUTED-RECHECK (end of release).
 - How work happens now: ADR 0012 (Codex workers, Claude orchestrator, heavy tests on GitHub, pull requests,
-  merge rules scaled to risk).
+  merge rules scaled to risk, GitHub issues for tickets and wave tracking).
 
 ## Work map (GitHub issues)
 
@@ -62,17 +62,15 @@ Epic: #2. Close an issue only when every box is ticked with evidence on merged `
 
 ## Branches
 
-- Keep (unmerged work): `ultra/r2w2-qb`, `ultra/r2w2-xb`, `ultra/r2w2-jb`.
-- Do not reuse `ultra/r2w3-r4`. It raised a test deadline and added a retry.
-- Many `ultra/*` diagnostic and campaign-trigger branches remain on the remote. They are candidates for cleanup
-  with the owner's approval.
+- On 2026-11-09, with the owner's approval, about 130 merged or throwaway remote branches were deleted. Only
+  `main` and the unmerged keepers `ultra/r2w2-qb`, `ultra/r2w2-xb`, `ultra/r2w2-jb` remain.
+- `ultra/r2w3-r4` is gone; it raised a test deadline and added a retry.
 
 ## Waiting for the owner
 
-- Confirm or change the ADR 0012 defaults:
-  - D1: local unit tests allowed.
-  - D2: a hosted macOS job replaces the leased Mac floor.
-  - D3: merge rules scaled to risk.
+- D1 answered 2026-11-09: compile only locally; tests run on GitHub.
+- D3 answered 2026-11-09: risk-scaled merge reviews accepted; full ADR 0006 protocol only for release candidates.
+- D2 remains open: a hosted macOS job replaces the leased Mac floor as a merge requirement; default pending owner confirmation.
 - Ratify: ADR 0008 Amendment 1, the first ADR 0006 addendum of 2026-10-10, the ADR 0009 addendum, ADR 0011, and the
   migration renumbering (v9 = `recording_limitations`, catalog links = v10).
 - Usability question Q5 asks which Canvas node "took the longest", but the product records no per-node time

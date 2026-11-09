@@ -12,4 +12,4 @@
   `outcome.ts`. Do not paraphrase it in components.
 - Accessibility is a requirement: keyboard paths, visible reasons on disabled controls (not tooltips only), one polite
   live region, 44 px touch targets, no horizontal scroll at 320 px, reduced motion.
-- Fast check: `tools/dev/check.sh web[:<file>]`.
+- Fast check: `tools/dev/check.sh web`.
