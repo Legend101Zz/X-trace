@@ -2,7 +2,7 @@
 //!
 //! The crate turns a plain, already-read catalog view ([`ExportInput`]) into
 //! deterministic artifacts: an OpenAPI 3.1 document, a set of POSIX `sh`
-//! cURL recipes, a Postman collection and (later) a bundle. It performs no
+//! cURL recipes, a Postman collection and a developer bundle. It performs no
 //! I/O of its own: it never opens a network connection, never reads the
 //! store and never executes anything it generates.
 //!
@@ -20,6 +20,7 @@
     deny(clippy::unwrap_used, clippy::expect_used, reason = "library code must not panic")
 )]
 
+pub mod bundle;
 pub mod canonical;
 pub mod curl;
 pub mod input_json;
@@ -31,32 +32,33 @@ pub mod sanitize;
 pub mod validate;
 
 pub use request::{
-    ClaimInput, EffectiveState, ExampleInput, ExampleOrigin, ExportError, ExportFile, ExportFormat,
-    ExportInput, ExportOutput, ExportRequest, HandlerInput, Omission, OperationInput, ParamInput,
-    ResponseInput, RevisionInput,
+    CatalogSummaryInput, ClaimInput, EffectiveState, ExampleInput, ExampleOrigin, ExportError,
+    ExportFile, ExportFormat, ExportInput, ExportOutput, ExportRequest, HandlerInput, Omission,
+    OperationInput, ParamInput, ResponseInput, RevisionInput,
 };
 
 /// Runs an export. Pure: same input and request give byte-identical output.
 ///
 /// # Errors
 ///
-/// Returns [`ExportError`] when the format is not implemented yet, the
-/// selection matches nothing in a way the format cannot represent, or the
-/// sanitizer gate finds a secret-shaped value in the finished document.
+/// Returns [`ExportError`] when structural validation fails or the sanitizer
+/// gate finds a secret-shaped value in the finished document.
 pub fn export(input: &ExportInput, request: &ExportRequest) -> Result<ExportOutput, ExportError> {
     let prepared = projection::prepare(input, request);
     match request.format {
         ExportFormat::OpenApi => openapi::render(&prepared),
         ExportFormat::Curl => curl::render(&prepared),
         ExportFormat::Postman => postman::render(&prepared),
-        ExportFormat::Bundle => {
-            Err(ExportError::FormatNotImplemented { format: request.format.name() })
-        }
+        ExportFormat::Bundle => bundle::render(&prepared),
     }
 }
 
 /// Sorts files, computes the content hash and assembles the output.
-pub(crate) fn finish(mut files: Vec<ExportFile>, omissions: Vec<Omission>) -> ExportOutput {
+pub(crate) fn finish(
+    mut files: Vec<ExportFile>,
+    omissions: Vec<Omission>,
+    operation_count: usize,
+) -> ExportOutput {
     files.sort_by(|a, b| a.path.cmp(&b.path));
     let mut omissions = omissions;
     omissions.sort();
@@ -70,5 +72,10 @@ pub(crate) fn finish(mut files: Vec<ExportFile>, omissions: Vec<Omission>) -> Ex
         hasher.update(&(file.bytes.len() as u64).to_le_bytes());
         hasher.update(&file.bytes);
     }
-    ExportOutput { files, omissions, content_hash: hasher.finalize().to_hex().to_string() }
+    ExportOutput {
+        operation_count,
+        files,
+        omissions,
+        content_hash: hasher.finalize().to_hex().to_string(),
+    }
 }

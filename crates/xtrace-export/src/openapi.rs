@@ -119,6 +119,9 @@ fn operation_json(op: &PreparedOp, operation_id: &str) -> Value {
     out.insert("responses".into(), Value::Object(responses));
 
     let mut x = Map::new();
+    if let Some(Value::Object(metadata)) = crate::projection::catalog_metadata(op) {
+        x.extend(metadata);
+    }
     x.insert("operation_id".into(), json!(op.operation_id));
     x.insert("effective_state".into(), json!(op.state.name()));
     if !op.binding_key.is_empty() {
@@ -148,15 +151,7 @@ fn operation_json(op: &PreparedOp, operation_id: &str) -> Value {
     if !op.handlers.is_empty() {
         x.insert(
             "handlers".into(),
-            Value::Array(
-                op.handlers
-                    .iter()
-                    .map(|h| {
-                        json!({"symbol": h.symbol, "path": h.path,
-                               "line_start": h.line_start, "line_end": h.line_end})
-                    })
-                    .collect(),
-            ),
+            Value::Array(op.handlers.iter().map(crate::projection::handler_json).collect()),
         );
     }
     if !op.examples.is_empty() {
@@ -257,5 +252,8 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
         ("openapi.json", canonical::json_pretty(&doc))
     };
     let file = ExportFile { path: name.to_owned(), mode: 0o644, bytes: text.into_bytes() };
-    Ok(crate::finish(vec![file], omissions))
+    let operation_count = doc["paths"]
+        .as_object()
+        .map_or(0, |paths| paths.values().filter_map(Value::as_object).map(Map::len).sum());
+    Ok(crate::finish(vec![file], omissions, operation_count))
 }

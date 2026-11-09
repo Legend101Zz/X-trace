@@ -123,10 +123,13 @@ fn item(op: &PreparedOp, omissions: &mut Vec<Omission>) -> Value {
     request.insert("url".into(), url);
     let observation =
         if op.state == crate::request::EffectiveState::Observed { "observed" } else { "inferred" };
+    let metadata = crate::projection::catalog_metadata(op)
+        .map(|value| format!("\nx-xtrace catalog summary: {value}"))
+        .unwrap_or_default();
     request.insert(
         "description".into(),
         json!(format!(
-            "operation: {}\ncatalog state: {}\nx-xtrace-observation: {observation}",
+            "operation: {}\ncatalog state: {}\nx-xtrace-observation: {observation}{metadata}",
             op.operation_id,
             op.state.name()
         )),
@@ -140,6 +143,13 @@ fn item(op: &PreparedOp, omissions: &mut Vec<Omission>) -> Value {
 ///
 /// Fails when the sanitizer gate finds a secret-shaped value.
 pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
+    for op in &prepared.ops {
+        if let Some(metadata) = crate::projection::catalog_metadata(op)
+            && let Some(path) = sanitize::gate(&metadata)
+        {
+            return Err(ExportError::SecretShaped { path });
+        }
+    }
     let mut omissions = prepared.omissions.clone();
     let items: Vec<Value> = prepared.ops.iter().map(|op| item(op, &mut omissions)).collect();
     let rev = &prepared.revision;
@@ -168,5 +178,5 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
         mode: 0o644,
         bytes: canonical::json_pretty(&doc).into_bytes(),
     };
-    Ok(crate::finish(vec![file], omissions))
+    Ok(crate::finish(vec![file], omissions, prepared.ops.len()))
 }

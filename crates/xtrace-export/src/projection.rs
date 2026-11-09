@@ -2,11 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::request::{
-    EffectiveState, ExampleOrigin, ExportInput, ExportRequest, HandlerInput, Omission,
-    OperationInput, RevisionInput,
+    CatalogSummaryInput, EffectiveState, ExampleOrigin, ExportInput, ExportRequest, HandlerInput,
+    Omission, OperationInput, RevisionInput,
 };
 use crate::sanitize;
 
@@ -91,6 +91,8 @@ pub struct PreparedOp {
     pub handlers: Vec<HandlerInput>,
     /// Request body media type, when any claim declares one.
     pub request_media: Option<String>,
+    /// Aggregate catalog facts, kept separate from individual claims.
+    pub catalog_summary: Option<CatalogSummaryInput>,
 }
 
 /// The whole prepared export.
@@ -382,10 +384,48 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
         omit(omissions, &op.operation_id, "examples".to_owned(), "no_scenario_or_claim_example");
     }
 
-    let provenance: BTreeSet<String> = claims.iter().map(|c| c.provenance.clone()).collect();
-    let limitation_codes: BTreeSet<String> =
+    let mut provenance: BTreeSet<String> = claims.iter().map(|c| c.provenance.clone()).collect();
+    let mut limitation_codes: BTreeSet<String> =
         claims.iter().flat_map(|c| c.limitation_codes.iter().cloned()).collect();
+    let mut catalog_summary = op.catalog_summary.clone();
+    if let Some(summary) = &mut catalog_summary {
+        summary.handler_symbols.sort();
+        summary.handler_symbols.dedup();
+        summary.handler_conflict |= summary.handler_symbols.len() > 1;
+        summary.handler_symbols.retain(|symbol| {
+            let ok = valid_symbol(symbol);
+            if !ok {
+                omit(omissions, &op.operation_id, "handler".to_owned(), "handler_symbol_invalid");
+            }
+            ok
+        });
+        summary.provenance.sort();
+        summary.provenance.dedup();
+        summary.limitation_codes.sort();
+        summary.limitation_codes.dedup();
+        provenance.extend(summary.provenance.iter().cloned());
+        limitation_codes.extend(summary.limitation_codes.iter().cloned());
+        // Even a singleton summary has no end line. Multiple claims also lack
+        // the symbol/location associations, so none can be chosen as a winner.
+        let reason = if summary.claim_count == 1 && summary.single_claim_handler.is_some() {
+            "source_end_line_unavailable"
+        } else {
+            summary.single_claim_handler = None;
+            "per_claim_locations_unavailable"
+        };
+        omit(omissions, &op.operation_id, "source".to_owned(), reason);
+        omit(
+            omissions,
+            &op.operation_id,
+            "confidence".to_owned(),
+            "per_claim_confidence_unavailable",
+        );
+        if summary.handler_conflict {
+            omit(omissions, &op.operation_id, "handler".to_owned(), "handler_conflict_unresolved");
+        }
+    }
     let mut handlers: Vec<HandlerInput> = claims.iter().filter_map(|c| c.handler.clone()).collect();
+    handlers.extend(catalog_summary.as_ref().and_then(|s| s.single_claim_handler.clone()));
     handlers.sort_by(|a, b| {
         (&a.path, a.line_start, &a.symbol).cmp(&(&b.path, b.line_start, &b.symbol))
     });
@@ -407,8 +447,7 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
     // A symbol is a short identifier-like string; refuse path separators,
     // control characters and oversize values.
     handlers.retain(|h| {
-        let ok = h.symbol.len() <= 200
-            && !h.symbol.chars().any(|c| c == '/' || c == '\\' || c.is_control());
+        let ok = valid_symbol(&h.symbol);
         if !ok {
             omit(omissions, &op.operation_id, "handler".to_owned(), "handler_symbol_invalid");
         }
@@ -433,5 +472,45 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
         conflicts,
         handlers,
         request_media,
+        catalog_summary,
     }
+}
+
+fn valid_symbol(symbol: &str) -> bool {
+    symbol.len() <= 200 && !symbol.chars().any(|c| c == '/' || c == '\\' || c.is_control())
+}
+
+/// Summary-only inputs carry the same explicit gaps and scope in every format.
+pub(crate) fn catalog_metadata(op: &PreparedOp) -> Option<Value> {
+    let summary = op.catalog_summary.as_ref()?;
+    let mut metadata = json!({
+        "operation_id": op.operation_id,
+        "application_component": op.component,
+        "binding_key": op.binding_key,
+        "effective_state": op.state.name(),
+        "claims_projection": "unavailable",
+        "claim_count": summary.claim_count,
+        "handler_symbols": summary.handler_symbols,
+        "handler_conflict": summary.handler_conflict,
+        "highest_confidence_basis_points": summary.highest_confidence_basis_points,
+        "provenance": summary.provenance,
+        "limitation_codes": summary.limitation_codes,
+        "source_locations": "only single-claim handler starts are available; no end lines",
+        "claim_confidence": "not available per claim",
+    });
+    if !op.handlers.is_empty() {
+        metadata["handlers"] = Value::Array(op.handlers.iter().map(handler_json).collect());
+    }
+    Some(metadata)
+}
+
+/// An unknown extent is omitted, never replaced with the start line.
+pub(crate) fn handler_json(handler: &HandlerInput) -> Value {
+    let mut value = json!({
+        "symbol": handler.symbol, "path": handler.path, "line_start": handler.line_start,
+    });
+    if let Some(end) = handler.line_end {
+        value["line_end"] = json!(end);
+    }
+    value
 }
