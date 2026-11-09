@@ -1990,6 +1990,7 @@ class _RunnerProcesses:
         self.waits: dict[int, Callable[..., int]] = {}
         self.children: dict[int, tuple[int, int]] = {}
         self.alive: set[int] = set()
+        self.reaped: set[int] = set()
         self.fixtures: dict[str, dict[str, Any]] = {}
         self.root_fixtures: dict[int, dict[str, Any]] = {}
         self.fds: set[int] = set()
@@ -2074,11 +2075,13 @@ class _RunnerProcesses:
                 "    for fd in held:",
                 f"        if fd not in ({start_r}, {child_ready_w}, {exit_w}): os.close(fd)",
                 f"    signal.alarm({int(_RUNNER_SAFETY_SECONDS)})",
-                f"    assert byte({start_r}) == b'x'", f"    os.close({start_r})",
+                f"    assert byte({start_r}) == b'x'",
                 "    os.setsid()",
                 *(["    os.close(1)", "    os.close(2)"] if closed_stdio else []),
                 f"    os.write({child_ready_w}, b'r')", f"    os.close({child_ready_w})",
-                "    signal.pause()", "    os._exit(0)",
+                # Retain the control pipe so cleanup can stop an adopted child
+                # without signalling a pid that launchd may already have reaped.
+                f"    assert byte({start_r}) == b''", "    os._exit(0)",
                 "children.append(pid)",
                 f"for fd in ({start_r}, {child_ready_w}, {exit_w}): os.close(fd); held.remove(fd)",
                 f"os.write({pid_w}, (str(pid) + '\\n').encode())",
@@ -2110,7 +2113,6 @@ class _RunnerProcesses:
             self.children[pid] = (process.pid, exit_r)
             self.alive.add(pid)
             os.write(start_w, b'x')
-            self.close_fd(start_w)
             assert self.byte(ready_r) == b'r', "child exited before readiness"
             self.close_fd(ready_r)
         self.close_fd(fixture["pid_r"])
@@ -2128,7 +2130,16 @@ class _RunnerProcesses:
             kwargs["pass_fds"] = tuple(fixture["passed"])
         process = self.popen(argv, *args, **kwargs)
         self.processes[process.pid] = process
-        wait = process.wait
+        self.reaped.discard(process.pid)
+        original_wait = process.wait
+
+        def wait(timeout: float | None = None) -> int:
+            try:
+                return original_wait(timeout=timeout)
+            finally:
+                if process.returncode is not None:
+                    self.reaped.add(process.pid)
+
         self.waits[process.pid] = wait
         if kwargs.get("start_new_session"):
             self.roots[process.pid] = process
@@ -2259,21 +2270,33 @@ class _RunnerProcesses:
         self.closed = True
         deadline = time.monotonic() + _RUNNER_SAFETY_SECONDS
         errors: list[BaseException] = []
-        # Signal everything first, even reaped roots: an unreported fork may still
-        # inhabit its root's group. Registered children may have detached already.
-        for pid, group in [(pid, True) for pid in self.roots] + [(pid, False) for pid in self.children]:
+
+        def owned_unreaped(process: subprocess.Popen) -> bool:
+            if process.returncode is not None or process.pid in self.reaped:
+                return False
             try:
-                (self.killpg if group else self.kill)(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except PermissionError as exc:
-                if sys.platform != "darwin" or not group:
-                    errors.append(exc)
-            except BaseException as exc:
-                errors.append(exc)
+                # WNOWAIT confirms ownership and leaves even an exited child
+                # unreaped, pinning its pid until this fixture waits below.
+                self.exited(process.pid)
+            except ChildProcessError:
+                self.reaped.add(process.pid)
+                return False
+            return True
+
+        # EOF also stops unpublished forks waiting for registration. Detached
+        # children may belong to launchd now; never signal their numeric pids.
+        for fixture in self.fixtures.values():
+            for (_start_r, start_w), _ready, _exit_pipe in fixture["channels"]:
+                self.close_fd(start_w)
         for pid, process in self.processes.items():
             try:
-                if process.returncode is None:
+                if owned_unreaped(process):
+                    if self.roots.get(pid) is process:
+                        try:
+                            self.killpg(pid, signal.SIGKILL)
+                        except PermissionError:
+                            if sys.platform != "darwin":
+                                raise
                     self.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
@@ -2292,6 +2315,8 @@ class _RunnerProcesses:
                         assert time.monotonic() < deadline, "fixture child was not reaped"
                         self.select([], [], [], min(0.01, max(0, deadline - time.monotonic())))
                         continue
+                    self.reaped.add(pid)
+                    self.alive.discard(pid)
                     if identity > 0:
                         break
             except ChildProcessError:
@@ -3872,31 +3897,12 @@ class RunnerTests(unittest.TestCase):
             self.processes.close_fd(release_w)
             return process
 
-        real_selector = run_gates.selectors.DefaultSelector
-        clock = self.processes.clock
-
-        class TimeoutSelector:
-            def __init__(self) -> None:
-                self.selector = real_selector()
-
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self.selector, name)
-
-            def select(self, timeout: float) -> Any:
-                events = self.selector.select(min(timeout, 0.01))
-                if not events:
-                    clock.sleep(timeout)
-                return events
-
         try:
             with mock.patch.object(run_gates, "LSOF_BINARY", sys.executable), \
                     mock.patch.object(run_gates.subprocess, "Popen", side_effect=launch), \
-                    mock.patch.object(run_gates.selectors, "DefaultSelector",
-                                      real_selector if oversized else TimeoutSelector):
+                    mock.patch.object(run_gates, "time", time):
                 result = run_gates._run_lsof_fields(
-                    ["-c", script], clock.monotonic() + (
-                        2 if oversized else run_gates.LSOF_CLEANUP_RESERVE_SECONDS + 0.15
-                    ),
+                    ["-c", script], time.monotonic() + (2 if oversized else 0.15),
                 )
             self.assertEqual(len(spawned), 1)
             return result, spawned[0]
@@ -3920,10 +3926,10 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(process.stderr.closed)
 
     def test_real_lsof_stalled_probe_is_terminated_and_reaped(self) -> None:
-        started = self.processes.clock.monotonic()
+        started = time.monotonic()
         result, process = self.real_lsof_probe(oversized=False)
         self.assertEqual(result.error, "time-budget-exceeded")
-        self.assertLess(self.processes.clock.monotonic() - started, 2)
+        self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(result.stdout, "")
         self.assertEqual(result.stderr, "")
         self.assert_probe_gone(process)
