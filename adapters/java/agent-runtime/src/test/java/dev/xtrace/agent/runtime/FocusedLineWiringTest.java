@@ -148,6 +148,35 @@ class FocusedLineWiringTest {
   }
 
   @Test
+  void branchesAndLoopEmitOnlyExecutedLinesInExecutionOrder() throws Exception {
+    load(true, "BranchLoop");
+    assertTrue(BootstrapBridge.installLineSink(lineSink));
+    Object target = loader.loadClass(PKG + "BranchLoop").getDeclaredConstructor().newInstance();
+    var sum = target.getClass().getMethod("sum", int.class);
+    assertTrue(BootstrapBridge.requestStart("GET", "/sum"));
+    assertEquals(1, sum.invoke(target, 3));
+    assertEquals(0, sum.invoke(target, 0));
+    BootstrapBridge.requestEnd(200, false);
+
+    List<RecordingEvent> lines = drain().stream()
+        .filter(e -> e.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR)
+        .toList();
+    // javac's LineNumberTable: the loop header repeats, each branch runs only when selected,
+    // and the zero-iteration call never reaches the body. A method extent cannot satisfy this.
+    assertEquals(
+        List.of(5, 6, 7, 8, 9, 13, 7, 8, 11, 13, 7, 8, 9, 13, 7, 15, 5, 6, 7, 15),
+        lines.stream().map(e -> e.getSource().getStartLine()).toList(), diagnostics());
+    for (RecordingEvent line : lines) {
+      assertEquals("BranchLoop.sum", line.getSymbol());
+      assertEquals(line.getSource().getStartLine(), line.getSource().getEndLine());
+      assertEquals(SourceBinding.SOURCE_BINDING_OBSERVED_UNATTESTED, line.getSourceBinding());
+      assertFalse(line.getParentEventId().isEmpty());
+    }
+    assertEquals(0, lineSink.linesWithoutSource());
+    assertEquals(0, lineSink.linesRejected());
+  }
+
+  @Test
   void webAnnotatedAccessorShapedHandlersAreProbedButPlainAccessorsAreNot() throws Exception {
     var matcher = FixtureInstrumentation.frameMethods();
     var methods =
