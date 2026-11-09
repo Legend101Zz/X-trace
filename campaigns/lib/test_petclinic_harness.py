@@ -54,12 +54,22 @@ class OverheadHarness(unittest.TestCase):
         detail = {"events": [event]}
         pet = harness.EXPECT["pet-and-visit-flow"][0]
         self.assertEqual(xinstr.layer_frames(detail, "repository", pet["layerHints"]["repository"]), [event])
+        detail["events"] = [{**event, "symbol": "org.springframework.data.jpa.repository.JpaRepository.findAll"}]
+        self.assertEqual(xinstr.layer_frames(detail, "repository", pet["layerHints"]["repository"]), [])
+        for symbol in ("org.springframework.samples.petclinic.owner.OwnerRepository.findById",
+                       "org.springframework.data.repository.CrudRepository.save"):
+            with self.subTest(symbol=symbol):
+                alternative = {**event, "symbol": symbol}
+                self.assertEqual(xinstr.layer_frames({"events": [alternative]}, "repository",
+                                                     pet["layerHints"]["repository"]), [alternative])
         # PetTypeRepository observations cannot stand in for the owner's write.
         detail["events"] = [{**event, "symbol": "org.springframework.samples.petclinic.owner.PetTypeRepository.findPetTypes"}]
         self.assertEqual(xinstr.layer_frames(detail, "repository", pet["layerHints"]["repository"]), [])
         detail["events"] = [event]
         owner_read = harness.EXPECT["owner-create-roundtrip"][1]
         self.assertEqual(xinstr.layer_frames(detail, "repository", owner_read["layerHints"]["repository"]), [])
+        visit = harness.EXPECT["pet-and-visit-flow"][1]
+        self.assertEqual(xinstr.layer_frames(detail, "repository", visit["layerHints"]["repository"]), [])
         self.assertEqual(xinstr.layer_frames({"events": []}, "repository", pet["layerHints"]["repository"]), [])
 
     def test_exactly_five_interleaved_pairs_record_real_intervals_and_pair_paths(self):

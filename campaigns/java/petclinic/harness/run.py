@@ -190,7 +190,7 @@ def baseline(out):
 # Petclinic has no service layer: its controllers call Spring Data repositories directly, so no `service` frame is required.
 # Proxy symbols name the method's actual declaring interface, including inherited CRUD methods.
 CRUD = "org.springframework.data.repository.CrudRepository"
-JPA = "org.springframework.data.jpa.repository.JpaRepository"
+JPA_SAVE_AND_FLUSH = "org.springframework.data.jpa.repository.JpaRepository.saveAndFlush"
 OWN = {"controller": "OwnerController", "repository": ["OwnerRepository", CRUD]}
 EXPECT = {
     "search-seeded": [
@@ -205,7 +205,7 @@ EXPECT = {
     "pet-and-visit-flow": [
         {"method": "POST", "route": "/owners/{ownerId}/pets/new", "statuses": [302, 200], "layers": ["controller", "repository"],
          # The successful submission calls the inherited saveAndFlush declaration.
-         "layerHints": {"controller": "PetController", "repository": [*OWN["repository"], JPA]}},
+         "layerHints": {"controller": "PetController", "repository": [*OWN["repository"], JPA_SAVE_AND_FLUSH]}},
         {"method": "POST", "route": "/owners/{ownerId}/pets/{petId}/visits/new", "statuses": [200, 302], "layers": ["controller", "repository"],
          "layerHints": {"controller": "VisitController", "repository": OWN["repository"]}}],
     "owner-edit": [
