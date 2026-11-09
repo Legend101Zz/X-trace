@@ -34,7 +34,7 @@ Epic: #2. Close an issue only when every box is ticked with evidence on merged `
 
 1. **Make main's CI clean.** Fix the nondeterministic tests below deterministically: inject clocks and process
    snapshots, have tests remove their own scratch, and have the `pack_inventory` test list only a directory it owns.
-   Prove each fix with several CI runs on the exact head.
+   Prove each fix with at least three CI runs on the exact head.
 2. **#3:** finish the three pushed, unmerged branches. Merge `origin/main` into each; never rebase pushed history.
    - `ultra/r2w2-qb`: real Petclinic harness flows and product outcome kinds.
    - `ultra/r2w2-xb`: `xtrace export` for OpenAPI/Postman/cURL.

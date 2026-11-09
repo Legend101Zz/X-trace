@@ -9,7 +9,7 @@ default:
     @just --list
 
 # Print required toolchain versions and confirm the caches described in
-# AGENTS.md are wired correctly.
+# tools/dev/README.md are wired correctly.
 doctor:
     @rustc --version
     @cargo --version

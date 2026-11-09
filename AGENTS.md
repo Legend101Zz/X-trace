@@ -62,7 +62,8 @@ needs the network and runs outside any agent sandbox.
 - **Honesty rules are product law** (ADR 0003 §7). An "active line" exists only from a recorded line event; a
   method's line range is never shown as one. Absence is "not observed", never "did not run". No invented timing,
   values or parent links. Partial never looks complete. UI copy comes from `honesty-strings.json`.
-- **Files end with exactly one newline and have no trailing whitespace.** CI gate 23 runs `git diff --check`.
+- **No trailing whitespace and no blank lines at the end of a file**; end every file with a newline. CI gate 23
+  runs `git diff --check`.
 - **Big files.** `crates/xtrace-store/src/recording_store.rs` (7.7k lines), `tools/release/test_release_tools.py`
   (5.9k), `tools/release/run_gates.py` (2.6k). Read the part you need (grep first). Do not reformat them.
 - **Known nondeterministic tests** are listed in `docs/STATE.md`. If one fails on your change, say so; never
@@ -70,13 +71,17 @@ needs the network and runs outside any agent sandbox.
 
 ## Rules
 
-- **Never weaken a test**: no deleting or loosening assertions, `#[ignore]`, `test.skip`, quarantines, retries or
-  raised deadlines. If a task needs that, stop and report it as infeasible.
+- **Never weaken a test, gate, budget, timeout or CI job**: no deleting or loosening assertions, `#[ignore]`,
+  `test.skip`, quarantines, retries or raised deadlines. A skipped or unreached step is never a pass. If a task needs
+  any of that, stop and report it as infeasible.
+- **Real evidence**: a feature is done only when a real framework application runs through the packaged product
+  path; mocks and fakes alone never complete it. Tests cover failure and privacy cases, not only the happy path.
 - **Contracts**: Protobuf/OpenAPI schemas, SQLite migrations, the XTF format, the redaction vocabulary and replay
   navigation change only in a ticket that says so, with an ADR when semantics change.
 - **Git**: work in your own worktree and branch. Workers do not commit, push or merge; the orchestrator reviews,
-  commits and opens the pull request. Every change reaches `main` through a PR with green CI (ADR 0012 §5). No
-  closing keywords in commits.
+  commits and opens the pull request. Every change reaches `main` through a PR whose required check `ci-ok` is
+  green on the exact head, with current `main` merged in (ADR 0012 §5). No closing keywords (`fixes #N`,
+  `closes #N`) in commits, PR titles or PR bodies.
 - **Forbidden commands**: `pkill`, `killall`, kill by pattern, `kill $(pgrep ...)`, `sudo`, `diskutil`,
   `docker ... prune`, `rm -rf` outside your worktree or the dev cache. Signal only PIDs you started.
 - **Public repository**: never commit secrets, captured values, owner-specific absolute paths or raw logs.

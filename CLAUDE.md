@@ -7,4 +7,3 @@
   to files, and the orchestrator reads the summaries.
 - `.claude/settings.json` installs a `PreToolUse` guard (`.claude/hooks/guard.sh`) that denies the forbidden
   commands listed in AGENTS.md. Do not disable it.
-- Never add a `CLAUDE.local.md`: it silently stops Claude Code from reading `AGENTS.md`.

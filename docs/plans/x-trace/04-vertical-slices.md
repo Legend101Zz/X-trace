@@ -580,11 +580,11 @@ Workers implement and may review work written by a different model; review
 and merge checks scale to risk as specified there.
 
 Workers leave coherent uncommitted diffs; the orchestrator alone commits, pushes,
-merges and releases. After a phase is reviewed and verified, the orchestrator
-stops and reports completed
-work, changes, verification, issues or decisions, remaining work, and the exact
-next proposed phase. The next phase, merge, push, or any background continuation
-requires explicit user approval; no automation may cross that boundary.
+merges and releases within the scope the owner authorized for the session
+(ADR 0012). At the end of that scope the orchestrator stops and reports
+completed work, changes, verification, issues or decisions, remaining work, and
+the exact next proposed work; anything beyond the authorized scope requires
+explicit owner approval, and no automation may cross that boundary.
 
 ## 17. Slice change control
 

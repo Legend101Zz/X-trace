@@ -1,7 +1,9 @@
 # ADR 0012: Agent workforce, GitHub-hosted verification and risk-scaled merges
 
-- Status: Accepted for decisions 1–3 (owner instruction, 2026-11-09). Decisions 4–6 are defaults adopted the same day,
-  pending owner confirmation; until the owner changes them, they apply.
+- Status: Accepted where it records the owner's instructions of 2026-11-09: Codex workers with a Claude orchestrator
+  (decision 1), heavy tests on GitHub only (decision 2), builds on the SSD with cleanup (decision 3). The local
+  unit-test allowance in decision 2 and decisions 4–6 are defaults adopted the same day, pending owner
+  confirmation; until the owner changes them, they apply.
 - Date: 2026-11-09
 - Amends: ADR 0006 (integration and acceptance mechanics) and ADR 0009 (wave batching): the merge protocol and
   the leased macOS floor requirement. Supersedes every rule that limits which agents or models may work on this
@@ -41,11 +43,12 @@
 ### 3. Where builds live (owner instruction)
 
 - Build outputs, dependency caches and test scratch live on the owner's external SSD, on an APFS volume with
-  ownership enabled (private-storage admission refuses `noowners` volumes; see ADR 0008). One cache root is set
-  per machine in `XTRACE_DEV_CACHE`; the path is never committed. `tools/dev/env.sh` derives every cache and scratch
-  path from it, with one Cargo build directory per worktree and a shared size-capped compiler cache.
-- `tools/dev/clean.sh` removes finished tickets' build and scratch directories and prunes old caches between
-  waves. It is a dry run unless `--apply` is given, and it never touches anything outside the cache root.
+  ownership enabled (private-storage admission refuses `noowners` volumes; see ADR 0008). Two roots are set per
+  machine and never committed: `XTRACE_DEV_CACHE` (dependency caches and per-worktree Cargo build directories) and
+  `XTRACE_DEV_SCRATCH` (short-path private test scratch). `tools/dev/env.sh` derives every path from them.
+- `tools/dev/clean.sh` removes the build and scratch directories of worktrees that no longer exist, between
+  waves. It is a dry run unless `--apply` is given, never touches an active worktree's directories, and never
+  deletes anything outside the two roots.
 
 ### 4. macOS evidence (default, owner question D2)
 
@@ -53,6 +56,9 @@
 - macOS evidence for merges will come from a GitHub-hosted macOS arm64 job (free for public repositories). It is
   added in a follow-up after the known nondeterministic tests are fixed. Until it exists, merges rely on the Linux
   floors and say so in the pull request.
+- This reverses the owner's 2026-10-10 decision to run no hosted macOS jobs, so it is the owner's call (D2).
+- No release candidate is accepted without macOS evidence for that exact candidate (the hosted job, or the leased
+  floor on a real Mac) unless the owner waives it in writing.
 - PLATFORM-MAC acceptance still requires a fresh-profile install of the exact unsigned release package on a real
   Mac (ADR 0006, second addendum of 2026-10-10).
 
@@ -65,6 +71,14 @@
 | Shared contracts (Protobuf/OpenAPI schemas, SQLite migrations, XTF, redaction vocabulary, replay navigation), security or privacy paths, release tooling, CI workflows | as above, with two independent reviews |
 | Release candidate (`ultra/rc-*`) | the full ADR 0006 protocol, with the leased macOS floor replaced as in decision 4 |
 
+- "CI green" means the `ci-ok` check of `ci.yml` on the exact head, plus any workflow the ticket names. Trigger
+  the others on the branch when the change touches them: `gh workflow run lane.yml --ref <branch> -f suite=<suite>`
+  (adapters, web, TUI suites), `gh workflow run package.yml --ref <branch>` (packaging), and an
+  `ultra/campaign/<project>` branch push for campaigns (capture semantics).
+- Before merging, the branch must contain the current `main` (merge `origin/main` into it, never rebase pushed
+  history), and CI must be green on that head, so the tested tree is the merged tree.
+- After every merge, `main` CI must be green before new feature work. A red `main` that cannot be fixed within 60
+  minutes is reverted with `git revert -m 1`.
 - Flakes: record the failing run before any re-run. A green re-run is not a clean pass until the cause is fixed.
   Never retry until green.
 - One review round plus at most one fix round per finding. After that the orchestrator decides, or escalates to
@@ -75,8 +89,9 @@
 - No requirement row becomes `accepted` without signed receipts checked against the owner's trust configuration
   (`tools/release/check_ledger.py`).
 - The REVIEWS-EXACT row no longer names a model. It requires independent architecture/security and
-  build/integration reviews of the exact release candidate, each by a model other than the one that wrote the
-  code, plus the orchestrator's complete diff review, exact gates, CI and post-merge checks.
+  build/integration reviews of the exact release candidate, each by another vendor's model than the writer's (for
+  example, Claude reviewing Codex-written code), plus the orchestrator's complete diff review, exact gates, CI and
+  post-merge checks.
 
 ## Consequences
 

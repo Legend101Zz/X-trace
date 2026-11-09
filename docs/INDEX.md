@@ -44,7 +44,8 @@ approved contracts; if code and a contract disagree, raise it instead of silentl
 ## Development and operations
 
 - `tools/dev/README.md`: environment, prep, fast checks, cache cleanup.
-- `docs/development/setup.md`: full developer setup and acceptance commands per component.
+- `docs/development/setup.md`: full developer setup and acceptance commands per component (the heavy commands
+  there are what CI runs; agents use `tools/dev/` locally).
 - `docs/packaging.md`: packages, supply chain, signing.
 - `docs/security-local.md`: the local security model.
 - `tools/release/README.md`: the 23-gate floor and release tools.
