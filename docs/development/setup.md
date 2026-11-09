@@ -332,9 +332,12 @@ declared duration and drop counts remain separate from completion. Unexercised
 capability codes remain in the bounded finish evidence but are not projected
 until they can be checked against an adapter manifest. A producer-declared
 summary is exposed only in a non-preview privacy state and is not proof of a
-captured response outcome. For Java/Spring, a recorded HTTP status is the status
-at `DispatcherServlet` exit; later filters or error handling may change what the
-client receives. Event values and full source replay remain
+captured response outcome. For Java/Spring, status is read at the exit of the
+outermost `Filter.doFilter` or `Servlet.service`. A normal return gives a final
+status unless `sendError` is pending. If `sendError` is pending, an exception
+escapes, or the request is async, the observation is labelled provisional and
+no final `httpStatus` is recorded. Without an observed servlet boundary, a
+status is also provisional. Event values and full source replay remain
 unavailable; bounded source excerpts are limited to the attested fixture
 methods.
 Read-only SQLite access keeps normal WAL visibility and may create SQLite

@@ -527,3 +527,5 @@ Decided by the root orchestrator under the owner's autonomous v0.01 launch autho
 The standard-mode line budget stays 0 (root decision 1 above supersedes the 1,024 in the budget table); `CaptureBudget::STANDARD.max_line_events` is 0 and ingest enforces it.
 
 **Amendment (2026-11-09).** For Java/Spring, the recorded HTTP status is the status at `DispatcherServlet` exit; later filters or error handling may change what the client receives. Java source lookup is confined to the project directory (or the application's working directory), with no ancestor search or symlink escapes.
+
+**Amendment (2026-11-09, servlet boundary).** This supersedes the preceding amendment’s Java/Spring status rule: the status is read at the exit of the outermost `Filter.doFilter` or `Servlet.service`. A normal return gives a final status unless `sendError` is pending. If `sendError` is pending, an exception escapes, or the request is async, the observation is labelled provisional and no final `httpStatus` is recorded. Without an observed servlet boundary, a status is also provisional.
