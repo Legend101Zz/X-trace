@@ -244,6 +244,20 @@ pub trait RecordingPersistencePort: Send + Sync {
     /// Typed event representation understood by the infrastructure adapter.
     type Event: Clone + Send + Sync + 'static;
 
+    /// Keeps the highest cumulative agent-capacity rejection count for a session.
+    /// Counts describe requests outside the recording stream, never dropped events.
+    ///
+    /// # Errors
+    /// Returns a persistence failure, or an explicit error for unsupported ports.
+    fn record_session_rejections(
+        &self,
+        _project_id: ProjectId,
+        _session_id: RuntimeSessionId,
+        _count: u64,
+    ) -> Result<(), PortError> {
+        Err(capture_error(PortErrorKind::Internal, "session health persistence unavailable"))
+    }
+
     /// Inserts or exactly replays one immutable recording anchor.
     ///
     /// # Errors
@@ -414,6 +428,19 @@ pub struct FinishRecordingReceipt {
 pub trait RecordingCapture: Send + Sync {
     /// Typed event supplied by the daemon's protocol translator.
     type Event: Clone + Send + Sync + 'static;
+
+    /// Persists a cumulative session rejection report without inventing a recording.
+    ///
+    /// # Errors
+    /// Returns a persistence failure, or an explicit error for unsupported implementations.
+    fn record_session_rejections(
+        &self,
+        _project_id: ProjectId,
+        _session_id: RuntimeSessionId,
+        _count: u64,
+    ) -> Result<(), PortError> {
+        Err(capture_error(PortErrorKind::Internal, "session health persistence unavailable"))
+    }
 
     /// Opens or exactly replays one recording anchor.
     ///
@@ -708,6 +735,15 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
 
 impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCaptureService<P> {
     type Event = P::Event;
+
+    fn record_session_rejections(
+        &self,
+        project_id: ProjectId,
+        session_id: RuntimeSessionId,
+        count: u64,
+    ) -> Result<(), PortError> {
+        self.port.record_session_rejections(project_id, session_id, count)
+    }
 
     fn begin_recording(&self, request: BeginRecording) -> Result<BeginRecordingReceipt, PortError> {
         self.begin_with_cap(request, MAX_RECORDED_EVENTS)

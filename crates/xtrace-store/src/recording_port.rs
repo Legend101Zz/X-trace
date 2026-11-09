@@ -146,6 +146,18 @@ impl ObservedEndpointReadPort for SqliteRecordingReader {
 impl RecordingPersistencePort for SqliteRecordingPersistence {
     type Event = XtfEventEnvelope;
 
+    fn record_session_rejections(
+        &self,
+        project_id: xtrace_domain::ProjectId,
+        session_id: xtrace_domain::RuntimeSessionId,
+        count: u64,
+    ) -> Result<(), PortError> {
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
+        let view =
+            self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
+        view.record_session_rejections(project_id, session_id, count).map_err(map_recording_error)
+    }
+
     fn validate_event(&self, event: &AcceptedRecordingEvent<Self::Event>) -> Result<(), PortError> {
         validate_xtf_event(event).map(|_| ())
     }
@@ -1132,7 +1144,16 @@ mod tests {
                 .as_object()
                 .is_some_and(|fields| fields.contains_key("path"))
         }));
-        assert_eq!(detail.incomplete_evidence, ["persisted_status:partial"]);
+        assert_eq!(
+            detail.incomplete_evidence,
+            [
+                "persisted_status:partial".to_owned(),
+                format!(
+                    "Agent capacity rejections: not observed (session {})",
+                    first.runtime_session_id
+                ),
+            ]
+        );
         let next_cursor = detail.next_cursor.clone().expect("bounded next window cursor");
         let rendered = serde_json::to_string(&detail).expect("render detail");
         assert!(!rendered.contains("VALUE_CANARY_RECORDING_READ"));
