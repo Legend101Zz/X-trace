@@ -689,7 +689,7 @@ impl AdmittedPrivateRoot {
             owner: first.st_uid,
             mode: stat_mode(&first) & 0o7777,
         };
-        if !probe::named_file_acl_admits(&self.path.join(name), identity, op) {
+        if !probe::named_file_acl_admits(&self.path.join(name), &self.directory, identity, op) {
             return Err(PrivateStorageError::Unavailable);
         }
         self.revalidate_until(op)?;

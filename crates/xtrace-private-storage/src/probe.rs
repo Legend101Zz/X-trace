@@ -25,7 +25,8 @@
 //! scope's memo and batched listing instead. Its key additionally carries the filesystem
 //! identity and mount flags of the held descriptor (`f_fsid`, `f_flags`) and the operation's
 //! filesystem profile, so a verdict judged under one profile never serves another. The identity
-//! checks, the per-operation deadline and the named-file probes are unchanged.
+//! checks and the per-operation deadline are unchanged. Regular files use the same
+//! state-bound policy: one listing per unchanged APFS file state in the operation/scope.
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -156,6 +157,8 @@ pub(crate) struct Operation {
     profile: crate::policy::FilesystemProfile,
     memoize: bool,
     judged: RefCell<Vec<DirectoryState>>,
+    #[cfg(target_os = "macos")]
+    file_judged: RefCell<Vec<MemoKey>>,
     /// The admission scope that was live on the creating thread when this operation was made.
     scope_id: Option<u64>,
     /// Prefix operands of the most recent ancestor walk; the batch is spawned lazily from them.
@@ -211,6 +214,8 @@ impl Operation {
             profile: crate::policy::FilesystemProfile::Durable,
             memoize,
             judged: RefCell::new(Vec::new()),
+            #[cfg(target_os = "macos")]
+            file_judged: RefCell::new(Vec::new()),
             scope_id: if memoize { scope::live_scope_id() } else { None },
             #[cfg(target_os = "macos")]
             walk: RefCell::new(Vec::new()),
@@ -345,7 +350,10 @@ impl Operation {
     fn scope_remember(&self, key: MemoKey) {
         if let Some(id) = self.scope_id {
             scope::with_scope(id, |state| {
-                if state.memo.len() < SCOPE_MEMO_LIMIT && !state.memo.contains(&key) {
+                let remembered = state.memo.len();
+                #[cfg(target_os = "macos")]
+                let remembered = remembered + state.file_memo.len();
+                if remembered < SCOPE_MEMO_LIMIT && !state.memo.contains(&key) {
                     state.memo.push(key);
                 }
             });
@@ -616,6 +624,7 @@ fn probe_directory(
 #[cfg(target_os = "linux")]
 pub(crate) fn named_file_acl_admits(
     path: &Path,
+    _directory: &File,
     _identity: FileIdentity,
     _operation: &Operation,
 ) -> bool {
@@ -629,10 +638,11 @@ pub(crate) fn named_file_acl_admits(
 #[cfg(target_os = "macos")]
 pub(crate) fn named_file_acl_admits(
     path: &Path,
+    directory: &File,
     identity: FileIdentity,
     operation: &Operation,
 ) -> bool {
-    if !file_listing_admits(path, operation) {
+    if !file_listing_admits(path, directory, None, identity, operation) {
         return false;
     }
     // Same inode, owner and mode; size is excluded because live SQLite files grow.
@@ -643,6 +653,7 @@ pub(crate) fn named_file_acl_admits(
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn named_file_acl_admits(
     _path: &Path,
+    _directory: &File,
     _identity: FileIdentity,
     _operation: &Operation,
 ) -> bool {
@@ -670,7 +681,7 @@ pub(crate) fn acl_admits_file(
     expected: FileIdentity,
     operation: &Operation,
 ) -> bool {
-    if !file_listing_admits(path, operation) {
+    if !file_listing_admits(path, file, Some(file), expected, operation) {
         return false;
     }
     let Ok(named) = std::fs::symlink_metadata(path) else { return false };
@@ -690,10 +701,90 @@ pub(crate) fn acl_admits_file(
 }
 
 /// Path-based macOS ACL probe for a regular file; never opens the file.
+///
+/// Threat model: an ACL edit by the owner or another process must not make a
+/// remembered deny-only verdict admit an allow entry. Reuse is APFS-only (nanosecond
+/// ctime), keyed by device/inode, owner, mode, ctime, filesystem identity/mount flags
+/// and profile. Path/descriptor identity checks still run before and after a query
+/// or hit. Writes, replacement, chmod, chown and ACL edits invalidate the key. A
+/// file changing during a fresh listing earns no memo, just like a busy directory;
+/// a hit whose state changes is refused. Failed verdicts are never cached.
+/// No file is opened here: closing another descriptor could release SQLite's locks.
 #[cfg(target_os = "macos")]
-fn file_listing_admits(path: &Path, operation: &Operation) -> bool {
-    let Some(text) = run_acl_listing(path, operation.deadline()) else { return false };
-    path.to_str().is_some_and(|expected| crate::policy::macos_file_listing_admits(&text, expected))
+fn file_listing_admits(
+    path: &Path,
+    filesystem_descriptor: &File,
+    file: Option<&File>,
+    expected: FileIdentity,
+    operation: &Operation,
+) -> bool {
+    if operation.expired() {
+        return false;
+    }
+    let state = || {
+        let named = std::fs::symlink_metadata(path).ok()?;
+        if !named.is_file() || !expected.same_directory(FileIdentity::from_metadata(&named)) {
+            return None;
+        }
+        let state = DirectoryState::of(&named, DirectoryRole::PrivateLeaf);
+        if let Some(file) = file {
+            let opened = file.metadata().ok()?;
+            if !expected.same_file(FileIdentity::from_metadata(&opened))
+                || DirectoryState::of(&opened, DirectoryRole::PrivateLeaf) != state
+            {
+                return None;
+            }
+        }
+        Some(state)
+    };
+    let Some(before) = state() else { return false };
+    let key = MemoKey::of_descriptor(before, filesystem_descriptor, operation.profile());
+    let remembered = key.as_ref().is_some_and(|key| {
+        operation.file_judged.borrow().contains(key)
+            || operation
+                .scope_id
+                .and_then(|id| scope::with_scope(id, |scope| scope.file_memo.contains(key)))
+                .unwrap_or(false)
+    });
+    if !remembered {
+        let Some(text) = run_acl_listing(path, operation.deadline()) else { return false };
+        if !path
+            .to_str()
+            .is_some_and(|expected| crate::policy::macos_file_listing_admits(&text, expected))
+        {
+            return false;
+        }
+    }
+    let Some(after) = state() else { return false };
+    if operation.expired() {
+        return false;
+    }
+    if after != before {
+        return !remembered;
+    }
+    if let Some(key) = key {
+        if MemoKey::of_descriptor(before, filesystem_descriptor, operation.profile()).as_ref()
+            != Some(&key)
+        {
+            return false;
+        }
+        if !remembered {
+            let mut judged = operation.file_judged.borrow_mut();
+            if judged.len() < SCOPE_MEMO_LIMIT {
+                judged.push(key.clone());
+            }
+            if let Some(id) = operation.scope_id {
+                scope::with_scope(id, |scope| {
+                    if scope.memo.len() + scope.file_memo.len() < SCOPE_MEMO_LIMIT
+                        && !scope.file_memo.contains(&key)
+                    {
+                        scope.file_memo.push(key);
+                    }
+                });
+            }
+        }
+    }
+    true
 }
 
 /// Longest single-directory listing accepted.
@@ -903,6 +994,83 @@ mod tests {
 
     fn fixture() -> tempfile::TempDir {
         tempfile::tempdir().expect("fixture directory")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn regular_file_listings_are_bounded_by_file_states_and_acl_edits_invalidate_them() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let root = fixture();
+        let directory = open(root.path());
+        let path = root.path().join("private-file");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("private file");
+        let _scope = crate::AdmissionScope::enter();
+        let admits = |file: &File| {
+            let op = Operation::new();
+            let identity = identity_of(file);
+            assert!(named_file_acl_admits(&path, &directory, identity, &op));
+            assert!(acl_admits_file(&path, file, identity, &op));
+        };
+        let before = ls_spawn_count();
+        admits(&file);
+        assert_eq!(ls_spawn_count() - before, 1, "one listing serves path and descriptor checks");
+        for _ in 0..8 {
+            admits(&file);
+        }
+        assert_eq!(
+            ls_spawn_count() - before,
+            1,
+            "unchanged files spawn nothing across scoped operations"
+        );
+
+        let old =
+            DirectoryState::of(&file.metadata().expect("before write"), DirectoryRole::PrivateLeaf);
+        file.write_all(b"observed prefix").expect("write changes ctime");
+        let new =
+            DirectoryState::of(&file.metadata().expect("after write"), DirectoryRole::PrivateLeaf);
+        assert_ne!(old, new);
+        admits(&file);
+        assert_eq!(ls_spawn_count() - before, 2, "data writes also invalidate the verdict");
+
+        let acl = |flag: &str, entry: &str| {
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .args([flag, entry])
+                    .arg(&path)
+                    .status()
+                    .expect("edit fixture ACL")
+                    .success()
+            );
+        };
+        acl("+a", "group:everyone allow read");
+        let op = Operation::new();
+        let identity = identity_of(&file);
+        assert!(
+            !named_file_acl_admits(&path, &directory, identity, &op),
+            "allow cannot reuse a deny-only verdict"
+        );
+        assert!(!acl_admits_file(&path, &file, identity, &op));
+        acl("-a", "group:everyone allow read");
+        acl("+a", "group:everyone deny delete");
+        let before = ls_spawn_count();
+        admits(&file);
+        admits(&file);
+        assert_eq!(ls_spawn_count() - before, 1, "a fresh deny-only state is cached again");
+        acl("-a", "group:everyone deny delete");
+
+        drop(_scope);
+        let before = ls_spawn_count();
+        admits(&file);
+        admits(&file);
+        assert_eq!(ls_spawn_count() - before, 2, "verdicts never escape their scope or operation");
     }
 
     fn judge(operation: &Operation, path: &Path, directory: &File) -> bool {

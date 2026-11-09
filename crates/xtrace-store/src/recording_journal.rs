@@ -891,6 +891,20 @@ impl SqliteRecordingStore<'_> {
         self.clear_journal(recording_id)
     }
 
+    /// A verified checkpoint snapshot, taken before opening the segment-row snapshot.
+    pub(crate) fn journal_events(
+        &self,
+        project_id: ProjectId,
+        recording_id: RecordingId,
+    ) -> Result<Option<(u32, Vec<XtfEventEnvelope>)>, RecordingStoreError> {
+        let id = CorrelationId::new();
+        let Some(tail) = load(&self.binding, recording_id, id)? else { return Ok(None) };
+        if tail.project_id != project_id {
+            return Err(object_corrupt_error(id));
+        }
+        Ok(Some((tail.ordinal, tail.events)))
+    }
+
     /// Journal events beyond the sealed prefix, for truthful lifecycle metadata.
     pub(crate) fn journal_summary(
         &self,
