@@ -594,13 +594,12 @@ public final class BootstrapBridge {
     return CONTEXT.get() != null;
   }
 
-  /** Names a missing focused probe only when that method actually runs in this request. */
-  public static void methodEntered(Class<?> type, String method, String descriptor) {
+  /** Called only by methods whose focused line probes were skipped at transformation time. */
+  public static void lineGap() {
     try {
       RequestContext context = CONTEXT.get();
       BridgeSink sink = SINK.get();
-      if (context == null || context.deferred || sink == null
-          || !sink.lineProbeUnavailable(type, method, descriptor)) return;
+      if (context == null || context.deferred || sink == null) return;
       flushLine(context);
       if (!safeEvent(sink, context, context.nextEventId(), context.currentParent(),
           BridgeEventKind.GAP, "xtrace.capture.gap.not-transformed", 1)) context.dropped++;

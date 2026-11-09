@@ -106,7 +106,6 @@ public final class AgentRuntime {
                 new dev.xtrace.agent.runtime.line.SiteRegistry());
         lineSink = new LineProbeBridgeSink(sink, lineProbes.registry());
         writer.capturePolicy("xtrace.focused.v1");
-        sink.useLineProbes(lineProbes);
       }
       proxySink = new ProxyCaptureSink(queue, config.scope(), config.focused());
       if (!ProxyBridge.install(proxySink)) {
