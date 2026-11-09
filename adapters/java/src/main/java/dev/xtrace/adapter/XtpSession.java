@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
@@ -32,6 +33,7 @@ import xtp.agent.v1.Recording.RecordingFinished;
 import xtp.agent.v1.Recording.RecordingStarted;
 import xtp.agent.v1.Transport.Ack;
 import xtp.agent.v1.Transport.AckDurability;
+import xtp.agent.v1.Transport.Health;
 
 /** Authenticated, sequential XTP session over a pinned Conscrypt TLS 1.3 connection. */
 public final class XtpSession implements AutoCloseable {
@@ -41,7 +43,7 @@ public final class XtpSession implements AutoCloseable {
   private static final int MAX_MANIFEST_BYTES = 64 * 1024;
   private static final Pattern CANONICAL_PIN = Pattern.compile("[0-9a-f]{64}");
 
-  private final SSLSocket socket;
+  private final Socket socket;
   private final InputStream input;
   private final OutputStream output;
   private final byte[] runtimeSessionId;
@@ -54,8 +56,9 @@ public final class XtpSession implements AutoCloseable {
   private long nextSequence = 1;
   private boolean closed;
 
-  private XtpSession(
-      SSLSocket socket,
+  // The caller must have authenticated and negotiated this connection before constructing it.
+  XtpSession(
+      Socket socket,
       byte[] runtimeSessionId,
       int protocolMajor,
       int protocolMinor,
@@ -185,13 +188,17 @@ public final class XtpSession implements AutoCloseable {
 
   /**
    * Sends one payload in invocation order and waits for its exact contiguous Staged ACK. More than
-   * 64 concurrent callers are rejected rather than queued without bound.
+   * 64 concurrent callers are rejected rather than queued without bound. Unsupported payloads fail
+   * before writing or consuming a sequence; the session remains usable.
    */
   public Ack send(String messageId, String correlationToken, Message payload)
       throws ClientException {
     if (messageId == null || messageId.isEmpty()) {
       throw new ClientException("XTR-JAVA-ENVELOPE", "message ID must not be empty");
     }
+    AgentEnvelope.Builder builder = AgentEnvelope.newBuilder();
+    // A local type rejection cannot make delivery ambiguous. Keep it outside fail-closed I/O.
+    setPayload(builder, payload);
     if (!pending.tryAcquire()) {
       throw new ClientException("XTR-JAVA-QUEUE", "XTP send queue is full");
     }
@@ -205,16 +212,14 @@ public final class XtpSession implements AutoCloseable {
         if (sequence == Long.MAX_VALUE) {
           throw new ClientException("XTR-JAVA-SEQUENCE", "session sequence is exhausted");
         }
-        AgentEnvelope.Builder builder =
-            AgentEnvelope.newBuilder()
-                .setProtocolMajor(protocolMajor)
-                .setProtocolMinor(protocolMinor)
-                .setRuntimeSessionId(ByteString.copyFrom(runtimeSessionId))
-                .setSessionSeq(sequence)
-                .setSentMonotonicNs(System.nanoTime())
-                .setMessageId(messageId)
-                .setCorrelationToken(correlationToken == null ? "" : correlationToken);
-        setPayload(builder, payload);
+        builder
+            .setProtocolMajor(protocolMajor)
+            .setProtocolMinor(protocolMinor)
+            .setRuntimeSessionId(ByteString.copyFrom(runtimeSessionId))
+            .setSessionSeq(sequence)
+            .setSentMonotonicNs(System.nanoTime())
+            .setMessageId(messageId)
+            .setCorrelationToken(correlationToken == null ? "" : correlationToken);
         Framing.write(output, builder.build(), maxEnvelopeBytes);
         AgentEnvelope response = nextNonHealth();
         validateAck(response, sequence);
@@ -238,6 +243,7 @@ public final class XtpSession implements AutoCloseable {
     else if (payload instanceof RecordingStarted value) envelope.setRecordingStarted(value);
     else if (payload instanceof EventBatch value) envelope.setEventBatch(value);
     else if (payload instanceof RecordingFinished value) envelope.setRecordingFinished(value);
+    else if (payload instanceof Health value) envelope.setHealth(value);
     else throw new ClientException("XTR-JAVA-ENVELOPE", "outgoing payload type is unsupported");
   }
 
@@ -320,7 +326,7 @@ public final class XtpSession implements AutoCloseable {
     }
   }
 
-  private static void closeQuietly(SSLSocket socket) {
+  private static void closeQuietly(Socket socket) {
     try {
       socket.close();
     } catch (IOException ignored) {

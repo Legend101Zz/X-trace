@@ -942,6 +942,30 @@ fn attach_keeps_existing_spring_target_alive_and_persists_real_request() {
     assert!(logical.windows(22).any(|bytes| bytes == b"OrderController.create"));
     assert_canaries_absent(&logical);
 
+    let listed = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["recording", "list", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("list attached recording through the read API");
+    assert!(listed.status.success(), "{}", diagnostic(&listed));
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("recording list");
+    let recordings = listed["recordings"].as_array().expect("recordings");
+    assert_eq!(recordings.len(), 1);
+    assert_eq!(recordings[0]["status"], "complete");
+    assert_eq!(recordings[0]["completion"], "complete");
+    let detail = recording_show_page(
+        &repo,
+        &data_home,
+        recordings[0]["recording_id"].as_str().expect("recording id"),
+        100,
+        None,
+    );
+    assert!(detail.status.success(), "{}", diagnostic(&detail));
+    let detail: Value = serde_json::from_slice(&detail.stdout).expect("attached detail");
+    assert_eq!(detail["status"], "complete");
+    assert_eq!(detail["completion"], "complete");
+
     // The Rust pack cache (`java-packs`, with its `.state` sidecar) and the Java helper's own
     // snapshot cache are siblings in the helper cache; the helper only lists its own directory,
     // so neither can break the other. The attach above ran with both present.
@@ -1311,7 +1335,26 @@ fn wait_for_recording_count(project_root: &Path, expected: i64) {
         if count >= expected {
             return;
         }
-        assert!(Instant::now() < deadline, "expected {expected} completed recordings, got {count}");
+        if Instant::now() >= deadline {
+            // Counts identify the persistence boundary without dumping captured request data.
+            let statuses = database
+                .prepare("SELECT status, COUNT(*) FROM recordings GROUP BY status ORDER BY status")
+                .expect("lifecycle status query")
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                .expect("lifecycle statuses")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("lifecycle counts");
+            let segments: i64 = database
+                .query_row("SELECT COUNT(*) FROM recording_segments", [], |row| row.get(0))
+                .expect("segment count");
+            let terminals: i64 = database
+                .query_row("SELECT COUNT(*) FROM recording_terminal_evidence", [], |row| row.get(0))
+                .expect("terminal evidence count");
+            panic!(
+                "expected {expected} completed recordings, got {count}; statuses={statuses:?}, \
+                 segments={segments}, terminals={terminals}"
+            );
+        }
         thread::sleep(Duration::from_millis(30));
     }
 }

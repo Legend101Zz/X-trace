@@ -722,12 +722,20 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   private void reportRejectedStarts() throws ClientException {
     long rejected = sink.rejectedStarts();
     if (rejected == reportedRejectedStarts) return;
-    session.send("java-rejected-starts:" + rejected, "", Health.newBuilder()
-        .setMonotonicNs(System.nanoTime())
-        .setQueueDepthBatches(queue.size())
-        .setResidentBytes(queue.bytes() + pendingEventBytes)
-        .setStatus("recording-starts-rejected=" + rejected)
-        .build());
+    try {
+      session.send("java-rejected-starts:" + rejected, "", Health.newBuilder()
+          .setMonotonicNs(System.nanoTime())
+          .setQueueDepthBatches(queue.size())
+          .setResidentBytes(queue.bytes() + pendingEventBytes)
+          .setStatus("recording-starts-rejected=" + rejected)
+          .build());
+    } catch (ClientException failure) {
+      if (!"XTR-JAVA-ENVELOPE".equals(failure.code())) throw failure;
+      // Local preflight rejection writes nothing and leaves the session usable. Health has no
+      // recording sequence: report the loss once for this count and let active streams finish.
+      System.err.println(
+          "{\"code\":\"XTR-JAVA-ENVELOPE\",\"message\":\"X-trace health payload was not sent; recording capture continues\"}");
+    }
     reportedRejectedStarts = rejected;
   }
 
