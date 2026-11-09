@@ -1,5 +1,5 @@
 # Cargo build artifacts and dependency caches are routed to the external SSD
-# via the environment variables documented in AGENTS.md. This .gitignore is
+# via the environment set up by tools/dev/env.sh (see tools/dev/README.md). This .gitignore is
 # intentionally minimal: it must only keep generated and local-state files out
 # of source control without masking anything the orchestrator needs to review.
 

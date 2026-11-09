@@ -1,53 +1,99 @@
-# X-trace implementation instructions
+# X-trace: agent instructions
 
-The approved product, architecture, program design, and vertical-slice plan under `docs/plans/x-trace/` are authoritative. Read all of them before changing code. If implementation evidence shows a contract is wrong, stop at that boundary and propose an ADR; do not silently redesign shared contracts.
+X-trace records what a Java/Spring or Node/Express backend actually did for each HTTP request, on the developer's
+machine, and replays it step by step (web viewer, TUI, CLI). It is local-first and read-only. Its core rule is
+honesty: it shows only what was observed and names every gap. Current state: `docs/STATE.md`. Doc map:
+`docs/INDEX.md`. How agents work on this repo (roles, merges, models): `docs/decisions/0012-agent-workforce-and-github-verification.md`.
 
-## Delivery discipline
+## Start here
 
-- Work only on the assigned slice and its acceptance criteria.
-- Prefer the smallest real end-to-end implementation over broad scaffolding.
-- A slice must exercise a real framework application through the packaged product path. Mocks alone do not complete a slice.
-- Do not change shared domain semantics, Protobuf/OpenAPI schemas, SQLite migrations, XTF format, redaction vocabulary, or replay navigation without explicit orchestrator review.
-- Use the agents the owner assigned for the current run (since 2026-10-04 an Opus 5.5 root with Sonnet 5.5 workers; see `docs/progress.md`) for implementation and review work when delegation is useful. The main orchestrator remains responsible for decomposition, architecture coherence, and independent review and testing.
-- Commit coherent changes on the assigned branch. Agents must not merge or push `main`; the orchestrator alone reviews, verifies, and may merge or push after the required approval.
-- Never include secrets, credentials, captured private data, or local absolute paths in source, fixtures, logs, snapshots, evidence, or commits.
+1. Read `docs/STATE.md` (current main, open work, known flakes). Do not read every plan; `docs/INDEX.md` says
+   which doc answers which question.
+2. Read the `AGENTS.md` in the area you change, if there is one (listed under "Map").
+3. Set up the environment once per shell: `source tools/dev/env.sh` (needs `XTRACE_DEV_CACHE` and
+   `XTRACE_DEV_SCRATCH`; see `tools/dev/README.md`).
 
-## Approval-gated phase workflow
+## Map
 
-Every phase follows this fixed boundary: `Phase -> Implement -> Review -> Verify -> Status -> user approval -> Next phase`.
+| Path | What | Area notes |
+|---|---|---|
+| `crates/` | Rust workspace (12 crates). `xtrace-domain` (pure types), `xtrace-application` (use cases), `xtrace-protocol` (generated XTP/XTF), `xtrace-ingest`, `xtrace-store` (SQLite + XTF segments), `xtrace-daemon` (loopback ingest + viewer API), `xtrace-cli` (the `xtrace` binary), `xtrace-runtime` (launch/attach/packs), `xtrace-private-storage`, `xtrace-tui`, `xtrace-export`, `xtrace-exercise` | `crates/xtrace-cli/AGENTS.md`, `crates/xtrace-store/AGENTS.md` |
+| `adapters/java/` | Gradle: JVM agent (bootstrap + runtime), attach helper, static analyzer, Spring fixture app | `adapters/java/AGENTS.md` |
+| `adapters/node/` | npm workspaces: Node loader/adapter, protocol codegen, analyzer | `adapters/node/AGENTS.md` |
+| `web/app/` | React 19 + TS + Vite viewer, embedded into the daemon | `web/app/AGENTS.md` |
+| `schema/` | Protobuf, OpenAPI (`schema/xtp-client/openapi.yaml`), fixtures incl. `schema/fixtures/replay/honesty-strings.json` | shared contract, see "Contracts" |
+| `tools/release/` | 23-gate floor runner, ledger checker, CI floor helper | `tools/release/AGENTS.md` |
+| `tools/qa/`, `campaigns/` | lane CI tooling; real-project campaigns (Petclinic, JHipster, Fineract, Directus, Medusa, Vendure) | |
+| `tools/dev/` | env, prep, fast checks, cache cleanup | `tools/dev/README.md` |
+| `evidence/v0.01/` | release ledger (`requirements.json`, 55 rows) and phase plan (`workflow.json`) | |
+| `docs/` | plans, ADRs (`docs/decisions/`), release spec, progress log | `docs/INDEX.md` |
 
-- The orchestrator defines a small, verifiable phase and its acceptance checks before implementation. Work may use multiple bounded agents for implementation, review, debugging, or architecture checks, but their output is untrusted until independently reviewed and tested by the orchestrator.
-- After review and verification, stop. The phase status report must enumerate: completed work; files or behavior changed; tests and verification run; issues or decisions; remaining work; and the exact next proposed phase.
-- Do not start, merge, push, schedule, or continue the next phase until the user explicitly approves that proposed next phase. No background automation may continue implementation across an approval boundary.
-- The user may explicitly authorize a bounded multi-phase autonomous batch as an exception to the per-phase approval stop. That authorization is approval only for the named batch scope and deadline; record it in the execution checkpoint before continuing. This does not waive any slice gate: each slice still requires its own implementation, independent review, verification, and merge decision before moving forward. Do not merge an unreviewed or unverified slice, exceed the authorized scope/deadline, or infer authorization from urgency or silence. Provide the user a consolidated review of the completed batch afterward.
+## Commands
 
-## Code quality
+Fast checks (local, offline, seconds to ~2 minutes). Run the ones for what you touched:
 
-- Keep dependency direction aligned with `02-architecture.md` and crate/package ownership in `03-program-design.md`.
-- Use descriptive names, small focused modules, typed errors, explicit invariants, and deterministic behavior.
-- Document public Rust items with useful rustdoc, public Java APIs with Javadoc, and exported TypeScript APIs with TSDoc where the contract is not obvious.
-- Developer comments must explain design intent, invariants, safety constraints, compatibility traps, or non-obvious tradeoffs. Do not narrate obvious syntax or leave generated comment noise.
-- Avoid speculative abstractions, placeholder implementations, dead code, and acceptance-path `TODO`s.
-- Tests accompany behavior and cover failure/privacy cases as well as the happy path.
-- Formatting, lint, build, and relevant test commands must pass with no ignored failures before handoff.
-
-## Storage and caches
-
-Keep large build/cache data on the external SSD whenever the tool allows it. Point every cache at one cache root on that drive, written here as `<CACHE>`. The real path is machine-specific: set it locally and never commit it.
-
-```text
-CARGO_HOME=<CACHE>/cargo
-CARGO_TARGET_DIR=<CACHE>/cargo-target
-GRADLE_USER_HOME=<CACHE>/gradle
-XDG_CACHE_HOME=<CACHE>/xdg
-PNPM_HOME=<CACHE>/pnpm
-NPM_CONFIG_CACHE=<CACHE>/npm
+```bash
+tools/dev/check.sh rust:<crate>            # cargo check + lib unit tests + clippy -D warnings for one crate
+tools/dev/check.sh rust:<crate>:<test>     # one integration test binary
+tools/dev/check.sh java[:<module>]         # Gradle tests (offline, strict dependency verification)
+tools/dev/check.sh node                    # generate:check + node tests
+tools/dev/check.sh web[:<file>]            # typecheck + vitest (one file if given)
+tools/dev/check.sh py:<module>             # python3 -B -m unittest <module>
+tools/dev/check.sh fmt                     # cargo fmt --check
+tools/dev/check.sh diff                    # whitespace / end-of-file check (CI gate 23)
 ```
 
-Release-gate builds run through `tools/release/leased_run.py`, which admits a private root only on a volume with ownership enabled; a `noowners` mount is refused.
+Heavy suites run on GitHub Actions only (ADR 0012): the full workspace tests, CLI journey tests that need built
+adapters, the 23-gate floors, packaging, campaigns and browser runs. Read CI with
+`gh -R Legend101Zz/X-trace run view <id> --log-failed`. `tools/dev/prep.sh` (fetch dependencies, build adapters)
+needs the network and runs outside any agent sandbox.
 
-Do not commit caches, generated build output, or owner-specific absolute paths.
+## Traps (each one has cost a past run real time)
 
-## Reference posture
+- **Test scratch must be private.** Tests that run `xtrace init` need `TMPDIR` and `XTRACE_TEST_PRIVATE_SCRATCH`
+  set to owner-only (0700) dirs on a volume with ownership enabled, with a short path. A `noowners` volume or `/tmp`
+  gives admission errors that look like product bugs. `tools/dev/env.sh` sets this up. Never set them by hand.
+- **CLI integration tests need built adapters.** 10 of 16 `crates/xtrace-cli/tests/*.rs` binaries use the built
+  Java agent/fixture, the Node packages and Playwright Chromium. A bare `cargo test --workspace` on a fresh
+  checkout fails. Leave those to CI unless `tools/dev/prep.sh --adapters` has run.
+- **Generated and embedded files change together.** OpenAPI → `web/app/src/api.generated.ts` (`npm run
+  check:api`); Protobuf → `adapters/node/packages/protocol/src/gen` (`npm run generate:check`); web app →
+  `crates/xtrace-daemon/assets/ui/` (`npm run embed`, `check:embedded`). Never hand-edit generated files.
+- **Honesty rules are product law** (ADR 0003 §7). An "active line" exists only from a recorded line event; a
+  method's line range is never shown as one. Absence is "not observed", never "did not run". No invented timing,
+  values or parent links. Partial never looks complete. UI copy comes from `honesty-strings.json`.
+- **No trailing whitespace and no blank lines at the end of a file**; end every file with a newline. CI gate 23
+  runs `git diff --check`.
+- **Big files.** `crates/xtrace-store/src/recording_store.rs` (7.7k lines), `tools/release/test_release_tools.py`
+  (5.9k), `tools/release/run_gates.py` (2.6k). Read the part you need (grep first). Do not reformat them.
+- **Known nondeterministic tests** are listed in `docs/STATE.md`. If one fails on your change, say so; never
+  retry until green, and never mark a re-run green as clean.
 
-Use the primary references and repositories listed in `02-architecture.md`. Learn from their boundaries, compatibility practices, and tests. Copy code only when license compatibility and attribution are explicitly verified; architectural inspiration is not permission to copy.
+## Rules
+
+- **Never weaken a test, gate, budget, timeout or CI job**: no deleting or loosening assertions, `#[ignore]`,
+  `test.skip`, quarantines, retries or raised deadlines. A skipped or unreached step is never a pass. If a task needs
+  any of that, stop and report it as infeasible.
+- **Real evidence**: a feature is done only when a real framework application runs through the packaged product
+  path; mocks and fakes alone never complete it. Tests cover failure and privacy cases, not only the happy path.
+- **Contracts**: Protobuf/OpenAPI schemas, SQLite migrations, the XTF format, the redaction vocabulary and replay
+  navigation change only in a ticket that says so, with an ADR when semantics change.
+- **Git**: work in your own worktree and branch. Workers do not commit, push or merge; the orchestrator reviews,
+  commits and opens the pull request. Every change reaches `main` through a PR whose required check `ci-ok` is
+  green on the exact head, with current `main` merged in (ADR 0012 §5). No closing keywords (`fixes #N`,
+  `closes #N`) in commits, PR titles or PR bodies.
+- **Forbidden commands**: `pkill`, `killall`, kill by pattern, `kill $(pgrep ...)`, `sudo`, `diskutil`,
+  `docker ... prune`, `rm -rf` outside your worktree or the dev cache. Signal only PIDs you started.
+- **Public repository**: never commit secrets, captured values, owner-specific absolute paths or raw logs.
+- **Code quality**: keep the dependency direction in `docs/plans/x-trace/02-architecture.md`; small focused
+  modules, typed errors, explicit invariants, deterministic tests (no sleeps to synchronize; wait for an observable
+  signal). Document public items where the contract is not obvious. No placeholder implementations or dead code.
+  Comments explain intent, invariants and traps, not syntax.
+- **Licenses**: learn from reference projects, but copy code only after checking license compatibility and
+  recording attribution.
+
+## Definition of done (for a ticket)
+
+The ticket's acceptance criteria are met; the fast checks for every touched area pass; generated and embedded
+files are regenerated; `tools/dev/check.sh diff` is clean; your report lists every command you ran with its real
+result. CI on the pull request is the final verdict.

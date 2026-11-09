@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 authors.workspace = true
-description = "Export formats and bundles (lane W). Skeleton created by C0."
+description = "OpenAPI 3.1, Postman Collection 2.1, cURL and developer-bundle exports from a read catalog view."
 
 [lints]
 workspace = true

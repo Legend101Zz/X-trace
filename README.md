@@ -10,7 +10,7 @@ including Node HTTP and Express capture, attach to a running JVM, `scan` and
 `export`, `exercise`, `retention`, `store` and `doctor --bundle` are still
 stubs (exit 9). None of it is a support claim: 0 of 55 v0.01 requirement rows
 are accepted. The paragraphs below describe the original Slice 1 tracer
-bullet. Current status: `docs/progress.md`; release specification:
+bullet. Current status: `docs/STATE.md`; release specification:
 `docs/releases/v0.01.md`.
 
 The Node 22 workspace under `adapters/node` is a protocol/conformance
@@ -44,6 +44,10 @@ Java compatibility.
 | `xtrace-private-storage` | Leaf crate: owner-enforced private directory admission (no X-trace deps) |
 | `xtrace-runtime`    | Runtime launch validation, agent injection, and process supervision    |
 | `xtrace-cli`        | Clap subcommands, project composition, output and path resolution       |
+| `xtrace-ingest`     | Recording assembler: per-recording sequence, lifecycle and idempotency checks |
+| `xtrace-tui`        | Terminal viewer library: pure update loop and a text-grid renderer      |
+| `xtrace-export`     | OpenAPI, Postman, cURL and bundle exports from a read catalog view      |
+| `xtrace-exercise`   | Exercise plans and previews (no networking yet)                         |
 
 Dependency direction follows `docs/plans/x-trace/02-architecture.md`:
 
@@ -211,7 +215,9 @@ against `schema/xtp-client/openapi.yaml`.
 
 `just test` and `just ci` prepare both language workspaces before Rust tests,
 so their daemon integration tests do not depend on ignored build output from
-another job or checkout.
+another job or checkout. Without `just`, `tools/dev/prep.sh --adapters` does
+the same preparation; `tools/dev/README.md` describes the agent-friendly
+environment and fast checks.
 
 The status report on an uninitialized repository is a single JSON document
 that names no projects and reports `initialized: false` without touching

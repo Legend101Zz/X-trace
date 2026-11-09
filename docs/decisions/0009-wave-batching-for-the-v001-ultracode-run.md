@@ -1,6 +1,7 @@
 # ADR 0009: Wave batching for the v0.01 unattended run
 
 - Status: Accepted (owner authorization, 2026-10-09, for one run only); extended to a second batch by the 2026-10-10 addendum below
+- Amended by: ADR 0012 (2026-11-09): merge rules scaled to risk; the leased macOS floor is no longer a merge requirement.
 - Date: 2026-10-09
 - Amends: ADR 0006 (v0.01 integration and acceptance mechanics), for the
   duration of one owner-authorized unattended batch. Outside that batch,
