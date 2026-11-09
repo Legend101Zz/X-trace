@@ -684,17 +684,13 @@ impl SqliteRecordingStore<'_> {
             let recording_id = recording_id_from_bytes(&raw_id, correlation_id)?;
             let completion =
                 completion_evidence(&connection, recording_id, &status, correlation_id)?;
-            let mut incomplete_evidence = match lifecycle_status {
+            let incomplete_evidence = match lifecycle_status {
                 RecordingStatus::Partial | RecordingStatus::Invalid => {
                     vec![format!("persisted_status:{status}")]
                 }
                 _ => Vec::new(),
             };
-            incomplete_evidence.push(session_rejection_evidence(
-                &connection,
-                recording_id,
-                correlation_id,
-            )?);
+            let session_context = session_context(&connection, recording_id, correlation_id)?;
             // A corrupt terminal row is already reported through `completion`
             // and `incomplete_evidence`; list metadata then stays null.
             let terminal =
@@ -723,6 +719,7 @@ impl SqliteRecordingStore<'_> {
                     .transpose()?
                     .map(|value| value.to_string()),
                 incomplete_evidence,
+                session_context,
                 event_cap: terminal
                     .as_ref()
                     .and_then(|finish| u32::try_from(finish.event_cap).ok()),
@@ -926,11 +923,7 @@ impl SqliteRecordingStore<'_> {
         if status == "partial" || status == "invalid" {
             incomplete_evidence.push(format!("persisted_status:{status}"));
         }
-        incomplete_evidence.push(session_rejection_evidence(
-            &connection,
-            request.recording_id,
-            correlation_id,
-        )?);
+        let session_context = session_context(&connection, request.recording_id, correlation_id)?;
         // A Partial that carries a real-looking digest but no capacity drops was sealed
         // without hashing because its declared bytes passed the verification bound; say so
         // instead of leaving the cause silent.
@@ -1291,6 +1284,7 @@ impl SqliteRecordingStore<'_> {
             events,
             has_more,
             incomplete_evidence,
+            session_context,
             // CONTRACTS 5: no terminal evidence reads `null`; terminal evidence without an
             // adapter outcome (every pre-outcome row) reads `unobserved`, never `responded`.
             outcome: terminal_finish.as_ref().map(|finish| {
@@ -5346,12 +5340,12 @@ fn validate_operation_has_observation(
     if found_link { Ok(()) } else { Err(endpoint_identity_corrupt(correlation_id)) }
 }
 
-fn session_rejection_evidence(
+fn session_context(
     connection: &rusqlite::Connection,
     recording_id: RecordingId,
     correlation_id: CorrelationId,
-) -> Result<String, RecordingStoreError> {
-    crate::session_health::recording_evidence(connection, recording_id).map_err(|error| {
+) -> Result<xtrace_application::recording_queries::SessionContext, RecordingStoreError> {
+    crate::session_health::recording_context(connection, recording_id).map_err(|error| {
         map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
     })
 }
@@ -5390,13 +5384,13 @@ fn recording_metadata_from_row(
     let lifecycle_status = recording_status(&status, correlation_id)?;
     let recording_id = observed_recording_id_from_bytes(&raw_id, correlation_id)?;
     let completion = completion_evidence(connection, recording_id, &status, correlation_id)?;
-    let mut incomplete_evidence = match lifecycle_status {
+    let incomplete_evidence = match lifecycle_status {
         RecordingStatus::Partial | RecordingStatus::Invalid => {
             vec![format!("persisted_status:{status}")]
         }
         _ => Vec::new(),
     };
-    incomplete_evidence.push(session_rejection_evidence(connection, recording_id, correlation_id)?);
+    let session_context = session_context(connection, recording_id, correlation_id)?;
     Ok(RecordingMetadata {
         recording_id,
         status: lifecycle_status,
@@ -5419,6 +5413,7 @@ fn recording_metadata_from_row(
             .transpose()?
             .map(|value| value.to_string()),
         incomplete_evidence,
+        session_context,
         event_cap: None,
         outcome_kind: None,
     })

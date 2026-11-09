@@ -1144,16 +1144,9 @@ mod tests {
                 .as_object()
                 .is_some_and(|fields| fields.contains_key("path"))
         }));
-        assert_eq!(
-            detail.incomplete_evidence,
-            [
-                "persisted_status:partial".to_owned(),
-                format!(
-                    "Agent capacity rejections: not observed (session {})",
-                    first.runtime_session_id
-                ),
-            ]
-        );
+        assert_eq!(detail.incomplete_evidence, ["persisted_status:partial"]);
+        assert_eq!(detail.session_context.runtime_session_id, first.runtime_session_id);
+        assert_eq!(detail.session_context.rejected_requests, None);
         let next_cursor = detail.next_cursor.clone().expect("bounded next window cursor");
         let rendered = serde_json::to_string(&detail).expect("render detail");
         assert!(!rendered.contains("VALUE_CANARY_RECORDING_READ"));
