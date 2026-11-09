@@ -33,6 +33,17 @@ ROUTES = frozenset(("/", "/owners", "/owners/find", "/owners/new", "/owners/{own
                     "/owners/{ownerId}/pets/{petId}/visits/new", "/vets", "/vets.html", "/oups"))
 KINDS = frozenset("unspecified request_update frame_enter frame_exit frame_throw line_cursor value_snapshot "
                   "database_start database_end outbound_http_start outbound_http_end async_link exception response gap".split())
+GAP_REASONS = frozenset("unspecified line_budget value_budget throttle queue_full correlation_lost class_not_transformed "
+                        "module_loaded_before_arm source_map_absent handled_exception_unobserved "
+                        "child_process_not_instrumented bootstrap_consumed".split())
+GAP_CODES = {"xtrace.capture.gap": "queue", "xtrace.capture.gap.recording-cap": "event_cap",
+             "xtrace.capture.gap.not-transformed": "untransformed",
+             "xtrace.capture.gap.writer-memory": "memory", "xtrace.capture.gap.recording-admission": "admission",
+             "xtrace.capture.gap.frame-limit": "frame_limit",
+             "xtrace.capture.gap.frame-limit.started": "start_frame_limit",
+             "xtrace.capture.gap.frame-limit.finished": "finish_frame_limit",
+             "xtrace.capture.gap.line-budget": "line_budget",
+             "xtrace.capture.handler_unresolved": "handler_unresolved"}
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 JAVA_SYMBOL = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.(?:[A-Za-z_$][\w$]*|<init>|<clinit>)", re.ASCII)
 # These prefixes classify layers only; they never authenticate symbol text.
@@ -46,7 +57,7 @@ REQUEST = re.compile(r"http\.request (?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) 
 RESPONSE = re.compile(r"http\.response (?:[1-5][0-9]{2}|unavailable)")
 
 FLOW_SOURCES = {
-    "record-stop-flow": ("api-record-stop",),
+    "record-stop-flow": ("api-record-stop", "api-live-record-stop/1", "api-live-record-stop/2", "api-live-record-stop/3"),
     "restart-reopen": ("api-after-restart", "api-before-restart"),
     "partial-recording-reopen": ("api-partial",),
     "active-line-frames": ("api-focused",), "frame-values": ("api-focused",),
@@ -81,6 +92,26 @@ def number(value, low=0, high=(1 << 64) - 1):
 
 def identifier(value):
     return value if isinstance(value, str) and UUID.fullmatch(value) else None
+
+
+def decimal(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9]{1,20}", value) and int(value) < 1 << 64 else None
+
+
+def drop_counts(value):
+    if not isinstance(value, dict):
+        return None
+    return {key: decimal(count) for key, count in value.items()
+            if isinstance(key, str) and re.fullmatch(r"[0-9]{1,3}", key) and int(key) <= 255}
+
+
+def incomplete(value):
+    """Only store-generated tokens, never arbitrary producer or exception text."""
+    if not isinstance(value, list):
+        return None
+    pattern = r"(?:persisted_status:(?:recording|finalizing|partial|invalid)|gap_event_sequence:[0-9]{1,20}|" \
+              r"durable_tail_pending:[0-9]{1,20}\.\.[0-9]{1,20}|verification_budget_exceeded)"
+    return [item if isinstance(item, str) and re.fullmatch(pattern, item) else None for item in value[:32]]
 
 
 def event_kind(value):
@@ -141,9 +172,21 @@ def recording(doc: dict) -> dict:
                          "frameId": identifier(event.get("frameId")),
                          "parentFrameId": identifier(event.get("parentFrameId")), "symbol": symbol,
                          "line": number(event.get("line"), 1, (1 << 32) - 1) if kind == "line_cursor" else None})
+            if kind == "gap":
+                gap = event.get("gap")
+                gap = gap if isinstance(gap, dict) else {}
+                rows[-1]["gap"] = {"reason": enum(gap.get("reason"), GAP_REASONS),
+                                   **{key: decimal(gap.get(key)) for key in ("count", "firstSequence", "lastSequence")}}
+                raw_symbol = event.get("symbol")
+                rows[-1]["captureGapCode"] = GAP_CODES.get(raw_symbol) if isinstance(raw_symbol, str) else None
     return {"recordingId": identifier(doc.get("recordingId")),
             "status": enum(doc.get("status"), ("recording", "finalizing", "complete", "partial", "invalid")),
             "completion": enum(doc.get("completion"), ("complete", "partial", "invalid", "unavailable")),
+            "durationNs": decimal(doc.get("durationNs")),
+            "dropCountsByPriority": drop_counts(doc.get("dropCountsByPriority")),
+            "incompleteEvidence": incomplete(doc.get("incompleteEvidence")),
+            "incompleteEvidenceOmitted": max(0, len(doc["incompleteEvidence"]) - 32)
+                if isinstance(doc.get("incompleteEvidence"), list) else 0,
             "routeTemplate": route,
             "outcome": {"kind": enum(outcome.get("kind"), ("responded", "exception_propagated", "client_aborted", "unobserved")),
                         "httpStatus": number(outcome.get("httpStatus"), 100, 599)},
@@ -157,7 +200,46 @@ def encoded(doc: dict) -> bytes:
     return (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def skeleton(step: str, roots: list[pathlib.Path], needles: list[bytes], excluded: frozenset[str] = frozenset()) -> dict:
+def proxy_diagnostics(path: pathlib.Path, needles: list[bytes]) -> dict:
+    """Session metadata only: these rows do not attribute a call to a recording."""
+    rows = []
+    result = {"scope": "session metadata; no per-request attribution", "rows": rows, "available": False,
+              "inputTruncated": False, "rowsOmitted": 0, "producerMayBeCapped": False}
+    if path.is_symlink() or any(p.is_symlink() for p in path.parents):
+        return result
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_INPUT_BYTES + 1)
+    except OSError:
+        return result
+    result["available"] = True
+    result["inputTruncated"] = len(raw) > MAX_INPUT_BYTES
+    observed = 0
+    for line in raw[:MAX_INPUT_BYTES].splitlines():
+        if not line.startswith(b'{"code":"XTR-JAVA-PROXY-DIAGNOSTIC",') or len(line) > 1024:
+            continue
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        observed += 1
+        row = {"result": enum(doc.get("result"), ("transformed", "transform_failed", "resolved", "no_declaration", "resolution_failed"))}
+        for key in ("proxyHash", "invocationHash", "declarationHash"):
+            value = doc.get(key)
+            row[key] = value if isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value) else None
+        # Apply the same canary needles even to hashes and fixed labels.
+        if any(n in encoded(row) for n in needles):
+            continue
+        if len(rows) < 128:
+            rows.append(row)
+        else:
+            result["rowsOmitted"] += 1
+    result["producerMayBeCapped"] = observed >= 128
+    return result
+
+
+def skeleton(step: str, roots: list[pathlib.Path], needles: list[bytes], excluded: frozenset[str] = frozenset(),
+             proxy: dict | None = None) -> dict:
     """Keep all event-kind counts even when event rows hit the output cap.
 
     Repeated ids in different snapshots are retained: a before/after comparison
@@ -170,6 +252,8 @@ def skeleton(step: str, roots: list[pathlib.Path], needles: list[bytes], exclude
                          "events": MAX_EVENTS, "eventsPerRecording": MAX_EVENTS_PER_RECORDING},
               "recordings": [], "filesUnreadable": 0, "inputTruncated": False,
               "recordingsOmitted": 0, "stringsWithheld": 0, "evidenceAvailable": False}
+    if proxy is not None:
+        result["proxyDiagnostics"] = proxy
     remaining = MAX_EVENTS
     files_seen = 0
     for snapshot, root in enumerate(roots):
@@ -216,13 +300,18 @@ def skeleton(step: str, roots: list[pathlib.Path], needles: list[bytes], exclude
     # every admitted recording before discarding event rows from the tail.
     while len(encoded(result)) > MAX_BYTES:
         row = next((r for r in reversed(result["recordings"]) if r["events"]), None)
-        if row is None:
+        if row is not None:
+            row["events"].pop()
+            row["eventsOmitted"] += 1
+        elif result["recordings"]:
             result["recordings"].pop()
             result["recordingsOmitted"] += 1
             result["evidenceAvailable"] = bool(result["recordings"])
+        elif proxy is not None and proxy["rows"]:
+            proxy["rows"].pop()
+            proxy["rowsOmitted"] += 1
         else:
-            row["events"].pop()
-            row["eventsOmitted"] += 1
+            raise ValueError("diagnostic envelope exceeds byte cap")
     return result
 
 
@@ -243,7 +332,8 @@ def write_failures(summary: pathlib.Path, instrumented: pathlib.Path, flows: pat
         elif step in INSTRUMENTED_STEPS:
             before = instrumented / "boundary-before"
         excluded = frozenset(p.stem.removeprefix("recording-") for p in before.glob("recording-*.json")) if before else frozenset()
-        report = skeleton(step, roots, needles, excluded)
+        proxy = proxy_diagnostics(instrumented / "application.log", needles) if step in INSTRUMENTED_STEPS else None
+        report = skeleton(step, roots, needles, excluded, proxy)
         if len(encoded(report)) > MAX_BYTES:
             raise ValueError("diagnostic size cap exceeded")
         (out / f"{step}.json").write_bytes(encoded(report))

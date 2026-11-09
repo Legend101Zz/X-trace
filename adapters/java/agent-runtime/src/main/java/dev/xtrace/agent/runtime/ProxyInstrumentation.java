@@ -58,9 +58,16 @@ final class ProxyInstrumentation {
     }
 
     @Override
+    public void onTransformation(TypeDescription type, ClassLoader loader, JavaModule module,
+        boolean loaded, net.bytebuddy.dynamic.DynamicType dynamicType) {
+      ProxyDiagnostics.report(type.getName(), null, null, "transformed");
+    }
+
+    @Override
     public void onError(String name, ClassLoader loader, JavaModule module,
         boolean loaded, Throwable error) {
       if (!PROXY_NAME.matcher(name).matches()) return;
+      ProxyDiagnostics.report(name, null, null, "transform_failed");
       try {
         onFailure.accept(error);
       } catch (RuntimeException | LinkageError ignored) {

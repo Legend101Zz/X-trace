@@ -45,6 +45,75 @@ def summary(path, failed=()):
 
 
 class Projection(unittest.TestCase):
+    def test_proxy_diagnostics_copy_only_hashes_and_fixed_codes_from_application_log(self):
+        row = {"code": "XTR-JAVA-PROXY-DIAGNOSTIC", "proxyHash": "sha256:" + "a" * 64,
+               "invocationHash": "sha256:" + "b" * 64, "declarationHash": "private symbol", "result": "resolved",
+               "arguments": "private values", "exception": "private exception"}
+        with tempfile.TemporaryDirectory() as td:
+            path = pathlib.Path(td) / "application.log"
+            path.write_bytes(b"private application text\n" + cd.encoded(row) +
+                             (json.dumps(row, separators=(",", ":")) + "\n").encode() * 2)
+            # Only code-first runtime rows are read; unrelated application JSON is ignored.
+            doc = cd.proxy_diagnostics(path, [])
+            self.assertTrue(doc["available"])
+            self.assertEqual(len(doc["rows"]), 2)
+            self.assertEqual(doc["rows"][0], {"proxyHash": row["proxyHash"], "invocationHash": row["invocationHash"],
+                                             "declarationHash": None, "result": "resolved"})
+            self.assertNotIn("private", json.dumps(doc))
+            self.assertEqual(cd.proxy_diagnostics(path, [b"a" * 32])["rows"], [])
+            path.write_bytes((json.dumps(row, separators=(",", ":")) + "\n").encode() * 130)
+            doc = cd.proxy_diagnostics(path, [])
+            self.assertEqual(len(doc["rows"]), 128)
+            self.assertEqual(doc["rowsOmitted"], 2)
+            self.assertTrue(doc["producerMayBeCapped"])
+            with mock.patch.object(cd, "MAX_BYTES", 3000):
+                bounded = cd.skeleton("recordings-per-scenario", [], [], proxy=doc)
+            self.assertLessEqual(len(cd.encoded(bounded)), 3000)
+            self.assertGreater(bounded["proxyDiagnostics"]["rowsOmitted"], 2)
+            link = pathlib.Path(td) / "link.log"
+            link.symlink_to(path)
+            self.assertFalse(cd.proxy_diagnostics(link, [])["available"])
+
+    def test_loss_mechanisms_are_distinguished_without_publishing_values(self):
+        for symbol, code, reason in (
+            ("xtrace.capture.gap.not-transformed", "untransformed", "class_not_transformed"),
+            ("xtrace.capture.gap.recording-cap", "event_cap", "throttle"),
+            ("xtrace.capture.gap.writer-memory", "memory", "throttle"),
+            ("xtrace.capture.gap.recording-admission", "admission", "throttle"),
+            ("xtrace.capture.gap.frame-limit", "frame_limit", "throttle"),
+            ("xtrace.capture.gap", "queue", "queue_full"),
+        ):
+            doc = {"durationNs": "123", "dropCountsByPriority": {"1": "5"},
+                   "incompleteEvidence": ["persisted_status:partial", "gap_event_sequence:45"],
+                   "events": [{"kind": "gap", "symbol": symbol,
+                               "gap": {"reason": reason, "count": "5", "firstSequence": "44", "lastSequence": "46",
+                                       "message": "private value"}}]}
+            with self.subTest(code=code):
+                row = cd.recording(doc)
+                self.assertEqual(row["events"][0]["captureGapCode"], code)
+                self.assertEqual(row["events"][0]["gap"], {"reason": reason, "count": "5", "firstSequence": "44", "lastSequence": "46"})
+                self.assertEqual(row["durationNs"], "123")
+                self.assertEqual(row["dropCountsByPriority"], {"1": "5"})
+                self.assertEqual(row["incompleteEvidence"], doc["incompleteEvidence"])
+                self.assertNotIn("private", json.dumps(row))
+
+    def test_loss_diagnostics_reject_arbitrary_text_types_and_unbounded_numbers(self):
+        row = cd.recording({"durationNs": 123, "dropCountsByPriority": {"secret": "2", "256": "2", "1": "private"},
+                            "incompleteEvidence": ["private exception", "persisted_status:complete"] + ["gap_event_sequence:2"] * 40,
+                            "events": [{"kind": "gap", "symbol": "private value",
+                                        "gap": {"reason": "private reason", "count": str(1 << 64),
+                                                "firstSequence": True, "lastSequence": "private"}}]})
+        self.assertIsNone(row["durationNs"])
+        self.assertEqual(row["dropCountsByPriority"], {"1": None})
+        self.assertEqual(row["incompleteEvidence"][:2], [None, None])
+        self.assertEqual(len(row["incompleteEvidence"]), 32)
+        self.assertEqual(row["incompleteEvidenceOmitted"], 10)
+        self.assertEqual(row["events"][0]["gap"], dict.fromkeys(("reason", "count", "firstSequence", "lastSequence")))
+        self.assertIsNone(row["events"][0]["captureGapCode"])
+        self.assertNotIn("private", json.dumps(row))
+        self.assertIsNone(cd.recording({})["incompleteEvidence"])
+        self.assertIsNone(cd.recording({})["dropCountsByPriority"])
+
     def test_only_structure_is_copied_and_a_method_extent_is_never_a_line(self):
         doc = detail()
         doc.update({"headers": {"Authorization": "private header text"}, "body": "private body text"})

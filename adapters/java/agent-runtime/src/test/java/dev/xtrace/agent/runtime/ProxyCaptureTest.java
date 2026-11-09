@@ -27,6 +27,8 @@ class ProxyCaptureTest {
     ProbeResult result = runProbe();
     assertEquals(0, result.exitCode(), result.text());
     assertTrue(result.text().contains("proxy-capture-cases=18"), result.text());
+    assertTrue(result.text().contains("\"result\":\"transformed\""), result.text());
+    assertTrue(result.text().contains("\"result\":\"resolved\""), result.text());
   }
 
   @Test
@@ -93,6 +95,7 @@ class ProxyCaptureTest {
         Path.of(System.getProperty("java.home"), "bin", "java").toString(),
         "-Xverify:all", "-Xbootclasspath/a:" + bridge, "-javaagent:" + agent,
         "-Dxtrace.proxy.probe.attach=" + attach,
+        "-Dxtrace.agent.recordingDiagnostics=true",
         "-cp", System.getProperty("java.class.path"), ProxyCaptureProbe.class.getName()));
     command.addAll(List.of(arguments));
     Process process = new ProcessBuilder(command)

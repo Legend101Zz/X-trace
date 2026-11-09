@@ -47,7 +47,8 @@ def make_stack(run_id: str) -> xcamp.Stack:
         app_args=["--server.port={APPPORT}", "--server.address={BINDADDR}"],
         env={"SPRING_PROFILES_ACTIVE": "postgres", "POSTGRES_URL": "jdbc:postgresql://{DBHOST}:{DBPORT}/petclinic",
              "POSTGRES_USER": "petclinic", "POSTGRES_PASS": "petclinic"},
-        java_opts=["-Xmx768m"], db_name="petclinic", db_user="petclinic", db_password="petclinic",
+        java_opts=["-Xmx768m", "-Dxtrace.agent.recordingDiagnostics=true"],
+        db_name="petclinic", db_user="petclinic", db_password="petclinic",
         ready_path="/actuator/health", ready_ok=lambda st, body: st == 200 and '"UP"' in body)
 
 
@@ -189,6 +190,7 @@ def baseline(out):
 # Petclinic has no service layer: its controllers call Spring Data repositories directly, so no `service` frame is required.
 # Proxy symbols name the method's actual declaring interface, including inherited CRUD methods.
 CRUD = "org.springframework.data.repository.CrudRepository"
+JPA = "org.springframework.data.jpa.repository.JpaRepository"
 OWN = {"controller": "OwnerController", "repository": ["OwnerRepository", CRUD]}
 EXPECT = {
     "search-seeded": [
@@ -202,7 +204,8 @@ EXPECT = {
         {"method": "POST", "route": "/owners/new", "status": 200, "layers": ["controller"], "layerHints": OWN}],
     "pet-and-visit-flow": [
         {"method": "POST", "route": "/owners/{ownerId}/pets/new", "statuses": [302, 200], "layers": ["controller", "repository"],
-         "layerHints": {"controller": "PetController", "repository": OWN["repository"]}},
+         # The successful submission calls the inherited saveAndFlush declaration.
+         "layerHints": {"controller": "PetController", "repository": [*OWN["repository"], JPA]}},
         {"method": "POST", "route": "/owners/{ownerId}/pets/{petId}/visits/new", "statuses": [200, 302], "layers": ["controller", "repository"],
          "layerHints": {"controller": "VisitController", "repository": OWN["repository"]}}],
     "owner-edit": [

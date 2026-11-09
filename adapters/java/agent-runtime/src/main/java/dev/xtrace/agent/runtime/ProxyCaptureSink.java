@@ -53,10 +53,17 @@ final class ProxyCaptureSink implements ProxyBridge.Sink {
       known = cache.get(method);
       if (known != null) return known.orElse(null);
       if (cache.size() >= 1024) return null;
-      Method found = find(proxy.getClass(), method);
-      ProxyBridge.Call call = found == null ? null : boundary(found);
-      cache.put(method, Optional.ofNullable(call));
-      return call;
+      try {
+        Method found = find(proxy.getClass(), method);
+        ProxyBridge.Call call = found == null ? null : boundary(found);
+        ProxyDiagnostics.resolution(proxy.getClass(), method, call == null ? null : call.symbol(),
+            call == null ? "no_declaration" : "resolved");
+        cache.put(method, Optional.ofNullable(call));
+        return call;
+      } catch (RuntimeException | LinkageError failure) {
+        ProxyDiagnostics.resolution(proxy.getClass(), method, null, "resolution_failed");
+        throw failure;
+      }
     }
   }
 

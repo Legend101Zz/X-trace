@@ -25,6 +25,7 @@ The judge_* functions are pure and unit-tested (test_xflows.py); the run_* funct
 from __future__ import annotations
 
 import json
+from contextlib import ExitStack
 import os
 import pathlib
 import secrets
@@ -430,10 +431,13 @@ def wait_canary_recording(client: xinstr.ViewerClient, out_dir: pathlib.Path, be
                 raise CanaryEvidenceError("canary request recording is ambiguous")
             if len(hits) == 1:
                 rid, detail = next(iter(hits.items()))
-                if completion_of(detail) == "complete" and xinstr.recording_http_status(detail) == 200 \
+                # Completion describes the persisted prefix too. An open recording has no
+                # terminal proof yet; only lifecycle status says when waiting must stop.
+                pending = detail.get("status") in ("recording", "finalizing")
+                if not pending and completion_of(detail) == "complete" and xinstr.recording_http_status(detail) == 200 \
                         and time.monotonic() <= deadline:
                     return rid, api["details"]
-                if completion_of(detail) in ("partial", "invalid", "unavailable"):
+                if not pending and completion_of(detail) in ("partial", "invalid", "unavailable"):
                     raise CanaryEvidenceError("canary request recording is not complete")
     finally:
         client.deadline = None
@@ -488,6 +492,27 @@ class Flows:
         return rc, doc, str(find_key(doc, "bootstrap_path") or "")
 
     # -- flow A --
+    def _recorded_gets(self, stack: Any, paths: list[str], wanted: list[tuple[str, str]]) -> dict[str, int | None]:
+        """Observe capture before stop, within each HTTP request's existing 30 s budget."""
+        import xcamp
+        dest = self.out_dir / "api-live-record-stop"
+        dest.mkdir(parents=True, exist_ok=True)
+        viewer, ready = xinstr.start_viewer(self.xtrace, self.project_dir, self.env, dest / "viewer.log")
+        try:
+            client = xinstr.ViewerClient(ready["origin"])
+            client.exchange(xinstr.bootstrap_token(ready["url"]))
+            initial = xinstr.collect_api(client, dest / "before")
+            if not initial["ok"]:
+                raise CanaryEvidenceError("cannot snapshot recordings before record-stop requests")
+            before, served = initial["details"], {}
+            for path, (method, route) in zip(paths, wanted, strict=True):
+                deadline = time.monotonic() + 30.0
+                served[path] = xcamp.http_request(stack.base, method, path, timeout=30)["status"]
+                _, before = wait_canary_recording(client, dest / str(len(served)), before, method, route, deadline)
+            return served
+        finally:
+            xinstr.stop_process_group(viewer)
+
     def record_stop(self) -> dict[str, tuple[str, int]]:
         paths = ["/owners?lastName=Davis", "/vets", "/owners/1"]
         wanted = [("GET", "/owners"), ("GET", "/vets"), ("GET", "/owners/{ownerId}")]
@@ -504,7 +529,7 @@ class Flows:
             if rc == 0 and bootstrap:
                 stack = self._stack("", [f"-javaagent:{self.agent}={bootstrap}"])
                 stack.up()
-                served = _paced_gets(stack.base, paths)
+                served = self._recorded_gets(stack, paths, wanted)
                 pid = find_key(doc, "pid")
                 stop_rc, _, _ = self._record("stop", timeout=90)
                 gone = isinstance(pid, int) and wait_gone(pid)
@@ -546,6 +571,7 @@ class Flows:
         before_ids = set(api0["details"])
         rc, doc, bootstrap = self._record()
         stack, sock = None, None
+        barriers = ExitStack()
         stop_rc, stop_doc = None, None
         stalled_id = None
         observation_error = None
@@ -554,11 +580,13 @@ class Flows:
                 stack = self._stack("", [f"-javaagent:{self.agent}={bootstrap}"])
                 stack.up()
                 _paced_gets(stack.base, ["/vets", "/owners?lastName=Davis"])
-                # An incomplete body may block before handler entry. Require durable request
-                # evidence from the product before claiming that capture was interrupted.
+                # Hold the insert inside the handler. An incomplete form body can block in
+                # a servlet filter before the MVC capture seam is ever reached.
+                barriers.enter_context(stack.hold_owner_writes())
                 sock = socket.create_connection(("127.0.0.1", stack.host_port), timeout=10)
+                body = b"firstName=Held&lastName=Interrupted&address=Street&city=Town&telephone=0123456789"
                 sock.sendall(b"POST /owners/new HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\n"
-                             b"Content-Length: 4096\r\nConnection: close\r\n\r\nfirstName=Held&lastName=Interrupted")
+                             + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
                 deadline = time.monotonic() + 3.0
 
                 def query(args: list[str]) -> dict:
@@ -597,6 +625,7 @@ class Flows:
         finally:
             if sock is not None:
                 sock.close()
+            barriers.close()
             if stack is not None:
                 stack.down()
             if rc == 0 and bootstrap:
@@ -717,7 +746,7 @@ class Flows:
                 for step in ("active-line-frames", "frame-values") if name == "focused" else (name,):
                     if step not in self.results:
                         self._set(step, _fail(exc))
-        self._set("flow-accommodations", ("reported", "pace_seconds=0.6 between lifecycle control requests; privacy requests wait for observable completed recordings within each request budget"))
+        self._set("flow-accommodations", ("reported", "record-stop and privacy requests observe completed recordings within each request budget; partial-flow controls use pace_seconds=0.6; its complete form submission waits behind an acknowledged database write barrier"))
         self._set("privacy-scope", ("reported", "focused capture records ordinary String arguments and locals, including business parameters, unless name, type or content rules redact them; exception messages use content-pattern redaction only; metadata exclusion alone does not prove value redaction"))
         self.results.setdefault("focused-canary-injection", {"status": "fail", "note": "focused canary requests did not complete"})
         for step in STEP_NAMES:

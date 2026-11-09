@@ -11,6 +11,7 @@ Naming rule: every container, network and volume created here is prefixed
 from __future__ import annotations
 
 import concurrent.futures
+from contextlib import contextmanager
 import hashlib
 import http.client
 import json
@@ -459,6 +460,40 @@ class Stack:
         return f"http://127.0.0.1:{self.host_port}"
 
     # ---- database access (read-only effect queries use the campaign role)
+    @contextmanager
+    def hold_owner_writes(self):
+        """Block Petclinic inserts after MVC entry until the interruption probe releases them.
+
+        The acknowledgement proves the transaction owns the lock. SHARE permits the
+        handler's reads but blocks its INSERT; closing stdin rolls the transaction back.
+        This changes only the disposable campaign database, never upstream source.
+        """
+        import select
+        if self.project != "petclinic" or not self.db_name:
+            raise RuntimeError("owner write barrier requires the Petclinic campaign database")
+        proc = subprocess.Popen(
+            ["docker", "exec", "-i", self.db, "psql", "-X", "-qAt", "-U", self.db_user,
+             "-d", self.db_name, "-v", "ON_ERROR_STOP=1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            proc.stdin.write(b"BEGIN; LOCK TABLE owners IN SHARE MODE; SELECT 1;\n")
+            proc.stdin.flush()
+            ready, _, _ = select.select([proc.stdout], [], [], 10.0)
+            if not ready or proc.stdout.readline() != b"1\n":
+                raise RuntimeError("owner write barrier was not acknowledged")
+            yield
+        finally:
+            try:
+                proc.stdin.close()
+            finally:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()  # only the docker exec process this harness started
+                    proc.wait(timeout=10)
+                finally:
+                    proc.stdout.close()
+
     def psql(self, query: str, db: str | None = None) -> list[list[str]]:
         if not self.db_name:
             return []
