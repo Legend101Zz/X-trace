@@ -35,10 +35,8 @@ KINDS = frozenset("unspecified request_update frame_enter frame_exit frame_throw
                   "database_start database_end outbound_http_start outbound_http_end async_link exception response gap".split())
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 JAVA_SYMBOL = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.(?:[A-Za-z_$][\w$]*|<init>|<clinit>)", re.ASCII)
-# Package boundaries are significant: lookalike prefixes are private too.
-# Keep this inventory specific to the pinned Petclinic campaign.
-SYMBOL_PACKAGES = (
-    "org.springframework.samples.petclinic",
+# These prefixes classify layers only; they never authenticate symbol text.
+FRAMEWORK_PACKAGES = (
     "java", "javax", "jdk",
     "org.springframework", "org.hibernate",
     "org.apache.catalina", "org.apache.coyote", "org.apache.tomcat",
@@ -92,6 +90,11 @@ def event_kind(value):
 
 
 def safe_symbol(value):
+    """Keep allowlisted HTTP metadata; replace Java text with a layer and hash.
+
+    Layers are naming heuristics, not proof that a class or member was built.
+    No Java symbol is authenticated by the private API snapshot.
+    """
     if not isinstance(value, str) or len(value) > 256:
         return None
     request = REQUEST.fullmatch(value)
@@ -101,9 +104,16 @@ def safe_symbol(value):
         return value
     if JAVA_SYMBOL.fullmatch(value):
         declaring_class = value.rsplit(".", 1)[0]
-        if any(declaring_class.startswith(package + ".") for package in SYMBOL_PACKAGES):
-            return value
-        return "withheld:sha256:" + hashlib.sha256(value.encode()).hexdigest()[:16]
+        layer = "other"
+        if declaring_class.startswith("org.springframework.samples.petclinic."):
+            class_name = declaring_class.rsplit(".", 1)[-1]
+            for suffix in ("Controller", "Service", "Repository"):
+                if class_name.endswith(suffix):
+                    layer = suffix.lower()
+                    break
+        elif any(declaring_class.startswith(package + ".") for package in FRAMEWORK_PACKAGES):
+            layer = "framework"
+        return f"withheld:{layer}:sha256:" + hashlib.sha256(value.encode()).hexdigest()
     return None
 
 
