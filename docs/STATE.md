@@ -70,7 +70,7 @@ Epic: #2. Close an issue only when every box is ticked with evidence on merged `
 
 - D1 answered 2026-11-09: compile only locally; tests run on GitHub.
 - D3 answered 2026-11-09: risk-scaled merge reviews accepted; full ADR 0006 protocol only for release candidates.
-- D2 remains open: a hosted macOS job replaces the leased Mac floor as a merge requirement; default pending owner confirmation.
+- D2 answered 2026-11-09: hosted `macos.yml` replaces the leased Mac merge floor; `ci-ok` and `macos-ok` gate wave merges and release candidates, not single tickets.
 - Ratify: ADR 0008 Amendment 1, the first ADR 0006 addendum of 2026-10-10, the ADR 0009 addendum, ADR 0011, and the
   migration renumbering (v9 = `recording_limitations`, catalog links = v10).
 - Usability question Q5 asks which Canvas node "took the longest", but the product records no per-node time

@@ -1,9 +1,8 @@
 # ADR 0012: Agent workforce, GitHub-hosted verification and risk-scaled merges
 
-- Status: On 2026-11-09 the owner accepted decisions 1–3 and D3 (decision 5, risk-scaled reviews), and changed
-  D1 (decision 2) to compile only locally. D2 (decision 4, hosted macOS replacing the leased floor as a merge
-  requirement) remains a default pending owner confirmation. Decision 6 remains a default pending owner confirmation;
-  defaults apply until changed.
+- Status: On 2026-11-09 the owner accepted decisions 1–3, D2 (decision 4, hosted macOS replacing the leased floor
+  as a merge requirement) and D3 (decision 5, risk-scaled reviews), and changed D1 (decision 2) to compile only
+  locally. Decision 6 remains a default pending owner confirmation; defaults apply until changed.
 - Date: 2026-11-09
 - Amends: ADR 0006 (integration and acceptance mechanics) and ADR 0009 (wave batching): the merge protocol and
   the leased macOS floor requirement. Supersedes every rule that limits which agents or models may work on this
@@ -43,8 +42,10 @@
   Allowed checks are `cargo check`, `cargo clippy`, `cargo test --no-run`, `cargo fmt --check`, TypeScript
   typecheck, Gradle `compileJava compileTestJava`, `python3 -B -m py_compile`, `bash -n`, `git diff --check`,
   and pure static checks such as the web contrast script (`tools/dev/check.sh`).
-- Every pull request gets the automatic `ci.yml` run; `ci-ok` must be green on the exact head before merge.
-  Heavy GitHub suites (`lane.yml`, `package.yml`, campaign branches) run at release-candidate merges, and otherwise
+- Owner clarification on 2026-11-09: tickets are batched into one pull request per wave; GitHub tests (`ci-ok`, plus
+  `macos-ok`) gate that wave merge and release candidates; single tickets do not get their own CI runs.
+- Small docs-only pull requests still need `ci-ok` green on the exact head before merge.
+  Other heavy GitHub suites (`lane.yml`, `package.yml`, campaign branches) run at release-candidate merges, and otherwise
   only when a ticket's acceptance needs them, such as a campaign fix, at the orchestrator's choice.
 
 ### 3. Where builds live (owner instruction)
@@ -57,15 +58,14 @@
   waves. It is a dry run unless `--apply` is given, never touches an active worktree's directories, and never
   deletes anything outside the two roots.
 
-### 4. macOS evidence (default, owner question D2)
+### 4. macOS evidence (accepted, owner answer D2)
 
+- Accepted by the owner on 2026-11-09 (D2).
 - The leased macOS 23-gate floor is no longer a merge requirement.
-- macOS evidence for merges will come from a GitHub-hosted macOS arm64 job (free for public repositories). It is
-  added in a follow-up after the known nondeterministic tests are fixed. Until it exists, merges rely on the Linux
-  floors and say so in the pull request.
-- This reverses the owner's 2026-10-10 decision to run no hosted macOS jobs, so it is the owner's call (D2).
-- No release candidate is accepted without macOS evidence for that exact candidate (the hosted job, or the leased
-  floor on a real Mac) unless the owner waives it in writing.
+- The GitHub-hosted macOS arm64 job in `macos.yml` (free for public repositories) supplies macOS evidence;
+  `macos-ok` must be green on the exact head for wave merges and release candidates.
+- `macos.yml` runs on pushes to `wave/**` and `ultra/rc-*`, or by `workflow_dispatch`, not on every pull request.
+- This reverses the owner's 2026-10-10 decision to run no hosted macOS jobs.
 - PLATFORM-MAC acceptance still requires a fresh-profile install of the exact unsigned release package on a real
   Mac (ADR 0006, second addendum of 2026-10-10).
 
@@ -83,7 +83,8 @@ at release candidates.
 
 - The original default triggered the other workflows when a change touched them.
 - Changed by the owner on 2026-11-09: "CI green" means the `ci-ok` check of `ci.yml` on the exact head, plus
-  any workflow the ticket names. Run `lane.yml`, `package.yml` and campaign branches at release-candidate merges,
+  `macos-ok` for wave merges and release candidates, and any workflow the ticket names.
+  Run `lane.yml`, `package.yml` and campaign branches at release-candidate merges,
   and otherwise only when ticket acceptance needs them, at the orchestrator's choice. Trigger them with
   `gh workflow run lane.yml --ref <branch> -f suite=<suite>`, `gh workflow run package.yml --ref <branch>`,
   or an `ultra/campaign/<project>` branch push, respectively.
@@ -111,9 +112,8 @@ at release candidates.
 
 ## Consequences
 
-- Faster merges for ordinary work. Each ticket's evidence is its pull request, its CI run and the review
-  record, not a private run folder.
-- Until the hosted macOS job exists, a macOS-only regression can reach `main` and is caught later, either by that
-  job or by the release-candidate protocol.
+- Tickets share their wave's pull request and GitHub test runs; evidence includes that pull request, its CI runs
+  and the review record.
+- Hosted macOS evidence gates wave merges and release candidates without requiring the leased Mac floor.
 - The rule text in older documents is historical where it describes past runs (`docs/progress.md` entries); current
   rules live in `AGENTS.md`, this ADR and `docs/STATE.md`.

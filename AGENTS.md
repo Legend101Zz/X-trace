@@ -43,8 +43,9 @@ tools/dev/check.sh fmt                     # cargo fmt --check
 tools/dev/check.sh diff                    # whitespace / end-of-file check (CI gate 23)
 ```
 
-All tests run on GitHub Actions (ADR 0012). Heavy suites include: the full workspace tests, CLI journey tests that need built
-adapters, the 23-gate floors, packaging, campaigns and browser runs. Read CI with
+All tests run on GitHub Actions at wave merges and release candidates, not per ticket (ADR 0012).
+Heavy suites include: the full workspace tests, CLI journey tests that need built adapters, the 23-gate floors,
+packaging, campaigns, browser runs and hosted macOS arm64 in `macos.yml` (D2; `macos-ok` required). Read CI with
 `gh -R Legend101Zz/X-trace run view <id> --log-failed`. `tools/dev/prep.sh` (fetch dependencies, build adapters)
 needs the network and runs outside any agent sandbox.
 
@@ -80,7 +81,8 @@ needs the network and runs outside any agent sandbox.
   navigation change only in a ticket that says so, with an ADR when semantics change.
 - **Git**: work in your own worktree and branch. Workers do not commit, push or merge; the orchestrator reviews,
   commits and opens the pull request. Every change reaches `main` through a PR whose required check `ci-ok` is
-  green on the exact head, with current `main` merged in (ADR 0012 §5). No closing keywords (`fixes #N`,
+  green on the exact head, plus `macos-ok` for wave merges and release candidates, with current `main` merged in
+  (ADR 0012 §5). Small docs-only PRs still need `ci-ok`. No closing keywords (`fixes #N`,
   `closes #N`) in commits, PR titles or PR bodies. Every ticket has an issue; use `Refs #N` in PRs and a tracking
   issue with a checklist for each wave (ADR 0012 §5).
 - **Forbidden commands**: `pkill`, `killall`, kill by pattern, `kill $(pgrep ...)`, `sudo`, `diskutil`,
