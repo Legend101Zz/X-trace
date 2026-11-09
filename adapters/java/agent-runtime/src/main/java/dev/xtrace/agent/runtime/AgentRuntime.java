@@ -97,8 +97,8 @@ public final class AgentRuntime {
       sink.useScope(config.scope());
       writer = new RecordingWriter(session, queue, sink);
       permanent = true;
-      // Line probes and value reads exist only in effective focused mode (CONTRACTS section 4:
-      // the standard line budget is 0). The daemon honours the focused claim only when armed.
+      // Line probes and all value reads, including proxy arguments/returns, are focused-only
+      // (ADR 0003 root decision 3). The daemon honours the focused claim only when armed.
       FixtureInstrumentation.LineProbes lineProbes = null;
       if (config.focused()) {
         lineProbes =
@@ -108,7 +108,7 @@ public final class AgentRuntime {
         writer.capturePolicy("xtrace.focused.v1");
         writer.untransformedCount(lineProbes::skippedCount);
       }
-      proxySink = new ProxyCaptureSink(queue, config.scope());
+      proxySink = new ProxyCaptureSink(queue, config.scope(), config.focused());
       if (!ProxyBridge.install(proxySink)) {
         throw new ClientException("XTR-JAVA-AGENT", "proxy sink is already active");
       }

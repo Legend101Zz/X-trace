@@ -21,10 +21,8 @@ public final class ProxyBridge {
     Sink sink = SINK.get();
     if (sink == null || !BootstrapBridge.hasContext()) return null;
     try {
-      Method declaration = sink.resolve(proxy, method);
-      if (declaration == null) return null;
-      Call call = new Call(sink, declaration,
-          declaration.getDeclaringClass().getName() + "." + declaration.getName());
+      Call call = sink.resolve(proxy, method);
+      if (call == null) return null;
       return BootstrapBridge.proxyFrame(call, arguments, null, null, true) ? call : null;
     } catch (Throwable ignored) {
       return null; // Probe failure cannot affect the handler.
@@ -40,13 +38,17 @@ public final class ProxyBridge {
     }
   }
 
-  /** Carries only declaration identity across the invocation, never arguments or results. */
-  public record Call(Sink sink, Method method, String symbol) {}
+  /** Reusable boundary metadata; never retains arguments, results or request identity. */
+  public record Call(EventSink sink, Method method, String symbol) {}
 
-  /** Sanitizes values synchronously before offering bounded events to the runtime queue. */
+  /** Resolves and caches boundary metadata once per proxy class/method. */
   public interface Sink {
-    Method resolve(Object proxy, Method method);
+    Call resolve(Object proxy, Method method);
+  }
 
+  /** Sanitizes authorized values synchronously before offering bounded runtime events. */
+  @FunctionalInterface
+  public interface EventSink {
     boolean offer(String recordingId, String eventId, String parentId, int kind, String symbol,
         long monotonicNs, Method method, Object[] arguments, Object result, Throwable thrown);
   }

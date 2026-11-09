@@ -58,6 +58,15 @@ tasks.withType<Test>().configureEach {
 }
 
 allprojects {
+    tasks.withType<Test>().configureEach {
+        testLogging {
+            exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+            showExceptions = true
+            showCauses = true
+            showStackTraces = true
+            showStandardStreams = false
+        }
+    }
     dependencyLocking {
         lockAllConfigurations()
     }

@@ -1,12 +1,17 @@
 package dev.xtrace.agent.runtime;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.Attributes;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
@@ -19,6 +24,43 @@ class ProxyCaptureTest {
 
   @Test
   void productionTransformerCapturesActualJdkProxiesAcrossTheCorpus() throws Exception {
+    ProbeResult result = runProbe();
+    assertEquals(0, result.exitCode(), result.text());
+    assertTrue(result.text().contains("proxy-capture-cases=17"), result.text());
+  }
+
+  @Test
+  void probePrintsItsFailureReasonBeforeExitingNonZero() throws Exception {
+    ProbeResult result = runProbe("unexpected-argument");
+    assertEquals(1, result.exitCode(), result.text());
+    assertTrue(result.text().contains("proxy-capture-probe failed"), result.text());
+    assertTrue(result.text().contains("java.lang.IllegalArgumentException: proxy capture probe accepts no arguments"),
+        result.text());
+    assertTrue(result.text().contains("ProxyCaptureProbe.main"), result.text());
+  }
+
+  @Test
+  void failureListenerOnlyStopsCaptureForGeneratedProxyNamesAndContainsCallbackFailures() {
+    AtomicInteger failures = new AtomicInteger();
+    ClassLoader loader = getClass().getClassLoader();
+    var error = new IllegalStateException("unresolvable in-memory superclass");
+    var listener = new ProxyInstrumentation.FailureListener(cause -> {
+      assertSame(error, cause);
+      failures.incrementAndGet();
+    });
+    listener.onError("demo.proxy.MemoryChild", loader, null, false, error);
+    listener.onError("demo.proxy.User$ProxyHelper", loader, null, false, error);
+    assertEquals(0, failures.get());
+    listener.onError("jdk.proxy2.$Proxy7", loader, null, false, error);
+    listener.onError("demo.proxy.$Proxy8", loader, null, false, error);
+    assertEquals(2, failures.get());
+    var throwing = new ProxyInstrumentation.FailureListener(cause -> { throw new IllegalStateException(); });
+    assertDoesNotThrow(() -> throwing.onError("jdk.proxy2.$Proxy7", loader, null, false, error));
+  }
+
+  private record ProbeResult(int exitCode, String text) {}
+
+  private ProbeResult runProbe(String... arguments) throws Exception {
     Path agent = scratch.resolve("proxy-probe-agent.jar");
     Manifest manifest = new Manifest();
     manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
@@ -34,16 +76,18 @@ class ProxyCaptureTest {
     Path bridge = Path.of(dev.xtrace.agent.bootstrap.BootstrapBridge.class
         .getProtectionDomain().getCodeSource().getLocation().toURI());
     Path output = scratch.resolve("proxy-probe-output.txt");
-    Process process = new ProcessBuilder(
+    List<String> command = new ArrayList<>(List.of(
         Path.of(System.getProperty("java.home"), "bin", "java").toString(),
         "-Xverify:all", "-Xbootclasspath/a:" + bridge, "-javaagent:" + agent,
-        "-cp", System.getProperty("java.class.path"), ProxyCaptureProbe.class.getName())
+        "-cp", System.getProperty("java.class.path"), ProxyCaptureProbe.class.getName()));
+    command.addAll(List.of(arguments));
+    Process process = new ProcessBuilder(command)
         .redirectErrorStream(true).redirectOutput(output.toFile()).start();
     try {
-      assertTrue(process.waitFor(60, TimeUnit.SECONDS), "proxy capture probe timed out");
+      boolean finished = process.waitFor(60, TimeUnit.SECONDS);
       String text = Files.readString(output, StandardCharsets.UTF_8);
-      assertEquals(0, process.exitValue(), text);
-      assertTrue(text.contains("proxy-capture-cases=13"), text);
+      assertTrue(finished, "proxy capture probe timed out\n" + text);
+      return new ProbeResult(process.exitValue(), text);
     } finally {
       if (process.isAlive()) process.destroyForcibly();
     }

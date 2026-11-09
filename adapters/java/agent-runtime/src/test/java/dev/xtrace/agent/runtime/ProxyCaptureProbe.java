@@ -28,23 +28,46 @@ import java.lang.annotation.RetentionPolicy;
 /** Child JVM corpus: actual Instrumentation transforms the real JDK-generated proxy classes. */
 public class ProxyCaptureProbe {
   @Retention(RetentionPolicy.RUNTIME)
-  @interface Case {}
+  @interface Case {
+    boolean focused() default true;
+  }
 
-  public static void main(String[] args) throws Exception {
+  public static void main(String[] args) {
+    try {
+      if (args.length != 0) throw new IllegalArgumentException("proxy capture probe accepts no arguments");
+      runCases();
+    } catch (Throwable failure) {
+      System.err.println("proxy-capture-probe failed");
+      failure.printStackTrace(System.err);
+      System.exit(1);
+    }
+  }
+
+  private static void runCases() throws Exception {
     assertNull(BootstrapBridge.class.getClassLoader(), "bridge must resolve from bootstrap");
+    assertNull(ProxyBridge.class.getClassLoader(), "proxy bridge must resolve from bootstrap");
+    assertNull(ProxyBridge.Call.class.getClassLoader(), "call metadata must resolve from bootstrap");
+    assertNull(ProxyBridge.EventSink.class.getClassLoader(), "event sink must resolve from bootstrap");
     java.util.concurrent.atomic.AtomicBoolean failed = new java.util.concurrent.atomic.AtomicBoolean();
-    ProxyInstrumentation.install(ProxyProbeAgent.instrumentation, () -> failed.set(true), false);
+    ProxyInstrumentation.install(ProxyProbeAgent.instrumentation, error -> {
+      failed.set(true);
+      System.err.println("proxy capture transformer failed");
+      error.printStackTrace(System.err);
+    }, false);
     Method[] methods = ProxyCaptureProbe.class.getDeclaredMethods();
     java.util.Arrays.sort(methods, java.util.Comparator.comparing(Method::getName));
     int count = 0;
     for (Method method : methods) {
-      if (!method.isAnnotationPresent(Case.class)) continue;
-      ProxyCaptureProbe probe = new ProxyCaptureProbe();
+      Case testCase = method.getAnnotation(Case.class);
+      if (testCase == null) continue;
+      ProxyCaptureProbe probe = new ProxyCaptureProbe(testCase.focused());
       try {
         probe.install();
         method.invoke(probe);
         assertFalse(failed.get(), "production transformer failed");
         count++;
+      } catch (Throwable failure) {
+        throw new AssertionError("proxy capture case failed: " + method.getName(), failure);
       } finally {
         probe.close();
       }
@@ -55,10 +78,14 @@ public class ProxyCaptureProbe {
   private final ApplicationScope scope = new ApplicationScope(
       List.of("demo.proxy"), List.of("src/test/java"));
   private final RuntimeBridgeSink events = new RuntimeBridgeSink(queue);
-  private final ProxyCaptureSink sink = new ProxyCaptureSink(queue, scope);
+  private final ProxyCaptureSink sink;
   private Class<?> contract;
   private Object proxy;
   private InvocationHandler handler;
+
+  private ProxyCaptureProbe(boolean focused) {
+    sink = new ProxyCaptureSink(queue, scope, focused);
+  }
 
   void install() throws Exception {
     events.useScope(scope);
@@ -118,6 +145,111 @@ public class ProxyCaptureProbe {
     return result;
   }
 
+  @Case(focused = false)
+  void standardModeCapturesBoundariesWithoutArgumentReturnOrThrowValues() throws Exception {
+    assertTrue(BootstrapBridge.requestStart("GET", "/repositories"));
+    assertEquals("standard-value-canary", call("save", String.class, "standard-value-canary"));
+    var failure = assertThrows(java.lang.reflect.InvocationTargetException.class,
+        () -> contract.getMethod("fail").invoke(proxy));
+    assertInstanceOf(IllegalStateException.class, failure.getCause());
+    BootstrapBridge.requestEnd(200, false);
+    var captured = drain();
+    var frames = captured.stream().filter(e -> e.kind() == BridgeEventKind.FRAME_ENTER
+        || e.kind() == BridgeEventKind.FRAME_EXIT || e.kind() == BridgeEventKind.FRAME_THROW).toList();
+    assertEquals(List.of(2, 3, 2, 4), frames.stream().map(QueueSignal.Event::kind).toList());
+    for (var frame : frames) assertTrue(frame.values().isEmpty(), frame.symbol());
+    assertEquals("demo.proxy.RepositoryContract.save", frames.get(0).symbol());
+    assertTrue(frames.get(0).sourcePath().endsWith("demo/proxy/RepositoryContract.java"));
+    assertEquals(captured.get(0).eventId(), frames.get(0).parentEventId());
+    assertEquals(frames.get(0).eventId(), frames.get(1).parentEventId());
+    assertEquals("java.lang.IllegalStateException", frames.get(3).exceptionType());
+    assertNull(frames.get(3).exceptionMessage());
+  }
+
+  @Case
+  void unrelatedInMemorySuperclassDoesNotStopProxyCapture() throws Exception {
+    String parent = "demo.proxy.MemoryBase";
+    String child = "demo.proxy.MemoryChild";
+    ClassLoader isolated = new Isolated(getClass().getClassLoader(), Map.of(
+        parent, memoryType(parent, "java.lang.Object"), child, memoryType(child, parent)));
+    // These types are defined from bytes, with no .class resources for Byte Buddy's type pool.
+    Class<?> loaded = isolated.loadClass(child);
+    assertEquals(parent, loaded.getSuperclass().getName());
+    assertNull(isolated.getResource(child.replace('.', '/') + ".class"));
+    assertNull(isolated.getResource(parent.replace('.', '/') + ".class"));
+    assertTrue(BootstrapBridge.requestStart("GET", "/repositories"));
+    assertEquals("value", call("save", String.class, "value"));
+    BootstrapBridge.requestEnd(200, false);
+    assertEquals(1, drain().stream().filter(e -> e.kind() == BridgeEventKind.FRAME_ENTER).count());
+  }
+
+  private static byte[] memoryType(String name, String parent) {
+    ClassWriter writer = new ClassWriter(0);
+    writer.visit(Opcodes.V17, Opcodes.ACC_PUBLIC | Opcodes.ACC_SUPER,
+        name.replace('.', '/'), null, parent.replace('.', '/'), null);
+    writer.visitEnd();
+    return writer.toByteArray();
+  }
+
+  @Case
+  void packagePrivateContractProxyCanCallTheBootstrapBridge() throws Exception {
+    Object privateProxy = demo.proxy.PackagePrivateRepository.create(handler);
+    assertTrue(Proxy.isProxyClass(privateProxy.getClass()));
+    assertFalse(java.lang.reflect.Modifier.isPublic(privateProxy.getClass().getModifiers()));
+    assertTrue(BootstrapBridge.requestStart("GET", "/repositories"));
+    assertEquals("private-contract", demo.proxy.PackagePrivateRepository.save(privateProxy, "private-contract"));
+    BootstrapBridge.requestEnd(200, false);
+    var frames = drain().stream().filter(e -> e.kind() == BridgeEventKind.FRAME_ENTER
+        || e.kind() == BridgeEventKind.FRAME_EXIT).toList();
+    assertEquals(List.of(2, 3), frames.stream().map(QueueSignal.Event::kind).toList());
+    assertEquals("demo.proxy.PackagePrivateRepository$Contract.save", frames.get(0).symbol());
+    assertEquals(frames.get(0).eventId(), frames.get(1).parentEventId());
+    assertEquals("private-contract", frames.get(1).values().get(0).preview());
+  }
+
+  @Case
+  void declarationAndSourceMetadataAreCachedPerProxyClassAndMethod() throws Exception {
+    Method method = proxy.getClass().getMethod("save", String.class);
+    ProxyBridge.Call boundary = sink.resolve(proxy, method);
+    assertNotNull(boundary);
+    assertSame(boundary, sink.resolve(proxy, proxy.getClass().getMethod("save", String.class)));
+    assertNotSame(boundary, sink.resolve(proxy, proxy.getClass().getMethod("save", long.class)));
+    Object other = Proxy.newProxyInstance(contract.getClassLoader(),
+        new Class<?>[] {contract, java.io.Serializable.class}, handler);
+    assertNotSame(boundary, sink.resolve(other, other.getClass().getMethod("save", String.class)));
+
+    Path temporary = Files.createTempDirectory("proxy-source-cache-");
+    try {
+      Path source = temporary.resolve("src/test/java/demo/proxy/RepositoryContract.java");
+      Files.createDirectories(source.getParent());
+      String original = Files.readString(sourceBase().resolve("src/test/java/demo/proxy/RepositoryContract.java"));
+      Files.writeString(source, "\n" + original);
+      byte[] bytes = ClassFileLocator.ForClassLoader.of(getClass().getClassLoader())
+          .locate(contract.getName()).resolve();
+      var before = ProxyInterfaceSources.lookup(boundary.method());
+      ProxyInterfaceSources.observe(contract.getClassLoader(), contract.getName().replace('.', '/'),
+          bytes, new ApplicationScope(scope.packages(), scope.sourceRoots(), temporary));
+      var after = ProxyInterfaceSources.lookup(boundary.method());
+      assertEquals(before.startLine() + 1, after.startLine());
+      assertFalse(java.util.Arrays.equals(before.hash(), after.hash()));
+
+      assertTrue(BootstrapBridge.requestStart("GET", "/repositories"));
+      assertEquals("cached", call("save", String.class, "cached"));
+      BootstrapBridge.requestEnd(200, false);
+      var frames = drain().stream().filter(e -> e.kind() == BridgeEventKind.FRAME_ENTER
+          || e.kind() == BridgeEventKind.FRAME_EXIT).toList();
+      assertEquals(2, frames.size());
+      for (var frame : frames) {
+        assertEquals(before.startLine(), frame.sourceStartLine());
+        assertArrayEquals(before.hash(), frame.sourceHash());
+      }
+    } finally {
+      try (var paths = Files.walk(temporary)) {
+        for (Path path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) Files.delete(path);
+      }
+    }
+  }
+
   @Case
   void realProxyNestsRepositoryBetweenServiceAndDatabaseWithInterfaceSource() throws Exception {
     assertTrue(BootstrapBridge.requestStart("GET", "/repositories"));
@@ -165,11 +297,14 @@ public class ProxyCaptureProbe {
     assertTrue(BootstrapBridge.requestStart("GET", "/repositories"));
     call("secret", String.class, "private-argument-canary");
     call("save", String.class, "Bearer private-content-canary");
-    call("save", String.class, "x".repeat(1024));
+    // Opaque alphanumeric runs are secrets under the content rule. Use ordinary long text
+    // to exercise truncation without weakening the independent redaction assertions.
+    call("save", String.class, "x ".repeat(512));
     Object hostile = new Object() {
       @Override public String toString() { throw new AssertionError("must not render"); }
     };
     assertSame(hostile, call("opaque", Object.class, hostile));
+    call("save", String.class, "x".repeat(1024));
     BootstrapBridge.requestEnd(200, false);
     var entries = drain().stream().filter(e -> e.kind() == BridgeEventKind.FRAME_ENTER).toList();
     assertEquals(ValueSnapshot.State.REDACTED, entries.get(0).values().get(0).state());
@@ -179,6 +314,9 @@ public class ProxyCaptureProbe {
     assertEquals(ValueSnapshot.State.TRUNCATED, entries.get(2).values().get(0).state());
     assertEquals(256, entries.get(2).values().get(0).preview().length());
     assertEquals(ValueSnapshot.State.UNAVAILABLE, entries.get(3).values().get(0).state());
+    assertEquals(ValueSnapshot.State.REDACTED, entries.get(4).values().get(0).state());
+    assertEquals("content.secret_pattern", entries.get(4).values().get(0).ruleId());
+    assertNull(entries.get(4).values().get(0).preview());
   }
 
   @Case
@@ -212,11 +350,13 @@ public class ProxyCaptureProbe {
     ProxyBridge.disable(sink);
     ProxyBridge.Sink failed = new ProxyBridge.Sink() {
       @Override
-      public Method resolve(Object proxy, Method method) { return sink.resolve(proxy, method); }
-      @Override
-      public boolean offer(String recording, String event, String parent, int kind, String symbol,
-          long ns, Method method, Object[] args, Object result, Throwable thrown) {
-        throw new IllegalStateException("sink failure");
+      public ProxyBridge.Call resolve(Object proxy, Method method) {
+        ProxyBridge.Call call = sink.resolve(proxy, method);
+        if (call == null) return null;
+        return new ProxyBridge.Call((recording, event, parent, kind, symbol,
+            ns, declaration, args, result, thrown) -> {
+          throw new IllegalStateException("sink failure");
+        }, call.method(), call.symbol());
       }
     };
     assertTrue(ProxyBridge.install(failed));
@@ -304,7 +444,7 @@ public class ProxyCaptureProbe {
     Class<?>[] parameters = new Class<?>[16];
     java.util.Arrays.fill(parameters, String.class);
     Object[] arguments = new Object[16];
-    java.util.Arrays.fill(arguments, "x".repeat(256));
+    java.util.Arrays.fill(arguments, "x ".repeat(128));
     assertTrue(BootstrapBridge.requestStart("GET", "/repositories"));
     assertEquals(arguments[0], contract.getMethod("wide", parameters).invoke(proxy, arguments));
     BootstrapBridge.requestEnd(200, false);
