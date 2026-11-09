@@ -34,6 +34,20 @@ class T(unittest.TestCase):
             code, stopped, buf = t.run(str(ni), td, 3.0, 24, 80)
             self.assertEqual(t.classify(code, stopped, buf)[0], "not-implemented")
 
+    def test_enter_opens_the_recording_so_its_route_reaches_the_transcript(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = pathlib.Path(td) / "fake"
+            # a list screen that names only ids; the route appears only after the key press
+            exe.write_text("#!/bin/sh\nprintf 'recordings: 01a12327-8de6-complete\\n'\nread x\nprintf 'http.request GET /owners\\n'\nsleep 0.3\nexit 0\n")
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            code, stopped, buf = t.run(str(exe), td, 5.0, 24, 80, open_after=0.5)
+            self.assertEqual(t.classify(code, stopped, buf)[0], "pass", buf)
+            plain = pathlib.Path(td) / "plain"  # a list that names ids only and exits by itself: no route, so no pass
+            plain.write_text("#!/bin/sh\nprintf 'recordings: 01a12327-8de6-complete\\n'\nexit 0\n")
+            plain.chmod(plain.stat().st_mode | stat.S_IXUSR)
+            code, stopped, buf = t.run(str(plain), td, 2.0, 24, 80, open_after=0)
+            self.assertEqual(t.classify(code, stopped, buf)[0], "fail")
+
 
 if __name__ == "__main__":
     unittest.main()

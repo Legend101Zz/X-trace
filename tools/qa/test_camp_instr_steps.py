@@ -23,11 +23,10 @@ class T(unittest.TestCase):
         r = {"scenarios": [sc("a"), sc("b")], "api": {"ok": True, "recordings": 5}, "problemClasses": {}, "recordingsWithSource": 3,
              "notes": {"stopCommand": {"exitCode": 3}, "launcherExitCode": 0}}
         d = by(s.instrumented_steps(r))
-        # everything the harness exercised passes; the record+stop flow is not exercised and stays not-implemented
-        gating = {"record-stop-flow", "active-line-frames", "frame-values", "restart-reopen", "partial-recording-reopen"}
-        self.assertEqual({n for n, v in d.items() if v[0] != "pass"}, gating, d)
-        for n in gating:
-            self.assertEqual(d[n][0], "not-implemented", n)
+        # everything the instrumented run exercised passes; the lifecycle and focused-capture flows are judged by `flows`
+        self.assertEqual({n for n, v in d.items() if v[0] != "pass"}, set(), d)
+        for n in s.FLOW_STEPS:
+            self.assertNotIn(n, d, "flow steps come only from the flows document")
         self.assertNotIn("executed line)", d["source-identity"][1].replace("not an executed line)", ""))
         self.assertIn("not an executed line", d["source-identity"][1])
 
@@ -51,8 +50,19 @@ class T(unittest.TestCase):
         self.assertEqual(d["instrumented-fingerprints-equal-baseline"][0], "fail")
         self.assertEqual(d["recordings-per-scenario"][0], "fail")
         self.assertEqual(d["source-identity"][0], "fail")
-        self.assertEqual(d["record-stop-flow"][0], "not-implemented")
         self.assertEqual(d["launcher-exit-after-sigterm"][0], "fail")
+
+    def test_flow_steps_come_from_the_document_and_missing_is_a_failure(self):
+        self.assertEqual({n: st for n, st, _ in s.flow_steps(None)}, {n: "fail" for n in s.FLOW_STEPS})
+        doc = {"steps": {n: {"status": "pass", "note": "ok"} for n in s.FLOW_STEPS}}
+        self.assertEqual({st for _, st, _ in s.flow_steps(doc)}, {"pass"})
+        doc["steps"]["frame-values"] = {"status": "fail", "note": "no captured binding"}
+        del doc["steps"]["restart-reopen"]
+        doc["steps"]["partial-recording-reopen"] = {"status": "skipped", "note": ""}
+        d = by(s.flow_steps(doc))
+        self.assertEqual(d["frame-values"], ("fail", "no captured binding"))
+        self.assertEqual(d["restart-reopen"][0], "fail")
+        self.assertEqual(d["partial-recording-reopen"][0], "fail")
 
     def test_zero_recordings_never_pass_source_identity(self):
         r = {"scenarios": [sc("a", rec=False)], "api": {"ok": True, "recordings": 0}, "problemClasses": {"no-recording-for-route": 1},

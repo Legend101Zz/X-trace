@@ -4,7 +4,8 @@
   tui_transcript.py --xtrace BIN --project-dir DIR --out DIR [--rows 40 --cols 120 --seconds 6]
 
 Verdicts: not-implemented (the command exits 9, the CLI's NotImplemented code), pass (exits 0 or is stopped by the
-harness after drawing and the transcript names at least one recorded route), fail (anything else). The harness only
+harness after drawing and the transcript names at least one recorded route; the harness presses Enter once after the list drew so the opened recording's
+request symbols are on screen), fail (anything else). The harness only
 signals the child it forked, by PID.
 """
 from __future__ import annotations
@@ -42,7 +43,10 @@ def classify(exit_code: int | None, stopped_by_harness: bool, transcript: bytes)
     return "pass", "transcript names a recorded route"
 
 
-def run(xtrace: str, project_dir: str, seconds: float, rows: int, cols: int) -> tuple[int | None, bool, bytes]:
+OPEN_KEY = b"\r"  # Enter opens the selected recording; the list view shows recording ids, the opened view shows the request symbols
+
+
+def run(xtrace: str, project_dir: str, seconds: float, rows: int, cols: int, open_after: float = 2.5) -> tuple[int | None, bool, bytes]:
     pid, fd = pty.fork()
     if pid == 0:  # child
         try:
@@ -51,10 +55,18 @@ def run(xtrace: str, project_dir: str, seconds: float, rows: int, cols: int) -> 
             os._exit(127)  # exec failed: never let the child continue as a copy of this harness
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     buf = b""
-    deadline = time.time() + seconds
+    started = time.time()
+    deadline = started + seconds
     status = None
     stopped = False
+    opened = False
     while time.time() < deadline:
+        if not opened and open_after and time.time() - started >= open_after:
+            opened = True  # one key press into the child's own PTY: open the first listed recording
+            try:
+                os.write(fd, OPEN_KEY)
+            except OSError:
+                pass
         r, _, _ = select.select([fd], [], [], 0.2)
         if r:
             try:
