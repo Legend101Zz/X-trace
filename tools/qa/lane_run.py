@@ -269,11 +269,17 @@ CARGO_SECTION = re.compile(r"^---- (\S+) (?:stdout|stderr) ----$")
 CARGO_PANIC = re.compile(r"^thread '([^']+)' panicked at ")
 CARGO_STATE = re.compile(r"^test (\S+) \.\.\.(?: (ok|FAILED|ignored))?$")
 CARGO_RUNNING = re.compile(r"^test (\S+) has been running for over \d+ seconds$")
-GRADLE_STATE = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\([^\n]*\))?(?:\[[^\n]*\])? (STARTED|PASSED|FAILED|SKIPPED)$")
+GRADLE_STATE = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\((?P<params>[^\n]*)\))?"
+                          r"(?:\[(?P<index>[^\n]*)\])? (?P<status>STARTED|PASSED|FAILED|SKIPPED)$")
 JAVA_SITE = re.compile(r"^\s*at [\w.$]+\((\w+\.java:\d+)\)\s*$")
 GRADLE_SHORT_SITE = re.compile(r"^[\w.$]+ at (\w+\.java:\d+)$")
-PROGRESS = re.compile(r"^(?:running \d+ tests?|test result: .+|> Task :[\w:.-]+(?: [A-Z-]+)?|"
-                      r"(?:Compiling|Finished) .+)$")
+SEMVER_NUMBER = r"(?:0|[1-9][0-9]*)"
+SEMVER_PRERELEASE = rf"(?:{SEMVER_NUMBER}|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+CARGO_COMPILE = re.compile(
+    rf"^Compiling ([A-Za-z_][A-Za-z0-9_-]{{0,63}}) v({SEMVER_NUMBER}\.{SEMVER_NUMBER}\.{SEMVER_NUMBER}"
+    rf"(?:-{SEMVER_PRERELEASE}(?:\.{SEMVER_PRERELEASE})*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)"
+    r"(?: .*)?$")
+LIBTEST_ASSERTION_FIELD = re.compile(r"^(?:  (?P<left>left)| (?P<right>right)): .*$")
 # Reuse the canary scanner's encoded needles, including recognisable marker families
 # when no private canary file was supplied. DIAG_BAD also guards host paths/credentials.
 CANARY_INDEX = canary.build_index({"marker": "CANARY", "mixed-marker": "canary"})
@@ -345,18 +351,35 @@ def _message_tokens(text: str) -> str:
     return "".join(out)
 
 
-def _message_structure(text: str, *, continuation: bool = False) -> str:
+def _message_structure(text: str) -> str:
     """Rebuild fixed syntax, masking every other token regardless of length.
 
     Known assertion fields consume their entire operand, including compound Debug
-    values. All other continuation lines are withheld unless already pure syntax;
-    an interior line of a quoted string or Debug value cannot become prose.
+    values. Only the first message line may pass through this sanitizer.
     """
     if field := MESSAGE_VALUE.fullmatch(text):
         return (_message_tokens(field["prefix"]) + field["label"].lower()
                 + " " + _value_placeholder(field["value"]))
-    structure = _message_tokens(text)
-    return "<value>" if continuation and structure != text else structure
+    return _message_tokens(text)
+
+
+def _timeout_progress(line: str) -> str | None:
+    """Rebuild harness facts; no parameter values or free-text suffixes survive."""
+    if state := CARGO_STATE.fullmatch(line):
+        name, status = state.groups()
+        if status is not None and ci_floor._valid_test_id(name):
+            return f"test {name} ... {status}"
+    elif gradle := GRADLE_STATE.fullmatch(line):
+        name = f"{gradle.group(1)}::{gradle.group(2)}"
+        status = gradle["status"]
+        if status != "SKIPPED" and ci_floor._valid_test_id(name):
+            params = "<params masked>" if gradle["params"] or gradle["index"] else ""
+            return f"{gradle.group(1)} > {gradle.group(2)}({params}) {status}"
+    elif compile_line := CARGO_COMPILE.fullmatch(line):
+        return f"Compiling {compile_line.group(1)} v{compile_line.group(2)}"
+    elif re.fullmatch(r"Finished(?: .*)?", line):
+        return "Finished"
+    return None
 
 
 def _failure_blocks(text: str):
@@ -409,6 +432,7 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             row.update(test=name, excerpt=WITHHELD)
             continue
         message = []
+        withheld_lines = 0
         after_panic = False
         for line in lines:
             if kind == "cargo" and line.lstrip().startswith(("note:", "stack backtrace:")):
@@ -421,21 +445,31 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
                 test_file = name.split("::")[0].split("$")[0] + ".java:"
                 if row["location"] == "not observed" or m.group(1).startswith(test_file):
                     row["location"] = m.group(1)
-            elif line.strip() and not line.lstrip().startswith(("at ", "note:", "stack backtrace:")):
+            elif (line.strip() or message) and not line.lstrip().startswith(("at ", "note:", "stack backtrace:")):
                 if after_panic or kind == "gradle":
-                    message.append(_message_structure(line.strip(), continuation=bool(message)))
+                    if not message:
+                        message.append(_message_structure(line.strip()))
+                    elif (kind == "cargo" and (field := LIBTEST_ASSERTION_FIELD.fullmatch(line))
+                          and len(message) < MAX_EXCERPT_LINES - 1):
+                        label = "left" if field["left"] else "right"
+                        message.append(f"{label}: <value>")
+                    else:
+                        withheld_lines += 1
                     if m := GRADLE_SHORT_SITE.fullmatch(line.strip()):
                         row["location"] = m.group(1)
         if not message:
             continue
+        if withheld_lines:
+            message.append(f"<{withheld_lines} more lines withheld>")
         row["message"] = message[:MAX_EXCERPT_LINES]
-        row["truncated"] = len(message) > MAX_EXCERPT_LINES
+        row["truncated"] = bool(withheld_lines) or len(message) > MAX_EXCERPT_LINES
         while len(_encoded(row)) > MAX_EXCERPT_BYTES and row["message"]:
             row["truncated"] = True
             overflow = len(_encoded(row)) - MAX_EXCERPT_BYTES
-            row["message"][-1] = row["message"][-1][:-max(1, overflow // 6)]
-            if not row["message"][-1]:
-                row["message"].pop()
+            # Preserve complete assertion frames and the withholding count at the byte cap.
+            row["message"][0] = row["message"][0][:-max(1, overflow // 6)]
+            if not row["message"][0]:
+                row["message"].pop(0)
     # Scan all serialized fields after redaction too, including names and locations.
     rows = [row if not _private("\n".join([row["test"], row.get("location", ""),
                                          *row.get("message", []), row.get("excerpt", "")]),
@@ -461,20 +495,26 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
                 active = bool(long or state.group(2) is None)
             elif gradle:
                 name = f"{gradle.group(1)}::{gradle.group(2)}"
-                active = gradle.group(3) == "STARTED"
+                active = gradle["status"] == "STARTED"
             if name is not None and ci_floor._valid_test_id(name):
                 if active:
                     running[name] = None
                 else:
                     running.pop(name, None)
-            if state or long or gradle or PROGRESS.fullmatch(line):
+            if state or long or gradle or line.split(" ", 1)[0] in {"Compiling", "Finished"}:
                 if _private(line, index):
                     withheld += 1
-                elif len(_encoded(line)) <= MAX_EXCERPT_BYTES:
-                    progress_omitted += int(len(progress) == MAX_PROGRESS_LINES)
-                    progress.append(line)
                 else:
-                    progress_omitted += 1
+                    rebuilt = _timeout_progress(line)
+                    if rebuilt is None:
+                        continue
+                    if _private(rebuilt, index):
+                        withheld += 1
+                    elif len(_encoded(rebuilt)) <= MAX_EXCERPT_BYTES:
+                        progress_omitted += int(len(progress) == MAX_PROGRESS_LINES)
+                        progress.append(rebuilt)
+                    else:
+                        progress_omitted += 1
         names = [n for n in running if not _private(n, index)]
         result["timeout"] = {"runningTests": names[:MAX_FAILING],
                              "runningOmitted": len(running) - min(len(names), MAX_FAILING),
