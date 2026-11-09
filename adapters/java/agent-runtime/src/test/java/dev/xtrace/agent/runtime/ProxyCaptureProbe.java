@@ -48,12 +48,26 @@ public class ProxyCaptureProbe {
     assertNull(ProxyBridge.class.getClassLoader(), "proxy bridge must resolve from bootstrap");
     assertNull(ProxyBridge.Call.class.getClassLoader(), "call metadata must resolve from bootstrap");
     assertNull(ProxyBridge.EventSink.class.getClassLoader(), "event sink must resolve from bootstrap");
+    boolean attach = Boolean.getBoolean("xtrace.proxy.probe.attach");
+    Object preloaded = attach
+        ? demo.framework.RepositoryProxyFactory.create(demo.proxy.SpringRepository.class) : null;
     java.util.concurrent.atomic.AtomicBoolean failed = new java.util.concurrent.atomic.AtomicBoolean();
     ProxyInstrumentation.install(ProxyProbeAgent.instrumentation, error -> {
       failed.set(true);
       System.err.println("proxy capture transformer failed");
       error.printStackTrace(System.err);
-    }, false);
+    }, attach);
+    if (attach) {
+      ProxyCaptureProbe probe = new ProxyCaptureProbe(false);
+      try {
+        probe.install();
+        probe.assertSpringStyleRepository(preloaded);
+        assertFalse(failed.get(), "production retransformation failed");
+        System.out.println("preloaded-proxy-capture-cases=1");
+      } finally {
+        probe.close();
+      }
+    }
     Method[] methods = ProxyCaptureProbe.class.getDeclaredMethods();
     java.util.Arrays.sort(methods, java.util.Comparator.comparing(Method::getName));
     int count = 0;
@@ -143,6 +157,63 @@ public class ProxyCaptureProbe {
       if (next instanceof QueueSignal.Event event) result.add(event);
     }
     return result;
+  }
+
+  @Case(focused = false)
+  void springStyleInfrastructureInterfacesAndFrameworkHandlerDoNotHideRepositoryCalls()
+      throws Exception {
+    assertSpringStyleRepository(
+        demo.framework.RepositoryProxyFactory.create(demo.proxy.SpringRepository.class));
+  }
+
+  private void assertSpringStyleRepository(Object springProxy) throws Exception {
+    Class<?> repository = demo.proxy.SpringRepository.class;
+    byte[] bytes = ClassFileLocator.ForClassLoader.of(repository.getClassLoader())
+        .locate(repository.getName()).resolve();
+    ProxyInterfaceSources.observe(repository.getClassLoader(), repository.getName().replace('.', '/'),
+        bytes, new ApplicationScope(scope.packages(), scope.sourceRoots(), sourceBase()));
+    assertTrue(Proxy.isProxyClass(springProxy.getClass()));
+    assertTrue(springProxy.getClass().getName().startsWith("jdk.proxy"));
+    assertSame(repository.getClassLoader(), springProxy.getClass().getClassLoader());
+    assertEquals(ApplicationScope.NOT_APPLICATION, scope.verdict(springProxy.getClass()));
+    assertEquals(ApplicationScope.APPLICATION, scope.verdict(repository));
+    assertEquals(ApplicationScope.NOT_APPLICATION,
+        scope.verdict(Proxy.getInvocationHandler(springProxy).getClass()));
+    assertEquals(4, springProxy.getClass().getInterfaces().length);
+    for (Class<?> extra : springProxy.getClass().getInterfaces()) {
+      if (extra != repository) assertEquals(ApplicationScope.NOT_APPLICATION, scope.verdict(extra));
+    }
+
+    assertTrue(BootstrapBridge.requestStart("GET", "/repositories"));
+    BootstrapBridge.frameEnter("Controller.find");
+    assertFalse(((demo.framework.RepositoryProxyFactory.Advised) springProxy).isFrozen());
+    assertSame(repository,
+        ((demo.framework.RepositoryProxyFactory.DecoratingProxy) springProxy).getDecoratedClass());
+    assertEquals("repository", springProxy.toString());
+    assertEquals("found", ((demo.proxy.SpringRepository) springProxy).findByName("found"));
+    assertEquals("saved", ((demo.proxy.SpringRepository) springProxy).save("saved"));
+    BootstrapBridge.frameExit("Controller.find", false);
+    BootstrapBridge.requestEnd(200, false);
+
+    var captured = drain();
+    assertEquals(List.of(1, 2, 2, 7, 8, 3, 2, 7, 8, 3, 3, 13),
+        captured.stream().map(QueueSignal.Event::kind).toList());
+    assertEquals("demo.proxy.SpringRepository.findByName", captured.get(2).symbol());
+    assertTrue(captured.get(2).sourcePath().endsWith("demo/proxy/SpringRepository.java"));
+    assertEquals(SourceIdentity.OBSERVED_UNATTESTED, captured.get(2).sourceBinding());
+    assertTrue(Files.readAllLines(sourceBase().resolve("src/test/java/demo/proxy/SpringRepository.java"))
+        .get(captured.get(2).sourceStartLine() - 1).contains("String findByName(String name)"));
+    // The inherited method remains a framework declaration, not an invented application method.
+    assertEquals("demo.framework.RepositoryProxyFactory$CrudRepository.save", captured.get(6).symbol());
+    for (int entry : List.of(2, 6)) {
+      assertEquals(captured.get(1).eventId(), captured.get(entry).parentEventId());
+      assertEquals(captured.get(entry).eventId(), captured.get(entry + 1).parentEventId());
+      assertEquals(captured.get(entry).eventId(), captured.get(entry + 3).parentEventId());
+      assertTrue(captured.get(entry).values().isEmpty());
+      assertTrue(captured.get(entry + 3).values().isEmpty());
+    }
+    assertNull(captured.get(6).sourcePath());
+    assertFalse(captured.stream().anyMatch(event -> event.kind() == BridgeEventKind.LINE_CURSOR));
   }
 
   @Case(focused = false)

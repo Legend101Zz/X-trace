@@ -547,6 +547,46 @@ public class SpringMvcBridgeTest {
   }
 
   @Test
+  void containerWrapperAndLaterErrorDispatchDoNotRewriteTheObservedFailure() {
+    Request request = new Request("GET", "/missing");
+    Response response = new Response(200);
+    IllegalArgumentException applicationFailure = new IllegalArgumentException("private-canary");
+    // FrameworkServlet wraps the handler failure before it escapes Servlet.service. Only the
+    // wrapper itself is observed at that boundary; a cause traversal must not invent a link.
+    Exception containerFailure = new Exception("private-wrapper-canary", applicationFailure);
+    SpringMvcBridge.servletEnter();
+    SpringMvcBridge.dispatchEnter();
+    assertTrue(SpringMvcBridge.start(request, new Handler(Controller.class)));
+    String frame = BootstrapBridge.frameEnter(Controller.class, "missing", "()V");
+    BootstrapBridge.frameExit(frame, applicationFailure);
+    SpringMvcBridge.end(request, response, applicationFailure);
+    SpringMvcBridge.dispatchEnd(response, applicationFailure);
+    SpringMvcBridge.servletEnd(request, response, containerFailure);
+
+    assertEquals("java.lang.IllegalArgumentException", sink.thrownType);
+    assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+    assertEquals("java.lang.Exception", sink.outcome.exceptionType());
+    assertEquals(null, sink.outcome.exceptionMessage());
+    assertEquals(null, sink.outcome.thrownFromEventId());
+    assertEquals(0, sink.outcome.httpStatus());
+    assertEquals(0, sink.status);
+    assertTrue(sink.symbols.contains(provisionalLabel(200)));
+    assertFalse(BootstrapBridge.hasContext());
+
+    Request error = new Request("GET", "/error");
+    error.dispatcher = Dispatch.ERROR;
+    response.status = 500;
+    SpringMvcBridge.servletEnter();
+    assertFalse(SpringMvcBridge.start(error, new Handler(Controller.class)));
+    SpringMvcBridge.servletEnd(error, response, null);
+    assertEquals(1, sink.starts());
+    assertEquals(1, sink.finishes);
+    assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, sink.outcome.kind());
+    assertEquals(0, sink.outcome.httpStatus());
+    assertEquals(0, sink.dropped);
+  }
+
+  @Test
   void bufferedErrorStatusStaysProvisionalWhenAnExceptionEscapesTheOuterServlet() {
     SpringMvcBridge.servletEnter();
     SpringMvcBridge.dispatchEnter();
