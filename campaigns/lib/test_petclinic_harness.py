@@ -19,6 +19,14 @@ class OverheadHarness(unittest.TestCase):
             spec.loader.exec_module(module)
         return module
 
+    def test_scenario_order_matches_the_pinned_baseline_and_burst_runs_last(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = self.load(td)
+            pinned = json.loads((ROOT / "campaigns/java/petclinic/baseline-summary.json").read_text())
+            self.assertEqual([sc.id for sc in harness.SCENARIOS], [sc["id"] for sc in pinned["scenarios"]])
+            self.assertEqual(harness.SCENARIOS[-1].kind, "concurrency")
+            self.assertTrue(all(sc.kind != "concurrency" for sc in harness.SCENARIOS[:-1]))
+
     def test_exactly_five_interleaved_pairs_record_real_intervals_and_pair_paths(self):
         with tempfile.TemporaryDirectory() as td:
             harness = self.load(td)

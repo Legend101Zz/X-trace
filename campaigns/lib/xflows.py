@@ -237,6 +237,27 @@ def _line_events(details: list[dict]) -> list[tuple[dict, dict]]:
     return out
 
 
+def line_parent_gaps(details: list[dict]) -> dict[str, int]:
+    """Count observed parent failures without guessing a method from cursor source or symbols."""
+    counts: dict[str, int] = {}
+    for detail in details:
+        by_id = {ev["frameId"]: ev for ev in detail.get("events", []) if ev.get("frameId")}
+        for ev in detail.get("events", []):
+            if not str(ev.get("kind", "")).endswith("line_cursor"):
+                continue
+            parent = by_id.get(ev.get("parentFrameId"))
+            if parent is None:
+                reason = "parent-not-observed"
+            elif not str(parent.get("kind", "")).endswith("frame_enter"):
+                reason = "parent-is-not-method-entry"
+            elif not isinstance(parent.get("source"), dict) or type(parent["source"].get("startLine")) is not int or parent["source"]["startLine"] < 1:
+                reason = "parent-method-extent-unavailable"
+            else:
+                continue
+            counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
 def judge_active_line(details: list[dict]) -> tuple[str, str]:
     if not details:
         return "fail", "no focused recording was read back"
@@ -250,7 +271,8 @@ def judge_active_line(details: list[dict]) -> tuple[str, str]:
         return "fail", f"{len(bad)} line_cursor events carry no observed line number"
     with_extent = [(ev, src) for ev, src in lines if type(src.get("startLine")) is int and src["startLine"] >= 1]
     if len(with_extent) != len(lines):
-        return "fail", f"{len(lines) - len(with_extent)} line events have no enclosing method extent through parentFrameId"
+        return "fail", (f"{len(lines) - len(with_extent)} line events have no enclosing method extent through parentFrameId; "
+                        + json.dumps(line_parent_gaps(details), sort_keys=True))
     outside = [ev for ev, src in with_extent if ev["line"] < src["startLine"] or
                (type(src.get("endLine")) is int and ev["line"] > src["endLine"])]
     moving = [ev for ev, src in with_extent if ev["line"] != src["startLine"]]

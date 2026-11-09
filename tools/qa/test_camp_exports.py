@@ -13,7 +13,7 @@ import camp_exports as ce  # noqa: E402
 import canary  # noqa: E402
 
 
-CATALOG = {"persisted": True, "catalogRevisionId": "rev", "result": {"operations": [{}]}}
+CATALOG = {"persisted": True, "catalogRevisionId": "rev", "changes": {"added": 1, "unknown": 0}, "result": {"operations": [{}]}}
 COUNTS = {"openapi": 1, "postman": 1, "curl": 1}
 
 
@@ -130,6 +130,30 @@ class T(unittest.TestCase):
             self.assertEqual(steps["export-bundle"], "pass")
             self.assertEqual(steps["export-formats"], "pass")
             self.assertTrue(all("--json" in call for call in calls))
+            for call in calls[1:]:
+                self.assertEqual(call[call.index("--revision") + 1], "rev")
+
+    def test_bundle_uses_persisted_revision_counts_instead_of_the_static_scan_subset(self):
+        with tempfile.TemporaryDirectory() as td:
+            dest = pathlib.Path(td) / "bundle"
+            write_bundle(dest)
+            # One runtime-only operation was retained in the revision; this scan saw none.
+            catalog = {**CATALOG, "result": {"operations": []}}
+            self.assertEqual(ce.judge_bundle(dest, catalog, COUNTS)[0], "pass")
+            # Without a measured full-revision count the static subset cannot prove equality.
+            for changes in (None, {}, {"added": True}, {"added": -1}):
+                self.assertEqual(ce.judge_bundle(dest, {**catalog, "changes": changes}, COUNTS)[0], "fail")
+            self.assertEqual(ce.judge_bundle(dest, {**catalog, "changes": {"added": 1, "unknown": 1}}, COUNTS)[0], "fail")
+
+    def test_bundle_failure_names_the_failed_contract_without_payload_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            dest = pathlib.Path(td) / "bundle"
+            write_bundle(dest)
+            update_manifest(dest, lambda m: m.update(revision_id="private-catalog-value"))
+            status, note = ce.judge_bundle(dest, CATALOG, COUNTS)
+            self.assertEqual(status, "fail")
+            self.assertIn("count or revision", note)
+            self.assertNotIn("private-catalog-value", note)
 
     def test_bundle_rejects_missing_empty_extra_stale_or_linked_files(self):
         changes = [

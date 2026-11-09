@@ -337,7 +337,73 @@ class T(unittest.TestCase):
         details["extra"] = dict(details["0"])
         self.assertFalse(xinstr.burst_accounting(details, sent, exp, {})["verified"])
 
-    def test_orchestration_waits_before_serial_and_stops_when_unaccounted(self):
+    def test_serial_boundary_requires_one_complete_recording_per_request(self):
+        exp, sent, details = self.boundary_fixture()
+        details.pop("1")
+        evidence = "1 requests were not recorded: agent capacity (session s, cumulative as last reported)"
+        cases = [{"0": {**details["0"], "incompleteEvidence": [evidence]}},
+                 {"0": {**details["0"], "completion": "partial"}, "1": details["0"]}]
+        for snapshot in cases:
+            with self.subTest(snapshot=snapshot), mock.patch.object(xinstr.time, "monotonic", return_value=0), \
+                 mock.patch.object(xinstr, "collect_api", return_value={"ok": True, "details": snapshot}):
+                result = xinstr.wait_burst_boundary(mock.Mock(), pathlib.Path("unused"), sent, exp, {}, 3, require_complete=True)
+            self.assertFalse(result["verified"])
+            self.assertIsNone(result["verifiedAt"])
+
+    def test_serial_first_boundary_never_uses_later_burst_or_canary_to_fill_a_missing_serial(self):
+        exp, _, details = self.boundary_fixture()
+        serial_sent = [("serial", "GET", "/owners/1"), ("serial", "GET", "/owners/2")]
+        for i, detail in enumerate(details.values()):
+            detail["_openedAt"] = f"2026-10-10T00:00:0{i}Z"
+        serial = xinstr.burst_accounting(details, serial_sent, exp, {})
+        later = {"burst": {**rec("GET", "/owners/{id}", 200), "completion": "complete"}}
+        burst_sent = [("burst", "GET", "/owners/3")]
+        combined = {**details, **later}
+        boundary = xinstr.burst_accounting(combined, burst_sent, exp, details)
+        sent = serial_sent + burst_sent + [(None, "GET", "/owners/4")]
+        verdict = xinstr.analyze(combined, exp, sent, frozenset({"burst"}), boundary, serial)
+        self.assertTrue(verdict["serial"]["passed"], verdict)
+        self.assertTrue(verdict["burst"]["passed"], verdict)
+        # Late recordings are outside the serial snapshot, even with the same route and time.
+        del combined["1"]
+        combined["canary"] = {**later["burst"], "_openedAt": "2026-10-10T00:00:01Z"}
+        verdict = xinstr.analyze(combined, exp, sent, frozenset({"burst"}), boundary, serial)
+        self.assertEqual(verdict["serial"]["expectations"][0]["problems"],
+                         ["serial-count-mismatch(recordings 1, requests 2)"])
+        self.assertFalse(verdict["serial"]["passed"])
+        self.assertEqual(verdict["serial"]["frameSymbols"], [])
+        self.assertEqual(verdict["burst"]["recordingsAttributed"], 1)
+
+    def test_frame_symbols_are_unique_names_from_attributed_entries_even_on_bad_outcomes(self):
+        detail = rec("GET", "/vets", 500, symbols=("VetController.show", "VetRepository.findAll", "VetController.show"))
+        detail["events"][1]["bindings"] = [{"value": {"preview": "private-value"}}]
+        detail["events"].append({"kind": "recording_event_kind:line_cursor", "symbol": "cursor-only"})
+        exp = {"s": [{"method": "GET", "route": "/vets", "status": 200}]}
+        verdict = xinstr.analyze({"r": detail, "other": rec("GET", "/owners", 200)}, exp)["s"]
+        self.assertFalse(verdict["passed"])
+        self.assertEqual(verdict["frameSymbols"], ["VetController.show", "VetRepository.findAll"])
+        self.assertNotIn("private-value", str(verdict))
+
+    def test_serial_symbol_inventory_includes_requests_without_a_scenario_expectation(self):
+        exp, _, details = self.boundary_fixture()
+        exp["other"] = [{"method": "GET", "route": "/vets", "status": 200}]
+        details["vets"] = {**rec("GET", "/vets", 200, symbols=("VetController.show",)), "completion": "complete"}
+        for i, detail in enumerate(details.values()):
+            detail["_openedAt"] = f"2026-10-10T00:00:0{i}Z"
+        sent = [("serial", "GET", "/owners/1"), ("serial", "GET", "/owners/2"), ("serial", "GET", "/vets")]
+        serial = xinstr.burst_accounting(details, sent, exp, {})
+        self.assertTrue(serial["verified"])
+        verdict = xinstr.analyze(details, exp, sent, frozenset({"burst"}), serial_boundary=serial)
+        self.assertTrue(verdict["serial"]["passed"])
+        self.assertEqual(verdict["serial"]["frameSymbols"],
+                         ["OwnerController.showOwner", "OwnerRepository.findById", "VetController.show"])
+        self.assertEqual(verdict["other"]["frameSymbols"], [])
+        details["1"]["_openedAt"] = details["0"]["_openedAt"]
+        verdict = xinstr.analyze(details, exp, sent, frozenset({"burst"}), serial_boundary=serial)
+        self.assertEqual(verdict["serial"]["attribution"], "ambiguous")
+        self.assertEqual(verdict["serial"]["frameSymbols"], ["VetController.show"])
+
+    def test_orchestration_preserves_serial_order_and_stops_burst_when_unaccounted(self):
         import tempfile
         import xcamp
         from types import SimpleNamespace
@@ -353,9 +419,17 @@ class T(unittest.TestCase):
                 exp, sent, details = self.boundary_fixture()
                 boundary = xinstr.burst_accounting(details, sent, exp, {})
                 boundary["verified"] = verified
-                def wait(*args):
+                def wait(*args, **kwargs):
                     events.append("boundary")
+                    if len(events) == 2:
+                        self.assertEqual([r[0] for r in args[2]], ["serial"])
+                        self.assertTrue(kwargs["require_complete"])
+                    else:
+                        self.assertEqual([r[0] for r in args[2]], ["burst"])
+                        self.assertEqual(args[5], deadline[0], "both phases share the existing budget")
+                    deadline.append(args[5])
                     return boundary
+                deadline = []
                 api = {"ok": True, "reason": "", "recordings": [], "details": {}}
                 with mock.patch.object(xinstr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "")), \
                      mock.patch.object(xinstr, "list_recording_ids", return_value=set()), \
@@ -371,13 +445,16 @@ class T(unittest.TestCase):
                         out_dir=pathlib.Path(td) / "out", norm_extra=[], expectations=exp, xtrace="xtrace",
                         project_dir=pathlib.Path(td), data_home=pathlib.Path(td) / "data", adaptations=[],
                         canaries=None, baseline_receipt=None, extra_canary_paths=[], harness_files=[])
-                self.assertEqual(events, ["burst", "boundary", "serial"] if verified else ["burst", "boundary"])
-                self.assertEqual(receipt["notes"]["burstBoundary"], boundary)
+                self.assertEqual(events, ["serial", "boundary", "burst", "boundary"] if verified else ["serial", "boundary"])
+                self.assertEqual(receipt["notes"]["serialBoundary"], boundary)
+                if verified:
+                    self.assertEqual(receipt["notes"]["burstBoundary"], boundary)
+                self.assertTrue(all("frameSymbols" in sc for sc in receipt["scenarios"]))
                 stack.down.assert_called_once()
                 if not verified:
-                    serial = next(s for s in receipt["scenarios"] if s["id"] == "serial")
-                    self.assertFalse(serial["scenarioChecksPassed"])
-                    self.assertEqual(serial["notRunReason"], "burst boundary was not verified")
+                    burst = next(s for s in receipt["scenarios"] if s["id"] == "burst")
+                    self.assertFalse(burst["scenarioChecksPassed"])
+                    self.assertEqual(burst["notRunReason"], "serial boundary was not verified")
 
     def test_recording_snapshot_requires_valid_paginated_cli_evidence(self):
         with mock.patch.object(xinstr.subprocess, "run", side_effect=[
@@ -408,12 +485,13 @@ class T(unittest.TestCase):
              mock.patch.object(xinstr, "ViewerClient"), mock.patch.object(xinstr, "stop_process_group"), \
              mock.patch.object(xinstr, "collect_api", return_value=api), \
              mock.patch.object(xcamp, "run_scenario", return_value=result), \
-             mock.patch.object(xinstr, "analyze", return_value={}) as analyze:
+             mock.patch.object(xinstr, "analyze", return_value={"s": {"frameSymbols": ["OwnerController.show"], "expectations": []}}) as analyze:
             receipt = xinstr.run_instrumented(project="petclinic", pin={}, make_stack=lambda tag: stack,
                 scenarios=[scenario], out_dir=pathlib.Path(td) / "out", norm_extra=[], expectations={}, xtrace="xtrace",
                 project_dir=pathlib.Path(td), data_home=pathlib.Path(td) / "data", adaptations=[],
                 canaries=None, baseline_receipt=None, extra_canary_paths=[], harness_files=[])
         self.assertEqual(receipt["api"]["recordings"], 1)
+        self.assertEqual(receipt["scenarios"][0]["frameSymbols"], ["OwnerController.show"])
         self.assertEqual(set(analyze.call_args.args[0]), {"new"})
         self.assertEqual(receipt["notes"]["accommodations"]["pace_seconds"], 0.4)
         self.assertEqual(receipt["notes"]["accommodations"]["drain_seconds"], 0)
