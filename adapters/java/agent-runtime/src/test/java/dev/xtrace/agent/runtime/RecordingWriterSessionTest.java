@@ -232,7 +232,7 @@ final class RecordingWriterSessionTest {
         .anyMatch(frame -> uuid(frame.getRecordingStarted().getRecordingId()).equals(FIRST)),
         "an unsendable start never reserves daemon capacity");
     if (incomplete && startAccepted) {
-      assertMinimalFinish(finishes.get(0), started ? 1 : 2);
+      assertMinimalFinish(finishes.get(0), started ? 1 : 2, 0);
     }
     for (var finish : finishes) {
       String id = uuid(finish.getRecordingId());
@@ -365,6 +365,15 @@ final class RecordingWriterSessionTest {
 
   @Test
   void aLimitTooSmallForTheGapFinishesOnlyThatRecordingAsIncompleteAndReportsWhy() throws Exception {
+    exerciseUnsendableEvent(false);
+  }
+
+  @Test
+  void abandonmentDuringFinishPreservesExactQueueAndBufferedEventLoss() throws Exception {
+    exerciseUnsendableEvent(true);
+  }
+
+  private static void exerciseUnsendableEvent(boolean finishQueued) throws Exception {
     ByteArrayOutputStream diagnostics = new ByteArrayOutputStream();
     PrintStream previous = System.err;
     BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
@@ -375,17 +384,33 @@ final class RecordingWriterSessionTest {
       System.setErr(capture);
       try {
         assertTrue(sink.offerStart(FIRST, 1, "GET", "/first"));
+        assertTrue(sink.offerEvent(FIRST, "prefix", "", BridgeEventKind.FRAME_ENTER,
+            "handler", 2, 0));
         assertTrue(sink.offerEvent(FIRST, "e".repeat(256), "p".repeat(256),
             BridgeEventKind.FRAME_ENTER, "private-canary", 2, 0));
-        assertTrue(sink.offerFinish(FIRST, 1, 3, 0, 0));
+        assertTrue(sink.offerEvent(FIRST, "buffered", "", BridgeEventKind.FRAME_EXIT,
+            "handler", 2, 0));
+        assertTrue(sink.offerEvent(FIRST, "response", "", BridgeEventKind.RESPONSE,
+            "http.response 500", 3, 500));
+        if (finishQueued) assertTrue(sink.offerFinish(FIRST, 1, 5, 0, 7));
+        writer.start();
+        // Without a queued Finish this terminal must come from a nonterminal flush.
+        var abandoned = peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED);
+        assertEquals(FIRST, uuid(abandoned.getRecordingFinished().getRecordingId()));
+        assertMinimalFinish(abandoned.getRecordingFinished(), 2, finishQueued ? 10 : 0);
+        if (!finishQueued) {
+          // Buffered loss is known, but the total is not. Later losses must not make the
+          // terminal evidence's counters false, or send a second terminal marker.
+          assertTrue(sink.offerEvent(FIRST, "after-abandonment", "", BridgeEventKind.FRAME_EXIT,
+              "handler", 4, 0));
+          assertTrue(sink.offerFinish(FIRST, 1, 5, 0, 7));
+        }
         assertTrue(sink.offerStart(LATER, 4, "GET", "/later"));
         assertTrue(sink.offerEvent(LATER, "later-response", "", BridgeEventKind.RESPONSE,
             "http.response 201", 5, 201));
         assertTrue(sink.offerFinish(LATER, 4, 6, 201, 0));
-        writer.start();
-        assertEquals(FIRST, uuid(peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED)
+        assertEquals(LATER, uuid(peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED)
             .getRecordingFinished().getRecordingId()));
-        peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED);
         assertFalse(peer.closed);
       } finally {
         writer.close();
@@ -398,9 +423,19 @@ final class RecordingWriterSessionTest {
     assertEquals(0, sink.activeRecordings());
     var finishes = peer.frames.stream().filter(AgentEnvelope::hasRecordingFinished).toList();
     assertEquals(2, finishes.size());
-    assertMinimalFinish(finishes.get(0).getRecordingFinished(), 1);
+    assertMinimalFinish(finishes.get(0).getRecordingFinished(), 2, finishQueued ? 10 : 0);
     assertEquals(LATER, uuid(finishes.get(1).getRecordingFinished().getRecordingId()));
     assertEquals(0, finishes.get(1).getRecordingFinished().getDropCountsByPriorityCount());
+    int terminalIndex = peer.frames.indexOf(finishes.get(0));
+    assertTrue(peer.frames.subList(terminalIndex + 1, peer.frames.size()).stream()
+        .noneMatch(frame -> frame.getCorrelationToken().equals(FIRST)),
+        "later events and the real Finish must not send frames after abandonment");
+    var prefix = peer.frames.stream().filter(AgentEnvelope::hasEventBatch)
+        .filter(frame -> uuid(frame.getEventBatch().getRecordingId()).equals(FIRST))
+        .flatMap(frame -> frame.getEventBatch().getEventsList().stream()).toList();
+    assertEquals(List.of("prefix"), prefix.stream().map(event -> event.getEventId()).toList());
+    assertArrayEquals(EventDigest.compute(List.of("later-response")),
+        finishes.get(1).getRecordingFinished().getEventDigest().toByteArray());
     String output = diagnostics.toString(StandardCharsets.UTF_8);
     assertTrue(output.contains("frame-limit gap could not be sent"));
     assertTrue(output.contains("\"recordingId\":\"" + FIRST + "\""));
@@ -408,12 +443,13 @@ final class RecordingWriterSessionTest {
     assertFalse(output.contains("private-canary"));
   }
 
-  private static void assertMinimalFinish(RecordingFinished finish, long sequence) {
-    assertEquals(RecordingFinished.newBuilder()
+  private static void assertMinimalFinish(RecordingFinished finish, long sequence, long knownDrops) {
+    var expected = RecordingFinished.newBuilder()
         .setRecordingId(finish.getRecordingId())
-        .setFinalRecordingSeq(sequence)
-        .putDropCountsByPriority(1, 1)
-        .build(), finish, "an abandoned recording sends only identity, watermark and loss marker");
+        .setFinalRecordingSeq(sequence);
+    if (knownDrops > 0) expected.putDropCountsByPriority(1, knownDrops);
+    assertEquals(expected.build(), finish,
+        "absent digest means incomplete proof; counters require a known total event loss");
   }
 
   @Test
@@ -440,19 +476,28 @@ final class RecordingWriterSessionTest {
           assertTrue(sink.offerEvent(id, unsendableEvent ? "e".repeat(256) : "response",
               "", unsendableEvent ? BridgeEventKind.FRAME_ENTER : BridgeEventKind.RESPONSE,
               "http.response 500", 3, 500));
-          assertTrue(sink.offerFinishWithOutcome(id, 2, 4, 500, 0,
-              new BridgeSink.Outcome(BridgeSink.Outcome.EXCEPTION_PROPAGATED, 0,
-                  i % 4 == 2 ? "E".repeat(256) : "java.lang.IllegalStateException",
-                  "private-canary " + "sanitized ".repeat(50), "")));
+          if (!unsendableEvent) {
+            assertTrue(sink.offerFinishWithOutcome(id, 2, 4, 500, 0,
+                new BridgeSink.Outcome(BridgeSink.Outcome.EXCEPTION_PROPAGATED, 0,
+                    i % 4 == 2 ? "E".repeat(256) : "java.lang.IllegalStateException",
+                    "private-canary " + "sanitized ".repeat(50), "")));
+          }
           var terminal = peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED);
           var finish = terminal.getRecordingFinished();
           assertEquals(id, uuid(finish.getRecordingId()));
-          assertMinimalFinish(finish, reducedStart || unsendableEvent ? 1 : 2);
-          // Compare the actual terminal envelope at the widest sequences with a start that
-          // contains only identity. Optional start fields can only increase this allowance.
+          assertMinimalFinish(finish, reducedStart || unsendableEvent ? 1 : 2, 0);
+          if (unsendableEvent) {
+            assertTrue(sink.offerFinishWithOutcome(id, 2, 4, 500, 0,
+                new BridgeSink.Outcome(BridgeSink.Outcome.EXCEPTION_PROPAGATED, 0,
+                    "java.lang.IllegalStateException",
+                    "private-canary " + "sanitized ".repeat(50), "")));
+          }
+          // Bound even a maximal exact drop count at the widest sequences against a start
+          // containing only identity. Optional start fields only increase this allowance.
           var widestTerminal = terminal.toBuilder().setSessionSeq(Long.MAX_VALUE)
               .setRecordingFinished(finish.toBuilder()
-                  .setFinalRecordingSeq(RecordingWriter.MAX_FOCUSED_EVENTS_PER_RECORDING + 1))
+                  .setFinalRecordingSeq(RecordingWriter.MAX_FOCUSED_EVENTS_PER_RECORDING + 1)
+                  .putDropCountsByPriority(1, Long.MAX_VALUE))
               .build();
           var smallestStart = terminal.toBuilder().setSessionSeq(Long.MAX_VALUE)
               .setMessageId(id + ":started")

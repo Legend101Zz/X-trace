@@ -261,14 +261,13 @@ fn translate_batch(
 fn translate_finished(
     finished: &RecordingFinished,
 ) -> Result<FinishRecording, RecordingPipelineError> {
-    // A minimal incomplete finish carries only identity, watermark and a loss marker.
+    // An absent digest is incomplete proof even with no measured event drops.
     // Proto3 decodes its omitted duration as zero; that is not an observed duration.
     let minimal_incomplete = finished.duration_ns == 0
         && finished.event_digest.is_empty()
         && finished.response_summary.is_none()
         && finished.outcome.is_none()
-        && finished.unsupported_capability_codes.is_empty()
-        && finished.drop_counts_by_priority.values().any(|count| *count > 0);
+        && finished.unsupported_capability_codes.is_empty();
     Ok(FinishRecording {
         recording_id: recording_id(&finished.recording_id)?,
         final_recording_seq: finished.final_recording_seq,
