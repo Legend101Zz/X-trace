@@ -27,6 +27,8 @@ const MAX_JOURNAL_BYTES: usize =
 thread_local! {
     pub(super) static BEFORE_SYNC: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_BOUNDARY: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static AFTER_SNAPSHOT_READS: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static SNAPSHOT_CONTENDED: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static BEFORE_PUBLICATION: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static BEFORE_CLEANUP: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     static CHECKPOINT_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -56,6 +58,46 @@ pub(super) fn snapshot_lock(
     let lock = Arc::new(RwLock::new(()));
     *entry = Arc::downgrade(&lock);
     Ok(lock)
+}
+
+// Lock the admitted journals directory itself: its inode survives checkpoint
+// replacement and tail cleanup, and read-only clients need not create a lock
+// file (including for journals written by older versions). This briefly
+// coordinates all journals in a project. Always take the process-local lock
+// first, and release both locks before syncing append data or decoding events.
+// Each call opens its own descriptor; closing it releases only this flock.
+#[cfg(unix)]
+fn snapshot_file_lock(
+    root: &AdmittedPrivateRoot,
+    exclusive: bool,
+    id: CorrelationId,
+) -> Result<std::fs::File, RecordingStoreError> {
+    use rustix::fs::{FlockOperation, flock};
+
+    let file = xtrace_private_storage::open_private_directory_descriptor(root.path())
+        .map_err(|_| object_io_error(id))?;
+    let operation =
+        if exclusive { FlockOperation::LockExclusive } else { FlockOperation::LockShared };
+    #[cfg(test)]
+    if exclusive {
+        // Observe actual kernel contention without a sleep or a timing-based
+        // assertion. The production path simply makes one blocking lock call.
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                root.revalidate().map_err(|_| object_io_error(id))?;
+                return Ok(file);
+            }
+            Err(rustix::io::Errno::WOULDBLOCK) => SNAPSHOT_CONTENDED.with(|hook| {
+                if let Some(hook) = hook.borrow().as_ref() {
+                    hook();
+                }
+            }),
+            Err(_) => return Err(object_io_error(id)),
+        }
+    }
+    flock(&file, operation).map_err(|_| object_io_error(id))?;
+    root.revalidate().map_err(|_| object_io_error(id))?;
+    Ok(file)
 }
 
 /// Only the large cardinality tests substitute the sync syscall. All writes,
@@ -266,6 +308,8 @@ fn publish_boundary(
     let lock = snapshot_lock(root, recording_id, id)?;
     let _snapshot = lock.write().map_err(|_| object_io_error(id))?;
     #[cfg(unix)]
+    let _file_snapshot = snapshot_file_lock(root, true, id)?;
+    #[cfg(unix)]
     {
         // Keep the same source/target admission and post-rename binding checks
         // as rename_replace, with an explicit full directory sync on Apple.
@@ -305,24 +349,35 @@ fn load_for_retry(
 ) -> Result<Option<Tail>, RecordingStoreError> {
     let Some(root) = directory(binding, false, id)? else { return Ok(None) };
     let lock = snapshot_lock(&root, recording_id, id)?;
-    let _snapshot = lock.read().map_err(|_| object_io_error(id))?;
-    let boundary = read_boundary(&root, recording_id, id)?;
+    let (boundary, bytes) = {
+        let _snapshot = lock.read().map_err(|_| object_io_error(id))?;
+        #[cfg(unix)]
+        let _file_snapshot = snapshot_file_lock(&root, false, id)?;
+        let boundary = read_boundary(&root, recording_id, id)?;
+        #[cfg(test)]
+        AFTER_BOUNDARY.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook();
+            }
+        });
+        let name = name(recording_id);
+        match std::fs::symlink_metadata(root.path().join(&name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && boundary.is_none() => {
+                return Ok(None);
+            }
+            Err(_) => return Err(object_io_error(id)),
+            Ok(_) => {}
+        }
+        let bytes =
+            root.read_bounded_file(&name, MAX_JOURNAL_BYTES).map_err(|_| object_io_error(id))?;
+        (boundary, bytes)
+    };
     #[cfg(test)]
-    AFTER_BOUNDARY.with(|hook| {
+    AFTER_SNAPSHOT_READS.with(|hook| {
         if let Some(hook) = hook.borrow().as_ref() {
             hook();
         }
     });
-    let name = name(recording_id);
-    match std::fs::symlink_metadata(root.path().join(&name)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && boundary.is_none() => {
-            return Ok(None);
-        }
-        Err(_) => return Err(object_io_error(id)),
-        Ok(_) => {}
-    }
-    let bytes =
-        root.read_bounded_file(&name, MAX_JOURNAL_BYTES).map_err(|_| object_io_error(id))?;
     // A crash during initial header creation cannot have acknowledged events.
     if bytes.len() < HEADER_BYTES {
         return if boundary.is_some() { Err(object_corrupt_error(id)) } else { Ok(None) };
@@ -639,6 +694,8 @@ impl SqliteRecordingStore<'_> {
         }
         let lock = snapshot_lock(&root, request.recording_id, id)?;
         let mutation = lock.write().map_err(|_| object_io_error(id))?;
+        #[cfg(unix)]
+        let file_mutation = snapshot_file_lock(&root, true, id)?;
         // Remove only an incomplete, unacknowledged suffix before an exact retry.
         if length != known.length {
             file.set_len(known.length).map_err(|_| object_io_error(id))?;
@@ -655,6 +712,8 @@ impl SqliteRecordingStore<'_> {
                 .and_then(|()| file.write_all(blake3::hash(bytes).as_bytes()))
                 .map_err(|_| object_io_error(id))?;
         }
+        #[cfg(unix)]
+        drop(file_mutation);
         drop(mutation);
         #[cfg(test)]
         BEFORE_SYNC.with(|hook| {
@@ -694,6 +753,8 @@ impl SqliteRecordingStore<'_> {
             });
             let lock = snapshot_lock(&root, recording_id, id)?;
             let _snapshot = lock.write().map_err(|_| object_io_error(id))?;
+            #[cfg(unix)]
+            let _file_snapshot = snapshot_file_lock(&root, true, id)?;
             let mut removed_boundary = false;
             for name in
                 [boundary_name(recording_id), format!("{}-next", boundary_name(recording_id))]
