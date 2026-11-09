@@ -15,7 +15,9 @@
 //! descriptor still shows exactly the state that was probed, and any change misses and is probed
 //! again. A hit is additionally gated by the same stat-based checks as a fresh probe: the named
 //! path must still resolve to the same directory (not a symlink) with the identity the caller
-//! expects, and the descriptor must match that identity. The memo lives inside one [`Operation`]
+//! expects, and the descriptor must match that identity. A fresh probe admits and remembers only
+//! an unchanged state across the listing, including when it uses a batch or falls back from one.
+//! The memo lives inside one [`Operation`]
 //! (one bounded 750 ms budget) and is dropped with it; it is never shared across threads or
 //! processes. Outside an admission scope it is never shared across operations either.
 //!
@@ -319,13 +321,15 @@ impl Operation {
         let parsed = crate::policy::split_batched_listing(&text, &names)?;
         let mut entries = Vec::new();
         for ((path, listing), before) in paths.iter().zip(parsed).zip(before) {
-            // Bind the listing to (device, inode) as `lstat` saw them on both sides of the run;
-            // an operand that moved, vanished or disagrees with the listing is simply left out.
+            // Keep only unchanged states. A raced operand needs a fresh single-directory
+            // listing under this operation's original deadline, even if its inode is unchanged.
             use std::os::unix::fs::MetadataExt as _;
             let after = std::fs::symlink_metadata(path).ok();
             let (Some(before), Some(after)) = (before, after) else { continue };
-            if before.dev() == after.dev()
-                && before.ino() == after.ino()
+            if before.is_dir()
+                && after.is_dir()
+                && DirectoryState::of(&before, DirectoryRole::Traversed)
+                    == DirectoryState::of(&after, DirectoryRole::Traversed)
                 && before.ino() == listing.inode
             {
                 entries.push(BatchEntry { path: path.clone(), device: before.dev(), listing });
@@ -439,19 +443,18 @@ pub(crate) fn directory_acl_admits(
     if !directory_is_expected(path, expected, &after) {
         return false;
     }
-    // Remember the verdict only if the directory did not change while it was being probed. A
-    // busy directory (siblings creating children) bumps ctime constantly; that must not turn a
-    // good verdict into a refusal, it only means this verdict is too old to reuse.
-    if DirectoryState::of(&after, role) == state {
-        operation.remember(state);
-        if let Some(key) = scope_key {
-            if operation.scope_key(DirectoryState::of(&after, role), directory).as_ref()
-                == Some(&key)
-            {
-                operation.scope_remember(key);
-            }
-        }
+    // A changed state invalidates admission itself, not just memoization: the listing may
+    // predate an ACL grant. Even an unrelated child change must fail closed.
+    if DirectoryState::of(&after, role) != state {
+        return false;
     }
+    if let Some(key) = scope_key {
+        if operation.scope_key(state, directory).as_ref() != Some(&key) {
+            return false;
+        }
+        operation.scope_remember(key);
+    }
+    operation.remember(state);
     true
 }
 
@@ -707,8 +710,8 @@ pub(crate) fn acl_admits_file(
 /// ctime), keyed by device/inode, owner, mode, ctime, filesystem identity/mount flags
 /// and profile. Path/descriptor identity checks still run before and after a query
 /// or hit. Writes, replacement, chmod, chown and ACL edits invalidate the key. A
-/// file changing during a fresh listing earns no memo, just like a busy directory;
-/// a hit whose state changes is refused. Failed verdicts are never cached.
+/// file changing during a fresh listing or a hit is refused, just like a directory;
+/// neither changed-state listings nor failed verdicts are cached.
 /// No file is opened here: closing another descriptor could release SQLite's locks.
 #[cfg(target_os = "macos")]
 fn file_listing_admits(
@@ -760,7 +763,7 @@ fn file_listing_admits(
         return false;
     }
     if after != before {
-        return !remembered;
+        return false;
     }
     if let Some(key) = key {
         if MemoKey::of_descriptor(before, filesystem_descriptor, operation.profile()).as_ref()
@@ -798,6 +801,14 @@ const BATCH_OUTPUT_LIMIT: usize = 512 * 1024;
 thread_local! {
     static LS_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BATCH_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AFTER_LISTING: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
+}
+
+/// One-shot mutation after stdout is captured and before any post-listing state read.
+#[cfg(all(target_os = "macos", test))]
+struct AfterListing {
+    path: std::path::PathBuf,
+    action: Box<dyn FnOnce()>,
 }
 
 /// Number of batched listings this thread has attempted. Test seam for the lazy-batch rule.
@@ -891,7 +902,22 @@ fn run_ls(flags: &str, paths: &[&Path], deadline: Instant, limit: usize) -> Opti
     if reader.join().is_err() || !status.is_some_and(|value| value.success()) || !bounded {
         return None;
     }
-    String::from_utf8(bytes).ok()
+    let text = String::from_utf8(bytes).ok()?;
+    #[cfg(test)]
+    {
+        let hook = AFTER_LISTING.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|hook| paths.contains(&hook.path.as_path())) {
+                slot.take()
+            } else {
+                None
+            }
+        });
+        if let Some(hook) = hook {
+            (hook.action)();
+        }
+    }
+    Some(text)
 }
 
 /// Requests termination of the owned ACL probe and confirms reaping within a
@@ -994,6 +1020,189 @@ mod tests {
 
     fn fixture() -> tempfile::TempDir {
         tempfile::tempdir().expect("fixture directory")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn edit_acl(path: &Path, flag: &str, entry: &str) {
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .args([flag, entry])
+                .arg(path)
+                .status()
+                .expect("edit fixture ACL")
+                .success()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn change_acl_after_listing(path: &Path, entry: &'static str) {
+        let path = path.to_path_buf();
+        let hook = AfterListing {
+            path: path.clone(),
+            action: Box::new(move || {
+                let before = std::fs::symlink_metadata(&path).expect("before ACL edit");
+                edit_acl(&path, "+a", entry);
+                let after = std::fs::symlink_metadata(&path).expect("after ACL edit");
+                assert!(
+                    FileIdentity::from_metadata(&before)
+                        .same_directory(FileIdentity::from_metadata(&after))
+                );
+                let before = DirectoryState::of(&before, DirectoryRole::PrivateLeaf);
+                let after = DirectoryState::of(&after, DirectoryRole::PrivateLeaf);
+                assert_ne!(before, after, "the ACL edit must invalidate the state key");
+            }),
+        };
+        AFTER_LISTING.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_no_file_verdicts(operation: &Operation) {
+        assert!(operation.file_judged.borrow().is_empty());
+        if let Some(id) = operation.scope_id {
+            assert_eq!(scope::with_scope(id, |scope| scope.file_memo.is_empty()), Some(true));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_acl_grant_during_listing_is_refused_without_caching() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        for scoped in [false, true] {
+            for descriptor_backed in [false, true] {
+                let root = fixture();
+                let directory = open(root.path());
+                let path = root.path().join("private-file");
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .expect("private file");
+                edit_acl(&path, "+a", "group:everyone deny delete");
+                let _scope = scoped.then(crate::AdmissionScope::enter);
+                let operation = Operation::new();
+                let identity = identity_of(&file);
+                let admits = || {
+                    if descriptor_backed {
+                        acl_admits_file(&path, &file, identity, &operation)
+                    } else {
+                        named_file_acl_admits(&path, &directory, identity, &operation)
+                    }
+                };
+                change_acl_after_listing(&path, "group:everyone allow read");
+                let before = ls_spawn_count();
+                assert!(!admits(), "a deny-only listing cannot admit the subsequent ACL grant");
+                AFTER_LISTING.with(|slot| assert!(slot.borrow().is_none(), "hook ran"));
+                assert_eq!(ls_spawn_count() - before, 1);
+                assert_no_file_verdicts(&operation);
+
+                assert!(!admits(), "the allow entry is still refused by a fresh listing");
+                assert_eq!(ls_spawn_count() - before, 2, "the raced verdict was not cached");
+                assert_no_file_verdicts(&operation);
+                assert!(!admits());
+                assert_eq!(ls_spawn_count() - before, 3, "negative verdicts are not cached");
+                assert_no_file_verdicts(&operation);
+                edit_acl(&path, "-a", "group:everyone allow read");
+                assert!(admits(), "an unchanged deny-only listing still admits");
+                edit_acl(&path, "-a", "group:everyone deny delete");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn file_admission_entry_points_refuse_a_changed_listing_state() {
+        for descriptor_backed in [false, true] {
+            let fixture = fixture();
+            let root = crate::AdmittedPrivateRoot::open(fixture.path()).expect("private root");
+            let file = root.create_private_file("private-file").expect("private file");
+            let path = root.path().join("private-file");
+            edit_acl(&path, "+a", "group:everyone deny delete");
+            let _scope = crate::AdmissionScope::enter();
+            // Descriptor admission queries the file twice. A benign edit ensures a later good
+            // listing cannot conceal the fact that the first listing raced a state change.
+            change_acl_after_listing(
+                &path,
+                if descriptor_backed {
+                    "group:everyone deny write"
+                } else {
+                    "group:everyone allow read"
+                },
+            );
+            let result = if descriptor_backed {
+                root.validate_file_binding("private-file", &file, false)
+            } else {
+                root.validate_regular_file("private-file")
+            };
+            assert_eq!(result, Err(crate::PrivateStorageError::Unavailable));
+            AFTER_LISTING.with(|slot| assert!(slot.borrow().is_none(), "hook ran"));
+            let id = scope::live_scope_id().expect("live scope");
+            assert_eq!(scope::with_scope(id, |scope| scope.file_memo.is_empty()), Some(true));
+            edit_acl(
+                &path,
+                "-a",
+                if descriptor_backed {
+                    "group:everyone deny write"
+                } else {
+                    "group:everyone allow read"
+                },
+            );
+            edit_acl(&path, "-a", "group:everyone deny delete");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_directory_changed_during_a_single_or_batched_listing_is_not_admitted_or_cached() {
+        for batched in [false, true] {
+            let root = fixture();
+            let path = root.path().join("directory");
+            std::fs::create_dir(&path).expect("fixture child");
+            let directory = open(&path);
+            let _scope = crate::AdmissionScope::enter();
+            let operation = Operation::new();
+            if batched {
+                operation.register_walk(&[root.path().to_path_buf(), path.clone()]);
+            }
+            // A benign edit keeps the listing policy acceptable. Even then, its changed state
+            // cannot be admitted using the listing captured before the edit.
+            change_acl_after_listing(&path, "group:everyone deny delete");
+            let before = ls_spawn_count();
+            assert!(!judge(&operation, &path, &directory));
+            AFTER_LISTING.with(|slot| assert!(slot.borrow().is_none(), "hook ran"));
+            assert_eq!(ls_spawn_count() - before, if batched { 2 } else { 1 });
+            assert!(operation.judged.borrow().is_empty());
+            let id = operation.scope_id.expect("live scope");
+            assert_eq!(scope::with_scope(id, |scope| scope.memo.is_empty()), Some(true));
+            assert!(judge(&operation, &path, &directory), "a new unchanged listing admits");
+            edit_acl(&path, "-a", "group:everyone deny delete");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_batch_discards_an_operand_whose_acl_changes_without_changing_its_inode() {
+        let root = fixture();
+        let path = root.path().join("directory");
+        std::fs::create_dir(&path).expect("fixture child");
+        let directory = open(&path);
+        edit_acl(&path, "+a", "group:everyone deny delete");
+        change_acl_after_listing(&path, "group:everyone allow read");
+        let operation = Operation::new();
+        let batch = operation
+            .take_batch(&[root.path().to_path_buf(), path.clone()])
+            .expect("bounded batch");
+        AFTER_LISTING.with(|slot| assert!(slot.borrow().is_none(), "hook ran"));
+        assert!(!batch.entries.iter().any(|entry| entry.path == path), "discard changed state");
+        *operation.prefetched.borrow_mut() = Some(batch);
+        let before = ls_spawn_count();
+        assert!(!judge(&operation, &path, &directory), "fallback must see the ACL grant");
+        assert_eq!(ls_spawn_count() - before, 1, "one fresh listing under the same deadline");
+        assert!(operation.judged.borrow().is_empty());
+        edit_acl(&path, "-a", "group:everyone allow read");
+        edit_acl(&path, "-a", "group:everyone deny delete");
     }
 
     #[cfg(target_os = "macos")]
