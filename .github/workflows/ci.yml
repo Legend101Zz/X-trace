@@ -15,8 +15,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  XTRACE_CI_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   release-tool-tests:
@@ -26,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install Linux descriptor inspection tool
@@ -48,7 +53,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor preflight-source \
             --repo "$GITHUB_WORKSPACE" \
             --phase-metadata evidence/v0.01/workflow.json \
-            --expected-head "$GITHUB_SHA"
+            --expected-head "$XTRACE_CI_SOURCE_SHA"
       - name: Admit private scratch before test output
         run: |
           set -euo pipefail
@@ -58,7 +63,7 @@ jobs:
           set +e
           umask 077
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor summarize-tests \
-            --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
+            --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$XTRACE_CI_SOURCE_SHA" \
             --log-file "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log"
           result=$?
           set -e
@@ -83,7 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -121,7 +126,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor preflight \
             --repo "$GITHUB_WORKSPACE" \
             --phase-metadata evidence/v0.01/workflow.json \
-            --expected-head "$GITHUB_SHA" \
+            --expected-head "$XTRACE_CI_SOURCE_SHA" \
             --java-major "${{ matrix.java-version }}" \
             --node-major "${{ matrix.node-version }}" \
             --tuple "${{ matrix.tuple }}"
@@ -134,7 +139,7 @@ jobs:
           set +e
           umask 077
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor summarize-tests \
-            --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$GITHUB_SHA" \
+            --root "$XTRACE_CI_PRIVATE_ROOT" --repo "$GITHUB_WORKSPACE" --source-sha "$XTRACE_CI_SOURCE_SHA" \
             --log-file "$XTRACE_CI_PRIVATE_ROOT/release-tool-tests.log"
           result=$?
           set -e
@@ -161,7 +166,7 @@ jobs:
             --root "$XTRACE_CI_PRIVATE_ROOT" \
             --repo "$GITHUB_WORKSPACE" \
             --label "floor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.tuple }}" \
-            --expected-head "$GITHUB_SHA" \
+            --expected-head "$XTRACE_CI_SOURCE_SHA" \
             --phase-base "${XTRACE_PHASE_BASE_SHA:-}" \
             --tuple "${{ matrix.tuple }}"
           result=$?
@@ -188,6 +193,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -254,6 +260,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -299,6 +306,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -439,3 +447,14 @@ jobs:
           test -f $SMOKE/userdata/projects/"$first_project"/metadata.sqlite3
           test -f $SMOKE/repo/.xtrace/config.toml
           grep -q '^project_id = ' $SMOKE/repo/.xtrace/config.toml
+
+  ci-ok:
+    needs: [release-tool-tests, release-floor-linux-x86_64, java-client, node-client, gates]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 -c 'import json, os, sys; sys.exit(not all(job["result"] == "success" for job in json.loads(os.environ["NEEDS_JSON"]).values()))'
