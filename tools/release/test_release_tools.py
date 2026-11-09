@@ -19,6 +19,7 @@ import time
 import unittest
 from types import SimpleNamespace
 from argparse import Namespace
+from typing import Any, Callable
 from unittest import mock
 
 from tools.release import check_ledger, leased_run, private_roots, provenance, recover_leases, run_gates
@@ -1969,6 +1970,175 @@ def _r2_killpg_created_group(pgid: int) -> None:
             raise
 
 
+class _RunnerProcesses:
+    """Real fixture processes, event-ordered lifetimes, and a private process table.
+
+    A tree reports ready only after every detached child has installed its FDs.
+    The parent then waits on a pipe, and children wait for a signal (never a
+    timed sleep). Snapshots model the chosen observation order rather than
+    sampling ps. A signal is reflected in the table only after wait/pipe EOF
+    confirms exit. Production tracking, signaling, draining and receipts run.
+    """
+
+    def __init__(self) -> None:
+        self.clock = FakeClock()
+        self.popen = subprocess.Popen
+        self.kill = os.kill
+        self.killpg = os.killpg
+        self.roots: dict[int, subprocess.Popen] = {}
+        self.waits: dict[int, Callable[..., int]] = {}
+        self.children: dict[int, tuple[int, int]] = {}
+        self.alive: set[int] = set()
+        self.fixtures: dict[str, dict[str, Any]] = {}
+        self.root_fixtures: dict[int, dict[str, Any]] = {}
+        self.reap_before_snapshot = False
+
+    def script(self, *, mode: str = "complete", count: int = 1,
+               pairs: bool = False, escaped: bool = False,
+               delay: float = 0.0, closed_stdio: bool = False,
+               pid_file: pathlib.Path | None = None) -> str:
+        assert mode in {"complete", "timeout", "interrupt"}
+        ready_r, ready_w = os.pipe()
+        release_r, release_w = os.pipe()
+        exits = [os.pipe() for _ in range(count)]
+        child_ready_r, child_ready_w = os.pipe()
+        passed = [ready_w, release_r, child_ready_r, child_ready_w, *(w for _r, w in exits)]
+        lines = ["import os, signal, subprocess, sys", "children = []"]
+        for _r, exit_w in exits:
+            setup = "os.close(1); os.close(2); " if closed_stdio else ""
+            child = (f"import os,signal; {setup}os.write({child_ready_w}, b'r'); "
+                     f"os.close({child_ready_w}); signal.pause()")
+            lines.extend((
+                f"child = subprocess.Popen([sys.executable, '-c', {child!r}], "
+                f"start_new_session=True, pass_fds=({child_ready_w}, {exit_w}))",
+                "children.append(child.pid)",
+                f"os.close({exit_w})",
+                f"assert os.read({child_ready_r}, 1) == b'r'",
+            ))
+        lines.extend((f"os.close({child_ready_r})", f"os.close({child_ready_w})"))
+        if pid_file is not None:
+            lines.append(f"open({str(pid_file)!r}, 'w').write(str(children[0]))")
+        lines.extend((
+            "print(' '.join(str(p) + ' ' + str(os.getpgid(p)) for p in children), flush=True)"
+            if pairs else "print(*children, flush=True)",
+            f"os.write({ready_w}, (','.join(map(str, children)) + '\\n').encode())",
+            f"os.close({ready_w})",
+            f"assert os.read({release_r}, 1) == b'x'",
+        ))
+        script = "\n".join(lines)
+        self.fixtures[script] = dict(
+            mode=mode, escaped=escaped, delay=delay, passed=passed,
+            ready_r=ready_r, release_w=release_w, exits=exits, released=False,
+        )
+        return script
+
+    def launch(self, argv: Any, *args: Any, **kwargs: Any) -> subprocess.Popen:
+        fixture = self.fixtures.get(argv[2]) if isinstance(argv, (list, tuple)) and len(argv) > 2 else None
+        if fixture is not None:
+            kwargs["pass_fds"] = tuple(fixture["passed"])
+        process = self.popen(argv, *args, **kwargs)
+        if not kwargs.get("start_new_session"):
+            return process
+        self.roots[process.pid] = process
+        wait = process.wait
+        self.waits[process.pid] = wait
+        if fixture is not None:
+            self.root_fixtures[process.pid] = fixture
+            for fd in fixture["passed"]:
+                os.close(fd)
+            fixture["passed"] = []
+            with os.fdopen(fixture.pop("ready_r"), "rb") as ready:
+                pids = [int(pid) for pid in ready.readline().strip().split(b",") if pid]
+            assert len(pids) == len(fixture["exits"]), "tree exited before readiness"
+            for pid, (exit_r, _exit_w) in zip(pids, fixture["exits"]):
+                self.children[pid] = (process.pid, exit_r)
+                self.alive.add(pid)
+
+        def event_wait(timeout: float | None = None) -> int:
+            if fixture is not None and process.returncode is None and not fixture["released"]:
+                mode = fixture["mode"]
+                if mode == "timeout":
+                    self.clock.sleep(timeout or 0)
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                if mode == "interrupt":
+                    fixture["mode"] = "timeout"
+                    raise KeyboardInterrupt
+                if timeout is not None and fixture["delay"] > timeout:
+                    self.clock.sleep(timeout)
+                    fixture["delay"] -= timeout
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                self.clock.sleep(fixture["delay"])
+                fixture["delay"] = 0.0
+                fixture["released"] = True
+                os.write(fixture["release_w"], b"x")
+            # Fixture completion is an event, not a race against Popen's poll budget.
+            return wait()
+
+        process.wait = event_wait
+        return process
+
+    def snapshot(self, *, timeout: float = 2.0) -> dict[int, tuple[int, str, str]]:
+        table: dict[int, tuple[int, str, str]] = {}
+        for pid, process in self.roots.items():
+            if self.reap_before_snapshot and pid not in self.root_fixtures:
+                self.waits[pid]()
+            table[pid] = (os.getpid(), f"root-{pid}", "S" if process.returncode is None else "Z")
+        for pid, (parent, _fd) in self.children.items():
+            fixture = self.root_fixtures[parent]
+            parent_live = self.roots[parent].returncode is None
+            if pid in self.alive and (not fixture["escaped"] or not parent_live):
+                table[pid] = (parent if parent_live else 1, f"child-{pid}", "S")
+        return table
+
+    def descriptor_child(self, setup: str, **kwargs: Any) -> subprocess.Popen:
+        """Publish readiness after the descriptor changes, before awaiting a signal."""
+        ready_r, ready_w = os.pipe()
+        script = (f"import os,signal; {setup}; os.write({ready_w}, b'r'); "
+                  f"os.close({ready_w}); signal.pause()")
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-c", script], pass_fds=(ready_w,),
+                start_new_session=True, **kwargs,
+            )
+        finally:
+            os.close(ready_w)
+        with os.fdopen(ready_r, "rb") as ready:
+            assert ready.read(1) == b"r", "descriptor fixture exited before readiness"
+        return child
+
+    def signal(self, pid: int, signum: int) -> None:
+        self.kill(pid, signum)
+        if not signum:
+            return
+        if pid in self.children:
+            # Only this fixture holds the write end; EOF proves signal delivery/exit.
+            assert os.read(self.children[pid][1], 1) == b""
+            self.alive.discard(pid)
+        elif pid in self.waits:
+            self.waits[pid]()
+
+    def signal_group(self, pid: int, signum: int) -> None:
+        self.killpg(pid, signum)
+        if signum and pid in self.waits:
+            self.waits[pid]()
+
+    def close(self) -> None:
+        for pid in list(self.alive):
+            self.signal(pid, signal.SIGKILL)
+        for pid, process in self.roots.items():
+            if process.returncode is None:
+                self.signal_group(pid, signal.SIGKILL)
+        for _pid, (_parent, fd) in self.children.items():
+            os.close(fd)
+        for fixture in self.fixtures.values():
+            for fd in [*fixture["passed"], fixture["release_w"]]:
+                os.close(fd)
+            if "ready_r" in fixture:
+                os.close(fixture["ready_r"])
+                for exit_r, _exit_w in fixture["exits"]:
+                    os.close(exit_r)
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(dir=test_scratch_root())
@@ -1998,6 +2168,38 @@ class RunnerTests(unittest.TestCase):
         self.versions_patcher = mock.patch.object(run_gates, "_versions", return_value={})
         self.versions_patcher.start()
         self.addCleanup(self.versions_patcher.stop)
+        self.processes = _RunnerProcesses()
+        # Replace this module's time object, not the shared stdlib module used
+        # by Popen. No wall time passes in runner deadlines between events.
+        self.patch_runner("time", SimpleNamespace(
+            monotonic=self.processes.clock.monotonic, time=time.time,
+            sleep=self.processes.clock.sleep,
+        ))
+        self.patch_runner("_process_snapshot", self.processes.snapshot)
+        self.patch_runner("_process_start_identity", lambda pid, _deadline: f"probe-{pid}")
+        for name in ("_settle_uninspectable_candidates", "_final_global_quiescence_scan", "_bounded_ownership_scan"):
+            original = getattr(run_gates, name)
+
+            def with_clock(*args: Any, _original: Callable = original, **kwargs: Any) -> Any:
+                kwargs.setdefault("monotonic", self.processes.clock.monotonic)
+                if "sleep" in _original.__annotations__:
+                    kwargs.setdefault("sleep", self.processes.clock.sleep)
+                return _original(*args, **kwargs)
+
+            self.patch_runner(name, with_clock)
+        popen_patch = mock.patch.object(run_gates.subprocess, "Popen", side_effect=self.processes.launch)
+        popen_patch.start()
+        self.addCleanup(popen_patch.stop)
+        for name, replacement in (("kill", self.processes.signal), ("killpg", self.processes.signal_group)):
+            patcher = mock.patch.object(run_gates.os, name, side_effect=replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(self.processes.close)
+
+    def patch_runner(self, name: str, replacement: Any) -> None:
+        patcher = mock.patch.object(run_gates, name, replacement)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def args(self) -> Namespace:
         return Namespace(repo=str(self.repo), base=self.base, label="P00-test", cache_root=str(self.cache), command_timeout=30)
@@ -2208,7 +2410,7 @@ class RunnerTests(unittest.TestCase):
                 self.close()
 
         settle = run_gates.NaturalExitSettle(
-            True, 1.0, 1, [], None, time.monotonic() + 120,
+            True, 1.0, 1, [], None, run_gates.time.monotonic() + 120,
         )
         with mock.patch.object(run_gates, "GATES", (gate,)), \
                 mock.patch.object(run_gates.subprocess, "Popen", side_effect=selective_popen), \
@@ -2754,7 +2956,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("already owned", receipt["error"])
 
     def test_timeout_kills_and_drains_spawned_grandchild_before_releasing_leases(self) -> None:
-        script = "import os,subprocess,sys,time; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); print(child.pid,os.getpgid(child.pid),flush=True); time.sleep(60)"
+        script = self.processes.script(mode="timeout", pairs=True)
         gate = run_gates.Gate("tree-timeout", (sys.executable, "-c", script))
         args = self.args()
         args.command_timeout = 0.4
@@ -2785,7 +2987,7 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse((self.cache / "leases/gradle").exists())
 
     def test_interrupt_kills_and_drains_spawned_grandchild(self) -> None:
-        script = "import os,subprocess,sys,time; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); print(child.pid,os.getpgid(child.pid),flush=True); time.sleep(60)"
+        script = self.processes.script(mode="interrupt", pairs=True)
         gate = run_gates.Gate("tree-interrupt", (sys.executable, "-c", script))
         args = self.args()
         args.command_timeout = 10
@@ -2798,18 +3000,6 @@ class RunnerTests(unittest.TestCase):
             if (kwargs.get("start_new_session") and isinstance(command, (list, tuple))
                     and command and command[0] == sys.executable):
                 spawned.append(process)
-                wait = process.wait
-                first_wait = True
-
-                def interrupt_once(timeout: float | None = None) -> int:
-                    nonlocal first_wait
-                    if first_wait:
-                        first_wait = False
-                        time.sleep(0.25)
-                        raise KeyboardInterrupt
-                    return wait(timeout=timeout)
-
-                process.wait = interrupt_once  # type: ignore[method-assign]
             return process
 
         with mock.patch.object(run_gates, "GATES", (gate,)), mock.patch.object(run_gates.subprocess, "Popen", side_effect=launch):
@@ -2825,16 +3015,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_completed_owned_descendant_is_drained_after_parent_exits(self) -> None:
         tracked = self.cache / "completed-owned-child-tracked"
-        script = "\n".join((
-            "import os, pathlib, subprocess, sys, time",
-            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)",
-            "print(child.pid, os.getpgid(child.pid), flush=True)",
-            f"marker = pathlib.Path({str(tracked)!r})",
-            "deadline = time.monotonic() + 10",
-            "while not marker.exists() and time.monotonic() < deadline:",
-            "    time.sleep(.01)",
-            "raise SystemExit(0 if marker.exists() else 91)",
-        ))
+        script = self.processes.script(pairs=True)
         gate = run_gates.Gate("completed-owned-child", (sys.executable, "-c", script))
         args = self.args()
         args.label = "P00-completed-owned-child"
@@ -2897,7 +3078,7 @@ class RunnerTests(unittest.TestCase):
                     pass
 
     def test_uncertain_process_tree_retains_both_leases_for_manual_recovery(self) -> None:
-        script = "import time; time.sleep(60)"
+        script = self.processes.script(mode="timeout", count=0)
         gate = run_gates.Gate("uncertain-timeout", (sys.executable, "-c", script))
         later = run_gates.Gate("unreached", (sys.executable, "-c", "pass"))
         args = self.args()
@@ -2937,7 +3118,7 @@ class RunnerTests(unittest.TestCase):
                     pass
 
     def test_version_probe_timeout_drains_detached_child_and_fails_probe(self) -> None:
-        script = "import os,subprocess,sys,time; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); print(child.pid,os.getpgid(child.pid),flush=True); time.sleep(60)"
+        script = self.processes.script(mode="timeout", pairs=True)
         logs = self.cache / "version-probe-logs"
         child_pid: int | None = None
         probes: list[dict[str, object]] = []
@@ -2980,10 +3161,10 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(commands, "at least git should be available for fast version probes")
         logs = self.cache / "fast-version-logs"
         probes: list[dict[str, object]] = []
-        # Real probe processes, but the machine-wide scan sees only this test's own tree, so an
-        # unrelated process starting elsewhere on the host cannot look like unowned churn.
-        with mock.patch.object(run_gates, "VERSION_COMMANDS", tuple(commands)), \
-                mock.patch.object(run_gates, "_process_snapshot", side_effect=own_process_snapshot()):
+        # Reap each real probe before its first injected snapshot: an exited root
+        # must still be identified, and host process churn cannot affect the result.
+        self.processes.reap_before_snapshot = True
+        with mock.patch.object(run_gates, "VERSION_COMMANDS", tuple(commands)):
             versions = REAL_VERSIONS(self.repo, os.environ.copy(), logs, probes)
         self.assertEqual(len(probes), len(commands))
         self.assertTrue(all(probe["status"] == "passed" and probe["exitCode"] == 0 for probe in probes))
@@ -3001,7 +3182,7 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(failure_point=failure_point):
                 args = self.args()
                 args.label = f"P00-log-{failure_point}"
-                script = "import os,subprocess,sys,time; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); print(child.pid,flush=True); time.sleep(.35)"
+                script = self.processes.script()
                 gate = run_gates.Gate(f"log-{failure_point}", (sys.executable, "-c", script))
                 args.command_timeout = 5
                 stop = mock.patch.object(run_gates, "_stop_and_reap_owned_tree", return_value=False)
@@ -3056,7 +3237,7 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(index=index):
                 args = self.args()
                 args.label = f"P00-fast-child-{index}"
-                script = "import subprocess,sys; child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); print(child.pid,flush=True)"
+                script = self.processes.script(escaped=True)
                 gate = run_gates.Gate("fast-detached-child", (sys.executable, "-c", script))
                 with mock.patch.object(run_gates, "GATES", (gate,)):
                     self.assertEqual(run_gates.run(args), 1)
@@ -3102,7 +3283,7 @@ class RunnerTests(unittest.TestCase):
             calls += 1
             if calls == 1:
                 unrelated = subprocess.Popen(
-                    [sys.executable, "-c", "import time; time.sleep(600)"],
+                    [sys.executable, "-c", "import signal; signal.pause()"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                 )
             return snapshot
@@ -3129,7 +3310,7 @@ class RunnerTests(unittest.TestCase):
         args = self.args()
         args.label = "P00-delayed-child"
         args.command_timeout = 5
-        script = "import subprocess,sys,time; time.sleep(.35); child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); print(child.pid,flush=True)"
+        script = self.processes.script(escaped=True, delay=0.35)
         gate = run_gates.Gate("delayed-detached-child", (sys.executable, "-c", script))
         child_pid: int | None = None
         try:
@@ -3176,11 +3357,7 @@ class RunnerTests(unittest.TestCase):
         args = self.args()
         args.label = "P00-final-scan-interrupt"
         args.command_timeout = 5
-        script = (
-            "import subprocess,sys,time; time.sleep(.35); "
-            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],start_new_session=True); "
-            "print(child.pid,flush=True)"
-        )
+        script = self.processes.script(escaped=True, delay=0.35)
         gate = run_gates.Gate("final-scan-interrupt", (sys.executable, "-c", script))
         real_scan = run_gates._untracked_processes_since
 
@@ -3251,7 +3428,7 @@ class RunnerTests(unittest.TestCase):
             calls += 1
             if calls == 1:
                 unrelated = subprocess.Popen(
-                    [sys.executable, "-c", "import time; time.sleep(600)"],
+                    [sys.executable, "-c", "import signal; signal.pause()"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                 )
             return snapshot
@@ -3286,19 +3463,16 @@ class RunnerTests(unittest.TestCase):
         log_path = self.root / "private-gate.log"
         log_path.write_text("private\n")
         baseline: dict[int, tuple[int, str, str]] = {}
-        closed_stdio = subprocess.Popen(
-            [sys.executable, "-c", "import os,time; os.close(1); os.close(2); time.sleep(30)"],
+        closed_stdio = self.processes.descriptor_child(
+            "os.close(1); os.close(2)",
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
         )
         log_stream = log_path.open("ab", buffering=0)
-        log_fd_child = subprocess.Popen(
-            [sys.executable, "-c", "import os,time; os.dup2(1,3); os.close(1); os.close(2); time.sleep(30)"],
+        log_fd_child = self.processes.descriptor_child(
+            "os.dup2(1,3); os.close(1); os.close(2)",
             stdin=subprocess.DEVNULL, stdout=log_stream, stderr=subprocess.DEVNULL,
-            start_new_session=True,
         )
         try:
-            time.sleep(0.1)
             real_snapshot = run_gates._process_snapshot()
             snapshot = {
                 pid: real_snapshot[pid]
@@ -3366,19 +3540,58 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(result.error)
 
     def test_lsof_probe_enforces_timeout_and_output_byte_budget(self) -> None:
-        with mock.patch.object(run_gates, "LSOF_BINARY", sys.executable):
-            started = time.monotonic()
+        clock = self.processes.clock
+        stream = SimpleNamespace(fileno=lambda: 91, close=lambda: None)
+        process = mock.Mock(pid=987658, returncode=None, stdout=stream, stderr=stream)
+
+        def wait(timeout: float | None = None) -> int:
+            self.assertIsNotNone(timeout, "probe reap must stay bounded")
+            clock.sleep(timeout)
+            process.returncode = -signal.SIGTERM
+            return process.returncode
+
+        process.wait.side_effect = wait
+        process.poll.side_effect = lambda: process.returncode
+        selector = mock.Mock()
+        selector.get_map.return_value = {91: stream}
+        key = SimpleNamespace(fileobj=stream, data="stdout")
+
+        def select(timeout: float) -> list[tuple[SimpleNamespace, int]]:
+            if not output_ready[0]:
+                clock.sleep(timeout)
+                return []
+            return [(key, 1)]
+
+        output_ready = [False]
+        selector.select.side_effect = select
+        with mock.patch.object(run_gates, "LSOF_BINARY", sys.executable), \
+                mock.patch.object(run_gates.subprocess, "Popen", return_value=process), \
+                mock.patch.object(run_gates.selectors, "DefaultSelector", return_value=selector), \
+                mock.patch.object(run_gates.os, "set_blocking"), \
+                mock.patch.object(run_gates.os, "read", return_value=b"x" * 65536), \
+                mock.patch.object(run_gates.os, "killpg") as signal_group, \
+                mock.patch.object(run_gates, "_lsof_process_group_state", return_value=False):
+            started = run_gates.time.monotonic()
             timed_out = run_gates._run_lsof_fields(
-                ["-c", "import time; time.sleep(30)"], time.monotonic() + 0.15,
+                ["-c", "import time; time.sleep(30)"], run_gates.time.monotonic() + 0.15,
             )
             self.assertEqual(timed_out.error, "time-budget-exceeded")
-            self.assertLess(time.monotonic() - started, 2)
+            self.assertLess(run_gates.time.monotonic() - started, 2)
+            self.assertEqual(signal_group.call_args_list, [
+                mock.call(process.pid, signal.SIGTERM), mock.call(process.pid, signal.SIGKILL),
+            ])
+            signal_group.reset_mock()
+            process.returncode = None
+            output_ready[0] = True
             oversized = run_gates._run_lsof_fields(
                 ["-c", "import sys,time; sys.stdout.write('x' * 2000000); sys.stdout.flush(); time.sleep(30)"],
-                time.monotonic() + 2,
+                run_gates.time.monotonic() + 2,
             )
             self.assertEqual(oversized.error, "output-limit-exceeded")
             self.assertLessEqual(len(oversized.stdout.encode()) + len(oversized.stderr.encode()), run_gates.MAX_LSOF_OUTPUT_BYTES + 65536)
+            self.assertEqual(signal_group.call_args_list, [
+                mock.call(process.pid, signal.SIGTERM), mock.call(process.pid, signal.SIGKILL),
+            ])
 
     def test_lsof_parser_never_resolves_untrusted_names_and_rejects_ambiguous_log_alias(self) -> None:
         ordinary = run_gates.LsofProbe(0, "p123\nf1\nn/Volumes/other/data.db\n", "")
@@ -3410,7 +3623,7 @@ class RunnerTests(unittest.TestCase):
         process = UnreapableProbe()
         with mock.patch.object(run_gates.os, "killpg", side_effect=PermissionError), \
                 mock.patch.object(run_gates, "_lsof_process_group_state", return_value=None):
-            drained, error = run_gates._terminate_lsof_process_group(process, time.monotonic() + 1)  # type: ignore[arg-type]
+            drained, error = run_gates._terminate_lsof_process_group(process, run_gates.time.monotonic() + 1)  # type: ignore[arg-type]
         self.assertFalse(drained)
         self.assertEqual(error, "probe-signal-failed")
         self.assertIsNone(process.returncode)
@@ -3503,12 +3716,12 @@ class RunnerTests(unittest.TestCase):
                         mock.patch.object(run_gates, "_lsof_process_group_state", return_value=None):
                     if isinstance(failure, KeyboardInterrupt):
                         with self.assertRaises(run_gates.InterruptedProbeCleanup) as raised:
-                            run_gates._run_lsof_fields([], time.monotonic() + 1)
+                            run_gates._run_lsof_fields([], run_gates.time.monotonic() + 1)
                         self.assertEqual(
                             raised.exception.owned_probe_processes[0]["startedAt"], "probe-start",
                         )
                     else:
-                        result = run_gates._run_lsof_fields([], time.monotonic() + 1)
+                        result = run_gates._run_lsof_fields([], run_gates.time.monotonic() + 1)
                         self.assertEqual(result.error, "probe-not-confirmed-drained")
                         self.assertEqual(result.owned_probe["startedAt"], "probe-start")
 
@@ -3573,7 +3786,7 @@ class RunnerTests(unittest.TestCase):
                         mock.patch.object(run_gates.os, "set_blocking"), \
                         mock.patch.object(run_gates.os, "killpg", side_effect=PermissionError), \
                         mock.patch.object(run_gates, "_lsof_process_group_state", return_value=None):
-                    result = run_gates._run_lsof_fields([], time.monotonic() + 1)
+                    result = run_gates._run_lsof_fields([], run_gates.time.monotonic() + 1)
                 self.assertEqual(result.error, "probe-not-confirmed-drained")
                 self.assertEqual(result.owned_probe["pid"], process.pid)
                 self.assertEqual(result.owned_probe["startedAt"], "probe-start")
@@ -3587,7 +3800,7 @@ class RunnerTests(unittest.TestCase):
                 mock.patch.object(run_gates.selectors, "DefaultSelector", return_value=selector), \
                 mock.patch.object(run_gates.os, "set_blocking"), \
                 mock.patch.object(run_gates, "_lsof_process_group_state", return_value=False):
-            result = run_gates._run_lsof_fields([], time.monotonic() + 1)
+            result = run_gates._run_lsof_fields([], run_gates.time.monotonic() + 1)
         self.assertEqual(result.error, "probe-not-confirmed-drained")
         self.assertEqual(result.owned_probe["pid"], process.pid)
         self.assertEqual(result.owned_probe["reason"], "probe-resource-cleanup-failed")
@@ -3636,19 +3849,14 @@ class RunnerTests(unittest.TestCase):
                 mock.patch.object(run_gates.os, "killpg", side_effect=PermissionError), \
                 mock.patch.object(run_gates, "_lsof_process_group_state", return_value=None):
             with self.assertRaises(run_gates.InterruptedProbeCleanup) as raised:
-                run_gates._run_lsof_fields([], time.monotonic() + 1)
+                run_gates._run_lsof_fields([], run_gates.time.monotonic() + 1)
         self.assertEqual(raised.exception.owned_probe_processes[0]["pid"], process.pid)
 
     def test_interrupted_descriptor_scan_retains_unconfirmed_candidate_in_both_leases(self) -> None:
         args = self.args()
         args.label = "P00-uninspectable-candidate"
         args.command_timeout = 5
-        script = (
-            "import subprocess,sys,time; time.sleep(.35); "
-            "child=subprocess.Popen([sys.executable,'-c','import os,time; os.close(1); os.close(2); time.sleep(60)'],"
-            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); "
-            "print(child.pid,flush=True)"
-        )
+        script = self.processes.script(escaped=True, delay=0.35, closed_stdio=True)
         gate = run_gates.Gate("uninspectable-candidate", (sys.executable, "-c", script))
         child_pid: int | None = None
         probe_identity = {"pid": 654321, "startedAt": "Mon Oct  5 12:00:00 2026", "processGroupId": 654321, "reason": "probe-reap-deadline-exceeded"}
@@ -3709,14 +3917,7 @@ class RunnerTests(unittest.TestCase):
         args = self.args()
         args.label = "P00-mixed-proc-candidates"
         args.command_timeout = 5
-        script = (
-            "import subprocess,sys,time; time.sleep(.35); "
-            "a=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
-            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); "
-            "b=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
-            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); "
-            "print(a.pid,b.pid,flush=True)"
-        )
+        script = self.processes.script(escaped=True, delay=0.35, count=2)
         gate = run_gates.Gate("mixed-proc-candidates", (sys.executable, "-c", script))
         child_pids: list[int] = []
         current_log_path: pathlib.Path | None = None
@@ -3805,13 +4006,7 @@ class RunnerTests(unittest.TestCase):
         args.label = "P00-classified-candidate"
         args.command_timeout = 5
         args.provenance = True
-        script = (
-            "import subprocess,sys,time; time.sleep(.35); "
-            "c=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
-            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True); "
-            f"open({str(self.root / 'detached-child.pid')!r},'w').write(str(c.pid)); "
-            "print(c.pid,flush=True)"
-        )
+        script = self.processes.script(escaped=True, delay=0.35, pid_file=self.root / "detached-child.pid")
         gate = run_gates.Gate("classified-candidate", (sys.executable, "-c", script))
         child_pids: list[int] = []
         real_is_dir = pathlib.Path.is_dir
@@ -3848,18 +4043,9 @@ class RunnerTests(unittest.TestCase):
                 return False
             return True if path == pathlib.Path("/proc") else real_is_dir(path)
 
-        def gate_children() -> list[int]:
-            # The gate records the detached child's pid; it is reparented away from the test
-            # tree, so name it explicitly. Unrelated host processes stay invisible.
-            try:
-                return [int((self.root / "detached-child.pid").read_text())]
-            except (OSError, ValueError):
-                return []
-
         try:
             with mock.patch.object(run_gates, "GATES", (gate,)), \
                     mock.patch.object(run_gates, "_track_descendants", return_value=None), \
-                    mock.patch.object(run_gates, "_process_snapshot", side_effect=own_process_snapshot(gate_children)), \
                     mock.patch.object(run_gates.provenance_module, "Provenance", StubProvenance), \
                     mock.patch.object(pathlib.Path, "is_dir", is_dir):
                 code = run_gates.run(args)
