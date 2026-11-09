@@ -1970,91 +1970,188 @@ def _r2_killpg_created_group(pgid: int) -> None:
             raise
 
 
-class _RunnerProcesses:
-    """Real fixture processes, event-ordered lifetimes, and a private process table.
+_RUNNER_SAFETY_SECONDS = 60.0
 
-    A tree reports ready only after every detached child has installed its FDs.
-    The parent then waits on a pipe, and children wait for a signal (never a
-    timed sleep). Snapshots model the chosen observation order rather than
-    sampling ps. A signal is reflected in the table only after wait/pipe EOF
-    confirms exit. Production tracking, signaling, draining and receipts run.
-    """
+
+class _RunnerProcesses:
+    """Event-ordered real trees, with bounded I/O and an unreaped process table."""
 
     def __init__(self) -> None:
+        import select
+
+        self.select = select.select
         self.clock = FakeClock()
         self.popen = subprocess.Popen
         self.kill = os.kill
         self.killpg = os.killpg
+        self.read = os.read
+        self.processes: dict[int, subprocess.Popen] = {}
         self.roots: dict[int, subprocess.Popen] = {}
         self.waits: dict[int, Callable[..., int]] = {}
         self.children: dict[int, tuple[int, int]] = {}
         self.alive: set[int] = set()
         self.fixtures: dict[str, dict[str, Any]] = {}
         self.root_fixtures: dict[int, dict[str, Any]] = {}
-        self.reap_before_snapshot = False
+        self.fds: set[int] = set()
+        self.exit_before_snapshot = False
+        self.first_root_states: dict[int, str] = {}
+        self.closed = False
+        self.failure: BaseException | None = None
+        # Linux must reap adopted grandchildren itself (container PID 1 may not).
+        # Darwin launchd adopts them; cleanup waits for their disappearance there.
+        self.subreaper_was_set: bool | None = None
+        if sys.platform.startswith("linux"):
+            value = ctypes.c_int()
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.prctl(provenance.PR_GET_CHILD_SUBREAPER, ctypes.byref(value), 0, 0, 0):
+                raise OSError(ctypes.get_errno(), "get child subreaper")
+            self.subreaper_was_set = bool(value.value)
+            assert provenance.set_child_subreaper(True), "fixture needs orphan reaping"
+
+    def pipe(self) -> tuple[int, int]:
+        assert not self.closed, "cannot create pipes after fixture cleanup"
+        pair = os.pipe()
+        self.fds.update(pair)
+        return pair
+
+    def close_fd(self, fd: int) -> None:
+        if fd in self.fds:
+            self.fds.remove(fd)
+            os.close(fd)
+
+    def byte(self, fd: int, *, deadline: float | None = None) -> bytes:
+        deadline = deadline if deadline is not None else time.monotonic() + _RUNNER_SAFETY_SECONDS
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self.select([fd], [], [], remaining)[0]:
+            self.failure = AssertionError("fixture pipe exceeded real-time safety bound")
+            self.close()
+            raise self.failure
+        return self.read(fd, 1)
+
+    def line(self, fd: int) -> bytes:
+        deadline = time.monotonic() + _RUNNER_SAFETY_SECONDS
+        result = bytearray()
+        while len(result) < 32:
+            value = self.byte(fd, deadline=deadline)
+            assert value, "fixture exited before publishing child pid"
+            if value == b"\n":
+                return bytes(result)
+            result.extend(value)
+        raise AssertionError("invalid fixture pid record")
 
     def script(self, *, mode: str = "complete", count: int = 1,
                pairs: bool = False, escaped: bool = False,
                delay: float = 0.0, closed_stdio: bool = False,
-               pid_file: pathlib.Path | None = None) -> str:
+               pid_file: pathlib.Path | None = None, delayed_spawn: bool = False) -> str:
         assert mode in {"complete", "timeout", "interrupt"}
-        ready_r, ready_w = os.pipe()
-        release_r, release_w = os.pipe()
-        exits = [os.pipe() for _ in range(count)]
-        child_ready_r, child_ready_w = os.pipe()
-        passed = [ready_w, release_r, child_ready_r, child_ready_w, *(w for _r, w in exits)]
-        lines = ["import os, signal, subprocess, sys", "children = []"]
-        for _r, exit_w in exits:
-            setup = "os.close(1); os.close(2); " if closed_stdio else ""
-            child = (f"import os,signal; {setup}os.write({child_ready_w}, b'r'); "
-                     f"os.close({child_ready_w}); signal.pause()")
+        pid_r, pid_w = self.pipe()
+        spawn_r, spawn_w = self.pipe()
+        release_r, release_w = self.pipe()
+        initial_r, initial_w = self.pipe()
+        ready_r, ready_w = self.pipe()
+        channels = [(self.pipe(), self.pipe(), self.pipe()) for _ in range(count)]
+        passed = [pid_w, spawn_r, release_r, initial_w, ready_w,
+                  *(fd for start, ready, exit_pipe in channels
+                    for fd in (start[0], ready[1], exit_pipe[1]))]
+        lines = [
+            "import os, signal, select",
+            f"signal.alarm({int(_RUNNER_SAFETY_SECONDS)})",
+            "def byte(fd):",
+            f"    assert select.select([fd], [], [], {_RUNNER_SAFETY_SECONDS})[0], 'fixture read timed out'",
+            "    return os.read(fd, 1)",
+            "children = []",
+            f"os.write({initial_w}, b'r')", f"os.close({initial_w})",
+            f"held = set({passed!r}) - {{{initial_w}}}",
+        ]
+        if delayed_spawn:
+            lines.append(f"assert byte({spawn_r}) == b's'")
+        for (start_r, _start_w), (_ready_r, child_ready_w), (_exit_r, exit_w) in channels:
             lines.extend((
-                f"child = subprocess.Popen([sys.executable, '-c', {child!r}], "
-                f"start_new_session=True, pass_fds=({child_ready_w}, {exit_w}))",
-                "children.append(child.pid)",
-                f"os.close({exit_w})",
-                f"assert os.read({child_ready_r}, 1) == b'r'",
+                "pid = os.fork()",
+                "if pid == 0:",
+                # Before registration the child remains in the root's private group.
+                # Thus even a root dying between fork and publication cannot leak it.
+                "    for fd in held:",
+                f"        if fd not in ({start_r}, {child_ready_w}, {exit_w}): os.close(fd)",
+                f"    signal.alarm({int(_RUNNER_SAFETY_SECONDS)})",
+                f"    assert byte({start_r}) == b'x'", f"    os.close({start_r})",
+                "    os.setsid()",
+                *(["    os.close(1)", "    os.close(2)"] if closed_stdio else []),
+                f"    os.write({child_ready_w}, b'r')", f"    os.close({child_ready_w})",
+                "    signal.pause()", "    os._exit(0)",
+                "children.append(pid)",
+                f"for fd in ({start_r}, {child_ready_w}, {exit_w}): os.close(fd); held.remove(fd)",
+                f"os.write({pid_w}, (str(pid) + '\\n').encode())",
             ))
-        lines.extend((f"os.close({child_ready_r})", f"os.close({child_ready_w})"))
+        lines.extend((f"os.close({pid_w})", f"assert byte({spawn_r}) == b'r'", f"os.close({spawn_r})"))
         if pid_file is not None:
             lines.append(f"open({str(pid_file)!r}, 'w').write(str(children[0]))")
         lines.extend((
             "print(' '.join(str(p) + ' ' + str(os.getpgid(p)) for p in children), flush=True)"
             if pairs else "print(*children, flush=True)",
-            f"os.write({ready_w}, (','.join(map(str, children)) + '\\n').encode())",
-            f"os.close({ready_w})",
-            f"assert os.read({release_r}, 1) == b'x'",
+            f"os.write({ready_w}, b'r')", f"os.close({ready_w})",
+            f"assert byte({release_r}) == b'x'", f"os.close({release_r})",
         ))
         script = "\n".join(lines)
         self.fixtures[script] = dict(
-            mode=mode, escaped=escaped, delay=delay, passed=passed,
-            ready_r=ready_r, release_w=release_w, exits=exits, released=False,
+            mode=mode, escaped=escaped, delay=delay, passed=passed, channels=channels,
+            pid_r=pid_r, spawn_w=spawn_w, release_w=release_w,
+            initial_r=initial_r, ready_r=ready_r, released=False,
+            delayed_spawn=delayed_spawn, spawned=False, snapshots=0,
         )
         return script
 
+    def spawn_children(self, process: subprocess.Popen, fixture: dict[str, Any]) -> None:
+        if fixture["delayed_spawn"]:
+            os.write(fixture["spawn_w"], b's')
+        for (_start_r, start_w), (ready_r, _ready_w), (exit_r, _exit_w) in fixture["channels"]:
+            pid = int(self.line(fixture["pid_r"]))
+            # Record identity before allowing setsid or waiting for readiness.
+            self.children[pid] = (process.pid, exit_r)
+            self.alive.add(pid)
+            os.write(start_w, b'x')
+            self.close_fd(start_w)
+            assert self.byte(ready_r) == b'r', "child exited before readiness"
+            self.close_fd(ready_r)
+        self.close_fd(fixture["pid_r"])
+        os.write(fixture["spawn_w"], b'r')
+        self.close_fd(fixture["spawn_w"])
+        assert self.byte(fixture["ready_r"]) == b'r', "root exited before readiness"
+        self.close_fd(fixture["ready_r"])
+        fixture["spawned"] = True
+        fixture["spawn_snapshot"] = fixture["snapshots"]
+
     def launch(self, argv: Any, *args: Any, **kwargs: Any) -> subprocess.Popen:
+        assert not self.closed, "cannot launch after fixture cleanup"
         fixture = self.fixtures.get(argv[2]) if isinstance(argv, (list, tuple)) and len(argv) > 2 else None
         if fixture is not None:
             kwargs["pass_fds"] = tuple(fixture["passed"])
         process = self.popen(argv, *args, **kwargs)
-        if not kwargs.get("start_new_session"):
-            return process
-        self.roots[process.pid] = process
+        self.processes[process.pid] = process
         wait = process.wait
         self.waits[process.pid] = wait
-        if fixture is not None:
-            self.root_fixtures[process.pid] = fixture
-            for fd in fixture["passed"]:
-                os.close(fd)
-            fixture["passed"] = []
-            with os.fdopen(fixture.pop("ready_r"), "rb") as ready:
-                pids = [int(pid) for pid in ready.readline().strip().split(b",") if pid]
-            assert len(pids) == len(fixture["exits"]), "tree exited before readiness"
-            for pid, (exit_r, _exit_w) in zip(pids, fixture["exits"]):
-                self.children[pid] = (process.pid, exit_r)
-                self.alive.add(pid)
+        if kwargs.get("start_new_session"):
+            self.roots[process.pid] = process
+        try:
+            if fixture is not None:
+                self.root_fixtures[process.pid] = fixture
+                for fd in fixture["passed"]:
+                    self.close_fd(fd)
+                assert self.byte(fixture["initial_r"]) == b'r', "root exited before startup"
+                self.close_fd(fixture["initial_r"])
+                if not fixture["delayed_spawn"]:
+                    self.spawn_children(process, fixture)
+            elif self.exit_before_snapshot and process.pid in self.roots:
+                # Return a guaranteed zombie to production, so an early poll/wait
+                # deterministically reaps it before its first ownership snapshot.
+                self.await_exit(process.pid)
+        except BaseException as exc:
+            self.failure = exc
+            self.close()
+            raise
 
         def event_wait(timeout: float | None = None) -> int:
+            just_released = False
             if fixture is not None and process.returncode is None and not fixture["released"]:
                 mode = fixture["mode"]
                 if mode == "timeout":
@@ -2063,84 +2160,207 @@ class _RunnerProcesses:
                 if mode == "interrupt":
                     fixture["mode"] = "timeout"
                     raise KeyboardInterrupt
+                assert fixture["spawned"], "parent released before controlled spawn"
                 if timeout is not None and fixture["delay"] > timeout:
                     self.clock.sleep(timeout)
                     fixture["delay"] -= timeout
                     raise subprocess.TimeoutExpired(argv, timeout)
                 self.clock.sleep(fixture["delay"])
                 fixture["delay"] = 0.0
-                fixture["released"] = True
+                fixture["released"] = just_released = True
                 os.write(fixture["release_w"], b"x")
-            # Fixture completion is an event, not a race against Popen's poll budget.
-            return wait()
+                self.close_fd(fixture["release_w"])
+            # Only releasing a controlled root may bypass the runner's poll interval.
+            # All other waits preserve the caller's timeout, including probe cleanup.
+            return wait(timeout=_RUNNER_SAFETY_SECONDS if just_released or timeout is None else timeout)
 
         process.wait = event_wait
         return process
 
+    def exited(self, pid: int) -> bool:
+        """Observe an exit without reaping, including on Python builds lacking waitid."""
+        if hasattr(os, "waitid"):
+            return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        assert sys.platform == "darwin", "non-reaping exit observation unavailable"
+        # Darwin libc waitid is available even where Python does not expose it.
+        # siginfo_t begins signo, errno, code, pid; the oversized buffer is zeroed.
+        info = ctypes.create_string_buffer(128)
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.waitid(1, pid, ctypes.byref(info), 0x04 | 0x01 | 0x20):
+            raise OSError(ctypes.get_errno(), "waitid")
+        return ctypes.c_int.from_buffer(info, 12).value != 0
+
+    def await_exit(self, pid: int) -> None:
+        deadline = time.monotonic() + _RUNNER_SAFETY_SECONDS
+        while not self.exited(pid):
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "fixture exit exceeded real-time safety bound"
+            self.select([], [], [], min(0.01, remaining))
+
     def snapshot(self, *, timeout: float = 2.0) -> dict[int, tuple[int, str, str]]:
         table: dict[int, tuple[int, str, str]] = {}
         for pid, process in self.roots.items():
-            if self.reap_before_snapshot and pid not in self.root_fixtures:
-                self.waits[pid]()
-            table[pid] = (os.getpid(), f"root-{pid}", "S" if process.returncode is None else "Z")
+            if process.returncode is not None:
+                continue
+            zombie = self.exited(pid)
+            state = "Z" if zombie else "S"
+            self.first_root_states.setdefault(pid, state)
+            table[pid] = (os.getpid(), f"root-{pid}", state)
+            fixture = self.root_fixtures.get(pid)
+            if fixture is not None:
+                fixture["snapshots"] += 1
+                if fixture["delayed_spawn"] and not fixture["spawned"] and fixture["snapshots"] == 2:
+                    self.spawn_children(process, fixture)
         for pid, (parent, _fd) in self.children.items():
             fixture = self.root_fixtures[parent]
-            parent_live = self.roots[parent].returncode is None
+            parent_live = parent in table and table[parent][2] != "Z"
             if pid in self.alive and (not fixture["escaped"] or not parent_live):
                 table[pid] = (parent if parent_live else 1, f"child-{pid}", "S")
         return table
 
     def descriptor_child(self, setup: str, **kwargs: Any) -> subprocess.Popen:
-        """Publish readiness after the descriptor changes, before awaiting a signal."""
-        ready_r, ready_w = os.pipe()
-        script = (f"import os,signal; {setup}; os.write({ready_w}, b'r'); "
-                  f"os.close({ready_w}); signal.pause()")
+        ready_r, ready_w = self.pipe()
+        script = (f"import os,signal; signal.alarm({int(_RUNNER_SAFETY_SECONDS)}); {setup}; "
+                  f"os.write({ready_w}, b'r'); os.close({ready_w}); signal.pause()")
         try:
             child = subprocess.Popen(
                 [sys.executable, "-c", script], pass_fds=(ready_w,),
                 start_new_session=True, **kwargs,
             )
+            self.close_fd(ready_w)
+            assert self.byte(ready_r) == b"r", "descriptor fixture exited before readiness"
+            return child
+        except BaseException as exc:
+            self.failure = exc
+            self.close()
+            raise
         finally:
-            os.close(ready_w)
-        with os.fdopen(ready_r, "rb") as ready:
-            assert ready.read(1) == b"r", "descriptor fixture exited before readiness"
-        return child
+            self.close_fd(ready_w)
+            self.close_fd(ready_r)
 
     def signal(self, pid: int, signum: int) -> None:
         self.kill(pid, signum)
         if not signum:
             return
         if pid in self.children:
-            # Only this fixture holds the write end; EOF proves signal delivery/exit.
-            assert os.read(self.children[pid][1], 1) == b""
+            assert self.byte(self.children[pid][1]) == b"", "child retained exit pipe"
             self.alive.discard(pid)
-        elif pid in self.waits:
-            self.waits[pid]()
+        elif pid in self.root_fixtures:
+            self.waits[pid](timeout=_RUNNER_SAFETY_SECONDS)
 
     def signal_group(self, pid: int, signum: int) -> None:
         self.killpg(pid, signum)
-        if signum and pid in self.waits:
-            self.waits[pid]()
+        if signum and pid in self.root_fixtures:
+            self.waits[pid](timeout=_RUNNER_SAFETY_SECONDS)
 
     def close(self) -> None:
-        for pid in list(self.alive):
-            self.signal(pid, signal.SIGKILL)
-        for pid, process in self.roots.items():
-            if process.returncode is None:
-                self.signal_group(pid, signal.SIGKILL)
-        for _pid, (_parent, fd) in self.children.items():
-            os.close(fd)
-        for fixture in self.fixtures.values():
-            for fd in [*fixture["passed"], fixture["release_w"]]:
-                os.close(fd)
-            if "ready_r" in fixture:
-                os.close(fixture["ready_r"])
-                for exit_r, _exit_w in fixture["exits"]:
-                    os.close(exit_r)
+        if self.closed:
+            return
+        self.closed = True
+        deadline = time.monotonic() + _RUNNER_SAFETY_SECONDS
+        errors: list[BaseException] = []
+        # Signal everything first, even reaped roots: an unreported fork may still
+        # inhabit its root's group. Registered children may have detached already.
+        for pid, group in [(pid, True) for pid in self.roots] + [(pid, False) for pid in self.children]:
+            try:
+                (self.killpg if group else self.kill)(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                if sys.platform != "darwin" or not group:
+                    errors.append(exc)
+            except BaseException as exc:
+                errors.append(exc)
+        for pid, process in self.processes.items():
+            try:
+                if process.returncode is None:
+                    self.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except BaseException as exc:
+                errors.append(exc)
+            try:
+                self.waits[pid](timeout=max(0, deadline - time.monotonic()))
+            except BaseException as exc:
+                errors.append(exc)
+        # Reap known/adopted children and unreported forks in each owned group.
+        for identity in [*self.children, *(-pid for pid in self.roots)]:
+            try:
+                while True:
+                    pid, _status = os.waitpid(identity, os.WNOHANG)
+                    if pid == 0:
+                        assert time.monotonic() < deadline, "fixture child was not reaped"
+                        self.select([], [], [], min(0.01, max(0, deadline - time.monotonic())))
+                        continue
+                    if identity > 0:
+                        break
+            except ChildProcessError:
+                pass
+            except BaseException as exc:
+                errors.append(exc)
+        if sys.platform == "darwin":
+            # launchd reaps adopted children, including unpublished forks still
+            # in their root's group. Wait for both identities and groups to vanish.
+            targets = [(pid, False) for pid in self.children] + [(pid, True) for pid in self.roots]
+            for pid, group in targets:
+                try:
+                    while True:
+                        try:
+                            (self.killpg if group else self.kill)(pid, 0)
+                        except ProcessLookupError:
+                            break
+                        except PermissionError:
+                            # Darwin reports EPERM for a zombie-only group.
+                            # It must still disappear once launchd has reaped it.
+                            pass
+                        assert time.monotonic() < deadline, "launchd did not reap fixture tree"
+                        self.select([], [], [], min(0.01, max(0, deadline - time.monotonic())))
+                except BaseException as exc:
+                    errors.append(exc)
+        for process in self.processes.values():
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except BaseException as exc:
+                        errors.append(exc)
+        self.alive.clear()
+        for fd in list(self.fds):
+            self.close_fd(fd)
+        if self.subreaper_was_set is not None:
+            assert provenance.set_child_subreaper(self.subreaper_was_set), "restore child subreaper"
+        if errors:
+            raise AssertionError("fixture cleanup failed") from errors[0]
 
 
 class RunnerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.processes = _RunnerProcesses()
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        self.watchdog_expired = False
+
+        def watchdog(_signum: int, _frame: Any) -> None:
+            self.watchdog_expired = True
+            self.processes.close()
+            raise AssertionError("RunnerTests exceeded real-time safety bound")
+
+        signal.signal(signal.SIGALRM, watchdog)
+        previous_timer = signal.setitimer(signal.ITIMER_REAL, _RUNNER_SAFETY_SECONDS)
+
+        def restore_watchdog() -> None:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+        self.addCleanup(restore_watchdog)
+        self.addCleanup(lambda: self.assertFalse(self.watchdog_expired, "real-time watchdog fired"))
+        self.addCleanup(lambda: self.assertIsNone(self.processes.failure, "fixture failed inside runner"))
+        self.addCleanup(self.processes.close)
+        # Register every Popen, including git/setup and descriptor/probe children,
+        # before any communicate, readiness read, or caller wait can block.
+        popen_patch = mock.patch.object(run_gates.subprocess, "Popen", side_effect=self.processes.launch)
+        popen_patch.start()
+        self.addCleanup(popen_patch.stop)
         self.temp = tempfile.TemporaryDirectory(dir=test_scratch_root())
         self.addCleanup(self.temp.cleanup)
         # Runner tests exercise orchestration against public synthetic trees.
@@ -2155,22 +2375,21 @@ class RunnerTests(unittest.TestCase):
         self.root = pathlib.Path(self.temp.name)
         self.repo = self.root / "repo"
         self.repo.mkdir()
-        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True, timeout=_RUNNER_SAFETY_SECONDS)
         for name in ("Cargo.lock", "adapters/java/gradle.lockfile", "adapters/node/package-lock.json", "web/app/package-lock.json"):
             path = self.repo / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("test lockfile\n")
-        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
-        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], check=True)
-        self.base = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True, timeout=_RUNNER_SAFETY_SECONDS)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], check=True, timeout=_RUNNER_SAFETY_SECONDS)
+        self.base = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True, timeout=_RUNNER_SAFETY_SECONDS).strip()
         self.cache = self.root / "cache"
         self.cache.mkdir(mode=0o700)
         self.versions_patcher = mock.patch.object(run_gates, "_versions", return_value={})
         self.versions_patcher.start()
         self.addCleanup(self.versions_patcher.stop)
-        self.processes = _RunnerProcesses()
-        # Replace this module's time object, not the shared stdlib module used
-        # by Popen. No wall time passes in runner deadlines between events.
+        # Keep event time deterministic. The independent real-time watchdog
+        # also bounds real lsof/select work while this clock is frozen.
         self.patch_runner("time", SimpleNamespace(
             monotonic=self.processes.clock.monotonic, time=time.time,
             sleep=self.processes.clock.sleep,
@@ -2187,9 +2406,6 @@ class RunnerTests(unittest.TestCase):
                 return _original(*args, **kwargs)
 
             self.patch_runner(name, with_clock)
-        popen_patch = mock.patch.object(run_gates.subprocess, "Popen", side_effect=self.processes.launch)
-        popen_patch.start()
-        self.addCleanup(popen_patch.stop)
         for name, replacement in (("kill", self.processes.signal), ("killpg", self.processes.signal_group)):
             patcher = mock.patch.object(run_gates.os, name, side_effect=replacement)
             patcher.start()
@@ -2582,7 +2798,7 @@ class RunnerTests(unittest.TestCase):
         driver = self.root / "run.mjs"
         driver.write_text(f'import {{ normalizeTree }} from "{(scripts / "generated-normalize.mjs").as_posix()}"; await normalizeTree(process.argv[2]);')
         for _ in range(2):  # idempotent
-            subprocess.run([node, str(driver), str(root)], check=True)
+            subprocess.run([node, str(driver), str(root)], check=True, timeout=_RUNNER_SAFETY_SECONDS)
             self.assertEqual((root / "a.ts").read_text(), "export {};\n")
             self.assertEqual((root / "sub" / "b.ts").read_text(), "export {};\n", "a missing trailing newline is added")
             self.assertEqual((root / "c.ts").read_text(), "export {};\n")
@@ -2680,7 +2896,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(held, [True], "the distribution is warmed while both leases are held")
         receipt = json.loads((self.cache / "release-gates" / "P00-prewarm-True" / "receipt.json").read_text())
         self.assertEqual(receipt["prewarm"], {"gradle": {"attempts": 1, "exitCode": 0}})
-        help_text = subprocess.run([sys.executable, '-B', '-m', 'tools.release.run_gates', '--help'], capture_output=True, text=True, cwd=pathlib.Path(__file__).resolve().parents[2]).stdout
+        help_text = subprocess.run([sys.executable, '-B', '-m', 'tools.release.run_gates', '--help'], capture_output=True, text=True, timeout=_RUNNER_SAFETY_SECONDS, cwd=pathlib.Path(__file__).resolve().parents[2]).stdout
         self.assertIn('--prewarm-gradle', help_text)
 
     def test_failed_gate_stops_and_never_claims_all_passed(self) -> None:
@@ -3161,15 +3377,38 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(commands, "at least git should be available for fast version probes")
         logs = self.cache / "fast-version-logs"
         probes: list[dict[str, object]] = []
-        # Reap each real probe before its first injected snapshot: an exited root
-        # must still be identified, and host process churn cannot affect the result.
-        self.processes.reap_before_snapshot = True
+        # Observe each real probe exited but UNREAPED before its first snapshot.
+        # An early production poll/wait must make it disappear and fail the run.
+        self.processes.exit_before_snapshot = True
         with mock.patch.object(run_gates, "VERSION_COMMANDS", tuple(commands)):
             versions = REAL_VERSIONS(self.repo, os.environ.copy(), logs, probes)
         self.assertEqual(len(probes), len(commands))
+        self.assertEqual(len(self.processes.first_root_states), len(commands))
+        self.assertEqual(set(self.processes.first_root_states.values()), {"Z"})
         self.assertTrue(all(probe["status"] == "passed" and probe["exitCode"] == 0 for probe in probes))
         self.assertEqual(set(versions), {command[0] for command in commands})
         self.assertTrue(all((logs / f"version-{command[0]}.log").is_file() for command in commands))
+
+    def test_root_reaped_before_first_snapshot_fails_identification(self) -> None:
+        for operation in ("poll", "wait"):
+            with self.subTest(operation=operation):
+                def reap_early(argv: Any, *args: Any, **kwargs: Any) -> subprocess.Popen:
+                    process = self.processes.launch(argv, *args, **kwargs)
+                    self.processes.await_exit(process.pid)
+                    if operation == "poll":
+                        self.assertEqual(process.poll(), 0)
+                    else:
+                        self.assertEqual(process.wait(timeout=_RUNNER_SAFETY_SECONDS), 0)
+                    self.assertNotIn(process.pid, self.processes.snapshot())
+                    return process
+
+                with mock.patch.object(run_gates.subprocess, "Popen", side_effect=reap_early):
+                    with self.assertRaisesRegex(run_gates.UncertainProcessTree, "cannot identify process"):
+                        run_gates._run(
+                            (sys.executable, "-c", "pass"), cwd=self.repo,
+                            env=os.environ.copy(), timeout=5,
+                            log_path=self.cache / f"early-reap-{operation}.log",
+                        )
 
     def test_buf_version_probe_uses_workspace_executable(self) -> None:
         self.assertEqual(
@@ -3310,7 +3549,7 @@ class RunnerTests(unittest.TestCase):
         args = self.args()
         args.label = "P00-delayed-child"
         args.command_timeout = 5
-        script = self.processes.script(escaped=True, delay=0.35)
+        script = self.processes.script(escaped=True, delay=0.35, delayed_spawn=True)
         gate = run_gates.Gate("delayed-detached-child", (sys.executable, "-c", script))
         child_pid: int | None = None
         try:
@@ -3319,6 +3558,10 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(run_gates.run(args), 1)
             run_dir = self.cache / "release-gates" / args.label
             receipt = json.loads((run_dir / "receipt.json").read_text())
+            fixture = self.processes.fixtures[script]
+            self.assertTrue(fixture["spawned"])
+            self.assertEqual(fixture["spawn_snapshot"], 2, "spawn follows the first parent snapshot")
+            self.assertTrue(fixture["released"], "parent exit is controlled separately from child spawn")
             log_files = list((run_dir / "logs").glob(".*.tmp"))
             if not log_files:
                 log_files = list((run_dir / "logs").glob("delayed-detached-child.log"))
@@ -3468,6 +3711,7 @@ class RunnerTests(unittest.TestCase):
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         log_stream = log_path.open("ab", buffering=0)
+        self.addCleanup(log_stream.close)
         log_fd_child = self.processes.descriptor_child(
             "os.dup2(1,3); os.close(1); os.close(2)",
             stdin=subprocess.DEVNULL, stdout=log_stream, stderr=subprocess.DEVNULL,
@@ -3565,7 +3809,7 @@ class RunnerTests(unittest.TestCase):
         output_ready = [False]
         selector.select.side_effect = select
         with mock.patch.object(run_gates, "LSOF_BINARY", sys.executable), \
-                mock.patch.object(run_gates.subprocess, "Popen", return_value=process), \
+                mock.patch.object(run_gates.subprocess, "Popen", return_value=process) as popen, \
                 mock.patch.object(run_gates.selectors, "DefaultSelector", return_value=selector), \
                 mock.patch.object(run_gates.os, "set_blocking"), \
                 mock.patch.object(run_gates.os, "read", return_value=b"x" * 65536), \
@@ -3576,6 +3820,10 @@ class RunnerTests(unittest.TestCase):
                 ["-c", "import time; time.sleep(30)"], run_gates.time.monotonic() + 0.15,
             )
             self.assertEqual(timed_out.error, "time-budget-exceeded")
+            self.assertEqual(popen.call_args.kwargs, dict(
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=True, start_new_session=True,
+            ))
             self.assertLess(run_gates.time.monotonic() - started, 2)
             self.assertEqual(signal_group.call_args_list, [
                 mock.call(process.pid, signal.SIGTERM), mock.call(process.pid, signal.SIGKILL),
@@ -3588,10 +3836,105 @@ class RunnerTests(unittest.TestCase):
                 run_gates.time.monotonic() + 2,
             )
             self.assertEqual(oversized.error, "output-limit-exceeded")
+            self.assertEqual(popen.call_args.kwargs, dict(
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=True, start_new_session=True,
+            ))
             self.assertLessEqual(len(oversized.stdout.encode()) + len(oversized.stderr.encode()), run_gates.MAX_LSOF_OUTPUT_BYTES + 65536)
             self.assertEqual(signal_group.call_args_list, [
                 mock.call(process.pid, signal.SIGTERM), mock.call(process.pid, signal.SIGKILL),
             ])
+
+    def real_lsof_probe(self, *, oversized: bool) -> tuple[run_gates.LsofProbe, subprocess.Popen]:
+        """Run the production probe with real pipes/signals, after an explicit handshake."""
+        ready_r, ready_w = self.processes.pipe()
+        release_r, release_w = self.processes.pipe()
+        script = "\n".join((
+            "import os, select, signal, sys",
+            f"signal.alarm({int(_RUNNER_SAFETY_SECONDS)})",
+            f"os.write({ready_w}, b'r')", f"os.close({ready_w})",
+            f"assert select.select([{release_r}], [], [], {_RUNNER_SAFETY_SECONDS})[0]",
+            f"assert os.read({release_r}, 1) == b'x'", f"os.close({release_r})",
+            "sys.stdout.buffer.write(b'x' * 2000000); sys.stdout.buffer.flush()" if oversized else "pass",
+            "signal.pause()",
+        ))
+        spawned: list[subprocess.Popen] = []
+
+        def launch(argv: Any, **kwargs: Any) -> subprocess.Popen:
+            kwargs["pass_fds"] = (ready_w, release_r)
+            process = self.processes.launch(argv, **kwargs)
+            spawned.append(process)  # Also registered centrally, before the readiness read.
+            self.processes.close_fd(ready_w)
+            self.processes.close_fd(release_r)
+            self.assertEqual(self.processes.byte(ready_r), b'r')
+            self.processes.close_fd(ready_r)
+            os.write(release_w, b'x')
+            self.processes.close_fd(release_w)
+            return process
+
+        real_selector = run_gates.selectors.DefaultSelector
+        clock = self.processes.clock
+
+        class TimeoutSelector:
+            def __init__(self) -> None:
+                self.selector = real_selector()
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self.selector, name)
+
+            def select(self, timeout: float) -> Any:
+                events = self.selector.select(min(timeout, 0.01))
+                if not events:
+                    clock.sleep(timeout)
+                return events
+
+        try:
+            with mock.patch.object(run_gates, "LSOF_BINARY", sys.executable), \
+                    mock.patch.object(run_gates.subprocess, "Popen", side_effect=launch), \
+                    mock.patch.object(run_gates.selectors, "DefaultSelector",
+                                      real_selector if oversized else TimeoutSelector):
+                result = run_gates._run_lsof_fields(
+                    ["-c", script], clock.monotonic() + (
+                        2 if oversized else run_gates.LSOF_CLEANUP_RESERVE_SECONDS + 0.15
+                    ),
+                )
+            self.assertEqual(len(spawned), 1)
+            return result, spawned[0]
+        except BaseException:
+            self.processes.close()
+            raise
+        finally:
+            for fd in (ready_r, ready_w, release_r, release_w):
+                self.processes.close_fd(fd)
+
+    def assert_probe_gone(self, process: subprocess.Popen) -> None:
+        self.assertIsNotNone(process.returncode, "production must reap its real probe")
+        self.assertIsNotNone(process.poll())
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(process.pid, os.WNOHANG)
+        with self.assertRaises(ProcessLookupError):
+            self.processes.kill(process.pid, 0)
+        with self.assertRaises(ProcessLookupError):
+            self.processes.killpg(process.pid, 0)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
+    def test_real_lsof_stalled_probe_is_terminated_and_reaped(self) -> None:
+        started = self.processes.clock.monotonic()
+        result, process = self.real_lsof_probe(oversized=False)
+        self.assertEqual(result.error, "time-budget-exceeded")
+        self.assertLess(self.processes.clock.monotonic() - started, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+        self.assert_probe_gone(process)
+
+    def test_real_lsof_oversized_probe_caps_bytes_and_is_terminated_and_reaped(self) -> None:
+        result, process = self.real_lsof_probe(oversized=True)
+        self.assertEqual(result.error, "output-limit-exceeded")
+        byte_count = len(result.stdout.encode()) + len(result.stderr.encode())
+        self.assertGreater(byte_count, run_gates.MAX_LSOF_OUTPUT_BYTES)
+        self.assertLessEqual(byte_count, run_gates.MAX_LSOF_OUTPUT_BYTES + 65536)
+        self.assert_probe_gone(process)
 
     def test_lsof_parser_never_resolves_untrusted_names_and_rejects_ambiguous_log_alias(self) -> None:
         ordinary = run_gates.LsofProbe(0, "p123\nf1\nn/Volumes/other/data.db\n", "")
@@ -4082,8 +4425,8 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("source identity changed during gate", receipt["gates"][0]["integrityFailure"])
 
     def test_non_ancestor_base_fails_before_gate(self) -> None:
-        subprocess.run(["git", "-C", str(self.repo), "checkout", "--orphan", "other"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "other"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "checkout", "--orphan", "other"], check=True, timeout=_RUNNER_SAFETY_SECONDS, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "other"], check=True, timeout=_RUNNER_SAFETY_SECONDS)
         with mock.patch.object(run_gates, "GATES", ()):
             with self.assertRaisesRegex(ValueError, "ancestor"):
                 run_gates.run(self.args())
