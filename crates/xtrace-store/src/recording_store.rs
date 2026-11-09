@@ -8232,6 +8232,276 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn first_unacknowledged_batch_and_checkpoint_temporary_are_removed_by_finish() {
+        for point in ["journal-checkpoint-before-sync", "journal-checkpoint-before-rename"] {
+            for tail_state in ["complete", "torn-header", "zero-header", "pending-only"] {
+                let fixture = on_disk_store("journal-unacknowledged-cleanup");
+                let project_id = ProjectId::new();
+                insert_project(&fixture.store, project_id);
+                let anchor =
+                    request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+                let view = fixture.store.recording_store(&fixture.root).expect("view");
+                view.begin_recording(&anchor).expect("anchor");
+                set_commit_failpoint(Some(point));
+                let result = view.journal_tail(
+                    &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                    0,
+                    &mut None,
+                );
+                assert!(commit_failpoint_fired());
+                set_commit_failpoint(None);
+                assert_eq!(
+                    result.expect_err("unacknowledged batch").kind(),
+                    RecordingStoreErrorKind::Transport
+                );
+                let tail =
+                    fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+                match tail_state {
+                    "torn-header" => std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&tail)
+                        .expect("tail")
+                        .set_len(12)
+                        .expect("torn initial header"),
+                    "zero-header" => std::fs::write(&tail, [0; 44]).expect("unsynced zero header"),
+                    "pending-only" => {
+                        std::fs::remove_file(&tail).expect("orphan checkpoint temporary")
+                    }
+                    _ => {}
+                }
+                assert_eq!(view.journal_summary(anchor.recording_id, 1).expect("no ack"), None);
+                let reopened =
+                    SqliteStore::open(&fixture.database, OpenOptions::default()).expect("reopen");
+                let recovery = reopened.recording_store(&fixture.root).expect("recovery");
+                recovery
+                    .finish_recording(&FinishRecording::without_digest(anchor.recording_id, 1))
+                    .expect("finish without admitting pending events");
+                assert_eq!(segment_count(&reopened), 0);
+                for suffix in ["tail", "tail.commit", "tail.commit-next"] {
+                    assert!(
+                        !fixture
+                            .root
+                            .join("journals")
+                            .join(format!("{}.{suffix}", anchor.recording_id))
+                            .exists()
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_removal_failure_retries_through_the_port_and_allows_the_next_segment() {
+        use xtrace_application::recording::RecordingPersistencePort as _;
+        let fixture = on_disk_store("journal-cleanup-retry");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        let port = crate::SqliteRecordingPersistence::new(fixture.store.clone(), &fixture.root);
+        port.persist_tail(&journal_request(project_id, anchor.recording_id, &[2, 3]), 0)
+            .expect("ack");
+        let segment = journal_request(project_id, anchor.recording_id, &[2, 3, 4]);
+        set_commit_failpoint(Some("journal-cleanup-before-tail-removal"));
+        let failed = port.persist_segment(&segment);
+        assert!(commit_failpoint_fired());
+        set_commit_failpoint(None);
+        assert_eq!(
+            failed.expect_err("cleanup interrupted").kind(),
+            xtrace_application::PortErrorKind::Transport
+        );
+        let journals = fixture.root.join("journals");
+        assert!(!journals.join(format!("{}.tail.commit", anchor.recording_id)).exists());
+        assert!(journals.join(format!("{}.tail", anchor.recording_id)).exists());
+        assert_eq!(
+            port.persist_segment(&segment)
+                .expect("retry clears pending tail and cached checkpoint")
+                .disposition,
+            xtrace_application::recording::PersistSegmentDisposition::ExactReplay
+        );
+        let mut next = journal_request(project_id, anchor.recording_id, &[5]);
+        next.segment_ordinal = 1;
+        assert!(port.persist_tail(&next, 0).expect("next segment is not jammed"));
+        view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 5))
+            .expect("recover next segment");
+        let page = view
+            .read_recording_window(
+                &ShowWindowRequest {
+                    project_id,
+                    recording_id: anchor.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                },
+                None,
+            )
+            .expect("both immutable segments");
+        assert_eq!(
+            page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+            ["2", "3", "4", "5"]
+        );
+        assert_eq!(segment_count(&fixture.store), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paused_reader_pins_a_snapshot_across_checkpoint_replacement_and_cleanup() {
+        for cleanup in [false, true] {
+            let fixture = on_disk_store("journal-reader-snapshot");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let recording_id = anchor.recording_id;
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            view.journal_tail(&journal_request(project_id, recording_id, &[2, 3]), 0, &mut None)
+                .expect("previous ack");
+            if cleanup {
+                view.commit_segment(&segment_request(project_id, recording_id, 0, &[2, 3]))
+                    .expect("publish before cleanup");
+            }
+            let root = AdmittedPrivateRoot::open(&fixture.root.join("journals")).expect("journals");
+            let snapshot =
+                recording_journal::snapshot_lock(&root, recording_id, CorrelationId::new())
+                    .expect("snapshot lock");
+            let reader_store = fixture.store.clone();
+            let reader_root = fixture.root.clone();
+            let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (boundary_tx, boundary_rx) = std::sync::mpsc::channel();
+            let (prepared_tx, prepared_rx) = std::sync::mpsc::channel();
+            let (publish_tx, publish_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    let hook: Box<dyn Fn()> = Box::new(move || {
+                        prepared_tx.send(()).expect("data prepared before reader starts");
+                        publish_rx.recv().expect("attempt mutation while reader is paused");
+                        assert!(
+                            snapshot.try_write().is_err(),
+                            "reader must pin checkpoint and tail together"
+                        );
+                        boundary_tx.send(()).expect("writer reached mutation boundary");
+                    });
+                    if cleanup {
+                        recording_journal::BEFORE_CLEANUP
+                            .with(|slot| *slot.borrow_mut() = Some(hook));
+                    } else {
+                        recording_journal::BEFORE_PUBLICATION
+                            .with(|slot| *slot.borrow_mut() = Some(hook));
+                    }
+                    let result = if cleanup {
+                        view.clear_segment_journal(recording_id, 0).map(|cleared| assert!(cleared))
+                    } else {
+                        view.journal_tail(
+                            &journal_request(project_id, recording_id, &[4]),
+                            2,
+                            &mut None,
+                        )
+                    };
+                    recording_journal::BEFORE_CLEANUP.with(|slot| {
+                        slot.borrow_mut().take();
+                    });
+                    recording_journal::BEFORE_PUBLICATION.with(|slot| {
+                        slot.borrow_mut().take();
+                    });
+                    result
+                });
+                prepared_rx.recv().expect("writer ready to publish or clean up");
+                let reader = scope.spawn(move || {
+                    let reader = reader_store.recording_store(&reader_root).expect("reader");
+                    recording_journal::AFTER_BOUNDARY.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            paused_tx.send(()).expect("reader paused after checkpoint read");
+                            resume_rx.recv().expect("resume pinned snapshot");
+                        }));
+                    });
+                    let result = reader.journal_summary(recording_id, 1);
+                    recording_journal::AFTER_BOUNDARY.with(|hook| {
+                        hook.borrow_mut().take();
+                    });
+                    result
+                });
+                paused_rx.recv().expect("reader has old checkpoint");
+                publish_tx.send(()).expect("writer may attempt replacement or cleanup");
+                boundary_rx.recv().expect("writer is at replacement or cleanup");
+                resume_tx.send(()).expect("allow reader to finish");
+                assert_eq!(
+                    reader.join().expect("reader thread").expect("stable snapshot"),
+                    Some((2, 3, 2))
+                );
+                writer.join().expect("writer thread").expect("writer completes after snapshot");
+            });
+            assert_eq!(
+                view.journal_summary(recording_id, 1).expect("next snapshot"),
+                if cleanup { None } else { Some((2, 4, 3)) }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_journal_appends_do_not_read_the_checkpoint_or_repeat_creation_syncs() {
+        use recording_journal::{
+            SyncKind, take_boundary_read_count, take_checkpoint_sync_count,
+            take_directory_sync_count, take_sync_count, take_sync_order,
+        };
+        let fixture = on_disk_store("journal-cached-cost");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        let mut checkpoint = None;
+        take_directory_sync_count();
+        view.journal_tail(
+            &journal_request(project_id, anchor.recording_id, &[2]),
+            0,
+            &mut checkpoint,
+        )
+        .expect("first ack");
+        assert_eq!(
+            take_directory_sync_count(),
+            2,
+            "cold parent and checkpoint publication barriers"
+        );
+        take_boundary_read_count();
+        take_checkpoint_sync_count();
+        take_sync_count();
+        take_sync_order();
+        view.journal_tail(
+            &journal_request(project_id, anchor.recording_id, &[3]),
+            1,
+            &mut checkpoint,
+        )
+        .expect("cached ack");
+        assert_eq!(take_boundary_read_count(), 0, "cached append never reloads its boundary");
+        assert_eq!(take_sync_count(), 1, "data must be durable before checkpoint publication");
+        assert_eq!(
+            take_checkpoint_sync_count(),
+            1,
+            "checkpoint contents must be durable before rename"
+        );
+        assert_eq!(take_directory_sync_count(), 1, "one directory barrier publishes both names");
+        assert_eq!(
+            take_sync_order(),
+            [SyncKind::Journal, SyncKind::Checkpoint, SyncKind::Directory]
+        );
+        assert_eq!(
+            view.journal_summary(anchor.recording_id, 1).expect("durable prefix"),
+            Some((2, 3, 2))
+        );
+        view.commit_segment(&segment_request(project_id, anchor.recording_id, 0, &[2, 3]))
+            .expect("publish before cleanup");
+        assert!(view.clear_segment_journal(anchor.recording_id, 0).expect("clear tail"));
+        assert_eq!(take_directory_sync_count(), 2, "checkpoint removal must precede tail removal");
+        assert!(view.clear_segment_journal(anchor.recording_id, 0).expect("empty cleanup retry"));
+        assert_eq!(take_directory_sync_count(), 0, "absent journal files need no sync");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn endpoint_and_unmatched_lists_share_the_journal_projection_and_session_context() {
         let fixture = on_disk_store("journal-endpoint-lists");
         let project_id = ProjectId::new();
@@ -8308,8 +8578,18 @@ mod tests {
         set_commit_failpoint(Some("after-commit-before-cleanup"));
         let result =
             view.commit_segment(&segment_request(project_id, anchor.recording_id, 0, &[2, 3, 4]));
+        assert!(commit_failpoint_fired(), "must reach the post-commit cleanup boundary");
         set_commit_failpoint(None);
-        result.expect_err("simulate interruption after the immutable commit");
+        // Once the SQLite row is authoritative, a staging cleanup fault is a
+        // successful commit with residue (also covered by the commit tests).
+        assert_eq!(
+            result.expect("authoritative segment commit").disposition,
+            SegmentCommitDisposition::Inserted
+        );
+        assert_eq!(
+            view.journal_summary(anchor.recording_id, 1).expect("stale journal retained"),
+            Some((2, 3, 2))
+        );
         assert_eq!(
             view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 4))
                 .expect("verified prefix recovery"),

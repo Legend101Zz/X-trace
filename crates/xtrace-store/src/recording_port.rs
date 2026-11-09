@@ -1915,11 +1915,16 @@ mod tests {
 
     fn journaled_singletons_recover(count: usize, focused: bool) {
         use crate::recording_store::recording_journal::{
-            take_checkpoint_sync_count, take_sync_count,
+            CountOnlySyncs, SyncKind, take_checkpoint_sync_count, take_directory_sync_count,
+            take_sync_count, take_sync_order,
         };
         use xtrace_application::recording::DEFAULT_SEGMENT_EVENTS;
         use xtrace_application::recording_queries::{RecordingCompletionEvidence, RecordingStatus};
 
+        // This is a cardinality/recovery test: 131,072 singleton batches must
+        // exercise every barrier without spending minutes flushing hardware.
+        // The journal fault tests and macOS latency test retain real syncs.
+        let _syncs = CountOnlySyncs::enter();
         let (directory, store, project) = fixture();
         let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
         let capture = RecordingCaptureService::new(
@@ -1938,6 +1943,8 @@ mod tests {
         }
         take_sync_count();
         take_checkpoint_sync_count();
+        take_directory_sync_count();
+        take_sync_order();
         let mut published = 0;
         for index in 0..count {
             let sequence = index as u64 + 2;
@@ -1949,6 +1956,23 @@ mod tests {
                 .expect("singleton acknowledgement");
             assert_eq!((receipt.accepted, receipt.dropped), (1, 0));
             published += receipt.persisted_segments;
+            let expected_order = if receipt.persisted_segments != 0 {
+                vec![SyncKind::Directory, SyncKind::Directory]
+            } else if index % DEFAULT_SEGMENT_EVENTS == 0 {
+                vec![
+                    SyncKind::Journal,
+                    SyncKind::Directory,
+                    SyncKind::Checkpoint,
+                    SyncKind::Directory,
+                ]
+            } else {
+                vec![SyncKind::Journal, SyncKind::Checkpoint, SyncKind::Directory]
+            };
+            assert_eq!(
+                take_sync_order(),
+                expected_order,
+                "durability barrier order for batch {index}"
+            );
         }
         assert_eq!(published, count / DEFAULT_SEGMENT_EVENTS);
         assert_eq!(
@@ -1960,6 +1984,11 @@ mod tests {
             take_checkpoint_sync_count(),
             count - count / DEFAULT_SEGMENT_EVENTS,
             "each durable batch also syncs its atomic checkpoint"
+        );
+        assert_eq!(
+            take_directory_sync_count(),
+            count - published + count.div_ceil(DEFAULT_SEGMENT_EVENTS) + 2 * published,
+            "publication, cold-parent and ordered cleanup directory barriers"
         );
         let last = count as u64 + 1;
         let duplicate = capture
@@ -1976,6 +2005,8 @@ mod tests {
             0,
             "empty and duplicate batches do not checkpoint"
         );
+        assert_eq!(take_directory_sync_count(), 0);
+        assert!(take_sync_order().is_empty(), "empty and duplicate batches do not sync");
         // Lose every volatile assembler/checkpoint and use a new SQLite connection.
         drop(capture);
         drop(adapter);
