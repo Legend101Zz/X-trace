@@ -19,22 +19,28 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * One bounded source read, confined to a canonical project directory, with no ancestor search.
+ * One bounded source read checked against a canonical project directory, with no ancestor search.
  *
  * <p>Use SecureDirectoryStream where available (normally Linux OpenJDK), pinning directories
  * from the canonical project base. Opening ancestors above the base would need read permission
- * where ordinary path lookup needs only search permission. macOS OpenJDK has no secure streams.
- * There, or when a directory is searchable but not listable, use a POSIX path walk: check every
- * canonical component with NOFOLLOW_LINKS, require stable file keys, open the final file with
- * NOFOLLOW_LINKS, and compare the directory keys and file key/size/timestamps after reading.
+ * where ordinary path lookup needs only search permission. Java on macOS has no directory-relative,
+ * no-follow file open. There, or when a directory is searchable but not listable, keep a verified
+ * POSIX path fallback: check every canonical component with NOFOLLOW_LINKS, require stable file
+ * keys, open the final file with NOFOLLOW_LINKS, and compare the directory keys and file
+ * key/size/timestamps after reading.
  * Unsupported providers fail closed with a distinct, once-per-process diagnostic.
  *
- * <p>Java 17 exposes channel size but no portable fstat/fileKey for an opened channel. Both
- * paths detect observed replacement/edit races, not every ABA replacement or in-place write
- * that restores metadata. In particular, the path fallback cannot atomically pin intermediate
- * directories: a writer inside the project (or an ancestor containing it) could replace and
- * restore a directory between checks. Neither path is an atomic content snapshot or a sandbox
- * against such a writer. Bytes remain only observed, never build-attested.
+ * <p>The path fallback cannot fully exclude a directory swapped and restored between checks.
+ * An attacker with write access inside the project can replace an intermediate directory with
+ * a symlink to an external directory, let the open read an equal-sized external file, then restore
+ * the directory before the next check. NOFOLLOW_LINKS protects only the final component, and
+ * Java 17 exposes channel size but no portable fstat/fileKey for the opened channel. A swap
+ * left in place fails closed, but a restored swap can bind external bytes to a project path.
+ * The agent records only the source hash, line count and path, not the source content. This
+ * fallback is not a confinement guarantee against such a writer.
+ *
+ * <p>Both paths detect observed replacement/edit races, not every in-place write that restores
+ * metadata. Neither is an atomic content snapshot. Bytes remain observed, never build-attested.
  */
 final class ConfinedSourceFiles {
   static final int MAX_SOURCE_BYTES = 1024 * 1024;
@@ -296,7 +302,7 @@ final class ConfinedSourceFiles {
 
   /** Missing files allow another declared root; an unsafe path stops resolution entirely. */
   private static Path locate(Path base, String relative) throws IOException {
-    Path suffix = Path.of(relative);
+    Path suffix = base.getFileSystem().getPath(relative);
     if (suffix.isAbsolute()) throw new IOException("source path is outside the project");
     // Validate the entire spelling even if an earlier component is missing.
     for (Path part : suffix) {

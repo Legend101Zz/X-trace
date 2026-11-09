@@ -18,7 +18,6 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Map;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.api.parallel.Resources;
@@ -241,9 +240,11 @@ class ConfinedSourceFilesTest {
         () -> read(project, forceFallback, file -> {}));
   }
 
-  @Test
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
   @ResourceLock(Resources.SYSTEM_ERR)
-  void unverifiableProviderHasADistinctDiagnosticWithoutPathsOrContent(@TempDir Path directory)
+  void unverifiableProviderHasADistinctDiagnosticWithoutPathsOrContent(
+      boolean forceFallback, @TempDir Path directory)
       throws Exception {
     ByteArrayOutputStream output = new ByteArrayOutputStream();
     PrintStream original = System.err;
@@ -253,10 +254,12 @@ class ConfinedSourceFilesTest {
       Path project = fs.getPath("/project");
       sourceTree(project);
       System.setErr(diagnostic);
+      int[] opens = {0};
       assertThrows(ConfinedSourceFiles.CannotVerify.class,
-          () -> read(project, true, file -> {}));
+          () -> read(project, forceFallback, file -> opens[0]++));
       assertThrows(ConfinedSourceFiles.CannotVerify.class,
-          () -> read(project, true, file -> {}));
+          () -> read(project, forceFallback, file -> opens[0]++));
+      assertEquals(0, opens[0], "an unverifiable provider must fail before opening source");
       assertEquals("{\"code\":\"XTR-JAVA-SOURCE-UNVERIFIABLE\","
           + "\"message\":\"Source unavailable: the platform cannot verify this read.\"}"
           + System.lineSeparator(), output.toString(StandardCharsets.UTF_8));
