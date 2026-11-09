@@ -519,7 +519,11 @@ impl SqliteRecordingStore<'_> {
         while let Some(row) = rows.next().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })? {
-            let metadata = recording_metadata_from_row(row, &connection, correlation_id)?;
+            let metadata = recording_metadata_from_row(row, &connection, self, correlation_id)?;
+            observed_recording_id_from_bytes(
+                metadata.recording_id.as_uuid().as_bytes(),
+                correlation_id,
+            )?;
             let disposition: Option<String> = row.get(7).map_err(|error| {
                 map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
             })?;
@@ -661,93 +665,7 @@ impl SqliteRecordingStore<'_> {
         while let Some(row) = rows.next().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })? {
-            let raw_id: Vec<u8> = row.get(0).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let status: String = row.get(1).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let opened_at: String = row.get(2).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let segment_count: i64 = row.get(3).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let event_count: i64 = row.get(4).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let first_sequence: Option<Vec<u8>> = row.get(5).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let last_sequence: Option<Vec<u8>> = row.get(6).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let lifecycle_status = recording_status(&status, correlation_id)?;
-            let recording_id = recording_id_from_bytes(&raw_id, correlation_id)?;
-            let completion =
-                completion_evidence(&connection, recording_id, &status, correlation_id)?;
-            let sealed_last = last_sequence
-                .as_deref()
-                .map(|value| decode_stored_sequence(value, correlation_id))
-                .transpose()?
-                .unwrap_or(1);
-            let journal = self.journal_summary(recording_id, sealed_last)?;
-            let mut incomplete_evidence = match lifecycle_status {
-                RecordingStatus::Partial | RecordingStatus::Invalid => {
-                    vec![format!("persisted_status:{status}")]
-                }
-                _ => Vec::new(),
-            };
-            let session_context = session_context(&connection, recording_id, correlation_id)?;
-            if let Some((first, last, _)) = journal {
-                incomplete_evidence.push(format!("durable_tail_pending:{first}..{last}"));
-            }
-            // A corrupt terminal row is already reported through `completion`
-            // and `incomplete_evidence`; list metadata then stays null.
-            let terminal =
-                load_terminal_finish(&connection, recording_id, completion, correlation_id)
-                    .ok()
-                    .flatten();
-            recordings.push(RecordingMetadata {
-                recording_id,
-                status: lifecycle_status,
-                completion,
-                opened_at,
-                segment_count: u64::try_from(segment_count)
-                    .map_err(|_| recording_query_corrupt_error(correlation_id))?
-                    .to_string(),
-                event_count: u64::try_from(event_count)
-                    .map_err(|_| recording_query_corrupt_error(correlation_id))?
-                    .saturating_add(journal.map_or(0, |(_, _, count)| count))
-                    .to_string(),
-                first_sequence: first_sequence
-                    .as_deref()
-                    .map(|value| decode_stored_sequence(value, correlation_id))
-                    .transpose()?
-                    .or_else(|| journal.map(|(first, _, _)| first))
-                    .map(|value| value.to_string()),
-                last_sequence: last_sequence
-                    .as_deref()
-                    .map(|value| decode_stored_sequence(value, correlation_id))
-                    .transpose()?
-                    .map(|value| journal.map_or(value, |(_, last, _)| last.max(value)))
-                    .or_else(|| journal.map(|(_, last, _)| last))
-                    .map(|value| value.to_string()),
-                incomplete_evidence,
-                session_context,
-                event_cap: terminal
-                    .as_ref()
-                    .and_then(|finish| u32::try_from(finish.event_cap).ok()),
-                // Terminal evidence without an adapter outcome (every pre-outcome
-                // row) reads `unobserved`; no terminal evidence reads `null` (CONTRACTS 5).
-                outcome_kind: terminal.as_ref().map(|finish| {
-                    finish
-                        .outcome
-                        .as_ref()
-                        .map_or("unobserved", |outcome| outcome.kind.as_str())
-                        .to_owned()
-                }),
-            });
+            recordings.push(recording_metadata_from_row(row, &connection, self, correlation_id)?);
         }
         let has_more = recordings.len() > usize::try_from(limit).unwrap_or(usize::MAX);
         if has_more {
@@ -5427,6 +5345,7 @@ fn session_context(
 fn recording_metadata_from_row(
     row: &rusqlite::Row<'_>,
     connection: &rusqlite::Connection,
+    view: &SqliteRecordingStore<'_>,
     correlation_id: CorrelationId,
 ) -> Result<RecordingMetadata, RecordingStoreError> {
     let raw_id: Vec<u8> = row.get(0).map_err(|error| {
@@ -5456,15 +5375,28 @@ fn recording_metadata_from_row(
         map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
     })?;
     let lifecycle_status = recording_status(&status, correlation_id)?;
-    let recording_id = observed_recording_id_from_bytes(&raw_id, correlation_id)?;
+    let recording_id = recording_id_from_bytes(&raw_id, correlation_id)?;
     let completion = completion_evidence(connection, recording_id, &status, correlation_id)?;
-    let incomplete_evidence = match lifecycle_status {
+    let sealed_last = last_sequence
+        .as_deref()
+        .map(|value| decode_stored_sequence(value, correlation_id))
+        .transpose()?
+        .unwrap_or(1);
+    let journal = view.journal_summary(recording_id, sealed_last)?;
+    let mut incomplete_evidence = match lifecycle_status {
         RecordingStatus::Partial | RecordingStatus::Invalid => {
             vec![format!("persisted_status:{status}")]
         }
         _ => Vec::new(),
     };
     let session_context = session_context(connection, recording_id, correlation_id)?;
+    if let Some((first, last, _)) = journal {
+        incomplete_evidence.push(format!("durable_tail_pending:{first}..{last}"));
+    }
+    // A corrupt terminal row is already reported through `completion`
+    // and `incomplete_evidence`; list metadata then stays null.
+    let terminal =
+        load_terminal_finish(connection, recording_id, completion, correlation_id).ok().flatten();
     Ok(RecordingMetadata {
         recording_id,
         status: lifecycle_status,
@@ -5475,21 +5407,29 @@ fn recording_metadata_from_row(
             .to_string(),
         event_count: u64::try_from(event_count)
             .map_err(|_| recording_query_corrupt_error(correlation_id))?
+            .saturating_add(journal.map_or(0, |(_, _, count)| count))
             .to_string(),
         first_sequence: first_sequence
             .as_deref()
             .map(|value| decode_stored_sequence(value, correlation_id))
             .transpose()?
+            .or_else(|| journal.map(|(first, _, _)| first))
             .map(|value| value.to_string()),
         last_sequence: last_sequence
             .as_deref()
             .map(|value| decode_stored_sequence(value, correlation_id))
             .transpose()?
+            .map(|value| journal.map_or(value, |(_, last, _)| last.max(value)))
+            .or_else(|| journal.map(|(_, last, _)| last))
             .map(|value| value.to_string()),
         incomplete_evidence,
         session_context,
-        event_cap: None,
-        outcome_kind: None,
+        event_cap: terminal.as_ref().and_then(|finish| u32::try_from(finish.event_cap).ok()),
+        // Terminal evidence without an adapter outcome (every pre-outcome
+        // row) reads `unobserved`; no terminal evidence reads `null` (CONTRACTS 5).
+        outcome_kind: terminal.as_ref().map(|finish| {
+            finish.outcome.as_ref().map_or("unobserved", |outcome| outcome.kind.as_str()).to_owned()
+        }),
     })
 }
 
@@ -7845,7 +7785,12 @@ mod tests {
     #[test]
     fn journal_sync_failures_require_exact_retry_and_recover_the_acknowledged_tail() {
         use prost::Message as _;
-        for point in ["journal-before-sync", "journal-after-sync"] {
+        for point in [
+            "journal-before-sync",
+            "journal-checkpoint-before-sync",
+            "journal-checkpoint-before-rename",
+            "journal-after-sync",
+        ] {
             let fixture = on_disk_store("journal-retry");
             let project_id = ProjectId::new();
             insert_project(&fixture.store, project_id);
@@ -7863,6 +7808,10 @@ mod tests {
                 RecordingStoreErrorKind::Transport
             );
             assert!(checkpoint.is_none());
+            assert_eq!(
+                view.journal_summary(anchor.recording_id, 1).expect("synced boundary only"),
+                (point == "journal-after-sync").then_some((2, 3, 2))
+            );
             let mut changed = tail.clone();
             changed.events[1].payload.event.as_mut().expect("event").event_id =
                 "changed".to_owned();
@@ -7976,6 +7925,377 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn journal_recovery_discards_full_length_torn_and_zero_filled_final_batches() {
+        use prost::Message as _;
+        let envelope = |sequence| {
+            let payload = event(sequence).encode_to_vec();
+            let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
+            bytes.extend_from_slice(&payload);
+            bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
+            bytes
+        };
+        let mut torn = envelope(4);
+        torn[4] ^= 1; // Full apparent length, with partially persisted payload.
+        let mut torn_digest = envelope(4);
+        *torn_digest.last_mut().expect("digest") ^= 1;
+        let mut partly_written_batch = envelope(4);
+        partly_written_batch.extend_from_slice(&[0; 36]);
+        for suffix in
+            [torn, torn_digest, vec![0; 36], vec![0; 4096], envelope(4), partly_written_batch]
+        {
+            let fixture = on_disk_store("journal-full-torn-tail");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                0,
+                &mut None,
+            )
+            .expect("acknowledged batch");
+            let path = fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .expect("journal")
+                .write_all(&suffix)
+                .expect("simulate crash suffix");
+            assert_eq!(
+                view.journal_summary(anchor.recording_id, 1).expect("committed prefix"),
+                Some((2, 3, 2))
+            );
+            // Use a fresh store so recovery cannot rely on an in-memory checkpoint.
+            let reopened = SqliteStore::open(&fixture.database, crate::OpenOptions::default())
+                .expect("reopen");
+            let recovery = reopened.recording_store(&fixture.root).expect("recovery view");
+            recovery
+                .finish_recording(&FinishRecording::without_digest(anchor.recording_id, 3))
+                .expect("recover committed batch");
+            let page = recovery
+                .read_recording_window(
+                    &ShowWindowRequest {
+                        project_id,
+                        recording_id: anchor.recording_id,
+                        limit: 10,
+                        after_sequence: None,
+                    },
+                    None,
+                )
+                .expect("recovered events");
+            assert_eq!(
+                page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+                ["2", "3"]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_checkpoint_publication_keeps_the_previous_batch_recoverable() {
+        for point in [
+            "journal-before-sync",
+            "journal-checkpoint-before-sync",
+            "journal-checkpoint-before-rename",
+        ] {
+            let fixture = on_disk_store("journal-checkpoint-crash");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            let mut checkpoint = None;
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                0,
+                &mut checkpoint,
+            )
+            .expect("committed batch");
+            let path = fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+            let committed_length = std::fs::metadata(&path).expect("journal").len() as usize;
+            set_commit_failpoint(Some(point));
+            let failure = view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[4, 5]),
+                2,
+                &mut checkpoint,
+            );
+            assert!(commit_failpoint_fired(), "checkpoint failure hook must fire");
+            set_commit_failpoint(None);
+            assert_eq!(
+                failure.expect_err("no acknowledgement").kind(),
+                RecordingStoreErrorKind::Transport
+            );
+            assert_eq!(
+                view.journal_summary(anchor.recording_id, 1).expect("previous ack only"),
+                Some((2, 3, 2))
+            );
+            let mut bytes = std::fs::read(&path).expect("full apparent append");
+            assert!(bytes.len() > committed_length);
+            bytes[committed_length..].fill(0);
+            std::fs::write(path, bytes).expect("simulate size persisted before data");
+            let reopened =
+                SqliteStore::open(&fixture.database, OpenOptions::default()).expect("reopen");
+            let recovery = reopened.recording_store(&fixture.root).expect("view");
+            recovery
+                .finish_recording(&FinishRecording::without_digest(anchor.recording_id, 3))
+                .expect("recover previous acknowledgement");
+            let page = recovery
+                .read_recording_window(
+                    &ShowWindowRequest {
+                        project_id,
+                        recording_id: anchor.recording_id,
+                        limit: 10,
+                        after_sequence: None,
+                    },
+                    None,
+                )
+                .expect("recovered prefix");
+            assert_eq!(
+                page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+                ["2", "3"]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_journals_are_checkpointed_before_their_first_new_append() {
+        let fixture = on_disk_store("legacy-journal-checkpoint");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        view.journal_tail(&journal_request(project_id, anchor.recording_id, &[2, 3]), 0, &mut None)
+            .expect("batch");
+        let path = fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+        let boundary =
+            fixture.root.join("journals").join(format!("{}.tail.commit", anchor.recording_id));
+        let mut bytes = std::fs::read(&path).expect("journal");
+        bytes[..8].copy_from_slice(b"XTRTAIL1");
+        std::fs::write(&path, bytes).expect("legacy header");
+        std::fs::remove_file(&boundary).expect("legacy has no checkpoint");
+        assert_eq!(
+            view.journal_summary(anchor.recording_id, 1).expect("legacy prefix"),
+            Some((2, 3, 2))
+        );
+        set_commit_failpoint(Some("journal-before-sync"));
+        let failure = view.journal_tail(
+            &journal_request(project_id, anchor.recording_id, &[4]),
+            2,
+            &mut None,
+        );
+        set_commit_failpoint(None);
+        failure.expect_err("new append was not synced");
+        assert!(boundary.exists(), "legacy prefix protected before writing new data");
+        assert_eq!(
+            view.journal_summary(anchor.recording_id, 1).expect("legacy acknowledged prefix only"),
+            Some((2, 3, 2))
+        );
+        view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 3))
+            .expect("legacy recovery");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_committed_corruption_is_reported_even_with_an_uncommitted_suffix() {
+        for position in [10, 44, 48] {
+            let fixture = on_disk_store("journal-committed-corruption");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                0,
+                &mut None,
+            )
+            .expect("ack");
+            let path = fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+            let mut bytes = std::fs::read(&path).expect("journal");
+            bytes[position] ^= 1;
+            bytes.extend_from_slice(&[0; 36]);
+            std::fs::write(&path, &bytes).expect("committed corruption followed by torn tail");
+            assert_eq!(
+                view.journal_summary(anchor.recording_id, 1)
+                    .expect_err("read reports committed corruption")
+                    .kind(),
+                RecordingStoreErrorKind::Corruption
+            );
+            assert_eq!(
+                view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 3))
+                    .expect_err("recovery reports committed corruption")
+                    .kind(),
+                RecordingStoreErrorKind::Corruption
+            );
+            assert_eq!(segment_count(&fixture.store), 0);
+            assert_eq!(std::fs::read(path).expect("unchanged journal"), bytes);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_reads_during_an_append_before_sync_see_only_the_previous_acknowledgement() {
+        for with_prefix in [false, true] {
+            let fixture = on_disk_store("journal-paused-append");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            let mut checkpoint = None;
+            if with_prefix {
+                view.journal_tail(
+                    &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                    0,
+                    &mut checkpoint,
+                )
+                .expect("prior ack");
+            }
+            let reader_store = fixture.store.clone();
+            let reader_root = fixture.root.clone();
+            let recording_id = anchor.recording_id;
+            let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook_observed = observed.clone();
+            recording_journal::BEFORE_SYNC.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    // The writer is paused inside this hook; a separate reader
+                    // thread must complete while the writer lock remains held.
+                    std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| {
+                                let reader =
+                                    reader_store.recording_store(&reader_root).expect("reader");
+                                let rows = reader
+                                    .list_recording_metadata(project_id, None, 10)
+                                    .expect("live list")
+                                    .0;
+                                assert_eq!(
+                                    rows[0].event_count,
+                                    if with_prefix { "2" } else { "0" }
+                                );
+                                assert_eq!(
+                                    rows[0].last_sequence.as_deref(),
+                                    with_prefix.then_some("3")
+                                );
+                                let expected = if with_prefix {
+                                    vec!["durable_tail_pending:2..3".to_owned()]
+                                } else {
+                                    vec![]
+                                };
+                                assert_eq!(rows[0].incomplete_evidence, expected);
+                                let page = reader
+                                    .read_recording_window(
+                                        &ShowWindowRequest {
+                                            project_id,
+                                            recording_id,
+                                            limit: 10,
+                                            after_sequence: None,
+                                        },
+                                        None,
+                                    )
+                                    .expect("live detail");
+                                assert_eq!(page.incomplete_evidence, expected);
+                            })
+                            .join()
+                            .expect("reader thread")
+                    });
+                    hook_observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                }));
+            });
+            let result = view.journal_tail(
+                &journal_request(
+                    project_id,
+                    recording_id,
+                    if with_prefix { &[4] } else { &[2, 3] },
+                ),
+                if with_prefix { 2 } else { 0 },
+                &mut checkpoint,
+            );
+            recording_journal::BEFORE_SYNC.with(|hook| {
+                hook.borrow_mut().take();
+            });
+            result.expect("synced ack");
+            assert!(observed.load(std::sync::atomic::Ordering::SeqCst), "pause hook must fire");
+            assert_eq!(
+                view.journal_summary(recording_id, 1).expect("published after sync"),
+                Some(if with_prefix { (2, 4, 3) } else { (2, 3, 2) })
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_and_unmatched_lists_share_the_journal_projection_and_session_context() {
+        let fixture = on_disk_store("journal-endpoint-lists");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let mut linked =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        linked.endpoint_observation = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "POST".to_owned(),
+            route_template: "/orders".to_owned(),
+        };
+        let unmatched =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        for anchor in [&linked, &unmatched] {
+            view.begin_recording(anchor).expect("anchor");
+            fixture.store.lock().expect("connection").execute(
+                "INSERT INTO session_health (project_id, runtime_session_id, rejected_requests) VALUES (?1, ?2, ?3)",
+                rusqlite::params![project_id.as_uuid().as_bytes(), anchor.runtime_session_id.as_uuid().as_bytes(), 7],
+            ).expect("session health");
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                0,
+                &mut None,
+            )
+            .expect("journal-only ack");
+        }
+        let operation = view.list_observed_endpoints(project_id, None, 10).expect("endpoints").0[0]
+            .operation_id;
+        let linked_rows =
+            view.list_operation_recordings(project_id, operation, None, 10).expect("linked").0;
+        let unmatched_rows =
+            view.list_unmatched_recordings(project_id, None, 10).expect("unmatched").0;
+        assert_eq!((linked_rows.len(), unmatched_rows.len()), (1, 1));
+        let standard = view.list_recording_metadata(project_id, None, 10).expect("standard").0;
+        for row in [&linked_rows[0], &unmatched_rows[0]] {
+            let metadata = &row.metadata;
+            assert_eq!(
+                metadata,
+                standard
+                    .iter()
+                    .find(|item| item.recording_id == metadata.recording_id)
+                    .expect("same recording")
+            );
+            assert_eq!(metadata.event_count, "2");
+            assert_eq!(metadata.first_sequence.as_deref(), Some("2"));
+            assert_eq!(metadata.last_sequence.as_deref(), Some("3"));
+            assert_eq!(metadata.incomplete_evidence, ["durable_tail_pending:2..3"]);
+            assert_eq!(metadata.session_context.rejected_requests.as_deref(), Some("7"));
+            assert_eq!(
+                metadata.session_context.runtime_session_id,
+                if metadata.recording_id == linked.recording_id {
+                    linked.runtime_session_id
+                } else {
+                    unmatched.runtime_session_id
+                }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn recovery_verifies_a_stale_journal_prefix_after_segment_commit() {
         let fixture = on_disk_store("journal-published-prefix");
         let project_id = ProjectId::new();
@@ -8073,6 +8393,66 @@ mod tests {
                 b"private-journal-link-canary"
             );
             assert_eq!(segment_count(&fixture.store), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_checkpoint_files_reject_links_without_changing_private_targets() {
+        for pending in [false, true] {
+            for hard_link in [false, true] {
+                let fixture = on_disk_store("journal-checkpoint-link");
+                let project_id = ProjectId::new();
+                insert_project(&fixture.store, project_id);
+                let anchor =
+                    request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+                let view = fixture.store.recording_store(&fixture.root).expect("view");
+                view.begin_recording(&anchor).expect("anchor");
+                let mut checkpoint = None;
+                view.journal_tail(
+                    &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                    0,
+                    &mut checkpoint,
+                )
+                .expect("ack");
+                let canary = fixture.root.join("checkpoint-canary");
+                std::fs::write(&canary, b"private-checkpoint-canary").expect("canary");
+                set_mode(&canary, 0o600);
+                let name = format!(
+                    "{}.tail.commit{}",
+                    anchor.recording_id,
+                    if pending { "-next" } else { "" }
+                );
+                let path = fixture.root.join("journals").join(name);
+                if !pending {
+                    std::fs::remove_file(&path).expect("replace checkpoint with link");
+                }
+                if hard_link {
+                    std::fs::hard_link(&canary, &path).expect("hard link");
+                } else {
+                    std::os::unix::fs::symlink(&canary, &path).expect("symlink");
+                }
+                view.journal_tail(
+                    &journal_request(project_id, anchor.recording_id, &[4]),
+                    2,
+                    &mut checkpoint,
+                )
+                .expect_err("checkpoint links fail closed");
+                assert_eq!(
+                    std::fs::read(canary).expect("target unchanged"),
+                    b"private-checkpoint-canary"
+                );
+                if pending {
+                    assert_eq!(
+                        view.journal_summary(anchor.recording_id, 1)
+                            .expect("previous boundary survives failed publication"),
+                        Some((2, 3, 2))
+                    );
+                } else {
+                    view.journal_summary(anchor.recording_id, 1)
+                        .expect_err("checkpoint read rejects link");
+                }
+            }
         }
     }
 

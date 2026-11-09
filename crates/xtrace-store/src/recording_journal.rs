@@ -1,8 +1,9 @@
 //! Private, bounded append journal for the one unfinished segment of a recording.
 //!
 //! XTF objects remain immutable. Only the current tail is appendable: each
-//! envelope has a length and digest, and an incomplete final append is ignored
-//! on recovery. Acknowledgement follows file sync, never merely a write.
+//! envelope has a length and digest. A separate, atomically replaced checkpoint
+//! names the synced prefix; bytes beyond it never participate in recovery or live
+//! reads. Acknowledgement follows data sync, checkpoint sync and directory sync.
 
 use std::io::{Seek as _, SeekFrom};
 
@@ -14,19 +15,29 @@ use xtrace_protocol::xtf::XtfEventEnvelope;
 
 use super::*;
 
-const MAGIC: &[u8; 8] = b"XTRTAIL1";
+const LEGACY_MAGIC: &[u8; 8] = b"XTRTAIL1";
+const MAGIC: &[u8; 8] = b"XTRTAIL2";
+const BOUNDARY_BYTES: usize = HEADER_BYTES + 8 + 32;
 const HEADER_BYTES: usize = 44;
 const MAX_JOURNAL_BYTES: usize =
     HEADER_BYTES + DEFAULT_SEGMENT_EVENT_BYTES + DEFAULT_SEGMENT_EVENTS * 32;
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static BEFORE_SYNC: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    static CHECKPOINT_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JOURNAL_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn take_sync_count() -> usize {
     JOURNAL_SYNCS.with(|count| count.replace(0))
+}
+
+/// Checkpoint file syncs are additional to the append-file sync count.
+#[cfg(test)]
+pub(crate) fn take_checkpoint_sync_count() -> usize {
+    CHECKPOINT_SYNCS.with(|count| count.replace(0))
 }
 
 /// A checkpoint is installed only after file and creation-directory sync.
@@ -75,15 +86,80 @@ fn name(recording_id: RecordingId) -> String {
     format!("{}.tail", recording_id.as_uuid())
 }
 
+fn boundary_name(recording_id: RecordingId) -> String {
+    format!("{}.tail.commit", recording_id.as_uuid())
+}
+
+fn read_boundary(
+    root: &AdmittedPrivateRoot,
+    recording_id: RecordingId,
+    id: CorrelationId,
+) -> Result<Option<Vec<u8>>, RecordingStoreError> {
+    let name = boundary_name(recording_id);
+    match std::fs::symlink_metadata(root.path().join(&name)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(object_io_error(id)),
+        Ok(_) => {}
+    }
+    let bytes = root.read_bounded_file(&name, BOUNDARY_BYTES).map_err(|_| object_io_error(id))?;
+    if bytes.len() != BOUNDARY_BYTES
+        || blake3::hash(&bytes[..HEADER_BYTES + 8]).as_bytes() != &bytes[HEADER_BYTES + 8..]
+        || &bytes[24..40] != recording_id.as_uuid().as_bytes()
+    {
+        return Err(object_corrupt_error(id));
+    }
+    Ok(Some(bytes))
+}
+
+/// The caller has synced the journal first. Never overwrite the old checkpoint:
+/// after a crash, rename exposes either the old synced boundary or the new one.
+fn publish_boundary(
+    root: &AdmittedPrivateRoot,
+    recording_id: RecordingId,
+    header: &[u8],
+    length: u64,
+    id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
+    let name = boundary_name(recording_id);
+    let pending = format!("{name}-next");
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(&length.to_be_bytes());
+    bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
+    let mut file = root.open_or_create_private_file(&pending).map_err(|_| object_io_error(id))?;
+    file.set_len(0).map_err(|_| object_io_error(id))?;
+    file.write_all(&bytes).map_err(|_| object_io_error(id))?;
+    commit_failpoint("journal-checkpoint-before-sync", id, false)?;
+    file.sync_all().map_err(|_| object_io_error(id))?;
+    #[cfg(test)]
+    CHECKPOINT_SYNCS.with(|count| count.set(count.get() + 1));
+    root.validate_file_binding(&pending, &file, true).map_err(|_| object_io_error(id))?;
+    commit_failpoint("journal-checkpoint-before-rename", id, false)?;
+    root.rename_replace(&pending, &name).map_err(|_| object_io_error(id))
+}
+
 fn load(
     binding: &ProjectRootBinding,
     recording_id: RecordingId,
     id: CorrelationId,
 ) -> Result<Option<Tail>, RecordingStoreError> {
+    load_for_retry(binding, recording_id, id, false)
+}
+
+// Fully written pending envelopes constrain ambiguous retries, but are never
+// visible to recovery/readers until the retry has synced and checkpointed them.
+fn load_for_retry(
+    binding: &ProjectRootBinding,
+    recording_id: RecordingId,
+    id: CorrelationId,
+    include_pending: bool,
+) -> Result<Option<Tail>, RecordingStoreError> {
     let Some(root) = directory(binding, false, id)? else { return Ok(None) };
+    let boundary = read_boundary(&root, recording_id, id)?;
     let name = name(recording_id);
     match std::fs::symlink_metadata(root.path().join(&name)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && boundary.is_none() => {
+            return Ok(None);
+        }
         Err(_) => return Err(object_io_error(id)),
         Ok(_) => {}
     }
@@ -91,10 +167,35 @@ fn load(
         root.read_bounded_file(&name, MAX_JOURNAL_BYTES).map_err(|_| object_io_error(id))?;
     // A crash during initial header creation cannot have acknowledged events.
     if bytes.len() < HEADER_BYTES {
-        return Ok(None);
+        return if boundary.is_some() { Err(object_corrupt_error(id)) } else { Ok(None) };
     }
-    if &bytes[..8] != MAGIC || &bytes[24..40] != recording_id.as_uuid().as_bytes() {
+    let legacy = &bytes[..8] == LEGACY_MAGIC && boundary.is_none();
+    let committed = if let Some(boundary) = &boundary {
+        let length = u64::from_be_bytes(
+            boundary[HEADER_BYTES..HEADER_BYTES + 8]
+                .try_into()
+                .map_err(|_| object_corrupt_error(id))?,
+        );
+        let length = usize::try_from(length).map_err(|_| object_corrupt_error(id))?;
+        if length < HEADER_BYTES
+            || length > bytes.len()
+            || boundary[..HEADER_BYTES] != bytes[..HEADER_BYTES]
+        {
+            return Err(object_corrupt_error(id));
+        }
+        length
+    } else if legacy {
+        bytes.len()
+    } else {
+        0
+    };
+    if (&bytes[..8] != MAGIC && &bytes[..8] != LEGACY_MAGIC)
+        || &bytes[24..40] != recording_id.as_uuid().as_bytes()
+    {
         return Err(object_corrupt_error(id));
+    }
+    if committed == 0 && !include_pending {
+        return Ok(None);
     }
     let project_id = project_id_from_bytes(&bytes[8..24], id)?;
     let ordinal =
@@ -104,47 +205,61 @@ fn load(
     }
     let mut events = Vec::new();
     let mut offset = HEADER_BYTES;
-    while bytes.len().saturating_sub(offset) >= 4 {
-        let length = u32::from_be_bytes(
-            bytes[offset..offset + 4].try_into().map_err(|_| object_corrupt_error(id))?,
-        ) as usize;
-        let end = offset
-            .checked_add(4)
-            .and_then(|value| value.checked_add(length))
-            .ok_or_else(|| object_corrupt_error(id))?;
-        let Some(digest_end) = end.checked_add(32) else { return Err(object_corrupt_error(id)) };
-        if digest_end > bytes.len() {
-            break;
-        }
-        let payload = &bytes[offset + 4..end];
-        if blake3::hash(payload).as_bytes() != &bytes[end..digest_end] {
+    let limit = if include_pending || legacy { bytes.len() } else { committed };
+    while offset < limit {
+        let decoded = decode_envelope(&bytes[..limit], offset, events.last(), id);
+        let (envelope, end) = match decoded {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) if legacy => break,
+            Ok(None) | Err(_) if offset >= committed => break,
+            _ => return Err(object_corrupt_error(id)),
+        };
+        if offset < committed && end > committed {
             return Err(object_corrupt_error(id));
-        }
-        let envelope = XtfEventEnvelope::decode(payload).map_err(|_| object_corrupt_error(id))?;
-        if envelope.encode_to_vec() != payload
-            || envelope
-                .event
-                .as_ref()
-                .is_none_or(|event| event.recording_seq != envelope.recording_seq)
-        {
-            return Err(object_corrupt_error(id));
-        }
-        if let Some(previous) =
-            events.last().and_then(|envelope: &XtfEventEnvelope| envelope.event.as_ref())
-        {
-            if previous.recording_seq.checked_add(1)
-                != envelope.event.as_ref().map(|event| event.recording_seq)
-            {
-                return Err(object_corrupt_error(id));
-            }
         }
         events.push(envelope);
         if events.len() > DEFAULT_SEGMENT_EVENTS {
             return Err(object_corrupt_error(id));
         }
-        offset = digest_end;
+        offset = end;
     }
     Ok(Some(Tail { project_id, ordinal, events, length: offset as u64 }))
+}
+
+fn decode_envelope(
+    bytes: &[u8],
+    offset: usize,
+    previous: Option<&XtfEventEnvelope>,
+    id: CorrelationId,
+) -> Result<Option<(XtfEventEnvelope, usize)>, RecordingStoreError> {
+    if bytes.len().saturating_sub(offset) < 4 {
+        return Ok(None);
+    }
+    let length = u32::from_be_bytes(
+        bytes[offset..offset + 4].try_into().map_err(|_| object_corrupt_error(id))?,
+    ) as usize;
+    let end = offset
+        .checked_add(4)
+        .and_then(|value| value.checked_add(length))
+        .ok_or_else(|| object_corrupt_error(id))?;
+    let digest_end = end.checked_add(32).ok_or_else(|| object_corrupt_error(id))?;
+    if digest_end > bytes.len() {
+        return Ok(None);
+    }
+    let payload = &bytes[offset + 4..end];
+    if blake3::hash(payload).as_bytes() != &bytes[end..digest_end] {
+        return Err(object_corrupt_error(id));
+    }
+    let envelope = XtfEventEnvelope::decode(payload).map_err(|_| object_corrupt_error(id))?;
+    if envelope.encode_to_vec() != payload
+        || envelope.event.as_ref().is_none_or(|event| event.recording_seq != envelope.recording_seq)
+        || previous.is_some_and(|previous| {
+            previous.recording_seq.checked_add(1) != Some(envelope.recording_seq)
+        })
+    {
+        return Err(object_corrupt_error(id));
+    }
+    Ok(Some((envelope, digest_end)))
 }
 
 impl SqliteRecordingStore<'_> {
@@ -253,7 +368,7 @@ impl SqliteRecordingStore<'_> {
             .filter(|known| known.ordinal == request.segment_ordinal && known.length == length);
         let cached = known.is_some();
         if known.is_none() {
-            let tail = load(&self.binding, request.recording_id, id)?;
+            let tail = load_for_retry(&self.binding, request.recording_id, id, true)?;
             if tail.as_ref().is_some_and(|tail| tail.project_id != request.project_id) {
                 return Err(segment_conflict_error(id));
             }
@@ -348,6 +463,17 @@ impl SqliteRecordingStore<'_> {
             *checkpoint = Some(known);
             return Ok(());
         }
+        if known.length >= HEADER_BYTES as u64
+            && read_boundary(&root, request.recording_id, id)?.is_none()
+        {
+            file.seek(SeekFrom::Start(0)).map_err(|_| object_io_error(id))?;
+            let mut header = [0; HEADER_BYTES];
+            file.read_exact(&mut header).map_err(|_| object_io_error(id))?;
+            if &header[..8] == LEGACY_MAGIC {
+                file.sync_all().map_err(|_| object_io_error(id))?;
+                publish_boundary(&root, request.recording_id, &header, known.length, id)?;
+            }
+        }
         // Remove only an incomplete, unacknowledged suffix before an exact retry.
         if length != known.length {
             file.set_len(known.length).map_err(|_| object_io_error(id))?;
@@ -368,6 +494,12 @@ impl SqliteRecordingStore<'_> {
                 .and_then(|()| file.write_all(blake3::hash(bytes).as_bytes()))
                 .map_err(|_| object_io_error(id))?;
         }
+        #[cfg(test)]
+        BEFORE_SYNC.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook();
+            }
+        });
         commit_failpoint("journal-before-sync", id, false)?;
         file.sync_all().map_err(|_| object_io_error(id))?;
         root.validate_file_binding(&name, &file, true).map_err(|_| object_io_error(id))?;
@@ -379,6 +511,10 @@ impl SqliteRecordingStore<'_> {
                 .and_then(|parent| parent.sync())
                 .map_err(|_| object_io_error(id))?;
         }
+        file.seek(SeekFrom::Start(0)).map_err(|_| object_io_error(id))?;
+        let mut header = [0; HEADER_BYTES];
+        file.read_exact(&mut header).map_err(|_| object_io_error(id))?;
+        publish_boundary(&root, request.recording_id, &header, final_length, id)?;
         commit_failpoint("journal-after-sync", id, false)?;
         known.length = final_length;
         known.digests.extend_from_slice(&digests[overlap..]);
@@ -392,6 +528,17 @@ impl SqliteRecordingStore<'_> {
     ) -> Result<(), RecordingStoreError> {
         let id = CorrelationId::new();
         if let Some(root) = directory(&self.binding, false, id)? {
+            for name in
+                [boundary_name(recording_id), format!("{}-next", boundary_name(recording_id))]
+            {
+                match std::fs::symlink_metadata(root.path().join(&name)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err(object_io_error(id)),
+                    Ok(_) => {}
+                }
+                root.remove_private_file(&name).map_err(|_| object_io_error(id))?;
+            }
+            root.sync().map_err(|_| object_io_error(id))?;
             let name = name(recording_id);
             match std::fs::symlink_metadata(root.path().join(&name)) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),

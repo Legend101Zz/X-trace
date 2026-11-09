@@ -418,6 +418,8 @@ fn map_recording_error(error: RecordingStoreError) -> PortError {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use std::os::unix::fs::OpenOptionsExt as _;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Arc;
@@ -1643,9 +1645,79 @@ mod tests {
         journaled_singletons_recover(2_048, false);
     }
 
+    /// The hosted macOS workspace suite runs this through the persistence port.
+    /// Includes validation, both file syncs and checkpoint-directory publication;
+    /// recording creation is outside the timed batch. No timing is inferred.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_journal_batch_acknowledgement_latency_p50_p95() {
+        const SAMPLES: usize = 32;
+        const BATCHES_PER_RECORDING: usize = 8;
+        let (directory, store, project) = fixture();
+        let adapter = SqliteRecordingPersistence::new(store.clone(), directory.path());
+        let mut metrics = String::new();
+        for batch_events in [1, 200] {
+            let mut elapsed_ns = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES / BATCHES_PER_RECORDING {
+                let recording_id = RecordingId::new();
+                adapter.begin_recording(&begin(project.id(), recording_id)).expect("begin");
+                for batch in 0..BATCHES_PER_RECORDING {
+                    let prefix = batch * batch_events;
+                    let events = (prefix..prefix + batch_events)
+                        .map(|index| {
+                            let sequence = index as u64 + 2;
+                            event(sequence, &format!("event-{sequence}"))
+                        })
+                        .collect();
+                    let request = PersistRecordingSegment {
+                        project_id: project.id(),
+                        recording_id,
+                        segment_ordinal: 0,
+                        events,
+                    };
+                    let start = std::time::Instant::now();
+                    assert!(adapter.persist_tail(&request, prefix).expect("durable ack"));
+                    elapsed_ns.push(start.elapsed().as_nanos());
+                }
+                adapter
+                    .finish_recording(&FinishRecording::without_digest(
+                        recording_id,
+                        (BATCHES_PER_RECORDING * batch_events) as u64 + 1,
+                    ))
+                    .expect("finish");
+            }
+            elapsed_ns.sort_unstable();
+            assert_eq!(elapsed_ns.len(), SAMPLES);
+            let p50 = elapsed_ns[SAMPLES.div_ceil(2) - 1];
+            let p95 = elapsed_ns[(SAMPLES * 95).div_ceil(100) - 1];
+            assert!(p50 > 0 && p95 >= p50);
+            let line = format!(
+                "JOURNAL_ACK_LATENCY batch_events={batch_events} samples={SAMPLES} p50_ns={p50} p95_ns={p95}\n"
+            );
+            print!("{line}");
+            metrics.push_str(&line);
+        }
+        // Successful test stdout is captured by libtest. The existing macOS
+        // artifact upload includes `frag`; keep numeric measurements there in
+        // a text file so the lane merger cannot mistake them for JSON results.
+        if let Some(root) = std::env::var_os("XTRACE_CI_PRIVATE_ROOT") {
+            let path = std::path::PathBuf::from(root).join("frag").join("journal-ack-latency.txt");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .expect("create latency artifact");
+            std::io::Write::write_all(&mut file, metrics.as_bytes())
+                .expect("write latency artifact");
+        }
+    }
+
     #[test]
     fn java_sized_batches_coalesce_and_finish_with_the_original_digest() {
-        use crate::recording_store::recording_journal::take_sync_count;
+        use crate::recording_store::recording_journal::{
+            take_checkpoint_sync_count, take_sync_count,
+        };
         let (directory, store, project) = fixture();
         let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
         let capture = RecordingCaptureService::new(
@@ -1663,6 +1735,7 @@ mod tests {
             hasher.update(event.payload.event.as_ref().expect("event").event_id.as_bytes());
         }
         take_sync_count();
+        take_checkpoint_sync_count();
         let mut segments = 0;
         for batch in events.chunks(200) {
             let receipt = capture
@@ -1673,6 +1746,7 @@ mod tests {
         }
         assert_eq!(segments, 1, "200-event batches coalesce at the 2000-event boundary");
         assert_eq!(take_sync_count(), 10, "one sync for each batch with a tail");
+        assert_eq!(take_checkpoint_sync_count(), 10, "one additional checkpoint sync per batch");
         let mut finish = FinishRecording::without_digest(recording_id, 2_049);
         finish.event_digest = hasher.finalize().as_bytes().to_vec();
         let finished = capture.finish_recording(finish.clone()).expect("verified finish");
@@ -1840,7 +1914,9 @@ mod tests {
     }
 
     fn journaled_singletons_recover(count: usize, focused: bool) {
-        use crate::recording_store::recording_journal::take_sync_count;
+        use crate::recording_store::recording_journal::{
+            take_checkpoint_sync_count, take_sync_count,
+        };
         use xtrace_application::recording::DEFAULT_SEGMENT_EVENTS;
         use xtrace_application::recording_queries::{RecordingCompletionEvidence, RecordingStatus};
 
@@ -1861,6 +1937,7 @@ mod tests {
             capture.begin_recording(anchor).expect("legacy begin");
         }
         take_sync_count();
+        take_checkpoint_sync_count();
         let mut published = 0;
         for index in 0..count {
             let sequence = index as u64 + 2;
@@ -1879,6 +1956,11 @@ mod tests {
             count - count / DEFAULT_SEGMENT_EVENTS,
             "one journal sync per non-boundary batch, rather than an XTF installation"
         );
+        assert_eq!(
+            take_checkpoint_sync_count(),
+            count - count / DEFAULT_SEGMENT_EVENTS,
+            "each durable batch also syncs its atomic checkpoint"
+        );
         let last = count as u64 + 1;
         let duplicate = capture
             .record_events(RecordEvents {
@@ -1889,6 +1971,11 @@ mod tests {
         assert_eq!((duplicate.duplicates, duplicate.persisted_segments), (1, 0));
         capture.record_events(RecordEvents { recording_id, events: vec![] }).expect("empty");
         assert_eq!(take_sync_count(), 0, "empty and duplicate batches do no persistence");
+        assert_eq!(
+            take_checkpoint_sync_count(),
+            0,
+            "empty and duplicate batches do not checkpoint"
+        );
         // Lose every volatile assembler/checkpoint and use a new SQLite connection.
         drop(capture);
         drop(adapter);
