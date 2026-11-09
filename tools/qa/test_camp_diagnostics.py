@@ -1,3 +1,4 @@
+import hashlib
 import json
 import pathlib
 import sys
@@ -59,15 +60,23 @@ class Projection(unittest.TestCase):
             self.assertEqual(set(event), {"kind", "sequence", "frameId", "parentFrameId", "symbol", "line"})
         self.assertEqual(row["events"][1], {"kind": "frame_enter", "sequence": "2", "frameId": FRAME,
                                           "parentFrameId": PARENT,
-                                          "symbol": "org.springframework.samples.petclinic.owner.OwnerController.showOwner", "line": None})
+                                          "symbol": "withheld:controller:sha256:" + hashlib.sha256(
+                                              doc["events"][1]["symbol"].encode()).hexdigest(), "line": None})
         self.assertEqual(row["events"][2]["line"], 103)
         text = json.dumps(row)
         for forbidden in ("private", "headers", "body", "source", "bindings", "message"):
             self.assertNotIn(forbidden, text)
 
-    def test_only_explicit_campaign_packages_publish_java_symbols(self):
+    def test_all_java_symbols_publish_only_a_layer_and_stable_hash(self):
+        for symbol, layer in (
+            ("org.springframework.samples.petclinic.owner.OwnerController.showOwner", "controller"),
+            ("org.springframework.samples.petclinic.owner.OwnerService.find", "service"),
+            ("org.springframework.samples.petclinic.owner.OwnerRepository.find", "repository"),
+            ("org.springframework.samples.petclinic.Owner.aliceSmith", "other"),
+        ):
+            with self.subTest(symbol=symbol):
+                self.assertEqual(cd.safe_symbol(symbol), f"withheld:{layer}:sha256:" + hashlib.sha256(symbol.encode()).hexdigest())
         for symbol in (
-            "org.springframework.samples.petclinic.owner.OwnerController.showOwner",
             "java.lang.String.length", "javax.sql.DataSource.getConnection",
             "jdk.proxy1.$Proxy0.findById", "org.springframework.web.servlet.DispatcherServlet.doDispatch",
             "org.hibernate.Session.find", "org.apache.catalina.core.ApplicationFilterChain.doFilter",
@@ -75,16 +84,25 @@ class Projection(unittest.TestCase):
             "jakarta.servlet.http.HttpServlet.service", "java.lang.Object.<init>", "java.lang.String.<clinit>",
         ):
             with self.subTest(symbol=symbol):
-                self.assertEqual(cd.safe_symbol(symbol), symbol)
+                self.assertEqual(cd.safe_symbol(symbol), "withheld:framework:sha256:" + hashlib.sha256(symbol.encode()).hexdigest())
         for symbol in ("alice.smith", "com.acme.customer.AliceSmith",
                        "org.springframeworkPrivate.AliceSmith.read", "javaPrivate.AliceSmith.read",
                        "org.apache.unlisted.AliceSmith.read", "OwnerController.showOwner"):
             with self.subTest(symbol=symbol):
                 withheld = cd.safe_symbol(symbol)
-                self.assertRegex(withheld, r"^withheld:sha256:[0-9a-f]{16}$")
+                self.assertRegex(withheld, r"^withheld:other:sha256:[0-9a-f]{64}$")
                 self.assertEqual(withheld, cd.safe_symbol(symbol))
                 self.assertNotIn(symbol, withheld)
         self.assertNotEqual(cd.safe_symbol("alice.smith"), cd.safe_symbol("alice.jones"))
+
+    def test_http_metadata_keeps_its_exact_allowlist(self):
+        for route in cd.ROUTES:
+            symbol = "http.request GET " + route
+            self.assertEqual(cd.safe_symbol(symbol), symbol)
+        for symbol in ("http.response 200", "http.response 599", "http.response unavailable"):
+            self.assertEqual(cd.safe_symbol(symbol), symbol)
+        for symbol in ("http.response 600", "http.response 200 private", "http.request GET /owners/aliceSmith"):
+            self.assertIsNone(cd.safe_symbol(symbol))
 
     def test_unavailable_and_untrusted_metadata_are_not_inferred(self):
         doc = {"recordingId": "user-data", "status": "secret", "completion": "secret", "outcome": {"kind": "secret", "httpStatus": True},
@@ -119,21 +137,37 @@ class Artifacts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td)
             doc = detail()
-            private_symbol = "alice.smith"
-            doc["events"] = [{"kind": kind, "symbol": private_symbol} for kind in sorted(cd.KINDS)]
-            save(root, doc, "instrumented/api")
+            # Non-canary suffixes under every formerly trusted namespace, for
+            # every event kind: neither syntax nor a package proves identity.
+            private_symbols = ["alice.smith"] + [prefix + ".Owner.privateCustomerName" for prefix in (
+                "org.springframework.samples.petclinic", "java", "javax", "jdk",
+                "org.springframework", "org.hibernate", "org.apache.catalina",
+                "org.apache.coyote", "org.apache.tomcat", "jakarta")]
+            private_symbols += ["java.alice.smith", "org.springframework.samples.petclinic.Owner.aliceSmith"]
+            doc["events"] = [{"kind": kind, "symbol": symbol}
+                             for symbol in private_symbols for kind in sorted(cd.KINDS)]
+            for index, symbol in enumerate(private_symbols):
+                save(root, {**doc, "recordingId": f"01900000-0000-7000-8000-{index:012d}",
+                            "events": [event for event in doc["events"] if event["symbol"] == symbol]}, "instrumented/api")
             summary(root / "summary.json", ("recordings-per-scenario",))
             canaries = canary.make_canaries(lambda: "0123456789abcdef")
             out = root / "out"
             cd.write_failures(root / "summary.json", root / "instrumented", root, out, canaries)
             report = json.loads((out / "recordings-per-scenario.json").read_text())
-            events = report["recordings"][0]["events"]
-            self.assertEqual(len(events), len(cd.KINDS))
-            for event in events:
-                self.assertRegex(event["symbol"], r"^withheld:sha256:[0-9a-f]{16}$")
-                self.assertEqual(event["symbol"], cd.safe_symbol(private_symbol))
+            events = [event for row in report["recordings"] for event in row["events"]]
+            self.assertEqual(len(events), len(private_symbols) * len(cd.KINDS))
+            for raw in doc["events"]:
+                event = cd.recording({"events": [raw]})["events"][0]
+                self.assertRegex(event["symbol"], r"^withheld:(?:framework|other):sha256:[0-9a-f]{64}$")
+                self.assertEqual(event["symbol"].rsplit(":", 1)[1], hashlib.sha256(raw["symbol"].encode()).hexdigest())
+            for event, raw in zip(events, doc["events"]):
+                self.assertEqual(event["symbol"], cd.safe_symbol(raw["symbol"]))
             for path in out.glob("*.json"):
-                self.assertNotIn(private_symbol, path.read_text())
+                text = path.read_text()
+                for private_symbol in private_symbols:
+                    self.assertNotIn(private_symbol, text)
+                for suffix in ("privateCustomerName", "aliceSmith", "alice.smith"):
+                    self.assertNotIn(suffix, text)
             scan = canary.run_scan(canaries, {"recording-diagnostics": [out]}, {"recording-diagnostics": 1})
             self.assertTrue(scan["clean"])
 
@@ -217,6 +251,8 @@ class Artifacts(unittest.TestCase):
 
     def test_canaries_are_withheld_even_from_valid_symbols_and_scanner_covers_the_skeleton(self):
         canaries = canary.make_canaries(lambda: "0123456789abcdef")
+        # Keep exercising the output scrub independently of symbol hashing.
+        canaries["recording-id"] = RID
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td)
             doc = detail()
@@ -230,7 +266,9 @@ class Artifacts(unittest.TestCase):
             out = root / "out"
             cd.write_failures(root / "summary.json", root / "instrumented", root, out, canaries)
             report = json.loads((out / "recordings-per-scenario.json").read_text())
-            self.assertIsNone(report["recordings"][0]["events"][2]["symbol"])
+            self.assertEqual(report["recordings"][0]["events"][2]["symbol"],
+                             "withheld:other:sha256:" + hashlib.sha256(doc["events"][2]["symbol"].encode()).hexdigest())
+            self.assertIsNone(report["recordings"][0]["recordingId"])
             self.assertEqual(report["stringsWithheld"], 1)
             locations = {"recording-diagnostics": [out]}
             self.assertTrue(canary.run_scan(canaries, locations, {"recording-diagnostics": 1})["clean"])
