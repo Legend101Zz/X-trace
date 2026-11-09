@@ -194,6 +194,7 @@ final class FixtureInstrumentation {
                                     .and(takesArguments(0))
                                     .and(not(isSynthetic())))));
     builder.installOn(instrumentation);
+    ServletBoundaryInstrumentation.install(instrumentation, onFailure, attach);
   }
 
   /** Focused-mode line probe wiring: one site registry and one thread-safe report sink. */
@@ -364,8 +365,7 @@ final class FixtureInstrumentation {
   /**
    * Brackets {@code DispatcherServlet#doDispatch}. The response status of a redirect or an error
    * view only exists after the view renders, which is after the handler adapter returned, so the
-   * owning request root closes here with the status at dispatcher exit. Enclosing filters and
-   * container error handling run outside this seam; final delivery to the client is not observed.
+   * dispatch ownership stays here while the outer standard servlet frame owns root completion.
    */
   public static final class DispatchAdvice {
     private DispatchAdvice() {}
