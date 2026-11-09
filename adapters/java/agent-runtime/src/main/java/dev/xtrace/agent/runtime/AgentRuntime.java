@@ -5,6 +5,7 @@ import dev.xtrace.adapter.BootstrapReader;
 import dev.xtrace.adapter.ClientException;
 import dev.xtrace.adapter.XtpSession;
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
+import dev.xtrace.agent.bootstrap.ProxyBridge;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -63,6 +64,7 @@ public final class AgentRuntime {
     RecordingWriter writer = null;
     RuntimeBridgeSink sink = null;
     LineProbeBridgeSink lineSink = null;
+    ProxyCaptureSink proxySink = null;
     boolean permanent = false;
     try {
       if (attach) FixtureInstrumentation.validateAttach(instrumentation);
@@ -106,6 +108,11 @@ public final class AgentRuntime {
         writer.capturePolicy("xtrace.focused.v1");
         writer.untransformedCount(lineProbes::skippedCount);
       }
+      proxySink = new ProxyCaptureSink(queue, config.scope());
+      if (!ProxyBridge.install(proxySink)) {
+        throw new ClientException("XTR-JAVA-AGENT", "proxy sink is already active");
+      }
+      ProxyInstrumentation.install(instrumentation, writer::stopIncomplete, attach);
       FixtureInstrumentation.install(
           instrumentation, writer::stopIncomplete, attach, config.scope(), lineProbes);
       if (lineSink != null && !BootstrapBridge.installLineSink(lineSink)) {
@@ -117,7 +124,7 @@ public final class AgentRuntime {
       if (!BootstrapBridge.install(sink)) {
         throw new ClientException("XTR-JAVA-AGENT", "bootstrap bridge is already active");
       }
-      RuntimeHandle handle = new RuntimeHandle(writer, sink, lineSink);
+      RuntimeHandle handle = new RuntimeHandle(writer, sink, lineSink, proxySink);
       if (!ACTIVE.compareAndSet(null, handle)) {
         BootstrapBridge.disable(sink);
         throw new ClientException("XTR-JAVA-AGENT", "agent runtime activation raced");
@@ -129,6 +136,7 @@ public final class AgentRuntime {
       writer = null;
       sink = null;
       lineSink = null;
+      proxySink = null;
       return result;
     } catch (ClientException error) {
       throw new StartFailure(permanent, error.code(), error.getMessage(), error);
@@ -140,6 +148,7 @@ public final class AgentRuntime {
       if (identity != null) Arrays.fill(identity, (byte) 0);
       if (sink != null) BootstrapBridge.disable(sink);
       if (lineSink != null) BootstrapBridge.disableLineSink(lineSink);
+      if (proxySink != null) proxySink.close();
       if (writer != null) writer.close();
       else if (session != null) closeSession(session);
       if (bootstrap != null) bootstrap.close();
@@ -233,19 +242,23 @@ public final class AgentRuntime {
     private final RecordingWriter writer;
     private final RuntimeBridgeSink sink;
     private final LineProbeBridgeSink lineSink;
+    private final ProxyCaptureSink proxySink;
     private final java.util.concurrent.atomic.AtomicBoolean closed =
         new java.util.concurrent.atomic.AtomicBoolean();
 
     private RuntimeHandle(
-        RecordingWriter writer, RuntimeBridgeSink sink, LineProbeBridgeSink lineSink) {
+        RecordingWriter writer, RuntimeBridgeSink sink, LineProbeBridgeSink lineSink,
+        ProxyCaptureSink proxySink) {
       this.writer = writer;
       this.sink = sink;
       this.lineSink = lineSink;
+      this.proxySink = proxySink;
     }
 
     private void close() {
       if (!closed.compareAndSet(false, true)) return;
       if (lineSink != null) BootstrapBridge.disableLineSink(lineSink);
+      proxySink.close();
       writer.close();
       BootstrapBridge.disable(sink);
       ACTIVE.compareAndSet(this, null);

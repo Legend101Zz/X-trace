@@ -234,6 +234,46 @@ public final class BootstrapBridge {
     return symbol;
   }
 
+  /** Emits proxy boundaries on the same parent stack and loss counters as concrete methods. */
+  static boolean proxyFrame(
+      ProxyBridge.Call call, Object[] arguments, Object result, Throwable thrown, boolean entering) {
+    RequestContext context = CONTEXT.get();
+    if (context == null || SINK.get() == null) return false;
+    if (!validSymbol(call.symbol())) {
+      context.dropped++;
+      return false;
+    }
+    flushLine(context);
+    String parent = context.currentParent();
+    if (!entering) {
+      if (context.frames.isEmpty()) return false;
+      Frame frame = context.frames.pop();
+      if (!frame.symbol.equals(call.symbol())) {
+        context.dropped++;
+        context.frames.clear();
+        return false;
+      }
+      if (!frame.eventId.isEmpty()) parent = frame.eventId;
+    }
+    String eventId = context.nextEventId();
+    int kind = entering ? BridgeEventKind.FRAME_ENTER
+        : thrown == null ? BridgeEventKind.FRAME_EXIT : BridgeEventKind.FRAME_THROW;
+    boolean accepted = false;
+    try {
+      accepted = call.sink().offer(context.recordingId, eventId, parent, kind, call.symbol(),
+          System.nanoTime(), call.method(), arguments, result, thrown);
+    } catch (Throwable ignored) {
+      // Count loss and retain the balanced stack even when a sink fails.
+    }
+    if (!accepted) context.dropped++;
+    if (entering) context.frames.push(new Frame(call.symbol(), accepted ? eventId : ""));
+    else if (thrown != null) {
+      context.lastThrown = thrown;
+      if (accepted) context.lastThrowEventId = eventId;
+    }
+    return true;
+  }
+
   /** Marks the active request as having no resolvable application handler (scope unknown). */
   public static void handlerUnresolved() {
     RequestContext context = CONTEXT.get();

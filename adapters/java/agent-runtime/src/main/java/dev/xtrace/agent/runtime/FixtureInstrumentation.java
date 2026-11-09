@@ -134,6 +134,7 @@ final class FixtureInstrumentation {
               classfileBuffer,
               scope.sourceRoots(),
               scope.sourceBase());
+          ProxyInterfaceSources.observe(loader, className, classfileBuffer, scope);
         }
         return null;
       }
