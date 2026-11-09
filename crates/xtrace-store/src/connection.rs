@@ -14,9 +14,10 @@
 //!   integrity;
 //! - `journal_mode = WAL` for concurrent readers and a single writer
 //!   without blocking on disk;
-//! - `synchronous = NORMAL` per `docs/plans/x-trace/03a-domain-and-storage.md`
-//!   §7 (FULL is reserved for migration checkpoints in later
-//!   slices);
+//! - `synchronous = FULL` so every write transaction, including Finish,
+//!   syncs the WAL at commit without waiting for readers to release snapshots;
+//! - `fullfsync = ON` and `checkpoint_fullfsync = ON` so Apple platforms
+//!   use full syncs for WAL commits and checkpoints;
 //! - `busy_timeout = 5000ms` so a brief contention window returns a
 //!   typed [`StoreErrorKind::Busy`] rather than failing immediately.
 //!
@@ -47,11 +48,10 @@ pub const JOURNAL_MODE_PRAGMA: &str = "PRAGMA journal_mode = WAL";
 
 /// Synchronous mode pragma string.
 ///
-/// `NORMAL` matches `03a-domain-and-storage.md` §7: it commits without
-/// the additional fsync that `FULL` requires while still surviving
-/// application-level crashes. `FULL` remains the documented choice
-/// for migration checkpoints in later slices.
-pub const SYNCHRONOUS_PRAGMA: &str = "PRAGMA synchronous = NORMAL";
+/// `FULL` syncs the WAL at each write commit, making acknowledged Finish
+/// evidence power-loss durable without a checkpoint barrier. This adds a
+/// WAL sync per write transaction compared with `NORMAL`.
+pub const SYNCHRONOUS_PRAGMA: &str = "PRAGMA synchronous = FULL";
 
 /// Busy timeout applied to every connection. Five seconds matches the
 /// value used by other local-first products; longer values mask real
@@ -646,6 +646,11 @@ fn apply_pragmas(
     connection
         .execute_batch(SYNCHRONOUS_PRAGMA)
         .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
+    // fullfsync covers the WAL sync at commit; checkpoint_fullfsync also
+    // covers automatic checkpoints. SQLite ignores these on other platforms.
+    connection
+        .execute_batch("PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON;")
+        .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
     let pragma = format!("PRAGMA busy_timeout = {}", busy_timeout.as_millis());
     connection
         .execute_batch(&pragma)
@@ -681,7 +686,7 @@ mod tests {
 
         let synchronous: i64 =
             conn.query_row("PRAGMA synchronous", [], |row| row.get(0)).expect("synchronous pragma");
-        assert_eq!(synchronous, 1, "synchronous must be NORMAL (value 1); FULL=2, OFF=0");
+        assert_eq!(synchronous, 2, "synchronous must be FULL (value 2); NORMAL=1, OFF=0");
     }
 
     #[test]
@@ -695,6 +700,21 @@ mod tests {
         // re-applying migrations.
         let reopened = SqliteStore::open(&path, OpenOptions::default()).expect("reopen");
         assert_eq!(reopened.bootstrap().schema_version, CURRENT_SCHEMA_VERSION);
+        for writer in [&store, &reopened] {
+            let connection = writer.lock().expect("writer connection");
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .expect("journal mode");
+            assert_eq!(journal_mode, "wal");
+            for (pragma, expected) in [
+                ("PRAGMA synchronous", 2_i64),
+                ("PRAGMA fullfsync", 1),
+                ("PRAGMA checkpoint_fullfsync", 1),
+            ] {
+                let actual: i64 = connection.query_row(pragma, [], |row| row.get(0)).expect(pragma);
+                assert_eq!(actual, expected, "writer durability: {pragma}");
+            }
+        }
     }
 
     #[test]
