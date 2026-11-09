@@ -6,8 +6,9 @@
 //! the capture mode; the daemon reads the capture mode to arm the session. Application roots may
 //! be absolute because this file is private; they are never copied to logs or the API.
 
+use std::path::Path;
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::json;
 
@@ -88,8 +89,8 @@ pub(crate) struct ResolvedCapture {
 
 impl ResolvedCapture {
     /// The version-1 `capture.json` document for these options.
-    pub(crate) fn document(&self) -> serde_json::Value {
-        document(self.depth, &self.application_packages, &self.source_roots)
+    pub(crate) fn document(&self, project_dir: &Path) -> serde_json::Value {
+        document(self.depth, &self.application_packages, &self.source_roots, Some(project_dir))
     }
 }
 
@@ -196,9 +197,10 @@ pub(crate) fn document(
     depth: CaptureDepth,
     application_packages: &[String],
     source_roots: &[String],
+    project_dir: Option<&Path>,
 ) -> serde_json::Value {
     let focused = depth == CaptureDepth::Focused;
-    json!({
+    let mut document = json!({
         "capture_schema_version": 1,
         "launch": { "kind": "direct", "package_manager": null },
         "capture": {
@@ -214,7 +216,13 @@ pub(crate) fn document(
             "deny_packages": [],
         },
         "launch_grant": { "launch_id": uuid_v4_like(), "multi_session": false },
-    })
+    });
+    // This private path binds relative source roots to the operator's project, even when the
+    // adapter is launched separately from another working directory. Older writers omit it.
+    if let Some(project_dir) = project_dir {
+        document["project_dir"] = json!(project_dir);
+    }
+    document
 }
 
 fn uuid_v4_like() -> String {
@@ -302,8 +310,12 @@ mod tests {
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../../schema/capture/capture.schema.json"))
                 .expect("schema parses");
-        let doc =
-            document(CaptureDepth::Focused, &["com.example".into()], &["src/main/java".into()]);
+        let doc = document(
+            CaptureDepth::Focused,
+            &["com.example".into()],
+            &["src/main/java".into()],
+            Some(Path::new("/project")),
+        );
         for key in schema["required"].as_array().expect("required") {
             assert!(doc.get(key.as_str().expect("key")).is_some(), "missing {key}");
         }
@@ -312,10 +324,21 @@ mod tests {
                 assert!(doc[section].get(key.as_str().expect("key")).is_some(), "{section}.{key}");
             }
         }
+        assert_eq!(doc["project_dir"], "/project");
+        assert_eq!(schema["properties"]["project_dir"]["type"], "string");
+        assert_eq!(
+            doc.as_object().expect("document").keys().collect::<std::collections::BTreeSet<_>>(),
+            schema["properties"]
+                .as_object()
+                .expect("properties")
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
         assert_eq!(doc["capture"]["mode"], "focused");
         assert_eq!(doc["capture"]["include_locals"], true);
         assert_eq!(doc["application_scope"]["application_packages"][0], "com.example");
-        let standard = document(CaptureDepth::Standard, &[], &[]);
+        let standard = document(CaptureDepth::Standard, &[], &[], None);
+        assert!(standard.get("project_dir").is_none(), "older writers may omit the project");
         assert_eq!(standard["capture"]["mode"], "standard");
         assert_eq!(standard["capture"]["max_line_events"], 0);
     }
@@ -326,7 +349,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("dir");
         let bootstrap = dir.path().join("bootstrap.json");
-        let doc = document(CaptureDepth::Focused, &[], &[]);
+        let doc = document(CaptureDepth::Focused, &[], &[], None);
         let path = write_beside(&bootstrap, &doc).expect("write");
         let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -340,7 +363,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("dir");
         let bootstrap = dir.path().join("bootstrap.json");
-        let path = write_beside(&bootstrap, &document(CaptureDepth::Focused, &[], &[])).expect("w");
+        let path =
+            write_beside(&bootstrap, &document(CaptureDepth::Focused, &[], &[], None)).expect("w");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         assert_eq!(
             armed_depth_beside(&bootstrap),
@@ -365,7 +389,7 @@ mod tests {
         assert_eq!(resolved.depth, CaptureDepth::Focused);
         assert_eq!(resolved.application_packages, vec!["com.example.app".to_owned()]);
         assert_eq!(resolved.source_roots, vec!["src/main/java".to_owned()]);
-        let document = resolved.document();
+        let document = resolved.document(Path::new("/project"));
         assert_eq!(document["application_scope"]["application_packages"][0], "com.example.app");
         assert_eq!(document["application_scope"]["source_roots"][0], "src/main/java");
         let empty = CaptureOptions {
@@ -386,7 +410,7 @@ mod tests {
             (CaptureDepth::Focused, xtrace_domain::CaptureMode::Focused),
             (CaptureDepth::Standard, xtrace_domain::CaptureMode::Standard),
         ] {
-            let bytes = serde_json::to_vec(&document(depth, &["com.example".into()], &[]))
+            let bytes = serde_json::to_vec(&document(depth, &["com.example".into()], &[], None))
                 .expect("serialize");
             assert_eq!(xtrace_daemon::capture_config::parse_armed_mode(&bytes), mode);
         }

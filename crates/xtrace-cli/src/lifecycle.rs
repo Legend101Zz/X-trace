@@ -733,7 +733,7 @@ mod unix {
         let resolved = capture.resolve(None);
         if let Err(error) = crate::capture_args::write_beside(
             Path::new(&record.bootstrap_path),
-            &resolved.document(),
+            &resolved.document(&repo),
         ) {
             remove_record(&state);
             abort_child(&mut child);

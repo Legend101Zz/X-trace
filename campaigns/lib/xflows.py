@@ -194,24 +194,29 @@ def judge_restart_reopen(*, restart_rc: int, restart_doc: Any, started_alive: bo
                     f"and event count; {len(readable)} show their request route")
 
 
-def judge_partial(*, record_rc: int, stop_rc: int, stop_doc: Any, control_details: list[dict], new_details: dict[str, dict],
-                  stalled: tuple[str, str]) -> tuple[str, str]:
+def judge_partial(*, record_rc: int, stop_rc: int | None, stop_doc: Any, control_details: list[dict], new_details: dict[str, dict],
+                  stalled: tuple[str, str], stalled_id: str | None = None) -> tuple[str, str]:
     if record_rc == 9 or stop_rc == 9:
         return "not-implemented", "xtrace record/stop exited 9"
     if record_rc != 0:
         return "fail", f"xtrace record exited {record_rc}"
+    if stop_rc is None:
+        return "fail", "xtrace stop was not invoked: record supplied no launch bootstrap"
     if stop_rc not in (0, 10):  # 10 = a recording could not be sealed (documented as partial success)
         return "fail", f"xtrace stop exited {stop_rc}"
     if not [d for d in control_details if completion_of(d) == "complete"]:
         return "fail", "control requests (answered before the interruption) produced no complete recording"
-    partial = {rid: d for rid, d in new_details.items() if completion_of(d) == "partial"}
+    if stalled_id is None:
+        return "fail", f"no observed open recording for {stalled[0]} {stalled[1]} before interruption"
+    partial = {rid: d for rid, d in new_details.items()
+               if rid == stalled_id and completion_of(d) == "partial" and xinstr.recording_matches(d, *stalled)}
     looks_complete = [rid[:8] for rid, d in new_details.items()
                       if completion_of(d) == "complete" and xinstr.recording_matches(d, *stalled)]
     if looks_complete:
         return "fail", f"the interrupted request {stalled[0]} {stalled[1]} reopens as complete ({','.join(looks_complete)})"
     if not partial:
         recovered = find_key(stop_doc, "recovered_recordings")
-        return "fail", (f"no recording reopened as partial after the interruption ({len(new_details)} new recordings; "
+        return "fail", (f"the observed interrupted recording did not reopen as partial ({len(new_details)} new recordings; "
                         f"stop reported {len(recovered) if isinstance(recovered, list) else 'no'} recovered)")
     no_evidence = [rid[:8] for rid, d in partial.items() if not d.get("incompleteEvidence") and not d.get("incomplete")]
     unread = [rid[:8] for rid, d in partial.items() if event_count(d) == 0]
@@ -337,15 +342,27 @@ class Flows:
         except Exception:
             pass
 
-    def _record(self) -> tuple[int, Any, str]:
-        rc, doc = cli(self.xtrace, ["record", "--project-dir", str(self.project_dir), "--json", *self._capture_flags()], self.env)
+    def _record(self, command: str = "record", *, timeout: float = 120.0) -> tuple[int, Any, str]:
+        # Lifecycle commands print ONE pretty JSON document. A bare array element is valid
+        # JSON too, so the shared line-oriented parser can mistake it for the whole response.
+        args = [command, "--project-dir", str(self.project_dir), "--json"]
+        if command in ("record", "restart"):
+            args += self._capture_flags()
+        result = subprocess.run([self.xtrace, *args], env=self.env, capture_output=True, text=True, timeout=timeout)
+        rc = result.returncode
+        body = result.stdout if result.stdout.strip() else result.stderr
+        doc = json.loads(body) if body.strip() else None
         return rc, doc, str(find_key(doc, "bootstrap_path") or "")
 
     # -- flow A --
     def record_stop(self) -> dict[str, tuple[str, int]]:
         paths = ["/owners?lastName=Davis", "/vets", "/owners/1"]
         wanted = [("GET", "/owners"), ("GET", "/vets"), ("GET", "/owners/{ownerId}")]
-        before_ids = list_ids(self.xtrace, self.project_dir, self.env)
+        api0 = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-before-record-stop")
+        if not api0["ok"]:
+            self._set("record-stop-flow", ("fail", f"read API unavailable before record: {api0['reason']}"))
+            return {}
+        before_ids = set(api0["details"])
         rc, doc, bootstrap = self._record()
         served: dict[str, int | None] = {}
         stop_rc, gone, new = -1, False, {}
@@ -356,7 +373,7 @@ class Flows:
                 stack.up()
                 served = _paced_gets(stack.base, paths)
                 pid = find_key(doc, "pid")
-                stop_rc, _ = cli(self.xtrace, ["stop", "--project-dir", str(self.project_dir), "--json"], self.env, timeout=90)
+                stop_rc, _, _ = self._record("stop", timeout=90)
                 gone = isinstance(pid, int) and wait_gone(pid)
         finally:
             if stack is not None:
@@ -376,11 +393,11 @@ class Flows:
     def restart_reopen(self) -> None:
         api0 = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-before-restart")
         before = {rid: (completion_of(d), event_count(d)) for rid, d in api0["details"].items()}
-        rc, doc = cli(self.xtrace, ["restart", "--project-dir", str(self.project_dir), "--json", *self._capture_flags()], self.env)
+        rc, doc, _ = self._record("restart")
         started = find_key(find_key(doc, "started"), "pid") if rc == 0 else None
         alive = isinstance(started, int) and pid_alive(started)
         api1 = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-after-restart") if rc == 0 else api0
-        stop_rc, _ = cli(self.xtrace, ["stop", "--project-dir", str(self.project_dir), "--json"], self.env, timeout=90)
+        stop_rc, _, _ = self._record("stop", timeout=90)
         if not api0["ok"] or (rc == 0 and not api1["ok"]):
             self._set("restart-reopen", ("fail", f"read API unavailable: {api0['reason'] or api1['reason']}"))
             return
@@ -389,36 +406,75 @@ class Flows:
 
     # -- flow C --
     def partial(self) -> None:
-        before_ids = list_ids(self.xtrace, self.project_dir, self.env)
+        api0 = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-before-partial")
+        if not api0["ok"]:
+            self._set("partial-recording-reopen", ("fail", f"read API unavailable before record: {api0['reason']}"))
+            return
+        before_ids = set(api0["details"])
         rc, doc, bootstrap = self._record()
         stack, sock = None, None
-        stop_rc, stop_doc = -1, None
+        stop_rc, stop_doc = None, None
+        stalled_id = None
+        observation_error = None
         try:
             if rc == 0 and bootstrap:
                 stack = self._stack("", [f"-javaagent:{self.agent}={bootstrap}"])
                 stack.up()
                 _paced_gets(stack.base, ["/vets", "/owners?lastName=Davis"])
-                # A request whose body never finishes: the handler is entered, the recording is open, the response never comes.
+                # An incomplete body may block before handler entry. Require durable request
+                # evidence from the product before claiming that capture was interrupted.
                 sock = socket.create_connection(("127.0.0.1", stack.host_port), timeout=10)
                 sock.sendall(b"POST /owners/new HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\n"
                              b"Content-Length: 4096\r\nConnection: close\r\n\r\nfirstName=Held&lastName=Interrupted")
-                time.sleep(3.0)
-                proc = getattr(stack, "_proc", None)
-                if proc is not None and proc.poll() is None:
+                deadline = time.monotonic() + 3.0
+
+                def query(args: list[str]) -> dict:
+                    result = subprocess.run([self.xtrace, "recording", *args, "--project-dir", str(self.project_dir)],
+                                            env=self.env, capture_output=True, text=True, timeout=30)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"recording {args[0]} exited {result.returncode}")
+                    return json.loads(result.stdout)
+
+                while time.monotonic() < deadline:
+                    after = None
+                    for _ in range(20):
+                        page = query(["list", "--limit", "200"] + (["--after", after] if after else []))
+                        for row in page["recordings"]:
+                            rid = row["recording_id"]
+                            if rid in before_ids or row["status"] != "recording":
+                                continue
+                            detail = query(["show", rid, "--limit", "1000"])
+                            if detail.get("status") == "recording" and xinstr.recording_matches(detail, "POST", "/owners/new"):
+                                stalled_id = rid
+                                break
+                        after = page.get("next_after")
+                        if stalled_id is not None or not after:
+                            break
+                    if stalled_id is not None:
+                        break
+                    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                if stalled_id is None:
+                    observation_error = "no observed open recording for POST /owners/new before the interruption deadline"
+                else:
+                    proc = getattr(stack, "_proc", None)
+                    if proc is None or proc.poll() is not None:
+                        raise RuntimeError("the observed stalled request has no live application process to interrupt")
                     os.kill(proc.pid, signal.SIGKILL)  # the application pid this harness started, nothing else
                     proc.wait(timeout=30)
-                time.sleep(2.0)
         finally:
             if sock is not None:
                 sock.close()
             if stack is not None:
                 stack.down()
             if rc == 0 and bootstrap:
-                stop_rc, stop_doc = cli(self.xtrace, ["stop", "--project-dir", str(self.project_dir), "--json"], self.env, timeout=90)
+                stop_rc, stop_doc, _ = self._record("stop", timeout=90)
             self._stop_daemon_quietly()
         if rc != 0 or not bootstrap:
             self._set("partial-recording-reopen", judge_partial(record_rc=rc, stop_rc=stop_rc, stop_doc=stop_doc,
                                                                 control_details=[], new_details={}, stalled=("POST", "/owners/new")))
+            return
+        if observation_error:
+            self._set("partial-recording-reopen", ("fail", observation_error))
             return
         api = read_api(self.xtrace, self.project_dir, self.env, self.out_dir / "api-partial")
         if not api["ok"]:
@@ -428,7 +484,7 @@ class Flows:
         controls = [d for d in new.values() if xinstr.recording_matches(d, "GET", "/vets")
                     or xinstr.recording_matches(d, "GET", "/owners")]
         self._set("partial-recording-reopen", judge_partial(record_rc=rc, stop_rc=stop_rc, stop_doc=stop_doc, control_details=controls,
-                                                            new_details=new, stalled=("POST", "/owners/new")))
+                                                            new_details=new, stalled=("POST", "/owners/new"), stalled_id=stalled_id))
 
     # -- flow D --
     def focused(self) -> None:

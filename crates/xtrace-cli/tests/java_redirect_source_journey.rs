@@ -39,6 +39,23 @@ impl Drop for RunProcess {
     }
 }
 
+struct StopDaemon<'a> {
+    repo: &'a Path,
+    data_home: &'a Path,
+}
+
+impl Drop for StopDaemon<'_> {
+    fn drop(&mut self) {
+        let _ = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+            .args(["stop", "--project-dir"])
+            .arg(self.repo)
+            .env("XTRACE_DATA_HOME", self.data_home)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 struct Captured {
     detail: Value,
     events: Vec<Value>,
@@ -52,7 +69,20 @@ fn field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a Value> {
 
 #[test]
 fn redirect_status_and_source_identity_are_recorded_from_an_unrelated_working_directory() {
-    let captured = run_redirect();
+    assert_redirect(run_redirect("run"));
+}
+
+#[test]
+fn record_source_identity_uses_the_project_when_the_jvm_starts_elsewhere() {
+    assert_redirect(run_redirect("record"));
+}
+
+#[test]
+fn restart_source_identity_uses_the_project_when_the_jvm_starts_elsewhere() {
+    assert_redirect(run_redirect("restart"));
+}
+
+fn assert_redirect(captured: Captured) {
     assert_eq!(
         captured.recording_count, 1,
         "exactly one recording for the one request; stderr: {}",
@@ -96,7 +126,7 @@ fn redirect_status_and_source_identity_are_recorded_from_an_unrelated_working_di
     );
 }
 
-fn run_redirect() -> Captured {
+fn run_redirect(mode: &str) -> Captured {
     let root = temp_root();
     let repo = root.path().join("repository");
     let elsewhere = root.path().join("unrelated working directory");
@@ -123,20 +153,57 @@ fn run_redirect() -> Captured {
 
     // The JVM starts in a directory that holds no sources and is not under the repository: the
     // operator-named project directory, not the working directory, is where source roots resolve.
-    let child = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+    let capture_flags = [
+        "--app-package",
+        "dev.xtrace.fixture",
+        "--source-root",
+        "adapters/java/spring-fixture/src/main/java",
+    ];
+    let _daemon = (mode != "run").then(|| StopDaemon { repo: &repo, data_home: &data_home });
+    let mut launch = if mode == "run" {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_xtrace"));
+        command.args(["run", "--project-dir"]).arg(&repo).arg("--java-agent").arg(&agent);
+        command.args(capture_flags).args(["--", "java"]);
+        command
+    } else {
+        // Both invocations use a non-canonical spelling and a CLI working directory unrelated
+        // to the project. The separately launched JVM has no source tree in its user.dir.
+        let project_arg = repo.join(".");
+        let mut armed = Value::Null;
+        for command in if mode == "restart" { vec!["record", "restart"] } else { vec!["record"] } {
+            let output = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+                .current_dir(&elsewhere)
+                .arg(command)
+                .arg("--project-dir")
+                .arg(&project_arg)
+                .args(capture_flags)
+                .env("XTRACE_DATA_HOME", &data_home)
+                .output()
+                .expect("arm detached capture");
+            assert!(
+                output.status.success(),
+                "{command}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let doc: Value = serde_json::from_slice(&output.stdout).expect("lifecycle JSON");
+            armed = if command == "restart" { doc["started"].clone() } else { doc };
+            let bootstrap = Path::new(armed["bootstrap_path"].as_str().expect("bootstrap path"));
+            let capture: Value = serde_json::from_slice(
+                &fs::read(bootstrap.with_file_name("capture.json")).expect("capture document"),
+            )
+            .expect("capture JSON");
+            assert_eq!(
+                capture["project_dir"],
+                serde_json::json!(repo.canonicalize().expect("canonical project"))
+            );
+        }
+        let bootstrap = armed["bootstrap_path"].as_str().expect("bootstrap path");
+        let mut command = Command::new("java");
+        command.arg(format!("-javaagent:{}={bootstrap}", agent.display()));
+        command
+    };
+    let child = launch
         .current_dir(&elsewhere)
-        .args(["run", "--project-dir"])
-        .arg(&repo)
-        .arg("--java-agent")
-        .arg(&agent)
-        .args([
-            "--app-package",
-            "dev.xtrace.fixture",
-            "--source-root",
-            "adapters/java/spring-fixture/src/main/java",
-        ])
-        .arg("--")
-        .arg("java")
         .arg("-jar")
         .arg(&fixture)
         .arg("--server.port=0")
@@ -146,7 +213,7 @@ fn run_redirect() -> Captured {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start xtrace run");
+        .expect("start instrumented application");
     let mut process = RunProcess { child };
     let stdout = process.child.stdout.take().expect("xtrace stdout");
     let (lines_tx, lines_rx) = std::sync::mpsc::channel();
@@ -169,6 +236,15 @@ fn run_redirect() -> Captured {
     let _stdout = stdout.join().expect("join stdout");
     let stderr = stderr.join().expect("join stderr");
 
+    if mode != "run" {
+        let stopped = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+            .args(["stop", "--project-dir"])
+            .arg(&repo)
+            .env("XTRACE_DATA_HOME", &data_home)
+            .output()
+            .expect("stop detached daemon");
+        assert!(stopped.status.success(), "stop: {}", String::from_utf8_lossy(&stopped.stderr));
+    }
     let list = cli(&["recording", "list"], &repo, &data_home);
     let list: Value = serde_json::from_slice(&list.stdout).expect("recording list JSON");
     let recordings = list["recordings"].as_array().expect("recordings");
