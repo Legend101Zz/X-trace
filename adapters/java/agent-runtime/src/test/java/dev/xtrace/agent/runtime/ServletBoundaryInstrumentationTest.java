@@ -2,6 +2,9 @@ package dev.xtrace.agent.runtime;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static net.bytebuddy.matcher.ElementMatchers.hasSuperType;
 import static net.bytebuddy.matcher.ElementMatchers.named;
@@ -15,6 +18,7 @@ import net.bytebuddy.dynamic.ClassFileLocator;
 import net.bytebuddy.description.modifier.Visibility;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.implementation.StubMethod;
+import net.bytebuddy.pool.TypePool;
 import org.junit.jupiter.api.Test;
 
 class ServletBoundaryInstrumentationTest {
@@ -42,8 +46,11 @@ class ServletBoundaryInstrumentationTest {
         .type(listener.selected(hasSuperType(named("jakarta.servlet.Filter"))))
         .transform((target, type, loader, module, domain) -> target)
         .makeRaw();
-    transformer.transform(getClass().getClassLoader(), "demo/Unrelated", null, null,
-        child.getBytes());
+    // makeRaw reports onError/onComplete, then rethrows a wrapper; the JVM ignores that exception.
+    var failure = assertThrows(IllegalStateException.class, () -> transformer.transform(
+        getClass().getClassLoader(), "demo/Unrelated", null, null, child.getBytes()));
+    assertEquals("Failed transformation of demo.Unrelated", failure.getMessage());
+    assertInstanceOf(TypePool.Resolution.NoSuchTypeException.class, failure.getCause());
     assertEquals(1, analysisErrors.get(), "the missing parent must actually fail analysis");
     assertEquals(0, failures.get());
   }
@@ -56,6 +63,7 @@ class ServletBoundaryInstrumentationTest {
         var implementation = new ByteBuddy().subclass(Object.class)
             .name("demo.Boundary").implement(contract.getTypeDescription()).make();
         AtomicInteger failures = new AtomicInteger();
+        var transformationFailure = new IllegalStateException("boundary transformation failed");
         var listener = new ServletBoundaryInstrumentation.FailureListener(failures::incrementAndGet);
         var locator = new ClassFileLocator.Compound(new ClassFileLocator.Simple(Map.of(
             contract.getTypeDescription().getName(), contract.getBytes(),
@@ -66,11 +74,14 @@ class ServletBoundaryInstrumentationTest {
             .with(listener)
             .type(listener.selected(hasSuperType(named(contract.getTypeDescription().getName()))))
             .transform((target, type, loader, module, domain) -> {
-              throw new IllegalStateException("boundary transformation failed");
+              throw transformationFailure;
             })
             .makeRaw();
-        assertDoesNotThrow(() -> transformer.transform(getClass().getClassLoader(),
-            "demo/Boundary", null, null, implementation.getBytes()));
+        // Assert only ByteBuddy's wrapper, then check that capture was stopped by the listener.
+        var failure = assertThrows(IllegalStateException.class, () -> transformer.transform(
+            getClass().getClassLoader(), "demo/Boundary", null, null, implementation.getBytes()));
+        assertEquals("Failed transformation of demo.Boundary", failure.getMessage());
+        assertSame(transformationFailure, failure.getCause());
         assertEquals(1, failures.get(), api + "." + boundary);
         listener.onError("demo.Boundary", getClass().getClassLoader(), null, false,
             new IllegalStateException("later unrelated analysis"));

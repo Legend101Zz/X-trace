@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.xtrace.agent.runtime.testapp.SampleService;
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -183,6 +184,35 @@ class SourceIdentityTest {
           swapped[0] = true;
         });
     assertTrue(swapped[0], "the opened parent must be replaced during the read");
+    assertSourceUnavailable();
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void directorySwappedAfterReadAndNotRestoredMakesSourceUnavailable(
+      boolean forceFallback, @TempDir Path directory) throws Exception {
+    Path external = sourceTree(directory.resolve("external"), 200);
+    Path project = directory.resolve("project");
+    Path file = sourceTree(project, 200);
+    sourceTree(project.resolve("fallback"), 200);
+    boolean[] swapped = {false};
+    SourceIdentity.observe(SampleService.class.getClassLoader(), INTERNAL, classBytes(),
+        List.of("src/main/java", "fallback/src/main/java"), project,
+        (base, relative) -> ConfinedSourceFiles.read(base, relative,
+            new ConfinedSourceFiles.BeforeOpen() {
+              @Override
+              public void run(Path validated) {}
+
+              @Override
+              public void afterRead(Path validated) throws IOException {
+                assertEquals(file.toRealPath(), validated);
+                Path parent = file.getParent();
+                Files.move(parent, parent.resolveSibling("saved-testapp"));
+                Files.createSymbolicLink(parent, external.getParent());
+                swapped[0] = true;
+              }
+            }, forceFallback));
+    assertTrue(swapped[0], "swap must remain in place after bytes were read");
     assertSourceUnavailable();
   }
 
