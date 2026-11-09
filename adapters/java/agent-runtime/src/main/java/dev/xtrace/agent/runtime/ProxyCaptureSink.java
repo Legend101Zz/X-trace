@@ -19,17 +19,19 @@ import java.util.concurrent.ConcurrentHashMap;
 final class ProxyCaptureSink implements ProxyBridge.Sink {
   private final BoundedEventQueue queue;
   private final ApplicationScope scope;
+  private final boolean focused;
   private volatile boolean active = true;
-  private final ClassValue<Map<Method, Optional<Method>>> declarations = new ClassValue<>() {
+  private final ClassValue<Map<Method, Optional<ProxyBridge.Call>>> declarations = new ClassValue<>() {
     @Override
-    protected Map<Method, Optional<Method>> computeValue(Class<?> type) {
+    protected Map<Method, Optional<ProxyBridge.Call>> computeValue(Class<?> type) {
       return new ConcurrentHashMap<>();
     }
   };
 
-  ProxyCaptureSink(BoundedEventQueue queue, ApplicationScope scope) {
+  ProxyCaptureSink(BoundedEventQueue queue, ApplicationScope scope, boolean focused) {
     this.queue = queue;
     this.scope = scope;
+    this.focused = focused;
   }
 
   void close() {
@@ -38,18 +40,35 @@ final class ProxyCaptureSink implements ProxyBridge.Sink {
   }
 
   @Override
-  public Method resolve(Object proxy, Method method) {
+  public ProxyBridge.Call resolve(Object proxy, Method method) {
     if (!active || proxy == null || method == null || !Proxy.isProxyClass(proxy.getClass())
         || method.getDeclaringClass() == Object.class) return null;
-    Map<Method, Optional<Method>> cache = declarations.get(proxy.getClass());
-    Optional<Method> known = cache.get(method);
+    Map<Method, Optional<ProxyBridge.Call>> cache = declarations.get(proxy.getClass());
+    Optional<ProxyBridge.Call> known = cache.get(method);
     if (known != null) return known.orElse(null);
-    Method found = find(proxy.getClass(), method);
     // A generated proxy has a finite method set, additionally capped against hostile classes.
+    // Only first resolution takes this per-class lock; hits never acquire loader monitors or
+    // rebuild descriptors. The ClassValue also lets an unloaded proxy release its metadata.
     synchronized (cache) {
-      if (cache.size() < 1024) cache.put(method, Optional.ofNullable(found));
+      known = cache.get(method);
+      if (known != null) return known.orElse(null);
+      if (cache.size() >= 1024) return null;
+      Method found = find(proxy.getClass(), method);
+      ProxyBridge.Call call = found == null ? null : boundary(found);
+      cache.put(method, Optional.ofNullable(call));
+      return call;
     }
-    return found;
+  }
+
+  private ProxyBridge.Call boundary(Method method) {
+    SourceAttestation.SourceInfo observed = ProxyInterfaceSources.lookup(method);
+    SourceAttestation.SourceInfo source = observed.path() != null && utf8(observed.path()) > 256
+        ? SourceAttestation.SourceInfo.unavailable(5) : observed;
+    var parameters = focused ? method.getParameters() : new java.lang.reflect.Parameter[0];
+    return new ProxyBridge.Call((recordingId, eventId, parentId, kind, symbol, ns,
+        declaration, arguments, result, thrown) -> offer(recordingId, eventId, parentId,
+            kind, symbol, ns, declaration, source, parameters, arguments, result, thrown),
+        method, method.getDeclaringClass().getName() + "." + method.getName());
   }
 
   private Method find(Class<?> proxy, Method method) {
@@ -72,20 +91,14 @@ final class ProxyCaptureSink implements ProxyBridge.Sink {
     return null;
   }
 
-  @Override
-  public boolean offer(String recordingId, String eventId, String parentId, int kind,
-      String symbol, long monotonicNs, Method method, Object[] arguments,
-      Object result, Throwable thrown) {
+  private boolean offer(String recordingId, String eventId, String parentId, int kind,
+      String symbol, long monotonicNs, Method method, SourceAttestation.SourceInfo source,
+      java.lang.reflect.Parameter[] parameters, Object[] arguments, Object result, Throwable thrown) {
     if (!active || utf8(symbol) > 256) return false;
-    SourceAttestation.SourceInfo source = ProxyInterfaceSources.lookup(method);
-    if (source.path() != null && utf8(source.path()) > 256) {
-      source = SourceAttestation.SourceInfo.unavailable(5);
-    }
     List<ValueSnapshot> values = new ArrayList<>();
     int bindingBytes = 0;
-    if (kind == BridgeEventKind.FRAME_ENTER && arguments != null) {
+    if (focused && kind == BridgeEventKind.FRAME_ENTER && arguments != null) {
       boolean aggregate = arguments.length > 16;
-      var parameters = method.getParameters();
       for (int i = 0; i < Math.min(arguments.length, 16); i++) {
         ValueSnapshot snapshot;
         if (i >= parameters.length || !parameters[i].isNamePresent()) {
@@ -111,7 +124,7 @@ final class ProxyCaptureSink implements ProxyBridge.Sink {
         values.add(ValueSanitizer.ofRef("arguments", NameOrigin.SYNTHESIZED, arguments,
             Role.ARGUMENT, ValueSanitizer.Limits.STANDARD));
       }
-    } else if (kind == BridgeEventKind.FRAME_EXIT && method.getReturnType() != void.class) {
+    } else if (focused && kind == BridgeEventKind.FRAME_EXIT && method.getReturnType() != void.class) {
       values.add(ValueSanitizer.ofRef("return", NameOrigin.SYNTHESIZED, result,
           Role.RETURN, ValueSanitizer.Limits.STANDARD));
     }

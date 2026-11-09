@@ -5,6 +5,8 @@ import static net.bytebuddy.matcher.ElementMatchers.*;
 import dev.xtrace.agent.bootstrap.ProxyBridge;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Method;
+import java.util.function.Consumer;
+import java.util.regex.Pattern;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.description.method.MethodDescription;
@@ -15,11 +17,15 @@ import net.bytebuddy.utility.JavaModule;
 
 /** Instruments each generated JDK proxy class once, including proxies backed by hidden handlers. */
 final class ProxyInstrumentation {
+  private static final Pattern PROXY_NAME = Pattern.compile("(?:.*\\.)?\\$Proxy[0-9]+");
+
   private ProxyInstrumentation() {}
 
   static ElementMatcher.Junction<TypeDescription> proxies() {
-    return hasSuperType(named("java.lang.reflect.Proxy"))
-        .and(not(named("java.lang.reflect.Proxy"))).and(not(isInterface()));
+    // JDK proxies always have this generated simple name, including package-private contracts.
+    // Reject other classes before resolving hierarchies that may exist only in memory.
+    return nameMatches(PROXY_NAME.pattern()).and(hasSuperType(named("java.lang.reflect.Proxy")))
+        .and(not(isInterface()));
   }
 
   static ElementMatcher.Junction<MethodDescription> invocations() {
@@ -27,23 +33,42 @@ final class ProxyInstrumentation {
   }
 
   static void install(Instrumentation instrumentation, Runnable onFailure, boolean attach) {
+    install(instrumentation, error -> onFailure.run(), attach);
+  }
+
+  static void install(Instrumentation instrumentation, Consumer<Throwable> onFailure, boolean attach) {
     new AgentBuilder.Default()
         .disableClassFormatChanges()
         .with(attach ? AgentBuilder.RedefinitionStrategy.RETRANSFORMATION
             : AgentBuilder.RedefinitionStrategy.DISABLED)
         .ignore(nameStartsWith("dev.xtrace.agent.").or(nameStartsWith("net.bytebuddy.")))
         .assureReadEdgeFromAndTo(instrumentation, ProxyBridge.class)
-        .with(new AgentBuilder.Listener.Adapter() {
-          @Override
-          public void onError(String name, ClassLoader loader, JavaModule module,
-              boolean loaded, Throwable error) {
-            onFailure.run();
-          }
-        })
+        .with(new FailureListener(onFailure))
         .type(proxies())
         .transform((target, type, loader, module, domain) ->
             target.visit(Advice.to(ProxyAdvice.class).on(invocations())))
         .installOn(instrumentation);
+  }
+
+  static final class FailureListener extends AgentBuilder.Listener.Adapter {
+    private final Consumer<Throwable> onFailure;
+
+    FailureListener(Consumer<Throwable> onFailure) {
+      this.onFailure = java.util.Objects.requireNonNull(onFailure);
+    }
+
+    @Override
+    public void onError(String name, ClassLoader loader, JavaModule module,
+        boolean loaded, Throwable error) {
+      if (!PROXY_NAME.matcher(name).matches()) return;
+      try {
+        onFailure.accept(error);
+      } catch (RuntimeException | LinkageError ignored) {
+        // The application must still be able to load the class after capture has failed.
+      }
+      System.err.println("{\"code\":\"XTR-JAVA-INSTRUMENTATION\","
+          + "\"message\":\"proxy boundary instrumentation failed; application continues\"}");
+    }
   }
 
   public static final class ProxyAdvice {
