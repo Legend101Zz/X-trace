@@ -625,6 +625,46 @@ class RecordingWriterTest {
   }
 
   @Test
+  void aLifecycleGapCannotExceedTheEventCapAndOtherRecordingsStillComplete() throws Exception {
+    int cap = RecordingWriter.MAX_EVENTS_PER_RECORDING;
+    BoundedEventQueue queue = new BoundedEventQueue(cap + 128, 64L * 1024 * 1024);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    FakeTransport transport = new FakeTransport(400);
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofSeconds(5));
+    writer.untransformedCount(() -> 1);
+    assertTrue(sink.offerStart(id(0), 1, "GET", "/" + "r".repeat(255)));
+    // A reduced start must share the cap with all four reserved gaps: memory pressure,
+    // cap overflow, queue loss and transforms. The oversized finish then has no marker slot.
+    assertTrue(queue.offer(new QueueSignal.Event(id(0), "large", "",
+        BridgeEventKind.FRAME_ENTER, "m", 2, 0,
+        Math.toIntExact(RecordingWriter.MAX_PENDING_EVENT_BYTES + 1)), false));
+    for (int i = 0; i < cap + 10; i++) {
+      assertTrue(sink.offerEvent(id(0), "e" + i, "", BridgeEventKind.FRAME_EXIT, "exit", 2, 0));
+    }
+    assertTrue(sink.offerFinishWithOutcome(id(0), 1, 3, 500, 1,
+        new BridgeSink.Outcome(BridgeSink.Outcome.EXCEPTION_PROPAGATED, 0,
+            "java.lang.IllegalStateException", "sanitized ".repeat(60), "")));
+    assertTrue(sink.offerStart(id(1), 4, "GET", "/later"));
+    assertTrue(sink.offerEvent(id(1), "response", "", BridgeEventKind.RESPONSE,
+        "http.response 200", 5, 200));
+    assertTrue(sink.offerFinish(id(1), 4, 6, 200, 0));
+    writer.start();
+    writer.close();
+    assertFalse(writer.isStopping());
+    assertTrue(writer.incompleteWasReported());
+    assertEquals(0, sink.activeRecordings());
+    var events = transport.batches.stream()
+        .filter(batch -> FakeTransport.uuid(batch.getRecordingId().toByteArray()).equals(id(0)))
+        .flatMap(batch -> batch.getEventsList().stream()).toList();
+    assertEquals(cap, events.size());
+    assertEquals(5, events.stream().filter(event -> event.hasGap()).count());
+    assertEquals(1, transport.finishes.size());
+    assertEquals(id(1), FakeTransport.uuid(transport.finishes.get(0).getRecordingId().toByteArray()));
+    assertArrayEquals(EventDigest.compute(List.of(id(1) + ":gap-untransformed", "response")),
+        transport.finishes.get(0).getEventDigest().toByteArray());
+  }
+
+  @Test
   void metadataOnlyExceptionsDoNotReferToDiscardedThrowEvents() throws Exception {
     BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
     RuntimeBridgeSink sink = new RuntimeBridgeSink(queue, 1, 1);
@@ -715,6 +755,7 @@ class RecordingWriterTest {
   }
 
   private static final class FakeTransport implements RecordingWriter.Transport {
+    private final int maxPayloadBytes;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final List<EventBatch> batches = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final List<RecordingStarted> starts = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -722,6 +763,14 @@ class RecordingWriterTest {
     private final List<Health> health = new java.util.concurrent.CopyOnWriteArrayList<>();
     private final LinkedBlockingQueue<Message> sent = new LinkedBlockingQueue<>();
     private final java.util.Set<String> messageIds = new java.util.HashSet<>();
+
+    private FakeTransport() {
+      this(1024 * 1024 - 4096);
+    }
+
+    private FakeTransport(int maxPayloadBytes) {
+      this.maxPayloadBytes = maxPayloadBytes;
+    }
 
     private <T extends Message> T await(Class<T> type) throws InterruptedException {
       long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
@@ -736,13 +785,14 @@ class RecordingWriterTest {
     @Override
     public boolean fitsEnvelope(String messageId, String correlationToken, Message payload) {
       // Same conservative envelope allowance enforced by this peer's send assertions.
-      return payload.getSerializedSize() <= 1024 * 1024 - 4096;
+      return payload.getSerializedSize() <= maxPayloadBytes;
     }
 
     @Override
     public Ack send(String messageId, String correlationToken, Message payload)
         throws ClientException {
       assertTrue(messageIds.add(messageId), "each streamed batch needs a distinct message identity");
+      assertTrue(fitsEnvelope(messageId, correlationToken, payload), "preflight must bound each send");
       Ack.Builder ack =
           Ack.newBuilder()
               .setDurability(AckDurability.ACK_DURABILITY_STAGED)

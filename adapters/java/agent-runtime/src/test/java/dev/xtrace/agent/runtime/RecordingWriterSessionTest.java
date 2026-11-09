@@ -48,6 +48,7 @@ import xtp.agent.v1.Transport.Health;
 final class RecordingWriterSessionTest {
   private static final String FIRST = "00000000-0000-4000-8000-000000000001";
   private static final String LATER = "00000000-0000-4000-8000-000000000002";
+  private static final String COMPANION = "00000000-0000-4000-8000-000000000003";
 
   @Test
   void rejectedStartHealthCrossesTheRealSessionAndLaterRecordingsComplete() throws Exception {
@@ -124,6 +125,160 @@ final class RecordingWriterSessionTest {
   @Test
   void oversizedThrowBecomesAGapAndTheOutcomeDoesNotClaimAnObservedThrow() throws Exception {
     exerciseOversizedEvent(true);
+  }
+
+  @Test
+  void oversizedStartRecordsItsReductionAndKeepsActiveAndSubsequentRecordingsUsable()
+      throws Exception {
+    exerciseOversizedLifecycle(true, false);
+  }
+
+  @Test
+  void oversizedFinishRecordsItsReductionAndKeepsActiveAndSubsequentRecordingsUsable()
+      throws Exception {
+    exerciseOversizedLifecycle(false, false);
+  }
+
+  @Test
+  void startIdentityThatCannotFitAbandonsOnlyThatRecording() throws Exception {
+    exerciseOversizedLifecycle(true, true);
+  }
+
+  @Test
+  void finishIdentityThatCannotFitAbandonsOnlyThatRecording() throws Exception {
+    exerciseOversizedLifecycle(false, true);
+  }
+
+  @Test
+  void aStartReductionMarkerThatCannotFitLeavesOnlyThatRecordingIncomplete() throws Exception {
+    exerciseOversizedLifecycle(true, false, 256);
+  }
+
+  @Test
+  void aFinishReductionMarkerThatCannotFitLeavesOnlyThatRecordingIncomplete() throws Exception {
+    exerciseOversizedLifecycle(false, false, 256);
+  }
+
+  private static void exerciseOversizedLifecycle(boolean started, boolean identityTooLarge)
+      throws Exception {
+    exerciseOversizedLifecycle(started, identityTooLarge, identityTooLarge ? 256 : 512);
+  }
+
+  private static void exerciseOversizedLifecycle(
+      boolean started, boolean identityTooLarge, int frameLimit)
+      throws Exception {
+    boolean incomplete = identityTooLarge || frameLimit == 256;
+    BoundedEventQueue queue = new BoundedEventQueue(32, 8192);
+    RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
+    AcknowledgingSocket peer = new AcknowledgingSocket(frameLimit);
+    RecordingWriter writer = new RecordingWriter(peer.session(), queue, sink);
+    ByteArrayOutputStream diagnostics = new ByteArrayOutputStream();
+    PrintStream previous = System.err;
+    String route = started ? "/private-canary/" + "r".repeat(240) : "/first";
+    String method = started && identityTooLarge ? "M".repeat(256) : "GET";
+    String exceptionType = identityTooLarge ? "E".repeat(256) : "java.lang.IllegalStateException";
+    try (PrintStream capture = new PrintStream(diagnostics, true, StandardCharsets.UTF_8)) {
+      System.setErr(capture);
+      try {
+        assertTrue(sink.offerStart(COMPANION, 1, "GET", "/companion"));
+        writer.start();
+        peer.await(AgentEnvelope.PayloadCase.RECORDING_STARTED);
+        assertTrue(sink.offerStart(FIRST, 2, method, route));
+        assertTrue(sink.offerEvent(FIRST, "first-response", "", BridgeEventKind.RESPONSE,
+            "http.response 500", 3, 500));
+        BridgeSink.Outcome outcome = started
+            ? new BridgeSink.Outcome(BridgeSink.Outcome.RESPONDED, 500, "", "", "")
+            : new BridgeSink.Outcome(BridgeSink.Outcome.EXCEPTION_PROPAGATED, 0,
+                exceptionType, "private-canary " + "sanitized ".repeat(50), "");
+        assertTrue(sink.offerFinishWithOutcome(FIRST, 2, 4, 500, 0, outcome));
+        assertTrue(sink.offerEvent(COMPANION, "companion-response", "", BridgeEventKind.RESPONSE,
+            "http.response 200", 5, 200));
+        assertTrue(sink.offerFinishWithOutcome(COMPANION, 1, 6, 200, 0,
+            new BridgeSink.Outcome(BridgeSink.Outcome.RESPONDED, 200, "", "", "")));
+        if (!incomplete) {
+          assertEquals(FIRST, uuid(peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED)
+              .getRecordingFinished().getRecordingId()));
+        }
+        assertEquals(COMPANION, uuid(peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED)
+            .getRecordingFinished().getRecordingId()));
+        assertFalse(peer.closed, "lifecycle size rejection must leave an active companion usable");
+        assertFalse(writer.isStopping());
+        // Admission and completion after the oversized lifecycle prove this is still a live session.
+        assertTrue(sink.offerStart(LATER, 7, "GET", "/later"));
+        assertTrue(sink.offerEvent(LATER, "later-response", "", BridgeEventKind.RESPONSE,
+            "http.response 201", 8, 201));
+        assertTrue(sink.offerFinishWithOutcome(LATER, 7, 9, 201, 0,
+            new BridgeSink.Outcome(BridgeSink.Outcome.RESPONDED, 201, "", "", "")));
+        assertEquals(LATER, uuid(peer.await(AgentEnvelope.PayloadCase.RECORDING_FINISHED)
+            .getRecordingFinished().getRecordingId()));
+        assertFalse(peer.closed);
+      } finally {
+        writer.close();
+      }
+    } finally {
+      System.setErr(previous);
+    }
+    assertFalse(writer.isStopping());
+    assertEquals(incomplete, writer.incompleteWasReported());
+    assertEquals(0, sink.activeRecordings(), "abandoned recordings must release their admission");
+    var finishes = peer.frames.stream().filter(AgentEnvelope::hasRecordingFinished)
+        .map(AgentEnvelope::getRecordingFinished).toList();
+    assertEquals(incomplete ? List.of(COMPANION, LATER) : List.of(FIRST, COMPANION, LATER),
+        finishes.stream().map(finish -> uuid(finish.getRecordingId())).toList());
+    for (var finish : finishes) {
+      String id = uuid(finish.getRecordingId());
+      if (id.equals(FIRST)) continue;
+      assertEquals(2, finish.getFinalRecordingSeq());
+      assertEquals(0, finish.getDropCountsByPriorityCount());
+      assertEquals(id.equals(COMPANION) ? 200 : 201, finish.getOutcome().getHttpStatus());
+      assertArrayEquals(EventDigest.compute(List.of(id.equals(COMPANION)
+          ? "companion-response" : "later-response")), finish.getEventDigest().toByteArray());
+    }
+    String output = diagnostics.toString(StandardCharsets.UTF_8);
+    assertFalse(output.contains("private-canary"));
+    if (incomplete) {
+      assertEquals(1, output.lines().count());
+      assertTrue(output.contains("\"code\":\"XTR-JAVA-CAPTURE-INCOMPLETE\""));
+      assertTrue(output.contains("\"recordingId\":\"" + FIRST + "\""));
+      assertTrue(output.contains(identityTooLarge
+          ? (started ? "RecordingStarted" : "RecordingFinished") + " identity exceeds the frame limit"
+          : "frame-limit " + (started ? "started" : "finished") + " marker could not be sent"));
+      assertTrue(peer.frames.stream().filter(AgentEnvelope::hasEventBatch)
+          .noneMatch(frame -> started && uuid(frame.getEventBatch().getRecordingId()).equals(FIRST)),
+          "an unsent start must not be followed by orphaned events");
+    } else {
+      assertEquals("", output);
+      var finish = finishes.get(0);
+      assertEquals(3, finish.getFinalRecordingSeq());
+      assertEquals(1, finish.getDropCountsByPriorityOrDefault(1, 0));
+      var events = peer.frames.stream().filter(AgentEnvelope::hasEventBatch)
+          .filter(frame -> uuid(frame.getEventBatch().getRecordingId()).equals(FIRST))
+          .flatMap(frame -> frame.getEventBatch().getEventsList().stream()).toList();
+      assertEquals(2, events.size());
+      var gap = events.get(started ? 0 : 1);
+      assertEquals(RecordingEventKind.RECORDING_EVENT_KIND_GAP, gap.getKind());
+      assertEquals(started ? RecordingWriter.START_FRAME_GAP_SYMBOL
+          : RecordingWriter.FINISH_FRAME_GAP_SYMBOL, gap.getSymbol());
+      assertEquals(GapReason.GAP_REASON_THROTTLE, gap.getGap().getReason());
+      assertEquals(1, gap.getGap().getCount());
+      assertEquals(started ? 2 : 4, gap.getMonotonicNs());
+      assertEquals(started ? 2 : 3, gap.getRecordingSeq());
+      assertArrayEquals(EventDigest.compute(events.stream().map(event -> event.getEventId()).toList()),
+          finish.getEventDigest().toByteArray());
+      if (started) {
+        var start = peer.frames.stream().filter(AgentEnvelope::hasRecordingStarted)
+            .map(AgentEnvelope::getRecordingStarted)
+            .filter(value -> uuid(value.getRecordingId()).equals(FIRST)).findFirst().orElseThrow();
+        assertEquals(route, start.getMatchedRouteTemplate());
+        assertEquals("", start.getUrlShape());
+        assertEquals(method, start.getMethod());
+        assertEquals(500, finish.getOutcome().getHttpStatus());
+      } else {
+        assertEquals(BridgeSink.Outcome.EXCEPTION_PROPAGATED, finish.getOutcome().getKindValue());
+        assertEquals(exceptionType, finish.getOutcome().getException().getExceptionType());
+        assertEquals("", finish.getOutcome().getException().getSanitizedMessage());
+      }
+    }
   }
 
   private static void exerciseOversizedEvent(boolean thrown) throws Exception {

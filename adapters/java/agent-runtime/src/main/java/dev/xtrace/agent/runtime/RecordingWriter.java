@@ -56,6 +56,8 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   static final String ADMISSION_GAP_SYMBOL = "xtrace.capture.gap.recording-admission";
   static final String MEMORY_GAP_SYMBOL = "xtrace.capture.gap.writer-memory";
   static final String FRAME_GAP_SYMBOL = "xtrace.capture.gap.frame-limit";
+  static final String START_FRAME_GAP_SYMBOL = FRAME_GAP_SYMBOL + ".started";
+  static final String FINISH_FRAME_GAP_SYMBOL = FRAME_GAP_SYMBOL + ".finished";
 
   private final Transport session;
   private final BoundedEventQueue queue;
@@ -178,7 +180,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       int cap = eventCap(capturePolicyId);
       int limit = closing(event.kind()) ? cap - GAP_RESERVE : cap - CLOSING_RESERVE;
       long bytes = Math.max(128, event.estimatedBytes());
-      if (recording.start.metadataOnly() || recording.gapUnreportable
+      if (recording.start.metadataOnly() || recording.unrecoverable
           || recording.acceptedEvents >= limit) {
         recording.writerDrops = saturatingAdd(recording.writerDrops, 1);
       } else if (pendingEventBytes <= maxPendingEventBytes - bytes) {
@@ -242,25 +244,41 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     }
     byte[] recordingBytes = uuidBytes(recordingId);
     pending.recordingId = recordingId;
+    String messageId = pending.start.recordingId() + ":started";
+    RecordingStarted.Builder start = RecordingStarted.newBuilder()
+        .setRecordingId(ByteString.copyFrom(recordingBytes))
+        .setRecordingSeq(1)
+        .setMethod(pending.start.method())
+        .setMatchedRouteTemplate(pending.start.route())
+        .setUrlShape(pending.start.route())
+        .setStartMonotonicNs(pending.start.monotonicNs())
+        .setThreadOrTaskId("request-thread")
+        .setCapturePolicyId(capturePolicyId);
+    boolean reduced = !session.fitsEnvelope(messageId, pending.start.recordingId(), start.build());
+    if (reduced) {
+      // Prefer the observed route template to its duplicate URL shape. Never truncate a route
+      // into a different route, or discard the method, clock or capture policy to make it fit.
+      start.clearUrlShape();
+      if (!session.fitsEnvelope(messageId, pending.start.recordingId(), start.build())) {
+        start.clearMatchedRouteTemplate().clearThreadOrTaskId();
+      }
+      if (!session.fitsEnvelope(messageId, pending.start.recordingId(), start.build())) {
+        abandon(pending, "RecordingStarted identity exceeds the frame limit");
+        return;
+      }
+    }
     Ack started =
         session.send(
-            pending.start.recordingId() + ":started",
+            messageId,
             pending.start.recordingId(),
-            RecordingStarted.newBuilder()
-                .setRecordingId(ByteString.copyFrom(recordingBytes))
-                .setRecordingSeq(1)
-                .setMethod(pending.start.method())
-                .setMatchedRouteTemplate(pending.start.route())
-                .setUrlShape(pending.start.route())
-                .setStartMonotonicNs(pending.start.monotonicNs())
-                .setThreadOrTaskId("request-thread")
-                .setCapturePolicyId(capturePolicyId)
-                .build());
+            start.build());
     requireRecordingAck(started, recordingId, 1);
+    if (reduced) sendLifecycleGap(pending, "started", pending.start.monotonicNs(),
+        START_FRAME_GAP_SYMBOL);
   }
 
   private void write(PendingRecording pending, QueueSignal.Finish finish) throws ClientException {
-    if (pending.gapUnreportable) return;
+    if (pending.unrecoverable) return;
     long droppedEvents = saturatingAdd(
         finish.droppedEvents(), saturatingAdd(pending.writerDrops, pending.memoryDrops));
     // Metadata-only admission retains the actual identity and terminal observation, but none of
@@ -291,13 +309,12 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     pending.events.clear();
     pending.events.addAll(ordered);
     flush(pending, true);
-    if (pending.gapUnreportable) return;
+    if (pending.unrecoverable) return;
     droppedEvents = saturatingAdd(droppedEvents, pending.frameDrops);
     if (pending.sequence == 1) {
       throw new ClientException("XTR-JAVA-RECORDING", "recording contains no accepted events");
     }
     byte[] digest = new byte[32];
-    pending.digest.doFinal(digest, 0);
     RecordingFinished.Builder terminal =
         RecordingFinished.newBuilder()
             .setRecordingId(ByteString.copyFrom(uuidBytes(pending.recordingId)))
@@ -314,12 +331,76 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       }
       terminal.setOutcome(outcome);
     }
+    String messageId = pending.start.recordingId() + ":finished";
+    if (!session.fitsEnvelope(messageId, pending.start.recordingId(), terminal.build())) {
+      // Keep the observed exception type and outcome kind. Omitted optional detail is named by
+      // a digest-covered gap, never replaced with text that could look like an observed value.
+      if (terminal.hasOutcome()) {
+        RecordingOutcome.Builder outcome = terminal.getOutcome().toBuilder();
+        if (outcome.hasException()) {
+          outcome.setException(outcome.getException().toBuilder().clearSanitizedMessage());
+        }
+        terminal.setOutcome(outcome);
+      }
+      terminal.setFinalRecordingSeq(Math.addExact(pending.sequence, 1))
+          .putDropCountsByPriority(1, saturatingAdd(droppedEvents, 1));
+      if (!session.fitsEnvelope(messageId, pending.start.recordingId(), terminal.build())) {
+        terminal.setOutcome(terminal.getOutcome().toBuilder().clearThrownFromEventId());
+      }
+      if (!session.fitsEnvelope(messageId, pending.start.recordingId(), terminal.build())) {
+        abandon(pending, "RecordingFinished identity exceeds the frame limit");
+        return;
+      }
+      if (!sendLifecycleGap(pending, "finished",
+          terminalMonotonic(pending.start.monotonicNs(), finish.finishedMonotonicNs()),
+          FINISH_FRAME_GAP_SYMBOL)) return;
+    }
+    pending.digest.doFinal(digest, 0);
+    terminal.setEventDigest(ByteString.copyFrom(digest));
     Ack finished =
         session.send(
-            pending.start.recordingId() + ":finished",
+            messageId,
             pending.start.recordingId(),
             terminal.build());
     requireRecordingAck(finished, pending.recordingId, pending.sequence);
+  }
+
+  /** A lifecycle reduction consumes a real sequence and participates in terminal loss accounting. */
+  private boolean sendLifecycleGap(
+      PendingRecording pending, String stage, long monotonicNs, String symbol)
+      throws ClientException {
+    if (pending.sequence > eventCap(capturePolicyId)) {
+      abandon(pending, "frame-limit " + stage + " marker exceeds the event limit");
+      return false;
+    }
+    QueueSignal.Event gap = gap(pending.start.recordingId(), "", monotonicNs, 1,
+        ":gap-frame-" + stage, symbol);
+    long sequence = Math.addExact(pending.sequence, 1);
+    EventBatch.Builder batch = newBatch(uuidBytes(pending.recordingId))
+        .addEvents(toProto(gap, sequence));
+    if (!fitsBatch(pending, batch)) {
+      abandon(pending, "frame-limit " + stage + " marker could not be sent");
+      return false;
+    }
+    sendChunk(pending, pending.recordingId, batch, pending.chunk++, sequence);
+    pending.sequence = sequence;
+    pending.lastEventId = gap.eventId();
+    pending.lastMonotonicNs = monotonicNs;
+    // A start marker consumes event capacity before the request's later observations arrive.
+    pending.acceptedEvents++;
+    byte[] id = gap.eventId().getBytes(StandardCharsets.UTF_8);
+    pending.digest.update(id, 0, id.length);
+    pending.frameDrops = saturatingAdd(pending.frameDrops, 1);
+    return true;
+  }
+
+  private void abandon(PendingRecording pending, String reason) {
+    pending.unrecoverable = true;
+    incompleteReported.set(true);
+    // Only fixed reasons and the validated UUID belong in diagnostics, never captured fields.
+    System.err.println("{\"code\":\"XTR-JAVA-CAPTURE-INCOMPLETE\","
+        + "\"message\":\"X-trace " + reason + "; affected recording remains incomplete\","
+        + "\"recordingId\":\"" + pending.recordingId + "\"}");
   }
 
   /** Sends the buffered prefix; the response stays behind terminal gap accounting until Finish. */
@@ -356,11 +437,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
           if (!fitsBatch(pending, batch)) {
             // A negotiated limit may be too small even for the bounded gap identity. Leave
             // this stream unfinished rather than claiming completeness or closing other streams.
-            pending.gapUnreportable = true;
-            incompleteReported.set(true);
-            System.err.println("{\"code\":\"XTR-JAVA-CAPTURE-INCOMPLETE\","
-                + "\"message\":\"X-trace frame-limit gap could not be sent; affected recording remains incomplete\","
-                + "\"recordingId\":\"" + pending.recordingId + "\"}");
+            abandon(pending, "frame-limit gap could not be sent");
             batch.clearEvents();
             break;
           }
@@ -586,7 +663,9 @@ final class RecordingWriter implements AutoCloseable, Runnable {
       boolean cap = event.symbol().equals(CAP_GAP_SYMBOL);
       boolean admission = event.symbol().equals(ADMISSION_GAP_SYMBOL);
       boolean memory = event.symbol().equals(MEMORY_GAP_SYMBOL);
-      boolean frame = event.symbol().equals(FRAME_GAP_SYMBOL);
+      boolean frame = event.symbol().equals(FRAME_GAP_SYMBOL)
+          || event.symbol().equals(START_FRAME_GAP_SYMBOL)
+          || event.symbol().equals(FINISH_FRAME_GAP_SYMBOL);
       boolean lines = event.symbol().equals(BootstrapBridge.LINE_BUDGET_SYMBOL);
       boolean untransformed = event.symbol().equals(UNTRANSFORMED_GAP_SYMBOL);
       builder.setGap(
@@ -837,7 +916,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     private long writerDrops;
     private long memoryDrops;
     private long frameDrops;
-    private boolean gapUnreportable;
+    private boolean unrecoverable;
     // Buffered non-throw allocations and retained throw allocations are disjoint charges.
     private long eventBytes;
     private long retainedThrowBytes;
