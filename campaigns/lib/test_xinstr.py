@@ -81,6 +81,31 @@ class T(unittest.TestCase):
         self.assertEqual(xinstr.layer_frames(rec("GET", "/", 200, symbols=("org.Repository.Helper.work",)), "repository"), [])
         self.assertEqual(xinstr.layer_frames(detail, "repository", "UnrelatedRepository"), [])
 
+    def test_exact_symbol_hint_requires_both_declaring_class_and_method(self):
+        symbol = "org.springframework.data.jpa.repository.JpaRepository.saveAndFlush"
+        hints = ["OwnerRepository", "org.springframework.data.repository.CrudRepository", symbol]
+        expectation = {"pet": [{"method": "POST", "route": "/pets/new", "status": 302,
+                                "layers": ["repository"], "layerHints": {"repository": hints}}]}
+        for observed, accepted in ((symbol, True),
+                                   ("org.springframework.data.jpa.repository.JpaRepository.findAll", False),
+                                   ("org.example.JpaRepository.saveAndFlush", False),
+                                   (symbol + "Extra", False),
+                                   ("org.example.OwnerRepository.save", True),
+                                   ("org.springframework.data.repository.CrudRepository.save", True)):
+            with self.subTest(symbol=observed):
+                detail = rec("POST", "/pets/new", 302, symbols=(observed,))
+                frames = xinstr.layer_frames(detail, "repository", hints)
+                self.assertEqual([ev["symbol"] for ev in frames], [observed] if accepted else [])
+                self.assertEqual(bool(xinstr.layer_frames(detail, "repository", symbol)), observed == symbol)
+                verdict = xinstr.analyze({"r": detail}, expectation)["pet"]
+                self.assertEqual(verdict["passed"], accepted, verdict)
+                if not accepted:
+                    self.assertIn("no-repository-frame", verdict["expectations"][0]["problems"])
+        # An exact hint still requires the declaring class to identify the layer.
+        other = "org.example.Helper.saveAndFlush"
+        self.assertEqual(xinstr.layer_frames(rec("POST", "/pets/new", 302, symbols=(other,)),
+                                             "repository", other), [])
+
     def test_inherited_repository_frame_keeps_its_observed_symbol_and_missing_source(self):
         symbol = "org.springframework.data.repository.CrudRepository.save"
         detail = rec("POST", "/owners/new", 302, symbols=(symbol,), src=False)

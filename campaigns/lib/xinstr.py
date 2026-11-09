@@ -283,7 +283,7 @@ def response_event_status(detail: dict) -> int | None:
 
 
 def layer_frames(detail: dict, layer: str, name_hint: str | list[str] | None = None) -> list[dict]:
-    """Match observed declaring classes; hints may name alternative inherited declarations."""
+    """Match layer classes with optional class-name or exact class.method symbol alternatives."""
     pat = LAYER_PATTERNS[layer]
     out = []
     for ev in detail.get("events", []):
@@ -293,7 +293,7 @@ def layer_frames(detail: dict, layer: str, name_hint: str | list[str] | None = N
         declaring, separator, _ = sym.rpartition(".")
         simple = declaring.rsplit(".", 1)[-1]
         hints = [name_hint] if isinstance(name_hint, str) else name_hint
-        if separator and pat.search(simple) and (hints is None or any(h in (declaring, simple) for h in hints)):
+        if separator and pat.search(simple) and (hints is None or any(h in (declaring, simple, sym) for h in hints)):
             out.append(ev)
     return out
 
