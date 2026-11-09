@@ -2515,6 +2515,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stored_line_cursors_reach_http_in_execution_order_across_pages_and_segments() {
+        use xtrace_protocol::generated::agent::{RecordingEvent, RecordingEventKind, SourceRange};
+        use xtrace_protocol::xtf::XtfEventEnvelope;
+        use xtrace_store::SegmentCommitRequest;
+
+        let scratch = std::path::PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
+            .expect("admitted private test scratch");
+        let root = tempfile::Builder::new()
+            .prefix("viewer-lines-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir_in(scratch)
+            .expect("temporary project root");
+        let database = root.path().join("metadata.sqlite3");
+        let store = SqliteStore::open(&database, OpenOptions::default()).expect("open store");
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .expect("secure database");
+        let timestamp = WallTime::from_parts(2026, 10, 3, 1, 2, 3, 0).expect("fixture time");
+        let project = Project {
+            id: ProjectId::new(),
+            canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/fixture/repo"),
+            display_name: "fixture".to_owned(),
+            created_at: timestamp,
+            last_opened_at: timestamp,
+            config_schema_version: 1,
+            effective_config_hash: String::new(),
+            active_capture_policy_id: None,
+            active_redaction_policy_id: None,
+        };
+        store.project_repository().insert_project(&project).expect("insert project");
+        let recording_id = RecordingId::new();
+        SqliteRecordingPersistence::new(store.clone(), root.path())
+            .begin_recording(&BeginRecording {
+                project_id: project.id(),
+                recording_id,
+                runtime_session_id: RuntimeSessionId::new(),
+                opened_at: timestamp,
+                endpoint_observation: EndpointObservationInput::default(),
+                limitations: Vec::new(),
+            })
+            .expect("begin recording");
+        let source_bytes = "// source\n".repeat(20);
+        std::fs::create_dir(root.path().join("src")).expect("source directory");
+        std::fs::write(root.path().join("src/BranchLoop.java"), &source_bytes)
+            .expect("source file");
+        let source_hash = blake3::hash(source_bytes.as_bytes()).as_bytes().to_vec();
+        // A repeated loop header and a backwards line jump must survive both page and segment
+        // boundaries. Frame extents use the same start line but are never active-line evidence.
+        let kinds_and_lines = [
+            (RecordingEventKind::FrameEnter, 5, 15),
+            (RecordingEventKind::LineCursor, 5, 5),
+            (RecordingEventKind::LineCursor, 7, 7),
+            (RecordingEventKind::LineCursor, 8, 8),
+            (RecordingEventKind::LineCursor, 11, 11),
+            (RecordingEventKind::LineCursor, 7, 7),
+            (RecordingEventKind::LineCursor, 15, 15),
+            (RecordingEventKind::FrameExit, 5, 15),
+        ];
+        let events: Vec<_> = kinds_and_lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, (kind, start_line, end_line))| {
+                let sequence = u64::try_from(index).expect("small index") + 2;
+                XtfEventEnvelope {
+                    recording_seq: sequence,
+                    event: Some(RecordingEvent {
+                        event_id: format!("event-{sequence}"),
+                        parent_event_id: if index == 0 { String::new() } else { "event-2".into() },
+                        recording_seq: sequence,
+                        monotonic_ns: sequence,
+                        kind: kind as i32,
+                        symbol: "BranchLoop.sum".into(),
+                        source_binding:
+                            xtrace_protocol::generated::agent::SourceBinding::ObservedUnattested
+                                as i32,
+                        source: Some(SourceRange {
+                            path: "src/BranchLoop.java".into(),
+                            start_line,
+                            end_line,
+                            content_hash: source_hash.clone().into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }
+            })
+            .collect();
+        let writer = store.recording_store(root.path()).expect("recording store");
+        for (ordinal, chunk) in events.chunks(4).enumerate() {
+            writer
+                .commit_segment(&SegmentCommitRequest {
+                    project_id: project.id(),
+                    recording_id,
+                    segment_ordinal: u32::try_from(ordinal).expect("small ordinal"),
+                    events: chunk.to_vec(),
+                })
+                .expect("persist real XTF segment");
+        }
+        let reader = SqliteRecordingReader::new(store, root.path()).with_source_root(root.path());
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(reader.clone()),
+            ObservedEndpointQueryService::new(reader),
+            project.id(),
+        )
+        .await
+        .expect("bind viewer");
+        let ready = bound.readiness();
+        let host = ready.origin.strip_prefix("http://").expect("loopback origin").to_owned();
+        let token = ready.url.rsplit_once("token=").expect("bootstrap token").1.to_owned();
+        let query_lane = bound.state.query_lane.clone();
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(bound.serve(async move {
+            let _ = receiver.await;
+        }));
+        let viewer = RunningViewer {
+            host,
+            origin: ready.origin,
+            token,
+            observed_calls: Arc::new(AtomicUsize::new(0)),
+            query_lane,
+            shutdown,
+            task,
+        };
+        let cookie = authenticate(&viewer).await;
+        let mut cursor = None;
+        let mut returned = Vec::new();
+        // Eight stored events at limit three require exactly three pages; a broken cursor must
+        // fail the assertion rather than turning this regression into an unbounded loop.
+        for page in 0..3 {
+            let suffix = cursor.as_ref().map_or(String::new(), |c| format!("&cursor={c}"));
+            let raw = format!(
+                "GET /api/v1/recordings/{recording_id}?limit=3{suffix} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            );
+            let response = request(&viewer.host, &raw).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            let body: serde_json::Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").expect("HTTP body").1)
+                    .expect("recording JSON");
+            assert_eq!(body["status"], "recording");
+            assert_eq!(body["completion"], "unavailable");
+            returned.extend(body["events"].as_array().expect("events").iter().cloned());
+            cursor = body["nextCursor"].as_str().map(str::to_owned);
+            assert_eq!(cursor.is_some(), page < 2);
+        }
+        assert_eq!(returned.len(), 8);
+        for (event, sequence) in returned.iter().zip(2..=9) {
+            assert_eq!(event["sequence"], sequence.to_string());
+        }
+        let lines: Vec<_> = returned
+            .iter()
+            .filter(|event| event["kind"] == "recording_event_kind:line_cursor")
+            .map(|event| event["line"].as_u64().expect("observed line"))
+            .collect();
+        assert_eq!(lines, [5, 7, 8, 11, 7, 15]);
+        for event in [&returned[0], &returned[7]] {
+            assert!(event["line"].is_null(), "a method extent is never an executed line");
+            assert_eq!(event["source"]["startLine"], 5);
+            assert_eq!(event["source"]["endLine"], 15);
+        }
+        let _ = viewer.shutdown.send(());
+        viewer.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn sqlite_identity_corruption_is_reported_by_the_authenticated_http_handler() {
         let scratch = std::path::PathBuf::from(
             std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
