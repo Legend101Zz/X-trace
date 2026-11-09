@@ -8,8 +8,13 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
       long monotonicNs,
       String method,
       String route,
-      int estimatedBytes)
-      implements QueueSignal {}
+      int estimatedBytes,
+      boolean metadataOnly)
+      implements QueueSignal {
+    Start(String recordingId, long monotonicNs, String method, String route, int estimatedBytes) {
+      this(recordingId, monotonicNs, method, route, estimatedBytes, false);
+    }
+  }
 
   record Event(
       String recordingId,
@@ -18,7 +23,7 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
       int kind,
       String symbol,
       long monotonicNs,
-      int detail,
+      long detail,
       String sourcePath,
       int sourceStartLine,
       int sourceEndLine,
@@ -36,7 +41,7 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
         int kind,
         String symbol,
         long monotonicNs,
-        int detail,
+        long detail,
         String sourcePath,
         int sourceStartLine,
         int sourceEndLine,
@@ -57,7 +62,7 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
         int kind,
         String symbol,
         long monotonicNs,
-        int detail,
+        long detail,
         int estimatedBytes) {
       this(recordingId, eventId, parentEventId, kind, symbol, monotonicNs, detail,
           null, 0, 0, null, 0, estimatedBytes, null, null);
@@ -70,7 +75,7 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
         int kind,
         String symbol,
         long monotonicNs,
-        int detail,
+        long detail,
         String sourcePath,
         int sourceStartLine,
         int sourceEndLine,
