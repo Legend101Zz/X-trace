@@ -6,6 +6,7 @@
 //! reads. Acknowledgement follows data sync, checkpoint sync and directory sync.
 
 use std::io::{Seek as _, SeekFrom};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use prost::Message as _;
 use xtrace_application::recording::{
@@ -25,8 +26,127 @@ const MAX_JOURNAL_BYTES: usize =
 #[cfg(test)]
 thread_local! {
     pub(super) static BEFORE_SYNC: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static AFTER_BOUNDARY: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static BEFORE_PUBLICATION: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static BEFORE_CLEANUP: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     static CHECKPOINT_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JOURNAL_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COUNT_ONLY_SYNCS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DIRECTORY_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BOUNDARY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SYNC_ORDER: std::cell::RefCell<Vec<SyncKind>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// Coordinate only journal mutation/publication, not the recording writer: a
+// reader must still complete while an append is waiting for its data sync.
+// Paths, rather than store instances, also cover independently opened readers.
+type SnapshotLocks = HashMap<PathBuf, Weak<RwLock<()>>>;
+pub(super) fn snapshot_lock(
+    root: &AdmittedPrivateRoot,
+    recording_id: RecordingId,
+    id: CorrelationId,
+) -> Result<Arc<RwLock<()>>, RecordingStoreError> {
+    static LOCKS: OnceLock<Mutex<SnapshotLocks>> = OnceLock::new();
+    let mut locks = LOCKS.get_or_init(Mutex::default).lock().map_err(|_| object_io_error(id))?;
+    locks.retain(|_, lock| lock.strong_count() != 0);
+    let entry = locks.entry(root.path().join(name(recording_id))).or_default();
+    if let Some(lock) = entry.upgrade() {
+        return Ok(lock);
+    }
+    let lock = Arc::new(RwLock::new(()));
+    *entry = Arc::downgrade(&lock);
+    Ok(lock)
+}
+
+/// Only the large cardinality tests substitute the sync syscall. All writes,
+/// admission, rename, sync ordering, fault boundaries and recovery stay real.
+#[cfg(test)]
+pub(crate) struct CountOnlySyncs(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(test)]
+impl CountOnlySyncs {
+    pub(crate) fn enter() -> Self {
+        COUNT_ONLY_SYNCS.with(|enabled| assert!(!enabled.replace(true)));
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(test)]
+impl Drop for CountOnlySyncs {
+    fn drop(&mut self) {
+        COUNT_ONLY_SYNCS.with(|enabled| enabled.set(false));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncKind {
+    Journal,
+    Checkpoint,
+    Directory,
+}
+
+fn durable_sync(
+    _kind: SyncKind,
+    sync: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    let count_only = COUNT_ONLY_SYNCS.with(|enabled| enabled.get());
+    #[cfg(not(test))]
+    let count_only = false;
+    if !count_only {
+        sync()?;
+    }
+    #[cfg(test)]
+    {
+        SYNC_ORDER.with(|order| order.borrow_mut().push(_kind));
+        let counter = match _kind {
+            SyncKind::Journal => &JOURNAL_SYNCS,
+            SyncKind::Checkpoint => &CHECKPOINT_SYNCS,
+            SyncKind::Directory => &DIRECTORY_SYNCS,
+        };
+        counter.with(|count| count.set(count.get() + 1));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn take_sync_order() -> Vec<SyncKind> {
+    SYNC_ORDER.with(|order| std::mem::take(&mut *order.borrow_mut()))
+}
+
+#[cfg(test)]
+pub(crate) fn take_directory_sync_count() -> usize {
+    DIRECTORY_SYNCS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_boundary_read_count() -> usize {
+    BOUNDARY_READS.with(|count| count.replace(0))
+}
+
+// Use the admitted descriptor for both renameat and its durability barrier.
+// Apple's fsync alone does not flush the device cache for directory changes.
+#[cfg(unix)]
+fn sync_directory_descriptor(file: &std::fs::File) -> std::io::Result<()> {
+    durable_sync(SyncKind::Directory, || {
+        #[cfg(target_vendor = "apple")]
+        let result = rustix::fs::fcntl_fullfsync(file);
+        #[cfg(not(target_vendor = "apple"))]
+        let result = rustix::fs::fsync(file);
+        result.map_err(std::io::Error::from)
+    })
+}
+
+fn sync_journal_directory(root: &AdmittedPrivateRoot) -> Result<(), PrivateStorageError> {
+    root.revalidate()?;
+    #[cfg(unix)]
+    {
+        let file = xtrace_private_storage::open_private_directory_descriptor(root.path())?;
+        sync_directory_descriptor(&file).map_err(|_| PrivateStorageError::Operation)?;
+    }
+    #[cfg(not(unix))]
+    root.sync()?;
+    root.revalidate()
 }
 
 #[cfg(test)]
@@ -44,6 +164,7 @@ pub(crate) fn take_checkpoint_sync_count() -> usize {
 /// Digests prevent an ambiguous retry from changing an already written prefix.
 #[derive(Debug)]
 pub(crate) struct Checkpoint {
+    header: [u8; HEADER_BYTES],
     ordinal: u32,
     length: u64,
     digests: Vec<[u8; 32]>,
@@ -52,6 +173,7 @@ pub(crate) struct Checkpoint {
 }
 
 struct Tail {
+    header: [u8; HEADER_BYTES],
     project_id: ProjectId,
     ordinal: u32,
     events: Vec<XtfEventEnvelope>,
@@ -71,7 +193,8 @@ fn directory(
         }
         let child =
             root.open_or_create_private_child("journals").map_err(|_| object_io_error(id))?;
-        root.sync().map_err(|_| object_io_error(id))?;
+        // Each cold writer syncs this parent before acknowledging. In
+        // particular it must do so again after an ambiguous creation failure.
         Ok(Some(child))
     } else {
         match std::fs::symlink_metadata(binding.root.join("journals")) {
@@ -95,6 +218,8 @@ fn read_boundary(
     recording_id: RecordingId,
     id: CorrelationId,
 ) -> Result<Option<Vec<u8>>, RecordingStoreError> {
+    #[cfg(test)]
+    BOUNDARY_READS.with(|count| count.set(count.get() + 1));
     let name = boundary_name(recording_id);
     match std::fs::symlink_metadata(root.path().join(&name)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -129,11 +254,36 @@ fn publish_boundary(
     file.set_len(0).map_err(|_| object_io_error(id))?;
     file.write_all(&bytes).map_err(|_| object_io_error(id))?;
     commit_failpoint("journal-checkpoint-before-sync", id, false)?;
-    file.sync_all().map_err(|_| object_io_error(id))?;
-    #[cfg(test)]
-    CHECKPOINT_SYNCS.with(|count| count.set(count.get() + 1));
+    durable_sync(SyncKind::Checkpoint, || file.sync_all()).map_err(|_| object_io_error(id))?;
     root.validate_file_binding(&pending, &file, true).map_err(|_| object_io_error(id))?;
     commit_failpoint("journal-checkpoint-before-rename", id, false)?;
+    #[cfg(test)]
+    BEFORE_PUBLICATION.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
+    let lock = snapshot_lock(root, recording_id, id)?;
+    let _snapshot = lock.write().map_err(|_| object_io_error(id))?;
+    #[cfg(unix)]
+    {
+        // Keep the same source/target admission and post-rename binding checks
+        // as rename_replace, with an explicit full directory sync on Apple.
+        let directory = xtrace_private_storage::open_private_directory_descriptor(root.path())
+            .map_err(|_| object_io_error(id))?;
+        root.validate_file_binding(&pending, &file, false).map_err(|_| object_io_error(id))?;
+        if root.validate_optional_private_file(&name).map_err(|_| object_io_error(id))? {
+            let target = root.open_regular_file(&name).map_err(|_| object_io_error(id))?;
+            root.validate_file_binding(&name, &target, false).map_err(|_| object_io_error(id))?;
+        }
+        root.revalidate().map_err(|_| object_io_error(id))?;
+        rustix::fs::renameat(&directory, pending.as_str(), &directory, name.as_str())
+            .map_err(|_| object_io_error(id))?;
+        root.validate_file_binding(&name, &file, false).map_err(|_| object_io_error(id))?;
+        sync_directory_descriptor(&directory).map_err(|_| object_io_error(id))?;
+        root.revalidate().map_err(|_| object_io_error(id))
+    }
+    #[cfg(not(unix))]
     root.rename_replace(&pending, &name).map_err(|_| object_io_error(id))
 }
 
@@ -154,7 +304,15 @@ fn load_for_retry(
     include_pending: bool,
 ) -> Result<Option<Tail>, RecordingStoreError> {
     let Some(root) = directory(binding, false, id)? else { return Ok(None) };
+    let lock = snapshot_lock(&root, recording_id, id)?;
+    let _snapshot = lock.read().map_err(|_| object_io_error(id))?;
     let boundary = read_boundary(&root, recording_id, id)?;
+    #[cfg(test)]
+    AFTER_BOUNDARY.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
     let name = name(recording_id);
     match std::fs::symlink_metadata(root.path().join(&name)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && boundary.is_none() => {
@@ -189,13 +347,13 @@ fn load_for_retry(
     } else {
         0
     };
+    if committed == 0 && !include_pending {
+        return Ok(None);
+    }
     if (&bytes[..8] != MAGIC && &bytes[..8] != LEGACY_MAGIC)
         || &bytes[24..40] != recording_id.as_uuid().as_bytes()
     {
         return Err(object_corrupt_error(id));
-    }
-    if committed == 0 && !include_pending {
-        return Ok(None);
     }
     let project_id = project_id_from_bytes(&bytes[8..24], id)?;
     let ordinal =
@@ -223,7 +381,8 @@ fn load_for_retry(
         }
         offset = end;
     }
-    Ok(Some(Tail { project_id, ordinal, events, length: offset as u64 }))
+    let header = bytes[..HEADER_BYTES].try_into().map_err(|_| object_corrupt_error(id))?;
+    Ok(Some(Tail { header, project_id, ordinal, events, length: offset as u64 }))
 }
 
 fn decode_envelope(
@@ -304,9 +463,9 @@ impl SqliteRecordingStore<'_> {
         // Also sync an exact retry: a previous sync may have failed ambiguously.
         file.sync_all().map_err(|_| object_io_error(id))?;
         root.validate_file_binding(&name, &file, true).map_err(|_| object_io_error(id))?;
-        root.sync().map_err(|_| object_io_error(id))?;
+        sync_journal_directory(&root).map_err(|_| object_io_error(id))?;
         AdmittedPrivateRoot::open(&self.binding.root)
-            .and_then(|parent| parent.sync())
+            .and_then(|parent| sync_journal_directory(&parent))
             .map_err(|_| object_io_error(id))
     }
 
@@ -373,6 +532,7 @@ impl SqliteRecordingStore<'_> {
                 return Err(segment_conflict_error(id));
             }
             known = tail.map(|tail| Checkpoint {
+                header: tail.header,
                 ordinal: tail.ordinal,
                 length: tail.length,
                 first_sequence: tail.events.first().map_or(0, |event| event.recording_seq),
@@ -389,7 +549,13 @@ impl SqliteRecordingStore<'_> {
                     .collect(),
             });
         }
+        let mut header = [0; HEADER_BYTES];
+        header[..8].copy_from_slice(MAGIC);
+        header[8..24].copy_from_slice(request.project_id.as_uuid().as_bytes());
+        header[24..40].copy_from_slice(request.recording_id.as_uuid().as_bytes());
+        header[40..44].copy_from_slice(&request.segment_ordinal.to_be_bytes());
         let mut known = known.unwrap_or(Checkpoint {
+            header,
             ordinal: request.segment_ordinal,
             length: 0,
             digests: Vec::new(),
@@ -463,28 +629,23 @@ impl SqliteRecordingStore<'_> {
             *checkpoint = Some(known);
             return Ok(());
         }
-        if known.length >= HEADER_BYTES as u64
+        if !cached
+            && known.length >= HEADER_BYTES as u64
+            && &known.header[..8] == LEGACY_MAGIC
             && read_boundary(&root, request.recording_id, id)?.is_none()
         {
-            file.seek(SeekFrom::Start(0)).map_err(|_| object_io_error(id))?;
-            let mut header = [0; HEADER_BYTES];
-            file.read_exact(&mut header).map_err(|_| object_io_error(id))?;
-            if &header[..8] == LEGACY_MAGIC {
-                file.sync_all().map_err(|_| object_io_error(id))?;
-                publish_boundary(&root, request.recording_id, &header, known.length, id)?;
-            }
+            durable_sync(SyncKind::Journal, || file.sync_all()).map_err(|_| object_io_error(id))?;
+            publish_boundary(&root, request.recording_id, &known.header, known.length, id)?;
         }
+        let lock = snapshot_lock(&root, request.recording_id, id)?;
+        let mutation = lock.write().map_err(|_| object_io_error(id))?;
         // Remove only an incomplete, unacknowledged suffix before an exact retry.
         if length != known.length {
             file.set_len(known.length).map_err(|_| object_io_error(id))?;
         }
         file.seek(SeekFrom::Start(known.length)).map_err(|_| object_io_error(id))?;
         if known.length == 0 {
-            file.write_all(MAGIC)
-                .and_then(|()| file.write_all(request.project_id.as_uuid().as_bytes()))
-                .and_then(|()| file.write_all(request.recording_id.as_uuid().as_bytes()))
-                .and_then(|()| file.write_all(&request.segment_ordinal.to_be_bytes()))
-                .map_err(|_| object_io_error(id))?;
+            file.write_all(&known.header).map_err(|_| object_io_error(id))?;
         }
         for event in suffix {
             let bytes = &event.canonical_bytes;
@@ -494,6 +655,7 @@ impl SqliteRecordingStore<'_> {
                 .and_then(|()| file.write_all(blake3::hash(bytes).as_bytes()))
                 .map_err(|_| object_io_error(id))?;
         }
+        drop(mutation);
         #[cfg(test)]
         BEFORE_SYNC.with(|hook| {
             if let Some(hook) = hook.borrow().as_ref() {
@@ -501,20 +663,16 @@ impl SqliteRecordingStore<'_> {
             }
         });
         commit_failpoint("journal-before-sync", id, false)?;
-        file.sync_all().map_err(|_| object_io_error(id))?;
+        durable_sync(SyncKind::Journal, || file.sync_all()).map_err(|_| object_io_error(id))?;
         root.validate_file_binding(&name, &file, true).map_err(|_| object_io_error(id))?;
-        #[cfg(test)]
-        JOURNAL_SYNCS.with(|count| count.set(count.get() + 1));
         if !cached {
-            root.sync().map_err(|_| object_io_error(id))?;
             AdmittedPrivateRoot::open(&self.binding.root)
-                .and_then(|parent| parent.sync())
+                .and_then(|parent| sync_journal_directory(&parent))
                 .map_err(|_| object_io_error(id))?;
         }
-        file.seek(SeekFrom::Start(0)).map_err(|_| object_io_error(id))?;
-        let mut header = [0; HEADER_BYTES];
-        file.read_exact(&mut header).map_err(|_| object_io_error(id))?;
-        publish_boundary(&root, request.recording_id, &header, final_length, id)?;
+        // The publication directory barrier covers both the tail's creation
+        // and checkpoint rename; a cold writer also persisted its parent.
+        publish_boundary(&root, request.recording_id, &known.header, final_length, id)?;
         commit_failpoint("journal-after-sync", id, false)?;
         known.length = final_length;
         known.digests.extend_from_slice(&digests[overlap..]);
@@ -528,6 +686,15 @@ impl SqliteRecordingStore<'_> {
     ) -> Result<(), RecordingStoreError> {
         let id = CorrelationId::new();
         if let Some(root) = directory(&self.binding, false, id)? {
+            #[cfg(test)]
+            BEFORE_CLEANUP.with(|hook| {
+                if let Some(hook) = hook.borrow().as_ref() {
+                    hook();
+                }
+            });
+            let lock = snapshot_lock(&root, recording_id, id)?;
+            let _snapshot = lock.write().map_err(|_| object_io_error(id))?;
+            let mut removed_boundary = false;
             for name in
                 [boundary_name(recording_id), format!("{}-next", boundary_name(recording_id))]
             {
@@ -537,16 +704,25 @@ impl SqliteRecordingStore<'_> {
                     Ok(_) => {}
                 }
                 root.remove_private_file(&name).map_err(|_| object_io_error(id))?;
+                removed_boundary = true;
             }
-            root.sync().map_err(|_| object_io_error(id))?;
             let name = name(recording_id);
             match std::fs::symlink_metadata(root.path().join(&name)) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if removed_boundary {
+                        sync_journal_directory(&root).map_err(|_| object_io_error(id))?;
+                    }
+                    return Ok(());
+                }
                 Err(_) => return Err(object_io_error(id)),
                 Ok(_) => {}
             }
+            // Repeat this barrier even if a prior attempt already unlinked the
+            // checkpoint: its absence must be durable before the tail vanishes.
+            sync_journal_directory(&root).map_err(|_| object_io_error(id))?;
+            commit_failpoint("journal-cleanup-before-tail-removal", id, false)?;
             root.remove_private_file(&name).map_err(|_| object_io_error(id))?;
-            root.sync().map_err(|_| object_io_error(id))?;
+            sync_journal_directory(&root).map_err(|_| object_io_error(id))?;
         }
         Ok(())
     }
@@ -557,7 +733,12 @@ impl SqliteRecordingStore<'_> {
         ordinal: u32,
     ) -> Result<bool, RecordingStoreError> {
         let id = CorrelationId::new();
-        if load(&self.binding, recording_id, id)?.is_some_and(|tail| tail.ordinal == ordinal) {
+        let _writer =
+            self.store.lock_recording_writer(id).map_err(|error| map_store_error(error, id))?;
+        // Pending bytes still identify the segment after checkpoint removal.
+        // Never clear a newer tail when replaying an older immutable segment.
+        let tail = load_for_retry(&self.binding, recording_id, id, true)?;
+        if tail.as_ref().is_none_or(|tail| tail.ordinal == ordinal) {
             self.clear_journal(recording_id)?;
             return Ok(true);
         }
@@ -590,7 +771,11 @@ impl SqliteRecordingStore<'_> {
         recording_id: RecordingId,
     ) -> Result<(), RecordingStoreError> {
         let id = CorrelationId::new();
-        let Some(tail) = load(&self.binding, recording_id, id)? else { return Ok(()) };
+        let Some(tail) = load(&self.binding, recording_id, id)? else {
+            // No checkpoint means no acknowledged events, not no files. Also
+            // remove an interrupted initial header and an orphan commit-next.
+            return self.clear_journal(recording_id);
+        };
         if tail.events.is_empty() {
             return self.clear_journal(recording_id);
         }
