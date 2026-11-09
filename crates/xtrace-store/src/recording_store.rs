@@ -8442,6 +8442,217 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn journal_snapshot_reader_process() {
+        use std::io::Write as _;
+
+        let Some(root) = std::env::var_os("XTRACE_JOURNAL_READER_ROOT") else { return };
+        let root = PathBuf::from(root);
+        let recording_id = RecordingId::from_uuid(
+            uuid::Uuid::parse_str(&std::env::var("XTRACE_JOURNAL_READER_ID").expect("id"))
+                .expect("recording UUID"),
+        );
+        let command = |expected: &str| {
+            let mut line = String::new();
+            assert!(std::io::stdin().read_line(&mut line).expect("parent command") > 0);
+            assert_eq!(line.trim_end(), expected);
+        };
+        let signal = |phase: &str| {
+            // Start a fresh line even when libtest has printed a test name.
+            println!("\nxtrace-journal:{phase}");
+            std::io::stdout().flush().expect("signal parent");
+        };
+        let store = SqliteStore::open(
+            &root.join("metadata.sqlite3"),
+            OpenOptions::default().with_must_exist(true).with_read_only(true),
+        )
+        .expect("independent read-only database");
+        let view = store.recording_store(&root).expect("read-only view");
+        let journals = AdmittedPrivateRoot::open(&root.join("journals")).expect("journals");
+        let snapshot =
+            recording_journal::snapshot_lock(&journals, recording_id, CorrelationId::new())
+                .expect("local snapshot lock");
+        recording_journal::AFTER_BOUNDARY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                signal("boundary");
+                command("copy");
+            }));
+        });
+        recording_journal::AFTER_SNAPSHOT_READS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(snapshot.try_write().is_ok(), "local read guard released before decode");
+                signal("copied");
+                command("decode");
+            }));
+        });
+        signal("ready");
+        command("read");
+        assert_eq!(
+            view.journal_summary(recording_id, 1).expect("untorn old snapshot without I/O error"),
+            Some((2, 3, 2))
+        );
+        recording_journal::AFTER_BOUNDARY.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        recording_journal::AFTER_SNAPSHOT_READS.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        assert_eq!(
+            view.journal_summary(recording_id, 1).expect("published snapshot without I/O error"),
+            if std::env::var("XTRACE_JOURNAL_READER_CLEANUP").expect("cleanup mode") == "true" {
+                None
+            } else {
+                Some((2, 4, 3))
+            }
+        );
+        signal("done");
+    }
+
+    // Reuse the unit-test executable as a helper so the child exercises the
+    // private read path, with its own lock registry and read-only SQLite store.
+    #[cfg(unix)]
+    struct JournalReaderProcess(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for JournalReaderProcess {
+        fn drop(&mut self) {
+            if self.0.try_wait().expect("reader status").is_none() {
+                self.0.kill().expect("stop this test's reader");
+                self.0.wait().expect("reap reader");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn separate_process_reader_pins_snapshot_and_releases_guards_before_decode() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        fn send(pipe: &mut BufReader<UnixStream>, command: &str) {
+            writeln!(pipe.get_mut(), "{command}").expect("send reader command");
+        }
+
+        fn expect_phase(pipe: &mut BufReader<UnixStream>, expected: &str) {
+            loop {
+                let mut line = String::new();
+                assert!(pipe.read_line(&mut line).expect("reader phase") > 0, "reader exited");
+                if let Some(phase) = line.trim_end().strip_prefix("xtrace-journal:") {
+                    assert_eq!(phase, expected);
+                    return;
+                }
+            }
+        }
+
+        for operation in ["checkpoint", "cleanup", "append"] {
+            let fixture = on_disk_store("journal-process-snapshot");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let recording_id = RecordingId::new();
+            let anchor = request(project_id, recording_id, RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("writer view");
+            view.begin_recording(&anchor).expect("anchor");
+            let mut checkpoint = None;
+            view.journal_tail(
+                &journal_request(project_id, recording_id, &[2, 3]),
+                0,
+                &mut checkpoint,
+            )
+            .expect("previous ack");
+            if operation == "cleanup" {
+                view.commit_segment(&segment_request(project_id, recording_id, 0, &[2, 3]))
+                    .expect("publish immutable segment before cleanup");
+            }
+            let (parent, child) = UnixStream::pair().expect("process handshake");
+            // These bounds only diagnose a broken handshake; synchronization
+            // always waits for an observable phase, never elapsed time.
+            for stream in [&parent, &child] {
+                stream.set_read_timeout(Some(Duration::from_secs(10))).expect("read bound");
+                stream.set_write_timeout(Some(Duration::from_secs(10))).expect("write bound");
+            }
+            let mut reader = JournalReaderProcess(
+                Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "recording_store::tests::journal_snapshot_reader_process",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("XTRACE_JOURNAL_READER_ROOT", &fixture.root)
+                    .env("XTRACE_JOURNAL_READER_ID", recording_id.to_string())
+                    .env("XTRACE_JOURNAL_READER_CLEANUP", (operation == "cleanup").to_string())
+                    .stdin(Stdio::from(OwnedFd::from(child.try_clone().expect("child input"))))
+                    .stdout(Stdio::from(OwnedFd::from(child)))
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("spawn independent reader"),
+            );
+            let mut pipe = BufReader::new(parent);
+            expect_phase(&mut pipe, "ready");
+            let (prepared_tx, prepared_rx) = std::sync::mpsc::channel();
+            let (publish_tx, publish_rx) = std::sync::mpsc::channel();
+            let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(move || {
+                    let prepared = move || {
+                        prepared_tx.send(()).expect("writer prepared");
+                        publish_rx.recv().expect("attempt mutation");
+                    };
+                    match operation {
+                        "checkpoint" => recording_journal::BEFORE_PUBLICATION
+                            .with(|hook| *hook.borrow_mut() = Some(Box::new(prepared))),
+                        "cleanup" => recording_journal::BEFORE_CLEANUP
+                            .with(|hook| *hook.borrow_mut() = Some(Box::new(prepared))),
+                        "append" => prepared(),
+                        _ => unreachable!(),
+                    }
+                    recording_journal::SNAPSHOT_CONTENDED.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            contended_tx.send(()).expect("kernel lock is held by reader");
+                        }));
+                    });
+                    let result = if operation == "cleanup" {
+                        view.clear_segment_journal(recording_id, 0).map(|cleared| assert!(cleared))
+                    } else {
+                        view.journal_tail(
+                            &journal_request(project_id, recording_id, &[4]),
+                            2,
+                            &mut checkpoint,
+                        )
+                    };
+                    recording_journal::BEFORE_PUBLICATION.with(|hook| {
+                        hook.borrow_mut().take();
+                    });
+                    recording_journal::BEFORE_CLEANUP.with(|hook| {
+                        hook.borrow_mut().take();
+                    });
+                    recording_journal::SNAPSHOT_CONTENDED.with(|hook| {
+                        hook.borrow_mut().take();
+                    });
+                    result
+                });
+                prepared_rx.recv_timeout(Duration::from_secs(10)).expect("writer ready");
+                send(&mut pipe, "read");
+                expect_phase(&mut pipe, "boundary");
+                publish_tx.send(()).expect("writer may attempt mutation");
+                contended_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("writer must encounter the other process's shared lock");
+                send(&mut pipe, "copy");
+                expect_phase(&mut pipe, "copied");
+                // The reader is now paused before decode. Joining the writer
+                // proves the file guard is released while decode is pending.
+                writer.join().expect("writer thread").expect("writer completes before decode");
+                send(&mut pipe, "decode");
+                expect_phase(&mut pipe, "done");
+            });
+            assert!(reader.0.wait().expect("reader exit").success());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cached_journal_appends_do_not_read_the_checkpoint_or_repeat_creation_syncs() {
         use recording_journal::{
             SyncKind, take_boundary_read_count, take_checkpoint_sync_count,
