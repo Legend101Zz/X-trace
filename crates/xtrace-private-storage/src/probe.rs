@@ -19,8 +19,9 @@
 //! including ctime; an identity check alone cannot detect an ACL edit. A change fails admission
 //! closed. Fresh probes apply the same checks across the listing, including batch fallbacks.
 //! A directory content change can invalidate a fresh listing without changing its ACL. In that
-//! case admission requires another listing with identical ACL entries and an unchanged state
-//! across that listing, under the original deadline. The raced verdict is never cached.
+//! case APFS admission requires another listing with identical ACL entries and an unchanged
+//! state across that listing, under the original deadline. Other filesystems fail closed.
+//! The raced verdict is never cached.
 //! Only positive, unchanged verdicts are stored, and each memo is bounded to 1024 entries.
 //! This does not defend against root forging filesystem metadata, or changes after the final
 //! state read; the capability's later uses still revalidate it.
@@ -86,8 +87,10 @@ impl DirectoryState {
         };
         // Deterministically model two directory ACL edits within one HFS+ ctime tick.
         #[cfg(all(target_os = "macos", test))]
-        if metadata.is_dir() && COARSE_FILESYSTEM.with(std::cell::Cell::get) {
-            return Self { ctime_seconds: 1, ctime_nanoseconds: 0, ..state };
+        if metadata.is_dir() {
+            if let Some(seconds) = COARSE_FILESYSTEM.with(std::cell::Cell::get) {
+                return Self { ctime_seconds: seconds, ctime_nanoseconds: 0, ..state };
+            }
         }
         state
     }
@@ -154,8 +157,11 @@ fn filesystem_identity(stats: &rustix::fs::StatFs) -> (String, u64, String) {
         .collect::<Vec<u8>>();
     let fstype = String::from_utf8_lossy(&name).into_owned();
     #[cfg(test)]
-    let fstype =
-        if COARSE_FILESYSTEM.with(std::cell::Cell::get) { "hfs".to_owned() } else { fstype };
+    let fstype = if COARSE_FILESYSTEM.with(|coarse| coarse.get().is_some()) {
+        "hfs".to_owned()
+    } else {
+        fstype
+    };
     (format!("{:?}", stats.f_fsid), u64::from(stats.f_flags), fstype)
 }
 
@@ -512,10 +518,10 @@ pub(crate) fn directory_acl_admits(
         return false;
     }
     // A changed state invalidates this verdict: the listing may predate an ACL grant. Child
-    // activity permits fresh evidence, never acceptance of the raced listing or cache hit.
+    // activity permits fresh evidence only on APFS, whose nanosecond ctime can prove stability.
     if DirectoryState::of(&after, role) != state {
         #[cfg(target_os = "macos")]
-        if directory_contents_changed(&before, &after) {
+        if key.is_some() && directory_contents_changed(&before, &after) {
             if let Some(listing) = listing {
                 return recheck_directory_listing(
                     operation, role, path, directory, expected, &listing,
@@ -919,8 +925,8 @@ thread_local! {
     static AFTER_LISTING: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
     static AFTER_INITIAL_STATE: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
     static BETWEEN_DIRECTORY_READS: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
-    /// Test-only HFS+ facts: coarse directory ctime and a filesystem ineligible for reuse.
-    static COARSE_FILESYSTEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only HFS+ facts: a chosen ctime second and a filesystem ineligible for reuse.
+    static COARSE_FILESYSTEM: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(all(target_os = "macos", test))]
@@ -1402,7 +1408,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     impl CoarseFilesystem {
         fn enter() -> Self {
-            COARSE_FILESYSTEM.with(|coarse| assert!(!coarse.replace(true)));
+            COARSE_FILESYSTEM.with(|coarse| assert!(coarse.replace(Some(1)).is_none()));
             Self
         }
     }
@@ -1410,7 +1416,74 @@ mod tests {
     #[cfg(target_os = "macos")]
     impl Drop for CoarseFilesystem {
         fn drop(&mut self) {
-            COARSE_FILESYSTEM.with(|coarse| coarse.set(false));
+            COARSE_FILESYSTEM.with(|coarse| coarse.set(None));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn coarse_ctime_child_races_cannot_recover_with_a_listing_that_hides_an_acl_grant() {
+        for scoped in [false, true] {
+            let root = fixture();
+            let path = root.path();
+            let directory = open(path);
+            let _coarse = CoarseFilesystem::enter();
+            let _scope = scoped.then(AdmissionScope::enter);
+            let changed_path = path.to_path_buf();
+            let hook = AfterListing {
+                path: changed_path.clone(),
+                action: Box::new(move || {
+                    let before = std::fs::symlink_metadata(&changed_path).expect("before child");
+                    let state = DirectoryState::of(&before, DirectoryRole::PrivateLeaf);
+                    std::fs::create_dir(changed_path.join("child")).expect("create child");
+                    // Cross one coarse ctime tick after the original listing, then freeze it.
+                    COARSE_FILESYSTEM.with(|coarse| coarse.set(Some(2)));
+                    let after = std::fs::symlink_metadata(&changed_path).expect("after child");
+                    assert!(directory_contents_changed(&before, &after));
+                    assert_ne!(
+                        state,
+                        DirectoryState::of(&after, DirectoryRole::PrivateLeaf),
+                        "the child change crosses a coarse ctime tick"
+                    );
+                    let grant_path = changed_path.clone();
+                    let grant = AfterListing {
+                        path: grant_path.clone(),
+                        action: Box::new(move || {
+                            let before = DirectoryState::of(
+                                &std::fs::symlink_metadata(&grant_path).expect("before grant"),
+                                DirectoryRole::PrivateLeaf,
+                            );
+                            edit_acl(&grant_path, "+a", "group:everyone allow read");
+                            assert_eq!(
+                                before,
+                                DirectoryState::of(
+                                    &std::fs::symlink_metadata(&grant_path).expect("after grant"),
+                                    DirectoryRole::PrivateLeaf,
+                                ),
+                                "a grant after the fresh listing is invisible within this tick"
+                            );
+                        }),
+                    };
+                    AFTER_LISTING.with(|slot| assert!(slot.borrow_mut().replace(grant).is_none()));
+                }),
+            };
+            AFTER_LISTING.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+            let operation = Operation::new();
+            let before = ls_spawn_count();
+            assert!(!judge(&operation, path, &directory), "coarse ctime cannot prove recovery");
+            assert_eq!(ls_spawn_count() - before, 1, "non-APFS races fail before a fresh listing");
+            AFTER_LISTING.with(|slot| assert!(slot.borrow().is_some(), "grant prevented"));
+            // Exercise the blocked interleaving: this fresh snapshot hides the subsequent grant,
+            // and the hook proves that coarse ctime cannot distinguish the two ACL states.
+            let text = run_acl_listing(path, operation.deadline()).expect("fresh listing");
+            assert!(crate::policy::macos_directory_listing_admits(&text, path.to_str().unwrap()));
+            AFTER_LISTING.with(|slot| assert!(slot.borrow().is_none(), "grant injected"));
+            assert!(!judge(&operation, path, &directory), "a new probe sees the grant");
+            assert!(operation.judged.borrow().is_empty());
+            if let Some(id) = operation.scope_id {
+                assert_eq!(scope::with_scope(id, |scope| scope.memo.is_empty()), Some(true));
+            }
+            edit_acl(path, "-a", "group:everyone allow read");
         }
     }
 
