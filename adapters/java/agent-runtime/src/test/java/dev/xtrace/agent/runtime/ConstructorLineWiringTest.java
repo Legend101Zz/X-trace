@@ -3,6 +3,7 @@ package dev.xtrace.agent.runtime;
 import static org.junit.jupiter.api.Assertions.*;
 
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
+import dev.xtrace.agent.bootstrap.MethodIdentity;
 import dev.xtrace.agent.runtime.line.MethodReport;
 import dev.xtrace.agent.runtime.line.ProbeEligibility;
 import dev.xtrace.agent.runtime.line.SiteRegistry;
@@ -39,6 +40,7 @@ class ConstructorLineWiringTest {
   private final FixtureInstrumentation.LineProbes probes =
       new FixtureInstrumentation.LineProbes(registry, limitations);
   private final Map<String, byte[]> definitions = new HashMap<>();
+  private final Map<String, java.util.Set<String>> methodSymbols = new HashMap<>();
   private Class<?> driver;
 
   @BeforeEach
@@ -73,6 +75,16 @@ class ConstructorLineWiringTest {
           .make().getBytes());
       SourceIdentity.observe(isolated, name.replace('.', '/'), original,
           List.of("src/test/java"), Path.of(System.getProperty("user.dir", ".")));
+      new ClassReader(original).accept(new ClassVisitor(Opcodes.ASM9) {
+        @Override
+        public MethodVisitor visitMethod(int access, String method, String descriptor,
+            String signature, String[] exceptions) {
+          String readable = name.substring(name.lastIndexOf('.') + 1) + "." + method;
+          methodSymbols.computeIfAbsent(readable, ignored -> new java.util.HashSet<>())
+              .add(MethodIdentity.symbol(name, method, descriptor));
+          return null;
+        }
+      }, ClassReader.SKIP_CODE);
     }
     driver = Class.forName(NAME, true, isolated);
     assertEquals(0, limitations.count());
@@ -118,7 +130,7 @@ class ConstructorLineWiringTest {
           assertEquals(event.getSymbol(), entry.getSymbol(), "never borrow the caller's boundary");
           assertTrue(entry.hasSource());
           assertEquals(entry.getSource().getPath(), event.getSource().getPath());
-          // Overloaded constructors share a symbol, but their observed source extents differ.
+          // Overloaded constructors have distinct identities and observed source extents.
           assertTrue(event.getSource().getStartLine() >= entry.getSource().getStartLine());
           assertTrue(event.getSource().getStartLine() <= entry.getSource().getEndLine());
         }
@@ -132,7 +144,11 @@ class ConstructorLineWiringTest {
   }
 
   private long count(List<RecordingEvent> events, RecordingEventKind kind, String symbol) {
-    return events.stream().filter(e -> e.getKind() == kind && e.getSymbol().equals(symbol)).count();
+    return events.stream().filter(e -> e.getKind() == kind && matches(e, symbol)).count();
+  }
+
+  private boolean matches(RecordingEvent event, String readable) {
+    return methodSymbols.getOrDefault(readable, java.util.Set.of()).contains(event.getSymbol());
   }
 
   private void assertGap(List<RecordingEvent> events) {
@@ -153,9 +169,9 @@ class ConstructorLineWiringTest {
     assertTrue(count(events, RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR, "ConstructorCases$Base.<init>") >= 2);
     assertTrue(count(events, RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR, "ConstructorCases.compute") > 0);
     var nested = events.stream().filter(e -> e.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER
-        && e.getSymbol().equals("ConstructorCases$Base.<init>")).toList().get(1);
+        && matches(e, "ConstructorCases$Base.<init>")).toList().get(1);
     assertTrue(events.stream().anyMatch(e -> e.getEventId().equals(nested.getParentEventId())
-        && e.getSymbol().equals("ConstructorCases$Chain.<init>")));
+        && matches(e, "ConstructorCases$Chain.<init>")));
   }
 
   @Test
@@ -188,7 +204,7 @@ class ConstructorLineWiringTest {
     Class<?> allocated = driver.getClassLoader().loadClass(NAME + "$AllocatedArgument");
     int delegationLine = SourceIdentity.lookup(allocated, "<init>", "()V").startLine();
     var cursors = events.stream().filter(e -> e.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR
-        && e.getSymbol().equals("ConstructorCases$AllocatedArgument.<init>")).toList();
+        && matches(e, "ConstructorCases$AllocatedArgument.<init>")).toList();
     assertFalse(cursors.isEmpty());
     assertTrue(cursors.stream().allMatch(e -> e.getSource().getStartLine() > delegationLine));
     assertEquals(2, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_EXIT, "ConstructorCases$Base.<init>"));
@@ -242,7 +258,7 @@ class ConstructorLineWiringTest {
     List<RecordingEvent> events = finish();
     assertGap(events);
     assertTrue(events.stream().noneMatch(e -> e.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR
-        && e.getSymbol().endsWith(".<clinit>")));
+        && e.getSymbol().contains(".<clinit>#m1:")));
     assertTrue(probes.reports().stream().anyMatch(r -> r.name().equals("<clinit>")
         && r.reason().equals(MethodReport.Reasons.INITIALIZER)));
   }

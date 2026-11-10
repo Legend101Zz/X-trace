@@ -11,7 +11,12 @@ package dev.xtrace.agent.bootstrap;
  * calls it before any other event of the same request.
  */
 public interface LineSink {
-  void line(String recordingId, String eventId, String parentEventId, int siteId, long monotonicNs);
+  /**
+   * Opens a cursor only when its site belongs to the accepted current method. False means that
+   * the cursor and its following values were withheld; the bridge counts the missing evidence.
+   */
+  boolean line(String recordingId, String eventId, String parentEventId, int siteId,
+      long monotonicNs, String methodIdentity);
 
   void valuesBegin(int siteId);
 

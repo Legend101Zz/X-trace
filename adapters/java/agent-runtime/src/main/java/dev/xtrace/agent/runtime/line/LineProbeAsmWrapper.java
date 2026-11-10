@@ -10,14 +10,15 @@ import net.bytebuddy.description.field.FieldList;
 import net.bytebuddy.description.method.MethodList;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.implementation.Implementation;
+import net.bytebuddy.jar.asm.ClassReader;
 import net.bytebuddy.jar.asm.ClassVisitor;
 import net.bytebuddy.jar.asm.ClassWriter;
 import net.bytebuddy.jar.asm.MethodVisitor;
 import net.bytebuddy.pool.TypePool;
 
 /**
- * Byte Buddy hook: {@code builder.visit(new LineProbeAsmWrapper(...))}. Adds {@code COMPUTE_MAXS}
- * to the writer flags (it never needs {@code COMPUTE_FRAMES}) and keeps existing stack map frames.
+ * Byte Buddy hook: {@code builder.visit(new LineProbeAsmWrapper(...))}. Rebuilds frames after
+ * inserting the skipped-entry guard. Expanded input also keeps composed advice in one frame format.
  */
 public class LineProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
   private final LineProbeConfig config;
@@ -63,18 +64,14 @@ public class LineProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
 
   @Override
   public int mergeWriter(int flags) {
-    // Only add COMPUTE_MAXS: this visitor works with or without a composed COMPUTE_FRAMES.
-    return flags | ClassWriter.COMPUTE_MAXS;
+    return flags | ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS;
   }
 
   @Override
   public int mergeReader(int flags) {
-    // Frames must reach the writer. The visitor handles compressed and expanded frames alike, so a
-    // composed Advice wrapper may keep EXPAND_FRAMES; only SKIP_FRAMES is removed.
-    // SKIP_DEBUG would hide the LineNumberTable and report a misleading no_line_table.
-    return flags
-        & ~(net.bytebuddy.jar.asm.ClassReader.SKIP_FRAMES
-            | net.bytebuddy.jar.asm.ClassReader.SKIP_DEBUG);
+    // The guard emits F_NEW. Mixing those with copied F_SAME/F_APPEND/F_CHOP corrupts ASM's
+    // offset bookkeeping. Do not rely on another wrapper (e.g. constructors) to expand frames.
+    return (flags | ClassReader.EXPAND_FRAMES) & ~(ClassReader.SKIP_FRAMES | ClassReader.SKIP_DEBUG);
   }
 
   /** Optional gap call, emitted inside a size-checked caller-side Throwable guard. */

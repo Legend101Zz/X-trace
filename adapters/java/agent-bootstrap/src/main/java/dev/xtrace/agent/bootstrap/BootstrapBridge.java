@@ -61,16 +61,28 @@ public final class BootstrapBridge {
         sink.lineIgnored();
         return;
       }
+      Frame current = context.frames.peek();
+      if (current == null || current.eventId.isEmpty()) {
+        // Queue capacity can recover before a pending cursor is flushed. Its missing entry must
+        // never be replaced with an ancestor's id, even when both methods have the same name.
+        context.dropped++;
+        sink.lineIgnored();
+        return;
+      }
       if (context.lineEvents >= MAX_LINE_EVENTS_PER_REQUEST) {
         context.lineDropped++;
         sink.lineIgnored();
         return;
       }
-      context.lineEvents++;
-      context.linePending = true;
-      sink.line(
-          context.recordingId, context.nextEventId(), context.currentParent(), siteId,
-          System.nanoTime());
+      if (sink.line(
+          context.recordingId, context.nextEventId(), current.eventId, siteId,
+          System.nanoTime(), current.symbol)) {
+        context.lineEvents++;
+        context.linePending = true;
+      } else {
+        context.dropped++;
+        sink.lineIgnored();
+      }
     } catch (Throwable ignored) {
       // fail open: a probe can never break application code
     }
@@ -208,15 +220,16 @@ public final class BootstrapBridge {
   }
 
   /**
-   * Emits a method boundary for an in-scope application class. The symbol is the simple class
-   * name plus the method name; source facts are resolved by the runtime from the declaring class,
-   * method name and descriptor, never from reflection on application objects.
+   * Emits a method boundary for an in-scope application class. Focused symbols include a hashed
+   * declaring-class/method/descriptor identity; source facts are resolved by the runtime,
+   * never from reflection on application objects. Standard capture keeps its readable symbols.
    */
   public static String frameEnter(Class<?> type, String method, String descriptor) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
     if (!captureActive(context) || sink == null || type == null || method == null) return null;
-    String symbol = simpleName(type.getName()) + "." + method;
+    String symbol = LINE_SINK.get() == null ? simpleName(type.getName()) + "." + method
+        : MethodIdentity.symbol(type.getName(), method, descriptor);
     if (!validSymbol(symbol)) return null;
     flushLine(context);
     String eventId = context.nextEventId();

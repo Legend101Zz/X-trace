@@ -1,6 +1,7 @@
 package dev.xtrace.agent.runtime;
 
 import dev.xtrace.agent.bootstrap.LineSink;
+import dev.xtrace.agent.bootstrap.MethodIdentity;
 import dev.xtrace.agent.runtime.line.SiteRegistry;
 import dev.xtrace.agent.runtime.line.ValueSanitizer;
 import dev.xtrace.agent.runtime.line.ValueSanitizer.Limits;
@@ -53,8 +54,8 @@ final class LineProbeBridgeSink implements LineSink {
   }
 
   @Override
-  public void line(
-      String recordingId, String eventId, String parentEventId, int siteId, long monotonicNs) {
+  public boolean line(String recordingId, String eventId, String parentEventId, int siteId,
+      long monotonicNs, String methodIdentity) {
     flush();
     Pending p = pending.get();
     p.active = true;
@@ -64,9 +65,16 @@ final class LineProbeBridgeSink implements LineSink {
     p.eventId = eventId;
     p.parentEventId = parentEventId;
     p.siteId = siteId;
+    SiteRegistry.Site site = registry.site(siteId);
+    p.symbol = site == null ? null : MethodIdentity.symbol(
+        site.classInternalName().replace('/', '.'), site.method(), site.descriptor());
     p.monotonicNs = monotonicNs;
     p.values.clear();
     p.previewBytes = 0;
+    if (p.symbol != null && p.symbol.equals(methodIdentity)) return true;
+    p.active = false;
+    lineIgnored();
+    return false;
   }
 
   @Override
@@ -137,11 +145,8 @@ final class LineProbeBridgeSink implements LineSink {
       withoutSource.incrementAndGet();
       return;
     }
-    String binary = site.classInternalName().replace('/', '.');
-    int dot = binary.lastIndexOf('.');
-    String symbol = (dot < 0 ? binary : binary.substring(dot + 1)) + "." + site.method();
     if (!events.offerLineEvent(
-        p.recordingId, p.eventId, p.parentEventId, symbol, p.monotonicNs, source, p.values)) {
+        p.recordingId, p.eventId, p.parentEventId, p.symbol, p.monotonicNs, source, p.values)) {
       rejected.incrementAndGet();
     }
   }
@@ -177,6 +182,7 @@ final class LineProbeBridgeSink implements LineSink {
     String recordingId;
     String eventId;
     String parentEventId;
+    String symbol;
     int siteId;
     long monotonicNs;
     int previewBytes;
