@@ -927,9 +927,14 @@ class FocusedProbeAccountingTest {
             new BoundedProbeAsmWrapper(broken, ignored -> limitations.report())))
         .makeRaw();
     assertTrue(BootstrapBridge.requestStart("GET", "/open-frame-failure"));
-    assertNull(transformer.transform(loader, name.replace('.', '/'), null, null, original),
-        "a failed frame computation must keep the JVM's original input bytes");
+    // makeRaw notifies the listener, then throws. The JVM ignores transformer exceptions and
+    // keeps the input bytes; a direct Java call must assert that exception rather than null.
+    var rejected = assertThrows(IllegalStateException.class,
+        () -> transformer.transform(loader, name.replace('.', '/'), null, null, original));
+    assertEquals("Failed transformation of " + name, rejected.getMessage());
     assertNotNull(failure.get());
+    assertSame(failure.get(), rejected.getCause());
+    assertInstanceOf(NegativeArraySizeException.class, failure.get());
     assertTrue(java.util.Arrays.stream(failure.get().getStackTrace())
         .anyMatch(frame -> frame.getClassName().equals("net.bytebuddy.jar.asm.MethodWriter")
             && frame.getMethodName().equals("computeAllFrames")),
@@ -962,15 +967,19 @@ class FocusedProbeAccountingTest {
     var listener = new FixtureInstrumentation.SafeListener(
         () -> fail("ordinary application failure must preserve the runtime"),
         new ApplicationScope(List.of("demo.probe"), List.of()), limitations);
+    var transformationFailure = new IllegalStateException("transformation failed");
     var transformer = new AgentBuilder.Default().with(listener)
         .type((type, definingLoader, module, redefined, domain) -> {
           listener.observeScope(definingLoader, type.getName(), domain);
           return type.getName().equals(name);
         })
         .transform((builder, type, definingLoader, module, domain) -> {
-          throw new IllegalStateException("transformation failed");
+          throw transformationFailure;
         }).makeRaw();
-    assertNull(transformer.transform(loader, name.replace('.', '/'), null, null, bytes));
+    var rejected = assertThrows(IllegalStateException.class,
+        () -> transformer.transform(loader, name.replace('.', '/'), null, null, bytes));
+    assertEquals("Failed transformation of " + name, rejected.getMessage());
+    assertSame(transformationFailure, rejected.getCause());
     Class<?> type = loader.define(bytes);
     Object instance = type.getConstructor().newInstance();
     assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));

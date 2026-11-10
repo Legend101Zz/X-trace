@@ -65,9 +65,13 @@ final class BoundedProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
     };
     // Advice otherwise emits placeholder maxima when ASM will compute them. Our decision must
     // precede that computation: request real composed bounds while the final writer keeps its
-    // original computation flags. Advice also retains the frames needed by an original fallback.
+    // original computation flags. Expanded frames are for intermediate advice only; the final
+    // writer ignores them and recomputes frames for either the candidate or the original fallback.
     int measuredFlags = writerFlags & ~(ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES);
-    ClassVisitor instrumented = probes.wrap(type, destination, context, pool, fields, methods,
+    // Byte Buddy's instrumentable method list excludes synthetic lambda bodies by default.
+    // The raw line visitor still sees them: supply the declared methods so their eligible
+    // boundary advice runs too. ProbeEligibility continues to exclude bridges and other synthetics.
+    ClassVisitor instrumented = probes.wrap(type, destination, context, pool, fields, type.getDeclaredMethods(),
         measuredFlags, readerFlags);
     return new ClassVisitor(Opcodes.ASM9, instrumented) {
       @Override

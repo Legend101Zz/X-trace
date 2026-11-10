@@ -264,6 +264,35 @@ class ConstructorLineWiringTest {
   }
 
   @Test
+  void constructorWrapperRebuildsFramesWithoutTheLineOrBoundedWrapper() throws Exception {
+    String name = NAME + "$BodyThrow";
+    ClassLoader parent = getClass().getClassLoader();
+    var locator = ClassFileLocator.ForClassLoader.of(parent);
+    byte[] transformed = new ByteBuddy()
+        .redefine(TypePool.Default.of(parent).describe(name).resolve(), locator)
+        // A preceding wrapper must not prevent expanded input from reaching the constructor.
+        .visit(new net.bytebuddy.asm.AsmVisitorWrapper.ForDeclaredMethods()
+            .readerFlags(ClassReader.SKIP_FRAMES))
+        .visit(new ConstructorProbeAsmWrapper())
+        .make().getBytes();
+    Class<?> type = new ClassLoader(parent) {
+      Class<?> define() { return defineClass(name, transformed, 0, transformed.length); }
+    }.define();
+    var constructor = type.getConstructor(boolean.class, long.class);
+    assertTrue(BootstrapBridge.requestStart("GET", "/constructor-frames"));
+    Object normal = constructor.newInstance(false, -3L);
+    assertEquals(1, type.getField("value").get(normal));
+    var failure = assertThrows(InvocationTargetException.class,
+        () -> constructor.newInstance(true, 3L));
+    assertSame(demo.probe.ConstructorCases.BODY_FAILURE, failure.getCause());
+    List<RecordingEvent> events = finish();
+    assertGap(events);
+    assertEquals(2, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER, "ConstructorCases$BodyThrow.<init>"));
+    assertEquals(1, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_EXIT, "ConstructorCases$BodyThrow.<init>"));
+    assertEquals(1, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_THROW, "ConstructorCases$BodyThrow.<init>"));
+  }
+
+  @Test
   void everyExecutableWithLineProbesAlsoHasItsOwnBoundaryAndExit() {
     for (var definition : definitions.entrySet()) {
       new ClassReader(definition.getValue()).accept(new ClassVisitor(Opcodes.ASM9) {
