@@ -67,6 +67,102 @@ mod published_reads {
     }
 
     #[test]
+    fn first_journal_creation_cannot_overtake_a_published_read() {
+        use rustix::fs::{FlockOperation, flock};
+
+        for kind in [ReadKind::List, ReadKind::Show, ReadKind::Unmatched] {
+            let fixture = on_disk_store("published-first-tail");
+            let project = ProjectId::new();
+            insert_project(&fixture.store, project);
+            let first = request(project, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let second = request(project, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("writer view");
+            view.begin_recording(&first).expect("first recording");
+            assert!(!fixture.root.join("journals").exists());
+            let reader_store = SqliteStore::open(
+                &fixture.database,
+                OpenOptions::default().with_must_exist(true).with_read_only(true),
+            )
+            .expect("independent read-only connection");
+            let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+            let (published_tx, published_rx) = std::sync::mpsc::channel();
+            let recording = first.recording_id;
+            std::thread::scope(|scope| {
+                let root = fixture.root.clone();
+                let reader = scope.spawn(move || {
+                    let hook_root = root.clone();
+                    recording_journal::AFTER_DIRECTORY_LOOKUP.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            assert!(
+                                !hook_root.join("journals").exists(),
+                                "reader creates no files"
+                            );
+                            paused_tx.send(()).expect("directory lookup before SQLite snapshot");
+                            resume_rx.recv().expect("resume snapshot");
+                        }));
+                    });
+                    let view = reader_store.recording_store(&root).expect("reader view");
+                    assert_prefix(&view, project, recording, kind, 0, 1, None);
+                    recording_journal::AFTER_DIRECTORY_LOOKUP.with(|hook| {
+                        hook.borrow_mut().take();
+                    });
+                });
+                paused_rx.recv().expect("reader observed no journals");
+                let writer = scope.spawn(|| {
+                    let directory =
+                        xtrace_private_storage::open_private_directory_descriptor(&fixture.root)
+                            .expect("project descriptor");
+                    let probe = flock(&directory, FlockOperation::NonBlockingLockExclusive);
+                    let blocked = probe == Err(rustix::io::Errno::WOULDBLOCK);
+                    if !blocked {
+                        probe.expect("creation lock probe");
+                    }
+                    drop(directory);
+                    probe_tx.send(blocked).expect("observed creation guard");
+                    view.journal_tail(&journal_request(project, recording, &[2, 3]), 0, &mut None)
+                        .expect("first acknowledged tail");
+                    view.begin_recording(&second).expect("recording after first tail");
+                    published_tx.send(()).expect("tail and second recording published");
+                });
+                let blocked = probe_rx.recv().expect("writer probed creation lock");
+                if !blocked {
+                    // Reproduce the old race without sleeps: publish A's tail,
+                    // then B's SQLite row before the reader pins SQLite.
+                    published_rx.recv().expect("writer overtakes unguarded read");
+                }
+                resume_tx.send(()).expect("reader may pin SQLite");
+                reader.join().expect("consistent prefix before first journal");
+                writer.join().expect("writer completes after reader");
+                assert!(blocked, "first creation must wait for {kind:?}'s publication guard");
+            });
+            let rows = view.list_recording_metadata(project, None, 10).expect("next list").0;
+            assert_eq!(rows.len(), 2);
+            let first_row = rows
+                .iter()
+                .find(|row| row.recording_id == first.recording_id)
+                .expect("first recording retained");
+            assert_eq!(first_row.event_count, "2");
+            assert_eq!(first_row.incomplete_evidence, ["durable_tail_pending:2..3"]);
+            let second_row = rows
+                .iter()
+                .find(|row| row.recording_id == second.recording_id)
+                .expect("second recording retained");
+            assert_eq!(second_row.event_count, "0");
+            assert_prefix(
+                &view,
+                project,
+                first.recording_id,
+                ReadKind::Show,
+                0,
+                3,
+                Some("durable_tail_pending:2..3"),
+            );
+        }
+    }
+
+    #[test]
     fn list_and_show_interleave_with_each_durable_publication_step() {
         for (phase, sealed, last, pending) in [
             ("journal-checkpoint-before-sync", 0, 3, Some("durable_tail_pending:2..3")),

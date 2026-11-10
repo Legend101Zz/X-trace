@@ -1659,7 +1659,7 @@ mod tests {
         assert!(first.honesty.recording.frames_with_gap.is_none());
         assert_eq!(first.events.len(), 1);
         assert_eq!(first.events[0].sequence, "2");
-        assert_eq!(first.events[0].kind, "request_update");
+        assert_eq!(first.events[0].kind, "recording_event_kind:request_update");
         assert_eq!(first.events[0].symbol.as_deref(), Some("http.request POST /owners/new"));
         assert!(first.events[0].frame_id.is_none());
         assert!(first.events[0].line.is_none());
@@ -1709,7 +1709,59 @@ mod tests {
         assert_eq!(complete.status, RecordingStatus::Complete);
         assert_eq!(complete.completion, RecordingCompletionEvidence::Complete);
         assert_eq!(complete.events.len(), 2);
+        assert_eq!(complete.events[0].kind, first.events[0].kind);
+        assert_eq!(complete.events[1].kind, second.events[0].kind);
         assert!(complete.incomplete_evidence.is_empty());
+    }
+
+    #[test]
+    fn journal_and_recovered_event_kinds_keep_the_persisted_namespace() {
+        use xtrace_application::recording_queries::RecordingEventWindow;
+
+        let (directory, store, project) = fixture();
+        let persistence =
+            Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
+        let capture = RecordingCaptureService::new(
+            persistence,
+            SegmentPolicy::default(),
+            std::num::NonZeroUsize::new(1).expect("retention"),
+        );
+        let anchor = begin(project.id(), RecordingId::new());
+        capture.begin_recording(anchor.clone()).expect("begin");
+        let mut events = vec![event(2, "request"), event(3, "enter")];
+        for (event, kind) in events.iter_mut().zip([K_REQUEST_UPDATE, K_ENTER]) {
+            event.payload.event.as_mut().expect("event").kind = kind;
+            event.canonical_bytes = event.payload.encode_to_vec();
+        }
+        capture
+            .record_events(RecordEvents { recording_id: anchor.recording_id, events })
+            .expect("acknowledge unfinished batch");
+        let reader = SqliteRecordingReader::new(store.clone(), directory.path());
+        let request = ShowWindowRequest {
+            project_id: project.id(),
+            recording_id: anchor.recording_id,
+            limit: 10,
+            after_sequence: None,
+        };
+        let live = reader.show_recording(&request).expect("journal events");
+        let kinds = |window: &RecordingEventWindow| {
+            window.events.iter().map(|event| event.kind.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds(&live),
+            ["recording_event_kind:request_update", "recording_event_kind:frame_enter"]
+        );
+        assert_eq!(live.segment_count, "0");
+        drop(capture);
+        assert_eq!(
+            SqliteRecordingPersistence::new(store, directory.path())
+                .finish_recording(&FinishRecording::without_digest(anchor.recording_id, 3))
+                .expect("recover acknowledged journal"),
+            RecordingCompletion::Partial,
+        );
+        let recovered = reader.show_recording(&request).expect("sealed recovered events");
+        assert_eq!(recovered.segment_count, "1");
+        assert_eq!(kinds(&recovered), kinds(&live));
     }
 
     #[test]

@@ -31,6 +31,7 @@ thread_local! {
     pub(super) static SNAPSHOT_CONTENDED: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static BEFORE_PUBLICATION: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static BEFORE_CLEANUP: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static AFTER_DIRECTORY_LOOKUP: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     static CHECKPOINT_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JOURNAL_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COUNT_ONLY_SYNCS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -60,11 +61,11 @@ pub(super) fn snapshot_lock(
     Ok(lock)
 }
 
-// Lock the admitted journals directory itself: its inode survives checkpoint
-// replacement and tail cleanup, and read-only clients need not create a lock
-// file (including for journals written by older versions). This briefly
-// coordinates all journals in a project. Always take the process-local lock
-// first, and release both locks before syncing append data or decoding events.
+// Lock admitted directory inodes: the project root coordinates first journals
+// creation; the journals directory survives checkpoint replacement and cleanup.
+// Read-only clients need not create a lock file, including for older journals.
+// Take a per-recording lock, if needed, before the journals flock, and release
+// mutation locks before syncing append data or decoding events.
 // Each call opens its own descriptor; closing it releases only this flock.
 #[cfg(unix)]
 fn snapshot_file_lock(
@@ -233,6 +234,10 @@ fn directory(
         if std::fs::symlink_metadata(binding.root.join("journals")).is_ok() {
             return root.open_private_child("journals").map(Some).map_err(|_| object_io_error(id));
         }
+        // A reader that found no journals retains a shared parent lock through
+        // its SQLite snapshot. Creation must wait until that read completes.
+        #[cfg(unix)]
+        let _creation = snapshot_file_lock(&root, true, id)?;
         let child =
             root.open_or_create_private_child("journals").map_err(|_| object_io_error(id))?;
         // Each cold writer syncs this parent before acknowledging. In
@@ -382,11 +387,13 @@ fn load_for_retry(
 /// transaction. Seals may commit meanwhile, but their old tails cannot be
 /// removed or replaced until every row and tail has been copied. Do not take a
 /// per-recording lock inside this guard: a writer may hold it while waiting on
-/// our directory flock. The flock alone also covers independent processes.
+/// our directory flock. When journals do not exist, retain the project-root
+/// flock instead so first creation cannot overtake the SQLite snapshot.
+/// These flocks also cover independent processes.
 pub(super) struct PublishedRead {
     root: Option<AdmittedPrivateRoot>,
     #[cfg(unix)]
-    _file_snapshot: Option<std::fs::File>,
+    _file_snapshot: std::fs::File,
 }
 
 impl PublishedRead {
@@ -394,10 +401,20 @@ impl PublishedRead {
         view: &SqliteRecordingStore<'_>,
         id: CorrelationId,
     ) -> Result<Self, RecordingStoreError> {
-        let root = directory(&view.binding, false, id)?;
         #[cfg(unix)]
-        let file_snapshot =
-            root.as_ref().map(|root| snapshot_file_lock(root, false, id)).transpose()?;
+        let creation_snapshot = snapshot_file_lock(&view.binding.private_root, false, id)?;
+        let root = directory(&view.binding, false, id)?;
+        #[cfg(test)]
+        AFTER_DIRECTORY_LOOKUP.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook();
+            }
+        });
+        #[cfg(unix)]
+        let file_snapshot = match &root {
+            Some(root) => snapshot_file_lock(root, false, id)?,
+            None => creation_snapshot,
+        };
         Ok(Self {
             root,
             #[cfg(unix)]
