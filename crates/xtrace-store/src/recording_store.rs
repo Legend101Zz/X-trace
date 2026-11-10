@@ -43,6 +43,24 @@ use crate::error::{StoreError, StoreErrorKind};
 
 #[path = "recording_journal.rs"]
 pub(crate) mod recording_journal;
+
+#[cfg(test)]
+type CommitObserver = Option<Box<dyn Fn(&str)>>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_READ_SNAPSHOT: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    static COMMIT_OBSERVER: std::cell::RefCell<CommitObserver> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_read_snapshot() {
+    AFTER_READ_SNAPSHOT.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
+}
 #[path = "recording_limitations.rs"]
 mod recording_limitations;
 use crate::xtf::{
@@ -457,8 +475,12 @@ impl SqliteRecordingStore<'_> {
     ) -> Result<(Vec<ObservedRecordingRecord>, bool), RecordingStoreError> {
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
+        let published = recording_journal::PublishedRead::new(self, correlation_id)?;
         let connection =
             self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        let connection = connection.unchecked_transaction().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         if !project_exists(&connection, project_id, correlation_id)? {
             return Err(read_not_found_error(correlation_id));
         }
@@ -519,7 +541,10 @@ impl SqliteRecordingStore<'_> {
         while let Some(row) = rows.next().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })? {
-            let metadata = recording_metadata_from_row(row, &connection, self, correlation_id)?;
+            #[cfg(test)]
+            after_read_snapshot();
+            let metadata =
+                recording_metadata_from_row(row, &connection, &published, correlation_id)?;
             observed_recording_id_from_bytes(
                 metadata.recording_id.as_uuid().as_bytes(),
                 correlation_id,
@@ -601,8 +626,12 @@ impl SqliteRecordingStore<'_> {
     ) -> Result<(Vec<RecordingMetadata>, bool), RecordingStoreError> {
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
+        let published = recording_journal::PublishedRead::new(self, correlation_id)?;
         let connection =
             self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        let connection = connection.unchecked_transaction().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         if !project_exists(&connection, project_id, correlation_id)? {
             return Err(read_not_found_error(correlation_id));
         }
@@ -665,7 +694,14 @@ impl SqliteRecordingStore<'_> {
         while let Some(row) = rows.next().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })? {
-            recordings.push(recording_metadata_from_row(row, &connection, self, correlation_id)?);
+            #[cfg(test)]
+            after_read_snapshot();
+            recordings.push(recording_metadata_from_row(
+                row,
+                &connection,
+                &published,
+                correlation_id,
+            )?);
         }
         let has_more = recordings.len() > usize::try_from(limit).unwrap_or(usize::MAX);
         if has_more {
@@ -688,6 +724,9 @@ impl SqliteRecordingStore<'_> {
         self.binding.revalidate(correlation_id)?;
         let connection =
             self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        let connection = connection.unchecked_transaction().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         let row: Option<(Vec<u8>, String)> = connection
             .query_row(
                 "SELECT project_id, status FROM recordings WHERE recording_id = ?1",
@@ -704,6 +743,8 @@ impl SqliteRecordingStore<'_> {
         if project_id_from_bytes(&raw_project_id, correlation_id)? != project_id {
             return Err(read_not_found_error(correlation_id));
         }
+        #[cfg(test)]
+        after_read_snapshot();
         let completion = completion_evidence(&connection, recording_id, &status, correlation_id)?;
         let Some(frame) =
             load_indexed_frame_by_id(&connection, recording_id, frame_id, correlation_id)?
@@ -750,8 +791,14 @@ impl SqliteRecordingStore<'_> {
     ) -> Result<RecordingEventWindow, RecordingStoreError> {
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
+        let published = recording_journal::PublishedRead::new(self, correlation_id)?;
         let connection =
             self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        // Keep lifecycle, terminal proof, segments and frame index on one WAL
+        // snapshot. Journal publication is already pinned before its first read.
+        let connection = connection.unchecked_transaction().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         let row: Option<(Vec<u8>, String)> = connection
             .query_row(
                 "SELECT project_id, status FROM recordings WHERE recording_id = ?1",
@@ -769,6 +816,8 @@ impl SqliteRecordingStore<'_> {
         if stored_project_id != request.project_id {
             return Err(read_not_found_error(correlation_id));
         }
+        #[cfg(test)]
+        after_read_snapshot();
         let lifecycle_status = recording_status(&status, correlation_id)?;
         let completion =
             completion_evidence(&connection, request.recording_id, &status, correlation_id)?;
@@ -823,10 +872,10 @@ impl SqliteRecordingStore<'_> {
             }
         };
 
-        // Read the checkpoint before the segment snapshot: publication commits the
-        // segment before removing its journal. Thus a concurrent publication can
-        // overlap these snapshots, but cannot hide the acknowledged prefix from both.
-        let journal = self.journal_events(stored_project_id, request.recording_id)?;
+        let journal = published.events(stored_project_id, request.recording_id)?;
+        // Tail bytes are owned and the SQLite transaction pins the matching
+        // sealed prefix. Release publication before object decoding/projection.
+        drop(published);
         let mut statement = connection
             .prepare(
                 "SELECT segment_ordinal, object_hash, first_recording_seq, last_recording_seq, \
@@ -4903,6 +4952,11 @@ fn commit_failpoint(
     correlation_id: CorrelationId,
     atomic_boundary: bool,
 ) -> Result<(), RecordingStoreError> {
+    COMMIT_OBSERVER.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(point);
+        }
+    });
     let injected = COMMIT_FAILPOINT.with(|configured| *configured.borrow() == Some(point));
     if injected {
         COMMIT_FAILPOINT_FIRED.with(|fired| fired.set(true));
@@ -5437,7 +5491,7 @@ fn session_context(
 fn recording_metadata_from_row(
     row: &rusqlite::Row<'_>,
     connection: &rusqlite::Connection,
-    view: &SqliteRecordingStore<'_>,
+    published: &recording_journal::PublishedRead,
     correlation_id: CorrelationId,
 ) -> Result<RecordingMetadata, RecordingStoreError> {
     let raw_id: Vec<u8> = row.get(0).map_err(|error| {
@@ -5474,7 +5528,7 @@ fn recording_metadata_from_row(
         .map(|value| decode_stored_sequence(value, correlation_id))
         .transpose()?
         .unwrap_or(1);
-    let journal = view.journal_summary(recording_id, sealed_last)?;
+    let journal = published.summary(recording_id, sealed_last)?;
     let mut incomplete_evidence = match lifecycle_status {
         RecordingStatus::Partial | RecordingStatus::Invalid => {
             vec![format!("persisted_status:{status}")]
@@ -5734,6 +5788,7 @@ fn map_store_error(error: StoreError, correlation_id: CorrelationId) -> Recordin
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
 mod tests {
+    include!("recording_published_read_tests.rs");
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
