@@ -1342,7 +1342,11 @@ mod tests {
     }
 
     fn fixture() -> tempfile::TempDir {
-        tempfile::tempdir().expect("fixture directory")
+        // tempfile defaults to 0777 & !umask; public admission requires a 0700 leaf.
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("fixture directory")
     }
 
     #[cfg(target_os = "macos")]
@@ -1651,6 +1655,36 @@ mod tests {
             assert!(!judge(&operation, &path, &directory));
             assert_linux_hooks_consumed();
             assert!(operation.judged.borrow().is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_private_io_fixture_does_not_depend_on_the_runner_umask() {
+        let executable = std::env::current_exe().expect("test executable");
+        for mask in ["000", "022", "077"] {
+            // umask belongs to the process: change it only in a child, never under parallel
+            // tests. Reuse both metadata/ACL hooks and every private-I/O assertion below.
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", "umask \"$1\"; shift; exec \"$@\"", "private-fixture", mask])
+                .arg(&executable)
+                .args([
+                    "--exact",
+                    "probe::tests::linux_private_io_and_sync_survive_sibling_activity_in_an_ancestor",
+                    "--nocapture",
+                ])
+                .output()
+                .expect("run sibling-activity regression with a controlled umask");
+            assert!(
+                output.status.success(),
+                "private fixture must work with umask {mask}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "the exact sibling-activity test must run, rather than matching zero tests"
+            );
         }
     }
 
