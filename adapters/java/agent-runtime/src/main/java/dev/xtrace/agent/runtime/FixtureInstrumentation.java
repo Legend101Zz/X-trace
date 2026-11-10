@@ -3,6 +3,7 @@ package dev.xtrace.agent.runtime;
 import static net.bytebuddy.matcher.ElementMatchers.isAbstract;
 import static net.bytebuddy.matcher.ElementMatchers.isAnnotatedWith;
 import static net.bytebuddy.matcher.ElementMatchers.isBridge;
+import static net.bytebuddy.matcher.ElementMatchers.isConstructor;
 import static net.bytebuddy.matcher.ElementMatchers.isMethod;
 import static net.bytebuddy.matcher.ElementMatchers.isNative;
 import static net.bytebuddy.matcher.ElementMatchers.isSynthetic;
@@ -216,13 +217,24 @@ final class FixtureInstrumentation {
   static net.bytebuddy.asm.AsmVisitorWrapper applicationProbes(
       ClassLoader loader, LineProbes lines, CaptureLimitations limitations) {
     Set<String> omitted = new java.util.HashSet<>();
-    return boundedProbes(lines == null ? null : lines.wrapper(loader, omitted), limitations, omitted);
+    return boundedProbes(lines == null ? null : lines.wrapper(loader, omitted), limitations, omitted,
+        gapOwnerAvailable(loader));
   }
 
   static net.bytebuddy.asm.AsmVisitorWrapper boundedProbes(
       net.bytebuddy.asm.AsmVisitorWrapper lines, CaptureLimitations limitations, Set<String> omitted) {
+    return boundedProbes(lines, limitations, omitted, true);
+  }
+
+  private static net.bytebuddy.asm.AsmVisitorWrapper boundedProbes(
+      net.bytebuddy.asm.AsmVisitorWrapper lines, CaptureLimitations limitations, Set<String> omitted,
+      boolean constructorOwnerAvailable) {
     net.bytebuddy.asm.AsmVisitorWrapper frames =
-        Advice.to(FrameAdvice.class).on(frameMethods(lines != null));
+        Advice.to(FrameAdvice.class).on(frameMethods(lines != null).and(not(isConstructor())));
+    if (lines != null && constructorOwnerAvailable) {
+      frames = new net.bytebuddy.asm.AsmVisitorWrapper.Compound(
+          frames, new ConstructorProbeAsmWrapper());
+    }
     return new BoundedProbeAsmWrapper(
         lines == null ? frames : new net.bytebuddy.asm.AsmVisitorWrapper.Compound(frames, lines),
         key -> {
@@ -306,15 +318,23 @@ final class FixtureInstrumentation {
     }
   }
 
-  /** Do not trust a child loader's same-named bridge, or a bridge without the gap entry point. */
+  /** Do not trust a shadow bridge or one missing the gap and constructor entry points. */
   static boolean gapOwnerAvailable(ClassLoader loader) {
     try {
       Class<?> owner = Class.forName(PROBE_OWNER.replace('/', '.'), false, loader);
       if (owner != BootstrapBridge.class) return false;
       java.lang.reflect.Method gap = owner.getDeclaredMethod("lineGap");
+      java.lang.reflect.Method enter = owner.getDeclaredMethod("constructorEnter", Class.class, String.class);
+      java.lang.reflect.Method exit = owner.getDeclaredMethod("constructorExit", String.class, Throwable.class);
       return java.lang.reflect.Modifier.isPublic(gap.getModifiers())
           && java.lang.reflect.Modifier.isStatic(gap.getModifiers())
-          && gap.getReturnType() == void.class;
+          && gap.getReturnType() == void.class
+          && java.lang.reflect.Modifier.isPublic(enter.getModifiers())
+          && java.lang.reflect.Modifier.isStatic(enter.getModifiers())
+          && enter.getReturnType() == String.class
+          && java.lang.reflect.Modifier.isPublic(exit.getModifiers())
+          && java.lang.reflect.Modifier.isStatic(exit.getModifiers())
+          && exit.getReturnType() == void.class;
     } catch (Throwable unavailable) {
       return false;
     }
@@ -453,12 +473,12 @@ final class FixtureInstrumentation {
   /** Focused cursors need their own method parent, including accessors and lambda bodies. */
   static net.bytebuddy.matcher.ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription>
       frameMethods(boolean focused) {
+    if (focused) return dev.xtrace.agent.runtime.line.ProbeEligibility.focused();
     var executable = isMethod()
         .and(not(isSynthetic()).or(nameStartsWith("lambda$")))
         .and(not(isBridge()))
         .and(not(isAbstract()))
         .and(not(isNative()));
-    if (focused) return executable;
     return executable
         .and(not(isSynthetic()))
         .and(not(nameStartsWith("lambda$")))

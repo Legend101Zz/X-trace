@@ -554,6 +554,76 @@ class FocusedProbeAccountingTest {
     assertPersistedPartial(1);
   }
 
+  @Test
+  void nearLimitConstructorCodeBudgetsTheWholeBodyBoundaryAndPreservesTheClass() throws Exception {
+    assertLimitedConstructor("ConstructorCodeLimit", 65_530, 0, 0);
+  }
+
+  @Test
+  void nearLimitConstructorLocalsBudgetTheBoundaryAndPreserveTheClass() throws Exception {
+    assertLimitedConstructor("ConstructorLocalLimit", 0, 0, 65_535);
+  }
+
+  @Test
+  void fullConstructorExceptionTableBudgetsTheUnwindHandlerAndPreservesTheClass() throws Exception {
+    assertLimitedConstructor("ConstructorHandlerLimit", 0, 65_535, 0);
+  }
+
+  private void assertLimitedConstructor(String simpleName, int nops, int handlers, int locals) throws Exception {
+    String name = "demo.probe." + simpleName;
+    ClassWriter bytes = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+    bytes.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, name.replace('.', '/'), null, "java/lang/Object", null);
+    MethodVisitor constructor = bytes.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
+    constructor.visitCode();
+    constructor.visitVarInsn(Opcodes.ALOAD, 0);
+    constructor.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+    Label start = new Label();
+    Label end = new Label();
+    Label handler = new Label();
+    for (int i = 0; i < handlers; i++) constructor.visitTryCatchBlock(start, end, handler, "java/lang/Throwable");
+    constructor.visitLabel(start);
+    constructor.visitLineNumber(1, start);
+    for (int i = 0; i < nops; i++) constructor.visitInsn(Opcodes.NOP);
+    if (locals > 0) {
+      constructor.visitInsn(Opcodes.ICONST_0);
+      constructor.visitVarInsn(Opcodes.ISTORE, locals - 1);
+    }
+    constructor.visitInsn(Opcodes.RETURN);
+    if (handlers > 0) {
+      constructor.visitLabel(end);
+      constructor.visitLabel(handler);
+      constructor.visitInsn(Opcodes.POP);
+      constructor.visitInsn(Opcodes.RETURN);
+    }
+    constructor.visitMaxs(0, 0);
+    constructor.visitEnd();
+    MethodVisitor healthy = bytes.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "healthy", "()I", null, null);
+    healthy.visitCode();
+    Label line = new Label();
+    healthy.visitLabel(line);
+    healthy.visitLineNumber(2, line);
+    healthy.visitInsn(Opcodes.ICONST_3);
+    healthy.visitInsn(Opcodes.IRETURN);
+    healthy.visitMaxs(0, 0);
+    healthy.visitEnd();
+    bytes.visitEnd();
+
+    Class<?> type = load(name, bytes.toByteArray());
+    assertEquals(0, probeCalls(type, "<init>", "()V", "line"));
+    assertEquals(0, probeCalls(type, "<init>", "()V", "constructorEnter"));
+    assertEquals(0, probeCalls(type, "<init>", "()V", "lineGap"));
+    assertEquals(1, probeCalls(type, "healthy", "()I", "frameEnter"));
+    assertEquals(1, probeCalls(type, "healthy", "()I", "line"));
+    assertTrue(probes.reports().stream().anyMatch(report -> report.name().equals("<init>")
+        && report.reason().equals(MethodReport.Reasons.TOO_LARGE)));
+    assertTrue(limitations.count() > 0);
+    assertTrue(BootstrapBridge.requestStart("GET", "/constructor-limit"));
+    assertNotNull(type.getConstructor().newInstance());
+    assertEquals(3, type.getMethod("healthy").invoke(null));
+    BootstrapBridge.requestEnd(200, false);
+    assertPersistedPartial(1);
+  }
+
   private void assertLimitedMethodAndHealthySibling(Class<?> type) throws Exception {
     assertEquals(1, probeCalls(type, "healthy", "()I", "line"));
     assertEquals(1, probeCalls(type, "healthy", "()I", "frameEnter"));
@@ -743,6 +813,22 @@ class FocusedProbeAccountingTest {
     Object instance = type.getConstructor().newInstance();
     assertTrue(BootstrapBridge.requestStart("POST", "/filtered-loader"));
     assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+    BootstrapBridge.requestEnd(200, false);
+    assertPersistedPartial(1);
+  }
+
+  @Test
+  void constructorBodyIsPreservedWhenItsDefiningLoaderCannotResolveTheBoundaryOwner() throws Exception {
+    String name = "demo.probe.CursorParents";
+    byte[] bytes = ClassFileLocator.ForClassLoader.of(getClass().getClassLoader()).locate(name).resolve();
+    Class<?> type = load(name, bytes, null, true);
+    assertEquals(0, probeCalls(type, "<init>", "()V", "constructorEnter"));
+    assertEquals(0, probeCalls(type, "<init>", "()V", "lineGap"));
+    assertEquals(0, probeCalls(type, "<init>", "()V", "line"));
+    assertTrue(limitations.count() > 0);
+    assertTrue(BootstrapBridge.requestStart("GET", "/constructor-owner"));
+    Object instance = type.getConstructor().newInstance();
+    assertEquals("initial", type.getMethod("getName").invoke(instance));
     BootstrapBridge.requestEnd(200, false);
     assertPersistedPartial(1);
   }
