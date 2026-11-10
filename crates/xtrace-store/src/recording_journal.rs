@@ -266,6 +266,9 @@ fn read_boundary(
     match std::fs::symlink_metadata(root.path().join(&name)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(object_io_error(id)),
+        Ok(metadata) if metadata.len() != BOUNDARY_BYTES as u64 => {
+            return Err(object_corrupt_error(id));
+        }
         Ok(_) => {}
     }
     let bytes = root.read_bounded_file(&name, BOUNDARY_BYTES).map_err(|_| object_io_error(id))?;
@@ -366,29 +369,113 @@ fn load_for_retry(
 ) -> Result<Option<Tail>, RecordingStoreError> {
     let Some(root) = directory(binding, false, id)? else { return Ok(None) };
     let lock = snapshot_lock(&root, recording_id, id)?;
-    let (boundary, bytes) = {
+    let snapshot = {
         let _snapshot = lock.read().map_err(|_| object_io_error(id))?;
         #[cfg(unix)]
         let _file_snapshot = snapshot_file_lock(&root, false, id)?;
-        let boundary = read_boundary(&root, recording_id, id)?;
-        #[cfg(test)]
-        AFTER_BOUNDARY.with(|hook| {
-            if let Some(hook) = hook.borrow().as_ref() {
-                hook();
-            }
-        });
-        let name = name(recording_id);
-        match std::fs::symlink_metadata(root.path().join(&name)) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && boundary.is_none() => {
-                return Ok(None);
-            }
-            Err(_) => return Err(object_io_error(id)),
-            Ok(_) => {}
-        }
-        let bytes =
-            root.read_bounded_file(&name, MAX_JOURNAL_BYTES).map_err(|_| object_io_error(id))?;
-        (boundary, bytes)
+        read_snapshot_files(&root, recording_id, id)?
     };
+    decode_snapshot(snapshot, recording_id, id, include_pending)
+}
+
+/// Pins journal publication before the caller establishes its SQLite read
+/// transaction. Seals may commit meanwhile, but their old tails cannot be
+/// removed or replaced until every row and tail has been copied. Do not take a
+/// per-recording lock inside this guard: a writer may hold it while waiting on
+/// our directory flock. The flock alone also covers independent processes.
+pub(super) struct PublishedRead {
+    root: Option<AdmittedPrivateRoot>,
+    #[cfg(unix)]
+    _file_snapshot: Option<std::fs::File>,
+}
+
+impl PublishedRead {
+    pub(super) fn new(
+        view: &SqliteRecordingStore<'_>,
+        id: CorrelationId,
+    ) -> Result<Self, RecordingStoreError> {
+        let root = directory(&view.binding, false, id)?;
+        #[cfg(unix)]
+        let file_snapshot =
+            root.as_ref().map(|root| snapshot_file_lock(root, false, id)).transpose()?;
+        Ok(Self {
+            root,
+            #[cfg(unix)]
+            _file_snapshot: file_snapshot,
+        })
+    }
+
+    fn load(
+        &self,
+        recording_id: RecordingId,
+        id: CorrelationId,
+    ) -> Result<Option<Tail>, RecordingStoreError> {
+        let Some(root) = &self.root else { return Ok(None) };
+        decode_snapshot(read_snapshot_files(root, recording_id, id)?, recording_id, id, false)
+    }
+
+    pub(super) fn events(
+        &self,
+        project_id: ProjectId,
+        recording_id: RecordingId,
+    ) -> Result<Option<(u32, Vec<XtfEventEnvelope>)>, RecordingStoreError> {
+        let id = CorrelationId::new();
+        let Some(tail) = self.load(recording_id, id)? else { return Ok(None) };
+        if tail.project_id != project_id {
+            return Err(object_corrupt_error(id));
+        }
+        Ok(Some((tail.ordinal, tail.events)))
+    }
+
+    pub(super) fn summary(
+        &self,
+        recording_id: RecordingId,
+        sealed_last: u64,
+    ) -> Result<Option<(u64, u64, u64)>, RecordingStoreError> {
+        summarize(self.load(recording_id, CorrelationId::new())?, sealed_last)
+    }
+}
+
+type SnapshotFiles = Option<(Option<Vec<u8>>, Vec<u8>)>;
+
+fn read_snapshot_files(
+    root: &AdmittedPrivateRoot,
+    recording_id: RecordingId,
+    id: CorrelationId,
+) -> Result<SnapshotFiles, RecordingStoreError> {
+    let boundary = read_boundary(root, recording_id, id)?;
+    #[cfg(test)]
+    AFTER_BOUNDARY.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
+    let name = name(recording_id);
+    match std::fs::symlink_metadata(root.path().join(&name)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && boundary.is_none() => {
+            return Ok(None);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(object_corrupt_error(id));
+        }
+        Err(_) => return Err(object_io_error(id)),
+        Ok(metadata) if metadata.len() > MAX_JOURNAL_BYTES as u64 => {
+            return Err(object_corrupt_error(id));
+        }
+        Ok(_) => {}
+    }
+    let bytes =
+        root.read_bounded_file(&name, MAX_JOURNAL_BYTES).map_err(|_| object_io_error(id))?;
+    Ok(Some((boundary, bytes)))
+}
+
+fn decode_snapshot(
+    snapshot: SnapshotFiles,
+    recording_id: RecordingId,
+    id: CorrelationId,
+    include_pending: bool,
+) -> Result<Option<Tail>, RecordingStoreError> {
+    let Some((boundary, bytes)) = snapshot else { return Ok(None) };
     #[cfg(test)]
     AFTER_SNAPSHOT_READS.with(|hook| {
         if let Some(hook) = hook.borrow().as_ref() {
@@ -891,44 +978,38 @@ impl SqliteRecordingStore<'_> {
         self.clear_journal(recording_id)
     }
 
-    /// A verified checkpoint snapshot, taken before opening the segment-row snapshot.
-    pub(crate) fn journal_events(
-        &self,
-        project_id: ProjectId,
-        recording_id: RecordingId,
-    ) -> Result<Option<(u32, Vec<XtfEventEnvelope>)>, RecordingStoreError> {
-        let id = CorrelationId::new();
-        let Some(tail) = load(&self.binding, recording_id, id)? else { return Ok(None) };
-        if tail.project_id != project_id {
-            return Err(object_corrupt_error(id));
-        }
-        Ok(Some((tail.ordinal, tail.events)))
-    }
-
     /// Journal events beyond the sealed prefix, for truthful lifecycle metadata.
+    #[cfg(test)]
     pub(crate) fn journal_summary(
         &self,
         recording_id: RecordingId,
         sealed_last: u64,
     ) -> Result<Option<(u64, u64, u64)>, RecordingStoreError> {
-        let id = CorrelationId::new();
-        let Some(tail) = load(&self.binding, recording_id, id)? else { return Ok(None) };
-        let mut sequences = tail
-            .events
-            .iter()
-            .filter_map(|envelope| envelope.event.as_ref())
-            .map(|event| event.recording_seq)
-            .filter(|sequence| *sequence > sealed_last);
-        let Some(first) = sequences.next() else { return Ok(None) };
-        let mut last = first;
-        let mut count = 1;
-        for sequence in sequences {
-            last = sequence;
-            count += 1;
-        }
-        if sealed_last.checked_add(1) != Some(first) {
-            return Err(object_corrupt_error(id));
-        }
-        Ok(Some((first, last, count)))
+        summarize(load(&self.binding, recording_id, CorrelationId::new())?, sealed_last)
     }
+}
+
+fn summarize(
+    tail: Option<Tail>,
+    sealed_last: u64,
+) -> Result<Option<(u64, u64, u64)>, RecordingStoreError> {
+    let id = CorrelationId::new();
+    let Some(tail) = tail else { return Ok(None) };
+    let mut sequences = tail
+        .events
+        .iter()
+        .filter_map(|envelope| envelope.event.as_ref())
+        .map(|event| event.recording_seq)
+        .filter(|sequence| *sequence > sealed_last);
+    let Some(first) = sequences.next() else { return Ok(None) };
+    let mut last = first;
+    let mut count = 1;
+    for sequence in sequences {
+        last = sequence;
+        count += 1;
+    }
+    if sealed_last.checked_add(1) != Some(first) {
+        return Err(object_corrupt_error(id));
+    }
+    Ok(Some((first, last, count)))
 }

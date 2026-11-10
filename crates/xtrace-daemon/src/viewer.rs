@@ -1819,7 +1819,12 @@ mod tests {
             _after: Option<RecordingId>,
             _limit: u32,
         ) -> Result<(Vec<RecordingMetadata>, bool), PortError> {
-            Ok((Vec::new(), false))
+            match self.observed_error {
+                Some(kind) => {
+                    Err(PortError::new(kind, "PRIVATE_DATABASE_CANARY", CorrelationId::new()))
+                }
+                None => Ok((Vec::new(), false)),
+            }
         }
 
         fn show_recording(
@@ -1827,7 +1832,7 @@ mod tests {
             _request: &ShowWindowRequest,
         ) -> Result<RecordingEventWindow, PortError> {
             Err(PortError::new(
-                PortErrorKind::NotFound,
+                self.observed_error.unwrap_or(PortErrorKind::NotFound),
                 "recording was not found",
                 CorrelationId::new(),
             ))
@@ -2933,6 +2938,217 @@ mod tests {
         assert!(!response.contains("/fixture/repo"));
         let _ = viewer.shutdown.send(());
         viewer.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recording_failures_have_stable_codes_and_request_ids_in_problem_json() {
+        for (kind, status, code) in [
+            (PortErrorKind::Transport, "500", "XTR-PORT-TRANSPORT"),
+            (PortErrorKind::Internal, "500", "XTR-PORT-INTERNAL"),
+            (PortErrorKind::Compatibility, "500", "XTR-PORT-COMPATIBILITY"),
+            (PortErrorKind::Conflict, "500", "XTR-PORT-CONFLICT"),
+            (PortErrorKind::Corruption, "422", "XTR-PORT-CORRUPTION"),
+        ] {
+            let viewer = start_with(ReadFixture::failing(kind)).await;
+            let cookie = authenticate(&viewer).await;
+            for path in [
+                "/api/v1/recordings".to_owned(),
+                format!("/api/v1/recordings/{}", RecordingId::new()),
+            ] {
+                let raw = format!(
+                    "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                    request_headers(&viewer.host, &viewer.origin)
+                );
+                let response = request(&viewer.host, &raw).await;
+                assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{response}");
+                let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+                let body: serde_json::Value = serde_json::from_str(body).expect("problem JSON");
+                assert_eq!(body["code"], code);
+                assert_eq!(body["status"].as_u64(), status.parse::<u64>().ok());
+                let request_id = body["requestId"].as_str().expect("request id");
+                assert!(request_id.parse::<CorrelationId>().is_ok());
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains(&format!("x-xtrace-request-id: {request_id}"))
+                );
+                assert!(headers.contains("application/problem+json"));
+                assert!(!response.contains("PRIVATE_DATABASE_CANARY"));
+            }
+            let _ = viewer.shutdown.send(());
+            viewer.task.await.expect("viewer task").expect("serve");
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_query_worker_failure_has_a_stable_problem_code() {
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(ReadFixture::default()),
+            ObservedEndpointQueryService::new(ReadFixture::default()),
+            ProjectId::new(),
+        )
+        .await
+        .expect("viewer state");
+        let request_id = CorrelationId::new();
+        let response = run_recording_query::<(), _, _>(&bound.state, request_id, || {
+            std::panic::resume_unwind(Box::new("PRIVATE_QUERY_PANIC_CANARY"))
+        })
+        .await
+        .expect_err("worker panic is contained");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()["x-xtrace-request-id"], request_id.to_string());
+        let body = axum::body::to_bytes(response.into_body(), 2048).await.expect("problem body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+        assert_eq!(body["code"], "XTR-VIEWER-QUERY-FAILED");
+        assert_eq!(body["requestId"], request_id.to_string());
+        assert!(!body.to_string().contains("PRIVATE_QUERY_PANIC_CANARY"));
+    }
+
+    #[tokio::test]
+    async fn recording_http_reads_follow_published_tails_and_seals_and_report_real_corruption() {
+        use prost::Message as _;
+        use xtrace_application::recording::{AcceptedRecordingEvent, PersistRecordingSegment};
+        use xtrace_protocol::generated::agent::{RecordingEvent, RecordingEventKind};
+        use xtrace_protocol::xtf::XtfEventEnvelope;
+
+        let fixture = crate::session_health_tests::HealthFixture::new();
+        fixture.begin();
+        let persistence = fixture.persistence();
+        let reader = SqliteRecordingReader::new(fixture.store.clone(), fixture.root.path());
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(reader.clone()),
+            ObservedEndpointQueryService::new(reader),
+            fixture.project_id,
+        )
+        .await
+        .expect("viewer");
+        let ready = bound.readiness();
+        let query_lane = bound.state.query_lane.clone();
+        let token = ready.url.rsplit_once("token=").expect("token").1.to_owned();
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(bound.serve(async move {
+            let _ = receiver.await;
+        }));
+        let viewer = RunningViewer {
+            host: ready.origin.strip_prefix("http://").expect("origin").to_owned(),
+            origin: ready.origin,
+            token,
+            observed_calls: Arc::default(),
+            query_lane,
+            shutdown,
+            task,
+        };
+        let cookie = authenticate(&viewer).await;
+        let event = |sequence, kind| {
+            let payload = XtfEventEnvelope {
+                recording_seq: sequence,
+                event: Some(RecordingEvent {
+                    event_id: format!("event-{sequence}"),
+                    recording_seq: sequence,
+                    monotonic_ns: sequence,
+                    kind: kind as i32,
+                    parent_event_id: if sequence == 3 { "event-2".into() } else { String::new() },
+                    ..Default::default()
+                }),
+            };
+            AcceptedRecordingEvent {
+                recording_seq: sequence,
+                monotonic_ns: sequence,
+                priority: 0,
+                canonical_bytes: payload.encode_to_vec(),
+                payload,
+            }
+        };
+        let mut segment = PersistRecordingSegment {
+            project_id: fixture.project_id,
+            recording_id: fixture.recording_id,
+            segment_ordinal: 0,
+            events: Vec::new(),
+        };
+        for phase in 0..5 {
+            let (count, sealed, pending) = match phase {
+                0 => (0, 0, None),
+                1 => {
+                    segment.events.push(event(2, RecordingEventKind::FrameEnter));
+                    persistence.persist_tail(&segment, 0).expect("first checkpoint");
+                    (1, 0, Some("durable_tail_pending:2..2"))
+                }
+                2 => {
+                    segment.events = vec![event(3, RecordingEventKind::FrameExit)];
+                    persistence.persist_tail(&segment, 1).expect("checkpoint replacement");
+                    (2, 0, Some("durable_tail_pending:2..3"))
+                }
+                3 => {
+                    segment.events.insert(0, event(2, RecordingEventKind::FrameEnter));
+                    persistence.persist_segment(&segment).expect("seal and cleanup");
+                    (2, 1, None)
+                }
+                _ => {
+                    segment.segment_ordinal = 1;
+                    segment.events = vec![event(4, RecordingEventKind::FrameEnter)];
+                    persistence.persist_tail(&segment, 0).expect("next tail");
+                    (3, 1, Some("durable_tail_pending:4..4"))
+                }
+            };
+            for (path, detail) in [
+                ("/api/v1/recordings".to_owned(), false),
+                (format!("/api/v1/recordings/{}", fixture.recording_id), true),
+            ] {
+                let raw = format!(
+                    "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                    request_headers(&viewer.host, &viewer.origin)
+                );
+                let response = request(&viewer.host, &raw).await;
+                assert!(response.starts_with("HTTP/1.1 200"), "phase {phase}: {response}");
+                let body: serde_json::Value =
+                    serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1)
+                        .expect("JSON");
+                let row = if detail { &body } else { &body["recordings"][0] };
+                assert_eq!(row["status"], "recording");
+                assert_eq!(row["completion"], "unavailable");
+                assert_eq!(row["segmentCount"], sealed.to_string());
+                assert_eq!(
+                    row["incompleteEvidence"],
+                    serde_json::json!(pending.into_iter().collect::<Vec<_>>())
+                );
+                if detail {
+                    assert_eq!(row["events"].as_array().expect("events").len(), count);
+                    assert_eq!(
+                        row["events"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|event| event["sequence"].as_str().unwrap())
+                            .collect::<Vec<_>>(),
+                        (2..count + 2).map(|sequence| sequence.to_string()).collect::<Vec<_>>()
+                    );
+                } else {
+                    assert_eq!(row["eventCount"], count.to_string());
+                }
+            }
+        }
+        let tail =
+            fixture.root.path().join("journals").join(format!("{}.tail", fixture.recording_id));
+        let mut bytes = std::fs::read(&tail).expect("acknowledged journal");
+        *bytes.last_mut().expect("digest byte") ^= 1;
+        std::fs::write(tail, bytes).expect("corrupt acknowledged digest");
+        for path in [
+            "/api/v1/recordings".to_owned(),
+            format!("/api/v1/recordings/{}", fixture.recording_id),
+        ] {
+            let raw = format!(
+                "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            );
+            let response = request(&viewer.host, &raw).await;
+            assert!(response.starts_with("HTTP/1.1 422"), "{response}");
+            let body: serde_json::Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1)
+                    .expect("problem JSON");
+            assert_eq!(body["code"], "XTR-PORT-CORRUPTION");
+        }
+        let _ = viewer.shutdown.send(());
+        viewer.task.await.expect("viewer task").expect("serve");
     }
 
     async fn health_api_evidence(count: Option<u64>, partial: bool) {
