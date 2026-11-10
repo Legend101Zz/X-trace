@@ -143,6 +143,27 @@ class CiPullRequestTests(unittest.TestCase):
                     self.assertNotEqual(run_check(), 0)
             results[job]["result"] = "success"
 
+    def test_private_storage_ci_feature_and_channels_stay_out_of_packaging(self):
+        manifest = (ROOT / "crates/xtrace-private-storage/Cargo.toml").read_text()
+        self.assertRegex(manifest, r"(?m)^ci-diagnostics = \[\]$")
+        default = re.search(r"(?m)^default\s*=\s*\[([^]]*)\]", manifest)
+        self.assertNotIn("ci-diagnostics", default[1] if default else "")
+        package = (ROOT / "packaging/build.py").read_text()
+        self.assertIn('["cargo", "build", "--release", "--locked", "-p", "xtrace-cli"]', package)
+        self.assertNotIn("ci-diagnostics", package)
+        jobs = self.workflow["jobs"]
+        gates = jobs["gates"]["steps"]
+        tests = next(step for step in gates if step.get("name") == "Unit and integration tests")
+        self.assertEqual(tests["env"]["XTRACE_CI_DIAG_DIR"], "${{ runner.temp }}/xt/frag/ci-diag")
+        self.assertIn("cargo test --locked --workspace --all-features --no-fail-fast", tests["run"])
+        scratch = next(step for step in gates if step.get("name") == "Admit private test scratch before cargo tests")
+        self.assertIn('"$root/frag/ci-diag"', scratch["run"])
+        floor = jobs["release-floor-linux-x86_64"]["steps"]
+        run = next(step for step in floor if step.get("name") == "Run all 23 pinned release gates")
+        self.assertEqual(run["env"]["XTRACE_CI_DIAG_DIR"], "${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/ci-diag")
+        admission = next(step for step in floor if step.get("name") == "Admit private logs, leases, caches, and test scratch before writes")
+        self.assertIn('mkdir -m 700 "$XTRACE_CI_PRIVATE_ROOT/frag" "$XTRACE_CI_PRIVATE_ROOT/frag/ci-diag"', admission["run"])
+
 
 class MacosWorkflowTests(unittest.TestCase):
     @classmethod
@@ -218,6 +239,18 @@ class MacosWorkflowTests(unittest.TestCase):
         uploads = [s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@")]
         self.assertEqual([s["with"]["path"] for s in uploads],
                          ["${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json"])
+
+    def test_rust_diagnostics_use_private_fragment_storage_and_test_only_feature(self):
+        steps = self.workflow["jobs"]["macos-arm64"]["steps"]
+        rust = next(step for step in steps if step.get("name") == "cargo test (locked workspace, no ignored tests)")
+        self.assertEqual(rust["env"]["XTRACE_CI_DIAG_DIR"], "${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag")
+        self.assertIn("cargo test --locked --workspace --all-features --no-fail-fast", rust["run"])
+        for step in steps:
+            if "packaging/build.py" in step.get("run", ""):
+                self.assertNotIn("XTRACE_CI_DIAG_DIR", step.get("env", {}))
+                self.assertNotIn("ci-diagnostics", step["run"])
+        upload = next(step for step in steps if step.get("uses", "").startswith("actions/upload-artifact@"))
+        self.assertEqual(upload["with"]["path"], "${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json")
 
     def test_store_measurements_reach_the_uploaded_rust_fragment_on_success_and_timeout(self):
         steps = self.workflow["jobs"]["macos-arm64"]["steps"]
