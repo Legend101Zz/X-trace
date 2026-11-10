@@ -122,12 +122,24 @@ fn assert_readable(fx: &Fixture, recording_id: RecordingId, recovered: bool) {
         }
     );
     assert!(window.duration_ns.is_none(), "no finish duration was observed");
+    assert_eq!(window.events.len(), 2);
+    assert!(!window.has_more);
+    assert_eq!(window.events[0].sequence, "2");
+    assert_eq!(window.events[1].sequence, "3");
+    assert_eq!(window.events[0].event_id.as_deref(), Some("unfinished-enter"));
+    assert_eq!(window.events[1].event_id.as_deref(), Some("unfinished-child"));
+    assert_eq!(window.events[1].parent_event_id.as_deref(), Some("unfinished-enter"));
+    for event in &window.events {
+        assert_eq!(event.kind, "recording_event_kind:frame_enter");
+        assert!(event.line.is_none(), "entry alone observes no active line");
+    }
     if !recovered {
         assert_eq!(window.segment_count, "0");
-        assert!(window.events.is_empty(), "the durable journal is projected on recovery");
-        assert!(
-            window.incomplete_evidence.iter().any(|reason| reason == "durable_tail_pending:2..3")
-        );
+        assert_eq!(window.incomplete_evidence, ["durable_tail_pending:2..3"]);
+        for event in &window.events {
+            assert!(event.frame_id.is_none(), "journal events have no persisted frame index");
+            assert!(event.parent_frame_id.is_none(), "parent event ids do not invent frame ids");
+        }
         let (recordings, _) = reader
             .list_recordings(fx.project_id.parse().expect("project id"), None, 10)
             .expect("journal-aware recovery metadata");
@@ -142,12 +154,8 @@ fn assert_readable(fx: &Fixture, recording_id: RecordingId, recovered: bool) {
         return;
     }
     assert_eq!(window.segment_count, "1");
-    assert_eq!(window.events.len(), 2);
-    assert_eq!(window.events[0].sequence, "2");
-    assert_eq!(window.events[1].sequence, "3");
-    assert_eq!(window.events[0].event_id.as_deref(), Some("unfinished-enter"));
-    assert_eq!(window.events[1].event_id.as_deref(), Some("unfinished-child"));
     assert!(window.events[0].frame_id.is_some());
+    assert!(window.events[1].frame_id.is_some());
     assert_eq!(window.events[1].parent_frame_id, window.events[0].frame_id);
 }
 
@@ -169,6 +177,28 @@ fn stop_while_a_request_is_open_recovers_its_acknowledged_events_as_partial() {
     assert_eq!(shown["completion"], "partial");
     assert_eq!(shown["events"].as_array().expect("events").len(), 2);
     drop(client);
+}
+
+#[test]
+fn acknowledged_unfinished_batch_survives_a_running_daemon_restart() {
+    let fx = fixture();
+    let started = fx.ok_json(&["record"]);
+    let pid = fx.track(started["pid"].as_u64().expect("daemon pid"));
+    let bootstrap = Path::new(started["bootstrap_path"].as_str().expect("bootstrap"));
+    let (client, recording_id) = unfinished_client(bootstrap);
+    assert_readable(&fx, recording_id, false);
+    let restarted = fx.ok_json(&["restart"]);
+    assert_eq!(restarted["previously_running"], true);
+    assert_recovery(&restarted["stopped"], recording_id);
+    assert!(!pid_alive(pid), "restart releases the previous daemon before recovery");
+    fx.track(restarted["started"]["pid"].as_u64().expect("restarted daemon pid"));
+    assert_readable(&fx, recording_id, true);
+    let shown = fx.ok_json(&["recording", "show", &recording_id.to_string()]);
+    assert_eq!(shown["status"], "partial");
+    assert_eq!(shown["completion"], "partial");
+    assert_eq!(shown["events"].as_array().expect("events").len(), 2);
+    drop(client);
+    fx.ok_json(&["stop"]);
 }
 
 #[test]
