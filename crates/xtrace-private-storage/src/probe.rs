@@ -18,6 +18,9 @@
 //! descriptor and named path and requires their complete states to equal the lookup state,
 //! including ctime; an identity check alone cannot detect an ACL edit. A change fails admission
 //! closed. Fresh probes apply the same checks across the listing, including batch fallbacks.
+//! A directory content change can invalidate a fresh listing without changing its ACL. In that
+//! case admission requires another listing with identical ACL entries and an unchanged state
+//! across that listing, under the original deadline. The raced verdict is never cached.
 //! Only positive, unchanged verdicts are stored, and each memo is bounded to 1024 entries.
 //! This does not defend against root forging filesystem metadata, or changes after the final
 //! state read; the capability's later uses still revalidate it.
@@ -55,7 +58,7 @@ const ACL_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 #[cfg(target_os = "macos")]
 const ACL_PROBE_CLEANUP_BUDGET: Duration = Duration::from_millis(100);
 
-/// Complete observable state of a directory, as read from its opened descriptor.
+/// State that invalidates an ACL verdict, for either a directory or a regular file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DirectoryState {
     device: u64,
@@ -277,7 +280,7 @@ impl Operation {
     /// Takes the one batched listing this operation (or its scope) may take, when `path` is on
     /// the registered walk. Returns whether a batch is now held.
     ///
-    /// The listings are not verdicts. `prefetched_verdict` uses one only for a directory whose
+    /// The listings are not verdicts. `prefetched_listing` uses one only for a directory whose
     /// opened descriptor reports the listing's inode and a ctime that is older than the moment
     /// the listing was taken, which proves the directory has not been modified since (a chmod,
     /// ACL edit or child change all advance ctime) and is the object that was listed. Otherwise
@@ -413,18 +416,50 @@ pub(crate) fn directory_probe_count() -> usize {
     DIRECTORY_PROBES.with(std::cell::Cell::get)
 }
 
-fn directory_is_expected(
+#[cfg(test)]
+fn record_directory_probe(path: &Path) {
+    DIRECTORY_PROBES.with(|count| count.set(count.get() + 1));
+    PROBED_PATHS.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
+}
+
+fn directory_metadata(
+    operation: &Operation,
     path: &Path,
+    directory: &File,
     expected: FileIdentity,
-    opened: &std::fs::Metadata,
     role: DirectoryRole,
-) -> bool {
-    let Ok(named) = std::fs::symlink_metadata(path) else { return false };
-    !named.file_type().is_symlink()
-        && named.is_dir()
-        && expected.same_directory(FileIdentity::from_metadata(&named))
-        && expected.same_directory(FileIdentity::from_metadata(opened))
-        && DirectoryState::of(&named, role) == DirectoryState::of(opened, role)
+) -> Option<std::fs::Metadata> {
+    loop {
+        if operation.expired() {
+            return None;
+        }
+        let opened = directory.metadata().ok()?;
+        #[cfg(all(target_os = "macos", test))]
+        run_directory_read_hook(path);
+        let named = std::fs::symlink_metadata(path).ok()?;
+        if !named.is_dir()
+            || !opened.is_dir()
+            || !expected.same_directory(FileIdentity::from_metadata(&named))
+            || !expected.same_directory(FileIdentity::from_metadata(&opened))
+        {
+            return None;
+        }
+        if DirectoryState::of(&named, role) == DirectoryState::of(&opened, role) {
+            return Some(opened);
+        }
+        // No verdict has been used yet. Obtain a matching descriptor/path snapshot if child
+        // activity raced these two reads; an ACL-only change still fails closed.
+        if cfg!(target_os = "macos") && directory_contents_changed(&opened, &named) {
+            continue;
+        }
+        return None;
+    }
+}
+
+/// mtime is only a reason to obtain fresh evidence, never proof that an ACL stayed unchanged.
+fn directory_contents_changed(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    (before.mtime(), before.mtime_nsec()) != (after.mtime(), after.mtime_nsec())
 }
 
 /// Judges a directory's ACL for `role`, with bounded APFS verdict reuse.
@@ -441,45 +476,106 @@ pub(crate) fn directory_acl_admits(
     if operation.expired() {
         return false;
     }
-    let Ok(before) = directory.metadata() else { return false };
-    if !directory_is_expected(path, expected, &before, role) {
+    let Some(before) = directory_metadata(operation, path, directory, expected, role) else {
         return false;
-    }
+    };
     let state = DirectoryState::of(&before, role);
     let key = operation.directory_key(state, directory);
     #[cfg(all(target_os = "macos", test))]
     run_initial_state_hook(path);
     let remembered =
         key.as_ref().is_some_and(|key| operation.already_judged(key) || operation.scope_has(key));
+    #[cfg(target_os = "macos")]
+    let mut listing = None;
     if !remembered {
         #[cfg(test)]
-        {
-            DIRECTORY_PROBES.with(|count| count.set(count.get() + 1));
-            PROBED_PATHS.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
-        }
-        if !probe_directory(operation, role, path, directory) {
+        record_directory_probe(path);
+        #[cfg(target_os = "macos")]
+        let admitted = {
+            listing = probe_directory(operation, path, directory);
+            listing.is_some()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let admitted = probe_directory(operation, role, path, directory);
+        if !admitted {
             return false;
         }
     }
-    let Ok(after) = directory.metadata() else { return false };
-    if operation.expired() || !directory_is_expected(path, expected, &after, role) {
+    let Some(after) = directory_metadata(operation, path, directory, expected, role) else {
+        return false;
+    };
+    if operation.expired()
+        || key
+            .as_ref()
+            .is_some_and(|key| operation.directory_key(state, directory).as_ref() != Some(key))
+    {
         return false;
     }
-    // A changed state invalidates admission itself, not just memoization: the listing may
-    // predate an ACL grant. Even an unrelated child change must fail closed.
+    // A changed state invalidates this verdict: the listing may predate an ACL grant. Child
+    // activity permits fresh evidence, never acceptance of the raced listing or cache hit.
     if DirectoryState::of(&after, role) != state {
+        #[cfg(target_os = "macos")]
+        if directory_contents_changed(&before, &after) {
+            if let Some(listing) = listing {
+                return recheck_directory_listing(
+                    operation, role, path, directory, expected, &listing,
+                ) && operation.directory_key(state, directory) == key
+                    && !operation.expired();
+            }
+        }
         return false;
     }
     if let Some(key) = key {
-        if operation.directory_key(state, directory).as_ref() != Some(&key) {
-            return false;
-        }
         if !remembered {
             operation.scope_remember(key.clone());
             operation.remember(key);
         }
     }
     true
+}
+
+/// Replace a listing raced by child activity with stable evidence. Comparing the ACL entries
+/// also refuses a deny-only ACL edit accompanied by a child change. Nothing on this path earns
+/// a memo; the original state was invalidated. Continuous mutation exhausts the same deadline.
+#[cfg(target_os = "macos")]
+fn recheck_directory_listing(
+    operation: &Operation,
+    role: DirectoryRole,
+    path: &Path,
+    directory: &File,
+    expected: FileIdentity,
+    original: &str,
+) -> bool {
+    loop {
+        let Some(before) = directory_metadata(operation, path, directory, expected, role) else {
+            return false;
+        };
+        let state = DirectoryState::of(&before, role);
+        let key = operation.directory_key(state, directory);
+        // A new single-operand listing is required; the batch predates the content change.
+        #[cfg(test)]
+        record_directory_probe(path);
+        let Some(text) = run_acl_listing(path, operation.deadline()) else { return false };
+        if !path
+            .to_str()
+            .is_some_and(|expected| crate::policy::macos_directory_listing_admits(&text, expected))
+            || !original.lines().skip(1).eq(text.lines().skip(1))
+        {
+            return false;
+        }
+        let Some(after) = directory_metadata(operation, path, directory, expected, role) else {
+            return false;
+        };
+        if operation.directory_key(state, directory) != key || operation.expired() {
+            return false;
+        }
+        if DirectoryState::of(&after, role) == state {
+            return true;
+        }
+        if !directory_contents_changed(&before, &after) {
+            return false;
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -514,24 +610,19 @@ fn probe_directory(
 }
 
 #[cfg(target_os = "macos")]
-fn probe_directory(
-    operation: &Operation,
-    _role: DirectoryRole,
-    path: &Path,
-    directory: &File,
-) -> bool {
-    if let Some(verdict) = prefetched_verdict(operation, path, directory) {
-        return verdict;
-    }
+fn probe_directory(operation: &Operation, path: &Path, directory: &File) -> Option<String> {
     // Lazy batch: taken only now that a directory on the walk missed the memo.
-    if operation.spawn_batch_for(path) {
-        if let Some(verdict) = prefetched_verdict(operation, path, directory) {
-            return verdict;
-        }
-    }
-    let Some(text) = run_acl_listing(path, operation.deadline()) else { return false };
+    let text = prefetched_listing(operation, path, directory)
+        .or_else(|| {
+            operation
+                .spawn_batch_for(path)
+                .then(|| prefetched_listing(operation, path, directory))
+                .flatten()
+        })
+        .or_else(|| run_acl_listing(path, operation.deadline()))?;
     path.to_str()
         .is_some_and(|expected| crate::policy::macos_directory_listing_admits(&text, expected))
+        .then_some(text)
 }
 
 /// A ctime must be at least this much older than the batched listing to be trusted.
@@ -578,17 +669,17 @@ fn batch_entry_describes(
 /// that listing provably describes it. Directories modified recently (busy ones) and
 /// directories the batch does not cover return `None` and are probed on their own.
 #[cfg(target_os = "macos")]
-fn prefetched_verdict(operation: &Operation, path: &Path, directory: &File) -> Option<bool> {
+fn prefetched_listing(operation: &Operation, path: &Path, directory: &File) -> Option<String> {
     let from_scope = operation.scope_id.and_then(|id| {
         scope::with_scope(id, |state| {
-            state.batch.as_ref().and_then(|batch| verdict_from_batch(batch, path, directory))
+            state.batch.as_ref().and_then(|batch| listing_from_batch(batch, path, directory))
         })
     });
     if let Some(Some(verdict)) = from_scope {
         return Some(verdict);
     }
     let own = operation.prefetched.borrow();
-    own.as_ref().and_then(|batch| verdict_from_batch(batch, path, directory))
+    own.as_ref().and_then(|batch| listing_from_batch(batch, path, directory))
 }
 
 /// Whether a batch taken at (`taken_at`, `taken_mono`) may still be trusted at (`now`,
@@ -604,7 +695,7 @@ fn batch_clock_trusted(
 }
 
 #[cfg(target_os = "macos")]
-fn verdict_from_batch(batch: &Prefetched, path: &Path, directory: &File) -> Option<bool> {
+fn listing_from_batch(batch: &Prefetched, path: &Path, directory: &File) -> Option<String> {
     use std::os::unix::fs::MetadataExt as _;
 
     // A batch is reused for up to a scope (10 s): re-check the realtime clock on every reuse and
@@ -632,9 +723,7 @@ fn verdict_from_batch(batch: &Prefetched, path: &Path, directory: &File) -> Opti
     if !batch_entry_describes(batch.taken_at, entry, metadata.dev(), metadata.ino(), ctime) {
         return None;
     }
-    Some(path.to_str().is_some_and(|expected| {
-        crate::policy::macos_directory_listing_admits(&entry.listing.text, expected)
-    }))
+    Some(entry.listing.text.clone())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -829,8 +918,20 @@ thread_local! {
     static BATCH_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AFTER_LISTING: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
     static AFTER_INITIAL_STATE: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
+    static BETWEEN_DIRECTORY_READS: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
     /// Test-only HFS+ facts: coarse directory ctime and a filesystem ineligible for reuse.
     static COARSE_FILESYSTEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(target_os = "macos", test))]
+fn run_directory_read_hook(path: &Path) {
+    let hook = BETWEEN_DIRECTORY_READS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|hook| hook.path == path) { slot.take() } else { None }
+    });
+    if let Some(hook) = hook {
+        (hook.action)();
+    }
 }
 
 #[cfg(all(target_os = "macos", test))]
@@ -1098,6 +1199,163 @@ mod tests {
     fn change_acl_after_listing(path: &Path, entry: &'static str) {
         let hook = acl_edit_hook(path, entry);
         AFTER_LISTING.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy)]
+    enum ContentEdit {
+        Create,
+        Rename,
+        Remove,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn content_edit_hook(
+        path: &Path,
+        edit: ContentEdit,
+        acl: Option<&'static str>,
+    ) -> AfterListing {
+        let path = path.to_path_buf();
+        AfterListing {
+            path: path.clone(),
+            action: Box::new(move || {
+                let before = std::fs::symlink_metadata(&path).expect("before child change");
+                match edit {
+                    ContentEdit::Create => {
+                        std::fs::create_dir(path.join("created")).expect("create child")
+                    }
+                    ContentEdit::Rename => {
+                        std::fs::rename(path.join("child"), path.join("renamed"))
+                            .expect("rename child")
+                    }
+                    ContentEdit::Remove => {
+                        std::fs::remove_file(path.join("child")).expect("remove child")
+                    }
+                }
+                if let Some(entry) = acl {
+                    edit_acl(&path, "+a", entry);
+                }
+                let after = std::fs::symlink_metadata(&path).expect("after child change");
+                assert!(
+                    FileIdentity::from_metadata(&before)
+                        .same_directory(FileIdentity::from_metadata(&after))
+                );
+                assert!(
+                    directory_contents_changed(&before, &after),
+                    "child activity changes mtime"
+                );
+                assert_ne!(
+                    DirectoryState::of(&before, DirectoryRole::PrivateLeaf),
+                    DirectoryState::of(&after, DirectoryRole::PrivateLeaf),
+                    "APFS child activity also invalidates the ctime key"
+                );
+            }),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_activity_between_descriptor_and_path_reads_requires_a_matching_snapshot() {
+        for acl in [None, Some("group:everyone allow read")] {
+            let root = fixture();
+            let path = root.path();
+            let directory = open(path);
+            let hook = content_edit_hook(path, ContentEdit::Create, acl);
+            BETWEEN_DIRECTORY_READS.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+            let operation = Operation::new();
+            assert_eq!(judge(&operation, path, &directory), acl.is_none());
+            BETWEEN_DIRECTORY_READS.with(|slot| assert!(slot.borrow().is_none(), "hook ran"));
+            assert_eq!(operation.judged.borrow().len(), usize::from(acl.is_none()));
+            if let Some(entry) = acl {
+                edit_acl(path, "-a", entry);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn child_activity_during_directory_admission_requires_a_fresh_unchanged_listing() {
+        for scoped in [false, true] {
+            for batched in [false, true] {
+                for edit in [ContentEdit::Create, ContentEdit::Rename, ContentEdit::Remove] {
+                    for acl in [None, Some("group:everyone allow read")] {
+                        let root = fixture();
+                        let path = root.path().join("directory");
+                        std::fs::create_dir(&path).expect("directory");
+                        std::fs::write(path.join("child"), b"").expect("child");
+                        let directory = open(&path);
+                        let _scope = scoped.then(AdmissionScope::enter);
+                        let operation = Operation::new();
+                        if batched {
+                            operation.register_walk(&[root.path().to_path_buf(), path.clone()]);
+                        }
+                        let hook = content_edit_hook(&path, edit, acl);
+                        AFTER_LISTING
+                            .with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+                        let before = ls_spawn_count();
+                        assert_eq!(judge(&operation, &path, &directory), acl.is_none());
+                        AFTER_LISTING.with(|slot| assert!(slot.borrow().is_none(), "hook ran"));
+                        assert!(ls_spawn_count() - before >= 2, "fresh evidence is required");
+                        assert!(operation.judged.borrow().is_empty(), "no raced verdict is cached");
+                        if let Some(id) = operation.scope_id {
+                            assert_eq!(
+                                scope::with_scope(id, |state| state.memo.is_empty()),
+                                Some(true)
+                            );
+                        }
+                        if let Some(entry) = acl {
+                            edit_acl(&path, "-a", entry);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_child_change_does_not_hide_a_deny_only_acl_edit_during_a_single_listing() {
+        let root = fixture();
+        let path = root.path();
+        let directory = open(path);
+        let hook = content_edit_hook(path, ContentEdit::Create, Some("group:everyone deny delete"));
+        AFTER_LISTING.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+        let operation = Operation::new();
+        assert!(!judge(&operation, path, &directory));
+        AFTER_LISTING.with(|slot| assert!(slot.borrow().is_none(), "hook ran"));
+        assert!(operation.judged.borrow().is_empty());
+        edit_acl(path, "-a", "group:everyone deny delete");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_content_recheck_still_refuses_an_acl_edit_after_its_listing() {
+        for entry in ["group:everyone allow read", "group:everyone deny delete"] {
+            let root = fixture();
+            let path = root.path();
+            let directory = open(path);
+            let content = content_edit_hook(path, ContentEdit::Create, None);
+            let changed_path = path.to_path_buf();
+            let hook = AfterListing {
+                path: path.to_path_buf(),
+                action: Box::new(move || {
+                    (content.action)();
+                    change_acl_after_listing(&changed_path, entry);
+                }),
+            };
+            AFTER_LISTING.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+            let operation = Operation::new();
+            let before = ls_spawn_count();
+            assert!(!judge(&operation, path, &directory));
+            AFTER_LISTING.with(|slot| assert!(slot.borrow().is_none(), "both hooks ran"));
+            assert_eq!(
+                ls_spawn_count() - before,
+                2,
+                "the second listing also needs a stable state"
+            );
+            assert!(operation.judged.borrow().is_empty());
+            edit_acl(path, "-a", entry);
+        }
     }
 
     #[cfg(target_os = "macos")]
