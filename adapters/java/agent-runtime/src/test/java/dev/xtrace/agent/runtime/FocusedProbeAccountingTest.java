@@ -112,6 +112,24 @@ class FocusedProbeAccountingTest {
     return probeCalls(type, method, descriptor, "lineGap");
   }
 
+  private int exceptionHandlers(Class<?> type, String method, String descriptor) {
+    int[] count = {0};
+    new ClassReader(transformedClasses.get(type)).accept(new ClassVisitor(Opcodes.ASM9) {
+      @Override
+      public MethodVisitor visitMethod(int access, String name, String desc,
+          String signature, String[] exceptions) {
+        if (!name.equals(method) || !desc.equals(descriptor)) return null;
+        return new MethodVisitor(Opcodes.ASM9) {
+          @Override
+          public void visitTryCatchBlock(Label start, Label end, Label handler, String type) {
+            count[0]++;
+          }
+        };
+      }
+    }, 0);
+    return count[0];
+  }
+
   private int probeCalls(Class<?> type, String method, String descriptor, String probe) {
     int[] count = {0};
     new ClassReader(transformedClasses.get(type)).accept(new ClassVisitor(Opcodes.ASM9) {
@@ -403,18 +421,25 @@ class FocusedProbeAccountingTest {
     Class<?> type = load(name, bytes.toByteArray());
     assertTrue(type.getDeclaredMethod("lambda$large$0").isSynthetic());
     assertEquals(0, gapProbes(type, "lambda$large$0", "()I"));
+    assertEquals(0, probeCalls(type, "lambda$large$0", "()I", "frameEnter"));
+    assertEquals(0, exceptionHandlers(type, "lambda$large$0", "()I"));
     assertEquals(1, probeCalls(type, "healthy", "()I", "line"));
+    assertEquals(1, probeCalls(type, "healthy", "()I", "frameEnter"));
     assertTrue(probes.reports().stream().anyMatch(report -> report.name().equals("lambda$large$0")
         && report.reason().equals(MethodReport.Reasons.TOO_LARGE)));
     assertTrue(probes.reports().stream().anyMatch(report -> report.name().equals("healthy")
         && report.status() == MethodReport.Status.INSTRUMENTED));
-    assertEquals(1, limitations.count());
+    // Count failed installations: the guarded gap call cannot fit, and neither can the
+    // lambda's boundary advice. These are two limitations for the same preserved method.
+    assertEquals(2, limitations.count());
     var supplier = (java.util.function.IntSupplier) type.getMethod("supplier").invoke(null);
     assertTrue(BootstrapBridge.requestStart("GET", "/near-limit"));
     assertEquals(5, supplier.getAsInt());
     assertEquals(3, type.getMethod("healthy").invoke(null));
     BootstrapBridge.requestEnd(200, false);
-    assertPersistedPartial(1);
+    CapturedRecording transport = assertPersistedPartial(1);
+    assertEquals(2, transport.batches.stream().flatMap(batch -> batch.getEventsList().stream())
+        .filter(event -> event.hasGap()).findFirst().orElseThrow().getGap().getCount());
   }
 
   @Test
@@ -461,14 +486,38 @@ class FocusedProbeAccountingTest {
     method.visitInsn(Opcodes.IRETURN);
     method.visitMaxs(0, 0);
     method.visitEnd();
+    MethodVisitor sibling = bytes.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+        "healthy", "()I", null, null);
+    sibling.visitCode();
+    Label siblingLine = new Label();
+    sibling.visitLabel(siblingLine);
+    sibling.visitLineNumber(1, siblingLine);
+    sibling.visitInsn(Opcodes.ICONST_3);
+    sibling.visitInsn(Opcodes.IRETURN);
+    sibling.visitMaxs(0, 0);
+    sibling.visitEnd();
     bytes.visitEnd();
     Class<?> type = load(name, bytes.toByteArray());
     assertEquals(0, gapProbes(type, "lambda$handlers$0", "()I"));
-    assertEquals(1, limitations.count());
+    assertEquals(0, probeCalls(type, "lambda$handlers$0", "()I", "frameEnter"));
+    assertEquals(65_535, exceptionHandlers(type, "lambda$handlers$0", "()I"));
+    assertEquals(1, probeCalls(type, "healthy", "()I", "line"));
+    assertEquals(1, probeCalls(type, "healthy", "()I", "frameEnter"));
+    assertTrue(probes.reports().stream().anyMatch(report -> report.name().equals("lambda$handlers$0")
+        && report.status() == MethodReport.Status.SKIPPED
+        && report.reason().equals(MethodReport.Reasons.TOO_LARGE)));
+    assertTrue(probes.reports().stream().anyMatch(report -> report.name().equals("healthy")
+        && report.status() == MethodReport.Status.INSTRUMENTED));
+    // Both the gap guard and the lambda boundary need handlers beyond the full table.
+    // The limitation count describes failed installations, not distinct methods.
+    assertEquals(2, limitations.count());
     assertTrue(BootstrapBridge.requestStart("GET", "/handler-limit"));
     assertEquals(5, type.getMethod("lambda$handlers$0").invoke(null));
+    assertEquals(3, type.getMethod("healthy").invoke(null));
     BootstrapBridge.requestEnd(200, false);
-    assertPersistedPartial(1);
+    CapturedRecording transport = assertPersistedPartial(1);
+    assertEquals(2, transport.batches.stream().flatMap(batch -> batch.getEventsList().stream())
+        .filter(event -> event.hasGap()).findFirst().orElseThrow().getGap().getCount());
   }
 
   @Test
