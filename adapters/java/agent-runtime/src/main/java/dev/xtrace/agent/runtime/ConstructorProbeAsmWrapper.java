@@ -13,6 +13,7 @@ import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.implementation.Implementation;
 import net.bytebuddy.jar.asm.ClassReader;
 import net.bytebuddy.jar.asm.ClassVisitor;
+import net.bytebuddy.jar.asm.ClassWriter;
 import net.bytebuddy.jar.asm.Label;
 import net.bytebuddy.jar.asm.MethodVisitor;
 import net.bytebuddy.jar.asm.Opcodes;
@@ -26,7 +27,15 @@ import net.bytebuddy.pool.TypePool;
  */
 final class ConstructorProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
   @Override
-  public int mergeReader(int flags) { return flags | ClassReader.EXPAND_FRAMES; }
+  public int mergeWriter(int flags) {
+    // Like the line/gap and bounded wrappers, rebuild frames for the selected final body.
+    return flags | ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS;
+  }
+
+  @Override
+  public int mergeReader(int flags) {
+    return (flags | ClassReader.EXPAND_FRAMES) & ~ClassReader.SKIP_FRAMES;
+  }
 
   @Override
   public ClassVisitor wrap(TypeDescription type, ClassVisitor writer, Implementation.Context context,

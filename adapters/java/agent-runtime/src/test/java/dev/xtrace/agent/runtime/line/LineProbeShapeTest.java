@@ -28,7 +28,7 @@ import static net.bytebuddy.matcher.ElementMatchers.named;
 /**
  * Retransformation safety: the instrumented class has exactly the original shape (no member,
  * attribute or hierarchy change), only Code differs, and every LineNumberTable entry run maps to
- * exactly one probe.
+ * exactly one probe in the observable body (constructors exclude delegation).
  */
 class LineProbeShapeTest {
   static final String OWNER = LineProbeDispatch.INTERNAL_NAME;
@@ -130,39 +130,58 @@ class LineProbeShapeTest {
     return out;
   }
 
-  /** Per method: {probe calls, independent count of instruction runs following a line entry}. */
+  /** Per method: {probe calls, independent count of mapped runs after constructor delegation}. */
   static Map<String, int[]> probeAndRunCounts(byte[] bytes) {
     Map<String, int[]> out = new java.util.TreeMap<>();
     new ClassReader(bytes)
         .accept(
             new ClassVisitor(Opcodes.ASM9) {
+              String owner;
+              String parent;
+
+              @Override
+              public void visit(int v, int a, String n, String s, String sup, String[] itf) {
+                owner = n;
+                parent = sup;
+              }
+
               @Override
               public MethodVisitor visitMethod(int a, String n, String d, String s, String[] e) {
                 int[] c = new int[2];
                 out.put(n + d, c);
                 return new MethodVisitor(Opcodes.ASM9) {
                   boolean pending;
+                  boolean mapped;
+                  boolean body = !n.equals("<init>");
 
                   private void real() {
                     if (pending) {
-                      c[1]++;
+                      if (body) c[1]++;
                       pending = false;
                     }
                   }
 
                   @Override
                   public void visitLineNumber(int l, net.bytebuddy.jar.asm.Label st) {
-                    pending = true;
+                    pending = l > 0;
+                    mapped = l > 0;
                   }
 
                   @Override
                   public void visitMethodInsn(int op, String o, String mn, String md, boolean i) {
                     if (op == Opcodes.INVOKESTATIC && o.equals(OWNER) && mn.equals("line") && md.equals("(I)V")) {
+                      assertTrue(body, "a constructor cursor must follow delegation: " + n + d);
                       c[0]++;
                       return; // our own probe does not start a run of the original code
                     }
                     if (o.equals(OWNER)) return;
                     real();
+                    if (!body && op == Opcodes.INVOKESPECIAL && mn.equals("<init>")
+                        && (o.equals(owner) || o.equals(parent))) {
+                      body = true;
+                      // Even an implicit constructor has a mapped RETURN after delegation.
+                      pending = mapped;
+                    }
                   }
 
                   @Override public void visitInsn(int op) { real(); }
