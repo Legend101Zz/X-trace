@@ -91,6 +91,7 @@ impl RecordingReadPort for SqliteRecordingReader {
         recording_id: xtrace_domain::RecordingId,
         frame_id: xtrace_domain::FrameId,
     ) -> Result<xtrace_application::FrameNavigationView, PortError> {
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
         view.read_frame_navigation(project_id, recording_id, frame_id).map_err(map_recording_error)
@@ -102,6 +103,7 @@ impl RecordingReadPort for SqliteRecordingReader {
         after: Option<xtrace_domain::RecordingId>,
         limit: u32,
     ) -> Result<(Vec<RecordingMetadata>, bool), PortError> {
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
         view.list_recording_metadata(project_id, after, limit).map_err(map_recording_error)
@@ -111,6 +113,7 @@ impl RecordingReadPort for SqliteRecordingReader {
         &self,
         request: &ShowWindowRequest,
     ) -> Result<RecordingEventWindow, PortError> {
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
         view.read_recording_window(request, self.source_root.as_deref())
@@ -125,6 +128,7 @@ impl ObservedEndpointReadPort for SqliteRecordingReader {
         after: Option<&ObservedEndpointKey>,
         limit: u32,
     ) -> Result<(Vec<ObservedEndpointRecord>, bool), PortError> {
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
         view.list_observed_endpoints(project_id, after, limit).map_err(map_recording_error)
@@ -137,6 +141,7 @@ impl ObservedEndpointReadPort for SqliteRecordingReader {
         after: Option<&ObservedRecordingKey>,
         limit: u32,
     ) -> Result<(Vec<ObservedRecordingRecord>, bool), PortError> {
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
         view.list_operation_recordings(project_id, operation_id, after, limit)
@@ -149,6 +154,7 @@ impl ObservedEndpointReadPort for SqliteRecordingReader {
         after: Option<&ObservedRecordingKey>,
         limit: u32,
     ) -> Result<(Vec<ObservedRecordingRecord>, bool), PortError> {
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
         view.list_unmatched_recordings(project_id, after, limit).map_err(map_recording_error)
@@ -218,10 +224,16 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
     ) -> Result<PortSegmentReceipt, PortError> {
         // One admission scope per store call (ADR 0008 Amendment 1); never held across calls.
         let _scope = xtrace_private_storage::AdmissionScope::enter();
+        #[cfg(test)]
+        let mut phase = crate::recording_store::work_profile::Phase::enter("segment_validation");
         let events =
             request.events.iter().map(validate_xtf_event).collect::<Result<Vec<_>, _>>()?;
+        #[cfg(test)]
+        phase.switch("segment_root_admission");
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
+        #[cfg(test)]
+        phase.switch("segment_commit");
         let receipt = view
             .commit_segment(&SegmentCommitRequest {
                 project_id: request.project_id,
@@ -230,6 +242,8 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
                 events,
             })
             .map_err(map_recording_error)?;
+        #[cfg(test)]
+        phase.switch("segment_journal_cleanup");
         if view
             .clear_segment_journal(request.recording_id, request.segment_ordinal)
             .map_err(map_recording_error)?
@@ -256,12 +270,20 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
         prefix_events: usize,
     ) -> Result<bool, PortError> {
         let _scope = xtrace_private_storage::AdmissionScope::enter();
+        #[cfg(test)]
+        let mut phase = crate::recording_store::work_profile::Phase::enter("tail_validation");
         for event in &request.events {
             validate_xtf_event(event)?;
         }
+        #[cfg(test)]
+        phase.switch("tail_root_admission");
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
+        #[cfg(test)]
+        phase.switch("checkpoint_mutex_wait");
         let mut checkpoints = self.journal_checkpoints.lock().map_err(|_| journal_lock_error())?;
+        #[cfg(test)]
+        phase.switch("journal_tail");
         view.journal_tail(
             request,
             prefix_events,
@@ -2049,6 +2071,8 @@ mod tests {
         use xtrace_application::recording::{DEFAULT_SEGMENT_EVENT_BYTES, MAX_RECORDING_SEGMENTS};
         use xtrace_application::recording_queries::RecordingCompletionEvidence;
 
+        use crate::recording_store::work_profile::{Phase, WorkProfile};
+        let profile = WorkProfile::start("sparse", MAX_RECORDING_SEGMENTS as usize, false);
         let (directory, store, project) = fixture();
         let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
         // Every adjacent pair crosses the ordinary two-second span boundary.
@@ -2070,16 +2094,22 @@ mod tests {
             event
         };
         let last = u64::from(MAX_RECORDING_SEGMENTS) + 1;
+        let mut phase = Phase::enter("admission_loop");
         for sequence in 2..=last {
             let receipt = capture
                 .record_events(RecordEvents { recording_id, events: vec![sparse_event(sequence)] })
                 .expect("sparse acknowledgement");
             assert_eq!((receipt.accepted, receipt.dropped), (1, 0));
+            if (sequence - 1) % 256 == 0 || sequence == last {
+                profile.progress((sequence - 1) as usize);
+            }
         }
+        phase.switch("reject_beyond_segment_cap");
         let rejected = capture
             .record_events(RecordEvents { recording_id, events: vec![sparse_event(last + 1)] })
             .expect_err("no acknowledgement beyond the readable ceiling");
         assert_eq!(rejected.kind(), PortErrorKind::Resource);
+        phase.switch("reopen_and_recover");
         drop(capture);
         drop(adapter);
         drop(store);
@@ -2096,6 +2126,7 @@ mod tests {
             RecordingCompletion::Partial
         );
         let reader = SqliteRecordingReader::new(reopened, directory.path());
+        phase.switch("pagination");
         let mut next = 2;
         loop {
             let page = reader
@@ -2113,6 +2144,7 @@ mod tests {
                 assert_eq!(event.sequence, next.to_string());
                 next += 1;
             }
+            profile.progress((next - 2) as usize);
             if !page.has_more {
                 break;
             }
@@ -2129,9 +2161,15 @@ mod tests {
             CountOnlySyncs, SyncKind, take_checkpoint_sync_count, take_directory_sync_count,
             take_sync_count, take_sync_order,
         };
+        use crate::recording_store::work_profile::{Phase, WorkProfile};
         use xtrace_application::recording::DEFAULT_SEGMENT_EVENTS;
         use xtrace_application::recording_queries::{RecordingCompletionEvidence, RecordingStatus};
 
+        let profile = WorkProfile::start(
+            if focused { "focused-singletons" } else { "singletons" },
+            count,
+            true,
+        );
         // This is a cardinality/recovery test: 131,072 singleton batches must
         // exercise every barrier without spending minutes flushing hardware.
         // The journal fault tests and macOS latency test retain real syncs.
@@ -2157,6 +2195,7 @@ mod tests {
         take_directory_sync_count();
         take_sync_order();
         let mut published = 0;
+        let mut phase = Phase::enter("admission_loop");
         for index in 0..count {
             let sequence = index as u64 + 2;
             let receipt = capture
@@ -2184,7 +2223,11 @@ mod tests {
                 expected_order,
                 "durability barrier order for batch {index}"
             );
+            if (index + 1) % 256 == 0 || index + 1 == count {
+                profile.progress(index + 1);
+            }
         }
+        phase.switch("duplicates_and_barrier_assertions");
         assert_eq!(published, count / DEFAULT_SEGMENT_EVENTS);
         assert_eq!(
             take_sync_count(),
@@ -2218,6 +2261,7 @@ mod tests {
         );
         assert_eq!(take_directory_sync_count(), 0);
         assert!(take_sync_order().is_empty(), "empty and duplicate batches do not sync");
+        phase.switch("reopen_and_recover");
         // Lose every volatile assembler/checkpoint and use a new SQLite connection.
         drop(capture);
         drop(adapter);
@@ -2263,6 +2307,7 @@ mod tests {
         assert!(expected_segments < xtrace_application::recording::MAX_RECORDING_SEGMENTS as usize);
         let mut after_sequence = None;
         let mut next = 2;
+        phase.switch("pagination");
         loop {
             let page = reader
                 .show_recording(&ShowWindowRequest {
@@ -2283,6 +2328,9 @@ mod tests {
                 assert_eq!(event.sequence, next.to_string());
                 assert_eq!(event.event_id.as_deref(), Some(format!("event-{next}").as_str()));
                 next += 1;
+            }
+            if (next - 2) % (137 * 32) == 0 || !page.has_more {
+                profile.progress((next - 2) as usize);
             }
             if !page.has_more {
                 break;

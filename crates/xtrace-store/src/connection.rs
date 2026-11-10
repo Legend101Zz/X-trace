@@ -576,6 +576,8 @@ impl SqliteStore {
     /// repositories (added in later slices) that share the same
     /// connection mutex.
     pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        #[cfg(test)]
+        let mut phase = crate::recording_store::work_profile::Phase::enter("connection_mutex_wait");
         let guard = self.inner.connection.lock().map_err(|_| {
             StoreError::new(
                 StoreErrorKind::Corruption,
@@ -583,6 +585,8 @@ impl SqliteStore {
                 CorrelationId::new(),
             )
         })?;
+        #[cfg(test)]
+        phase.switch("connection_file_admission");
         if let (Some(root), Some(name), Some(file)) = (
             &self.inner.private_root,
             &self.inner.private_database_name,
@@ -614,6 +618,8 @@ impl SqliteStore {
         &self,
         correlation_id: CorrelationId,
     ) -> Result<MutexGuard<'_, ()>, StoreError> {
+        #[cfg(test)]
+        let _phase = crate::recording_store::work_profile::Phase::enter("writer_mutex_wait");
         self.inner.recording_writer.lock().map_err(|_| {
             StoreError::new(
                 StoreErrorKind::Corruption,
