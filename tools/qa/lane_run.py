@@ -21,7 +21,7 @@ import subprocess
 import sys
 from collections import deque
 
-from tools.qa import canary
+from tools.qa import canary, store_profiles
 from tools.release import ci_floor
 
 MAX_FAILING = 32
@@ -722,6 +722,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     frag = {"suite": suite, "variant": variant, "step": step, "status": status,
             "exitCode": proc.returncode, **{k: v for k, v in facts.items() if k != "counted"}}
     fragment_path = out / f"{suite}__{variant}__{step}.json"
+    if suite == "rust" and step == "test":
+        # This path runs after success, failure and the existing command timeout.
+        # Only rebuilt vocabulary/numbers leave the private profile text files.
+        frag["storeProfiles"] = store_profiles.collect(out)
     if status == "fail":
         frag["timedOut"] = timed_out
         frag["failureDetails"] = (failure_details(

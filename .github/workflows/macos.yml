@@ -85,8 +85,8 @@ jobs:
     # NOT COVERED until broker code exists: other-UID broker negative (ADR 0006 addendum 2026-10-10, item 3)
     needs: release-tool-tests
     runs-on: macos-15
-    # Recent runs took about 61 minutes; allow room for the Rust runner's 50-minute inner bound.
-    timeout-minutes: 120
+    # Preserve the original job bound, including the Rust runner's 50-minute inner bound.
+    timeout-minutes: 180
     permissions:
       contents: read
     strategy:
@@ -265,7 +265,8 @@ jobs:
         if: always()
         with:
           name: xtrace-macos-arm64-frag-${{ matrix.tuple }}
-          # Fragments include bounded, privacy-scanned excerpts. Never upload the private logs.
+          # Rust fragments also retain validated numeric store profiles, including on timeout.
+          # Fragments include bounded, privacy-scanned excerpts. Never upload private logs or profile text.
           path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
           if-no-files-found: ignore
           retention-days: 14

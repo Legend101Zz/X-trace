@@ -1,12 +1,16 @@
+import fnmatch
 import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
-from tools.qa import workflow_lint
+from tools.qa import lane_run, workflow_lint
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -60,6 +64,28 @@ class CiPullRequestTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.workflow = workflow_lint.load(ROOT / ".github/workflows/ci.yml")
+
+    def test_bounded_apt_installs_and_job_timeouts_are_preserved_in_both_workflows(self):
+        installs = 0
+        for filename in ("ci.yml", "macos.yml"):
+            workflow = workflow_lint.load(ROOT / ".github/workflows" / filename)
+            for job_id, job in workflow["jobs"].items():
+                with self.subTest(workflow=filename, job=job_id):
+                    self.assertGreater(job["timeout-minutes"], 0)
+                    for step in job["steps"]:
+                        run = step.get("run", "")
+                        if "apt-get" not in run:
+                            continue
+                        installs += 1
+                        self.assertEqual(step["timeout-minutes"], 10)
+                        self.assertEqual(run.count("sudo -n env DEBIAN_FRONTEND=noninteractive apt-get"), 2)
+                        for option in ("Acquire::Retries=3", "Acquire::http::Timeout=30",
+                                       "Acquire::https::Timeout=30", "DPkg::Lock::Timeout=60"):
+                            self.assertEqual(run.count(f"-o {option}"), 2)
+                        self.assertIn("-o APT::Update::Error-Mode=any update", run)
+                        self.assertIn("install --yes", run)
+                        self.assertIn("lsof", run)
+        self.assertEqual(installs, 3)
 
     def test_concurrency_cancels_only_pull_requests(self):
         self.assertEqual(self.workflow["concurrency"], {
@@ -192,6 +218,62 @@ class MacosWorkflowTests(unittest.TestCase):
         uploads = [s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@")]
         self.assertEqual([s["with"]["path"] for s in uploads],
                          ["${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json"])
+
+    def test_store_measurements_reach_the_uploaded_rust_fragment_on_success_and_timeout(self):
+        steps = self.workflow["jobs"]["macos-arm64"]["steps"]
+        rust = [s for s in steps if "--suite rust" in s.get("run", "")
+                and "--step test" in s["run"]]
+        self.assertEqual(len(rust), 1)
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@"))
+        self.assertGreater(steps.index(upload), steps.index(rust[0]))
+        self.assertEqual(upload["if"], "always()")
+        for timed_out in (False, True):
+            with self.subTest(timed_out=timed_out), tempfile.TemporaryDirectory() as temporary:
+                directory = pathlib.Path(temporary) / "frag"
+                command = shlex.split(rust[0]["run"].replace("$XTRACE_CI_PRIVATE_ROOT", temporary)
+                                      .replace("${{ matrix.tuple }}", "jdk17-node22"))
+                self.assertEqual(command[:4], ["python3", "-B", "-m", "tools.qa.lane_run"])
+
+                def run(cmd, *, stdout, **kwargs):
+                    self.assertEqual(kwargs["timeout"], 3000)
+                    state = "progress" if timed_out else "returned"
+                    (directory / "store-sparse-active.txt").write_text(
+                        "elapsed_ns=900 completed=256 active=journal_append".ljust(159) + "\n")
+                    (directory / "store-sparse-progress.txt").write_text(
+                        "expected_admissions=4096 counted_journal_syncs=false\n"
+                        f"state={state} completed=256 elapsed_ns=800\n"
+                        "phase=journal_append spans=3 total_ns=500 max_ns=300 acl_probes=2\n"
+                        "phase=private_payload spans=3 total_ns=500 max_ns=300 acl_probes=2\n")
+                    stdout.write(b"private log token=private_payload\n"
+                                 b"test result: ok. 1030 passed; 0 failed; 0 ignored\n")
+                    stdout.flush()
+                    if timed_out:
+                        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+                    return subprocess.CompletedProcess(cmd, 0)
+
+                with mock.patch.object(sys, "argv", ["lane_run", *command[4:]]), \
+                        mock.patch.dict(os.environ, {"LANE_PRIVATE_LOG_DIR": temporary}), \
+                        mock.patch.object(lane_run, "_checkout_metadata", return_value=lane_run.CheckoutMetadata({})), \
+                        mock.patch.object(lane_run.subprocess, "run", side_effect=run):
+                    self.assertEqual(lane_run.main(), 124 if timed_out else 0)
+                fragment = directory / "rust__jdk17-node22__test.json"
+                pattern = upload["with"]["path"].replace("${{ env.XTRACE_CI_PRIVATE_ROOT }}", temporary)
+                self.assertTrue(fnmatch.fnmatch(str(fragment), pattern))
+                self.assertFalse(fnmatch.fnmatch(str(directory / "store-sparse-progress.txt"), pattern))
+                text = fragment.read_text()
+                self.assertNotIn("private_payload", text)
+                self.assertNotIn("private log", text)
+                document = json.loads(text)
+                self.assertEqual(document["status"], "fail" if timed_out else "pass")
+                if timed_out:
+                    self.assertTrue(document["timedOut"])
+                self.assertEqual(document["storeProfiles"], {"sparse": {
+                    "workload": {"expected_admissions": 4096, "counted_journal_syncs": 0},
+                    "active": {"elapsed_ns": 900, "completed": 256, "active": "journal_append"},
+                    "lastReport": {"state": "progress" if timed_out else "returned",
+                                   "completed": 256, "elapsed_ns": 800},
+                    "phases": {"journal_append": {"spans": 3, "total_ns": 500, "max_ns": 300, "acl_probes": 2}},
+                }})
 
     def test_aggregator_covers_every_job_and_rejects_each_non_success(self):
         jobs = self.workflow["jobs"]
