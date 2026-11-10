@@ -20,7 +20,7 @@ import re
 import stat
 import subprocess
 import sys
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Sequence
 from enum import Enum
 
@@ -171,41 +171,52 @@ def _fmt(value) -> str:
     return "n/a" if value is None else str(value)
 
 
-# Compiler output is eligible only before test output begins. Headline prose is
-# never public, including clippy messages without a rustc error code.
-DIAG_HEAD = re.compile(r"^error(?:\[(E[0-9]{4})\])?: .*$")
-DIAG_LOC = re.compile(r"^\s*--> (\S{1,300}):([0-9]{1,9}):[0-9]{1,9}$")
+# Only direct Cargo compile invocations have a structured compiler channel.
 DIAG_BAD = re.compile(r"(/home/|/Users/|/Volumes/|/tmp/|/runner|\\|token|secret|password|bearer|authorization|cookie|api[_-]?key)", re.I)
 MAX_DIAG = 20
 
 
-def diagnostics(text: str, *, metadata=None, index=None) -> tuple[list[str], int]:
-    """Publish only codes and HEAD locations from the compiler-only prefix."""
+def _compiler_command(command: Sequence[str]) -> bool:
+    return (len(command) >= 3 and command[0] == "cargo" and command[1] in {"build", "check", "clippy"}
+            and "--message-format=json" in command and "--" not in command
+            and sum(arg.startswith("--message-format") for arg in command) == 1)
+
+
+def diagnostics(text: str, *, command: Sequence[str] = (), metadata=None, index=None) -> tuple[list[str], int]:
+    """Read Cargo JSON stdout only; mixed output never establishes provenance."""
+    if not _compiler_command(command):
+        return [], 0
     metadata = _checkout_metadata() if metadata is None else metadata
     index = CANARY_INDEX if index is None else index
     out = []
     dropped = 0
-    pending = None
-    for line in ANSI.sub("", text).splitlines():
-        # A test process may print an entire compiler diagnostic as a payload.
-        # Once tests start, no later unframed line restores compiler provenance.
-        if (CARGO_STATE.fullmatch(line) or CARGO_SECTION.fullmatch(line)
-                or "panicked at" in line or line == "failures:"
-                or re.fullmatch(r"running [0-9]+ tests?", line)
-                or GRADLE_STATE.fullmatch(line.strip()) or re.match(r"\s*Running (?:unittests|tests/)", line)):
-            break
-        if head := DIAG_HEAD.fullmatch(line):
-            pending = head[1]
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except (ValueError, RecursionError):
             continue
-        if (loc := DIAG_LOC.fullmatch(line)) and pending is not None:
-            site = metadata.location(f"{loc[1]}:{loc[2]}", index)
-            if site == UNVERIFIED or _private(pending, index) or len(out) >= MAX_DIAG:
+        if not isinstance(record, dict) or record.get("reason") != "compiler-message":
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict) or message.get("level") != "error":
+            continue
+        code = message.get("code")
+        code = code.get("code") if isinstance(code, dict) else None
+        spans = message.get("spans")
+        if not isinstance(code, str) or not re.fullmatch(r"E[0-9]{4}", code) or not isinstance(spans, list):
+            continue
+        for span in spans:
+            if not isinstance(span, dict) or span.get("is_primary") is not True:
+                continue
+            path, line_number = span.get("file_name"), span.get("line_start")
+            if not isinstance(path, str) or type(line_number) is not int:
+                dropped += 1
+                continue
+            site = metadata.location(f"{path}:{line_number}", index)
+            if site == UNVERIFIED or _private(code, index) or len(out) >= MAX_DIAG:
                 dropped += 1
             else:
-                out.append(f"{pending} @ {site}")
-            pending = None
-        elif line.strip():
-            pending = None
+                out.append(f"{code} @ {site}")
     return out, dropped
 
 
@@ -247,6 +258,8 @@ class UnverifiedReason(str, Enum):
     EXCERPT_CAP = "excerpt-cap"
     AMBIGUOUS_PANIC = "ambiguous-panic-block"
     DIAGNOSTIC_THREAD = "diagnostic-thread-unverified"
+    DIAGNOSTIC_NOT_FAILING = "diagnostic-thread-not-failing"
+    DIAGNOSTIC_AMBIGUOUS = "diagnostic-thread-ambiguous"
 
 
 # Reuse the canary scanner's encoded needles, including recognisable marker families
@@ -649,7 +662,11 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             failure(f"{m[2]}::{m[1]}")["kind"] = "exit"
         elif m := re.fullmatch(r"\s*not ok \d+ - (.+)", line):
             failure(m[1])["kind"] = "exit"
-    outcomes = {m[1]: m[2] for line in harness if (m := CARGO_STATE.fullmatch(line)) and m[2]}
+    states = [m.groups() for line in harness if (m := CARGO_STATE.fullmatch(line)) and m[2]]
+    outcomes = dict(states)
+    occurrences = Counter(name for name, _ in states)
+    failing_threads = {name for name, status in outcomes.items() if status == "FAILED"
+                       and occurrences[name] == 1 and name in metadata.rust_tests and not _private(name, index)}
     for block_number, (name, framework, lines, panic_lines) in enumerate(blocks):
         if framework == "cargo" and outcomes.get(name) in {"ok", "ignored"}:
             continue
@@ -726,12 +743,26 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             else:
                 java_frames = False
             row["withheldLines"] += 1
+    # A product record attests an observation, never a test outcome or cause.
+    # Exact thread matches may associate observations with independent failures.
+    observations: dict[tuple[str, str | None], dict] = {}
     for name, categories in diagnostic_records[:MAX_CI_RECORDS]:
-        if name == UNVERIFIED:
-            row = failure("<ci-diagnostics>", unattributed=UnverifiedReason.DIAGNOSTIC_THREAD)
-        else:
-            row = failure(name)
-            row["test"] = name  # exact HEAD-verified libtest thread name
+        attributed = name in failing_threads
+        reason = None
+        if not attributed:
+            if name == UNVERIFIED:
+                reason = UnverifiedReason.DIAGNOSTIC_THREAD.value
+            elif occurrences[name] > 1:
+                reason = UnverifiedReason.DIAGNOSTIC_AMBIGUOUS.value
+            else:
+                reason = UnverifiedReason.DIAGNOSTIC_NOT_FAILING.value
+        key = (name if attributed else UNVERIFIED, reason)
+        if key not in observations:
+            row = {"test": key[0], "relevance": "unknown", "category": []}
+            if reason is not None:
+                row["testUnverifiedReason"] = reason
+            observations[key] = row
+        row = observations[key]
         for value in categories:
             if value not in row["category"] and len(row["category"]) < MAX_CATEGORIES:
                 row["category"].append(value)
@@ -747,6 +778,14 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             row.update(test=UNVERIFIED, location=UNVERIFIED,
                        testUnverifiedReason=UnverifiedReason.EXCERPT_CAP.value)
     result: dict = {"failures": rows[:MAX_FAILING], "omitted": max(0, len(rows) - MAX_FAILING)}
+    if observations:
+        result["observedDiagnostics"] = list(observations.values())[:MAX_FAILING]
+        result["diagnosticsOmitted"] = max(0, len(observations) - MAX_FAILING)
+        for row in result["observedDiagnostics"]:
+            while len(_encoded(row)) > MAX_EXCERPT_BYTES and row["category"]:
+                row["category"].pop()
+            if len(_encoded(row)) > MAX_EXCERPT_BYTES:
+                row.update(test=UNVERIFIED, testUnverifiedReason=UnverifiedReason.EXCERPT_CAP.value)
     if timed_out:
         running: dict[str, None] = {}
         unverified_running: set[str] = set()
@@ -792,6 +831,9 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
         if result["failures"]:
             result["failures"].pop()
             result["omitted"] += 1
+        elif result.get("observedDiagnostics"):
+            result["observedDiagnostics"].pop()
+            result["diagnosticsOmitted"] += 1
         elif result.get("timeout", {}).get("progress"):
             result["timeout"]["progress"].pop(0)
             result["timeout"]["progressOmitted"] += 1
@@ -858,8 +900,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     with open(log_path, "wb") as log:
         os.umask(previous_umask)
         try:
-            proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=args.cwd or None,
-                                  check=False, timeout=args.timeout, env=child_env)
+            if _compiler_command(cmd):
+                # Cargo JSON is stdout. stderr (including build-script output)
+                # is private and cannot supply compiler facts.
+                with os.fdopen(os.open(log_path.with_suffix(".stderr.log"),
+                                       os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as compiler_stderr:
+                    proc = subprocess.run(cmd, stdout=log, stderr=compiler_stderr, cwd=args.cwd or None,
+                                          check=False, timeout=args.timeout, env=child_env)
+            else:
+                proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=args.cwd or None,
+                                      check=False, timeout=args.timeout, env=child_env)
         except subprocess.TimeoutExpired:  # a timeout is a failed step with a fragment, never a traceback with argv
             timed_out = True
             proc = subprocess.CompletedProcess(cmd, 124)
@@ -911,13 +961,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     for name in facts["failingTests"]:
         print(f"lane failing-test {name}")
     if status == "fail":
-        diags, ddropped = diagnostics(text, metadata=metadata, index=index) if index is not None else ([], 0)
+        diags, ddropped = diagnostics(text, command=cmd, metadata=metadata, index=index) if index is not None else ([], 0)
         for d in diags:
             print(f"lane diagnostic {d}")
         if ddropped:
             print(f"lane diagnostic-overflow dropped={ddropped}")
         for row in (frag["failureDetails"] or {}).get("failures", []):
             print("lane failure " + _encoded(row).decode("ascii"))
+        for row in (frag["failureDetails"] or {}).get("observedDiagnostics", []):
+            print("lane observed-diagnostic " + _encoded(row).decode("ascii"))
     if facts["failingTruncated"] or facts["droppedInvalidNames"]:
         print(f"lane failing-test-overflow truncated={facts['failingTruncated']} "
               f"dropped-invalid={facts['droppedInvalidNames']}")
