@@ -50,6 +50,21 @@ public class ConstructorCases {
     return 7;
   }
 
+  /** Two hydrated owner/pet/type rows: six three-level constructor chains. */
+  public static Object[] rehydrate() {
+    return new Object[] {
+        new EntityOwner(), new EntityPet(), new EntityType(),
+        new EntityOwner(), new EntityPet(), new EntityType()
+    };
+  }
+
+  public static class EntityBase {}
+  public static class EntityPerson extends EntityBase {}
+  public static class EntityOwner extends EntityPerson {}
+  public static class EntityNamed extends EntityBase {}
+  public static class EntityPet extends EntityNamed {}
+  public static class EntityType extends EntityNamed {}
+
   public static class Base {
     public int value;
 

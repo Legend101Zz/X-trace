@@ -45,7 +45,9 @@ GAP_CODES = {"xtrace.capture.gap": "queue", "xtrace.capture.gap.recording-cap": 
              "xtrace.capture.gap.line-budget": "line_budget",
              "xtrace.capture.handler_unresolved": "handler_unresolved"}
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
-JAVA_SYMBOL = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.(?:[A-Za-z_$][\w$]*|<init>|<clinit>)", re.ASCII)
+JAVA_SYMBOL = re.compile(
+    r"(?P<member>[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.(?:[A-Za-z_$][\w$]*|<init>|<clinit>))"
+    r"(?P<identity>#m1:[0-9a-f]{64})?", re.ASCII)
 # These prefixes classify layers only; they never authenticate symbol text.
 FRAMEWORK_PACKAGES = (
     "java", "javax", "jdk",
@@ -133,10 +135,14 @@ def safe_symbol(value):
         return value if request[1] in ROUTES else None
     if RESPONSE.fullmatch(value):
         return value
-    if JAVA_SYMBOL.fullmatch(value):
-        declaring_class = value.rsplit(".", 1)[0]
+    java = JAVA_SYMBOL.fullmatch(value)
+    if java:
+        declaring_class = java["member"].rsplit(".", 1)[0]
         layer = "other"
-        if declaring_class.startswith("org.springframework.samples.petclinic."):
+        # MethodIdentity uses simple class names. These suffixes remain naming
+        # heuristics; retain the whole identity in the hash to distinguish overloads.
+        if declaring_class.startswith("org.springframework.samples.petclinic.") or (
+                java["identity"] and "." not in declaring_class):
             class_name = declaring_class.rsplit(".", 1)[-1]
             for suffix in ("Controller", "Service", "Repository"):
                 if class_name.endswith(suffix):
