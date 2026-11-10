@@ -26,6 +26,7 @@ env:
 jobs:
   release-tool-tests:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -35,9 +36,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Install Linux descriptor inspection tool
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes lsof
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=60 install --yes lsof
       - name: Select private root path
         # The runner context is not available in job-level `env`; derive the
         # path from the shell-level runner variable and export it here.
@@ -72,7 +78,7 @@ jobs:
   release-floor-linux-x86_64:
     needs: release-tool-tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 120
     permissions:
       contents: read
     strategy:
@@ -103,9 +109,14 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - name: Install release-floor system prerequisites
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=60 install --yes \
             lsof \
             libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
             libcairo2 libcups2t64 libdrm2 libgbm1 libglib2.0-0t64 \
@@ -183,6 +194,7 @@ jobs:
 
   java-client:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
@@ -254,6 +266,7 @@ jobs:
 
   node-client:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
@@ -300,6 +313,8 @@ jobs:
 
   gates:
     runs-on: ubuntu-latest
+    # Recent run took 49 minutes; leave room for runner and download variance.
+    timeout-minutes: 90
     env:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
