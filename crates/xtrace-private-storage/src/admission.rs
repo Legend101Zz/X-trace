@@ -2072,7 +2072,7 @@ mod tests {
         );
         assert_eq!(
             leaf.create_private_child_for_operation("late", expired).map(|_| ()),
-            Err(PrivateStorageError::Unavailable)
+            Err(PrivateStorageError::check(Step::Deadline))
         );
         assert!(!leaf.path().join("late").exists(), "no directory created after expiry");
         assert_eq!(probe::probed_paths().len(), before, "no ACL probe after expiry");
@@ -2365,7 +2365,7 @@ mod tests {
         );
         assert_eq!(
             leaf.create_private_child_for_operation("late", expired).map(|_| ()),
-            Err(PrivateStorageError::Unavailable)
+            Err(PrivateStorageError::check(Step::Deadline))
         );
         assert!(!leaf.path().join("late").exists(), "no directory created after expiry");
         assert_eq!(probe::probed_paths().len(), before, "no ACL probe after expiry");
