@@ -20,7 +20,9 @@
 //! closed. Fresh probes apply the same checks across the listing, including batch fallbacks.
 //! A directory content change can invalidate a fresh listing without changing its ACL. In that
 //! case APFS admission requires another listing with identical ACL entries and an unchanged
-//! state across that listing, under the original deadline. Other filesystems fail closed.
+//! state across that listing, under the original deadline. Linux requires the same evidence
+//! from both ACL attributes on an admitted filesystem with subsecond ctime. Coarse timestamps
+//! and other filesystems fail closed.
 //! The raced verdict is never cached.
 //! Only positive, unchanged verdicts are stored, and each memo is bounded to 1024 entries.
 //! This does not defend against root forging filesystem metadata, or changes after the final
@@ -440,7 +442,7 @@ fn directory_metadata(
             return None;
         }
         let opened = directory.metadata().ok()?;
-        #[cfg(all(target_os = "macos", test))]
+        #[cfg(all(any(target_os = "linux", target_os = "macos"), test))]
         run_directory_read_hook(path);
         let named = std::fs::symlink_metadata(path).ok()?;
         if !named.is_dir()
@@ -456,6 +458,10 @@ fn directory_metadata(
         // No verdict has been used yet. Obtain a matching descriptor/path snapshot if child
         // activity raced these two reads; an ACL-only change still fails closed.
         if cfg!(target_os = "macos") && directory_contents_changed(&opened, &named) {
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        if linux_directory_can_recheck(operation, directory, &opened, &named) {
             continue;
         }
         return None;
@@ -493,6 +499,8 @@ pub(crate) fn directory_acl_admits(
         key.as_ref().is_some_and(|key| operation.already_judged(key) || operation.scope_has(key));
     #[cfg(target_os = "macos")]
     let mut listing = None;
+    #[cfg(target_os = "linux")]
+    let mut acl = None;
     if !remembered {
         #[cfg(test)]
         record_directory_probe(path);
@@ -501,7 +509,12 @@ pub(crate) fn directory_acl_admits(
             listing = probe_directory(operation, path, directory);
             listing.is_some()
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        let admitted = {
+            acl = probe_directory(operation, role, path, directory);
+            acl.is_some()
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let admitted = probe_directory(operation, role, path, directory);
         if !admitted {
             return false;
@@ -518,7 +531,7 @@ pub(crate) fn directory_acl_admits(
         return false;
     }
     // A changed state invalidates this verdict: the listing may predate an ACL grant. Child
-    // activity permits fresh evidence only on APFS, whose nanosecond ctime can prove stability.
+    // activity requires fresh, identical ACL evidence bracketed by an unchanged precise state.
     if DirectoryState::of(&after, role) != state {
         #[cfg(target_os = "macos")]
         if key.is_some() && directory_contents_changed(&before, &after) {
@@ -527,6 +540,14 @@ pub(crate) fn directory_acl_admits(
                     operation, role, path, directory, expected, &listing,
                 ) && operation.directory_key(state, directory) == key
                     && !operation.expired();
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if linux_directory_can_recheck(operation, directory, &before, &after) {
+            if let Some(acl) = acl {
+                return recheck_linux_directory_acl(
+                    operation, role, path, directory, expected, &acl,
+                );
             }
         }
         return false;
@@ -585,6 +606,67 @@ fn recheck_directory_listing(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Eq, PartialEq)]
+struct LinuxDirectoryAcl {
+    access: Option<Vec<u8>>,
+    default: Option<Vec<u8>>,
+}
+
+/// Content changes justify gathering new evidence, never accepting the raced verdict.
+/// Do not rely on whole-second ctime to detect an ACL edit after the new attribute reads.
+#[cfg(target_os = "linux")]
+fn linux_directory_can_recheck(
+    operation: &Operation,
+    directory: &File,
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    directory_contents_changed(before, after)
+        && before.ctime_nsec() != 0
+        && after.ctime_nsec() != 0
+        && rustix::fs::fstatfs(directory).is_ok_and(|stats| {
+            crate::policy::linux_filesystem_admitted(stats.f_type as u64, operation.profile())
+        })
+}
+
+/// Obtain an unchanged snapshot of both attributes under the original operation deadline.
+/// Equality also refuses a policy-compatible ACL edit accompanying a child mutation.
+#[cfg(target_os = "linux")]
+fn recheck_linux_directory_acl(
+    operation: &Operation,
+    role: DirectoryRole,
+    path: &Path,
+    directory: &File,
+    expected: FileIdentity,
+    original: &LinuxDirectoryAcl,
+) -> bool {
+    loop {
+        let Some(before) = directory_metadata(operation, path, directory, expected, role) else {
+            return false;
+        };
+        #[cfg(test)]
+        record_directory_probe(path);
+        let Some(acl) = probe_directory(operation, role, path, directory) else { return false };
+        if &acl != original {
+            return false;
+        }
+        let Some(after) = directory_metadata(operation, path, directory, expected, role) else {
+            return false;
+        };
+        if operation.expired() {
+            return false;
+        }
+        if DirectoryState::of(&before, role) == DirectoryState::of(&after, role) {
+            return true;
+        }
+        if !linux_directory_can_recheck(operation, directory, &before, &after) {
+            return false;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn read_acl_attribute(directory: &File, name: &str) -> Result<Option<Vec<u8>>, ()> {
     let mut value = vec![0_u8; 16 * 1024];
     match rustix::fs::fgetxattr(directory, name, value.as_mut_slice()) {
@@ -605,14 +687,13 @@ fn probe_directory(
     role: DirectoryRole,
     _path: &Path,
     directory: &File,
-) -> bool {
-    let Ok(access) = read_acl_attribute(directory, "system.posix_acl_access") else {
-        return false;
-    };
-    let Ok(default) = read_acl_attribute(directory, "system.posix_acl_default") else {
-        return false;
-    };
+) -> Option<LinuxDirectoryAcl> {
+    let access = read_acl_attribute(directory, "system.posix_acl_access").ok()?;
+    let default = read_acl_attribute(directory, "system.posix_acl_default").ok()?;
+    #[cfg(test)]
+    run_directory_probe_hook(_path);
     crate::policy::linux_directory_acl_admits(role, access.as_deref(), default.as_deref())
+        .then_some(LinuxDirectoryAcl { access, default })
 }
 
 #[cfg(target_os = "macos")]
@@ -924,12 +1005,32 @@ thread_local! {
     static BATCH_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AFTER_LISTING: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
     static AFTER_INITIAL_STATE: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
-    static BETWEEN_DIRECTORY_READS: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
     /// Test-only HFS+ facts: a chosen ctime second and a filesystem ineligible for reuse.
     static COARSE_FILESYSTEM: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(all(target_os = "macos", test))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), test))]
+thread_local! {
+    static BETWEEN_DIRECTORY_READS: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
+}
+
+#[cfg(all(target_os = "linux", test))]
+thread_local! {
+    static AFTER_DIRECTORY_PROBE: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn run_directory_probe_hook(path: &Path) {
+    let hook = AFTER_DIRECTORY_PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|hook| hook.path == path) { slot.take() } else { None }
+    });
+    if let Some(hook) = hook {
+        (hook.action)();
+    }
+}
+
+#[cfg(all(any(target_os = "linux", target_os = "macos"), test))]
 fn run_directory_read_hook(path: &Path) {
     let hook = BETWEEN_DIRECTORY_READS.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -951,8 +1052,8 @@ fn run_initial_state_hook(path: &Path) {
     }
 }
 
-/// One-shot mutation after stdout is captured and before any post-listing state read.
-#[cfg(all(target_os = "macos", test))]
+/// One-shot mutation at a directory metadata or ACL evidence boundary.
+#[cfg(all(any(target_os = "linux", target_os = "macos"), test))]
 struct AfterListing {
     path: std::path::PathBuf,
     action: Box<dyn FnOnce()>,
@@ -1207,12 +1308,331 @@ mod tests {
         AFTER_LISTING.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[derive(Clone, Copy)]
     enum ContentEdit {
         Create,
         Rename,
         Remove,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_observe_content_change(path: &Path, before: &std::fs::Metadata) -> std::fs::Metadata {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = open(path);
+        let deadline = Instant::now() + ADMISSION_BUDGET;
+        let marker =
+            std::time::UNIX_EPOCH + Duration::from_secs(if before.mtime() == 1 { 2 } else { 1 });
+        loop {
+            let after = directory.metadata().expect("after child change");
+            if directory_contents_changed(before, &after)
+                && DirectoryState::of(before, DirectoryRole::PrivateLeaf)
+                    != DirectoryState::of(&after, DirectoryRole::PrivateLeaf)
+            {
+                return after;
+            }
+            assert!(Instant::now() < deadline, "filesystem must expose a changed state");
+            // Some Linux kernels timestamp several syscalls in one clock tick. Observe a new
+            // tick without a sleep; touching mtime leaves ownership, mode and both ACLs intact.
+            directory.set_modified(marker).expect("advance observable directory state");
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_content_edit_hook(path: &Path, edit: ContentEdit) -> AfterListing {
+        let path = path.to_path_buf();
+        AfterListing {
+            path: path.clone(),
+            action: Box::new(move || {
+                let before = std::fs::symlink_metadata(&path).expect("before child change");
+                match edit {
+                    ContentEdit::Create => {
+                        std::fs::create_dir(path.join("created")).expect("create sibling directory")
+                    }
+                    ContentEdit::Rename => {
+                        std::fs::rename(path.join("child"), path.join("renamed"))
+                            .expect("rename sibling")
+                    }
+                    ContentEdit::Remove => {
+                        std::fs::remove_file(path.join("child")).expect("remove sibling")
+                    }
+                }
+                let after = linux_observe_content_change(&path, &before);
+                assert!(
+                    identity_of(&open(&path)).same_directory(FileIdentity::from_metadata(&before))
+                );
+                assert!(directory_contents_changed(&before, &after), "child mutation moves mtime");
+                assert_ne!(
+                    DirectoryState::of(&before, DirectoryRole::PrivateLeaf),
+                    DirectoryState::of(&after, DirectoryRole::PrivateLeaf),
+                    "child mutation invalidates the ACL snapshot"
+                );
+            }),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_linux_hook(hook: AfterListing, between_reads: bool) {
+        if between_reads {
+            BETWEEN_DIRECTORY_READS.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+        } else {
+            AFTER_DIRECTORY_PROBE.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_linux_hooks_consumed() {
+        BETWEEN_DIRECTORY_READS.with(|slot| assert!(slot.borrow().is_none(), "metadata hook ran"));
+        AFTER_DIRECTORY_PROBE.with(|slot| assert!(slot.borrow().is_none(), "ACL hook ran"));
+    }
+
+    /// Re-arm until the observable creation, so the mutation races post-create validation.
+    #[cfg(target_os = "linux")]
+    fn linux_content_hook_after_creation(parent: &Path, file: &Path, between_reads: bool) {
+        let parent = parent.to_path_buf();
+        let file = file.to_path_buf();
+        install_linux_hook(
+            AfterListing {
+                path: parent.clone(),
+                action: Box::new(move || {
+                    if file.exists() {
+                        (linux_content_edit_hook(&parent, ContentEdit::Create).action)();
+                    } else {
+                        linux_content_hook_after_creation(&parent, &file, between_reads);
+                    }
+                }),
+            },
+            between_reads,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_child_mutations_require_fresh_stable_acl_evidence() {
+        for between_reads in [true, false] {
+            for edit in [ContentEdit::Create, ContentEdit::Rename, ContentEdit::Remove] {
+                for role in [DirectoryRole::Traversed, DirectoryRole::PrivateLeaf] {
+                    let root = fixture();
+                    let path = root.path();
+                    std::fs::write(path.join("child"), b"").expect("sibling fixture");
+                    let directory = open(path);
+                    let _scope = crate::AdmissionScope::enter();
+                    let operation = Operation::new();
+                    install_linux_hook(linux_content_edit_hook(path, edit), between_reads);
+                    let before = directory_probe_count();
+                    assert!(directory_acl_admits(
+                        &operation,
+                        role,
+                        path,
+                        &directory,
+                        identity_of(&directory)
+                    ));
+                    assert_linux_hooks_consumed();
+                    assert_eq!(
+                        directory_probe_count() - before,
+                        if between_reads { 1 } else { 2 },
+                        "an ACL snapshot raced by content must be replaced"
+                    );
+                    assert!(operation.judged.borrow().is_empty(), "Linux never caches verdicts");
+                    let id = scope::live_scope_id().expect("live scope");
+                    assert_eq!(scope::with_scope(id, |state| state.memo.len()), Some(0));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_acl(named_permissions: u16) -> Vec<u8> {
+        let mut value = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (1_u16, 7_u16, u32::MAX),
+            (2, named_permissions, 12345),
+            (4, 0, u32::MAX),
+            (16, 0, u32::MAX),
+            (32, 0, u32::MAX),
+        ] {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&permissions.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_child_mutations_cannot_hide_access_or_default_acl_edits() {
+        for attribute in ["system.posix_acl_access", "system.posix_acl_default"] {
+            for permissions in [4, 7] {
+                for during_recheck in [false, true] {
+                    let root = fixture();
+                    let path = root.path();
+                    let directory = open(path);
+                    let operation = Operation::new();
+                    let changed_path = path.to_path_buf();
+                    let acl_hook = AfterListing {
+                        path: changed_path.clone(),
+                        action: Box::new(move || {
+                            let before = std::fs::symlink_metadata(&changed_path)
+                                .expect("before ACL and content change");
+                            std::fs::create_dir(changed_path.join("acl-child"))
+                                .expect("content change alongside ACL edit");
+                            rustix::fs::fsetxattr(
+                                open(&changed_path),
+                                attribute,
+                                &linux_acl(permissions),
+                                rustix::fs::XattrFlags::empty(),
+                            )
+                            .expect("set real ACL without changing mode 0700");
+                            linux_observe_content_change(&changed_path, &before);
+                        }),
+                    };
+                    if during_recheck {
+                        let content = linux_content_edit_hook(path, ContentEdit::Create);
+                        install_linux_hook(
+                            AfterListing {
+                                path: path.to_path_buf(),
+                                action: Box::new(move || {
+                                    (content.action)();
+                                    install_linux_hook(acl_hook, false);
+                                }),
+                            },
+                            false,
+                        );
+                    } else {
+                        install_linux_hook(acl_hook, false);
+                    }
+                    // Traversal would accept a new read-only access ACL or a well-formed default
+                    // ACL in isolation. Neither may silently replace evidence raced by a child.
+                    assert!(!directory_acl_admits(
+                        &operation,
+                        DirectoryRole::Traversed,
+                        path,
+                        &directory,
+                        identity_of(&directory),
+                    ));
+                    assert_linux_hooks_consumed();
+                    assert!(operation.judged.borrow().is_empty());
+                    assert!(
+                        !directory_acl_admits(
+                            &Operation::new(),
+                            DirectoryRole::PrivateLeaf,
+                            path,
+                            &directory,
+                            identity_of(&directory),
+                        ),
+                        "private leaves still refuse every ACL"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_content_rechecks_refuse_replacement_and_mode_changes() {
+        for mutation in ["mode", "directory", "symlink"] {
+            let fixture = fixture();
+            let path = fixture.path().join("private");
+            std::fs::create_dir(&path).expect("private directory");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("private mode");
+            let directory = open(&path);
+            let operation = Operation::new();
+            let content = linux_content_edit_hook(&path, ContentEdit::Create);
+            let changed_path = path.clone();
+            let replacement = AfterListing {
+                path: path.clone(),
+                action: Box::new(move || {
+                    if mutation == "mode" {
+                        std::fs::set_permissions(
+                            &changed_path,
+                            std::fs::Permissions::from_mode(0o777),
+                        )
+                        .expect("unsafe mode");
+                    } else {
+                        let old = changed_path.with_file_name("old");
+                        std::fs::rename(&changed_path, &old).expect("move admitted directory");
+                        if mutation == "symlink" {
+                            std::os::unix::fs::symlink(&old, &changed_path)
+                                .expect("replace with link");
+                        } else {
+                            std::fs::create_dir(&changed_path).expect("replace directory");
+                        }
+                    }
+                }),
+            };
+            install_linux_hook(
+                AfterListing {
+                    path: path.clone(),
+                    action: Box::new(move || {
+                        (content.action)();
+                        install_linux_hook(replacement, false);
+                    }),
+                },
+                false,
+            );
+            assert!(!judge(&operation, &path, &directory));
+            assert_linux_hooks_consumed();
+            assert!(operation.judged.borrow().is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_private_io_and_sync_survive_sibling_activity_in_an_ancestor() {
+        use std::io::Write as _;
+
+        for between_reads in [true, false] {
+            for operation in ["open", "create", "sync", "rename", "mkdir", "remove"] {
+                let fixture = fixture();
+                let parent = crate::AdmittedPrivateRoot::open(fixture.path()).expect("parent");
+                let root = parent.create_private_child("private").expect("private leaf");
+                root.create_private_child("empty").expect("empty child");
+                let mut staged = root.create_private_file("staged").expect("staged file");
+                staged.write_all(b"replacement-canary").expect("write fixture");
+                staged.sync_all().expect("sync fixture");
+                if operation == "create" {
+                    linux_content_hook_after_creation(
+                        parent.path(),
+                        &root.path().join("new"),
+                        between_reads,
+                    );
+                } else {
+                    install_linux_hook(
+                        linux_content_edit_hook(parent.path(), ContentEdit::Create),
+                        between_reads,
+                    );
+                }
+                match operation {
+                    "open" => {
+                        crate::AdmittedPrivateRoot::open(root.path()).expect("admit leaf");
+                    }
+                    "create" => {
+                        let mut file =
+                            root.create_private_file("new").expect("create private file");
+                        file.write_all(b"new-canary").expect("write private file");
+                        file.sync_all().expect("sync private file");
+                        assert_eq!(root.read_bounded_file("new", 64).expect("read"), b"new-canary");
+                    }
+                    "sync" => root.sync().expect("sync admitted directory"),
+                    "rename" => {
+                        root.rename_replace("staged", "published").expect("publish");
+                        assert_eq!(
+                            root.read_bounded_file("published", 64).expect("read"),
+                            b"replacement-canary"
+                        );
+                    }
+                    "mkdir" => {
+                        root.create_private_child("new-child").expect("create child");
+                    }
+                    "remove" => root.remove_private_child("empty").expect("remove empty child"),
+                    _ => unreachable!(),
+                }
+                assert_linux_hooks_consumed();
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
