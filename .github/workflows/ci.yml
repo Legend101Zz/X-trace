@@ -399,6 +399,21 @@ jobs:
         run: cargo fmt --all --check
       - name: Strict clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Reject release CI diagnostic channel
+        run: |
+          set -euo pipefail
+          umask 077
+          log="${RUNNER_TEMP:?}/ci-diagnostics-release.log"
+          if cargo check --release --locked -p xtrace-private-storage --features ci-diagnostics >"$log" 2>&1; then
+            echo "release diagnostic feature was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics requires debug_assertions; release/package builds must exclude it' "$log" >/dev/null
+          if cargo check --release --locked -p xtrace-private-storage --all-features >"$log" 2>&1; then
+            echo "release all-features diagnostic channel was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics requires debug_assertions; release/package builds must exclude it' "$log" >/dev/null
       - name: Unit and integration tests
         env:
           XTRACE_CI_DIAG_DIR: ${{ runner.temp }}/xt/frag/ci-diag

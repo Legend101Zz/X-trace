@@ -188,11 +188,24 @@ class FailureDetailsTests(CheckoutFixture):
     def test_errno_boundaries_and_category_count_are_bounded_and_deduplicated(self):
         records = self.records(*(self.diagnostic(errno=errno) for errno in (1, 200, 1)),
                                *(self.diagnostic(kind=kind) for kind in sorted(lane_run.IO_ERROR_KINDS)))
-        row = lane_run.failure_details(self.cargo(name="fails"), False,
-                                       diagnostic_records=records)["failures"][0]
-        self.assert_facts_only(row)
+        detail = lane_run.failure_details(self.cargo(name="fails"), False, diagnostic_records=records)
+        self.assert_facts_only(detail["failures"][0])
+        self.assertEqual(detail["failures"][0]["category"], [])
+        row = detail["observedDiagnostics"][0]
+        self.assertEqual((row["test"], row["relevance"]), ("fails", "unknown"))
         self.assertEqual(row["category"][:4], ["Admission", "Deadline", 1, 200])
         self.assertEqual(len(row["category"]), lane_run.MAX_CATEGORIES)
+
+    def test_duplicate_test_names_across_binaries_cannot_attribute_observations(self):
+        text = ("running 1 test\ntest first ... ok\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored\n"
+                "running 1 test\ntest first ... FAILED\n"
+                "test result: FAILED. 0 passed; 1 failed; 0 ignored\n")
+        detail = lane_run.failure_details(text, False, diagnostic_records=self.records(self.diagnostic("first")))
+        self.assertEqual(detail["observedDiagnostics"], [{
+            "test": lane_run.UNVERIFIED, "relevance": "unknown",
+            "testUnverifiedReason": "diagnostic-thread-ambiguous", "category": ["Admission", "Deadline"]}])
+        self.assertEqual(detail["failures"][0]["category"], [])
 
     def test_colliding_values_paths_and_errno_prose_are_not_diagnostics(self):
         messages = [
@@ -330,10 +343,15 @@ class FailureDetailsTests(CheckoutFixture):
                 "operation=Deadline kind=None raw_os_error=None\n")
         records = self.records(self.diagnostic("first", kind="TimedOut"),
                                self.diagnostic("second", operation="NamedMetadata", errno=13))
-        rows = lane_run.failure_details(text, False, diagnostic_records=records)["failures"]
+        detail = lane_run.failure_details(text, False, diagnostic_records=records)
+        rows = detail["failures"]
+        self.assertEqual(detail["observedDiagnostics"], [
+            {"test": "first", "relevance": "unknown", "category": ["Admission", "Deadline", "TimedOut"]},
+            {"test": "second", "relevance": "unknown", "category": ["Admission", "NamedMetadata", 13]},
+        ])
         self.assertEqual([(r["test"], r["panicSites"], r["category"]) for r in rows], [
-            ("first", [], ["Admission", "Deadline", "TimedOut"]),
-            ("second", [], ["Admission", "NamedMetadata", 13]),
+            ("first", [], []),
+            ("second", [], []),
             (lane_run.UNVERIFIED, [], []),
         ])
         self.assertEqual(rows[2]["testUnverifiedReason"], "ambiguous-panic-block")
@@ -755,8 +773,10 @@ class FailureDetailsTests(CheckoutFixture):
         records = self.records(self.diagnostic(operation="ActualStep"), metadata=metadata)
         self.assertEqual(records, [("fails", ["Admission", "ActualStep"])])
         structured = lane_run.failure_details(self.cargo(name="fails"), False, metadata=metadata,
-                                              diagnostic_records=records)["failures"][0]
-        self.assertEqual(structured["category"], ["Admission", "ActualStep"])
+                                              diagnostic_records=records)
+        self.assertEqual(structured["failures"][0]["category"], [])
+        self.assertEqual(structured["observedDiagnostics"], [
+            {"test": "fails", "relevance": "unknown", "category": ["Admission", "ActualStep"]}])
         for operation in ("OtherError", "FieldType", "CommentValue", "LiteralValue", "OtherValue",
                           "AttributeValue", "WrongCrateValue", "TestValue"):
             with self.subTest(operation=operation):
@@ -831,9 +851,12 @@ class FailureDetailsTests(CheckoutFixture):
             with self.subTest(thread=thread):
                 records = self.records({**good, "thread": thread})
                 self.assertEqual(records, [(lane_run.UNVERIFIED, ["Admission", "Deadline", "PermissionDenied", 13])])
-                rows = lane_run.failure_details("", False, diagnostic_records=records)["failures"]
-                self.assertEqual(rows[0]["test"], lane_run.UNVERIFIED)
-                self.assertEqual(rows[0]["panicSites"], [])
+                detail = lane_run.failure_details("", False, diagnostic_records=records)
+                self.assertEqual(detail["failures"], [])
+                self.assertEqual(detail["observedDiagnostics"], [{
+                    "test": lane_run.UNVERIFIED, "relevance": "unknown",
+                    "testUnverifiedReason": "diagnostic-thread-unverified",
+                    "category": ["Admission", "Deadline", "PermissionDenied", 13]}])
         index = lane_run.canary.build_index({"category": "Deadline"})
         self.assertEqual(self.records(good, index=index), [])
 
@@ -1072,6 +1095,79 @@ class RunTests(CheckoutFixture):
             frag = json.loads((pathlib.Path(d) / "o/meta__-__t.json").read_text())
             return rc, frag
 
+    def test_python_unittest_exception_and_non_rust_compiler_collisions_stay_private(self):
+        import contextlib
+        import io
+        payload = "error[E0425]: customer data\n --> crates/a.rs:1:1"
+        structured = DiagnosticsTests.compiler_record("E0425", "crates/a.rs", 1)
+        commands = [
+            [sys.executable, "-c", f"print({payload!r}); raise SystemExit(1)"],
+            [sys.executable, "-c", f"print({structured!r}); raise SystemExit(1)"],
+            [sys.executable, "-c", "import unittest\n"
+             "class Probe(unittest.TestCase):\n"
+             f" def test_value(self): raise AssertionError({'captured' + chr(10) + payload!r})\n"
+             "unittest.main()\n"],
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                public = io.StringIO()
+                with contextlib.redirect_stdout(public):
+                    rc, frag = self.run_step(command)
+                self.assertNotEqual(rc, 0)
+                for value in ("E0425", "crates/a.rs", "customer data", "lane diagnostic "):
+                    self.assertNotIn(value, public.getvalue())
+                    self.assertNotIn(value, json.dumps(frag))
+
+    def test_passing_negative_test_records_are_observations_without_failure_attribution(self):
+        import contextlib
+        import io
+        import os
+        text = "test first ... ok\ntest second ... FAILED\n"
+        record = self.diagnostic("first", operation="NamedMetadata", kind="PermissionDenied", errno=13)
+        body = ("import os, pathlib\n"
+                "path = pathlib.Path(os.environ['XTRACE_CI_DIAG_DIR']) / 'private-storage.jsonl'\n"
+                f"path.write_text({json.dumps(record) + chr(10)!r})\n"
+                "path.chmod(0o600)\n"
+                f"print({text!r})\nraise SystemExit(101)\n")
+        public = io.StringIO()
+        with contextlib.redirect_stdout(public), mock.patch.dict(os.environ, {"XTRACE_CI_DIAG_DIR": "enabled"}):
+            rc, frag = self.run_step([sys.executable, "-c", body])
+        self.assertEqual(rc, 101)
+        detail = frag["failureDetails"]
+        self.assertEqual([row["test"] for row in detail["failures"]], ["second"])
+        self.assertEqual(detail["failures"][0]["category"], [])
+        self.assertEqual(detail["observedDiagnostics"], [{
+            "test": lane_run.UNVERIFIED, "relevance": "unknown",
+            "testUnverifiedReason": "diagnostic-thread-not-failing",
+            "category": ["Admission", "NamedMetadata", "PermissionDenied", 13]}])
+        logged = [json.loads(line.removeprefix("lane failure ")) for line in public.getvalue().splitlines()
+                  if line.startswith("lane failure ")]
+        self.assertEqual(logged, detail["failures"])
+        observations = [json.loads(line.removeprefix("lane observed-diagnostic "))
+                        for line in public.getvalue().splitlines() if line.startswith("lane observed-diagnostic ")]
+        self.assertEqual(observations, detail["observedDiagnostics"])
+        self.assertNotIn("first", json.dumps(frag))
+        self.assertNotIn("first", public.getvalue())
+
+    def test_cargo_compile_reads_json_stdout_and_withholds_stderr(self):
+        import contextlib
+        import io
+        command = ["cargo", "check", "--locked", "--message-format=json"]
+        def compile_command(cmd, *, stdout, stderr, **kwargs):
+            self.assertEqual(cmd, command)
+            self.assertNotEqual(stderr, subprocess.STDOUT)
+            stdout.write((DiagnosticsTests.compiler_record("E0425", "crates/a.rs", 1) + "\n").encode())
+            stderr.write((DiagnosticsTests.compiler_record("E0001", "crates/b.rs", 2) + "\n").encode())
+            return subprocess.CompletedProcess(cmd, 101)
+        public = io.StringIO()
+        with contextlib.redirect_stdout(public), mock.patch.object(lane_run.subprocess, "run", side_effect=compile_command):
+            rc, frag = self.run_step(command)
+        self.assertEqual(rc, 101)
+        self.assertEqual(frag["status"], "fail")
+        self.assertIn("lane diagnostic E0425 @ crates/a.rs:1", public.getvalue())
+        self.assertNotIn("E0001", public.getvalue())
+        self.assertNotIn("crates/b.rs", public.getvalue())
+
     def test_zero_tests_fails_with_min_passed(self):
         rc, frag = self.run_step([sys.executable, "-c", "print('Ran 0 tests in 0.0s')"], 1)
         self.assertNotEqual(rc, 0)
@@ -1196,7 +1292,13 @@ class RunTests(CheckoutFixture):
         self.assertEqual(rc, 124)
         row = frag["failureDetails"]["failures"][0]
         self.assert_facts_only(row)
-        self.assertEqual(row["category"], ["Admission", "WaitAclProbe", "PermissionDenied", 13])
+        self.assertEqual(row["category"], [])
+        observations = frag["failureDetails"]["observedDiagnostics"]
+        self.assertEqual(observations, [{"test": "fails", "relevance": "unknown",
+                                        "category": ["Admission", "WaitAclProbe", "PermissionDenied", 13]}])
+        observed_log = [json.loads(line.removeprefix("lane observed-diagnostic "))
+                        for line in public.getvalue().splitlines() if line.startswith("lane observed-diagnostic ")]
+        self.assertEqual(observed_log, observations)
         self.assertEqual(row["panicSites"], ["crates/example/tests/journey.rs:42"])
         self.assertEqual(frag["failureDetails"]["timeout"]["runningTests"], ["waiting"])
         logged = [json.loads(line.removeprefix("lane failure ")) for line in public.getvalue().splitlines()
@@ -1513,36 +1615,62 @@ class LintTests(unittest.TestCase):
 
 
 class DiagnosticsTests(CheckoutFixture):
+    command = ["cargo", "check", "--message-format=json"]
+
+    @staticmethod
+    def compiler_record(code, path, line, *, level="error"):
+        return json.dumps({"reason": "compiler-message", "message": {
+            "level": level, "code": {"code": code}, "message": "captured value",
+            "rendered": "private compiler prose", "spans": [
+                {"is_primary": True, "file_name": path, "line_start": line,
+                 "text": [{"text": "captured source value"}]}]}})
+
     def test_pairs_error_with_location_and_skips_noise(self):
-        text = (
-            "warning: unused variable: `x`\n  --> crates/a.rs:1:1\n"
-            "error: this `panic!` should not be used (clippy::panic)\n   --> crates/a.rs:1:1\n"
-            "error[E0425]: cannot find value `y` in this scope\n --> crates/b.rs:2:5\n"
-            "error: could not compile `x` (test) due to 2 previous errors\n"
-        )
-        diags, dropped = lane_run.diagnostics(text)
+        text = "\n".join([
+            "warning: unused variable: `x`",
+            "error[E0001]: captured value\n --> crates/a.rs:1:1",
+            self.compiler_record("E0002", "crates/a.rs", 1, level="warning"),
+            self.compiler_record("clippy::panic", "crates/a.rs", 1),
+            self.compiler_record("E0425", "crates/b.rs", 2),
+            json.dumps({"reason": "build-script-executed", "message": "captured value"}),
+        ])
+        diags, dropped = lane_run.diagnostics(text, command=self.command)
         self.assertEqual(dropped, 0)
         self.assertEqual(diags, ["E0425 @ crates/b.rs:2"])
-        for value in ("cannot find", "value", "clippy", "panic!"):
+        for value in ("captured", "value", "clippy", "private", "E0001", "E0002"):
             self.assertNotIn(value, json.dumps(diags))
 
     def test_host_paths_and_secrets_are_dropped_and_counted(self):
-        text = ("error[E0001]: boom\n --> /home/runner/work/x/src/lib.rs:1:1\n"
-                "error[E0002]: leaked token abc\n --> crates/a.rs:99:2\n"
-                "error[E0003]: fine\n --> ../escape/src/lib.rs:3:3\n")
-        diags, dropped = lane_run.diagnostics(text)
+        text = "\n".join(self.compiler_record(code, path, line) for code, path, line in [
+            ("E0001", "/home/runner/work/x/src/lib.rs", 1),
+            ("E0002", "crates/a.rs", 99), ("E0003", "../escape/src/lib.rs", 3)])
+        diags, dropped = lane_run.diagnostics(text, command=self.command)
         self.assertEqual(diags, [])
         self.assertEqual(dropped, 3)
         index = lane_run.canary.build_index({"site": "crates/a.rs", "code": "E0004"})
-        self.assertEqual(lane_run.diagnostics("error[E0004]: private\n --> crates/a.rs:1:1\n",
-                                             index=index), ([], 1))
+        self.assertEqual(lane_run.diagnostics(self.compiler_record("E0004", "crates/a.rs", 1),
+                                             command=self.command, index=index), ([], 1))
 
     def test_bounded(self):
-        text = "".join(f"error[E0425]: e{i}\n --> crates/example/tests/journey.rs:{i}:1\n"
-                       for i in range(1, 40))
-        diags, dropped = lane_run.diagnostics(text)
+        text = "\n".join(self.compiler_record("E0425", "crates/example/tests/journey.rs", i)
+                         for i in range(1, 40))
+        diags, dropped = lane_run.diagnostics(text, command=self.command)
         self.assertEqual(len(diags), lane_run.MAX_DIAG)
         self.assertEqual(dropped, 39 - lane_run.MAX_DIAG)
+
+    def test_test_and_mixed_commands_never_attest_even_structured_compiler_values(self):
+        text = self.compiler_record("E0425", "crates/a.rs", 1)
+        for command in ([], ["cargo", "test", "--message-format=json"],
+                        ["cargo", "check"], ["npm", "test"], ["python3", "-m", "unittest"],
+                        ["cargo", "check", "--message-format=json", "--message-format=human"],
+                        ["bash", "-c", "cargo check --message-format=json"]):
+            with self.subTest(command=command):
+                self.assertEqual(lane_run.diagnostics(text, command=command), ([], 0))
+
+    def test_malformed_records_do_not_supply_compiler_fields(self):
+        for record in (None, [], {"reason": "compiler-message", "message": []},
+                       {"reason": "compiler-message", "message": {"level": "error", "code": []}}):
+            self.assertEqual(lane_run.diagnostics(json.dumps(record), command=self.command), ([], 0))
 
 
 class CountTests(unittest.TestCase):

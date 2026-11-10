@@ -151,6 +151,7 @@ class CiPullRequestTests(unittest.TestCase):
         package = (ROOT / "packaging/build.py").read_text()
         self.assertIn('["cargo", "build", "--release", "--locked", "-p", "xtrace-cli"]', package)
         self.assertNotIn("ci-diagnostics", package)
+        self.assertNotIn("--all-features", package)
         jobs = self.workflow["jobs"]
         gates = jobs["gates"]["steps"]
         tests = next(step for step in gates if step.get("name") == "Unit and integration tests")
@@ -163,6 +164,36 @@ class CiPullRequestTests(unittest.TestCase):
         self.assertEqual(run["env"]["XTRACE_CI_DIAG_DIR"], "${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/ci-diag")
         admission = next(step for step in floor if step.get("name") == "Admit private logs, leases, caches, and test scratch before writes")
         self.assertIn('mkdir -m 700 "$XTRACE_CI_PRIVATE_ROOT/frag" "$XTRACE_CI_PRIVATE_ROOT/frag/ci-diag"', admission["run"])
+
+    def test_release_guard_is_compiled_for_explicit_and_all_features_on_both_platforms(self):
+        source = (ROOT / "crates/xtrace-private-storage/src/diagnostic.rs").read_text()
+        guard = "ci-diagnostics requires debug_assertions; release/package builds must exclude it"
+        self.assertIn('#[cfg(all(feature = "ci-diagnostics", not(debug_assertions)))]\n'
+                      f'compile_error!("{guard}");', source)
+        self.assertIn('#[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]\nmod ci', source)
+        for filename, job_id in (("ci.yml", "gates"), ("macos.yml", "macos-arm64")):
+            workflow = workflow_lint.load(ROOT / ".github/workflows" / filename)
+            steps = workflow["jobs"][job_id]["steps"]
+            step = next(s for s in steps if s.get("name") == "Reject release CI diagnostic channel")
+            run = step["run"]
+            with self.subTest(workflow=filename):
+                self.assertNotIn("continue-on-error", step)
+                self.assertIn("set -euo pipefail", run)
+                self.assertIn("umask 077", run)
+                self.assertEqual(run.count("exit 1"), 2)
+                self.assertEqual(run.count(f"grep -F '{guard}'"), 2)
+                for features in ("--features ci-diagnostics", "--all-features"):
+                    self.assertIn("if cargo check --release --locked -p xtrace-private-storage "
+                                  + features + ' >"$log" 2>&1; then', run)
+            for job in workflow["jobs"].values():
+                self.assertNotIn("XTRACE_CI_DIAG_DIR", job.get("env", {}))
+                for candidate in job["steps"]:
+                    command = candidate.get("run", "")
+                    if candidate.get("name") == step["name"]:
+                        continue
+                    if "--release" in command or "packaging/build.py" in command:
+                        self.assertNotIn("ci-diagnostics", command)
+                        self.assertNotIn("--all-features", command)
 
 
 class MacosWorkflowTests(unittest.TestCase):

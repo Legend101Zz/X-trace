@@ -197,11 +197,27 @@ jobs:
           python3 -B -m tools.qa.lane_run run --suite java --variant "${{ matrix.java-version }}" --step gradle --cwd adapters/java \
             --junit-glob "*/build/test-results/test/*.xml" --min-passed 190 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
+      - name: Reject release CI diagnostic channel
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          umask 077
+          log="${RUNNER_TEMP:?}/ci-diagnostics-release.log"
+          if cargo check --release --locked -p xtrace-private-storage --features ci-diagnostics >"$log" 2>&1; then
+            echo "release diagnostic feature was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics requires debug_assertions; release/package builds must exclude it' "$log" >/dev/null
+          if cargo check --release --locked -p xtrace-private-storage --all-features >"$log" 2>&1; then
+            echo "release all-features diagnostic channel was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics requires debug_assertions; release/package builds must exclude it' "$log" >/dev/null
       - name: cargo build (locked workspace)
         if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step build --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
-            cargo build --locked --workspace --all-features
+            cargo build --locked --workspace --all-features --message-format=json
       - name: cargo test (locked workspace, no ignored tests)
         if: ${{ !cancelled() }}
         env:
