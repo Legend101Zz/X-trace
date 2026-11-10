@@ -24,23 +24,28 @@ class T(unittest.TestCase):
     def test_live_list_failure_keeps_only_fixed_problem_metadata_and_never_retries(self):
         import json
         import tempfile
-        problem = {"code": "XTR-STORE-OBJECT-IO", "requestId": "01900000-0000-7000-8000-000000000001",
-                   "detail": "private source path", "message": "private captured value"}
-        client = mock.Mock()
-        client.get.return_value = (500, problem)
-        with tempfile.TemporaryDirectory() as td, \
-             mock.patch.object(xinstr.time, "monotonic", return_value=1):
-            result = xinstr.wait_burst_boundary(client, pathlib.Path(td), [], {}, {}, 3)
-            self.assertFalse(result["verified"])
-            self.assertEqual(result["readError"], "recordings list HTTP 500")
-            self.assertEqual(result["readProblem"], {"httpStatus": 500, "code": problem["code"],
-                                                     "requestId": problem["requestId"]})
-            self.assertNotIn("private", json.dumps(result))
-        client.get.assert_called_once()
-        self.assertIsNone(client.deadline)
+        for status, code in ((422, "XTR-PORT-CORRUPTION"), (500, "XTR-PORT-TRANSPORT"),
+                             (500, "XTR-PORT-INTERNAL")):
+            with self.subTest(status=status, code=code):
+                problem = {"code": code, "requestId": "01900000-0000-7000-8000-000000000001",
+                           "detail": "private source path", "message": "private captured value"}
+                client = mock.Mock()
+                client.get.return_value = (status, problem)
+                with tempfile.TemporaryDirectory() as td, \
+                     mock.patch.object(xinstr.time, "monotonic", return_value=1):
+                    result = xinstr.wait_burst_boundary(client, pathlib.Path(td), [], {}, {}, 3)
+                    self.assertFalse(result["verified"])
+                    self.assertEqual(result["readError"], f"recordings list HTTP {status}")
+                    self.assertEqual(result["readProblem"], {"httpStatus": status, "code": code,
+                                                             "requestId": problem["requestId"]})
+                    self.assertNotIn("private", json.dumps(result))
+                client.get.assert_called_once()
+                self.assertIsNone(client.deadline)
 
     def test_read_problem_rejects_unknown_codes_and_private_request_ids(self):
         for doc in (None, [], "private", {"code": "XTR-private", "requestId": "private"},
+                    {"code": "XTR-PORT-PRIVATE", "requestId": "private"},
+                    {"code": "XTR-PORT-TRANSPORT\nprivate", "requestId": "private"},
                     {"code": ["XTR-STORE-OBJECT-IO"], "requestId": 1}):
             self.assertEqual(xinstr.read_problem(500, doc), {"httpStatus": 500, "code": None, "requestId": None})
 

@@ -68,9 +68,10 @@ class FocusedLineWiringTest {
     Map<String, byte[]> definitions = new HashMap<>();
     Map<String, byte[]> originals = new HashMap<>();
     for (String name : names) {
-      TypeDescription type = TypePool.Default.of(parent).describe(PKG + name).resolve();
+      String className = name.contains(".") ? name : PKG + name;
+      TypeDescription type = TypePool.Default.of(parent).describe(className).resolve();
       byte[] original =
-          ClassFileLocator.ForClassLoader.of(parent).locate(PKG + name).resolve();
+          ClassFileLocator.ForClassLoader.of(parent).locate(className).resolve();
       var lines = probes
           ? new LineProbeAsmWrapper(
               LineProbeConfig.focused(FixtureInstrumentation.PROBE_OWNER),
@@ -85,8 +86,8 @@ class FocusedLineWiringTest {
           .redefine(type, ClassFileLocator.ForClassLoader.of(parent))
           .visit(FixtureInstrumentation.boundedProbes(
               lines, new FixtureInstrumentation.CaptureLimitations(), new java.util.HashSet<>()));
-      definitions.put(PKG + name, builder.make().getBytes());
-      originals.put(PKG + name, original);
+      definitions.put(className, builder.make().getBytes());
+      originals.put(className, original);
     }
     loader = new Isolated(parent, definitions);
     // Production observes the input bytes under the application's defining loader.
@@ -112,6 +113,42 @@ class FocusedLineWiringTest {
       }
     }
     return events;
+  }
+
+  @Test
+  void springFixtureNamespaceEmitsObservedCursorsUnderItsOwnFrame() throws Exception {
+    String className = "dev.xtrace.fixture.FocusedOrders";
+    load(true, className);
+    assertTrue(BootstrapBridge.installLineSink(lineSink));
+    Class<?> type = loader.loadClass(className);
+    Object target = type.getConstructor().newInstance();
+    assertTrue(BootstrapBridge.requestStart("GET", "/orders/total"));
+    assertEquals(7, type.getMethod("total", boolean.class).invoke(target, true));
+    BootstrapBridge.requestEnd(200, false);
+
+    List<RecordingEvent> events = drain();
+    String symbol = MethodIdentity.symbol(className, "total", "(Z)I");
+    RecordingEvent entry = events.stream()
+        .filter(event -> event.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER
+            && event.getSymbol().equals(symbol))
+        .findFirst().orElseThrow();
+    List<RecordingEvent> lines = events.stream()
+        .filter(event -> event.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR)
+        .toList();
+    assertEquals(List.of(5, 6), lines.stream().map(event -> event.getSource().getStartLine()).toList(),
+        diagnostics());
+    for (RecordingEvent line : lines) {
+      assertEquals(symbol, line.getSymbol());
+      assertEquals(entry.getEventId(), line.getParentEventId());
+      assertEquals("src/test/java/dev/xtrace/fixture/FocusedOrders.java", line.getSource().getPath());
+      assertEquals(line.getSource().getStartLine(), line.getSource().getEndLine());
+      assertEquals(32, line.getSource().getContentHash().size());
+      assertEquals(SourceBinding.SOURCE_BINDING_OBSERVED_UNATTESTED, line.getSourceBinding());
+    }
+    assertEquals(0, lineSink.linesWithoutSource());
+    assertEquals(0, lineSink.linesRejected());
+    assertTrue(reports.stream().anyMatch(report -> report.name().equals("total")
+        && report.status() == MethodReport.Status.INSTRUMENTED));
   }
 
   @Test

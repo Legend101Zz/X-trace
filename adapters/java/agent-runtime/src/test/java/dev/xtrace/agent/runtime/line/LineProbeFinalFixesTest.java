@@ -172,6 +172,16 @@ class LineProbeFinalFixesTest {
     assertTrue(new LineProbeInstrumenter(LineProbeConfig.focused(OWNER), new SiteRegistry()).instrument(app).changed());
   }
 
+  @Test
+  void adapterNamespaceCannotAcquireLineOrValueProbes() {
+    String internal = "dev/xtrace/adapter/Runtime";
+    byte[] plain = simple(internal, 10, 11, true, null);
+    LineProbeInstrumenter.Result result =
+        new LineProbeInstrumenter(LineProbeConfig.focused(OWNER), new SiteRegistry()).instrument(plain);
+    assertFalse(result.changed());
+    assertEquals(Reasons.DENY_SCOPE, result.methods().get(0).reason());
+  }
+
   // ---- F6: line 0 ----
 
   @Test

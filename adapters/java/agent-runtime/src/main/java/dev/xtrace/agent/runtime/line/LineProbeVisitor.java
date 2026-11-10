@@ -110,10 +110,13 @@ public class LineProbeVisitor extends ClassVisitor {
 
   /**
    * Defence in depth behind the scope matcher (ADR 0003 section 2.1): a probe inside the probe
-   * owner, X-trace itself or the JDK would recurse into itself or the runtime.
+   * owner, the agent/adapter or the JDK would recurse into itself or the runtime. Application
+   * packages can share dev.xtrace (the Spring fixture does); match the runtime namespaces only,
+   * consistently with ApplicationScope's fixed exclusions.
    */
   static boolean isDenyScope(String internalName) {
-    return internalName.startsWith("dev/xtrace/")
+    return internalName.startsWith("dev/xtrace/agent/")
+        || internalName.startsWith("dev/xtrace/adapter/")
         || internalName.startsWith("java/")
         || internalName.startsWith("javax/")
         || internalName.startsWith("jdk/")
