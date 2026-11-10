@@ -195,7 +195,7 @@ public final class BootstrapBridge {
   public static void frameEnter(String symbol, java.lang.reflect.Method method) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || !validSymbol(symbol)) return;
+    if (!captureActive(context) || sink == null || !validSymbol(symbol)) return;
     flushLine(context);
     String eventId = context.nextEventId();
     String parent = context.currentParent();
@@ -215,7 +215,7 @@ public final class BootstrapBridge {
   public static String frameEnter(Class<?> type, String method, String descriptor) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || type == null || method == null) return null;
+    if (!captureActive(context) || sink == null || type == null || method == null) return null;
     String symbol = simpleName(type.getName()) + "." + method;
     if (!validSymbol(symbol)) return null;
     flushLine(context);
@@ -239,7 +239,7 @@ public final class BootstrapBridge {
   static boolean proxyFrame(
       ProxyBridge.Call call, Object[] arguments, Object result, Throwable thrown, boolean entering) {
     RequestContext context = CONTEXT.get();
-    if (context == null || SINK.get() == null) return false;
+    if (!captureActive(context) || SINK.get() == null) return false;
     if (!validSymbol(call.symbol())) {
       context.dropped++;
       return false;
@@ -317,6 +317,7 @@ public final class BootstrapBridge {
   public static boolean deferRequestEnd(Throwable thrown) {
     RequestContext context = CONTEXT.get();
     if (context == null) return false;
+    if (!context.deferred) context.deferredBoundary = SpringMvcBridge.captureBoundary();
     context.deferred = true;
     context.deferredThrown = thrown;
     if (thrown == null || thrown != context.lastThrown) context.lastThrowEventId = "";
@@ -328,6 +329,23 @@ public final class BootstrapBridge {
   public static boolean awaitingResolution() {
     RequestContext context = CONTEXT.get();
     return context != null && context.deferred;
+  }
+
+  static Object exceptionResolutionEnter() {
+    RequestContext context = CONTEXT.get();
+    if (context == null || !context.deferred) return null;
+    if (context.deferredBoundary == null ? SpringMvcBridge.captureBoundary() != null
+        : !SpringMvcBridge.boundaryActive(context.deferredBoundary)) return null;
+    context.resolutionDepth++;
+    return context;
+  }
+
+  static boolean resolving(Object boundary) {
+    return boundary != null && boundary == CONTEXT.get();
+  }
+
+  static void exceptionResolutionEnd(Object boundary) {
+    if (boundary instanceof RequestContext context && context.resolutionDepth > 0) context.resolutionDepth--;
   }
 
   static String simpleName(String binaryName) {
@@ -404,7 +422,7 @@ public final class BootstrapBridge {
   public static void frameExit(String symbol, Throwable thrown) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || context.frames.isEmpty()) return;
+    if (!captureActive(context) || sink == null || context.frames.isEmpty()) return;
     flushLine(context);
     Frame frame = context.frames.pop();
     if (!frame.symbol.equals(symbol)) {
@@ -461,7 +479,7 @@ public final class BootstrapBridge {
   public static void databaseStart() {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || context.databaseActive) return;
+    if (!captureActive(context) || sink == null || context.databaseActive) return;
     flushLine(context);
     context.databaseActive = true;
     context.databaseEventId = "";
@@ -484,7 +502,7 @@ public final class BootstrapBridge {
   public static void databaseEnd(boolean threw) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || !context.databaseActive) return;
+    if (!captureActive(context) || sink == null || !context.databaseActive) return;
     flushLine(context);
     String start = context.databaseEventId;
     context.databaseActive = false;
@@ -594,14 +612,18 @@ public final class BootstrapBridge {
     return CONTEXT.get() != null;
   }
 
+  private static boolean captureActive(RequestContext context) {
+    return context != null && (!context.deferred || context.resolutionDepth > 0
+        || SpringMvcBridge.boundaryActive(context.deferredBoundary));
+  }
+
   /** Called only by methods whose focused line probes were skipped at transformation time. */
   public static void lineGap() {
     try {
       RequestContext context = CONTEXT.get();
       BridgeSink sink = SINK.get();
-      // Deferred exception resolution still belongs to this open recording. requestEnd removes
-      // the context, and requestStart retires stale deferrals before admitting another request.
-      if (context == null || sink == null) return;
+      // A retained thread-local alone is not evidence that later work belongs to this request.
+      if (!captureActive(context) || sink == null) return;
       flushLine(context);
       if (!safeEvent(sink, context, context.nextEventId(), context.currentParent(),
           BridgeEventKind.GAP, "xtrace.capture.gap.not-transformed", 1)) context.dropped++;
@@ -683,6 +705,8 @@ public final class BootstrapBridge {
     private int nextEvent = 1;
     private String requestEventId = "";
     private boolean deferred;
+    private Object deferredBoundary;
+    private int resolutionDepth;
     private Throwable deferredThrown;
     private boolean unresolvedReported;
     private String lastThrowEventId = "";

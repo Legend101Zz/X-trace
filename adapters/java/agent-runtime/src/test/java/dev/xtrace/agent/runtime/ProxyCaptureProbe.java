@@ -519,11 +519,16 @@ public class ProxyCaptureProbe {
 
   @Case
   void repositoryDuringViewRenderingRemainsInsideTheDeferredRequest() throws Exception {
-    assertTrue(BootstrapBridge.requestStart("GET", "/repositories"));
-    assertTrue(BootstrapBridge.deferRequestEnd(null));
-    assertEquals("view-data", call("save", String.class, "view-data"));
-    BootstrapBridge.requestEnd(200, false);
-    assertEquals(1, drain().stream().filter(e -> e.kind() == BridgeEventKind.FRAME_ENTER).count());
+    dev.xtrace.agent.bootstrap.SpringMvcBridge.dispatchEnter();
+    try {
+      assertTrue(BootstrapBridge.requestStart("GET", "/repositories"));
+      assertTrue(BootstrapBridge.deferRequestEnd(null));
+      assertEquals("view-data", call("save", String.class, "view-data"));
+      BootstrapBridge.requestEnd(200, false);
+      assertEquals(1, drain().stream().filter(e -> e.kind() == BridgeEventKind.FRAME_ENTER).count());
+    } finally {
+      dev.xtrace.agent.bootstrap.SpringMvcBridge.dispatchEnd(null, null);
+    }
   }
 
   @Case
