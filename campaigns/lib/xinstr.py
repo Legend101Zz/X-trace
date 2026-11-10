@@ -26,6 +26,24 @@ LAYER_PATTERNS = {
     "repository": re.compile(r"Repository|Dao$"),
 }
 
+# Fixed product codes only: an error body can also contain private detail text.
+READ_PROBLEM_CODES = frozenset((
+    "XTR-VIEWER-QUERY-FAILED", "XTR-VIEWER-QUERY-BUSY", "XTR-PRIVATE-STORAGE-UNAVAILABLE",
+    "XTR-STORE-OBJECT-IO", "XTR-STORE-OBJECT-CORRUPT", "XTR-STORE-RECORDING-QUERY-CORRUPT",
+    "XTR-STORE-RECORDING-ROOT-IO", "XTR-STORE-RECORDING-ROOT-INVALID",
+    "XTR-STORE-RECORDING-ROOT-PERMISSION", "XTR-STORE-RECORDING-SQLITE-IO",
+    "XTR-STORE-RECORDING-SQLITE-BUSY", "XTR-STORE-RECORDING-SQLITE-INTERNAL",
+))
+
+
+def read_problem(status: int, doc: Any) -> dict[str, Any]:
+    """Publish bounded failure metadata, never an API error's message or detail."""
+    doc = doc if isinstance(doc, dict) else {}
+    code, request_id = doc.get("code"), doc.get("requestId")
+    return {"httpStatus": status, "code": code if isinstance(code, str) and code in READ_PROBLEM_CODES else None,
+            "requestId": request_id if isinstance(request_id, str) and re.fullmatch(
+                r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", request_id) else None}
+
 
 # ------------------------------------------------------------------ stats ----
 def percentile(values: list[float], q: float) -> float | None:
@@ -203,7 +221,8 @@ def collect_api(client: ViewerClient, out_dir: pathlib.Path, max_recordings: int
         st, doc = client.get(q)
         (out_dir / f"recordings-page-{pages}.json").write_text(json.dumps(doc, indent=1, sort_keys=True))
         if st != 200:
-            return {"ok": False, "reason": f"recordings list HTTP {st}", "recordings": [], "details": {}}
+            return {"ok": False, "reason": f"recordings list HTTP {st}", "problem": read_problem(st, doc),
+                    "recordings": [], "details": {}}
         listing += doc.get("recordings", [])
         after = doc.get("nextAfter")
         pages += 1
@@ -473,6 +492,8 @@ def wait_burst_boundary(client: ViewerClient, out_dir: pathlib.Path, sent: list,
             api = collect_api(client, out_dir)
             if not api["ok"]:
                 boundary["readError"] = api["reason"]
+                if "problem" in api:
+                    boundary["readProblem"] = api["problem"]
                 break
             boundary = burst_accounting(api["details"], sent, expectations, before)
             if boundary["verified"] and time.monotonic() <= deadline:
@@ -887,6 +908,11 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
                              "frameSymbols": [],
                              "recordingVerdict": verdicts.get(sc.id), "elapsedMs": 0,
                              "notRunReason": "serial boundary was not verified"})
+    workloads_passed = (len(results) == len(scenarios) and bool(results)
+                        and all(r["passed"] for r in results))
+    boundaries_verified = (not any(sc.kind == "concurrency" for sc in scenarios)
+                           or bool(serial_boundary and serial_boundary["verified"]
+                                   and boundary and boundary["verified"]))
     receipt = {
         "schemaVersion": 1, "kind": "instrumented_campaign_non_release", "project": project, "releaseAcceptance": False,
         "instrumented": True, "signed": False, "pin": pin, "syntheticDataOnly": True, "configurationAdaptations": adaptations,
@@ -898,7 +924,9 @@ def run_instrumented(*, project: str, pin: dict[str, Any], make_stack: Callable[
         "problemClasses": problem_classes(verdicts), "scenarios": scen_out,
         "recordingsWithSource": sum(e["recordingsWithSource"] for v in verdicts.values() for e in v["expectations"]),
         "recordingsWithStatus": sum(e["recordingsWithStatus"] for v in verdicts.values() for e in v["expectations"]),
-        "result": "recorded" if api["ok"] and results else "failed",
+        # A successful read after shutdown cannot repair a failed live boundary or
+        # turn an unreached workload into a successful interleaved overhead run.
+        "result": "recorded" if api["ok"] and workloads_passed and boundaries_verified else "failed",
     }
     (out_dir / "receipt.json").write_text(json.dumps(receipt, indent=1, sort_keys=True))
     return receipt

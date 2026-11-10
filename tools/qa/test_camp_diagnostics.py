@@ -187,6 +187,28 @@ class Projection(unittest.TestCase):
         for symbol in ("http.response 600", "http.response 200 private", "http.request GET /owners/aliceSmith"):
             self.assertIsNone(cd.safe_symbol(symbol))
 
+    def test_versioned_method_and_constructor_identities_survive_as_hashes_only(self):
+        symbols = (
+            ("OwnerController.showOwner", "controller"), ("OrderService.find", "service"),
+            ("OwnerRepository.findById", "repository"), ("BaseEntity.<init>", "other"),
+            ("Person.<init>", "other"), ("Owner.<init>", "other"),
+            ("org.springframework.samples.petclinic.owner.OwnerController.showOwner", "controller"),
+        )
+        for member, layer in symbols:
+            for identity in ("a" * 64, "b" * 64):
+                symbol = member + "#m1:" + identity
+                with self.subTest(symbol=symbol):
+                    row = cd.recording({"events": [{"kind": "frame_enter", "symbol": symbol}]})
+                    self.assertEqual(row["events"][0]["symbol"],
+                                     f"withheld:{layer}:sha256:" + hashlib.sha256(symbol.encode()).hexdigest())
+                    self.assertNotIn(member, json.dumps(row))
+                    self.assertNotIn(identity, json.dumps(row))
+            self.assertNotEqual(cd.safe_symbol(member + "#m1:" + "a" * 64),
+                                cd.safe_symbol(member + "#m1:" + "b" * 64))
+        for suffix in ("#m2:" + "a" * 64, "#m1:private", "#m1:" + "a" * 63,
+                       "#m1:" + "a" * 65, "#m1:" + "A" * 64, "#m1:" + "a" * 64 + " private"):
+            self.assertIsNone(cd.safe_symbol("Owner.<init>" + suffix))
+
     def test_unavailable_and_untrusted_metadata_are_not_inferred(self):
         doc = {"recordingId": "user-data", "status": "secret", "completion": "secret", "outcome": {"kind": "secret", "httpStatus": True},
                "events": [{"kind": "secret", "sequence": "secret", "frameId": "private-path", "parentFrameId": {"value": "secret"},

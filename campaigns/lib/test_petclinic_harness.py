@@ -121,6 +121,20 @@ class OverheadHarness(unittest.TestCase):
                 harness.baseline(pathlib.Path(td) / "baseline")
                 self.assertNotIn("XCAMP_LAUNCH_PREFIX", os.environ)
 
+    def test_failed_instrumented_repeat_stops_the_pairs_and_keeps_its_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = self.load(td)
+            out = pathlib.Path(td) / "overhead"
+            with mock.patch.dict(os.environ, {"XCAMP_OVERHEAD_DIR": str(out)}), \
+                 mock.patch.object(harness, "baseline", return_value={"result": "passed_baseline_only"}) as baseline, \
+                 mock.patch.object(harness, "instrumented", return_value=1) as instrumented:
+                self.assertEqual(harness.overhead(), 1)
+            baseline.assert_called_once()
+            instrumented.assert_called_once()
+            rows = json.loads((out / "runs.json").read_text())["runs"]
+            self.assertEqual([(row["mode"], row["repeat"], row["exitCode"]) for row in rows],
+                             [("baseline", 0, 0), ("instrumented", 0, 1)])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,29 @@ def rec(method, path, status, symbols=("OwnerController.showOwner", "OwnerReposi
 
 
 class T(unittest.TestCase):
+    def test_live_list_failure_keeps_only_fixed_problem_metadata_and_never_retries(self):
+        import json
+        import tempfile
+        problem = {"code": "XTR-STORE-OBJECT-IO", "requestId": "01900000-0000-7000-8000-000000000001",
+                   "detail": "private source path", "message": "private captured value"}
+        client = mock.Mock()
+        client.get.return_value = (500, problem)
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(xinstr.time, "monotonic", return_value=1):
+            result = xinstr.wait_burst_boundary(client, pathlib.Path(td), [], {}, {}, 3)
+            self.assertFalse(result["verified"])
+            self.assertEqual(result["readError"], "recordings list HTTP 500")
+            self.assertEqual(result["readProblem"], {"httpStatus": 500, "code": problem["code"],
+                                                     "requestId": problem["requestId"]})
+            self.assertNotIn("private", json.dumps(result))
+        client.get.assert_called_once()
+        self.assertIsNone(client.deadline)
+
+    def test_read_problem_rejects_unknown_codes_and_private_request_ids(self):
+        for doc in (None, [], "private", {"code": "XTR-private", "requestId": "private"},
+                    {"code": ["XTR-STORE-OBJECT-IO"], "requestId": 1}):
+            self.assertEqual(xinstr.read_problem(500, doc), {"httpStatus": 500, "code": None, "requestId": None})
+
     def test_percentile(self):
         self.assertIsNone(xinstr.percentile([], 50))
         self.assertEqual(xinstr.percentile([5, 1, 3, 2, 4], 50), 3)
@@ -606,12 +629,44 @@ class T(unittest.TestCase):
                 self.assertEqual(receipt["notes"]["serialBoundary"], boundary)
                 if verified:
                     self.assertEqual(receipt["notes"]["burstBoundary"], boundary)
+                    self.assertEqual(receipt["result"], "recorded")
                 self.assertTrue(all("frameSymbols" in sc for sc in receipt["scenarios"]))
                 stack.down.assert_called_once()
                 if not verified:
                     burst = next(s for s in receipt["scenarios"] if s["id"] == "burst")
                     self.assertFalse(burst["scenarioChecksPassed"])
                     self.assertEqual(burst["notRunReason"], "serial boundary was not verified")
+                    self.assertEqual(receipt["result"], "failed", "a later API read cannot repair a skipped workload")
+
+    def test_failed_workload_or_burst_boundary_cannot_be_reported_recorded(self):
+        import tempfile
+        import xcamp
+        from types import SimpleNamespace
+        for workload_ok, boundary_ok in ((False, True), (True, False)):
+            with self.subTest(workload=workload_ok, boundary=boundary_ok), tempfile.TemporaryDirectory() as td:
+                stack = mock.Mock(launcher_exit=0, base="http://127.0.0.1:1234")
+                stack.logs.return_value = ""
+                scenario = SimpleNamespace(id="burst", kind="concurrency")
+                res = {"id": "burst", "passed": workload_ok, "semanticEffectFingerprint": "fp",
+                       "requests": [], "elapsedMs": 1}
+                api = {"ok": True, "reason": "", "recordings": [], "details": {}}
+                boundary = {"verified": boundary_ok, "recordingIds": [], "snapshotIds": []}
+                with mock.patch.object(xinstr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "")), \
+                     mock.patch.object(xinstr, "list_recording_ids", return_value=set()), \
+                     mock.patch.object(xinstr, "start_viewer", return_value=(object(), {"origin": stack.base, "url": "http://x/#" + "A" * 43})), \
+                     mock.patch.object(xinstr, "ViewerClient"), mock.patch.object(xinstr, "stop_process_group"), \
+                     mock.patch.object(xinstr, "collect_api", return_value=api), \
+                     mock.patch.object(xinstr, "wait_burst_boundary", return_value=boundary), \
+                     mock.patch.object(xinstr, "analyze", return_value={}), \
+                     mock.patch.object(xcamp, "run_scenario", return_value=res):
+                    receipt = xinstr.run_instrumented(
+                        project="p", pin={}, make_stack=lambda _: stack, scenarios=[scenario],
+                        out_dir=pathlib.Path(td) / "out", norm_extra=[], expectations={}, xtrace="xtrace",
+                        project_dir=pathlib.Path(td), data_home=pathlib.Path(td) / "data", adaptations=[],
+                        canaries=None, baseline_receipt=None, extra_canary_paths=[], harness_files=[])
+                self.assertTrue(receipt["api"]["ok"])
+                self.assertEqual(receipt["result"], "failed")
+                stack.down.assert_called_once()
 
     def test_recording_snapshot_requires_valid_paginated_cli_evidence(self):
         with mock.patch.object(xinstr.subprocess, "run", side_effect=[

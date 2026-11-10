@@ -65,7 +65,8 @@ class ConstructorLineWiringTest {
     List<String> names = new ArrayList<>();
     for (String suffix : List.of("", "$Base", "$Chain", "$BodyThrow", "$SuperThrow",
         "$ArgumentThrow", "$Initializer", "$UntracedBase", "$UntracedSuperThrow",
-        "$AllocatedArgument", "$BranchedArgument")) names.add(NAME + suffix);
+        "$AllocatedArgument", "$BranchedArgument", "$EntityBase", "$EntityPerson", "$EntityOwner",
+        "$EntityNamed", "$EntityPet", "$EntityType")) names.add(NAME + suffix);
     names.add("demo.probe.CursorParents");
     for (String name : names) {
       byte[] original = locator.locate(name).resolve();
@@ -154,6 +155,39 @@ class ConstructorLineWiringTest {
   private void assertGap(List<RecordingEvent> events) {
     assertTrue(events.stream().anyMatch(e -> e.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_GAP
         && e.getSymbol().equals(RecordingWriter.UNTRANSFORMED_GAP_SYMBOL)));
+  }
+
+  @Test
+  void sixHydratedEntityChainsKeepEighteenHonestPreambleGapsDespiteSuccessfulTransformation() throws Exception {
+    assertTrue(BootstrapBridge.requestStart("GET", "/hydrate"));
+    assertEquals(6, ((Object[]) invoke("rehydrate")).length);
+    List<RecordingEvent> events = finish();
+    int groups = 0;
+    int consecutive = 0;
+    for (RecordingEvent event : events) {
+      if (event.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_GAP) {
+        assertEquals(RecordingWriter.UNTRANSFORMED_GAP_SYMBOL, event.getSymbol());
+        assertEquals(1, event.getGap().getCount());
+        consecutive++;
+      } else if (consecutive > 0) {
+        assertEquals(3, consecutive, "each entity delegates through two application superclasses");
+        consecutive = 0;
+        groups++;
+      }
+    }
+    assertEquals(0, consecutive);
+    assertEquals(6, groups);
+    for (var expected : Map.of("EntityBase", 6, "EntityPerson", 2, "EntityOwner", 2,
+        "EntityNamed", 4, "EntityPet", 2, "EntityType", 2).entrySet()) {
+      String symbol = "ConstructorCases$" + expected.getKey() + ".<init>";
+      assertEquals(expected.getValue().longValue(),
+          count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER, symbol));
+      assertEquals(expected.getValue().longValue(),
+          count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_EXIT, symbol));
+      assertEquals(expected.getValue().longValue(),
+          count(events, RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR, symbol));
+    }
+    assertEquals(0, limitations.count(), "these gaps are invocation evidence, not failed installations");
   }
 
   @Test
