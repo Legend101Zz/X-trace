@@ -3,6 +3,7 @@ package dev.xtrace.agent.runtime;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
@@ -17,7 +18,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import net.bytebuddy.ByteBuddy;
-import net.bytebuddy.asm.Advice;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.dynamic.ClassFileLocator;
 import net.bytebuddy.pool.TypePool;
@@ -62,35 +62,35 @@ class FocusedLineWiringTest {
   private void load(boolean probes, String... names) throws Exception {
     ClassLoader parent = getClass().getClassLoader();
     Map<String, byte[]> definitions = new HashMap<>();
+    Map<String, byte[]> originals = new HashMap<>();
     for (String name : names) {
       TypeDescription type = TypePool.Default.of(parent).describe(PKG + name).resolve();
       byte[] original =
           ClassFileLocator.ForClassLoader.of(parent).locate(PKG + name).resolve();
-      var builder =
-          new ByteBuddy()
-              .redefine(type, ClassFileLocator.ForClassLoader.of(parent))
-              .visit(
-                  Advice.to(FixtureInstrumentation.FrameAdvice.class)
-                      .on(FixtureInstrumentation.frameMethods()));
-      if (probes) {
-        builder =
-            builder.visit(
-                new LineProbeAsmWrapper(
-                    LineProbeConfig.focused(FixtureInstrumentation.PROBE_OWNER),
-                    registry,
-                    t -> null,
-                    reports::addAll,
-                    // Production passes null (bootstrap loader); the unit test classpath has the
-                    // bridge on the application loader.
-                    getClass().getClassLoader()));
-      }
+      var lines = probes
+          ? new LineProbeAsmWrapper(
+              LineProbeConfig.focused(FixtureInstrumentation.PROBE_OWNER),
+              registry,
+              t -> null,
+              reports::addAll,
+              // Production passes null (bootstrap loader); the unit test classpath has the
+              // bridge on the application loader.
+              getClass().getClassLoader())
+          : null;
+      var builder = new ByteBuddy()
+          .redefine(type, ClassFileLocator.ForClassLoader.of(parent))
+          .visit(FixtureInstrumentation.boundedProbes(
+              lines, new FixtureInstrumentation.CaptureLimitations(), new java.util.HashSet<>()));
       definitions.put(PKG + name, builder.make().getBytes());
-      // The runtime observes the original class bytes in its transformer, before any rewrite.
-      SourceIdentity.observe(
-          parent, (PKG + name).replace('.', '/'), original,
-          List.of("src/test/java"), Path.of(System.getProperty("user.dir", ".")));
+      originals.put(PKG + name, original);
     }
     loader = new Isolated(parent, definitions);
+    // Production observes the input bytes under the application's defining loader.
+    for (var original : originals.entrySet()) {
+      SourceIdentity.observe(
+          loader, original.getKey().replace('.', '/'), original.getValue(),
+          List.of("src/test/java"), Path.of(System.getProperty("user.dir", ".")));
+    }
   }
 
   private String diagnostics() {
@@ -177,6 +177,62 @@ class FocusedLineWiringTest {
   }
 
   @Test
+  void focusedAccessorsAndLambdasParentEveryCursorToTheirOwnObservedEntry() throws Exception {
+    load(true, "CursorParents");
+    assertTrue(BootstrapBridge.installLineSink(lineSink));
+    Class<?> type = loader.loadClass(PKG + "CursorParents");
+    Object target = type.getConstructor().newInstance();
+    assertTrue(BootstrapBridge.requestStart("GET", "/parents"));
+    type.getMethod("setName", String.class).invoke(target, "updated");
+    assertEquals("updated", type.getMethod("getName").invoke(target));
+    assertEquals(true, type.getMethod("isReady").invoke(target));
+    assertEquals("updated", type.getMethod("readName").invoke(target));
+    assertEquals("updated", type.getMethod("getViaLambda").invoke(target));
+    assertEquals("cursor-parent", type.getMethod("toString").invoke(target));
+    var failure = assertThrows(java.lang.reflect.InvocationTargetException.class,
+        () -> type.getMethod("getBroken").invoke(target));
+    assertEquals(IllegalStateException.class, failure.getCause().getClass());
+    assertEquals("updated", type.getMethod("getName").invoke(target));
+    BootstrapBridge.requestEnd(200, false);
+
+    Map<String, RecordingEvent> entries = new HashMap<>();
+    java.util.Set<String> cursorMethods = new java.util.HashSet<>();
+    boolean nestedGetter = false;
+    boolean observedThrow = false;
+    for (RecordingEvent event : drain()) {
+      if (event.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER) {
+        entries.put(event.getEventId(), event);
+        if (event.getSymbol().equals("CursorParents.getName")) {
+          RecordingEvent caller = entries.get(event.getParentEventId());
+          nestedGetter |= caller != null && caller.getSymbol().equals("CursorParents.readName");
+        }
+      }
+      if (event.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR) {
+        RecordingEvent parent = entries.get(event.getParentEventId());
+        assertNotNull(parent, "cursor needs an earlier method entry: " + event.getSymbol());
+        assertEquals(event.getSymbol(), parent.getSymbol(), "a caller's extent cannot stand in");
+        assertTrue(parent.hasSource());
+        assertEquals(parent.getSource().getPath(), event.getSource().getPath());
+        assertTrue(event.getSource().getStartLine() >= parent.getSource().getStartLine());
+        assertTrue(event.getSource().getStartLine() <= parent.getSource().getEndLine());
+        cursorMethods.add(event.getSymbol());
+      }
+      if (event.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_THROW) {
+        observedThrow |= event.getSymbol().equals("CursorParents.getBroken");
+      }
+    }
+    for (String method : List.of("setName", "getName", "isReady", "readName", "getViaLambda",
+        "toString", "getBroken")) {
+      assertTrue(cursorMethods.contains("CursorParents." + method), method);
+    }
+    assertTrue(cursorMethods.stream().anyMatch(symbol -> symbol.startsWith("CursorParents.lambda$")));
+    assertTrue(nestedGetter, "nested accessor entry keeps the observed caller");
+    assertTrue(observedThrow, "throwing accessor unwinds its own frame");
+    assertEquals(0, lineSink.linesWithoutSource());
+    assertEquals(0, lineSink.linesRejected());
+  }
+
+  @Test
   void webAnnotatedAccessorShapedHandlersAreProbedButPlainAccessorsAreNot() throws Exception {
     var matcher = FixtureInstrumentation.frameMethods();
     var methods =
@@ -188,6 +244,9 @@ class FocusedLineWiringTest {
     assertEquals(false, probed.get("getName"));
     assertEquals(false, probed.get("isReady"));
     assertEquals(false, probed.get("setName"));
+    var focused = FixtureInstrumentation.frameMethods(true);
+    methods.stream().filter(method -> !method.isConstructor())
+        .forEach(method -> assertTrue(focused.matches(method), method.getName()));
   }
 
   @Test

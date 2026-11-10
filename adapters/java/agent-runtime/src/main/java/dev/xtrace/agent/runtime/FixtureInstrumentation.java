@@ -221,7 +221,8 @@ final class FixtureInstrumentation {
 
   static net.bytebuddy.asm.AsmVisitorWrapper boundedProbes(
       net.bytebuddy.asm.AsmVisitorWrapper lines, CaptureLimitations limitations, Set<String> omitted) {
-    net.bytebuddy.asm.AsmVisitorWrapper frames = Advice.to(FrameAdvice.class).on(frameMethods());
+    net.bytebuddy.asm.AsmVisitorWrapper frames =
+        Advice.to(FrameAdvice.class).on(frameMethods(lines != null));
     return new BoundedProbeAsmWrapper(
         lines == null ? frames : new net.bytebuddy.asm.AsmVisitorWrapper.Compound(frames, lines),
         key -> {
@@ -446,11 +447,20 @@ final class FixtureInstrumentation {
   /** Methods that get boundary probes: real behavior, not accessors, bridges or Object plumbing. */
   static net.bytebuddy.matcher.ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription>
       frameMethods() {
-    return isMethod()
-        .and(not(isSynthetic()))
+    return frameMethods(false);
+  }
+
+  /** Focused cursors need their own method parent, including accessors and lambda bodies. */
+  static net.bytebuddy.matcher.ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription>
+      frameMethods(boolean focused) {
+    var executable = isMethod()
+        .and(not(isSynthetic()).or(nameStartsWith("lambda$")))
         .and(not(isBridge()))
         .and(not(isAbstract()))
-        .and(not(isNative()))
+        .and(not(isNative()));
+    if (focused) return executable;
+    return executable
+        .and(not(isSynthetic()))
         .and(not(nameStartsWith("lambda$")))
         .and(
             not(
