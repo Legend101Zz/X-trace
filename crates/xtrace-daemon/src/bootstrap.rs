@@ -740,16 +740,21 @@ mod tests {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn unique_dir(label: &str) -> PathBuf {
-        let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let nanos =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
             .map(PathBuf::from)
             .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required");
-        AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
+        unique_dir_in(&root, label)
+    }
+
+    // Retain admission and private child creation; report child failures at the fixture call.
+    #[track_caller]
+    fn unique_dir_in(root: &AdmittedPrivateRoot, label: &str) -> PathBuf {
+        let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let name =
             format!("xtrace-daemon-bootstrap-{label}-{}-{counter}-{nanos}", std::process::id(),);
-        let root = AdmittedPrivateRoot::open(&scratch).expect("admitted private test scratch");
         root.create_private_child(&name)
             .expect("private bootstrap test directory")
             .path()
@@ -945,14 +950,23 @@ mod tests {
     #[test]
     fn write_rejects_symlinked_parent_directory() {
         use std::os::unix::fs::symlink;
-        let real_dir = unique_dir("real-parent");
-        let link_dir = unique_dir("link-parent");
+        // Distinct sites identify setup admission, child creation, symlink creation and write
+        // rejection even on the macOS lane, which withholds assertion messages.
+        let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+            .map(PathBuf::from)
+            .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required");
+        let root = AdmittedPrivateRoot::open(&scratch).expect("symlink test scratch admission");
+        let real_dir = unique_dir_in(&root, "real-parent");
+        let link_dir = unique_dir_in(&root, "link-parent");
         let link = link_dir.join("parent-link");
-        symlink(&real_dir, &link).unwrap();
+        symlink(&real_dir, &link).expect("create parent symlink");
         let target = link.join("bootstrap.json");
         let err = BootstrapArtifact::write(&target, sample_fields(), BootstrapOwner::Persistent)
             .unwrap_err();
         assert!(matches!(err, DaemonError::Bootstrap(_)));
+        assert!(!real_dir.join("bootstrap.json").exists(), "no write through the symlink");
+        assert_eq!(fs::read_dir(&real_dir).expect("real parent entries").count(), 0);
+        assert!(fs::symlink_metadata(&link).expect("parent symlink remains").is_symlink());
         let _ = fs::remove_dir_all(&real_dir);
         let _ = fs::remove_dir_all(&link_dir);
     }

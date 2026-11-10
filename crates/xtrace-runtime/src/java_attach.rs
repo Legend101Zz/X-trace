@@ -1929,10 +1929,57 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 for handle in handles {
-                    handle.join().expect("worker").expect("first attach into a fresh cache");
+                    let outcome = handle.join().expect("worker");
+                    assert_concurrent_attach_success(outcome.as_ref().map(|_| ()));
                 }
             });
             assert_eq!(sealed_names(&fixture.cache).len(), 4);
+        }
+    }
+
+    // The macOS lane withholds panic messages but publishes source sites. Keep each failure
+    // category on its own panic line, without track_caller, so a site identifies the failed
+    // check without exposing paths, captured values, or operating-system error text.
+    fn assert_concurrent_attach_success(outcome: Result<(), &AttachError>) {
+        match outcome {
+            Err(AttachError::PrivateStorage("private storage cannot be admitted")) => {
+                outcome.expect("concurrent attach: shared directory admission failed");
+            }
+            Err(AttachError::PrivateStorage("the retained Java pack snapshot is unsafe")) => {
+                outcome.expect("concurrent attach: retained snapshot admission failed");
+            }
+            Err(AttachError::PrivateStorage("the Java helper cache changed")) => {
+                outcome.expect("concurrent attach: cache root admission failed");
+            }
+            Err(AttachError::PrivateStorage("the Java pack cache state is unsafe")) => {
+                outcome.expect("concurrent attach: state file metadata was rejected");
+            }
+            Err(AttachError::PrivateStorage(
+                "the Java pack cache state file could not be opened",
+            )) => {
+                outcome.expect("concurrent attach: state file open failed");
+            }
+            Err(AttachError::PrivateStorage("the Java pack cache is busy")) => {
+                outcome.expect("concurrent attach: bounded lock wait exhausted");
+            }
+            Err(AttachError::PrivateStorage("the Java pack cache lock failed")) => {
+                outcome.expect("concurrent attach: lock operation failed");
+            }
+            Err(AttachError::PrivateStorage(
+                "the private Java pack snapshot could not be published",
+            )) => {
+                outcome.expect("concurrent attach: snapshot publication failed");
+            }
+            Err(AttachError::PrivateStorage(_)) => {
+                outcome.expect("concurrent attach: another private cache operation failed");
+            }
+            Err(AttachError::Validation(_)) => {
+                outcome.expect("concurrent attach: pack validation failed");
+            }
+            Err(AttachError::Unsupported | AttachError::Process) => {
+                outcome.expect("concurrent attach: unexpected non-cache failure");
+            }
+            Ok(()) => {}
         }
     }
 
@@ -2138,6 +2185,9 @@ mod tests {
         });
         for outcome in &results {
             if let Err(error) = outcome {
+                if !error.to_string().contains("in use") {
+                    assert_concurrent_attach_success(Err(error));
+                }
                 assert!(error.to_string().contains("in use"), "clean failure: {error}");
             }
         }
