@@ -244,17 +244,32 @@ def judge_partial(*, record_rc: int, stop_rc: int | None, stop_doc: Any, control
                     f"was killed mid-request; the interrupted request never reads as complete")
 
 
+def _line_parent_failure(event: dict, parent: dict | None) -> str | None:
+    if parent is None:
+        return "parent-not-observed"
+    if not str(parent.get("kind", "")).endswith("frame_enter"):
+        return "parent-is-not-method-entry"
+    # An accessor cursor can otherwise borrow its caller's overlapping extent.
+    # Compare observed symbols only; never infer a parent from a matching symbol.
+    if event.get("symbol") and parent.get("symbol") and event["symbol"] != parent["symbol"]:
+        return "parent-method-symbol-mismatch"
+    source = parent.get("source")
+    if not isinstance(source, dict) or type(source.get("startLine")) is not int or source["startLine"] < 1:
+        return "parent-method-extent-unavailable"
+    return None
+
+
 def _line_events(details: list[dict]) -> list[tuple[dict, dict]]:
     out = []
     for d in details:
-        sources = {ev["frameId"]: ev.get("source") for ev in d.get("events", [])
-                   if ev.get("frameId") and str(ev.get("kind", "")).endswith("frame_enter")}
+        by_id = {ev["frameId"]: ev for ev in d.get("events", []) if ev.get("frameId")}
         for ev in d.get("events", []):
             if str(ev.get("kind", "")).endswith("line_cursor"):
                 # Every cursor has its own frame id and one-line source range. Only its
                 # observed parent method's FRAME_ENTER supplies a method extent.
-                source = sources.get(ev.get("parentFrameId"))
-                out.append((ev, source if isinstance(source, dict) else {}))
+                parent = by_id.get(ev.get("parentFrameId"))
+                source = parent["source"] if _line_parent_failure(ev, parent) is None else {}
+                out.append((ev, source))
     return out
 
 
@@ -266,16 +281,9 @@ def line_parent_gaps(details: list[dict]) -> dict[str, int]:
         for ev in detail.get("events", []):
             if not str(ev.get("kind", "")).endswith("line_cursor"):
                 continue
-            parent = by_id.get(ev.get("parentFrameId"))
-            if parent is None:
-                reason = "parent-not-observed"
-            elif not str(parent.get("kind", "")).endswith("frame_enter"):
-                reason = "parent-is-not-method-entry"
-            elif not isinstance(parent.get("source"), dict) or type(parent["source"].get("startLine")) is not int or parent["source"]["startLine"] < 1:
-                reason = "parent-method-extent-unavailable"
-            else:
-                continue
-            counts[reason] = counts.get(reason, 0) + 1
+            reason = _line_parent_failure(ev, by_id.get(ev.get("parentFrameId")))
+            if reason is not None:
+                counts[reason] = counts.get(reason, 0) + 1
     return counts
 
 

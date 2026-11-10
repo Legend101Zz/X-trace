@@ -20,10 +20,11 @@ def rec(method="GET", route="/vets", completion="complete", events=4, evidence=(
 
 
 def line_rec(start=10, end=30, lines=(12, 15), fid="f1", with_source=True):
-    evs = [{"kind": "recording_event_kind:frame_enter", "frameId": fid,
+    evs = [{"kind": "recording_event_kind:frame_enter", "frameId": fid, "symbol": "A.run",
             "source": {"path": "A.java", "startLine": start, "endLine": end, "status": "matched"} if with_source else None}]
     evs += [{"kind": "recording_event_kind:line_cursor", "frameId": f"{fid}-cursor-{i}", "parentFrameId": fid,
-             "line": n, "source": {"path": "A.java", "startLine": n, "endLine": n, "status": "matched"}}
+             "line": n, "symbol": "A.run",
+             "source": {"path": "A.java", "startLine": n, "endLine": n, "status": "matched"}}
             for i, n in enumerate(lines)]
     return {"events": evs}
 
@@ -131,6 +132,32 @@ class Judges(unittest.TestCase):
         self.assertEqual(xflows.judge_active_line([detail])[0], "fail")
         detail["events"][0]["kind"] = "recording_event_kind:frame_exit"
         self.assertEqual(xflows.judge_active_line([detail])[0], "fail")
+
+    def test_accessor_cursor_cannot_borrow_its_callers_overlapping_extent(self):
+        detail = line_rec()
+        for event in detail["events"][1:]:
+            event["symbol"] = "A.getName"
+        # The getter was observed, but its id is not the recorded cursor parent.
+        detail["events"].append({**detail["events"][0], "frameId": "getter", "symbol": "A.getName"})
+        self.assertEqual(xflows.line_parent_gaps([detail]), {"parent-method-symbol-mismatch": 2})
+        status, note = xflows.judge_active_line([detail])
+        self.assertEqual(status, "fail")
+        self.assertIn("parent-method-symbol-mismatch", note)
+        self.assertNotIn("A.getName", note)
+        self.assertNotIn("A.run", note)
+        for event in detail["events"][1:3]:
+            event["parentFrameId"] = "getter"
+        self.assertEqual(xflows.line_parent_gaps([detail]), {})
+        self.assertEqual(xflows.judge_active_line([detail])[0], "pass")
+
+    def test_request_parent_is_not_a_method_extent_even_with_matching_source(self):
+        detail = line_rec()
+        detail["events"][0]["kind"] = "recording_event_kind:request_update"
+        self.assertEqual(xflows.line_parent_gaps([detail]), {"parent-is-not-method-entry": 2})
+        status, note = xflows.judge_active_line([detail])
+        self.assertEqual(status, "fail")
+        self.assertIn("2 line events", note)
+        self.assertIn("parent-is-not-method-entry", note)
 
     def test_line_parent_diagnostics_distinguish_missing_non_method_and_unavailable_extent(self):
         details = [line_rec(fid=str(i)) for i in range(3)]

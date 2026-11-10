@@ -135,7 +135,11 @@ final class SourceIdentity {
               @Override
               public MethodVisitor visitMethod(
                   int access, String name, String descriptor, String signature, String[] ex) {
-                if ((access & (Opcodes.ACC_SYNTHETIC | Opcodes.ACC_BRIDGE)) != 0) return null;
+                // Lambda bodies own focused cursors and need the same observed extent as methods.
+                if ((access & Opcodes.ACC_BRIDGE) != 0
+                    || ((access & Opcodes.ACC_SYNTHETIC) != 0 && !name.startsWith("lambda$"))) {
+                  return null;
+                }
                 int[] range = {Integer.MAX_VALUE, 0};
                 facts.lines.put(name + descriptor, range);
                 return new MethodVisitor(Opcodes.ASM9) {
