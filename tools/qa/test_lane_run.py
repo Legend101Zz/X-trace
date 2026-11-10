@@ -63,6 +63,11 @@ class CheckoutFixture(unittest.TestCase):
                 f"@Test\nvoid {name}() {{}}" for name in ("check", "done", "waiting", "skip")) + "\n}\n",
             "web/app/src/example.test.ts": 'test("checkout JS test", () => {});\n',
             "tools/qa/test_example.py": "class ExampleTests:\n    def test_example(self): pass\n",
+            "crates/xtrace-private-storage/src/admission.rs": (
+                'pub enum PrivateStorageError {\n#[error("private storage is unavailable: {0}")]\n'
+                'Admission(AdmissionFailure), Unavailable, InvalidName, AlreadyExists, Operation,\n}\n'),
+            "crates/xtrace-private-storage/src/diagnostic.rs": (
+                "pub enum AdmissionOperation { Deadline, WaitAclProbe, NamedMetadata, }\n"),
         }
         for name, source in self.sources.items():
             path = self.checkout / name
@@ -74,8 +79,22 @@ class CheckoutFixture(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def assert_facts_only(self, row):
-        self.assertEqual(set(row), {"test", "location", "kind", "withheldLines"})
+        fields = {"test", "location", "kind", "withheldLines", "category", "panicSites"}
+        if row["test"] == lane_run.UNVERIFIED:
+            fields.add("testUnverifiedReason")
+            self.assertIn(row["testUnverifiedReason"], {reason.value for reason in lane_run.UnverifiedReason})
+        self.assertEqual(set(row), fields)
         self.assertIn(row["kind"], {"assertion", "panic", "timeout", "exit", "unknown"})
+        self.assertLessEqual(len(row["category"]), lane_run.MAX_CATEGORIES)
+        self.assertEqual(len(row["category"]), len(set(row["category"])))
+        for category in row["category"]:
+            if type(category) is int:
+                self.assertTrue(1 <= category <= 200)
+            else:
+                self.assertIn(category, self.metadata.diagnostic_variants | lane_run.IO_ERROR_KINDS)
+        self.assertLessEqual(len(row["panicSites"]), lane_run.MAX_PANIC_SITES)
+        for site in row["panicSites"]:
+            self.assertEqual(site, self.metadata.location(site, lane_run.CANARY_INDEX))
         self.assertIsInstance(row["withheldLines"], int)
         self.assertGreaterEqual(row["withheldLines"], 0)
         self.assertLessEqual(len(lane_run._encoded(row)), lane_run.MAX_EXCERPT_BYTES)
@@ -112,6 +131,81 @@ class FailureDetailsTests(CheckoutFixture):
             self.assert_facts_only(row)
         for value in ("unrelated", "first assertion", "second assertion"):
             self.assertNotIn(value, json.dumps(rows))
+
+    def test_private_storage_categories_from_realistic_debug_and_display_panics(self):
+        cases = [
+            ('admit private scratch: Admission(AdmissionFailure { operation: WaitAclProbe, '
+             'kind: Some(PermissionDenied), raw_os_error: Some(13) })',
+             ["Admission", "WaitAclProbe", "PermissionDenied", 13]),
+            ('write: Bootstrap("private storage is unavailable: operation=Deadline '
+             'kind=Some(TimedOut) raw_os_error=Some(60)")', ["Deadline", "TimedOut", 60]),
+        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                row = lane_run.failure_details(self.cargo(message=message), False)["failures"][0]
+                self.assert_facts_only(row)
+                self.assertEqual(row["category"], expected)
+                self.assertEqual(row["panicSites"], ["crates/example/tests/journey.rs:42"])
+
+    def test_categories_withhold_paths_values_unknown_identifiers_and_other_numbers(self):
+        message = ('Admission(AdmissionFailure { operation: NamedMetadata, kind: Some(PermissionDenied), '
+                   'raw_os_error: Some(13) })\n'
+                   'path=/private/Deadline/Unavailable customer-731 balance: 42 UnknownDiagnostic 999999\n'
+                   'raw_os_error: Some(999999) raw_os_error: Some(-13) raw_os_error: Some(0)\n'
+                   'raw_os_error: Some(201) raw_os_error: Some(013) raw_os_error: Some(13.5)')
+        row = lane_run.failure_details(self.cargo(message=message), False)["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual(row["category"], ["Admission", "NamedMetadata", "PermissionDenied", 13])
+        for value in ("/private", "Deadline", "Unavailable", "customer-731", "balance", "42",
+                      "UnknownDiagnostic", "999999", "201", "013", "13.5"):
+            self.assertNotIn(value, json.dumps(row["category"]))
+
+    def test_errno_boundaries_and_category_count_are_bounded_and_deduplicated(self):
+        message = ("raw_os_error=Some(1) raw_os_error=Some(200) raw_os_error=Some(1) "
+                   + " ".join(sorted(lane_run.IO_ERROR_KINDS)))
+        row = lane_run.failure_details(self.cargo(message=message), False)["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual(row["category"][:2], [1, 200])
+        self.assertEqual(len(row["category"]), lane_run.MAX_CATEGORIES)
+
+    def test_categories_and_multiple_sites_stay_with_their_tests(self):
+        text = ("test first ... FAILED\ntest second ... FAILED\n"
+                "---- first stdout ----\n"
+                "thread 'first' panicked at crates/a.rs:1:2:\noperation=Deadline\n"
+                "thread 'worker' panicked at crates/a.rs:2:3:\nkind=Some(TimedOut)\n"
+                "---- second stdout ----\n"
+                "thread 'second' panicked at crates/b.rs:2:4:\n"
+                "operation=NamedMetadata raw_os_error=Some(13)\n")
+        rows = lane_run.failure_details(text, False)["failures"]
+        self.assertEqual([(r["test"], r["panicSites"], r["category"]) for r in rows], [
+            ("first", ["crates/a.rs:1", "crates/a.rs:2"], ["Deadline", "TimedOut"]),
+            ("second", ["crates/b.rs:2"], ["NamedMetadata", 13]),
+        ])
+        for row in rows:
+            self.assert_facts_only(row)
+
+    def test_timeout_keeps_panic_facts_before_a_failed_harness_observation(self):
+        text = ("test waiting ...\n"
+                "thread 'waiting' panicked at crates/a.rs:1:2:\n"
+                "operation=Deadline kind=Some(TimedOut)\n")
+        detail = lane_run.failure_details(text, True)
+        self.assertEqual(detail["timeout"]["runningTests"], ["waiting"])
+        row = detail["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual((row["test"], row["panicSites"], row["category"]),
+                         ("waiting", ["crates/a.rs:1"], ["Deadline", "TimedOut"]))
+        self.assertEqual(lane_run.failure_details(text + "test waiting ... ok\n", True)["failures"], [])
+
+    def test_panic_sites_are_bounded_and_backtraces_cannot_add_categories(self):
+        text = "test fails ... FAILED\n---- fails stdout ----\n" + "".join(
+            f"thread 'worker{i}' panicked at crates/example/tests/journey.rs:{i + 1}:2:\noperation=Deadline\n"
+            for i in range(lane_run.MAX_PANIC_SITES + 3))
+        text += "stack backtrace:\nkind=Some(PermissionDenied) raw_os_error=Some(13)\n"
+        row = lane_run.failure_details(text, False)["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual(row["category"], ["Deadline"])
+        self.assertEqual(row["panicSites"], [f"crates/example/tests/journey.rs:{i + 1}"
+                                             for i in range(lane_run.MAX_PANIC_SITES)])
 
     def test_gradle_full_and_short_failure_formats(self):
         for exception in ("org.opentest4j.AssertionFailedError: expected: <200> but was: <500>",
@@ -165,7 +259,8 @@ class FailureDetailsTests(CheckoutFixture):
     def test_missing_failure_output_is_unverified(self):
         row = lane_run.failure_details("test missing ... FAILED\n", False)["failures"][0]
         self.assertEqual(row, {"test": lane_run.UNVERIFIED, "location": lane_run.UNVERIFIED,
-                               "kind": "exit", "withheldLines": 0})
+                               "kind": "exit", "withheldLines": 0, "category": [], "panicSites": [],
+                               "testUnverifiedReason": "name-not-declared-in-head"})
         self.assertNotIn("missing", json.dumps(row))
 
     def test_per_test_line_and_serialized_byte_caps(self):
@@ -456,6 +551,43 @@ class FailureDetailsTests(CheckoutFixture):
         for candidate in ("comment_value", "literal_value", "helper_value", "ghp_abc123"):
             self.assertEqual(metadata.test(candidate, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
 
+    def test_rust_lifetimes_do_not_hide_declared_tests(self):
+        source = ("fn before(_: &mut Formatter<'_>) {}\n"
+                  "#[test]\nfn between_lifetimes() {}\n"
+                  "fn after(_: &mut Formatter<'_>) {}\n"
+                  "const C: char = 'x';\n"
+                  'const TEXT: &str = "#[test] fn literal_value() {}";\n')
+        metadata = lane_run.CheckoutMetadata({"crates/example/src/lib.rs": source})
+        self.assertEqual(metadata.tests, {"between_lifetimes"})
+        self.assertEqual(metadata.test("tests::between_lifetimes", lane_run.CANARY_INDEX), "between_lifetimes")
+
+    def test_categories_require_declarations_in_the_private_storage_diagnostic_enums(self):
+        source = ('/* outer /* inner */ enum AdmissionOperation { CommentValue } */\n'
+                  'const TEXT: &str = r###"enum PrivateStorageError { LiteralValue }"###;\n'
+                  'enum OtherEnum { OtherValue }\n'
+                  'enum AdmissionOperation { ActualStep, }\n'
+                  'enum PrivateStorageError {\n#[error("AttributeValue")]\n'
+                  'Admission(AdmissionFailure), OtherError { detail: FieldType },\n}\n')
+        metadata = lane_run.CheckoutMetadata({
+            "crates/xtrace-private-storage/src/diagnostic.rs": source,
+            "crates/example/src/error.rs": "enum AdmissionOperation { WrongCrateValue }",
+            "crates/xtrace-private-storage/tests/example.rs": "enum AdmissionOperation { TestValue }",
+        })
+        self.assertEqual(metadata.diagnostic_variants, {"ActualStep", "Admission", "OtherError"})
+        row = lane_run.failure_details(self.cargo(message=(
+            "ActualStep Admission AdmissionFailure OtherError FieldType CommentValue LiteralValue "
+            "OtherValue AttributeValue WrongCrateValue TestValue")), False, metadata=metadata)["failures"][0]
+        self.assertEqual(row["category"], ["ActualStep", "Admission", "OtherError"])
+        self.assertEqual(row["testUnverifiedReason"], "name-not-declared-in-head")
+
+    def test_unverified_name_reason_distinguishes_privacy_from_missing_declaration(self):
+        index = lane_run.canary.build_index({"name": "fails", "category": "Deadline"})
+        row = lane_run.failure_details(self.cargo(message="operation=Deadline"), False,
+                                       index=index)["failures"][0]
+        self.assertEqual(row["test"], lane_run.UNVERIFIED)
+        self.assertEqual(row["testUnverifiedReason"], "privacy-scan")
+        self.assertEqual(row["category"], [])
+
     def test_java_locations_require_a_unique_tracked_file_and_valid_line(self):
         for site in ("HttpTest.java:0", "HttpTest.java:10000", "ghp_abc123.java:7"):
             self.assertEqual(self.metadata.location(site, lane_run.CANARY_INDEX, java=True), lane_run.UNVERIFIED)
@@ -510,7 +642,9 @@ class CheckoutLookupTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 101)
         row = frag["failureDetails"]["failures"][0]
         self.assertEqual((row["test"], row["location"], row["kind"]), (name, f"{path}:{line}", "panic"))
-        self.assertEqual(set(row), {"test", "location", "kind", "withheldLines"})
+        self.assertEqual(set(row), {"test", "location", "kind", "withheldLines", "category", "panicSites"})
+        self.assertEqual(row["category"], [])
+        self.assertEqual(row["panicSites"], [f"{path}:{line}"])
         self.assertEqual(frag["failingTests"], [name])
         self.assertNotIn("not persisted", json.dumps(frag))
 
@@ -519,6 +653,7 @@ class CheckoutLookupTests(unittest.TestCase):
             detail = lane_run.failure_details(FailureDetailsTests.cargo(), False)
         row = detail["failures"][0]
         self.assertEqual((row["test"], row["location"]), (lane_run.UNVERIFIED, lane_run.UNVERIFIED))
+        self.assertEqual(row["testUnverifiedReason"], "metadata-unavailable")
         self.assertNotIn("journey", json.dumps(detail))
 
 
@@ -534,6 +669,10 @@ class CommittedCheckoutTests(unittest.TestCase):
         self.path.write_text("#[test]\nfn committed_test() {}\n")
         (directory / "alias.rs").symlink_to("example.rs")
         (directory / "outside.rs").symlink_to("../outside.rs")
+        self.diagnostic = self.checkout / "crates/xtrace-private-storage/src/diagnostic.rs"
+        self.diagnostic.parent.mkdir(parents=True)
+        self.diagnostic.write_text("pub enum AdmissionOperation { Deadline, }\n")
+        (self.diagnostic.parent / "alias.rs").symlink_to("diagnostic.rs")
         env = {**os.environ, "GIT_AUTHOR_NAME": "Fixture", "GIT_COMMITTER_NAME": "Fixture",
                "GIT_AUTHOR_EMAIL": "fixture@example.test", "GIT_COMMITTER_EMAIL": "fixture@example.test"}
         for command in (["init"], ["add", "."], ["commit", "-m", "Fixture"]):
@@ -559,6 +698,21 @@ class CommittedCheckoutTests(unittest.TestCase):
         for site in ("crates/tests/example.rs:3", "crates/tests/alias.rs:1",
                      "crates/tests/outside.rs:1", "crates/tests/untracked.rs:1"):
             self.assertEqual(metadata.location(site, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
+
+    def test_diagnostic_vocabulary_comes_only_from_head_blobs(self):
+        self.diagnostic.write_text("pub enum AdmissionOperation { StagedValue, }\n")
+        subprocess.run(["git", "-C", str(self.checkout), "add", "crates/xtrace-private-storage/src/diagnostic.rs"],
+                       check=True, capture_output=True)
+        self.diagnostic.unlink()
+        (self.diagnostic.parent / "untracked.rs").write_text("enum AdmissionOperation { UntrackedValue }")
+        metadata = lane_run._checkout_metadata()
+        self.assertEqual(metadata.diagnostic_variants, {"Deadline"})
+        row = lane_run.failure_details(FailureDetailsTests.cargo(
+            name="committed_test", site="crates/tests/example.rs:2:1",
+            message="Deadline StagedValue UntrackedValue"), False, metadata=metadata)["failures"][0]
+        self.assertEqual(row["category"], ["Deadline"])
+        self.assertNotIn("StagedValue", json.dumps(row))
+        self.assertNotIn("UntrackedValue", json.dumps(row))
 
     def test_wrapped_command_cannot_attest_captured_values_by_rewriting_tracked_tests(self):
         import os
@@ -771,6 +925,28 @@ class RunTests(CheckoutFixture):
         self.assertTrue(frag["timedOut"])
         self.assertEqual(frag["status"], "fail")
         return frag
+
+    def test_timeout_publishes_categories_and_sites_in_fragment_and_job_log(self):
+        import contextlib
+        import io
+        text = FailureDetailsTests.cargo(message=(
+            "admit scratch: Admission(AdmissionFailure { operation: WaitAclProbe, "
+            "kind: Some(PermissionDenied), raw_os_error: Some(13) })\n"
+            "captured-value-731 /private/example/path 999999")) + "test waiting ...\n"
+        public = io.StringIO()
+        with contextlib.redirect_stdout(public):
+            frag = self.timed_out_step(text)
+        row = frag["failureDetails"]["failures"][0]
+        self.assert_facts_only(row)
+        self.assertEqual(row["category"], ["Admission", "WaitAclProbe", "PermissionDenied", 13])
+        self.assertEqual(row["panicSites"], ["crates/example/tests/journey.rs:42"])
+        self.assertEqual(frag["failureDetails"]["timeout"]["runningTests"], ["waiting"])
+        logged = [json.loads(line.removeprefix("lane failure ")) for line in public.getvalue().splitlines()
+                  if line.startswith("lane failure ")]
+        self.assertEqual(logged, [row])
+        for value in ("captured-value-731", "/private/example/path", "999999", "AdmissionFailure"):
+            self.assertNotIn(value, json.dumps(frag))
+            self.assertNotIn(value, public.getvalue())
 
     def test_timeout_fragment_never_serializes_progress_values(self):
         cases = [

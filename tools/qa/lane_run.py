@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 from collections import deque
+from enum import Enum
 
 from tools.qa import canary, store_profiles
 from tools.release import ci_floor
@@ -176,7 +177,7 @@ DIAG_PATH_OK = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]{0,200}$")
 DIAG_BAD = re.compile(r"(/home/|/Users/|/Volumes/|/tmp/|/runner|\\|token|secret|password|bearer|authorization|cookie|api[_-]?key)", re.I)
 DIAG_SKIP = re.compile(r"^(warning|error): (\d+ warnings? emitted|aborting due to|could not compile|build failed|unused)", re.I)
 MAX_DIAG = 20
-# Test panics: only the repo-relative source location survives (never the message, which may carry data or paths).
+# Candidate panic locations still require HEAD verification before publication.
 PANIC_LOC = re.compile(r"panicked at (\S{1,300}?):(\d+):(\d+):?\s*$")
 
 
@@ -273,6 +274,28 @@ GRADLE_STATE = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\((?P<params>[^\n]*)\
 JAVA_SITE = re.compile(r"^\s*at [\w.$]+\((\w+\.java:\d+)\)\s*$")
 GRADLE_SHORT_SITE = re.compile(r"^[\w.$]+ at (\w+\.java:\d+)$")
 UNVERIFIED = "<unverified>"
+MAX_CATEGORIES = 16
+MAX_PANIC_SITES = 8
+# std::io::ErrorKind is non-exhaustive. Changes to this vocabulary require review.
+IO_ERROR_KINDS = frozenset({
+    "NotFound", "PermissionDenied", "ConnectionRefused", "ConnectionReset", "HostUnreachable",
+    "NetworkUnreachable", "ConnectionAborted", "NotConnected", "AddrInUse", "AddrNotAvailable",
+    "NetworkDown", "BrokenPipe", "AlreadyExists", "WouldBlock", "NotADirectory", "IsADirectory",
+    "DirectoryNotEmpty", "ReadOnlyFilesystem", "FilesystemLoop", "StaleNetworkFileHandle",
+    "InvalidInput", "InvalidData", "TimedOut", "WriteZero", "StorageFull", "NotSeekable",
+    "QuotaExceeded", "FileTooLarge", "ResourceBusy", "ExecutableFileBusy", "Deadlock",
+    "CrossesDevices", "TooManyLinks", "InvalidFilename", "ArgumentListTooLong", "Interrupted",
+    "Unsupported", "UnexpectedEof", "OutOfMemory", "InProgress", "Other", "Uncategorized",
+})
+
+
+class UnverifiedReason(str, Enum):
+    METADATA_UNAVAILABLE = "metadata-unavailable"
+    NAME_NOT_DECLARED = "name-not-declared-in-head"
+    PRIVACY_SCAN = "privacy-scan"
+    EXCERPT_CAP = "excerpt-cap"
+
+
 # Reuse the canary scanner's encoded needles, including recognisable marker families
 # when no private canary file was supplied. DIAG_BAD also guards host paths/credentials.
 CANARY_INDEX = canary.build_index({"marker": "CANARY", "mixed-marker": "canary"})
@@ -296,12 +319,17 @@ def _private(text: str, index) -> bool:
 SOURCE_LITERAL = re.compile(
     r'/\*.*?\*/|//[^\n]*|r(?P<hash>\#*)".*?"(?P=hash)'
     r'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`', re.S)
+# A Rust lifetime or label is not a character literal. The general string grammar
+# would swallow declarations between two lifetimes, hiding real tests from HEAD.
+RUST_LITERAL = re.compile(
+    r'/\*.*?\*/|//[^\n]*|r(?P<hash>\#*)".*?"(?P=hash)'
+    r'|"(?:\\.|[^"\\])*"|\'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^\'\\\n])\'', re.S)
 
 
-def _source_mask(source: str) -> str:
+def _source_mask(source: str, *, rust: bool = False) -> str:
     masked = list(source)
     offset = 0
-    while match := SOURCE_LITERAL.search(source, offset):
+    while match := (RUST_LITERAL if rust else SOURCE_LITERAL).search(source, offset):
         end = match.end()
         if match[0].startswith("/*"):
             # Rust permits nested block comments. A regex ending at the first
@@ -321,12 +349,36 @@ def _source_mask(source: str) -> str:
     return "".join(masked)
 
 
+def _diagnostic_variants(source: str) -> set[str]:
+    """Read only variant declarations of the private-storage diagnostic enums."""
+    masked = _source_mask(source, rust=True)
+    variants = set()
+    for enum in re.finditer(r"\benum\s+(?:PrivateStorageError|AdmissionOperation)\s*\{", masked):
+        depth = 0
+        expect_variant = True
+        for token in re.finditer(r"[A-Za-z_]\w*|[^\s]", masked[enum.end():]):
+            word = token[0]
+            if word == "}" and depth == 0:
+                break
+            if depth == 0 and expect_variant and re.fullmatch(r"[A-Za-z_]\w*", word):
+                variants.add(word)
+                expect_variant = False
+            if word in "({[":
+                depth += 1
+            elif word in ")}]":
+                depth -= 1
+            elif word == "," and depth == 0:
+                expect_variant = True
+    return variants
+
+
 class CheckoutMetadata:
     """Only regular-file blobs from the snapshotted commit can attest facts."""
 
     def __init__(self, sources: dict[str, str]):
         self.files: dict[str, int] = {}
         self.tests: set[str] = set()
+        self.diagnostic_variants: set[str] = set()
         self.java_files: dict[str, list[str]] = {}
         for name, source in sources.items():
             path = pathlib.PurePosixPath(name)
@@ -336,6 +388,8 @@ class CheckoutMetadata:
             if path.suffix == ".java":
                 self.java_files.setdefault(path.name, []).append(name)
             self._read_tests(path, source)
+            if path.suffix == ".rs" and path.parts[:3] == ("crates", "xtrace-private-storage", "src"):
+                self.diagnostic_variants.update(_diagnostic_variants(source))
 
     def _read_tests(self, path: pathlib.PurePosixPath, source: str) -> None:
         test_path = bool(set(path.parts) & {"test", "tests", "__tests__"})
@@ -345,7 +399,7 @@ class CheckoutMetadata:
                 or path.suffix == ".java" and test_path or js_test
                 or path.suffix == ".py" and path.name.startswith("test_")):
             return
-        masked = _source_mask(source)
+        masked = _source_mask(source, rust=path.suffix == ".rs")
         if path.suffix == ".rs" and path.parts[0] == "crates":
             # Requiring a test attribute also excludes helper functions in tests/.
             self.tests.update(re.findall(
@@ -378,6 +432,15 @@ class CheckoutMetadata:
         # function name, never a prefix that the source metadata did not attest.
         name = candidate if candidate in self.tests else candidate.rsplit("::", 1)[-1]
         return name if name in self.tests and not _private(name, index) else UNVERIFIED
+
+    def test_unverified_reason(self, candidate: str) -> UnverifiedReason:
+        """Explain a name already rejected by test(), without retaining it."""
+        if not self.files:
+            return UnverifiedReason.METADATA_UNAVAILABLE
+        name = candidate if candidate in self.tests else candidate.rsplit("::", 1)[-1]
+        if name not in self.tests:
+            return UnverifiedReason.NAME_NOT_DECLARED
+        return UnverifiedReason.PRIVACY_SCAN
 
     def location(self, candidate: str, index, *, java: bool = False) -> str:
         path, sep, line = candidate.rpartition(":")
@@ -443,7 +506,32 @@ def _checkout_metadata() -> CheckoutMetadata:
     return CheckoutMetadata(sources)
 
 
-def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], int | None]], list[str]]:
+def _panic_categories(text: str, metadata: CheckoutMetadata, index) -> list[str | int]:
+    """Rebuild vocabulary tokens and explicitly labelled errno facts, never prose.
+
+    Treat path-like operands as whole tokens so their components cannot become
+    categories. Unlabelled numbers (assertion values, lines, pids) are not errno.
+    """
+    allowed = metadata.diagnostic_variants | IO_ERROR_KINDS
+    numbers = {}
+    for match in re.finditer(
+            r"(?<![A-Za-z0-9_./\\-])raw_os_error\s*[:=]\s*"
+            r"(?:Some\(([1-9][0-9]{0,2})\)|([1-9][0-9]{0,2}))(?=[\s,}\)\]\"\\]|$)", text):
+        group = 1 if match[1] is not None else 2
+        if 1 <= int(match[group]) <= 200:
+            numbers[match.start(group)] = int(match[group])
+    categories: list[str | int] = []
+    for match in re.finditer(r"[A-Za-z0-9_./\\+-]+", text):
+        token = match[0]
+        value = token if token in allowed else numbers.get(match.start())
+        if value is not None and value not in categories and not _private(str(value), index):
+            categories.append(value)
+            if len(categories) == MAX_CATEGORIES:
+                break
+    return categories
+
+
+def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], list[int]]], list[str]]:
     """Separate harness observations from failure bodies once, before extraction.
 
     Open quoted or compound values cannot introduce harness boundaries. Body lines
@@ -455,7 +543,7 @@ def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], int | None
     kind = "cargo"
     captured = False
     lines: list[str] = []
-    panic_line = None
+    panic_lines: list[int] = []
     quote = None
     depth = 0
     for line in ANSI.sub("", text).splitlines():
@@ -470,15 +558,15 @@ def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], int | None
             or GRADLE_STATE.fullmatch(line.strip()))
         if boundary:
             if name is not None:
-                blocks.append((name, kind, lines, panic_line))
+                blocks.append((name, kind, lines, panic_lines))
             name, lines = next_name, []
-            panic_line = None
+            panic_lines = []
             kind = "gradle" if gradle else "cargo"
             captured = section is not None
         if name is not None:
             if not section and not gradle:
-                if panic and panic_line is None:
-                    panic_line = len(lines)
+                if panic:
+                    panic_lines.append(len(lines))
                 lines.append(line)
                 # Panic headers contain the thread name, not a message operand.
                 if not panic:
@@ -503,7 +591,7 @@ def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], int | None
         if gradle:
             harness.append(line.strip())
     if name is not None:
-        blocks.append((name, kind, lines, panic_line))
+        blocks.append((name, kind, lines, panic_lines))
     return blocks, harness
 
 
@@ -521,15 +609,20 @@ def _timeout_progress(line: str) -> tuple[str, str] | None:
 
 def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT_BYTES,
                     index=None, metadata: CheckoutMetadata | None = None) -> dict | None:
-    """Publish verified names/sites, fixed kinds and counts; never message prose."""
+    """Publish verified names/sites, bounded categories and counts; never prose."""
     index = CANARY_INDEX if index is None else index
     metadata = _checkout_metadata() if metadata is None else metadata
     blocks, harness = _output_parts(text)
     failures: dict[str, dict] = {}
 
     def failure(name: str) -> dict:
-        return failures.setdefault(name, {"test": metadata.test(name, index), "location": UNVERIFIED,
-                                          "kind": "unknown", "withheldLines": 0})
+        if name not in failures:
+            row = {"test": metadata.test(name, index), "location": UNVERIFIED,
+                   "kind": "unknown", "withheldLines": 0, "category": [], "panicSites": []}
+            if row["test"] == UNVERIFIED:
+                row["testUnverifiedReason"] = metadata.test_unverified_reason(name).value
+            failures[name] = row
+        return failures[name]
 
     for line in harness:
         if m := CARGO_FAIL.fullmatch(line):
@@ -540,24 +633,42 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             failure(f"{m[2]}::{m[1]}")["kind"] = "exit"
         elif m := re.fullmatch(r"\s*not ok \d+ - (.+)", line):
             failure(m[1])["kind"] = "exit"
-    for name, framework, lines, panic_line in blocks:
-        # A panic can belong to a passing should_panic test. A failure block
-        # enriches a reported failure; it cannot declare a new failed test.
+    outcomes = {m[1]: m[2] for line in harness if (m := CARGO_STATE.fullmatch(line)) and m[2]}
+    for name, framework, lines, panic_lines in blocks:
+        # A passing should_panic test is not a failure. On timeout, retain an
+        # observed panic even if its terminal harness outcome never arrived.
         if name not in failures:
-            continue
+            if not (timed_out and panic_lines and name not in outcomes):
+                continue
+            failure(name)
         row = failures[name]
         after_panic = False
+        in_panic_message = False
         first_message = True
         java_frames = False
         for line_number, line in enumerate(lines):
             if not line.strip():
                 continue
-            if framework == "cargo" and line_number == panic_line:
+            if framework == "cargo" and line_number in panic_lines:
                 after_panic = True
+                in_panic_message = True
+                first_message = True
                 row["kind"] = "panic"
-                if site := PANIC_LOC.search(line):
-                    row["location"] = metadata.location(f"{site[1]}:{site[2]}", index)
+                sites, _ = panic_sites(line)
+                for site in sites:
+                    location = metadata.location(site, index)
+                    if location != UNVERIFIED:
+                        if row["location"] == UNVERIFIED:
+                            row["location"] = location
+                        if location not in row["panicSites"] and len(row["panicSites"]) < MAX_PANIC_SITES:
+                            row["panicSites"].append(location)
                 continue
+            if line.startswith(("stack backtrace:", "note: run with ")):
+                in_panic_message = False
+            if in_panic_message:
+                for category in _panic_categories(line, metadata, index):
+                    if category not in row["category"] and len(row["category"]) < MAX_CATEGORIES:
+                        row["category"].append(category)
             if first_message and (after_panic or framework == "gradle"):
                 first_message = False
                 if line.strip().startswith(("assertion ", "java.lang.AssertionError", "org.opentest4j.AssertionFailedError")):
@@ -580,8 +691,13 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
     for row in rows:
         # Names and locations have independent provenance; scanning can only
         # remove them. It never rebuilds or copies any part of a message.
+        while len(_encoded(row)) > MAX_EXCERPT_BYTES and row["panicSites"]:
+            row["panicSites"].pop()
+        while len(_encoded(row)) > MAX_EXCERPT_BYTES and row["category"]:
+            row["category"].pop()
         if len(_encoded(row)) > MAX_EXCERPT_BYTES:
-            row.update(test=UNVERIFIED, location=UNVERIFIED)
+            row.update(test=UNVERIFIED, location=UNVERIFIED,
+                       testUnverifiedReason=UnverifiedReason.EXCERPT_CAP.value)
     result: dict = {"failures": rows[:MAX_FAILING], "omitted": max(0, len(rows) - MAX_FAILING)}
     if timed_out:
         running: dict[str, None] = {}
@@ -744,11 +860,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"lane diagnostic {d}")
         if ddropped:
             print(f"lane diagnostic-overflow dropped={ddropped}")
-        sites, sdropped = panic_sites(text)
-        for site in sites:
-            print(f"lane panic-site {site}")
-        if sdropped:
-            print(f"lane panic-site-overflow dropped={sdropped}")
+        for row in (frag["failureDetails"] or {}).get("failures", []):
+            print("lane failure " + _encoded(row).decode("ascii"))
         hints = error_hints(text)
         for code in hints["errorCodes"]:
             print(f"lane error-code {code}")
