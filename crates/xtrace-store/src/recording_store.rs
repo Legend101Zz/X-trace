@@ -45,6 +45,10 @@ use crate::error::{StoreError, StoreErrorKind};
 pub(crate) mod recording_journal;
 
 #[cfg(test)]
+#[path = "recording_work_profile.rs"]
+pub(crate) mod work_profile;
+
+#[cfg(test)]
 type CommitObserver = Option<Box<dyn Fn(&str)>>;
 
 #[cfg(test)]
@@ -310,7 +314,6 @@ impl SqliteStore {
             )
         })?;
         let binding = ProjectRootBinding::new(project_root, database_path.clone(), correlation_id)?;
-        binding.revalidate(correlation_id)?;
         Ok(SqliteRecordingStore { store: self, binding })
     }
 }
@@ -789,6 +792,11 @@ impl SqliteRecordingStore<'_> {
         request: &ShowWindowRequest,
         source_root: Option<&Path>,
     ) -> Result<RecordingEventWindow, RecordingStoreError> {
+        // Readers perform many admissions too. Share only state-bound ACL
+        // verdicts within this call, just as the persistence port does.
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
+        #[cfg(test)]
+        let mut phase = work_profile::Phase::enter("read_window_admission");
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
         let published = recording_journal::PublishedRead::new(self, correlation_id)?;
@@ -872,6 +880,8 @@ impl SqliteRecordingStore<'_> {
             }
         };
 
+        #[cfg(test)]
+        phase.switch("read_journal_snapshot");
         let journal = published.events(stored_project_id, request.recording_id)?;
         // Tail bytes are owned and the SQLite transaction pins the matching
         // sealed prefix. Release publication before object decoding/projection.
@@ -937,6 +947,8 @@ impl SqliteRecordingStore<'_> {
         while let Some(row) = rows.next().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })? {
+            #[cfg(test)]
+            phase.switch("read_segment_metadata");
             if segment_count >= MAX_RECORDING_QUERY_SEGMENTS {
                 return Err(recording_query_resource_error(correlation_id));
             }
@@ -1078,11 +1090,15 @@ impl SqliteRecordingStore<'_> {
             }
             let object_path =
                 object_path_from_row(&self.binding.root, &segment.object_hash, correlation_id)?;
+            #[cfg(test)]
+            phase.switch("read_object_admission");
             validate_managed_tree(
                 &self.binding.root,
                 object_path.parent().ok_or_else(|| object_corrupt_error(correlation_id))?,
                 correlation_id,
             )?;
+            #[cfg(test)]
+            phase.switch("read_object_bytes_and_admission");
             let bytes = read_bounded_regular_file(&object_path, correlation_id, false)?;
             if i64::try_from(bytes.len()).map_err(|_| object_corrupt_error(correlation_id))?
                 != segment.compressed_bytes
@@ -1090,6 +1106,8 @@ impl SqliteRecordingStore<'_> {
                 return Err(object_corrupt_error(correlation_id));
             }
             let expected_hash = content_hash_from_bytes(&segment.object_hash, correlation_id)?;
+            #[cfg(test)]
+            phase.switch("read_object_decode");
             let decoded = crate::xtf::decode_compressed_segment(&bytes, expected_hash)
                 .map_err(|_| object_corrupt_error(correlation_id))?;
             let verified = decoded.verified();
@@ -1110,6 +1128,8 @@ impl SqliteRecordingStore<'_> {
             }
             verified_input_bytes = work_if_added.unwrap_or(segment_work);
             decoded_ranges.push((first_sequence, last_sequence));
+            #[cfg(test)]
+            phase.switch("read_frame_verification");
             index_verified_segment_frames(
                 &connection,
                 request.recording_id,
@@ -1118,6 +1138,8 @@ impl SqliteRecordingStore<'_> {
                 &mut verified_frame_ids,
                 correlation_id,
             )?;
+            #[cfg(test)]
+            phase.switch("read_projection");
             for envelope in decoded.events() {
                 let Some(event) = envelope.event.as_ref() else {
                     return Err(object_corrupt_error(correlation_id));
@@ -1151,6 +1173,8 @@ impl SqliteRecordingStore<'_> {
                 events.push(projected);
             }
         }
+        #[cfg(test)]
+        phase.switch("read_tail_projection");
         let mut has_journal_tail = false;
         if let Some((ordinal, tail)) = journal {
             // Use the boundary from the same row snapshot that was decoded,
@@ -1207,6 +1231,8 @@ impl SqliteRecordingStore<'_> {
                 events.push(projected);
             }
         }
+        #[cfg(test)]
+        phase.switch("read_navigation");
         for event in &mut events {
             let sequence = event
                 .sequence
@@ -1322,6 +1348,8 @@ impl SqliteRecordingStore<'_> {
             events.truncate(final_event_count);
             has_more = true;
         }
+        #[cfg(test)]
+        phase.switch("read_finalize");
         Ok(RecordingEventWindow {
             recording_id: request.recording_id,
             status: lifecycle_status,
@@ -1512,6 +1540,8 @@ impl SqliteRecordingStore<'_> {
         &self,
         request: &SegmentCommitRequest,
     ) -> Result<SegmentCommitReceipt, RecordingStoreError> {
+        #[cfg(test)]
+        let mut phase = work_profile::Phase::enter("segment_encode_and_validate");
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
         let logical = encode_logical_segment(&XtfSegmentInput {
@@ -1551,6 +1581,8 @@ impl SqliteRecordingStore<'_> {
         }
 
         self.binding.revalidate(correlation_id)?;
+        #[cfg(test)]
+        phase.switch("segment_staging_admission");
         let mut staging =
             create_staging_files(&self.binding, request.recording_id, correlation_id)?;
         commit_failpoint("before-logical-write", correlation_id, false)?;
@@ -1560,6 +1592,8 @@ impl SqliteRecordingStore<'_> {
         // to the filesystem here; the compressed file's device barrier below
         // makes both durable before publication. Avoid a second F_FULLFSYNC
         // per segment on Apple without changing the segment or Finish promise.
+        #[cfg(test)]
+        phase.switch("segment_logical_write");
         write_synced_file(
             &staging.logical,
             logical.logical_bytes(),
@@ -1570,6 +1604,8 @@ impl SqliteRecordingStore<'_> {
         commit_failpoint("after-logical-sync", correlation_id, false)?;
         self.binding.revalidate(correlation_id)?;
         commit_failpoint("before-compression", correlation_id, false)?;
+        #[cfg(test)]
+        phase.switch("segment_compression");
         let compressed = compress_logical_bytes(logical.logical_bytes())
             .map_err(|error| map_xtf_error(error, correlation_id))?;
         commit_failpoint("after-compression-before-write", correlation_id, false)?;
@@ -1577,10 +1613,14 @@ impl SqliteRecordingStore<'_> {
             .map_err(|_| segment_validation_error(correlation_id))?;
         validate_managed_tree(&self.binding.root, &staging.directory, correlation_id)?;
         validate_managed_file(&staging.compressed, correlation_id, true)?;
+        #[cfg(test)]
+        phase.switch("segment_compressed_write");
         write_synced_file(&staging.compressed, &compressed, FileSync::Device, correlation_id)?;
         sync_directory(&staging.directory, correlation_id, "XTR-STORE-OBJECT-IO")?;
         commit_failpoint("after-compressed-sync", correlation_id, false)?;
 
+        #[cfg(test)]
+        phase.switch("segment_object_publication");
         validate_managed_tree(&self.binding.root, &staging.directory, correlation_id)?;
         let staged = read_bounded_regular_file(&staging.compressed, correlation_id, true)?;
         verify_staged_object(&staged, &candidate, correlation_id)?;
@@ -1614,6 +1654,8 @@ impl SqliteRecordingStore<'_> {
         commit_failpoint("after-object-directory-sync", correlation_id, true)?;
 
         let outcome = {
+            #[cfg(test)]
+            phase.switch("segment_sql_transaction");
             commit_failpoint("before-transaction", correlation_id, false)?;
             let connection =
                 self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
@@ -2118,6 +2160,13 @@ fn validate_frame_identities(
     request: &SegmentCommitRequest,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT 1 FROM recording_frame_index WHERE recording_id = ?1 AND event_id_digest = ?2",
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
     let mut local = HashSet::new();
     for envelope in &request.events {
         let Some(event) = envelope.event.as_ref() else {
@@ -2132,9 +2181,8 @@ fn validate_frame_identities(
             }
         }
         let digest = blake3::hash(event.event_id.as_bytes());
-        let exists: Option<i64> = connection
+        let exists: Option<i64> = statement
             .query_row(
-                "SELECT 1 FROM recording_frame_index WHERE recording_id = ?1 AND event_id_digest = ?2",
                 rusqlite::params![
                     request.recording_id.as_uuid().as_bytes().to_vec(),
                     digest.as_bytes().as_slice(),
@@ -3258,14 +3306,23 @@ fn index_verified_segment_frames(
     verified_frame_ids: &mut HashMap<u64, xtrace_domain::FrameId>,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    // A paginated read verifies the whole intersecting segment, including its
+    // lookbehind. Reuse this query for all envelopes instead of recompiling it
+    // for every event on every page.
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT frame_id, segment_ordinal, event_offset, event_id_digest, monotonic_ns \
+         FROM recording_frame_index WHERE recording_id = ?1 AND recording_seq = ?2",
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
     for (event_offset, envelope) in envelopes.iter().enumerate() {
         let Some(event) = envelope.event.as_ref() else {
             return Err(object_corrupt_error(correlation_id));
         };
-        let indexed: Option<FrameIndexRow> = connection
+        let indexed: Option<FrameIndexRow> = statement
             .query_row(
-                "SELECT frame_id, segment_ordinal, event_offset, event_id_digest, monotonic_ns \
-                 FROM recording_frame_index WHERE recording_id = ?1 AND recording_seq = ?2",
                 rusqlite::params![
                     recording_id.as_uuid().as_bytes().to_vec(),
                     event.recording_seq.to_be_bytes().as_slice(),
@@ -4462,6 +4519,11 @@ thread_local! {
 }
 
 fn sync_recording_file(file: &std::fs::File, kind: FileSync) -> std::io::Result<()> {
+    #[cfg(test)]
+    let _phase = work_profile::Phase::enter(match kind {
+        FileSync::Filesystem => "filesystem_sync_syscall",
+        FileSync::Device => "device_sync_syscall",
+    });
     match kind {
         #[cfg(unix)]
         FileSync::Filesystem => rustix::fs::fsync(file).map_err(std::io::Error::from)?,
@@ -4578,6 +4640,8 @@ fn sync_directory(
     correlation_id: CorrelationId,
     code: &'static str,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(test)]
+    let _phase = work_profile::Phase::enter("segment_directory_sync_and_admission");
     let failure = || {
         if code == "XTR-STORE-ATOMIC-INSTALL" {
             atomic_install_error(correlation_id)
@@ -4991,6 +5055,8 @@ impl ProjectRootBinding {
         database_path: PathBuf,
         correlation_id: CorrelationId,
     ) -> Result<Self, RecordingStoreError> {
+        #[cfg(test)]
+        let _phase = work_profile::Phase::enter("root_binding_admission");
         let private_root = AdmittedPrivateRoot::open(root).map_err(|_| {
             RecordingStoreError::new(
                 RecordingStoreErrorKind::Permission,
@@ -5017,6 +5083,8 @@ impl ProjectRootBinding {
     /// Construction-time checks cannot eliminate filesystem TOCTOU. Later
     /// publish code reuses this method before every filesystem boundary.
     fn revalidate(&self, correlation_id: CorrelationId) -> Result<(), RecordingStoreError> {
+        #[cfg(test)]
+        let _phase = work_profile::Phase::enter("root_database_admission");
         #[cfg(not(unix))]
         {
             return Err(RecordingStoreError::new(

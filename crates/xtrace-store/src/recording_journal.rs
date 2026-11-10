@@ -49,8 +49,12 @@ pub(super) fn snapshot_lock(
     recording_id: RecordingId,
     id: CorrelationId,
 ) -> Result<Arc<RwLock<()>>, RecordingStoreError> {
+    #[cfg(test)]
+    let mut phase = work_profile::Phase::enter("snapshot_registry_mutex_wait");
     static LOCKS: OnceLock<Mutex<SnapshotLocks>> = OnceLock::new();
     let mut locks = LOCKS.get_or_init(Mutex::default).lock().map_err(|_| object_io_error(id))?;
+    #[cfg(test)]
+    phase.switch("snapshot_registry_scan");
     locks.retain(|_, lock| lock.strong_count() != 0);
     let entry = locks.entry(root.path().join(name(recording_id))).or_default();
     if let Some(lock) = entry.upgrade() {
@@ -75,16 +79,22 @@ fn snapshot_file_lock(
 ) -> Result<std::fs::File, RecordingStoreError> {
     use rustix::fs::{FlockOperation, flock};
 
+    #[cfg(test)]
+    let mut phase = work_profile::Phase::enter("flock_admission");
     let file = xtrace_private_storage::open_private_directory_descriptor(root.path())
         .map_err(|_| object_io_error(id))?;
     let operation =
         if exclusive { FlockOperation::LockExclusive } else { FlockOperation::LockShared };
+    #[cfg(test)]
+    phase.switch("flock_wait");
     #[cfg(test)]
     if exclusive {
         // Observe actual kernel contention without a sleep or a timing-based
         // assertion. The production path simply makes one blocking lock call.
         match flock(&file, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => {
+                #[cfg(test)]
+                phase.switch("flock_revalidate");
                 root.revalidate().map_err(|_| object_io_error(id))?;
                 return Ok(file);
             }
@@ -97,6 +107,8 @@ fn snapshot_file_lock(
         }
     }
     flock(&file, operation).map_err(|_| object_io_error(id))?;
+    #[cfg(test)]
+    phase.switch("flock_revalidate");
     root.revalidate().map_err(|_| object_io_error(id))?;
     Ok(file)
 }
@@ -132,6 +144,12 @@ fn durable_sync(
     _kind: SyncKind,
     sync: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    #[cfg(test)]
+    let _phase = work_profile::Phase::enter(match _kind {
+        SyncKind::Journal => "journal_sync",
+        SyncKind::Checkpoint => "checkpoint_sync",
+        SyncKind::Directory => "directory_sync",
+    });
     #[cfg(test)]
     let count_only = COUNT_ONLY_SYNCS.with(|enabled| enabled.get());
     #[cfg(not(test))]
@@ -228,8 +246,12 @@ fn directory(
     create: bool,
     id: CorrelationId,
 ) -> Result<Option<AdmittedPrivateRoot>, RecordingStoreError> {
+    #[cfg(test)]
+    let _phase = work_profile::Phase::enter("journal_directory_admission");
     binding.revalidate(id)?;
-    let root = AdmittedPrivateRoot::open(&binding.root).map_err(|_| object_io_error(id))?;
+    // The binding already owns and has just revalidated this capability.
+    // Child APIs still rewalk ancestors and check the named child themselves.
+    let root = &binding.private_root;
     if create {
         if std::fs::symlink_metadata(binding.root.join("journals")).is_ok() {
             return root.open_private_child("journals").map(Some).map_err(|_| object_io_error(id));
@@ -237,7 +259,7 @@ fn directory(
         // A reader that found no journals retains a shared parent lock through
         // its SQLite snapshot. Creation must wait until that read completes.
         #[cfg(unix)]
-        let _creation = snapshot_file_lock(&root, true, id)?;
+        let _creation = snapshot_file_lock(root, true, id)?;
         let child =
             root.open_or_create_private_child("journals").map_err(|_| object_io_error(id))?;
         // Each cold writer syncs this parent before acknowledging. In
@@ -331,7 +353,11 @@ fn publish_boundary(
         }
     });
     let lock = snapshot_lock(root, recording_id, id)?;
-    let _snapshot = lock.write().map_err(|_| object_io_error(id))?;
+    let _snapshot = {
+        #[cfg(test)]
+        let _phase = work_profile::Phase::enter("publication_rwlock_wait");
+        lock.write().map_err(|_| object_io_error(id))?
+    };
     #[cfg(unix)]
     let _file_snapshot = snapshot_file_lock(root, true, id)?;
     #[cfg(unix)]
@@ -341,10 +367,10 @@ fn publish_boundary(
         let directory = xtrace_private_storage::open_private_directory_descriptor(root.path())
             .map_err(|_| object_io_error(id))?;
         root.validate_file_binding(&pending, file, false).map_err(|_| object_io_error(id))?;
-        if root.validate_optional_private_file(&name).map_err(|_| object_io_error(id))? {
-            let target = root.open_regular_file(&name).map_err(|_| object_io_error(id))?;
-            root.validate_file_binding(&name, &target, false).map_err(|_| object_io_error(id))?;
-        }
+        // The old target is discarded, not read. Stat-only admission already
+        // checks owner, mode, ACL, filesystem, link count and stable identity.
+        // Opening it and validating it twice more adds no publication evidence.
+        root.validate_optional_private_file(&name).map_err(|_| object_io_error(id))?;
         root.revalidate().map_err(|_| object_io_error(id))?;
         rustix::fs::renameat(&directory, pending.as_str(), &directory, name.as_str())
             .map_err(|_| object_io_error(id))?;
@@ -372,6 +398,8 @@ fn load_for_retry(
     id: CorrelationId,
     include_pending: bool,
 ) -> Result<Option<Tail>, RecordingStoreError> {
+    #[cfg(test)]
+    let _phase = work_profile::Phase::enter("journal_retry_load");
     let Some(root) = directory(binding, false, id)? else { return Ok(None) };
     let lock = snapshot_lock(&root, recording_id, id)?;
     let snapshot = {
@@ -675,9 +703,13 @@ impl SqliteRecordingStore<'_> {
         prefix_events: usize,
         checkpoint: &mut Option<Checkpoint>,
     ) -> Result<(), RecordingStoreError> {
+        #[cfg(test)]
+        let mut phase = work_profile::Phase::enter("writer_wait");
         let id = CorrelationId::new();
         let _writer =
             self.store.lock_recording_writer(id).map_err(|error| map_store_error(error, id))?;
+        #[cfg(test)]
+        phase.switch("journal_validation");
         if u64::from(request.segment_ordinal) >= MAX_RECORDING_QUERY_SEGMENTS {
             return Err(recording_query_resource_error(id));
         }
@@ -695,9 +727,13 @@ impl SqliteRecordingStore<'_> {
         })
         .map_err(|error| map_xtf_error(error, id))?;
         let root = directory(&self.binding, true, id)?.ok_or_else(|| object_io_error(id))?;
+        #[cfg(test)]
+        phase.switch("tail_file_admission");
         let name = name(request.recording_id);
         let mut file = root.open_or_create_private_file(&name).map_err(|_| object_io_error(id))?;
         let length = file.metadata().map_err(|_| object_io_error(id))?.len();
+        #[cfg(test)]
+        phase.switch("journal_validation");
         let mut known = checkpoint
             .take()
             .filter(|known| known.ordinal == request.segment_ordinal && known.length == length);
@@ -782,7 +818,11 @@ impl SqliteRecordingStore<'_> {
         let mut candidate = SegmentMetadata::from_logical(&logical, &commit, id)?;
         candidate.first_recording_seq = known.first_sequence;
         {
+            #[cfg(test)]
+            phase.switch("connection_wait_and_admission");
             let connection = self.store.lock().map_err(|error| map_store_error(error, id))?;
+            #[cfg(test)]
+            phase.switch("journal_sql_validation");
             validate_recording_anchor(&connection, &commit, id)?;
             validate_new_continuity(&connection, &commit, &candidate, id)?;
             validate_frame_identities(
@@ -794,6 +834,8 @@ impl SqliteRecordingStore<'_> {
                 id,
             )?;
         }
+        #[cfg(test)]
+        phase.switch("journal_validation");
         for envelope in suffix {
             let event =
                 envelope.payload.event.as_ref().ok_or_else(|| segment_validation_error(id))?;
@@ -817,9 +859,13 @@ impl SqliteRecordingStore<'_> {
             publish_boundary(&root, request.recording_id, &boundary, id)?;
         }
         let lock = snapshot_lock(&root, request.recording_id, id)?;
+        #[cfg(test)]
+        phase.switch("snapshot_write_wait");
         let mutation = lock.write().map_err(|_| object_io_error(id))?;
         #[cfg(unix)]
         let file_mutation = snapshot_file_lock(&root, true, id)?;
+        #[cfg(test)]
+        phase.switch("journal_append");
         // Remove only an incomplete, unacknowledged suffix before an exact retry.
         if length != known.length {
             file.set_len(known.length).map_err(|_| object_io_error(id))?;
@@ -839,6 +885,8 @@ impl SqliteRecordingStore<'_> {
         #[cfg(unix)]
         drop(file_mutation);
         drop(mutation);
+        #[cfg(test)]
+        phase.switch("checkpoint_prepare");
         let boundary =
             prepare_boundary(&root, request.recording_id, &known.header, final_length, id)?;
         #[cfg(test)]
@@ -850,6 +898,8 @@ impl SqliteRecordingStore<'_> {
         commit_failpoint("journal-before-sync", id, false)?;
         durable_sync(SyncKind::Journal, || sync_recording_file(&file, FileSync::Device))
             .map_err(|_| object_io_error(id))?;
+        #[cfg(test)]
+        phase.switch("tail_binding_admission");
         root.validate_file_binding(&name, &file, true).map_err(|_| object_io_error(id))?;
         if !cached {
             AdmittedPrivateRoot::open(&self.binding.root)
@@ -858,6 +908,8 @@ impl SqliteRecordingStore<'_> {
         }
         // The publication directory barrier covers both the tail's creation
         // and checkpoint rename; a cold writer also persisted its parent.
+        #[cfg(test)]
+        phase.switch("checkpoint_publish");
         publish_boundary(&root, request.recording_id, &boundary, id)?;
         commit_failpoint("journal-after-sync", id, false)?;
         known.length = final_length;
