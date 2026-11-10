@@ -266,7 +266,8 @@ MAX_JOB_EXCERPT_BYTES = 24 * 1024
 MAX_PROGRESS_LINES = 12
 WITHHELD = "withheld: privacy scan"
 CARGO_SECTION = re.compile(r"^---- (\S+) (?:stdout|stderr) ----$")
-CARGO_PANIC = re.compile(r"^thread '([^']+)' panicked at ")
+CARGO_PANIC = re.compile(
+    r"^thread '([^']+)'(?: \([0-9]+\))? panicked at (\S{1,300}):([0-9]+):([0-9]+):$")
 CARGO_STATE = re.compile(r"^test (\S+) \.\.\.(?: (ok|FAILED|ignored))?$")
 CARGO_RUNNING = re.compile(r"^test (\S+) has been running for over \d+ seconds$")
 GRADLE_STATE = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\((?P<params>[^\n]*)\))?"
@@ -294,6 +295,7 @@ class UnverifiedReason(str, Enum):
     NAME_NOT_DECLARED = "name-not-declared-in-head"
     PRIVACY_SCAN = "privacy-scan"
     EXCERPT_CAP = "excerpt-cap"
+    AMBIGUOUS_PANIC = "ambiguous-panic-block"
 
 
 # Reuse the canary scanner's encoded needles, including recognisable marker families
@@ -349,11 +351,11 @@ def _source_mask(source: str, *, rust: bool = False) -> str:
     return "".join(masked)
 
 
-def _diagnostic_variants(source: str) -> set[str]:
+def _diagnostic_variants(source: str, enums: str = "PrivateStorageError|AdmissionOperation") -> set[str]:
     """Read only variant declarations of the private-storage diagnostic enums."""
     masked = _source_mask(source, rust=True)
     variants = set()
-    for enum in re.finditer(r"\benum\s+(?:PrivateStorageError|AdmissionOperation)\s*\{", masked):
+    for enum in re.finditer(r"\benum\s+(?:" + enums + r")\s*\{", masked):
         depth = 0
         expect_variant = True
         for token in re.finditer(r"[A-Za-z_]\w*|[^\s]", masked[enum.end():]):
@@ -379,6 +381,7 @@ class CheckoutMetadata:
         self.files: dict[str, int] = {}
         self.tests: set[str] = set()
         self.diagnostic_variants: set[str] = set()
+        self.admission_operations: set[str] = set()
         self.java_files: dict[str, list[str]] = {}
         for name, source in sources.items():
             path = pathlib.PurePosixPath(name)
@@ -390,6 +393,7 @@ class CheckoutMetadata:
             self._read_tests(path, source)
             if path.suffix == ".rs" and path.parts[:3] == ("crates", "xtrace-private-storage", "src"):
                 self.diagnostic_variants.update(_diagnostic_variants(source))
+                self.admission_operations.update(_diagnostic_variants(source, "AdmissionOperation"))
 
     def _read_tests(self, path: pathlib.PurePosixPath, source: str) -> None:
         test_path = bool(set(path.parts) & {"test", "tests", "__tests__"})
@@ -506,28 +510,42 @@ def _checkout_metadata() -> CheckoutMetadata:
     return CheckoutMetadata(sources)
 
 
-def _panic_categories(text: str, metadata: CheckoutMetadata, index) -> list[str | int]:
-    """Rebuild vocabulary tokens and explicitly labelled errno facts, never prose.
+# These are the exact derived Debug / Display renderings in diagnostic.rs.
+# Unicode-aware token boundaries prevent path components or captured identifiers
+# from supplying a rendering. No isolated word or errno-shaped prose is a fact.
+_DIAGNOSTIC_FIELDS = (
+    r"(?P<operation>[A-Za-z]+){sep}kind{assign}(?:None|Some\((?P<kind>[A-Za-z]+)\))"
+    r"{sep}raw_os_error{assign}(?:None|Some\((?P<errno>[1-9][0-9]{{0,2}})\))")
+_DIAGNOSTIC_START = r"(?<![\w./\\+-])"
+_DIAGNOSTIC_END = r"(?![\w./\\+-])"
+ADMISSION_DEBUG = re.compile(
+    _DIAGNOSTIC_START + r"(?P<admission>Admission\()?AdmissionFailure \{ operation: "
+    + _DIAGNOSTIC_FIELDS.format(sep=", ", assign=": ") + r" \}(?(admission)\))" + _DIAGNOSTIC_END)
+ADMISSION_DISPLAY = re.compile(
+    _DIAGNOSTIC_START + r"operation=" + _DIAGNOSTIC_FIELDS.format(sep=" ", assign="=")
+    + _DIAGNOSTIC_END)
 
-    Treat path-like operands as whole tokens so their components cannot become
-    categories. Unlabelled numbers (assertion values, lines, pids) are not errno.
-    """
-    allowed = metadata.diagnostic_variants | IO_ERROR_KINDS
-    numbers = {}
-    for match in re.finditer(
-            r"(?<![A-Za-z0-9_./\\-])raw_os_error\s*[:=]\s*"
-            r"(?:Some\(([1-9][0-9]{0,2})\)|([1-9][0-9]{0,2}))(?=[\s,}\)\]\"\\]|$)", text):
-        group = 1 if match[1] is not None else 2
-        if 1 <= int(match[group]) <= 200:
-            numbers[match.start(group)] = int(match[group])
+
+def _panic_categories(text: str, metadata: CheckoutMetadata, index) -> list[str | int]:
+    """Publish fields only from complete fixed diagnostic renderings."""
     categories: list[str | int] = []
-    for match in re.finditer(r"[A-Za-z0-9_./\\+-]+", text):
-        token = match[0]
-        value = token if token in allowed else numbers.get(match.start())
-        if value is not None and value not in categories and not _private(str(value), index):
-            categories.append(value)
-            if len(categories) == MAX_CATEGORIES:
-                break
+    matches = sorted([*ADMISSION_DEBUG.finditer(text), *ADMISSION_DISPLAY.finditer(text)],
+                     key=lambda match: match.start())
+    for match in matches:
+        operation, kind, errno = match["operation"], match["kind"], match["errno"]
+        admission = match.re is ADMISSION_DEBUG and match["admission"] is not None
+        if (operation not in metadata.admission_operations or kind is not None and kind not in IO_ERROR_KINDS
+                or errno is not None and int(errno) > 200
+                or admission and "Admission" not in metadata.diagnostic_variants):
+            continue
+        values = (["Admission"] if admission else []) + [operation]
+        if kind is not None:
+            values.append(kind)
+        if errno is not None:
+            values.append(int(errno))
+        for value in values:
+            if value not in categories and not _private(str(value), index) and len(categories) < MAX_CATEGORIES:
+                categories.append(value)
     return categories
 
 
@@ -536,22 +554,23 @@ def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], list[int]]
 
     Open quoted or compound values cannot introduce harness boundaries. Body lines
     are never rescanned for timeout progress, even when they look like build output.
+    Keep headers together until a libtest boundary so interleaving cannot switch
+    the owner of a message before its ambiguity has been checked.
     """
     blocks = []
     harness = []
     name = None
     kind = "cargo"
-    captured = False
     lines: list[str] = []
     panic_lines: list[int] = []
     quote = None
     depth = 0
     for line in ANSI.sub("", text).splitlines():
         section = CARGO_SECTION.fullmatch(line) if not quote and not depth else None
-        panic = CARGO_PANIC.match(line) if not quote and not depth else None
+        panic = CARGO_PANIC.fullmatch(line) if not quote and not depth else None
         gradle = GRADLE_FAIL.fullmatch(line.strip()) if not quote and not depth else None
         next_name = (section[1] if section else f"{gradle[1]}::{gradle[2]}" if gradle else
-                     panic[1] if panic and not captured and panic[1] != name else None)
+                     panic[1] if panic and name is None else None)
         boundary = not quote and not depth and (
             next_name is not None or CARGO_STATE.fullmatch(line) or CARGO_RUNNING.fullmatch(line)
             or CARGO_RESULT.match(line) or line == "failures:" or line.startswith("> Task ")
@@ -562,7 +581,6 @@ def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], list[int]]
             name, lines = next_name, []
             panic_lines = []
             kind = "gradle" if gradle else "cargo"
-            captured = section is not None
         if name is not None:
             if not section and not gradle:
                 if panic:
@@ -613,16 +631,20 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
     index = CANARY_INDEX if index is None else index
     metadata = _checkout_metadata() if metadata is None else metadata
     blocks, harness = _output_parts(text)
-    failures: dict[str, dict] = {}
+    failures: dict[str | tuple[str], dict] = {}
 
-    def failure(name: str) -> dict:
-        if name not in failures:
+    def failure(name: str, *, unattributed: UnverifiedReason | None = None) -> dict:
+        # Captured names cannot collide with internal unattributed row keys.
+        key = name if unattributed is None else (name,)
+        if key not in failures:
             row = {"test": metadata.test(name, index), "location": UNVERIFIED,
                    "kind": "unknown", "withheldLines": 0, "category": [], "panicSites": []}
             if row["test"] == UNVERIFIED:
                 row["testUnverifiedReason"] = metadata.test_unverified_reason(name).value
-            failures[name] = row
-        return failures[name]
+            if unattributed is not None:
+                row.update(test=UNVERIFIED, testUnverifiedReason=unattributed.value)
+            failures[key] = row
+        return failures[key]
 
     for line in harness:
         if m := CARGO_FAIL.fullmatch(line):
@@ -634,7 +656,39 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
         elif m := re.fullmatch(r"\s*not ok \d+ - (.+)", line):
             failure(m[1])["kind"] = "exit"
     outcomes = {m[1]: m[2] for line in harness if (m := CARGO_STATE.fullmatch(line)) and m[2]}
-    for name, framework, lines, panic_lines in blocks:
+    for block_number, (name, framework, lines, panic_lines) in enumerate(blocks):
+        if framework == "cargo" and outcomes.get(name) in {"ok", "ignored"}:
+            continue
+        if panic_lines:
+            header = CARGO_PANIC.fullmatch(lines[panic_lines[0]])
+            header_test = metadata.test(header[1], index)
+            first_line = next(i for i, line in enumerate(lines) if line.strip())
+            # A second header before a libtest boundary may be parallel output
+            # or a multiline message. Neither its sites nor its messages have
+            # a proven owner. A section name cannot attest a worker thread.
+            reason = None
+            if len(panic_lines) != 1 or panic_lines[0] != first_line:
+                reason = UnverifiedReason.AMBIGUOUS_PANIC
+            elif header_test == UNVERIFIED:
+                reason = metadata.test_unverified_reason(header[1])
+            elif metadata.test(name, index) != header_test:
+                reason = UnverifiedReason.AMBIGUOUS_PANIC
+            if reason is not None:
+                if name in failures:
+                    failures[name]["withheldLines"] += sum(bool(line.strip()) for line in lines)
+                for line_number in panic_lines:
+                    sites, _ = panic_sites(lines[line_number])
+                    for site in sites:
+                        location = metadata.location(site, index)
+                        if location == UNVERIFIED:
+                            continue
+                        row = failure(f"<panic-block-{block_number}>", unattributed=reason)
+                        row["kind"] = "panic"
+                        if row["location"] == UNVERIFIED:
+                            row["location"] = location
+                        if location not in row["panicSites"] and len(row["panicSites"]) < MAX_PANIC_SITES:
+                            row["panicSites"].append(location)
+                continue
         # A passing should_panic test is not a failure. On timeout, retain an
         # observed panic even if its terminal harness outcome never arrived.
         if name not in failures:
