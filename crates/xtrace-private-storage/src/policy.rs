@@ -341,7 +341,18 @@ fn parse_macos_acl_listing_kind(text: &str, expected_path: &str, kind: u8) -> bo
             "chown",
         ];
         if parsed.is_empty()
-            || parsed.iter().any(|right| right.is_empty() || !RIGHTS.contains(right))
+            || parsed.iter().any(|right| {
+                // Darwin lists the same permission bits with directory-specific names.
+                // Normalize only those aliases, after requiring a deny-only entry.
+                let right = match (kind, *right) {
+                    (b'd', "list") => "read",
+                    (b'd', "add_file") => "write",
+                    (b'd', "search") => "execute",
+                    (b'd', "add_subdirectory") => "append",
+                    (_, right) => right,
+                };
+                right.is_empty() || !RIGHTS.contains(&right)
+            })
         {
             return false;
         }
@@ -463,6 +474,34 @@ mod tests {
             "drwxr-xr-x+ 4 alice staff - 128 Oct 4 00:23 /Users/alice/Documents\n",
             "/Users/alice/Documents",
         ));
+    }
+
+    #[test]
+    fn macos_directory_right_names_preserve_the_deny_only_policy() {
+        let header = "drwx------+ 3 xtrace-test staff - 96 Oct 4 12:00 /private/root\n";
+        for right in ["list", "add_file", "search", "add_subdirectory"] {
+            assert!(macos_directory_listing_admits(
+                &format!("{header} 0: group:everyone deny {right}\n"),
+                "/private/root",
+            ));
+            assert!(!macos_directory_listing_admits(
+                &format!("{header} 0: group:everyone allow {right}\n"),
+                "/private/root",
+            ));
+            assert!(!parse_macos_acl_listing_kind(
+                &format!(
+                    "-rw-------+ 1 xtrace-test staff - 0 Oct 4 12:00 /private/root\n 0: group:everyone deny {right}\n"
+                ),
+                "/private/root",
+                b'-',
+            ));
+        }
+        for rights in ["add_file,unknown", "add_file,,search", "add_file,"] {
+            assert!(!macos_directory_listing_admits(
+                &format!("{header} 0: group:everyone deny {rights}\n"),
+                "/private/root",
+            ));
+        }
     }
 
     #[test]

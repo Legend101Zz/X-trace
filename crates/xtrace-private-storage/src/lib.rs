@@ -13,6 +13,10 @@
 #[cfg(unix)]
 mod admission;
 #[cfg(unix)]
+mod diagnostic;
+#[cfg(unix)]
+pub use diagnostic::{AdmissionFailure, AdmissionOperation};
+#[cfg(unix)]
 mod policy;
 #[cfg(unix)]
 mod probe;

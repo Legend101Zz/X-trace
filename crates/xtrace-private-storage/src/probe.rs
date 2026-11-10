@@ -48,6 +48,7 @@ use std::time::{Duration, Instant};
 use crate::admission::FileIdentity;
 use crate::policy::{DirectoryRole, FilesystemProfile};
 use crate::scope;
+use crate::{AdmissionFailure, AdmissionOperation as Step, PrivateStorageError};
 
 /// Most verdicts one operation or scope remembers; beyond it new verdicts are not stored.
 const SCOPE_MEMO_LIMIT: usize = 1024;
@@ -177,6 +178,7 @@ fn filesystem_identity(_stats: &rustix::fs::StatFs) -> (String, u64, String) {
 /// One bounded admission operation: a single deadline plus the verdicts earned inside it.
 pub(crate) struct Operation {
     deadline: Instant,
+    failure: std::cell::Cell<Option<AdmissionFailure>>,
     profile: crate::policy::FilesystemProfile,
     memoize: bool,
     judged: RefCell<Vec<MemoKey>>,
@@ -234,6 +236,7 @@ impl Operation {
         let memoize = cfg!(target_os = "macos");
         Self {
             deadline,
+            failure: std::cell::Cell::new(None),
             profile: crate::policy::FilesystemProfile::Durable,
             memoize,
             judged: RefCell::new(Vec::new()),
@@ -247,6 +250,23 @@ impl Operation {
             #[cfg(target_os = "macos")]
             prefetched: RefCell::new(None),
         }
+    }
+
+    /// Preserve the first fatal probe failure, never subprocess text or operands.
+    fn record_failure(&self, failure: AdmissionFailure) {
+        if self.failure.get().is_none() {
+            self.failure.set(Some(failure));
+        }
+    }
+
+    pub(crate) fn failure(&self, fallback: Step) -> PrivateStorageError {
+        PrivateStorageError::Admission(self.failure.get().unwrap_or_else(|| {
+            AdmissionFailure::check(if self.expired() { Step::Deadline } else { fallback })
+        }))
+    }
+
+    fn io<T>(&self, operation: Step, result: std::io::Result<T>) -> Option<T> {
+        result.map_err(|error| self.record_failure(AdmissionFailure::io(operation, error))).ok()
     }
 
     /// An operation that memoizes on every platform, so the memo logic is testable on Linux.
@@ -333,7 +353,7 @@ impl Operation {
         let started = Instant::now();
         let taken_at = std::time::SystemTime::now();
         let operands = paths.iter().map(std::path::PathBuf::as_path).collect::<Vec<_>>();
-        let text = run_ls("-ldeOi", &operands, self.deadline, BATCH_OUTPUT_LIMIT)?;
+        let text = run_ls("-ldeOi", &operands, self.deadline, BATCH_OUTPUT_LIMIT).ok()?;
         // A realtime clock that stepped while `ls` ran (or went backwards) makes `taken_at`
         // meaningless for the ctime comparison: drop the whole batch.
         if !clock_is_consistent(taken_at, std::time::SystemTime::now(), started.elapsed()) {
@@ -441,15 +461,16 @@ fn directory_metadata(
         if operation.expired() {
             return None;
         }
-        let opened = directory.metadata().ok()?;
+        let opened = operation.io(Step::DescriptorMetadata, directory.metadata())?;
         #[cfg(all(any(target_os = "linux", target_os = "macos"), test))]
         run_directory_read_hook(path);
-        let named = std::fs::symlink_metadata(path).ok()?;
+        let named = operation.io(Step::NamedMetadata, std::fs::symlink_metadata(path))?;
         if !named.is_dir()
             || !opened.is_dir()
             || !expected.same_directory(FileIdentity::from_metadata(&named))
             || !expected.same_directory(FileIdentity::from_metadata(&opened))
         {
+            operation.record_failure(AdmissionFailure::check(Step::Identity));
             return None;
         }
         if DirectoryState::of(&named, role) == DirectoryState::of(&opened, role) {
@@ -464,6 +485,7 @@ fn directory_metadata(
         if linux_directory_can_recheck(operation, directory, &opened, &named) {
             continue;
         }
+        operation.record_failure(AdmissionFailure::check(Step::AclState));
         return None;
     }
 }
@@ -582,7 +604,13 @@ fn recheck_directory_listing(
         // A new single-operand listing is required; the batch predates the content change.
         #[cfg(test)]
         record_directory_probe(path);
-        let Some(text) = run_acl_listing(path, operation.deadline()) else { return false };
+        let text = match run_acl_listing(path, operation.deadline()) {
+            Ok(text) => text,
+            Err(failure) => {
+                operation.record_failure(failure);
+                return false;
+            }
+        };
         if !path
             .to_str()
             .is_some_and(|expected| crate::policy::macos_directory_listing_admits(&text, expected))
@@ -667,7 +695,7 @@ fn recheck_linux_directory_acl(
 }
 
 #[cfg(target_os = "linux")]
-fn read_acl_attribute(directory: &File, name: &str) -> Result<Option<Vec<u8>>, ()> {
+fn read_acl_attribute(directory: &File, name: &str) -> Result<Option<Vec<u8>>, rustix::io::Errno> {
     let mut value = vec![0_u8; 16 * 1024];
     match rustix::fs::fgetxattr(directory, name, value.as_mut_slice()) {
         Ok(length) => {
@@ -677,23 +705,32 @@ fn read_acl_attribute(directory: &File, name: &str) -> Result<Option<Vec<u8>>, (
         Err(error) if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NODATA => {
             Ok(None)
         }
-        Err(_) => Err(()),
+        Err(error) => Err(error),
     }
 }
 
 #[cfg(target_os = "linux")]
 fn probe_directory(
-    _operation: &Operation,
+    operation: &Operation,
     role: DirectoryRole,
     _path: &Path,
     directory: &File,
 ) -> Option<LinuxDirectoryAcl> {
-    let access = read_acl_attribute(directory, "system.posix_acl_access").ok()?;
-    let default = read_acl_attribute(directory, "system.posix_acl_default").ok()?;
+    let access = operation.io(
+        Step::AccessAcl,
+        read_acl_attribute(directory, "system.posix_acl_access").map_err(Into::into),
+    )?;
+    let default = operation.io(
+        Step::DefaultAcl,
+        read_acl_attribute(directory, "system.posix_acl_default").map_err(Into::into),
+    )?;
     #[cfg(test)]
     run_directory_probe_hook(_path);
-    crate::policy::linux_directory_acl_admits(role, access.as_deref(), default.as_deref())
-        .then_some(LinuxDirectoryAcl { access, default })
+    if !crate::policy::linux_directory_acl_admits(role, access.as_deref(), default.as_deref()) {
+        operation.record_failure(AdmissionFailure::check(Step::AclPolicy));
+        return None;
+    }
+    Some(LinuxDirectoryAcl { access, default })
 }
 
 #[cfg(target_os = "macos")]
@@ -706,10 +743,21 @@ fn probe_directory(operation: &Operation, path: &Path, directory: &File) -> Opti
                 .then(|| prefetched_listing(operation, path, directory))
                 .flatten()
         })
-        .or_else(|| run_acl_listing(path, operation.deadline()))?;
-    path.to_str()
+        .or_else(|| match run_acl_listing(path, operation.deadline()) {
+            Ok(text) => Some(text),
+            Err(failure) => {
+                operation.record_failure(failure);
+                None
+            }
+        })?;
+    if !path
+        .to_str()
         .is_some_and(|expected| crate::policy::macos_directory_listing_admits(&text, expected))
-        .then_some(text)
+    {
+        operation.record_failure(AdmissionFailure::check(Step::AclPolicy));
+        return None;
+    }
+    Some(text)
 }
 
 /// A ctime must be at least this much older than the batched listing to be trusted.
@@ -925,7 +973,7 @@ fn file_listing_admits(
         return false;
     }
     let state = || {
-        let named = std::fs::symlink_metadata(path).ok()?;
+        let named = operation.io(Step::NamedMetadata, std::fs::symlink_metadata(path))?;
         if !named.is_file() || !expected.same_directory(FileIdentity::from_metadata(&named)) {
             return None;
         }
@@ -952,7 +1000,13 @@ fn file_listing_admits(
                 .unwrap_or(false)
     });
     if !remembered {
-        let Some(text) = run_acl_listing(path, operation.deadline()) else { return false };
+        let text = match run_acl_listing(path, operation.deadline()) {
+            Ok(text) => text,
+            Err(failure) => {
+                operation.record_failure(failure);
+                return false;
+            }
+        };
         if !path
             .to_str()
             .is_some_and(|expected| crate::policy::macos_file_listing_admits(&text, expected))
@@ -1073,32 +1127,38 @@ pub(crate) fn ls_spawn_count() -> usize {
 
 /// Runs `/bin/ls -ldeO <path>` under the deadline and returns its bounded stdout.
 #[cfg(target_os = "macos")]
-fn run_acl_listing(path: &Path, deadline: Instant) -> Option<String> {
+fn run_acl_listing(path: &Path, deadline: Instant) -> Result<String, AdmissionFailure> {
     run_ls("-ldeO", &[path], deadline, LISTING_OUTPUT_LIMIT)
 }
 
 /// Runs `/bin/ls <flags> <paths...>` under the deadline and returns its bounded stdout.
 ///
 /// This is the only place that spawns the probe. Any failure (control characters in a path,
-/// spawn failure, deadline, oversized or non-UTF-8 output, nonzero exit) is `None`, which every
-/// caller treats as a refusal or a fallback to a single-directory probe.
+/// spawn failure, deadline, oversized or non-UTF-8 output, nonzero exit) is a fixed diagnostic,
+/// which every caller treats as a refusal or a fallback to a single-directory probe.
 #[cfg(target_os = "macos")]
-fn run_ls(flags: &str, paths: &[&Path], deadline: Instant, limit: usize) -> Option<String> {
+fn run_ls(
+    flags: &str,
+    paths: &[&Path],
+    deadline: Instant,
+    limit: usize,
+) -> Result<String, AdmissionFailure> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::thread;
 
-    if Instant::now() >= deadline
-        || paths.iter().any(|path| path.as_os_str().to_string_lossy().chars().any(char::is_control))
-    {
-        return None;
+    if Instant::now() >= deadline {
+        return Err(AdmissionFailure::check(Step::Deadline));
+    }
+    if paths.iter().any(|path| path.as_os_str().to_string_lossy().chars().any(char::is_control)) {
+        return Err(AdmissionFailure::check(Step::AclProbeOperand));
     }
     #[cfg(test)]
     LS_SPAWNS.with(|count| count.set(count.get() + 1));
     #[cfg(feature = "spawn-counter")]
     crate::spawn_counter::record_ls_spawn();
-    let Ok(mut child) = Command::new("/bin/ls")
+    let mut child = Command::new("/bin/ls")
         .arg(flags)
         .args(paths)
         .env("LC_ALL", "C")
@@ -1106,30 +1166,38 @@ fn run_ls(flags: &str, paths: &[&Path], deadline: Instant, limit: usize) -> Opti
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return None;
-    };
+        .map_err(|error| AdmissionFailure::io(Step::SpawnAclProbe, error))?;
     let Some(mut stdout) = child.stdout.take() else {
         report_acl_probe_cleanup(stop_acl_probe(&mut child, probe_cleanup_deadline(deadline)));
-        return None;
+        return Err(AdmissionFailure::check(Step::ReadAclProbe));
     };
     let (sender, receiver) = mpsc::sync_channel(1);
     let reader = thread::spawn(move || {
         let mut bytes = Vec::new();
         let result = stdout.by_ref().take(limit as u64 + 1).read_to_end(&mut bytes);
         // A failed send only means the receiver is gone, so there is nobody left to tell.
-        let _ = sender.send((result.is_ok() && bytes.len() <= limit, bytes));
+        let result = result
+            .map_err(|error| AdmissionFailure::io(Step::ReadAclProbe, error))
+            .and_then(|_| {
+                if bytes.len() <= limit {
+                    Ok(bytes)
+                } else {
+                    Err(AdmissionFailure::check(Step::AclProbeOutput))
+                }
+            });
+        let _ = sender.send(result);
     });
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break Ok(status),
             Ok(None) if Instant::now() < deadline => thread::sleep(
                 deadline.saturating_duration_since(Instant::now()).min(ACL_PROBE_POLL_INTERVAL),
             ),
-            _ => break None,
+            Ok(None) => break Err(AdmissionFailure::check(Step::Deadline)),
+            Err(error) => break Err(AdmissionFailure::io(Step::WaitAclProbe, error)),
         }
     };
-    if status.is_none() {
+    if let Err(failure) = status {
         let cleanup_deadline = probe_cleanup_deadline(deadline);
         report_acl_probe_cleanup(stop_acl_probe(&mut child, cleanup_deadline));
         match receiver.recv_timeout(cleanup_deadline.saturating_duration_since(Instant::now())) {
@@ -1140,17 +1208,24 @@ fn run_ls(flags: &str, paths: &[&Path], deadline: Instant, limit: usize) -> Opti
             }
             Err(_) => tracing::warn!("private storage ACL reader drain is unconfirmed"),
         }
-        return None;
+        return Err(failure);
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let Ok((bounded, bytes)) = receiver.recv_timeout(remaining) else {
+    let received = receiver.recv_timeout(remaining).map_err(|error| {
         tracing::warn!("private storage ACL reader drain is unconfirmed");
-        return None;
-    };
-    if reader.join().is_err() || !status.is_some_and(|value| value.success()) || !bounded {
-        return None;
+        AdmissionFailure::check(match error {
+            mpsc::RecvTimeoutError::Timeout => Step::Deadline,
+            mpsc::RecvTimeoutError::Disconnected => Step::ReadAclProbe,
+        })
+    })?;
+    if reader.join().is_err() {
+        return Err(AdmissionFailure::check(Step::JoinAclReader));
     }
-    let text = String::from_utf8(bytes).ok()?;
+    if !status.is_ok_and(|value| value.success()) {
+        return Err(AdmissionFailure::check(Step::AclProbeExit));
+    }
+    let text =
+        String::from_utf8(received?).map_err(|_| AdmissionFailure::check(Step::AclProbeOutput))?;
     #[cfg(test)]
     {
         let hook = AFTER_LISTING.with(|slot| {
@@ -1165,7 +1240,7 @@ fn run_ls(flags: &str, paths: &[&Path], deadline: Instant, limit: usize) -> Opti
             (hook.action)();
         }
     }
-    Some(text)
+    Ok(text)
 }
 
 /// Requests termination of the owned ACL probe and confirms reaping within a

@@ -11,12 +11,16 @@ use thiserror::Error;
 
 use crate::policy::{self, DirectoryRole, FilesystemProfile};
 use crate::probe::{self, Operation};
+use crate::{AdmissionFailure, AdmissionOperation as Step};
 
 const MAX_PATH_COMPONENTS: usize = 128;
 
 /// Sanitized failure to prove that private storage is safe to use.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum PrivateStorageError {
+    /// Admission failed with privacy-safe operation and OS error facts.
+    #[error("private storage is unavailable: {0}")]
+    Admission(AdmissionFailure),
     /// The path, descriptor, owner, permissions, ACL, or filesystem failed closed validation.
     #[error("private storage is unavailable")]
     Unavailable,
@@ -29,6 +33,16 @@ pub enum PrivateStorageError {
     /// The requested bounded operation failed.
     #[error("private storage operation failed")]
     Operation,
+}
+
+impl PrivateStorageError {
+    pub(crate) fn check(operation: Step) -> Self {
+        Self::Admission(AdmissionFailure::check(operation))
+    }
+
+    pub(crate) fn io(operation: Step, error: impl Into<std::io::Error>) -> Self {
+        Self::Admission(AdmissionFailure::io(operation, error))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,11 +131,15 @@ impl AdmittedPrivateRoot {
     ) -> Result<(), PrivateStorageError> {
         let op = &Operation::new().with_profile(profile);
         let walked = open_directory_without_symlinks_until(path, op)?;
-        let supplied = directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
-        let walked_metadata = walked.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let supplied = directory
+            .metadata()
+            .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
+        let walked_metadata = walked
+            .metadata()
+            .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
         let supplied_identity = FileIdentity::from_metadata(&supplied);
         if !supplied_identity.same_directory(FileIdentity::from_metadata(&walked_metadata)) {
-            return Err(PrivateStorageError::Unavailable);
+            return Err(PrivateStorageError::check(Step::Identity));
         }
         admit_directory_descriptor_until(path, directory, role_of(private_leaf), op)
     }
@@ -222,7 +240,7 @@ impl AdmittedPrivateRoot {
                 Err(error) if error == rustix::io::Errno::NOENT => {
                     current = current.create_private_child_until(name, op)?;
                 }
-                Err(_) => return Err(PrivateStorageError::Unavailable),
+                Err(error) => return Err(PrivateStorageError::io(Step::OpenDirectory, error)),
             }
         }
         current.revalidate_until(op)?;
@@ -237,7 +255,9 @@ impl AdmittedPrivateRoot {
         op: &Operation,
     ) -> Result<Self, PrivateStorageError> {
         admit_directory_descriptor_until(&path, &directory, role_of(private_leaf), op)?;
-        let metadata = directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let metadata = directory
+            .metadata()
+            .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
         Ok(Self {
             path,
             directory,
@@ -265,7 +285,9 @@ impl AdmittedPrivateRoot {
         let op = &Operation::new().with_profile(profile);
         let directory = open_directory_without_symlinks_until(path, op)?;
         admit_directory_descriptor_until(path, &directory, role_of(private_leaf), op)?;
-        let metadata = directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let metadata = directory
+            .metadata()
+            .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
         let identity = FileIdentity::from_metadata(&metadata);
         Ok(Self { path: path.to_path_buf(), directory, identity, private_leaf, profile })
     }
@@ -295,8 +317,13 @@ impl AdmittedPrivateRoot {
         // only the retained leaf descriptor would miss replacement of an
         // intermediate ancestor after this capability was created.
         let walked = open_directory_without_symlinks_until(&self.path, op)?;
-        let metadata = self.directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
-        let walked_metadata = walked.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let metadata = self
+            .directory
+            .metadata()
+            .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
+        let walked_metadata = walked
+            .metadata()
+            .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
         if !self.identity.same_directory(FileIdentity::from_metadata(&metadata))
             || !self.identity.same_directory(FileIdentity::from_metadata(&walked_metadata))
         {
@@ -670,8 +697,10 @@ impl AdmittedPrivateRoot {
             }
             Err(_) => return Err(PrivateStorageError::Unavailable),
         };
-        let directory_metadata =
-            self.directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let directory_metadata = self
+            .directory
+            .metadata()
+            .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
         let group_other = rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO;
         if rustix::fs::FileType::from_raw_mode(first.st_mode) != rustix::fs::FileType::RegularFile
             || first.st_uid != rustix::process::getuid().as_raw()
@@ -1047,8 +1076,10 @@ impl AdmittedPrivateRoot {
         if !probe::acl_admits_file(&self.path.join(name), file, descriptor_identity, op) {
             return Err(PrivateStorageError::Unavailable);
         }
-        let directory_metadata =
-            self.directory.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+        let directory_metadata = self
+            .directory
+            .metadata()
+            .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
         if descriptor.dev() != directory_metadata.dev() {
             return Err(PrivateStorageError::Unavailable);
         }
@@ -1137,7 +1168,7 @@ fn open_directory_descriptor(path: &str) -> Result<File, PrivateStorageError> {
         rustix::fs::Mode::empty(),
     )
     .map(File::from)
-    .map_err(|_| PrivateStorageError::Unavailable)
+    .map_err(|error| PrivateStorageError::io(Step::OpenDirectory, error))
 }
 
 fn open_directory_without_symlinks_until(
@@ -1187,7 +1218,7 @@ fn open_directory_without_symlinks_until(
                     rustix::fs::Mode::empty(),
                 )
                 .map(File::from)
-                .map_err(|_| PrivateStorageError::Unavailable)?;
+                .map_err(|error| PrivateStorageError::io(Step::OpenDirectory, error))?;
                 traversed.push(name);
                 descriptor = opened;
                 verify_ancestor_metadata(&traversed, &descriptor, op)?;
@@ -1207,16 +1238,19 @@ fn verify_ancestor_metadata(
     op: &Operation,
 ) -> Result<(), PrivateStorageError> {
     if op.expired() {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(PrivateStorageError::check(Step::Deadline));
     }
-    let named = std::fs::symlink_metadata(path).map_err(|_| PrivateStorageError::Unavailable)?;
-    let opened = descriptor.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+    let named = std::fs::symlink_metadata(path)
+        .map_err(|error| PrivateStorageError::io(Step::NamedMetadata, error))?;
+    let opened = descriptor
+        .metadata()
+        .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
     let identity = FileIdentity::from_metadata(&opened);
     if named.file_type().is_symlink()
         || !named.is_dir()
         || !identity.same_directory(FileIdentity::from_metadata(&named))
     {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(PrivateStorageError::check(Step::Identity));
     }
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -1225,26 +1259,27 @@ fn verify_ancestor_metadata(
             opened.uid(),
             opened.mode(),
             rustix::process::getuid().as_raw(),
-        ) || !rustix::fs::fstatfs(descriptor)
-            .is_ok_and(|filesystem| owner_enforcing_local_filesystem(&filesystem, op.profile()))
-            || !probe::directory_acl_admits(
-                op,
-                DirectoryRole::Traversed,
-                path,
-                descriptor,
-                identity,
-            )
-        {
-            return Err(PrivateStorageError::Unavailable);
+        ) {
+            return Err(PrivateStorageError::check(Step::OwnershipAndMode));
+        }
+        let filesystem = rustix::fs::fstatfs(descriptor)
+            .map_err(|error| PrivateStorageError::io(Step::FilesystemMetadata, error))?;
+        if !owner_enforcing_local_filesystem(&filesystem, op.profile()) {
+            return Err(PrivateStorageError::check(Step::FilesystemPolicy));
+        }
+        if !probe::directory_acl_admits(op, DirectoryRole::Traversed, path, descriptor, identity) {
+            return Err(op.failure(Step::AclState));
         }
     }
-    let named_after =
-        std::fs::symlink_metadata(path).map_err(|_| PrivateStorageError::Unavailable)?;
-    let opened_after = descriptor.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+    let named_after = std::fs::symlink_metadata(path)
+        .map_err(|error| PrivateStorageError::io(Step::NamedMetadata, error))?;
+    let opened_after = descriptor
+        .metadata()
+        .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
     if !identity.same_directory(FileIdentity::from_metadata(&named_after))
         || !identity.same_directory(FileIdentity::from_metadata(&opened_after))
     {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(PrivateStorageError::check(Step::Identity));
     }
     Ok(())
 }
@@ -1267,14 +1302,17 @@ fn admit_directory_descriptor_until(
     use std::os::unix::fs::MetadataExt as _;
 
     verify_ancestor_metadata(path, descriptor, op)?;
-    let named = std::fs::symlink_metadata(path).map_err(|_| PrivateStorageError::Unavailable)?;
-    let opened = descriptor.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+    let named = std::fs::symlink_metadata(path)
+        .map_err(|error| PrivateStorageError::io(Step::NamedMetadata, error))?;
+    let opened = descriptor
+        .metadata()
+        .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
     let identity = FileIdentity::from_metadata(&opened);
     if named.file_type().is_symlink()
         || !named.is_dir()
         || !identity.same_directory(FileIdentity::from_metadata(&named))
     {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(PrivateStorageError::check(Step::Identity));
     }
     if !policy::directory_metadata_admits(
         role,
@@ -1282,26 +1320,29 @@ fn admit_directory_descriptor_until(
         opened.mode(),
         rustix::process::getuid().as_raw(),
     ) {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(PrivateStorageError::check(Step::OwnershipAndMode));
     }
-    let filesystem =
-        rustix::fs::fstatfs(descriptor).map_err(|_| PrivateStorageError::Unavailable)?;
+    let filesystem = rustix::fs::fstatfs(descriptor)
+        .map_err(|error| PrivateStorageError::io(Step::FilesystemMetadata, error))?;
     // Only a private (or sealed) leaf must carry no ACL at all. Every other component is merely
     // walked through (or is a container whose created children are re-admitted as private
     // leaves, which refuses an inherited ACL), so it gets the traversal policy.
-    if !owner_enforcing_local_filesystem(&filesystem, op.profile())
-        || !probe::directory_acl_admits(op, role, path, descriptor, identity)
-    {
-        return Err(PrivateStorageError::Unavailable);
+    if !owner_enforcing_local_filesystem(&filesystem, op.profile()) {
+        return Err(PrivateStorageError::check(Step::FilesystemPolicy));
+    }
+    if !probe::directory_acl_admits(op, role, path, descriptor, identity) {
+        return Err(op.failure(Step::AclState));
     }
     verify_ancestor_metadata(path, descriptor, op)?;
-    let named_after =
-        std::fs::symlink_metadata(path).map_err(|_| PrivateStorageError::Unavailable)?;
-    let opened_after = descriptor.metadata().map_err(|_| PrivateStorageError::Unavailable)?;
+    let named_after = std::fs::symlink_metadata(path)
+        .map_err(|error| PrivateStorageError::io(Step::NamedMetadata, error))?;
+    let opened_after = descriptor
+        .metadata()
+        .map_err(|error| PrivateStorageError::io(Step::DescriptorMetadata, error))?;
     if !identity.same_directory(FileIdentity::from_metadata(&named_after))
         || !identity.same_directory(FileIdentity::from_metadata(&opened_after))
     {
-        return Err(PrivateStorageError::Unavailable);
+        return Err(PrivateStorageError::check(Step::Identity));
     }
     Ok(())
 }
@@ -1582,6 +1623,17 @@ mod tests {
     }
 
     #[test]
+    fn directory_open_errors_retain_only_operation_kind_and_errno() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let absent = fixture.path().join("private-name-canary");
+        let error = open_directory_descriptor(absent.to_str().expect("fixture name"))
+            .expect_err("missing directory fails closed");
+        assert_eq!(error, PrivateStorageError::io(Step::OpenDirectory, rustix::io::Errno::NOENT));
+        assert!(!error.to_string().contains("private-name-canary"));
+        assert!(!format!("{error:?}").contains("private-name-canary"));
+    }
+
+    #[test]
     fn rejects_path_syntax_as_a_child_name() {
         for name in ["", ".", "..", "a/b", "a\0b", "a\nb"] {
             assert_eq!(validate_child_name(name), Err(PrivateStorageError::InvalidName));
@@ -1633,7 +1685,13 @@ mod tests {
         std::fs::rename(ancestor.path(), &moved_path).expect("move admitted ancestor");
         symlink(&moved_path, ancestor.path()).expect("replace ancestor with symlink");
 
-        assert_eq!(child.revalidate(), Err(PrivateStorageError::Unavailable));
+        assert!(matches!(
+            child.revalidate(),
+            Err(PrivateStorageError::Admission(AdmissionFailure {
+                operation: Step::OpenDirectory,
+                ..
+            }))
+        ));
 
         std::fs::remove_file(ancestor.path()).expect("remove symlink canary");
         let moved = scratch.open_private_child(&moved_name).expect("reopen moved ancestor");
@@ -2008,7 +2066,10 @@ mod tests {
         let expired = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(5));
         let before = probe::probed_paths().len();
-        assert_eq!(leaf.revalidate_for_operation(expired), Err(PrivateStorageError::Unavailable));
+        assert_eq!(
+            leaf.revalidate_for_operation(expired),
+            Err(PrivateStorageError::check(Step::Deadline))
+        );
         assert_eq!(
             leaf.create_private_child_for_operation("late", expired).map(|_| ()),
             Err(PrivateStorageError::Unavailable)
@@ -2298,7 +2359,10 @@ mod tests {
         let expired = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(5));
         let before = probe::probed_paths().len();
-        assert_eq!(leaf.revalidate_for_operation(expired), Err(PrivateStorageError::Unavailable));
+        assert_eq!(
+            leaf.revalidate_for_operation(expired),
+            Err(PrivateStorageError::check(Step::Deadline))
+        );
         assert_eq!(
             leaf.create_private_child_for_operation("late", expired).map(|_| ()),
             Err(PrivateStorageError::Unavailable)
