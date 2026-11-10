@@ -68,7 +68,7 @@ class CheckoutFixture(unittest.TestCase):
             path = self.checkout / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(source)
-        self.metadata = lane_run.CheckoutMetadata(self.checkout, list(self.sources))
+        self.metadata = lane_run.CheckoutMetadata(self.sources)
         patcher = mock.patch.object(lane_run, "_checkout_metadata", return_value=self.metadata)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -103,11 +103,11 @@ class FailureDetailsTests(CheckoutFixture):
         text = ("unrelated stdout\n"
                 "thread 'first' panicked at crates/a.rs:1:2:\nfirst assertion\n"
                 "test first ... FAILED\n"
-                "thread 'second' panicked at crates/b.rs:3:4:\nsecond assertion\n"
+                "thread 'second' panicked at crates/b.rs:2:4:\nsecond assertion\n"
                 "test second ... FAILED\n")
         rows = lane_run.failure_details(text, False)["failures"]
         self.assertEqual([(r["test"], r["location"], r["kind"]) for r in rows],
-                         [("first", "crates/a.rs:1", "panic"), ("second", "crates/b.rs:3", "panic")])
+                         [("first", "crates/a.rs:1", "panic"), ("second", "crates/b.rs:2", "panic")])
         for row in rows:
             self.assert_facts_only(row)
         for value in ("unrelated", "first assertion", "second assertion"):
@@ -451,27 +451,10 @@ class FailureDetailsTests(CheckoutFixture):
                   'const VALUE: &str = r###"#[test]\nfn literal_value() {}"###;\n'
                   'fn helper_value() {}\n#[test]\nfn actual_test() {}\n')
         (self.checkout / name).write_text(source)
-        metadata = lane_run.CheckoutMetadata(self.checkout, [name])
+        metadata = lane_run.CheckoutMetadata({name: source})
         self.assertEqual(metadata.tests, {"actual_test"})
         for candidate in ("comment_value", "literal_value", "helper_value", "ghp_abc123"):
             self.assertEqual(metadata.test(candidate, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
-
-    def test_untracked_and_symlinked_files_cannot_attest_names_or_locations(self):
-        directory = self.checkout / "crates/example/tests"
-        (directory / "untracked.rs").write_text("#[test]\nfn untracked_value() {}\n")
-        (directory / "alias.rs").symlink_to(directory / "untracked.rs")
-        tracked = [*self.sources, "crates/example/tests/alias.rs"]
-        metadata = lane_run.CheckoutMetadata(self.checkout, tracked)
-        for name in ("untracked_value", "alias"):
-            self.assertEqual(metadata.test(name, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
-        for path in ("crates/example/tests/untracked.rs:1", "crates/example/tests/alias.rs:1"):
-            self.assertEqual(metadata.location(path, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
-        outside = directory / "outside.rs"
-        outside.symlink_to(ROOT / "crates/xtrace-domain/tests/honesty_strings.rs")
-        metadata = lane_run.CheckoutMetadata(self.checkout, ["crates/example/tests/outside.rs"])
-        self.assertEqual(metadata.tests, set())
-        self.assertEqual(metadata.location("crates/example/tests/outside.rs:1", lane_run.CANARY_INDEX),
-                         lane_run.UNVERIFIED)
 
     def test_java_locations_require_a_unique_tracked_file_and_valid_line(self):
         for site in ("HttpTest.java:0", "HttpTest.java:10000", "ghp_abc123.java:7"):
@@ -479,7 +462,7 @@ class FailureDetailsTests(CheckoutFixture):
         duplicate = "adapters/java/tests/other/HttpTest.java"
         (self.checkout / duplicate).parent.mkdir()
         (self.checkout / duplicate).write_text(self.sources["adapters/java/tests/HttpTest.java"])
-        metadata = lane_run.CheckoutMetadata(self.checkout, [*self.sources, duplicate])
+        metadata = lane_run.CheckoutMetadata({**self.sources, duplicate: self.sources["adapters/java/tests/HttpTest.java"]})
         self.assertEqual(metadata.location("HttpTest.java:3", lane_run.CANARY_INDEX, java=True), lane_run.UNVERIFIED)
 
     def test_java_continuations_cannot_supply_even_a_tracked_location(self):
@@ -537,6 +520,84 @@ class CheckoutLookupTests(unittest.TestCase):
         row = detail["failures"][0]
         self.assertEqual((row["test"], row["location"]), (lane_run.UNVERIFIED, lane_run.UNVERIFIED))
         self.assertNotIn("journey", json.dumps(detail))
+
+
+class CommittedCheckoutTests(unittest.TestCase):
+    def setUp(self):
+        import os
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.checkout = pathlib.Path(temporary.name)
+        directory = self.checkout / "crates/tests"
+        directory.mkdir(parents=True)
+        self.path = directory / "example.rs"
+        self.path.write_text("#[test]\nfn committed_test() {}\n")
+        (directory / "alias.rs").symlink_to("example.rs")
+        (directory / "outside.rs").symlink_to("../outside.rs")
+        env = {**os.environ, "GIT_AUTHOR_NAME": "Fixture", "GIT_COMMITTER_NAME": "Fixture",
+               "GIT_AUTHOR_EMAIL": "fixture@example.test", "GIT_COMMITTER_EMAIL": "fixture@example.test"}
+        for command in (["init"], ["add", "."], ["commit", "-m", "Fixture"]):
+            subprocess.run(["git", "-C", str(self.checkout), *command], env=env,
+                           check=True, capture_output=True)
+        patcher = mock.patch.object(lane_run, "__file__", str(self.checkout / "tools/qa/lane_run.py"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_committed_blobs_ignore_staged_changes_deleted_files_and_symlinks(self):
+        self.path.write_text("#[test]\nfn captured_value() {}\n" + "\n" * 10)
+        subprocess.run(["git", "-C", str(self.checkout), "add", "crates/tests/example.rs"],
+                       check=True, capture_output=True)
+        self.path.unlink()
+        (self.checkout / "crates/tests/untracked.rs").write_text("#[test]\nfn untracked_value() {}\n")
+        (self.checkout / "crates/outside.rs").write_text("#[test]\nfn outside_value() {}\n")
+        metadata = lane_run._checkout_metadata()
+        self.assertEqual(metadata.tests, {"committed_test"})
+        self.assertEqual(metadata.location("crates/tests/example.rs:2", lane_run.CANARY_INDEX),
+                         "crates/tests/example.rs:2")
+        for name in ("captured_value", "untracked_value", "outside_value", "alias"):
+            self.assertEqual(metadata.test(name, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
+        for site in ("crates/tests/example.rs:3", "crates/tests/alias.rs:1",
+                     "crates/tests/outside.rs:1", "crates/tests/untracked.rs:1"):
+            self.assertEqual(metadata.location(site, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
+
+    def test_wrapped_command_cannot_attest_captured_values_by_rewriting_tracked_tests(self):
+        import os
+        captured = "customer42"
+        self.assertFalse(lane_run._private(captured, lane_run.CANARY_INDEX))
+        original_run = subprocess.run
+        for timed_out in (False, True):
+            with self.subTest(timed_out=timed_out):
+                text = (f"test {captured} has been running for over 60 seconds\n" if timed_out else
+                        FailureDetailsTests.cargo(name=captured, site="crates/tests/example.rs:3:1"))
+                source = f"#[test]\nfn {captured}() {{}}\n// captured extra line\n"
+                body = (f"from pathlib import Path; Path({str(self.path)!r}).write_text({source!r}); "
+                        f"print({text!r}); raise SystemExit(101)")
+                args = type("A", (), {"suite": "rust", "variant": "-", "step": "t",
+                                      "out": str(self.checkout / "out"), "cwd": "", "timeout": 60,
+                                      "min_passed": 0, "command": [sys.executable, "-c", body]})()
+
+                def command(cmd, **kwargs):
+                    result = original_run(cmd, **kwargs)
+                    if timed_out:
+                        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+                    return result
+
+                with mock.patch.dict(os.environ, {"LANE_PRIVATE_LOG_DIR": str(self.checkout)}), \
+                        mock.patch.object(lane_run.subprocess, "run", side_effect=command):
+                    rc = lane_run.cmd_run(args)
+                self.assertEqual(rc, 124 if timed_out else 101)
+                self.assertIn(captured, self.path.read_text())
+                frag = json.loads((self.checkout / "out/rust__-__t.json").read_text())
+                self.assertNotIn(captured, json.dumps(frag))
+                detail = frag["failureDetails"]
+                if timed_out:
+                    self.assertEqual(detail["timeout"]["progress"], [])
+                    self.assertEqual(detail["timeout"]["runningTests"], [])
+                    self.assertEqual(detail["timeout"]["runningOmitted"], 1)
+                else:
+                    self.assertEqual(frag["failingTests"], [lane_run.UNVERIFIED])
+                    self.assertEqual((detail["failures"][0]["test"], detail["failures"][0]["location"]),
+                                     (lane_run.UNVERIFIED, lane_run.UNVERIFIED))
 
 
 class MergeTests(unittest.TestCase):
@@ -813,9 +874,11 @@ class RunTests(CheckoutFixture):
             stdout.write(text.encode())
             return subprocess.CompletedProcess(cmd, 101)
 
+        # Fact-only rows are small; use a budget that eight fragments can exhaust.
         with tempfile.TemporaryDirectory() as temporary, \
                 mock.patch.dict(os.environ, {"LANE_PRIVATE_LOG_DIR": temporary}), \
-                mock.patch.object(lane_run.subprocess, "run", side_effect=failed):
+                mock.patch.object(lane_run.subprocess, "run", side_effect=failed), \
+                mock.patch.object(lane_run, "MAX_JOB_EXCERPT_BYTES", 4096):
             args = type("A", (), {"suite": "rust", "variant": "-", "step": "first", "out": temporary + "/o",
                                   "cwd": "", "timeout": 3000, "min_passed": 0, "command": ["unused-command"]})()
             for step in ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"):

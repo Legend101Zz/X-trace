@@ -322,26 +322,15 @@ def _source_mask(source: str) -> str:
 
 
 class CheckoutMetadata:
-    """Only tracked, readable files contained in this checkout can attest facts."""
+    """Only regular-file blobs from the snapshotted commit can attest facts."""
 
-    def __init__(self, root: pathlib.Path, tracked: list[str]):
-        self.root = root.resolve()
+    def __init__(self, sources: dict[str, str]):
         self.files: dict[str, int] = {}
         self.tests: set[str] = set()
         self.java_files: dict[str, list[str]] = {}
-        for name in tracked:
+        for name, source in sources.items():
             path = pathlib.PurePosixPath(name)
             if path.is_absolute() or ".." in path.parts or "\\" in name:
-                continue
-            local = self.root / path
-            try:
-                if any(parent.is_symlink() for parent in (local, *local.parents)
-                       if parent != self.root and self.root in parent.parents):
-                    continue
-                if not local.resolve().is_relative_to(self.root) or not local.is_file():
-                    continue
-                source = local.read_text(encoding="utf-8")
-            except (OSError, UnicodeError, ValueError):
                 continue
             self.files[name] = len(source.splitlines())
             if path.suffix == ".java":
@@ -409,15 +398,49 @@ class CheckoutMetadata:
 def _checkout_metadata() -> CheckoutMetadata:
     root = pathlib.Path(__file__).resolve().parents[2]
     try:
-        # Use the index, never paths learned from captured command output. Popen
-        # keeps this lookup separate from the wrapped command's run/timeout path.
-        with subprocess.Popen(["git", "-C", str(root), "ls-files", "--cached", "-z"],
+        # HEAD is the commit checked out by the lane. Capture its tree before
+        # running the command; neither the index nor working files attest facts.
+        # Object ids from this single tree listing pin every subsequent blob read.
+        with subprocess.Popen(["git", "-C", str(root), "ls-tree", "-r", "-z", "HEAD"],
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
             output, _ = proc.communicate()
-            tracked = output.decode("utf-8").split("\0") if proc.returncode == 0 else []
-    except (OSError, UnicodeError):
-        tracked = []
-    return CheckoutMetadata(root, [name for name in tracked if name])
+            if proc.returncode:
+                return CheckoutMetadata({})
+        entries = []
+        for entry in output.split(b"\0"):
+            if not entry:
+                continue
+            header, name = entry.split(b"\t", 1)
+            mode, kind, oid = header.split()
+            if mode in {b"100644", b"100755"} and kind == b"blob":
+                entries.append((name.decode("utf-8"), oid))
+        with subprocess.Popen(["git", "-C", str(root), "cat-file", "--batch"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL) as proc:
+            output, _ = proc.communicate(b"".join(oid + b"\n" for _, oid in entries))
+            if proc.returncode:
+                return CheckoutMetadata({})
+        sources = {}
+        offset = 0
+        for name, oid in entries:
+            end = output.index(b"\n", offset)
+            actual, kind, size = output[offset:end].split()
+            length = int(size)
+            offset = end + 1
+            if (actual != oid or kind != b"blob" or length < 0
+                    or output[offset + length:offset + length + 1] != b"\n"):
+                return CheckoutMetadata({})
+            blob = output[offset:offset + length]
+            offset += length + 1
+            try:
+                sources[name] = blob.decode("utf-8")
+            except UnicodeError:
+                continue  # binary files cannot attest source facts
+        if offset != len(output):
+            return CheckoutMetadata({})
+    except (OSError, UnicodeError, ValueError):
+        return CheckoutMetadata({})
+    return CheckoutMetadata(sources)
 
 
 def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], int | None]], list[str]]:
@@ -660,6 +683,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not cmd:
         raise SystemExit("no command")
     log_path = log_dir / f"{suite}-{variant}-{step}.log"
+    metadata = _checkout_metadata()
     timed_out = False
     with open(log_path, "wb") as log:
         os.umask(previous_umask)
@@ -690,7 +714,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         status = "fail"  # a skipped or ignored test is not a pass on a no-skips row
         print(f"lane {suite}/{variant}/{step}: {facts['ignored']} ignored or skipped tests (maximum {max_ignored})")
     index = _excerpt_index(getattr(args, "canaries", ""))
-    metadata = _checkout_metadata() if status == "fail" or facts["failingTests"] else None
     if facts["failingTests"]:
         # The older summary field is part of the same public fragment. It must
         # not bypass the provenance checks applied to failureDetails.
