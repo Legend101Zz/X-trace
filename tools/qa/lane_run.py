@@ -17,9 +17,11 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 from collections import deque
+from collections.abc import Sequence
 from enum import Enum
 
 from tools.qa import canary, store_profiles
@@ -169,92 +171,40 @@ def _fmt(value) -> str:
     return "n/a" if value is None else str(value)
 
 
-# Compiler diagnostics shown on failure (Cc-001, J-002): only rustc/clippy headline lines and repo-relative locations,
-# bounded and filtered. Anything that looks like a host path, a user name or a credential is dropped and only counted.
-DIAG_HEAD = re.compile(r"^(error|warning)(\[[A-Z]\d{4}\])?: (.{1,200})$")
-DIAG_LOC = re.compile(r"^\s*--> (\S{1,300}):(\d+):(\d+)$")
-DIAG_PATH_OK = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]{0,200}$")
+# Compiler output is eligible only before test output begins. Headline prose is
+# never public, including clippy messages without a rustc error code.
+DIAG_HEAD = re.compile(r"^error(?:\[(E[0-9]{4})\])?: .*$")
+DIAG_LOC = re.compile(r"^\s*--> (\S{1,300}):([0-9]{1,9}):[0-9]{1,9}$")
 DIAG_BAD = re.compile(r"(/home/|/Users/|/Volumes/|/tmp/|/runner|\\|token|secret|password|bearer|authorization|cookie|api[_-]?key)", re.I)
-DIAG_SKIP = re.compile(r"^(warning|error): (\d+ warnings? emitted|aborting due to|could not compile|build failed|unused)", re.I)
 MAX_DIAG = 20
-# Candidate panic locations still require HEAD verification before publication.
-PANIC_LOC = re.compile(r"panicked at (\S{1,300}?):(\d+):(\d+):?\s*$")
 
 
-def panic_sites(text: str) -> tuple[list[str], int]:
-    out: list[str] = []
+def diagnostics(text: str, *, metadata=None, index=None) -> tuple[list[str], int]:
+    """Publish only codes and HEAD locations from the compiler-only prefix."""
+    metadata = _checkout_metadata() if metadata is None else metadata
+    index = CANARY_INDEX if index is None else index
+    out = []
     dropped = 0
-    for raw in text.splitlines():
-        m = PANIC_LOC.search(raw.rstrip())
-        if not m:
+    pending = None
+    for line in ANSI.sub("", text).splitlines():
+        # A test process may print an entire compiler diagnostic as a payload.
+        # Once tests start, no later unframed line restores compiler provenance.
+        if (CARGO_STATE.fullmatch(line) or CARGO_SECTION.fullmatch(line)
+                or "panicked at" in line or line == "failures:"
+                or re.fullmatch(r"running [0-9]+ tests?", line)
+                or GRADLE_STATE.fullmatch(line.strip()) or re.match(r"\s*Running (?:unittests|tests/)", line)):
+            break
+        if head := DIAG_HEAD.fullmatch(line):
+            pending = head[1]
             continue
-        path = m.group(1)
-        site = f"{path}:{m.group(2)}"
-        if (DIAG_BAD.search(path) or ".." in path or not DIAG_PATH_OK.match(path) or path.startswith("/")
-                or site in out):
-            if site not in out:
+        if (loc := DIAG_LOC.fullmatch(line)) and pending is not None:
+            site = metadata.location(f"{loc[1]}:{loc[2]}", index)
+            if site == UNVERIFIED or _private(pending, index) or len(out) >= MAX_DIAG:
                 dropped += 1
-            continue
-        if len(out) < MAX_DIAG:
-            out.append(site)
-        else:
-            dropped += 1
-    return out, dropped
-
-
-# Error code and category hints for failing tests. Same sources and the same allowlist grammars as the release floor
-# (tools.release.ci_floor): a candidate that does not match is dropped and counted, never scrubbed or echoed.
-ERROR_CODE_SRC = re.compile(r'ErrorCode\("([^"\n]{0,400})"\)')
-ERROR_CATEGORY_SRC = re.compile(r"category: ([A-Za-z]{1,40}),")
-MAX_ERROR_HINTS = 16
-
-
-def error_hints(text: str) -> dict:
-    """Allowlisted XTR-* error codes and error categories seen in a (failing) log, in first-seen order."""
-    codes: list[str] = []
-    categories: list[str] = []
-    dropped = 0
-    for raw in ANSI.sub("", text).splitlines():
-        for code in ERROR_CODE_SRC.findall(raw):
-            if not ci_floor._valid_error_code(code):
-                dropped += 1
-            elif code not in codes:
-                codes.append(code)
-        for category in ERROR_CATEGORY_SRC.findall(raw):
-            if not ci_floor._valid_error_category(category):
-                dropped += 1
-            elif category not in categories:
-                categories.append(category)
-    truncated = max(0, len(codes) - MAX_ERROR_HINTS) + max(0, len(categories) - MAX_ERROR_HINTS)
-    return {"errorCodes": codes[:MAX_ERROR_HINTS], "errorCategories": categories[:MAX_ERROR_HINTS],
-            "droppedInvalid": dropped, "truncated": truncated}
-
-
-def diagnostics(text: str) -> tuple[list[str], int]:
-    """(lines to print, dropped count). Pairs each `error: msg` with the `--> file:line:col` that follows it."""
-    out: list[str] = []
-    dropped = 0
-    pending: str | None = None
-    for raw in text.splitlines():
-        line = raw.rstrip()
-        m = DIAG_HEAD.match(line)
-        if m:
-            pending = None
-            if m.group(1) != "error" or DIAG_SKIP.match(line):
-                continue
-            if DIAG_BAD.search(line):
-                dropped += 1
-                continue
-            pending = f"{m.group(1)}{m.group(2) or ''}: {m.group(3)}"
-            continue
-        loc = DIAG_LOC.match(line)
-        if loc and pending is not None:
-            if DIAG_BAD.search(loc.group(1)) or ".." in loc.group(1) or not DIAG_PATH_OK.match(loc.group(1)):
-                dropped += 1
-            elif len(out) < MAX_DIAG:
-                out.append(f"{pending} @ {loc.group(1)}:{loc.group(2)}:{loc.group(3)}")
             else:
-                dropped += 1
+                out.append(f"{pending} @ {site}")
+            pending = None
+        elif line.strip():
             pending = None
     return out, dropped
 
@@ -296,6 +246,7 @@ class UnverifiedReason(str, Enum):
     PRIVACY_SCAN = "privacy-scan"
     EXCERPT_CAP = "excerpt-cap"
     AMBIGUOUS_PANIC = "ambiguous-panic-block"
+    DIAGNOSTIC_THREAD = "diagnostic-thread-unverified"
 
 
 # Reuse the canary scanner's encoded needles, including recognisable marker families
@@ -380,8 +331,10 @@ class CheckoutMetadata:
     def __init__(self, sources: dict[str, str]):
         self.files: dict[str, int] = {}
         self.tests: set[str] = set()
+        self.rust_tests: set[str] = set()
         self.diagnostic_variants: set[str] = set()
         self.admission_operations: set[str] = set()
+        self.error_variants: set[str] = set()
         self.java_files: dict[str, list[str]] = {}
         for name, source in sources.items():
             path = pathlib.PurePosixPath(name)
@@ -394,6 +347,7 @@ class CheckoutMetadata:
             if path.suffix == ".rs" and path.parts[:3] == ("crates", "xtrace-private-storage", "src"):
                 self.diagnostic_variants.update(_diagnostic_variants(source))
                 self.admission_operations.update(_diagnostic_variants(source, "AdmissionOperation"))
+                self.error_variants.update(_diagnostic_variants(source, "PrivateStorageError"))
 
     def _read_tests(self, path: pathlib.PurePosixPath, source: str) -> None:
         test_path = bool(set(path.parts) & {"test", "tests", "__tests__"})
@@ -406,9 +360,31 @@ class CheckoutMetadata:
         masked = _source_mask(source, rust=path.suffix == ".rs")
         if path.suffix == ".rs" and path.parts[0] == "crates":
             # Requiring a test attribute also excludes helper functions in tests/.
-            self.tests.update(re.findall(
+            declarations = list(re.finditer(
                 r"#\[(?:[A-Za-z_]\w*::)?test(?:\([^]]*\))?\]\s*"
                 r"(?:#\[[^]]*\]\s*)*(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(", masked))
+            self.tests.update(match[1] for match in declarations)
+            # Exact libtest names include file and inline module prefixes. Never
+            # attest an arbitrary prefix merely because its last component fits.
+            parts = list(path.parts)
+            prefix = []
+            if "src" in parts:
+                prefix = parts[parts.index("src") + 1:-1]
+                if path.stem not in {"lib", "main", "mod"}:
+                    prefix.append(path.stem)
+            elif "tests" in parts and parts.index("tests") + 2 < len(parts):
+                prefix = parts[parts.index("tests") + 1:-1]
+                if path.stem != "mod":
+                    prefix.append(path.stem)
+            for match in declarations:
+                scopes = []
+                for token in re.finditer(r"\bmod\s+([A-Za-z_]\w*)\s*\{|[{}]", masked[:match.start()]):
+                    if token[0] == "}":
+                        if scopes:
+                            scopes.pop()
+                    else:
+                        scopes.append(token[1])
+                self.rust_tests.add("::".join([*prefix, *filter(None, scopes), match[1]]))
         elif path.suffix == ".java" and test_path:
             methods = re.findall(
                 r"@(?:Test|ParameterizedTest|RepeatedTest|Case)\b(?:\([^)]*\))?\s*"
@@ -510,43 +486,60 @@ def _checkout_metadata() -> CheckoutMetadata:
     return CheckoutMetadata(sources)
 
 
-# These are the exact derived Debug / Display renderings in diagnostic.rs.
-# Unicode-aware token boundaries prevent path components or captured identifiers
-# from supplying a rendering. No isolated word or errno-shaped prose is a fact.
-_DIAGNOSTIC_FIELDS = (
-    r"(?P<operation>[A-Za-z]+){sep}kind{assign}(?:None|Some\((?P<kind>[A-Za-z]+)\))"
-    r"{sep}raw_os_error{assign}(?:None|Some\((?P<errno>[1-9][0-9]{{0,2}})\))")
-_DIAGNOSTIC_START = r"(?<![\w./\\+-])"
-_DIAGNOSTIC_END = r"(?![\w./\\+-])"
-ADMISSION_DEBUG = re.compile(
-    _DIAGNOSTIC_START + r"(?P<admission>Admission\()?AdmissionFailure \{ operation: "
-    + _DIAGNOSTIC_FIELDS.format(sep=", ", assign=": ") + r" \}(?(admission)\))" + _DIAGNOSTIC_END)
-ADMISSION_DISPLAY = re.compile(
-    _DIAGNOSTIC_START + r"operation=" + _DIAGNOSTIC_FIELDS.format(sep=" ", assign="=")
-    + _DIAGNOSTIC_END)
+MAX_CI_RECORDS = 256
+MAX_CI_RECORD_BYTES = 2048
 
 
-def _panic_categories(text: str, metadata: CheckoutMetadata, index) -> list[str | int]:
-    """Publish fields only from complete fixed diagnostic renderings."""
-    categories: list[str | int] = []
-    matches = sorted([*ADMISSION_DEBUG.finditer(text), *ADMISSION_DISPLAY.finditer(text)],
-                     key=lambda match: match.start())
-    for match in matches:
-        operation, kind, errno = match["operation"], match["kind"], match["errno"]
-        admission = match.re is ADMISSION_DEBUG and match["admission"] is not None
-        if (operation not in metadata.admission_operations or kind is not None and kind not in IO_ERROR_KINDS
-                or errno is not None and int(errno) > 200
-                or admission and "Admission" not in metadata.diagnostic_variants):
-            continue
-        values = (["Admission"] if admission else []) + [operation]
-        if kind is not None:
-            values.append(kind)
-        if errno is not None:
-            values.append(int(errno))
-        for value in values:
-            if value not in categories and not _private(str(value), index) and len(categories) < MAX_CATEGORIES:
-                categories.append(value)
-    return categories
+def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, index) -> list[tuple[str, list[str | int]]]:
+    """Read bounded product records. Raw output is never a diagnostic source."""
+    if directory is None:
+        return []
+    records = []
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        root_fd = os.open(directory, flags | os.O_DIRECTORY)
+        try:
+            root = os.fstat(root_fd)
+            if root.st_uid != os.getuid() or stat.S_IMODE(root.st_mode) != 0o700:
+                return []
+            fd = os.open("private-storage.jsonl", flags, dir_fd=root_fd)
+        finally:
+            os.close(root_fd)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                return []
+            for _ in range(MAX_CI_RECORDS):
+                raw = stream.readline(MAX_CI_RECORD_BYTES + 1)
+                if not raw:
+                    break
+                if len(raw) > MAX_CI_RECORD_BYTES or not raw.endswith(b"\n"):
+                    break  # never reinterpret a partial/oversize record's suffix
+                try:
+                    record = json.loads(raw)
+                except (ValueError, UnicodeError, RecursionError):
+                    continue
+                if not isinstance(record, dict) or set(record) != {"thread", "error", "operation", "kind", "errno"}:
+                    continue
+                thread, error, operation, kind, errno = (record[key] for key in
+                                                        ("thread", "error", "operation", "kind", "errno"))
+                if (not isinstance(error, str) or error not in metadata.error_variants
+                        or error != "Admission" or not isinstance(operation, str)
+                        or operation not in metadata.admission_operations
+                        or kind is not None and (not isinstance(kind, str) or kind not in IO_ERROR_KINDS)
+                        or errno is not None and (type(errno) is not int or not 1 <= errno <= 200)):
+                    continue
+                values = [error, operation, *([kind] if kind is not None else []),
+                          *([errno] if errno is not None else [])]
+                if any(_private(str(value), index) for value in values):
+                    continue
+                name = (thread if isinstance(thread, str) and thread in metadata.rust_tests
+                        and not _private(thread, index) else UNVERIFIED)
+                records.append((name, values))
+    except (OSError, ValueError):
+        return []
+    return records
 
 
 def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], list[int]]], list[str]]:
@@ -554,8 +547,8 @@ def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], list[int]]
 
     Open quoted or compound values cannot introduce harness boundaries. Body lines
     are never rescanned for timeout progress, even when they look like build output.
-    Keep headers together until a libtest boundary so interleaving cannot switch
-    the owner of a message before its ambiguity has been checked.
+    After a panic starts, retain the rest of the stream in the same block.
+    Harness-looking lines in a payload cannot attest its end or another owner.
     """
     blocks = []
     harness = []
@@ -575,14 +568,14 @@ def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], list[int]]
             next_name is not None or CARGO_STATE.fullmatch(line) or CARGO_RUNNING.fullmatch(line)
             or CARGO_RESULT.match(line) or line == "failures:" or line.startswith("> Task ")
             or GRADLE_STATE.fullmatch(line.strip()))
-        if boundary:
+        if boundary and not panic_lines:
             if name is not None:
                 blocks.append((name, kind, lines, panic_lines))
             name, lines = next_name, []
             panic_lines = []
             kind = "gradle" if gradle else "cargo"
         if name is not None:
-            if not section and not gradle:
+            if panic_lines or not section and not gradle:
                 if panic:
                     panic_lines.append(len(lines))
                 lines.append(line)
@@ -606,7 +599,7 @@ def _output_parts(text: str) -> tuple[list[tuple[str, str, list[str], list[int]]
         else:
             harness.append(line)
         # Gradle FAILED both starts a body and reports a harness observation.
-        if gradle:
+        if gradle and not panic_lines:
             harness.append(line.strip())
     if name is not None:
         blocks.append((name, kind, lines, panic_lines))
@@ -626,7 +619,8 @@ def _timeout_progress(line: str) -> tuple[str, str] | None:
 
 
 def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT_BYTES,
-                    index=None, metadata: CheckoutMetadata | None = None) -> dict | None:
+                    index=None, metadata: CheckoutMetadata | None = None,
+                    diagnostic_records: Sequence[tuple[str, list[str | int]]] = ()) -> dict | None:
     """Publish verified names/sites, bounded categories and counts; never prose."""
     index = CANARY_INDEX if index is None else index
     metadata = _checkout_metadata() if metadata is None else metadata
@@ -663,11 +657,19 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             header = CARGO_PANIC.fullmatch(lines[panic_lines[0]])
             header_test = metadata.test(header[1], index)
             first_line = next(i for i, line in enumerate(lines) if line.strip())
-            # A second header before a libtest boundary may be parallel output
-            # or a multiline message. Neither its sites nor its messages have
-            # a proven owner. A section name cannot attest a worker thread.
+            # Even a terminal test status or a stdout section can be payload.
+            # Check the entire remaining block, including quoted lines, before
+            # considering a site. Even apparent footers may be message prose;
+            # only a single observed message line can retain a site.
+            message = []
+            shaped = False
+            for line in lines[panic_lines[0] + 1:]:
+                shaped |= bool(re.match(r"\s*thread .*panicked at |\s*---- .* (?:stdout|stderr) ----", line))
+                if not line.strip():
+                    continue
+                message.append(line)
             reason = None
-            if len(panic_lines) != 1 or panic_lines[0] != first_line:
+            if len(panic_lines) != 1 or panic_lines[0] != first_line or shaped or len(message) != 1:
                 reason = UnverifiedReason.AMBIGUOUS_PANIC
             elif header_test == UNVERIFIED:
                 reason = metadata.test_unverified_reason(header[1])
@@ -676,28 +678,21 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             if reason is not None:
                 if name in failures:
                     failures[name]["withheldLines"] += sum(bool(line.strip()) for line in lines)
-                for line_number in panic_lines:
-                    sites, _ = panic_sites(lines[line_number])
-                    for site in sites:
-                        location = metadata.location(site, index)
-                        if location == UNVERIFIED:
-                            continue
-                        row = failure(f"<panic-block-{block_number}>", unattributed=reason)
-                        row["kind"] = "panic"
-                        if row["location"] == UNVERIFIED:
-                            row["location"] = location
-                        if location not in row["panicSites"] and len(row["panicSites"]) < MAX_PANIC_SITES:
-                            row["panicSites"].append(location)
+                row = failure(f"<panic-block-{block_number}>", unattributed=reason)
+                row.update(kind="panic", withheldLines=sum(bool(line.strip()) for line in lines))
                 continue
         # A passing should_panic test is not a failure. On timeout, retain an
         # observed panic even if its terminal harness outcome never arrived.
         if name not in failures:
-            if not (timed_out and panic_lines and name not in outcomes):
+            if not panic_lines:
+                continue
+            terminal = next((m[2] for line in reversed(lines)
+                             if (m := CARGO_STATE.fullmatch(line)) and m[1] == name), None)
+            if terminal in {"ok", "ignored"} or not (timed_out or terminal == "FAILED"):
                 continue
             failure(name)
         row = failures[name]
         after_panic = False
-        in_panic_message = False
         first_message = True
         java_frames = False
         for line_number, line in enumerate(lines):
@@ -705,24 +700,14 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
                 continue
             if framework == "cargo" and line_number in panic_lines:
                 after_panic = True
-                in_panic_message = True
                 first_message = True
                 row["kind"] = "panic"
-                sites, _ = panic_sites(line)
-                for site in sites:
-                    location = metadata.location(site, index)
-                    if location != UNVERIFIED:
-                        if row["location"] == UNVERIFIED:
-                            row["location"] = location
-                        if location not in row["panicSites"] and len(row["panicSites"]) < MAX_PANIC_SITES:
-                            row["panicSites"].append(location)
+                header = CARGO_PANIC.fullmatch(line)
+                location = metadata.location(f"{header[2]}:{header[3]}", index)
+                if location != UNVERIFIED:
+                    row["location"] = location
+                    row["panicSites"] = [location]
                 continue
-            if line.startswith(("stack backtrace:", "note: run with ")):
-                in_panic_message = False
-            if in_panic_message:
-                for category in _panic_categories(line, metadata, index):
-                    if category not in row["category"] and len(row["category"]) < MAX_CATEGORIES:
-                        row["category"].append(category)
             if first_message and (after_panic or framework == "gradle"):
                 first_message = False
                 if line.strip().startswith(("assertion ", "java.lang.AssertionError", "org.opentest4j.AssertionFailedError")):
@@ -741,6 +726,15 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             else:
                 java_frames = False
             row["withheldLines"] += 1
+    for name, categories in diagnostic_records[:MAX_CI_RECORDS]:
+        if name == UNVERIFIED:
+            row = failure("<ci-diagnostics>", unattributed=UnverifiedReason.DIAGNOSTIC_THREAD)
+        else:
+            row = failure(name)
+            row["test"] = name  # exact HEAD-verified libtest thread name
+        for value in categories:
+            if value not in row["category"] and len(row["category"]) < MAX_CATEGORIES:
+                row["category"].append(value)
     rows = list(failures.values())
     for row in rows:
         # Names and locations have independent provenance; scanning can only
@@ -854,19 +848,26 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise SystemExit("no command")
     log_path = log_dir / f"{suite}-{variant}-{step}.log"
     metadata = _checkout_metadata()
+    diagnostic_directory = None
+    child_env = os.environ.copy()
+    if "XTRACE_CI_DIAG_DIR" in child_env:
+        import tempfile
+        diagnostic_directory = pathlib.Path(tempfile.mkdtemp(prefix="ci-diag-", dir=out))
+        child_env["XTRACE_CI_DIAG_DIR"] = str(diagnostic_directory)
     timed_out = False
     with open(log_path, "wb") as log:
         os.umask(previous_umask)
         try:
             proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=args.cwd or None,
-                                  check=False, timeout=args.timeout)
+                                  check=False, timeout=args.timeout, env=child_env)
         except subprocess.TimeoutExpired:  # a timeout is a failed step with a fragment, never a traceback with argv
             timed_out = True
             proc = subprocess.CompletedProcess(cmd, 124)
-            log.write(f"\nlane: step exceeded its {args.timeout}s timeout\n".encode())
             print(f"lane {suite}/{variant}/{step}: timeout after {args.timeout}s")
     text = log_path.read_text(encoding="utf-8", errors="replace")
     facts = parse_output(text)
+    _, harness = _output_parts(text)
+    facts["failingTests"] = parse_output("\n".join(harness))["failingTests"]
     if getattr(args, "junit_glob", ""):
         # Gradle prints no totals on success; the JUnit XML reports are the count of record for the Java suite.
         jc = junit_counts(pathlib.Path(args.cwd or "."), args.junit_glob)
@@ -899,7 +900,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     if status == "fail":
         frag["timedOut"] = timed_out
         frag["failureDetails"] = (failure_details(
-            text, timed_out, budget=_remaining_excerpt_budget(out, fragment_path), index=index, metadata=metadata)
+            text, timed_out, budget=_remaining_excerpt_budget(out, fragment_path), index=index, metadata=metadata,
+            diagnostic_records=_ci_diagnostics(diagnostic_directory, metadata, index))
             if index is not None else None)
         if frag["failureDetails"] is None:
             frag["failureDetailsUnavailable"] = WITHHELD if index is None else "job excerpt cap"
@@ -909,20 +911,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     for name in facts["failingTests"]:
         print(f"lane failing-test {name}")
     if status == "fail":
-        diags, ddropped = diagnostics(text)
+        diags, ddropped = diagnostics(text, metadata=metadata, index=index) if index is not None else ([], 0)
         for d in diags:
             print(f"lane diagnostic {d}")
         if ddropped:
             print(f"lane diagnostic-overflow dropped={ddropped}")
         for row in (frag["failureDetails"] or {}).get("failures", []):
             print("lane failure " + _encoded(row).decode("ascii"))
-        hints = error_hints(text)
-        for code in hints["errorCodes"]:
-            print(f"lane error-code {code}")
-        for category in hints["errorCategories"]:
-            print(f"lane error-category {category}")
-        if hints["droppedInvalid"] or hints["truncated"]:
-            print(f"lane error-hint-overflow dropped={hints['droppedInvalid']} truncated={hints['truncated']}")
     if facts["failingTruncated"] or facts["droppedInvalidNames"]:
         print(f"lane failing-test-overflow truncated={facts['failingTruncated']} "
               f"dropped-invalid={facts['droppedInvalidNames']}")

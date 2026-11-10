@@ -204,6 +204,8 @@ jobs:
             cargo build --locked --workspace --all-features
       - name: cargo test (locked workspace, no ignored tests)
         if: ${{ !cancelled() }}
+        env:
+          XTRACE_CI_DIAG_DIR: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag
         run: |
           python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step test --min-passed 1030 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             cargo test --locked --workspace --all-features --no-fail-fast

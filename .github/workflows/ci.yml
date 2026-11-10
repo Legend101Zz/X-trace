@@ -145,6 +145,7 @@ jobs:
         run: |
           set -euo pipefail
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor prepare-private-root --root "$XTRACE_CI_PRIVATE_ROOT"
+          mkdir -m 700 "$XTRACE_CI_PRIVATE_ROOT/frag" "$XTRACE_CI_PRIVATE_ROOT/frag/ci-diag"
       - name: Verify full release tooling suite on the exact source
         run: |
           set +e
@@ -156,6 +157,8 @@ jobs:
           set -e
           exit "$result"
       - name: Run all 23 pinned release gates
+        env:
+          XTRACE_CI_DIAG_DIR: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/ci-diag
         run: |
           set +e
           umask 077
@@ -389,7 +392,7 @@ jobs:
         run: |
           set -euo pipefail
           root="${RUNNER_TEMP:?}/xt"
-          mkdir -m 700 "$root" "$root/tmp" "$root/priv"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/frag" "$root/frag/ci-diag"
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: Format gate (stable rustfmt, no nightly-only keys)
@@ -397,6 +400,8 @@ jobs:
       - name: Strict clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Unit and integration tests
+        env:
+          XTRACE_CI_DIAG_DIR: ${{ runner.temp }}/xt/frag/ci-diag
         run: cargo test --locked --workspace --all-features --no-fail-fast
       - name: Restricted-PATH vendored-protoc build
         # `PATH` excludes any directory that could host a system `protoc`,
