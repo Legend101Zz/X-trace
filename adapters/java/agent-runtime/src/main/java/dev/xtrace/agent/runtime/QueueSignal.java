@@ -94,7 +94,8 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
       int responseStatus,
       long droppedEvents,
       int estimatedBytes,
-      dev.xtrace.agent.bootstrap.BridgeSink.Outcome outcome)
+      dev.xtrace.agent.bootstrap.BridgeSink.Outcome outcome,
+      long untransformedCount)
       implements QueueSignal {
     Finish(
         String recordingId,
@@ -104,7 +105,7 @@ sealed interface QueueSignal permits QueueSignal.Start, QueueSignal.Event, Queue
         long droppedEvents,
         int estimatedBytes) {
       this(recordingId, startedMonotonicNs, finishedMonotonicNs, responseStatus, droppedEvents,
-          estimatedBytes, null);
+          estimatedBytes, null, 0);
     }
   }
 }

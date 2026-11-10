@@ -110,6 +110,7 @@ final class FixtureInstrumentation {
     if (!INSTALLED.compareAndSet(false, true)) {
       throw new IllegalStateException("fixture instrumentation is already installed");
     }
+    SafeListener listener = new SafeListener(onFailure, scope, limitations);
     AgentBuilder builder =
         new AgentBuilder.Default()
             .disableClassFormatChanges()
@@ -117,7 +118,7 @@ final class FixtureInstrumentation {
                 attach
                     ? AgentBuilder.RedefinitionStrategy.RETRANSFORMATION
                     : AgentBuilder.RedefinitionStrategy.DISABLED)
-            .with(new SafeListener(onFailure, scope, limitations))
+            .with(listener)
             .ignore(
                 named("dev.xtrace.agent.bootstrap.XTraceAgent")
                     .or(named("dev.xtrace.agent.bootstrap.BootstrapBridge"))
@@ -182,22 +183,21 @@ final class FixtureInstrumentation {
                                         .and(takesArguments(2))
                                         .and(not(isSynthetic())))))
             .type(
-                (type, loader, module, redefined, domain) ->
-                    !type.isInterface()
+                (type, loader, module, redefined, domain) -> {
+                  int verdict = listener.observeScope(loader, type.getName(), domain);
+                  return !type.isInterface()
                         && !type.isEnum()
                         && !type.isAnnotation()
                         && !type.isRecord()
-                        && scope.isApplication(type.getName(), domain))
+                        && verdict == ApplicationScope.APPLICATION;
+                })
             .transform(
                 (target, type, loader, module, domain) -> {
                   if (lineProbes == null && !gapOwnerAvailable(loader)) {
                     limitations.report();
                     return target;
                   }
-                  net.bytebuddy.dynamic.DynamicType.Builder<?> framed =
-                      target.visit(Advice.to(FrameAdvice.class).on(frameMethods()));
-                  return lineProbes == null ? framed : framed
-                      .visit(lineProbes.wrapper(loader));
+                  return target.visit(applicationProbes(loader, lineProbes, limitations));
                 })
             .type(named(H2_STATEMENT))
             .transform(
@@ -211,6 +211,23 @@ final class FixtureInstrumentation {
                                     .and(not(isSynthetic())))));
     builder.installOn(instrumentation);
     ServletBoundaryInstrumentation.install(instrumentation, onFailure, attach);
+  }
+
+  static net.bytebuddy.asm.AsmVisitorWrapper applicationProbes(
+      ClassLoader loader, LineProbes lines, CaptureLimitations limitations) {
+    Set<String> omitted = new java.util.HashSet<>();
+    return boundedProbes(lines == null ? null : lines.wrapper(loader, omitted), limitations, omitted);
+  }
+
+  static net.bytebuddy.asm.AsmVisitorWrapper boundedProbes(
+      net.bytebuddy.asm.AsmVisitorWrapper lines, CaptureLimitations limitations, Set<String> omitted) {
+    net.bytebuddy.asm.AsmVisitorWrapper frames = Advice.to(FrameAdvice.class).on(frameMethods());
+    return new BoundedProbeAsmWrapper(
+        lines == null ? frames : new net.bytebuddy.asm.AsmVisitorWrapper.Compound(frames, lines),
+        key -> {
+          omitted.add(key);
+          limitations.report();
+        });
   }
 
   /** Focused-mode line probe wiring: one site registry and one thread-safe report sink. */
@@ -241,6 +258,11 @@ final class FixtureInstrumentation {
     }
 
     dev.xtrace.agent.runtime.line.LineProbeAsmWrapper wrapper(ClassLoader ownerLoader) {
+      return wrapper(ownerLoader, Set.of());
+    }
+
+    private dev.xtrace.agent.runtime.line.LineProbeAsmWrapper wrapper(
+        ClassLoader ownerLoader, Set<String> omitted) {
       boolean gapAvailable = gapOwnerAvailable(ownerLoader);
       if (!gapAvailable) limitations.report();
       return new dev.xtrace.agent.runtime.line.LineProbeAsmWrapper(
@@ -253,7 +275,11 @@ final class FixtureInstrumentation {
                 reportCount.decrementAndGet();
                 return;
               }
-              reports.add(report);
+              reports.add(omitted.contains(report.name() + report.descriptor())
+                  ? new dev.xtrace.agent.runtime.line.MethodReport(report.name(), report.descriptor(),
+                      dev.xtrace.agent.runtime.line.MethodReport.Status.SKIPPED,
+                      dev.xtrace.agent.runtime.line.MethodReport.Reasons.TOO_LARGE, 0, 0, "")
+                  : report);
             }
           },
           ownerLoader) {
@@ -317,6 +343,20 @@ final class FixtureInstrumentation {
     private final Runnable onFailure;
     private final ApplicationScope scope;
     private final CaptureLimitations limitations;
+    // Only in-flight callbacks are retained. Loader identity separates equal names, and a stack
+    // preserves the outer verdict when class loading recursively transforms another class.
+    private final ThreadLocal<java.util.Deque<ScopedType>> transforming = new ThreadLocal<>();
+
+    private static final class ScopedType {
+      final ClassLoader loader;
+      final String name;
+      int verdict = ApplicationScope.UNKNOWN;
+
+      ScopedType(ClassLoader loader, String name) {
+        this.loader = loader;
+        this.name = name;
+      }
+    }
 
     SafeListener(Runnable onFailure) {
       this(onFailure, ApplicationScope.defaultScope(), new CaptureLimitations());
@@ -329,15 +369,61 @@ final class FixtureInstrumentation {
     }
 
     @Override
+    public void onDiscovery(String name, ClassLoader loader, JavaModule module, boolean loaded) {
+      java.util.Deque<ScopedType> pending = transforming.get();
+      if (pending == null) {
+        pending = new java.util.ArrayDeque<>();
+        transforming.set(pending);
+      }
+      pending.push(new ScopedType(loader, name));
+    }
+
+    int observeScope(ClassLoader loader, String name, ProtectionDomain domain) {
+      int verdict = scope.verdict(name, domain);
+      java.util.Deque<ScopedType> pending = transforming.get();
+      // Retransformation discovery also evaluates matchers outside transform callbacks. Those
+      // scans must not retain loaders or leave a verdict for a later, unrelated callback.
+      if (pending != null) {
+        for (ScopedType entry : pending) {
+          if (entry.loader == loader && entry.name.equals(name)) {
+            entry.verdict = verdict;
+            break;
+          }
+        }
+      }
+      return verdict;
+    }
+
+    private int recordedScope(ClassLoader loader, String name, boolean retire) {
+      java.util.Deque<ScopedType> pending = transforming.get();
+      if (pending == null) return ApplicationScope.UNKNOWN;
+      int verdict = ApplicationScope.UNKNOWN;
+      var entries = pending.iterator();
+      while (entries.hasNext()) {
+        ScopedType entry = entries.next();
+        if (entry.loader == loader && entry.name.equals(name)) {
+          verdict = entry.verdict;
+          if (retire) entries.remove();
+          break;
+        }
+      }
+      if (pending.isEmpty()) transforming.remove();
+      return verdict;
+    }
+
+    @Override
+    public void onComplete(String name, ClassLoader loader, JavaModule module, boolean loaded) {
+      recordedScope(loader, name, true);
+    }
+
+    @Override
     public void onError(
         String typeName,
         ClassLoader classLoader,
         JavaModule module,
         boolean loaded,
         Throwable throwable) {
-      // The error callback has no ProtectionDomain. With default Boot scope an unknown origin
-      // might be application code; conservatively disclose the failure rather than lose it.
-      if (scope.verdict(typeName, null) != ApplicationScope.NOT_APPLICATION) limitations.report();
+      if (recordedScope(classLoader, typeName, false) == ApplicationScope.APPLICATION) limitations.report();
       if (isExplicitTarget(typeName)) {
         try {
           onFailure.run();
@@ -423,12 +509,18 @@ final class FixtureInstrumentation {
   public static final class ExceptionResolutionAdvice {
     private ExceptionResolutionAdvice() {}
 
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static Object enter() {
+      return dev.xtrace.agent.bootstrap.SpringMvcBridge.exceptionResolutionEnter();
+    }
+
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void exit(
         @Advice.Argument(1) Object response,
         @Advice.Return Object resolved,
-        @Advice.Thrown Throwable thrown) {
-      dev.xtrace.agent.bootstrap.SpringMvcBridge.exceptionResolved(response, resolved, thrown);
+        @Advice.Thrown Throwable thrown,
+        @Advice.Enter Object boundary) {
+      dev.xtrace.agent.bootstrap.SpringMvcBridge.exceptionResolved(response, resolved, thrown, boundary);
     }
   }
 

@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import com.google.protobuf.Message;
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
 import dev.xtrace.agent.bootstrap.BridgeEventKind;
+import dev.xtrace.agent.bootstrap.SpringMvcBridge;
 import dev.xtrace.agent.runtime.line.MethodReport;
 import dev.xtrace.agent.runtime.line.LineProbeAsmWrapper;
 import dev.xtrace.agent.runtime.line.LineProbeConfig;
@@ -52,6 +53,7 @@ class FocusedProbeAccountingTest {
 
   @BeforeEach
   void install() {
+    sink.untransformedCount(limitations::count);
     assertTrue(BootstrapBridge.install(sink));
   }
 
@@ -77,6 +79,11 @@ class FocusedProbeAccountingTest {
   }
 
   private Class<?> load(String name, byte[] bytes, LineProbeAsmWrapper wrapper, boolean rejectBridge) {
+    return load(name, bytes, wrapper, rejectBridge, true);
+  }
+
+  private Class<?> load(String name, byte[] bytes, LineProbeAsmWrapper wrapper, boolean rejectBridge,
+      boolean focused) {
     ClassLoader parent = getClass().getClassLoader();
     var locator = new ClassFileLocator.Compound(ClassFileLocator.Simple.of(name, bytes),
         ClassFileLocator.ForClassLoader.of(parent));
@@ -93,8 +100,9 @@ class FocusedProbeAccountingTest {
     }
     Isolated loader = new Isolated();
     byte[] transformed = new ByteBuddy().redefine(TypePool.Default.of(locator).describe(name).resolve(), locator)
-        .visit(Advice.to(FixtureInstrumentation.FrameAdvice.class).on(FixtureInstrumentation.frameMethods()))
-        .visit(wrapper == null ? probes.wrapper(loader) : wrapper).make().getBytes();
+        .visit(wrapper == null ? FixtureInstrumentation.applicationProbes(loader, focused ? probes : null, limitations)
+            : FixtureInstrumentation.boundedProbes(wrapper, limitations, new java.util.HashSet<>()))
+        .make().getBytes();
     Class<?> type = loader.define(transformed);
     transformedClasses.put(type, transformed);
     return type;
@@ -416,8 +424,11 @@ class FocusedProbeAccountingTest {
     assertTrue(BootstrapBridge.requestStart("POST", "/exception"));
     assertTrue(BootstrapBridge.deferRequestEnd(new IllegalStateException("handled")));
     assertTrue(BootstrapBridge.awaitingResolution());
+    Object resolution = SpringMvcBridge.exceptionResolutionEnter();
+    assertNotNull(resolution);
     assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
     BootstrapBridge.requestEnd(422, false);
+    SpringMvcBridge.exceptionResolved(null, null, null, resolution);
     // The ended context cannot receive later gaps or contaminate the next recording.
     BootstrapBridge.lineGap();
     assertFalse(BootstrapBridge.hasContext());
@@ -461,12 +472,260 @@ class FocusedProbeAccountingTest {
   }
 
   @Test
+  void nearLimitOrdinaryExceptionTableBudgetsFrameAdviceAndKeepsHealthySibling() throws Exception {
+    String name = "demo.probe.OrdinaryHandlerLimit";
+    byte[] minimal = ordinaryLimitClass(name, 0, 0, 0);
+    var locator = new ClassFileLocator.Compound(ClassFileLocator.Simple.of(name, minimal),
+        ClassFileLocator.ForClassLoader.of(getClass().getClassLoader()));
+    byte[] framed = new ByteBuddy().redefine(TypePool.Default.of(locator).describe(name).resolve(), locator)
+        .visit(Advice.to(FixtureInstrumentation.FrameAdvice.class).on(FixtureInstrumentation.frameMethods()))
+        .make().getBytes();
+    int[] frameHandlers = {0};
+    new ClassReader(framed).accept(new ClassVisitor(Opcodes.ASM9) {
+      @Override
+      public MethodVisitor visitMethod(int access, String method, String descriptor,
+          String signature, String[] exceptions) {
+        if (!method.equals("limited")) return null;
+        return new MethodVisitor(Opcodes.ASM9) {
+          @Override
+          public void visitTryCatchBlock(Label start, Label end, Label handler, String type) {
+            frameHandlers[0]++;
+          }
+        };
+      }
+    }, 0);
+    assertTrue(frameHandlers[0] > 0);
+    // Frame advice alone fills the table exactly. Adding the skipped-method guard must cause
+    // this ordinary method to fall back before ASM can truncate the count with putShort.
+    Class<?> type = load(name, ordinaryLimitClass(name, 0, 65_535 - frameHandlers[0], 0));
+    assertEquals(0, gapProbes(type, "limited", "()I"));
+    assertEquals(0, probeCalls(type, "limited", "()I", "frameEnter"));
+    assertEquals(1, limitations.count());
+    assertLimitedMethodAndHealthySibling(type);
+  }
+
+  @Test
+  void nearLimitOrdinaryCodeBudgetsFrameAdviceAndKeepsHealthySibling() throws Exception {
+    // The original method is valid at exactly 65,535 bytes; no composed advice can fit.
+    Class<?> type = load("demo.probe.OrdinaryCodeLimit",
+        ordinaryLimitClass("demo.probe.OrdinaryCodeLimit", 65_533, 0, 0));
+    assertEquals(0, probeCalls(type, "limited", "()I", "frameEnter"));
+    assertTrue(limitations.count() > 0);
+    assertLimitedMethodAndHealthySibling(type);
+  }
+
+  @Test
+  void nearLimitOrdinaryLocalsBudgetFrameAdviceAndKeepHealthySibling() throws Exception {
+    Class<?> type = load("demo.probe.OrdinaryLocalLimit",
+        ordinaryLimitClass("demo.probe.OrdinaryLocalLimit", 0, 0, 65_535));
+    assertEquals(0, probeCalls(type, "limited", "()I", "frameEnter"));
+    assertTrue(limitations.count() > 0);
+    assertLimitedMethodAndHealthySibling(type);
+  }
+
+  @Test
+  void standardModeAlsoPreservesNearLimitOrdinaryMethodsAndHealthySiblingFrames() throws Exception {
+    String name = "demo.probe.StandardCodeLimit";
+    Class<?> type = load(name, ordinaryLimitClass(name, 65_533, 0, 0), null, false, false);
+    assertEquals(0, probeCalls(type, "limited", "()I", "frameEnter"));
+    assertEquals(1, probeCalls(type, "healthy", "()I", "frameEnter"));
+    assertEquals(0, probeCalls(type, null, null, "line"));
+    assertEquals(1, limitations.count());
+    assertTrue(BootstrapBridge.requestStart("GET", "/standard-limit"));
+    assertEquals(5, type.getMethod("limited").invoke(null));
+    assertEquals(3, type.getMethod("healthy").invoke(null));
+    BootstrapBridge.requestEnd(200, false);
+    assertPersistedPartial(1);
+  }
+
+  @Test
+  void nearLimitStackOmitsLineInstrumentationAndKeepsTheClassValid() throws Exception {
+    String name = "demo.probe.OrdinaryStackLimit";
+    // A declared maximum may conservatively exceed actual usage. It remains a valid input;
+    // composing probes must still avoid overflowing the class file's unsigned stack field.
+    Class<?> type = load(name, ordinaryLimitClass(name, 0, 0, 0, 65_535));
+    assertTrue(probes.reports().stream().anyMatch(report -> report.name().equals("limited")
+        && report.reason().equals(MethodReport.Reasons.TOO_LARGE)));
+    assertEquals(1, probeCalls(type, "healthy", "()I", "line"));
+    assertTrue(BootstrapBridge.requestStart("GET", "/stack-limit"));
+    assertEquals(5, type.getMethod("limited").invoke(null));
+    assertEquals(3, type.getMethod("healthy").invoke(null));
+    BootstrapBridge.requestEnd(200, false);
+    assertPersistedPartial(1);
+  }
+
+  private void assertLimitedMethodAndHealthySibling(Class<?> type) throws Exception {
+    assertEquals(1, probeCalls(type, "healthy", "()I", "line"));
+    assertEquals(1, probeCalls(type, "healthy", "()I", "frameEnter"));
+    assertTrue(probes.reports().stream().anyMatch(report -> report.name().equals("limited")
+        && report.status() == MethodReport.Status.SKIPPED
+        && report.reason().equals(MethodReport.Reasons.TOO_LARGE)));
+    assertTrue(probes.reports().stream().anyMatch(report -> report.name().equals("healthy")
+        && report.status() == MethodReport.Status.INSTRUMENTED));
+    assertTrue(BootstrapBridge.requestStart("GET", "/ordinary-limit"));
+    assertEquals(5, type.getMethod("limited").invoke(null));
+    assertEquals(3, type.getMethod("healthy").invoke(null));
+    BootstrapBridge.requestEnd(200, false);
+    CapturedRecording transport = assertPersistedPartial(1);
+    assertEquals(limitations.count(), transport.batches.stream()
+        .flatMap(batch -> batch.getEventsList().stream()).filter(event -> event.hasGap())
+        .findFirst().orElseThrow().getGap().getCount());
+  }
+
+  private static byte[] ordinaryLimitClass(String name, int nops, int handlers, int locals) {
+    return ordinaryLimitClass(name, nops, handlers, locals, 0);
+  }
+
+  private static byte[] ordinaryLimitClass(String name, int nops, int handlers, int locals, int stack) {
+    ClassWriter bytes = new ClassWriter(stack == 0 ? ClassWriter.COMPUTE_FRAMES : 0);
+    bytes.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, name.replace('.', '/'), null, "java/lang/Object", null);
+    MethodVisitor method = bytes.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+        "limited", "()I", null, null);
+    method.visitCode();
+    Label start = new Label();
+    Label end = new Label();
+    Label handler = new Label();
+    for (int i = 0; i < handlers; i++) method.visitTryCatchBlock(start, end, handler, "java/lang/Throwable");
+    method.visitLabel(start);
+    if (stack > 0) method.visitLineNumber(1, start);
+    for (int i = 0; i < nops; i++) method.visitInsn(Opcodes.NOP);
+    method.visitInsn(Opcodes.ICONST_5);
+    if (locals > 0) {
+      method.visitVarInsn(Opcodes.ISTORE, locals - 1);
+      method.visitVarInsn(Opcodes.ILOAD, locals - 1);
+    }
+    method.visitInsn(Opcodes.IRETURN);
+    if (handlers > 0) {
+      method.visitLabel(end);
+      method.visitLabel(handler);
+      method.visitInsn(Opcodes.POP);
+      method.visitInsn(Opcodes.ICONST_0);
+      method.visitInsn(Opcodes.IRETURN);
+    }
+    method.visitMaxs(stack, locals);
+    method.visitEnd();
+    MethodVisitor sibling = bytes.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+        "healthy", "()I", null, null);
+    sibling.visitCode();
+    Label line = new Label();
+    sibling.visitLabel(line);
+    sibling.visitLineNumber(1, line);
+    sibling.visitInsn(Opcodes.ICONST_3);
+    sibling.visitInsn(Opcodes.IRETURN);
+    sibling.visitMaxs(1, 0);
+    sibling.visitEnd();
+    bytes.visitEnd();
+    return bytes.toByteArray();
+  }
+
+  @Test
   void staleDeferralCannotAttributeGapsToTheNextRequest() throws Exception {
-    assertTrue(BootstrapBridge.requestStart("GET", "/stale"));
+    Class<?> type = load("demo.probe.Orders", true);
+    Object instance = type.getConstructor().newInstance();
+    SpringMvcBridge.dispatchEnter();
+    try {
+      assertTrue(BootstrapBridge.requestStart("GET", "/stale"));
+      assertTrue(BootstrapBridge.deferRequestEnd(new IllegalStateException("unresolved")));
+      assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+      assertTrue(BootstrapBridge.requestStart("GET", "/next"));
+      assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+      BootstrapBridge.requestEnd(200, false);
+      assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+      CapturedRecording transport = assertPersistedPartial(4, 2);
+      assertNotEquals(transport.starts.get(0).getRecordingId(), transport.starts.get(1).getRecordingId());
+      assertEquals(2, persistedGaps(transport, 0));
+      assertEquals(2, persistedGaps(transport, 1));
+      assertEquals(transport.starts.get(0).getRecordingId(), transport.finishes.get(0).getRecordingId());
+      assertEquals(xtp.agent.v1.Recording.OutcomeKind.OUTCOME_KIND_EXCEPTION_PROPAGATED,
+          transport.finishes.get(0).getOutcome().getKind());
+      assertEquals(200, transport.finishes.get(1).getOutcome().getHttpStatus());
+      assertFalse(BootstrapBridge.hasContext());
+    } finally {
+      SpringMvcBridge.dispatchEnd(null, null);
+    }
+  }
+
+  @Test
+  void unresolvedDeferralOutsideAnObservableBoundaryCannotReceiveUnrelatedGaps() throws Exception {
+    Class<?> type = load("demo.probe.Orders", true);
+    Object instance = type.getConstructor().newInstance();
+    assertTrue(BootstrapBridge.requestStart("GET", "/unresolved"));
     assertTrue(BootstrapBridge.deferRequestEnd(new IllegalStateException("unresolved")));
+    assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+    assertTrue(BootstrapBridge.awaitingResolution());
+    // A new unrelated dispatch on the same thread must not adopt the abandoned context.
+    SpringMvcBridge.dispatchEnter();
+    try {
+      Object resolution = SpringMvcBridge.exceptionResolutionEnter();
+      assertNull(resolution, "a new dispatch cannot adopt a stale deferral");
+      assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+      SpringMvcBridge.exceptionResolved(null, new Object(), null, resolution);
+    } finally {
+      SpringMvcBridge.dispatchEnd(null, null);
+    }
     assertTrue(BootstrapBridge.requestStart("GET", "/next"));
     BootstrapBridge.requestEnd(200, false);
-    assertTrue(events().stream().noneMatch(event -> event.kind() == BridgeEventKind.GAP));
+    CapturedRecording transport = assertPersistedPartial(0, 2);
+    assertEquals(0, persistedGaps(transport, 0));
+    assertEquals(0, persistedGaps(transport, 1));
+    assertTrue(transport.batches.stream().flatMap(batch -> batch.getEventsList().stream())
+        .noneMatch(event -> event.getKind() == xtp.agent.v1.Recording.RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER));
+  }
+
+  @Test
+  void deferredGapAttributionEndsWhenItsDispatchExitsEvenIfStillUnresolved() throws Exception {
+    Class<?> type = load("demo.probe.Orders", true);
+    Object instance = type.getConstructor().newInstance();
+    SpringMvcBridge.dispatchEnter();
+    try {
+      assertTrue(BootstrapBridge.requestStart("GET", "/unresolved"));
+      assertTrue(BootstrapBridge.deferRequestEnd(new IllegalStateException("unresolved")));
+      assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+    } finally {
+      SpringMvcBridge.dispatchEnd(null, null);
+    }
+    assertTrue(BootstrapBridge.awaitingResolution());
+    assertNull(SpringMvcBridge.exceptionResolutionEnter(), "the original dispatch has ended");
+    assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+    assertTrue(BootstrapBridge.requestStart("GET", "/next"));
+    BootstrapBridge.requestEnd(200, false);
+    CapturedRecording transport = assertPersistedPartial(2, 2);
+    assertEquals(2, persistedGaps(transport, 0));
+    assertEquals(0, persistedGaps(transport, 1));
+  }
+
+  @Test
+  void healthyFinishQueuedBeforeTransformationFailureRemainsHealthyWhenDrainedLater() throws Exception {
+    assertTrue(BootstrapBridge.requestStart("GET", "/healthy"));
+    BootstrapBridge.requestEnd(200, false);
+    limitations.report();
+    assertTrue(BootstrapBridge.requestStart("GET", "/later"));
+    BootstrapBridge.requestEnd(200, false);
+    // The writer has not started: both finishes are queued before its first drain.
+    CapturedRecording transport = assertPersistedPartial(1, 2);
+    assertEquals(0, persistedGaps(transport, 0));
+    assertEquals(1, persistedGaps(transport, 1));
+    assertEquals(200, transport.finishes.get(0).getOutcome().getHttpStatus());
+  }
+
+  @Test
+  void exceptionResolutionExitCannotFinishAReplacementContext() throws Exception {
+    Class<?> type = load("demo.probe.Orders", true);
+    Object instance = type.getConstructor().newInstance();
+    assertTrue(BootstrapBridge.requestStart("GET", "/stale-resolver"));
+    assertTrue(BootstrapBridge.deferRequestEnd(new IllegalStateException("unresolved")));
+    Object resolution = SpringMvcBridge.exceptionResolutionEnter();
+    assertNotNull(resolution);
+    assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+    assertTrue(BootstrapBridge.requestStart("GET", "/replacement"));
+    assertEquals("ABC", type.getMethod("create", String.class).invoke(instance, " abc "));
+    SpringMvcBridge.exceptionResolved(null, new Object(), null, resolution);
+    assertTrue(BootstrapBridge.inRequest(), "the old resolver cannot complete the replacement");
+    BootstrapBridge.requestEnd(200, false);
+    CapturedRecording transport = assertPersistedPartial(4, 2);
+    assertEquals(2, persistedGaps(transport, 0));
+    assertEquals(2, persistedGaps(transport, 1));
+    assertEquals(200, transport.finishes.get(1).getOutcome().getHttpStatus());
   }
 
   @Test
@@ -545,7 +804,10 @@ class FocusedProbeAccountingTest {
         () -> fail("ordinary application failure must preserve the runtime"),
         new ApplicationScope(List.of("demo.probe"), List.of()), limitations);
     var transformer = new AgentBuilder.Default().with(listener)
-        .type(net.bytebuddy.matcher.ElementMatchers.named(name))
+        .type((type, definingLoader, module, redefined, domain) -> {
+          listener.observeScope(definingLoader, type.getName(), domain);
+          return type.getName().equals(name);
+        })
         .transform((builder, type, definingLoader, module, domain) -> {
           throw new IllegalStateException("transformation failed");
         }).makeRaw();
@@ -578,7 +840,6 @@ class FocusedProbeAccountingTest {
     CapturedRecording transport = new CapturedRecording();
     RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofMillis(100));
     writer.capturePolicy("xtrace.focused.v1");
-    writer.untransformedCount(limitations::count);
     writer.start();
     writer.close();
     assertFalse(writer.incompleteWasReported());

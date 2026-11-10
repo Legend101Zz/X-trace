@@ -28,6 +28,7 @@ final class RuntimeBridgeSink implements BridgeSink {
   private final AtomicInteger inFlightStartAdmissions = new AtomicInteger();
   private final AtomicInteger incompleteKind = new AtomicInteger();
   private volatile ApplicationScope scope = ApplicationScope.defaultScope();
+  private volatile java.util.function.LongSupplier untransformed = () -> 0L;
   private final Runnable afterStartIncrement;
   private final Runnable beforeStartDecrement;
 
@@ -257,6 +258,11 @@ final class RuntimeBridgeSink implements BridgeSink {
     this.scope = java.util.Objects.requireNonNull(scope, "scope");
   }
 
+  /** Sampled on the request thread when Finish is produced, before asynchronous draining. */
+  void untransformedCount(java.util.function.LongSupplier supplier) {
+    untransformed = java.util.Objects.requireNonNull(supplier, "supplier");
+  }
+
   @Override
   public boolean offerFinish(
       String recordingId,
@@ -290,7 +296,8 @@ final class RuntimeBridgeSink implements BridgeSink {
               responseStatus,
               droppedEvents,
               bytes,
-              outcome));
+              outcome,
+              untransformed.getAsLong()));
     }
   }
 

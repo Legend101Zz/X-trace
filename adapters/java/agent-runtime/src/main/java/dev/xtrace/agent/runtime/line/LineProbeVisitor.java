@@ -188,6 +188,9 @@ public class LineProbeVisitor extends ClassVisitor {
     private boolean hasJsrRet;
     private int estimatedBytes;
     private int tryCatchBlocks;
+    private int maxStack;
+    private int probeStack;
+    private boolean gapGuard;
 
     Buffer(MethodVisitor out, int access, String name, String descriptor) {
       super(ASM, null);
@@ -408,7 +411,9 @@ public class LineProbeVisitor extends ClassVisitor {
 
     @Override
     public void visitMaxs(int maxStack, int maxLocals) {
-      add(Kind.OTHER, mv -> mv.visitMaxs(maxStack, maxLocals));
+      this.maxStack = maxStack;
+      // Expose the inserted stack requirement to composed advice and its final budget check.
+      add(Kind.OTHER, mv -> mv.visitMaxs(Math.max(maxStack + probeStack, gapGuard ? 1 : 0), maxLocals));
     }
 
     @Override
@@ -457,6 +462,7 @@ public class LineProbeVisitor extends ClassVisitor {
               || tryCatchBlocks == 65_535 || hasJsrRet) {
             skippedMethodEntryUnavailable();
           } else {
+            gapGuard = true;
             guardedSkippedEntry();
           }
         }
@@ -466,6 +472,7 @@ public class LineProbeVisitor extends ClassVisitor {
         reports.add(skipped(name, descriptor, d.skip()));
         return;
       }
+      probeStack = d.values() ? 4 : 1;
       int valueCalls = replay(d.plan(), d.values(), d.siteIds());
       reports.add(
           new MethodReport(
@@ -525,6 +532,9 @@ public class LineProbeVisitor extends ClassVisitor {
         }
       }
       if (skip == null && !registry.hasRoomFor(plan.size())) skip = Reasons.REGISTRY_FULL;
+      if (skip == null && (long) maxStack + (values ? 4 : 1) > 65_535) {
+        skip = Reasons.TOO_LARGE;
+      }
       if (skip != null) return new Decision(plan, false, valuesReason, null, skip);
 
       if (values) {

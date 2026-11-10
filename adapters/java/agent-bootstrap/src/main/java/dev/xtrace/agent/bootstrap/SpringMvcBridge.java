@@ -64,6 +64,22 @@ public final class SpringMvcBridge {
 
   private SpringMvcBridge() {}
 
+  // Identity, rather than thread reuse, ties a deferral to the frame that observed it. Prefer
+  // the outer servlet so post-dispatch filter work remains attributable until that frame exits.
+  static Object captureBoundary() {
+    ServletState servlet = SERVLET.get();
+    return servlet != null ? servlet : DISPATCH.get();
+  }
+
+  static boolean boundaryActive(Object boundary) {
+    return boundary != null && (boundary == SERVLET.get() || boundary == DISPATCH.get());
+  }
+
+  /** Brackets resolver work even when dispatch instrumentation is unavailable. */
+  public static Object exceptionResolutionEnter() {
+    return BootstrapBridge.exceptionResolutionEnter();
+  }
+
   /** Enters a standard Filter.doFilter or Servlet.service frame on this thread. */
   public static void servletEnter() {
     ServletState state = SERVLET.get();
@@ -216,6 +232,19 @@ public final class SpringMvcBridge {
    * it, this seam observes the resolver's status, not a later rendered view or filter response.
    */
   public static void exceptionResolved(Object response, Object resolved, Throwable thrown) {
+    finishExceptionResolution(response, resolved, thrown);
+  }
+
+  /** Completes only the context observed on entry, then retires that resolver's attribution. */
+  public static void exceptionResolved(Object response, Object resolved, Throwable thrown, Object boundary) {
+    try {
+      if (BootstrapBridge.resolving(boundary)) finishExceptionResolution(response, resolved, thrown);
+    } finally {
+      BootstrapBridge.exceptionResolutionEnd(boundary);
+    }
+  }
+
+  private static void finishExceptionResolution(Object response, Object resolved, Throwable thrown) {
     if (!BootstrapBridge.awaitingResolution()) return;
     DispatchState state = DISPATCH.get();
     if (state != null) {

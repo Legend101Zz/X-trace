@@ -604,7 +604,7 @@ class RecordingWriterTest {
     FakeTransport transport = new FakeTransport();
     RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofSeconds(5));
     writer.capturePolicy("xtrace.focused.v1");
-    writer.untransformedCount(() -> 1);
+    sink.untransformedCount(() -> 1);
     assertTrue(sink.offerStart(id(0), 1, "GET", "/focused"));
     // Closing events can fill the closing reserve, but must leave space for generated gaps.
     for (int i = 0; i < cap + 10; i++) {
@@ -631,7 +631,7 @@ class RecordingWriterTest {
     RuntimeBridgeSink sink = new RuntimeBridgeSink(queue);
     FakeTransport transport = new FakeTransport(400);
     RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofSeconds(5));
-    writer.untransformedCount(() -> 1);
+    sink.untransformedCount(() -> 1);
     assertTrue(sink.offerStart(id(0), 1, "GET", "/" + "r".repeat(255)));
     // A reduced start must share the cap with all four reserved gaps: memory pressure,
     // cap overflow, queue loss and transforms. The oversized finish then has no marker slot.

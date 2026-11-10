@@ -74,7 +74,6 @@ final class RecordingWriter implements AutoCloseable, Runnable {
   private long reportedRejectedStarts;
   private volatile long shutdownStartedNs;
   private volatile String capturePolicyId = "";
-  private volatile java.util.function.LongSupplier untransformed = () -> 0L;
 
   RecordingWriter(XtpSession session, BoundedEventQueue queue, RuntimeBridgeSink sink)
       throws ClientException {
@@ -226,11 +225,6 @@ final class RecordingWriter implements AutoCloseable, Runnable {
         || kind == BridgeEventKind.RESPONSE;
   }
 
-  /** Count of probe installations whose missing invocation coverage cannot be attributed. */
-  void untransformedCount(java.util.function.LongSupplier supplier) {
-    this.untransformed = java.util.Objects.requireNonNull(supplier, "supplier");
-  }
-
   /** Policy the recordings claim; the daemon grants focused only for a session armed focused. */
   void capturePolicy(String policyId) {
     this.capturePolicyId = policyId == null ? "" : policyId;
@@ -289,7 +283,7 @@ final class RecordingWriter implements AutoCloseable, Runnable {
     // the request's event stream. Count at least its missing request observation, even for a
     // caller that supplies no shed count. No response, parent link or timing is reconstructed.
     if (pending.start.metadataOnly()) droppedEvents = Math.max(1, droppedEvents);
-    long skippedTransforms = pending.start.metadataOnly() ? 0 : untransformed.getAsLong();
+    long skippedTransforms = pending.start.metadataOnly() ? 0 : finish.untransformedCount();
     List<QueueSignal.Event> ordered =
         pending.start.metadataOnly()
             ? List.of(gap(pending.start.recordingId(), "",

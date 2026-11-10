@@ -98,7 +98,7 @@ public final class AgentRuntime {
       writer = new RecordingWriter(session, queue, sink);
       FixtureInstrumentation.CaptureLimitations limitations =
           new FixtureInstrumentation.CaptureLimitations();
-      writer.untransformedCount(limitations::count);
+      sink.untransformedCount(limitations::count);
       permanent = true;
       // Line probes and all value reads, including proxy arguments/returns, are focused-only
       // (ADR 0003 root decision 3). The daemon honours the focused claim only when armed.
