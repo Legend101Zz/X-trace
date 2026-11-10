@@ -2,6 +2,7 @@ package dev.xtrace.agent.runtime;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import com.google.protobuf.Message;
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
 import dev.xtrace.agent.bootstrap.MethodIdentity;
 import dev.xtrace.agent.runtime.line.MethodReport;
@@ -25,10 +26,15 @@ import net.bytebuddy.pool.TypePool;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import xtp.agent.v1.Recording.EventBatch;
 import xtp.agent.v1.Recording.RecordingEvent;
 import xtp.agent.v1.Recording.RecordingEventKind;
+import xtp.agent.v1.Recording.RecordingFinished;
+import xtp.agent.v1.Recording.RecordingStarted;
+import xtp.agent.v1.Transport.Ack;
+import xtp.agent.v1.Transport.AckDurability;
 
-/** Constructor bodies use real frames; omitted delegation and initializer lines are explicit gaps. */
+/** Constructor bodies use real frames; only preambles with omitted observations emit gaps. */
 class ConstructorLineWiringTest {
   private static final String NAME = "demo.probe.ConstructorCases";
   private final BoundedEventQueue queue = new BoundedEventQueue(4096, 4 * 1024 * 1024);
@@ -66,7 +72,8 @@ class ConstructorLineWiringTest {
     for (String suffix : List.of("", "$Base", "$Chain", "$BodyThrow", "$SuperThrow",
         "$ArgumentThrow", "$Initializer", "$UntracedBase", "$UntracedSuperThrow",
         "$AllocatedArgument", "$BranchedArgument", "$EntityBase", "$EntityPerson", "$EntityOwner",
-        "$EntityNamed", "$EntityPet", "$EntityType")) names.add(NAME + suffix);
+        "$EntityNamed", "$EntityPet", "$EntityType", "$ExplicitSuper", "$ArgumentBase",
+        "$LoadedArguments", "$ConstantDelegation")) names.add(NAME + suffix);
     names.add("demo.probe.CursorParents");
     for (String name : names) {
       byte[] original = locator.locate(name).resolve();
@@ -157,26 +164,17 @@ class ConstructorLineWiringTest {
         && e.getSymbol().equals(RecordingWriter.UNTRANSFORMED_GAP_SYMBOL)));
   }
 
+  private void assertNoGap(List<RecordingEvent> events) {
+    assertEquals(0, events.stream()
+        .filter(e -> e.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_GAP).count());
+  }
+
   @Test
-  void sixHydratedEntityChainsKeepEighteenHonestPreambleGapsDespiteSuccessfulTransformation() throws Exception {
+  void sixHydratedEntityChainsKeepAllEighteenBodiesWithoutPreambleGaps() throws Exception {
     assertTrue(BootstrapBridge.requestStart("GET", "/hydrate"));
     assertEquals(6, ((Object[]) invoke("rehydrate")).length);
     List<RecordingEvent> events = finish();
-    int groups = 0;
-    int consecutive = 0;
-    for (RecordingEvent event : events) {
-      if (event.getKind() == RecordingEventKind.RECORDING_EVENT_KIND_GAP) {
-        assertEquals(RecordingWriter.UNTRANSFORMED_GAP_SYMBOL, event.getSymbol());
-        assertEquals(1, event.getGap().getCount());
-        consecutive++;
-      } else if (consecutive > 0) {
-        assertEquals(3, consecutive, "each entity delegates through two application superclasses");
-        consecutive = 0;
-        groups++;
-      }
-    }
-    assertEquals(0, consecutive);
-    assertEquals(6, groups);
+    assertNoGap(events);
     for (var expected : Map.of("EntityBase", 6, "EntityPerson", 2, "EntityOwner", 2,
         "EntityNamed", 4, "EntityPet", 2, "EntityType", 2).entrySet()) {
       String symbol = "ConstructorCases$" + expected.getKey() + ".<init>";
@@ -187,7 +185,98 @@ class ConstructorLineWiringTest {
       assertEquals(expected.getValue().longValue(),
           count(events, RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR, symbol));
     }
-    assertEquals(0, limitations.count(), "these gaps are invocation evidence, not failed installations");
+    assertEquals(0, limitations.count());
+  }
+
+  @Test
+  void implicitSuperEmitsNoGap() throws Exception {
+    assertTrivial("implicitSuper", "EntityBase");
+  }
+
+  @Test
+  void explicitSuperEmitsNoGap() throws Exception {
+    assertTrivial("explicitSuper", "ExplicitSuper");
+  }
+
+  @Test
+  void explicitSuperWithOnlyArgumentLoadsEmitsNoGap() throws Exception {
+    assertTrivial("loadedSuperArguments", "LoadedArguments");
+  }
+
+  @Test
+  void thisDelegationWithAConstantEmitsNoGap() throws Exception {
+    assertTrivial("constantThisArgument", "ConstantDelegation");
+  }
+
+  private void assertTrivial(String method, String type) throws Exception {
+    assertTrue(BootstrapBridge.requestStart("GET", "/trivial"));
+    Object result = invoke(method);
+    assertNotNull(result);
+    if (result instanceof Integer) assertEquals(120, result);
+    List<RecordingEvent> events = finish();
+    assertNoGap(events);
+    String symbol = "ConstructorCases$" + type + ".<init>";
+    long expected = type.equals("ConstantDelegation") ? 2 : 1;
+    assertEquals(expected, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER, symbol));
+    assertEquals(expected, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_EXIT, symbol));
+    assertTrue(count(events, RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR, symbol) >= expected);
+  }
+
+  @Test
+  void hydratedOwnerAndPetChainsWriteACompleteRecordingWithNoGapsOrDrops() throws Exception {
+    assertTrue(BootstrapBridge.requestStart("GET", "/hydrate"));
+    assertEquals(6, ((Object[]) invoke("rehydrate")).length);
+    BootstrapBridge.requestEnd(200, false);
+    CapturedRecording transport = new CapturedRecording();
+    RecordingWriter writer = new RecordingWriter(transport, queue, sink, Duration.ofSeconds(5));
+    writer.capturePolicy("xtrace.focused.v1");
+    writer.start();
+    writer.close();
+    assertFalse(writer.incompleteWasReported());
+    assertEquals(1, transport.starts.size());
+    assertEquals(1, transport.finishes.size());
+    List<RecordingEvent> events = transport.batches.stream()
+        .flatMap(batch -> batch.getEventsList().stream()).toList();
+    assertNoGap(events);
+    assertEquals(18, events.stream().filter(e -> e.getKind()
+        == RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER && e.getSymbol().contains(".<init>#")).count());
+    var terminal = transport.finishes.get(0);
+    assertEquals(transport.starts.get(0).getRecordingId(), terminal.getRecordingId());
+    assertEquals(0, terminal.getDropCountsByPriorityCount());
+    assertEquals(events.size() + 1L, terminal.getFinalRecordingSeq());
+    assertArrayEquals(EventDigest.compute(events.stream().map(RecordingEvent::getEventId).toList()),
+        terminal.getEventDigest().toByteArray());
+  }
+
+  private static final class CapturedRecording implements RecordingWriter.Transport {
+    final List<RecordingStarted> starts = new ArrayList<>();
+    final List<EventBatch> batches = new ArrayList<>();
+    final List<RecordingFinished> finishes = new ArrayList<>();
+
+    @Override
+    public Ack send(String messageId, String correlationToken, Message payload) {
+      Ack.Builder ack = Ack.newBuilder().setDurability(AckDurability.ACK_DURABILITY_STAGED);
+      if (payload instanceof RecordingStarted started) {
+        starts.add(started);
+        ack.putHighestContiguousRecordingSeq(correlationToken, 1);
+      } else if (payload instanceof EventBatch batch) {
+        batches.add(batch);
+        ack.putHighestContiguousRecordingSeq(correlationToken,
+            batch.getEvents(batch.getEventsCount() - 1).getRecordingSeq());
+      } else if (payload instanceof RecordingFinished finished) {
+        finishes.add(finished);
+        ack.putHighestContiguousRecordingSeq(correlationToken, finished.getFinalRecordingSeq());
+      }
+      return ack.build();
+    }
+
+    @Override
+    public boolean fitsEnvelope(String messageId, String correlationToken, Message payload) {
+      return payload.getSerializedSize() <= RecordingWriter.MAX_BATCH_BYTES;
+    }
+
+    @Override
+    public void close() {}
   }
 
   @Test
@@ -196,6 +285,8 @@ class ConstructorLineWiringTest {
     assertEquals(36, invoke("normal"));
     List<RecordingEvent> events = finish();
     assertGap(events);
+    assertEquals(1, events.stream().filter(RecordingEvent::hasGap).count(),
+        "only the computed super argument loses preamble observations");
     assertEquals(3, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER, "ConstructorCases$Chain.<init>"));
     assertEquals(3, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_EXIT, "ConstructorCases$Chain.<init>"));
     assertEquals(2, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER, "ConstructorCases$Base.<init>"));
@@ -224,7 +315,7 @@ class ConstructorLineWiringTest {
   }
 
   @Test
-  void uninstrumentedSuperThrowAlsoLeavesNoDanglingConstructorFrame() throws Exception {
+  void trivialUninstrumentedSuperThrowLeavesNoPreambleGapOrDanglingConstructorFrame() throws Exception {
     assertFailure("untracedSuperFailure", IllegalArgumentException.class, "ConstructorCases$UntracedSuperThrow.<init>", false);
   }
 
@@ -234,6 +325,8 @@ class ConstructorLineWiringTest {
     assertEquals(4, invoke("allocatedSuperArgument"));
     List<RecordingEvent> events = finish();
     assertGap(events);
+    assertEquals(1, events.stream().filter(RecordingEvent::hasGap).count(),
+        "NEW before delegation must keep its gap even when the allocated constructor is trivial");
     assertEquals(1, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER, "ConstructorCases$AllocatedArgument.<init>"));
     Class<?> allocated = driver.getClassLoader().loadClass(NAME + "$AllocatedArgument");
     int delegationLine = SourceIdentity.lookup(allocated, "<init>", "()V").startLine();
@@ -250,6 +343,8 @@ class ConstructorLineWiringTest {
     assertEquals(3, invoke("branchedSuperArgument"));
     List<RecordingEvent> events = finish();
     assertGap(events);
+    assertEquals(1, events.stream().filter(RecordingEvent::hasGap).count(),
+        "the branched preamble stays explicitly unobserved");
     assertEquals(0, count(events, RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR, "ConstructorCases$BranchedArgument.<init>"));
     assertEquals(0, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER, "ConstructorCases$BranchedArgument.<init>"));
     assertTrue(probes.reports().stream().anyMatch(r -> r.name().equals("<init>")
@@ -274,7 +369,8 @@ class ConstructorLineWiringTest {
     if (method.equals("bodyFailure")) assertSame(driver.getField("BODY_FAILURE").get(null), failure.getCause());
     assertEquals(7, invoke("after"));
     List<RecordingEvent> events = finish();
-    assertGap(events);
+    if (method.equals("untracedSuperFailure")) assertNoGap(events);
+    else assertGap(events);
     assertEquals(bodyEntered ? 1 : 0, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_ENTER, constructor));
     assertEquals(bodyEntered ? 1 : 0, count(events, RecordingEventKind.RECORDING_EVENT_KIND_FRAME_THROW, constructor));
     assertEquals(bodyEntered, count(events, RecordingEventKind.RECORDING_EVENT_KIND_LINE_CURSOR, constructor) > 0);

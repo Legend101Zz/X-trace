@@ -50,6 +50,22 @@ public class ConstructorCases {
     return 7;
   }
 
+  public static Object implicitSuper() {
+    return new EntityBase();
+  }
+
+  public static Object explicitSuper() {
+    return new ExplicitSuper();
+  }
+
+  public static int loadedSuperArguments() {
+    return new LoadedArguments(120, 2L, 3f, 4d, "literal").value;
+  }
+
+  public static int constantThisArgument() {
+    return new ConstantDelegation().value;
+  }
+
   /** Two hydrated owner/pet/type rows: six three-level constructor chains. */
   public static Object[] rehydrate() {
     return new Object[] {
@@ -64,6 +80,36 @@ public class ConstructorCases {
   public static class EntityNamed extends EntityBase {}
   public static class EntityPet extends EntityNamed {}
   public static class EntityType extends EntityNamed {}
+
+  public static class ExplicitSuper {
+    public ExplicitSuper() {
+      super();
+    }
+  }
+
+  public static class ArgumentBase {
+    public int value;
+
+    public ArgumentBase(int value, long wide, float fraction, double precise, Object reference) {
+      this.value = value;
+    }
+  }
+
+  public static class LoadedArguments extends ArgumentBase {
+    public LoadedArguments(int value, long wide, float fraction, double precise, Object reference) {
+      super(value, wide, fraction, precise, reference);
+    }
+  }
+
+  public static class ConstantDelegation extends Base {
+    public ConstantDelegation() {
+      this(119);
+    }
+
+    public ConstantDelegation(int value) {
+      super(value);
+    }
+  }
 
   public static class Base {
     public int value;
