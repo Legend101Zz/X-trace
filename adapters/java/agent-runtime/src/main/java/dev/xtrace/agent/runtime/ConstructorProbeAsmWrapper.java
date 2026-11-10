@@ -23,7 +23,8 @@ import net.bytebuddy.pool.TypePool;
 /**
  * Constructor body boundaries. The delegation call is outside the boundary: catching its failure
  * would require a verifier-illegal handler spanning initialization of uninitializedThis. Focused
- * cursors omit that preamble, and its entry gap also accounts for a delegation that never returns.
+ * cursors omit that preamble. An entry gap names lost observations only when the preamble does
+ * more than load the receiver, arguments and literals on the delegation line.
  */
 final class ConstructorProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
   @Override
@@ -84,9 +85,11 @@ final class ConstructorProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
     @Override
     public void visitCode() {
       super.visitCode();
-      // This bootstrap entry point catches Throwable and never reads the receiver.
-      mv.visitMethodInsn(Opcodes.INVOKESTATIC, FixtureInstrumentation.PROBE_OWNER,
-          "lineGap", "()V", false);
+      if (!preamble.trivial()) {
+        // This bootstrap entry point catches Throwable and never reads the receiver.
+        mv.visitMethodInsn(Opcodes.INVOKESTATIC, FixtureInstrumentation.PROBE_OWNER,
+            "lineGap", "()V", false);
+      }
     }
 
     @Override
