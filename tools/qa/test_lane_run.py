@@ -67,7 +67,7 @@ class CheckoutFixture(unittest.TestCase):
                 'pub enum PrivateStorageError {\n#[error("private storage is unavailable: {0}")]\n'
                 'Admission(AdmissionFailure), Unavailable, InvalidName, AlreadyExists, Operation,\n}\n'),
             "crates/xtrace-private-storage/src/diagnostic.rs": (
-                "pub enum AdmissionOperation { Deadline, WaitAclProbe, NamedMetadata, }\n"),
+                "pub enum AdmissionOperation { Deadline, WaitAclProbe, NamedMetadata, OwnershipAndMode, }\n"),
         }
         for name, source in self.sources.items():
             path = self.checkout / name
@@ -103,9 +103,10 @@ class CheckoutFixture(unittest.TestCase):
 class FailureDetailsTests(CheckoutFixture):
     @staticmethod
     def cargo(name="journey::fails", message="assertion `left == right` failed\n  left: 1\n right: 2",
-              site="crates/example/tests/journey.rs:42:7"):
+              site="crates/example/tests/journey.rs:42:7", thread_id=None):
+        tid = f" ({thread_id})" if thread_id is not None else ""
         return (f"test {name} ... FAILED\n\nfailures:\n\n---- {name} stdout ----\n"
-                f"thread '{name}' panicked at {site}:\n"
+                f"thread '{name}'{tid} panicked at {site}:\n"
                 f"{message}\nnote: run with RUST_BACKTRACE=1\n\nfailures:\n    {name}\n"
                 "test result: FAILED. 0 passed; 1 failed; 0 ignored\n")
 
@@ -139,6 +140,10 @@ class FailureDetailsTests(CheckoutFixture):
              ["Admission", "WaitAclProbe", "PermissionDenied", 13]),
             ('write: Bootstrap("private storage is unavailable: operation=Deadline '
              'kind=Some(TimedOut) raw_os_error=Some(60)")', ["Deadline", "TimedOut", 60]),
+            ('parent: Admission(AdmissionFailure { operation: OwnershipAndMode, '
+             'kind: None, raw_os_error: None })', ["Admission", "OwnershipAndMode"]),
+            ('AdmissionFailure { operation: NamedMetadata, kind: None, raw_os_error: None }',
+             ["NamedMetadata"]),
         ]
         for message, expected in cases:
             with self.subTest(message=message):
@@ -161,21 +166,143 @@ class FailureDetailsTests(CheckoutFixture):
             self.assertNotIn(value, json.dumps(row["category"]))
 
     def test_errno_boundaries_and_category_count_are_bounded_and_deduplicated(self):
-        message = ("raw_os_error=Some(1) raw_os_error=Some(200) raw_os_error=Some(1) "
-                   + " ".join(sorted(lane_run.IO_ERROR_KINDS)))
+        message = " ".join(f"operation=Deadline kind=None raw_os_error=Some({errno})"
+                           for errno in (1, 200, 1))
+        message += " " + " ".join(f"operation=Deadline kind=Some({kind}) raw_os_error=None"
+                                  for kind in sorted(lane_run.IO_ERROR_KINDS))
         row = lane_run.failure_details(self.cargo(message=message), False)["failures"][0]
         self.assert_facts_only(row)
-        self.assertEqual(row["category"][:2], [1, 200])
+        self.assertEqual(row["category"][:3], ["Deadline", 1, 200])
         self.assertEqual(len(row["category"]), lane_run.MAX_CATEGORIES)
+
+    def test_colliding_values_paths_and_errno_prose_are_not_diagnostics(self):
+        messages = [
+            "Deadline Admission OwnershipAndMode PermissionDenied 13 42",
+            "captured value: Deadline",
+            "/private/éDeadline /private/éPermissionDenied /private/Deadline",
+            "captured raw_os_error=42 raw_os_error: Some(13) raw_os_error=Some(60)",
+            "operation=Deadline", "kind=Some(TimedOut)",
+            "operation=Deadline kind=Some(TimedOut)",
+            "operation=Admission kind=None raw_os_error=None",
+            "operation=UnknownOperation kind=None raw_os_error=None",
+            "operation=Deadline kind=Some(UnknownKind) raw_os_error=Some(13)",
+        ]
+        for errno in ("0", "201", "999999", "013", "-13", "13.5", "42"):
+            # A bare number is never the Debug rendering of Option<i32>.
+            value = errno if errno == "42" else f"Some({errno})"
+            messages.extend([
+                f"operation=Deadline kind=None raw_os_error={value}",
+                "Admission(AdmissionFailure { operation: Deadline, kind: None, "
+                f"raw_os_error: {value} }})",
+            ])
+        for prefix, suffix in (("é", ""), ("/private/é", ""), ("", "é"), ("", "/file")):
+            messages.extend([
+                prefix + "operation=Deadline kind=None raw_os_error=None" + suffix,
+                prefix + "AdmissionFailure { operation: Deadline, kind: None, raw_os_error: None }" + suffix,
+            ])
+        for message in messages:
+            with self.subTest(message=message):
+                row = lane_run.failure_details(self.cargo(message=message), False)["failures"][0]
+                self.assertEqual(row["category"], [])
+                self.assertEqual(row["panicSites"], ["crates/example/tests/journey.rs:42"])
+                self.assert_facts_only(row)
+
+    def test_only_complete_rendering_fields_survive_surrounding_prose(self):
+        message = ("Deadline PermissionDenied 42 raw_os_error=Some(99) before: "
+                   "Admission(AdmissionFailure { operation: OwnershipAndMode, kind: None, raw_os_error: None })"
+                   " after TimedOut 13 raw_os_error: Some(60)")
+        row = lane_run.failure_details(self.cargo(message=message), False)["failures"][0]
+        self.assertEqual(row["category"], ["Admission", "OwnershipAndMode"])
+        self.assert_facts_only(row)
+
+    def test_parallel_uncaptured_headers_withhold_test_attribution(self):
+        for tid in ("", " (987654321)"):
+            text = (f"thread 'first'{tid} panicked at crates/a.rs:1:2:\n"
+                    f"thread 'second'{tid} panicked at crates/b.rs:2:4:\n"
+                    "operation=Deadline kind=None raw_os_error=Some(13)\n"
+                    "operation=NamedMetadata kind=Some(PermissionDenied) raw_os_error=Some(42)\n"
+                    "test first ... FAILED\ntest second ... FAILED\n")
+            with self.subTest(tid=tid):
+                rows = lane_run.failure_details(text, False)["failures"]
+                self.assertEqual([row["test"] for row in rows], ["first", "second", lane_run.UNVERIFIED])
+                for row in rows[:2]:
+                    self.assertEqual((row["location"], row["panicSites"], row["category"]),
+                                     (lane_run.UNVERIFIED, [], []))
+                self.assertEqual(rows[2]["testUnverifiedReason"], "ambiguous-panic-block")
+                self.assertEqual(rows[2]["panicSites"], ["crates/a.rs:1", "crates/b.rs:2"])
+                self.assertEqual(rows[2]["category"], [])
+                for row in rows:
+                    self.assert_facts_only(row)
+                self.assertNotIn("987654321", json.dumps(rows))
+
+    def test_multiline_panic_header_cannot_attest_another_site_or_test(self):
+        text = ("test first ... FAILED\n---- first stdout ----\n"
+                "thread 'first' (987654321) panicked at crates/a.rs:1:2:\n"
+                "captured multiline prose\n"
+                "thread 'second' (123456789) panicked at crates/b.rs:2:4:\n"
+                "operation=Deadline kind=Some(TimedOut) raw_os_error=Some(60)\n")
+        rows = lane_run.failure_details(text, False)["failures"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["test"], rows[0]["location"], rows[0]["panicSites"], rows[0]["category"]),
+                         ("first", lane_run.UNVERIFIED, [], []))
+        self.assertEqual((rows[1]["test"], rows[1]["testUnverifiedReason"], rows[1]["category"]),
+                         (lane_run.UNVERIFIED, "ambiguous-panic-block", []))
+        self.assertEqual(rows[1]["panicSites"], ["crates/a.rs:1", "crates/b.rs:2"])
+        for row in rows:
+            self.assert_facts_only(row)
+        for value in ("second", "987654321", "123456789", "captured multiline prose"):
+            self.assertNotIn(value, json.dumps(rows))
+
+    def test_unattributed_row_key_cannot_collide_with_a_captured_test_name(self):
+        metadata = lane_run.CheckoutMetadata({
+            **self.sources, "web/app/src/internal.test.ts": 'test("<panic-block-0>", () => {});\n',
+        })
+        text = ("test <panic-block-0> ... FAILED\n"
+                "thread 'first' panicked at crates/a.rs:1:2:\n"
+                "thread 'second' panicked at crates/b.rs:2:4:\n"
+                "operation=Deadline kind=None raw_os_error=None\n")
+        rows = lane_run.failure_details(text, False, metadata=metadata)["failures"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["test"], rows[0]["panicSites"], rows[0]["category"]),
+                         ("<panic-block-0>", [], []))
+        self.assertEqual((rows[1]["test"], rows[1]["testUnverifiedReason"], rows[1]["category"]),
+                         (lane_run.UNVERIFIED, "ambiguous-panic-block", []))
+        self.assertEqual(rows[1]["panicSites"], ["crates/a.rs:1", "crates/b.rs:2"])
+
+    def test_header_after_captured_prose_or_for_another_test_is_unattributed(self):
+        for prefix, thread in (("captured prose\n", "first"), ("", "second")):
+            text = ("test first ... FAILED\n---- first stdout ----\n" + prefix
+                    + f"thread '{thread}' panicked at crates/b.rs:2:4:\n"
+                    + "operation=Deadline kind=None raw_os_error=None\n")
+            with self.subTest(prefix=prefix, thread=thread):
+                rows = lane_run.failure_details(text, False)["failures"]
+                self.assertEqual((rows[0]["location"], rows[0]["panicSites"], rows[0]["category"]),
+                                 (lane_run.UNVERIFIED, [], []))
+                self.assertEqual((rows[1]["test"], rows[1]["testUnverifiedReason"], rows[1]["panicSites"]),
+                                 (lane_run.UNVERIFIED, "ambiguous-panic-block", ["crates/b.rs:2"]))
+                self.assertEqual(rows[1]["category"], [])
+
+    def test_thread_id_must_be_parenthesized_ascii_digits(self):
+        for tid in (" (１２３)", " (-123)", " (123x)", " 123"):
+            text = ("test first ... FAILED\n---- first stdout ----\n"
+                    f"thread 'first'{tid} panicked at crates/a.rs:1:2:\n"
+                    "operation=Deadline kind=None raw_os_error=None\n")
+            with self.subTest(tid=tid):
+                row = lane_run.failure_details(text, False)["failures"][0]
+                self.assertEqual((row["location"], row["panicSites"], row["category"]),
+                                 (lane_run.UNVERIFIED, [], []))
 
     def test_categories_and_multiple_sites_stay_with_their_tests(self):
         text = ("test first ... FAILED\ntest second ... FAILED\n"
                 "---- first stdout ----\n"
-                "thread 'first' panicked at crates/a.rs:1:2:\noperation=Deadline\n"
-                "thread 'worker' panicked at crates/a.rs:2:3:\nkind=Some(TimedOut)\n"
+                "thread 'first' panicked at crates/a.rs:1:2:\n"
+                "operation=Deadline kind=None raw_os_error=None\n"
+                "---- first stderr ----\n"
+                "thread 'first' panicked at crates/a.rs:2:3:\n"
+                "operation=Deadline kind=Some(TimedOut) raw_os_error=None\n"
                 "---- second stdout ----\n"
                 "thread 'second' panicked at crates/b.rs:2:4:\n"
-                "operation=NamedMetadata raw_os_error=Some(13)\n")
+                "operation=NamedMetadata kind=None raw_os_error=Some(13)\n")
         rows = lane_run.failure_details(text, False)["failures"]
         self.assertEqual([(r["test"], r["panicSites"], r["category"]) for r in rows], [
             ("first", ["crates/a.rs:1", "crates/a.rs:2"], ["Deadline", "TimedOut"]),
@@ -187,7 +314,7 @@ class FailureDetailsTests(CheckoutFixture):
     def test_timeout_keeps_panic_facts_before_a_failed_harness_observation(self):
         text = ("test waiting ...\n"
                 "thread 'waiting' panicked at crates/a.rs:1:2:\n"
-                "operation=Deadline kind=Some(TimedOut)\n")
+                "operation=Deadline kind=Some(TimedOut) raw_os_error=None\n")
         detail = lane_run.failure_details(text, True)
         self.assertEqual(detail["timeout"]["runningTests"], ["waiting"])
         row = detail["failures"][0]
@@ -198,9 +325,11 @@ class FailureDetailsTests(CheckoutFixture):
 
     def test_panic_sites_are_bounded_and_backtraces_cannot_add_categories(self):
         text = "test fails ... FAILED\n---- fails stdout ----\n" + "".join(
-            f"thread 'worker{i}' panicked at crates/example/tests/journey.rs:{i + 1}:2:\noperation=Deadline\n"
+            "---- fails stderr ----\n"
+            f"thread 'fails' panicked at crates/example/tests/journey.rs:{i + 1}:2:\n"
+            "operation=Deadline kind=None raw_os_error=None\n"
             for i in range(lane_run.MAX_PANIC_SITES + 3))
-        text += "stack backtrace:\nkind=Some(PermissionDenied) raw_os_error=Some(13)\n"
+        text += "stack backtrace:\noperation=NamedMetadata kind=Some(PermissionDenied) raw_os_error=Some(13)\n"
         row = lane_run.failure_details(text, False)["failures"][0]
         self.assert_facts_only(row)
         self.assertEqual(row["category"], ["Deadline"])
@@ -237,13 +366,19 @@ class FailureDetailsTests(CheckoutFixture):
         for value in ("first assertion", "irrelevant", "other output"):
             self.assertNotIn(value, json.dumps(row))
 
-    def test_captured_worker_panic_belongs_to_the_harness_test_section(self):
+    def test_captured_worker_panic_has_no_verified_test_owner(self):
         text = ("test journey ... FAILED\n---- journey stdout ----\n"
                 "thread 'worker' panicked at crates/a.rs:1:2:\nworker assertion\n")
-        row = lane_run.failure_details(text, False)["failures"][0]
-        self.assert_facts_only(row)
-        self.assertEqual((row["test"], row["location"], row["kind"]), ("journey", "crates/a.rs:1", "panic"))
-        self.assertNotIn("worker", json.dumps(row))
+        rows = lane_run.failure_details(text, False)["failures"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["test"], rows[0]["location"], rows[0]["panicSites"], rows[0]["category"]),
+                         ("journey", lane_run.UNVERIFIED, [], []))
+        self.assertEqual((rows[1]["test"], rows[1]["location"], rows[1]["kind"]),
+                         (lane_run.UNVERIFIED, "crates/a.rs:1", "panic"))
+        self.assertEqual(rows[1]["testUnverifiedReason"], "name-not-declared-in-head")
+        for row in rows:
+            self.assert_facts_only(row)
+        self.assertNotIn("worker", json.dumps(rows))
 
     def test_unsafe_panic_location_is_never_published_as_a_source_site(self):
         for path in ("../escape.rs", "/absolute/file.rs", "crates/missing.rs",
@@ -572,13 +707,21 @@ class FailureDetailsTests(CheckoutFixture):
             "crates/xtrace-private-storage/src/diagnostic.rs": source,
             "crates/example/src/error.rs": "enum AdmissionOperation { WrongCrateValue }",
             "crates/xtrace-private-storage/tests/example.rs": "enum AdmissionOperation { TestValue }",
+            "crates/example/tests/journey.rs": self.sources["crates/example/tests/journey.rs"],
         })
         self.assertEqual(metadata.diagnostic_variants, {"ActualStep", "Admission", "OtherError"})
+        self.assertEqual(metadata.admission_operations, {"ActualStep"})
         row = lane_run.failure_details(self.cargo(message=(
+            "Admission(AdmissionFailure { operation: ActualStep, kind: None, raw_os_error: None }) "
             "ActualStep Admission AdmissionFailure OtherError FieldType CommentValue LiteralValue "
             "OtherValue AttributeValue WrongCrateValue TestValue")), False, metadata=metadata)["failures"][0]
-        self.assertEqual(row["category"], ["ActualStep", "Admission", "OtherError"])
-        self.assertEqual(row["testUnverifiedReason"], "name-not-declared-in-head")
+        self.assertEqual(row["category"], ["Admission", "ActualStep"])
+        self.assertEqual(row["test"], "fails")
+        for operation in ("OtherError", "FieldType", "CommentValue", "LiteralValue", "OtherValue",
+                          "AttributeValue", "WrongCrateValue", "TestValue"):
+            with self.subTest(operation=operation):
+                self.assertEqual(lane_run._panic_categories(
+                    f"operation={operation} kind=None raw_os_error=None", metadata, lane_run.CANARY_INDEX), [])
 
     def test_unverified_name_reason_distinguishes_privacy_from_missing_declaration(self):
         index = lane_run.canary.build_index({"name": "fails", "category": "Deadline"})
@@ -709,7 +852,9 @@ class CommittedCheckoutTests(unittest.TestCase):
         self.assertEqual(metadata.diagnostic_variants, {"Deadline"})
         row = lane_run.failure_details(FailureDetailsTests.cargo(
             name="committed_test", site="crates/tests/example.rs:2:1",
-            message="Deadline StagedValue UntrackedValue"), False, metadata=metadata)["failures"][0]
+            message=("operation=Deadline kind=None raw_os_error=None "
+                     "operation=StagedValue kind=None raw_os_error=None "
+                     "operation=UntrackedValue kind=None raw_os_error=None")), False, metadata=metadata)["failures"][0]
         self.assertEqual(row["category"], ["Deadline"])
         self.assertNotIn("StagedValue", json.dumps(row))
         self.assertNotIn("UntrackedValue", json.dumps(row))
@@ -932,7 +1077,7 @@ class RunTests(CheckoutFixture):
         text = FailureDetailsTests.cargo(message=(
             "admit scratch: Admission(AdmissionFailure { operation: WaitAclProbe, "
             "kind: Some(PermissionDenied), raw_os_error: Some(13) })\n"
-            "captured-value-731 /private/example/path 999999")) + "test waiting ...\n"
+            "captured-value-731 /private/example/path 999999"), thread_id=987654321) + "test waiting ...\n"
         public = io.StringIO()
         with contextlib.redirect_stdout(public):
             frag = self.timed_out_step(text)
@@ -944,9 +1089,45 @@ class RunTests(CheckoutFixture):
         logged = [json.loads(line.removeprefix("lane failure ")) for line in public.getvalue().splitlines()
                   if line.startswith("lane failure ")]
         self.assertEqual(logged, [row])
-        for value in ("captured-value-731", "/private/example/path", "999999", "AdmissionFailure"):
+        for value in ("captured-value-731", "/private/example/path", "999999", "AdmissionFailure", "987654321"):
             self.assertNotIn(value, json.dumps(frag))
             self.assertNotIn(value, public.getvalue())
+
+    def test_current_headers_have_fragment_and_job_log_parity_in_all_output_modes(self):
+        import contextlib
+        import io
+        message = ("parent: Admission(AdmissionFailure { operation: OwnershipAndMode, "
+                   "kind: None, raw_os_error: None })")
+        header = "thread 'fails' (987654321) panicked at crates/example/tests/journey.rs:42:7:\n"
+        cases = [
+            ("captured", FailureDetailsTests.cargo(name="fails", message=message, thread_id=987654321), False),
+            ("nocapture", header + message + "\ntest fails ... FAILED\n", False),
+            ("timeout", "test fails ...\n" + header + message + "\n", True),
+            ("captured-timeout", "---- fails stdout ----\n" + header + message + "\n", True),
+        ]
+        for mode, text, timed_out in cases:
+            with self.subTest(mode=mode):
+                public = io.StringIO()
+                with contextlib.redirect_stdout(public):
+                    if timed_out:
+                        frag = self.timed_out_step(text)
+                    else:
+                        rc, frag = self.run_step([sys.executable, "-c", f"print({text!r}); raise SystemExit(101)"])
+                        self.assertEqual(rc, 101)
+                self.assertEqual(frag["timedOut"], timed_out)
+                self.assertEqual(len(frag["failureDetails"]["failures"]), 1)
+                row = frag["failureDetails"]["failures"][0]
+                self.assert_facts_only(row)
+                self.assertEqual((row["test"], row["location"], row["kind"]),
+                                 ("fails", "crates/example/tests/journey.rs:42", "panic"))
+                self.assertEqual(row["panicSites"], ["crates/example/tests/journey.rs:42"])
+                self.assertEqual(row["category"], ["Admission", "OwnershipAndMode"])
+                logged = [json.loads(line.removeprefix("lane failure "))
+                          for line in public.getvalue().splitlines() if line.startswith("lane failure ")]
+                self.assertEqual(logged, [row])
+                for value in ("987654321", "parent:", "AdmissionFailure", "raw_os_error"):
+                    self.assertNotIn(value, json.dumps(frag))
+                    self.assertNotIn(value, public.getvalue())
 
     def test_timeout_fragment_never_serializes_progress_values(self):
         cases = [
