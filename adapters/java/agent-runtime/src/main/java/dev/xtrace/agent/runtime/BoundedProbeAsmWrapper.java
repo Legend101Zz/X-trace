@@ -10,6 +10,7 @@ import net.bytebuddy.description.field.FieldList;
 import net.bytebuddy.description.method.MethodList;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.implementation.Implementation;
+import net.bytebuddy.jar.asm.ClassReader;
 import net.bytebuddy.jar.asm.ClassVisitor;
 import net.bytebuddy.jar.asm.ClassWriter;
 import net.bytebuddy.jar.asm.MethodVisitor;
@@ -27,10 +28,16 @@ final class BoundedProbeAsmWrapper extends AsmVisitorWrapper.AbstractBase {
   }
 
   @Override
-  public int mergeWriter(int flags) { return probes.mergeWriter(flags); }
+  public int mergeWriter(int flags) {
+    // Serialize only after the final, selected bodies have had all control-flow frames rebuilt.
+    // A frame computation failure escapes make() into AgentBuilder's fail-open/onError path.
+    return probes.mergeWriter(flags) | ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS;
+  }
 
   @Override
-  public int mergeReader(int flags) { return probes.mergeReader(flags); }
+  public int mergeReader(int flags) {
+    return (probes.mergeReader(flags) | ClassReader.EXPAND_FRAMES) & ~ClassReader.SKIP_FRAMES;
+  }
 
   @Override
   public ClassVisitor wrap(TypeDescription type, ClassVisitor writer, Implementation.Context context,

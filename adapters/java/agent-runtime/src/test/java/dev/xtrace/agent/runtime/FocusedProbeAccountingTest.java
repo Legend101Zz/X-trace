@@ -876,6 +876,79 @@ class FocusedProbeAccountingTest {
   }
 
   @Test
+  void frameComputationFailureKeepsOriginalBytesAndMarksOpenAndFutureRecordingsPartial() throws Exception {
+    String name = "demo.probe.Orders";
+    ClassLoader parent = getClass().getClassLoader();
+    byte[] original = ClassFileLocator.ForClassLoader.of(parent).locate(name).resolve();
+    ClassLoader loader = new ClassLoader(parent) { };
+    var listener = new FixtureInstrumentation.SafeListener(
+        () -> fail("ordinary application frame failure must preserve the runtime"),
+        new ApplicationScope(List.of("demo.probe"), List.of()), limitations);
+    var broken = new net.bytebuddy.asm.AsmVisitorWrapper.AbstractBase() {
+      @Override
+      public ClassVisitor wrap(net.bytebuddy.description.type.TypeDescription type, ClassVisitor writer,
+          net.bytebuddy.implementation.Implementation.Context context, TypePool pool,
+          net.bytebuddy.description.field.FieldList<net.bytebuddy.description.field.FieldDescription.InDefinedShape> fields,
+          net.bytebuddy.description.method.MethodList<?> methods, int writerFlags, int readerFlags) {
+        return new ClassVisitor(Opcodes.ASM9, writer) {
+          @Override
+          public MethodVisitor visitMethod(int access, String method, String descriptor,
+              String signature, String[] exceptions) {
+            MethodVisitor output = super.visitMethod(access, method, descriptor, signature, exceptions);
+            if (!method.equals("create") || !descriptor.startsWith("(Ljava/lang/String;")) return output;
+            return new MethodVisitor(Opcodes.ASM9, output) {
+              @Override
+              public void visitCode() {
+                super.visitCode();
+                // An empty-stack pop followed by an edge forces final frame computation to fail.
+                // Without COMPUTE_FRAMES make() would hand this malformed body to the JVM.
+                Label merge = new Label();
+                visitInsn(Opcodes.POP);
+                visitJumpInsn(Opcodes.GOTO, merge);
+                visitLabel(merge);
+              }
+            };
+          }
+        };
+      }
+    };
+    var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+    var transformer = new AgentBuilder.Default().with(new AgentBuilder.Listener.Compound(listener,
+        new AgentBuilder.Listener.Adapter() {
+          @Override
+          public void onError(String type, ClassLoader definingLoader, net.bytebuddy.utility.JavaModule module,
+              boolean loaded, Throwable problem) { failure.set(problem); }
+        }))
+        .type((type, definingLoader, module, redefined, domain) -> {
+          listener.observeScope(definingLoader, type.getName(), domain);
+          return type.getName().equals(name);
+        })
+        .transform((builder, type, definingLoader, module, domain) -> builder.visit(
+            new BoundedProbeAsmWrapper(broken, ignored -> limitations.report())))
+        .makeRaw();
+    assertTrue(BootstrapBridge.requestStart("GET", "/open-frame-failure"));
+    assertNull(transformer.transform(loader, name.replace('.', '/'), null, null, original),
+        "a failed frame computation must keep the JVM's original input bytes");
+    assertNotNull(failure.get());
+    assertTrue(java.util.Arrays.stream(failure.get().getStackTrace())
+        .anyMatch(frame -> frame.getClassName().equals("net.bytebuddy.jar.asm.MethodWriter")
+            && frame.getMethodName().equals("computeAllFrames")),
+        "the negative control must reach final frame computation: " + failure.get());
+    assertEquals(1, limitations.count());
+    Class<?> preserved = new ClassLoader(parent) {
+      Class<?> define() { return defineClass(name, original, 0, original.length); }
+    }.define();
+    Object target = preserved.getConstructor().newInstance();
+    assertEquals("ABC", preserved.getMethod("create", String.class).invoke(target, " abc "));
+    BootstrapBridge.requestEnd(200, false);
+    assertTrue(BootstrapBridge.requestStart("GET", "/after-frame-failure"));
+    BootstrapBridge.requestEnd(200, false);
+    CapturedRecording persisted = assertPersistedPartial(2, 2);
+    assertEquals(1, persistedGaps(persisted, 0));
+    assertEquals(1, persistedGaps(persisted, 1));
+  }
+
+  @Test
   void ordinaryApplicationTransformationFailureMarksOpenAndFutureRecordingsPartial() throws Exception {
     String name = "demo.probe.Orders";
     ClassLoader parent = getClass().getClassLoader();

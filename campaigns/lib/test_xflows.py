@@ -1,4 +1,5 @@
 import json
+import hashlib
 from contextlib import nullcontext
 import pathlib
 import subprocess
@@ -20,10 +21,11 @@ def rec(method="GET", route="/vets", completion="complete", events=4, evidence=(
 
 
 def line_rec(start=10, end=30, lines=(12, 15), fid="f1", with_source=True):
-    evs = [{"kind": "recording_event_kind:frame_enter", "frameId": fid, "symbol": "A.run",
+    symbol = "A.run#m1:" + hashlib.sha256(b"demo.A\0run\0()V").hexdigest()
+    evs = [{"kind": "recording_event_kind:frame_enter", "frameId": fid, "symbol": symbol,
             "source": {"path": "A.java", "startLine": start, "endLine": end, "status": "matched"} if with_source else None}]
     evs += [{"kind": "recording_event_kind:line_cursor", "frameId": f"{fid}-cursor-{i}", "parentFrameId": fid,
-             "line": n, "symbol": "A.run",
+             "line": n, "symbol": symbol,
              "source": {"path": "A.java", "startLine": n, "endLine": n, "status": "matched"}}
             for i, n in enumerate(lines)]
     return {"events": evs}
@@ -135,10 +137,11 @@ class Judges(unittest.TestCase):
 
     def test_accessor_cursor_cannot_borrow_its_callers_overlapping_extent(self):
         detail = line_rec()
+        getter = "A.getName#m1:" + hashlib.sha256(b"demo.A\0getName\0()Ljava/lang/String;").hexdigest()
         for event in detail["events"][1:]:
-            event["symbol"] = "A.getName"
+            event["symbol"] = getter
         # The getter was observed, but its id is not the recorded cursor parent.
-        detail["events"].append({**detail["events"][0], "frameId": "getter", "symbol": "A.getName"})
+        detail["events"].append({**detail["events"][0], "frameId": "getter", "symbol": getter})
         self.assertEqual(xflows.line_parent_gaps([detail]), {"parent-method-symbol-mismatch": 2})
         status, note = xflows.judge_active_line([detail])
         self.assertEqual(status, "fail")
@@ -149,6 +152,32 @@ class Judges(unittest.TestCase):
             event["parentFrameId"] = "getter"
         self.assertEqual(xflows.line_parent_gaps([detail]), {})
         self.assertEqual(xflows.judge_active_line([detail])[0], "pass")
+
+    def test_overload_cursor_cannot_borrow_a_same_named_callers_overlapping_lines(self):
+        detail = line_rec()
+        # Both overloads declare the same lines. The callee's entry was dropped, and its cursor
+        # borrows the accepted caller's parent id. Names and extents alone would accept this.
+        callee = "A.run#m1:" + hashlib.sha256(b"demo.A\0run\0(I)V").hexdigest()
+        for event in detail["events"][1:]:
+            event["symbol"] = callee
+        status, note = xflows.judge_active_line([detail])
+        self.assertEqual(status, "fail")
+        self.assertEqual(xflows.line_parent_gaps([detail]), {"parent-method-symbol-mismatch": 2})
+        self.assertIn("parent-method-symbol-mismatch", note)
+        self.assertNotIn(callee, note)
+        detail["events"].append({**detail["events"][0], "frameId": "overload", "symbol": callee})
+        for event in detail["events"][1:3]:
+            event["parentFrameId"] = "overload"
+        self.assertEqual(xflows.judge_active_line([detail])[0], "pass")
+
+    def test_cursor_parent_requires_an_observed_overload_distinguishing_identity(self):
+        for symbol in (None, "A.run", "A.run#m1:" + "0" * 63, "A.run#m1:" + "g" * 64):
+            with self.subTest(symbol=symbol):
+                detail = line_rec()
+                for event in detail["events"]:
+                    event["symbol"] = symbol
+                self.assertEqual(xflows.line_parent_gaps([detail]), {"parent-method-identity-unavailable": 2})
+                self.assertEqual(xflows.judge_active_line([detail])[0], "fail")
 
     def test_request_parent_is_not_a_method_extent_even_with_matching_source(self):
         detail = line_rec()

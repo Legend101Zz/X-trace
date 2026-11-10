@@ -26,6 +26,7 @@ dependencies {
 
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
+    jvmArgs("-Xverify:all")
 }
 
 tasks.jar {

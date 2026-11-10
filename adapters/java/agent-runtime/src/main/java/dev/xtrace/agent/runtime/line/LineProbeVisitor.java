@@ -20,12 +20,12 @@ import net.bytebuddy.jar.asm.TypePath;
  * ASM class visitor that inserts a call-only static probe at the first instruction of every
  * LineNumberTable entry (ADR 0003 section 2.2).
  *
- * <p>Safety rules that make the output verifier-clean without frame recomputation:
+ * <p>Safety rules for the inserted probes:
  *
  * <ul>
  *   <li>Probes push constants / already-live locals and call a static {@code void} method, so the
- *       operand stack is neutral at every inserted point. Only {@code COMPUTE_MAXS} is needed; the
- *       writer must not use {@code COMPUTE_FRAMES}.
+ *       operand stack is neutral at every inserted point. The standalone line-only instrumenter
+ *       preserves frames; wrappers adding guarded gap calls rebuild frames for the new handlers.
  *   <li>A probe is placed immediately before the first real instruction at or after the line label,
  *       after any {@code visitFrame} for that offset, so a stack map frame still describes the first
  *       byte of the probe (jump targets land on the probe, never past it).

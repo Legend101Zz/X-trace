@@ -28,6 +28,7 @@ import json
 from contextlib import ExitStack
 import os
 import pathlib
+import re
 import secrets
 import shlex
 import signal
@@ -249,10 +250,14 @@ def _line_parent_failure(event: dict, parent: dict | None) -> str | None:
         return "parent-not-observed"
     if not str(parent.get("kind", "")).endswith("frame_enter"):
         return "parent-is-not-method-entry"
-    # An accessor cursor can otherwise borrow its caller's overlapping extent.
-    # Compare observed symbols only; never infer a parent from a matching symbol.
+    # Simple names and source extents cannot distinguish overloads on the same line. Java agents
+    # append SHA-256(declaring binary name, method, descriptor); never infer a missing identity.
     if event.get("symbol") and parent.get("symbol") and event["symbol"] != parent["symbol"]:
         return "parent-method-symbol-mismatch"
+    identities = [re.fullmatch(r".+#m1:([0-9a-f]{64})", str(item.get("symbol", "")))
+                  for item in (event, parent)]
+    if any(identity is None for identity in identities):
+        return "parent-method-identity-unavailable"
     source = parent.get("source")
     if not isinstance(source, dict) or type(source.get("startLine")) is not int or source["startLine"] < 1:
         return "parent-method-extent-unavailable"
