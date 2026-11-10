@@ -235,6 +235,24 @@ public final class BootstrapBridge {
     return symbol;
   }
 
+  /** Constructor body entry; no receiver is passed, and probe failures never escape. */
+  public static String constructorEnter(Class<?> type, String descriptor) {
+    try {
+      return frameEnter(type, "<init>", descriptor);
+    } catch (Throwable ignored) {
+      return null;
+    }
+  }
+
+  /** Closes only a constructor body whose entry ran while capture was active. */
+  public static void constructorExit(String symbol, Throwable thrown) {
+    try {
+      if (symbol != null) frameExit(symbol, thrown);
+    } catch (Throwable ignored) {
+      // Constructor instrumentation must preserve both normal returns and the original throwable.
+    }
+  }
+
   /** Emits proxy boundaries on the same parent stack and loss counters as concrete methods. */
   static boolean proxyFrame(
       ProxyBridge.Call call, Object[] arguments, Object result, Throwable thrown, boolean entering) {

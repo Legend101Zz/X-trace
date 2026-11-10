@@ -38,6 +38,9 @@ import net.bytebuddy.jar.asm.TypePath;
  *
  * <p>Local reads (focused mode) are gated by the LocalVariableTable range covering the probe, and
  * never read slot 0 of an instance method (it may be {@code uninitializedThis} in a constructor).
+ * Constructor probes start at the first mapped instruction after delegation returns; production
+ * composition opens a body boundary there and records an entry gap for the omitted preamble.
+ * Class initializers are skipped and use the same explicit-gap path as other unsupported code.
  */
 public class LineProbeVisitor extends ClassVisitor {
   private static final int ASM = Opcodes.ASM9;
@@ -47,6 +50,7 @@ public class LineProbeVisitor extends ClassVisitor {
   private final byte[] classDigest;
   private final List<MethodReport> reports;
   private String className = "";
+  private String superName;
   private int classVersion;
   /** False once any marker says the class was not produced by javac (LVT precision unknown). */
   private boolean javacLvtTrusted = true;
@@ -71,6 +75,7 @@ public class LineProbeVisitor extends ClassVisitor {
   public void visit(
       int version, int access, String name, String signature, String superName, String[] interfaces) {
     this.className = name;
+    this.superName = superName;
     classVersion = version & 0xffff;
     denied = name.equals(config.probeOwner()) || isDenyScope(name);
     if (denied) {
@@ -127,13 +132,9 @@ public class LineProbeVisitor extends ClassVisitor {
     MethodVisitor next = super.visitMethod(access, name, descriptor, signature, exceptions);
     if (next == null) return null;
     if (denied) return next;
-    if ((access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) return next;
-    if ((access & Opcodes.ACC_BRIDGE) != 0) {
-      reports.add(skipped(name, descriptor, Reasons.BRIDGE));
-      return next;
-    }
-    if ((access & Opcodes.ACC_SYNTHETIC) != 0 && !name.startsWith("lambda$")) {
-      reports.add(skipped(name, descriptor, Reasons.SYNTHETIC));
+    String exclusion = ProbeEligibility.exclusion(access, name);
+    if (exclusion != null && !Reasons.INITIALIZER.equals(exclusion)) {
+      if (!exclusion.equals(Reasons.NO_CODE)) reports.add(skipped(name, descriptor, exclusion));
       return next;
     }
     return new Buffer(next, access, name, descriptor);
@@ -488,6 +489,12 @@ public class LineProbeVisitor extends ClassVisitor {
 
     private Decision decide() {
       String skip = classSkipReason();
+      if (skip == null) skip = ProbeEligibility.exclusion(access, name);
+      if (skip == null && name.equals("<init>")) {
+        ConstructorPreamble preamble = new ConstructorPreamble(className, superName);
+        for (var op : ops) op.accept(preamble);
+        if (!preamble.supported()) skip = Reasons.CONSTRUCTOR_PREAMBLE;
+      }
       if (skip == null) {
         if (!hasLine) skip = Reasons.NO_LINE_TABLE;
         else if (hasJsrRet) skip = Reasons.JSR_RET;
@@ -603,7 +610,10 @@ public class LineProbeVisitor extends ClassVisitor {
     /** Pending-line walk: one planned site per run of line entries before a real instruction. */
     private List<PlannedSite> plan() {
       List<PlannedSite> plan = new ArrayList<>();
+      ConstructorPreamble preamble = name.equals("<init>")
+          ? new ConstructorPreamble(className, superName) : null;
       int pendingLine = -1;
+      int currentLine = -1;
       for (int i = 0; i < ops.size(); i++) {
         Kind kind = kinds.get(i);
         if (kind == Kind.LINE) {
@@ -612,9 +622,22 @@ public class LineProbeVisitor extends ClassVisitor {
             zeroLineEntries++;
             pendingLine = -1;
           }
+          currentLine = pendingLine;
         } else if (kind == Kind.INSN && pendingLine > 0) {
-          plan.add(new PlannedSite(i, pendingLine, config.focusedValues() ? liveAt(i) : List.of()));
+          if (preamble == null || preamble.initialized()) {
+            plan.add(new PlannedSite(i, pendingLine, config.focusedValues() ? liveAt(i) : List.of()));
+          }
           pendingLine = -1;
+        }
+        if (preamble != null) {
+          boolean wasInitialized = preamble.initialized();
+          ops.get(i).accept(preamble);
+          if (!wasInitialized && preamble.initialized()) {
+            // The line table still maps the instruction after delegation to this source line.
+            // Observe that instruction only after our body boundary opens, even for an implicit
+            // constructor whose entire body (including RETURN) has one line table entry.
+            pendingLine = currentLine;
+          }
         }
       }
       return plan;
