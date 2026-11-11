@@ -1784,8 +1784,8 @@ mod tests {
 
     // ---- probe-count bounds -------------------------------------------------------------
     //
-    // On macOS every directory ACL probe is a `/bin/ls` subprocess, so the number of probes an
-    // operation runs is its latency. These tests count real probes (the cfg(test) counter in
+    // On macOS a directory ACL probe uses native empty-ACL evidence or `/bin/ls`. These tests
+    // count ACL decisions independently of subprocesses (the cfg(test) counter in
     // `probe`) and pin an upper bound per operation for a path of D directories (the root plus
     // each component). With the per-operation memo each distinct directory state is probed once:
     // `revalidate` costs D, and `create_private_child` costs D plus re-probes of the parent (whose

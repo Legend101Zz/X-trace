@@ -1,6 +1,6 @@
 //! Owner-enforced private directory admission for local X-trace state.
 //!
-//! This is a leaf crate: it depends on no other X-trace crate so the store, the
+//! The macOS SDK bridge is the only X-trace dependency, so the store, the
 //! runtime, the daemon and the CLI can all share one implementation of the
 //! private-storage policy (ownership, mode, ACL, filesystem type, and path
 //! identity) without depending on each other.
@@ -14,6 +14,8 @@
 mod admission;
 #[cfg(unix)]
 mod diagnostic;
+#[cfg(target_os = "macos")]
+mod macos_acl;
 #[cfg(unix)]
 pub use diagnostic::{AdmissionFailure, AdmissionOperation};
 #[cfg(unix)]

@@ -9,6 +9,7 @@ members = [
     "crates/xtrace-cli",
     "crates/xtrace-daemon",
     "crates/xtrace-private-storage",
+    "crates/xtrace-macos-acl",
     "crates/xtrace-runtime",
     "crates/xtrace-tui",
     "crates/xtrace-export",

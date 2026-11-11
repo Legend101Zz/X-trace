@@ -1,0 +1,29 @@
+[package]
+name = "xtrace-macos-acl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Safe, minimal macOS SDK ACL evidence bridge."
+
+# Only this SDK bridge permits unsafe. build.rs checks every other workspace lint.
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+pedantic = { level = "allow", priority = -1 }
+allow_attributes = "allow"
+allow_attributes_without_reason = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+result_large_err = "allow"
+
+[build-dependencies]
+toml = { workspace = true }

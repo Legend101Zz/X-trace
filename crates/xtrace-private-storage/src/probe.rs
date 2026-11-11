@@ -1,7 +1,7 @@
 //! ACL probes and the per-operation verdict memo.
 //!
-//! Admission walks every component of a path, and on macOS the only available oracle for "does
-//! this directory carry an ACL" is a `/bin/ls -ldeO` subprocess. A single operation (one
+//! Admission walks every component of a path. On macOS an exact native empty-ACL query avoids
+//! single-object `/bin/ls -ldeO` probes; all other results keep the listing oracle. An operation (one
 //! `revalidate`, one `create_private_child`, ...) used to spawn it several times per component. An
 //! [`Operation`] bounds one such operation with a single deadline and remembers which directory
 //! *states* it has already judged acceptable, so eligible states are probed once while space
@@ -438,8 +438,8 @@ pub(crate) fn probed_paths() -> Vec<std::path::PathBuf> {
     PROBED_PATHS.with(|paths| paths.borrow().clone())
 }
 
-/// Number of real directory ACL probes this thread has run (a `/bin/ls` spawn on macOS, the
-/// extended-attribute reads on Linux). Test seam for the probe-count bounds.
+/// Number of directory ACL decisions this thread has probed (native or listing evidence on
+/// macOS, extended-attribute reads on Linux). Test seam for the probe-count bounds.
 #[cfg(test)]
 pub(crate) fn directory_probe_count() -> usize {
     DIRECTORY_PROBES.with(std::cell::Cell::get)
@@ -619,7 +619,7 @@ fn recheck_directory_listing(
     path: &Path,
     directory: &File,
     expected: FileIdentity,
-    original: &str,
+    original: &DirectoryEvidence,
 ) -> bool {
     loop {
         let Some(before) = directory_metadata(operation, path, directory, expected, role) else {
@@ -644,7 +644,13 @@ fn recheck_directory_listing(
             );
             return false;
         }
-        if !original.lines().skip(1).eq(text.lines().skip(1)) {
+        let same_acl = match original {
+            DirectoryEvidence::NoAcl => text.lines().nth(1).is_none(),
+            DirectoryEvidence::Listing(original) => {
+                original.lines().skip(1).eq(text.lines().skip(1))
+            }
+        };
+        if !same_acl {
             diagnostic::observe_context(
                 Step::AclState,
                 AdmissionContext::listing(
@@ -781,22 +787,36 @@ fn probe_directory(
 }
 
 #[cfg(target_os = "macos")]
-fn probe_directory(operation: &Operation, path: &Path, directory: &File) -> Option<String> {
+enum DirectoryEvidence {
+    NoAcl,
+    Listing(String),
+}
+
+#[cfg(target_os = "macos")]
+fn probe_directory(
+    operation: &Operation,
+    path: &Path,
+    directory: &File,
+) -> Option<DirectoryEvidence> {
     // Lazy batch: taken only now that a directory on the walk missed the memo.
-    let text = prefetched_listing(operation, path, directory)
-        .or_else(|| {
-            operation
-                .spawn_batch_for(path)
-                .then(|| prefetched_listing(operation, path, directory))
-                .flatten()
-        })
-        .or_else(|| match run_acl_listing(path, operation.deadline()) {
-            Ok(text) => Some(text),
-            Err(failure) => {
-                operation.record_failure(failure);
-                None
-            }
-        })?;
+    let text = prefetched_listing(operation, path, directory).or_else(|| {
+        operation
+            .spawn_batch_for(path)
+            .then(|| prefetched_listing(operation, path, directory))
+            .flatten()
+    });
+    // Keep the already amortised walk batch. A native query only replaces an otherwise
+    // necessary single-object listing, inside the caller's unchanged state/identity bracket.
+    if text.is_none() && native_no_acl(path, Some(directory), true) {
+        return Some(DirectoryEvidence::NoAcl);
+    }
+    let text = text.or_else(|| match run_acl_listing(path, operation.deadline()) {
+        Ok(text) => Some(text),
+        Err(failure) => {
+            operation.record_failure(failure);
+            None
+        }
+    })?;
     if let Err(refusal) = directory_listing_verdict(&text, path) {
         operation.record_failure(AdmissionFailure::check_context(
             Step::AclPolicy,
@@ -804,7 +824,44 @@ fn probe_directory(operation: &Operation, path: &Path, directory: &File) -> Opti
         ));
         return None;
     }
-    Some(text)
+    Some(DirectoryEvidence::Listing(text))
+}
+
+/// The native result replaces only an empty-ACL listing. Preserve the listing parser's path
+/// and file-flag restrictions as well as its object type. Every failure falls back to `ls`.
+#[cfg(target_os = "macos")]
+fn native_no_acl(path: &Path, descriptor: Option<&File>, directory: bool) -> bool {
+    use std::os::macos::fs::MetadataExt as _;
+    if !path.as_os_str().as_encoded_bytes().is_ascii()
+        || path.as_os_str().to_string_lossy().chars().any(char::is_control)
+    {
+        return false;
+    }
+    let metadata = match descriptor {
+        Some(file) => file.metadata(),
+        None => std::fs::symlink_metadata(path),
+    };
+    let Ok(metadata) = metadata else { return false };
+    // <sys/stat.h>: UF_HIDDEN, SF_RESTRICTED, SF_NOUNLINK; same flags as policy.rs.
+    const ALLOWED_FLAGS: u32 = 0x0000_8000 | 0x0008_0000 | 0x0010_0000;
+    if (if directory { !metadata.is_dir() } else { !metadata.is_file() })
+        || metadata.st_flags() & !ALLOWED_FLAGS != 0
+        || !crate::macos_acl::listing_names_compatible(&metadata)
+    {
+        return false;
+    }
+    let absent = crate::macos_acl::no_extended_acl(path, descriptor);
+    #[cfg(test)]
+    if absent {
+        let hook = AFTER_NATIVE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|hook| hook.path == path) { slot.take() } else { None }
+        });
+        if let Some(hook) = hook {
+            (hook.action)();
+        }
+    }
+    absent
 }
 
 #[cfg(target_os = "macos")]
@@ -1007,7 +1064,7 @@ pub(crate) fn acl_admits_file(
     false
 }
 
-/// Path-based macOS ACL probe for a regular file; never opens the file.
+/// macOS ACL evidence for a regular file; never opens another file descriptor.
 ///
 /// Threat model: an ACL edit by the owner or another process must not make a
 /// remembered deny-only verdict admit an allow entry. Reuse is APFS-only (nanosecond
@@ -1055,7 +1112,7 @@ fn file_listing_admits(
                 .and_then(|id| scope::with_scope(id, |scope| scope.file_memo.contains(key)))
                 .unwrap_or(false)
     });
-    if !remembered {
+    if !remembered && !native_no_acl(path, file, false) {
         let text = match run_acl_listing(path, operation.deadline()) {
             Ok(text) => text,
             Err(failure) => {
@@ -1115,6 +1172,7 @@ thread_local! {
     static BATCH_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static AFTER_LISTING: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
     static AFTER_INITIAL_STATE: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
+    static AFTER_NATIVE: RefCell<Option<AfterListing>> = const { RefCell::new(None) };
     /// Test-only HFS+ facts: a chosen ctime second and a filesystem ineligible for reuse.
     static COARSE_FILESYSTEM: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
@@ -1866,6 +1924,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn child_activity_during_directory_admission_requires_a_fresh_unchanged_listing() {
+        // Exercise the listing fallback and retain its existing spawn/race assertions.
+        let _native_error = crate::macos_acl::NativeError::inject();
         for scoped in [false, true] {
             for batched in [false, true] {
                 for edit in [ContentEdit::Create, ContentEdit::Rename, ContentEdit::Remove] {
@@ -1923,6 +1983,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_child_change_does_not_hide_a_deny_only_acl_edit_during_a_single_listing() {
+        // Exercise the listing fallback and retain its existing spawn/race assertions.
+        let _native_error = crate::macos_acl::NativeError::inject();
         let root = fixture();
         let path = root.path();
         let directory = open(path);
@@ -1938,6 +2000,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_content_recheck_still_refuses_an_acl_edit_after_its_listing() {
+        // Exercise the listing fallback and retain its existing spawn/race assertions.
+        let _native_error = crate::macos_acl::NativeError::inject();
         for entry in ["group:everyone allow read", "group:everyone deny delete"] {
             let root = fixture();
             let path = root.path();
@@ -2025,6 +2089,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn coarse_ctime_child_races_cannot_recover_with_a_listing_that_hides_an_acl_grant() {
+        // Exercise the listing fallback and retain its existing spawn/race assertions.
+        let _native_error = crate::macos_acl::NativeError::inject();
         for scoped in [false, true] {
             let root = fixture();
             let path = root.path();
@@ -2230,6 +2296,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn operation_and_scope_memos_are_bounded_across_directory_and_file_verdicts() {
+        // Exercise the listing fallback and retain its existing spawn/race assertions.
+        let _native_error = crate::macos_acl::NativeError::inject();
         for file_entries in [0, SCOPE_MEMO_LIMIT] {
             let root = fixture();
             let directory = open(root.path());
@@ -2273,6 +2341,209 @@ mod tests {
             assert_eq!(
                 scope::with_scope(id, |scope| scope.memo.len() + scope.file_memo.len()),
                 Some(SCOPE_MEMO_LIMIT)
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_empty_acl_admits_files_and_directories_but_grants_use_the_listing() {
+        let root = fixture();
+        let directory = open(root.path());
+        let path = root.path().join("private-file");
+        let file = File::create(&path).expect("fixture file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("private mode");
+        for kind in 0..3 {
+            // 0: held directory; 1: held regular file; 2: descriptor-free connection file.
+            let admits = |operation: &Operation| match kind {
+                0 => judge(operation, root.path(), &directory),
+                1 => acl_admits_file(&path, &file, identity_of(&file), operation),
+                _ => named_file_acl_admits(&path, &directory, identity_of(&file), operation),
+            };
+            let object = if kind == 0 { root.path() } else { path.as_path() };
+            let before = ls_spawn_count();
+            let decisions = directory_probe_count();
+            assert!(admits(&Operation::new()));
+            assert_eq!(ls_spawn_count(), before, "empty ACL must use native evidence");
+            assert_eq!(directory_probe_count() - decisions, usize::from(kind == 0));
+
+            edit_acl(object, "+a", "group:everyone allow read");
+            let operation = Operation::new();
+            assert!(!admits(&operation));
+            assert_eq!(ls_spawn_count() - before, 1, "present ACL must use ls");
+            let native_fallback_failure = operation.failure(Step::AclState);
+            {
+                let _native_error = crate::macos_acl::NativeError::inject();
+                let operation = Operation::new();
+                assert!(!admits(&operation));
+                assert_eq!(operation.failure(Step::AclState), native_fallback_failure);
+            }
+            edit_acl(object, "-a", "group:everyone allow read");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_errors_fall_back_without_changing_admission_or_recording_an_error() {
+        let root = fixture();
+        let directory = open(root.path());
+        let path = root.path().join("private-file");
+        let file = File::create(&path).expect("fixture file");
+        let _native_error = crate::macos_acl::NativeError::inject();
+        let before = ls_spawn_count();
+        let operation = Operation::new();
+        assert!(judge(&operation, root.path(), &directory));
+        assert!(acl_admits_file(&path, &file, identity_of(&file), &operation));
+        assert!(named_file_acl_admits(&path, &directory, identity_of(&file), &Operation::new()));
+        assert_eq!(ls_spawn_count() - before, 3);
+        assert!(operation.failure.get().is_none(), "native errors must not escape fallback");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unchanged_no_acl_files_remove_one_subprocess_per_admission_without_a_scope() {
+        const FILES: usize = 12;
+        let root = fixture();
+        let directory = open(root.path());
+        let files = (0..FILES)
+            .map(|index| {
+                let path = root.path().join(format!("private-{index}"));
+                let file = File::create(&path).expect("fixture file");
+                (path, file)
+            })
+            .collect::<Vec<_>>();
+        for descriptor_backed in [false, true] {
+            let admit_all = || {
+                for (path, file) in &files {
+                    let operation = Operation::new();
+                    let identity = identity_of(file);
+                    assert!(if descriptor_backed {
+                        acl_admits_file(path, file, identity, &operation)
+                    } else {
+                        named_file_acl_admits(path, &directory, identity, &operation)
+                    });
+                }
+            };
+            let before = ls_spawn_count();
+            {
+                let _native_error = crate::macos_acl::NativeError::inject();
+                admit_all();
+            }
+            assert_eq!(ls_spawn_count() - before, FILES, "baseline: one ls per file");
+            let before = ls_spawn_count();
+            admit_all();
+            assert_eq!(ls_spawn_count(), before, "native evidence needs no processes");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_evidence_is_still_bound_to_unchanged_descriptor_and_named_states() {
+        for kind in 0..3 {
+            for replace in [false, true] {
+                let root = fixture();
+                let directory = open(root.path());
+                let path = root.path().join("private-file");
+                let file = File::create(&path).expect("fixture file");
+                let object = if kind == 0 { root.path() } else { path.as_path() };
+                let changed = object.to_path_buf();
+                let hook = if replace {
+                    AfterListing {
+                        path: changed.clone(),
+                        action: Box::new(move || {
+                            std::fs::rename(&changed, changed.with_extension("old"))
+                                .expect("replace admitted name");
+                            if kind == 0 {
+                                std::fs::create_dir(&changed).expect("replacement directory");
+                            } else {
+                                File::create(&changed).expect("replacement file");
+                            }
+                        }),
+                    }
+                } else {
+                    acl_edit_hook(object, "group:everyone allow read")
+                };
+                AFTER_NATIVE.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+                let operation = Operation::new();
+                let before = ls_spawn_count();
+                assert!(!match kind {
+                    0 => judge(&operation, object, &directory),
+                    1 => acl_admits_file(&path, &file, identity_of(&file), &operation),
+                    _ => named_file_acl_admits(&path, &directory, identity_of(&file), &operation),
+                });
+                AFTER_NATIVE.with(|slot| assert!(slot.borrow().is_none(), "native hook ran"));
+                assert_eq!(ls_spawn_count(), before);
+                assert!(operation.judged.borrow().is_empty());
+                assert_no_file_verdicts(&operation);
+                if replace && kind == 0 {
+                    // Keep TempDir cleanup responsible for the renamed directory as well.
+                    std::fs::remove_dir(object).expect("remove replacement");
+                    std::fs::rename(object.with_extension("old"), object).expect("restore root");
+                }
+                if !replace {
+                    edit_acl(object, "-a", "group:everyone allow read");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_content_change_after_native_evidence_needs_a_matching_stable_listing() {
+        for acl in [None, Some("group:everyone allow read"), Some("group:everyone deny delete")] {
+            let root = fixture();
+            let directory = open(root.path());
+            let hook = content_edit_hook(root.path(), ContentEdit::Create, acl);
+            AFTER_NATIVE.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+            let operation = Operation::new();
+            let before = ls_spawn_count();
+            let decisions = directory_probe_count();
+            assert_eq!(judge(&operation, root.path(), &directory), acl.is_none());
+            AFTER_NATIVE.with(|slot| assert!(slot.borrow().is_none(), "native hook ran"));
+            assert_eq!(ls_spawn_count() - before, 1, "fresh listing replaces raced evidence");
+            assert_eq!(directory_probe_count() - decisions, 2, "count both ACL decisions");
+            assert!(operation.judged.borrow().is_empty(), "never memoize raced evidence");
+            if let Some(acl) = acl {
+                edit_acl(root.path(), "-a", acl);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_evidence_keeps_listing_restrictions_on_names_flags_and_types() {
+        let root = fixture();
+        let path = root.path().join("non-ascii-\u{e9}");
+        let file = File::create(&path).expect("fixture file");
+        assert!(!native_no_acl(&path, Some(&file), false));
+        assert!(!native_no_acl(root.path(), Some(&file), true));
+        assert!(!native_no_acl(root.path(), None, false));
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).expect("fixture link");
+        assert!(!native_no_acl(&link, None, false));
+
+        let path = root.path().join("hidden-file");
+        let file = File::create(&path).expect("flag fixture");
+        for (flag, admits) in [("hidden", true), ("uchg", false)] {
+            let chflags = |flag: &str| {
+                assert!(
+                    std::process::Command::new("/bin/chflags")
+                        .arg(flag)
+                        .arg(&path)
+                        .status()
+                        .expect("set fixture flags")
+                        .success()
+                );
+            };
+            chflags(flag);
+            let native = native_no_acl(&path, Some(&file), false);
+            let text = run_acl_listing(&path, Operation::new().deadline()).expect("listing");
+            chflags("0");
+            assert_eq!(native, admits);
+            assert_eq!(
+                crate::policy::macos_file_listing_admits(&text, path.to_str().unwrap()),
+                admits
             );
         }
     }
@@ -2378,6 +2649,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_directory_changed_during_a_single_or_batched_listing_is_not_admitted_or_cached() {
+        // Exercise the listing fallback and retain its existing spawn/race assertions.
+        let _native_error = crate::macos_acl::NativeError::inject();
         for batched in [false, true] {
             let root = fixture();
             let path = root.path().join("directory");
@@ -2430,6 +2703,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn regular_file_listings_are_bounded_by_file_states_and_acl_edits_invalidate_them() {
+        // Exercise the listing fallback and retain its existing spawn/race assertions.
+        let _native_error = crate::macos_acl::NativeError::inject();
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
 

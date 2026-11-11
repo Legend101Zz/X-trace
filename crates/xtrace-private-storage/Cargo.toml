@@ -28,3 +28,6 @@ rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile = "3.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+xtrace-macos-acl = { path = "../xtrace-macos-acl" }

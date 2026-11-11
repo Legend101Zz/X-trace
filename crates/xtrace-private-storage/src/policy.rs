@@ -383,7 +383,7 @@ pub(crate) fn macos_acl_listing_verdict(
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn valid_owner_name(value: &str) -> bool {
+pub(crate) fn valid_owner_name(value: &str) -> bool {
     !value.is_empty()
         && value
             .bytes()
