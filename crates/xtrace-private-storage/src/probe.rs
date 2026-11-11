@@ -1509,6 +1509,102 @@ mod tests {
         Remove,
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn appending_a_child_between_directory_reads_does_not_invalidate_admission() {
+        use std::io::Write as _;
+
+        let root = fixture();
+        let path = root.path();
+        let directory = open(path);
+        let child = path.join("tail");
+        std::fs::write(&child, b"prefix").expect("journal fixture");
+        let mut tail =
+            std::fs::OpenOptions::new().append(true).open(&child).expect("append handle");
+        let before = directory.metadata().expect("directory before append");
+        let hook = AfterListing {
+            path: path.to_path_buf(),
+            action: Box::new(move || {
+                tail.write_all(b"-suffix").expect("append child during directory snapshot");
+            }),
+        };
+        BETWEEN_DIRECTORY_READS.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+        assert!(judge(&Operation::new(), path, &directory));
+        BETWEEN_DIRECTORY_READS.with(|slot| assert!(slot.borrow().is_none(), "append ran"));
+        let after = directory.metadata().expect("directory after append");
+        assert_eq!(
+            DirectoryState::of(&before, DirectoryRole::PrivateLeaf),
+            DirectoryState::of(&after, DirectoryRole::PrivateLeaf),
+            "appending a regular file does not change its parent directory's ACL state"
+        );
+        assert_eq!(std::fs::read(&child).expect("read appended tail"), b"prefix-suffix");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn mode_edits_between_directory_reads_fail_closed_even_when_the_new_mode_is_private() {
+        for mode in [0o500, 0o777] {
+            let root = fixture();
+            let path = root.path();
+            let directory = open(path);
+            let changed_path = path.to_path_buf();
+            let hook = AfterListing {
+                path: changed_path.clone(),
+                action: Box::new(move || {
+                    std::fs::set_permissions(&changed_path, std::fs::Permissions::from_mode(mode))
+                        .expect("change directory mode during snapshot");
+                }),
+            };
+            BETWEEN_DIRECTORY_READS.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+            assert!(!judge(&Operation::new(), path, &directory));
+            BETWEEN_DIRECTORY_READS.with(|slot| assert!(slot.borrow().is_none(), "mode edit ran"));
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("restore fixture mode");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn acl_edits_between_directory_reads_fail_closed_without_an_mtime_or_mode_change() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        for attribute in ["system.posix_acl_access", "system.posix_acl_default"] {
+            let root = fixture();
+            let path = root.path();
+            let directory = open(path);
+            let before = directory.metadata().expect("directory before ACL edit");
+            let changed_path = path.to_path_buf();
+            let hook = AfterListing {
+                path: changed_path.clone(),
+                action: Box::new(move || {
+                    rustix::fs::fsetxattr(
+                        open(&changed_path),
+                        attribute,
+                        &linux_acl(4),
+                        rustix::fs::XattrFlags::empty(),
+                    )
+                    .expect("set real ACL during directory snapshot");
+                }),
+            };
+            BETWEEN_DIRECTORY_READS.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+            assert!(!directory_acl_admits(
+                &Operation::new(),
+                DirectoryRole::PrivateLeaf,
+                path,
+                &directory,
+                identity_of(&directory),
+            ));
+            BETWEEN_DIRECTORY_READS.with(|slot| assert!(slot.borrow().is_none(), "ACL edit ran"));
+            let after = directory.metadata().expect("directory after ACL edit");
+            assert_eq!((before.mtime(), before.mtime_nsec()), (after.mtime(), after.mtime_nsec()));
+            assert_eq!(before.mode(), after.mode(), "a zero ACL mask preserves mode 0700");
+            assert_eq!(before.uid(), after.uid());
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            assert_eq!(before.nlink(), after.nlink());
+            assert_eq!(before.len(), after.len());
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn linux_observe_content_change(path: &Path, before: &std::fs::Metadata) -> std::fs::Metadata {
         use std::os::unix::fs::MetadataExt as _;
