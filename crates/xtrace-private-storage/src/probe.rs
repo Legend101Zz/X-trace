@@ -46,7 +46,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::admission::FileIdentity;
-use crate::diagnostic::{AdmissionContext, AdmissionSite};
+use crate::diagnostic::{self, AdmissionContext, AdmissionSite};
 use crate::policy::{DirectoryRole, FilesystemProfile};
 use crate::scope;
 use crate::{AdmissionFailure, AdmissionOperation as Step, PrivateStorageError};
@@ -556,10 +556,10 @@ pub(crate) fn directory_acl_admits(
         .as_ref()
         .is_some_and(|key| operation.directory_key(state, directory).as_ref() != Some(key))
     {
-        operation.record_failure(AdmissionFailure::check_context(
+        diagnostic::observe_context(
             Step::AclState,
             AdmissionContext::state(AdmissionSite::Filesystem, &before, &after),
-        ));
+        );
         return false;
     }
     // A changed state invalidates this verdict: the listing may predate an ACL grant. Child
@@ -573,10 +573,10 @@ pub(crate) fn directory_acl_admits(
                     return false;
                 }
                 if operation.directory_key(state, directory) != key {
-                    operation.record_failure(AdmissionFailure::check_context(
+                    diagnostic::observe_context(
                         Step::AclState,
                         AdmissionContext::state(AdmissionSite::RecheckFilesystem, &before, &after),
-                    ));
+                    );
                     return false;
                 }
                 return !operation.expired();
@@ -590,14 +590,14 @@ pub(crate) fn directory_acl_admits(
                 );
             }
         }
-        operation.record_failure(AdmissionFailure::check_context(
+        diagnostic::observe_context(
             Step::AclState,
             AdmissionContext::state(
                 if remembered { AdmissionSite::MemoState } else { AdmissionSite::ProbeState },
                 &before,
                 &after,
             ),
-        ));
+        );
         return false;
     }
     if let Some(key) = key {
@@ -638,30 +638,30 @@ fn recheck_directory_listing(
             }
         };
         if let Err(refusal) = directory_listing_verdict(&text, path) {
-            operation.record_failure(AdmissionFailure::check_context(
+            diagnostic::observe_context(
                 Step::AclPolicy,
                 AdmissionContext::listing(AdmissionSite::RecheckListing, refusal),
-            ));
+            );
             return false;
         }
         if !original.lines().skip(1).eq(text.lines().skip(1)) {
-            operation.record_failure(AdmissionFailure::check_context(
+            diagnostic::observe_context(
                 Step::AclState,
                 AdmissionContext::listing(
                     AdmissionSite::RecheckAcl,
                     crate::diagnostic::ListingRefusal::NotChecked,
                 ),
-            ));
+            );
             return false;
         }
         let Some(after) = directory_metadata(operation, path, directory, expected, role) else {
             return false;
         };
         if operation.directory_key(state, directory) != key {
-            operation.record_failure(AdmissionFailure::check_context(
+            diagnostic::observe_context(
                 Step::AclState,
                 AdmissionContext::state(AdmissionSite::RecheckFilesystem, &before, &after),
-            ));
+            );
             return false;
         }
         if operation.expired() {
@@ -671,10 +671,10 @@ fn recheck_directory_listing(
             return true;
         }
         if !directory_contents_changed(&before, &after) {
-            operation.record_failure(AdmissionFailure::check_context(
+            diagnostic::observe_context(
                 Step::AclState,
                 AdmissionContext::state(AdmissionSite::RecheckState, &before, &after),
-            ));
+            );
             return false;
         }
     }
@@ -1869,14 +1869,18 @@ mod tests {
         for scoped in [false, true] {
             for batched in [false, true] {
                 for edit in [ContentEdit::Create, ContentEdit::Rename, ContentEdit::Remove] {
-                    for acl in [None, Some("group:everyone allow read")] {
+                    for acl in [
+                        None,
+                        Some("group:everyone allow read"),
+                        Some("group:everyone deny delete"),
+                    ] {
                         let root = fixture();
                         let path = root.path().join("directory");
                         std::fs::create_dir(&path).expect("directory");
                         std::fs::write(path.join("child"), b"").expect("child");
                         let directory = open(&path);
                         let _scope = scoped.then(AdmissionScope::enter);
-                        let operation = Operation::new();
+                        let mut operation = Operation::new();
                         if batched {
                             operation.register_walk(&[root.path().to_path_buf(), path.clone()]);
                         }
@@ -1895,6 +1899,19 @@ mod tests {
                             );
                         }
                         if let Some(entry) = acl {
+                            // admission.rs uses this fallback when the boolean verdict refuses.
+                            // These assertions apply with and without ci-diagnostics.
+                            assert_eq!(
+                                operation.failure(Step::AclState),
+                                PrivateStorageError::check(Step::AclState)
+                            );
+                            assert!(operation.failure.get().is_none(), "diagnostics only observe");
+                            operation.deadline = Instant::now();
+                            assert_eq!(
+                                operation.failure(Step::AclState),
+                                PrivateStorageError::check(Step::Deadline),
+                                "an unrecorded refusal retains deadline precedence"
+                            );
                             edit_acl(&path, "-a", entry);
                         }
                     }
