@@ -492,6 +492,11 @@ mod tests {
 
     use crate::{OpenOptions, SqliteRecordingPersistence, SqliteRecordingReader, SqliteStore};
 
+    // These cardinality workloads prove recovery and readability, not success under
+    // competing bulk I/O. Keep their real admissions (including the 750 ms budget)
+    // and segment fsyncs, but do not run the three heavy workloads together.
+    static CARDINALITY_WORKLOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn fixture() -> (tempfile::TempDir, SqliteStore, Project) {
         let temp_base = std::path::PathBuf::from(
             std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
@@ -2129,6 +2134,7 @@ mod tests {
         use xtrace_application::recording_queries::RecordingCompletionEvidence;
 
         use crate::recording_store::work_profile::{Phase, WorkProfile};
+        let _workload = CARDINALITY_WORKLOAD.lock().expect("cardinality workload lock");
         let profile = WorkProfile::start("sparse", MAX_RECORDING_SEGMENTS as usize, false);
         let (directory, store, project) = fixture();
         let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
@@ -2222,6 +2228,7 @@ mod tests {
         use xtrace_application::recording::DEFAULT_SEGMENT_EVENTS;
         use xtrace_application::recording_queries::{RecordingCompletionEvidence, RecordingStatus};
 
+        let _workload = CARDINALITY_WORKLOAD.lock().expect("cardinality workload lock");
         let profile = WorkProfile::start(
             if focused { "focused-singletons" } else { "singletons" },
             count,

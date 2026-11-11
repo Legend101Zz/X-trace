@@ -2069,7 +2069,6 @@ mod tests {
     fn an_expired_deadline_refuses_before_any_probe() {
         let leaf = nested_leaf();
         let expired = std::time::Instant::now();
-        std::thread::sleep(std::time::Duration::from_millis(5));
         let before = probe::probed_paths().len();
         assert_eq!(
             leaf.revalidate_for_operation(expired),
@@ -2079,7 +2078,12 @@ mod tests {
             leaf.create_private_child_for_operation("late", expired).map(|_| ()),
             Err(PrivateStorageError::check(Step::Deadline))
         );
+        assert_eq!(
+            leaf.create_private_file_for_operation("late.xtf", expired).map(|_| ()),
+            Err(PrivateStorageError::check(Step::Deadline))
+        );
         assert!(!leaf.path().join("late").exists(), "no directory created after expiry");
+        assert!(!leaf.path().join("late.xtf").exists(), "no staging file created after expiry");
         assert_eq!(probe::probed_paths().len(), before, "no ACL probe after expiry");
     }
 
@@ -2365,7 +2369,6 @@ mod tests {
         let _scope = AdmissionScope::enter();
         leaf.revalidate().expect("warm the scope");
         let expired = std::time::Instant::now();
-        std::thread::sleep(std::time::Duration::from_millis(5));
         let before = probe::probed_paths().len();
         assert_eq!(
             leaf.revalidate_for_operation(expired),
