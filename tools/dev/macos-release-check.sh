@@ -2,7 +2,9 @@
 # Owner release check (2026-11-11 decision, W2-R27a). Run from a clean checkout:
 #   bash tools/dev/macos-release-check.sh
 # Prerequisites: macOS, Xcode command line tools, stable Rust (rustfmt/clippy),
-# Python 3, Node 22 or 24/npm, OpenSSL 3 first on PATH, and a local JDK 17.
+# Python 3, Node 22 and 24/npm, OpenSSL 3 first on PATH, and a local JDK 17.
+# Node discovery checks PATH and Homebrew's versioned bin directories. Optional
+# XTRACE_NODE_22_BIN / XTRACE_NODE_24_BIN select directories containing node/npm.
 # Locally installed JDKs 17/21/25 are tested; missing versions are reported.
 # Set XTRACE_DEV_CACHE and XTRACE_DEV_SCRATCH as in tools/dev/README.md.
 # Run tools/dev/prep.sh --adapters --browsers first (locked dependencies only).
@@ -47,18 +49,61 @@ release_tools() {
         --log-file "$run_root/release-raw.log"
 }
 node_suite() {
-    lane --suite node --step install -- npm ci --prefix adapters/node
-    lane --suite node --step generate-check -- npm run generate:check --prefix adapters/node
-    lane --suite node --step test --min-passed 85 --max-ignored 0 -- npm test --prefix adapters/node
+    local version=$1
+    lane --suite node --variant "$version" --step install -- npm ci --prefix adapters/node
+    lane --suite node --variant "$version" --step generate-check -- npm run generate:check --prefix adapters/node
+    lane --suite node --variant "$version" --step test --min-passed 85 --max-ignored 0 -- npm test --prefix adapters/node
     npm run build --prefix adapters/node
 }
 web_suite() {
-    lane --suite web --step install -- npm ci --prefix web/app
+    local version=$1
+    lane --suite web --variant "$version" --step install -- npm ci --prefix web/app
     (cd web/app && npx --no-install playwright install chromium)
-    lane --suite web --step typecheck -- npm run typecheck --prefix web/app
-    lane --suite web --step unit-tests --min-passed 75 --max-ignored 0 -- npm test --prefix web/app
-    lane --suite web --step check-api -- npm run check:api --prefix web/app
-    lane --suite web --step check-embedded -- npm run check:embedded --prefix web/app
+    lane --suite web --variant "$version" --step typecheck -- npm run typecheck --prefix web/app
+    lane --suite web --variant "$version" --step unit-tests --min-passed 75 --max-ignored 0 -- npm test --prefix web/app
+    lane --suite web --variant "$version" --step check-api -- npm run check:api --prefix web/app
+    lane --suite web --variant "$version" --step check-embedded -- npm run check:embedded --prefix web/app
+}
+node_bin() {
+    local version=$1 setting="XTRACE_NODE_${1}_BIN" directory actual
+    local override=${!setting-}
+    local candidates=()
+    if [[ -n $override ]]; then
+        candidates=("$override")
+    else
+        IFS=: read -r -a candidates <<< "$PATH"
+        candidates+=("/opt/homebrew/opt/node@$version/bin" "/usr/local/opt/node@$version/bin")
+    fi
+    for directory in "${candidates[@]}"; do
+        # Absolute paths keep selection stable when web_suite changes directory.
+        [[ $directory == /* && -x $directory/node && -x $directory/npm ]] || continue
+        actual=$("$directory/node" --version 2>/dev/null) || continue
+        if [[ $actual =~ ^v${version}\.[0-9]+\.[0-9]+$ ]]; then
+            printf '%s\n' "$directory"
+            return 0
+        fi
+    done
+    return 1
+}
+node_runtime_suite() {
+    local suite=$1 version=$2 directory=$3 actual
+    export PATH="$directory:$PATH"
+    actual=$(node --version)
+    [[ $actual =~ ^v${version}\.[0-9]+\.[0-9]+$ ]]
+    printf '%s-%s version=%s\n' "$suite" "$version" "$actual" >> "$summary"
+    "${suite}_suite" "$version"
+}
+run_node_versions() {
+    local version directory
+    for version in 22 24; do
+        if directory=$(node_bin "$version"); then
+            run_suite "node-$version" node_runtime_suite node "$version" "$directory"
+            run_suite "web-$version" node_runtime_suite web "$version" "$directory"
+        else
+            gap "node-$version-unavailable"
+            gap "web-node-$version-unavailable"
+        fi
+    done
 }
 java_suite() {
     local version=$1 jdk=$2
@@ -116,8 +161,7 @@ allprojects {
 }
 GRADLE
 run_suite release-tools release_tools
-run_suite node node_suite
-run_suite web web_suite
+run_node_versions
 jdk_count=0
 for version in 17 21 25; do
     jdk=$(/usr/libexec/java_home -F -v "$version" 2>/dev/null)

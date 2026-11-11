@@ -290,10 +290,14 @@ def _encoded(value) -> bytes:
     return json.dumps(value, sort_keys=True, ensure_ascii=True).encode("utf-8")
 
 
-def _private(text: str, index) -> bool:
+def _private(text: str, index, *, verified_identifier: bool = False) -> bool:
+    """Skip text heuristics only after independent repository/vocabulary attestation.
+
+    Canary needles and control characters are forbidden even in attested names.
+    """
     hits: dict = {}
     canary.scan_bytes(text.encode("utf-8"), index, hits, "ci-excerpt")
-    return bool(hits or DIAG_BAD.search(text) or PRIVATE_TEXT.search(text)
+    return bool(hits or (not verified_identifier and (DIAG_BAD.search(text) or PRIVATE_TEXT.search(text)))
                 or any(ord(c) < 32 and c not in "\n\t" for c in text))
 
 
@@ -355,6 +359,16 @@ def _diagnostic_variants(source: str, enums: str = "PrivateStorageError|Admissio
     return variants
 
 
+# Share the declaration grammar between short names and full module contexts.
+RUST_TEST_DECLARATION = (
+    r"#\[(?:[A-Za-z_]\w*::)?test(?:\([^]]*\))?\]\s*"
+    r"(?:#\[[^]]*\]\s*)*"
+    r"(?:pub(?:\s*\(\s*(?:crate|self|super|in\s+(?:crate|self|super)"
+    r"(?:\s*::\s*[A-Za-z_]\w*)*)\s*\))?\s+)?"
+    r"(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\("
+)
+
+
 class CheckoutMetadata:
     """Only regular-file blobs from the snapshotted commit can attest facts."""
 
@@ -403,9 +417,7 @@ class CheckoutMetadata:
         masked = _source_mask(source, rust=path.suffix == ".rs")
         if path.suffix == ".rs" and path.parts[0] == "crates":
             # Requiring a test attribute also excludes helper functions in tests/.
-            declarations = list(re.finditer(
-                r"#\[(?:[A-Za-z_]\w*::)?test(?:\([^]]*\))?\]\s*"
-                r"(?:#\[[^]]*\]\s*)*(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(", masked))
+            declarations = list(re.finditer(RUST_TEST_DECLARATION, masked))
             self.tests.update(match[1] for match in declarations)
         elif path.suffix == ".java" and test_path:
             methods = re.findall(
@@ -456,9 +468,7 @@ class CheckoutMetadata:
         referenced = set()
         token_pattern = re.compile(
             r"#\[\s*path\s*=|\binclude\s*!\s*\(|"
-            r"\bmod\s+([A-Za-z_]\w*)\s*([;{])|[{}]|"
-            r"#\[(?:[A-Za-z_]\w*::)?test(?:\([^]]*\))?\]\s*"
-            r"(?:#\[[^]]*\]\s*)*(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(")
+            r"\bmod\s+([A-Za-z_]\w*)\s*([;{])|[{}]|" + RUST_TEST_DECLARATION)
         for name, source in rust.items():
             path = pathlib.PurePosixPath(name)
             masked = _source_mask(source, rust=True)
@@ -549,7 +559,7 @@ class CheckoutMetadata:
         # Rust module prefixes are captured output too. Publish the declared
         # function name, never a prefix that the source metadata did not attest.
         name = candidate if candidate in self.tests else candidate.rsplit("::", 1)[-1]
-        return name if name in self.tests and not _private(name, index) else UNVERIFIED
+        return name if name in self.tests and not _private(name, index, verified_identifier=True) else UNVERIFIED
 
     def test_unverified_reason(self, candidate: str) -> UnverifiedReason:
         """Explain a name already rejected by test(), without retaining it."""
@@ -573,7 +583,7 @@ class CheckoutMetadata:
                 or "\\" in path or not 1 <= int(line) <= self.files.get(path, 0)):
             return UNVERIFIED
         site = f"{path}:{int(line)}"
-        return UNVERIFIED if _private(site, index) else site
+        return UNVERIFIED if _private(site, index, verified_identifier=True) else site
 
 
 def _checkout_metadata() -> CheckoutMetadata:
@@ -706,10 +716,11 @@ def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, 
                                                   or fields[key] not in metadata.admission_callers)
                                for key in ("store_phase", "store_site"))):
                     continue
-                if any(_private(str(value), index) for value in [*values, *fields.values()]):
+                # Every value above is a declared enum, fixed vocabulary or bounded scalar.
+                if any(_private(str(value), index, verified_identifier=True) for value in [*values, *fields.values()]):
                     continue
                 name = (thread if isinstance(thread, str) and thread in metadata.rust_tests
-                        and not _private(thread, index) else UNVERIFIED)
+                        and not _private(thread, index, verified_identifier=True) else UNVERIFIED)
                 records.append(AdmissionDiagnostic(name, values, fields))
     except (OSError, ValueError):
         return []
@@ -794,7 +805,7 @@ def _timeout_progress(line: str) -> tuple[str, str] | None:
 
 def _rust_failure_name(name: str, metadata: CheckoutMetadata, index) -> str:
     """Complete libtest identifiers, including module prefixes, must exist in HEAD."""
-    return name if name in metadata.rust_tests and not _private(name, index) else UNVERIFIED
+    return name if name in metadata.rust_tests and not _private(name, index, verified_identifier=True) else UNVERIFIED
 
 
 def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata, index) -> list[dict]:
@@ -802,7 +813,8 @@ def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata,
         return []  # Expected panics in a successful binary are not failures.
     # Use the timing observer's target attestation, including ambiguous target
     # refusal. Neither executable paths nor thread names leave this function.
-    observer = rust_timing.Observations(metadata.rust_targets, lambda value: _private(value, index))
+    observer = rust_timing.Observations(metadata.rust_targets,
+                                       lambda value: _private(value, index, verified_identifier=True))
     observer.line(report.header, 0)
     binary = observer.active[0]
     rows = {}
@@ -900,7 +912,7 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
     ambiguous_threads.update(name for name, count in occurrences.items() if count > 1)
     failing_threads = {name for name, status in outcomes.items() if status == "FAILED"
                        and name not in ambiguous_threads and name in metadata.rust_tests
-                       and not _private(name, index)}
+                       and not _private(name, index, verified_identifier=True)}
     for block_number, (name, framework, lines, panic_lines) in enumerate(blocks):
         if framework == "cargo" and outcomes.get(name) in {"ok", "ignored"}:
             continue
@@ -1161,8 +1173,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         try:
             if rust_timing.is_test_command(cmd):
                 index = _excerpt_index(getattr(args, "canaries", ""))
-                observations = rust_timing.Observations(metadata.rust_targets,
-                                                       lambda value: index is None or _private(value, index))
+                observations = rust_timing.Observations(
+                    metadata.rust_targets,
+                    lambda value: index is None or _private(value, index, verified_identifier=True))
                 proc, timed_out, timing = rust_timing.run(
                     cmd, log=log, cwd=args.cwd or None, env=child_env, timeout=args.timeout, observations=observations,
                     **({"checkpoint": recovery / "timing.json"} if recovery is not None else {}))
@@ -1199,7 +1212,7 @@ def prepare_recovery(root: pathlib.Path) -> pathlib.Path:
 def recover_timeout(args, directory: pathlib.Path, metadata: CheckoutMetadata, duration: float) -> int:
     """Called only after the outer supervisor has stopped and reaped its owned tree."""
     index = _excerpt_index(getattr(args, "canaries", ""))
-    private = lambda value: index is None or _private(value, index)
+    private = lambda value: index is None or _private(value, index, verified_identifier=True)
     observations = rust_timing.Observations(metadata.rust_targets, private)
     wall = duration
     basis = "supervised-wrapper; timing-checkpoint-unavailable"

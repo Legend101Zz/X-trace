@@ -248,6 +248,57 @@ class TimingTests(unittest.TestCase):
 
 
 class FragmentTimingTests(unittest.TestCase):
+    def test_verified_private_binaries_keep_canary_checks_in_live_and_recovered_timing(self):
+        for crate, needle in (("xtrace-private-storage", None), ("xtrace-private-CANARY", None),
+                              ("xtrace-private-storage", "storage")):
+            with self.subTest(crate=crate, needle=needle), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                sources = {"crates/example/Cargo.toml": f'[package]\nname = "{crate}"\n',
+                           "crates/example/src/lib.rs": "pub fn example() {}\n"}
+                metadata = lane_run.CheckoutMetadata(sources)
+                name = crate.replace("-", "_")
+                header = f"     Running unittests src/lib.rs (target/debug/deps/{name}-0123456789abcdef)"
+                expected = ({"crate": crate, "targetKind": "lib", "targetName": name}
+                            if needle is None and "CANARY" not in crate else lane_run.UNVERIFIED)
+                args = argparse.Namespace(suite="rust", variant="-", step="focused", out=str(root / "live"),
+                                          private_log_dir=temporary, command=["cargo", "test"], cwd="",
+                                          timeout=3000, min_passed=0, canaries="")
+                if needle is not None:
+                    canaries = root / "canaries.json"
+                    canaries.write_text(json.dumps({"binary": needle}))
+                    args.canaries = str(canaries)
+
+                def run(command, *, log, observations, **kwargs):
+                    log.write((header + "\n").encode())
+                    observations.line(header, 1)
+                    return subprocess.CompletedProcess(command, 124), True, observations.finish(20, True)
+
+                with mock.patch.object(lane_run, "_checkout_metadata", return_value=metadata), \
+                        mock.patch.object(rust_timing, "run", side_effect=run), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(lane_run.cmd_run(args), 124)
+
+                directory = lane_run.prepare_recovery(root)
+                (directory / "output.log").write_text(header + "\n")
+                # A checkpoint is private input: recovery must reattest its identities.
+                unscanned = rust_timing.Observations(metadata.rust_targets, lambda value: False)
+                unscanned.line(header, 1)
+                (directory / "timing.json").write_text(json.dumps({"started": 0, "state": unscanned.snapshot()}))
+                args.out = str(root / "recovered")
+                with mock.patch.object(lane_run.time, "monotonic", return_value=20), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(lane_run.recover_timeout(args, directory, metadata, 20), 124)
+
+                for mode in ("live", "recovered"):
+                    with self.subTest(mode=mode):
+                        fragment = json.loads((root / mode / "rust__-__focused.json").read_text())
+                        timing = fragment["rustTiming"]
+                        self.assertEqual(timing["events"][0]["binary"], expected)
+                        self.assertEqual(timing["runningAtTimeout"][0]["binary"], expected)
+                        if expected == lane_run.UNVERIFIED:
+                            self.assertNotIn(crate, json.dumps(fragment))
+                            self.assertNotIn(name, json.dumps(fragment))
+
     def test_unverified_binary_is_withheld_from_both_fragment_and_job_log(self):
         with tempfile.TemporaryDirectory() as temporary:
             args = argparse.Namespace(suite="rust", variant="-", step="test", out=temporary,

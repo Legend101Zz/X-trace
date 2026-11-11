@@ -738,6 +738,41 @@ class FailureDetailsTests(CheckoutFixture):
         detail = lane_run.failure_details("not ok 1 - checkout JS test\n", False)
         self.assertEqual(detail["failures"][0]["test"], "checkout JS test")
 
+    def test_attested_identifiers_skip_keywords_and_shapes_while_free_text_does_not(self):
+        for name in ("private_key", "credential", "passwd", "api_key", "password",
+                     "/opt/local/fixture", "https://fixture.example/path", "fixture@example.test"):
+            with self.subTest(name=name):
+                metadata = lane_run.CheckoutMetadata({
+                    "web/app/src/example.test.ts": f"test({json.dumps(name)}, () => {{}});\n",
+                })
+                self.assertIn(name, metadata.tests)
+                self.assertEqual(metadata.test(name, lane_run.CANARY_INDEX), name)
+                self.assertTrue(lane_run._private(name, lane_run.CANARY_INDEX))
+                self.assertEqual(self.metadata.test(name, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
+        path = "crates/private_key/tests/credential.rs"
+        metadata = lane_run.CheckoutMetadata({path: "#[test]\nfn private_key() {}\n"})
+        self.assertEqual(metadata.location(f"{path}:2", lane_run.CANARY_INDEX), f"{path}:2")
+        self.assertEqual(metadata.test("private_key", lane_run.CANARY_INDEX), "private_key")
+        self.assertEqual(lane_run._rust_failure_name("private_key", metadata, lane_run.CANARY_INDEX), "private_key")
+        self.assertTrue(lane_run._private("captured private_key fixture", lane_run.CANARY_INDEX))
+
+    def test_attested_private_thread_keeps_structured_diagnostics_and_canary_guard(self):
+        name = "private_root_admission"
+        metadata = lane_run.CheckoutMetadata({**self.sources,
+                                             "crates/example/tests/private.rs": f"#[test]\nfn {name}() {{}}\n"})
+        self.assertEqual(self.records(self.diagnostic(thread=name), metadata=metadata),
+                         [lane_run.AdmissionDiagnostic(name, ["Admission", "Deadline"])])
+        index = [*lane_run.CANARY_INDEX, *lane_run.canary.build_index({"thread": "root_admission"})]
+        self.assertEqual(self.records(self.diagnostic(thread=name), metadata=metadata, index=index),
+                         [lane_run.AdmissionDiagnostic(lane_run.UNVERIFIED, ["Admission", "Deadline"])])
+        detail = lane_run.failure_details(f"test {name} ... FAILED\n", False, metadata=metadata,
+                                          diagnostic_records=self.records(self.diagnostic(thread=name),
+                                                                          metadata=metadata))
+        self.assertEqual(detail["failures"][0]["test"], name)
+        self.assertEqual(detail["failures"][0]["category"], [])
+        self.assertEqual(detail["observedDiagnostics"], [
+            {"test": name, "relevance": "unknown", "category": ["Admission", "Deadline"]}])
+
     def test_comments_literals_and_helpers_cannot_attest_names(self):
         name = "crates/example/tests/declarations.rs"
         source = ('/* outer /* inner */ #[test]\nfn comment_value() {} */\n'
@@ -758,6 +793,20 @@ class FailureDetailsTests(CheckoutFixture):
         metadata = lane_run.CheckoutMetadata({"crates/example/src/lib.rs": source})
         self.assertEqual(metadata.tests, {"between_lifetimes"})
         self.assertEqual(metadata.test("tests::between_lifetimes", lane_run.CANARY_INDEX), "between_lifetimes")
+
+    def test_rust_visibility_preserves_test_attribute_and_module_context(self):
+        for visibility in ("", "pub ", "pub(crate) ", "pub(super) ", "pub(self) ",
+                           "pub(in crate::outer) "):
+            for asynchronous in ("", "async "):
+                with self.subTest(visibility=visibility, asynchronous=asynchronous):
+                    declaration = f"{visibility}{asynchronous}fn"
+                    source = (f"mod outer {{ #[test] #[allow(dead_code)] {declaration} actual() {{}}\n"
+                              f"{declaration} helper() {{}}\n"
+                              f'const TEXT: &str = "#[test] {declaration} literal() {{}}";\n'
+                              f"/* #[test] {declaration} comment() {{}} */ }}\n")
+                    metadata = lane_run.CheckoutMetadata({"crates/example/src/lib.rs": source})
+                    self.assertEqual(metadata.tests, {"actual"})
+                    self.assertEqual(metadata.rust_tests, {"outer::actual"})
 
     def test_categories_require_declarations_in_the_private_storage_diagnostic_enums(self):
         source = ('/* outer /* inner */ enum AdmissionOperation { CommentValue } */\n'
