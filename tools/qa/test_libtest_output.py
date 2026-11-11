@@ -84,16 +84,59 @@ class LibtestOutputTests(unittest.TestCase):
         for value in ("fixture value", "12345", "67890", "<unnamed>", "stack backtrace", "fixture frame"):
             self.assertNotIn(value, json.dumps(fragment) + public)
 
-    def test_nocapture_single_failure_owns_worker_and_child_main_panics(self):
+    def test_nocapture_only_executed_test_owns_worker_and_child_main_panics(self):
         for thread in ("<unnamed>", "main", "worker"):
             with self.subTest(thread=thread):
                 text = transcript(["case0"], "test case0 ... child output\n"
                                   f"thread '{thread}' (123) panicked at {SITE}:7:\n"
-                                  "child assertion prose\nFAILED\n", passed=3)
+                                  "child assertion prose\nFAILED\n")
                 row, = self.details(text)["failures"]
                 self.assertEqual((row["test"], row["binary"], row["panicSites"]),
                                  ("case0", BINARY, [SITE]))
                 self.assertNotIn("child assertion prose", json.dumps(row))
+
+    def test_nocapture_sole_failure_among_passing_tests_has_no_panic_owner(self):
+        for thread in ("<unnamed>", "main", "worker", "case0"):
+            with self.subTest(thread=thread):
+                text = transcript(["case0"], "test case0 ... child output\n"
+                                  f"thread '{thread}' (123) panicked at {SITE}:7:\n"
+                                  "child assertion prose\nFAILED\n", passed=3)
+                failed, ambiguous = self.details(text)["failures"]
+                self.assertEqual((failed["test"], failed["kind"], failed["location"], failed["panicSites"]),
+                                 ("case0", "exit", lane_run.UNVERIFIED, []))
+                self.assertEqual((ambiguous["test"], ambiguous["testUnverifiedReason"], ambiguous["panicSites"]),
+                                 (lane_run.UNVERIFIED, "ambiguous-panic-block", []))
+
+    def test_existing_caught_scope_panic_passes_next_to_an_unrelated_failure(self):
+        path = "crates/xtrace-private-storage/src/scope.rs"
+        root = pathlib.Path(__file__).resolve().parents[2]
+        source = (root / path).read_text()
+        name = "scope::tests::a_panic_inside_a_live_scope_leaves_nothing_behind_for_the_next_scope"
+        unrelated = "admission::tests::an_expired_deadline_refuses_before_any_probe"
+        line = next(i for i, text in enumerate(source.splitlines(), 1)
+                    if 'panic!("store call failed inside a scope")' in text)
+        self.metadata = lane_run._checkout_metadata()
+        self.assertIn(name, self.metadata.rust_tests)
+        self.assertIn(unrelated, self.metadata.rust_tests)
+        self.assertEqual(self.metadata.location(f"{path}:{line}", lane_run.CANARY_INDEX), f"{path}:{line}")
+        header = "     Running unittests src/lib.rs (target/debug/deps/xtrace_private_storage-0123456789abcdef)"
+        text = transcript([unrelated], f"thread '{name}' panicked at {path}:{line}:13:\n"
+                          f"store call failed inside a scope\ntest {name} ... ok\n"
+                          f"test {unrelated} ... FAILED\n", passed=1, header=header)
+        failed, ambiguous = self.details(text)["failures"]
+        self.assertEqual((failed["test"], failed["kind"], failed["location"], failed["panicSites"]),
+                         (unrelated, "exit", lane_run.UNVERIFIED, []))
+        self.assertEqual((ambiguous["test"], ambiguous["location"], ambiguous["panicSites"]),
+                         (lane_run.UNVERIFIED, lane_run.UNVERIFIED, []))
+        self.assertEqual(ambiguous["testUnverifiedReason"], "ambiguous-panic-block")
+
+    def test_passing_should_panic_next_to_unrelated_failure_has_no_panic_owner(self):
+        text = transcript(["case0"], f"thread 'case1' panicked at {SITE}:7:\nexpected panic\n"
+                          "test case1 - should panic ... ok\ntest case0 ... FAILED\n", passed=1)
+        failed, ambiguous = self.details(text)["failures"]
+        self.assertEqual((failed["test"], failed["kind"], failed["panicSites"]), ("case0", "exit", []))
+        self.assertEqual((ambiguous["test"], ambiguous["testUnverifiedReason"], ambiguous["panicSites"]),
+                         (lane_run.UNVERIFIED, "ambiguous-panic-block", []))
 
     def test_nocapture_multiple_failures_do_not_use_thread_names_as_owners(self):
         text = transcript(["case0", "case1"], f"thread 'case0' panicked at {SITE}:7:\nfixture value\n")
@@ -205,11 +248,47 @@ class LibtestOutputTests(unittest.TestCase):
         self.assertEqual(row["category"], [])
 
     def test_summary_failure_names_keep_structured_diagnostic_provenance(self):
-        text = transcript(["case0"], "test case0 ... child output\nFAILED\n")
+        text = transcript(["case1"], "test case1 ... child output\nFAILED\n")
+        detail = self.details(text, diagnostic_records=[
+            lane_run.AdmissionDiagnostic("case1", ["Admission", "Deadline"])])
+        self.assertEqual(detail["observedDiagnostics"], [
+            {"test": "case1", "relevance": "unknown", "category": ["Admission", "Deadline"]}])
+
+    def test_same_name_passing_and_failing_binaries_cannot_own_diagnostic(self):
+        other = HEADER.replace("journey", "other")
+        for body in ("test case0 ... ok\n", "test case0 - should panic ... ok\n", ""):
+            for passing_first in (True, False):
+                with self.subTest(body=body, passing_first=passing_first):
+                    passing = (f"{other}\nrunning 1 test\n{body}"
+                               "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n")
+                    failed = transcript(["case0"])
+                    text = passing + failed if passing_first else failed + passing
+                    detail = self.details(text, diagnostic_records=[
+                        lane_run.AdmissionDiagnostic("case0", ["Admission", "Deadline"])])
+                    self.assertEqual(detail["observedDiagnostics"], [{
+                        "test": lane_run.UNVERIFIED, "thread": "case0", "relevance": "unknown",
+                        "testUnverifiedReason": "diagnostic-thread-ambiguous", "category": ["Admission", "Deadline"]}])
+                    self.assertEqual(detail["failures"][0]["category"], [])
+
+    def test_duplicate_name_is_ambiguous_even_when_only_failing_binary_report_arrives(self):
+        detail = self.details(transcript(["case0"]), diagnostic_records=[
+            lane_run.AdmissionDiagnostic("case0", ["Admission", "Deadline"])])
+        observation, = detail["observedDiagnostics"]
+        self.assertEqual((observation["test"], observation["testUnverifiedReason"]),
+                         (lane_run.UNVERIFIED, "diagnostic-thread-ambiguous"))
+
+    def test_successful_report_names_count_even_if_that_binary_sources_are_unavailable(self):
+        other = HEADER.replace("journey", "other")
+        self.metadata = lane_run.CheckoutMetadata({name: source for name, source in SOURCES.items()
+                                                  if not name.endswith("other.rs")})
+        self.assertEqual(len(self.metadata.rust_test_owners["case0"]), 1)
+        text = (f"{other}\nrunning 1 test\ntest case0 ... ok\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n") + transcript(["case0"])
         detail = self.details(text, diagnostic_records=[
             lane_run.AdmissionDiagnostic("case0", ["Admission", "Deadline"])])
-        self.assertEqual(detail["observedDiagnostics"], [
-            {"test": "case0", "relevance": "unknown", "category": ["Admission", "Deadline"]}])
+        self.assertEqual(detail["observedDiagnostics"], [{
+            "test": lane_run.UNVERIFIED, "thread": "case0", "relevance": "unknown",
+            "testUnverifiedReason": "diagnostic-thread-ambiguous", "category": ["Admission", "Deadline"]}])
 
     def test_successful_binary_with_should_panic_output_has_no_failure_row(self):
         text = (f"{HEADER}\nrunning 1 test\nthread 'case0' panicked at {SITE}:7:\n"

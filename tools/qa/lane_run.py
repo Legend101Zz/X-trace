@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from collections import Counter, deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -362,6 +363,7 @@ class CheckoutMetadata:
         self.files: dict[str, int] = {}
         self.tests: set[str] = set()
         self.rust_tests: set[str] = set()
+        self.rust_test_owners: dict[str, set[rust_timing.Target | str]] = {}
         self.diagnostic_variants: set[str] = set()
         self.admission_operations: set[str] = set()
         self.error_variants: set[str] = set()
@@ -388,6 +390,7 @@ class CheckoutMetadata:
                     self.admission_objects.update(_diagnostic_variants(source, "AdmissionObject"))
                 if name == "crates/xtrace-private-storage/src/caller.rs":
                     self.admission_callers.update(_diagnostic_variants(source, "AdmissionCaller"))
+        self._read_rust_contexts(sources)
 
     def _read_tests(self, path: pathlib.PurePosixPath, source: str) -> None:
         test_path = bool(set(path.parts) & {"test", "tests", "__tests__"})
@@ -404,27 +407,6 @@ class CheckoutMetadata:
                 r"#\[(?:[A-Za-z_]\w*::)?test(?:\([^]]*\))?\]\s*"
                 r"(?:#\[[^]]*\]\s*)*(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(", masked))
             self.tests.update(match[1] for match in declarations)
-            # Exact libtest names include file and inline module prefixes. Never
-            # attest an arbitrary prefix merely because its last component fits.
-            parts = list(path.parts)
-            prefix = []
-            if "src" in parts:
-                prefix = parts[parts.index("src") + 1:-1]
-                if path.stem not in {"lib", "main", "mod"}:
-                    prefix.append(path.stem)
-            elif "tests" in parts and parts.index("tests") + 2 < len(parts):
-                prefix = parts[parts.index("tests") + 1:-1]
-                if path.stem != "mod":
-                    prefix.append(path.stem)
-            for match in declarations:
-                scopes = []
-                for token in re.finditer(r"\bmod\s+([A-Za-z_]\w*)\s*\{|[{}]", masked[:match.start()]):
-                    if token[0] == "}":
-                        if scopes:
-                            scopes.pop()
-                    else:
-                        scopes.append(token[1])
-                self.rust_tests.add("::".join([*prefix, *filter(None, scopes), match[1]]))
         elif path.suffix == ".java" and test_path:
             methods = re.findall(
                 r"@(?:Test|ParameterizedTest|RepeatedTest|Case)\b(?:\([^)]*\))?\s*"
@@ -446,6 +428,122 @@ class CheckoutMetadata:
                     self.tests.update(f"{node.name}::{method.name}" for method in node.body
                                       if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
                                       and method.name.startswith("test_"))
+
+    def _read_rust_contexts(self, sources: dict[str, str]) -> None:
+        """Resolve module edges from HEAD, never from the working filesystem.
+
+        Literal includes inherit their caller's module. A path attribute names
+        a file, not a module prefix. Keep each root's identity separately because
+        identical libtest names in different binaries cannot own a thread-only
+        diagnostic record.
+        """
+        rust = {name: source for name, source in sources.items()
+                if name in self.files and name.startswith("crates/") and name.endswith(".rs")}
+        roots: dict[str, set[rust_timing.Target]] = {}
+        for name, source in sources.items():
+            path = pathlib.PurePosixPath(name)
+            if name not in self.files or path.name != "Cargo.toml" or path.parts[0] != "crates":
+                continue
+            try:
+                crate = tomllib.loads(source).get("package", {}).get("name")
+            except tomllib.TOMLDecodeError:
+                continue
+            for target in self.rust_targets:
+                filename = str(path.parent / target.path)
+                if target.crate == crate and filename in rust:
+                    roots.setdefault(filename, set()).add(target)
+        graph = {}
+        referenced = set()
+        token_pattern = re.compile(
+            r"#\[\s*path\s*=|\binclude\s*!\s*\(|"
+            r"\bmod\s+([A-Za-z_]\w*)\s*([;{])|[{}]|"
+            r"#\[(?:[A-Za-z_]\w*::)?test(?:\([^]]*\))?\]\s*"
+            r"(?:#\[[^]]*\]\s*)*(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(")
+        for name, source in rust.items():
+            path = pathlib.PurePosixPath(name)
+            masked = _source_mask(source, rust=True)
+            scopes = []
+            tests, edges = [], []
+            skip_until = 0
+            for token in token_pattern.finditer(masked):
+                if token.start() < skip_until:
+                    continue
+                inline = tuple(filter(None, scopes))
+                module_dir = (path.parent if name in roots or path.stem in {"lib", "main", "mod"}
+                              else path.with_suffix(""))
+                destination = None
+                added = inline
+                if token[0].startswith("#[") and token[3]:
+                    tests.append((*inline, token[3]))
+                elif token[0].startswith("#["):
+                    literal = re.match(r'\s*"([^"\\\n]+)"\s*\]\s*'
+                                       r'(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_]\w*)\s*;',
+                                       source[token.end():])
+                    if literal:
+                        base = module_dir.joinpath(*inline) if inline else path.parent
+                        destination = base / literal[1]
+                        added = (*inline, literal[2])
+                        skip_until = token.end() + literal.end()
+                elif token[0].startswith("include"):
+                    literal = re.match(r'\s*"([^"\\\n]+)"\s*\)', source[token.end():])
+                    if literal:
+                        destination = path.parent / literal[1]
+                elif token[1]:
+                    if token[2] == "{":
+                        scopes.append(token[1])
+                    else:
+                        base = module_dir.joinpath(*inline)
+                        candidates = [base / f"{token[1]}.rs", base / token[1] / "mod.rs"]
+                        matches = [candidate for candidate in candidates if str(candidate) in rust]
+                        if len(matches) == 1:
+                            destination = matches[0]
+                            added = (*inline, token[1])
+                elif token[0] == "{":
+                    scopes.append(None)
+                elif token[0] == "}" and scopes:
+                    scopes.pop()
+                if (destination is not None and not destination.is_absolute()
+                        and ".." not in destination.parts and "\\" not in str(destination)
+                        and str(destination) in rust):
+                    edges.append((str(destination), added))
+                    referenced.add(str(destination))
+            graph[name] = tests, edges
+
+        visited = set()
+
+        def walk(name, prefix, owner, active):
+            if name in active:
+                return  # Cycles cannot establish another module context.
+            visited.add(name)
+            tests, edges = graph[name]
+            for suffix in tests:
+                test = "::".join((*prefix, *suffix))
+                self.rust_tests.add(test)
+                self.rust_test_owners.setdefault(test, set()).add(owner)
+            for destination, added in edges:
+                walk(destination, (*prefix, *added), owner, active | {name})
+
+        for root in sorted(roots):
+            for target in roots[root]:
+                walk(root, (), target, set())
+        # Standalone source fixtures and modules whose parent is unavailable
+        # retain conventional prefixes. Referenced files never gain a guessed
+        # filename prefix alongside their resolved module names.
+        for name in sorted(set(rust) - referenced - roots.keys()):
+            if name in visited:
+                continue
+            path = pathlib.PurePosixPath(name)
+            parts = list(path.parts)
+            prefix = []
+            if "src" in parts:
+                prefix = parts[parts.index("src") + 1:-1]
+                if path.stem not in {"lib", "main", "mod"}:
+                    prefix.append(path.stem)
+            elif "tests" in parts and parts.index("tests") + 2 < len(parts):
+                prefix = parts[parts.index("tests") + 1:-1]
+                if path.stem != "mod":
+                    prefix.append(path.stem)
+            walk(name, tuple(prefix), name, set())
 
     def test(self, candidate: str, index) -> str:
         # Rust module prefixes are captured output too. Publish the declared
@@ -731,10 +829,11 @@ def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata,
             continue
         panic = CARGO_PANIC.fullmatch(line) if allowed else None
         if panic:
-            # Captured worker/child threads belong to the section's test. With
-            # --nocapture, a sole failure is the only permitted fallback owner.
+            # A captured section establishes ownership. Without one, even a
+            # sole failure can coexist with passing tests that panic and catch
+            # the unwind. Only a report with one executed test permits fallback.
             current = rows.get(section) if section is not None else (
-                next(iter(rows.values())) if report.counts[1] == 1 and len(rows) == 1 else None)
+                next(iter(rows.values())) if report.counts[:2] == (0, 1) and len(rows) == 1 else None)
             if current is None:
                 if ambiguous is None:
                     ambiguous = {"test": UNVERIFIED, "binary": binary, "location": UNVERIFIED,
@@ -787,11 +886,21 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
         elif m := re.fullmatch(r"\s*not ok \d+ - (.+)", line):
             failure(m[1])["kind"] = "exit"
     states = [m.groups() for line in harness if (m := CARGO_STATE.fullmatch(line)) and m[2]]
-    states.extend((name, "FAILED") for report in reports for name in report.names)
+    for report in reports:
+        # Retain successful names too, including should_panic tests. Count each
+        # name once per execution, rather than once per printed status line.
+        completed = {match[1]: match[2] for line, allowed in zip(report.body, report.boundaries)
+                     if allowed and (match := re.fullmatch(
+                         r"test (\S+)(?: - should panic)? \.\.\. (ok|ignored)", line))}
+        completed.update((name, "FAILED") for name in report.names)
+        states.extend(completed.items())
     outcomes = dict(states)
     occurrences = Counter(name for name, _ in states)
+    ambiguous_threads = {name for name, owners in metadata.rust_test_owners.items() if len(owners) > 1}
+    ambiguous_threads.update(name for name, count in occurrences.items() if count > 1)
     failing_threads = {name for name, status in outcomes.items() if status == "FAILED"
-                       and occurrences[name] == 1 and name in metadata.rust_tests and not _private(name, index)}
+                       and name not in ambiguous_threads and name in metadata.rust_tests
+                       and not _private(name, index)}
     for block_number, (name, framework, lines, panic_lines) in enumerate(blocks):
         if framework == "cargo" and outcomes.get(name) in {"ok", "ignored"}:
             continue
@@ -878,7 +987,7 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
         if not attributed:
             if name == UNVERIFIED:
                 reason = UnverifiedReason.DIAGNOSTIC_THREAD.value
-            elif occurrences[name] > 1:
+            elif name in ambiguous_threads:
                 reason = UnverifiedReason.DIAGNOSTIC_AMBIGUOUS.value
             else:
                 reason = UnverifiedReason.DIAGNOSTIC_NOT_FAILING.value
