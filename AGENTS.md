@@ -30,7 +30,7 @@ honesty: it shows only what was observed and names every gap. Current state: `do
 
 ## Commands
 
-Local checks are compile-only. Run the checks for what you touched; all tests run on GitHub:
+Development checks are compile-only locally. Run the checks for what you touched:
 
 ```bash
 tools/dev/check.sh rust:<crate>            # cargo check + clippy for one crate
@@ -43,9 +43,10 @@ tools/dev/check.sh fmt                     # cargo fmt --check
 tools/dev/check.sh diff                    # whitespace / end-of-file check (CI gate 23)
 ```
 
-All tests run on GitHub Actions at wave merges and release candidates, not per ticket (ADR 0012).
+Development tests run on Linux GitHub Actions at wave merges and release candidates, not per ticket (ADR 0012).
 Heavy suites include: the full workspace tests, CLI journey tests that need built adapters, the 23-gate floors,
-packaging, campaigns, browser runs and hosted macOS arm64 in `macos.yml` (D2; `macos-ok` required). Read CI with
+packaging, campaigns and browser runs. Do not wait for, trigger or require macOS CI during development. At release,
+the owner runs `tools/dev/macos-release-check.sh` locally on a Mac; fix failures before release. Read CI with
 `gh -R Legend101Zz/X-trace run view <id> --log-failed`. `tools/dev/prep.sh` (fetch dependencies, build adapters)
 needs the network and runs outside any agent sandbox.
 
@@ -81,8 +82,8 @@ needs the network and runs outside any agent sandbox.
 - **Contracts**: Protobuf/OpenAPI schemas, SQLite migrations, the XTF format, the redaction vocabulary and replay
   navigation change only in a ticket that says so, with an ADR when semantics change.
 - **Git**: work in your own worktree and branch. Workers do not commit, push or merge; the orchestrator reviews,
-  commits and opens the pull request. Every change reaches `main` through a PR whose required check `ci-ok` is
-  green on the exact head, plus `macos-ok` for wave merges and release candidates, with current `main` merged in
+  commits and opens the pull request. Every change reaches `main` through a PR whose Linux `ci-ok` check is
+  green on the exact head and whose required reviews are clean, with current `main` merged in
   (ADR 0012 §5). Small docs-only PRs still need `ci-ok`. No closing keywords (`fixes #N`,
   `closes #N`) in commits, PR titles or PR bodies. Every ticket has an issue; use `Refs #N` in PRs and a tracking
   issue with a checklist for each wave (ADR 0012 §5).

@@ -16,6 +16,9 @@
 
 ## Decision
 
+The macOS requirements in decisions 2, 4 and 5 and the consequences below are superseded by the amendment at the
+end of this ADR. The original text is retained as history.
+
 ### 1. Who does the work (owner instruction)
 
 - **Workers** are OpenAI Codex CLI agents on `gpt-6.1-sol` (default for product code and tests) or
@@ -119,3 +122,14 @@ at release candidates.
 - Hosted macOS evidence gates wave merges and release candidates without requiring the leased Mac floor.
 - The rule text in older documents is historical where it describes past runs (`docs/progress.md` entries); current
   rules live in `AGENTS.md`, this ADR and `docs/STATE.md`.
+
+## Amendment: macOS verification at release (2026-11-11)
+
+The owner decided to use Linux tests during development because macOS tests take too long. This supersedes the
+hosted macOS merge and release-candidate requirements and push triggers in decisions 2, 4 and 5 and the consequences
+above. Hosted macOS CI no longer runs per push; `macos.yml` is available by manual dispatch. Agents must not wait
+for, trigger or require macOS CI during development.
+
+Merges require Linux `ci-ok` on the exact head and clean reviews under decision 5. At release, the owner runs
+`tools/dev/macos-release-check.sh` locally on a Mac. Fix any failures before release. PLATFORM-MAC still requires
+the fresh-profile install of the exact unsigned release package on a real Mac.
