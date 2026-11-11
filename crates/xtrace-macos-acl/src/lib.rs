@@ -12,17 +12,54 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
-// sys/acl.h: acl_t is `struct _acl *`, and acl_type_t is an enum with nonnegative
-// values (the Darwin C ABI uses unsigned int). The pointee is deliberately opaque.
+// <sys/acl.h>: acl_t is `struct _acl *`. The pointee is deliberately opaque.
 #[repr(C)]
 struct Acl {
     _private: [u8; 0],
 }
 
+#[cfg(test)]
 #[repr(u32)]
 enum AclType {
     Extended = 0x0000_0100,
 }
+
+// <sys/_types/_filesec_t.h> and <sys/fcntl.h>: opaque SDK-owned security state.
+#[repr(C)]
+struct Filesec {
+    _private: [u8; 0],
+}
+
+#[repr(u32)]
+enum FilesecProperty {
+    Acl = 5,
+}
+
+// <sys/stat.h>, __DARWIN_STRUCT_STAT64, on arm64 and x86_64. Only output storage;
+// Rust never reads it. In particular, do not use the legacy 32-bit-inode layout.
+#[repr(C)]
+struct Stat {
+    dev: i32,
+    mode: u16,
+    nlink: u16,
+    ino: u64,
+    uid: u32,
+    gid: u32,
+    rdev: i32,
+    times: [[i64; 2]; 4],
+    size: i64,
+    blocks: i64,
+    blksize: i32,
+    flags: u32,
+    generation: u32,
+    spare: i32,
+    qspare: [i64; 2],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<Stat>() == 144);
+    assert!(std::mem::align_of::<Stat>() == 8);
+};
 
 // <pwd.h>, <grp.h>: uid_t/gid_t are u32 and __darwin_time_t is long on macOS.
 #[repr(C)]
@@ -47,11 +84,28 @@ struct Group {
     gr_mem: *mut *mut c_char,
 }
 
-// SAFETY: signatures match <sys/acl.h>, <pwd.h> and <grp.h>. ssize_t is isize
-// on both supported macOS architectures; all pointers remain SDK-owned or borrowed.
+// SAFETY: signatures match <sys/acl.h>, <sys/fcntl.h>, <sys/stat.h>, <pwd.h>
+// and <grp.h>. ssize_t is isize on both supported macOS architectures. Intel's
+// inode64 symbols match the Stat layout; arm64 uses that layout without a suffix.
 unsafe extern "C" {
-    fn acl_get_fd_np(fd: c_int, acl_type: AclType) -> *mut Acl;
-    fn acl_get_link_np(path_p: *const c_char, acl_type: AclType) -> *mut Acl;
+    fn filesec_init() -> *mut Filesec;
+    fn filesec_free(filesec: *mut Filesec);
+    fn filesec_query_property(
+        filesec: *mut Filesec,
+        property: FilesecProperty,
+        present: *mut c_int,
+    ) -> c_int;
+    fn filesec_get_property(
+        filesec: *mut Filesec,
+        property: FilesecProperty,
+        value: *mut c_void,
+    ) -> c_int;
+    #[cfg_attr(target_arch = "x86_64", link_name = "fstatx_np$INODE64")]
+    fn fstatx_np(fd: c_int, stat: *mut Stat, filesec: *mut Filesec) -> c_int;
+    #[cfg_attr(target_arch = "x86_64", link_name = "lstatx_np$INODE64")]
+    fn lstatx_np(path: *const c_char, stat: *mut Stat, filesec: *mut Filesec) -> c_int;
+    #[cfg(test)]
+    fn acl_set_fd_np(fd: c_int, acl: *mut Acl, acl_type: AclType) -> c_int;
     fn acl_init(count: c_int) -> *mut Acl;
     fn acl_size(acl: *mut Acl) -> isize;
     fn acl_free(obj_p: *mut c_void) -> c_int;
@@ -119,12 +173,15 @@ pub fn listing_names_compatible(
     }
 }
 
-/// Returns true only for a proven empty extended ACL; false means nonempty or unknown.
+/// Returns true only for a proven absent or empty extended ACL; false means nonempty or unknown.
 /// This is evidence only: callers must bracket it with identity, state and deadline checks.
 /// A supplied file is queried by held descriptor; otherwise the final name is not followed.
 ///
-/// Only a successful query returning an empty ACL can bypass `ls`. No errno, including
-/// ENOENT, EINVAL or ENOTSUP, proves absence. `acl_init(3)` documents a zero-entry ACL;
+/// A successful extended stat followed by a successful property query proves absence when
+/// FILESEC_ACL is unset: Darwin Libc's statx1 clears it for KAUTH_FILESEC_NOACL. Bare
+/// NULL/ENOENT from acl_get_fd_np or acl_get_link_np is not used as evidence; errors from
+/// stat or either property operation always force fallback. `acl_init(3)` documents a
+/// zero-entry ACL;
 /// `acl_size(3)` gives its external representation size. The extended format has a fixed
 /// header plus one fixed-size record per entry, so equal successful sizes prove zero entries
 /// without inspecting an opaque handle or mistaking Darwin's end-of-iteration EINVAL for
@@ -132,14 +189,40 @@ pub fn listing_names_compatible(
 pub fn no_extended_acl(path: &Path, descriptor: Option<&File>) -> bool {
     let Ok(path) = CString::new(path.as_os_str().as_bytes()) else { return false };
     // SAFETY: the CString remains live and terminated, and any supplied descriptor is borrowed
-    // for the whole call. All non-null handles come from the SDK, are used only with SDK ACL
-    // functions, and are freed exactly once on every branch. No pointee is read by Rust.
+    // for the whole call. Stat is correctly aligned SDK output storage. Each filesec is fresh,
+    // populated only by a successful bound/unfollowed query, and freed on every branch. The
+    // property getter allocates an independent acl_t, freed even if a later operation fails.
     unsafe {
-        let acl = match descriptor {
-            Some(file) => acl_get_fd_np(file.as_raw_fd(), AclType::Extended),
-            None => acl_get_link_np(path.as_ptr(), AclType::Extended),
+        let filesec = filesec_init();
+        if filesec.is_null() {
+            return false;
+        }
+        let mut stat = std::mem::MaybeUninit::<Stat>::uninit();
+        let queried = match descriptor {
+            Some(file) => fstatx_np(file.as_raw_fd(), stat.as_mut_ptr(), filesec),
+            None => lstatx_np(path.as_ptr(), stat.as_mut_ptr(), filesec),
         };
-        if acl.is_null() {
+        let mut present = -1;
+        if queried != 0 || filesec_query_property(filesec, FilesecProperty::Acl, &mut present) != 0
+        {
+            filesec_free(filesec);
+            return false;
+        }
+        if present == 0 {
+            filesec_free(filesec);
+            return true;
+        }
+        if present != 1 {
+            filesec_free(filesec);
+            return false;
+        }
+        let mut acl: *mut Acl = std::ptr::null_mut();
+        let got_acl = filesec_get_property(filesec, FilesecProperty::Acl, (&raw mut acl).cast());
+        filesec_free(filesec);
+        if got_acl != 0 || acl.is_null() {
+            if !acl.is_null() {
+                acl_free(acl.cast());
+            }
             return false;
         }
         let empty = acl_init(0);
@@ -154,3 +237,6 @@ pub fn no_extended_acl(path: &Path, descriptor: Option<&File>) -> bool {
         size > 0 && size == empty_size && freed_empty && freed_acl
     }
 }
+
+#[cfg(test)]
+mod tests;
