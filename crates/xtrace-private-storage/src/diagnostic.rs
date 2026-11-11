@@ -169,6 +169,13 @@ impl AdmissionFailure {
     }
 }
 
+/// Observe a refusal without changing the caller's fallback or deadline precedence.
+pub(crate) fn observe_context(operation: AdmissionOperation, context: AdmissionContext) {
+    // Only check_context's feature-gated CI channel consumes this observation.
+    // The returned failure must never enter the operation's failure accumulator.
+    let _ = AdmissionFailure::check_context(operation, context);
+}
+
 #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
 mod ci {
     use super::{AdmissionContext, AdmissionFailure};
