@@ -123,12 +123,14 @@ class LibtestOutputTests(unittest.TestCase):
         self.assertIn(unrelated, self.metadata.rust_tests)
         self.assertGreaterEqual(line, 1)
         self.assertLessEqual(line, self.metadata.files[path])
-        # The real path is attested, but PRIVATE_TEXT also matches "private-".
+        # A keyword match cannot suppress an attested, canary-free repository site.
         hits = {}
         lane_run.canary.scan_bytes(f"{path}:{line}".encode(), lane_run.CANARY_INDEX, hits, "fixture")
         self.assertEqual(hits, {})
         self.assertEqual(lane_run.PRIVATE_TEXT.search(path)[0], "private-")
-        self.assertEqual(self.metadata.location(f"{path}:{line}", lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
+        self.assertEqual(line, 171)
+        self.assertEqual(self.metadata.location(f"{path}:{line}", lane_run.CANARY_INDEX),
+                         "crates/xtrace-private-storage/src/scope.rs:171")
         header = "     Running unittests src/lib.rs (target/debug/deps/xtrace_private_storage-0123456789abcdef)"
         text = transcript([unrelated], f"thread '{name}' panicked at {path}:{line}:13:\n"
                           f"store call failed inside a scope\ntest {name} ... ok\n"
@@ -166,6 +168,60 @@ class LibtestOutputTests(unittest.TestCase):
         self.assertNotIn("testUnverifiedReason", row)
         self.assertIn(name, public)
         self.assertNotIn("private fixture detail", json.dumps(fragment) + public)
+
+    def test_head_private_storage_site_and_binary_publish_without_message_prose(self):
+        self.metadata = lane_run._checkout_metadata()
+        name = "scope::tests::a_panic_inside_a_live_scope_leaves_nothing_behind_for_the_next_scope"
+        site = "crates/xtrace-private-storage/src/scope.rs:171"
+        header = "     Running unittests src/lib.rs (target/debug/deps/xtrace_private_storage-0123456789abcdef)"
+        fragment, public = self.finalize(transcript([name], f"---- {name} stdout ----\n"
+                                                  f"thread 'worker' panicked at {site}:13:\n"
+                                                  "captured private_key fixture\n", header=header))
+        row, = fragment["failureDetails"]["failures"]
+        self.assertEqual((row["test"], row["location"], row["panicSites"]), (name, site, [site]))
+        self.assertEqual(row["binary"], {"crate": "xtrace-private-storage", "targetKind": "lib",
+                                         "targetName": "xtrace_private_storage"})
+        self.assertIn(site, public)
+        self.assertNotIn("private_key", json.dumps(fragment) + public)
+
+    def test_head_private_test_names_publish_in_fragment_and_job_log(self):
+        self.metadata = lane_run._checkout_metadata()
+        header = "     Running unittests src/lib.rs (target/debug/deps/xtrace_runtime-0123456789abcdef)"
+        for short in ("private_root_admission_rejects_symlink_paths_before_mount_probe",
+                      "private_leaf_and_ancestor_policy_rejects_loose_modes_and_acl_grants"):
+            with self.subTest(name=short):
+                name = f"java_attach::tests::{short}"
+                self.assertEqual(self.metadata.test(name, lane_run.CANARY_INDEX), short)
+                fragment, public = self.finalize(transcript([name], header=header))
+                self.assertEqual(fragment["failingTests"], [name])
+                row, = fragment["failureDetails"]["failures"]
+                self.assertEqual(row["test"], name)
+                self.assertNotIn("testUnverifiedReason", row)
+                self.assertIn(name, public)
+
+    def test_canary_needles_in_attested_paths_tests_and_binaries_are_withheld(self):
+        index = [*lane_run.CANARY_INDEX, *lane_run.canary.build_index({"fixture": "fixture31fe"})]
+        for needle in ("CANARY", "canary", "fixture31fe", "6669787475726533316665"):
+            with self.subTest(needle=needle):
+                crate = f"private-{needle}"
+                name = f"private_{needle}"
+                path = f"crates/{crate}/src/lib.rs"
+                self.metadata = lane_run.CheckoutMetadata({
+                    f"crates/{crate}/Cargo.toml": f'[package]\nname = "{crate}"\n',
+                    path: f"#[test]\nfn {name}() {{}}\n",
+                })
+                self.assertIn(name, self.metadata.tests)
+                self.assertIn(name, self.metadata.rust_tests)
+                self.assertEqual(self.metadata.test(name, index), lane_run.UNVERIFIED)
+                self.assertEqual(self.metadata.location(f"{path}:2", index), lane_run.UNVERIFIED)
+                header = f"     Running unittests src/lib.rs (target/debug/deps/{name}-0123456789abcdef)"
+                text = transcript([name], f"---- {name} stdout ----\n"
+                                  f"thread 'worker' panicked at {path}:2:7:\nfixture\n", header=header)
+                row, = self.details(text, index=index)["failures"]
+                self.assertEqual((row["test"], row["binary"], row["location"], row["panicSites"]),
+                                 (lane_run.UNVERIFIED, lane_run.UNVERIFIED, lane_run.UNVERIFIED, []))
+                self.assertEqual(row["testUnverifiedReason"], "privacy-scan")
+                self.assertNotIn(needle, json.dumps(row))
 
     def test_passing_should_panic_next_to_unrelated_failure_has_no_panic_owner(self):
         text = transcript(["case0"], f"thread 'case1' panicked at {SITE}:7:\nexpected panic\n"
