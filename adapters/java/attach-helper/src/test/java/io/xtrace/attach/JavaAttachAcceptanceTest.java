@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
-import java.net.ServerSocket;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -37,6 +36,8 @@ class JavaAttachAcceptanceTest {
       Pattern.compile("\\\"recording_id\\\":\\\"([0-9a-f-]{36})\\\"");
   private static final Pattern STRING_FIELD =
       Pattern.compile("\\\"%s\\\":\\\"((?:\\\\.|[^\\\"\\\\])*)\\\"");
+  private static final Pattern TOMCAT_BOUND_PORT =
+      Pattern.compile("Tomcat started on port ([0-9]{1,5}) \\(http\\)");
 
   @Test
   void attachesToRunningSpringJvmAndPersistsVerifiedSourceEvidence() throws Exception {
@@ -84,20 +85,21 @@ class JavaAttachAcceptanceTest {
       String secondReady = waitForFirstLine(secondDaemonOutput, secondDaemon, Duration.ofSeconds(15));
       Path secondBootstrap = Path.of(stringField(secondReady, "bootstrap_path"));
 
-      int port = freePort();
       stage[0] = "start-spring-fixture";
+      Path fixtureOutput = logs.resolve("fixture.out");
       fixtureProcess =
           new ProcessBuilder(
                   targetJava.toString(),
                   "-jar",
                   fixture.toString(),
                   "--server.address=127.0.0.1",
-                  "--server.port=" + port,
+                  "--server.port=0",
+                  "--logging.level.org.springframework.boot.tomcat.TomcatWebServer=INFO",
                   "--spring.main.banner-mode=off")
-              .redirectOutput(logs.resolve("fixture.out").toFile())
+              .redirectOutput(fixtureOutput.toFile())
               .redirectError(logs.resolve("fixture.err").toFile())
               .start();
-      waitForFixture(port, fixtureProcess, Duration.ofSeconds(45));
+      int port = waitForFixture(fixtureOutput, fixtureProcess, Duration.ofSeconds(45));
 
       String inspected =
           runHelper(
@@ -234,6 +236,48 @@ class JavaAttachAcceptanceTest {
   }
 
   @Test
+  void attach_acceptance_uses_fixture_bound_port() {
+    String output = """
+        Tomcat initialized with port 0 (http)
+        Tomcat started on port 0 (http)
+        Tomcat started on port 65536 (http)
+        Tomcat started on port 47129 (http) with context path '/'
+        """;
+    assertEquals(47129, fixtureBoundPort(output));
+    assertEquals(0, fixtureBoundPort("Tomcat initialized with port 8080 (http)"));
+    assertEquals(0, fixtureBoundPort("Tomcat started on port 47129 (http"));
+  }
+
+  @Test
+  void attach_fixture_exit_before_port_reports_failure() throws Exception {
+    Path root = Files.createTempDirectory("xtrace-java-attach-port-test-");
+    Process child = null;
+    try {
+      setPrivateDirectory(root);
+      Path output = root.resolve("fixture.out");
+      child = new ProcessBuilder(
+          Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+          "-jar",
+          root.resolve("missing-fixture.jar").toString())
+          .redirectOutput(output.toFile())
+          .redirectError(root.resolve("fixture.err").toFile())
+          .start();
+      Process fixture = child;
+      AssertionError failure = assertThrows(
+          AssertionError.class, () -> waitForFixture(output, fixture, Duration.ofSeconds(45)));
+      assertFalse(child.isAlive());
+      assertTrue(child.exitValue() != 0);
+      assertEquals(
+          "the disposable Spring fixture exited before reporting its bound port (exit status "
+              + child.exitValue() + ")",
+          failure.getMessage());
+    } finally {
+      stop(child);
+      deleteTree(root);
+    }
+  }
+
+  @Test
   void unconfirmedOwnedChildRetainsFixtureRootAndPrivateRecoveryReceipt() throws Exception {
     Path root = Files.createTempDirectory("xtrace-java-attach-cleanup-test-");
     setPrivateDirectory(root);
@@ -322,22 +366,51 @@ class JavaAttachAcceptanceTest {
     }
   }
 
-  private static void waitForFixture(int port, Process process, Duration timeout)
+  private static int waitForFixture(Path output, Process process, Duration timeout)
       throws Exception {
     long deadline = System.nanoTime() + timeout.toNanos();
+    int port = 0;
     IOException lastError = null;
     while (System.nanoTime() < deadline && process.isAlive()) {
-      try {
-        HttpResponse<String> response = get(port, "/__fixture/count");
-        if (response.statusCode() == 200) return;
-      } catch (IOException error) {
-        lastError = error;
+      if (port == 0) port = fixtureBoundPort(readTailText(output));
+      if (port != 0) {
+        try {
+          HttpResponse<String> response = get(port, "/__fixture/count");
+          if (response.statusCode() == 200) return port;
+        } catch (IOException error) {
+          lastError = error;
+        }
       }
-      Thread.sleep(100);
+      long remaining = deadline - System.nanoTime();
+      if (remaining <= 0
+          || process.waitFor(
+              Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(100)), TimeUnit.NANOSECONDS)) {
+        break;
+      }
+    }
+    if (!process.isAlive()) {
+      throw new AssertionError(
+          "the disposable Spring fixture exited before "
+              + (port == 0 ? "reporting its bound port" : "HTTP readiness")
+              + " (exit status " + process.exitValue() + ")");
+    }
+    if (port == 0) {
+      throw new AssertionError(
+          "the disposable Spring fixture did not report its bound port before the readiness deadline");
     }
     throw new AssertionError(
         "the disposable Spring fixture did not become ready"
             + (lastError == null ? "" : " (HTTP connection unavailable)"));
+  }
+
+  private static int fixtureBoundPort(String output) {
+    // Boot logs the connector's local port after it has started.
+    Matcher matcher = TOMCAT_BOUND_PORT.matcher(output);
+    while (matcher.find()) {
+      int port = Integer.parseInt(matcher.group(1));
+      if (port > 0 && port <= 65535) return port;
+    }
+    return 0;
   }
 
   private static HttpResponse<String> postOrder(int port) throws Exception {
@@ -641,12 +714,6 @@ class JavaAttachAcceptanceTest {
     Matcher matcher = pattern.matcher(json);
     if (!matcher.find()) throw new AssertionError("required JSON field is unavailable");
     return matcher.group(1).replace("\\\\", "\\").replace("\\\"", "\"");
-  }
-
-  private static int freePort() throws IOException {
-    try (ServerSocket socket = new ServerSocket(0)) {
-      return socket.getLocalPort();
-    }
   }
 
   private static Path requiredPath(String property) {

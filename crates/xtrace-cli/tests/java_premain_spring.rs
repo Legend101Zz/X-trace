@@ -7,6 +7,9 @@
     reason = "end-to-end test asserts on controlled local process and fixture state"
 )]
 
+#[path = "common/spring_readiness.rs"]
+mod spring_readiness;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write as _};
 use std::net::{Shutdown, TcpStream};
@@ -18,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use prost::Message as _;
 use rusqlite::Connection;
 use serde_json::Value;
+use spring_readiness::ReadinessStderr;
 use tempfile::TempDir;
 use xtrace_domain::ContentHash;
 use xtrace_protocol::generated::agent::{InteractionKind, RecordingEvent, RecordingEventKind};
@@ -63,6 +67,7 @@ struct CapturedProcess {
     stdout: thread::JoinHandle<ScannedOutput>,
     stderr: thread::JoinHandle<ScannedOutput>,
     stdout_lines: std::sync::mpsc::Receiver<Vec<u8>>,
+    readiness_stderr: ReadinessStderr,
 }
 
 impl CapturedProcess {
@@ -72,7 +77,9 @@ impl CapturedProcess {
             panic!("spawn {label}: {error}");
         }));
         let mut stdout = child.stdout.take().expect("captured child stdout");
-        let mut stderr = child.stderr.take().expect("captured child stderr");
+        let stderr = child.stderr.take().expect("captured child stderr");
+        let readiness_stderr = ReadinessStderr::default();
+        let mut stderr = readiness_stderr.observe(stderr);
         let (lines_tx, stdout_lines) = std::sync::mpsc::channel();
         Self {
             child,
@@ -81,6 +88,7 @@ impl CapturedProcess {
             }),
             stderr: thread::spawn(move || drain_scanned(&mut stderr, 256 * 1024)),
             stdout_lines,
+            readiness_stderr,
         }
     }
 
@@ -156,8 +164,8 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
         "local proof requires JDK 17 or 21, got: {version_text}"
     );
 
-    let valid = launch_fixture(&agent, &fixture, &bootstrap);
-    let port = wait_for_fixture(&valid.stdout_lines);
+    let mut valid = launch_fixture(&agent, &fixture, &bootstrap);
+    let port = wait_for_fixture(&mut valid);
     let isolation = http(port, "GET", "/__fixture/isolation", &[], None);
     assert_eq!(isolation.status, 200);
     let isolation_json: Value = serde_json::from_slice(&isolation.body).expect("isolation JSON");
@@ -334,8 +342,8 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let mut mismatch_daemon = start_quiet_daemon(&repo, &data_home);
     let mismatch_bootstrap = mismatch_daemon.1.clone();
     let manifest_mismatched_fixture = tamper_fixture_class_attestation(root.path(), &fixture);
-    let mismatched = launch_fixture(&agent, &manifest_mismatched_fixture, &mismatch_bootstrap);
-    let mismatch_port = wait_for_fixture(&mismatched.stdout_lines);
+    let mut mismatched = launch_fixture(&agent, &manifest_mismatched_fixture, &mismatch_bootstrap);
+    let mismatch_port = wait_for_fixture(&mut mismatched);
     assert_eq!(post_order(mismatch_port).status, 201);
     let (mismatch_stdout, mismatch_stderr) = mismatched.stop();
     assert_scanned_clean("class mismatch fixture stdout", &mismatch_stdout);
@@ -356,8 +364,9 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     let mut mutated_class_daemon = start_quiet_daemon(&repo, &data_home);
     let mutated_class_bootstrap = mutated_class_daemon.1.clone();
     let mutated_class_fixture = mutate_fixture_classfile(root.path(), &fixture);
-    let mutated_class = launch_fixture(&agent, &mutated_class_fixture, &mutated_class_bootstrap);
-    let mutated_class_port = wait_for_fixture(&mutated_class.stdout_lines);
+    let mut mutated_class =
+        launch_fixture(&agent, &mutated_class_fixture, &mutated_class_bootstrap);
+    let mutated_class_port = wait_for_fixture(&mut mutated_class);
     assert_eq!(post_order(mutated_class_port).status, 201, "mutated class remains loadable");
     let (mutated_class_stdout, mutated_class_stderr) = mutated_class.stop();
     assert_scanned_clean("mutated class fixture stdout", &mutated_class_stdout);
@@ -391,15 +400,15 @@ fn premain_captures_real_spring_request_and_fails_open_without_leaking_canaries(
     assert_canaries_absent("actual classfile mutation CLI", &class_mutation_show.stdout);
     signal_and_wait(&mut mutated_class_daemon.0, "-INT");
 
-    let unavailable = launch_fixture(&agent, &fixture, &unavailable_bootstrap);
-    let unavailable_port = wait_for_fixture(&unavailable.stdout_lines);
+    let mut unavailable = launch_fixture(&agent, &fixture, &unavailable_bootstrap);
+    let unavailable_port = wait_for_fixture(&mut unavailable);
     assert_eq!(post_order(unavailable_port).status, 201);
     let (unavailable_stdout, unavailable_stderr) = unavailable.stop();
     assert!(text(&unavailable_stderr.sample).contains("XTR-JAVA-AGENT-UNAVAILABLE"));
 
     let invalid_path = root.path().join("missing private bootstrap.json");
-    let invalid = launch_fixture(&agent, &fixture, &invalid_path);
-    let invalid_port = wait_for_fixture(&invalid.stdout_lines);
+    let mut invalid = launch_fixture(&agent, &fixture, &invalid_path);
+    let invalid_port = wait_for_fixture(&mut invalid);
     assert_eq!(post_order(invalid_port).status, 201);
     let (invalid_stdout, invalid_stderr) = invalid.stop();
     assert!(text(&invalid_stderr.sample).contains("XTR-JAVA-AGENT-UNAVAILABLE"));
@@ -655,25 +664,14 @@ fn launch_fixture(agent: &Path, fixture: &Path, bootstrap: &Path) -> CapturedPro
     CapturedProcess::spawn(command, "Spring fixture")
 }
 
-fn wait_for_fixture(lines: &std::sync::mpsc::Receiver<Vec<u8>>) -> u16 {
+fn wait_for_fixture(process: &mut CapturedProcess) -> u16 {
     let deadline = Instant::now() + Duration::from_secs(30);
-    let port = loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .expect("Spring fixture readiness deadline elapsed");
-        let line = lines
-            .recv_timeout(remaining)
-            .expect("Spring fixture did not report its bound port before the readiness deadline");
-        // Boot 4.1.1 logs the connector's local port only after it has started.
-        let line = String::from_utf8_lossy(&line);
-        if let Some((_, address)) = line.split_once("Tomcat started on port ") {
-            if let Some((port, _)) = address.split_once(" (http)") {
-                let port = port.parse::<u16>().expect("Spring fixture bound port");
-                assert_ne!(port, 0, "Spring fixture must report its actual bound port");
-                break port;
-            }
-        }
-    };
+    let port = spring_readiness::wait_for_fixture(
+        &process.stdout_lines,
+        deadline,
+        &mut process.child,
+        &process.readiness_stderr,
+    );
     loop {
         if let Ok(response) = try_http(port, "GET", "/__fixture/count", &[], None) {
             if response.status == 200 {
