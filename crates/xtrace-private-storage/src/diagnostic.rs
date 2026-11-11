@@ -503,6 +503,7 @@ mod ci {
         fn record_and_byte_caps_stop_silently() -> std::io::Result<()> {
             let directory = tempfile::tempdir()?;
             let directory = directory.path().canonicalize()?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
             let path = directory.join("private-storage.jsonl");
             let budget = AtomicUsize::new(0);
             for _ in 0..MAX_RECORDS + 10 {
@@ -529,6 +530,7 @@ mod ci {
         fn concurrent_writers_keep_complete_lines_within_both_caps() -> std::io::Result<()> {
             let directory = tempfile::tempdir()?;
             let directory = directory.path().canonicalize()?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
             let path = directory.join("private-storage.jsonl");
             let record = "{\"error\":\"Admission\"}\n";
             for prefix in [0, MAX_BYTES as usize - 2 * record.len()] {
@@ -585,8 +587,9 @@ mod ci {
             }
             let directory = tempfile::tempdir()?;
             let directory = directory.path().canonicalize()?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
             let path = directory.join("private-storage.jsonl");
-            for size in [4095, 4096, MAX_BYTES as usize, MAX_BYTES as usize + 1] {
+            for size in [0, 4095, 4096, MAX_BYTES as usize, MAX_BYTES as usize + 1] {
                 std::fs::write(&path, vec![b'\n'; size])?;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
                 // Rust's test binary retains the default SIGXFSZ disposition.
@@ -608,7 +611,34 @@ mod ci {
                     output.status
                 );
                 assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
-                assert_eq!(std::fs::read(&path)?, vec![b'\n'; size]);
+                if size == 0 {
+                    // Prove the child reached the writer under the same file limit.
+                    let contents = std::fs::read_to_string(&path)?;
+                    assert!(!contents.is_empty());
+                    assert!(contents.len() <= 4096);
+                    let expected = line(
+                        AdmissionFailure {
+                            operation: AdmissionOperation::NamedMetadata,
+                            kind: Some(std::io::ErrorKind::PermissionDenied),
+                            raw_os_error: Some(13),
+                        },
+                        Some(concat!(
+                            "diagnostic::ci::tests::",
+                            "saturated_file_and_fsize_limit_preserve_original_admission"
+                        )),
+                        None,
+                    )
+                    .map_err(std::io::Error::other)?;
+                    assert_eq!(
+                        contents,
+                        expected
+                            .as_str()
+                            .map_err(std::io::Error::other)?
+                            .repeat(contents.lines().count())
+                    );
+                } else {
+                    assert_eq!(std::fs::read(&path)?, vec![b'\n'; size]);
+                }
             }
             Ok(())
         }

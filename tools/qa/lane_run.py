@@ -348,6 +348,8 @@ class CheckoutMetadata:
         self.diagnostic_variants: set[str] = set()
         self.admission_operations: set[str] = set()
         self.error_variants: set[str] = set()
+        self.admission_sites: set[str] = set()
+        self.listing_refusals: set[str] = set()
         self.java_files: dict[str, list[str]] = {}
         for name, source in sources.items():
             path = pathlib.PurePosixPath(name)
@@ -361,6 +363,8 @@ class CheckoutMetadata:
                 self.diagnostic_variants.update(_diagnostic_variants(source))
                 self.admission_operations.update(_diagnostic_variants(source, "AdmissionOperation"))
                 self.error_variants.update(_diagnostic_variants(source, "PrivateStorageError"))
+                self.admission_sites.update(_diagnostic_variants(source, "AdmissionSite"))
+                self.listing_refusals.update(_diagnostic_variants(source, "ListingRefusal"))
 
     def _read_tests(self, path: pathlib.PurePosixPath, source: str) -> None:
         test_path = bool(set(path.parts) & {"test", "tests", "__tests__"})
@@ -533,7 +537,9 @@ def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, 
                     record = json.loads(raw)
                 except (ValueError, UnicodeError, RecursionError):
                     continue
-                if not isinstance(record, dict) or set(record) != {"thread", "error", "operation", "kind", "errno"}:
+                base_fields = {"thread", "error", "operation", "kind", "errno"}
+                context_fields = {"site", "changes", "listing"}
+                if not isinstance(record, dict) or set(record) not in (base_fields, base_fields | context_fields):
                     continue
                 thread, error, operation, kind, errno = (record[key] for key in
                                                         ("thread", "error", "operation", "kind", "errno"))
@@ -545,6 +551,13 @@ def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, 
                     continue
                 values = [error, operation, *([kind] if kind is not None else []),
                           *([errno] if errno is not None else [])]
+                if "site" in record:
+                    site, changes, listing = (record[key] for key in ("site", "changes", "listing"))
+                    if (not isinstance(site, str) or site not in metadata.admission_sites
+                            or type(changes) is not int or not 0 <= changes <= 31
+                            or not isinstance(listing, str) or listing not in metadata.listing_refusals):
+                        continue
+                    values.extend((site, changes, listing))
                 if any(_private(str(value), index) for value in values):
                     continue
                 name = (thread if isinstance(thread, str) and thread in metadata.rust_tests
