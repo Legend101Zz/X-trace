@@ -14,6 +14,9 @@
 mod admission;
 #[cfg(unix)]
 mod diagnostic;
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code, reason = "minimal sys/acl.h bridge; all other modules deny unsafe")]
+mod macos_acl;
 #[cfg(unix)]
 pub use diagnostic::{AdmissionFailure, AdmissionOperation};
 #[cfg(unix)]
