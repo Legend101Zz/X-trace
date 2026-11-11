@@ -1228,6 +1228,7 @@ def _run(
     max_log_bytes: int | None = None,
     provenance: bool = False,
     provenance_report: dict[str, Any] | None = None,
+    outcome_report: dict[str, bool] | None = None,
 ) -> tuple[int, float]:
     """Run one supervised command, optionally enforcing a live log-size cap.
 
@@ -1241,6 +1242,10 @@ def _run(
     stops only this run's owned process tree through the same path as a
     timeout, returns LOG_LIMIT_EXIT_CODE, and any tree that cannot be confirmed
     drained fails closed as an uncertain process tree.
+
+    On normal return, `outcome_report` receives `timed_out` from this
+    supervisor's deadline observation. A child's exit code 124 alone does not
+    set it. The return tuple and existing reports are unchanged.
     """
     started = time.monotonic()
     fd = private_roots.create_private_file(
@@ -1603,6 +1608,8 @@ def _run(
                 log_io_error, process.returncode, round(time.monotonic() - started, 6),
             ) from log_io_error
         raise log_io_error
+    if outcome_report is not None:
+        outcome_report["timed_out"] = timed_out
     return code, round(time.monotonic() - started, 6)
 
 

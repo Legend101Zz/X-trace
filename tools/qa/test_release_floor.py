@@ -140,6 +140,44 @@ class FloorEnvironmentTests(CheckoutFixture):
 
 
 class FloorSupervisorTests(unittest.TestCase):
+    def test_wrapper_timeout_preserves_its_completed_fragment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            shim = root / "bin"
+            shim.mkdir(mode=0o700)
+            cargo = shim / "cargo"
+            cargo.write_text(f"#!{sys.executable}\nimport signal\nsignal.pause()\n")
+            cargo.chmod(0o700)
+            gate = run_gates.Gate("rust-workspace", ("cargo", "test", "--locked"))
+            fragment_path = root / "frag/rust__-__rust-workspace.json"
+            original_run = run_gates._run
+            completed = {}
+
+            def capture_completed(argv, **kwargs):
+                result = original_run(argv, **kwargs)
+                self.assertEqual(result[0], 124)
+                self.assertEqual(kwargs["outcome_report"], {"timed_out": False})
+                completed["fragment"] = fragment_path.read_bytes()
+                return result
+
+            with mock.patch.object(run_gates, "GATES", (gate,)), \
+                    mock.patch.object(run_gates, "_run", side_effect=capture_completed), \
+                    mock.patch.object(run_gates, "_process_snapshot", side_effect=own_process_snapshot()), \
+                    mock.patch.object(lane_run, "recover_timeout", wraps=lane_run.recover_timeout) as recovery, \
+                    release_floor.configured_floor(root, 0):
+                # Expire the wrapper's timer immediately; the outer supervisor
+                # keeps a bounded safety budget and observes the wrapper's return.
+                code, _ = run_gates._run(list(run_gates.GATES[0].argv),
+                                         cwd=pathlib.Path(__file__).resolve().parents[2],
+                                         env={**os.environ, "PATH": str(shim) + os.pathsep + os.environ["PATH"]},
+                                         timeout=10, log_path=root / "supervisor.log")
+            self.assertEqual(code, 124)
+            recovery.assert_not_called()
+            self.assertEqual(fragment_path.read_bytes(), completed["fragment"])
+            fragment = json.loads(completed["fragment"])
+            self.assertEqual((fragment["status"], fragment["exitCode"], fragment["timedOut"]), ("fail", 124, True))
+            self.assertNotIn("wallObservation", fragment["rustTiming"])
+
     def test_outer_timeout_publishes_completed_active_and_diagnostic_observations(self):
         """Exercise real _run termination, with lane_run's own deadline still pending."""
         metadata = lane_run._checkout_metadata()
@@ -217,6 +255,7 @@ class FloorSupervisorTests(unittest.TestCase):
             self.assertEqual((fragment["status"], fragment["exitCode"], fragment["timedOut"]), ("fail", 124, True))
             self.assertEqual(fragment["passed"], 3)
             timing = fragment["rustTiming"]
+            self.assertEqual(timing["wallObservation"], "cargo-start-to-supervisor-cleanup")
             self.assertEqual([row["event"] for row in timing["events"]], ["start", "completion", "start"])
             self.assertEqual(timing["events"][1]["observation"], "libtest-result")
             active = timing["runningAtTimeout"][0]
