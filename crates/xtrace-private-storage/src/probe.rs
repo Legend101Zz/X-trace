@@ -1529,6 +1529,21 @@ mod tests {
             .expect("fixture directory")
     }
 
+    #[test]
+    fn expiry_after_a_successful_probe_refuses_the_same_unchanged_directory() {
+        let root = fixture();
+        let directory = open(root.path());
+        let mut operation = Operation::new();
+        assert!(judge(&operation, root.path(), &directory));
+        let before = directory_probe_count();
+        // Expire this operation explicitly; no scheduler delay or filesystem
+        // mutation is needed to exercise the production deadline refusal.
+        operation.deadline = Instant::now();
+        assert!(!judge(&operation, root.path(), &directory));
+        assert_eq!(operation.failure(Step::AclState), PrivateStorageError::check(Step::Deadline));
+        assert_eq!(directory_probe_count(), before, "no new ACL evidence after expiry");
+    }
+
     #[cfg(feature = "ci-diagnostics")]
     #[test]
     fn diagnostic_depth_keeps_the_requested_root_across_child_walks() {
