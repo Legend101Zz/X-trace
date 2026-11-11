@@ -67,7 +67,9 @@ class CheckoutFixture(unittest.TestCase):
                 'pub enum PrivateStorageError {\n#[error("private storage is unavailable: {0}")]\n'
                 'Admission(AdmissionFailure), Unavailable, InvalidName, AlreadyExists, Operation,\n}\n'),
             "crates/xtrace-private-storage/src/diagnostic.rs": (
-                "pub enum AdmissionOperation { Deadline, WaitAclProbe, NamedMetadata, OwnershipAndMode, }\n"),
+                "pub enum AdmissionOperation { Deadline, WaitAclProbe, NamedMetadata, OwnershipAndMode, AclState, }\n"
+                "pub(crate) enum AdmissionSite { Snapshot, ProbeState, RecheckAcl, }\n"
+                "pub(crate) enum ListingRefusal { NotChecked, InheritedAllow, Header, }\n"),
         }
         for name, source in self.sources.items():
             path = self.checkout / name
@@ -860,6 +862,28 @@ class FailureDetailsTests(CheckoutFixture):
         index = lane_run.canary.build_index({"category": "Deadline"})
         self.assertEqual(self.records(good, index=index), [])
 
+    def test_context_fields_use_their_own_head_enum_and_mask_bounds(self):
+        good = self.diagnostic(operation="AclState", site="Snapshot", changes=0, listing="NotChecked")
+        self.assertEqual(self.metadata.admission_sites, {"Snapshot", "ProbeState", "RecheckAcl"})
+        self.assertEqual(self.metadata.listing_refusals, {"NotChecked", "InheritedAllow", "Header"})
+        for site in sorted(self.metadata.admission_sites):
+            for listing in sorted(self.metadata.listing_refusals):
+                for changes in (0, 1, 3, 16, 31):
+                    with self.subTest(site=site, listing=listing, changes=changes):
+                        self.assertEqual(self.records({**good, "site": site, "listing": listing,
+                                                       "changes": changes}),
+                                         [("fails", ["Admission", "AclState", site, changes, listing])])
+        for field in ("site", "changes", "listing"):
+            self.assertEqual(self.records({key: value for key, value in good.items() if key != field}), [])
+        index = lane_run.canary.build_index({"category": "Snapshot"})
+        self.assertEqual(self.records(good, index=index), [])
+        metadata = lane_run.CheckoutMetadata({**self.sources,
+            "crates/xtrace-private-storage/src/diagnostic.rs":
+                "pub enum AdmissionOperation { AclState, }\n"
+                "const TEXT: &str = \"enum AdmissionSite { Snapshot, }\";\n"
+                "// enum ListingRefusal { NotChecked, }\n"})
+        self.assertEqual(self.records(good, metadata=metadata), [])
+
     def test_structured_thread_names_include_only_head_verified_modules(self):
         metadata = lane_run.CheckoutMetadata({
             **self.sources,
@@ -940,7 +964,9 @@ class CommittedCheckoutTests(unittest.TestCase):
         (directory / "outside.rs").symlink_to("../outside.rs")
         self.diagnostic = self.checkout / "crates/xtrace-private-storage/src/diagnostic.rs"
         self.diagnostic.parent.mkdir(parents=True)
-        self.diagnostic.write_text("pub enum AdmissionOperation { Deadline, }\n")
+        self.diagnostic.write_text("pub enum AdmissionOperation { Deadline, }\n"
+                                   "pub(crate) enum AdmissionSite { Snapshot, }\n"
+                                   "pub(crate) enum ListingRefusal { NotChecked, }\n")
         (self.diagnostic.parent / "alias.rs").symlink_to("diagnostic.rs")
         env = {**os.environ, "GIT_AUTHOR_NAME": "Fixture", "GIT_COMMITTER_NAME": "Fixture",
                "GIT_AUTHOR_EMAIL": "fixture@example.test", "GIT_COMMITTER_EMAIL": "fixture@example.test"}
@@ -969,13 +995,20 @@ class CommittedCheckoutTests(unittest.TestCase):
             self.assertEqual(metadata.location(site, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
 
     def test_diagnostic_vocabulary_comes_only_from_head_blobs(self):
-        self.diagnostic.write_text("pub enum AdmissionOperation { StagedValue, }\n")
+        self.diagnostic.write_text("pub enum AdmissionOperation { StagedValue, }\n"
+                                   "pub(crate) enum AdmissionSite { StagedSite, }\n"
+                                   "pub(crate) enum ListingRefusal { StagedListing, }\n")
         subprocess.run(["git", "-C", str(self.checkout), "add", "crates/xtrace-private-storage/src/diagnostic.rs"],
                        check=True, capture_output=True)
         self.diagnostic.unlink()
-        (self.diagnostic.parent / "untracked.rs").write_text("enum AdmissionOperation { UntrackedValue }")
+        (self.diagnostic.parent / "untracked.rs").write_text(
+            "enum AdmissionOperation { UntrackedValue }\n"
+            "enum AdmissionSite { UntrackedSite }\n"
+            "enum ListingRefusal { UntrackedListing }\n")
         metadata = lane_run._checkout_metadata()
         self.assertEqual(metadata.diagnostic_variants, {"Deadline"})
+        self.assertEqual(metadata.admission_sites, {"Snapshot"})
+        self.assertEqual(metadata.listing_refusals, {"NotChecked"})
         row = lane_run.failure_details(FailureDetailsTests.cargo(
             name="committed_test", site="crates/tests/example.rs:2:1",
             message=("operation=Deadline kind=None raw_os_error=None "
@@ -1148,6 +1181,48 @@ class RunTests(CheckoutFixture):
         self.assertEqual(observations, detail["observedDiagnostics"])
         self.assertNotIn("first", json.dumps(frag))
         self.assertNotIn("first", public.getvalue())
+
+    def test_acl_context_validation_in_fragment_and_job_log(self):
+        import contextlib
+        import io
+        import os
+        good = self.diagnostic(operation="AclState", site="ProbeState", changes=31, listing="InheritedAllow")
+        cases = [(good, ["Admission", "AclState", "ProbeState", 31, "InheritedAllow"])]
+        for field, values in {
+            "site": ["Unknown", "InheritedAllow", "AclState", [], None, 13],
+            "listing": ["Unknown", "ProbeState", "AclState", [], None, 13],
+            "changes": [-1, 32, 10**100, True, False, "3", 3.5, [], None],
+        }.items():
+            cases.extend(({**good, field: value}, None) for value in values)
+        cases.append(({**good, "message": "captured-value"}, None))
+        cases.extend(({key: value for key, value in good.items() if key != field}, None)
+                     for field in ("site", "changes", "listing"))
+        for record, categories in cases:
+            with self.subTest(record=record):
+                def command(cmd, *, stdout, env, **kwargs):
+                    path = pathlib.Path(env["XTRACE_CI_DIAG_DIR"]) / "private-storage.jsonl"
+                    path.write_text(json.dumps(record) + "\n")
+                    path.chmod(0o600)
+                    stdout.write(b"test fails ... FAILED\n")
+                    return subprocess.CompletedProcess(cmd, 101)
+
+                public = io.StringIO()
+                with contextlib.redirect_stdout(public), \
+                        mock.patch.dict(os.environ, {"XTRACE_CI_DIAG_DIR": "enabled"}), \
+                        mock.patch.object(lane_run.subprocess, "run", side_effect=command):
+                    rc, frag = self.run_step(["unused-command"])
+                self.assertEqual(rc, 101)
+                observations = frag["failureDetails"].get("observedDiagnostics", [])
+                expected = ([{"test": "fails", "relevance": "unknown", "category": categories}]
+                            if categories is not None else [])
+                self.assertEqual(observations, expected)
+                logged = [json.loads(line.removeprefix("lane observed-diagnostic "))
+                          for line in public.getvalue().splitlines()
+                          if line.startswith("lane observed-diagnostic ")]
+                self.assertEqual(logged, expected)
+                self.assertEqual(frag["failureDetails"]["failures"][0]["category"], [])
+                self.assertNotIn("captured-value", public.getvalue())
+                self.assertNotIn("captured-value", json.dumps(frag))
 
     def test_cargo_compile_reads_json_stdout_and_withholds_stderr(self):
         import contextlib
