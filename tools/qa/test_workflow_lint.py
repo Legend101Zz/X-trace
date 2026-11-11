@@ -155,7 +155,7 @@ class CiPullRequestTests(unittest.TestCase):
         jobs = self.workflow["jobs"]
         gates = jobs["gates"]["steps"]
         tests = next(step for step in gates if step.get("name") == "Unit and integration tests")
-        self.assertEqual(tests["env"]["XTRACE_CI_DIAG_DIR"], "${{ runner.temp }}/xt/frag/ci-diag")
+        self.assertIn('export XTRACE_CI_DIAG_DIR="${RUNNER_TEMP:?}/xt/frag/ci-diag"', tests["run"])
         self.assertIn("cargo test --locked --workspace --all-features --no-fail-fast", tests["run"])
         scratch = next(step for step in gates if step.get("name") == "Admit private test scratch before cargo tests")
         self.assertIn('"$root/frag/ci-diag"', scratch["run"])
@@ -180,10 +180,16 @@ class CiPullRequestTests(unittest.TestCase):
                 self.assertNotIn("continue-on-error", step)
                 self.assertIn("set -euo pipefail", run)
                 self.assertIn("umask 077", run)
-                self.assertEqual(run.count("exit 1"), 2)
+                self.assertNotIn("runner.temp", (ROOT / ".github/workflows" / filename).read_text())
+                self.assertEqual(run.count("exit 1"), 4)
                 self.assertEqual(run.count(f"grep -F '{guard}'"), 2)
+                override_guard = "ci-diagnostics is forbidden in release profiles even with debug assertions"
+                self.assertEqual(run.count(f"grep -F '{override_guard}'"), 2)
                 for features in ("--features ci-diagnostics", "--all-features"):
                     self.assertIn("if cargo check --release --locked -p xtrace-private-storage "
+                                  + features + ' >"$log" 2>&1; then', run)
+                    self.assertIn("if CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo check "
+                                  "--release --locked -p xtrace-private-storage "
                                   + features + ' >"$log" 2>&1; then', run)
             for job in workflow["jobs"].values():
                 self.assertNotIn("XTRACE_CI_DIAG_DIR", job.get("env", {}))
@@ -194,6 +200,27 @@ class CiPullRequestTests(unittest.TestCase):
                     if "--release" in command or "packaging/build.py" in command:
                         self.assertNotIn("ci-diagnostics", command)
                         self.assertNotIn("--all-features", command)
+
+
+    def test_release_packaging_checks_reject_diagnostics_with_debug_assertions(self):
+        # ci.yml's gates job runs this module. Execute both existing packaging
+        # checks with the override that used to bypass the source-level guard.
+        for filename, job_id in (("ci.yml", "gates"), ("macos.yml", "macos-arm64")):
+            workflow = workflow_lint.load(ROOT / ".github/workflows" / filename)
+            step = next(s for s in workflow["jobs"][job_id]["steps"]
+                        if s.get("name") == "Reject release CI diagnostic channel")
+            with self.subTest(workflow=filename), tempfile.TemporaryDirectory() as temporary:
+                result = subprocess.run(
+                    ["bash", "-e", "-c", step["run"]], cwd=ROOT,
+                    env={**os.environ, "RUNNER_TEMP": temporary,
+                         "CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS": "true"},
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                log = (pathlib.Path(temporary) / "ci-diagnostics-release.log").read_text()
+                self.assertIn(
+                    "ci-diagnostics is forbidden in release profiles even with debug assertions", log,
+                )
 
 
 class MacosWorkflowTests(unittest.TestCase):

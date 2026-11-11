@@ -12,7 +12,8 @@ description = "Owner-enforced private directory admission shared by X-trace stor
 workspace = true
 
 [features]
-# Private CI channel only. diagnostic.rs rejects this feature without debug assertions.
+# Private CI channel only. build.rs rejects release profiles regardless of debug assertions;
+# diagnostic.rs also rejects builds without debug assertions.
 ci-diagnostics = []
 # Test seam: counts `/bin/ls` spawns per thread. Off by default; consumers enable it only through
 # [dev-dependencies] so release builds never contain it.

@@ -2,6 +2,7 @@
 
 use std::io;
 
+// A second layer: build.rs rejects release profiles even with debug assertions enabled.
 #[cfg(all(feature = "ci-diagnostics", not(debug_assertions)))]
 compile_error!("ci-diagnostics requires debug_assertions; release/package builds must exclude it");
 
@@ -251,11 +252,19 @@ mod ci {
     }
 
     fn reserve(budget: &AtomicUsize) -> bool {
-        budget
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                (count < MAX_RECORDS).then_some(count + 1)
-            })
-            .is_ok()
+        let mut count = budget.load(Ordering::Relaxed);
+        while count < MAX_RECORDS {
+            match budget.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(current) => count = current,
+            }
+        }
+        false
     }
 
     pub(super) fn record(failure: AdmissionFailure) {

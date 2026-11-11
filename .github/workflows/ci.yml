@@ -414,10 +414,20 @@ jobs:
             exit 1
           fi
           grep -F 'ci-diagnostics requires debug_assertions; release/package builds must exclude it' "$log" >/dev/null
+          if CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo check --release --locked -p xtrace-private-storage --features ci-diagnostics >"$log" 2>&1; then
+            echo "release diagnostic channel with debug assertions was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics is forbidden in release profiles even with debug assertions' "$log" >/dev/null
+          if CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo check --release --locked -p xtrace-private-storage --all-features >"$log" 2>&1; then
+            echo "release diagnostic channel with debug assertions was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics is forbidden in release profiles even with debug assertions' "$log" >/dev/null
       - name: Unit and integration tests
-        env:
-          XTRACE_CI_DIAG_DIR: ${{ runner.temp }}/xt/frag/ci-diag
-        run: cargo test --locked --workspace --all-features --no-fail-fast
+        run: |
+          export XTRACE_CI_DIAG_DIR="${RUNNER_TEMP:?}/xt/frag/ci-diag"
+          cargo test --locked --workspace --all-features --no-fail-fast
       - name: Restricted-PATH vendored-protoc build
         # `PATH` excludes any directory that could host a system `protoc`,
         # proving the build script resolves the binary exclusively through
