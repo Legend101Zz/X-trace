@@ -40,37 +40,62 @@ a durable journal, a CI diagnostics channel, and the macOS native ACL fast path 
 Linux `ci-ok` passed on `8d2a9b1` in run `43024028230`; both release floors passed 23/23.
 The Petclinic campaign in run `43024105219` passed 37 of 45 steps. The other eight were reported, not passed.
 
-## Next work, in order
+## Wave 3 handoff
 
-Start Wave 3 on `wave/w3`. Read issue #3 first, then #4. Finish the remaining #3 Petclinic campaign gaps:
+[Draft PR #70](https://github.com/Legend101Zz/X-trace/pull/70) tracks `wave/w3`; the tracker is
+[#69](https://github.com/Legend101Zz/X-trace/issues/69). Main remains at `f92f0bf`. Wave changes are not merged:
 
-- `baseline-jar-sha-vs-pinned`: the observed jar hash differed from the pinned hash.
-- `unpaced-load-not-exercised`: serial requests were paced; the agent admits at most eight unwritten recordings.
-- `analyzer-source-accommodation`: the analyzer was built from source, not shipped in the candidate package.
-- `tui-navigation-accommodation`: routes were checked in detail, not in the list.
-- `overhead-measurement`: paced load and possible capture drops qualify the measurement; no budget was applied.
-- `flow-accommodations`: flows used request budgets, pacing and an acknowledged database wait.
-- `privacy-scope`: focused capture and exception message redaction have the reported scope.
-- `campaign-receipt-artifact`: the receipt was unsigned and non-release.
+- `ef29c58` implements the two carried review minors. Independent review found no issues.
+- `94fa938` implements [#22](https://github.com/Legend101Zz/X-trace/issues/22) attach port and readiness
+  diagnostics. The Java attach-helper and four Rust test binaries compile; formatting and diff checks passed.
+  No tests ran locally. #22 remains open. Both readiness reviews are complete, with no blocker or major findings.
+  One review has no actionable findings. The other found a minor race at
+  `crates/xtrace-cli/tests/common/spring_readiness.rs:84`: stdout disconnect can be reported before the stderr
+  reader samples an already-produced diagnostic. The existing test drains stderr before formatting the failure.
+  Carry this to the next fix batch under the minor rule, preserving deadlines and bounded waiting on inherited pipes.
 
-Carry forward the two review minors: the caught-panic test hard-codes line 171 in `scope.rs`, and a store test
-mutex can be poisoned after a workload failure. The ctime-only admission refusal is still unexplained; diagnostics
-now attribute it. Investigate the deferred macOS failures at the release check.
+Post-merge main CI [43042206403](https://github.com/Legend101Zz/X-trace/actions/runs/43042206403), attempt 4,
+completed with four failing jobs, all verified as apt DNS setup failures; tests were not reached in those jobs.
+Only the failed jobs were rerun as attempt 5, which is pending.
+The first wave CI [43057483505](https://github.com/Legend101Zz/X-trace/actions/runs/43057483505) on `6a46c76`
+likewise failed apt DNS setup in release-tool-tests before tests; it provides no green acceptance.
+Broader feature work and merge remain gated on green main and exact-head CI. No macOS CI is requested.
 
-Then work on #4, followed by #5 and #6 in parallel, #7, #8 and #9. Close an issue only when every box is ticked
-with evidence on merged `main`.
+After infrastructure clears, finish [#3](https://github.com/Legend101Zz/X-trace/issues/3):
 
-## Known nondeterministic tests (fix; never retry to green)
+1. [#32](https://github.com/Legend101Zz/X-trace/issues/32): exact export claims and a truthful policy digest.
+2. [#36](https://github.com/Legend101Zz/X-trace/issues/36): observed per-request burst correlation.
+3. [#52](https://github.com/Legend101Zz/X-trace/issues/52): bounded observed cause types, with an explicitly
+   scoped contract/ADR ticket.
+4. Then [#4](https://github.com/Legend101Zz/X-trace/issues/4), followed by #5 and #6 in parallel, #7, #8 and #9.
 
-- `crates/xtrace-cli/tests/lifecycle_journey.rs` `stale_record_naming_a_zombie_is_cleaned_up_by_stop_and_restart`
-  (#14): the test now waits for the zombie state and its failure message shows the exit code and stderr, but the
-  2026-10-10 failure's cause is unproven. If it recurs, read that message first.
-- `adapters/java/attach-helper` `JavaAttachAcceptanceTest` still picks a free port before starting the Spring
-  fixture, the race fixed in #21 for the Rust journeys (#22).
+Integrate and review the work, obtain exact-head Linux CI, and run a fresh packaged Petclinic campaign before
+assessing #3 acceptance. Close an issue only when every box has evidence on merged `main`. See `docs/INDEX.md`
+for the plans and release documents.
+
+## Petclinic accommodations and remaining evidence
+
+The Wave 2 campaign reported these gaps; they are not passes for missing evidence:
+
+- The observed baseline jar hash differed from the pinned hash.
+- Serial load was paced, with request budgets and an acknowledged database wait; unpaced load was not exercised.
+  Possible capture drops qualify the overhead measurement; no budget was applied.
+- The analyzer was built from source; packaging it belongs to #8. TUI routes were checked in detail, not in the list.
+- Focused capture and exception message redaction have the reported privacy scope.
+- The campaign receipt was unsigned and non-release. Release acceptance needs accepted campaign receipts.
+
+The ctime-only admission refusal is still unexplained; diagnostics now attribute it.
+
+## Known nondeterministic test (fix; never retry to green)
+
+[#14](https://github.com/Legend101Zz/X-trace/issues/14) remains open: the historical zombie lifecycle failure log lacks the
+actual stop status and stderr, so its cause remains unknown. The current test waits for zombie state and reports
+status and stderr. No speculative fix is justified. If it recurs, preserve those diagnostics and the exact CI head.
+Three green exact-head runs remain unestablished.
 
 ## Branches
 
-- Wave 3 starts on `wave/w3`, from main at `f92f0bf`.
+- `wave/w3` is based on main at `f92f0bf`; readiness reviews are complete and green CI is pending.
 - Wave branches (`wave/<n>`) are deleted after their merge and a green post-merge `main`.
 
 ## Waiting for the owner
