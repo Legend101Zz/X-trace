@@ -4,6 +4,9 @@
 //! establishes only the root binding, scoped error surface, and idempotent
 //! recording anchor needed before object publication can be added safely.
 
+#[cfg(unix)]
+use xtrace_private_storage::{AdmissionCaller as Caller, AdmissionCallerGuard as CallerGuard};
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read as _, Write as _};
@@ -627,6 +630,8 @@ impl SqliteRecordingStore<'_> {
         after: Option<RecordingId>,
         limit: u32,
     ) -> Result<(Vec<RecordingMetadata>, bool), RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
         let published = recording_journal::PublishedRead::new(self, correlation_id)?;
@@ -723,6 +728,8 @@ impl SqliteRecordingStore<'_> {
         recording_id: RecordingId,
         frame_id: xtrace_domain::FrameId,
     ) -> Result<xtrace_application::FrameNavigationView, RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
         let connection =
@@ -792,6 +799,8 @@ impl SqliteRecordingStore<'_> {
         request: &ShowWindowRequest,
         source_root: Option<&Path>,
     ) -> Result<RecordingEventWindow, RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
         // Readers perform many admissions too. Share only state-bound ACL
         // verdicts within this call, just as the persistence port does.
         let _scope = xtrace_private_storage::AdmissionScope::enter();
@@ -1416,6 +1425,8 @@ impl SqliteRecordingStore<'_> {
         &self,
         request: &BeginRecordingRequest,
     ) -> Result<BeginRecordingReceipt, RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Begin);
         let correlation_id = CorrelationId::new();
         let _writer = self
             .store
@@ -1526,6 +1537,8 @@ impl SqliteRecordingStore<'_> {
         &self,
         request: &SegmentCommitRequest,
     ) -> Result<SegmentCommitReceipt, RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Append);
         reset_staging_write_observer();
         let correlation_id = CorrelationId::new();
         let _writer = self
@@ -1756,6 +1769,8 @@ impl SqliteRecordingStore<'_> {
         &self,
         request: &FinishRecording,
     ) -> Result<RecordingCompletion, RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Finish);
         let correlation_id = CorrelationId::new();
         if request.event_digest.len() > 32
             || request.drop_counts_by_priority.len() > 256
@@ -4415,6 +4430,8 @@ fn create_staging_files(
     recording_id: RecordingId,
     correlation_id: CorrelationId,
 ) -> Result<StagingFiles, RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SegmentStage);
     binding.revalidate(correlation_id)?;
     let root =
         AdmittedPrivateRoot::open(&binding.root).map_err(|_| object_io_error(correlation_id))?;
@@ -4461,6 +4478,8 @@ fn ensure_object_parent(
     destination: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SegmentStage);
     binding.revalidate(correlation_id)?;
     let objects = binding.root.join("objects");
     let b3 = objects.join("b3");
@@ -4485,6 +4504,8 @@ fn ensure_owner_only_directory(
     directory: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::ManagedDirectory);
     let relative =
         directory.strip_prefix(root).map_err(|_| atomic_install_error(correlation_id))?;
     let root_cap = AdmittedPrivateRoot::open(root).map_err(|_| object_io_error(correlation_id))?;
@@ -4541,6 +4562,8 @@ fn write_synced_file(
     sync: FileSync,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SegmentStage);
     note_staging_write();
     let parent = path.parent().ok_or_else(|| object_io_error(correlation_id))?;
     let name = path
@@ -4561,6 +4584,8 @@ fn validate_managed_directory(
     directory: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::ManagedDirectory);
     AdmittedPrivateRoot::open(directory)
         .and_then(|root| root.revalidate())
         .map_err(|_| atomic_install_error(correlation_id))
@@ -4572,6 +4597,8 @@ fn validate_managed_tree(
     directory: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::ManagedTree);
     let relative =
         directory.strip_prefix(root).map_err(|_| atomic_install_error(correlation_id))?;
     let mut current =
@@ -4614,6 +4641,8 @@ fn validate_managed_file(
     correlation_id: CorrelationId,
     absent_is_valid: bool,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::ManagedFile);
     let parent = path.parent().ok_or_else(|| atomic_install_error(correlation_id))?;
     let name = path
         .file_name()
@@ -4762,6 +4791,8 @@ fn publish_no_replace<F>(
 where
     F: FnOnce(),
 {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SegmentPublish);
     let staging_parent = staging.parent().ok_or_else(|| atomic_install_error(correlation_id))?;
     let staging_name = staging
         .file_name()
@@ -4821,6 +4852,8 @@ where
 }
 
 fn cleanup_owned_staging_paths(staging: &StagingFiles, correlation_id: CorrelationId) {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SegmentCleanup);
     let Some(parent) = staging.directory.parent() else {
         tracing::warn!("recording segment staging cleanup could not bind its parent");
         return;
@@ -5056,6 +5089,8 @@ impl ProjectRootBinding {
     ) -> Result<Self, RecordingStoreError> {
         #[cfg(test)]
         let _phase = work_profile::Phase::enter("root_binding_admission");
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::RootBinding);
         let private_root = AdmittedPrivateRoot::open(root).map_err(|_| {
             RecordingStoreError::new(
                 RecordingStoreErrorKind::Permission,
@@ -5082,6 +5117,8 @@ impl ProjectRootBinding {
     /// Construction-time checks cannot eliminate filesystem TOCTOU. Later
     /// publish code reuses this method before every filesystem boundary.
     fn revalidate(&self, correlation_id: CorrelationId) -> Result<(), RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::RootBinding);
         #[cfg(test)]
         let _phase = work_profile::Phase::enter("root_database_admission");
         #[cfg(not(unix))]
