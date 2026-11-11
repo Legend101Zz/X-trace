@@ -9,6 +9,9 @@
 
 mod support;
 
+#[path = "common/spring_readiness.rs"]
+mod spring_readiness;
+
 use std::fs;
 use std::io::BufRead as _;
 use std::io::{Read, Write as _};
@@ -20,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde_json::Value;
+use spring_readiness::ReadinessStderr;
 use tempfile::TempDir;
 use xtrace_application::recording::{
     BeginRecording, EndpointObservationInput, RecordingPersistencePort,
@@ -132,13 +136,20 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
     let stdout = child.stdout.take().expect("xtrace stdout");
     let stderr = child.stderr.take().expect("xtrace stderr");
     let (lines_tx, lines_rx) = std::sync::mpsc::channel();
+    let readiness_stderr = ReadinessStderr::default();
+    let stderr = readiness_stderr.observe(stderr);
     let mut process = RunProcess {
         child,
         stdout: Some(thread::spawn(move || drain_fixture_stdout(stdout, lines_tx))),
         stderr: Some(thread::spawn(move || drain(stderr))),
     };
 
-    let port = wait_for_fixture(&lines_rx);
+    let port = spring_readiness::wait_for_fixture(
+        &lines_rx,
+        Instant::now() + Duration::from_secs(45),
+        &mut process.child,
+        &readiness_stderr,
+    );
     let response = post_order(port);
     assert!(
         response.starts_with(b"HTTP/1.1 201"),
@@ -873,12 +884,19 @@ fn attach_keeps_existing_spring_target_alive_and_persists_real_request() {
     let target_stdout = target_child.stdout.take().expect("target stdout");
     let target_stderr = target_child.stderr.take().expect("target stderr");
     let (lines_tx, lines_rx) = std::sync::mpsc::channel();
+    let readiness_stderr = ReadinessStderr::default();
+    let target_stderr = readiness_stderr.observe(target_stderr);
     let mut target = RunProcess {
         child: target_child,
         stdout: Some(thread::spawn(move || drain_fixture_stdout(target_stdout, lines_tx))),
         stderr: Some(thread::spawn(move || drain(target_stderr))),
     };
-    let port = wait_for_fixture(&lines_rx);
+    let port = spring_readiness::wait_for_fixture(
+        &lines_rx,
+        Instant::now() + Duration::from_secs(45),
+        &mut target.child,
+        &readiness_stderr,
+    );
 
     let mut attach_command = Command::new(env!("CARGO_BIN_EXE_xtrace"));
     attach_command
@@ -1228,27 +1246,6 @@ fn copy_fixture_sources(repo: &Path) {
     for name in ["OrderController.java", "OrderService.java", "OrderRepository.java"] {
         fs::copy(source_root.join(name), destination.join(name))
             .expect("copy allowlisted fixture source");
-    }
-}
-
-fn wait_for_fixture(lines: &std::sync::mpsc::Receiver<Vec<u8>>) -> u16 {
-    let deadline = Instant::now() + Duration::from_secs(45);
-    loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .expect("Spring fixture readiness deadline elapsed");
-        let line = lines
-            .recv_timeout(remaining)
-            .expect("Spring fixture did not report its bound port before the readiness deadline");
-        // Boot 4.1.1 logs the connector's local port only after it has started.
-        let line = String::from_utf8_lossy(&line);
-        if let Some((_, address)) = line.split_once("Tomcat started on port ") {
-            if let Some((port, _)) = address.split_once(" (http)") {
-                let port = port.parse::<u16>().expect("Spring fixture bound port");
-                assert_ne!(port, 0, "Spring fixture must report its actual bound port");
-                return port;
-            }
-        }
     }
 }
 
