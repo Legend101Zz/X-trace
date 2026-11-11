@@ -24,7 +24,7 @@ from collections import Counter, deque
 from collections.abc import Sequence
 from enum import Enum
 
-from tools.qa import canary, store_profiles
+from tools.qa import canary, rust_timing, store_profiles
 from tools.release import ci_floor
 
 MAX_FAILING = 32
@@ -342,6 +342,7 @@ class CheckoutMetadata:
     """Only regular-file blobs from the snapshotted commit can attest facts."""
 
     def __init__(self, sources: dict[str, str]):
+        self.rust_targets = rust_timing.checkout_targets(sources)
         self.files: dict[str, int] = {}
         self.tests: set[str] = set()
         self.rust_tests: set[str] = set()
@@ -890,11 +891,22 @@ def _excerpt_index(path: str):
         return None
 
 
+def publish_rust_timing(timing: dict) -> None:
+    """Print the same sanitized observations stored in the step fragment."""
+    for event in timing["events"]:
+        print("lane rust-binary " + _encoded(event).decode("ascii"))
+    for binary in timing["runningAtTimeout"]:
+        print("lane rust-timeout " + _encoded(binary).decode("ascii"))
+    summary = {key: value for key, value in timing.items() if key not in {"events", "runningAtTimeout"}}
+    print("lane rust-timing " + _encoded(summary).decode("ascii"))
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     suite, variant, step = (_check_name(args.suite, "suite"), _check_name(args.variant, "variant"),
                             _check_name(args.step, "step"))
     out = pathlib.Path(args.out)
-    log_dir = pathlib.Path(os.environ.get("LANE_PRIVATE_LOG_DIR") or os.environ.get("RUNNER_TEMP", "/tmp")) / "xl"
+    log_dir = pathlib.Path(getattr(args, "private_log_dir", "") or os.environ.get("LANE_PRIVATE_LOG_DIR")
+                           or os.environ.get("RUNNER_TEMP", "/tmp")) / "xl"
     previous_umask = os.umask(0o077)  # private log only; the wrapped command keeps the job's umask
     log_dir.mkdir(mode=0o700, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
@@ -905,15 +917,24 @@ def cmd_run(args: argparse.Namespace) -> int:
     metadata = _checkout_metadata()
     diagnostic_directory = None
     child_env = os.environ.copy()
-    if "XTRACE_CI_DIAG_DIR" in child_env:
+    if "XTRACE_CI_DIAG_DIR" in child_env or (getattr(args, "ci_diagnostics", False) and rust_timing.is_test_command(cmd)):
         import tempfile
         diagnostic_directory = pathlib.Path(tempfile.mkdtemp(prefix="ci-diag-", dir=out))
         child_env["XTRACE_CI_DIAG_DIR"] = str(diagnostic_directory)
     timed_out = False
+    timing = None
     with open(log_path, "wb") as log:
         os.umask(previous_umask)
         try:
-            if _compiler_command(cmd):
+            if rust_timing.is_test_command(cmd):
+                index = _excerpt_index(getattr(args, "canaries", ""))
+                observations = rust_timing.Observations(metadata.rust_targets,
+                                                       lambda value: index is None or _private(value, index))
+                proc, timed_out, timing = rust_timing.run(
+                    cmd, log=log, cwd=args.cwd or None, env=child_env, timeout=args.timeout, observations=observations)
+                if timed_out:
+                    print(f"lane {suite}/{variant}/{step}: timeout after {args.timeout}s")
+            elif _compiler_command(cmd):
                 # Cargo JSON is stdout. stderr (including build-script output)
                 # is private and cannot supply compiler facts.
                 with os.fdopen(os.open(log_path.with_suffix(".stderr.log"),
@@ -956,6 +977,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     frag = {"suite": suite, "variant": variant, "step": step, "status": status,
             "exitCode": proc.returncode, **{k: v for k, v in facts.items() if k != "counted"}}
     fragment_path = out / f"{suite}__{variant}__{step}.json"
+    if timing is not None:
+        frag["rustTiming"] = timing
     if suite == "rust" and step == "test":
         # This path runs after success, failure and the existing command timeout.
         # Only rebuilt vocabulary/numbers leave the private profile text files.
@@ -971,6 +994,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     fragment_path.write_bytes(_encoded(frag) + b"\n")
     print(f"lane {suite}/{variant}/{step}: {status} exit={proc.returncode} "
           f"passed={_fmt(facts['passed'])} failed={_fmt(facts['failed'])} ignored={_fmt(facts['ignored'])}")
+    if timing is not None:
+        publish_rust_timing(timing)
     for name in facts["failingTests"]:
         print(f"lane failing-test {name}")
     if status == "fail":
@@ -1078,6 +1103,8 @@ def main() -> int:
     r.add_argument("--max-ignored", type=int, default=-1, help="fail a zero-exit step that ignored or skipped more tests")
     r.add_argument("--junit-glob", default="", help="glob (relative to --cwd) of JUnit XML reports to count")
     r.add_argument("--timeout", type=int, default=3000)
+    r.add_argument("--ci-diagnostics", action="store_true", help="private diagnostics directory for a Cargo test task only")
+    r.add_argument("--private-log-dir", default="", help="private parent for raw logs when the task environment is stripped")
     r.add_argument("--canaries", default="", help="optional private canary JSON; unreadable files withhold excerpts")
     r.add_argument("command", nargs=argparse.REMAINDER)
     m = sub.add_parser("merge")

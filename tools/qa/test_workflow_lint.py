@@ -161,9 +161,10 @@ class CiPullRequestTests(unittest.TestCase):
         self.assertIn('"$root/frag/ci-diag"', scratch["run"])
         floor = jobs["release-floor-linux-x86_64"]["steps"]
         run = next(step for step in floor if step.get("name") == "Run all 23 pinned release gates")
-        self.assertEqual(run["env"]["XTRACE_CI_DIAG_DIR"], "${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/ci-diag")
+        self.assertNotIn("XTRACE_CI_DIAG_DIR", run.get("env", {}))
+        self.assertIn("tools.qa.release_floor run", run["run"])
         admission = next(step for step in floor if step.get("name") == "Admit private logs, leases, caches, and test scratch before writes")
-        self.assertIn('mkdir -m 700 "$XTRACE_CI_PRIVATE_ROOT/frag" "$XTRACE_CI_PRIVATE_ROOT/frag/ci-diag"', admission["run"])
+        self.assertIn('mkdir -m 700 "$XTRACE_CI_PRIVATE_ROOT/frag"', admission["run"])
 
     def test_release_guard_is_compiled_for_explicit_and_all_features_on_both_platforms(self):
         source = (ROOT / "crates/xtrace-private-storage/src/diagnostic.rs").read_text()
@@ -292,11 +293,14 @@ class MacosWorkflowTests(unittest.TestCase):
         self.assertEqual(uploads[0]["with"]["path"], "${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json")
         linux = workflow_lint.load(ROOT / ".github/workflows/ci.yml")
         steps = linux["jobs"]["release-floor-linux-x86_64"]["steps"]
-        self.assertTrue(any("tools.release.ci_floor sanitize-floor" in s.get("run", "") for s in steps))
+        self.assertTrue(any("tools.qa.release_floor sanitize-floor" in s.get("run", "") for s in steps))
+        self.assertTrue(any("tools.qa.release_floor run" in s.get("run", "") for s in steps))
         self.assertFalse(any("tools.qa.lane_run" in s.get("run", "") for s in steps))
         uploads = [s for s in steps if s.get("uses", "").startswith("actions/upload-artifact@")]
-        self.assertEqual([s["with"]["path"] for s in uploads],
-                         ["${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json"])
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0]["with"]["path"].splitlines(),
+                         ["${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json",
+                          "${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json"])
 
     def test_rust_diagnostics_use_private_fragment_storage_and_test_only_feature(self):
         steps = self.workflow["jobs"]["macos-arm64"]["steps"]
@@ -325,7 +329,7 @@ class MacosWorkflowTests(unittest.TestCase):
                                       .replace("${{ matrix.tuple }}", "jdk17-node22"))
                 self.assertEqual(command[:4], ["python3", "-B", "-m", "tools.qa.lane_run"])
 
-                def run(cmd, *, stdout, **kwargs):
+                def run(cmd, *, log, observations, **kwargs):
                     self.assertEqual(kwargs["timeout"], 3000)
                     state = "progress" if timed_out else "returned"
                     (directory / "store-sparse-active.txt").write_text(
@@ -335,17 +339,16 @@ class MacosWorkflowTests(unittest.TestCase):
                         f"state={state} completed=256 elapsed_ns=800\n"
                         "phase=journal_append spans=3 total_ns=500 max_ns=300 acl_probes=2\n"
                         "phase=private_payload spans=3 total_ns=500 max_ns=300 acl_probes=2\n")
-                    stdout.write(b"private log token=private_payload\n"
-                                 b"test result: ok. 1030 passed; 0 failed; 0 ignored\n")
-                    stdout.flush()
-                    if timed_out:
-                        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-                    return subprocess.CompletedProcess(cmd, 0)
+                    log.write(b"private log token=private_payload\n"
+                              b"test result: ok. 1030 passed; 0 failed; 0 ignored\n")
+                    log.flush()
+                    return (subprocess.CompletedProcess(cmd, 124 if timed_out else 0), timed_out,
+                            observations.finish(3000 if timed_out else 1, timed_out))
 
                 with mock.patch.object(sys, "argv", ["lane_run", *command[4:]]), \
                         mock.patch.dict(os.environ, {"LANE_PRIVATE_LOG_DIR": temporary}), \
                         mock.patch.object(lane_run, "_checkout_metadata", return_value=lane_run.CheckoutMetadata({})), \
-                        mock.patch.object(lane_run.subprocess, "run", side_effect=run):
+                        mock.patch.object(lane_run.rust_timing, "run", side_effect=run):
                     self.assertEqual(lane_run.main(), 124 if timed_out else 0)
                 fragment = directory / "rust__jdk17-node22__test.json"
                 pattern = upload["with"]["path"].replace("${{ env.XTRACE_CI_PRIVATE_ROOT }}", temporary)

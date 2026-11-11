@@ -145,7 +145,7 @@ jobs:
         run: |
           set -euo pipefail
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor prepare-private-root --root "$XTRACE_CI_PRIVATE_ROOT"
-          mkdir -m 700 "$XTRACE_CI_PRIVATE_ROOT/frag" "$XTRACE_CI_PRIVATE_ROOT/frag/ci-diag"
+          mkdir -m 700 "$XTRACE_CI_PRIVATE_ROOT/frag"
       - name: Verify full release tooling suite on the exact source
         run: |
           set +e
@@ -157,12 +157,10 @@ jobs:
           set -e
           exit "$result"
       - name: Run all 23 pinned release gates
-        env:
-          XTRACE_CI_DIAG_DIR: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/ci-diag
         run: |
           set +e
           umask 077
-          python3 -B -m tools.release.run_gates \
+          python3 -B -m tools.qa.release_floor run \
             --repo "$GITHUB_WORKSPACE" \
             --base "$XTRACE_PHASE_BASE_SHA" \
             --label "floor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.tuple }}" \
@@ -176,7 +174,7 @@ jobs:
         if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
         run: |
           set +e
-          python3 -B -m tools.release.ci_floor sanitize-floor \
+          python3 -B -m tools.qa.release_floor sanitize-floor \
             --root "$XTRACE_CI_PRIVATE_ROOT" \
             --repo "$GITHUB_WORKSPACE" \
             --label "floor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.tuple }}" \
@@ -186,12 +184,14 @@ jobs:
           result=$?
           set -e
           exit "$result"
-      - name: Upload sanitized floor summary only
+      - name: Upload sanitized floor summary and Rust lane fragments
         if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: xtrace-v001-floor-${{ matrix.tuple }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json
+          path: |
+            ${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json
+            ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
           if-no-files-found: error
           retention-days: 14
 
@@ -334,7 +334,7 @@ jobs:
           # The env tests also need an owner-only ancestor within the 24-byte scratch cap.
           chmod 700 "$RUNNER_TEMP"
           XTRACE_DEV_TEST_ROOT="$root" XTRACE_DEV_SCRATCH="$RUNNER_TEMP" TMPDIR="$root" \
-            python3 -B -m unittest tools.dev.test_dev_tools tools.dev.test_guard tools.qa.test_workflow_lint
+            python3 -B -m unittest tools.dev.test_dev_tools tools.dev.test_guard tools.qa.test_workflow_lint tools.qa.test_rust_timing tools.qa.test_release_floor
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
