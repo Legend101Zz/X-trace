@@ -318,8 +318,11 @@ class MacosWorkflowTests(unittest.TestCase):
         job = self.workflow["jobs"]["macos-arm64"]
         rust = next(step for step in job["steps"]
                     if step.get("name") == "cargo test (locked workspace, no ignored tests)")
-        command = shlex.split(rust["run"].replace("${{ matrix.tuple }}", "jdk17-node22"))
+        command = shlex.split(rust["run"].replace("\\\n", "")
+                              .replace("${{ matrix.tuple }}", "jdk17-node22"))
         args = lane_run.parser().parse_args(command[4:])
+        self.assertEqual(args.command, ["--", "cargo", "test", "--locked", "--workspace",
+                                        "--all-features", "--no-fail-fast"])
         self.assertEqual(args.timeout, 3000)
         self.assertNotIn("timeout-minutes", rust)
         self.assertGreater(job["timeout-minutes"] * 60, args.timeout)
@@ -335,11 +338,14 @@ class MacosWorkflowTests(unittest.TestCase):
         for timed_out in (False, True):
             with self.subTest(timed_out=timed_out), tempfile.TemporaryDirectory() as temporary:
                 directory = pathlib.Path(temporary) / "frag"
-                command = shlex.split(rust[0]["run"].replace("$XTRACE_CI_PRIVATE_ROOT", temporary)
+                command = shlex.split(rust[0]["run"].replace("\\\n", "")
+                                      .replace("$XTRACE_CI_PRIVATE_ROOT", temporary)
                                       .replace("${{ matrix.tuple }}", "jdk17-node22"))
                 self.assertEqual(command[:4], ["python3", "-B", "-m", "tools.qa.lane_run"])
 
                 def run(cmd, *, log, observations, **kwargs):
+                    self.assertEqual(cmd, ["cargo", "test", "--locked", "--workspace",
+                                           "--all-features", "--no-fail-fast"])
                     self.assertEqual(kwargs["timeout"], 3000)
                     state = "progress" if timed_out else "returned"
                     (directory / "store-sparse-active.txt").write_text(
@@ -358,8 +364,9 @@ class MacosWorkflowTests(unittest.TestCase):
                 with mock.patch.object(sys, "argv", ["lane_run", *command[4:]]), \
                         mock.patch.dict(os.environ, {"LANE_PRIVATE_LOG_DIR": temporary}), \
                         mock.patch.object(lane_run, "_checkout_metadata", return_value=lane_run.CheckoutMetadata({})), \
-                        mock.patch.object(lane_run.rust_timing, "run", side_effect=run):
+                        mock.patch.object(lane_run.rust_timing, "run", autospec=True, side_effect=run) as execute:
                     self.assertEqual(lane_run.main(), 124 if timed_out else 0)
+                execute.assert_called_once()
                 fragment = directory / "rust__jdk17-node22__test.json"
                 pattern = upload["with"]["path"].replace("${{ env.XTRACE_CI_PRIVATE_ROOT }}", temporary)
                 self.assertTrue(fnmatch.fnmatch(str(fragment), pattern))

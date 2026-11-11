@@ -212,10 +212,7 @@ pub fn no_extended_acl(path: &Path, descriptor: Option<&File>) -> bool {
             filesec_free(filesec);
             return true;
         }
-        if present != 1 {
-            filesec_free(filesec);
-            return false;
-        }
+        // Libc returns the property's validity bitmask, not a normalized boolean.
         let mut acl: *mut Acl = std::ptr::null_mut();
         let got_acl = filesec_get_property(filesec, FilesecProperty::Acl, (&raw mut acl).cast());
         filesec_free(filesec);
