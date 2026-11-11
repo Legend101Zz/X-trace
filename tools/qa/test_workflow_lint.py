@@ -241,18 +241,25 @@ class MacosWorkflowTests(unittest.TestCase):
         cls.path = ROOT / ".github/workflows/macos.yml"
         cls.workflow = workflow_lint.load(cls.path)
 
-    def test_only_manual_and_wave_or_release_candidate_pushes_trigger(self):
+    def test_only_manual_dispatch_triggers(self):
+        # Owner decision 2026-11-11 (W2-R27a): Linux CI during development;
+        # macOS is on demand, with a local owner check before release.
         # Ruby's YAML 1.1 parser represents the unquoted `on` key as JSON's "true".
         triggers = self.workflow.get("on", self.workflow.get("true"))
-        self.assertEqual(triggers, {
-            "workflow_dispatch": None,
-            "push": {"branches": ["wave/**", "ultra/rc-*"]},
-        })
+        self.assertEqual(triggers, {"workflow_dispatch": None})
         self.assertEqual(self.workflow["concurrency"], {
             "group": "${{ github.workflow }}-${{ github.ref }}",
             "cancel-in-progress": False,
         })
         self.assertEqual(workflow_lint.lint(self.path, True), [])
+
+    def test_linux_ci_has_no_macos_dependency(self):
+        workflow = workflow_lint.load(ROOT / ".github/workflows/ci.yml")
+        for job in workflow["jobs"].values():
+            needed = job.get("needs", [])
+            needed = [needed] if isinstance(needed, str) else needed
+            self.assertTrue(set(needed).issubset(workflow["jobs"]))
+        self.assertNotIn("macos", json.dumps(workflow).lower())
 
     def test_source_jobs_use_the_exact_head(self):
         jobs = self.workflow["jobs"]
