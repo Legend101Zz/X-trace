@@ -6,8 +6,8 @@ and package tasks never receive the test-only feature or diagnostics directory.
 
 The supervisor finalizes timeouts after cleanup from private bounded checkpoints.
 This keeps the original deadline and survives wrapper startup delays or SIGKILL;
-an earlier inner timer alone cannot guarantee either. Recovery uses the same HEAD
-validation, diagnostic reader, privacy scan and fragment publisher as normal runs.
+an earlier inner timer alone cannot guarantee either. Job cancellation can stop
+the supervisor too. Sanitization can then recover observations from its checkpoint.
 """
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ import pathlib
 import sys
 from dataclasses import replace
 
-from tools.qa import lane_run
+from tools.qa import floor_progress, lane_run
 from tools.release import ci_floor, run_gates
 
-RUST_TEST_GATES = frozenset({"rust-cli-spring-journey", "rust-focused", "rust-workspace"})
+RUST_TEST_GATES = floor_progress.RUST_TEST_GATES
 DIAGNOSTIC_FEATURE = "xtrace-private-storage/ci-diagnostics"
 
 
@@ -59,8 +59,14 @@ def configured_floor(root: pathlib.Path, timeout: int):
         # The parent survives _run's deadline and process-tree cleanup. Capture
         # HEAD metadata here too: recovery must not attest a changed working tree.
         metadata = lane_run._checkout_metadata()
-        directory = lane_run.prepare_recovery(root)
-        kwargs["env"] = {**kwargs["env"], "XTRACE_LANE_RECOVERY_DIR": str(directory)}
+        env = dict(kwargs["env"])
+        if kwargs.get("command_observed") is not None:
+            run_dir = kwargs["log_path"].parent.parent
+            directory = lane_run.prepare_recovery(root, directory=floor_progress.rust_directory(run_dir, args.step))
+            env["XTRACE_CI_PRIVATE_ROOT"] = str(directory)
+        else:
+            directory = lane_run.prepare_recovery(root)
+        kwargs["env"] = {**env, "XTRACE_LANE_RECOVERY_DIR": str(directory)}
         outcome = kwargs.get("outcome_report")
         if outcome is None:
             outcome = kwargs["outcome_report"] = {}
@@ -98,7 +104,8 @@ def main():
         original_argv = sys.argv
         sys.argv = [original_argv[0], *([] if args.action == "run" else ["sanitize-floor"]), *forwarded]
         try:
-            return run_gates.main() if args.action == "run" else ci_floor.main()
+            return (run_gates.main(gate_progress=floor_progress.GateCheckpoint())
+                    if args.action == "run" else ci_floor.main())
         finally:
             sys.argv = original_argv
 

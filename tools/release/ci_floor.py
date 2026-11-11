@@ -1612,6 +1612,20 @@ def _sanitize_floor(args: argparse.Namespace) -> int:
             summary["failure"] = _describe_runner_failure(root, args.label)
         except Exception:  # noqa: BLE001 - diagnostics must never break the summary
             summary["failure"] = {"stage": "unavailable"}
+    # Progress is independent of the receipt and the full-suite result. Neither
+    # a completed command nor a reported test can contribute to floor acceptance.
+    from tools.qa import floor_progress
+
+    summary["progress"] = floor_progress.UNAVAILABLE
+    checkpoint = receipt_path.with_name(floor_progress.CHECKPOINT_NAME)
+    try:
+        if (tuple_is_supported and _valid_sha(args.expected_head) and _valid_sha(args.phase_base)
+                and checkpoint.is_file()):
+            repo = pathlib.Path(args.repo)
+            proof = _source_proofs(repo, args.expected_head, args.phase_base)
+            summary["progress"] = floor_progress.collect(checkpoint, repo, proof, EXPECTED_GATE_NAMES)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, RecursionError):
+        pass  # An absent or invalid checkpoint leaves progress unavailable.
     private_roots.atomic_write_private(
         root / "release-floor-summary.json",
         (json.dumps(summary, indent=2, sort_keys=True) + "\n").encode(),
