@@ -77,6 +77,8 @@ fn snapshot_file_lock(
     exclusive: bool,
     id: CorrelationId,
 ) -> Result<std::fs::File, RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::JournalLock);
     use rustix::fs::{FlockOperation, flock};
 
     #[cfg(test)]
@@ -199,6 +201,8 @@ fn sync_directory_descriptor(file: &std::fs::File) -> std::io::Result<()> {
 }
 
 fn sync_journal_directory(root: &AdmittedPrivateRoot) -> Result<(), PrivateStorageError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::JournalSync);
     root.revalidate()?;
     #[cfg(unix)]
     {
@@ -246,6 +250,8 @@ fn directory(
     create: bool,
     id: CorrelationId,
 ) -> Result<Option<AdmittedPrivateRoot>, RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::JournalDirectory);
     #[cfg(test)]
     let _phase = work_profile::Phase::enter("journal_directory_admission");
     binding.revalidate(id)?;
@@ -319,6 +325,8 @@ fn prepare_boundary(
     length: u64,
     id: CorrelationId,
 ) -> Result<std::fs::File, RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::JournalPrepare);
     let name = boundary_name(recording_id);
     let pending = format!("{name}-next");
     let mut bytes = header.to_vec();
@@ -343,6 +351,8 @@ fn publish_boundary(
     file: &std::fs::File,
     id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::JournalPublish);
     let name = boundary_name(recording_id);
     let pending = format!("{name}-next");
     commit_failpoint("journal-checkpoint-before-rename", id, false)?;
@@ -487,6 +497,8 @@ fn read_snapshot_files(
     recording_id: RecordingId,
     id: CorrelationId,
 ) -> Result<SnapshotFiles, RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::JournalRead);
     let boundary = read_boundary(root, recording_id, id)?;
     #[cfg(test)]
     AFTER_BOUNDARY.with(|hook| {
@@ -630,6 +642,8 @@ impl SqliteRecordingStore<'_> {
         recording_id: RecordingId,
         cap: usize,
     ) -> Result<(), RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::JournalCaptureCap);
         let id = CorrelationId::new();
         if !event_cap_in_bounds(cap as u64) {
             return Err(terminal_validation_error(id));
@@ -702,6 +716,8 @@ impl SqliteRecordingStore<'_> {
         prefix_events: usize,
         checkpoint: &mut Option<Checkpoint>,
     ) -> Result<(), RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::JournalAppend);
         #[cfg(test)]
         let mut phase = work_profile::Phase::enter("writer_wait");
         let id = CorrelationId::new();
@@ -921,6 +937,8 @@ impl SqliteRecordingStore<'_> {
         &self,
         recording_id: RecordingId,
     ) -> Result<(), RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::JournalRemove);
         let id = CorrelationId::new();
         if let Some(root) = directory(&self.binding, false, id)? {
             #[cfg(test)]
@@ -1009,6 +1027,8 @@ impl SqliteRecordingStore<'_> {
         &self,
         recording_id: RecordingId,
     ) -> Result<(), RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Recover);
         let id = CorrelationId::new();
         let Some(tail) = load(&self.binding, recording_id, id)? else {
             // No checkpoint means no acknowledged events, not no files. Also

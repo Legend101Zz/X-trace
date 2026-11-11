@@ -187,6 +187,9 @@ pub(crate) struct Operation {
     file_judged: RefCell<Vec<MemoKey>>,
     /// The admission scope that was live on the creating thread when this operation was made.
     scope_id: Option<u64>,
+    /// Only a count is retained; diagnostics never keep an admission pathname.
+    #[cfg(feature = "ci-diagnostics")]
+    root_depth: std::cell::Cell<Option<i64>>,
     /// Prefix operands of the most recent ancestor walk; the batch is spawned lazily from them.
     #[cfg(target_os = "macos")]
     walk: RefCell<Vec<std::path::PathBuf>>,
@@ -244,12 +247,35 @@ impl Operation {
             #[cfg(target_os = "macos")]
             file_judged: RefCell::new(Vec::new()),
             scope_id: if memoize { scope::live_scope_id() } else { None },
+            #[cfg(feature = "ci-diagnostics")]
+            root_depth: std::cell::Cell::new(None),
             #[cfg(target_os = "macos")]
             walk: RefCell::new(Vec::new()),
             #[cfg(target_os = "macos")]
             batch_attempted: std::cell::Cell::new(false),
             #[cfg(target_os = "macos")]
             prefetched: RefCell::new(None),
+        }
+    }
+
+    /// Keep the first requested root while child operations reuse this budget.
+    pub(crate) fn register_root(&self, path: &Path) {
+        #[cfg(feature = "ci-diagnostics")]
+        if self.root_depth.get().is_none() {
+            self.root_depth.set(i64::try_from(path.components().count()).ok());
+        }
+        let _ = path;
+    }
+
+    fn relative_depth(&self, path: &Path) -> Option<i64> {
+        #[cfg(feature = "ci-diagnostics")]
+        {
+            i64::try_from(path.components().count()).ok()?.checked_sub(self.root_depth.get()?)
+        }
+        #[cfg(not(feature = "ci-diagnostics"))]
+        {
+            let _ = path;
+            None
         }
     }
 
@@ -458,6 +484,7 @@ fn directory_metadata(
     expected: FileIdentity,
     role: DirectoryRole,
 ) -> Option<std::fs::Metadata> {
+    operation.register_root(path);
     loop {
         if operation.expired() {
             return None;
@@ -488,7 +515,8 @@ fn directory_metadata(
         }
         operation.record_failure(AdmissionFailure::check_context(
             Step::AclState,
-            AdmissionContext::state(AdmissionSite::Snapshot, &opened, &named),
+            AdmissionContext::state(AdmissionSite::Snapshot, &opened, &named)
+                .at_depth(operation.relative_depth(path)),
         ));
         return None;
     }
@@ -558,7 +586,8 @@ pub(crate) fn directory_acl_admits(
     {
         diagnostic::observe_context(
             Step::AclState,
-            AdmissionContext::state(AdmissionSite::Filesystem, &before, &after),
+            AdmissionContext::state(AdmissionSite::Filesystem, &before, &after)
+                .at_depth(operation.relative_depth(path)),
         );
         return false;
     }
@@ -575,7 +604,8 @@ pub(crate) fn directory_acl_admits(
                 if operation.directory_key(state, directory) != key {
                     diagnostic::observe_context(
                         Step::AclState,
-                        AdmissionContext::state(AdmissionSite::RecheckFilesystem, &before, &after),
+                        AdmissionContext::state(AdmissionSite::RecheckFilesystem, &before, &after)
+                            .at_depth(operation.relative_depth(path)),
                     );
                     return false;
                 }
@@ -596,7 +626,8 @@ pub(crate) fn directory_acl_admits(
                 if remembered { AdmissionSite::MemoState } else { AdmissionSite::ProbeState },
                 &before,
                 &after,
-            ),
+            )
+            .at_depth(operation.relative_depth(path)),
         );
         return false;
     }
@@ -666,7 +697,8 @@ fn recheck_directory_listing(
         if operation.directory_key(state, directory) != key {
             diagnostic::observe_context(
                 Step::AclState,
-                AdmissionContext::state(AdmissionSite::RecheckFilesystem, &before, &after),
+                AdmissionContext::state(AdmissionSite::RecheckFilesystem, &before, &after)
+                    .at_depth(operation.relative_depth(path)),
             );
             return false;
         }
@@ -679,7 +711,8 @@ fn recheck_directory_listing(
         if !directory_contents_changed(&before, &after) {
             diagnostic::observe_context(
                 Step::AclState,
-                AdmissionContext::state(AdmissionSite::RecheckState, &before, &after),
+                AdmissionContext::state(AdmissionSite::RecheckState, &before, &after)
+                    .at_depth(operation.relative_depth(path)),
             );
             return false;
         }
@@ -1082,6 +1115,7 @@ fn file_listing_admits(
     expected: FileIdentity,
     operation: &Operation,
 ) -> bool {
+    operation.register_root(path);
     if operation.expired() {
         return false;
     }
@@ -1096,12 +1130,17 @@ fn file_listing_admits(
             if !expected.same_file(FileIdentity::from_metadata(&opened))
                 || DirectoryState::of(&opened, DirectoryRole::PrivateLeaf) != state
             {
+                diagnostic::observe_context(
+                    Step::AclState,
+                    AdmissionContext::state(AdmissionSite::Snapshot, &opened, &named)
+                        .at_depth(operation.relative_depth(path)),
+                );
                 return None;
             }
         }
-        Some(state)
+        Some((state, named))
     };
-    let Some(before) = state() else { return false };
+    let Some((before, before_metadata)) = state() else { return false };
     let key = MemoKey::of_descriptor(before, filesystem_descriptor, operation.profile());
     #[cfg(test)]
     run_initial_state_hook(path);
@@ -1127,11 +1166,20 @@ fn file_listing_admits(
             return false;
         }
     }
-    let Some(after) = state() else { return false };
+    let Some((after, after_metadata)) = state() else { return false };
     if operation.expired() {
         return false;
     }
     if after != before {
+        diagnostic::observe_context(
+            Step::AclState,
+            AdmissionContext::state(
+                if remembered { AdmissionSite::MemoState } else { AdmissionSite::ProbeState },
+                &before_metadata,
+                &after_metadata,
+            )
+            .at_depth(operation.relative_depth(path)),
+        );
         return false;
     }
     if let Some(key) = key {
@@ -1461,6 +1509,20 @@ mod tests {
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir()
             .expect("fixture directory")
+    }
+
+    #[cfg(feature = "ci-diagnostics")]
+    #[test]
+    fn diagnostic_depth_keeps_the_requested_root_across_child_walks() {
+        let op = Operation::new();
+        let root = Path::new("/private/diagnostic-canary/root");
+        assert_eq!(op.relative_depth(root), None);
+        op.register_root(root);
+        op.register_root(&root.join("child"));
+        assert_eq!(op.relative_depth(root), Some(0));
+        assert_eq!(op.relative_depth(&root.join("file")), Some(1));
+        assert_eq!(op.relative_depth(Path::new("/private")), Some(-2));
+        assert_eq!(op.relative_depth(Path::new("/")), Some(-3));
     }
 
     #[cfg(target_os = "macos")]

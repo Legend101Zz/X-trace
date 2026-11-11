@@ -182,6 +182,7 @@ impl AdmittedPrivateRoot {
 
         let profile = FilesystemProfile::Durable;
         let op = &Operation::new().with_profile(profile);
+        op.register_root(path);
         if !path.is_absolute() {
             return Err(PrivateStorageError::InvalidName);
         }
@@ -1175,6 +1176,7 @@ fn open_directory_without_symlinks_until(
     path: &Path,
     op: &Operation,
 ) -> Result<File, PrivateStorageError> {
+    op.register_root(path);
     use std::path::Component;
 
     if !path.is_absolute() {

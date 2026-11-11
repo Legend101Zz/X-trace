@@ -1,5 +1,8 @@
 //! Application recording-persistence port backed by the SQLite/XTF store.
 
+#[cfg(unix)]
+use xtrace_private_storage::{AdmissionCaller as Caller, AdmissionCallerGuard as CallerGuard};
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -91,6 +94,8 @@ impl RecordingReadPort for SqliteRecordingReader {
         recording_id: xtrace_domain::RecordingId,
         frame_id: xtrace_domain::FrameId,
     ) -> Result<xtrace_application::FrameNavigationView, PortError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
@@ -103,6 +108,8 @@ impl RecordingReadPort for SqliteRecordingReader {
         after: Option<xtrace_domain::RecordingId>,
         limit: u32,
     ) -> Result<(Vec<RecordingMetadata>, bool), PortError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
@@ -113,6 +120,8 @@ impl RecordingReadPort for SqliteRecordingReader {
         &self,
         request: &ShowWindowRequest,
     ) -> Result<RecordingEventWindow, PortError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
@@ -128,6 +137,8 @@ impl ObservedEndpointReadPort for SqliteRecordingReader {
         after: Option<&ObservedEndpointKey>,
         limit: u32,
     ) -> Result<(Vec<ObservedEndpointRecord>, bool), PortError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
@@ -141,6 +152,8 @@ impl ObservedEndpointReadPort for SqliteRecordingReader {
         after: Option<&ObservedRecordingKey>,
         limit: u32,
     ) -> Result<(Vec<ObservedRecordingRecord>, bool), PortError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
@@ -154,6 +167,8 @@ impl ObservedEndpointReadPort for SqliteRecordingReader {
         after: Option<&ObservedRecordingKey>,
         limit: u32,
     ) -> Result<(Vec<ObservedRecordingRecord>, bool), PortError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
@@ -170,6 +185,8 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
         session_id: xtrace_domain::RuntimeSessionId,
         count: u64,
     ) -> Result<(), PortError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Append);
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
             self.store.recording_store(&self.project_data_root).map_err(map_recording_error)?;
@@ -181,6 +198,8 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
     }
 
     fn begin_recording(&self, request: &BeginRecording) -> Result<PortBeginReceipt, PortError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Begin);
         // One admission scope per store call (ADR 0008 Amendment 1); never held across calls.
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =
@@ -222,6 +241,8 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
         &self,
         request: &PersistRecordingSegment<Self::Event>,
     ) -> Result<PortSegmentReceipt, PortError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Append);
         // One admission scope per store call (ADR 0008 Amendment 1); never held across calls.
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         #[cfg(test)]
@@ -269,6 +290,8 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
         request: &PersistRecordingSegment<Self::Event>,
         prefix_events: usize,
     ) -> Result<bool, PortError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Append);
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         #[cfg(test)]
         let mut phase = crate::recording_store::work_profile::Phase::enter("tail_validation");
@@ -297,6 +320,8 @@ impl RecordingPersistencePort for SqliteRecordingPersistence {
         &self,
         request: &FinishRecording,
     ) -> Result<RecordingCompletion, PortError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Finish);
         // One admission scope per store call (ADR 0008 Amendment 1); never held across calls.
         let _scope = xtrace_private_storage::AdmissionScope::enter();
         let view =

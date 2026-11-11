@@ -50,6 +50,13 @@ pub(crate) enum ListingRefusal {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) enum AdmissionObject {
+    File,
+    Directory,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct AdmissionContext {
     pub site: AdmissionSite,
     /// Difference mask: ctime=1, mtime=2, mode=4, owner=8, device/inode=16.
@@ -57,6 +64,10 @@ pub(crate) struct AdmissionContext {
     /// Listing-only sites use zero because they do not compare metadata.
     pub changes: u8,
     pub listing: ListingRefusal,
+    pub object: Option<AdmissionObject>,
+    /// Zero is the requested admission root, negative values are ancestors, +1 is a child.
+    pub component_depth: Option<i64>,
+    pub nlink_changed: Option<bool>,
 }
 
 impl AdmissionContext {
@@ -74,12 +85,31 @@ impl AdmissionContext {
                 | (u8::from(before.mode() != after.mode()) << 2)
                 | (u8::from(before.uid() != after.uid()) << 3)
                 | (u8::from((before.dev(), before.ino()) != (after.dev(), after.ino())) << 4);
-        Self { site, changes, listing: ListingRefusal::NotChecked }
+        let object = if before.is_dir() {
+            AdmissionObject::Directory
+        } else if before.is_file() {
+            AdmissionObject::File
+        } else {
+            AdmissionObject::Other
+        };
+        Self {
+            site,
+            changes,
+            listing: ListingRefusal::NotChecked,
+            object: Some(object),
+            component_depth: None,
+            nlink_changed: Some(before.nlink() != after.nlink()),
+        }
+    }
+
+    pub(crate) fn at_depth(mut self, depth: Option<i64>) -> Self {
+        self.component_depth = depth;
+        self
     }
 
     #[cfg(target_os = "macos")]
     pub(crate) fn listing(site: AdmissionSite, listing: ListingRefusal) -> Self {
-        Self { site, changes: 0, listing }
+        Self { site, changes: 0, listing, object: None, component_depth: None, nlink_changed: None }
     }
 }
 
@@ -155,7 +185,14 @@ impl AdmissionFailure {
         #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
         ci::record(failure, Some(context));
         // The context is not part of the returned error or the release diagnostic channel.
-        let _ = (context.site, context.changes, context.listing);
+        let _ = (
+            context.site,
+            context.changes,
+            context.listing,
+            context.object,
+            context.component_depth,
+            context.nlink_changed,
+        );
         failure
     }
 
@@ -265,6 +302,22 @@ mod ci {
                 ",\"site\":\"{:?}\",\"changes\":{},\"listing\":\"{:?}\"",
                 context.site, context.changes, context.listing
             )?;
+            if let Some(object) = context.object {
+                write!(json, ",\"object\":\"{object:?}\"")?;
+            }
+            if let Some(depth) = context.component_depth {
+                write!(json, ",\"component_depth\":{depth}")?;
+            }
+            if let Some(changed) = context.nlink_changed {
+                write!(json, ",\"nlink_changed\":{changed}")?;
+            }
+        }
+        let (phase, site) = crate::caller::current();
+        if let Some(phase) = phase {
+            write!(json, ",\"store_phase\":\"{phase:?}\"")?;
+        }
+        if let Some(site) = site {
+            write!(json, ",\"store_site\":\"{site:?}\"")?;
         }
         json.write_str("}\n")?;
         Ok(json)
@@ -468,13 +521,17 @@ mod ci {
                 site: AdmissionSite::Snapshot,
                 changes: 3,
                 listing: ListingRefusal::NotChecked,
+                object: Some(super::super::AdmissionObject::Directory),
+                component_depth: Some(-2),
+                nlink_changed: Some(true),
             };
             assert_eq!(
                 line(failure, None, Some(context))?.as_str()?,
                 concat!(
                     "{\"thread\":null,\"error\":\"Admission\",\"operation\":\"AclState\",",
                     "\"kind\":null,\"errno\":null,\"site\":\"Snapshot\",",
-                    "\"changes\":3,\"listing\":\"NotChecked\"}\n"
+                    "\"changes\":3,\"listing\":\"NotChecked\",\"object\":\"Directory\",",
+                    "\"component_depth\":-2,\"nlink_changed\":true}\n"
                 )
             );
             let context = AdmissionContext { listing: ListingRefusal::InheritedAllow, ..context };
@@ -482,6 +539,13 @@ mod ci {
             assert!(record.as_str()?.contains("\"listing\":\"InheritedAllow\""));
             assert!(record.len <= MAX_LINE);
             assert_eq!(AdmissionFailure::check_context(failure.operation, context), failure);
+            let _phase = crate::AdmissionCallerGuard::enter(crate::AdmissionCaller::Append);
+            let _site = crate::AdmissionCallerGuard::enter(crate::AdmissionCaller::JournalPublish);
+            let record = line(failure, None, Some(context))?;
+            let record = record.as_str()?;
+            assert!(record.contains("\"store_phase\":\"Append\""));
+            assert!(record.contains("\"store_site\":\"JournalPublish\""));
+            assert!(record.len() <= MAX_LINE);
             Ok(())
         }
 
@@ -719,6 +783,7 @@ mod tests {
         let changed = AdmissionContext::state(AdmissionSite::Snapshot, &before, &after);
         assert_eq!(changed.changes & 4, 4, "mode difference");
         assert_eq!(changed.changes & (2 | 8 | 16), 0, "mtime, owner and identity stayed equal");
+        assert_eq!(changed.nlink_changed, Some(false));
         std::fs::set_permissions(root.path(), before.permissions())?;
         let other = tempfile::tempdir_in(root.path())?;
         let replaced = AdmissionContext::state(
@@ -727,6 +792,15 @@ mod tests {
             &other.path().symlink_metadata()?,
         );
         assert_eq!(replaced.changes & 16, 16, "different inode");
+        let file = root.path().join("file");
+        std::fs::write(&file, b"link-count-canary")?;
+        let before = file.symlink_metadata()?;
+        std::fs::hard_link(&file, root.path().join("link"))?;
+        let linked =
+            AdmissionContext::state(AdmissionSite::Snapshot, &before, &file.symlink_metadata()?);
+        assert!(matches!(linked.object, Some(AdmissionObject::File)));
+        assert_eq!(linked.nlink_changed, Some(true));
+        assert_eq!(linked.changes & (2 | 4 | 8 | 16), 0);
         Ok(())
     }
 

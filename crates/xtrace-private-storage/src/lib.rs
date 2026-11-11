@@ -13,6 +13,10 @@
 #[cfg(unix)]
 mod admission;
 #[cfg(unix)]
+mod caller;
+#[cfg(unix)]
+pub use caller::{AdmissionCaller, AdmissionCallerGuard};
+#[cfg(unix)]
 mod diagnostic;
 #[cfg(target_os = "macos")]
 mod macos_acl;

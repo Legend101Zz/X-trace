@@ -35,6 +35,8 @@ use xtrace_domain::CorrelationId;
 use crate::error::{StoreError, StoreErrorKind};
 use crate::migrations;
 use crate::project_repository::SqliteProjectRepository;
+#[cfg(unix)]
+use xtrace_private_storage::{AdmissionCaller as Caller, AdmissionCallerGuard as CallerGuard};
 use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
 /// Application binary identifier stored in `schema_meta.app_version`.
@@ -230,6 +232,8 @@ fn validate_sqlite_private_files(
     database_name: &str,
     correlation_id: CorrelationId,
 ) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SqliteFiles);
     let mut names = Vec::with_capacity(4);
     names.push(database_name.to_owned());
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -286,6 +290,8 @@ impl SqliteStore {
     /// Returns [`StoreError`] when SQLite cannot open the connection,
     /// the parent directory does not exist, or migrations fail.
     pub fn open(path: &Path, options: OpenOptions) -> Result<Self, StoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::SqliteOpen);
         let bootstrap = options.bootstrap_correlation_id;
         let parent =
             path.parent().filter(|value| !value.as_os_str().is_empty()).ok_or_else(|| {
@@ -417,6 +423,8 @@ impl SqliteStore {
         database_path: Option<PathBuf>,
         options: OpenOptions,
     ) -> Result<Self, StoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::SqliteWrap);
         let bootstrap = options.bootstrap_correlation_id;
         let private_state = database_path
             .as_deref()
@@ -473,6 +481,8 @@ impl SqliteStore {
         private_root: Option<AdmittedPrivateRoot>,
         private_database_file: Option<std::fs::File>,
     ) -> Result<Self, StoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::SqliteWrap);
         let bootstrap = options.bootstrap_correlation_id;
         let private_database_name = match (&private_root, &database_path) {
             (Some(_), Some(path)) => Some(
@@ -576,6 +586,8 @@ impl SqliteStore {
     /// repositories (added in later slices) that share the same
     /// connection mutex.
     pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::SqliteFiles);
         #[cfg(test)]
         let mut phase = crate::recording_store::work_profile::Phase::enter("connection_mutex_wait");
         let guard = self.inner.connection.lock().map_err(|_| {
