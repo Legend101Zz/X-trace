@@ -7,6 +7,7 @@
   "required": ["capture_schema_version", "launch", "capture", "application_scope", "launch_grant"],
   "properties": {
     "capture_schema_version": { "const": 1 },
+    "project_dir": { "type": "string", "minLength": 1, "description": "Canonical project directory used to resolve source_roots, independent of the adapter working directory. Private; never copied to the API or logs. Optional for older writers." },
     "launch": {
       "type": "object",
       "required": ["kind", "package_manager"],

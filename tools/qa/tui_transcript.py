@@ -4,7 +4,8 @@
   tui_transcript.py --xtrace BIN --project-dir DIR --out DIR [--rows 40 --cols 120 --seconds 6]
 
 Verdicts: not-implemented (the command exits 9, the CLI's NotImplemented code), pass (exits 0 or is stopped by the
-harness after drawing and the transcript names at least one recorded route), fail (anything else). The harness only
+harness after drawing and the transcript names at least one recorded route; the harness presses Enter once after the list drew so the opened recording's
+request symbols are on screen), fail (anything else). The harness only
 signals the child it forked, by PID.
 """
 from __future__ import annotations
@@ -33,7 +34,7 @@ def classify(exit_code: int | None, stopped_by_harness: bool, transcript: bytes)
         return "not-implemented", "xtrace tui exited 9 (not implemented in this build)"
     if exit_code is None:
         return "fail", "no exit status"
-    if exit_code not in (0,) and not stopped_by_harness:
+    if exit_code != 0 and not (stopped_by_harness and exit_code in (137, 143)):
         return "fail", f"exit {exit_code}"
     if not text.strip():
         return "fail", "empty transcript"
@@ -42,21 +43,79 @@ def classify(exit_code: int | None, stopped_by_harness: bool, transcript: bytes)
     return "pass", "transcript names a recorded route"
 
 
-def run(xtrace: str, project_dir: str, seconds: float, rows: int, cols: int) -> tuple[int | None, bool, bytes]:
+OPEN_KEY = b"\r"
+LIST_ROW = re.compile(rb">\s+[0-9a-f]{8}-[0-9a-f-]{27}\s+(?:complete|partial|invalid)\s+\d+ events", re.I)
+
+
+def list_observed(transcript: bytes) -> bool:
+    text = ANSI.sub(b"", transcript)
+    return b"recordings" in text.lower() and LIST_ROW.search(text) is not None
+
+
+def run(xtrace: str, project_dir: str, seconds: float, rows: int, cols: int,
+        open_recording: bool = True, observations: dict | None = None) -> tuple[int | None, bool, bytes]:
     pid, fd = pty.fork()
-    if pid == 0:  # child
+    if pid == 0:
         try:
             os.execv(xtrace, [xtrace, "tui", "--project-dir", project_dir])
         finally:
-            os._exit(127)  # exec failed: never let the child continue as a copy of this harness
+            os._exit(127)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     buf = b""
-    deadline = time.time() + seconds
     status = None
+    opened = False
     stopped = False
-    while time.time() < deadline:
-        r, _, _ = select.select([fd], [], [], 0.2)
-        if r:
+    eof = False
+    opened_at = None
+    opened_offset = 0
+    started = time.monotonic()
+
+    def observe_until(deadline: float, interact: bool = False) -> None:
+        nonlocal buf, status, opened, eof, opened_at, opened_offset
+        while time.monotonic() < deadline and status is None:
+            r, _, _ = select.select([] if eof else [fd], [], [], min(0.05, max(0, deadline - time.monotonic())))
+            if r:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b""
+                buf += chunk
+                eof = not chunk
+            if interact and open_recording and not opened and list_observed(buf):
+                try:
+                    os.write(fd, OPEN_KEY)
+                    opened = True
+                    opened_at = round(time.monotonic() - started, 3)
+                    opened_offset = len(buf)
+                except OSError:
+                    pass  # an exited child is judged from its actual wait status below
+            done, st = os.waitpid(pid, os.WNOHANG)
+            if done:
+                status = st
+            if interact and opened and ROUTE.search(ANSI.sub(b"", buf[opened_offset:])):
+                return  # route is observed; elapsed time alone never completes the transcript
+
+    try:
+        observe_until(started + seconds, interact=True)
+        if status is None:
+            stopped = True
+            if list_observed(buf):
+                try:
+                    os.write(fd, b"q")
+                except OSError:
+                    pass
+            observe_until(time.monotonic() + 0.5)
+            if status is None:
+                os.kill(pid, signal.SIGTERM)
+                observe_until(time.monotonic() + 0.5)
+            if status is None:
+                os.kill(pid, signal.SIGKILL)
+                _, status = os.waitpid(pid, 0)
+        # Drain bytes already emitted by the exited child.
+        while not eof:
+            r, _, _ = select.select([fd], [], [], 0)
+            if not r:
+                break
             try:
                 chunk = os.read(fd, 65536)
             except OSError:
@@ -64,44 +123,13 @@ def run(xtrace: str, project_dir: str, seconds: float, rows: int, cols: int) -> 
             if not chunk:
                 break
             buf += chunk
-        done, st = os.waitpid(pid, os.WNOHANG)
-        if done:
-            status = st
-            break
-    if status is None:  # the PTY closed (child exited) before we reaped it?
-        for _ in range(10):
-            done, st = os.waitpid(pid, os.WNOHANG)
-            if done:
-                status = st
-                break
-            time.sleep(0.05)
-    if status is None:
-        stopped = True
-        try:
-            os.write(fd, b"q")
-            time.sleep(0.5)
-            done, st = os.waitpid(pid, os.WNOHANG)
-            if not done:
-                os.kill(pid, signal.SIGTERM)
-                time.sleep(0.5)
-                done, st = os.waitpid(pid, os.WNOHANG)
-                if not done:
-                    os.kill(pid, signal.SIGKILL)
-                    _, st = os.waitpid(pid, 0)
-            status = st
-        except OSError:
-            status = 0
-    try:
-        while True:
-            r, _, _ = select.select([fd], [], [], 0.1)
-            if not r:
-                break
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            buf += chunk
-    except OSError:
-        pass
+    finally:
+        os.close(fd)
+    if observations is not None:
+        observations.update({"listObserved": list_observed(buf), "inputSent": opened,
+                             "open_after": opened_at,
+                             "routeObservedAfterOpen": bool(opened and ROUTE.search(ANSI.sub(b"", buf[opened_offset:]))),
+                             "accommodation": "Enter opens a recording after an observed list row; routes are checked in detail, not in the list"})
     code = os.waitstatus_to_exitcode(status) if status is not None else None
     if code is not None and code < 0:
         code = 128 + -code
@@ -119,12 +147,13 @@ def main() -> int:
     a = ap.parse_args()
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    code, stopped, buf = run(a.xtrace, a.project_dir, a.seconds, a.rows, a.cols)
+    observations = {}
+    code, stopped, buf = run(a.xtrace, a.project_dir, a.seconds, a.rows, a.cols, observations=observations)
     (out / "tui.transcript.raw").write_bytes(buf)
     (out / "tui.transcript.txt").write_bytes(ANSI.sub(b"", buf))
     verdict, reason = classify(code, stopped, buf)
     doc = {"schemaVersion": 1, "kind": "tui_pty_transcript", "exitCode": code, "stoppedByHarness": stopped,
-           "bytes": len(buf), "verdict": verdict, "reason": reason, "rows": a.rows, "cols": a.cols}
+           "bytes": len(buf), "verdict": verdict, "reason": reason, "rows": a.rows, "cols": a.cols, "observations": observations}
     (out / "tui.json").write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n")
     print(f"tui transcript: {verdict} ({reason})")
     return {"pass": 0, "not-implemented": 3}.get(verdict, 1)

@@ -37,6 +37,9 @@ public record MethodReport(
   public static final class Reasons {
     public static final String BRIDGE = "bridge";
     public static final String SYNTHETIC = "synthetic";
+    public static final String NO_CODE = "no_code";
+    public static final String INITIALIZER = "class_initializer_not_instrumented";
+    public static final String CONSTRUCTOR_PREAMBLE = "constructor_preamble_unsupported";
     public static final String NO_LINE_TABLE = "no_line_table";
     public static final String TOO_LARGE = "method_too_large";
     public static final String SITE_BUDGET = "line_site_budget_exceeded";

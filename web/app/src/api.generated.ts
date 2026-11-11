@@ -183,6 +183,13 @@ export interface components {
             /** Format: uuid */
             requestId: string;
         };
+        /** @description Latest report for this recording's session. Rejected requests were not recorded; this does not establish that the selected recording is incomplete. */
+        SessionContext: {
+            /** Format: uuid */
+            runtimeSessionId: string;
+            /** @description Cumulative rejected request starts as last reported. Null means not observed; '0' is an explicitly reported zero. Decimal strings preserve the full stored count. */
+            rejectedRequests: string | null;
+        };
         Recording: {
             /** Format: uuid */
             recordingId: string;
@@ -196,6 +203,7 @@ export interface components {
             firstSequence?: string | null;
             lastSequence?: string | null;
             incompleteEvidence: string[];
+            sessionContext: components["schemas"]["SessionContext"];
             /** @description Event cap recorded in terminal evidence. */
             eventCap?: number | null;
             /**
@@ -246,6 +254,7 @@ export interface components {
             firstSequence: string | null;
             lastSequence: string | null;
             incompleteEvidence: string[];
+            sessionContext: components["schemas"]["SessionContext"];
             /** Format: uuid */
             operationId: string | null;
             /** @enum {string|null} */
@@ -275,6 +284,7 @@ export interface components {
             segmentCount: string;
             events: components["schemas"]["Event"][];
             incompleteEvidence: string[];
+            sessionContext: components["schemas"]["SessionContext"];
             unavailable: components["schemas"]["Unavailable"];
             /** @description Adapter-observed outcome; null when terminal evidence is absent. Nothing is synthesized. */
             outcome: null | components["schemas"]["Outcome"];
@@ -445,6 +455,8 @@ export interface components {
             interaction?: {
                 [key: string]: string | null;
             } | null;
+            /** @description Persisted exception type only; null when no payload was recorded. Messages and stack text are withheld. Cause chains are not recorded by the current agent protocol and must not be inferred from other events. */
+            exception: null | components["schemas"]["EventException"];
             /**
              * @description Adapter-reported compile-time class-to-source binding result.
              * @enum {string}
@@ -484,6 +496,10 @@ export interface components {
             /** @description Empty means none observed. */
             bindings: components["schemas"]["Binding"][];
             gap: null | components["schemas"]["Gap"];
+        };
+        EventException: {
+            /** @description Recorded type name; null when not observed. Oversized legacy names use a truncation marker recorded in fieldTruncations. */
+            exceptionType: string | null;
         };
         /** @enum {string} */
         Completion: "complete" | "partial" | "invalid" | "unavailable";

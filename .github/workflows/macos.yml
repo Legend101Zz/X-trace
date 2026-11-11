@@ -2,10 +2,6 @@ name: macos
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - "wave/**"
-      - "ultra/rc-*"
 
 permissions:
   contents: read
@@ -22,7 +18,7 @@ jobs:
   # Preserve the original macOS job's release-tool-tests prerequisite on the same source.
   release-tool-tests:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -32,9 +28,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Install Linux descriptor inspection tool
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes lsof
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=60 install --yes lsof
       - name: Select private root path
         # The runner context is not available in job-level `env`; derive the
         # path from the shell-level runner variable and export it here.
@@ -80,6 +81,7 @@ jobs:
     # NOT COVERED until broker code exists: other-UID broker negative (ADR 0006 addendum 2026-10-10, item 3)
     needs: release-tool-tests
     runs-on: macos-15
+    # Preserve the original job bound, including the Rust runner's 50-minute inner bound.
     timeout-minutes: 180
     permissions:
       contents: read
@@ -191,13 +193,41 @@ jobs:
           python3 -B -m tools.qa.lane_run run --suite java --variant "${{ matrix.java-version }}" --step gradle --cwd adapters/java \
             --junit-glob "*/build/test-results/test/*.xml" --min-passed 190 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             ./gradlew --dependency-verification strict clean test installDist agentDist fixtureBootJar
+      - name: Reject release CI diagnostic channel
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          umask 077
+          log="${RUNNER_TEMP:?}/ci-diagnostics-release.log"
+          if cargo check --release --locked -p xtrace-private-storage --features ci-diagnostics >"$log" 2>&1; then
+            echo "release diagnostic feature was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics requires debug_assertions; release/package builds must exclude it' "$log" >/dev/null
+          if cargo check --release --locked -p xtrace-private-storage --all-features >"$log" 2>&1; then
+            echo "release all-features diagnostic channel was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics requires debug_assertions; release/package builds must exclude it' "$log" >/dev/null
+          if CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo check --release --locked -p xtrace-private-storage --features ci-diagnostics >"$log" 2>&1; then
+            echo "release diagnostic channel with debug assertions was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics is forbidden in release profiles even with debug assertions' "$log" >/dev/null
+          if CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo check --release --locked -p xtrace-private-storage --all-features >"$log" 2>&1; then
+            echo "release diagnostic channel with debug assertions was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics is forbidden in release profiles even with debug assertions' "$log" >/dev/null
       - name: cargo build (locked workspace)
         if: ${{ !cancelled() }}
         run: |
           python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step build --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
-            cargo build --locked --workspace --all-features
+            cargo build --locked --workspace --all-features --message-format=json
       - name: cargo test (locked workspace, no ignored tests)
         if: ${{ !cancelled() }}
+        env:
+          XTRACE_CI_DIAG_DIR: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag
         run: |
           python3 -B -m tools.qa.lane_run run --suite rust --variant "${{ matrix.tuple }}" --step test --min-passed 1030 --max-ignored 0 --out "$XTRACE_CI_PRIVATE_ROOT/frag" -- \
             cargo test --locked --workspace --all-features --no-fail-fast
@@ -259,7 +289,9 @@ jobs:
         if: always()
         with:
           name: xtrace-macos-arm64-frag-${{ matrix.tuple }}
-          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag
+          # Rust fragments also retain validated numeric store profiles, including on timeout.
+          # Fragments include bounded, privacy-scanned excerpts. Never upload private logs or profile text.
+          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
           if-no-files-found: ignore
           retention-days: 14
 

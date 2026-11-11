@@ -144,3 +144,5 @@ exit 9 with a message; they never exit 0 and never print a success document.
   restarts nearer the anchor, so `anchorFrameId` always names a frame in the page.
 - Not done: the `boundaryReason` extra for async roots (an async root's `out`
   is a plain `boundary`).
+
+**Amendment (2026-11-09).** `xtrace export` supports OpenAPI, Postman, cURL and developer bundles. Missing revisions or operation IDs exit 3; usage errors exit 2. Non-empty destinations are refused, and files are staged in a private sibling directory and published by one rename. Per-claim end lines and confidence are unavailable; multi-claim locations are also unavailable. The bundle omits the unavailable policy digest and reports the omission.

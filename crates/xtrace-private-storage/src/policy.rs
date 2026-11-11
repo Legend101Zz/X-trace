@@ -75,8 +75,8 @@ pub(crate) fn linux_directory_acl_admits(
     }
 }
 
-/// macOS ACL rule for a directory, given the `/bin/ls -ldeO` listing text. Role independent.
-#[cfg(any(target_os = "macos", test))]
+/// Boolean projection used by the policy tables and parser regressions.
+#[cfg(test)]
 pub(crate) fn macos_directory_listing_admits(text: &str, expected_path: &str) -> bool {
     parse_macos_acl_listing_kind(text, expected_path, b'd')
 }
@@ -238,13 +238,23 @@ fn linux_default_acl_is_well_formed(bytes: &[u8]) -> bool {
 
 #[cfg(any(target_os = "macos", test))]
 fn parse_macos_acl_listing_kind(text: &str, expected_path: &str, kind: u8) -> bool {
+    macos_acl_listing_verdict(text, expected_path, kind).is_ok()
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn macos_acl_listing_verdict(
+    text: &str,
+    expected_path: &str,
+    kind: u8,
+) -> Result<(), crate::diagnostic::ListingRefusal> {
+    use crate::diagnostic::ListingRefusal as Refusal;
     if text.contains('\r') || !text.is_ascii() || !text.ends_with('\n') {
-        return false;
+        return Err(Refusal::Text);
     }
     let mut lines = text.lines();
-    let Some(header) = lines.next() else { return false };
-    let Some(prefix) = header.strip_suffix(expected_path) else { return false };
-    let Some(prefix) = prefix.strip_suffix(' ') else { return false };
+    let Some(header) = lines.next() else { return Err(Refusal::Header) };
+    let Some(prefix) = header.strip_suffix(expected_path) else { return Err(Refusal::Header) };
+    let Some(prefix) = prefix.strip_suffix(' ') else { return Err(Refusal::Header) };
     let fields = prefix.split_ascii_whitespace().collect::<Vec<_>>();
     if fields.len() != 9
         || fields[1].parse::<u64>().is_err()
@@ -274,30 +284,30 @@ fn parse_macos_acl_listing_kind(text: &str, expected_path: &str, kind: u8) -> bo
         || (fields[8].contains(':') && fields[8].len() != 5)
         || (!fields[8].contains(':') && fields[8].len() != 4)
     {
-        return false;
+        return Err(Refusal::Header);
     }
     let mode = fields[0].as_bytes();
     if mode.len() < 10 || mode[0] != kind || !valid_posix_mode(&mode[1..10]) {
-        return false;
+        return Err(Refusal::Mode);
     }
     let suffix = &mode[10..];
     if !(suffix.is_empty() || suffix == b"+" || suffix == b"@" || suffix == b"+@") {
-        return false;
+        return Err(Refusal::Mode);
     }
     let acl_required = suffix.contains(&b'+');
     let mut saw_acl = false;
     let mut expected_index = 0_u32;
     for line in lines {
-        let Some((index, body)) = line.trim().split_once(':') else { return false };
-        let Ok(index) = index.parse::<u32>() else { return false };
+        let Some((index, body)) = line.trim().split_once(':') else { return Err(Refusal::Index) };
+        let Ok(index) = index.parse::<u32>() else { return Err(Refusal::Index) };
         if index != expected_index {
-            return false;
+            return Err(Refusal::Index);
         }
-        let Some(next) = expected_index.checked_add(1) else { return false };
+        let Some(next) = expected_index.checked_add(1) else { return Err(Refusal::Index) };
         expected_index = next;
         let words = body.split_ascii_whitespace().collect::<Vec<_>>();
         if words.len() < 3 || !valid_acl_principal(words[0]) {
-            return false;
+            return Err(Refusal::Principal);
         }
         let effects = words
             .iter()
@@ -305,11 +315,18 @@ fn parse_macos_acl_listing_kind(text: &str, expected_path: &str, kind: u8) -> bo
             .filter(|(_, word)| matches!(**word, "allow" | "deny"))
             .collect::<Vec<_>>();
         if effects.len() != 1 {
-            return false;
+            return Err(Refusal::Effect);
         }
         let (effect_index, effect) = effects[0];
-        if *effect != "deny" || effect_index == 0 || effect_index + 1 >= words.len() {
-            return false;
+        if effect_index == 0 || effect_index + 1 >= words.len() {
+            return Err(Refusal::Effect);
+        }
+        if *effect != "deny" {
+            return Err(if words[1..effect_index].contains(&"inherited") {
+                Refusal::InheritedAllow
+            } else {
+                Refusal::Allow
+            });
         }
         if words[1..effect_index].iter().any(|word| {
             !matches!(
@@ -322,7 +339,7 @@ fn parse_macos_acl_listing_kind(text: &str, expected_path: &str, kind: u8) -> bo
                     | "no_propagate"
             )
         }) {
-            return false;
+            return Err(Refusal::InheritanceFlags);
         }
         let rights = words[effect_index + 1..].join("");
         let parsed = rights.split(',').collect::<Vec<_>>();
@@ -341,17 +358,32 @@ fn parse_macos_acl_listing_kind(text: &str, expected_path: &str, kind: u8) -> bo
             "chown",
         ];
         if parsed.is_empty()
-            || parsed.iter().any(|right| right.is_empty() || !RIGHTS.contains(right))
+            || parsed.iter().any(|right| {
+                // Darwin lists the same permission bits with directory-specific names.
+                // Normalize only those aliases, after requiring a deny-only entry.
+                let right = match (kind, *right) {
+                    (b'd', "list") => "read",
+                    (b'd', "add_file") => "write",
+                    (b'd', "search") => "execute",
+                    (b'd', "add_subdirectory") => "append",
+                    (_, right) => right,
+                };
+                right.is_empty() || !RIGHTS.contains(&right)
+            })
         {
-            return false;
+            return Err(Refusal::Rights);
         }
         saw_acl = true;
     }
-    (!acl_required || saw_acl) && (!saw_acl || suffix.contains(&b'@') || acl_required)
+    if (!acl_required || saw_acl) && (!saw_acl || suffix.contains(&b'@') || acl_required) {
+        Ok(())
+    } else {
+        Err(Refusal::Marker)
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn valid_owner_name(value: &str) -> bool {
+pub(crate) fn valid_owner_name(value: &str) -> bool {
     !value.is_empty()
         && value
             .bytes()
@@ -463,6 +495,62 @@ mod tests {
             "drwxr-xr-x+ 4 alice staff - 128 Oct 4 00:23 /Users/alice/Documents\n",
             "/Users/alice/Documents",
         ));
+    }
+
+    #[test]
+    fn macos_listing_refusals_distinguish_inheritance_policy_and_parser_gaps() {
+        use crate::diagnostic::ListingRefusal as Refusal;
+        let path = "/private/fixture";
+        let header = "drwx------+ 3 example staff - 96 Oct 4 12:00 /private/fixture\n";
+        for (entry, refusal) in [
+            ("0: group:everyone allow read", Refusal::Allow),
+            ("0: group:everyone inherited allow read", Refusal::InheritedAllow),
+            ("0: group:everyone deny unknown", Refusal::Rights),
+            ("0: group:everyone inherited deny unknown", Refusal::Rights),
+            ("0: group:everyone unknown deny read", Refusal::InheritanceFlags),
+            ("1: group:everyone deny read", Refusal::Index),
+            ("0: invalid deny read", Refusal::Principal),
+            ("0: group:everyone allow deny read", Refusal::Effect),
+        ] {
+            let text = format!("{header}{entry}\n");
+            assert_eq!(macos_acl_listing_verdict(&text, path, b'd'), Err(refusal));
+            assert!(!macos_directory_listing_admits(&text, path));
+        }
+        assert_eq!(macos_acl_listing_verdict(header, path, b'd'), Err(Refusal::Marker));
+        assert_eq!(macos_acl_listing_verdict(header, "/different", b'd'), Err(Refusal::Header));
+        assert_eq!(macos_acl_listing_verdict(header, path, b'-'), Err(Refusal::Mode));
+        assert_eq!(macos_acl_listing_verdict("private-canary", path, b'd'), Err(Refusal::Text));
+        let inherited_deny = format!("{header}0: group:everyone inherited deny delete\n");
+        assert_eq!(macos_acl_listing_verdict(&inherited_deny, path, b'd'), Ok(()));
+        assert!(macos_directory_listing_admits(&inherited_deny, path));
+    }
+
+    #[test]
+    fn macos_directory_right_names_preserve_the_deny_only_policy() {
+        let header = "drwx------+ 3 xtrace-test staff - 96 Oct 4 12:00 /private/root\n";
+        for right in ["list", "add_file", "search", "add_subdirectory"] {
+            assert!(macos_directory_listing_admits(
+                &format!("{header} 0: group:everyone deny {right}\n"),
+                "/private/root",
+            ));
+            assert!(!macos_directory_listing_admits(
+                &format!("{header} 0: group:everyone allow {right}\n"),
+                "/private/root",
+            ));
+            assert!(!parse_macos_acl_listing_kind(
+                &format!(
+                    "-rw-------+ 1 xtrace-test staff - 0 Oct 4 12:00 /private/root\n 0: group:everyone deny {right}\n"
+                ),
+                "/private/root",
+                b'-',
+            ));
+        }
+        for rights in ["add_file,unknown", "add_file,,search", "add_file,"] {
+            assert!(!macos_directory_listing_admits(
+                &format!("{header} 0: group:everyone deny {rights}\n"),
+                "/private/root",
+            ));
+        }
     }
 
     #[test]

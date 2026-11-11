@@ -2,6 +2,7 @@ package dev.xtrace.agent.runtime.line;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.xtrace.agent.runtime.line.CorpusHarness.Run;
@@ -46,12 +47,18 @@ class LineProbeFallbackTest {
         build("nog", CorpusPipeline.noExtra(), new String[] {"-g:none"}, LineProbeConfig.focused(OWNER));
     for (var e : p.results.entrySet()) {
       assertFalse(e.getValue().changed(), e.getKey());
+      assertSame(p.plainBytes.get(e.getKey()), e.getValue().bytes(), e.getKey());
       for (MethodReport m : e.getValue().methods()) {
         assertEquals(Status.SKIPPED, m.status());
-        assertTrue(
-            m.reason().equals(Reasons.NO_LINE_TABLE) || m.reason().equals(Reasons.SYNTHETIC)
-                || m.reason().equals(Reasons.BRIDGE),
-            m.toString());
+        if (m.name().equals("<clinit>")) {
+          // Initializers have no boundary even when debug information is present.
+          assertEquals(Reasons.INITIALIZER, m.reason());
+        } else {
+          assertTrue(
+              m.reason().equals(Reasons.NO_LINE_TABLE) || m.reason().equals(Reasons.SYNTHETIC)
+                  || m.reason().equals(Reasons.BRIDGE),
+              m.toString());
+        }
       }
     }
     assertEquals(0, p.registry.siteCount());

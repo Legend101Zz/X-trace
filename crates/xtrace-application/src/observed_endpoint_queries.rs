@@ -10,7 +10,9 @@ use xtrace_domain::{
 
 use crate::{
     PortError,
-    recording_queries::{RecordingCompletionEvidence, RecordingMetadata, RecordingStatus},
+    recording_queries::{
+        RecordingCompletionEvidence, RecordingMetadata, RecordingStatus, SessionContext,
+    },
 };
 
 /// Default and maximum endpoint page sizes.
@@ -184,6 +186,8 @@ pub struct ObservedRecordingDto {
     pub last_sequence: Option<String>,
     /// Persisted incomplete evidence.
     pub incomplete_evidence: Vec<String>,
+    /// Session-wide capture context, separate from this recording's completion evidence.
+    pub session_context: SessionContext,
     /// Operation identity when the recording has a valid linked observation.
     pub operation_id: Option<OperationId>,
     /// Accepted policy retained with the observation.
@@ -413,6 +417,7 @@ fn recording_dto(row: ObservedRecordingRecord) -> ObservedRecordingDto {
         first_sequence: row.metadata.first_sequence,
         last_sequence: row.metadata.last_sequence,
         incomplete_evidence: row.metadata.incomplete_evidence,
+        session_context: row.metadata.session_context,
         operation_id: row.operation_id,
         observation_policy: row.observation_policy,
         unmatched_reason: row.unmatched_reason,
@@ -665,6 +670,7 @@ mod tests {
         calls: Arc<Mutex<Vec<FakeCall>>>,
         has_more: bool,
         empty: bool,
+        recordings: Vec<ObservedRecordingRecord>,
     }
     impl ObservedEndpointReadPort for Fake {
         fn list_observed_endpoints(
@@ -706,7 +712,7 @@ mod tests {
                 limit,
                 after.map(|key| key.recording_id.to_string()),
             ));
-            Ok((Vec::new(), false))
+            Ok((self.recordings.clone(), false))
         }
         fn list_unmatched_recordings(
             &self,
@@ -719,7 +725,73 @@ mod tests {
                 limit,
                 after.map(|key| key.recording_id.to_string()),
             ));
-            Ok((Vec::new(), false))
+            Ok((self.recordings.clone(), false))
+        }
+    }
+    #[test]
+    fn linked_and_unmatched_lists_preserve_all_session_context_states() {
+        let project_id = ProjectId::new();
+        let operation_id = OperationId::new();
+        for linked in [true, false] {
+            for rejected_requests in [None, Some("0"), Some("18446744073709551615")] {
+                let context = SessionContext {
+                    runtime_session_id: xtrace_domain::RuntimeSessionId::new(),
+                    rejected_requests: rejected_requests.map(str::to_owned),
+                };
+                let row = ObservedRecordingRecord {
+                    metadata: RecordingMetadata {
+                        recording_id: RecordingId::new(),
+                        status: RecordingStatus::Complete,
+                        completion: RecordingCompletionEvidence::Complete,
+                        opened_at: "2026-09-30T00:00:00Z".into(),
+                        segment_count: "1".into(),
+                        event_count: "4".into(),
+                        first_sequence: Some("1".into()),
+                        last_sequence: Some("4".into()),
+                        incomplete_evidence: Vec::new(),
+                        session_context: context.clone(),
+                        event_cap: None,
+                        outcome_kind: None,
+                    },
+                    operation_id: linked.then_some(operation_id),
+                    observation_policy: linked.then(|| "spring-orders-v1".into()),
+                    unmatched_reason: None,
+                };
+                let service = ObservedEndpointQueryService::new(Fake {
+                    recordings: vec![row],
+                    ..Fake::default()
+                });
+                let page = if linked {
+                    service.list_operation_recordings(
+                        ListOperationRecordings {
+                            project_id,
+                            operation_id,
+                            limit: None,
+                            cursor: None,
+                        },
+                        CorrelationId::new(),
+                    )
+                } else {
+                    service.list_unmatched_recordings(
+                        ListUnmatchedRecordings { project_id, limit: None, cursor: None },
+                        CorrelationId::new(),
+                    )
+                }
+                .expect("recording page");
+                assert_eq!(page.items.len(), 1);
+                assert_eq!(page.items[0].session_context, context);
+                assert_eq!(page.items[0].completion, RecordingCompletionEvidence::Complete);
+                assert!(page.items[0].incomplete_evidence.is_empty());
+                let json = serde_json::to_value(&page).expect("serialized recording page");
+                assert_eq!(
+                    json["items"][0]["sessionContext"],
+                    serde_json::json!({
+                        "runtimeSessionId": context.runtime_session_id,
+                        "rejectedRequests": rejected_requests,
+                    })
+                );
+                assert_eq!(json["items"][0]["incompleteEvidence"], serde_json::json!([]));
+            }
         }
     }
     #[test]

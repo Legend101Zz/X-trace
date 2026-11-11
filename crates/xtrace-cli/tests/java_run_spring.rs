@@ -145,7 +145,7 @@ fn run_launches_spring_fixture_captures_selected_root_and_forwards_shutdown() {
         "fixture returned {}",
         String::from_utf8_lossy(&response)
     );
-    let logical = wait_for_segment(&project_root);
+    let logical = read_complete_recording_segments(&project_root);
     assert!(logical.windows(22).any(|bytes| bytes == b"OrderController.create"));
     for canary in
         ["BODY_CANARY_1D4", "AUTH_CANARY_1D4", "COOKIE_CANARY_1D4", "PATH_QUERY_CANARY_1E2"]
@@ -938,10 +938,33 @@ fn attach_keeps_existing_spring_target_alive_and_persists_real_request() {
         "fixture returned {}",
         String::from_utf8_lossy(&response)
     );
-    let logical = wait_for_segment(&project_root);
+    let logical = read_complete_recording_segments(&project_root);
     assert!(logical.windows(22).any(|bytes| bytes == b"OrderController.create"));
     assert_canaries_absent(&logical);
-    wait_for_recording_count(&project_root, 1);
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_xtrace"))
+        .args(["recording", "list", "--project-dir"])
+        .arg(&repo)
+        .env("XTRACE_DATA_HOME", &data_home)
+        .output()
+        .expect("list attached recording through the read API");
+    assert!(listed.status.success(), "{}", diagnostic(&listed));
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("recording list");
+    let recordings = listed["recordings"].as_array().expect("recordings");
+    assert_eq!(recordings.len(), 1);
+    assert_eq!(recordings[0]["status"], "complete");
+    assert_eq!(recordings[0]["completion"], "complete");
+    let detail = recording_show_page(
+        &repo,
+        &data_home,
+        recordings[0]["recording_id"].as_str().expect("recording id"),
+        100,
+        None,
+    );
+    assert!(detail.status.success(), "{}", diagnostic(&detail));
+    let detail: Value = serde_json::from_slice(&detail.stdout).expect("attached detail");
+    assert_eq!(detail["status"], "complete");
+    assert_eq!(detail["completion"], "complete");
 
     // The Rust pack cache (`java-packs`, with its `.state` sidecar) and the Java helper's own
     // snapshot cache are siblings in the helper cache; the helper only lists its own directory,
@@ -1262,31 +1285,42 @@ fn fixture_count(port: u16) -> u64 {
         .expect("fixture count")
 }
 
-fn wait_for_segment(project_root: &Path) -> Vec<u8> {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let database = Connection::open(project_root.join("metadata.sqlite3")).expect("SQLite");
-        let object_hash = database
-            .query_row(
-                "SELECT object_hash FROM recording_segments WHERE segment_ordinal = 0 LIMIT 1",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .ok();
-        if let Some(object_hash) = object_hash {
-            let hash = object_hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-            let object_path = project_root
-                .join("objects/b3")
-                .join(&hash[..2])
-                .join(format!("{}.xtf.zst", &hash[2..]));
-            let compressed = fs::read(object_path).expect("XTF object");
-            let expected = format!("b3:{hash}").parse().expect("content hash");
-            verify_compressed_segment(&compressed, expected).expect("verified XTF");
-            return zstd::stream::decode_all(compressed.as_slice()).expect("decompress XTF");
-        }
-        assert!(Instant::now() < deadline, "request was not persisted to selected project");
-        thread::sleep(Duration::from_millis(30));
+fn read_complete_recording_segments(project_root: &Path) -> Vec<u8> {
+    // Acknowledged batches can seal segments before the request finishes. Only
+    // completion makes the full set of immutable segments available to inspect.
+    wait_for_recording_count(project_root, 1);
+    let database = Connection::open(project_root.join("metadata.sqlite3")).expect("SQLite");
+    let recording_ids = database
+        .prepare("SELECT recording_id FROM recordings WHERE status = 'complete'")
+        .expect("completed recording query")
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .expect("completed recordings")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("completed recording IDs");
+    assert_eq!(recording_ids.len(), 1, "one completed request before inspecting its segments");
+    let mut query = database
+        .prepare(
+            "SELECT object_hash FROM recording_segments WHERE recording_id = ?1 ORDER BY segment_ordinal",
+        )
+        .expect("segment query");
+    let hashes = query
+        .query_map([&recording_ids[0]], |row| row.get::<_, Vec<u8>>(0))
+        .expect("segment hashes");
+    let mut logical = Vec::new();
+    for object_hash in hashes {
+        let object_hash = object_hash.expect("segment hash");
+        let hash = object_hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let object_path = project_root
+            .join("objects/b3")
+            .join(&hash[..2])
+            .join(format!("{}.xtf.zst", &hash[2..]));
+        let compressed = fs::read(object_path).expect("XTF object");
+        let expected = format!("b3:{hash}").parse().expect("content hash");
+        verify_compressed_segment(&compressed, expected).expect("verified XTF");
+        logical.extend(zstd::stream::decode_all(compressed.as_slice()).expect("decompress XTF"));
     }
+    assert!(!logical.is_empty(), "completed request must have persisted segments");
+    logical
 }
 
 fn wait_for_recording_count(project_root: &Path, expected: i64) {
@@ -1301,7 +1335,26 @@ fn wait_for_recording_count(project_root: &Path, expected: i64) {
         if count >= expected {
             return;
         }
-        assert!(Instant::now() < deadline, "expected {expected} completed recordings, got {count}");
+        if Instant::now() >= deadline {
+            // Counts identify the persistence boundary without dumping captured request data.
+            let statuses = database
+                .prepare("SELECT status, COUNT(*) FROM recordings GROUP BY status ORDER BY status")
+                .expect("lifecycle status query")
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                .expect("lifecycle statuses")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("lifecycle counts");
+            let segments: i64 = database
+                .query_row("SELECT COUNT(*) FROM recording_segments", [], |row| row.get(0))
+                .expect("segment count");
+            let terminals: i64 = database
+                .query_row("SELECT COUNT(*) FROM recording_terminal_evidence", [], |row| row.get(0))
+                .expect("terminal evidence count");
+            panic!(
+                "expected {expected} completed recordings, got {count}; statuses={statuses:?}, \
+                 segments={segments}, terminals={terminals}"
+            );
+        }
         thread::sleep(Duration::from_millis(30));
     }
 }

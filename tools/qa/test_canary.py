@@ -36,6 +36,26 @@ class CanaryTests(unittest.TestCase):
         self.assertTrue(r["clean"])
         self.assertEqual(r["hits"], [])
 
+    def test_business_secret_matches_product_content_rule_and_is_strictly_scanned(self):
+        import re
+        value = self.c["focused-business-secret"]
+        # Redaction.java's authorization-style content rule, not an ordinary marker.
+        self.assertIsNotNone(re.search(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}", value))
+        (self.root / "recording.json").write_text(json.dumps({"preview": value}))
+        report = self.scan(focused=self.root)
+        self.assertFalse(report["clean"])
+        self.assertIn("focused-business-secret", {h["canary"] for h in report["hits"]})
+        self.assertNotIn(value, json.dumps(report))
+
+    def test_plain_control_demonstrates_scanner_sees_captured_binding_path(self):
+        marker = "XTplain.0123456789abcdef"
+        (self.root / "recording.json").write_text(json.dumps({"events": [{"bindings": [{"name": "lastName", "value": {
+            "state": "captured", "preview": marker, "shape": "string"}}]}]}))
+        self.assertTrue(self.scan(focused=self.root)["clean"])
+        positive = canary.run_scan({"plain-control": marker}, {"focused": [self.root]})
+        self.assertFalse(positive["clean"])
+        self.assertTrue(any(h["encoding"] == "raw" and h["count"] == 1 for h in positive["hits"]))
+
     def test_absent_location_is_not_clean(self):
         r = self.scan(store=self.root / "missing")
         self.assertFalse(r["clean"])

@@ -26,6 +26,7 @@ env:
 jobs:
   release-tool-tests:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -35,9 +36,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Install Linux descriptor inspection tool
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes lsof
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=60 install --yes lsof
       - name: Select private root path
         # The runner context is not available in job-level `env`; derive the
         # path from the shell-level runner variable and export it here.
@@ -72,7 +78,7 @@ jobs:
   release-floor-linux-x86_64:
     needs: release-tool-tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 120
     permissions:
       contents: read
     strategy:
@@ -103,9 +109,14 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - name: Install release-floor system prerequisites
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=60 -o APT::Update::Error-Mode=any update
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=60 install --yes \
             lsof \
             libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
             libcairo2 libcups2t64 libdrm2 libgbm1 libglib2.0-0t64 \
@@ -134,6 +145,7 @@ jobs:
         run: |
           set -euo pipefail
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m tools.release.ci_floor prepare-private-root --root "$XTRACE_CI_PRIVATE_ROOT"
+          mkdir -m 700 "$XTRACE_CI_PRIVATE_ROOT/frag"
       - name: Verify full release tooling suite on the exact source
         run: |
           set +e
@@ -148,7 +160,7 @@ jobs:
         run: |
           set +e
           umask 077
-          python3 -B -m tools.release.run_gates \
+          python3 -B -m tools.qa.release_floor run \
             --repo "$GITHUB_WORKSPACE" \
             --base "$XTRACE_PHASE_BASE_SHA" \
             --label "floor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.tuple }}" \
@@ -162,7 +174,7 @@ jobs:
         if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
         run: |
           set +e
-          python3 -B -m tools.release.ci_floor sanitize-floor \
+          python3 -B -m tools.qa.release_floor sanitize-floor \
             --root "$XTRACE_CI_PRIVATE_ROOT" \
             --repo "$GITHUB_WORKSPACE" \
             --label "floor-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.tuple }}" \
@@ -172,17 +184,20 @@ jobs:
           result=$?
           set -e
           exit "$result"
-      - name: Upload sanitized floor summary only
+      - name: Upload sanitized floor summary and Rust lane fragments
         if: always() && env.XTRACE_PRIVATE_ROOT_ADMITTED == '1'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: xtrace-v001-floor-${{ matrix.tuple }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json
+          path: |
+            ${{ env.XTRACE_CI_PRIVATE_ROOT }}/release-floor-summary.json
+            ${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json
           if-no-files-found: error
           retention-days: 14
 
   java-client:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
@@ -254,6 +269,7 @@ jobs:
 
   node-client:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
@@ -300,6 +316,8 @@ jobs:
 
   gates:
     runs-on: ubuntu-latest
+    # Recent run took 49 minutes; leave room for runner and download variance.
+    timeout-minutes: 90
     env:
       NPM_CONFIG_CACHE: /tmp/xtrace-npm-cache
       PLAYWRIGHT_BROWSERS_PATH: /tmp/xtrace-playwright
@@ -308,7 +326,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Test dev tools, command guard and workflow lint
+      - name: Test dev tools, command guard and full QA suite
         run: |
           set -euo pipefail
           root="${RUNNER_TEMP:?}/xd"
@@ -316,7 +334,9 @@ jobs:
           # The env tests also need an owner-only ancestor within the 24-byte scratch cap.
           chmod 700 "$RUNNER_TEMP"
           XTRACE_DEV_TEST_ROOT="$root" XTRACE_DEV_SCRATCH="$RUNNER_TEMP" TMPDIR="$root" \
-            python3 -B -m unittest tools.dev.test_dev_tools tools.dev.test_guard tools.qa.test_workflow_lint
+            python3 -B -m unittest tools.dev.test_dev_tools tools.dev.test_guard tools.qa.test_release_floor
+          # Match lane/campaign discovery without the dev tests' private TMPDIR override.
+          python3 -B -m unittest discover -s tools/qa -p 'test_*.py'
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -374,15 +394,42 @@ jobs:
         run: |
           set -euo pipefail
           root="${RUNNER_TEMP:?}/xt"
-          mkdir -m 700 "$root" "$root/tmp" "$root/priv"
+          mkdir -m 700 "$root" "$root/tmp" "$root/priv" "$root/frag" "$root/frag/ci-diag"
           echo "TMPDIR=$root/tmp" >> "$GITHUB_ENV"
           echo "XTRACE_TEST_PRIVATE_SCRATCH=$root/priv" >> "$GITHUB_ENV"
       - name: Format gate (stable rustfmt, no nightly-only keys)
         run: cargo fmt --all --check
       - name: Strict clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Reject release CI diagnostic channel
+        run: |
+          set -euo pipefail
+          umask 077
+          log="${RUNNER_TEMP:?}/ci-diagnostics-release.log"
+          if cargo check --release --locked -p xtrace-private-storage --features ci-diagnostics >"$log" 2>&1; then
+            echo "release diagnostic feature was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics requires debug_assertions; release/package builds must exclude it' "$log" >/dev/null
+          if cargo check --release --locked -p xtrace-private-storage --all-features >"$log" 2>&1; then
+            echo "release all-features diagnostic channel was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics requires debug_assertions; release/package builds must exclude it' "$log" >/dev/null
+          if CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo check --release --locked -p xtrace-private-storage --features ci-diagnostics >"$log" 2>&1; then
+            echo "release diagnostic channel with debug assertions was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics is forbidden in release profiles even with debug assertions' "$log" >/dev/null
+          if CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo check --release --locked -p xtrace-private-storage --all-features >"$log" 2>&1; then
+            echo "release diagnostic channel with debug assertions was accepted"
+            exit 1
+          fi
+          grep -F 'ci-diagnostics is forbidden in release profiles even with debug assertions' "$log" >/dev/null
       - name: Unit and integration tests
-        run: cargo test --locked --workspace --all-features --no-fail-fast
+        run: |
+          export XTRACE_CI_DIAG_DIR="${RUNNER_TEMP:?}/xt/frag/ci-diag"
+          cargo test --locked --workspace --all-features --no-fail-fast
       - name: Restricted-PATH vendored-protoc build
         # `PATH` excludes any directory that could host a system `protoc`,
         # proving the build script resolves the binary exclusively through

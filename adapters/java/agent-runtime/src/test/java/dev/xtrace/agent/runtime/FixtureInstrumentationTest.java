@@ -1,5 +1,6 @@
 package dev.xtrace.agent.runtime;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -8,10 +9,111 @@ import dev.xtrace.adapter.ClientException;
 import dev.xtrace.fixture.OrderService;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Proxy;
+import java.net.URI;
+import java.security.CodeSource;
+import java.security.ProtectionDomain;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import net.bytebuddy.jar.asm.ClassWriter;
+import net.bytebuddy.jar.asm.Opcodes;
 import org.junit.jupiter.api.Test;
 
 class FixtureInstrumentationTest {
+  @Test
+  void defaultBootScopePreservesDependencyExclusionAndUnknownOriginsOnFailure() throws Exception {
+    assertScopedFailures(ApplicationScope.defaultScope());
+  }
+
+  @Test
+  void overlappingConfiguredPackagesPreserveBootDependencyExclusionOnFailure() throws Exception {
+    assertScopedFailures(new ApplicationScope(List.of("demo.probe"), List.of()));
+  }
+
+  private void assertScopedFailures(ApplicationScope scope) throws Exception {
+    var limitations = new FixtureInstrumentation.CaptureLimitations();
+    var listener = new FixtureInstrumentation.SafeListener(
+        () -> { throw new AssertionError("ordinary failures must fail open"); }, scope, limitations);
+    // Deliberately equal loaders: type identity uses loader identity, never equals/hashCode.
+    ClassLoader application = equalLoader();
+    ClassLoader dependency = equalLoader();
+    String name = "demo.probe.SharedName";
+    observe(listener, application, name, bootDomain("classes/"));
+    observe(listener, dependency, name, bootDomain("lib/dependency.jar"));
+    listener.onError(name, dependency, null, false, new IllegalStateException("dependency"));
+    listener.onComplete(name, dependency, null, false);
+    assertEquals(0, limitations.count());
+    listener.onError(name, application, null, false, new IllegalStateException("application"));
+    listener.onComplete(name, application, null, false);
+    assertEquals(1, limitations.count());
+    // Completion consumes successful verdicts; an error without an observed origin cannot
+    // reuse the previous application's verdict or invent application scope from a name.
+    observe(listener, application, name, bootDomain("classes/"));
+    listener.onComplete(name, application, null, false);
+    listener.onError(name, application, null, false, new IllegalStateException("no callback"));
+    observe(listener, application, "other.library.Unknown", null);
+    listener.onError("other.library.Unknown", application, null, false, new IllegalStateException("unknown"));
+    listener.onComplete("other.library.Unknown", application, null, false);
+    assertEquals(1, limitations.count());
+    listener.observeScope(application, name, bootDomain("classes/"));
+    listener.onError(name, application, null, false, new IllegalStateException("discovery scan"));
+    assertEquals(1, limitations.count());
+    // Error is followed by completion. A nested callback for the same key must retire only
+    // its own verdict, preserving the outer application's in-flight scope decision.
+    observe(listener, application, name, bootDomain("classes/"));
+    observe(listener, application, name, bootDomain("lib/dependency.jar"));
+    listener.onError(name, application, null, false, new IllegalStateException("nested dependency"));
+    listener.onComplete(name, application, null, false);
+    assertEquals(1, limitations.count());
+    listener.onError(name, application, null, false, new IllegalStateException("outer application"));
+    listener.onComplete(name, application, null, false);
+    assertEquals(2, limitations.count());
+  }
+
+  private static void observe(FixtureInstrumentation.SafeListener listener, ClassLoader loader,
+      String name, ProtectionDomain domain) {
+    listener.onDiscovery(name, loader, null, false);
+    listener.observeScope(loader, name, domain);
+  }
+
+  private ClassLoader equalLoader() {
+    return new ClassLoader(getClass().getClassLoader()) {
+      @Override public boolean equals(Object other) { return other instanceof ClassLoader; }
+      @Override public int hashCode() { return 0; }
+    };
+  }
+
+  private static ProtectionDomain bootDomain(String suffix) throws Exception {
+    return new ProtectionDomain(new CodeSource(URI.create("file:/application.jar!/BOOT-INF/" + suffix).toURL(),
+        (java.security.cert.Certificate[]) null), null);
+  }
+
+  @Test
+  void gapOwnerRequiresTheActualBridgeEvenWhenAShadowHasLineGap() {
+    assertTrue(FixtureInstrumentation.gapOwnerAvailable(getClass().getClassLoader()));
+    String name = FixtureInstrumentation.PROBE_OWNER.replace('/', '.');
+    ClassWriter bytes = new ClassWriter(0);
+    bytes.visit(Opcodes.V17, Opcodes.ACC_PUBLIC, FixtureInstrumentation.PROBE_OWNER,
+        null, "java/lang/Object", null);
+    var gap = bytes.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC, "lineGap", "()V", null, null);
+    gap.visitCode();
+    gap.visitInsn(Opcodes.RETURN);
+    gap.visitMaxs(0, 0);
+    gap.visitEnd();
+    bytes.visitEnd();
+    byte[] shadow = bytes.toByteArray();
+    ClassLoader loader = new ClassLoader(getClass().getClassLoader()) {
+      @Override
+      protected Class<?> loadClass(String requested, boolean resolve) throws ClassNotFoundException {
+        if (!name.equals(requested)) return super.loadClass(requested, resolve);
+        Class<?> owner = findLoadedClass(requested);
+        if (owner == null) owner = defineClass(requested, shadow, 0, shadow.length);
+        if (resolve) resolveClass(owner);
+        return owner;
+      }
+    };
+    assertFalse(FixtureInstrumentation.gapOwnerAvailable(loader));
+  }
+
   @Test
   void matchersExcludeAgentFrameworkProxiesAndUnrelatedApplicationTypes() {
     assertTrue(

@@ -224,12 +224,13 @@ jobs:
         if: matrix.project == 'petclinic' && always()
         run: |
           set -eu
+          umask 077
           mkdir -p "$RUNNER_TEMP/priv"
-          # a failing suite fails the step; the verdict line of each suite is printed explicitly
-          python3 -B -m unittest discover -s tools/qa -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-qa.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/priv/ut-qa.log"; exit 1; }
-          grep -E '^(Ran [0-9]+ tests|OK)' "$RUNNER_TEMP/priv/ut-qa.log" | tr '\n' ' '; echo "(tools/qa)"
-          python3 -B -m unittest discover -s campaigns/lib -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-camp.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/priv/ut-camp.log"; exit 1; }
-          grep -E '^(Ran [0-9]+ tests|OK)' "$RUNNER_TEMP/priv/ut-camp.log" | tr '\n' ' '; echo "(campaigns/lib)"
+          # Publish test identities and counts, without assertion values or buffered stdout.
+          python3 -B -m tools.qa.unittest_run --result "$RUNNER_TEMP/priv/ut-qa.json" discover -s tools/qa -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-qa.log" 2>&1 || { python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-qa.json"; exit 1; }
+          python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-qa.json"
+          python3 -B -m tools.qa.unittest_run --result "$RUNNER_TEMP/priv/ut-camp.json" discover -s campaigns/lib -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-camp.log" 2>&1 || { python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-camp.json"; exit 1; }
+          python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-camp.json"
           python3 -B tools/qa/canary.py probe
           python3 -B tools/qa/canary.py gen --out "$RUNNER_TEMP/priv/canaries.json"
       - name: Instrumented scenarios through the packaged xtrace run
@@ -255,12 +256,20 @@ jobs:
           echo "INSTR_DIR=${d}" >> "$GITHUB_ENV"
           python3 -B tools/qa/camp_instr_steps.py instrumented --file "$CAMP_OUT/summary.json" --project petclinic \
             --receipt "${d:-/nonexistent}/receipt.json"
+      - name: Build the real Spring MVC analyzer from the candidate sources
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          (cd adapters/java && ./gradlew --no-daemon --dependency-verification strict :static-analyzer:installDist)
+          echo "XCAMP_ANALYZER=$GITHUB_WORKSPACE/adapters/java/static-analyzer/build/install/xtrace-java-static/bin/xtrace-java-static" >> "$GITHUB_ENV"
+          python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
+            --step analyzer-source-accommodation --status reported \
+            --note "real Spring MVC analyzer built from candidate sources; analyzer is not shipped in the candidate package"
       - name: Exports of the recorded project (scanned for canaries below)
         if: matrix.project == 'petclinic' && always()
         run: |
           export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
           python3 -B tools/qa/camp_exports.py --xtrace "$XCAMP_XTRACE" --project-dir "$CAMP_ROOT/java/petclinic/src" \
-            --out "$RUNNER_TEMP/xt/exports" --file "$CAMP_OUT/summary.json" --project petclinic
+            --analyzer "$XCAMP_ANALYZER" --out "$RUNNER_TEMP/xt/exports" --file "$CAMP_OUT/summary.json" --project petclinic
       - name: Browser setup
         if: matrix.project == 'petclinic' && always()
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -288,11 +297,25 @@ jobs:
           python3 -B tools/qa/tui_transcript.py --xtrace "$XCAMP_XTRACE" --project-dir "$CAMP_ROOT/java/petclinic/src" \
             --out "$RUNNER_TEMP/priv/tui" || true
           python3 -B tools/qa/camp_instr_steps.py tui --file "$CAMP_OUT/summary.json" --project petclinic --tui "$RUNNER_TEMP/priv/tui/tui.json"
-      - name: Overhead, baseline against instrumented (reported)
+      - name: Overhead, five interleaved baseline and instrumented repeats
+        if: matrix.project == 'petclinic' && always()
+        env:
+          XCAMP_APP_MODE: host
+          XCAMP_PLATFORM: linux/amd64
+        run: |
+          set -o pipefail
+          export XTRACE_CAMPAIGN_ROOT="$CAMP_ROOT" XCAMP_JAVA="$JAVA_HOME/bin/java"
+          export XCAMP_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          export XCAMP_CANARY_FILE="$RUNNER_TEMP/priv/canaries.json"
+          export XCAMP_OVERHEAD_DIR="$CAMP_ROOT/java/petclinic/overhead"
+          python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project petclinic \
+            --step overhead-workloads -- python3 -B campaigns/java/petclinic/harness/run.py overhead \
+            2>&1 | tee "$RUNNER_TEMP/priv/ci-overhead.log"
+      - name: Judge overhead repeat evidence
         if: matrix.project == 'petclinic' && always()
         run: |
-          python3 -B tools/qa/camp_overhead.py --baseline "$CAMP_ROOT/java/petclinic/baseline-1/receipt.json" \
-            --instrumented "${INSTR_DIR:-/nonexistent}/receipt.json" --out "$CAMP_OUT/overhead.json" || true
+          python3 -B tools/qa/camp_overhead.py --manifest "$CAMP_ROOT/java/petclinic/overhead/runs.json" \
+            --out "$CAMP_OUT/overhead.json" || true
           python3 -B tools/qa/camp_instr_steps.py overhead --file "$CAMP_OUT/summary.json" --project petclinic --overhead "$CAMP_OUT/overhead.json"
       - name: Lifecycle, xtrace record then xtrace stop (daemon only, no application launch)
         if: matrix.project == 'petclinic' && always()
@@ -300,15 +323,39 @@ jobs:
           export XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
           python3 -B tools/qa/camp_lifecycle.py --xtrace "$XCAMP_XTRACE" --project-dir "$CAMP_ROOT/java/petclinic/src" \
             --file "$CAMP_OUT/summary.json" --project petclinic
+      - name: Product flows, record/stop with a launched application, restart, interrupted recording, focused lines and values
+        if: matrix.project == 'petclinic' && always()
+        env:
+          XCAMP_APP_MODE: host
+          XCAMP_PLATFORM: linux/amd64
+        run: |
+          set -o pipefail
+          export XTRACE_CAMPAIGN_ROOT="$CAMP_ROOT"
+          export XCAMP_JAVA="$JAVA_HOME/bin/java"
+          export XCAMP_DATA_HOME="$RUNNER_TEMP/xt/data" XTRACE_DATA_HOME="$RUNNER_TEMP/xt/data" TMPDIR="$RUNNER_TEMP/xt/tmp"
+          export XCAMP_CANARY_FILE="$RUNNER_TEMP/priv/canaries.json"
+          python3 -B campaigns/java/petclinic/harness/run.py flows 2>&1 | tee "$RUNNER_TEMP/priv/ci-flows.log" || true
+          d=$(ls -d "$CAMP_ROOT"/java/petclinic/flows-* 2>/dev/null | sort -V | tail -n1 || true)
+          echo "FLOWS_DIR=${d}" >> "$GITHUB_ENV"
+          python3 -B tools/qa/camp_instr_steps.py flows --file "$CAMP_OUT/summary.json" --project petclinic \
+            --flows "${d:-/nonexistent}/flows.json"
+          if [ -n "${d}" ] && [ -f "$d/flows.json" ]; then cp "$d/flows.json" "$CAMP_OUT/flows.json"; fi
+      - name: Recording skeletons for failed judges (no captured values)
+        if: matrix.project == 'petclinic' && always()
+        run: |
+          python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project petclinic \
+            --step recording-diagnostics -- python3 -B tools/qa/camp_diagnostics.py \
+              --summary "$CAMP_OUT/summary.json" --instrumented "${INSTR_DIR:-/nonexistent}" \
+              --flows "${FLOWS_DIR:-/nonexistent}" --out "$CAMP_OUT/recording-diagnostics" \
+              --canaries "$RUNNER_TEMP/priv/canaries.json"
       - name: Privacy canary scan (class names only, canaries are never printed)
         if: matrix.project == 'petclinic' && always()
         run: |
           set -u
           I="${INSTR_DIR:-/nonexistent}"
           # every surface the run produced is scanned; a required surface that is absent or empty makes the scan NOT clean.
-          # The exports surface is required only when `xtrace export` produced files (while it exits 9 the export-formats
-          # step is recorded not-implemented and the scan says so instead of counting an empty directory as covered).
-          req="--require store:1 --require daemon-log:2 --require ui-json:1 --require receipts:1 --require ci-output:1 --require browser-dom:1"
+          # Exports and focused artifacts are required independently; empty or missing output fails coverage.
+          req="--require store:1 --require daemon-log:2 --require ui-json:1 --require receipts:1 --require ci-output:1 --require browser-dom:1 --require exports:3 --require bundle-files:6 --require focused-artifacts:1 --require standard-artifacts:1 --require overhead-artifacts:1 --require recording-diagnostics:1"
           # the TUI surface counts as covered only when the transcript is a real one (verdict pass); a stub that printed an
           # error is not a covered surface and is recorded as such instead
           if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("verdict")=="pass" else 1)' "$RUNNER_TEMP/priv/tui/tui.json" 2>/dev/null; then
@@ -318,10 +365,6 @@ jobs:
             python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
               --step privacy-scan-tui --status not-implemented --note "no real TUI transcript exists to scan (tui verdict is not pass)"
           fi
-          if [ -n "$(ls -A "$RUNNER_TEMP/xt/exports" 2>/dev/null)" ]; then req="$req --require exports:1"; else
-            echo "exports surface: no files (xtrace export not implemented in this build); NOT counted as scanned"
-            python3 -B tools/qa/camp_summary.py record --file "$CAMP_OUT/summary.json" --project petclinic \
-              --step privacy-scan-exports --status not-implemented --note "no export files exist to scan (xtrace export exits 9)"; fi
           python3 -B tools/qa/camp_summary.py exec --file "$CAMP_OUT/summary.json" --project petclinic \
             --step privacy-canary-scan -- python3 -B tools/qa/canary.py scan $req \
               --canaries "$RUNNER_TEMP/priv/canaries.json" \
@@ -331,7 +374,15 @@ jobs:
               --loc "daemon-log=$I/viewer.log" \
               --loc "daemon-log=$I/application.log" \
               --loc "ui-json=$I/api" \
+              --loc "ui-json=${FLOWS_DIR:-/nonexistent}" \
+              --loc "focused-artifacts=${FLOWS_DIR:-/nonexistent}/api-focused" \
+              --loc "standard-artifacts=${FLOWS_DIR:-/nonexistent}/api-standard" \
+              --loc "overhead-artifacts=$CAMP_ROOT/java/petclinic/overhead" \
+              --loc "recording-diagnostics=$CAMP_OUT/recording-diagnostics" \
+              --loc "ci-output=$RUNNER_TEMP/priv/ci-overhead.log" \
+              --loc "ci-output=$RUNNER_TEMP/priv/ci-flows.log" \
               --loc "exports=$RUNNER_TEMP/xt/exports" \
+              --loc "bundle-files=$RUNNER_TEMP/xt/exports/export-bundle" \
               --loc "receipts=$I/receipt.json" \
               --loc "receipts=$CAMP_OUT/summary.json" \
               --loc "receipts=$CAMP_OUT/overhead.json" \
@@ -365,6 +416,10 @@ jobs:
               mkdir -p "$CAMP_OUT/instrumented-raw"
               cp -R "$RUNNER_TEMP/priv/browser" "$CAMP_OUT/browser" 2>/dev/null || true
               cp -R "$RUNNER_TEMP/priv/tui" "$CAMP_OUT/tui" 2>/dev/null || true
+              mkdir -p "$CAMP_OUT/overhead-receipts"
+              for d in "$CAMP_ROOT/java/petclinic/overhead"/*; do
+                if [ -f "$d/receipt.json" ]; then cp "$d/receipt.json" "$CAMP_OUT/overhead-receipts/$(basename "$d").json"; fi
+              done
               cp -R "$INSTR_DIR/api" "$INSTR_DIR/viewer.log" "$INSTR_DIR/application.log" "$CAMP_OUT/instrumented-raw/" 2>/dev/null || true
               # names and sizes of the private store, and the CLI's own view of the recordings (cross-check of the read path)
               (cd "$RUNNER_TEMP/xt" && find . -type f -printf '%P %s\n' | sort) > "$CAMP_OUT/instrumented-raw/store-tree.txt" 2>/dev/null || true

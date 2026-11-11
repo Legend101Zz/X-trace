@@ -11,8 +11,8 @@
 //! `v0004_recording_terminal_evidence`; P03A appends
 //! `v0005_catalog_discovery` and `v0006_catalog_retry_namespace_expiry`; the
 //! replay contract appends `v0007_recording_event_cap_sanity_bound` and
-//! `v0008_frame_index_depth_async`; ADR 0011 appends `v0009_recording_limitations`.
-//! Migrations remain append-only: later
+//! `v0008_frame_index_depth_async`; ADR 0011 appends `v0009_recording_limitations`;
+//! session health appends `v0010_session_health`. Migrations remain append-only: later
 //! slices must add a new record instead of editing an applied one.
 //!
 //! Migrations deliberately avoid statements that cannot be safely
@@ -42,6 +42,15 @@ use rusqlite::Connection;
 use xtrace_domain::{CorrelationId, WallTime};
 
 use crate::error::{StoreError, StoreErrorKind};
+
+const SESSION_HEALTH_SCHEMA: &str = "
+CREATE TABLE session_health (
+    project_id BLOB NOT NULL REFERENCES projects(project_id),
+    runtime_session_id BLOB NOT NULL CHECK(length(runtime_session_id) = 16),
+    rejected_requests INTEGER NOT NULL CHECK(rejected_requests >= 0),
+    PRIMARY KEY (project_id, runtime_session_id)
+) STRICT;
+";
 
 /// One declared migration. The body is the SQL to apply.
 #[derive(Clone, Debug)]
@@ -103,6 +112,11 @@ impl Migrations {
                 version: 9,
                 label: "v0009_recording_limitations",
                 statements: &[RECORDING_LIMITATIONS_SCHEMA],
+            },
+            MigrationRecord {
+                version: 10,
+                label: "v0010_session_health",
+                statements: &[SESSION_HEALTH_SCHEMA],
             },
         ]
     }
@@ -1329,7 +1343,7 @@ mod tests {
             apply_pending(&conn, "0.1.0-test", CorrelationId::new()).expect("apply v9"),
             Migrations::latest_version()
         );
-        assert_eq!(Migrations::latest_version(), 9);
+        assert_eq!(Migrations::latest_version(), 10);
         assert_ne!(applied_checksum(&conn), v8_checksum, "checksum changes with v9");
         let legacy: i64 = conn
             .query_row(
@@ -1383,6 +1397,44 @@ mod tests {
             Migrations::prefix_checksum(&Migrations::catalog()[..9]),
             "b3:0affdf3f22d4972b62aca522ea631a850d354a32175921d136f5e44a612c3a3b"
         );
+    }
+
+    #[test]
+    fn migration_v10_keeps_legacy_rejections_unobserved_and_checks_session_reports() {
+        let conn = new_memory();
+        apply_catalog(&conn, "test", CorrelationId::new(), &Migrations::catalog()[..9])
+            .expect("v9 store");
+        let checksum = applied_checksum(&conn);
+        let project = id(0x31);
+        insert_project(&conn, &project).expect("project");
+        insert_recording(&conn, &id(0x41), &project, &id(0x51), "partial")
+            .expect("legacy recording");
+        assert_eq!(apply_pending(&conn, "test", CorrelationId::new()).expect("v10"), 10);
+        assert_ne!(applied_checksum(&conn), checksum);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM session_health", [], |row| row.get::<_, i64>(0))
+                .expect("no invented counts"),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM recordings", [], |row| row.get::<_, i64>(0))
+                .expect("legacy recordings retained"),
+            1
+        );
+        let sql = "INSERT INTO session_health VALUES (?1, ?2, ?3)";
+        for count in [0, i64::MAX] {
+            conn.execute(sql, params![project, id(if count == 0 { 0x51 } else { 0x52 }), count])
+                .expect("bounded count");
+        }
+        for (owner, session, count) in [
+            (project, id(0x53).to_vec(), -1),
+            (id(0x99), id(0x53).to_vec(), 1),
+            (project, vec![0; 15], 1),
+            (project, id(0x51).to_vec(), 1),
+        ] {
+            assert!(conn.execute(sql, params![owner, session, count]).is_err());
+        }
+        assert_eq!(apply_pending(&conn, "test", CorrelationId::new()).expect("reopen"), 10);
     }
 
     #[test]

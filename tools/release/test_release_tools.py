@@ -3199,6 +3199,22 @@ class RunnerTests(unittest.TestCase):
         receipt = json.loads((self.cache / "release-gates/P00-test/receipt.json").read_text())
         self.assertIn("already owned", receipt["error"])
 
+    def test_child_exit_124_is_not_a_supervisor_timeout(self) -> None:
+        outcome = {"timed_out": True}
+        with mock.patch.object(
+            run_gates, "_untracked_processes_since",
+            return_value=run_gates.UntrackedProcessScan([], [], None, 0),
+        ):
+            code, duration = run_gates._run(
+                [sys.executable, "-c", "raise SystemExit(124)"], cwd=self.repo,
+                env=dict(os.environ), timeout=30, log_path=self.cache / "child-124.log",
+                outcome_report=outcome,
+            )
+        self.assertEqual(code, 124)
+        self.assertGreaterEqual(duration, 0)
+        self.assertEqual(outcome, {"timed_out": False})
+        self.assertNotIn("Gate timed out", (self.cache / "child-124.log").read_text())
+
     def test_timeout_kills_and_drains_spawned_grandchild_before_releasing_leases(self) -> None:
         script = self.processes.script(mode="timeout", pairs=True)
         gate = run_gates.Gate("tree-timeout", (sys.executable, "-c", script))
@@ -3206,6 +3222,11 @@ class RunnerTests(unittest.TestCase):
         args.command_timeout = 0.4
         spawned: list[subprocess.Popen[bytes]] = []
         popen = subprocess.Popen
+        original_run = run_gates._run
+        outcome: dict[str, bool] = {}
+
+        def record_outcome(argv: Any, **kwargs: Any) -> tuple[int, float]:
+            return original_run(argv, outcome_report=outcome, **kwargs)
 
         def capture_process(*argv: object, **kwargs: object) -> subprocess.Popen[bytes]:
             process = popen(*argv, **kwargs)
@@ -3213,12 +3234,15 @@ class RunnerTests(unittest.TestCase):
                 spawned.append(process)
             return process
 
-        with mock.patch.object(run_gates, "GATES", (gate,)), mock.patch.object(run_gates.subprocess, "Popen", side_effect=capture_process):
+        with mock.patch.object(run_gates, "GATES", (gate,)), \
+                mock.patch.object(run_gates, "_run", side_effect=record_outcome), \
+                mock.patch.object(run_gates.subprocess, "Popen", side_effect=capture_process):
             with mock.patch.object(
                 run_gates, "_untracked_processes_since",
                 return_value=run_gates.UntrackedProcessScan([], [], None, 0),
             ):
                 self.assertEqual(run_gates.run(args), 1)
+        self.assertEqual(outcome, {"timed_out": True})
         receipt = json.loads((self.cache / "release-gates/P00-test/receipt.json").read_text())
         entry = receipt["gates"][0]
         self.assertEqual(entry["exitCode"], 124)

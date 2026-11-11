@@ -41,6 +41,9 @@ pub const MAX_CAPACITY_DROP_PRIORITIES: usize = 64;
 const MAX_DROP_COUNT_BUCKETS: usize = 256;
 /// Default maximum number of events in one immutable segment.
 pub const DEFAULT_SEGMENT_EVENTS: usize = 2_000;
+/// Hard admission ceiling shared with the store's bounded read scan.
+/// A batch requiring another segment is rejected before accepting any events.
+pub const MAX_RECORDING_SEGMENTS: u32 = 10_000;
 /// Default maximum number of unfinished recording IDs retained by one capture service.
 pub const DEFAULT_MAX_RETAINED_RECORDINGS: usize = 1_024;
 
@@ -244,6 +247,20 @@ pub trait RecordingPersistencePort: Send + Sync {
     /// Typed event representation understood by the infrastructure adapter.
     type Event: Clone + Send + Sync + 'static;
 
+    /// Keeps the highest cumulative agent-capacity rejection count for a session.
+    /// Counts describe requests outside the recording stream, never dropped events.
+    ///
+    /// # Errors
+    /// Returns a persistence failure, or an explicit error for unsupported ports.
+    fn record_session_rejections(
+        &self,
+        _project_id: ProjectId,
+        _session_id: RuntimeSessionId,
+        _count: u64,
+    ) -> Result<(), PortError> {
+        Err(capture_error(PortErrorKind::Internal, "session health persistence unavailable"))
+    }
+
     /// Inserts or exactly replays one immutable recording anchor.
     ///
     /// # Errors
@@ -251,6 +268,15 @@ pub trait RecordingPersistencePort: Send + Sync {
     /// Returns a typed port failure without changing application state.
     fn begin_recording(&self, request: &BeginRecording)
     -> Result<BeginRecordingReceipt, PortError>;
+
+    /// Persists the assembler's effective cap with the anchor for interruption recovery.
+    fn begin_recording_with_cap(
+        &self,
+        request: &BeginRecording,
+        _event_cap: usize,
+    ) -> Result<BeginRecordingReceipt, PortError> {
+        self.begin_recording(request)
+    }
 
     /// Validates one event's typed payload against its supplied canonical bytes.
     ///
@@ -274,6 +300,21 @@ pub trait RecordingPersistencePort: Send + Sync {
         &self,
         request: &PersistRecordingSegment<Self::Event>,
     ) -> Result<PersistSegmentReceipt, PortError>;
+
+    /// Appends the current tail's new suffix without publishing an immutable segment.
+    /// `prefix_events` counts envelopes already acknowledged in this ordinal;
+    /// the request contains only envelopes after that prefix. On failure the
+    /// same prefix and suffix must remain safe to retry, even after a full write.
+    /// Returns false for ports that require the ordinary segment fallback.
+    /// A successful journal write must survive interruption and support exact
+    /// prefix replay. Finish and recovery publish the journal as a normal segment.
+    fn persist_tail(
+        &self,
+        _request: &PersistRecordingSegment<Self::Event>,
+        _prefix_events: usize,
+    ) -> Result<bool, PortError> {
+        Ok(false)
+    }
 
     /// Persists and verifies terminal evidence after all segment bytes are durable.
     fn finish_recording(
@@ -415,6 +456,19 @@ pub trait RecordingCapture: Send + Sync {
     /// Typed event supplied by the daemon's protocol translator.
     type Event: Clone + Send + Sync + 'static;
 
+    /// Persists a cumulative session rejection report without inventing a recording.
+    ///
+    /// # Errors
+    /// Returns a persistence failure, or an explicit error for unsupported implementations.
+    fn record_session_rejections(
+        &self,
+        _project_id: ProjectId,
+        _session_id: RuntimeSessionId,
+        _count: u64,
+    ) -> Result<(), PortError> {
+        Err(capture_error(PortErrorKind::Internal, "session health persistence unavailable"))
+    }
+
     /// Opens or exactly replays one recording anchor.
     ///
     /// # Errors
@@ -436,8 +490,10 @@ pub trait RecordingCapture: Send + Sync {
         self.begin_recording(request)
     }
 
-    /// Stages admitted events and persists every segment that reaches a seal
-    /// boundary.
+    /// Persists admitted events, including the buffered tail, before returning
+    /// success. No later event, idle timer, or finish is needed for durability.
+    /// A journaled tail becomes replayable on Finish or interruption recovery;
+    /// live reads expose the sealed prefix and identify the pending journal.
     ///
     /// # Errors
     ///
@@ -540,7 +596,7 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
             endpoint_observation: request.endpoint_observation,
             limitations: request.limitations,
         };
-        let receipt = match self.port.begin_recording(&stable) {
+        let receipt = match self.port.begin_recording_with_cap(&stable, state.event_cap) {
             Ok(receipt) => receipt,
             Err(error) => {
                 let definitive = matches!(
@@ -645,6 +701,7 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
             capture_error(PortErrorKind::Resource, "recording exhausted segment ordinals")
         })?;
         let events = std::mem::take(&mut state.current_events);
+        state.current_journaled_events = 0;
         state.current_event_bytes = 0;
         state.current_first_monotonic_ns = None;
         state.pending = Some(PendingSegment { segment_ordinal: ordinal, events });
@@ -709,6 +766,15 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCaptureService<P> {
 impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCaptureService<P> {
     type Event = P::Event;
 
+    fn record_session_rejections(
+        &self,
+        project_id: ProjectId,
+        session_id: RuntimeSessionId,
+        count: u64,
+    ) -> Result<(), PortError> {
+        self.port.record_session_rejections(project_id, session_id, count)
+    }
+
     fn begin_recording(&self, request: BeginRecording) -> Result<BeginRecordingReceipt, PortError> {
         self.begin_with_cap(request, MAX_RECORDED_EVENTS)
     }
@@ -751,6 +817,28 @@ impl<P: RecordingPersistencePort + ?Sized> RecordingCapture for RecordingCapture
         };
         for event in preflight.new_events {
             receipt.persisted_segments += self.stage_new_event(&mut state, event)?;
+        }
+        if state.current_journaled_events < state.current_events.len() {
+            let journaled = self.port.persist_tail(
+                &PersistRecordingSegment {
+                    project_id: state.project_id,
+                    recording_id: state.recording_id,
+                    segment_ordinal: state.next_segment_ordinal.ok_or_else(|| {
+                        capture_error(
+                            PortErrorKind::Resource,
+                            "recording exhausted segment ordinals",
+                        )
+                    })?,
+                    events: state.current_events[state.current_journaled_events..].to_vec(),
+                },
+                state.current_journaled_events,
+            )?;
+            if journaled {
+                state.current_journaled_events = state.current_events.len();
+            }
+            if !journaled {
+                receipt.persisted_segments += self.seal_current(&mut state)?;
+            }
         }
         // Counted only after staging succeeded so a retried batch recomputes
         // the same drops instead of double counting them.
@@ -829,6 +917,7 @@ struct RecordingAssembly<E> {
     capacity_dropped_by_priority: BTreeMap<u32, u64>,
     event_digests: BTreeMap<u64, [u8; 32]>,
     current_events: Vec<AcceptedRecordingEvent<E>>,
+    current_journaled_events: usize,
     current_event_bytes: usize,
     current_first_monotonic_ns: Option<u64>,
     next_segment_ordinal: Option<u32>,
@@ -856,6 +945,7 @@ impl<E> RecordingAssembly<E> {
             capacity_dropped_by_priority: BTreeMap::new(),
             event_digests: BTreeMap::new(),
             current_events: Vec::new(),
+            current_journaled_events: 0,
             current_event_bytes: 0,
             current_first_monotonic_ns: None,
             next_segment_ordinal: Some(0),
@@ -974,6 +1064,46 @@ fn preflight_events<P: RecordingPersistencePort + ?Sized>(
         scratch_highest = event.recording_seq;
         batch_digests.insert(event.recording_seq, digest);
         new_events.push(event.clone());
+    }
+    // Reserve a readable ordinal for every event, including the journal tail.
+    // This runs before pending I/O or state changes, so a rejected batch cannot
+    // strand an acknowledged prefix beyond the read API's scan ceiling.
+    let mut ordinal = state.next_segment_ordinal.map(u64::from).unwrap_or(u64::MAX);
+    if state.pending.is_some() {
+        ordinal = ordinal.saturating_add(1);
+    }
+    let mut count = state.current_events.len();
+    let mut bytes = state.current_event_bytes;
+    let mut first = state.current_first_monotonic_ns;
+    for event in &new_events {
+        let size = encoded_event_bytes(event)?;
+        if count > 0
+            && (count >= policy.max_events
+                || bytes.saturating_add(size) > policy.max_event_bytes
+                || first.is_some_and(|start| {
+                    event.monotonic_ns.saturating_sub(start) >= policy.max_span_ns
+                }))
+        {
+            ordinal = ordinal.saturating_add(1);
+            count = 0;
+            bytes = 0;
+            first = None;
+        }
+        if ordinal >= u64::from(MAX_RECORDING_SEGMENTS) {
+            return Err(capture_error(
+                PortErrorKind::Resource,
+                "recording segment admission limit reached; accepted prefix remains recoverable",
+            ));
+        }
+        first.get_or_insert(event.monotonic_ns);
+        count += 1;
+        bytes += size;
+        if count == policy.max_events || bytes == policy.max_event_bytes {
+            ordinal += 1;
+            count = 0;
+            bytes = 0;
+            first = None;
+        }
     }
     Ok(Preflight { duplicates, dropped, dropped_by_priority, new_events })
 }
@@ -1616,7 +1746,7 @@ mod tests {
             })
             .expect("original remains replayable");
         assert_eq!(retry.duplicates, 1);
-        assert!(port.snapshot().segments.is_empty());
+        assert_eq!(port.snapshot().segments.len(), 1, "replays must not write extra segments");
     }
 
     #[test]
@@ -1636,18 +1766,23 @@ mod tests {
         let gap = service
             .record_events(RecordEvents { recording_id, events: vec![event(4, u64::MAX, 0xa4)] });
         assert_eq!(gap.expect_err("gap rejected").kind(), PortErrorKind::Conflict);
-        assert!(port.snapshot().segments.is_empty(), "gap must not seal or mutate");
+        assert_eq!(port.snapshot().segments.len(), 1, "gap must not write another segment");
+        assert_eq!(persisted_sequences(&port), [2], "gap must not mutate persisted events");
 
         let accepted = service
             .record_events(RecordEvents { recording_id, events: vec![event(3, u64::MAX, 0xa3)] })
             .expect("contiguous event at max clock");
         assert_eq!(accepted.accepted, 1);
-        assert_eq!(accepted.persisted_segments, 0);
+        assert_eq!(accepted.persisted_segments, 1);
         service.finish_recording(FinishRecording::without_digest(recording_id, 3)).expect("finish");
         let segments = port.snapshot().segments;
-        assert_eq!(segments.len(), 1);
+        assert_eq!(segments.len(), 2);
         assert_eq!(
-            segments[0].events.iter().map(|event| event.payload.sequence).collect::<Vec<_>>(),
+            segments
+                .iter()
+                .flat_map(|segment| &segment.events)
+                .map(|event| event.payload.sequence)
+                .collect::<Vec<_>>(),
             [2, 3]
         );
     }
@@ -1698,6 +1833,120 @@ mod tests {
     }
 
     #[test]
+    fn small_batch_tail_is_durable_on_return_without_a_later_event_or_finish() {
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        let recording_id = begin(wall(1)).recording_id;
+        service.begin_recording(begin(wall(1))).expect("begin");
+
+        for (ordinal, sequences) in [(0, vec![2, 3]), (1, vec![4])] {
+            let receipt = service
+                .record_events(RecordEvents {
+                    recording_id,
+                    events: sequences.iter().map(|&seq| event(seq, 0, 7)).collect(),
+                })
+                .expect("batch acknowledgement");
+            assert_eq!(receipt.accepted, sequences.len());
+            assert_eq!(receipt.persisted_segments, 1);
+            let snapshot = port.snapshot();
+            assert_eq!(snapshot.segments.len(), ordinal + 1);
+            assert_eq!(snapshot.segments[ordinal].segment_ordinal as usize, ordinal);
+            assert_eq!(
+                snapshot.segments[ordinal]
+                    .events
+                    .iter()
+                    .map(|event| event.recording_seq)
+                    .collect::<Vec<_>>(),
+                sequences
+            );
+        }
+        assert!(port.finishes.lock().expect("finishes").is_empty(), "recording remains open");
+        let empty = service
+            .record_events(RecordEvents { recording_id, events: vec![] })
+            .expect("empty batch");
+        assert_eq!(empty.persisted_segments, 0);
+        assert_eq!(port.snapshot().segments.len(), 2, "no empty segments");
+    }
+
+    #[test]
+    fn segment_admission_reserves_the_tail_and_rejects_a_whole_crossing_batch() {
+        let port = Arc::new(FakePort::default());
+        let policy = SegmentPolicy::new(1, DEFAULT_SEGMENT_EVENT_BYTES, DEFAULT_SEGMENT_SPAN_NS)
+            .expect("one event per segment, as with maximally sparse input");
+        let capture = service(Arc::clone(&port), policy);
+        let recording_id = begin(wall(1)).recording_id;
+        capture.begin_recording_with_mode(begin(wall(1)), CaptureMode::Focused).expect("begin");
+        let last_before_limit = u64::from(MAX_RECORDING_SEGMENTS);
+        capture
+            .record_events(RecordEvents {
+                recording_id,
+                events: (2..=last_before_limit).map(|seq| event(seq, 0, 7)).collect(),
+            })
+            .expect("readable prefix");
+        let crossing = capture
+            .record_events(RecordEvents {
+                recording_id,
+                events: vec![
+                    event(last_before_limit + 1, 0, 7),
+                    event(last_before_limit + 2, 0, 7),
+                ],
+            })
+            .expect_err("whole batch would cross the read ceiling");
+        assert_eq!(crossing.kind(), PortErrorKind::Resource);
+        assert_eq!(port.snapshot().segments.len(), MAX_RECORDING_SEGMENTS as usize - 1);
+        let last = capture
+            .record_events(RecordEvents {
+                recording_id,
+                events: vec![event(last_before_limit + 1, 0, 7)],
+            })
+            .expect("last readable ordinal is still available");
+        assert_eq!(
+            (last.accepted, last.duplicates),
+            (1, 0),
+            "rejected input did not mutate identity state"
+        );
+        let beyond = capture
+            .record_events(RecordEvents {
+                recording_id,
+                events: (last_before_limit + 2..=FOCUSED_EVENT_CAP as u64 + 1)
+                    .map(|seq| event(seq, 0, 7))
+                    .collect(),
+            })
+            .expect_err("no unreadable suffix is acknowledged");
+        assert_eq!(beyond.kind(), PortErrorKind::Resource);
+        assert_eq!(port.snapshot().segments.len(), MAX_RECORDING_SEGMENTS as usize);
+        let finished = capture
+            .finish_recording(FinishRecording::without_digest(recording_id, last_before_limit + 1))
+            .expect("accepted prefix can still finish as partial");
+        assert_eq!(finished.completion, RecordingCompletion::Partial);
+        assert_eq!(finished.persisted_segments, 0);
+    }
+
+    #[test]
+    fn small_batch_tail_failure_prevents_success_and_retries_the_immutable_segment() {
+        let port = Arc::new(FakePort::default());
+        let service = service(Arc::clone(&port), SegmentPolicy::default());
+        let recording_id = begin(wall(1)).recording_id;
+        service.begin_recording(begin(wall(1))).expect("begin");
+        port.fail_next_segment_after_record.store(true, Ordering::SeqCst);
+        let request = RecordEvents { recording_id, events: vec![event(2, 0, 7)] };
+        let failed = service.record_events(request.clone()).expect_err("tail is not acknowledged");
+        assert_eq!(failed.kind(), PortErrorKind::Transport);
+        let receipt = service.record_events(request).expect("exact retry");
+        assert_eq!((receipt.accepted, receipt.duplicates, receipt.persisted_segments), (0, 1, 1));
+        let snapshot = port.snapshot();
+        assert_eq!(snapshot.segments.len(), 2);
+        assert_eq!(snapshot.segments[0].segment_ordinal, 0);
+        assert_eq!(snapshot.segments[1].segment_ordinal, 0);
+        assert_eq!(snapshot.segments[0].events, snapshot.segments[1].events);
+        let next = service
+            .record_events(RecordEvents { recording_id, events: vec![event(3, 0, 8)] })
+            .expect("next batch");
+        assert_eq!(next.persisted_segments, 1);
+        assert_eq!(port.snapshot().segments[2].segment_ordinal, 1);
+    }
+
+    #[test]
     fn default_policy_seals_at_two_thousand_events_and_two_seconds() {
         let count_port = Arc::new(FakePort::default());
         let count_service = service(Arc::clone(&count_port), SegmentPolicy::default());
@@ -1708,8 +1957,9 @@ mod tests {
             .collect();
         count_service.record_events(RecordEvents { recording_id, events }).expect("events");
         let count_segments = count_port.snapshot().segments;
-        assert_eq!(count_segments.len(), 1);
+        assert_eq!(count_segments.len(), 2);
         assert_eq!(count_segments[0].events.len(), DEFAULT_SEGMENT_EVENTS);
+        assert_eq!(count_segments[1].events.len(), 1, "tail is durable before finish");
 
         count_service
             .finish_recording(FinishRecording::without_digest(recording_id, 2_002))
@@ -1728,8 +1978,9 @@ mod tests {
             })
             .expect("span boundary");
         let span_segments = span_port.snapshot().segments;
-        assert_eq!(span_segments.len(), 1);
+        assert_eq!(span_segments.len(), 2);
         assert_eq!(span_segments[0].events[0].recording_seq, 2);
+        assert_eq!(span_segments[1].events[0].recording_seq, 3, "tail is durable before finish");
         span_service
             .finish_recording(FinishRecording::without_digest(recording_id, 3))
             .expect("finish");
@@ -2047,7 +2298,7 @@ mod tests {
         let finished = service
             .finish_recording(FinishRecording::without_digest(recording_id, 3))
             .expect("declared finish gap persists terminal evidence");
-        assert_eq!(finished.persisted_segments, 1);
+        assert_eq!(finished.persisted_segments, 0);
         assert_eq!(finished.completion, RecordingCompletion::Partial);
         assert!(!port.snapshot().segments.is_empty());
         let conflicting =
@@ -2129,7 +2380,8 @@ mod tests {
         let finish = service
             .finish_recording(FinishRecording::without_digest(recording_id, 2))
             .expect("finish");
-        assert_eq!(finish.persisted_segments, 1);
+        assert_eq!(finish.persisted_segments, 0);
+        assert_eq!(port.snapshot().segments.len(), 1, "finish must not rewrite the durable tail");
         assert!(!finish.exact_replay);
         let replay = service
             .finish_recording(FinishRecording::without_digest(recording_id, 2))

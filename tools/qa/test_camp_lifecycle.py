@@ -19,6 +19,13 @@ def fake(td: pathlib.Path, body: str) -> str:
 
 
 class T(unittest.TestCase):
+    def test_lifecycle_parses_a_whole_pretty_document(self):
+        doc = {"data": {"pid": 4242, "source_roots": ["src/main/java"]}}
+        self.assertEqual(cl.parse_json(json.dumps(doc, indent=2)), doc)
+        self.assertEqual(cl.find_pid(cl.parse_json(json.dumps(doc, indent=2))), 4242)
+        self.assertIsNone(cl.parse_json('{"items": [\n"inner"\n'))
+        self.assertIsNone(cl.parse_json('{"first": 1}\n{"second": 2}'))
+
     def test_find_pid(self):
         self.assertEqual(cl.find_pid({"ok": True, "data": {"daemon": {"pid": 4242}}}), 4242)
         self.assertIsNone(cl.find_pid({"data": {"pid": 1}}))

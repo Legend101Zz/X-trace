@@ -1678,6 +1678,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "xtrace-macos-acl"
+version = "0.0.1"
+dependencies = [
+ "toml",
+]
+
+[[package]]
 name = "xtrace-private-storage"
 version = "0.0.1"
 dependencies = [
@@ -1685,6 +1692,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "xtrace-macos-acl",
 ]
 
 [[package]]

@@ -52,6 +52,8 @@ x-trace/
     xtrace-application/
     xtrace-protocol/
     xtrace-ingest/
+    xtrace-private-storage/ # private directory admission
+    xtrace-macos-acl/     # safe macOS SDK ACL bridge
     xtrace-store/
     xtrace-runtime/
     xtrace-exercise/
@@ -112,6 +114,8 @@ x-trace/
 | `xtrace-application` | commands, queries, use-case services, authorization/safety policy, ports | concrete storage, process APIs, UI |
 | `xtrace-protocol` | generated Protobuf/OpenAPI types and explicit translation to domain DTOs | domain decisions |
 | `xtrace-ingest` | connection workers, ordering validation, correlation, batching, backpressure | SQLite schema, UI fanout policy |
+| `xtrace-private-storage` | private directory admission and ACL policy | SDK FFI |
+| `xtrace-macos-acl` | safe macOS SDK ACL evidence bridge | admission policy |
 | `xtrace-store` | bundled SQLite, object store, migrations, recovery, retention | use-case policy |
 | `xtrace-runtime` | launch, attach, process discovery, adapter package selection | Java/Node framework logic |
 | `xtrace-exercise` | request-plan synthesis and bounded execution | silent approval, credential persistence |

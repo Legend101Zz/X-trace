@@ -390,6 +390,9 @@ where
             Some(PayloadOneof::Ack(ack)) => return ack,
             Some(PayloadOneof::Health(_)) => continue,
             Some(PayloadOneof::ProtocolError(err)) => {
+                if matches!(label, "cap start ACK" | "cap batch ACK" | "cap finish ACK") {
+                    unexpected_event_cap_protocol_error(label, &err);
+                }
                 unreachable!(
                     "unexpected ProtocolError from daemon after {label}: {} {}",
                     err.code, err.message,
@@ -397,6 +400,50 @@ where
             }
             other => unreachable!("expected Ack after {label}, got {other:?}"),
         }
+    }
+}
+
+/// CI withholds panic prose but retains the source location. Keep these panic
+/// sites separate so the event-cap failure identifies both the operation and
+/// the wire error family without publishing a message, identifier or value.
+/// The fixed transport message distinguishes the capture pipeline from other
+/// transport failures; the ingest capacity message distinguishes cap rejection.
+fn unexpected_event_cap_protocol_error(operation: &str, error: &ProtocolError) -> ! {
+    match (operation, error.code.as_str(), error.message.as_str()) {
+        ("cap start ACK", "XTR-DAEMON-TRANSPORT", "recording capture operation failed") => {
+            panic!("event-cap start: capture pipeline failed")
+        }
+        ("cap start ACK", "XTR-CAPTURE-INGEST", _) => {
+            panic!("event-cap start: ingest rejected")
+        }
+        ("cap start ACK", "XTR-DAEMON-SESSION-SEQUENCE", _) => {
+            panic!("event-cap start: session sequence rejected")
+        }
+        ("cap start ACK", _, _) => panic!("event-cap start: other protocol error"),
+        ("cap batch ACK", "XTR-DAEMON-TRANSPORT", "recording capture operation failed") => {
+            panic!("event-cap batch: capture pipeline failed")
+        }
+        ("cap batch ACK", "XTR-CAPTURE-INGEST", "ingest rejection: event_capacity_reached") => {
+            panic!("event-cap batch: ingest capacity rejected")
+        }
+        ("cap batch ACK", "XTR-CAPTURE-INGEST", _) => {
+            panic!("event-cap batch: other ingest rejection")
+        }
+        ("cap batch ACK", "XTR-DAEMON-SESSION-SEQUENCE", _) => {
+            panic!("event-cap batch: session sequence rejected")
+        }
+        ("cap batch ACK", _, _) => panic!("event-cap batch: other protocol error"),
+        ("cap finish ACK", "XTR-DAEMON-TRANSPORT", "recording capture operation failed") => {
+            panic!("event-cap finish: capture pipeline failed")
+        }
+        ("cap finish ACK", "XTR-CAPTURE-INGEST", _) => {
+            panic!("event-cap finish: ingest rejected")
+        }
+        ("cap finish ACK", "XTR-DAEMON-SESSION-SEQUENCE", _) => {
+            panic!("event-cap finish: session sequence rejected")
+        }
+        ("cap finish ACK", _, _) => panic!("event-cap finish: other protocol error"),
+        _ => unreachable!("event-cap diagnostic called for another operation"),
     }
 }
 

@@ -23,11 +23,10 @@ class T(unittest.TestCase):
         r = {"scenarios": [sc("a"), sc("b")], "api": {"ok": True, "recordings": 5}, "problemClasses": {}, "recordingsWithSource": 3,
              "notes": {"stopCommand": {"exitCode": 3}, "launcherExitCode": 0}}
         d = by(s.instrumented_steps(r))
-        # everything the harness exercised passes; the record+stop flow is not exercised and stays not-implemented
-        gating = {"record-stop-flow", "active-line-frames", "frame-values", "restart-reopen", "partial-recording-reopen"}
-        self.assertEqual({n for n, v in d.items() if v[0] != "pass"}, gating, d)
-        for n in gating:
-            self.assertEqual(d[n][0], "not-implemented", n)
+        # everything the instrumented run exercised passes; the lifecycle and focused-capture flows are judged by `flows`
+        self.assertEqual({n for n, v in d.items() if v[0] != "pass"}, set(), d)
+        for n in s.FLOW_STEPS:
+            self.assertNotIn(n, d, "flow steps come only from the flows document")
         self.assertNotIn("executed line)", d["source-identity"][1].replace("not an executed line)", ""))
         self.assertIn("not an executed line", d["source-identity"][1])
 
@@ -40,9 +39,28 @@ class T(unittest.TestCase):
     def test_overhead_needs_five_repeats(self):
         agg = {"baseline": {"p50Ms": 1, "p95Ms": 2, "n": 14}, "instrumented": {"p50Ms": 2, "p95Ms": 3, "n": 14}, "p50Ratio": 2, "p95Ratio": 1.5}
         d = by(s.overhead_steps({"aggregate": agg}))
-        self.assertEqual((d["overhead-measurement"][0], d["overhead-repeats-ge-5"][0]), ("reported", "not-implemented"))
-        self.assertEqual(by(s.overhead_steps({"aggregate": agg, "repeats": 5}))["overhead-repeats-ge-5"][0], "pass")
+        self.assertEqual((d["overhead-measurement"][0], d["overhead-repeats-ge-5"][0]), ("fail", "fail"))
+        self.assertEqual(by(s.overhead_steps({"aggregate": agg, "repeats": 5}))["overhead-repeats-ge-5"][0], "fail")
+        from test_camp_overhead import paired_runs
+        import camp_overhead
+        valid = camp_overhead.compare_interleaved(paired_runs())
+        self.assertEqual(by(s.overhead_steps(valid))["overhead-repeats-ge-5"][0], "pass")
+        self.assertEqual(by(s.overhead_steps(valid))["overhead-measurement"][0], "reported")
+        valid["runs"][1]["startedNs"] = valid["runs"][0]["startedNs"]
+        self.assertEqual(by(s.overhead_steps(valid))["overhead-repeats-ge-5"][0], "fail")
         self.assertEqual(by(s.overhead_steps(None))["overhead-repeats-ge-5"][0], "fail")
+
+    def test_accommodations_are_visible_and_never_product_passes(self):
+        r = {"scenarios": [], "notes": {"accommodations": {"pace_seconds": 0.4, "drain_seconds": 0, "reason": "writer bound"}}}
+        d = by(s.instrumented_steps(r))
+        self.assertEqual(d["unpaced-load-not-exercised"][0], "reported")
+        self.assertIn("pace_seconds", d["unpaced-load-not-exercised"][1])
+        d = by(s.tui_steps({"verdict": "pass", "observations": {"accommodation": "route read from detail", "open_after": 0.1}}))
+        self.assertEqual(d["tui-navigation-accommodation"][0], "reported")
+        self.assertIn("detail", d["tui-navigation-accommodation"][1])
+        self.assertIn("focused-canary-injection", s.FLOW_STEPS)
+        for name in ("focused-redaction-control", "focused-value-control", "standard-no-values"):
+            self.assertIn(name, s.FLOW_STEPS)
 
     def test_each_failure_is_visible(self):
         r = {"scenarios": [sc("a", eq=False), sc("b", rec=False)], "api": {"ok": True, "recordings": 5},
@@ -51,8 +69,26 @@ class T(unittest.TestCase):
         self.assertEqual(d["instrumented-fingerprints-equal-baseline"][0], "fail")
         self.assertEqual(d["recordings-per-scenario"][0], "fail")
         self.assertEqual(d["source-identity"][0], "fail")
-        self.assertEqual(d["record-stop-flow"][0], "not-implemented")
         self.assertEqual(d["launcher-exit-after-sigterm"][0], "fail")
+
+    def test_flow_steps_come_from_the_document_and_missing_is_a_failure(self):
+        self.assertEqual({n: st for n, st, _ in s.flow_steps(None)}, {n: "fail" for n in s.FLOW_STEPS})
+        doc = {"steps": {n: {"status": "pass", "note": "ok"} for n in s.FLOW_STEPS}}
+        self.assertEqual({st for _, st, _ in s.flow_steps(doc)}, {"pass"})
+        doc["steps"]["frame-values"] = {"status": "fail", "note": "no captured binding"}
+        del doc["steps"]["restart-reopen"]
+        doc["steps"]["partial-recording-reopen"] = {"status": "skipped", "note": ""}
+        d = by(s.flow_steps(doc))
+        self.assertEqual(d["frame-values"], ("fail", "no captured binding"))
+        self.assertEqual(d["restart-reopen"][0], "fail")
+        self.assertEqual(d["partial-recording-reopen"][0], "fail")
+
+    def test_privacy_scope_is_visible_without_becoming_a_pass(self):
+        doc = {"steps": {"privacy-scope": {"status": "reported", "note": "focused ordinary Strings are captured"}}}
+        steps = by(s.flow_steps(doc))
+        self.assertEqual(steps["privacy-scope"], ("reported", "focused ordinary Strings are captured"))
+        self.assertEqual(steps["focused-redaction-control"][0], "fail")
+        self.assertEqual(steps["standard-no-values"][0], "fail")
 
     def test_zero_recordings_never_pass_source_identity(self):
         r = {"scenarios": [sc("a", rec=False)], "api": {"ok": True, "recordings": 0}, "problemClasses": {"no-recording-for-route": 1},

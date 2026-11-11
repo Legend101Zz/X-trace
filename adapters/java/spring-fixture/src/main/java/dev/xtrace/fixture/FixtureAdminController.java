@@ -2,8 +2,10 @@ package dev.xtrace.fixture;
 
 import java.util.Map;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.view.RedirectView;
 
 /** Test-only observations that are deliberately outside the instrumented controller matcher. */
 @RestController
@@ -20,6 +22,15 @@ public class FixtureAdminController {
   @GetMapping("/count")
   public Map<String, Integer> count() {
     return Map.of("count", repository.count());
+  }
+
+  /**
+   * Answers with a redirect view. The 302 status is set while the view renders, after the handler
+   * adapter returned, which is how a Post/Redirect/Get controller behaves.
+   */
+  @PostMapping("/redirect")
+  public RedirectView redirect() {
+    return new RedirectView("/__fixture/count");
   }
 
   /** Reports whether private agent dependencies leaked into the application classloader. */

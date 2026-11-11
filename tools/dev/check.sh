@@ -48,7 +48,7 @@ case "$part" in
             tasks=(":$module:compileJava" ":$module:compileTestJava")
         fi
         [[ $# == 0 ]] || { usage >&2; exit 2; }
-        run adapters/java/gradlew -p adapters/java --dependency-verification strict "${tasks[@]}"
+        run adapters/java/gradlew -p adapters/java --no-daemon --dependency-verification strict "${tasks[@]}"
         ;;
     node)
         run npm run generate:check --prefix adapters/node

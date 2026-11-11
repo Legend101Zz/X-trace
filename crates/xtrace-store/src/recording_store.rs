@@ -4,6 +4,9 @@
 //! establishes only the root binding, scoped error surface, and idempotent
 //! recording anchor needed before object publication can be added safely.
 
+#[cfg(unix)]
+use xtrace_private_storage::{AdmissionCaller as Caller, AdmissionCallerGuard as CallerGuard};
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read as _, Write as _};
@@ -26,9 +29,9 @@ const MAX_TERMINAL_REQUEST_JSON_BYTES: usize = 64 * 1024;
 use xtrace_application::recording_queries::{
     FrameNavigation, MAX_RECORDING_EVENT_PROJECTION_BYTES, MAX_RECORDING_FINISH_VERIFIED_BYTES,
     MAX_RECORDING_VERIFIED_INPUT_BYTES, NavigationResult, NavigationUnavailable, PersistedBinding,
-    PersistedEvent, PersistedGap, PersistedInteraction, PersistedOutcome, PersistedSource,
-    PersistedValue, RecordingCapacity, RecordingCompletionEvidence, RecordingEventWindow,
-    RecordingMetadata, RecordingStatus, ShowWindowRequest, SourceStatus,
+    PersistedEvent, PersistedException, PersistedGap, PersistedInteraction, PersistedOutcome,
+    PersistedSource, PersistedValue, RecordingCapacity, RecordingCompletionEvidence,
+    RecordingEventWindow, RecordingMetadata, RecordingStatus, ShowWindowRequest, SourceStatus,
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::is_projectable_source_path;
@@ -41,6 +44,30 @@ use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 use crate::connection::SqliteStore;
 use crate::error::{StoreError, StoreErrorKind};
 
+#[path = "recording_journal.rs"]
+pub(crate) mod recording_journal;
+
+#[cfg(test)]
+#[path = "recording_work_profile.rs"]
+pub(crate) mod work_profile;
+
+#[cfg(test)]
+type CommitObserver = Option<Box<dyn Fn(&str)>>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_READ_SNAPSHOT: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    static COMMIT_OBSERVER: std::cell::RefCell<CommitObserver> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_read_snapshot() {
+    AFTER_READ_SNAPSHOT.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
+}
 #[path = "recording_limitations.rs"]
 mod recording_limitations;
 use crate::xtf::{
@@ -290,12 +317,31 @@ impl SqliteStore {
             )
         })?;
         let binding = ProjectRootBinding::new(project_root, database_path.clone(), correlation_id)?;
-        binding.revalidate(correlation_id)?;
         Ok(SqliteRecordingStore { store: self, binding })
     }
 }
 
 impl SqliteRecordingStore<'_> {
+    /// Keeps a cumulative agent report even when no recording could be admitted.
+    ///
+    /// # Errors
+    /// Returns a validation, project-ownership or persistence failure.
+    pub fn record_session_rejections(
+        &self,
+        project_id: ProjectId,
+        session_id: RuntimeSessionId,
+        count: u64,
+    ) -> Result<(), RecordingStoreError> {
+        let correlation_id = CorrelationId::new();
+        let _writer = self
+            .store
+            .lock_recording_writer(correlation_id)
+            .map_err(|error| map_store_error(error, correlation_id))?;
+        self.binding.revalidate(correlation_id)?;
+        crate::session_health::persist(self.store, project_id, session_id, count)
+            .map_err(|error| map_store_error(error, correlation_id))
+    }
+
     /// Lists observed endpoints with a project-bound keyset read.
     pub(crate) fn list_observed_endpoints(
         &self,
@@ -435,8 +481,12 @@ impl SqliteRecordingStore<'_> {
     ) -> Result<(Vec<ObservedRecordingRecord>, bool), RecordingStoreError> {
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
+        let published = recording_journal::PublishedRead::new(self, correlation_id)?;
         let connection =
             self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        let connection = connection.unchecked_transaction().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         if !project_exists(&connection, project_id, correlation_id)? {
             return Err(read_not_found_error(correlation_id));
         }
@@ -497,7 +547,14 @@ impl SqliteRecordingStore<'_> {
         while let Some(row) = rows.next().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })? {
-            let metadata = recording_metadata_from_row(row, &connection, correlation_id)?;
+            #[cfg(test)]
+            after_read_snapshot();
+            let metadata =
+                recording_metadata_from_row(row, &connection, &published, correlation_id)?;
+            observed_recording_id_from_bytes(
+                metadata.recording_id.as_uuid().as_bytes(),
+                correlation_id,
+            )?;
             let disposition: Option<String> = row.get(7).map_err(|error| {
                 map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
             })?;
@@ -573,10 +630,16 @@ impl SqliteRecordingStore<'_> {
         after: Option<RecordingId>,
         limit: u32,
     ) -> Result<(Vec<RecordingMetadata>, bool), RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
+        let published = recording_journal::PublishedRead::new(self, correlation_id)?;
         let connection =
             self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        let connection = connection.unchecked_transaction().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         if !project_exists(&connection, project_id, correlation_id)? {
             return Err(read_not_found_error(correlation_id));
         }
@@ -639,78 +702,14 @@ impl SqliteRecordingStore<'_> {
         while let Some(row) = rows.next().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })? {
-            let raw_id: Vec<u8> = row.get(0).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let status: String = row.get(1).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let opened_at: String = row.get(2).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let segment_count: i64 = row.get(3).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let event_count: i64 = row.get(4).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let first_sequence: Option<Vec<u8>> = row.get(5).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let last_sequence: Option<Vec<u8>> = row.get(6).map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-            let lifecycle_status = recording_status(&status, correlation_id)?;
-            let recording_id = recording_id_from_bytes(&raw_id, correlation_id)?;
-            let completion =
-                completion_evidence(&connection, recording_id, &status, correlation_id)?;
-            let incomplete_evidence = match lifecycle_status {
-                RecordingStatus::Partial | RecordingStatus::Invalid => {
-                    vec![format!("persisted_status:{status}")]
-                }
-                _ => Vec::new(),
-            };
-            // A corrupt terminal row is already reported through `completion`
-            // and `incomplete_evidence`; list metadata then stays null.
-            let terminal =
-                load_terminal_finish(&connection, recording_id, completion, correlation_id)
-                    .ok()
-                    .flatten();
-            recordings.push(RecordingMetadata {
-                recording_id,
-                status: lifecycle_status,
-                completion,
-                opened_at,
-                segment_count: u64::try_from(segment_count)
-                    .map_err(|_| recording_query_corrupt_error(correlation_id))?
-                    .to_string(),
-                event_count: u64::try_from(event_count)
-                    .map_err(|_| recording_query_corrupt_error(correlation_id))?
-                    .to_string(),
-                first_sequence: first_sequence
-                    .as_deref()
-                    .map(|value| decode_stored_sequence(value, correlation_id))
-                    .transpose()?
-                    .map(|value| value.to_string()),
-                last_sequence: last_sequence
-                    .as_deref()
-                    .map(|value| decode_stored_sequence(value, correlation_id))
-                    .transpose()?
-                    .map(|value| value.to_string()),
-                incomplete_evidence,
-                event_cap: terminal
-                    .as_ref()
-                    .and_then(|finish| u32::try_from(finish.event_cap).ok()),
-                // Terminal evidence without an adapter outcome (every pre-outcome
-                // row) reads `unobserved`; no terminal evidence reads `null` (CONTRACTS 5).
-                outcome_kind: terminal.as_ref().map(|finish| {
-                    finish
-                        .outcome
-                        .as_ref()
-                        .map_or("unobserved", |outcome| outcome.kind.as_str())
-                        .to_owned()
-                }),
-            });
+            #[cfg(test)]
+            after_read_snapshot();
+            recordings.push(recording_metadata_from_row(
+                row,
+                &connection,
+                &published,
+                correlation_id,
+            )?);
         }
         let has_more = recordings.len() > usize::try_from(limit).unwrap_or(usize::MAX);
         if has_more {
@@ -729,10 +728,15 @@ impl SqliteRecordingStore<'_> {
         recording_id: RecordingId,
         frame_id: xtrace_domain::FrameId,
     ) -> Result<xtrace_application::FrameNavigationView, RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
         let connection =
             self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        let connection = connection.unchecked_transaction().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         let row: Option<(Vec<u8>, String)> = connection
             .query_row(
                 "SELECT project_id, status FROM recordings WHERE recording_id = ?1",
@@ -749,6 +753,8 @@ impl SqliteRecordingStore<'_> {
         if project_id_from_bytes(&raw_project_id, correlation_id)? != project_id {
             return Err(read_not_found_error(correlation_id));
         }
+        #[cfg(test)]
+        after_read_snapshot();
         let completion = completion_evidence(&connection, recording_id, &status, correlation_id)?;
         let Some(frame) =
             load_indexed_frame_by_id(&connection, recording_id, frame_id, correlation_id)?
@@ -793,10 +799,23 @@ impl SqliteRecordingStore<'_> {
         request: &ShowWindowRequest,
         source_root: Option<&Path>,
     ) -> Result<RecordingEventWindow, RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Read);
+        // Readers perform many admissions too. Share only state-bound ACL
+        // verdicts within this call, just as the persistence port does.
+        let _scope = xtrace_private_storage::AdmissionScope::enter();
+        #[cfg(test)]
+        let mut phase = work_profile::Phase::enter("read_window_admission");
         let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
+        let published = recording_journal::PublishedRead::new(self, correlation_id)?;
         let connection =
             self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
+        // Keep lifecycle, terminal proof, segments and frame index on one WAL
+        // snapshot. Journal publication is already pinned before its first read.
+        let connection = connection.unchecked_transaction().map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
         let row: Option<(Vec<u8>, String)> = connection
             .query_row(
                 "SELECT project_id, status FROM recordings WHERE recording_id = ?1",
@@ -814,6 +833,8 @@ impl SqliteRecordingStore<'_> {
         if stored_project_id != request.project_id {
             return Err(read_not_found_error(correlation_id));
         }
+        #[cfg(test)]
+        after_read_snapshot();
         let lifecycle_status = recording_status(&status, correlation_id)?;
         let completion =
             completion_evidence(&connection, request.recording_id, &status, correlation_id)?;
@@ -868,6 +889,12 @@ impl SqliteRecordingStore<'_> {
             }
         };
 
+        #[cfg(test)]
+        phase.switch("read_journal_snapshot");
+        let journal = published.events(stored_project_id, request.recording_id)?;
+        // Tail bytes are owned and the SQLite transaction pins the matching
+        // sealed prefix. Release publication before object decoding/projection.
+        drop(published);
         let mut statement = connection
             .prepare(
                 "SELECT segment_ordinal, object_hash, first_recording_seq, last_recording_seq, \
@@ -894,13 +921,20 @@ impl SqliteRecordingStore<'_> {
         let mut has_more = false;
         let mut projection_bytes = 2_usize;
         let mut projection_byte_limit_reached = false;
-        let mut verified_input_bytes = 0_usize;
+        // The journal has no compression stage, so count each verified envelope
+        // once, including its length and digest. Its loader also bounds total bytes.
+        let mut verified_input_bytes = journal.as_ref().map_or(0, |(_, tail)| {
+            tail.iter().map(|event| prost::Message::encoded_len(event) + 36).sum::<usize>()
+        });
         let mut verified_work_limit_reached = false;
         let mut incomplete_evidence = Vec::new();
         let mut source_cache = SourceProjectionCache::default();
         if status == "partial" || status == "invalid" {
             incomplete_evidence.push(format!("persisted_status:{status}"));
         }
+        let pending_evidence_index = incomplete_evidence.len();
+        let session_context = session_context(&connection, request.recording_id, correlation_id)?;
+        let mut sealed_last = 1;
         // A Partial that carries a real-looking digest but no capacity drops was sealed
         // without hashing because its declared bytes passed the verification bound; say so
         // instead of leaving the cause silent.
@@ -922,6 +956,8 @@ impl SqliteRecordingStore<'_> {
         while let Some(row) = rows.next().map_err(|error| {
             map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
         })? {
+            #[cfg(test)]
+            phase.switch("read_segment_metadata");
             if segment_count >= MAX_RECORDING_QUERY_SEGMENTS {
                 return Err(recording_query_resource_error(correlation_id));
             }
@@ -971,6 +1007,7 @@ impl SqliteRecordingStore<'_> {
                 .checked_add(1)
                 .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
             expected_sequence = last_sequence.checked_add(1);
+            sealed_last = last_sequence;
             segment_count = segment_count
                 .checked_add(1)
                 .ok_or_else(|| recording_query_corrupt_error(correlation_id))?;
@@ -1062,11 +1099,15 @@ impl SqliteRecordingStore<'_> {
             }
             let object_path =
                 object_path_from_row(&self.binding.root, &segment.object_hash, correlation_id)?;
+            #[cfg(test)]
+            phase.switch("read_object_admission");
             validate_managed_tree(
                 &self.binding.root,
                 object_path.parent().ok_or_else(|| object_corrupt_error(correlation_id))?,
                 correlation_id,
             )?;
+            #[cfg(test)]
+            phase.switch("read_object_bytes_and_admission");
             let bytes = read_bounded_regular_file(&object_path, correlation_id, false)?;
             if i64::try_from(bytes.len()).map_err(|_| object_corrupt_error(correlation_id))?
                 != segment.compressed_bytes
@@ -1074,6 +1115,8 @@ impl SqliteRecordingStore<'_> {
                 return Err(object_corrupt_error(correlation_id));
             }
             let expected_hash = content_hash_from_bytes(&segment.object_hash, correlation_id)?;
+            #[cfg(test)]
+            phase.switch("read_object_decode");
             let decoded = crate::xtf::decode_compressed_segment(&bytes, expected_hash)
                 .map_err(|_| object_corrupt_error(correlation_id))?;
             let verified = decoded.verified();
@@ -1094,6 +1137,8 @@ impl SqliteRecordingStore<'_> {
             }
             verified_input_bytes = work_if_added.unwrap_or(segment_work);
             decoded_ranges.push((first_sequence, last_sequence));
+            #[cfg(test)]
+            phase.switch("read_frame_verification");
             index_verified_segment_frames(
                 &connection,
                 request.recording_id,
@@ -1102,6 +1147,8 @@ impl SqliteRecordingStore<'_> {
                 &mut verified_frame_ids,
                 correlation_id,
             )?;
+            #[cfg(test)]
+            phase.switch("read_projection");
             for envelope in decoded.events() {
                 let Some(event) = envelope.event.as_ref() else {
                     return Err(object_corrupt_error(correlation_id));
@@ -1135,6 +1182,66 @@ impl SqliteRecordingStore<'_> {
                 events.push(projected);
             }
         }
+        #[cfg(test)]
+        phase.switch("read_tail_projection");
+        let mut has_journal_tail = false;
+        if let Some((ordinal, tail)) = journal {
+            // Use the boundary from the same row snapshot that was decoded,
+            // including rows beyond this page, to avoid repeating a published tail.
+            let tail: Vec<_> =
+                tail.into_iter().filter(|event| event.recording_seq > sealed_last).collect();
+            has_journal_tail = !tail.is_empty();
+            if !tail.is_empty() && ordinal != expected_ordinal {
+                return Err(object_corrupt_error(correlation_id));
+            }
+            if let (Some(first), Some(last)) = (tail.first(), tail.last()) {
+                if sealed_last.checked_add(1) != Some(first.recording_seq) {
+                    return Err(object_corrupt_error(correlation_id));
+                }
+                incomplete_evidence.insert(
+                    pending_evidence_index,
+                    format!("durable_tail_pending:{}..{}", first.recording_seq, last.recording_seq),
+                );
+            }
+            // Journal envelopes have already passed checkpoint, digest, canonical
+            // encoding and sequence checks. Project them exactly like XTF events;
+            // they supply neither terminal proof nor an invented frame identity.
+            for envelope in &tail {
+                let event =
+                    envelope.event.as_ref().ok_or_else(|| object_corrupt_error(correlation_id))?;
+                if event.recording_seq <= request.after_sequence.unwrap_or(0) {
+                    continue;
+                }
+                if events.len() == event_limit
+                    || projection_byte_limit_reached
+                    || verified_work_limit_reached
+                {
+                    has_more = true;
+                    break;
+                }
+                let projected = project_persisted_event(event, source_root, &mut source_cache);
+                let projected_size = projected
+                    .serialized_size_with_separator()
+                    .map_err(|_| recording_query_resource_error(correlation_id))?;
+                if projected_size > MAX_RECORDING_EVENT_PROJECTION_BYTES {
+                    return Err(recording_query_resource_error(correlation_id));
+                }
+                if projection_bytes
+                    .checked_add(projected_size)
+                    .is_none_or(|total| total > MAX_RECORDING_EVENT_PROJECTION_BYTES)
+                {
+                    has_more = true;
+                    break;
+                }
+                if event.kind == WIRE_KIND_GAP {
+                    incomplete_evidence.push(format!("gap_event_sequence:{}", event.recording_seq));
+                }
+                projection_bytes += projected_size;
+                events.push(projected);
+            }
+        }
+        #[cfg(test)]
+        phase.switch("read_navigation");
         for event in &mut events {
             let sequence = event
                 .sequence
@@ -1250,6 +1357,8 @@ impl SqliteRecordingStore<'_> {
             events.truncate(final_event_count);
             has_more = true;
         }
+        #[cfg(test)]
+        phase.switch("read_finalize");
         Ok(RecordingEventWindow {
             recording_id: request.recording_id,
             status: lifecycle_status,
@@ -1261,6 +1370,7 @@ impl SqliteRecordingStore<'_> {
             events,
             has_more,
             incomplete_evidence,
+            session_context,
             // CONTRACTS 5: no terminal evidence reads `null`; terminal evidence without an
             // adapter outcome (every pre-outcome row) reads `unobserved`, never `responded`.
             outcome: terminal_finish.as_ref().map(|finish| {
@@ -1288,7 +1398,13 @@ impl SqliteRecordingStore<'_> {
             .map_err(|error| {
                 map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
             })?,
-            frame_honesty: load_frame_honesty(&connection, request.recording_id, correlation_id)?,
+            // Journal events have no frame-index rows yet. Counts over only the
+            // sealed prefix cannot claim to describe the whole recording.
+            frame_honesty: if has_journal_tail {
+                None
+            } else {
+                load_frame_honesty(&connection, request.recording_id, correlation_id)?
+            },
         })
     }
 
@@ -1309,6 +1425,8 @@ impl SqliteRecordingStore<'_> {
         &self,
         request: &BeginRecordingRequest,
     ) -> Result<BeginRecordingReceipt, RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Begin);
         let correlation_id = CorrelationId::new();
         let _writer = self
             .store
@@ -1419,12 +1537,25 @@ impl SqliteRecordingStore<'_> {
         &self,
         request: &SegmentCommitRequest,
     ) -> Result<SegmentCommitReceipt, RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Append);
         reset_staging_write_observer();
         let correlation_id = CorrelationId::new();
         let _writer = self
             .store
             .lock_recording_writer(correlation_id)
             .map_err(|error| map_store_error(error, correlation_id))?;
+        self.commit_segment_under_writer(request)
+    }
+
+    // The caller holds the recording writer across recovery and terminal commit.
+    fn commit_segment_under_writer(
+        &self,
+        request: &SegmentCommitRequest,
+    ) -> Result<SegmentCommitReceipt, RecordingStoreError> {
+        #[cfg(test)]
+        let mut phase = work_profile::Phase::enter("segment_encode_and_validate");
+        let correlation_id = CorrelationId::new();
         self.binding.revalidate(correlation_id)?;
         let logical = encode_logical_segment(&XtfSegmentInput {
             project_id: request.project_id,
@@ -1434,6 +1565,7 @@ impl SqliteRecordingStore<'_> {
         })
         .map_err(|error| map_xtf_error(error, correlation_id))?;
         let mut candidate = SegmentMetadata::from_logical(&logical, request, correlation_id)?;
+        self.validate_journal_segment(request)?;
 
         let existing = {
             let connection =
@@ -1447,6 +1579,9 @@ impl SqliteRecordingStore<'_> {
             )? {
                 Some(existing)
             } else {
+                if u64::from(request.segment_ordinal) >= MAX_RECORDING_QUERY_SEGMENTS {
+                    return Err(recording_query_resource_error(correlation_id));
+                }
                 // Sequence and ordinal continuity is the primary structural contract, so it
                 // is reported before the per-frame identity checks.
                 validate_new_continuity(&connection, request, &candidate, correlation_id)?;
@@ -1459,16 +1594,31 @@ impl SqliteRecordingStore<'_> {
         }
 
         self.binding.revalidate(correlation_id)?;
+        #[cfg(test)]
+        phase.switch("segment_staging_admission");
         let mut staging =
             create_staging_files(&self.binding, request.recording_id, correlation_id)?;
         commit_failpoint("before-logical-write", correlation_id, false)?;
         validate_managed_tree(&self.binding.root, &staging.directory, correlation_id)?;
         validate_managed_file(&staging.logical, correlation_id, true)?;
-        write_synced_file(&staging.logical, logical.logical_bytes(), correlation_id)?;
-        sync_directory(&staging.directory, correlation_id, "XTR-STORE-OBJECT-IO")?;
+        // The logical file is scratch, never an acknowledged object. Flush it
+        // to the filesystem here; the compressed file's device barrier below
+        // makes both durable before publication. Avoid a second F_FULLFSYNC
+        // per segment on Apple without changing the segment or Finish promise.
+        #[cfg(test)]
+        phase.switch("segment_logical_write");
+        write_synced_file(
+            &staging.logical,
+            logical.logical_bytes(),
+            FileSync::Filesystem,
+            correlation_id,
+        )?;
+        // write_synced_file has already admitted and synced this directory.
         commit_failpoint("after-logical-sync", correlation_id, false)?;
         self.binding.revalidate(correlation_id)?;
         commit_failpoint("before-compression", correlation_id, false)?;
+        #[cfg(test)]
+        phase.switch("segment_compression");
         let compressed = compress_logical_bytes(logical.logical_bytes())
             .map_err(|error| map_xtf_error(error, correlation_id))?;
         commit_failpoint("after-compression-before-write", correlation_id, false)?;
@@ -1476,10 +1626,13 @@ impl SqliteRecordingStore<'_> {
             .map_err(|_| segment_validation_error(correlation_id))?;
         validate_managed_tree(&self.binding.root, &staging.directory, correlation_id)?;
         validate_managed_file(&staging.compressed, correlation_id, true)?;
-        write_synced_file(&staging.compressed, &compressed, correlation_id)?;
-        sync_directory(&staging.directory, correlation_id, "XTR-STORE-OBJECT-IO")?;
+        #[cfg(test)]
+        phase.switch("segment_compressed_write");
+        write_synced_file(&staging.compressed, &compressed, FileSync::Device, correlation_id)?;
         commit_failpoint("after-compressed-sync", correlation_id, false)?;
 
+        #[cfg(test)]
+        phase.switch("segment_object_publication");
         validate_managed_tree(&self.binding.root, &staging.directory, correlation_id)?;
         let staged = read_bounded_regular_file(&staging.compressed, correlation_id, true)?;
         verify_staged_object(&staged, &candidate, correlation_id)?;
@@ -1513,6 +1666,8 @@ impl SqliteRecordingStore<'_> {
         commit_failpoint("after-object-directory-sync", correlation_id, true)?;
 
         let outcome = {
+            #[cfg(test)]
+            phase.switch("segment_sql_transaction");
             commit_failpoint("before-transaction", correlation_id, false)?;
             let connection =
                 self.store.lock().map_err(|error| map_store_error(error, correlation_id))?;
@@ -1606,12 +1761,16 @@ impl SqliteRecordingStore<'_> {
     /// Verifies the persisted V1 event-ID digest and commits terminal evidence.
     ///
     /// The terminal row and lifecycle status share one SQLite transaction.
+    /// Writer connections use synchronous=FULL, so its commit syncs terminal
+    /// evidence to the WAL without a checkpoint or waiting for readers.
     /// Existing rows without terminal evidence remain unverified and are never
     /// promoted by this operation.
     pub fn finish_recording(
         &self,
         request: &FinishRecording,
     ) -> Result<RecordingCompletion, RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::Finish);
         let correlation_id = CorrelationId::new();
         if request.event_digest.len() > 32
             || request.drop_counts_by_priority.len() > 256
@@ -1627,6 +1786,28 @@ impl SqliteRecordingStore<'_> {
         {
             return Err(terminal_validation_error(correlation_id));
         }
+        let mut effective = request.clone();
+        if let Some(cap) = self.capture_cap(request.recording_id)? {
+            if cap != request.event_cap {
+                // Lifecycle recovery has no adapter Finish and uses the legacy
+                // constructor. Restore the recorded policy only for that marker;
+                // changes to actual finish evidence remain immutable conflicts.
+                let recovery_marker = request.event_cap
+                    == xtrace_application::recording::legacy_event_cap()
+                    && request.event_digest.is_empty()
+                    && request.duration_ns.is_none()
+                    && request.drop_counts_by_priority.is_empty()
+                    && request.unsupported_capability_codes.is_empty()
+                    && request.capacity_dropped_events == 0
+                    && request.response_summary.is_none()
+                    && request.outcome.is_none();
+                if !recovery_marker {
+                    return Err(terminal_conflict_error(correlation_id));
+                }
+                effective.event_cap = cap;
+            }
+        }
+        let request = &effective;
         let request_json = serde_json::to_string(request)
             .map_err(|_| terminal_validation_error(correlation_id))?;
         if request_json.len() > MAX_TERMINAL_REQUEST_JSON_BYTES {
@@ -1636,6 +1817,7 @@ impl SqliteRecordingStore<'_> {
             .store
             .lock_recording_writer(correlation_id)
             .map_err(|error| map_store_error(error, correlation_id))?;
+        self.recover_journal_under_writer(request.recording_id)?;
         self.binding.revalidate(correlation_id)?;
 
         let terminal = {
@@ -1992,6 +2174,13 @@ fn validate_frame_identities(
     request: &SegmentCommitRequest,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT 1 FROM recording_frame_index WHERE recording_id = ?1 AND event_id_digest = ?2",
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
     let mut local = HashSet::new();
     for envelope in &request.events {
         let Some(event) = envelope.event.as_ref() else {
@@ -2006,9 +2195,8 @@ fn validate_frame_identities(
             }
         }
         let digest = blake3::hash(event.event_id.as_bytes());
-        let exists: Option<i64> = connection
+        let exists: Option<i64> = statement
             .query_row(
-                "SELECT 1 FROM recording_frame_index WHERE recording_id = ?1 AND event_id_digest = ?2",
                 rusqlite::params![
                     request.recording_id.as_uuid().as_bytes().to_vec(),
                     digest.as_bytes().as_slice(),
@@ -2419,7 +2607,8 @@ fn decode_stored_sequence(
     Ok(u64::from_be_bytes(raw))
 }
 
-const MAX_RECORDING_QUERY_SEGMENTS: u64 = 10_000;
+const MAX_RECORDING_QUERY_SEGMENTS: u64 =
+    xtrace_application::recording::MAX_RECORDING_SEGMENTS as u64;
 
 fn recording_id_from_bytes(
     bytes: &[u8],
@@ -3131,14 +3320,23 @@ fn index_verified_segment_frames(
     verified_frame_ids: &mut HashMap<u64, xtrace_domain::FrameId>,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    // A paginated read verifies the whole intersecting segment, including its
+    // lookbehind. Reuse this query for all envelopes instead of recompiling it
+    // for every event on every page.
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT frame_id, segment_ordinal, event_offset, event_id_digest, monotonic_ns \
+         FROM recording_frame_index WHERE recording_id = ?1 AND recording_seq = ?2",
+        )
+        .map_err(|error| {
+            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+        })?;
     for (event_offset, envelope) in envelopes.iter().enumerate() {
         let Some(event) = envelope.event.as_ref() else {
             return Err(object_corrupt_error(correlation_id));
         };
-        let indexed: Option<FrameIndexRow> = connection
+        let indexed: Option<FrameIndexRow> = statement
             .query_row(
-                "SELECT frame_id, segment_ordinal, event_offset, event_id_digest, monotonic_ns \
-                 FROM recording_frame_index WHERE recording_id = ?1 AND recording_seq = ?2",
                 rusqlite::params![
                     recording_id.as_uuid().as_bytes().to_vec(),
                     event.recording_seq.to_be_bytes().as_slice(),
@@ -3250,6 +3448,11 @@ fn project_persisted_event(
         kind: recording_event_kind_label(event.kind),
         symbol: nonempty(&event.symbol),
         interaction,
+        // Only type identity crosses the read boundary. Neither a field called
+        // sanitized_message nor stack text proves that legacy stored text is safe.
+        exception: event.exception.as_ref().map(|exception| PersistedException {
+            exception_type: nonempty(&exception.exception_type),
+        }),
         source,
         source_binding,
         field_truncations: Vec::new(),
@@ -4227,6 +4430,8 @@ fn create_staging_files(
     recording_id: RecordingId,
     correlation_id: CorrelationId,
 ) -> Result<StagingFiles, RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SegmentStage);
     binding.revalidate(correlation_id)?;
     let root =
         AdmittedPrivateRoot::open(&binding.root).map_err(|_| object_io_error(correlation_id))?;
@@ -4273,6 +4478,8 @@ fn ensure_object_parent(
     destination: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SegmentStage);
     binding.revalidate(correlation_id)?;
     let objects = binding.root.join("objects");
     let b3 = objects.join("b3");
@@ -4297,6 +4504,8 @@ fn ensure_owner_only_directory(
     directory: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::ManagedDirectory);
     let relative =
         directory.strip_prefix(root).map_err(|_| atomic_install_error(correlation_id))?;
     let root_cap = AdmittedPrivateRoot::open(root).map_err(|_| object_io_error(correlation_id))?;
@@ -4318,11 +4527,43 @@ fn ensure_owner_only_directory(
     current.revalidate().map_err(|_| object_io_error(correlation_id))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileSync {
+    Filesystem,
+    Device,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FILE_SYNCS: std::cell::RefCell<Vec<FileSync>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn sync_recording_file(file: &std::fs::File, kind: FileSync) -> std::io::Result<()> {
+    #[cfg(test)]
+    let _phase = work_profile::Phase::enter(match kind {
+        FileSync::Filesystem => "filesystem_sync_syscall",
+        FileSync::Device => "device_sync_syscall",
+    });
+    match kind {
+        #[cfg(unix)]
+        FileSync::Filesystem => rustix::fs::fsync(file).map_err(std::io::Error::from)?,
+        #[cfg(not(unix))]
+        FileSync::Filesystem => file.sync_all()?,
+        FileSync::Device => file.sync_all()?,
+    }
+    #[cfg(test)]
+    FILE_SYNCS.with(|syncs| syncs.borrow_mut().push(kind));
+    Ok(())
+}
+
 fn write_synced_file(
     path: &Path,
     bytes: &[u8],
+    sync: FileSync,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SegmentStage);
     note_staging_write();
     let parent = path.parent().ok_or_else(|| object_io_error(correlation_id))?;
     let name = path
@@ -4333,7 +4574,7 @@ fn write_synced_file(
     let mut file = root.create_private_file(name).map_err(|_| object_io_error(correlation_id))?;
     file.write_all(bytes).map_err(|_| object_io_error(correlation_id))?;
     file.flush().map_err(|_| object_io_error(correlation_id))?;
-    file.sync_all().map_err(|_| object_io_error(correlation_id))?;
+    sync_recording_file(&file, sync).map_err(|_| object_io_error(correlation_id))?;
     root.validate_file_binding(name, &file, true).map_err(|_| object_io_error(correlation_id))?;
     root.sync().map_err(|_| object_io_error(correlation_id))
 }
@@ -4343,6 +4584,8 @@ fn validate_managed_directory(
     directory: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::ManagedDirectory);
     AdmittedPrivateRoot::open(directory)
         .and_then(|root| root.revalidate())
         .map_err(|_| atomic_install_error(correlation_id))
@@ -4354,6 +4597,8 @@ fn validate_managed_tree(
     directory: &Path,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::ManagedTree);
     let relative =
         directory.strip_prefix(root).map_err(|_| atomic_install_error(correlation_id))?;
     let mut current =
@@ -4396,6 +4641,8 @@ fn validate_managed_file(
     correlation_id: CorrelationId,
     absent_is_valid: bool,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::ManagedFile);
     let parent = path.parent().ok_or_else(|| atomic_install_error(correlation_id))?;
     let name = path
         .file_name()
@@ -4421,6 +4668,8 @@ fn sync_directory(
     correlation_id: CorrelationId,
     code: &'static str,
 ) -> Result<(), RecordingStoreError> {
+    #[cfg(test)]
+    let _phase = work_profile::Phase::enter("segment_directory_sync_and_admission");
     let failure = || {
         if code == "XTR-STORE-ATOMIC-INSTALL" {
             atomic_install_error(correlation_id)
@@ -4542,6 +4791,8 @@ fn publish_no_replace<F>(
 where
     F: FnOnce(),
 {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SegmentPublish);
     let staging_parent = staging.parent().ok_or_else(|| atomic_install_error(correlation_id))?;
     let staging_name = staging
         .file_name()
@@ -4601,6 +4852,8 @@ where
 }
 
 fn cleanup_owned_staging_paths(staging: &StagingFiles, correlation_id: CorrelationId) {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SegmentCleanup);
     let Some(parent) = staging.directory.parent() else {
         tracing::warn!("recording segment staging cleanup could not bind its parent");
         return;
@@ -4795,6 +5048,11 @@ fn commit_failpoint(
     correlation_id: CorrelationId,
     atomic_boundary: bool,
 ) -> Result<(), RecordingStoreError> {
+    COMMIT_OBSERVER.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(point);
+        }
+    });
     let injected = COMMIT_FAILPOINT.with(|configured| *configured.borrow() == Some(point));
     if injected {
         COMMIT_FAILPOINT_FIRED.with(|fired| fired.set(true));
@@ -4829,6 +5087,10 @@ impl ProjectRootBinding {
         database_path: PathBuf,
         correlation_id: CorrelationId,
     ) -> Result<Self, RecordingStoreError> {
+        #[cfg(test)]
+        let _phase = work_profile::Phase::enter("root_binding_admission");
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::RootBinding);
         let private_root = AdmittedPrivateRoot::open(root).map_err(|_| {
             RecordingStoreError::new(
                 RecordingStoreErrorKind::Permission,
@@ -4855,6 +5117,10 @@ impl ProjectRootBinding {
     /// Construction-time checks cannot eliminate filesystem TOCTOU. Later
     /// publish code reuses this method before every filesystem boundary.
     fn revalidate(&self, correlation_id: CorrelationId) -> Result<(), RecordingStoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::RootBinding);
+        #[cfg(test)]
+        let _phase = work_profile::Phase::enter("root_database_admission");
         #[cfg(not(unix))]
         {
             return Err(RecordingStoreError::new(
@@ -5316,9 +5582,20 @@ fn validate_operation_has_observation(
     if found_link { Ok(()) } else { Err(endpoint_identity_corrupt(correlation_id)) }
 }
 
+fn session_context(
+    connection: &rusqlite::Connection,
+    recording_id: RecordingId,
+    correlation_id: CorrelationId,
+) -> Result<xtrace_application::recording_queries::SessionContext, RecordingStoreError> {
+    crate::session_health::recording_context(connection, recording_id).map_err(|error| {
+        map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
+    })
+}
+
 fn recording_metadata_from_row(
     row: &rusqlite::Row<'_>,
     connection: &rusqlite::Connection,
+    published: &recording_journal::PublishedRead,
     correlation_id: CorrelationId,
 ) -> Result<RecordingMetadata, RecordingStoreError> {
     let raw_id: Vec<u8> = row.get(0).map_err(|error| {
@@ -5348,14 +5625,28 @@ fn recording_metadata_from_row(
         map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
     })?;
     let lifecycle_status = recording_status(&status, correlation_id)?;
-    let recording_id = observed_recording_id_from_bytes(&raw_id, correlation_id)?;
+    let recording_id = recording_id_from_bytes(&raw_id, correlation_id)?;
     let completion = completion_evidence(connection, recording_id, &status, correlation_id)?;
-    let incomplete_evidence = match lifecycle_status {
+    let sealed_last = last_sequence
+        .as_deref()
+        .map(|value| decode_stored_sequence(value, correlation_id))
+        .transpose()?
+        .unwrap_or(1);
+    let journal = published.summary(recording_id, sealed_last)?;
+    let mut incomplete_evidence = match lifecycle_status {
         RecordingStatus::Partial | RecordingStatus::Invalid => {
             vec![format!("persisted_status:{status}")]
         }
         _ => Vec::new(),
     };
+    let session_context = session_context(connection, recording_id, correlation_id)?;
+    if let Some((first, last, _)) = journal {
+        incomplete_evidence.push(format!("durable_tail_pending:{first}..{last}"));
+    }
+    // A corrupt terminal row is already reported through `completion`
+    // and `incomplete_evidence`; list metadata then stays null.
+    let terminal =
+        load_terminal_finish(connection, recording_id, completion, correlation_id).ok().flatten();
     Ok(RecordingMetadata {
         recording_id,
         status: lifecycle_status,
@@ -5366,20 +5657,29 @@ fn recording_metadata_from_row(
             .to_string(),
         event_count: u64::try_from(event_count)
             .map_err(|_| recording_query_corrupt_error(correlation_id))?
+            .saturating_add(journal.map_or(0, |(_, _, count)| count))
             .to_string(),
         first_sequence: first_sequence
             .as_deref()
             .map(|value| decode_stored_sequence(value, correlation_id))
             .transpose()?
+            .or_else(|| journal.map(|(first, _, _)| first))
             .map(|value| value.to_string()),
         last_sequence: last_sequence
             .as_deref()
             .map(|value| decode_stored_sequence(value, correlation_id))
             .transpose()?
+            .map(|value| journal.map_or(value, |(_, last, _)| last.max(value)))
+            .or_else(|| journal.map(|(_, last, _)| last))
             .map(|value| value.to_string()),
         incomplete_evidence,
-        event_cap: None,
-        outcome_kind: None,
+        session_context,
+        event_cap: terminal.as_ref().and_then(|finish| u32::try_from(finish.event_cap).ok()),
+        // Terminal evidence without an adapter outcome (every pre-outcome
+        // row) reads `unobserved`; no terminal evidence reads `null` (CONTRACTS 5).
+        outcome_kind: terminal.as_ref().map(|finish| {
+            finish.outcome.as_ref().map_or("unobserved", |outcome| outcome.kind.as_str()).to_owned()
+        }),
     })
 }
 
@@ -5592,6 +5892,7 @@ fn map_store_error(error: StoreError, correlation_id: CorrelationId) -> Recordin
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
 mod tests {
+    include!("recording_published_read_tests.rs");
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -6624,7 +6925,8 @@ mod tests {
             CorrelationId::new(),
         )
         .expect("object parent");
-        write_synced_file(&destination, &alternate, CorrelationId::new()).expect("preplace");
+        write_synced_file(&destination, &alternate, FileSync::Device, CorrelationId::new())
+            .expect("preplace");
         sync_directory(
             destination.parent().expect("parent"),
             CorrelationId::new(),
@@ -6720,8 +7022,13 @@ mod tests {
             CorrelationId::new(),
         )
         .expect("parent");
-        write_synced_file(&destination, encoded.compressed_bytes(), CorrelationId::new())
-            .expect("object");
+        write_synced_file(
+            &destination,
+            encoded.compressed_bytes(),
+            FileSync::Device,
+            CorrelationId::new(),
+        )
+        .expect("object");
         let connection = fixture.store.lock().expect("connection");
         connection
             .execute(
@@ -6886,8 +7193,10 @@ mod tests {
         let left = fixture.root.join("race-left.zst");
         let right = fixture.root.join("race-right.zst");
         let destination = fixture.root.join("race-destination.zst");
-        write_synced_file(&left, &compressed, CorrelationId::new()).expect("left staging");
-        write_synced_file(&right, &compressed, CorrelationId::new()).expect("right staging");
+        write_synced_file(&left, &compressed, FileSync::Device, CorrelationId::new())
+            .expect("left staging");
+        write_synced_file(&right, &compressed, FileSync::Device, CorrelationId::new())
+            .expect("right staging");
         let barrier = std::sync::Barrier::new(3);
         let (left_result, right_result) = std::thread::scope(|scope| {
             let left_barrier = &barrier;
@@ -7616,6 +7925,1497 @@ mod tests {
                 ..RecordingEvent::default()
             }),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_exceptions_project_only_the_recorded_type_without_message_or_stack_text() {
+        use xtrace_protocol::generated::agent::{ExceptionPayload, RecordingEventKind};
+
+        let fixture = on_disk_store("exception-projection");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        let mut segment = segment_request(project_id, anchor.recording_id, 0, &[2, 3, 4]);
+        for (envelope, kind) in segment.events.iter_mut().zip([
+            RecordingEventKind::FrameThrow,
+            RecordingEventKind::Exception,
+            RecordingEventKind::FrameThrow,
+        ]) {
+            let event = envelope.event.as_mut().expect("event");
+            event.kind = kind as i32;
+            if event.recording_seq != 4 {
+                event.exception = Some(ExceptionPayload {
+                    exception_type: "org.example.ApplicationException".into(),
+                    sanitized_message: "private-message-canary password=do-not-display".into(),
+                    stack_frames: vec!["Caused by: private-stack-canary".into()],
+                });
+            }
+        }
+        view.commit_segment(&segment).expect("persist XTF");
+        let page = view
+            .read_recording_window(
+                &ShowWindowRequest {
+                    project_id,
+                    recording_id: anchor.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                },
+                None,
+            )
+            .expect("read persisted events");
+        assert_eq!(page.events.len(), 3);
+        for event in &page.events[..2] {
+            let exception = event.exception.as_ref().expect("persisted exception");
+            assert_eq!(
+                exception.exception_type.as_deref(),
+                Some("org.example.ApplicationException")
+            );
+        }
+        assert!(page.events[2].exception.is_none(), "never infer a missing throw payload");
+        let json = serde_json::to_string(&page.events).expect("serialize projection");
+        assert!(!json.contains("private-message-canary"));
+        assert!(!json.contains("do-not-display"));
+        assert!(!json.contains("private-stack-canary"));
+    }
+
+    #[test]
+    fn exception_projection_bounds_legacy_types_and_preserves_missing_type() {
+        use xtrace_protocol::generated::agent::ExceptionPayload;
+
+        let mut event = RecordingEvent {
+            exception: Some(ExceptionPayload {
+                exception_type: "x".repeat(257),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let projected =
+            project_persisted_event(&event, None, &mut SourceProjectionCache::default());
+        assert_eq!(
+            projected.exception.expect("payload").exception_type.as_deref(),
+            Some("[truncated]")
+        );
+        assert_eq!(
+            projected.field_truncations,
+            vec![xtrace_application::FieldTruncation {
+                field: "exception.exceptionType".into(),
+                original_bytes: "257".into(),
+                representation: xtrace_application::FieldRepresentation::Truncated,
+            }]
+        );
+        event.exception.as_mut().expect("payload").exception_type.clear();
+        let projected =
+            project_persisted_event(&event, None, &mut SourceProjectionCache::default());
+        assert!(projected.exception.expect("payload").exception_type.is_none());
+        assert!(projected.field_truncations.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn journal_request(
+        project_id: ProjectId,
+        recording_id: RecordingId,
+        sequences: &[u64],
+    ) -> xtrace_application::recording::PersistRecordingSegment<XtfEventEnvelope> {
+        use prost::Message as _;
+        xtrace_application::recording::PersistRecordingSegment {
+            project_id,
+            recording_id,
+            segment_ordinal: 0,
+            events: sequences
+                .iter()
+                .map(|sequence| {
+                    let payload = event(*sequence);
+                    xtrace_application::recording::AcceptedRecordingEvent {
+                        recording_seq: *sequence,
+                        monotonic_ns: 0,
+                        priority: 0,
+                        canonical_bytes: payload.encode_to_vec(),
+                        payload,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_checkpoint_and_segment_scratch_share_their_data_device_barrier() {
+        let fixture = on_disk_store("grouped-syncs");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        FILE_SYNCS.with(|syncs| syncs.borrow_mut().clear());
+        let mut checkpoint = None;
+        for (sequence, prefix) in [(2, 0), (3, 1)] {
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[sequence]),
+                prefix,
+                &mut checkpoint,
+            )
+            .expect("durable batch");
+            FILE_SYNCS.with(|syncs| {
+                assert_eq!(
+                    std::mem::take(&mut *syncs.borrow_mut()),
+                    [FileSync::Filesystem, FileSync::Device],
+                    "flush the unpublished checkpoint before one shared device barrier"
+                );
+            });
+        }
+        // Lose the volatile checkpoint before publishing and completing: the
+        // grouped barrier must still leave a fully recoverable journal prefix.
+        drop(checkpoint);
+        let mut finish = FinishRecording::without_digest(anchor.recording_id, 3);
+        finish.event_digest = blake3::hash(b"event-2event-3").as_bytes().to_vec();
+        assert_eq!(view.finish_recording(&finish).expect("Finish"), RecordingCompletion::Complete);
+        FILE_SYNCS.with(|syncs| {
+            assert_eq!(
+                std::mem::take(&mut *syncs.borrow_mut()),
+                [FileSync::Filesystem, FileSync::Device],
+                "logical scratch must not add a device flush per sealed segment"
+            );
+        });
+        let reopened = SqliteStore::open(
+            &fixture.database,
+            OpenOptions::default().with_must_exist(true).with_read_only(true),
+        )
+        .expect("fresh reader at Finish success");
+        let page = reopened
+            .recording_store(&fixture.root)
+            .expect("read view")
+            .read_recording_window(
+                &ShowWindowRequest {
+                    project_id,
+                    recording_id: anchor.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                },
+                None,
+            )
+            .expect("complete readback");
+        assert_eq!(page.status, RecordingStatus::Complete);
+        assert_eq!(page.completion, RecordingCompletionEvidence::Complete);
+        assert_eq!(page.events.len(), 2);
+        assert!(page.incomplete_evidence.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_and_exact_replay_succeed_with_a_pinned_wal_reader() {
+        let fixture = on_disk_store("terminal-durable");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        view.journal_tail(&journal_request(project_id, anchor.recording_id, &[2, 3]), 0, &mut None)
+            .expect("acknowledged tail");
+        // Pin the WAL before Finish writes terminal evidence. A zero busy
+        // timeout makes any accidental checkpoint barrier fail immediately.
+        {
+            let connection = fixture.store.lock().expect("Finish writer");
+            connection
+                .busy_timeout(std::time::Duration::ZERO)
+                .expect("nonblocking checkpoint fixture");
+            for (pragma, expected) in [
+                ("PRAGMA synchronous", 2_i64),
+                ("PRAGMA fullfsync", 1),
+                ("PRAGMA checkpoint_fullfsync", 1),
+            ] {
+                let actual: i64 = connection.query_row(pragma, [], |row| row.get(0)).expect(pragma);
+                assert_eq!(actual, expected, "Finish writer durability: {pragma}");
+            }
+        }
+        let pinned = rusqlite::Connection::open_with_flags(
+            &fixture.database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("independent read-only connection");
+        pinned.execute_batch("BEGIN").expect("pin snapshot");
+        let status: String = pinned
+            .query_row("SELECT status FROM recordings", [], |row| row.get(0))
+            .expect("read old status");
+        assert_eq!(status, "recording");
+        let mut finish = FinishRecording::without_digest(anchor.recording_id, 3);
+        finish.event_digest = blake3::hash(b"event-2event-3").as_bytes().to_vec();
+        assert_eq!(
+            view.finish_recording(&finish).expect("durable Finish with pinned reader"),
+            RecordingCompletion::Complete
+        );
+        assert_eq!(
+            view.finish_recording(&finish).expect("exact replay with pinned reader"),
+            RecordingCompletion::Complete
+        );
+        let status: String = pinned
+            .query_row("SELECT status FROM recordings", [], |row| row.get(0))
+            .expect("snapshot remains pinned after Finish and replay");
+        assert_eq!(status, "recording");
+        let connection = fixture.store.lock().expect("writer");
+        let (frames, checkpointed): (i64, i64) = connection
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| Ok((row.get(1)?, row.get(2)?)))
+            .expect("checkpoint state");
+        assert!(frames > 0);
+        assert!(frames > checkpointed, "pinned reader prevents checkpointing terminal evidence");
+        assert_eq!(
+            connection
+                .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .expect("durable write policy"),
+            2
+        );
+        drop(connection);
+        let reader = SqliteStore::open(
+            &fixture.database,
+            OpenOptions::default().with_must_exist(true).with_read_only(true),
+        )
+        .expect("fresh read-only store");
+        let read_view = reader.recording_store(&fixture.root).expect("read view");
+        let (items, more) = read_view.list_recording_metadata(project_id, None, 10).expect("list");
+        assert!(!more);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, xtrace_application::RecordingStatus::Complete);
+        assert_eq!(items[0].completion, RecordingCompletionEvidence::Complete);
+        let detail = read_view
+            .read_recording_window(
+                &ShowWindowRequest {
+                    project_id,
+                    recording_id: anchor.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                },
+                None,
+            )
+            .expect("detail at Finish success");
+        assert_eq!(detail.status, xtrace_application::RecordingStatus::Complete);
+        assert_eq!(detail.completion, RecordingCompletionEvidence::Complete);
+        assert_eq!(detail.events.len(), 2);
+        assert!(!detail.has_more);
+        assert!(detail.incomplete_evidence.is_empty());
+        pinned.execute_batch("ROLLBACK").expect("release pinned snapshot");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_sync_failures_require_exact_retry_and_recover_the_acknowledged_tail() {
+        use prost::Message as _;
+        for point in [
+            "journal-before-sync",
+            "journal-checkpoint-before-sync",
+            "journal-checkpoint-before-rename",
+            "journal-after-sync",
+        ] {
+            let fixture = on_disk_store("journal-retry");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            let tail = journal_request(project_id, anchor.recording_id, &[2, 3]);
+            let mut checkpoint = None;
+            set_commit_failpoint(Some(point));
+            let failure = view.journal_tail(&tail, 0, &mut checkpoint);
+            set_commit_failpoint(None);
+            assert_eq!(
+                failure.expect_err("no acknowledgement on sync failure").kind(),
+                RecordingStoreErrorKind::Transport
+            );
+            assert!(checkpoint.is_none());
+            assert_eq!(
+                view.journal_summary(anchor.recording_id, 1).expect("synced boundary only"),
+                (point == "journal-after-sync").then_some((2, 3, 2))
+            );
+            let mut changed = tail.clone();
+            changed.events[1].payload.event.as_mut().expect("event").event_id =
+                "changed".to_owned();
+            changed.events[1].canonical_bytes = changed.events[1].payload.encode_to_vec();
+            assert_eq!(
+                view.journal_tail(&changed, 0, &mut checkpoint)
+                    .expect_err("immutable prefix")
+                    .kind(),
+                RecordingStoreErrorKind::Conflict
+            );
+            view.journal_tail(&tail, 0, &mut checkpoint).expect("exact ambiguous retry");
+            assert_eq!(
+                segment_count(&fixture.store),
+                0,
+                "acknowledgement did not create an object"
+            );
+            let mut replacement = segment_request(project_id, anchor.recording_id, 0, &[2, 3]);
+            replacement.events[1].event.as_mut().expect("event").event_id = "changed".to_owned();
+            assert_eq!(
+                view.commit_segment(&replacement)
+                    .expect_err("publication cannot replace the journal prefix")
+                    .kind(),
+                RecordingStoreErrorKind::Conflict
+            );
+            assert_eq!(
+                view.commit_segment(&segment_request(project_id, anchor.recording_id, 0, &[2]))
+                    .expect_err("publication cannot shorten the journal prefix")
+                    .kind(),
+                RecordingStoreErrorKind::Conflict
+            );
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[4]),
+                2,
+                &mut checkpoint,
+            )
+            .expect("append a later batch");
+            let finish = FinishRecording::without_digest(anchor.recording_id, 4);
+            assert_eq!(
+                view.finish_recording(&finish).expect("recover tail"),
+                RecordingCompletion::Partial
+            );
+            assert_eq!(
+                view.finish_recording(&finish).expect("exact finish retry"),
+                RecordingCompletion::Partial
+            );
+            assert_eq!(segment_count(&fixture.store), 1);
+            let page = view
+                .read_recording_window(
+                    &ShowWindowRequest {
+                        project_id,
+                        recording_id: anchor.recording_id,
+                        limit: 10,
+                        after_sequence: None,
+                    },
+                    None,
+                )
+                .expect("recovered read");
+            assert_eq!(
+                page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+                ["2", "3", "4"]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_recovery_ignores_an_incomplete_unacknowledged_append() {
+        for suffix in [vec![0, 0], vec![0, 0, 0, 100, 1, 2, 3]] {
+            let fixture = on_disk_store("journal-torn-tail");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                0,
+                &mut None,
+            )
+            .expect("acknowledged tail");
+            let path = fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .expect("journal")
+                .write_all(&suffix)
+                .expect("simulate interrupted append");
+            assert_eq!(
+                view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 3))
+                    .expect("recover prefix"),
+                RecordingCompletion::Partial
+            );
+            let page = view
+                .read_recording_window(
+                    &ShowWindowRequest {
+                        project_id,
+                        recording_id: anchor.recording_id,
+                        limit: 10,
+                        after_sequence: None,
+                    },
+                    None,
+                )
+                .expect("partial read");
+            assert_eq!(
+                page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+                ["2", "3"]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_recovery_discards_full_length_torn_and_zero_filled_final_batches() {
+        use prost::Message as _;
+        let envelope = |sequence| {
+            let payload = event(sequence).encode_to_vec();
+            let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
+            bytes.extend_from_slice(&payload);
+            bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
+            bytes
+        };
+        let mut torn = envelope(4);
+        torn[4] ^= 1; // Full apparent length, with partially persisted payload.
+        let mut torn_digest = envelope(4);
+        *torn_digest.last_mut().expect("digest") ^= 1;
+        let mut partly_written_batch = envelope(4);
+        partly_written_batch.extend_from_slice(&[0; 36]);
+        for suffix in
+            [torn, torn_digest, vec![0; 36], vec![0; 4096], envelope(4), partly_written_batch]
+        {
+            let fixture = on_disk_store("journal-full-torn-tail");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                0,
+                &mut None,
+            )
+            .expect("acknowledged batch");
+            let path = fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .expect("journal")
+                .write_all(&suffix)
+                .expect("simulate crash suffix");
+            assert_eq!(
+                view.journal_summary(anchor.recording_id, 1).expect("committed prefix"),
+                Some((2, 3, 2))
+            );
+            // Use a fresh store so recovery cannot rely on an in-memory checkpoint.
+            let reopened = SqliteStore::open(&fixture.database, crate::OpenOptions::default())
+                .expect("reopen");
+            let recovery = reopened.recording_store(&fixture.root).expect("recovery view");
+            recovery
+                .finish_recording(&FinishRecording::without_digest(anchor.recording_id, 3))
+                .expect("recover committed batch");
+            let page = recovery
+                .read_recording_window(
+                    &ShowWindowRequest {
+                        project_id,
+                        recording_id: anchor.recording_id,
+                        limit: 10,
+                        after_sequence: None,
+                    },
+                    None,
+                )
+                .expect("recovered events");
+            assert_eq!(
+                page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+                ["2", "3"]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_checkpoint_publication_keeps_the_previous_batch_recoverable() {
+        for point in [
+            "journal-before-sync",
+            "journal-checkpoint-before-sync",
+            "journal-checkpoint-before-rename",
+        ] {
+            let fixture = on_disk_store("journal-checkpoint-crash");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            let mut checkpoint = None;
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                0,
+                &mut checkpoint,
+            )
+            .expect("committed batch");
+            let path = fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+            let committed_length = std::fs::metadata(&path).expect("journal").len() as usize;
+            set_commit_failpoint(Some(point));
+            let failure = view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[4, 5]),
+                2,
+                &mut checkpoint,
+            );
+            assert!(commit_failpoint_fired(), "checkpoint failure hook must fire");
+            set_commit_failpoint(None);
+            assert_eq!(
+                failure.expect_err("no acknowledgement").kind(),
+                RecordingStoreErrorKind::Transport
+            );
+            assert_eq!(
+                view.journal_summary(anchor.recording_id, 1).expect("previous ack only"),
+                Some((2, 3, 2))
+            );
+            let mut bytes = std::fs::read(&path).expect("full apparent append");
+            assert!(bytes.len() > committed_length);
+            bytes[committed_length..].fill(0);
+            std::fs::write(path, bytes).expect("simulate size persisted before data");
+            let reopened =
+                SqliteStore::open(&fixture.database, OpenOptions::default()).expect("reopen");
+            let recovery = reopened.recording_store(&fixture.root).expect("view");
+            recovery
+                .finish_recording(&FinishRecording::without_digest(anchor.recording_id, 3))
+                .expect("recover previous acknowledgement");
+            let page = recovery
+                .read_recording_window(
+                    &ShowWindowRequest {
+                        project_id,
+                        recording_id: anchor.recording_id,
+                        limit: 10,
+                        after_sequence: None,
+                    },
+                    None,
+                )
+                .expect("recovered prefix");
+            assert_eq!(
+                page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+                ["2", "3"]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_journals_are_checkpointed_before_their_first_new_append() {
+        let fixture = on_disk_store("legacy-journal-checkpoint");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        view.journal_tail(&journal_request(project_id, anchor.recording_id, &[2, 3]), 0, &mut None)
+            .expect("batch");
+        let path = fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+        let boundary =
+            fixture.root.join("journals").join(format!("{}.tail.commit", anchor.recording_id));
+        let mut bytes = std::fs::read(&path).expect("journal");
+        bytes[..8].copy_from_slice(b"XTRTAIL1");
+        std::fs::write(&path, bytes).expect("legacy header");
+        std::fs::remove_file(&boundary).expect("legacy has no checkpoint");
+        assert_eq!(
+            view.journal_summary(anchor.recording_id, 1).expect("legacy prefix"),
+            Some((2, 3, 2))
+        );
+        set_commit_failpoint(Some("journal-before-sync"));
+        let failure = view.journal_tail(
+            &journal_request(project_id, anchor.recording_id, &[4]),
+            2,
+            &mut None,
+        );
+        set_commit_failpoint(None);
+        failure.expect_err("new append was not synced");
+        assert!(boundary.exists(), "legacy prefix protected before writing new data");
+        assert_eq!(
+            view.journal_summary(anchor.recording_id, 1).expect("legacy acknowledged prefix only"),
+            Some((2, 3, 2))
+        );
+        view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 3))
+            .expect("legacy recovery");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_committed_corruption_is_reported_even_with_an_uncommitted_suffix() {
+        for position in [10, 44, 48] {
+            let fixture = on_disk_store("journal-committed-corruption");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                0,
+                &mut None,
+            )
+            .expect("ack");
+            let path = fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+            let mut bytes = std::fs::read(&path).expect("journal");
+            bytes[position] ^= 1;
+            bytes.extend_from_slice(&[0; 36]);
+            std::fs::write(&path, &bytes).expect("committed corruption followed by torn tail");
+            assert_eq!(
+                view.journal_summary(anchor.recording_id, 1)
+                    .expect_err("read reports committed corruption")
+                    .kind(),
+                RecordingStoreErrorKind::Corruption
+            );
+            assert_eq!(
+                view.read_recording_window(
+                    &ShowWindowRequest {
+                        project_id,
+                        recording_id: anchor.recording_id,
+                        limit: 10,
+                        after_sequence: None,
+                    },
+                    None
+                )
+                .expect_err("live events must reject checkpointed corruption")
+                .kind(),
+                RecordingStoreErrorKind::Corruption
+            );
+            assert_eq!(
+                view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 3))
+                    .expect_err("recovery reports committed corruption")
+                    .kind(),
+                RecordingStoreErrorKind::Corruption
+            );
+            assert_eq!(segment_count(&fixture.store), 0);
+            assert_eq!(std::fs::read(path).expect("unchanged journal"), bytes);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_reads_during_an_append_before_sync_see_only_the_previous_acknowledgement() {
+        for with_prefix in [false, true] {
+            let fixture = on_disk_store("journal-paused-append");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            let mut checkpoint = None;
+            if with_prefix {
+                view.journal_tail(
+                    &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                    0,
+                    &mut checkpoint,
+                )
+                .expect("prior ack");
+            }
+            let reader_store = fixture.store.clone();
+            let reader_root = fixture.root.clone();
+            let recording_id = anchor.recording_id;
+            let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook_observed = observed.clone();
+            recording_journal::BEFORE_SYNC.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    // The writer is paused inside this hook; a separate reader
+                    // thread must complete while the writer lock remains held.
+                    std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| {
+                                let reader =
+                                    reader_store.recording_store(&reader_root).expect("reader");
+                                let rows = reader
+                                    .list_recording_metadata(project_id, None, 10)
+                                    .expect("live list")
+                                    .0;
+                                assert_eq!(
+                                    rows[0].event_count,
+                                    if with_prefix { "2" } else { "0" }
+                                );
+                                assert_eq!(
+                                    rows[0].last_sequence.as_deref(),
+                                    with_prefix.then_some("3")
+                                );
+                                let expected = if with_prefix {
+                                    vec!["durable_tail_pending:2..3".to_owned()]
+                                } else {
+                                    vec![]
+                                };
+                                assert_eq!(rows[0].incomplete_evidence, expected);
+                                let page = reader
+                                    .read_recording_window(
+                                        &ShowWindowRequest {
+                                            project_id,
+                                            recording_id,
+                                            limit: 10,
+                                            after_sequence: None,
+                                        },
+                                        None,
+                                    )
+                                    .expect("live detail");
+                                assert_eq!(page.incomplete_evidence, expected);
+                                assert_eq!(
+                                    page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+                                    if with_prefix { vec!["2", "3"] } else { vec![] },
+                                    "a pending append must expose only the previously checkpointed events"
+                                );
+                            })
+                            .join()
+                            .expect("reader thread")
+                    });
+                    hook_observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                }));
+            });
+            let result = view.journal_tail(
+                &journal_request(
+                    project_id,
+                    recording_id,
+                    if with_prefix { &[4] } else { &[2, 3] },
+                ),
+                if with_prefix { 2 } else { 0 },
+                &mut checkpoint,
+            );
+            recording_journal::BEFORE_SYNC.with(|hook| {
+                hook.borrow_mut().take();
+            });
+            result.expect("synced ack");
+            assert!(observed.load(std::sync::atomic::Ordering::SeqCst), "pause hook must fire");
+            assert_eq!(
+                view.journal_summary(recording_id, 1).expect("published after sync"),
+                Some(if with_prefix { (2, 4, 3) } else { (2, 3, 2) })
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_unacknowledged_batch_and_checkpoint_temporary_are_removed_by_finish() {
+        for point in ["journal-checkpoint-before-sync", "journal-checkpoint-before-rename"] {
+            for tail_state in ["complete", "torn-header", "zero-header", "pending-only"] {
+                let fixture = on_disk_store("journal-unacknowledged-cleanup");
+                let project_id = ProjectId::new();
+                insert_project(&fixture.store, project_id);
+                let anchor =
+                    request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+                let view = fixture.store.recording_store(&fixture.root).expect("view");
+                view.begin_recording(&anchor).expect("anchor");
+                set_commit_failpoint(Some(point));
+                let result = view.journal_tail(
+                    &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                    0,
+                    &mut None,
+                );
+                assert!(commit_failpoint_fired());
+                set_commit_failpoint(None);
+                assert_eq!(
+                    result.expect_err("unacknowledged batch").kind(),
+                    RecordingStoreErrorKind::Transport
+                );
+                let tail =
+                    fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+                match tail_state {
+                    "torn-header" => std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&tail)
+                        .expect("tail")
+                        .set_len(12)
+                        .expect("torn initial header"),
+                    "zero-header" => std::fs::write(&tail, [0; 44]).expect("unsynced zero header"),
+                    "pending-only" => {
+                        std::fs::remove_file(&tail).expect("orphan checkpoint temporary")
+                    }
+                    _ => {}
+                }
+                assert_eq!(view.journal_summary(anchor.recording_id, 1).expect("no ack"), None);
+                let reopened =
+                    SqliteStore::open(&fixture.database, OpenOptions::default()).expect("reopen");
+                let recovery = reopened.recording_store(&fixture.root).expect("recovery");
+                recovery
+                    .finish_recording(&FinishRecording::without_digest(anchor.recording_id, 1))
+                    .expect("finish without admitting pending events");
+                assert_eq!(segment_count(&reopened), 0);
+                for suffix in ["tail", "tail.commit", "tail.commit-next"] {
+                    assert!(
+                        !fixture
+                            .root
+                            .join("journals")
+                            .join(format!("{}.{suffix}", anchor.recording_id))
+                            .exists()
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_removal_failure_retries_through_the_port_and_allows_the_next_segment() {
+        use xtrace_application::recording::RecordingPersistencePort as _;
+        let fixture = on_disk_store("journal-cleanup-retry");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        let port = crate::SqliteRecordingPersistence::new(fixture.store.clone(), &fixture.root);
+        port.persist_tail(&journal_request(project_id, anchor.recording_id, &[2, 3]), 0)
+            .expect("ack");
+        let segment = journal_request(project_id, anchor.recording_id, &[2, 3, 4]);
+        set_commit_failpoint(Some("journal-cleanup-before-tail-removal"));
+        let failed = port.persist_segment(&segment);
+        assert!(commit_failpoint_fired());
+        set_commit_failpoint(None);
+        assert_eq!(
+            failed.expect_err("cleanup interrupted").kind(),
+            xtrace_application::PortErrorKind::Transport
+        );
+        let journals = fixture.root.join("journals");
+        assert!(!journals.join(format!("{}.tail.commit", anchor.recording_id)).exists());
+        assert!(journals.join(format!("{}.tail", anchor.recording_id)).exists());
+        assert_eq!(
+            port.persist_segment(&segment)
+                .expect("retry clears pending tail and cached checkpoint")
+                .disposition,
+            xtrace_application::recording::PersistSegmentDisposition::ExactReplay
+        );
+        let mut next = journal_request(project_id, anchor.recording_id, &[5]);
+        next.segment_ordinal = 1;
+        assert!(port.persist_tail(&next, 0).expect("next segment is not jammed"));
+        view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 5))
+            .expect("recover next segment");
+        let page = view
+            .read_recording_window(
+                &ShowWindowRequest {
+                    project_id,
+                    recording_id: anchor.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                },
+                None,
+            )
+            .expect("both immutable segments");
+        assert_eq!(
+            page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+            ["2", "3", "4", "5"]
+        );
+        assert_eq!(segment_count(&fixture.store), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paused_reader_pins_a_snapshot_across_checkpoint_replacement_and_cleanup() {
+        for cleanup in [false, true] {
+            let fixture = on_disk_store("journal-reader-snapshot");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let recording_id = anchor.recording_id;
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            view.journal_tail(&journal_request(project_id, recording_id, &[2, 3]), 0, &mut None)
+                .expect("previous ack");
+            if cleanup {
+                view.commit_segment(&segment_request(project_id, recording_id, 0, &[2, 3]))
+                    .expect("publish before cleanup");
+            }
+            let root = AdmittedPrivateRoot::open(&fixture.root.join("journals")).expect("journals");
+            let snapshot =
+                recording_journal::snapshot_lock(&root, recording_id, CorrelationId::new())
+                    .expect("snapshot lock");
+            let reader_store = fixture.store.clone();
+            let reader_root = fixture.root.clone();
+            let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (boundary_tx, boundary_rx) = std::sync::mpsc::channel();
+            let (prepared_tx, prepared_rx) = std::sync::mpsc::channel();
+            let (publish_tx, publish_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    let hook: Box<dyn Fn()> = Box::new(move || {
+                        prepared_tx.send(()).expect("data prepared before reader starts");
+                        publish_rx.recv().expect("attempt mutation while reader is paused");
+                        assert!(
+                            snapshot.try_write().is_err(),
+                            "reader must pin checkpoint and tail together"
+                        );
+                        boundary_tx.send(()).expect("writer reached mutation boundary");
+                    });
+                    if cleanup {
+                        recording_journal::BEFORE_CLEANUP
+                            .with(|slot| *slot.borrow_mut() = Some(hook));
+                    } else {
+                        recording_journal::BEFORE_PUBLICATION
+                            .with(|slot| *slot.borrow_mut() = Some(hook));
+                    }
+                    let result = if cleanup {
+                        view.clear_segment_journal(recording_id, 0).map(|cleared| assert!(cleared))
+                    } else {
+                        view.journal_tail(
+                            &journal_request(project_id, recording_id, &[4]),
+                            2,
+                            &mut None,
+                        )
+                    };
+                    recording_journal::BEFORE_CLEANUP.with(|slot| {
+                        slot.borrow_mut().take();
+                    });
+                    recording_journal::BEFORE_PUBLICATION.with(|slot| {
+                        slot.borrow_mut().take();
+                    });
+                    result
+                });
+                prepared_rx.recv().expect("writer ready to publish or clean up");
+                let reader = scope.spawn(move || {
+                    let reader = reader_store.recording_store(&reader_root).expect("reader");
+                    recording_journal::AFTER_BOUNDARY.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            paused_tx.send(()).expect("reader paused after checkpoint read");
+                            resume_rx.recv().expect("resume pinned snapshot");
+                        }));
+                    });
+                    let result = reader.journal_summary(recording_id, 1);
+                    recording_journal::AFTER_BOUNDARY.with(|hook| {
+                        hook.borrow_mut().take();
+                    });
+                    result
+                });
+                paused_rx.recv().expect("reader has old checkpoint");
+                publish_tx.send(()).expect("writer may attempt replacement or cleanup");
+                boundary_rx.recv().expect("writer is at replacement or cleanup");
+                resume_tx.send(()).expect("allow reader to finish");
+                assert_eq!(
+                    reader.join().expect("reader thread").expect("stable snapshot"),
+                    Some((2, 3, 2))
+                );
+                writer.join().expect("writer thread").expect("writer completes after snapshot");
+            });
+            assert_eq!(
+                view.journal_summary(recording_id, 1).expect("next snapshot"),
+                if cleanup { None } else { Some((2, 4, 3)) }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_snapshot_reader_process() {
+        use std::io::Write as _;
+
+        let Some(root) = std::env::var_os("XTRACE_JOURNAL_READER_ROOT") else { return };
+        let root = PathBuf::from(root);
+        let recording_id = RecordingId::from_uuid(
+            uuid::Uuid::parse_str(&std::env::var("XTRACE_JOURNAL_READER_ID").expect("id"))
+                .expect("recording UUID"),
+        );
+        let command = |expected: &str| {
+            let mut line = String::new();
+            assert!(std::io::stdin().read_line(&mut line).expect("parent command") > 0);
+            assert_eq!(line.trim_end(), expected);
+        };
+        let signal = |phase: &str| {
+            // Start a fresh line even when libtest has printed a test name.
+            println!("\nxtrace-journal:{phase}");
+            std::io::stdout().flush().expect("signal parent");
+        };
+        let store = SqliteStore::open(
+            &root.join("metadata.sqlite3"),
+            OpenOptions::default().with_must_exist(true).with_read_only(true),
+        )
+        .expect("independent read-only database");
+        let view = store.recording_store(&root).expect("read-only view");
+        let journals = AdmittedPrivateRoot::open(&root.join("journals")).expect("journals");
+        let snapshot =
+            recording_journal::snapshot_lock(&journals, recording_id, CorrelationId::new())
+                .expect("local snapshot lock");
+        recording_journal::AFTER_BOUNDARY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                signal("boundary");
+                command("copy");
+            }));
+        });
+        recording_journal::AFTER_SNAPSHOT_READS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(snapshot.try_write().is_ok(), "local read guard released before decode");
+                signal("copied");
+                command("decode");
+            }));
+        });
+        signal("ready");
+        command("read");
+        assert_eq!(
+            view.journal_summary(recording_id, 1).expect("untorn old snapshot without I/O error"),
+            Some((2, 3, 2))
+        );
+        recording_journal::AFTER_BOUNDARY.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        recording_journal::AFTER_SNAPSHOT_READS.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        assert_eq!(
+            view.journal_summary(recording_id, 1).expect("published snapshot without I/O error"),
+            if std::env::var("XTRACE_JOURNAL_READER_CLEANUP").expect("cleanup mode") == "true" {
+                None
+            } else {
+                Some((2, 4, 3))
+            }
+        );
+        signal("done");
+    }
+
+    // Reuse the unit-test executable as a helper so the child exercises the
+    // private read path, with its own lock registry and read-only SQLite store.
+    #[cfg(unix)]
+    struct JournalReaderProcess(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for JournalReaderProcess {
+        fn drop(&mut self) {
+            if self.0.try_wait().expect("reader status").is_none() {
+                self.0.kill().expect("stop this test's reader");
+                self.0.wait().expect("reap reader");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn separate_process_reader_pins_snapshot_and_releases_guards_before_decode() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        fn send(pipe: &mut BufReader<UnixStream>, command: &str) {
+            writeln!(pipe.get_mut(), "{command}").expect("send reader command");
+        }
+
+        fn expect_phase(pipe: &mut BufReader<UnixStream>, expected: &str) {
+            loop {
+                let mut line = String::new();
+                assert!(pipe.read_line(&mut line).expect("reader phase") > 0, "reader exited");
+                if let Some(phase) = line.trim_end().strip_prefix("xtrace-journal:") {
+                    assert_eq!(phase, expected);
+                    return;
+                }
+            }
+        }
+
+        for operation in ["checkpoint", "cleanup", "append"] {
+            let fixture = on_disk_store("journal-process-snapshot");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let recording_id = RecordingId::new();
+            let anchor = request(project_id, recording_id, RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("writer view");
+            view.begin_recording(&anchor).expect("anchor");
+            let mut checkpoint = None;
+            view.journal_tail(
+                &journal_request(project_id, recording_id, &[2, 3]),
+                0,
+                &mut checkpoint,
+            )
+            .expect("previous ack");
+            if operation == "cleanup" {
+                view.commit_segment(&segment_request(project_id, recording_id, 0, &[2, 3]))
+                    .expect("publish immutable segment before cleanup");
+            }
+            let (parent, child) = UnixStream::pair().expect("process handshake");
+            // These bounds only diagnose a broken handshake; synchronization
+            // always waits for an observable phase, never elapsed time.
+            for stream in [&parent, &child] {
+                stream.set_read_timeout(Some(Duration::from_secs(10))).expect("read bound");
+                stream.set_write_timeout(Some(Duration::from_secs(10))).expect("write bound");
+            }
+            let mut reader = JournalReaderProcess(
+                Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "recording_store::tests::journal_snapshot_reader_process",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("XTRACE_JOURNAL_READER_ROOT", &fixture.root)
+                    .env("XTRACE_JOURNAL_READER_ID", recording_id.to_string())
+                    .env("XTRACE_JOURNAL_READER_CLEANUP", (operation == "cleanup").to_string())
+                    .stdin(Stdio::from(OwnedFd::from(child.try_clone().expect("child input"))))
+                    .stdout(Stdio::from(OwnedFd::from(child)))
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("spawn independent reader"),
+            );
+            let mut pipe = BufReader::new(parent);
+            expect_phase(&mut pipe, "ready");
+            let (prepared_tx, prepared_rx) = std::sync::mpsc::channel();
+            let (publish_tx, publish_rx) = std::sync::mpsc::channel();
+            let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(move || {
+                    let prepared = move || {
+                        prepared_tx.send(()).expect("writer prepared");
+                        publish_rx.recv().expect("attempt mutation");
+                    };
+                    match operation {
+                        "checkpoint" => recording_journal::BEFORE_PUBLICATION
+                            .with(|hook| *hook.borrow_mut() = Some(Box::new(prepared))),
+                        "cleanup" => recording_journal::BEFORE_CLEANUP
+                            .with(|hook| *hook.borrow_mut() = Some(Box::new(prepared))),
+                        "append" => prepared(),
+                        _ => unreachable!(),
+                    }
+                    recording_journal::SNAPSHOT_CONTENDED.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            contended_tx.send(()).expect("kernel lock is held by reader");
+                        }));
+                    });
+                    let result = if operation == "cleanup" {
+                        view.clear_segment_journal(recording_id, 0).map(|cleared| assert!(cleared))
+                    } else {
+                        view.journal_tail(
+                            &journal_request(project_id, recording_id, &[4]),
+                            2,
+                            &mut checkpoint,
+                        )
+                    };
+                    recording_journal::BEFORE_PUBLICATION.with(|hook| {
+                        hook.borrow_mut().take();
+                    });
+                    recording_journal::BEFORE_CLEANUP.with(|hook| {
+                        hook.borrow_mut().take();
+                    });
+                    recording_journal::SNAPSHOT_CONTENDED.with(|hook| {
+                        hook.borrow_mut().take();
+                    });
+                    result
+                });
+                prepared_rx.recv_timeout(Duration::from_secs(10)).expect("writer ready");
+                send(&mut pipe, "read");
+                expect_phase(&mut pipe, "boundary");
+                publish_tx.send(()).expect("writer may attempt mutation");
+                contended_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("writer must encounter the other process's shared lock");
+                send(&mut pipe, "copy");
+                expect_phase(&mut pipe, "copied");
+                // The reader is now paused before decode. Joining the writer
+                // proves the file guard is released while decode is pending.
+                writer.join().expect("writer thread").expect("writer completes before decode");
+                send(&mut pipe, "decode");
+                expect_phase(&mut pipe, "done");
+            });
+            assert!(reader.0.wait().expect("reader exit").success());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_journal_appends_do_not_read_the_checkpoint_or_repeat_creation_syncs() {
+        use recording_journal::{
+            SyncKind, take_boundary_read_count, take_checkpoint_sync_count,
+            take_directory_sync_count, take_sync_count, take_sync_order,
+        };
+        let fixture = on_disk_store("journal-cached-cost");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        let mut checkpoint = None;
+        take_directory_sync_count();
+        view.journal_tail(
+            &journal_request(project_id, anchor.recording_id, &[2]),
+            0,
+            &mut checkpoint,
+        )
+        .expect("first ack");
+        assert_eq!(
+            take_directory_sync_count(),
+            2,
+            "cold parent and checkpoint publication barriers"
+        );
+        take_boundary_read_count();
+        take_checkpoint_sync_count();
+        take_sync_count();
+        take_sync_order();
+        view.journal_tail(
+            &journal_request(project_id, anchor.recording_id, &[3]),
+            1,
+            &mut checkpoint,
+        )
+        .expect("cached ack");
+        assert_eq!(take_boundary_read_count(), 0, "cached append never reloads its boundary");
+        assert_eq!(take_sync_count(), 1, "data must be durable before checkpoint publication");
+        assert_eq!(
+            take_checkpoint_sync_count(),
+            1,
+            "checkpoint contents must be durable before rename"
+        );
+        assert_eq!(take_directory_sync_count(), 1, "one directory barrier publishes both names");
+        assert_eq!(
+            take_sync_order(),
+            [SyncKind::Checkpoint, SyncKind::Journal, SyncKind::Directory]
+        );
+        assert_eq!(
+            view.journal_summary(anchor.recording_id, 1).expect("durable prefix"),
+            Some((2, 3, 2))
+        );
+        view.commit_segment(&segment_request(project_id, anchor.recording_id, 0, &[2, 3]))
+            .expect("publish before cleanup");
+        assert!(view.clear_segment_journal(anchor.recording_id, 0).expect("clear tail"));
+        assert_eq!(take_directory_sync_count(), 2, "checkpoint removal must precede tail removal");
+        assert!(view.clear_segment_journal(anchor.recording_id, 0).expect("empty cleanup retry"));
+        assert_eq!(take_directory_sync_count(), 0, "absent journal files need no sync");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_and_unmatched_lists_share_the_journal_projection_and_session_context() {
+        let fixture = on_disk_store("journal-endpoint-lists");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        let mut linked =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        linked.endpoint_observation = EndpointObservationInput {
+            policy_id: Some("spring-orders-v1".to_owned()),
+            application_component: Some("spring-fixture".to_owned()),
+            binding_key: Some("default".to_owned()),
+            method: "POST".to_owned(),
+            route_template: "/orders".to_owned(),
+        };
+        let unmatched =
+            request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        for anchor in [&linked, &unmatched] {
+            view.begin_recording(anchor).expect("anchor");
+            fixture.store.lock().expect("connection").execute(
+                "INSERT INTO session_health (project_id, runtime_session_id, rejected_requests) VALUES (?1, ?2, ?3)",
+                rusqlite::params![project_id.as_uuid().as_bytes(), anchor.runtime_session_id.as_uuid().as_bytes(), 7],
+            ).expect("session health");
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                0,
+                &mut None,
+            )
+            .expect("journal-only ack");
+        }
+        let operation = view.list_observed_endpoints(project_id, None, 10).expect("endpoints").0[0]
+            .operation_id;
+        let linked_rows =
+            view.list_operation_recordings(project_id, operation, None, 10).expect("linked").0;
+        let unmatched_rows =
+            view.list_unmatched_recordings(project_id, None, 10).expect("unmatched").0;
+        assert_eq!((linked_rows.len(), unmatched_rows.len()), (1, 1));
+        let standard = view.list_recording_metadata(project_id, None, 10).expect("standard").0;
+        for row in [&linked_rows[0], &unmatched_rows[0]] {
+            let metadata = &row.metadata;
+            assert_eq!(
+                metadata,
+                standard
+                    .iter()
+                    .find(|item| item.recording_id == metadata.recording_id)
+                    .expect("same recording")
+            );
+            assert_eq!(metadata.event_count, "2");
+            assert_eq!(metadata.first_sequence.as_deref(), Some("2"));
+            assert_eq!(metadata.last_sequence.as_deref(), Some("3"));
+            assert_eq!(metadata.incomplete_evidence, ["durable_tail_pending:2..3"]);
+            assert_eq!(metadata.session_context.rejected_requests.as_deref(), Some("7"));
+            assert_eq!(
+                metadata.session_context.runtime_session_id,
+                if metadata.recording_id == linked.recording_id {
+                    linked.runtime_session_id
+                } else {
+                    unmatched.runtime_session_id
+                }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_verifies_a_stale_journal_prefix_after_segment_commit() {
+        let fixture = on_disk_store("journal-published-prefix");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        view.journal_tail(&journal_request(project_id, anchor.recording_id, &[2, 3]), 0, &mut None)
+            .expect("acknowledged tail");
+        set_commit_failpoint(Some("after-commit-before-cleanup"));
+        let result =
+            view.commit_segment(&segment_request(project_id, anchor.recording_id, 0, &[2, 3, 4]));
+        assert!(commit_failpoint_fired(), "must reach the post-commit cleanup boundary");
+        set_commit_failpoint(None);
+        // Once the SQLite row is authoritative, a staging cleanup fault is a
+        // successful commit with residue (also covered by the commit tests).
+        assert_eq!(
+            result.expect("authoritative segment commit").disposition,
+            SegmentCommitDisposition::Inserted
+        );
+        assert_eq!(
+            view.journal_summary(anchor.recording_id, 1).expect("stale journal retained"),
+            Some((2, 3, 2))
+        );
+        let page = view
+            .read_recording_window(
+                &ShowWindowRequest {
+                    project_id,
+                    recording_id: anchor.recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                },
+                None,
+            )
+            .expect("read after publication before journal cleanup");
+        assert_eq!(
+            page.events.iter().map(|event| event.sequence.as_str()).collect::<Vec<_>>(),
+            ["2", "3", "4"]
+        );
+        assert!(page.incomplete_evidence.is_empty(), "the old journal prefix is already sealed");
+        assert_eq!(
+            view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 4))
+                .expect("verified prefix recovery"),
+            RecordingCompletion::Partial
+        );
+        assert_eq!(segment_count(&fixture.store), 1, "stale journal was not duplicated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_append_truncates_only_an_incomplete_suffix_and_rejects_checksum_corruption() {
+        let fixture = on_disk_store("journal-append-prefix");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        view.journal_tail(&journal_request(project_id, anchor.recording_id, &[2, 3]), 0, &mut None)
+            .expect("first acknowledgement");
+        let path = fixture.root.join("journals").join(format!("{}.tail", anchor.recording_id));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("journal")
+            .write_all(&[0, 0, 0, 100, 1])
+            .expect("incomplete suffix");
+        view.journal_tail(&journal_request(project_id, anchor.recording_id, &[4]), 2, &mut None)
+            .expect("append after interruption");
+        assert_eq!(
+            view.journal_summary(anchor.recording_id, 1).expect("prefix intact"),
+            Some((2, 4, 3))
+        );
+        let mut bytes = std::fs::read(&path).expect("journal bytes");
+        *bytes.last_mut().expect("digest byte") ^= 1;
+        std::fs::write(&path, &bytes).expect("simulate corruption");
+        assert_eq!(
+            view.finish_recording(&FinishRecording::without_digest(anchor.recording_id, 4))
+                .expect_err("corruption is not an incomplete append")
+                .kind(),
+            RecordingStoreErrorKind::Corruption
+        );
+        assert_eq!(
+            segment_count(&fixture.store),
+            0,
+            "corruption never becomes a verified XTF object"
+        );
+        assert_eq!(std::fs::read(path).expect("failure retained journal"), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_links_and_keeps_the_target_private_bytes_unchanged() {
+        for hard_link in [false, true] {
+            let fixture = on_disk_store("journal-link");
+            let project_id = ProjectId::new();
+            insert_project(&fixture.store, project_id);
+            let anchor =
+                request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+            let view = fixture.store.recording_store(&fixture.root).expect("view");
+            view.begin_recording(&anchor).expect("anchor");
+            let directory = fixture.root.join("journals");
+            std::fs::create_dir(&directory).expect("journal directory");
+            set_mode(&directory, 0o700);
+            let canary = fixture.root.join("canary");
+            std::fs::write(&canary, b"private-journal-link-canary").expect("canary");
+            set_mode(&canary, 0o600);
+            let path = directory.join(format!("{}.tail", anchor.recording_id));
+            if hard_link {
+                std::fs::hard_link(&canary, path).expect("hard link");
+            } else {
+                std::os::unix::fs::symlink(&canary, path).expect("symlink");
+            }
+            view.journal_tail(
+                &journal_request(project_id, anchor.recording_id, &[2]),
+                0,
+                &mut None,
+            )
+            .expect_err("links fail closed");
+            assert_eq!(
+                std::fs::read(canary).expect("canary remains"),
+                b"private-journal-link-canary"
+            );
+            assert_eq!(segment_count(&fixture.store), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_checkpoint_files_reject_links_without_changing_private_targets() {
+        for pending in [false, true] {
+            for hard_link in [false, true] {
+                let fixture = on_disk_store("journal-checkpoint-link");
+                let project_id = ProjectId::new();
+                insert_project(&fixture.store, project_id);
+                let anchor =
+                    request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+                let view = fixture.store.recording_store(&fixture.root).expect("view");
+                view.begin_recording(&anchor).expect("anchor");
+                let mut checkpoint = None;
+                view.journal_tail(
+                    &journal_request(project_id, anchor.recording_id, &[2, 3]),
+                    0,
+                    &mut checkpoint,
+                )
+                .expect("ack");
+                let canary = fixture.root.join("checkpoint-canary");
+                std::fs::write(&canary, b"private-checkpoint-canary").expect("canary");
+                set_mode(&canary, 0o600);
+                let name = format!(
+                    "{}.tail.commit{}",
+                    anchor.recording_id,
+                    if pending { "-next" } else { "" }
+                );
+                let path = fixture.root.join("journals").join(name);
+                if !pending {
+                    std::fs::remove_file(&path).expect("replace checkpoint with link");
+                }
+                if hard_link {
+                    std::fs::hard_link(&canary, &path).expect("hard link");
+                } else {
+                    std::os::unix::fs::symlink(&canary, &path).expect("symlink");
+                }
+                view.journal_tail(
+                    &journal_request(project_id, anchor.recording_id, &[4]),
+                    2,
+                    &mut checkpoint,
+                )
+                .expect_err("checkpoint links fail closed");
+                assert_eq!(
+                    std::fs::read(canary).expect("target unchanged"),
+                    b"private-checkpoint-canary"
+                );
+                if pending {
+                    assert_eq!(
+                        view.journal_summary(anchor.recording_id, 1)
+                            .expect("previous boundary survives failed publication"),
+                        Some((2, 3, 2))
+                    );
+                } else {
+                    view.journal_summary(anchor.recording_id, 1)
+                        .expect_err("checkpoint read rejects link");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_rejects_new_ordinals_beyond_the_read_scan_ceiling() {
+        let fixture = on_disk_store("segment-admission");
+        let project_id = ProjectId::new();
+        insert_project(&fixture.store, project_id);
+        let anchor = request(project_id, RecordingId::new(), RuntimeSessionId::new(), opened_at());
+        let view = fixture.store.recording_store(&fixture.root).expect("view");
+        view.begin_recording(&anchor).expect("anchor");
+        let ordinal = xtrace_application::recording::MAX_RECORDING_SEGMENTS;
+        assert_eq!(u64::from(ordinal), MAX_RECORDING_QUERY_SEGMENTS);
+        assert_eq!(
+            view.commit_segment(&segment_request(project_id, anchor.recording_id, ordinal, &[2]))
+                .expect_err("cannot publish an unreadable ordinal")
+                .kind(),
+            RecordingStoreErrorKind::Resource
+        );
+        assert_eq!(segment_count(&fixture.store), 0);
     }
 
     #[cfg(unix)]

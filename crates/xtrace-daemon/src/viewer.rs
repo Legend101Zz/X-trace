@@ -1488,6 +1488,7 @@ struct TransportRecording {
     first_sequence: Option<String>,
     last_sequence: Option<String>,
     incomplete_evidence: Vec<String>,
+    session_context: xtrace_application::recording_queries::SessionContext,
     event_cap: Option<u32>,
     outcome_kind: Option<String>,
 }
@@ -1511,6 +1512,7 @@ fn to_transport_list(page: RecordingListPage, request_id: CorrelationId) -> Tran
                 first_sequence: item.first_sequence,
                 last_sequence: item.last_sequence,
                 incomplete_evidence: item.incomplete_evidence,
+                session_context: item.session_context,
                 event_cap: item.event_cap,
                 outcome_kind: item.outcome_kind,
             })
@@ -1538,6 +1540,7 @@ struct TransportDetail {
     segment_count: String,
     events: Vec<TransportEvent>,
     incomplete_evidence: Vec<String>,
+    session_context: xtrace_application::recording_queries::SessionContext,
     unavailable: xtrace_application::UnavailableEvidence,
     outcome: Option<xtrace_application::PersistedOutcome>,
     capacity: Option<xtrace_application::RecordingCapacity>,
@@ -1564,6 +1567,7 @@ struct TransportEvent {
     kind: String,
     symbol: Option<String>,
     interaction: Option<xtrace_application::PersistedInteraction>,
+    exception: Option<xtrace_application::recording_queries::PersistedException>,
     source: Option<xtrace_application::PersistedSource>,
     source_binding: xtrace_domain::SourceBinding,
     field_truncations: Vec<TransportTruncation>,
@@ -1611,6 +1615,7 @@ fn to_transport_detail(detail: RecordingDetail, request_id: CorrelationId) -> Tr
                 kind: item.kind,
                 symbol: item.symbol,
                 interaction: item.interaction,
+                exception: item.exception,
                 source: item.source,
                 source_binding: item.source_binding,
                 depth: item.depth,
@@ -1631,6 +1636,7 @@ fn to_transport_detail(detail: RecordingDetail, request_id: CorrelationId) -> Tr
             })
             .collect(),
         incomplete_evidence: detail.incomplete_evidence,
+        session_context: detail.session_context,
         unavailable: detail.unavailable,
         outcome: detail.outcome,
         capacity: detail.capacity,
@@ -1813,7 +1819,12 @@ mod tests {
             _after: Option<RecordingId>,
             _limit: u32,
         ) -> Result<(Vec<RecordingMetadata>, bool), PortError> {
-            Ok((Vec::new(), false))
+            match self.observed_error {
+                Some(kind) => {
+                    Err(PortError::new(kind, "PRIVATE_DATABASE_CANARY", CorrelationId::new()))
+                }
+                None => Ok((Vec::new(), false)),
+            }
         }
 
         fn show_recording(
@@ -1821,7 +1832,7 @@ mod tests {
             _request: &ShowWindowRequest,
         ) -> Result<RecordingEventWindow, PortError> {
             Err(PortError::new(
-                PortErrorKind::NotFound,
+                self.observed_error.unwrap_or(PortErrorKind::NotFound),
                 "recording was not found",
                 CorrelationId::new(),
             ))
@@ -2255,6 +2266,7 @@ mod tests {
                 kind: "frame_enter".into(),
                 symbol: None,
                 interaction: None,
+                exception: None,
                 source: None,
                 source_binding: xtrace_domain::SourceBinding::Unspecified,
                 field_truncations: Vec::new(),
@@ -2266,6 +2278,10 @@ mod tests {
                 gap: None,
             }],
             incomplete_evidence: Vec::new(),
+            session_context: xtrace_application::recording_queries::SessionContext {
+                runtime_session_id: RuntimeSessionId::new(),
+                rejected_requests: None,
+            },
             unavailable: xtrace_application::UnavailableEvidence::default(),
             outcome: None,
             capacity: None,
@@ -2290,6 +2306,12 @@ mod tests {
         actual.sort();
         documented.sort();
         assert_eq!(actual, documented, "RecordingDetail DTO drifted from openapi");
+        let mut actual_session: Vec<String> =
+            json["sessionContext"].as_object().expect("session context").keys().cloned().collect();
+        let mut documented_session = section("SessionContext");
+        actual_session.sort();
+        documented_session.sort();
+        assert_eq!(actual_session, documented_session, "SessionContext DTO drifted from openapi");
         let mut actual_event: Vec<String> =
             json["events"][0].as_object().expect("event object").keys().cloned().collect();
         let mut documented_event = section("Event");
@@ -2515,6 +2537,312 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stored_line_cursors_reach_http_in_execution_order_across_pages_and_segments() {
+        use xtrace_protocol::generated::agent::{RecordingEvent, RecordingEventKind, SourceRange};
+        use xtrace_protocol::xtf::XtfEventEnvelope;
+        use xtrace_store::SegmentCommitRequest;
+
+        let scratch = std::path::PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
+            .expect("admitted private test scratch");
+        let root = tempfile::Builder::new()
+            .prefix("viewer-lines-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir_in(scratch)
+            .expect("temporary project root");
+        let database = root.path().join("metadata.sqlite3");
+        let store = SqliteStore::open(&database, OpenOptions::default()).expect("open store");
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .expect("secure database");
+        let timestamp = WallTime::from_parts(2026, 10, 3, 1, 2, 3, 0).expect("fixture time");
+        let project = Project {
+            id: ProjectId::new(),
+            canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/fixture/repo"),
+            display_name: "fixture".to_owned(),
+            created_at: timestamp,
+            last_opened_at: timestamp,
+            config_schema_version: 1,
+            effective_config_hash: String::new(),
+            active_capture_policy_id: None,
+            active_redaction_policy_id: None,
+        };
+        store.project_repository().insert_project(&project).expect("insert project");
+        let recording_id = RecordingId::new();
+        SqliteRecordingPersistence::new(store.clone(), root.path())
+            .begin_recording(&BeginRecording {
+                project_id: project.id(),
+                recording_id,
+                runtime_session_id: RuntimeSessionId::new(),
+                opened_at: timestamp,
+                endpoint_observation: EndpointObservationInput::default(),
+                limitations: Vec::new(),
+            })
+            .expect("begin recording");
+        let source_bytes = "// source\n".repeat(20);
+        std::fs::create_dir(root.path().join("src")).expect("source directory");
+        std::fs::write(root.path().join("src/BranchLoop.java"), &source_bytes)
+            .expect("source file");
+        let source_hash = blake3::hash(source_bytes.as_bytes()).as_bytes().to_vec();
+        // A repeated loop header and a backwards line jump must survive both page and segment
+        // boundaries. Frame extents use the same start line but are never active-line evidence.
+        let kinds_and_lines = [
+            (RecordingEventKind::FrameEnter, 5, 15),
+            (RecordingEventKind::LineCursor, 5, 5),
+            (RecordingEventKind::LineCursor, 7, 7),
+            (RecordingEventKind::LineCursor, 8, 8),
+            (RecordingEventKind::LineCursor, 11, 11),
+            (RecordingEventKind::LineCursor, 7, 7),
+            (RecordingEventKind::LineCursor, 15, 15),
+            (RecordingEventKind::FrameExit, 5, 15),
+        ];
+        let events: Vec<_> = kinds_and_lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, (kind, start_line, end_line))| {
+                let sequence = u64::try_from(index).expect("small index") + 2;
+                XtfEventEnvelope {
+                    recording_seq: sequence,
+                    event: Some(RecordingEvent {
+                        event_id: format!("event-{sequence}"),
+                        parent_event_id: if index == 0 { String::new() } else { "event-2".into() },
+                        recording_seq: sequence,
+                        monotonic_ns: sequence,
+                        kind: kind as i32,
+                        symbol: "BranchLoop.sum".into(),
+                        source_binding:
+                            xtrace_protocol::generated::agent::SourceBinding::ObservedUnattested
+                                as i32,
+                        source: Some(SourceRange {
+                            path: "src/BranchLoop.java".into(),
+                            start_line,
+                            end_line,
+                            content_hash: source_hash.clone().into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }
+            })
+            .collect();
+        let writer = store.recording_store(root.path()).expect("recording store");
+        for (ordinal, chunk) in events.chunks(4).enumerate() {
+            writer
+                .commit_segment(&SegmentCommitRequest {
+                    project_id: project.id(),
+                    recording_id,
+                    segment_ordinal: u32::try_from(ordinal).expect("small ordinal"),
+                    events: chunk.to_vec(),
+                })
+                .expect("persist real XTF segment");
+        }
+        let reader = SqliteRecordingReader::new(store, root.path()).with_source_root(root.path());
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(reader.clone()),
+            ObservedEndpointQueryService::new(reader),
+            project.id(),
+        )
+        .await
+        .expect("bind viewer");
+        let ready = bound.readiness();
+        let host = ready.origin.strip_prefix("http://").expect("loopback origin").to_owned();
+        let token = ready.url.rsplit_once("token=").expect("bootstrap token").1.to_owned();
+        let query_lane = bound.state.query_lane.clone();
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(bound.serve(async move {
+            let _ = receiver.await;
+        }));
+        let viewer = RunningViewer {
+            host,
+            origin: ready.origin,
+            token,
+            observed_calls: Arc::new(AtomicUsize::new(0)),
+            query_lane,
+            shutdown,
+            task,
+        };
+        let cookie = authenticate(&viewer).await;
+        let mut cursor = None;
+        let mut returned = Vec::new();
+        // Eight stored events at limit three require exactly three pages; a broken cursor must
+        // fail the assertion rather than turning this regression into an unbounded loop.
+        for page in 0..3 {
+            let suffix = cursor.as_ref().map_or(String::new(), |c| format!("&cursor={c}"));
+            let raw = format!(
+                "GET /api/v1/recordings/{recording_id}?limit=3{suffix} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            );
+            let response = request(&viewer.host, &raw).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            let body: serde_json::Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").expect("HTTP body").1)
+                    .expect("recording JSON");
+            assert_eq!(body["status"], "recording");
+            assert_eq!(body["completion"], "unavailable");
+            returned.extend(body["events"].as_array().expect("events").iter().cloned());
+            cursor = body["nextCursor"].as_str().map(str::to_owned);
+            assert_eq!(cursor.is_some(), page < 2);
+        }
+        assert_eq!(returned.len(), 8);
+        for (event, sequence) in returned.iter().zip(2..=9) {
+            assert_eq!(event["sequence"], sequence.to_string());
+        }
+        let lines: Vec<_> = returned
+            .iter()
+            .filter(|event| event["kind"] == "recording_event_kind:line_cursor")
+            .map(|event| event["line"].as_u64().expect("observed line"))
+            .collect();
+        assert_eq!(lines, [5, 7, 8, 11, 7, 15]);
+        for event in [&returned[0], &returned[7]] {
+            assert!(event["line"].is_null(), "a method extent is never an executed line");
+            assert_eq!(event["source"]["startLine"], 5);
+            assert_eq!(event["source"]["endLine"], 15);
+        }
+        let _ = viewer.shutdown.send(());
+        viewer.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stored_throw_type_reaches_http_without_message_or_stack_text() {
+        use xtrace_protocol::generated::agent::{
+            ExceptionPayload, RecordingEvent, RecordingEventKind,
+        };
+        use xtrace_protocol::xtf::XtfEventEnvelope;
+        use xtrace_store::SegmentCommitRequest;
+
+        let scratch = std::path::PathBuf::from(
+            std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
+                .expect("owner-enforced XTRACE_TEST_PRIVATE_SCRATCH is required"),
+        );
+        xtrace_private_storage::AdmittedPrivateRoot::open(&scratch)
+            .expect("admitted private test scratch");
+        let root = tempfile::Builder::new()
+            .prefix("viewer-throw-")
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir_in(scratch)
+            .expect("temporary project root");
+        let database = root.path().join("metadata.sqlite3");
+        let store = SqliteStore::open(&database, OpenOptions::default()).expect("open store");
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .expect("secure database");
+        let timestamp = WallTime::from_parts(2026, 10, 3, 1, 2, 3, 0).expect("fixture time");
+        let project = Project {
+            id: ProjectId::new(),
+            canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/fixture/repo"),
+            display_name: "fixture".into(),
+            created_at: timestamp,
+            last_opened_at: timestamp,
+            config_schema_version: 1,
+            effective_config_hash: String::new(),
+            active_capture_policy_id: None,
+            active_redaction_policy_id: None,
+        };
+        store.project_repository().insert_project(&project).expect("insert project");
+        let recording_id = RecordingId::new();
+        SqliteRecordingPersistence::new(store.clone(), root.path())
+            .begin_recording(&BeginRecording {
+                project_id: project.id(),
+                recording_id,
+                runtime_session_id: RuntimeSessionId::new(),
+                opened_at: timestamp,
+                endpoint_observation: EndpointObservationInput::default(),
+                limitations: Vec::new(),
+            })
+            .expect("begin recording");
+        store
+            .recording_store(root.path())
+            .expect("recording store")
+            .commit_segment(&SegmentCommitRequest {
+                project_id: project.id(),
+                recording_id,
+                segment_ordinal: 0,
+                events: [
+                    (2, Some("org.example.ApplicationException")),
+                    (3, Some("jakarta.servlet.ServletException")),
+                    (4, None),
+                ]
+                .into_iter()
+                .map(|(sequence, exception_type)| XtfEventEnvelope {
+                    recording_seq: sequence,
+                    event: Some(RecordingEvent {
+                        event_id: format!("event-{sequence}"),
+                        recording_seq: sequence,
+                        kind: RecordingEventKind::FrameThrow as i32,
+                        exception: exception_type.map(|exception_type| ExceptionPayload {
+                            exception_type: exception_type.into(),
+                            // Bypass ingest deliberately: legacy persisted text must never
+                            // become public merely because its field is called sanitized.
+                            sanitized_message: "private-message-canary password=do-not-display"
+                                .into(),
+                            stack_frames: vec!["Caused by: private-stack-canary".into()],
+                        }),
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+            })
+            .expect("persist real XTF segment");
+        let reader = SqliteRecordingReader::new(store, root.path());
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(reader.clone()),
+            ObservedEndpointQueryService::new(reader),
+            project.id(),
+        )
+        .await
+        .expect("bind viewer");
+        let ready = bound.readiness();
+        let host = ready.origin.strip_prefix("http://").expect("loopback origin").to_owned();
+        let token = ready.url.rsplit_once("token=").expect("bootstrap token").1.to_owned();
+        let query_lane = bound.state.query_lane.clone();
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(bound.serve(async move {
+            let _ = receiver.await;
+        }));
+        let viewer = RunningViewer {
+            host,
+            origin: ready.origin,
+            token,
+            observed_calls: Arc::new(AtomicUsize::new(0)),
+            query_lane,
+            shutdown,
+            task,
+        };
+        let cookie = authenticate(&viewer).await;
+        let raw = format!(
+            "GET /api/v1/recordings/{recording_id} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            request_headers(&viewer.host, &viewer.origin)
+        );
+        let response = request(&viewer.host, &raw).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!response.contains("private-message-canary"));
+        assert!(!response.contains("do-not-display"));
+        assert!(!response.contains("private-stack-canary"));
+        let body: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").expect("HTTP body").1)
+                .expect("recording JSON");
+        let events = body["events"].as_array().expect("events");
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0]["exception"],
+            serde_json::json!({
+                "exceptionType": "org.example.ApplicationException",
+            })
+        );
+        assert_eq!(
+            events[1]["exception"],
+            serde_json::json!({
+                "exceptionType": "jakarta.servlet.ServletException",
+            })
+        );
+        assert!(events[2]["exception"].is_null(), "never infer a missing payload");
+        assert!(body["outcome"].is_null(), "never infer a recording outcome from a throw");
+        let _ = viewer.shutdown.send(());
+        viewer.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn sqlite_identity_corruption_is_reported_by_the_authenticated_http_handler() {
         let scratch = std::path::PathBuf::from(
             std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
@@ -2610,6 +2938,320 @@ mod tests {
         assert!(!response.contains("/fixture/repo"));
         let _ = viewer.shutdown.send(());
         viewer.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recording_failures_have_stable_codes_and_request_ids_in_problem_json() {
+        for (kind, status, code) in [
+            (PortErrorKind::Transport, "500", "XTR-PORT-TRANSPORT"),
+            (PortErrorKind::Internal, "500", "XTR-PORT-INTERNAL"),
+            (PortErrorKind::Compatibility, "500", "XTR-PORT-COMPATIBILITY"),
+            (PortErrorKind::Conflict, "500", "XTR-PORT-CONFLICT"),
+            (PortErrorKind::Corruption, "422", "XTR-PORT-CORRUPTION"),
+        ] {
+            let viewer = start_with(ReadFixture::failing(kind)).await;
+            let cookie = authenticate(&viewer).await;
+            for path in [
+                "/api/v1/recordings".to_owned(),
+                format!("/api/v1/recordings/{}", RecordingId::new()),
+            ] {
+                let raw = format!(
+                    "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                    request_headers(&viewer.host, &viewer.origin)
+                );
+                let response = request(&viewer.host, &raw).await;
+                assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{response}");
+                let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+                let body: serde_json::Value = serde_json::from_str(body).expect("problem JSON");
+                assert_eq!(body["code"], code);
+                assert_eq!(body["status"].as_u64(), status.parse::<u64>().ok());
+                let request_id = body["requestId"].as_str().expect("request id");
+                assert!(request_id.parse::<CorrelationId>().is_ok());
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains(&format!("x-xtrace-request-id: {request_id}"))
+                );
+                assert!(headers.contains("application/problem+json"));
+                assert!(!response.contains("PRIVATE_DATABASE_CANARY"));
+            }
+            let _ = viewer.shutdown.send(());
+            viewer.task.await.expect("viewer task").expect("serve");
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_query_worker_failure_has_a_stable_problem_code() {
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(ReadFixture::default()),
+            ObservedEndpointQueryService::new(ReadFixture::default()),
+            ProjectId::new(),
+        )
+        .await
+        .expect("viewer state");
+        let request_id = CorrelationId::new();
+        let response = run_recording_query::<(), _, _>(&bound.state, request_id, || {
+            std::panic::resume_unwind(Box::new("PRIVATE_QUERY_PANIC_CANARY"))
+        })
+        .await
+        .expect_err("worker panic is contained");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()["x-xtrace-request-id"], request_id.to_string());
+        let body = axum::body::to_bytes(response.into_body(), 2048).await.expect("problem body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+        assert_eq!(body["code"], "XTR-VIEWER-QUERY-FAILED");
+        assert_eq!(body["requestId"], request_id.to_string());
+        assert!(!body.to_string().contains("PRIVATE_QUERY_PANIC_CANARY"));
+    }
+
+    #[tokio::test]
+    async fn recording_http_reads_follow_published_tails_and_seals_and_report_real_corruption() {
+        use prost::Message as _;
+        use xtrace_application::recording::{AcceptedRecordingEvent, PersistRecordingSegment};
+        use xtrace_protocol::generated::agent::{RecordingEvent, RecordingEventKind};
+        use xtrace_protocol::xtf::XtfEventEnvelope;
+
+        let fixture = crate::session_health_tests::HealthFixture::new();
+        fixture.begin();
+        let persistence = fixture.persistence();
+        let reader = SqliteRecordingReader::new(fixture.store.clone(), fixture.root.path());
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(reader.clone()),
+            ObservedEndpointQueryService::new(reader),
+            fixture.project_id,
+        )
+        .await
+        .expect("viewer");
+        let ready = bound.readiness();
+        let query_lane = bound.state.query_lane.clone();
+        let token = ready.url.rsplit_once("token=").expect("token").1.to_owned();
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(bound.serve(async move {
+            let _ = receiver.await;
+        }));
+        let viewer = RunningViewer {
+            host: ready.origin.strip_prefix("http://").expect("origin").to_owned(),
+            origin: ready.origin,
+            token,
+            observed_calls: Arc::default(),
+            query_lane,
+            shutdown,
+            task,
+        };
+        let cookie = authenticate(&viewer).await;
+        let event = |sequence, kind| {
+            let payload = XtfEventEnvelope {
+                recording_seq: sequence,
+                event: Some(RecordingEvent {
+                    event_id: format!("event-{sequence}"),
+                    recording_seq: sequence,
+                    monotonic_ns: sequence,
+                    kind: kind as i32,
+                    parent_event_id: if sequence == 3 { "event-2".into() } else { String::new() },
+                    ..Default::default()
+                }),
+            };
+            AcceptedRecordingEvent {
+                recording_seq: sequence,
+                monotonic_ns: sequence,
+                priority: 0,
+                canonical_bytes: payload.encode_to_vec(),
+                payload,
+            }
+        };
+        let mut segment = PersistRecordingSegment {
+            project_id: fixture.project_id,
+            recording_id: fixture.recording_id,
+            segment_ordinal: 0,
+            events: Vec::new(),
+        };
+        for phase in 0..5 {
+            let (count, sealed, pending) = match phase {
+                0 => (0, 0, None),
+                1 => {
+                    segment.events.push(event(2, RecordingEventKind::FrameEnter));
+                    persistence.persist_tail(&segment, 0).expect("first checkpoint");
+                    (1, 0, Some("durable_tail_pending:2..2"))
+                }
+                2 => {
+                    segment.events = vec![event(3, RecordingEventKind::FrameExit)];
+                    persistence.persist_tail(&segment, 1).expect("checkpoint replacement");
+                    (2, 0, Some("durable_tail_pending:2..3"))
+                }
+                3 => {
+                    segment.events.insert(0, event(2, RecordingEventKind::FrameEnter));
+                    persistence.persist_segment(&segment).expect("seal and cleanup");
+                    (2, 1, None)
+                }
+                _ => {
+                    segment.segment_ordinal = 1;
+                    segment.events = vec![event(4, RecordingEventKind::FrameEnter)];
+                    persistence.persist_tail(&segment, 0).expect("next tail");
+                    (3, 1, Some("durable_tail_pending:4..4"))
+                }
+            };
+            for (path, detail) in [
+                ("/api/v1/recordings".to_owned(), false),
+                (format!("/api/v1/recordings/{}", fixture.recording_id), true),
+            ] {
+                let raw = format!(
+                    "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                    request_headers(&viewer.host, &viewer.origin)
+                );
+                let response = request(&viewer.host, &raw).await;
+                assert!(response.starts_with("HTTP/1.1 200"), "phase {phase}: {response}");
+                let body: serde_json::Value =
+                    serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1)
+                        .expect("JSON");
+                let row = if detail { &body } else { &body["recordings"][0] };
+                assert_eq!(row["status"], "recording");
+                assert_eq!(row["completion"], "unavailable");
+                assert_eq!(row["segmentCount"], sealed.to_string());
+                assert_eq!(
+                    row["incompleteEvidence"],
+                    serde_json::json!(pending.into_iter().collect::<Vec<_>>())
+                );
+                if detail {
+                    assert_eq!(row["events"].as_array().expect("events").len(), count);
+                    assert_eq!(
+                        row["events"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|event| event["sequence"].as_str().unwrap())
+                            .collect::<Vec<_>>(),
+                        (2..count + 2).map(|sequence| sequence.to_string()).collect::<Vec<_>>()
+                    );
+                } else {
+                    assert_eq!(row["eventCount"], count.to_string());
+                }
+            }
+        }
+        let tail =
+            fixture.root.path().join("journals").join(format!("{}.tail", fixture.recording_id));
+        let mut bytes = std::fs::read(&tail).expect("acknowledged journal");
+        *bytes.last_mut().expect("digest byte") ^= 1;
+        std::fs::write(tail, bytes).expect("corrupt acknowledged digest");
+        for path in [
+            "/api/v1/recordings".to_owned(),
+            format!("/api/v1/recordings/{}", fixture.recording_id),
+        ] {
+            let raw = format!(
+                "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin)
+            );
+            let response = request(&viewer.host, &raw).await;
+            assert!(response.starts_with("HTTP/1.1 422"), "{response}");
+            let body: serde_json::Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1)
+                    .expect("problem JSON");
+            assert_eq!(body["code"], "XTR-PORT-CORRUPTION");
+        }
+        let _ = viewer.shutdown.send(());
+        viewer.task.await.expect("viewer task").expect("serve");
+    }
+
+    async fn health_api_evidence(count: Option<u64>, partial: bool) {
+        let fixture = crate::session_health_tests::HealthFixture::new();
+        fixture.begin();
+        fixture.finish(partial);
+        if let Some(count) = count {
+            fixture
+                .persistence()
+                .record_session_rejections(fixture.project_id, fixture.session_id, count)
+                .expect("session Health report");
+        }
+        // Another session must never supply the selected recording's missing report.
+        fixture
+            .persistence()
+            .record_session_rejections(fixture.project_id, RuntimeSessionId::new(), 99)
+            .expect("unrelated session");
+        let reader = SqliteRecordingReader::new(fixture.store.clone(), fixture.root.path());
+        let bound = BoundViewer::bind(
+            RecordingQueryService::new(reader.clone()),
+            ObservedEndpointQueryService::new(reader),
+            fixture.project_id,
+        )
+        .await
+        .expect("viewer");
+        let ready = bound.readiness();
+        let query_lane = bound.state.query_lane.clone();
+        let token = ready.url.rsplit_once("token=").expect("token").1.to_owned();
+        let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(bound.serve(async move {
+            let _ = receiver.await;
+        }));
+        let viewer = RunningViewer {
+            host: ready.origin.strip_prefix("http://").expect("origin").to_owned(),
+            origin: ready.origin,
+            token,
+            observed_calls: Arc::new(AtomicUsize::new(0)),
+            query_lane,
+            shutdown,
+            task,
+        };
+        let cookie = authenticate(&viewer).await;
+        let expected_context = serde_json::json!({
+            "runtimeSessionId": fixture.session_id,
+            "rejectedRequests": count.map(|count| count.to_string()),
+        });
+        let expected_incomplete = if partial {
+            serde_json::json!(["persisted_status:partial"])
+        } else {
+            serde_json::json!([])
+        };
+        for (path, detail) in [
+            (format!("/api/v1/recordings/{}?limit=10", fixture.recording_id), true),
+            ("/api/v1/recordings?limit=10".to_owned(), false),
+        ] {
+            let raw = format!(
+                "GET {path} HTTP/1.1\r\n{}Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+                request_headers(&viewer.host, &viewer.origin),
+            );
+            let response = request(&viewer.host, &raw).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            let body: serde_json::Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").expect("HTTP body").1)
+                    .expect("JSON");
+            let recording = if detail { &body } else { &body["recordings"][0] };
+            assert_eq!(recording["sessionContext"], expected_context);
+            assert_eq!(recording["incompleteEvidence"], expected_incomplete);
+            assert_eq!(recording["completion"], if partial { "partial" } else { "complete" });
+            assert_eq!(recording["status"], if partial { "partial" } else { "complete" });
+            if detail {
+                assert_eq!(body["honesty"]["recording"]["incomplete"], expected_incomplete);
+                assert_eq!(body["events"], serde_json::json!([]), "no synthetic request or event");
+            }
+        }
+        let _ = viewer.shutdown.send(());
+        viewer.task.await.expect("viewer task").expect("serve");
+    }
+
+    #[tokio::test]
+    async fn health_rejections_are_session_context_without_changing_recording_completion() {
+        health_api_evidence(Some(7), false).await;
+    }
+
+    #[tokio::test]
+    async fn no_health_report_reads_as_not_observed() {
+        health_api_evidence(None, false).await;
+    }
+
+    #[tokio::test]
+    async fn explicitly_observed_zero_is_distinct_from_no_health_report() {
+        health_api_evidence(Some(0), false).await;
+    }
+
+    #[tokio::test]
+    async fn session_context_preserves_real_recording_incompleteness() {
+        health_api_evidence(Some(7), true).await;
+        health_api_evidence(Some(0), true).await;
+        health_api_evidence(None, true).await;
+    }
+
+    #[tokio::test]
+    async fn session_context_preserves_counts_above_javascript_integer_precision() {
+        health_api_evidence(Some(i64::MAX as u64), false).await;
     }
 
     #[tokio::test]

@@ -84,7 +84,18 @@ impl RecordingPipeline {
         limitations: Vec<String>,
     ) -> Result<(), RecordingPipelineError> {
         match incoming {
-            IncomingEnvelope::CapabilitySet(_) | IncomingEnvelope::Health(_) => Ok(()),
+            IncomingEnvelope::CapabilitySet(_) => Ok(()),
+            IncomingEnvelope::Health(health) => {
+                let Some(count) = rejected_starts(&health.status) else {
+                    return Ok(());
+                };
+                let capture = Arc::clone(&self.capture);
+                self.lane
+                    .run(shutdown, move || {
+                        capture.record_session_rejections(project_id, runtime_session_id, count)
+                    })
+                    .await
+            }
             IncomingEnvelope::RecordingStarted(started) => {
                 let request = translate_started(
                     &started,
@@ -113,6 +124,14 @@ impl RecordingPipeline {
             }
         }
     }
+}
+
+/// RecordingWriter reports the Java sink's saturating, cumulative signed-long counter.
+/// Do not retain arbitrary Health status text or interpret generic health as a zero count.
+pub(crate) fn rejected_starts(status: &str) -> Option<u64> {
+    let decimal = status.strip_prefix("recording-starts-rejected=")?;
+    let count = decimal.parse::<u64>().ok()?;
+    (count <= i64::MAX as u64 && count.to_string() == decimal).then_some(count)
 }
 
 struct BlockingLane {
@@ -242,10 +261,17 @@ fn translate_batch(
 fn translate_finished(
     finished: &RecordingFinished,
 ) -> Result<FinishRecording, RecordingPipelineError> {
+    // An absent digest is incomplete proof even with no measured event drops.
+    // Proto3 decodes its omitted duration as zero; that is not an observed duration.
+    let minimal_incomplete = finished.duration_ns == 0
+        && finished.event_digest.is_empty()
+        && finished.response_summary.is_none()
+        && finished.outcome.is_none()
+        && finished.unsupported_capability_codes.is_empty();
     Ok(FinishRecording {
         recording_id: recording_id(&finished.recording_id)?,
         final_recording_seq: finished.final_recording_seq,
-        duration_ns: Some(finished.duration_ns),
+        duration_ns: (!minimal_incomplete).then_some(finished.duration_ns),
         event_digest: finished.event_digest.to_vec(),
         drop_counts_by_priority: finished
             .drop_counts_by_priority

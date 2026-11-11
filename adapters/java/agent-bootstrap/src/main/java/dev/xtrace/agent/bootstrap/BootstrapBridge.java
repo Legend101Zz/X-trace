@@ -61,16 +61,28 @@ public final class BootstrapBridge {
         sink.lineIgnored();
         return;
       }
+      Frame current = context.frames.peek();
+      if (current == null || current.eventId.isEmpty()) {
+        // Queue capacity can recover before a pending cursor is flushed. Its missing entry must
+        // never be replaced with an ancestor's id, even when both methods have the same name.
+        context.dropped++;
+        sink.lineIgnored();
+        return;
+      }
       if (context.lineEvents >= MAX_LINE_EVENTS_PER_REQUEST) {
         context.lineDropped++;
         sink.lineIgnored();
         return;
       }
-      context.lineEvents++;
-      context.linePending = true;
-      sink.line(
-          context.recordingId, context.nextEventId(), context.currentParent(), siteId,
-          System.nanoTime());
+      if (sink.line(
+          context.recordingId, context.nextEventId(), current.eventId, siteId,
+          System.nanoTime(), current.symbol)) {
+        context.lineEvents++;
+        context.linePending = true;
+      } else {
+        context.dropped++;
+        sink.lineIgnored();
+      }
     } catch (Throwable ignored) {
       // fail open: a probe can never break application code
     }
@@ -156,8 +168,9 @@ public final class BootstrapBridge {
   public static boolean requestStart(String method, String route) {
     RequestContext stale = CONTEXT.get();
     // A request whose end was deferred for exception resolution but never resolved on this
-    // thread is closed as unobserved so it cannot block or leak into the next request.
-    if (stale != null && stale.deferred) requestEnd(0, stale.lastThrown);
+    // thread is closed without a status so it cannot leak into the next request. Only the
+    // exception that caused deferral can propagate, never a handled frame throw.
+    if (stale != null && stale.deferred) requestEnd(0, stale.deferredThrown);
     if (CONTEXT.get() != null || !validMethod(method) || !validRoute(route)) return false;
     BridgeSink sink = SINK.get();
     if (sink == null) return false;
@@ -194,7 +207,7 @@ public final class BootstrapBridge {
   public static void frameEnter(String symbol, java.lang.reflect.Method method) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || !validSymbol(symbol)) return;
+    if (!captureActive(context) || sink == null || !validSymbol(symbol)) return;
     flushLine(context);
     String eventId = context.nextEventId();
     String parent = context.currentParent();
@@ -207,15 +220,16 @@ public final class BootstrapBridge {
   }
 
   /**
-   * Emits a method boundary for an in-scope application class. The symbol is the simple class
-   * name plus the method name; source facts are resolved by the runtime from the declaring class,
-   * method name and descriptor, never from reflection on application objects.
+   * Emits a method boundary for an in-scope application class. Focused symbols include a hashed
+   * declaring-class/method/descriptor identity; source facts are resolved by the runtime,
+   * never from reflection on application objects. Standard capture keeps its readable symbols.
    */
   public static String frameEnter(Class<?> type, String method, String descriptor) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || type == null || method == null) return null;
-    String symbol = simpleName(type.getName()) + "." + method;
+    if (!captureActive(context) || sink == null || type == null || method == null) return null;
+    String symbol = LINE_SINK.get() == null ? simpleName(type.getName()) + "." + method
+        : MethodIdentity.symbol(type.getName(), method, descriptor);
     if (!validSymbol(symbol)) return null;
     flushLine(context);
     String eventId = context.nextEventId();
@@ -232,6 +246,64 @@ public final class BootstrapBridge {
     if (!accepted) context.dropped++;
     context.frames.push(new Frame(symbol, accepted ? eventId : ""));
     return symbol;
+  }
+
+  /** Constructor body entry; no receiver is passed, and probe failures never escape. */
+  public static String constructorEnter(Class<?> type, String descriptor) {
+    try {
+      return frameEnter(type, "<init>", descriptor);
+    } catch (Throwable ignored) {
+      return null;
+    }
+  }
+
+  /** Closes only a constructor body whose entry ran while capture was active. */
+  public static void constructorExit(String symbol, Throwable thrown) {
+    try {
+      if (symbol != null) frameExit(symbol, thrown);
+    } catch (Throwable ignored) {
+      // Constructor instrumentation must preserve both normal returns and the original throwable.
+    }
+  }
+
+  /** Emits proxy boundaries on the same parent stack and loss counters as concrete methods. */
+  static boolean proxyFrame(
+      ProxyBridge.Call call, Object[] arguments, Object result, Throwable thrown, boolean entering) {
+    RequestContext context = CONTEXT.get();
+    if (!captureActive(context) || SINK.get() == null) return false;
+    if (!validSymbol(call.symbol())) {
+      context.dropped++;
+      return false;
+    }
+    flushLine(context);
+    String parent = context.currentParent();
+    if (!entering) {
+      if (context.frames.isEmpty()) return false;
+      Frame frame = context.frames.pop();
+      if (!frame.symbol.equals(call.symbol())) {
+        context.dropped++;
+        context.frames.clear();
+        return false;
+      }
+      if (!frame.eventId.isEmpty()) parent = frame.eventId;
+    }
+    String eventId = context.nextEventId();
+    int kind = entering ? BridgeEventKind.FRAME_ENTER
+        : thrown == null ? BridgeEventKind.FRAME_EXIT : BridgeEventKind.FRAME_THROW;
+    boolean accepted = false;
+    try {
+      accepted = call.sink().offer(context.recordingId, eventId, parent, kind, call.symbol(),
+          System.nanoTime(), call.method(), arguments, result, thrown);
+    } catch (Throwable ignored) {
+      // Count loss and retain the balanced stack even when a sink fails.
+    }
+    if (!accepted) context.dropped++;
+    if (entering) context.frames.push(new Frame(call.symbol(), accepted ? eventId : ""));
+    else if (thrown != null) {
+      context.lastThrown = thrown;
+      if (accepted) context.lastThrowEventId = eventId;
+    }
+    return true;
   }
 
   /** Marks the active request as having no resolvable application handler (scope unknown). */
@@ -270,12 +342,16 @@ public final class BootstrapBridge {
 
   /**
    * Keeps the request open after the handler threw, so the container's exception resolution can
-   * report the response it chose. Returns false when there is no open request.
+   * report the response it chose, or (null {@code thrown}) until the dispatch completes and the
+   * status at the outer servlet boundary is observed. Returns false when there is no open request.
    */
   public static boolean deferRequestEnd(Throwable thrown) {
     RequestContext context = CONTEXT.get();
     if (context == null) return false;
+    if (!context.deferred) context.deferredBoundary = SpringMvcBridge.captureBoundary();
     context.deferred = true;
+    context.deferredThrown = thrown;
+    if (thrown == null || thrown != context.lastThrown) context.lastThrowEventId = "";
     context.lastThrown = thrown;
     return true;
   }
@@ -284,6 +360,23 @@ public final class BootstrapBridge {
   public static boolean awaitingResolution() {
     RequestContext context = CONTEXT.get();
     return context != null && context.deferred;
+  }
+
+  static Object exceptionResolutionEnter() {
+    RequestContext context = CONTEXT.get();
+    if (context == null || !context.deferred) return null;
+    if (context.deferredBoundary == null ? SpringMvcBridge.captureBoundary() != null
+        : !SpringMvcBridge.boundaryActive(context.deferredBoundary)) return null;
+    context.resolutionDepth++;
+    return context;
+  }
+
+  static boolean resolving(Object boundary) {
+    return boundary != null && boundary == CONTEXT.get();
+  }
+
+  static void exceptionResolutionEnd(Object boundary) {
+    if (boundary instanceof RequestContext context && context.resolutionDepth > 0) context.resolutionDepth--;
   }
 
   static String simpleName(String binaryName) {
@@ -360,7 +453,7 @@ public final class BootstrapBridge {
   public static void frameExit(String symbol, Throwable thrown) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || context.frames.isEmpty()) return;
+    if (!captureActive(context) || sink == null || context.frames.isEmpty()) return;
     flushLine(context);
     Frame frame = context.frames.pop();
     if (!frame.symbol.equals(symbol)) {
@@ -375,7 +468,7 @@ public final class BootstrapBridge {
       accepted = safeEvent(sink, context, eventId, parent, BridgeEventKind.FRAME_EXIT, symbol, 0);
     } else {
       accepted = safeThrow(sink, context, eventId, parent, symbol, thrown);
-      if (accepted) context.lastThrowEventId = eventId;
+      context.lastThrowEventId = accepted ? eventId : "";
       context.lastThrown = thrown;
     }
     if (!accepted) context.dropped++;
@@ -417,7 +510,7 @@ public final class BootstrapBridge {
   public static void databaseStart() {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || context.databaseActive) return;
+    if (!captureActive(context) || sink == null || context.databaseActive) return;
     flushLine(context);
     context.databaseActive = true;
     context.databaseEventId = "";
@@ -440,7 +533,7 @@ public final class BootstrapBridge {
   public static void databaseEnd(boolean threw) {
     RequestContext context = CONTEXT.get();
     BridgeSink sink = SINK.get();
-    if (context == null || sink == null || !context.databaseActive) return;
+    if (!captureActive(context) || sink == null || !context.databaseActive) return;
     flushLine(context);
     String start = context.databaseEventId;
     context.databaseActive = false;
@@ -464,11 +557,26 @@ public final class BootstrapBridge {
   }
 
   /**
-   * Ends the request. A non-null {@code thrown} means an exception left the handler; the observed
-   * outcome is then EXCEPTION_PROPAGATED unless a response status was observed, in which case the
-   * exception was mapped to that response (RESPONDED). No status and no exception is UNOBSERVED.
+   * Ends the request with an authoritative status supplied by the caller (0 if unobserved).
+   * Without a status, a non-null {@code thrown} means EXCEPTION_PROPAGATED; neither means
+   * UNOBSERVED. Intermediate statuses must use {@link #provisionalRequestEnd} instead.
    */
   public static void requestEnd(int responseStatus, Throwable thrown) {
+    requestEnd(responseStatus, thrown, null);
+  }
+
+  /**
+   * Records an intermediate servlet status as evidence, never as the authoritative outcome or
+   * numeric response interaction. Only a bounded status number enters the explanatory label.
+   */
+  public static void provisionalRequestEnd(int observedStatus, Throwable thrown) {
+    int status = observedStatus >= 100 && observedStatus <= 599 ? observedStatus : 0;
+    requestEnd(0, thrown, "http.response unavailable; final status not observed; "
+        + (status == 0 ? "provisional status unavailable"
+            : "observed status was " + status + " (provisional)"));
+  }
+
+  private static void requestEnd(int responseStatus, Throwable thrown, String responseLabel) {
     RequestContext context = CONTEXT.get();
     try {
       BridgeSink sink = SINK.get();
@@ -491,12 +599,13 @@ public final class BootstrapBridge {
           eventId,
           context.requestEventId,
           BridgeEventKind.RESPONSE,
-          sanitizedStatus == 0 ? "http.response unavailable" : "http.response " + sanitizedStatus,
+          responseLabel != null ? responseLabel
+              : sanitizedStatus == 0 ? "http.response unavailable" : "http.response " + sanitizedStatus,
           sanitizedStatus)) {
         context.dropped++;
       }
-      boolean threw = thrown != null;
-      if (threw && sanitizedStatus != 0 && sanitizedStatus < 500) context.dropped++;
+      // The caller decides whether a status is final. Pending container error handling or an
+      // escaping servlet exception supplies only provisional evidence, not a dropped event.
       safeFinish(sink, context, sanitizedStatus, outcome(context, sanitizedStatus, thrown));
     } finally {
       CONTEXT.remove();
@@ -505,9 +614,10 @@ public final class BootstrapBridge {
 
   private static BridgeSink.Outcome outcome(
       RequestContext context, int status, Throwable thrown) {
-    String thrownFrom = context.lastThrowEventId;
+    String thrownFrom = thrown == UNKNOWN_THROWABLE || thrown == context.lastThrown
+        ? context.lastThrowEventId : "";
     if (status != 0) {
-      // A status was observed. A mapped exception is a response, not a propagated failure.
+      // The caller supplied a final status, including buffered responses at normal servlet exit.
       return new BridgeSink.Outcome(BridgeSink.Outcome.RESPONDED, status, null, null, null);
     }
     if (thrown == null) {
@@ -531,6 +641,26 @@ public final class BootstrapBridge {
 
   public static boolean hasContext() {
     return CONTEXT.get() != null;
+  }
+
+  private static boolean captureActive(RequestContext context) {
+    return context != null && (!context.deferred || context.resolutionDepth > 0
+        || SpringMvcBridge.boundaryActive(context.deferredBoundary));
+  }
+
+  /** Called only by methods whose focused line probes were skipped at transformation time. */
+  public static void lineGap() {
+    try {
+      RequestContext context = CONTEXT.get();
+      BridgeSink sink = SINK.get();
+      // A retained thread-local alone is not evidence that later work belongs to this request.
+      if (!captureActive(context) || sink == null) return;
+      flushLine(context);
+      if (!safeEvent(sink, context, context.nextEventId(), context.currentParent(),
+          BridgeEventKind.GAP, "xtrace.capture.gap.not-transformed", 1)) context.dropped++;
+    } catch (Throwable ignored) {
+      // Limitation probes cannot affect application behavior.
+    }
   }
 
   static void resetForTest() {
@@ -606,6 +736,9 @@ public final class BootstrapBridge {
     private int nextEvent = 1;
     private String requestEventId = "";
     private boolean deferred;
+    private Object deferredBoundary;
+    private int resolutionDepth;
+    private Throwable deferredThrown;
     private boolean unresolvedReported;
     private String lastThrowEventId = "";
     private Throwable lastThrown;

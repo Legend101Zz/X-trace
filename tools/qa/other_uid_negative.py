@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Other-UID private-storage substitute used by the hosted macOS CI job (ADR 0006 section 2.3 and ADR 0012).
-`macos.yml` runs on `wave/**` and `ultra/rc-*` pushes and `workflow_dispatch`. Its `macos-ok` check gates wave
-merges and release candidates; the leased macOS floor is no longer a merge requirement.
+Owner decision 2026-11-11 (W2-R27a): `macos.yml` runs only via `workflow_dispatch`.
+Linux CI gates development; the owner checks macOS locally before release.
 
 This is the "private-storage substitute" for the other-UID broker negative: it runs only while the tree holds no
 broker code, and it does not replace the broker negative once broker code exists.

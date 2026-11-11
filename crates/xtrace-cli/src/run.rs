@@ -195,6 +195,9 @@ async fn run_unix(
         binding_key,
         ..xtrace_application::recording::EndpointObservationInput::default()
     };
+    // The JVM may be started from any directory, so the repository the operator named is passed
+    // to the agent in the private capture file; source roots resolve against it.
+    let source_base = crate::commands::resolve_repo(&project_dir)?;
     let prepared = crate::daemon::prepare_with_observation(
         project_dir,
         &crate::paths::read_env_path,
@@ -210,6 +213,7 @@ async fn run_unix(
         capture.depth,
         &scope.application_packages,
         &capture.source_roots,
+        Some(&source_base),
     );
     if let Err(error) = crate::capture_args::write_beside(&bootstrap_path, &capture_document) {
         let _ = runtime_dir.cleanup();

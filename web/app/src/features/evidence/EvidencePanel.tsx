@@ -1,6 +1,7 @@
 import { NavigationControls } from './NavigationControls';
 import type { NavAction, NavFrameNavigation } from '../../replay/navigation';
 import { sourceStateText } from '../../replay/source-states';
+import { sessionContextText } from '../../replay/outcome';
 import type { Detail, ReplayEvent } from '../../types';
 
 export interface EvidencePanelProps {
@@ -24,8 +25,10 @@ export function EvidencePanel({ active, currentStatus, detail, event, selectedEv
   return <section className="pane" role="tabpanel" id="evidence-panel" aria-labelledby="evidence-tab" data-active={active} aria-label="Evidence inspector">
         <div className="pane-head"><div><div className="eyebrow">Persisted facts</div><h1>Evidence inspector</h1></div><span className="top-meta">{currentStatus}</span></div>
         <div className="inspector">
+          {detail?.sessionContext ? <div className="inspector-section"><div className="inspector-label">Session context</div><div className="inspector-value">{sessionContextText(detail.sessionContext)}</div></div> : null}
           {event ? <>
             <div className="inspector-section"><div className="inspector-label">Event identity</div><div className="inspector-value mono">{event.eventId || 'Unavailable'}</div></div>
+            {event.exception ? <div className="inspector-value">Thrown exception: <span className="mono">{event.exception.exceptionType ?? 'type not observed'}</span> · cause chain not observed</div> : null}
             <div className="inspector-section"><div className="inspector-label">Relationships</div><div className="inspector-value">Parent: <span className="mono">{event.parentEventId || 'Unavailable'}</span></div><div className="inspector-value">Async parent: <span className="mono">{event.asyncParentEventId || 'Unavailable'}</span></div></div>
             <div className="inspector-section"><div className="inspector-label">Persisted interaction</div>{event.interaction ? Object.entries(event.interaction).filter(([, value]) => value).map(([key, value]) => <div className="inspector-value" key={key}>{key}: <span className="mono">{value}</span></div>) : <div className="inspector-value">No interaction fields persisted</div>}</div>
             {event.fieldTruncations.map((item) => <div key={item.field} className="evidence-state">{item.field} {item.representation} · {item.originalBytes} bytes</div>)}

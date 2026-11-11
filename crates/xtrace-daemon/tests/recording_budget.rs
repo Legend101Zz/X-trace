@@ -20,6 +20,9 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use xtrace_application::ProjectRepository;
 use xtrace_application::recording::{RecordingCapture, SegmentPolicy};
+use xtrace_application::recording_queries::{
+    RecordingCompletionEvidence, RecordingReadPort as _, RecordingStatus, ShowWindowRequest,
+};
 use xtrace_daemon::bootstrap::BootstrapArtifact;
 use xtrace_daemon::{
     BoundDaemon, DaemonBuilder, DaemonConfig, DaemonError, LoopbackPolicy, OutboundCapacity,
@@ -27,16 +30,17 @@ use xtrace_daemon::{
 };
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
-    Project, ProjectId, RepositoryFingerprint as DomainFingerprint, RepositoryFingerprint,
-    RuntimeSessionId, WallTime,
+    Project, ProjectId, RecordingId, RepositoryFingerprint as DomainFingerprint,
+    RepositoryFingerprint, RuntimeSessionId, WallTime,
 };
 use xtrace_protocol::envelope::xtp_payload_ctor::PayloadOneof;
 use xtrace_protocol::generated::agent::{
-    AckDurability, AdapterHello, AgentEnvelope, RecordingFinished, RecordingStarted,
+    AckDurability, AdapterHello, AgentEnvelope, EventBatch, RecordingEvent, RecordingEventKind,
+    RecordingFinished, RecordingStarted,
 };
 use xtrace_protocol::handshake;
 use xtrace_protocol::xtf::XtfEventEnvelope;
-use xtrace_store::{OpenOptions, SqliteRecordingPersistence, SqliteStore};
+use xtrace_store::{OpenOptions, SqliteRecordingPersistence, SqliteRecordingReader, SqliteStore};
 
 const EXPECTED_REPOSITORY_FINGERPRINT: &str =
     "b3:1111111111111111111111111111111111111111111111111111111111111111";
@@ -354,7 +358,220 @@ fn set_owner_only(path: &std::path::Path, mode: u32) {
 const FINISHED_REQUESTS: u128 = 300;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streamed_batches_are_visible_while_open_and_complete_at_the_finish_ack() {
+    streamed_recording_journey(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn focused_streamed_batches_complete_at_the_finish_ack() {
+    streamed_recording_journey(true).await;
+}
+
+async fn streamed_recording_journey(focused: bool) {
+    let daemon_temp = secure_tempdir("xtrace-stream-daemon-");
+    if focused {
+        let capture = daemon_temp.path().join("capture.json");
+        std::fs::write(&capture, r#"{"capture_schema_version":1,"capture":{"mode":"focused"}}"#)
+            .expect("write focused arming policy");
+        set_owner_only(&capture, 0o600);
+    }
+    let project_root = secure_tempdir("xtrace-stream-data-");
+    let project_id = ProjectId::new();
+    let session_id = RuntimeSessionId::new();
+    let store =
+        SqliteStore::open(&project_root.path().join("metadata.sqlite3"), OpenOptions::default())
+            .expect("open SQLite");
+    set_owner_only(&project_root.path().join("metadata.sqlite3"), 0o600);
+    store
+        .project_repository()
+        .insert_project(&Project {
+            id: project_id,
+            canonical_repo_hash: RepositoryFingerprint::from_canonical_path("/fixture/repo"),
+            display_name: "streamed recording".to_owned(),
+            created_at: WallTime::now(),
+            last_opened_at: WallTime::now(),
+            config_schema_version: 1,
+            effective_config_hash: String::new(),
+            active_capture_policy_id: None,
+            active_redaction_policy_id: None,
+        })
+        .expect("insert project");
+    let capture = Arc::new(xtrace_application::recording::RecordingCaptureService::new(
+        Arc::new(SqliteRecordingPersistence::new(store, project_root.path())),
+        SegmentPolicy::default(),
+        std::num::NonZeroUsize::new(1).expect("retention"),
+    ));
+    let (bound, secret, _, _, address, pin) = spawn_daemon_with_capture(
+        daemon_temp.path().join("bootstrap.json"),
+        Duration::from_secs(60),
+        8,
+        &expected_fingerprint(),
+        project_id,
+        session_id,
+        capture,
+    )
+    .await
+    .expect("bind daemon");
+    let (shutdown_tx, daemon_handle) = daemon_task(bound);
+    let mut tls = connect_authenticated(address, &pin, &secret, &session_id, &[0x86; 32]).await;
+    let (mut reader, mut writer) = tokio::io::split(&mut tls);
+    // An independent handle prevents volatile assembly state from satisfying the assertions.
+    let persisted = SqliteRecordingReader::new(
+        SqliteStore::open(
+            &project_root.path().join("metadata.sqlite3"),
+            OpenOptions::default().with_must_exist(true),
+        )
+        .expect("reopen SQLite"),
+        project_root.path(),
+    );
+    let recording_id = RecordingId::new();
+    let bytes = Bytes::copy_from_slice(recording_id.as_uuid().as_bytes());
+    let events: Vec<_> = (2..=451)
+        .map(|sequence| RecordingEvent {
+            event_id: format!("event-{sequence}"),
+            recording_seq: sequence,
+            monotonic_ns: sequence * 10,
+            kind: RecordingEventKind::FrameEnter as i32,
+            symbol: "streaming.handler".to_owned(),
+            ..RecordingEvent::default()
+        })
+        .collect();
+    let mut digest = blake3::Hasher::new();
+    for event in &events {
+        digest.update(event.event_id.as_bytes());
+    }
+    let mut payloads = vec![PayloadOneof::RecordingStarted(RecordingStarted {
+        recording_id: bytes.clone(),
+        recording_seq: 1,
+        method: "GET".to_owned(),
+        matched_route_template: "/streaming".to_owned(),
+        capture_policy_id: if focused {
+            xtrace_domain::CAPTURE_POLICY_FOCUSED_ID.to_owned()
+        } else {
+            xtrace_domain::CAPTURE_POLICY_STANDARD_ID.to_owned()
+        },
+        ..RecordingStarted::default()
+    })];
+    payloads.extend(events.chunks(200).map(|chunk| {
+        PayloadOneof::EventBatch(EventBatch { recording_id: bytes.clone(), events: chunk.to_vec() })
+    }));
+    payloads.push(PayloadOneof::RecordingFinished(RecordingFinished {
+        recording_id: bytes,
+        final_recording_seq: 451,
+        duration_ns: 5000,
+        event_digest: Bytes::copy_from_slice(digest.finalize().as_bytes()),
+        ..RecordingFinished::default()
+    }));
+    for (index, payload) in payloads.into_iter().enumerate() {
+        let finishing = matches!(payload, PayloadOneof::RecordingFinished(_));
+        let session_seq = index as u64 + 1;
+        write_envelope(&mut writer, payload, &session_id, session_seq, session_seq)
+            .await
+            .expect("send recording evidence");
+        let ack = next_ack(&mut reader, "streaming recording").await;
+        assert!(ack.rejected.is_empty());
+        assert_eq!(ack.highest_contiguous_session_seq, session_seq);
+        let (listed, more) = persisted.list_recordings(project_id, None, 10).expect("live list");
+        assert!(!more);
+        assert_eq!(listed.len(), 1, "Start must be visible before any events or Finish");
+        let item = &listed[0];
+        assert_eq!(item.recording_id, recording_id);
+        assert_eq!(
+            item.status,
+            if finishing { RecordingStatus::Complete } else { RecordingStatus::Recording }
+        );
+        assert_eq!(
+            item.completion,
+            if finishing {
+                RecordingCompletionEvidence::Complete
+            } else {
+                RecordingCompletionEvidence::Unavailable
+            }
+        );
+        let expected_events = if finishing { 450 } else { (index * 200).min(450) };
+        assert_eq!(item.event_count, expected_events.to_string());
+        if !finishing {
+            assert_eq!(item.segment_count, "0", "small batches stay in the journal until Finish");
+            let live = persisted
+                .show_recording(&ShowWindowRequest {
+                    project_id,
+                    recording_id,
+                    limit: 100,
+                    after_sequence: None,
+                })
+                .expect("acknowledged events are readable while open");
+            assert_eq!(live.status, RecordingStatus::Recording);
+            assert_eq!(live.completion, RecordingCompletionEvidence::Unavailable);
+            assert_eq!(live.events.len(), expected_events.min(100));
+            assert!(live.adapter_summary.is_none());
+            assert!(live.duration_ns.is_none());
+            for (actual, sent) in live.events.iter().zip(&events) {
+                assert_eq!(actual.sequence, sent.recording_seq.to_string());
+                assert_eq!(actual.event_id.as_deref(), Some(sent.event_id.as_str()));
+            }
+        }
+    }
+    // The count limit is also bounded by the 256 KiB projection budget.
+    // Read every page immediately after ACK, without waiting for more ingest.
+    let mut observed = Vec::new();
+    let mut after_sequence = None;
+    loop {
+        let window = persisted
+            .show_recording(&ShowWindowRequest {
+                project_id,
+                recording_id,
+                limit: 500,
+                after_sequence,
+            })
+            .expect("complete detail");
+        assert_eq!(window.status, RecordingStatus::Complete);
+        assert_eq!(window.completion, RecordingCompletionEvidence::Complete);
+        assert_eq!(
+            window.capacity.as_ref().expect("terminal capacity").event_cap,
+            if focused {
+                xtrace_domain::FOCUSED_EVENT_CAP as u32
+            } else {
+                xtrace_domain::STANDARD_EVENT_CAP as u32
+            }
+        );
+        assert!(window.incomplete_evidence.is_empty());
+        assert!(!window.events.is_empty(), "every page makes progress");
+        let last = window.events.last().unwrap().sequence.parse::<u64>().expect("sequence");
+        assert!(after_sequence.is_none_or(|previous| last > previous));
+        after_sequence = Some(last);
+        observed.extend(window.events);
+        assert!(observed.len() <= events.len(), "no duplicated or invented events");
+        if !window.has_more {
+            break;
+        }
+    }
+    assert_eq!(observed.len(), events.len());
+    for (actual, sent) in observed.iter().zip(&events) {
+        assert_eq!(actual.sequence, sent.recording_seq.to_string());
+        assert_eq!(actual.event_id.as_deref(), Some(sent.event_id.as_str()));
+    }
+    drop(reader);
+    drop(writer);
+    drop(tls);
+    shutdown_tx.send(()).expect("request shutdown");
+    tokio::time::timeout(Duration::from_secs(10), daemon_handle)
+        .await
+        .expect("shutdown deadline")
+        .expect("daemon task")
+        .expect("serve");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_257_is_accepted_after_256_finished_recordings() {
+    finished_recording_budget_journey(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_recordings_release_capacity_and_read_as_partial_with_an_active_companion() {
+    finished_recording_budget_journey(true).await;
+}
+
+async fn finished_recording_budget_journey(abandoned: bool) {
     let daemon_temp = secure_tempdir("xtrace-budget-daemon-");
     let bootstrap_path = daemon_temp.path().join("bootstrap.json");
     let project_root = secure_tempdir("xtrace-budget-data-");
@@ -377,14 +594,14 @@ async fn request_257_is_accepted_after_256_finished_recordings() {
         active_redaction_policy_id: None,
     };
     store.project_repository().insert_project(&project).expect("insert project");
-    let adapter = Arc::new(SqliteRecordingPersistence::new(store, project_root.path()));
+    let adapter = Arc::new(SqliteRecordingPersistence::new(store.clone(), project_root.path()));
     // A retained-ID bound far below the request count proves the application layer also stops
     // counting finished recordings.
     let capture: Arc<dyn RecordingCapture<Event = XtfEventEnvelope>> =
         Arc::new(xtrace_application::recording::RecordingCaptureService::new(
             adapter,
             SegmentPolicy::default(),
-            std::num::NonZeroUsize::new(16).expect("non-zero"),
+            std::num::NonZeroUsize::new(if abandoned { 2 } else { 16 }).expect("non-zero"),
         ));
     let (bound, secret, _, _, address, pin) = spawn_daemon_with_capture(
         bootstrap_path,
@@ -401,23 +618,67 @@ async fn request_257_is_accepted_after_256_finished_recordings() {
     let mut tls_stream =
         connect_authenticated(address, &pin, &secret, &session_id, &[0x85; 32]).await;
     let (mut reader, mut writer) = tokio::io::split(&mut tls_stream);
+    let persisted = SqliteRecordingReader::new(store, project_root.path());
+    let companion_id = RecordingId::new();
+    let companion_bytes = Bytes::copy_from_slice(companion_id.as_uuid().as_bytes());
 
     let mut session_seq = 1_u64;
-    for request in 1..=FINISHED_REQUESTS {
-        let recording_id = Bytes::copy_from_slice(&(0x0100_0000_u128 + request).to_be_bytes());
-        for payload in [
+    if abandoned {
+        write_envelope(
+            &mut writer,
             PayloadOneof::RecordingStarted(RecordingStarted {
-                recording_id: recording_id.clone(),
+                recording_id: companion_bytes.clone(),
                 recording_seq: 1,
                 method: "GET".to_owned(),
                 ..RecordingStarted::default()
             }),
-            PayloadOneof::RecordingFinished(RecordingFinished {
+            &session_id,
+            session_seq,
+            session_seq,
+        )
+        .await
+        .expect("start active companion");
+        let ack = next_ack(&mut reader, "companion start").await;
+        assert!(ack.rejected.is_empty());
+        session_seq += 1;
+    }
+    for request in 1..=FINISHED_REQUESTS {
+        let recording_id = Bytes::copy_from_slice(&(0x0100_0000_u128 + request).to_be_bytes());
+        let mut payloads = vec![PayloadOneof::RecordingStarted(RecordingStarted {
+            recording_id: recording_id.clone(),
+            recording_seq: 1,
+            method: "GET".to_owned(),
+            ..RecordingStarted::default()
+        })];
+        // Exercise abandonment immediately after Start and after an acknowledged event.
+        let has_prefix = abandoned && request % 2 == 0;
+        if has_prefix {
+            payloads.push(PayloadOneof::EventBatch(EventBatch {
                 recording_id: recording_id.clone(),
-                final_recording_seq: 1,
-                ..RecordingFinished::default()
-            }),
-        ] {
+                events: vec![RecordingEvent {
+                    event_id: "observed-prefix".to_owned(),
+                    recording_seq: 2,
+                    monotonic_ns: 10,
+                    kind: RecordingEventKind::FrameEnter as i32,
+                    symbol: "fixture.handler".to_owned(),
+                    ..RecordingEvent::default()
+                }],
+            }));
+        }
+        // Missing digest is unknown terminal loss, independently of measured drops. Cover a
+        // prefix whose events all arrived and both empty/nonempty prefixes with known drops.
+        let known_drops = if abandoned && request % 3 == 0 { 7 } else { 0 };
+        payloads.push(PayloadOneof::RecordingFinished(RecordingFinished {
+            recording_id: recording_id.clone(),
+            final_recording_seq: if has_prefix { 2 } else { 1 },
+            drop_counts_by_priority: if known_drops > 0 {
+                [(1, known_drops)].into_iter().collect()
+            } else {
+                Default::default()
+            },
+            ..RecordingFinished::default()
+        }));
+        for payload in payloads {
             write_envelope(&mut writer, payload, &session_id, session_seq, session_seq)
                 .await
                 .expect("write recording envelope");
@@ -427,12 +688,100 @@ async fn request_257_is_accepted_after_256_finished_recordings() {
             assert_eq!(ack.durability, AckDurability::Staged as i32);
             session_seq += 1;
         }
+        if abandoned {
+            let window = persisted
+                .show_recording(&ShowWindowRequest {
+                    project_id,
+                    recording_id: RecordingId::from_uuid(
+                        uuid::Uuid::from_slice(&recording_id).expect("recording UUID"),
+                    ),
+                    limit: 10,
+                    after_sequence: None,
+                })
+                .expect("abandoned recording reads at finish ACK");
+            assert_eq!(window.status, RecordingStatus::Partial);
+            assert_eq!(window.completion, RecordingCompletionEvidence::Partial);
+            assert_eq!(window.events.len(), usize::from(has_prefix));
+            let expected_drops = if known_drops > 0 {
+                [(1, known_drops.to_string())].into()
+            } else {
+                Default::default()
+            };
+            assert_eq!(window.drop_counts_by_priority, expected_drops);
+            assert!(window.duration_ns.is_none(), "no duration was observed");
+            // A minimal Finish is terminal evidence. The read contract exposes an
+            // unobserved outcome for it; null is reserved for no Finish at all.
+            let outcome = window.outcome.expect("minimal Finish has unobserved terminal evidence");
+            assert_eq!(outcome.kind, "unobserved");
+            assert!(outcome.http_status.is_none(), "no HTTP status was observed");
+            assert!(outcome.exception.is_none(), "no exception was observed");
+            assert!(outcome.thrown_from_event_id.is_none(), "no throw link was observed");
+            assert!(!window.incomplete_evidence.is_empty());
+        }
+    }
+
+    if abandoned {
+        let companion = persisted
+            .show_recording(&ShowWindowRequest {
+                project_id,
+                recording_id: companion_id,
+                limit: 10,
+                after_sequence: None,
+            })
+            .expect("companion remained active across abandoned requests");
+        assert_eq!(companion.status, RecordingStatus::Recording);
+        assert!(companion.outcome.is_none(), "the active companion has no Finish evidence");
+        let later_id = RecordingId::new();
+        let later_bytes = Bytes::copy_from_slice(later_id.as_uuid().as_bytes());
+        // A subsequent recording and the still-active companion both finish as verified complete.
+        for payload in [
+            PayloadOneof::RecordingStarted(RecordingStarted {
+                recording_id: later_bytes.clone(),
+                recording_seq: 1,
+                method: "GET".to_owned(),
+                ..RecordingStarted::default()
+            }),
+            PayloadOneof::RecordingFinished(RecordingFinished {
+                recording_id: later_bytes,
+                final_recording_seq: 1,
+                event_digest: Bytes::copy_from_slice(blake3::hash(&[]).as_bytes()),
+                ..RecordingFinished::default()
+            }),
+            PayloadOneof::RecordingFinished(RecordingFinished {
+                recording_id: companion_bytes,
+                final_recording_seq: 1,
+                event_digest: Bytes::copy_from_slice(blake3::hash(&[]).as_bytes()),
+                ..RecordingFinished::default()
+            }),
+        ] {
+            write_envelope(&mut writer, payload, &session_id, session_seq, session_seq)
+                .await
+                .expect("later recording and companion completion");
+            let ack = next_ack(&mut reader, "completion after repeated abandonment").await;
+            assert_eq!(ack.highest_contiguous_session_seq, session_seq);
+            assert!(ack.rejected.is_empty());
+            session_seq += 1;
+        }
+        for recording_id in [later_id, companion_id] {
+            let window = persisted
+                .show_recording(&ShowWindowRequest {
+                    project_id,
+                    recording_id,
+                    limit: 10,
+                    after_sequence: None,
+                })
+                .expect("verified complete recording");
+            assert_eq!(window.status, RecordingStatus::Complete);
+            assert_eq!(window.completion, RecordingCompletionEvidence::Complete);
+            assert!(window.incomplete_evidence.is_empty());
+            assert_eq!(window.duration_ns.as_deref(), Some("0"));
+        }
     }
 
     // Acks are staged; read the store back (second read-only connection) until every
     // recording is durable and finished, so the test proves the persisted outcome too.
     let database = project_root.path().join("metadata.sqlite3");
-    let wanted = i64::try_from(FINISHED_REQUESTS).expect("fits");
+    let wanted = i64::try_from(FINISHED_REQUESTS + if abandoned { 2 } else { 0 }).expect("fits");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let connection = rusqlite::Connection::open_with_flags(

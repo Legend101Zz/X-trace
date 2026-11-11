@@ -287,7 +287,17 @@ fn verify_retained_snapshot_directories(root: &Path) -> Result<(), AttachError> 
         0o500,
         ATTACH_CACHE_FILESYSTEMS,
     )
-    .map_err(|_| AttachError::PrivateStorage("the retained Java pack snapshot is unsafe"))
+    .map_err(|error| admission_error("the retained Java pack snapshot is unsafe", error))
+}
+
+/// Keeps the public error unchanged; tests retain only the sanitized admission facts.
+fn admission_error(
+    context: &'static str,
+    _error: xtrace_private_storage::PrivateStorageError,
+) -> AttachError {
+    #[cfg(test)]
+    hooks::ADMISSION_FAILURE.with(|slot| slot.set(Some((context, _error))));
+    AttachError::PrivateStorage(context)
 }
 
 /// The private `java-packs` cache: sealed content-addressed snapshots plus sidecar state.
@@ -434,7 +444,7 @@ impl PackCache {
             cache,
             ATTACH_CACHE_FILESYSTEMS,
         )
-        .map_err(|_| AttachError::PrivateStorage("the Java helper cache changed"))?;
+        .map_err(|error| admission_error("the Java helper cache changed", error))?;
         let path = cache.join(PACKS_DIR);
         let packs = open_or_create_private_child(&parent, PACKS_DIR)?;
         admit_directory_descriptor(&path, &packs, true)?;
@@ -763,8 +773,8 @@ impl PackCache {
                 &incoming_path.join(directory),
                 ATTACH_CACHE_FILESYSTEMS,
             )
-            .map_err(|_| {
-                AttachError::PrivateStorage("the private Java pack snapshot is unavailable")
+            .map_err(|error| {
+                admission_error("the private Java pack snapshot is unavailable", error)
             })?;
         }
         let mut total = 0_u64;
@@ -1117,14 +1127,14 @@ const ATTACH_CACHE_FILESYSTEMS: xtrace_private_storage::FilesystemProfile =
 pub fn admit_private_directory(path: &Path) -> Result<(), AttachError> {
     xtrace_private_storage::AdmittedPrivateRoot::open(path)
         .map(|_| ())
-        .map_err(|_| AttachError::PrivateStorage("private storage cannot be admitted"))
+        .map_err(|error| admission_error("private storage cannot be admitted", error))
 }
 
 /// Admits a user-data container that may be traversable but is not writable by other users.
 pub fn admit_private_container_directory(path: &Path) -> Result<(), AttachError> {
     xtrace_private_storage::AdmittedPrivateRoot::open_container(path)
         .map(|_| ())
-        .map_err(|_| AttachError::PrivateStorage("private storage cannot be admitted"))
+        .map_err(|error| admission_error("private storage cannot be admitted", error))
 }
 
 pub(super) fn admit_directory_descriptor(
@@ -1138,7 +1148,7 @@ pub(super) fn admit_directory_descriptor(
         owner_only,
         ATTACH_CACHE_FILESYSTEMS,
     )
-    .map_err(|_| AttachError::PrivateStorage("private storage cannot be admitted"))
+    .map_err(|error| admission_error("private storage cannot be admitted", error))
 }
 
 /// Creates a private, durable helper cache below an already-admitted user data home.
@@ -1147,10 +1157,10 @@ pub fn prepare_helper_cache(data_home: &Path) -> Result<PathBuf, AttachError> {
         data_home,
         ATTACH_CACHE_FILESYSTEMS,
     )
-    .map_err(|_| AttachError::PrivateStorage("the user data home cannot be admitted"))?;
+    .map_err(|error| admission_error("the user data home cannot be admitted", error))?;
     let cache = parent
         .open_or_create_private_child(".xtrace-java-attach-cache")
-        .map_err(|_| AttachError::PrivateStorage("the Java helper cache is unavailable"))?;
+        .map_err(|error| admission_error("the Java helper cache is unavailable", error))?;
     Ok(cache.path().to_path_buf())
 }
 
@@ -1516,6 +1526,9 @@ mod hooks {
     thread_local! {
         static HOOKS: std::cell::RefCell<Vec<(&'static str, Hook)>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        pub(super) static ADMISSION_FAILURE:
+            std::cell::Cell<Option<(&'static str, xtrace_private_storage::PrivateStorageError)>> =
+            const { std::cell::Cell::new(None) };
     }
 
     pub(super) fn install(point: &'static str, hook: Hook) {
@@ -1602,7 +1615,8 @@ mod tests {
         let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
             .map(PathBuf::from)
             .expect("the gate must provide an owner-enforced private scratch root");
-        admit_private_directory(&scratch).expect("gate-provided scratch admission");
+        attach_result(|| admit_private_directory(&scratch))
+            .expect("gate-provided scratch admission");
         let source = private_tempdir_in(&scratch).expect("temporary source pack under scratch");
         make_pack(source.path());
         let cache = private_tempdir_in(&scratch).expect("temporary private cache under scratch");
@@ -1612,7 +1626,8 @@ mod tests {
             .expect("private cache mode");
 
         let source_pack = JavaAttachPack::validate(source.path()).expect("verified source pack");
-        let snapshot = source_pack.snapshot_into(&cache_path).expect("private pack snapshot");
+        let snapshot = attach_result(|| source_pack.snapshot_into(&cache_path))
+            .expect("private pack snapshot");
         let snapshot_bytes = std::fs::read(snapshot.helper_jar()).expect("snapshot helper bytes");
         std::fs::write(source.path().join("attach/xtrace-attach.jar"), b"replaced source")
             .expect("replace source helper");
@@ -1648,7 +1663,8 @@ mod tests {
         let scratch = std::env::var_os("XTRACE_TEST_PRIVATE_SCRATCH")
             .map(PathBuf::from)
             .expect("the gate must provide an owner-enforced private scratch root");
-        admit_private_directory(&scratch).expect("gate-provided scratch admission");
+        attach_result(|| admit_private_directory(&scratch))
+            .expect("gate-provided scratch admission");
         let holder = private_tempdir_in(&scratch).expect("temporary private cache under scratch");
         let cache = holder.path().join("cache");
         std::fs::create_dir(&cache).expect("cache directory");
@@ -1695,7 +1711,7 @@ mod tests {
     fn snapshot_aged(fixture: &CacheFixture, tag: &str, age_secs: u64) -> String {
         let (_source, pack) = tagged_source(tag);
         let name = snapshot_name_of(&pack);
-        drop(pack.snapshot_into(&fixture.cache).expect("snapshot"));
+        drop(attach_result(|| pack.snapshot_into(&fixture.cache)).expect("snapshot"));
         set_recency(&fixture.cache, &name, age_secs);
         name
     }
@@ -1719,11 +1735,12 @@ mod tests {
             .collect::<Vec<_>>();
         // Re-attaching the oldest snapshot refreshes its recency, so "b" becomes the LRU.
         let (_source, again) = tagged_source("a");
-        drop(again.snapshot_into(&fixture.cache).expect("refresh a"));
+        drop(attach_result(|| again.snapshot_into(&fixture.cache)).expect("refresh a"));
         assert_eq!(sealed_names(&fixture.cache).len(), MAX_RETAINED_PACK_SNAPSHOTS);
 
         let (_source, fifth) = tagged_source("e");
-        let fifth_snapshot = fifth.snapshot_into(&fixture.cache).expect("fifth build evicts");
+        let fifth_snapshot =
+            attach_result(|| fifth.snapshot_into(&fixture.cache)).expect("fifth build evicts");
         assert!(JavaAttachPack::validate(fifth_snapshot.root()).is_ok());
 
         let remaining = sealed_names(&fixture.cache);
@@ -1742,14 +1759,16 @@ mod tests {
             .iter()
             .map(|tag| {
                 let (source, pack) = tagged_source(tag);
-                let snapshot = pack.snapshot_into(&fixture.cache).expect("snapshot");
+                let snapshot =
+                    attach_result(|| pack.snapshot_into(&fixture.cache)).expect("snapshot");
                 (source, snapshot)
             })
             .collect::<Vec<_>>();
         let before = sealed_names(&fixture.cache);
 
         let (_source, fifth) = tagged_source("e");
-        let error = fifth.snapshot_into(&fixture.cache).expect_err("every snapshot is in use");
+        let error = attach_result(|| fifth.snapshot_into(&fixture.cache))
+            .expect_err("every snapshot is in use");
         assert!(error.to_string().contains("in use"), "clear error: {error}");
         assert_eq!(sealed_names(&fixture.cache), before, "nothing was evicted");
         assert!(incoming_names(&fixture.cache).is_empty(), "failed build leaves no residue");
@@ -1763,7 +1782,8 @@ mod tests {
         let released_root = released.root().to_path_buf();
         drop(released);
         let (_source, fifth) = tagged_source("e");
-        let fifth = fifth.snapshot_into(&fixture.cache).expect("evicts the only unleased snapshot");
+        let fifth = attach_result(|| fifth.snapshot_into(&fixture.cache))
+            .expect("evicts the only unleased snapshot");
         assert!(!released_root.exists());
         for (_, snapshot) in &held {
             assert!(snapshot.root().exists(), "leased snapshots survive");
@@ -1775,21 +1795,21 @@ mod tests {
     fn a_clone_keeps_the_lease_after_the_original_is_dropped() {
         let fixture = cache_fixture();
         let (_source, pack) = tagged_source("a");
-        let first = pack.snapshot_into(&fixture.cache).expect("snapshot");
+        let first = attach_result(|| pack.snapshot_into(&fixture.cache)).expect("snapshot");
         let clone = first.clone();
         drop(first);
         let others = ["b", "c", "d"]
             .iter()
             .map(|tag| {
                 let (source, pack) = tagged_source(tag);
-                (source, pack.snapshot_into(&fixture.cache).expect("snapshot"))
+                (source, attach_result(|| pack.snapshot_into(&fixture.cache)).expect("snapshot"))
             })
             .collect::<Vec<_>>();
         let (_source, fifth) = tagged_source("e");
-        assert!(fifth.snapshot_into(&fixture.cache).is_err());
+        assert!(attach_result(|| fifth.snapshot_into(&fixture.cache)).is_err());
         drop(others);
         let (_source, fifth) = tagged_source("e");
-        fifth.snapshot_into(&fixture.cache).expect("others were evictable");
+        attach_result(|| fifth.snapshot_into(&fixture.cache)).expect("others were evictable");
         assert!(clone.root().exists());
     }
 
@@ -1839,7 +1859,8 @@ mod tests {
 
         // Residue never counts toward the cap: a fifth build still succeeds by evicting one.
         let (_source, fifth) = tagged_source("e");
-        fifth.snapshot_into(&fixture.cache).expect("fifth build with residue present");
+        attach_result(|| fifth.snapshot_into(&fixture.cache))
+            .expect("fifth build with residue present");
 
         assert_eq!(sealed_names(&fixture.cache).len(), MAX_RETAINED_PACK_SNAPSHOTS);
         let incoming = incoming_names(&fixture.cache);
@@ -1857,19 +1878,27 @@ mod tests {
         let packs = fixture.cache.join(PACKS_DIR);
         // Pre-atomic residue: a final-named directory that never validates.
         let (_hold, state_pack) = tagged_source("bootstrap");
-        drop(state_pack.snapshot_into(&fixture.cache).expect("creates the cache layout"));
+        drop(
+            attach_result(|| state_pack.snapshot_into(&fixture.cache))
+                .expect("creates the cache layout"),
+        );
         std::fs::create_dir(packs.join(&name)).expect("legacy residue");
         std::fs::set_permissions(packs.join(&name), std::fs::Permissions::from_mode(0o700))
             .expect("legacy mode");
 
-        let cache = PackCache::open(&fixture.cache).expect("cache");
-        let lease = cache.lease(&name).expect("lease");
-        let error = pack.snapshot_into(&fixture.cache).expect_err("leased residue is not touched");
-        assert!(matches!(error, AttachError::Validation(_)), "the verification error: {error}");
+        let cache = attach_result(|| PackCache::open(&fixture.cache)).expect("cache");
+        let lease = attach_result(|| cache.lease(&name)).expect("lease");
+        let error = attach_result(|| pack.snapshot_into(&fixture.cache))
+            .expect_err("leased residue is not touched");
+        assert!(
+            matches!(error.error, AttachError::Validation(_)),
+            "the verification error: {error}"
+        );
         assert!(packs.join(&name).exists());
         drop(lease);
 
-        let rebuilt = pack.snapshot_into(&fixture.cache).expect("unleased residue is replaced");
+        let rebuilt = attach_result(|| pack.snapshot_into(&fixture.cache))
+            .expect("unleased residue is replaced");
         assert!(JavaAttachPack::validate(rebuilt.root()).is_ok());
     }
 
@@ -1880,29 +1909,33 @@ mod tests {
             .map(|index| tagged_source(&format!("shared-{index}")))
             .collect::<Vec<_>>();
         let results = std::thread::scope(|scope| {
-            let handles =
-                (0..8)
-                    .map(|worker| {
-                        let cache = &fixture.cache;
-                        let sources = &sources;
-                        scope.spawn(move || {
-                            let mut outcomes = Vec::new();
-                            for round in 0..3 {
-                                let (_, pack) = &sources[(worker + round) % sources.len()];
-                                outcomes.push(pack.snapshot_into(cache).map(|snapshot| {
+            let handles = (0..8)
+                .map(|worker| {
+                    let cache = &fixture.cache;
+                    let sources = &sources;
+                    scope.spawn(move || {
+                        let mut outcomes = Vec::new();
+                        for round in 0..3 {
+                            let (_, pack) = &sources[(worker + round) % sources.len()];
+                            let (outcome, admission) = capture_attach(|| pack.snapshot_into(cache));
+                            outcomes.push((
+                                outcome.map(|snapshot| {
                                     JavaAttachPack::validate(snapshot.root()).is_ok()
-                                }));
-                            }
-                            outcomes
-                        })
+                                }),
+                                admission,
+                            ));
+                        }
+                        outcomes
                     })
-                    .collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
             handles
                 .into_iter()
                 .flat_map(|handle| handle.join().expect("worker"))
                 .collect::<Vec<_>>()
         });
-        for outcome in results {
+        for (outcome, admission) in results {
+            assert_concurrent_attach_success(outcome.as_ref().map(|_| ()), admission);
             assert!(outcome.expect("attach within the cap succeeds"));
         }
         assert_eq!(sealed_names(&fixture.cache).len(), MAX_RETAINED_PACK_SNAPSHOTS);
@@ -1910,7 +1943,7 @@ mod tests {
         for name in sealed_names(&fixture.cache) {
             let path = fixture.cache.join(PACKS_DIR).join(name);
             JavaAttachPack::validate(&path).expect("intact snapshot");
-            verify_retained_snapshot_directories(&path).expect("sealed snapshot");
+            attach_result(|| verify_retained_snapshot_directories(&path)).expect("sealed snapshot");
         }
     }
 
@@ -1925,14 +1958,193 @@ mod tests {
                     .iter()
                     .map(|(_, pack)| {
                         let cache = &fixture.cache;
-                        scope.spawn(move || pack.snapshot_into(cache).map(|_| ()))
+                        scope.spawn(move || {
+                            let (outcome, admission) = capture_attach(|| pack.snapshot_into(cache));
+                            (outcome.map(|_| ()), admission)
+                        })
                     })
                     .collect::<Vec<_>>();
                 for handle in handles {
-                    handle.join().expect("worker").expect("first attach into a fresh cache");
+                    let (outcome, admission) = handle.join().expect("worker");
+                    assert_concurrent_attach_success(outcome.as_ref().map(|_| ()), admission);
                 }
             });
             assert_eq!(sealed_names(&fixture.cache).len(), 4);
+        }
+    }
+
+    // Capture on the calling thread before a worker's result crosses a join boundary. Clear
+    // both before and after the operation: a recovered refusal must not describe a later error.
+    fn capture_attach<T>(
+        operation: impl FnOnce() -> Result<T, AttachError>,
+    ) -> (Result<T, AttachError>, Option<xtrace_private_storage::PrivateStorageError>) {
+        hooks::ADMISSION_FAILURE.with(|slot| slot.set(None));
+        let outcome = operation();
+        let admission =
+            hooks::ADMISSION_FAILURE.with(std::cell::Cell::take).and_then(|(context, error)| {
+                match &outcome {
+                    Err(AttachError::PrivateStorage(message)) if *message == context => Some(error),
+                    _ => None,
+                }
+            });
+        (outcome, admission)
+    }
+
+    /// Only static attach messages, admission enums and errno can reach test failure output.
+    #[derive(Debug)]
+    struct AttachFailure {
+        error: AttachError,
+        admission: Option<xtrace_private_storage::PrivateStorageError>,
+    }
+
+    impl std::fmt::Display for AttachFailure {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{}; admission={:?}", self.error, self.admission)
+        }
+    }
+
+    fn attach_result<T>(
+        operation: impl FnOnce() -> Result<T, AttachError>,
+    ) -> Result<T, AttachFailure> {
+        let (outcome, admission) = capture_attach(operation);
+        outcome.map_err(|error| AttachFailure { error, admission })
+    }
+
+    #[test]
+    fn attach_failure_output_contains_only_static_context_and_admission_facts() {
+        use xtrace_private_storage::{AdmissionFailure, AdmissionOperation, PrivateStorageError};
+        let admission = PrivateStorageError::Admission(AdmissionFailure {
+            operation: AdmissionOperation::AccessAcl,
+            kind: Some(std::io::ErrorKind::PermissionDenied),
+            raw_os_error: Some(13),
+        });
+        // Capture in a worker, just as the cache concurrency tests do.
+        let failure = std::thread::spawn(move || {
+            attach_result::<()>(|| {
+                Err(admission_error("private storage cannot be admitted", admission))
+            })
+            .expect_err("admission refusal")
+        })
+        .join()
+        .expect("diagnostic worker");
+        assert_eq!(failure.admission, Some(admission));
+        assert_eq!(
+            format!("{failure:?}"),
+            "AttachFailure { error: PrivateStorage(\"private storage cannot be admitted\"), admission: Some(Admission(AdmissionFailure { operation: AccessAcl, kind: Some(PermissionDenied), raw_os_error: Some(13) })) }"
+        );
+        assert_eq!(
+            failure.to_string(),
+            "private storage cannot be admitted; admission=Some(Admission(AdmissionFailure { operation: AccessAcl, kind: Some(PermissionDenied), raw_os_error: Some(13) }))"
+        );
+    }
+
+    #[test]
+    fn attach_diagnostics_discard_stale_recovered_and_unrelated_refusals() {
+        use xtrace_private_storage::PrivateStorageError;
+        let context = "private storage cannot be admitted";
+        let refusal = PrivateStorageError::Unavailable;
+        let _ = admission_error(context, refusal);
+        let (_, stale) = capture_attach::<()>(|| Err(AttachError::PrivateStorage(context)));
+        assert_eq!(stale, None, "a previous operation's failure is discarded");
+
+        let (outcome, recovered) = capture_attach(|| {
+            let _ = admission_error(context, refusal);
+            Ok(())
+        });
+        outcome.expect("operation recovered");
+        assert_eq!(recovered, None);
+        assert!(hooks::ADMISSION_FAILURE.with(std::cell::Cell::take).is_none());
+
+        let (_, unrelated) = capture_attach::<()>(|| {
+            let _ = admission_error(context, refusal);
+            Err(AttachError::PrivateStorage("the Java pack cache lock failed"))
+        });
+        assert_eq!(unrelated, None, "only the returned refusal's context is attached");
+    }
+
+    // The macOS lane withholds panic messages but publishes source sites. Keep each failure
+    // category on its own panic line, without track_caller, so a site identifies the failed
+    // check without exposing paths, captured values, or operating-system error text.
+    fn assert_concurrent_attach_success(
+        outcome: Result<(), &AttachError>,
+        admission: Option<xtrace_private_storage::PrivateStorageError>,
+    ) {
+        if let Some(error) = admission {
+            assert_admission_success(Err(error));
+        }
+        match outcome {
+            Err(AttachError::PrivateStorage("private storage cannot be admitted")) => {
+                outcome.expect("concurrent attach: shared directory admission failed");
+            }
+            Err(AttachError::PrivateStorage("the retained Java pack snapshot is unsafe")) => {
+                outcome.expect("concurrent attach: retained snapshot admission failed");
+            }
+            Err(AttachError::PrivateStorage("the Java helper cache changed")) => {
+                outcome.expect("concurrent attach: cache root admission failed");
+            }
+            Err(AttachError::PrivateStorage("the Java pack cache state is unsafe")) => {
+                outcome.expect("concurrent attach: state file metadata was rejected");
+            }
+            Err(AttachError::PrivateStorage(
+                "the Java pack cache state file could not be opened",
+            )) => {
+                outcome.expect("concurrent attach: state file open failed");
+            }
+            Err(AttachError::PrivateStorage("the Java pack cache is busy")) => {
+                outcome.expect("concurrent attach: bounded lock wait exhausted");
+            }
+            Err(AttachError::PrivateStorage("the Java pack cache lock failed")) => {
+                outcome.expect("concurrent attach: lock operation failed");
+            }
+            Err(AttachError::PrivateStorage(
+                "the private Java pack snapshot could not be published",
+            )) => {
+                outcome.expect("concurrent attach: snapshot publication failed");
+            }
+            Err(AttachError::PrivateStorage(_)) => {
+                outcome.expect("concurrent attach: another private cache operation failed");
+            }
+            Err(AttachError::Validation(_)) => {
+                outcome.expect("concurrent attach: pack validation failed");
+            }
+            Err(AttachError::Unsupported | AttachError::Process) => {
+                outcome.expect("concurrent attach: unexpected non-cache failure");
+            }
+            Ok(()) => {}
+        }
+    }
+
+    // Raw panic messages are withheld by the lane. Each enum gets a distinct source site,
+    // so failureDetails.failures[].location identifies the underlying admission category.
+    fn assert_admission_success(outcome: Result<(), xtrace_private_storage::PrivateStorageError>) {
+        use xtrace_private_storage::{AdmissionOperation as Step, PrivateStorageError as Error};
+        match outcome {
+            Err(Error::Admission(failure)) => match failure.operation {
+                Step::OpenDirectory => outcome.expect("OpenDirectory"),
+                Step::DescriptorMetadata => outcome.expect("DescriptorMetadata"),
+                Step::NamedMetadata => outcome.expect("NamedMetadata"),
+                Step::Identity => outcome.expect("Identity"),
+                Step::OwnershipAndMode => outcome.expect("OwnershipAndMode"),
+                Step::FilesystemMetadata => outcome.expect("FilesystemMetadata"),
+                Step::FilesystemPolicy => outcome.expect("FilesystemPolicy"),
+                Step::AccessAcl => outcome.expect("AccessAcl"),
+                Step::DefaultAcl => outcome.expect("DefaultAcl"),
+                Step::AclPolicy => outcome.expect("AclPolicy"),
+                Step::AclState => outcome.expect("AclState"),
+                Step::SpawnAclProbe => outcome.expect("SpawnAclProbe"),
+                Step::WaitAclProbe => outcome.expect("WaitAclProbe"),
+                Step::ReadAclProbe => outcome.expect("ReadAclProbe"),
+                Step::JoinAclReader => outcome.expect("JoinAclReader"),
+                Step::AclProbeExit => outcome.expect("AclProbeExit"),
+                Step::AclProbeOutput => outcome.expect("AclProbeOutput"),
+                Step::AclProbeOperand => outcome.expect("AclProbeOperand"),
+                Step::Deadline => outcome.expect("Deadline"),
+            },
+            Err(Error::Unavailable) => outcome.expect("Unavailable"),
+            Err(Error::InvalidName) => outcome.expect("InvalidName"),
+            Err(Error::AlreadyExists) => outcome.expect("AlreadyExists"),
+            Err(Error::Operation) => outcome.expect("Operation"),
+            Ok(()) => {}
         }
     }
 
@@ -1943,14 +2155,19 @@ mod tests {
     fn concurrent_creation_of_one_state_file_never_fails() {
         let fixture = cache_fixture();
         let (_source, pack) = tagged_source("seed");
-        drop(pack.snapshot_into(&fixture.cache).expect("creates the cache layout"));
-        let cache = PackCache::open(&fixture.cache).expect("cache");
+        drop(
+            attach_result(|| pack.snapshot_into(&fixture.cache)).expect("creates the cache layout"),
+        );
+        let cache = attach_result(|| PackCache::open(&fixture.cache)).expect("cache");
         for round in 0..150 {
             let name = format!("{round:064x}.use");
             std::thread::scope(|scope| {
                 let handles = (0..16)
                     .map(|_| {
-                        scope.spawn(|| cache.state_file(&name, true).map(|file| file.is_some()))
+                        scope.spawn(|| {
+                            attach_result(|| cache.state_file(&name, true))
+                                .map(|file| file.is_some())
+                        })
                     })
                     .collect::<Vec<_>>();
                 for handle in handles {
@@ -1966,8 +2183,10 @@ mod tests {
     fn reaper_cannot_steal_a_new_builders_lock_file() {
         let fixture = cache_fixture();
         let (_source, pack) = tagged_source("seed");
-        drop(pack.snapshot_into(&fixture.cache).expect("creates the cache layout"));
-        let cache = PackCache::open(&fixture.cache).expect("cache");
+        drop(
+            attach_result(|| pack.snapshot_into(&fixture.cache)).expect("creates the cache layout"),
+        );
+        let cache = attach_result(|| PackCache::open(&fixture.cache)).expect("cache");
         let stop = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
             let reapers = (0..2)
@@ -1980,10 +2199,15 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             for _ in 0..200 {
-                let incoming = cache.begin_incoming().expect("builder");
+                let incoming = attach_result(|| cache.begin_incoming()).expect("builder");
                 let build = format!("{}.build", incoming.name);
-                assert!(cache.state_entry_is(&build, &incoming._build_lock).expect("entry"));
-                let other = cache.state_file(&build, false).expect("open").expect("present");
+                assert!(
+                    attach_result(|| cache.state_entry_is(&build, &incoming._build_lock))
+                        .expect("entry")
+                );
+                let other = attach_result(|| cache.state_file(&build, false))
+                    .expect("open")
+                    .expect("present");
                 assert!(!try_lock(&other, true).expect("lock"), "builder lock must be held");
                 drop(incoming);
             }
@@ -1998,7 +2222,9 @@ mod tests {
     fn many_crash_residues_are_shed_a_batch_per_attach_and_the_cache_heals() {
         let fixture = cache_fixture();
         let (_source, seed) = tagged_source("seed");
-        drop(seed.snapshot_into(&fixture.cache).expect("creates the cache layout"));
+        drop(
+            attach_result(|| seed.snapshot_into(&fixture.cache)).expect("creates the cache layout"),
+        );
         let packs = fixture.cache.join(PACKS_DIR);
         let state = packs.join(STATE_DIR);
         let residues = MAX_CACHE_ENTRIES + 40;
@@ -2021,7 +2247,7 @@ mod tests {
         let mut attempts = 0;
         let healed = loop {
             attempts += 1;
-            match other.snapshot_into(&fixture.cache) {
+            match attach_result(|| other.snapshot_into(&fixture.cache)) {
                 Ok(snapshot) => break snapshot,
                 Err(error) => assert!(
                     attempts <= residues.div_ceil(REAP_BATCH),
@@ -2042,11 +2268,13 @@ mod tests {
     fn state_file_unlinked_after_open_is_retried_not_reported_unsafe() {
         let fixture = cache_fixture();
         let (_source, pack) = tagged_source("seed");
-        drop(pack.snapshot_into(&fixture.cache).expect("creates the cache layout"));
-        let cache = PackCache::open(&fixture.cache).expect("cache");
+        drop(
+            attach_result(|| pack.snapshot_into(&fixture.cache)).expect("creates the cache layout"),
+        );
+        let cache = attach_result(|| PackCache::open(&fixture.cache)).expect("cache");
         let stem = format!("{:064x}", 7);
         let name = format!("{stem}.use");
-        drop(cache.state_file(&name, true).expect("create").expect("file"));
+        drop(attach_result(|| cache.state_file(&name, true)).expect("create").expect("file"));
 
         let fired = std::rc::Rc::new(std::cell::Cell::new(0_u32));
         let counter = fired.clone();
@@ -2060,10 +2288,14 @@ mod tests {
                 }
             }),
         );
-        let lease = cache.lease(&stem).expect("lease survives a concurrent unlink");
+        let lease =
+            attach_result(|| cache.lease(&stem)).expect("lease survives a concurrent unlink");
         hooks::clear();
         assert_eq!(fired.get(), 1);
-        assert!(cache.state_entry_is(&name, &lease).expect("entry"), "lease is on the live file");
+        assert!(
+            attach_result(|| cache.state_entry_is(&name, &lease)).expect("entry"),
+            "lease is on the live file"
+        );
         // Reading a name that vanished reports it absent rather than unsafe.
         hooks::install(
             "state_file_opened",
@@ -2071,7 +2303,7 @@ mod tests {
                 let _ = rustix::fs::unlinkat(directory, opened, rustix::fs::AtFlags::empty());
             }),
         );
-        assert!(cache.state_file(&name, false).expect("no error").is_none());
+        assert!(attach_result(|| cache.state_file(&name, false)).expect("no error").is_none());
         hooks::clear();
     }
 
@@ -2081,8 +2313,10 @@ mod tests {
     fn listing_skips_entries_removed_mid_listing_but_still_rejects_unknown_names() {
         let fixture = cache_fixture();
         let (_source, pack) = tagged_source("seed");
-        drop(pack.snapshot_into(&fixture.cache).expect("creates the cache layout"));
-        let cache = PackCache::open(&fixture.cache).expect("cache");
+        drop(
+            attach_result(|| pack.snapshot_into(&fixture.cache)).expect("creates the cache layout"),
+        );
+        let cache = attach_result(|| PackCache::open(&fixture.cache)).expect("cache");
         let packs = fixture.cache.join(PACKS_DIR);
         let incoming = format!("{INCOMING_PREFIX}9-{}", "d".repeat(32));
         std::fs::create_dir(packs.join(&incoming)).expect("incoming");
@@ -2099,7 +2333,7 @@ mod tests {
                 }
             }),
         );
-        let listing = cache.list().expect("a vanished entry is not an error");
+        let listing = attach_result(|| cache.list()).expect("a vanished entry is not an error");
         hooks::clear();
         assert!(listing.incoming.is_empty());
         assert_eq!(listing.sealed.len(), 1);
@@ -2115,7 +2349,10 @@ mod tests {
                 }
             }),
         );
-        assert!(cache.list().is_err(), "unknown names fail closed even if they vanish");
+        assert!(
+            attach_result(|| cache.list()).is_err(),
+            "unknown names fail closed even if they vanish"
+        );
         hooks::clear();
     }
 
@@ -2130,14 +2367,18 @@ mod tests {
                     let cache = &fixture.cache;
                     let (_, pack) = &sources[worker];
                     scope.spawn(move || {
-                        pack.snapshot_into(cache).map(|snapshot| snapshot.root().to_path_buf())
+                        let (outcome, admission) = capture_attach(|| pack.snapshot_into(cache));
+                        (outcome.map(|snapshot| snapshot.root().to_path_buf()), admission)
                     })
                 })
                 .collect::<Vec<_>>();
             handles.into_iter().map(|handle| handle.join().expect("worker")).collect::<Vec<_>>()
         });
-        for outcome in &results {
+        for (outcome, admission) in &results {
             if let Err(error) = outcome {
+                if !error.to_string().contains("in use") {
+                    assert_concurrent_attach_success(Err(error), *admission);
+                }
                 assert!(error.to_string().contains("in use"), "clean failure: {error}");
             }
         }
@@ -2152,12 +2393,12 @@ mod tests {
     fn unexpected_cache_entries_fail_closed() {
         let fixture = cache_fixture();
         let (_source, pack) = tagged_source("a");
-        drop(pack.snapshot_into(&fixture.cache).expect("snapshot"));
+        drop(attach_result(|| pack.snapshot_into(&fixture.cache)).expect("snapshot"));
         let stray = fixture.cache.join(PACKS_DIR).join("not-a-snapshot");
         std::fs::create_dir(&stray).expect("stray");
         std::fs::set_permissions(&stray, std::fs::Permissions::from_mode(0o700)).expect("mode");
         let (_source, other) = tagged_source("b");
-        assert!(other.snapshot_into(&fixture.cache).is_err());
+        assert!(attach_result(|| other.snapshot_into(&fixture.cache)).is_err());
         assert!(stray.exists(), "unknown entries are never deleted");
     }
 
@@ -2257,7 +2498,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary root");
         let link = root.path().join("link");
         std::os::unix::fs::symlink(root.path(), &link).expect("directory symlink");
-        assert!(admit_private_directory(&link).is_err());
+        assert!(attach_result(|| admit_private_directory(&link)).is_err());
     }
 
     #[test]
@@ -2299,17 +2540,23 @@ mod tests {
             return;
         };
         let home = private_tempdir_in(&tmpfs).expect("private directory on tmpfs");
-        let cache = prepare_helper_cache(home.path()).expect("attach cache admitted on tmpfs");
-        PackCache::open(&cache).expect("pack cache opens on tmpfs");
-        assert!(admit_private_directory(home.path()).is_err(), "durable roots refuse tmpfs");
-        assert!(admit_private_container_directory(home.path()).is_err());
+        let cache = attach_result(|| prepare_helper_cache(home.path()))
+            .expect("attach cache admitted on tmpfs");
+        attach_result(|| PackCache::open(&cache)).expect("pack cache opens on tmpfs");
+        assert!(
+            attach_result(|| admit_private_directory(home.path())).is_err(),
+            "durable roots refuse tmpfs"
+        );
+        assert!(attach_result(|| admit_private_container_directory(home.path())).is_err());
     }
 
     #[test]
     fn an_over_full_cache_root_fails_fast_before_the_pack_is_copied() {
         let fixture = cache_fixture();
         let (_seed_source, seed) = tagged_source("seed");
-        drop(seed.snapshot_into(&fixture.cache).expect("creates the cache layout"));
+        drop(
+            attach_result(|| seed.snapshot_into(&fixture.cache)).expect("creates the cache layout"),
+        );
         let packs = fixture.cache.join(PACKS_DIR);
         let state = packs.join(STATE_DIR);
         for index in 0..MAX_CACHE_ENTRIES + 40 {
@@ -2323,7 +2570,8 @@ mod tests {
         }
         let (_source, other) = tagged_source("other");
         let started = BUILDS_STARTED.with(std::cell::Cell::get);
-        let error = other.snapshot_into(&fixture.cache).expect_err("over-full cache");
+        let error =
+            attach_result(|| other.snapshot_into(&fixture.cache)).expect_err("over-full cache");
         // No build (and so no copy of the pack) was ever started.
         assert_eq!(BUILDS_STARTED.with(std::cell::Cell::get), started);
         let message = error.to_string();
@@ -2336,11 +2584,13 @@ mod tests {
     fn the_reaper_sheds_residue_even_when_many_live_builders_come_first() {
         let fixture = cache_fixture();
         let (_source, seed) = tagged_source("seed");
-        drop(seed.snapshot_into(&fixture.cache).expect("creates the cache layout"));
-        let cache = PackCache::open(&fixture.cache).expect("cache");
+        drop(
+            attach_result(|| seed.snapshot_into(&fixture.cache)).expect("creates the cache layout"),
+        );
+        let cache = attach_result(|| PackCache::open(&fixture.cache)).expect("cache");
         // More live builders than one removal batch, all holding their builder locks.
         let live = (0..REAP_BATCH + 8)
-            .map(|_| cache.begin_incoming().expect("live builder"))
+            .map(|_| attach_result(|| cache.begin_incoming()).expect("live builder"))
             .collect::<Vec<_>>();
         let packs = fixture.cache.join(PACKS_DIR);
         let state = packs.join(STATE_DIR);

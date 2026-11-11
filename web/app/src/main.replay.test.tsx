@@ -5,13 +5,15 @@ import App from './main';
 
 const operationA = '018f0000-0000-7000-8000-000000000001';
 const recordingA = '018f0000-0000-7000-8000-000000000011';
+const runtimeSessionId = '018f0000-0000-7000-8000-000000000021';
+const sessionContext = { runtimeSessionId, rejectedRequests: null as string | null };
 
 const endpoints = { items: [{ operationId: operationA, projectId: 'p', applicationComponent: 'svc', binding: 'default', method: 'POST', routeTemplate: '/orders', observation: 'observed', observationPolicy: 'pol' }], nextCursor: null };
-const linked = { items: [{ recordingId: recordingA, status: 'complete', completion: 'complete', openedAt: '2026-10-03T10:00:00Z', segmentCount: '1', eventCount: '4', firstSequence: '1', lastSequence: '4', incompleteEvidence: [], operationId: operationA, observationPolicy: 'pol', unmatchedReason: null }], nextCursor: null };
+const linked = { items: [{ recordingId: recordingA, status: 'complete', completion: 'complete', openedAt: '2026-10-03T10:00:00Z', segmentCount: '1', eventCount: '4', firstSequence: '1', lastSequence: '4', incompleteEvidence: [], sessionContext, operationId: operationA, observationPolicy: 'pol', unmatchedReason: null }], nextCursor: null };
 
 const none = { state: 'boundary' };
 const nav = (over: Record<string, unknown>) => ({ previous: none, next: none, into: none, over: none, out: none, ...over });
-const ev = (n: number, parent: string | null, symbol: string, navigation: object) => ({ sequence: String(n), frameId: `f${n}`, eventId: `event-${n}`, navigation, monotonicNs: String(n * 10), kind: 'method', symbol, parentFrameId: parent, sourceBinding: 'unspecified', fieldTruncations: [] });
+const ev = (n: number, parent: string | null, symbol: string, navigation: object) => ({ sequence: String(n), frameId: `f${n}`, eventId: `event-${n}`, navigation, monotonicNs: String(n * 10), kind: 'method', symbol, parentFrameId: parent, sourceBinding: 'unspecified', fieldTruncations: [], exception: null as { exceptionType: string | null } | null });
 
 const events = [
   ev(1, null, 'Controller.create', nav({ next: { state: 'target', frameId: 'f2' }, into: { state: 'target', frameId: 'f2' } })),
@@ -22,6 +24,7 @@ const events = [
 
 const detail = {
   recordingId: recordingA, status: 'complete', completion: 'complete', adapterSummary: null, durationNs: '20', dropCountsByPriority: {}, segmentCount: '1', incompleteEvidence: [], nextCursor: null,
+  sessionContext,
   unavailable: { source: 'unavailable', values: 'unavailable', completion: 'unavailable' },
   outcome: { kind: 'exception', httpStatus: 500, exception: { exceptionType: 'java.lang.IllegalStateException', message: 'boom' }, thrownFromEventId: null },
   events,
@@ -41,24 +44,79 @@ async function openRecording() {
 const inspector = () => screen.getByRole('tabpanel', { name: 'evidence', hidden: true });
 
 describe('replay wiring in the app', () => {
+  let responseDetail = detail;
   beforeEach(() => {
+    responseDetail = detail;
     window.history.replaceState(null, '', '/viewer#token=t');
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
       const path = route(input);
       if (path === '/api/v1/auth/exchange') return json({ authenticated: true });
       if (path.startsWith('/api/v1/endpoints?')) return json(endpoints);
       if (path.includes('/recordings') && path.includes('/endpoints/')) return json(linked);
-      if (path.startsWith('/api/v1/recordings/')) return json(detail);
+      if (path.startsWith('/api/v1/recordings/')) return json(responseDetail);
       throw new Error(`Unexpected request ${path}`);
     }));
   });
   afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
+
+  it.each([
+    [null, 'agent capacity rejections not observed'],
+    ['0', '0 requests were not recorded due to agent capacity (cumulative as last reported)'],
+    ['7', '7 requests were not recorded due to agent capacity (cumulative as last reported)'],
+  ])('shows session count %s separately in the banner and inspector', async (rejectedRequests, message) => {
+    responseDetail = { ...detail, sessionContext: { runtimeSessionId, rejectedRequests } };
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: /Controller\.create/ }));
+    const banner = screen.getByRole('region', { name: 'Recording outcome' });
+    const text = `Session capture context (session ${runtimeSessionId}): ${message}`;
+    expect(within(banner).getByText('Recording complete: finish evidence was verified.')).toBeInTheDocument();
+    expect(banner).toHaveClass('outcome-banner--complete');
+    expect(within(banner).getByText(text)).toBeInTheDocument();
+    expect(within(banner).queryByText(/Persisted incomplete evidence:/)).not.toBeInTheDocument();
+    expect(within(inspector()).getByText('Session context')).toBeInTheDocument();
+    expect(within(inspector()).getByText(text)).toBeInTheDocument();
+    expect(within(inspector()).queryByText(/Persisted incomplete evidence:/)).not.toBeInTheDocument();
+  });
 
   it('renders the outcome banner from the real outcome shape', async () => {
     await openRecording();
     const banner = screen.getByRole('region', { name: 'Recording outcome' });
     expect(within(banner).getByText('Response status 500 (as reported by the adapter)')).toBeInTheDocument();
     expect(within(banner).getByText('Exception java.lang.IllegalStateException: boom')).toBeInTheDocument();
+  });
+
+  it('shows the selected throw type separately from the framework outcome wrapper', async () => {
+    responseDetail = {
+      ...detail,
+      outcome: { ...detail.outcome, exception: { exceptionType: 'jakarta.servlet.ServletException', message: 'wrapper' } },
+      events: events.map((event, index) => index === 1 ? {
+        ...event,
+        kind: 'recording_event_kind:frame_throw',
+        exception: {
+          exceptionType: 'org.example.ApplicationException',
+          message: 'private-message-canary',
+          stackFrames: ['private-stack-canary'],
+        },
+      } : event),
+    };
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: /Repo\.save/ }));
+    expect(within(inspector()).getByText('org.example.ApplicationException')).toBeInTheDocument();
+    expect(within(inspector()).getByText(/cause chain not observed/)).toBeInTheDocument();
+    expect(within(inspector()).queryByText(/jakarta.servlet.ServletException/)).not.toBeInTheDocument();
+    expect(within(inspector()).queryByText(/private-message-canary|private-stack-canary/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Controller\.create/ }));
+    expect(within(inspector()).queryByText(/Thrown exception:/)).not.toBeInTheDocument();
+  });
+
+  it('names a missing throw type without substituting the recording outcome', async () => {
+    responseDetail = { ...detail, events: events.map((event, index) => index === 1 ? {
+      ...event, kind: 'recording_event_kind:frame_throw', exception: { exceptionType: null },
+    } : event) };
+    await openRecording();
+    fireEvent.click(screen.getByRole('button', { name: /Repo\.save/ }));
+    expect(within(inspector()).getByText('type not observed')).toBeInTheDocument();
+    expect(within(inspector()).queryByText(/java.lang.IllegalStateException/)).not.toBeInTheDocument();
   });
 
   it('keeps one selection across Linear -> Canvas -> inspector -> Linear', async () => {

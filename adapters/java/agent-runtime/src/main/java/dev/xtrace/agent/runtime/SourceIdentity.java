@@ -1,9 +1,6 @@
 package dev.xtrace.agent.runtime;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
@@ -25,6 +22,10 @@ import net.bytebuddy.jar.asm.Opcodes;
  * binding is therefore {@code OBSERVED_UNATTESTED}; a file that is missing, whose name disagrees
  * with the class's {@code SourceFile}, or whose length cannot contain the method's lines is shown
  * as such and never as a match.
+ *
+ * <p>The canonical source base is the confinement boundary: the explicit project directory, or
+ * the application's working directory when none was supplied. Neither case searches ancestors.
+ * Every path component must remain inside that boundary, including after following symlinks.
  */
 final class SourceIdentity {
   /** Wire value of {@code SOURCE_BINDING_OBSERVED_UNATTESTED}. */
@@ -33,7 +34,6 @@ final class SourceIdentity {
   private static final int ATTESTATION_MISSING = 2;
   private static final int DEBUG_METADATA_ABSENT = 4;
   private static final int SOURCE_METADATA_INVALID = 5;
-  private static final long MAX_SOURCE_BYTES = 1024 * 1024;
   private static final int MAX_CLASS_BYTES = 8 * 1024 * 1024;
   private static final int MAX_CLASSES_PER_LOADER = 20_000;
 
@@ -48,11 +48,32 @@ final class SourceIdentity {
       byte[] classBytes,
       List<String> sourceRoots,
       Path workingDirectory) {
+    observe(loader, internalName, classBytes, sourceRoots, workingDirectory, file -> {});
+  }
+
+  static void observe(
+      ClassLoader loader,
+      String internalName,
+      byte[] classBytes,
+      List<String> sourceRoots,
+      Path workingDirectory,
+      ConfinedSourceFiles.BeforeOpen beforeOpen) {
+    observe(loader, internalName, classBytes, sourceRoots, workingDirectory,
+        (base, relative) -> ConfinedSourceFiles.read(base, relative, beforeOpen));
+  }
+
+  static void observe(
+      ClassLoader loader,
+      String internalName,
+      byte[] classBytes,
+      List<String> sourceRoots,
+      Path workingDirectory,
+      ConfinedSourceFiles.Reader reader) {
     if (loader == null || internalName == null || classBytes == null) return;
     if (classBytes.length > MAX_CLASS_BYTES) return;
     try {
       ClassFacts facts = parse(internalName, classBytes);
-      facts.resolve(sourceRoots, workingDirectory);
+      facts.resolve(sourceRoots, workingDirectory, reader);
       synchronized (LOADERS) {
         Map<String, ClassFacts> classes = LOADERS.computeIfAbsent(loader, key -> new HashMap<>());
         if (classes.size() < MAX_CLASSES_PER_LOADER) {
@@ -114,7 +135,11 @@ final class SourceIdentity {
               @Override
               public MethodVisitor visitMethod(
                   int access, String name, String descriptor, String signature, String[] ex) {
-                if ((access & (Opcodes.ACC_SYNTHETIC | Opcodes.ACC_BRIDGE)) != 0) return null;
+                // Lambda bodies own focused cursors and need the same observed extent as methods.
+                if ((access & Opcodes.ACC_BRIDGE) != 0
+                    || ((access & Opcodes.ACC_SYNTHETIC) != 0 && !name.startsWith("lambda$"))) {
+                  return null;
+                }
                 int[] range = {Integer.MAX_VALUE, 0};
                 facts.lines.put(name + descriptor, range);
                 return new MethodVisitor(Opcodes.ASM9) {
@@ -164,29 +189,44 @@ final class SourceIdentity {
     }
 
     void resolve(List<String> sourceRoots, Path workingDirectory) {
+      resolve(sourceRoots, workingDirectory, ConfinedSourceFiles::read);
+    }
+
+    void resolve(List<String> sourceRoots, Path workingDirectory,
+        ConfinedSourceFiles.Reader reader) {
       if (sourceFile == null || !simpleSourceName(sourceFile)) {
         fileProblem = sourceFile == null ? DEBUG_METADATA_ABSENT : SOURCE_METADATA_INVALID;
         return;
       }
       int slash = internalName.lastIndexOf('/');
       String packagePath = slash < 0 ? "" : internalName.substring(0, slash + 1);
-      for (String root : sourceRoots) {
-        Path found = locate(workingDirectory, root + "/" + packagePath + sourceFile);
-        if (found == null) continue;
-        try {
-          if (Files.size(found) > MAX_SOURCE_BYTES) {
-            fileProblem = SOURCE_METADATA_INVALID;
-            return;
-          }
-          byte[] bytes = Files.readAllBytes(found);
-          hash = SourceAttestation.blake3Of(bytes);
-          fileLines = countLines(bytes);
-          path = repoRelative(found, workingDirectory);
-          return;
-        } catch (IOException unreadable) {
+      try {
+        if (workingDirectory == null) {
           fileProblem = ATTESTATION_MISSING;
           return;
         }
+        Path base = workingDirectory.toRealPath();
+        for (String root : sourceRoots) {
+          ConfinedSourceFiles.Source found = reader.read(
+              base, root + "/" + packagePath + sourceFile);
+          if (found == null) continue;
+          if (!found.path().getFileName().toString().equals(sourceFile)) {
+            fileProblem = SOURCE_METADATA_INVALID;
+            return;
+          }
+          byte[] bytes = found.bytes();
+          hash = SourceAttestation.blake3Of(bytes);
+          fileLines = countLines(bytes);
+          path = found.path().toString().replace('\\', '/');
+          return;
+        }
+      } catch (ConfinedSourceFiles.TooLarge invalid) {
+        fileProblem = SOURCE_METADATA_INVALID;
+        return;
+      } catch (IOException unavailable) {
+        // An unsafe or unreadable path must not fall through to a different source root.
+        // Provider capability failures also emit XTR-JAVA-SOURCE-UNVERIFIABLE once; the wire
+        // binding vocabulary has no platform-unverifiable value.
       }
       fileProblem = ATTESTATION_MISSING;
     }
@@ -226,33 +266,6 @@ final class SourceIdentity {
       if (c == '/' || c == '\\' || c < ' ' || c == 0x7f || c == ':') return false;
     }
     return !name.equals(".java") && !name.startsWith(".");
-  }
-
-  /** Finds the file by climbing from the working directory; each probe is a plain regular file. */
-  private static Path locate(Path workingDirectory, String relative) {
-    if (workingDirectory == null) return null;
-    Path base = workingDirectory.toAbsolutePath().normalize();
-    for (int depth = 0; depth < 8 && base != null; depth++, base = base.getParent()) {
-      Path candidate = base.resolve(relative).normalize();
-      if (!candidate.startsWith(base)) return null;
-      if (Files.isRegularFile(candidate, LinkOption.NOFOLLOW_LINKS)) return candidate;
-    }
-    return null;
-  }
-
-  /** Path relative to the nearest ancestor holding {@code .git}, else to the working directory. */
-  static String repoRelative(Path file, Path workingDirectory) {
-    Path root = null;
-    for (Path dir = file.getParent(); dir != null; dir = dir.getParent()) {
-      if (Files.exists(dir.resolve(".git"), LinkOption.NOFOLLOW_LINKS)) {
-        root = dir;
-        break;
-      }
-    }
-    if (root == null) root = workingDirectory.toAbsolutePath().normalize();
-    if (!file.startsWith(root)) return file.getFileName().toString();
-    String relative = root.relativize(file).toString().replace('\\', '/');
-    return new String(relative.getBytes(StandardCharsets.UTF_8), StandardCharsets.UTF_8);
   }
 
   static int countLines(byte[] bytes) {

@@ -44,6 +44,7 @@ pub mod migrations;
 pub mod project_repository;
 pub mod recording_port;
 pub mod recording_store;
+mod session_health;
 pub mod xtf;
 
 pub use catalog_discovery_store::SqliteCatalogDiscoveryStore;

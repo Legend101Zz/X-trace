@@ -39,6 +39,7 @@ pub fn op(id: &str, method: &str, route: &str, claims: Vec<ClaimInput>) -> Opera
         effective_state: EffectiveState::Registered,
         claims_available: true,
         claims,
+        catalog_summary: None,
     }
 }
 
@@ -60,7 +61,7 @@ pub fn spring_orders() -> ExportInput {
         symbol: "OrderController.get".into(),
         path: "src/main/java/demo/OrderController.java".into(),
         line_start: 20,
-        line_end: 31,
+        line_end: Some(31),
     });
     get_one.examples = vec![example("param:id", "typical", ExampleOrigin::Scenario, "42")];
 

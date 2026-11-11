@@ -223,6 +223,9 @@ fn recipe(op: &PreparedOp, ordinal: u32) -> Recipe {
     s.push_str(&format!("# operation: {}\n", comment_safe(&op.operation_id)));
     s.push_str(&format!("# route: {} {}\n", comment_safe(&op.method), comment_safe(&op.path)));
     s.push_str(&format!("# catalog state: {}\n", op.state.name()));
+    if let Some(metadata) = crate::projection::catalog_metadata(op) {
+        s.push_str(&format!("# x-xtrace catalog summary: {metadata}\n"));
+    }
     if mutating {
         s.push_str(&format!(
             "# MUTATING: {} may change state on the target. Review it before running.\n",
@@ -304,7 +307,7 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
         files.push(ExportFile { path: name, mode: 0o644, bytes: r.script.into_bytes() });
     }
     files.push(ExportFile { path: "all.sh".to_owned(), mode: 0o644, bytes: all.into_bytes() });
-    Ok(crate::finish(files, omissions))
+    Ok(crate::finish(files, omissions, prepared.ops.len()))
 }
 
 fn secret_in(script: &str) -> Option<String> {

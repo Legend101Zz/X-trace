@@ -14,9 +14,10 @@
 //!   integrity;
 //! - `journal_mode = WAL` for concurrent readers and a single writer
 //!   without blocking on disk;
-//! - `synchronous = NORMAL` per `docs/plans/x-trace/03a-domain-and-storage.md`
-//!   §7 (FULL is reserved for migration checkpoints in later
-//!   slices);
+//! - `synchronous = FULL` so every write transaction, including Finish,
+//!   syncs the WAL at commit without waiting for readers to release snapshots;
+//! - `fullfsync = ON` and `checkpoint_fullfsync = ON` so Apple platforms
+//!   use full syncs for WAL commits and checkpoints;
 //! - `busy_timeout = 5000ms` so a brief contention window returns a
 //!   typed [`StoreErrorKind::Busy`] rather than failing immediately.
 //!
@@ -34,6 +35,8 @@ use xtrace_domain::CorrelationId;
 use crate::error::{StoreError, StoreErrorKind};
 use crate::migrations;
 use crate::project_repository::SqliteProjectRepository;
+#[cfg(unix)]
+use xtrace_private_storage::{AdmissionCaller as Caller, AdmissionCallerGuard as CallerGuard};
 use xtrace_private_storage::{AdmittedPrivateRoot, PrivateStorageError};
 
 /// Application binary identifier stored in `schema_meta.app_version`.
@@ -47,11 +50,10 @@ pub const JOURNAL_MODE_PRAGMA: &str = "PRAGMA journal_mode = WAL";
 
 /// Synchronous mode pragma string.
 ///
-/// `NORMAL` matches `03a-domain-and-storage.md` §7: it commits without
-/// the additional fsync that `FULL` requires while still surviving
-/// application-level crashes. `FULL` remains the documented choice
-/// for migration checkpoints in later slices.
-pub const SYNCHRONOUS_PRAGMA: &str = "PRAGMA synchronous = NORMAL";
+/// `FULL` syncs the WAL at each write commit, making acknowledged Finish
+/// evidence power-loss durable without a checkpoint barrier. This adds a
+/// WAL sync per write transaction compared with `NORMAL`.
+pub const SYNCHRONOUS_PRAGMA: &str = "PRAGMA synchronous = FULL";
 
 /// Busy timeout applied to every connection. Five seconds matches the
 /// value used by other local-first products; longer values mask real
@@ -60,7 +62,7 @@ pub const BUSY_TIMEOUT_PRAGMA: &str = "PRAGMA busy_timeout = 5000";
 
 /// Maximum schema version this binary can read. Bumped together with
 /// new migrations.
-pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_SCHEMA_VERSION: u32 = 10;
 
 /// Stable ABI version of the store crate. Bumped when the on-disk
 /// representation changes in a way that requires all linked code to
@@ -230,6 +232,8 @@ fn validate_sqlite_private_files(
     database_name: &str,
     correlation_id: CorrelationId,
 ) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    let _admission_caller = CallerGuard::enter(Caller::SqliteFiles);
     let mut names = Vec::with_capacity(4);
     names.push(database_name.to_owned());
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -286,6 +290,8 @@ impl SqliteStore {
     /// Returns [`StoreError`] when SQLite cannot open the connection,
     /// the parent directory does not exist, or migrations fail.
     pub fn open(path: &Path, options: OpenOptions) -> Result<Self, StoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::SqliteOpen);
         let bootstrap = options.bootstrap_correlation_id;
         let parent =
             path.parent().filter(|value| !value.as_os_str().is_empty()).ok_or_else(|| {
@@ -417,6 +423,8 @@ impl SqliteStore {
         database_path: Option<PathBuf>,
         options: OpenOptions,
     ) -> Result<Self, StoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::SqliteWrap);
         let bootstrap = options.bootstrap_correlation_id;
         let private_state = database_path
             .as_deref()
@@ -473,6 +481,8 @@ impl SqliteStore {
         private_root: Option<AdmittedPrivateRoot>,
         private_database_file: Option<std::fs::File>,
     ) -> Result<Self, StoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::SqliteWrap);
         let bootstrap = options.bootstrap_correlation_id;
         let private_database_name = match (&private_root, &database_path) {
             (Some(_), Some(path)) => Some(
@@ -576,6 +586,10 @@ impl SqliteStore {
     /// repositories (added in later slices) that share the same
     /// connection mutex.
     pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        #[cfg(unix)]
+        let _admission_caller = CallerGuard::enter(Caller::SqliteFiles);
+        #[cfg(test)]
+        let mut phase = crate::recording_store::work_profile::Phase::enter("connection_mutex_wait");
         let guard = self.inner.connection.lock().map_err(|_| {
             StoreError::new(
                 StoreErrorKind::Corruption,
@@ -583,6 +597,8 @@ impl SqliteStore {
                 CorrelationId::new(),
             )
         })?;
+        #[cfg(test)]
+        phase.switch("connection_file_admission");
         if let (Some(root), Some(name), Some(file)) = (
             &self.inner.private_root,
             &self.inner.private_database_name,
@@ -614,6 +630,8 @@ impl SqliteStore {
         &self,
         correlation_id: CorrelationId,
     ) -> Result<MutexGuard<'_, ()>, StoreError> {
+        #[cfg(test)]
+        let _phase = crate::recording_store::work_profile::Phase::enter("writer_mutex_wait");
         self.inner.recording_writer.lock().map_err(|_| {
             StoreError::new(
                 StoreErrorKind::Corruption,
@@ -645,6 +663,11 @@ fn apply_pragmas(
         .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
     connection
         .execute_batch(SYNCHRONOUS_PRAGMA)
+        .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
+    // fullfsync covers the WAL sync at commit; checkpoint_fullfsync also
+    // covers automatic checkpoints. SQLite ignores these on other platforms.
+    connection
+        .execute_batch("PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON;")
         .map_err(|err| StoreError::from_rusqlite(err, correlation_id))?;
     let pragma = format!("PRAGMA busy_timeout = {}", busy_timeout.as_millis());
     connection
@@ -681,7 +704,7 @@ mod tests {
 
         let synchronous: i64 =
             conn.query_row("PRAGMA synchronous", [], |row| row.get(0)).expect("synchronous pragma");
-        assert_eq!(synchronous, 1, "synchronous must be NORMAL (value 1); FULL=2, OFF=0");
+        assert_eq!(synchronous, 2, "synchronous must be FULL (value 2); NORMAL=1, OFF=0");
     }
 
     #[test]
@@ -695,6 +718,21 @@ mod tests {
         // re-applying migrations.
         let reopened = SqliteStore::open(&path, OpenOptions::default()).expect("reopen");
         assert_eq!(reopened.bootstrap().schema_version, CURRENT_SCHEMA_VERSION);
+        for writer in [&store, &reopened] {
+            let connection = writer.lock().expect("writer connection");
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .expect("journal mode");
+            assert_eq!(journal_mode, "wal");
+            for (pragma, expected) in [
+                ("PRAGMA synchronous", 2_i64),
+                ("PRAGMA fullfsync", 1),
+                ("PRAGMA checkpoint_fullfsync", 1),
+            ] {
+                let actual: i64 = connection.query_row(pragma, [], |row| row.get(0)).expect(pragma);
+                assert_eq!(actual, expected, "writer durability: {pragma}");
+            }
+        }
     }
 
     #[test]

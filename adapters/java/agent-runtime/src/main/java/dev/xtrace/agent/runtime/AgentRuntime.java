@@ -5,6 +5,7 @@ import dev.xtrace.adapter.BootstrapReader;
 import dev.xtrace.adapter.ClientException;
 import dev.xtrace.adapter.XtpSession;
 import dev.xtrace.agent.bootstrap.BootstrapBridge;
+import dev.xtrace.agent.bootstrap.ProxyBridge;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -63,6 +64,7 @@ public final class AgentRuntime {
     RecordingWriter writer = null;
     RuntimeBridgeSink sink = null;
     LineProbeBridgeSink lineSink = null;
+    ProxyCaptureSink proxySink = null;
     boolean permanent = false;
     try {
       if (attach) FixtureInstrumentation.validateAttach(instrumentation);
@@ -94,20 +96,27 @@ public final class AgentRuntime {
       sink = new RuntimeBridgeSink(queue);
       sink.useScope(config.scope());
       writer = new RecordingWriter(session, queue, sink);
+      FixtureInstrumentation.CaptureLimitations limitations =
+          new FixtureInstrumentation.CaptureLimitations();
+      sink.untransformedCount(limitations::count);
       permanent = true;
-      // Line probes and value reads exist only in effective focused mode (CONTRACTS section 4:
-      // the standard line budget is 0). The daemon honours the focused claim only when armed.
+      // Line probes and all value reads, including proxy arguments/returns, are focused-only
+      // (ADR 0003 root decision 3). The daemon honours the focused claim only when armed.
       FixtureInstrumentation.LineProbes lineProbes = null;
       if (config.focused()) {
         lineProbes =
             new FixtureInstrumentation.LineProbes(
-                new dev.xtrace.agent.runtime.line.SiteRegistry());
+                new dev.xtrace.agent.runtime.line.SiteRegistry(), limitations);
         lineSink = new LineProbeBridgeSink(sink, lineProbes.registry());
         writer.capturePolicy("xtrace.focused.v1");
-        writer.untransformedCount(lineProbes::skippedCount);
       }
+      proxySink = new ProxyCaptureSink(queue, config.scope(), config.focused());
+      if (!ProxyBridge.install(proxySink)) {
+        throw new ClientException("XTR-JAVA-AGENT", "proxy sink is already active");
+      }
+      ProxyInstrumentation.install(instrumentation, writer::stopIncomplete, attach);
       FixtureInstrumentation.install(
-          instrumentation, writer::stopIncomplete, attach, config.scope(), lineProbes);
+          instrumentation, writer::stopIncomplete, attach, config.scope(), lineProbes, limitations);
       if (lineSink != null && !BootstrapBridge.installLineSink(lineSink)) {
         throw new ClientException("XTR-JAVA-AGENT", "line sink is already active");
       }
@@ -117,7 +126,7 @@ public final class AgentRuntime {
       if (!BootstrapBridge.install(sink)) {
         throw new ClientException("XTR-JAVA-AGENT", "bootstrap bridge is already active");
       }
-      RuntimeHandle handle = new RuntimeHandle(writer, sink, lineSink);
+      RuntimeHandle handle = new RuntimeHandle(writer, sink, lineSink, proxySink);
       if (!ACTIVE.compareAndSet(null, handle)) {
         BootstrapBridge.disable(sink);
         throw new ClientException("XTR-JAVA-AGENT", "agent runtime activation raced");
@@ -129,6 +138,7 @@ public final class AgentRuntime {
       writer = null;
       sink = null;
       lineSink = null;
+      proxySink = null;
       return result;
     } catch (ClientException error) {
       throw new StartFailure(permanent, error.code(), error.getMessage(), error);
@@ -140,6 +150,7 @@ public final class AgentRuntime {
       if (identity != null) Arrays.fill(identity, (byte) 0);
       if (sink != null) BootstrapBridge.disable(sink);
       if (lineSink != null) BootstrapBridge.disableLineSink(lineSink);
+      if (proxySink != null) proxySink.close();
       if (writer != null) writer.close();
       else if (session != null) closeSession(session);
       if (bootstrap != null) bootstrap.close();
@@ -233,19 +244,23 @@ public final class AgentRuntime {
     private final RecordingWriter writer;
     private final RuntimeBridgeSink sink;
     private final LineProbeBridgeSink lineSink;
+    private final ProxyCaptureSink proxySink;
     private final java.util.concurrent.atomic.AtomicBoolean closed =
         new java.util.concurrent.atomic.AtomicBoolean();
 
     private RuntimeHandle(
-        RecordingWriter writer, RuntimeBridgeSink sink, LineProbeBridgeSink lineSink) {
+        RecordingWriter writer, RuntimeBridgeSink sink, LineProbeBridgeSink lineSink,
+        ProxyCaptureSink proxySink) {
       this.writer = writer;
       this.sink = sink;
       this.lineSink = lineSink;
+      this.proxySink = proxySink;
     }
 
     private void close() {
       if (!closed.compareAndSet(false, true)) return;
       if (lineSink != null) BootstrapBridge.disableLineSink(lineSink);
+      proxySink.close();
       writer.close();
       BootstrapBridge.disable(sink);
       ACTIVE.compareAndSet(this, null);

@@ -61,3 +61,21 @@ only; new or upgraded dependencies require a ticket.
 Only cache `target/*` and scratch `*` entries are eligible.
 Symlinks and nested mounts are refused before deletion.
 Dependency caches stay intact; cache maintenance commands are suggestions only.
+
+Before release, the owner runs `bash tools/dev/macos-release-check.sh` on a Mac
+from a clean checkout after prep. This is the local test exception from the
+2026-11-11 owner decision (W2-R27a); normal agent checks remain compile-only.
+The script header lists prerequisites. It runs release tooling, Node and web on
+both Node 22 and 24, Java tests on locally installed JDKs 17/21/25, Rust workspace tests, release
+diagnostic guards, and the arm64 package journey. It continues after a suite
+fails and prints each suite's exit code. Private logs stay in a new scratch
+directory. Exit 1 means a suite failed; exit 2 means coverage is incomplete.
+Node discovery checks every absolute PATH directory and Homebrew's versioned
+bin directories. Set `XTRACE_NODE_22_BIN` and `XTRACE_NODE_24_BIN` to select
+other directories containing executable `node` and `npm` commands. Each override
+must report the matching Node major version. Each suite records its full Node
+version; each unavailable version is a named Node and web coverage gap.
+Missing JDKs, an unsupported package architecture, and the hosted-only
+other-UID check are named gaps. The manual macOS workflow retains the
+other-UID check; the local script alone cannot certify it.
+Hosted `macos.yml` now runs only on manual dispatch; Linux `ci-ok` gates development.

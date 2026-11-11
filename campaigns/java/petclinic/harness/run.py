@@ -15,6 +15,7 @@ import pathlib
 import re
 import shlex
 import sys
+import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "lib"))
@@ -43,10 +44,11 @@ def build() -> int:
 def make_stack(run_id: str) -> xcamp.Stack:
     return xcamp.Stack(
         project="petclinic", jdk_image=IMAGE, jar=JAR, run_id=run_id, app_port=8080,
-        app_args=["--server.port={APPPORT}"],
+        app_args=["--server.port={APPPORT}", "--server.address={BINDADDR}"],
         env={"SPRING_PROFILES_ACTIVE": "postgres", "POSTGRES_URL": "jdbc:postgresql://{DBHOST}:{DBPORT}/petclinic",
              "POSTGRES_USER": "petclinic", "POSTGRES_PASS": "petclinic"},
-        java_opts=["-Xmx768m"], db_name="petclinic", db_user="petclinic", db_password="petclinic",
+        java_opts=["-Xmx768m", "-Dxtrace.agent.recordingDiagnostics=true"],
+        db_name="petclinic", db_user="petclinic", db_password="petclinic",
         ready_path="/actuator/health", ready_ok=lambda st, body: st == 200 and '"UP"' in body)
 
 
@@ -176,6 +178,7 @@ SCENARIOS = [
 
 
 def baseline(out):
+    os.environ.pop("XCAMP_LAUNCH_PREFIX", None)
     return xcamp.run_baseline(project="petclinic", pin={**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR),
                               "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
                               "postgresImageDigest": xcamp.POSTGRES_DIGEST, "jdkImage": IMAGE},
@@ -185,35 +188,46 @@ def baseline(out):
 
 # Per-scenario expectations on the RECORDINGS (route, HTTP outcome, controller/repository frames, source identity).
 # Petclinic has no service layer: its controllers call Spring Data repositories directly, so no `service` frame is required.
-OWN = {"controller": "OwnerController", "repository": "OwnerRepository"}
+# Proxy symbols name the method's actual declaring interface, including inherited CRUD methods.
+CRUD = "org.springframework.data.repository.CrudRepository"
+JPA_SAVE_AND_FLUSH = "org.springframework.data.jpa.repository.JpaRepository.saveAndFlush"
+OWN = {"controller": "OwnerController", "repository": ["OwnerRepository", CRUD]}
 EXPECT = {
     "search-seeded": [
         {"method": "GET", "route": "/owners", "status": 200, "layers": ["controller", "repository"], "layerHints": OWN},
         {"method": "GET", "route": "/vets", "status": 200, "layers": ["controller", "repository"],
-         "layerHints": {"controller": "VetController", "repository": "VetRepository"}}],
+         "layerHints": {"controller": "VetController", "repository": ["VetRepository", CRUD]}}],
     "owner-create-roundtrip": [
         {"method": "POST", "route": "/owners/new", "status": 302, "layers": ["controller", "repository"], "layerHints": OWN},
         {"method": "GET", "route": "/owners/{ownerId}", "status": 200, "layers": ["controller", "repository"], "layerHints": OWN}],
     "owner-validation-error": [
         {"method": "POST", "route": "/owners/new", "status": 200, "layers": ["controller"], "layerHints": OWN}],
     "pet-and-visit-flow": [
-        {"method": "POST", "route": "/owners/{ownerId}/pets/new", "status": 302, "layers": ["controller", "repository"],
-         "layerHints": {"controller": "PetController", "repository": "OwnerRepository"}},
-        {"method": "POST", "route": "/owners/{ownerId}/pets/{petId}/visits/new", "status": 302, "layers": ["controller", "repository"],
-         "layerHints": {"controller": "VisitController", "repository": "OwnerRepository"}}],
+        {"method": "POST", "route": "/owners/{ownerId}/pets/new", "statuses": [302, 200], "layers": ["controller", "repository"],
+         # The successful submission calls the inherited saveAndFlush declaration.
+         "layerHints": {"controller": "PetController", "repository": [*OWN["repository"], JPA_SAVE_AND_FLUSH]}},
+        {"method": "POST", "route": "/owners/{ownerId}/pets/{petId}/visits/new", "statuses": [200, 302], "layers": ["controller", "repository"],
+         "layerHints": {"controller": "VisitController", "repository": OWN["repository"]}}],
     "owner-edit": [
         {"method": "POST", "route": "/owners/{ownerId}/edit", "status": 302, "layers": ["controller", "repository"], "layerHints": OWN}],
     "missing-owner-error": [
-        {"method": "GET", "route": "/owners/{ownerId}", "status": 500, "layers": ["controller", "repository"], "layerHints": OWN}],
+        # The servlet boundary withholds the container's later status as provisional.
+        {"method": "GET", "route": "/owners/{ownerId}", "status": None, "outcome": "exception_propagated", "exception": "IllegalArgumentException",
+         "layers": ["controller", "repository"], "layerHints": OWN}],
     "controller-crash-path": [
-        {"method": "GET", "route": "/oups", "status": 500, "layers": ["controller"], "layerHints": {"controller": "CrashController"}}],
+        {"method": "GET", "route": "/oups", "status": None, "outcome": "exception_propagated", "exception": "RuntimeException", "layers": ["controller"],
+         "layerHints": {"controller": "CrashController"}}],
     "concurrent-isolation": [
         {"method": "GET", "route": "/owners/{ownerId}", "status": 200, "layers": ["controller"], "layerHints": OWN, "minCount": 30},
         {"method": "POST", "route": "/owners/new", "status": 302, "layers": ["controller"], "layerHints": OWN, "minCount": 10}],
 }
 
 
-def instrumented() -> int:
+APP_PACKAGE = "org.springframework.samples.petclinic"   # petclinic's root package (every controller and repository lives below it)
+SOURCE_ROOT = "src/main/java"                           # repo-relative to the project directory (the pinned checkout)
+
+
+def instrumented(out: pathlib.Path | None = None, baseline_receipt: pathlib.Path | None = None) -> int:
     """One reset-to-finish run with the app launched by the PACKAGED `xtrace run`, then judged through the read API."""
     need = {k: os.environ.get(k, "") for k in ("XCAMP_XTRACE", "XCAMP_AGENT", "XCAMP_DATA_HOME")}
     missing = [k for k, v in need.items() if not v]
@@ -222,15 +236,16 @@ def instrumented() -> int:
         return 2
     xtrace, agent = need["XCAMP_XTRACE"], need["XCAMP_AGENT"]
     os.environ["XCAMP_LAUNCH_PREFIX"] = " ".join(shlex.quote(x) for x in
-        [xtrace, "run", "--project-dir", str(SRC), "--java-agent", agent, "--"])
+        [xtrace, "run", "--project-dir", str(SRC), "--java-agent", agent,
+         "--app-package", APP_PACKAGE, "--source-root", SOURCE_ROOT, "--"])
     canaries = None
     if os.environ.get("XCAMP_CANARY_FILE"):
         canaries = json.loads(pathlib.Path(os.environ["XCAMP_CANARY_FILE"]).read_text())
     n = 1
     while (PROJ / f"instrumented-{n}").exists():
         n += 1
-    out = PROJ / f"instrumented-{n}"
-    baseline_receipt = pathlib.Path(os.environ["XCAMP_BASELINE_RECEIPT"]) if os.environ.get("XCAMP_BASELINE_RECEIPT") else None
+    out = out or PROJ / f"instrumented-{n}"
+    baseline_receipt = baseline_receipt or (pathlib.Path(os.environ["XCAMP_BASELINE_RECEIPT"]) if os.environ.get("XCAMP_BASELINE_RECEIPT") else None)
     r = xinstr.run_instrumented(
         project="petclinic", pin={**CAMP["upstream"], "jarSha256": xcamp.sha256_file(JAR), "git": xcamp.git_pin_check(SRC, CAMP["upstream"]["sha"]),
                                   "postgresImageDigest": xcamp.POSTGRES_DIGEST, "jdkImage": IMAGE},
@@ -242,7 +257,55 @@ def instrumented() -> int:
     return 0 if r["result"] == "recorded" else 1
 
 
+def overhead() -> int:
+    """Five fresh baseline/instrumented pairs, in that order; no retry of a failed repeat."""
+    root = pathlib.Path(os.environ["XCAMP_OVERHEAD_DIR"])
+    root.mkdir(parents=True, exist_ok=False)
+    runs = []
+    manifest = root / "runs.json"
+    for repeat in range(5):
+        baseline_receipt = root / f"baseline-{repeat}" / "receipt.json"
+        for mode in ("baseline", "instrumented"):
+            dest = root / f"{mode}-{repeat}"
+            started = time.time_ns()
+            if mode == "baseline":
+                result = baseline(dest)
+                rc = 0 if result["result"] == "passed_baseline_only" else 1
+            else:
+                rc = instrumented(dest, baseline_receipt)
+            runs.append({"mode": mode, "repeat": repeat, "startedNs": started, "finishedNs": time.time_ns(),
+                         "receiptPath": str((dest / "receipt.json").resolve()), "exitCode": rc})
+            manifest.write_text(json.dumps({"runs": runs}, indent=1, sort_keys=True) + "\n")
+            if rc != 0:
+                return rc
+    return 0
+
+
+def flows() -> int:
+    """Lifecycle and focused-capture flows (record/stop, restart, interrupted recording, lines, values); writes flows-<n>/flows.json."""
+    need = {k: os.environ.get(k, "") for k in ("XCAMP_XTRACE", "XCAMP_AGENT", "XCAMP_DATA_HOME")}
+    missing = [k for k, v in need.items() if not v]
+    if missing or os.environ.get("XCAMP_APP_MODE") != "host":
+        print("flows needs XCAMP_APP_MODE=host and " + ", ".join(missing or ["(all set)"]))
+        return 2
+    import xflows
+    n = 1
+    while (PROJ / f"flows-{n}").exists():
+        n += 1
+    out = PROJ / f"flows-{n}"
+    out.mkdir(parents=True)
+    results = xflows.Flows(xtrace=need["XCAMP_XTRACE"], agent=need["XCAMP_AGENT"], project_dir=SRC,
+                           data_home=pathlib.Path(need["XCAMP_DATA_HOME"]), out_dir=out, make_stack=make_stack,
+                           app_package=APP_PACKAGE, source_root=SOURCE_ROOT).run_all()
+    (out / "flows.json").write_text(json.dumps({"schemaVersion": 1, "kind": "campaign_flows", "steps": results}, indent=1, sort_keys=True))
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "overhead":
+        sys.exit(overhead())
     if len(sys.argv) > 1 and sys.argv[1] == "instrumented":
         sys.exit(instrumented())
+    if len(sys.argv) > 1 and sys.argv[1] == "flows":
+        sys.exit(flows())
     sys.exit(xcamp.main_cli("petclinic", build, baseline, PROJ))

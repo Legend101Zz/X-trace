@@ -3,6 +3,7 @@ package dev.xtrace.agent.runtime;
 import static net.bytebuddy.matcher.ElementMatchers.isAbstract;
 import static net.bytebuddy.matcher.ElementMatchers.isAnnotatedWith;
 import static net.bytebuddy.matcher.ElementMatchers.isBridge;
+import static net.bytebuddy.matcher.ElementMatchers.isConstructor;
 import static net.bytebuddy.matcher.ElementMatchers.isMethod;
 import static net.bytebuddy.matcher.ElementMatchers.isNative;
 import static net.bytebuddy.matcher.ElementMatchers.isSynthetic;
@@ -79,7 +80,7 @@ final class FixtureInstrumentation {
     install(instrumentation, onFailure, attach, scope, null);
   }
 
-  /** Probe owner application classes call; bootstrap-visible, so every loader resolves it. */
+  /** Probe owner application classes call, subject to their defining loader's visibility. */
   static final String PROBE_OWNER = "dev/xtrace/agent/bootstrap/BootstrapBridge";
 
   /** Method reports kept for diagnostics; bounded so a huge application cannot grow it. */
@@ -96,9 +97,21 @@ final class FixtureInstrumentation {
       boolean attach,
       ApplicationScope scope,
       LineProbes lineProbes) {
+    install(instrumentation, onFailure, attach, scope, lineProbes,
+        lineProbes == null ? new CaptureLimitations() : lineProbes.limitations);
+  }
+
+  static void install(
+      Instrumentation instrumentation,
+      Runnable onFailure,
+      boolean attach,
+      ApplicationScope scope,
+      LineProbes lineProbes,
+      CaptureLimitations limitations) {
     if (!INSTALLED.compareAndSet(false, true)) {
       throw new IllegalStateException("fixture instrumentation is already installed");
     }
+    SafeListener listener = new SafeListener(onFailure, scope, limitations);
     AgentBuilder builder =
         new AgentBuilder.Default()
             .disableClassFormatChanges()
@@ -106,7 +119,7 @@ final class FixtureInstrumentation {
                 attach
                     ? AgentBuilder.RedefinitionStrategy.RETRANSFORMATION
                     : AgentBuilder.RedefinitionStrategy.DISABLED)
-            .with(new SafeListener(onFailure))
+            .with(listener)
             .ignore(
                 named("dev.xtrace.agent.bootstrap.XTraceAgent")
                     .or(named("dev.xtrace.agent.bootstrap.BootstrapBridge"))
@@ -133,7 +146,8 @@ final class FixtureInstrumentation {
               className,
               classfileBuffer,
               scope.sourceRoots(),
-              java.nio.file.Path.of(System.getProperty("user.dir", ".")));
+              scope.sourceBase());
+          ProxyInterfaceSources.observe(loader, className, classfileBuffer, scope);
         }
         return null;
       }
@@ -154,25 +168,37 @@ final class FixtureInstrumentation {
             .type(named(DISPATCHER))
             .transform(
                 (target, type, loader, module, domain) ->
-                    target.visit(
-                        Advice.to(ExceptionResolutionAdvice.class)
-                            .on(
-                                isMethod()
-                                    .and(named("processHandlerException"))
-                                    .and(takesArguments(4))
-                                    .and(not(isSynthetic())))))
+                    target
+                        .visit(
+                            Advice.to(ExceptionResolutionAdvice.class)
+                                .on(
+                                    isMethod()
+                                        .and(named("processHandlerException"))
+                                        .and(takesArguments(4))
+                                        .and(not(isSynthetic()))))
+                        .visit(
+                            Advice.to(DispatchAdvice.class)
+                                .on(
+                                    isMethod()
+                                        .and(named("doDispatch"))
+                                        .and(takesArguments(2))
+                                        .and(not(isSynthetic())))))
             .type(
-                (type, loader, module, redefined, domain) ->
-                    !type.isInterface()
+                (type, loader, module, redefined, domain) -> {
+                  int verdict = listener.observeScope(loader, type.getName(), domain);
+                  return !type.isInterface()
                         && !type.isEnum()
                         && !type.isAnnotation()
                         && !type.isRecord()
-                        && scope.isApplication(type.getName(), domain))
+                        && verdict == ApplicationScope.APPLICATION;
+                })
             .transform(
                 (target, type, loader, module, domain) -> {
-                  net.bytebuddy.dynamic.DynamicType.Builder<?> framed =
-                      target.visit(Advice.to(FrameAdvice.class).on(frameMethods()));
-                  return lineProbes == null ? framed : framed.visit(lineProbes.wrapper());
+                  if (lineProbes == null && !gapOwnerAvailable(loader)) {
+                    limitations.report();
+                    return target;
+                  }
+                  return target.visit(applicationProbes(loader, lineProbes, limitations));
                 })
             .type(named(H2_STATEMENT))
             .transform(
@@ -185,11 +211,42 @@ final class FixtureInstrumentation {
                                     .and(takesArguments(0))
                                     .and(not(isSynthetic())))));
     builder.installOn(instrumentation);
+    ServletBoundaryInstrumentation.install(instrumentation, onFailure, attach);
+  }
+
+  static net.bytebuddy.asm.AsmVisitorWrapper applicationProbes(
+      ClassLoader loader, LineProbes lines, CaptureLimitations limitations) {
+    Set<String> omitted = new java.util.HashSet<>();
+    return boundedProbes(lines == null ? null : lines.wrapper(loader, omitted), limitations, omitted,
+        gapOwnerAvailable(loader));
+  }
+
+  static net.bytebuddy.asm.AsmVisitorWrapper boundedProbes(
+      net.bytebuddy.asm.AsmVisitorWrapper lines, CaptureLimitations limitations, Set<String> omitted) {
+    return boundedProbes(lines, limitations, omitted, true);
+  }
+
+  private static net.bytebuddy.asm.AsmVisitorWrapper boundedProbes(
+      net.bytebuddy.asm.AsmVisitorWrapper lines, CaptureLimitations limitations, Set<String> omitted,
+      boolean constructorOwnerAvailable) {
+    net.bytebuddy.asm.AsmVisitorWrapper frames =
+        Advice.to(FrameAdvice.class).on(frameMethods(lines != null).and(not(isConstructor())));
+    if (lines != null && constructorOwnerAvailable) {
+      frames = new net.bytebuddy.asm.AsmVisitorWrapper.Compound(
+          frames, new ConstructorProbeAsmWrapper());
+    }
+    return new BoundedProbeAsmWrapper(
+        lines == null ? frames : new net.bytebuddy.asm.AsmVisitorWrapper.Compound(frames, lines),
+        key -> {
+          omitted.add(key);
+          limitations.report();
+        });
   }
 
   /** Focused-mode line probe wiring: one site registry and one thread-safe report sink. */
   static final class LineProbes {
     private final dev.xtrace.agent.runtime.line.SiteRegistry registry;
+    private final CaptureLimitations limitations;
     private final java.util.concurrent.ConcurrentLinkedQueue<
             dev.xtrace.agent.runtime.line.MethodReport>
         reports = new java.util.concurrent.ConcurrentLinkedQueue<>();
@@ -197,58 +254,187 @@ final class FixtureInstrumentation {
         new java.util.concurrent.atomic.AtomicInteger();
 
     LineProbes(dev.xtrace.agent.runtime.line.SiteRegistry registry) {
+      this(registry, new CaptureLimitations());
+    }
+
+    LineProbes(dev.xtrace.agent.runtime.line.SiteRegistry registry, CaptureLimitations limitations) {
       this.registry = java.util.Objects.requireNonNull(registry, "registry");
+      this.limitations = java.util.Objects.requireNonNull(limitations, "limitations");
     }
 
     dev.xtrace.agent.runtime.line.SiteRegistry registry() {
       return registry;
     }
 
-    /**
-     * Methods or classes the wrapper left untouched for a reason that is not by design (bridge and
-     * synthetic methods are never probed on purpose and are not counted).
-     */
-    long skippedCount() {
-      long skipped = 0;
-      for (dev.xtrace.agent.runtime.line.MethodReport report : reports) {
-        if (report.status() != dev.xtrace.agent.runtime.line.MethodReport.Status.SKIPPED) continue;
-        String reason = report.reason();
-        if (dev.xtrace.agent.runtime.line.MethodReport.Reasons.BRIDGE.equals(reason)
-            || dev.xtrace.agent.runtime.line.MethodReport.Reasons.SYNTHETIC.equals(reason)) {
-          continue;
-        }
-        skipped++;
-      }
-      return skipped;
-    }
-
     java.util.List<dev.xtrace.agent.runtime.line.MethodReport> reports() {
       return java.util.List.copyOf(reports);
     }
 
-    dev.xtrace.agent.runtime.line.LineProbeAsmWrapper wrapper() {
+    dev.xtrace.agent.runtime.line.LineProbeAsmWrapper wrapper(ClassLoader ownerLoader) {
+      return wrapper(ownerLoader, Set.of());
+    }
+
+    private dev.xtrace.agent.runtime.line.LineProbeAsmWrapper wrapper(
+        ClassLoader ownerLoader, Set<String> omitted) {
+      boolean gapAvailable = gapOwnerAvailable(ownerLoader);
+      if (!gapAvailable) limitations.report();
       return new dev.xtrace.agent.runtime.line.LineProbeAsmWrapper(
           dev.xtrace.agent.runtime.line.LineProbeConfig.focused(PROBE_OWNER),
           registry,
-          type -> null,
+          ignored -> null,
           batch -> {
             for (dev.xtrace.agent.runtime.line.MethodReport report : batch) {
               if (reportCount.incrementAndGet() > MAX_LINE_REPORTS) {
                 reportCount.decrementAndGet();
                 return;
               }
-              reports.add(report);
+              reports.add(omitted.contains(report.name() + report.descriptor())
+                  ? new dev.xtrace.agent.runtime.line.MethodReport(report.name(), report.descriptor(),
+                      dev.xtrace.agent.runtime.line.MethodReport.Status.SKIPPED,
+                      dev.xtrace.agent.runtime.line.MethodReport.Reasons.TOO_LARGE, 0, 0, "")
+                  : report);
             }
           },
-          null);
+          ownerLoader) {
+        @Override
+        protected String probeOwnerProblem() {
+          return gapAvailable ? super.probeOwnerProblem() : "bootstrap gap bridge unavailable";
+        }
+
+        @Override
+        protected int skippedMethodEntryBytes() { return gapAvailable ? 3 : 0; }
+
+        @Override
+        protected void skippedMethodEntryUnavailable() { limitations.report(); }
+
+        @Override
+        protected void skippedMethodEntry(net.bytebuddy.jar.asm.MethodVisitor method) {
+          // The decision travels with this method's bytecode, including lambda bodies. No loader
+          // registry or diagnostic-buffer capacity can change attribution at request time.
+          method.visitMethodInsn(net.bytebuddy.jar.asm.Opcodes.INVOKESTATIC,
+              PROBE_OWNER, "lineGap", "()V", false);
+        }
+      };
     }
+  }
+
+  /** Do not trust a shadow bridge or one missing the gap and constructor entry points. */
+  static boolean gapOwnerAvailable(ClassLoader loader) {
+    try {
+      Class<?> owner = Class.forName(PROBE_OWNER.replace('/', '.'), false, loader);
+      if (owner != BootstrapBridge.class) return false;
+      java.lang.reflect.Method gap = owner.getDeclaredMethod("lineGap");
+      java.lang.reflect.Method enter = owner.getDeclaredMethod("constructorEnter", Class.class, String.class);
+      java.lang.reflect.Method exit = owner.getDeclaredMethod("constructorExit", String.class, Throwable.class);
+      return java.lang.reflect.Modifier.isPublic(gap.getModifiers())
+          && java.lang.reflect.Modifier.isStatic(gap.getModifiers())
+          && gap.getReturnType() == void.class
+          && java.lang.reflect.Modifier.isPublic(enter.getModifiers())
+          && java.lang.reflect.Modifier.isStatic(enter.getModifiers())
+          && enter.getReturnType() == String.class
+          && java.lang.reflect.Modifier.isPublic(exit.getModifiers())
+          && java.lang.reflect.Modifier.isStatic(exit.getModifiers())
+          && exit.getReturnType() == void.class;
+    } catch (Throwable unavailable) {
+      return false;
+    }
+  }
+
+  /**
+   * Sticky process coverage limitation. Without invocation probes, affected requests cannot be
+   * identified, so every later recording conservatively names CLASS_NOT_TRANSFORMED. The count
+   * describes failed probe installations, never an invented number of missed invocations.
+   */
+  static final class CaptureLimitations {
+    private final java.util.concurrent.atomic.AtomicLong count =
+        new java.util.concurrent.atomic.AtomicLong();
+
+    void report() {
+      long previous = count.getAndUpdate(value -> value == Long.MAX_VALUE ? value : value + 1);
+      if (previous == 0) {
+        System.err.println(
+            "{\"code\":\"XTR-JAVA-INSTRUMENTATION\",\"message\":\"application invocation probes unavailable; recordings remain partial; application continues\"}");
+      }
+    }
+
+    long count() { return count.get(); }
   }
 
   static final class SafeListener extends AgentBuilder.Listener.Adapter {
     private final Runnable onFailure;
+    private final ApplicationScope scope;
+    private final CaptureLimitations limitations;
+    // Only in-flight callbacks are retained. Loader identity separates equal names, and a stack
+    // preserves the outer verdict when class loading recursively transforms another class.
+    private final ThreadLocal<java.util.Deque<ScopedType>> transforming = new ThreadLocal<>();
+
+    private static final class ScopedType {
+      final ClassLoader loader;
+      final String name;
+      int verdict = ApplicationScope.UNKNOWN;
+
+      ScopedType(ClassLoader loader, String name) {
+        this.loader = loader;
+        this.name = name;
+      }
+    }
 
     SafeListener(Runnable onFailure) {
+      this(onFailure, ApplicationScope.defaultScope(), new CaptureLimitations());
+    }
+
+    SafeListener(Runnable onFailure, ApplicationScope scope, CaptureLimitations limitations) {
       this.onFailure = java.util.Objects.requireNonNull(onFailure, "onFailure");
+      this.scope = scope;
+      this.limitations = limitations;
+    }
+
+    @Override
+    public void onDiscovery(String name, ClassLoader loader, JavaModule module, boolean loaded) {
+      java.util.Deque<ScopedType> pending = transforming.get();
+      if (pending == null) {
+        pending = new java.util.ArrayDeque<>();
+        transforming.set(pending);
+      }
+      pending.push(new ScopedType(loader, name));
+    }
+
+    int observeScope(ClassLoader loader, String name, ProtectionDomain domain) {
+      int verdict = scope.verdict(name, domain);
+      java.util.Deque<ScopedType> pending = transforming.get();
+      // Retransformation discovery also evaluates matchers outside transform callbacks. Those
+      // scans must not retain loaders or leave a verdict for a later, unrelated callback.
+      if (pending != null) {
+        for (ScopedType entry : pending) {
+          if (entry.loader == loader && entry.name.equals(name)) {
+            entry.verdict = verdict;
+            break;
+          }
+        }
+      }
+      return verdict;
+    }
+
+    private int recordedScope(ClassLoader loader, String name, boolean retire) {
+      java.util.Deque<ScopedType> pending = transforming.get();
+      if (pending == null) return ApplicationScope.UNKNOWN;
+      int verdict = ApplicationScope.UNKNOWN;
+      var entries = pending.iterator();
+      while (entries.hasNext()) {
+        ScopedType entry = entries.next();
+        if (entry.loader == loader && entry.name.equals(name)) {
+          verdict = entry.verdict;
+          if (retire) entries.remove();
+          break;
+        }
+      }
+      if (pending.isEmpty()) transforming.remove();
+      return verdict;
+    }
+
+    @Override
+    public void onComplete(String name, ClassLoader loader, JavaModule module, boolean loaded) {
+      recordedScope(loader, name, true);
     }
 
     @Override
@@ -258,10 +444,11 @@ final class FixtureInstrumentation {
         JavaModule module,
         boolean loaded,
         Throwable throwable) {
+      if (recordedScope(classLoader, typeName, false) == ApplicationScope.APPLICATION) limitations.report();
       if (isExplicitTarget(typeName)) {
         try {
           onFailure.run();
-        } catch (RuntimeException | LinkageError ignored) {
+        } catch (Throwable ignored) {
           // An agent failure callback must not escape into application class loading.
         }
         System.err.println(
@@ -280,11 +467,20 @@ final class FixtureInstrumentation {
   /** Methods that get boundary probes: real behavior, not accessors, bridges or Object plumbing. */
   static net.bytebuddy.matcher.ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription>
       frameMethods() {
-    return isMethod()
-        .and(not(isSynthetic()))
+    return frameMethods(false);
+  }
+
+  /** Focused cursors need their own method parent, including accessors and lambda bodies. */
+  static net.bytebuddy.matcher.ElementMatcher.Junction<net.bytebuddy.description.method.MethodDescription>
+      frameMethods(boolean focused) {
+    if (focused) return dev.xtrace.agent.runtime.line.ProbeEligibility.focused();
+    var executable = isMethod()
+        .and(not(isSynthetic()).or(nameStartsWith("lambda$")))
         .and(not(isBridge()))
         .and(not(isAbstract()))
-        .and(not(isNative()))
+        .and(not(isNative()));
+    return executable
+        .and(not(isSynthetic()))
         .and(not(nameStartsWith("lambda$")))
         .and(
             not(
@@ -343,12 +539,37 @@ final class FixtureInstrumentation {
   public static final class ExceptionResolutionAdvice {
     private ExceptionResolutionAdvice() {}
 
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static Object enter() {
+      return dev.xtrace.agent.bootstrap.SpringMvcBridge.exceptionResolutionEnter();
+    }
+
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
     public static void exit(
         @Advice.Argument(1) Object response,
         @Advice.Return Object resolved,
-        @Advice.Thrown Throwable thrown) {
-      dev.xtrace.agent.bootstrap.SpringMvcBridge.exceptionResolved(response, resolved, thrown);
+        @Advice.Thrown Throwable thrown,
+        @Advice.Enter Object boundary) {
+      dev.xtrace.agent.bootstrap.SpringMvcBridge.exceptionResolved(response, resolved, thrown, boundary);
+    }
+  }
+
+  /**
+   * Brackets {@code DispatcherServlet#doDispatch}. The response status of a redirect or an error
+   * view only exists after the view renders, which is after the handler adapter returned, so the
+   * dispatch ownership stays here while the outer standard servlet frame owns root completion.
+   */
+  public static final class DispatchAdvice {
+    private DispatchAdvice() {}
+
+    @Advice.OnMethodEnter(suppress = Throwable.class)
+    public static void enter() {
+      dev.xtrace.agent.bootstrap.SpringMvcBridge.dispatchEnter();
+    }
+
+    @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
+    public static void exit(@Advice.Argument(1) Object response, @Advice.Thrown Throwable thrown) {
+      dev.xtrace.agent.bootstrap.SpringMvcBridge.dispatchEnd(response, thrown);
     }
   }
 

@@ -20,23 +20,27 @@ import net.bytebuddy.jar.asm.TypePath;
  * ASM class visitor that inserts a call-only static probe at the first instruction of every
  * LineNumberTable entry (ADR 0003 section 2.2).
  *
- * <p>Safety rules that make the output verifier-clean without frame recomputation:
+ * <p>Safety rules for the inserted probes:
  *
  * <ul>
  *   <li>Probes push constants / already-live locals and call a static {@code void} method, so the
- *       operand stack is neutral at every inserted point. Only {@code COMPUTE_MAXS} is needed; the
- *       writer must not use {@code COMPUTE_FRAMES}.
+ *       operand stack is neutral at every inserted point. The standalone line-only instrumenter
+ *       preserves frames; wrappers adding guarded gap calls rebuild frames for the new handlers.
  *   <li>A probe is placed immediately before the first real instruction at or after the line label,
  *       after any {@code visitFrame} for that offset, so a stack map frame still describes the first
  *       byte of the probe (jump targets land on the probe, never past it).
  *   <li>No field, method or class is added (retransformation-safe).
  *   <li>Bridge and non-lambda synthetic methods, methods without a LineNumberTable, methods using
  *       JSR/RET, and methods that would exceed the code-size or site budgets are left byte-for-byte
- *       equivalent and reported as SKIPPED with a reason.
+ *       equivalent and reported as SKIPPED with a reason. A caller may add a gap entry probe to
+ *       eligible skipped methods through {@link #skippedMethodEntry(MethodVisitor)}.
  * </ul>
  *
  * <p>Local reads (focused mode) are gated by the LocalVariableTable range covering the probe, and
  * never read slot 0 of an instance method (it may be {@code uninitializedThis} in a constructor).
+ * Constructor probes start at the first mapped instruction after delegation returns; production
+ * composition opens a body boundary there and records an entry gap for the omitted preamble.
+ * Class initializers are skipped and use the same explicit-gap path as other unsupported code.
  */
 public class LineProbeVisitor extends ClassVisitor {
   private static final int ASM = Opcodes.ASM9;
@@ -46,6 +50,8 @@ public class LineProbeVisitor extends ClassVisitor {
   private final byte[] classDigest;
   private final List<MethodReport> reports;
   private String className = "";
+  private String superName;
+  private int classVersion;
   /** False once any marker says the class was not produced by javac (LVT precision unknown). */
   private boolean javacLvtTrusted = true;
   private boolean sawJavaSource;
@@ -69,6 +75,8 @@ public class LineProbeVisitor extends ClassVisitor {
   public void visit(
       int version, int access, String name, String signature, String superName, String[] interfaces) {
     this.className = name;
+    this.superName = superName;
+    classVersion = version & 0xffff;
     denied = name.equals(config.probeOwner()) || isDenyScope(name);
     if (denied) {
       reports.add(
@@ -102,10 +110,13 @@ public class LineProbeVisitor extends ClassVisitor {
 
   /**
    * Defence in depth behind the scope matcher (ADR 0003 section 2.1): a probe inside the probe
-   * owner, X-trace itself or the JDK would recurse into itself or the runtime.
+   * owner, the agent/adapter or the JDK would recurse into itself or the runtime. Application
+   * packages can share dev.xtrace (the Spring fixture does); match the runtime namespaces only,
+   * consistently with ApplicationScope's fixed exclusions.
    */
   static boolean isDenyScope(String internalName) {
-    return internalName.startsWith("dev/xtrace/")
+    return internalName.startsWith("dev/xtrace/agent/")
+        || internalName.startsWith("dev/xtrace/adapter/")
         || internalName.startsWith("java/")
         || internalName.startsWith("javax/")
         || internalName.startsWith("jdk/")
@@ -124,13 +135,9 @@ public class LineProbeVisitor extends ClassVisitor {
     MethodVisitor next = super.visitMethod(access, name, descriptor, signature, exceptions);
     if (next == null) return null;
     if (denied) return next;
-    if ((access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) return next;
-    if ((access & Opcodes.ACC_BRIDGE) != 0) {
-      reports.add(skipped(name, descriptor, Reasons.BRIDGE));
-      return next;
-    }
-    if ((access & Opcodes.ACC_SYNTHETIC) != 0 && !name.startsWith("lambda$")) {
-      reports.add(skipped(name, descriptor, Reasons.SYNTHETIC));
+    String exclusion = ProbeEligibility.exclusion(access, name);
+    if (exclusion != null && !Reasons.INITIALIZER.equals(exclusion)) {
+      if (!exclusion.equals(Reasons.NO_CODE)) reports.add(skipped(name, descriptor, exclusion));
       return next;
     }
     return new Buffer(next, access, name, descriptor);
@@ -140,6 +147,18 @@ public class LineProbeVisitor extends ClassVisitor {
     return new MethodReport(name, descriptor, Status.SKIPPED, reason, 0, 0, Reasons.NONE);
   }
 
+  /** Emits an optional, stack-neutral entry probe after an eligible method's skip decision. */
+  protected void skippedMethodEntry(MethodVisitor method) {}
+
+  /** Conservative byte bound for the optional call, excluding its caller-side suppression. */
+  protected int skippedMethodEntryBytes() { return 0; }
+
+  /** Reports that invocation attribution is unavailable even though the method is preserved. */
+  protected void skippedMethodEntryUnavailable() {}
+
+  /** A class-level owner failure still uses the buffered, size-checked skipped-method path. */
+  protected String classSkipReason() { return null; }
+
   // ---------------------------------------------------------------------------------------------
 
   private enum Kind {
@@ -147,6 +166,7 @@ public class LineProbeVisitor extends ClassVisitor {
     LABEL,
     LINE,
     FRAME,
+    TRY_CATCH,
     INSN
   }
 
@@ -171,6 +191,10 @@ public class LineProbeVisitor extends ClassVisitor {
     private boolean hasLine;
     private boolean hasJsrRet;
     private int estimatedBytes;
+    private int tryCatchBlocks;
+    private int maxStack;
+    private int probeStack;
+    private boolean gapGuard;
 
     Buffer(MethodVisitor out, int access, String name, String descriptor) {
       super(ASM, null);
@@ -337,7 +361,8 @@ public class LineProbeVisitor extends ClassVisitor {
 
     @Override
     public void visitTryCatchBlock(Label start, Label end, Label handler, String type) {
-      add(Kind.OTHER, mv -> mv.visitTryCatchBlock(start, end, handler, type));
+      tryCatchBlocks++;
+      add(Kind.TRY_CATCH, mv -> mv.visitTryCatchBlock(start, end, handler, type));
     }
 
     @Override
@@ -390,7 +415,9 @@ public class LineProbeVisitor extends ClassVisitor {
 
     @Override
     public void visitMaxs(int maxStack, int maxLocals) {
-      add(Kind.OTHER, mv -> mv.visitMaxs(maxStack, maxLocals));
+      this.maxStack = maxStack;
+      // Expose the inserted stack requirement to composed advice and its final budget check.
+      add(Kind.OTHER, mv -> mv.visitMaxs(Math.max(maxStack + probeStack, gapGuard ? 1 : 0), maxLocals));
     }
 
     @Override
@@ -424,10 +451,32 @@ public class LineProbeVisitor extends ClassVisitor {
         d = new Decision(List.of(), false, Reasons.NONE, null, Reasons.TRANSFORM_ERROR);
       }
       if (d.skip() != null) {
-        replay(List.of(), false, null);
+        // Keep the entry probe outside the original labels so a back edge never repeats it.
+        ops.get(0).accept(out); // visitCode
+        // Append the guard after the original exception table so type-annotation indexes keep
+        // referring to the same application handlers. None of those handlers covers our call.
+        for (int i = 1; i < ops.size(); i++) {
+          if (kinds.get(i) == Kind.TRY_CATCH) ops.get(i).accept(out);
+        }
+        int probeBytes = skippedMethodEntryBytes();
+        if (probeBytes > 0) {
+          // Estimates already include worst-case switch padding and jump widening. The guard
+          // adds a short goto and pop; never risk losing healthy siblings for this gap call.
+          if ((long) estimatedBytes + probeBytes + 4 > 65_535
+              || tryCatchBlocks == 65_535 || hasJsrRet) {
+            skippedMethodEntryUnavailable();
+          } else {
+            gapGuard = true;
+            guardedSkippedEntry();
+          }
+        }
+        for (int i = 1; i < ops.size(); i++) {
+          if (kinds.get(i) != Kind.TRY_CATCH) ops.get(i).accept(out);
+        }
         reports.add(skipped(name, descriptor, d.skip()));
         return;
       }
+      probeStack = d.values() ? 4 : 1;
       int valueCalls = replay(d.plan(), d.values(), d.siteIds());
       reports.add(
           new MethodReport(
@@ -442,9 +491,17 @@ public class LineProbeVisitor extends ClassVisitor {
     }
 
     private Decision decide() {
-      String skip = null;
-      if (!hasLine) skip = Reasons.NO_LINE_TABLE;
-      else if (hasJsrRet) skip = Reasons.JSR_RET;
+      String skip = classSkipReason();
+      if (skip == null) skip = ProbeEligibility.exclusion(access, name);
+      if (skip == null && name.equals("<init>")) {
+        ConstructorPreamble preamble = new ConstructorPreamble(className, superName);
+        for (var op : ops) op.accept(preamble);
+        if (!preamble.supported()) skip = Reasons.CONSTRUCTOR_PREAMBLE;
+      }
+      if (skip == null) {
+        if (!hasLine) skip = Reasons.NO_LINE_TABLE;
+        else if (hasJsrRet) skip = Reasons.JSR_RET;
+      }
 
       List<PlannedSite> plan = skip == null ? plan() : List.of();
       String valuesReason = Reasons.NONE;
@@ -485,6 +542,9 @@ public class LineProbeVisitor extends ClassVisitor {
         }
       }
       if (skip == null && !registry.hasRoomFor(plan.size())) skip = Reasons.REGISTRY_FULL;
+      if (skip == null && (long) maxStack + (values ? 4 : 1) > 65_535) {
+        skip = Reasons.TOO_LARGE;
+      }
       if (skip != null) return new Decision(plan, false, valuesReason, null, skip);
 
       if (values) {
@@ -509,10 +569,54 @@ public class LineProbeVisitor extends ClassVisitor {
       return new Decision(plan, values, valuesReason, siteIds, null);
     }
 
+    private void guardedSkippedEntry() {
+      Label start = new Label();
+      Label end = new Label();
+      Label handler = new Label();
+      Label resume = new Label();
+      out.visitTryCatchBlock(start, end, handler, "java/lang/Throwable");
+      out.visitLabel(start);
+      skippedMethodEntry(out);
+      out.visitLabel(end);
+      out.visitJumpInsn(Opcodes.GOTO, resume);
+      out.visitLabel(handler);
+      Object[] initial = initialLocals();
+      if (classVersion >= Opcodes.V1_6) {
+        out.visitFrame(Opcodes.F_NEW, initial.length, initial, 1,
+            new Object[] {"java/lang/Throwable"});
+      }
+      out.visitInsn(Opcodes.POP);
+      out.visitLabel(resume);
+      if (classVersion >= Opcodes.V1_6) {
+        out.visitFrame(Opcodes.F_NEW, initial.length, initial, 0, new Object[0]);
+      }
+    }
+
+    private Object[] initialLocals() {
+      List<Object> initial = new ArrayList<>();
+      if ((access & Opcodes.ACC_STATIC) == 0) {
+        initial.add(name.equals("<init>") ? Opcodes.UNINITIALIZED_THIS : className);
+      }
+      for (Type argument : Type.getArgumentTypes(descriptor)) {
+        initial.add(switch (argument.getSort()) {
+          case Type.BOOLEAN, Type.BYTE, Type.CHAR, Type.SHORT, Type.INT -> Opcodes.INTEGER;
+          case Type.FLOAT -> Opcodes.FLOAT;
+          case Type.LONG -> Opcodes.LONG;
+          case Type.DOUBLE -> Opcodes.DOUBLE;
+          case Type.ARRAY -> argument.getDescriptor();
+          default -> argument.getInternalName();
+        });
+      }
+      return initial.toArray();
+    }
+
     /** Pending-line walk: one planned site per run of line entries before a real instruction. */
     private List<PlannedSite> plan() {
       List<PlannedSite> plan = new ArrayList<>();
+      ConstructorPreamble preamble = name.equals("<init>")
+          ? new ConstructorPreamble(className, superName) : null;
       int pendingLine = -1;
+      int currentLine = -1;
       for (int i = 0; i < ops.size(); i++) {
         Kind kind = kinds.get(i);
         if (kind == Kind.LINE) {
@@ -521,9 +625,22 @@ public class LineProbeVisitor extends ClassVisitor {
             zeroLineEntries++;
             pendingLine = -1;
           }
+          currentLine = pendingLine;
         } else if (kind == Kind.INSN && pendingLine > 0) {
-          plan.add(new PlannedSite(i, pendingLine, config.focusedValues() ? liveAt(i) : List.of()));
+          if (preamble == null || preamble.initialized()) {
+            plan.add(new PlannedSite(i, pendingLine, config.focusedValues() ? liveAt(i) : List.of()));
+          }
           pendingLine = -1;
+        }
+        if (preamble != null) {
+          boolean wasInitialized = preamble.initialized();
+          ops.get(i).accept(preamble);
+          if (!wasInitialized && preamble.initialized()) {
+            // The line table still maps the instruction after delegation to this source line.
+            // Observe that instruction only after our body boundary opens, even for an implicit
+            // constructor whose entire body (including RETURN) has one line table entry.
+            pendingLine = currentLine;
+          }
         }
       }
       return plan;

@@ -99,6 +99,8 @@ mod recording_pipeline;
 pub mod runtime;
 pub mod secret;
 pub mod session;
+#[cfg(test)]
+mod session_health_tests;
 pub mod tls;
 pub mod viewer;
 

@@ -41,11 +41,11 @@ gradle.projectsEvaluated {
     }
 }
 GRADLE
-run adapters/java/gradlew -p adapters/java --dependency-verification strict \
+run adapters/java/gradlew -p adapters/java --no-daemon --dependency-verification strict \
     --init-script "$init_script" xtraceDevResolveDependencies
 if [[ $adapters == 1 ]]; then
     run npm run build --prefix adapters/node
-    run adapters/java/gradlew -p adapters/java --dependency-verification strict \
+    run adapters/java/gradlew -p adapters/java --no-daemon --dependency-verification strict \
         testClasses installDist agentDist fixtureBootJar
     # Assets are checked in; check:embedded builds the viewer and verifies them.
     run npm run check:embedded --prefix web/app

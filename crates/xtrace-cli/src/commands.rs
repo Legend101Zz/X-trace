@@ -91,7 +91,7 @@ pub enum XtraceCommand {
     /// Run read-only diagnostics on the installation and the project store; exits 1 on any
     /// failed check. `--json` and `--yes` are accepted; output is always JSON.
     Doctor(crate::doctor::DoctorArgs),
-    /// Export captured endpoints (not implemented yet).
+    /// Export catalog operations as OpenAPI, Postman or cURL files.
     Export(crate::export::ExportArgs),
     /// Plan and run exercises (not implemented yet).
     Exercise {
