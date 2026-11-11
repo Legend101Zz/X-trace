@@ -46,6 +46,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::admission::FileIdentity;
+use crate::diagnostic::{AdmissionContext, AdmissionSite};
 use crate::policy::{DirectoryRole, FilesystemProfile};
 use crate::scope;
 use crate::{AdmissionFailure, AdmissionOperation as Step, PrivateStorageError};
@@ -485,7 +486,10 @@ fn directory_metadata(
         if linux_directory_can_recheck(operation, directory, &opened, &named) {
             continue;
         }
-        operation.record_failure(AdmissionFailure::check(Step::AclState));
+        operation.record_failure(AdmissionFailure::check_context(
+            Step::AclState,
+            AdmissionContext::state(AdmissionSite::Snapshot, &opened, &named),
+        ));
         return None;
     }
 }
@@ -545,11 +549,17 @@ pub(crate) fn directory_acl_admits(
     let Some(after) = directory_metadata(operation, path, directory, expected, role) else {
         return false;
     };
-    if operation.expired()
-        || key
-            .as_ref()
-            .is_some_and(|key| operation.directory_key(state, directory).as_ref() != Some(key))
+    if operation.expired() {
+        return false;
+    }
+    if key
+        .as_ref()
+        .is_some_and(|key| operation.directory_key(state, directory).as_ref() != Some(key))
     {
+        operation.record_failure(AdmissionFailure::check_context(
+            Step::AclState,
+            AdmissionContext::state(AdmissionSite::Filesystem, &before, &after),
+        ));
         return false;
     }
     // A changed state invalidates this verdict: the listing may predate an ACL grant. Child
@@ -558,10 +568,18 @@ pub(crate) fn directory_acl_admits(
         #[cfg(target_os = "macos")]
         if key.is_some() && directory_contents_changed(&before, &after) {
             if let Some(listing) = listing {
-                return recheck_directory_listing(
-                    operation, role, path, directory, expected, &listing,
-                ) && operation.directory_key(state, directory) == key
-                    && !operation.expired();
+                if !recheck_directory_listing(operation, role, path, directory, expected, &listing)
+                {
+                    return false;
+                }
+                if operation.directory_key(state, directory) != key {
+                    operation.record_failure(AdmissionFailure::check_context(
+                        Step::AclState,
+                        AdmissionContext::state(AdmissionSite::RecheckFilesystem, &before, &after),
+                    ));
+                    return false;
+                }
+                return !operation.expired();
             }
         }
         #[cfg(target_os = "linux")]
@@ -572,6 +590,14 @@ pub(crate) fn directory_acl_admits(
                 );
             }
         }
+        operation.record_failure(AdmissionFailure::check_context(
+            Step::AclState,
+            AdmissionContext::state(
+                if remembered { AdmissionSite::MemoState } else { AdmissionSite::ProbeState },
+                &before,
+                &after,
+            ),
+        ));
         return false;
     }
     if let Some(key) = key {
@@ -611,23 +637,44 @@ fn recheck_directory_listing(
                 return false;
             }
         };
-        if !path
-            .to_str()
-            .is_some_and(|expected| crate::policy::macos_directory_listing_admits(&text, expected))
-            || !original.lines().skip(1).eq(text.lines().skip(1))
-        {
+        if let Err(refusal) = directory_listing_verdict(&text, path) {
+            operation.record_failure(AdmissionFailure::check_context(
+                Step::AclPolicy,
+                AdmissionContext::listing(AdmissionSite::RecheckListing, refusal),
+            ));
+            return false;
+        }
+        if !original.lines().skip(1).eq(text.lines().skip(1)) {
+            operation.record_failure(AdmissionFailure::check_context(
+                Step::AclState,
+                AdmissionContext::listing(
+                    AdmissionSite::RecheckAcl,
+                    crate::diagnostic::ListingRefusal::NotChecked,
+                ),
+            ));
             return false;
         }
         let Some(after) = directory_metadata(operation, path, directory, expected, role) else {
             return false;
         };
-        if operation.directory_key(state, directory) != key || operation.expired() {
+        if operation.directory_key(state, directory) != key {
+            operation.record_failure(AdmissionFailure::check_context(
+                Step::AclState,
+                AdmissionContext::state(AdmissionSite::RecheckFilesystem, &before, &after),
+            ));
+            return false;
+        }
+        if operation.expired() {
             return false;
         }
         if DirectoryState::of(&after, role) == state {
             return true;
         }
         if !directory_contents_changed(&before, &after) {
+            operation.record_failure(AdmissionFailure::check_context(
+                Step::AclState,
+                AdmissionContext::state(AdmissionSite::RecheckState, &before, &after),
+            ));
             return false;
         }
     }
@@ -750,14 +797,23 @@ fn probe_directory(operation: &Operation, path: &Path, directory: &File) -> Opti
                 None
             }
         })?;
-    if !path
-        .to_str()
-        .is_some_and(|expected| crate::policy::macos_directory_listing_admits(&text, expected))
-    {
-        operation.record_failure(AdmissionFailure::check(Step::AclPolicy));
+    if let Err(refusal) = directory_listing_verdict(&text, path) {
+        operation.record_failure(AdmissionFailure::check_context(
+            Step::AclPolicy,
+            AdmissionContext::listing(AdmissionSite::Listing, refusal),
+        ));
         return None;
     }
     Some(text)
+}
+
+#[cfg(target_os = "macos")]
+fn directory_listing_verdict(
+    text: &str,
+    path: &Path,
+) -> Result<(), crate::diagnostic::ListingRefusal> {
+    let expected = path.to_str().ok_or(crate::diagnostic::ListingRefusal::Text)?;
+    crate::policy::macos_acl_listing_verdict(text, expected, b'd')
 }
 
 /// A ctime must be at least this much older than the batched listing to be trusted.

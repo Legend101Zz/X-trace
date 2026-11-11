@@ -2,6 +2,87 @@
 
 use std::io;
 
+/// Check sites, rather than paths, distinguish otherwise identical ACL-state refusals.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AdmissionSite {
+    Snapshot,
+    ProbeState,
+    MemoState,
+    Filesystem,
+    #[cfg(target_os = "macos")]
+    Listing,
+    #[cfg(target_os = "macos")]
+    RecheckListing,
+    #[cfg(target_os = "macos")]
+    RecheckAcl,
+    #[cfg(target_os = "macos")]
+    RecheckState,
+    #[cfg(target_os = "macos")]
+    RecheckFilesystem,
+}
+
+/// Parser outcomes contain no listing text, principal, right, or pathname.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ListingRefusal {
+    NotChecked,
+    #[cfg(any(target_os = "macos", test))]
+    Text,
+    #[cfg(any(target_os = "macos", test))]
+    Header,
+    #[cfg(any(target_os = "macos", test))]
+    Mode,
+    #[cfg(any(target_os = "macos", test))]
+    Index,
+    #[cfg(any(target_os = "macos", test))]
+    Principal,
+    #[cfg(any(target_os = "macos", test))]
+    Effect,
+    #[cfg(any(target_os = "macos", test))]
+    Allow,
+    #[cfg(any(target_os = "macos", test))]
+    InheritedAllow,
+    #[cfg(any(target_os = "macos", test))]
+    InheritanceFlags,
+    #[cfg(any(target_os = "macos", test))]
+    Rights,
+    #[cfg(any(target_os = "macos", test))]
+    Marker,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdmissionContext {
+    pub site: AdmissionSite,
+    /// Difference mask: ctime=1, mtime=2, mode=4, owner=8, device/inode=16.
+    /// This records equality only; timestamps, IDs and modes never leave the process.
+    /// Listing-only sites use zero because they do not compare metadata.
+    pub changes: u8,
+    pub listing: ListingRefusal,
+}
+
+impl AdmissionContext {
+    pub(crate) fn state(
+        site: AdmissionSite,
+        before: &std::fs::Metadata,
+        after: &std::fs::Metadata,
+    ) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        let changes =
+            u8::from((before.ctime(), before.ctime_nsec()) != (after.ctime(), after.ctime_nsec()))
+                | (u8::from(
+                    (before.mtime(), before.mtime_nsec()) != (after.mtime(), after.mtime_nsec()),
+                ) << 1)
+                | (u8::from(before.mode() != after.mode()) << 2)
+                | (u8::from(before.uid() != after.uid()) << 3)
+                | (u8::from((before.dev(), before.ino()) != (after.dev(), after.ino())) << 4);
+        Self { site, changes, listing: ListingRefusal::NotChecked }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn listing(site: AdmissionSite, listing: ListingRefusal) -> Self {
+        Self { site, changes: 0, listing }
+    }
+}
+
 // A second layer: build.rs rejects release profiles even with debug assertions enabled.
 #[cfg(all(feature = "ci-diagnostics", not(debug_assertions)))]
 compile_error!("ci-diagnostics requires debug_assertions; release/package builds must exclude it");
@@ -65,7 +146,16 @@ impl AdmissionFailure {
     pub(crate) fn check(operation: AdmissionOperation) -> Self {
         let failure = Self { operation, kind: None, raw_os_error: None };
         #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
-        ci::record(failure);
+        ci::record(failure, None);
+        failure
+    }
+
+    pub(crate) fn check_context(operation: AdmissionOperation, context: AdmissionContext) -> Self {
+        let failure = Self { operation, kind: None, raw_os_error: None };
+        #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
+        ci::record(failure, Some(context));
+        // The context is not part of the returned error or the release diagnostic channel.
+        let _ = (context.site, context.changes, context.listing);
         failure
     }
 
@@ -74,14 +164,14 @@ impl AdmissionFailure {
         let failure =
             Self { operation, kind: Some(error.kind()), raw_os_error: error.raw_os_error() };
         #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
-        ci::record(failure);
+        ci::record(failure, None);
         failure
     }
 }
 
 #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
 mod ci {
-    use super::AdmissionFailure;
+    use super::{AdmissionContext, AdmissionFailure};
     use std::fmt::Write as _;
     use std::fs::File;
     use std::io::Write as _;
@@ -134,7 +224,11 @@ mod ci {
         json.write_char('"')
     }
 
-    fn line(failure: AdmissionFailure, thread: Option<&str>) -> Result<Record, std::fmt::Error> {
+    fn line(
+        failure: AdmissionFailure,
+        thread: Option<&str>,
+        context: Option<AdmissionContext>,
+    ) -> Result<Record, std::fmt::Error> {
         let mut json = Record::new();
         json.write_str("{\"thread\":")?;
         if let Some(thread) = thread.filter(|name| name.len() <= 512) {
@@ -157,6 +251,13 @@ mod ci {
             write!(json, "{errno}")?;
         } else {
             json.write_str("null")?;
+        }
+        if let Some(context) = context {
+            write!(
+                json,
+                ",\"site\":\"{:?}\",\"changes\":{},\"listing\":\"{:?}\"",
+                context.site, context.changes, context.listing
+            )?;
         }
         json.write_str("}\n")?;
         Ok(json)
@@ -267,12 +368,12 @@ mod ci {
         false
     }
 
-    pub(super) fn record(failure: AdmissionFailure) {
+    pub(super) fn record(failure: AdmissionFailure, context: Option<AdmissionContext>) {
         let _ = std::panic::catch_unwind(|| {
             if let Some(directory) = std::env::var_os("XTRACE_CI_DIAG_DIR") {
                 if reserve(&RECORDS) {
                     let thread = std::thread::current();
-                    if let Ok(record) = line(failure, thread.name()) {
+                    if let Ok(record) = line(failure, thread.name(), context) {
                         if let Ok(record) = record.as_str() {
                             let _ = append(Path::new(&directory), record);
                         }
@@ -299,7 +400,7 @@ mod ci {
                 kind: Some(std::io::ErrorKind::PermissionDenied),
                 raw_os_error: Some(13),
             };
-            let record = line(failure, Some(expected))?;
+            let record = line(failure, Some(expected), None)?;
             let record = record.as_str()?;
             assert_eq!(
                 record,
@@ -310,7 +411,7 @@ mod ci {
             let mut escaped = Record::new();
             quoted(&mut escaped, "a\"\\\n\t")?;
             assert_eq!(escaped.as_str()?, "\"a\\\"\\\\\\u000a\\u0009\"");
-            assert!(line(failure, Some(&"\0".repeat(MAX_LINE))).is_err());
+            assert!(line(failure, Some(&"\0".repeat(MAX_LINE)), None).is_err());
             let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
             append(directory.path(), record)?;
@@ -325,9 +426,39 @@ mod ci {
                 raw_os_error: None,
             };
             assert_eq!(
-                line(absent, None)?.as_str()?,
+                line(absent, None, None)?.as_str()?,
                 "{\"thread\":null,\"error\":\"Admission\",\"operation\":\"Deadline\",\"kind\":null,\"errno\":null}\n"
             );
+            Ok(())
+        }
+
+        #[test]
+        fn contextual_record_contains_only_fixed_categories_and_a_difference_mask()
+        -> Result<(), Box<dyn std::error::Error>> {
+            use crate::diagnostic::{AdmissionContext, AdmissionSite, ListingRefusal};
+            let failure = AdmissionFailure {
+                operation: AdmissionOperation::AclState,
+                kind: None,
+                raw_os_error: None,
+            };
+            let context = AdmissionContext {
+                site: AdmissionSite::Snapshot,
+                changes: 3,
+                listing: ListingRefusal::NotChecked,
+            };
+            assert_eq!(
+                line(failure, None, Some(context))?.as_str()?,
+                concat!(
+                    "{\"thread\":null,\"error\":\"Admission\",\"operation\":\"AclState\",",
+                    "\"kind\":null,\"errno\":null,\"site\":\"Snapshot\",",
+                    "\"changes\":3,\"listing\":\"NotChecked\"}\n"
+                )
+            );
+            let context = AdmissionContext { listing: ListingRefusal::InheritedAllow, ..context };
+            let record = line(failure, None, Some(context))?;
+            assert!(record.as_str()?.contains("\"listing\":\"InheritedAllow\""));
+            assert!(record.len <= MAX_LINE);
+            assert_eq!(AdmissionFailure::check_context(failure.operation, context), failure);
             Ok(())
         }
 
@@ -487,6 +618,31 @@ mod ci {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_evidence_reports_differences_without_retaining_metadata() -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir()?;
+        let before = root.path().symlink_metadata()?;
+        let unchanged = AdmissionContext::state(AdmissionSite::Snapshot, &before, &before);
+        assert_eq!(unchanged.changes, 0);
+        assert_eq!(unchanged.listing, ListingRefusal::NotChecked);
+        let mode = before.permissions().mode() ^ 0o100;
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(mode))?;
+        let after = root.path().symlink_metadata()?;
+        let changed = AdmissionContext::state(AdmissionSite::Snapshot, &before, &after);
+        assert_eq!(changed.changes & 4, 4, "mode difference");
+        assert_eq!(changed.changes & (2 | 8 | 16), 0, "mtime, owner and identity stayed equal");
+        std::fs::set_permissions(root.path(), before.permissions())?;
+        let other = tempfile::tempdir_in(root.path())?;
+        let replaced = AdmissionContext::state(
+            AdmissionSite::Snapshot,
+            &before,
+            &other.path().symlink_metadata()?,
+        );
+        assert_eq!(replaced.changes & 16, 16, "different inode");
+        Ok(())
+    }
 
     #[test]
     fn rendering_keeps_only_fixed_operations_and_os_error_facts() {
