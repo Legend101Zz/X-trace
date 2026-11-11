@@ -383,6 +383,8 @@ x-trace/
     xtrace-application/  # use cases and ports
     xtrace-protocol/     # generated XTP and API types
     xtrace-ingest/       # validation, correlation, backpressure
+    xtrace-private-storage/ # private directory admission
+    xtrace-macos-acl/     # safe macOS SDK ACL bridge
     xtrace-store/        # SQLite and object store adapters
     xtrace-daemon/       # lifecycle, HTTP, WebSocket, adapter server
     xtrace-cli/          # command surface

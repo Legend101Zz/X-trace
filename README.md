@@ -67,7 +67,8 @@ Java compatibility.
 | `xtrace-protocol`   | Generated XTP protobuf bindings and domain-DTO translation              |
 | `xtrace-store`      | Bundled SQLite store, migrations, and `ProjectRepository` adapter      |
 | `xtrace-daemon`     | Authenticated XTP ingress and experimental isolated loopback viewer     |
-| `xtrace-private-storage` | Leaf crate: owner-enforced private directory admission (no X-trace deps) |
+| `xtrace-private-storage` | Owner-enforced private directory admission |
+| `xtrace-macos-acl`  | Safe macOS SDK ACL evidence; isolated unsafe FFI                         |
 | `xtrace-runtime`    | Runtime launch validation, agent injection, and process supervision    |
 | `xtrace-cli`        | Clap subcommands, project composition, output and path resolution       |
 | `xtrace-ingest`     | Recording assembler: per-recording sequence, lifecycle and idempotency checks |
@@ -83,7 +84,8 @@ xtrace-runtime   -> xtrace-private-storage, xtrace-protocol, OS process launch a
 xtrace-daemon    -> xtrace-application, xtrace-domain, xtrace-ingest, xtrace-private-storage, xtrace-protocol
 xtrace-store     -> xtrace-application, xtrace-domain, xtrace-private-storage, xtrace-protocol
 xtrace-ingest    -> xtrace-domain, xtrace-protocol
-xtrace-private-storage -> (leaf: no X-trace crates)
+xtrace-private-storage -> xtrace-macos-acl (macOS only)
+xtrace-macos-acl -> (leaf: SDK only)
 xtrace-protocol  -> xtrace-domain
 xtrace-application -> xtrace-domain
 ```

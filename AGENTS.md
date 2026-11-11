@@ -17,7 +17,7 @@ honesty: it shows only what was observed and names every gap. Current state: `do
 
 | Path | What | Area notes |
 |---|---|---|
-| `crates/` | Rust workspace (12 crates). `xtrace-domain` (pure types), `xtrace-application` (use cases), `xtrace-protocol` (generated XTP/XTF), `xtrace-ingest`, `xtrace-store` (SQLite + XTF segments), `xtrace-daemon` (loopback ingest + viewer API), `xtrace-cli` (the `xtrace` binary), `xtrace-runtime` (launch/attach/packs), `xtrace-private-storage`, `xtrace-tui`, `xtrace-export`, `xtrace-exercise` | `crates/xtrace-cli/AGENTS.md`, `crates/xtrace-store/AGENTS.md` |
+| `crates/` | Rust workspace (13 crates). `xtrace-domain` (pure types), `xtrace-application` (use cases), `xtrace-protocol` (generated XTP/XTF), `xtrace-ingest`, `xtrace-store` (SQLite + XTF segments), `xtrace-daemon` (loopback ingest + viewer API), `xtrace-cli` (the `xtrace` binary), `xtrace-runtime` (launch/attach/packs), `xtrace-private-storage`, `xtrace-macos-acl` (safe SDK bridge), `xtrace-tui`, `xtrace-export`, `xtrace-exercise` | `crates/xtrace-cli/AGENTS.md`, `crates/xtrace-store/AGENTS.md` |
 | `adapters/java/` | Gradle: JVM agent (bootstrap + runtime), attach helper, static analyzer, Spring fixture app | `adapters/java/AGENTS.md` |
 | `adapters/node/` | npm workspaces: Node loader/adapter, protocol codegen, analyzer | `adapters/node/AGENTS.md` |
 | `web/app/` | React 19 + TS + Vite viewer, embedded into the daemon | `web/app/AGENTS.md` |

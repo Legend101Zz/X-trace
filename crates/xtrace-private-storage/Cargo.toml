@@ -8,23 +8,8 @@ publish.workspace = true
 authors.workspace = true
 description = "Owner-enforced private directory admission shared by X-trace storage and runtime crates."
 
-# Match workspace lints, with a scoped exception for the macOS SDK bridge. `forbid` cannot
-# be overridden at module scope; `deny` keeps unsafe forbidden everywhere else in this crate.
-[lints.rust]
-unsafe_code = "deny"
-missing_docs = "warn"
-unused_must_use = "deny"
-
-[lints.clippy]
-pedantic = { level = "allow", priority = -1 }
-allow_attributes = "allow"
-allow_attributes_without_reason = "warn"
-unwrap_used = "warn"
-expect_used = "warn"
-panic = "deny"
-todo = "deny"
-unimplemented = "deny"
-result_large_err = "allow"
+[lints]
+workspace = true
 
 [features]
 # Private CI channel only. build.rs rejects release profiles regardless of debug assertions;
@@ -43,3 +28,6 @@ rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile = "3.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+xtrace-macos-acl = { path = "../xtrace-macos-acl" }
