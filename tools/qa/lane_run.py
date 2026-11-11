@@ -27,7 +27,7 @@ from collections import Counter, deque
 from collections.abc import Sequence
 from enum import Enum
 
-from tools.qa import canary, rust_timing, store_profiles
+from tools.qa import canary, libtest_output, rust_timing, store_profiles
 from tools.release import ci_floor
 
 MAX_FAILING = 32
@@ -60,6 +60,7 @@ TAP_NOT_OK = re.compile(r"^\s*not ok \d+ - (\S+)\s*$")
 
 
 def parse_output(text: str) -> dict:
+    reports, text = libtest_output.partition(text)
     failing: list[str] = []
     dropped = 0
     passed = failed = ignored = 0
@@ -121,6 +122,17 @@ def parse_output(text: str) -> dict:
             if ci_floor._valid_test_id(cand):
                 if cand not in failing:
                     failing.append(cand)
+            else:
+                dropped += 1
+    for report in reports:
+        passed += report.counts[0]
+        failed += report.counts[1]
+        ignored += report.counts[2]
+        counted = True
+        for name in report.names:
+            if ci_floor._valid_test_id(name):
+                # The same name in different binaries denotes separate failures.
+                failing.append(name)
             else:
                 dropped += 1
     return {
@@ -230,9 +242,8 @@ MAX_JOB_EXCERPT_BYTES = 24 * 1024
 MAX_PROGRESS_LINES = 12
 MAX_TIMING_CHECKPOINT_BYTES = 1024 * 1024
 WITHHELD = "withheld: privacy scan"
-CARGO_SECTION = re.compile(r"^---- (\S+) (?:stdout|stderr) ----$")
-CARGO_PANIC = re.compile(
-    r"^thread '([^']+)'(?: \([0-9]+\))? panicked at (\S{1,300}):([0-9]+):([0-9]+):$")
+CARGO_SECTION = libtest_output.SECTION
+CARGO_PANIC = libtest_output.PANIC
 CARGO_STATE = re.compile(r"^test (\S+) \.\.\.(?: (ok|FAILED|ignored))?$")
 CARGO_RUNNING = re.compile(r"^test (\S+) has been running for over \d+ seconds$")
 GRADLE_STATE = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\((?P<params>[^\n]*)\))?"
@@ -649,12 +660,73 @@ def _timeout_progress(line: str) -> tuple[str, str] | None:
     return None
 
 
+def _rust_failure_name(name: str, metadata: CheckoutMetadata, index) -> str:
+    """Complete libtest identifiers, including module prefixes, must exist in HEAD."""
+    return name if name in metadata.rust_tests and not _private(name, index) else UNVERIFIED
+
+
+def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata, index) -> list[dict]:
+    if not report.counts[1]:
+        return []  # Expected panics in a successful binary are not failures.
+    # Use the timing observer's target attestation, including ambiguous target
+    # refusal. Neither executable paths nor thread names leave this function.
+    observer = rust_timing.Observations(metadata.rust_targets, lambda value: _private(value, index))
+    observer.line(report.header, 0)
+    binary = observer.active[0]
+    rows = {}
+    for name in report.names:
+        verified = _rust_failure_name(name, metadata, index)
+        row = {"test": verified, "binary": binary, "location": UNVERIFIED, "kind": "exit",
+               "withheldLines": 0, "category": [], "panicSites": []}
+        if verified == UNVERIFIED:
+            row["testUnverifiedReason"] = (
+                UnverifiedReason.PRIVACY_SCAN.value if name in metadata.rust_tests
+                else UnverifiedReason.NAME_NOT_DECLARED.value if metadata.files
+                else UnverifiedReason.METADATA_UNAVAILABLE.value)
+        rows[name] = row
+    section = None
+    current = None
+    ambiguous = None
+    for line, allowed in zip(report.body, report.boundaries):
+        if allowed and (header := CARGO_SECTION.fullmatch(line)):
+            section = header[1]
+            current = rows.get(section)
+            continue
+        if allowed and line == "failures:":
+            section = current = None
+            continue
+        panic = CARGO_PANIC.fullmatch(line) if allowed else None
+        if panic:
+            # Captured worker/child threads belong to the section's test. With
+            # --nocapture, a sole failure is the only permitted fallback owner.
+            current = rows.get(section) if section is not None else (
+                next(iter(rows.values())) if report.counts[1] == 1 and len(rows) == 1 else None)
+            if current is None:
+                if ambiguous is None:
+                    ambiguous = {"test": UNVERIFIED, "binary": binary, "location": UNVERIFIED,
+                                 "kind": "panic", "withheldLines": 0, "category": [], "panicSites": [],
+                                 "testUnverifiedReason": UnverifiedReason.AMBIGUOUS_PANIC.value}
+                current = ambiguous
+            current["kind"] = "panic"
+            if current is not ambiguous:
+                site = metadata.location(f"{panic[2]}:{panic[3]}", index)
+                if site != UNVERIFIED and site not in current["panicSites"]:
+                    if len(current["panicSites"]) < MAX_PANIC_SITES:
+                        current["panicSites"].append(site)
+                    if current["location"] == UNVERIFIED:
+                        current["location"] = site
+        if current is not None and line.strip():
+            current["withheldLines"] += 1
+    return [*rows.values(), *([ambiguous] if ambiguous is not None else [])]
+
+
 def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT_BYTES,
                     index=None, metadata: CheckoutMetadata | None = None,
                     diagnostic_records: Sequence[tuple[str, list[str | int]]] = ()) -> dict | None:
     """Publish verified names/sites, bounded categories and counts; never prose."""
     index = CANARY_INDEX if index is None else index
     metadata = _checkout_metadata() if metadata is None else metadata
+    reports, text = libtest_output.partition(text)
     blocks, harness = _output_parts(text)
     failures: dict[str | tuple[str], dict] = {}
 
@@ -681,6 +753,7 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
         elif m := re.fullmatch(r"\s*not ok \d+ - (.+)", line):
             failure(m[1])["kind"] = "exit"
     states = [m.groups() for line in harness if (m := CARGO_STATE.fullmatch(line)) and m[2]]
+    states.extend((name, "FAILED") for report in reports for name in report.names)
     outcomes = dict(states)
     occurrences = Counter(name for name, _ in states)
     failing_threads = {name for name, status in outcomes.items() if status == "FAILED"
@@ -784,7 +857,8 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
         for value in categories:
             if value not in row["category"] and len(row["category"]) < MAX_CATEGORIES:
                 row["category"].append(value)
-    rows = list(failures.values())
+    rows = [row for report in reports for row in _libtest_failures(report, metadata, index)]
+    rows.extend(failures.values())
     for row in rows:
         # Names and locations have independent provenance; scanning can only
         # remove them. It never rebuilds or copies any part of a message.
@@ -860,7 +934,7 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             result["timeout"]["runningOmitted"] += 1
         else:
             return None
-    if failures and not result["failures"] and not timed_out:
+    if rows and not result["failures"] and not timed_out:
         return None
     return result
 
@@ -1009,8 +1083,18 @@ def finalize_run(args, *, cmd, log_path, metadata, diagnostic_directory, code, t
     out.mkdir(parents=True, exist_ok=True)
     text = log_path.read_text(encoding="utf-8", errors="replace")
     facts = parse_output(text)
-    _, harness = _output_parts(text)
-    facts["failingTests"] = parse_output("\n".join(harness))["failingTests"]
+    reports, remainder = libtest_output.partition(text)
+    _, harness = _output_parts(remainder)
+    names = parse_output("\n".join(harness))
+    candidates = [(name, False) for name in names["failingTests"]]
+    for report in reports:
+        for name in report.names:
+            if ci_floor._valid_test_id(name):
+                candidates.append((name, True))
+            else:
+                names["droppedInvalidNames"] += 1
+    facts["failingTruncated"] = names["failingTruncated"] + max(0, len(candidates) - MAX_FAILING)
+    facts["droppedInvalidNames"] = names["droppedInvalidNames"]
     if getattr(args, "junit_glob", ""):
         # Gradle prints no totals on success; the JUnit XML reports are the count of record for the Java suite.
         jc = junit_counts(pathlib.Path(args.cwd or "."), args.junit_glob)
@@ -1028,11 +1112,13 @@ def finalize_run(args, *, cmd, log_path, metadata, diagnostic_directory, code, t
         status = "fail"  # a skipped or ignored test is not a pass on a no-skips row
         print(f"lane {suite}/{variant}/{step}: {facts['ignored']} ignored or skipped tests (maximum {max_ignored})")
     index = _excerpt_index(getattr(args, "canaries", ""))
-    if facts["failingTests"]:
-        # The older summary field is part of the same public fragment. It must
-        # not bypass the provenance checks applied to failureDetails.
-        facts["failingTests"] = [metadata.test(name, index) if index is not None else UNVERIFIED
-                                 for name in facts["failingTests"]]
+    # The older summary field obeys the same provenance checks as failureDetails.
+    facts["failingTests"] = [(_rust_failure_name(name, metadata, index) if rust else metadata.test(name, index))
+                             if index is not None else UNVERIFIED for name, rust in candidates[:MAX_FAILING]]
+    if facts["failed"] is not None:
+        published = sum(name != UNVERIFIED for name in facts["failingTests"])
+        facts["failingNamesMissing"] = max(0, facts["failed"] - published)
+        facts["failingNamesExcess"] = max(0, published - facts["failed"])
     frag = {"suite": suite, "variant": variant, "step": step, "status": status,
             "exitCode": code, **{k: v for k, v in facts.items() if k != "counted"}}
     fragment_path = out / f"{suite}__{variant}__{step}.json"
@@ -1072,6 +1158,8 @@ def finalize_run(args, *, cmd, log_path, metadata, diagnostic_directory, code, t
     if facts["failingTruncated"] or facts["droppedInvalidNames"]:
         print(f"lane failing-test-overflow truncated={facts['failingTruncated']} "
               f"dropped-invalid={facts['droppedInvalidNames']}")
+    if facts.get("failingNamesMissing") or facts.get("failingNamesExcess"):
+        print(f"lane failing-test-gap missing={facts['failingNamesMissing']} excess={facts['failingNamesExcess']}")
     return 0 if status == "pass" else (code or 1)
 
 
