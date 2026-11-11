@@ -355,6 +355,16 @@ def _diagnostic_variants(source: str, enums: str = "PrivateStorageError|Admissio
     return variants
 
 
+# Share the declaration grammar between short names and full module contexts.
+RUST_TEST_DECLARATION = (
+    r"#\[(?:[A-Za-z_]\w*::)?test(?:\([^]]*\))?\]\s*"
+    r"(?:#\[[^]]*\]\s*)*"
+    r"(?:pub(?:\s*\(\s*(?:crate|self|super|in\s+(?:crate|self|super)"
+    r"(?:\s*::\s*[A-Za-z_]\w*)*)\s*\))?\s+)?"
+    r"(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\("
+)
+
+
 class CheckoutMetadata:
     """Only regular-file blobs from the snapshotted commit can attest facts."""
 
@@ -403,9 +413,7 @@ class CheckoutMetadata:
         masked = _source_mask(source, rust=path.suffix == ".rs")
         if path.suffix == ".rs" and path.parts[0] == "crates":
             # Requiring a test attribute also excludes helper functions in tests/.
-            declarations = list(re.finditer(
-                r"#\[(?:[A-Za-z_]\w*::)?test(?:\([^]]*\))?\]\s*"
-                r"(?:#\[[^]]*\]\s*)*(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(", masked))
+            declarations = list(re.finditer(RUST_TEST_DECLARATION, masked))
             self.tests.update(match[1] for match in declarations)
         elif path.suffix == ".java" and test_path:
             methods = re.findall(
@@ -456,9 +464,7 @@ class CheckoutMetadata:
         referenced = set()
         token_pattern = re.compile(
             r"#\[\s*path\s*=|\binclude\s*!\s*\(|"
-            r"\bmod\s+([A-Za-z_]\w*)\s*([;{])|[{}]|"
-            r"#\[(?:[A-Za-z_]\w*::)?test(?:\([^]]*\))?\]\s*"
-            r"(?:#\[[^]]*\]\s*)*(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(")
+            r"\bmod\s+([A-Za-z_]\w*)\s*([;{])|[{}]|" + RUST_TEST_DECLARATION)
         for name, source in rust.items():
             path = pathlib.PurePosixPath(name)
             masked = _source_mask(source, rust=True)

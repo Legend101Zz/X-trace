@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import pathlib
+import subprocess
 import tempfile
 import unittest
 
@@ -110,7 +111,9 @@ class LibtestOutputTests(unittest.TestCase):
     def test_existing_caught_scope_panic_passes_next_to_an_unrelated_failure(self):
         path = "crates/xtrace-private-storage/src/scope.rs"
         root = pathlib.Path(__file__).resolve().parents[2]
-        source = (root / path).read_text()
+        # Use the same committed source as _checkout_metadata(), not a working edit.
+        source = subprocess.run(["git", "-C", str(root), "show", f"HEAD:{path}"],
+                                check=True, capture_output=True, text=True).stdout
         name = "scope::tests::a_panic_inside_a_live_scope_leaves_nothing_behind_for_the_next_scope"
         unrelated = "admission::tests::an_expired_deadline_refuses_before_any_probe"
         line = next(i for i, text in enumerate(source.splitlines(), 1)
@@ -118,7 +121,14 @@ class LibtestOutputTests(unittest.TestCase):
         self.metadata = lane_run._checkout_metadata()
         self.assertIn(name, self.metadata.rust_tests)
         self.assertIn(unrelated, self.metadata.rust_tests)
-        self.assertEqual(self.metadata.location(f"{path}:{line}", lane_run.CANARY_INDEX), f"{path}:{line}")
+        self.assertGreaterEqual(line, 1)
+        self.assertLessEqual(line, self.metadata.files[path])
+        # The real path is attested, but PRIVATE_TEXT also matches "private-".
+        hits = {}
+        lane_run.canary.scan_bytes(f"{path}:{line}".encode(), lane_run.CANARY_INDEX, hits, "fixture")
+        self.assertEqual(hits, {})
+        self.assertEqual(lane_run.PRIVATE_TEXT.search(path)[0], "private-")
+        self.assertEqual(self.metadata.location(f"{path}:{line}", lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
         header = "     Running unittests src/lib.rs (target/debug/deps/xtrace_private_storage-0123456789abcdef)"
         text = transcript([unrelated], f"thread '{name}' panicked at {path}:{line}:13:\n"
                           f"store call failed inside a scope\ntest {name} ... ok\n"
@@ -129,6 +139,33 @@ class LibtestOutputTests(unittest.TestCase):
         self.assertEqual((ambiguous["test"], ambiguous["location"], ambiguous["panicSites"]),
                          (lane_run.UNVERIFIED, lane_run.UNVERIFIED, []))
         self.assertEqual(ambiguous["testUnverifiedReason"], "ambiguous-panic-block")
+
+    def test_caught_panic_at_publishable_site_stays_unattributed_next_to_failure(self):
+        # Attribution must withhold the site even when privacy would allow it.
+        self.assertEqual(self.metadata.location(SITE, lane_run.CANARY_INDEX), SITE)
+        text = transcript(["case0"], f"thread 'case1' panicked at {SITE}:7:\n"
+                          "caught panic\ntest case1 ... ok\ntest case0 ... FAILED\n", passed=1)
+        failed, ambiguous = self.details(text)["failures"]
+        self.assertEqual((failed["test"], failed["kind"], failed["location"], failed["panicSites"]),
+                         ("case0", "exit", lane_run.UNVERIFIED, []))
+        self.assertEqual((ambiguous["test"], ambiguous["location"], ambiguous["panicSites"]),
+                         (lane_run.UNVERIFIED, lane_run.UNVERIFIED, []))
+        self.assertEqual(ambiguous["testUnverifiedReason"], "ambiguous-panic-block")
+
+    def test_repository_visible_diagnostic_test_keeps_complete_failure_name(self):
+        self.metadata = lane_run._checkout_metadata()
+        name = "diagnostic::tests::rendering_keeps_only_fixed_operations_and_os_error_facts"
+        self.assertIn(name.rsplit("::", 1)[-1], self.metadata.tests)
+        self.assertIn(name, self.metadata.rust_tests)
+        header = "     Running unittests src/lib.rs (target/debug/deps/xtrace_private_storage-0123456789abcdef)"
+        fragment, public = self.finalize(transcript([name], f"---- {name} stdout ----\n"
+                                                  "Error: private fixture detail\n", header=header))
+        self.assertEqual(fragment["failingTests"], [name])
+        row, = fragment["failureDetails"]["failures"]
+        self.assertEqual(row["test"], name)
+        self.assertNotIn("testUnverifiedReason", row)
+        self.assertIn(name, public)
+        self.assertNotIn("private fixture detail", json.dumps(fragment) + public)
 
     def test_passing_should_panic_next_to_unrelated_failure_has_no_panic_owner(self):
         text = transcript(["case0"], f"thread 'case1' panicked at {SITE}:7:\nexpected panic\n"

@@ -759,6 +759,20 @@ class FailureDetailsTests(CheckoutFixture):
         self.assertEqual(metadata.tests, {"between_lifetimes"})
         self.assertEqual(metadata.test("tests::between_lifetimes", lane_run.CANARY_INDEX), "between_lifetimes")
 
+    def test_rust_visibility_preserves_test_attribute_and_module_context(self):
+        for visibility in ("", "pub ", "pub(crate) ", "pub(super) ", "pub(self) ",
+                           "pub(in crate::outer) "):
+            for asynchronous in ("", "async "):
+                with self.subTest(visibility=visibility, asynchronous=asynchronous):
+                    declaration = f"{visibility}{asynchronous}fn"
+                    source = (f"mod outer {{ #[test] #[allow(dead_code)] {declaration} actual() {{}}\n"
+                              f"{declaration} helper() {{}}\n"
+                              f'const TEXT: &str = "#[test] {declaration} literal() {{}}";\n'
+                              f"/* #[test] {declaration} comment() {{}} */ }}\n")
+                    metadata = lane_run.CheckoutMetadata({"crates/example/src/lib.rs": source})
+                    self.assertEqual(metadata.tests, {"actual"})
+                    self.assertEqual(metadata.rust_tests, {"outer::actual"})
+
     def test_categories_require_declarations_in_the_private_storage_diagnostic_enums(self):
         source = ('/* outer /* inner */ enum AdmissionOperation { CommentValue } */\n'
                   'const TEXT: &str = r###"enum PrivateStorageError { LiteralValue }"###;\n'
