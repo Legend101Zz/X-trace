@@ -287,7 +287,17 @@ fn verify_retained_snapshot_directories(root: &Path) -> Result<(), AttachError> 
         0o500,
         ATTACH_CACHE_FILESYSTEMS,
     )
-    .map_err(|_| AttachError::PrivateStorage("the retained Java pack snapshot is unsafe"))
+    .map_err(|error| admission_error("the retained Java pack snapshot is unsafe", error))
+}
+
+/// Keeps the public error unchanged; tests retain only the sanitized admission facts.
+fn admission_error(
+    context: &'static str,
+    _error: xtrace_private_storage::PrivateStorageError,
+) -> AttachError {
+    #[cfg(test)]
+    hooks::ADMISSION_FAILURE.with(|slot| slot.set(Some((context, _error))));
+    AttachError::PrivateStorage(context)
 }
 
 /// The private `java-packs` cache: sealed content-addressed snapshots plus sidecar state.
@@ -434,7 +444,7 @@ impl PackCache {
             cache,
             ATTACH_CACHE_FILESYSTEMS,
         )
-        .map_err(|_| AttachError::PrivateStorage("the Java helper cache changed"))?;
+        .map_err(|error| admission_error("the Java helper cache changed", error))?;
         let path = cache.join(PACKS_DIR);
         let packs = open_or_create_private_child(&parent, PACKS_DIR)?;
         admit_directory_descriptor(&path, &packs, true)?;
@@ -1138,7 +1148,7 @@ pub(super) fn admit_directory_descriptor(
         owner_only,
         ATTACH_CACHE_FILESYSTEMS,
     )
-    .map_err(|_| AttachError::PrivateStorage("private storage cannot be admitted"))
+    .map_err(|error| admission_error("private storage cannot be admitted", error))
 }
 
 /// Creates a private, durable helper cache below an already-admitted user data home.
@@ -1516,6 +1526,9 @@ mod hooks {
     thread_local! {
         static HOOKS: std::cell::RefCell<Vec<(&'static str, Hook)>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        pub(super) static ADMISSION_FAILURE:
+            std::cell::Cell<Option<(&'static str, xtrace_private_storage::PrivateStorageError)>> =
+            const { std::cell::Cell::new(None) };
     }
 
     pub(super) fn install(point: &'static str, hook: Hook) {
@@ -1880,29 +1893,33 @@ mod tests {
             .map(|index| tagged_source(&format!("shared-{index}")))
             .collect::<Vec<_>>();
         let results = std::thread::scope(|scope| {
-            let handles =
-                (0..8)
-                    .map(|worker| {
-                        let cache = &fixture.cache;
-                        let sources = &sources;
-                        scope.spawn(move || {
-                            let mut outcomes = Vec::new();
-                            for round in 0..3 {
-                                let (_, pack) = &sources[(worker + round) % sources.len()];
-                                outcomes.push(pack.snapshot_into(cache).map(|snapshot| {
+            let handles = (0..8)
+                .map(|worker| {
+                    let cache = &fixture.cache;
+                    let sources = &sources;
+                    scope.spawn(move || {
+                        let mut outcomes = Vec::new();
+                        for round in 0..3 {
+                            let (_, pack) = &sources[(worker + round) % sources.len()];
+                            let (outcome, admission) = concurrent_snapshot(pack, cache);
+                            outcomes.push((
+                                outcome.map(|snapshot| {
                                     JavaAttachPack::validate(snapshot.root()).is_ok()
-                                }));
-                            }
-                            outcomes
-                        })
+                                }),
+                                admission,
+                            ));
+                        }
+                        outcomes
                     })
-                    .collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
             handles
                 .into_iter()
                 .flat_map(|handle| handle.join().expect("worker"))
                 .collect::<Vec<_>>()
         });
-        for outcome in results {
+        for (outcome, admission) in results {
+            assert_concurrent_attach_success(outcome.as_ref().map(|_| ()), admission);
             assert!(outcome.expect("attach within the cap succeeds"));
         }
         assert_eq!(sealed_names(&fixture.cache).len(), MAX_RETAINED_PACK_SNAPSHOTS);
@@ -1925,22 +1942,50 @@ mod tests {
                     .iter()
                     .map(|(_, pack)| {
                         let cache = &fixture.cache;
-                        scope.spawn(move || pack.snapshot_into(cache).map(|_| ()))
+                        scope.spawn(move || {
+                            let (outcome, admission) = concurrent_snapshot(pack, cache);
+                            (outcome.map(|_| ()), admission)
+                        })
                     })
                     .collect::<Vec<_>>();
                 for handle in handles {
-                    let outcome = handle.join().expect("worker");
-                    assert_concurrent_attach_success(outcome.as_ref().map(|_| ()));
+                    let (outcome, admission) = handle.join().expect("worker");
+                    assert_concurrent_attach_success(outcome.as_ref().map(|_| ()), admission);
                 }
             });
             assert_eq!(sealed_names(&fixture.cache).len(), 4);
         }
     }
 
+    // Take the facts on the worker and assert on the libtest thread, so the lane can associate
+    // them with the failing test. A recovered admission error must not describe a later failure.
+    fn concurrent_snapshot(
+        pack: &JavaAttachPack,
+        cache: &Path,
+    ) -> (Result<JavaAttachPack, AttachError>, Option<xtrace_private_storage::PrivateStorageError>)
+    {
+        hooks::ADMISSION_FAILURE.with(|slot| slot.set(None));
+        let outcome = pack.snapshot_into(cache);
+        let admission =
+            hooks::ADMISSION_FAILURE.with(std::cell::Cell::take).and_then(|(context, error)| {
+                match &outcome {
+                    Err(AttachError::PrivateStorage(message)) if *message == context => Some(error),
+                    _ => None,
+                }
+            });
+        (outcome, admission)
+    }
+
     // The macOS lane withholds panic messages but publishes source sites. Keep each failure
     // category on its own panic line, without track_caller, so a site identifies the failed
     // check without exposing paths, captured values, or operating-system error text.
-    fn assert_concurrent_attach_success(outcome: Result<(), &AttachError>) {
+    fn assert_concurrent_attach_success(
+        outcome: Result<(), &AttachError>,
+        admission: Option<xtrace_private_storage::PrivateStorageError>,
+    ) {
+        if let Some(error) = admission {
+            assert_admission_success(Err(error));
+        }
         match outcome {
             Err(AttachError::PrivateStorage("private storage cannot be admitted")) => {
                 outcome.expect("concurrent attach: shared directory admission failed");
@@ -1979,6 +2024,40 @@ mod tests {
             Err(AttachError::Unsupported | AttachError::Process) => {
                 outcome.expect("concurrent attach: unexpected non-cache failure");
             }
+            Ok(()) => {}
+        }
+    }
+
+    // Raw panic messages are withheld by the lane. Each enum gets a distinct source site,
+    // so failureDetails.failures[].location identifies the underlying admission category.
+    fn assert_admission_success(outcome: Result<(), xtrace_private_storage::PrivateStorageError>) {
+        use xtrace_private_storage::{AdmissionOperation as Step, PrivateStorageError as Error};
+        match outcome {
+            Err(Error::Admission(failure)) => match failure.operation {
+                Step::OpenDirectory => outcome.expect("OpenDirectory"),
+                Step::DescriptorMetadata => outcome.expect("DescriptorMetadata"),
+                Step::NamedMetadata => outcome.expect("NamedMetadata"),
+                Step::Identity => outcome.expect("Identity"),
+                Step::OwnershipAndMode => outcome.expect("OwnershipAndMode"),
+                Step::FilesystemMetadata => outcome.expect("FilesystemMetadata"),
+                Step::FilesystemPolicy => outcome.expect("FilesystemPolicy"),
+                Step::AccessAcl => outcome.expect("AccessAcl"),
+                Step::DefaultAcl => outcome.expect("DefaultAcl"),
+                Step::AclPolicy => outcome.expect("AclPolicy"),
+                Step::AclState => outcome.expect("AclState"),
+                Step::SpawnAclProbe => outcome.expect("SpawnAclProbe"),
+                Step::WaitAclProbe => outcome.expect("WaitAclProbe"),
+                Step::ReadAclProbe => outcome.expect("ReadAclProbe"),
+                Step::JoinAclReader => outcome.expect("JoinAclReader"),
+                Step::AclProbeExit => outcome.expect("AclProbeExit"),
+                Step::AclProbeOutput => outcome.expect("AclProbeOutput"),
+                Step::AclProbeOperand => outcome.expect("AclProbeOperand"),
+                Step::Deadline => outcome.expect("Deadline"),
+            },
+            Err(Error::Unavailable) => outcome.expect("Unavailable"),
+            Err(Error::InvalidName) => outcome.expect("InvalidName"),
+            Err(Error::AlreadyExists) => outcome.expect("AlreadyExists"),
+            Err(Error::Operation) => outcome.expect("Operation"),
             Ok(()) => {}
         }
     }
@@ -2186,7 +2265,7 @@ mod tests {
         for outcome in &results {
             if let Err(error) = outcome {
                 if !error.to_string().contains("in use") {
-                    assert_concurrent_attach_success(Err(error));
+                    assert_concurrent_attach_success(Err(error), None);
                 }
                 assert!(error.to_string().contains("in use"), "clean failure: {error}");
             }
