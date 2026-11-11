@@ -16,6 +16,8 @@ mod admission;
 mod diagnostic;
 #[cfg(target_os = "macos")]
 mod macos_acl;
+#[cfg(all(test, unix, any(target_os = "macos", feature = "ci-diagnostics")))]
+mod test_process;
 #[cfg(unix)]
 pub use diagnostic::{AdmissionFailure, AdmissionOperation};
 #[cfg(unix)]

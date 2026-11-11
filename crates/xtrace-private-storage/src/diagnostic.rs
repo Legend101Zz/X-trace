@@ -296,8 +296,7 @@ mod ci {
 
     // Never use admission here: recording must not recurse or change its result.
     fn append(directory: &Path, record: &str) -> std::io::Result<()> {
-        use rustix::fs::{FlockOperation, Mode, OFlags, flock, openat};
-        use rustix::process::{Resource, getrlimit};
+        use rustix::fs::{Mode, OFlags, openat};
         if record.len() > MAX_LINE {
             return Ok(());
         }
@@ -307,7 +306,7 @@ mod ci {
         if metadata.uid() != uid || metadata.mode() & 0o777 != 0o700 {
             return Ok(());
         }
-        let mut file = File::from(openat(
+        let file = File::from(openat(
             &root,
             "private-storage.jsonl",
             OFlags::RDWR
@@ -318,12 +317,29 @@ mod ci {
                 | OFlags::NONBLOCK,
             Mode::from_raw_mode(0o600),
         )?);
+        append_file(file, record)
+    }
+
+    struct AppendLock<'a>(&'a File);
+
+    impl Drop for AppendLock<'_> {
+        fn drop(&mut self) {
+            // Closing alone releases flock only at the last reference. A concurrent spawn
+            // can retain a duplicate until exec even with CLOEXEC, dropping later records.
+            let _ = rustix::fs::flock(self.0, rustix::fs::FlockOperation::Unlock);
+        }
+    }
+
+    fn append_file(file: File, record: &str) -> std::io::Result<()> {
+        use rustix::fs::{FlockOperation, flock};
+        use rustix::process::{Resource, getrlimit};
         // Independent open descriptions plus flock serialize threads AND
         // processes. Contention drops the observation instead of waiting.
         flock(&file, FlockOperation::NonBlockingLockExclusive)?;
+        let _lock = AppendLock(&file);
         let metadata = file.metadata()?;
         if !metadata.is_file()
-            || metadata.uid() != uid
+            || metadata.uid() != rustix::process::getuid().as_raw()
             || metadata.mode() & 0o777 != 0o600
             || metadata.nlink() != 1
         {
@@ -343,7 +359,7 @@ mod ci {
         // Refuse a pre-existing torn tail instead of joining a new record to it.
         // A short write is rolled back under the lock; no suffix is ever retried.
         // The size check also prevents SIGXFSZ with the current soft file limit.
-        match file.write(record.as_bytes()) {
+        match (&file).write(record.as_bytes()) {
             Ok(written) if written != record.len() => {
                 let _ = file.set_len(metadata.len());
             }
@@ -534,6 +550,37 @@ mod ci {
         }
 
         #[test]
+        fn append_unlocks_even_while_a_spawn_retains_the_file_description() -> std::io::Result<()> {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+            let path = directory.path().join("private-storage.jsonl");
+            // Model the descriptor reference held between fork and exec, without a timing
+            // race. Both a successful write and the early refusal paths must unlock it.
+            for prefix in [Vec::new(), b"torn".to_vec(), vec![b'\n'; MAX_BYTES as usize]] {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .create(true)
+                    .mode(0o600)
+                    .open(&path)?;
+                std::fs::write(&path, &prefix)?;
+                let inherited = file.try_clone()?;
+                append_file(file, "{}\n")?;
+                // This independent open must acquire the lock, even though the duplicated
+                // description is still live. Without explicit unlock this returns WouldBlock.
+                append(directory.path(), "{}\n")?;
+                drop(inherited);
+                assert_eq!(
+                    std::fs::read(&path)?,
+                    if prefix.is_empty() { b"{}\n{}\n".to_vec() } else { prefix }
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
         fn concurrent_writers_keep_complete_lines_within_both_caps() -> std::io::Result<()> {
             let directory = tempfile::tempdir()?;
             let directory = directory.path().canonicalize()?;
@@ -601,22 +648,24 @@ mod ci {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
                 // Rust's test binary retains the default SIGXFSZ disposition.
                 // A write at the limit would kill this child before its asserts.
-                let output = std::process::Command::new(std::env::current_exe()?)
-                    .args([
-                        "--exact",
-                        concat!(
-                            "diagnostic::ci::tests::",
-                            "saturated_file_and_fsize_limit_preserve_original_admission"
-                        ),
-                    ])
-                    .env(CHILD, "1")
-                    .env("XTRACE_CI_DIAG_DIR", &directory)
-                    .output()?;
+                let output = crate::test_process::output(
+                    std::process::Command::new(std::env::current_exe()?)
+                        .args([
+                            "--exact",
+                            concat!(
+                                "diagnostic::ci::tests::",
+                                "saturated_file_and_fsize_limit_preserve_original_admission"
+                            ),
+                        ])
+                        .env(CHILD, "1")
+                        .env("XTRACE_CI_DIAG_DIR", &directory),
+                )?;
                 assert!(
                     output.status.success(),
                     "diagnostic writer changed admission: {}",
                     output.status
                 );
+                assert!(output.stderr.is_empty(), "diagnostic child must remain silent on stderr");
                 assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
                 if size == 0 {
                     // Prove the child reached the writer under the same file limit.

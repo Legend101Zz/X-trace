@@ -1466,12 +1466,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn edit_acl(path: &Path, flag: &str, entry: &str) {
         assert!(
-            std::process::Command::new("/bin/chmod")
-                .args([flag, entry])
-                .arg(path)
-                .status()
-                .expect("edit fixture ACL")
-                .success()
+            crate::test_process::output(
+                std::process::Command::new("/bin/chmod").args([flag, entry]).arg(path)
+            )
+            .expect("edit fixture ACL")
+            .status
+            .success()
         );
     }
 
@@ -1948,7 +1948,12 @@ mod tests {
                         AFTER_LISTING
                             .with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
                         let before = ls_spawn_count();
-                        assert_eq!(judge(&operation, &path, &directory), acl.is_none());
+                        // A discarded batch contributes no ACL evidence. Its replacement
+                        // can admit a deny-only ACL once a matching stable recheck confirms
+                        // it, as it did before 64441ec; an allow grant always refuses.
+                        let admitted =
+                            acl.is_none() || (batched && acl == Some("group:everyone deny delete"));
+                        assert_eq!(judge(&operation, &path, &directory), admitted);
                         AFTER_LISTING.with(|slot| assert!(slot.borrow().is_none(), "hook ran"));
                         assert!(ls_spawn_count() - before >= 2, "fresh evidence is required");
                         assert!(operation.judged.borrow().is_empty(), "no raced verdict is cached");
@@ -1958,20 +1963,36 @@ mod tests {
                                 Some(true)
                             );
                         }
-                        if let Some(entry) = acl {
-                            // admission.rs uses this fallback when the boolean verdict refuses.
-                            // These assertions apply with and without ci-diagnostics.
+                        if !admitted {
+                            // A raced batch discards this operand and probes it afresh. An
+                            // allow grant then fails the initial policy check, which already
+                            // recorded AclPolicy before 64441ec. Single-listing rechecks
+                            // leave the AclState fallback unrecorded.
+                            let recorded = batched;
+                            let expected = if recorded { Step::AclPolicy } else { Step::AclState };
                             assert_eq!(
                                 operation.failure(Step::AclState),
-                                PrivateStorageError::check(Step::AclState)
+                                PrivateStorageError::check(expected)
                             );
-                            assert!(operation.failure.get().is_none(), "diagnostics only observe");
+                            assert_eq!(
+                                operation.failure.get(),
+                                recorded.then(|| AdmissionFailure::check(Step::AclPolicy)),
+                                "only the fresh initial probe records a policy failure"
+                            );
                             operation.deadline = Instant::now();
                             assert_eq!(
                                 operation.failure(Step::AclState),
-                                PrivateStorageError::check(Step::Deadline),
-                                "an unrecorded refusal retains deadline precedence"
+                                PrivateStorageError::check(if recorded {
+                                    Step::AclPolicy
+                                } else {
+                                    Step::Deadline
+                                }),
+                                "recorded failures precede the deadline; unrecorded refusals do not"
                             );
+                        } else {
+                            assert!(operation.failure.get().is_none(), "admitted without failure");
+                        }
+                        if let Some(entry) = acl {
                             edit_acl(&path, "-a", entry);
                         }
                     }
