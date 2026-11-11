@@ -61,10 +61,13 @@ def configured_floor(root: pathlib.Path, timeout: int):
         metadata = lane_run._checkout_metadata()
         directory = lane_run.prepare_recovery(root)
         kwargs["env"] = {**kwargs["env"], "XTRACE_LANE_RECOVERY_DIR": str(directory)}
+        outcome = kwargs.get("outcome_report")
+        if outcome is None:
+            outcome = kwargs["outcome_report"] = {}
         code, duration = original_run(argv, **kwargs)
-        if code == 124:
-            # Always replace even an existing fragment: the outer deadline may
-            # have expired while the wrapper was publishing its normal result.
+        if outcome.get("timed_out") is True:
+            # An outer timeout may interrupt publication. A wrapper that exits
+            # 124 on its own has already finalized and keeps its fragment.
             lane_run.recover_timeout(args, directory, metadata, duration)
         return code, duration
 

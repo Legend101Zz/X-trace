@@ -64,7 +64,7 @@ fn assert_acl_property(path: &Path, file: &File, expected: bool) -> io::Result<(
             filesec_free(filesec);
             assert_eq!(status, 0, "extended stat");
             assert_eq!(property, 0, "ACL property query");
-            assert_eq!(present, c_int::from(expected), "ACL property presence");
+            assert_eq!(present != 0, expected, "ACL property presence");
         }
     }
     Ok(())
