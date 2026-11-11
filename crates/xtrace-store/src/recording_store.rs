@@ -1600,7 +1600,7 @@ impl SqliteRecordingStore<'_> {
             FileSync::Filesystem,
             correlation_id,
         )?;
-        sync_directory(&staging.directory, correlation_id, "XTR-STORE-OBJECT-IO")?;
+        // write_synced_file has already admitted and synced this directory.
         commit_failpoint("after-logical-sync", correlation_id, false)?;
         self.binding.revalidate(correlation_id)?;
         commit_failpoint("before-compression", correlation_id, false)?;
@@ -1616,7 +1616,6 @@ impl SqliteRecordingStore<'_> {
         #[cfg(test)]
         phase.switch("segment_compressed_write");
         write_synced_file(&staging.compressed, &compressed, FileSync::Device, correlation_id)?;
-        sync_directory(&staging.directory, correlation_id, "XTR-STORE-OBJECT-IO")?;
         commit_failpoint("after-compressed-sync", correlation_id, false)?;
 
         #[cfg(test)]

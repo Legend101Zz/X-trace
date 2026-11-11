@@ -359,13 +359,12 @@ fn publish_boundary(
         lock.write().map_err(|_| object_io_error(id))?
     };
     #[cfg(unix)]
-    let _file_snapshot = snapshot_file_lock(root, true, id)?;
+    let directory = snapshot_file_lock(root, true, id)?;
     #[cfg(unix)]
     {
-        // Keep the same source/target admission and post-rename binding checks
-        // as rename_replace, with an explicit full directory sync on Apple.
-        let directory = xtrace_private_storage::open_private_directory_descriptor(root.path())
-            .map_err(|_| object_io_error(id))?;
+        // The flock already owns an admitted descriptor for this directory.
+        // Use that same inode for rename and sync, retaining source/target
+        // admission and post-rename binding checks plus Apple's full sync.
         root.validate_file_binding(&pending, file, false).map_err(|_| object_io_error(id))?;
         // The old target is discarded, not read. Stat-only admission already
         // checks owner, mode, ACL, filesystem, link count and stable identity.

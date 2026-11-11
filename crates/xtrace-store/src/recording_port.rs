@@ -2066,6 +2066,38 @@ mod tests {
         );
     }
 
+    // CI withholds error prose but retains verified panic sites. Keep one site
+    // per store error code so these workloads distinguish causes without
+    // emitting paths, payloads, correlation ids or arbitrary source strings.
+    #[allow(
+        clippy::panic,
+        reason = "test assertion sites identify withheld acknowledgement errors"
+    )]
+    fn acknowledgement_failed<T>(error: xtrace_application::PortError) -> T {
+        match error.message().split_once(": ").map(|(code, _)| code) {
+            Some("XTR-PRIVATE-STORAGE-UNAVAILABLE") => panic!("acknowledgement admission"),
+            Some("XTR-STORE-OBJECT-IO") => panic!("acknowledgement object io"),
+            Some("XTR-STORE-OBJECT-CORRUPT") => panic!("acknowledgement object corruption"),
+            Some("XTR-STORE-ATOMIC-INSTALL") => panic!("acknowledgement atomic installation"),
+            Some("XTR-STORE-XTF-VERIFY") => panic!("acknowledgement xtf verification"),
+            Some("XTR-STORE-SEGMENT-VALIDATION") => panic!("acknowledgement segment validation"),
+            Some("XTR-STORE-SEGMENT-CONFLICT") => panic!("acknowledgement segment conflict"),
+            Some("XTR-STORE-SEGMENT-CONTINUITY") => panic!("acknowledgement segment continuity"),
+            Some("XTR-STORE-FRAME-IDENTITY") => panic!("acknowledgement frame identity"),
+            Some("XTR-STORE-RECORDING-SQLITE-BUSY") => panic!("acknowledgement sqlite busy"),
+            Some("XTR-STORE-RECORDING-SQLITE-IO") => panic!("acknowledgement sqlite io"),
+            Some("XTR-STORE-RECORDING-SQLITE-RESOURCE") => {
+                panic!("acknowledgement sqlite resource")
+            }
+            _ => match error.kind() {
+                PortErrorKind::Validation => panic!("acknowledgement other validation"),
+                PortErrorKind::Conflict => panic!("acknowledgement other conflict"),
+                PortErrorKind::Resource => panic!("acknowledgement other resource"),
+                _ => panic!("acknowledgement other error"),
+            },
+        }
+    }
+
     #[test]
     fn sparse_acknowledged_batches_hit_admission_before_becoming_unreadable() {
         use xtrace_application::recording::{DEFAULT_SEGMENT_EVENT_BYTES, MAX_RECORDING_SEGMENTS};
@@ -2098,7 +2130,7 @@ mod tests {
         for sequence in 2..=last {
             let receipt = capture
                 .record_events(RecordEvents { recording_id, events: vec![sparse_event(sequence)] })
-                .expect("sparse acknowledgement");
+                .unwrap_or_else(acknowledgement_failed);
             assert_eq!((receipt.accepted, receipt.dropped), (1, 0));
             if (sequence - 1) % 256 == 0 || sequence == last {
                 profile.progress((sequence - 1) as usize);
@@ -2203,7 +2235,7 @@ mod tests {
                     recording_id,
                     events: vec![event(sequence, &format!("event-{sequence}"))],
                 })
-                .expect("singleton acknowledgement");
+                .unwrap_or_else(acknowledgement_failed);
             assert_eq!((receipt.accepted, receipt.dropped), (1, 0));
             published += receipt.persisted_segments;
             let expected_order = if receipt.persisted_segments != 0 {
