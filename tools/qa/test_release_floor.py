@@ -140,8 +140,15 @@ class FloorEnvironmentTests(CheckoutFixture):
 
 
 class FloorSupervisorTests(unittest.TestCase):
+    def private_temporary_directory(self):
+        # _run admits every log ancestor; a 0700 leaf under /tmp still fails.
+        # Do not depend on the private TMPDIR supplied only by PR CI's dev tests.
+        # The owned checkout is the fallback when no scratch root is configured.
+        return tempfile.TemporaryDirectory(
+            dir=os.environ.get("XTRACE_TEST_SCRATCH_ROOT") or pathlib.Path(__file__).resolve().parents[2])
+
     def test_wrapper_timeout_preserves_its_completed_fragment(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with self.private_temporary_directory() as temporary:
             root = pathlib.Path(temporary)
             shim = root / "bin"
             shim.mkdir(mode=0o700)
@@ -194,7 +201,7 @@ class FloorSupervisorTests(unittest.TestCase):
                   f"test {waiting} ...\n"
                   "captured-value-731\n")
         record = {"thread": name, "error": "Admission", "operation": "Deadline", "kind": None, "errno": None}
-        with tempfile.TemporaryDirectory() as temporary:
+        with self.private_temporary_directory() as temporary:
             root = pathlib.Path(temporary)
             shim = root / "bin"
             shim.mkdir(mode=0o700)

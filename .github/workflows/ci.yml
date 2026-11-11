@@ -326,7 +326,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Test dev tools, command guard and workflow lint
+      - name: Test dev tools, command guard and full QA suite
         run: |
           set -euo pipefail
           root="${RUNNER_TEMP:?}/xd"
@@ -334,7 +334,9 @@ jobs:
           # The env tests also need an owner-only ancestor within the 24-byte scratch cap.
           chmod 700 "$RUNNER_TEMP"
           XTRACE_DEV_TEST_ROOT="$root" XTRACE_DEV_SCRATCH="$RUNNER_TEMP" TMPDIR="$root" \
-            python3 -B -m unittest tools.dev.test_dev_tools tools.dev.test_guard tools.qa.test_workflow_lint tools.qa.test_rust_timing tools.qa.test_release_floor
+            python3 -B -m unittest tools.dev.test_dev_tools tools.dev.test_guard tools.qa.test_release_floor
+          # Match lane/campaign discovery without the dev tests' private TMPDIR override.
+          python3 -B -m unittest discover -s tools/qa -p 'test_*.py'
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
