@@ -111,7 +111,9 @@ runs it (Linux x86_64).
 upload of unsigned artifacts. If the verifier is absent on a branch the step warns and records "NOT RUN" (a skip, not a
 pass). `permissions: contents: read`, no secrets, actions pinned by commit SHA. Since 2026-10-10 the unsigned
 macos-arm64 package is built locally at release time (`python3 packaging/build.py --out dist --platform macos-arm64`), not in CI. `ci.yml` (push to `main`, `slice/**`,
-`ultra/*-integration`, `ultra/rc-*`, and pull requests) runs the Linux 23-gate floors. `macos.yml` runs hosted macOS arm64 jobs on `wave/**` and `ultra/rc-*` pushes and `workflow_dispatch`; `macos-ok` must be green for wave merges and release candidates. The leased macOS floor is no longer a merge requirement;
+`ultra/*-integration`, `ultra/rc-*`, and pull requests) runs the Linux 23-gate floors. `macos.yml` is manual
+dispatch only and is not a development merge gate. At release the owner runs `tools/dev/macos-release-check.sh`
+locally on a Mac and fixes failures before release. The leased macOS floor is no longer a merge requirement;
 `lane.yml` runs per-branch suites on `ultra/**`; `campaigns.yml` runs on `ultra/campaign/**` pushes and manual dispatch.
 
 ## What needs the owner
