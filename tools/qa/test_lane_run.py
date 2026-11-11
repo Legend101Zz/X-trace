@@ -69,7 +69,12 @@ class CheckoutFixture(unittest.TestCase):
             "crates/xtrace-private-storage/src/diagnostic.rs": (
                 "pub enum AdmissionOperation { Deadline, WaitAclProbe, NamedMetadata, OwnershipAndMode, AclState, }\n"
                 "pub(crate) enum AdmissionSite { Snapshot, ProbeState, RecheckAcl, }\n"
-                "pub(crate) enum ListingRefusal { NotChecked, InheritedAllow, Header, }\n"),
+                "pub(crate) enum ListingRefusal { NotChecked, InheritedAllow, Header, }\n"
+                "pub(crate) enum AdmissionObject { File, Directory, Other, }\n"
+                "mod ci { mod tests { #[test]\n"
+                "fn contextual_record_contains_only_fixed_categories_and_a_difference_mask() {} } }\n"),
+            "crates/xtrace-private-storage/src/caller.rs": (
+                "pub enum AdmissionCaller { Append, JournalPublish, Read, }\n"),
         }
         for name, source in self.sources.items():
             path = self.checkout / name
@@ -206,6 +211,7 @@ class FailureDetailsTests(CheckoutFixture):
         detail = lane_run.failure_details(text, False, diagnostic_records=self.records(self.diagnostic("first")))
         self.assertEqual(detail["observedDiagnostics"], [{
             "test": lane_run.UNVERIFIED, "relevance": "unknown",
+            "thread": "first",
             "testUnverifiedReason": "diagnostic-thread-ambiguous", "category": ["Admission", "Deadline"]}])
         self.assertEqual(detail["failures"][0]["category"], [])
 
@@ -773,7 +779,7 @@ class FailureDetailsTests(CheckoutFixture):
         self.assertEqual(row["category"], [])
         self.assertEqual(row["test"], "fails")
         records = self.records(self.diagnostic(operation="ActualStep"), metadata=metadata)
-        self.assertEqual(records, [("fails", ["Admission", "ActualStep"])])
+        self.assertEqual(records, [lane_run.AdmissionDiagnostic("fails", ["Admission", "ActualStep"])])
         structured = lane_run.failure_details(self.cargo(name="fails"), False, metadata=metadata,
                                               diagnostic_records=records)
         self.assertEqual(structured["failures"][0]["category"], [])
@@ -837,7 +843,8 @@ class FailureDetailsTests(CheckoutFixture):
 
     def test_structured_records_validate_every_field_and_exact_thread_name(self):
         good = self.diagnostic(kind="PermissionDenied", errno=13)
-        self.assertEqual(self.records(good), [("fails", ["Admission", "Deadline", "PermissionDenied", 13])])
+        self.assertEqual(self.records(good), [
+            lane_run.AdmissionDiagnostic("fails", ["Admission", "Deadline", "PermissionDenied", 13])])
         for field, values in {
             "error": ["/private/path", "Unknown", [], 42],
             "operation": ["/private/Deadline", "Unknown", [], None],
@@ -852,7 +859,8 @@ class FailureDetailsTests(CheckoutFixture):
         for thread in (None, "/private/fails", "customer42::fails", "unverified", [], 42):
             with self.subTest(thread=thread):
                 records = self.records({**good, "thread": thread})
-                self.assertEqual(records, [(lane_run.UNVERIFIED, ["Admission", "Deadline", "PermissionDenied", 13])])
+                self.assertEqual(records, [lane_run.AdmissionDiagnostic(
+                    lane_run.UNVERIFIED, ["Admission", "Deadline", "PermissionDenied", 13])])
                 detail = lane_run.failure_details("", False, diagnostic_records=records)
                 self.assertEqual(detail["failures"], [])
                 self.assertEqual(detail["observedDiagnostics"], [{
@@ -872,7 +880,8 @@ class FailureDetailsTests(CheckoutFixture):
                     with self.subTest(site=site, listing=listing, changes=changes):
                         self.assertEqual(self.records({**good, "site": site, "listing": listing,
                                                        "changes": changes}),
-                                         [("fails", ["Admission", "AclState", site, changes, listing])])
+                                         [lane_run.AdmissionDiagnostic(
+                                             "fails", ["Admission", "AclState", site, changes, listing])])
         for field in ("site", "changes", "listing"):
             self.assertEqual(self.records({key: value for key, value in good.items() if key != field}), [])
         index = lane_run.canary.build_index({"category": "Snapshot"})
@@ -891,9 +900,115 @@ class FailureDetailsTests(CheckoutFixture):
         })
         self.assertIn("probe::tests::scoped", metadata.rust_tests)
         self.assertEqual(self.records(self.diagnostic("probe::tests::scoped"), metadata=metadata),
-                         [("probe::tests::scoped", ["Admission", "Deadline"])])
+                         [lane_run.AdmissionDiagnostic("probe::tests::scoped", ["Admission", "Deadline"])])
         for thread in ("scoped", "tests::scoped", "customer42::scoped"):
-            self.assertEqual(self.records(self.diagnostic(thread), metadata=metadata)[0][0], lane_run.UNVERIFIED)
+            self.assertEqual(self.records(self.diagnostic(thread), metadata=metadata)[0].thread, lane_run.UNVERIFIED)
+
+    def test_new_context_fields_publish_each_value_with_its_json_type(self):
+        good = self.diagnostic(operation="AclState", site="Snapshot", changes=0, listing="NotChecked")
+        for field, values in {
+            "object": ["File", "Directory", "Other"],
+            "component_depth": [-(2**63), -2, -1, 0, 1, 2**63 - 1],
+            "nlink_changed": [False, True],
+        }.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    records = self.records({**good, field: value})
+                    self.assertEqual(records, [lane_run.AdmissionDiagnostic(
+                        "fails", ["Admission", "AclState", "Snapshot", 0, "NotChecked"], {field: value})])
+                    detail = lane_run.failure_details(self.cargo(name="fails"), False, diagnostic_records=records)
+                    row, = detail["observedDiagnostics"]
+                    self.assertEqual(row, {"test": "fails", "relevance": "unknown",
+                                          "category": records[0].categories, field: value})
+                    self.assertIs(type(json.loads(json.dumps(row))[field]), type(value))
+                    self.assertEqual(detail["failures"][0]["category"], [])
+
+    def test_caller_fields_publish_without_metadata_context_and_independently(self):
+        for caller in sorted(self.metadata.admission_callers):
+            for fields in ({"store_phase": caller}, {"store_site": caller},
+                           {"store_phase": caller, "store_site": "JournalPublish"}):
+                with self.subTest(fields=fields):
+                    records = self.records(self.diagnostic(**fields))
+                    self.assertEqual(records, [lane_run.AdmissionDiagnostic("fails", ["Admission", "Deadline"], fields)])
+                    detail = lane_run.failure_details(self.cargo(name="fails"), False, diagnostic_records=records)
+                    self.assertEqual(detail["observedDiagnostics"], [
+                        {"test": "fails", "relevance": "unknown", "category": ["Admission", "Deadline"], **fields}])
+
+    def test_new_fields_reject_wrong_types_bounds_and_vocabularies(self):
+        good = self.diagnostic(operation="AclState", site="Snapshot", changes=3, listing="NotChecked",
+                               object="Directory", component_depth=-2, nlink_changed=True,
+                               store_phase="Append", store_site="JournalPublish")
+        self.assertEqual(len(self.records(good)), 1)
+        for field, values in {
+            "object": [None, [], {}, 1, True, "Unknown", "Append", "Snapshot", "file"],
+            "component_depth": [None, [], {}, True, False, "-2", -2.0, -(2**63) - 1, 2**63, 10**100],
+            "nlink_changed": [None, [], {}, 0, 1, "true", 0.0, 1.0],
+            "store_phase": [None, [], {}, True, 1, "Unknown", "Directory", "Snapshot", "append"],
+            "store_site": [None, [], {}, False, 0, "Unknown", "File", "NotChecked", "journalpublish"],
+        }.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.assertEqual(self.records({**good, field: value}), [])
+        self.assertEqual(self.records({**good, "unknown": "captured-value"}), [])
+        for key in ("site", "changes", "listing"):
+            self.assertEqual(self.records({k: v for k, v in good.items() if k != key}), [])
+        for field in ("object", "component_depth", "nlink_changed"):
+            self.assertEqual(self.records(self.diagnostic(**{field: good[field]})), [])
+        for value in ("Directory", "-2", "True", "Append", "JournalPublish"):
+            with self.subTest(private=value):
+                index = lane_run.canary.build_index({"category": value})
+                self.assertEqual(self.records(good, index=index), [])
+
+    def test_new_vocabulary_requires_the_declaring_head_file(self):
+        metadata = lane_run.CheckoutMetadata({**self.sources,
+            "crates/xtrace-private-storage/src/diagnostic.rs": (
+                self.sources["crates/xtrace-private-storage/src/diagnostic.rs"]
+                + "enum AdmissionCaller { WrongFileCaller, }\n"),
+            "crates/xtrace-private-storage/src/caller.rs": (
+                self.sources["crates/xtrace-private-storage/src/caller.rs"]
+                + 'const TEXT: &str = "enum AdmissionCaller { LiteralCaller }";\n'
+                + "// enum AdmissionCaller { CommentCaller }\n"
+                + "enum AdmissionObject { WrongFileObject, }\n"),
+            "crates/other/src/caller.rs": "enum AdmissionCaller { WrongCrateCaller, }\n",
+            "crates/xtrace-private-storage/src/nested/caller.rs": "enum AdmissionCaller { NestedCaller, }\n",
+            "crates/xtrace-private-storage/tests/caller.rs": "enum AdmissionCaller { TestCaller, }\n",
+        })
+        self.assertEqual(metadata.admission_objects, {"File", "Directory", "Other"})
+        self.assertEqual(metadata.admission_callers, {"Append", "JournalPublish", "Read"})
+        for caller in ("WrongFileCaller", "LiteralCaller", "CommentCaller", "WrongCrateCaller",
+                       "NestedCaller", "TestCaller"):
+            for field in ("store_phase", "store_site"):
+                self.assertEqual(self.records(self.diagnostic(**{field: caller}), metadata=metadata), [])
+
+    def test_differing_attribution_fields_are_not_overwritten_or_combined(self):
+        records = self.records(self.diagnostic(store_phase="Append", store_site="JournalPublish"),
+                               self.diagnostic(store_phase="Read", store_site="JournalPublish"),
+                               self.diagnostic(store_phase="Append", store_site="JournalPublish"))
+        detail = lane_run.failure_details(self.cargo(name="fails"), False, diagnostic_records=records)
+        self.assertEqual(detail["observedDiagnostics"], [
+            {"test": "fails", "relevance": "unknown", "category": ["Admission", "Deadline"],
+             "store_phase": phase, "store_site": "JournalPublish"} for phase in ("Append", "Read")])
+
+    def test_synthetic_thread_never_falls_back_to_an_unrelated_failure(self):
+        synthetic = "diagnostic::ci::tests::contextual_record_contains_only_fixed_categories_and_a_difference_mask"
+        records = self.records(self.diagnostic(synthetic, operation="AclState", site="Snapshot", changes=3,
+                                              listing="InheritedAllow", object="Directory", component_depth=-2,
+                                              nlink_changed=True))
+        for status in (None, "ok", "FAILED"):
+            with self.subTest(status=status):
+                text = "test fails ... FAILED\n"
+                if status is not None:
+                    text += f"test {synthetic} ... {status}\n"
+                detail = lane_run.failure_details(text, False, diagnostic_records=records)
+                expected = {"test": synthetic if status == "FAILED" else lane_run.UNVERIFIED,
+                            "relevance": "unknown", "category": ["Admission", "AclState", "Snapshot", 3,
+                                                                    "InheritedAllow"],
+                            "object": "Directory", "component_depth": -2, "nlink_changed": True}
+                if status != "FAILED":
+                    expected.update(thread=synthetic, testUnverifiedReason="diagnostic-thread-not-failing")
+                self.assertEqual(detail["observedDiagnostics"], [expected])
+                unrelated, = [row for row in detail["failures"] if row["test"] == "fails"]
+                self.assertEqual(unrelated["category"], [])
 
     def test_record_reader_bounds_and_private_file_admission(self):
         import os
@@ -966,7 +1081,10 @@ class CommittedCheckoutTests(unittest.TestCase):
         self.diagnostic.parent.mkdir(parents=True)
         self.diagnostic.write_text("pub enum AdmissionOperation { Deadline, }\n"
                                    "pub(crate) enum AdmissionSite { Snapshot, }\n"
-                                   "pub(crate) enum ListingRefusal { NotChecked, }\n")
+                                   "pub(crate) enum ListingRefusal { NotChecked, }\n"
+                                   "pub(crate) enum AdmissionObject { Directory, }\n")
+        self.caller = self.diagnostic.parent / "caller.rs"
+        self.caller.write_text("pub enum AdmissionCaller { Append, JournalPublish, }\n")
         (self.diagnostic.parent / "alias.rs").symlink_to("diagnostic.rs")
         env = {**os.environ, "GIT_AUTHOR_NAME": "Fixture", "GIT_COMMITTER_NAME": "Fixture",
                "GIT_AUTHOR_EMAIL": "fixture@example.test", "GIT_COMMITTER_EMAIL": "fixture@example.test"}
@@ -997,18 +1115,27 @@ class CommittedCheckoutTests(unittest.TestCase):
     def test_diagnostic_vocabulary_comes_only_from_head_blobs(self):
         self.diagnostic.write_text("pub enum AdmissionOperation { StagedValue, }\n"
                                    "pub(crate) enum AdmissionSite { StagedSite, }\n"
-                                   "pub(crate) enum ListingRefusal { StagedListing, }\n")
+                                   "pub(crate) enum ListingRefusal { StagedListing, }\n"
+                                   "pub(crate) enum AdmissionObject { StagedObject, }\n")
         subprocess.run(["git", "-C", str(self.checkout), "add", "crates/xtrace-private-storage/src/diagnostic.rs"],
                        check=True, capture_output=True)
         self.diagnostic.unlink()
+        self.caller.write_text("pub enum AdmissionCaller { StagedCaller, }\n")
+        subprocess.run(["git", "-C", str(self.checkout), "add", "crates/xtrace-private-storage/src/caller.rs"],
+                       check=True, capture_output=True)
+        self.caller.write_text("pub enum AdmissionCaller { WorkingCaller, }\n")
         (self.diagnostic.parent / "untracked.rs").write_text(
             "enum AdmissionOperation { UntrackedValue }\n"
             "enum AdmissionSite { UntrackedSite }\n"
-            "enum ListingRefusal { UntrackedListing }\n")
+            "enum ListingRefusal { UntrackedListing }\n"
+            "enum AdmissionObject { UntrackedObject }\n"
+            "enum AdmissionCaller { UntrackedCaller }\n")
         metadata = lane_run._checkout_metadata()
         self.assertEqual(metadata.diagnostic_variants, {"Deadline"})
         self.assertEqual(metadata.admission_sites, {"Snapshot"})
         self.assertEqual(metadata.listing_refusals, {"NotChecked"})
+        self.assertEqual(metadata.admission_objects, {"Directory"})
+        self.assertEqual(metadata.admission_callers, {"Append", "JournalPublish"})
         row = lane_run.failure_details(FailureDetailsTests.cargo(
             name="committed_test", site="crates/tests/example.rs:2:1",
             message=("operation=Deadline kind=None raw_os_error=None "
@@ -1171,6 +1298,7 @@ class RunTests(CheckoutFixture):
         self.assertEqual(detail["failures"][0]["category"], [])
         self.assertEqual(detail["observedDiagnostics"], [{
             "test": lane_run.UNVERIFIED, "relevance": "unknown",
+            "thread": "first",
             "testUnverifiedReason": "diagnostic-thread-not-failing",
             "category": ["Admission", "NamedMetadata", "PermissionDenied", 13]}])
         logged = [json.loads(line.removeprefix("lane failure ")) for line in public.getvalue().splitlines()
@@ -1179,8 +1307,12 @@ class RunTests(CheckoutFixture):
         observations = [json.loads(line.removeprefix("lane observed-diagnostic "))
                         for line in public.getvalue().splitlines() if line.startswith("lane observed-diagnostic ")]
         self.assertEqual(observations, detail["observedDiagnostics"])
-        self.assertNotIn("first", json.dumps(frag))
-        self.assertNotIn("first", public.getvalue())
+        self.assertEqual(observations[0]["thread"], "first")
+        # Only the explicit source-thread fact may expose the passing test's name.
+        self.assertEqual(json.dumps(frag).count('"thread": "first"'), 1)
+        self.assertEqual(public.getvalue().count('"thread": "first"'), 1)
+        self.assertNotIn("first", json.dumps(frag).replace('"thread": "first"', ""))
+        self.assertNotIn("first", public.getvalue().replace('"thread": "first"', ""))
 
     def test_acl_context_validation_in_fragment_and_job_log(self):
         import contextlib
@@ -1223,6 +1355,50 @@ class RunTests(CheckoutFixture):
                 self.assertEqual(frag["failureDetails"]["failures"][0]["category"], [])
                 self.assertNotIn("captured-value", public.getvalue())
                 self.assertNotIn("captured-value", json.dumps(frag))
+
+    def test_new_fields_and_synthetic_threads_in_fragment_and_job_log(self):
+        import contextlib
+        import io
+        import os
+        synthetic = "diagnostic::ci::tests::contextual_record_contains_only_fixed_categories_and_a_difference_mask"
+        self.assertIn(synthetic, self.metadata.rust_tests)
+        fields = {"object": "Directory", "component_depth": -2, "nlink_changed": True,
+                  "store_phase": "Append", "store_site": "JournalPublish"}
+        context = {"operation": "AclState", "site": "Snapshot", "changes": 3, "listing": "InheritedAllow"}
+        records = [self.diagnostic(**context, **fields),
+                   self.diagnostic(synthetic, **context, **fields),
+                   self.diagnostic("first", **context, **fields),
+                   self.diagnostic(store_site="JournalPublish")]
+
+        def command(cmd, *, stdout, env, **kwargs):
+            path = pathlib.Path(env["XTRACE_CI_DIAG_DIR"]) / "private-storage.jsonl"
+            path.write_text("".join(json.dumps(record) + "\n" for record in records))
+            path.chmod(0o600)
+            stdout.write(f"test {synthetic} ... ok\ntest first ... ok\ntest fails ... FAILED\n".encode())
+            return subprocess.CompletedProcess(cmd, 101)
+
+        expected = [{"test": "fails", "relevance": "unknown",
+                     "category": ["Admission", "AclState", "Snapshot", 3, "InheritedAllow"], **fields}]
+        expected.extend({"test": lane_run.UNVERIFIED, "relevance": "unknown", "thread": thread,
+                         "testUnverifiedReason": "diagnostic-thread-not-failing",
+                         "category": ["Admission", "AclState", "Snapshot", 3, "InheritedAllow"], **fields}
+                        for thread in (synthetic, "first"))
+        expected.append({"test": "fails", "relevance": "unknown", "category": ["Admission", "Deadline"],
+                         "store_site": "JournalPublish"})
+        public = io.StringIO()
+        with contextlib.redirect_stdout(public), \
+                mock.patch.dict(os.environ, {"XTRACE_CI_DIAG_DIR": "enabled"}), \
+                mock.patch.object(lane_run.subprocess, "run", side_effect=command):
+            rc, frag = self.run_step(["unused-command"])
+        self.assertEqual(rc, 101)
+        detail = frag["failureDetails"]
+        self.assertEqual(detail["observedDiagnostics"], expected)
+        logged = [json.loads(line.removeprefix("lane observed-diagnostic "))
+                  for line in public.getvalue().splitlines() if line.startswith("lane observed-diagnostic ")]
+        self.assertEqual(logged, expected)
+        self.assertEqual([row["test"] for row in detail["failures"]], ["fails"])
+        self.assertEqual(detail["failures"][0]["category"], [])
+        self.assertIs(type(logged[0]["nlink_changed"]), bool)
 
     def test_cargo_compile_reads_json_stdout_and_withholds_stderr(self):
         import contextlib

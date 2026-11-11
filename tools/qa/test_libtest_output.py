@@ -206,7 +206,8 @@ class LibtestOutputTests(unittest.TestCase):
 
     def test_summary_failure_names_keep_structured_diagnostic_provenance(self):
         text = transcript(["case0"], "test case0 ... child output\nFAILED\n")
-        detail = self.details(text, diagnostic_records=[("case0", ["Admission", "Deadline"])])
+        detail = self.details(text, diagnostic_records=[
+            lane_run.AdmissionDiagnostic("case0", ["Admission", "Deadline"])])
         self.assertEqual(detail["observedDiagnostics"], [
             {"test": "case0", "relevance": "unknown", "category": ["Admission", "Deadline"]}])
 
