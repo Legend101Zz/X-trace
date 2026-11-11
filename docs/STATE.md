@@ -12,10 +12,9 @@ The one place for "where are we". Rewrite it (do not append) at the end of every
   HUMAN-OWNER, REVIEWS-EXACT, DISTRIBUTED-RECHECK (end of release).
 - How work happens now: ADR 0012 (Codex workers, Claude orchestrator, heavy tests on GitHub, pull requests,
   merge rules scaled to risk, GitHub issues for tickets and wave tracking).
-- Development merges require Linux `ci-ok` and clean reviews. Do not wait for, trigger or require macOS CI.
-  At release, the owner runs `tools/dev/macos-release-check.sh` locally on a Mac; fix failures before release.
-- The per-check `/bin/ls` cost was found and replaced by native ACL checks. The JDK 21 macOS suite took 718 s on
-  `a7a4268`, down from over 3000 s. Remaining macOS test failures are deferred to the release check.
+- The owner decided on 2026-11-11 that development CI is Linux-only (ADR 0012 amendment). Merges require Linux
+  `ci-ok` and clean reviews. Before release, the owner runs `tools/dev/macos-release-check.sh` locally on a Mac
+  and fixes failures. Remaining macOS failures are deferred to that check.
 
 ## Work map (GitHub issues)
 
@@ -34,24 +33,32 @@ work.
 
 Epic: #2. Close an issue only when every box is ticked with evidence on merged `main`.
 
+## Wave 2 delivered
+
+PR #38 merged as `f92f0bf`. It delivered Spring MVC capture on Petclinic, export, lifecycle, focused capture,
+a durable journal, a CI diagnostics channel, and the macOS native ACL fast path in `xtrace-macos-acl`.
+Linux `ci-ok` passed on `8d2a9b1` in run `43024028230`; both release floors passed 23/23.
+The Petclinic campaign in run `43024105219` passed 37 of 45 steps. The other eight were reported, not passed.
+
 ## Next work, in order
 
-1. **Wave 2 = #3:** finish the three pushed, unmerged branches. Merge `origin/main` into each; never rebase pushed
-   history.
-   - `ultra/r2w2-qb`: real Petclinic harness flows and product outcome kinds.
-   - `ultra/r2w2-xb`: `xtrace export` for OpenAPI/Postman/cURL.
-   - `ultra/r2w2-jb`: final HTTP status read after view rendering, and source roots relative to the project. Not yet
-     reviewed.
+Start Wave 3 on `wave/w3`. Read issue #3 first, then #4. Finish the remaining #3 Petclinic campaign gaps:
 
-   Then the product gaps: Spring Data repository frames (JDK proxies), the agent's limit of 8 unwritten
-   recordings, TUI rows showing only ids, line events not reaching the read API. Done when the Petclinic campaign
-   is green with zero not-implemented steps.
-2. **#4**, then **#5** and **#6** in parallel, then **#7** (the UI is built from the new design handoff), **#8**,
-   then **#9**.
+- `baseline-jar-sha-vs-pinned`: the observed jar hash differed from the pinned hash.
+- `unpaced-load-not-exercised`: serial requests were paced; the agent admits at most eight unwritten recordings.
+- `analyzer-source-accommodation`: the analyzer was built from source, not shipped in the candidate package.
+- `tui-navigation-accommodation`: routes were checked in detail, not in the list.
+- `overhead-measurement`: paced load and possible capture drops qualify the measurement; no budget was applied.
+- `flow-accommodations`: flows used request budgets, pacing and an acknowledged database wait.
+- `privacy-scope`: focused capture and exception message redaction have the reported scope.
+- `campaign-receipt-artifact`: the receipt was unsigned and non-release.
 
-Wave 1 (#18, PR #20, merged as `931f917`) removed the races behind the scan, Node HTTP, release-tool runner,
-`pack_inventory` and Spring fixture test failures (#12, #13, #15, #16, #21), recorded the owner's ADR 0012 answers
-(#17) and added the hosted macOS workflow (#19). Its head passed `ci-ok` on three runs and `macos-ok`.
+Carry forward the two review minors: the caught-panic test hard-codes line 171 in `scope.rs`, and a store test
+mutex can be poisoned after a workload failure. The ctime-only admission refusal is still unexplained; diagnostics
+now attribute it. Investigate the deferred macOS failures at the release check.
+
+Then work on #4, followed by #5 and #6 in parallel, #7, #8 and #9. Close an issue only when every box is ticked
+with evidence on merged `main`.
 
 ## Known nondeterministic tests (fix; never retry to green)
 
@@ -63,9 +70,7 @@ Wave 1 (#18, PR #20, merged as `931f917`) removed the races behind the scan, Nod
 
 ## Branches
 
-- On 2026-11-09, with the owner's approval, about 130 merged or throwaway remote branches were deleted. Only
-  `main` and the unmerged keepers `ultra/r2w2-qb`, `ultra/r2w2-xb`, `ultra/r2w2-jb` remain. `ultra/r2w3-r4` is
-  gone; it raised a test deadline and added a retry.
+- Wave 3 starts on `wave/w3`, from main at `f92f0bf`.
 - Wave branches (`wave/<n>`) are deleted after their merge and a green post-merge `main`.
 
 ## Waiting for the owner
