@@ -1,8 +1,9 @@
 //! ACL probes and the per-operation verdict memo.
 //!
 //! Admission walks every component of a path. On macOS an exact native empty-ACL query avoids
-//! single-object `/bin/ls -ldeO` probes; all other results keep the listing oracle. An operation (one
-//! `revalidate`, one `create_private_child`, ...) used to spawn it several times per component. An
+//! `/bin/ls` probes, including ancestor batches and content rechecks; all other results keep the
+//! listing oracle. An operation (one `revalidate`, one `create_private_child`, ...) used to spawn
+//! it several times per component. An
 //! [`Operation`] bounds one such operation with a single deadline and remembers which directory
 //! *states* it has already judged acceptable, so eligible states are probed once while space
 //! remains. File validation revalidates its parent before and after checking the file, so directory
@@ -19,8 +20,8 @@
 //! including ctime; an identity check alone cannot detect an ACL edit. A change fails admission
 //! closed. Fresh probes apply the same checks across the listing, including batch fallbacks.
 //! A directory content change can invalidate a fresh listing without changing its ACL. In that
-//! case APFS admission requires another listing with identical ACL entries and an unchanged
-//! state across that listing, under the original deadline. Linux requires the same evidence
+//! case APFS admission requires fresh identical ACL evidence and an unchanged state across that
+//! query, under the original deadline. Linux requires the same evidence
 //! from both ACL attributes on an admitted filesystem with subsecond ctime. Coarse timestamps
 //! and other filesystems fail closed.
 //! The raced verdict is never cached.
@@ -323,7 +324,7 @@ impl Operation {
 
     /// Registers the prefix operands of an ancestor walk. Nothing is spawned here: the batched
     /// listing is taken lazily, by [`Self::spawn_batch_for`], only when a directory on the walk
-    /// misses the memo and no usable batched entry exists.
+    /// misses the memo and neither native empty-ACL evidence nor a usable batched entry exists.
     #[cfg(target_os = "macos")]
     pub(crate) fn register_walk(&self, paths: &[std::path::PathBuf]) {
         if !self.memoize || paths.len() < 2 {
@@ -640,7 +641,7 @@ pub(crate) fn directory_acl_admits(
     true
 }
 
-/// Replace a listing raced by child activity with stable evidence. Comparing the ACL entries
+/// Replace ACL evidence raced by child activity with stable evidence. Comparing the ACL entries
 /// also refuses a deny-only ACL edit accompanied by a child change. Nothing on this path earns
 /// a memo; the original state was invalidated. Continuous mutation exhausts the same deadline.
 #[cfg(target_os = "macos")]
@@ -658,30 +659,30 @@ fn recheck_directory_listing(
         };
         let state = DirectoryState::of(&before, role);
         let key = operation.directory_key(state, directory);
-        // A new single-operand listing is required; the batch predates the content change.
+        // The batch predates the content change. Obtain fresh per-object evidence inside
+        // this new state bracket; nonempty or unknown native results keep the listing oracle.
         #[cfg(test)]
         record_directory_probe(path);
-        let text = match run_acl_listing(path, operation.deadline()) {
-            Ok(text) => text,
-            Err(failure) => {
-                operation.record_failure(failure);
+        let fresh = if native_no_acl(path, Some(directory), true) {
+            DirectoryEvidence::NoAcl
+        } else {
+            let text = match run_acl_listing(path, operation.deadline()) {
+                Ok(text) => text,
+                Err(failure) => {
+                    operation.record_failure(failure);
+                    return false;
+                }
+            };
+            if let Err(refusal) = directory_listing_verdict(&text, path) {
+                diagnostic::observe_context(
+                    Step::AclPolicy,
+                    AdmissionContext::listing(AdmissionSite::RecheckListing, refusal),
+                );
                 return false;
             }
+            DirectoryEvidence::Listing(text)
         };
-        if let Err(refusal) = directory_listing_verdict(&text, path) {
-            diagnostic::observe_context(
-                Step::AclPolicy,
-                AdmissionContext::listing(AdmissionSite::RecheckListing, refusal),
-            );
-            return false;
-        }
-        let same_acl = match original {
-            DirectoryEvidence::NoAcl => text.lines().nth(1).is_none(),
-            DirectoryEvidence::Listing(original) => {
-                original.lines().skip(1).eq(text.lines().skip(1))
-            }
-        };
-        if !same_acl {
+        if !original.same_acl(&fresh) {
             diagnostic::observe_context(
                 Step::AclState,
                 AdmissionContext::listing(
@@ -826,23 +827,40 @@ enum DirectoryEvidence {
 }
 
 #[cfg(target_os = "macos")]
+impl DirectoryEvidence {
+    /// Native absence matches only a listing with no ACL entries, never a deny-only ACL.
+    fn same_acl(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::NoAcl, Self::NoAcl) => true,
+            (Self::NoAcl, Self::Listing(text)) | (Self::Listing(text), Self::NoAcl) => {
+                text.lines().nth(1).is_none()
+            }
+            (Self::Listing(left), Self::Listing(right)) => {
+                left.lines().skip(1).eq(right.lines().skip(1))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn probe_directory(
     operation: &Operation,
     path: &Path,
     directory: &File,
 ) -> Option<DirectoryEvidence> {
-    // Lazy batch: taken only now that a directory on the walk missed the memo.
-    let text = prefetched_listing(operation, path, directory).or_else(|| {
+    // Use an existing, bound listing when available. Otherwise query this held object before
+    // starting a walk batch: a no-ACL walk needs no subprocess at all. The caller brackets
+    // either source with the same descriptor/named states and original deadline.
+    let text = prefetched_listing(operation, path, directory);
+    if text.is_none() && native_no_acl(path, Some(directory), true) {
+        return Some(DirectoryEvidence::NoAcl);
+    }
+    let text = text.or_else(|| {
         operation
             .spawn_batch_for(path)
             .then(|| prefetched_listing(operation, path, directory))
             .flatten()
     });
-    // Keep the already amortised walk batch. A native query only replaces an otherwise
-    // necessary single-object listing, inside the caller's unchanged state/identity bracket.
-    if text.is_none() && native_no_acl(path, Some(directory), true) {
-        return Some(DirectoryEvidence::NoAcl);
-    }
     let text = text.or_else(|| match run_acl_listing(path, operation.deadline()) {
         Ok(text) => Some(text),
         Err(failure) => {
@@ -2645,6 +2663,10 @@ mod tests {
                 };
                 AFTER_NATIVE.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
                 let operation = Operation::new();
+                operation.register_walk(&[
+                    root.path().parent().expect("scratch parent").to_path_buf(),
+                    root.path().to_path_buf(),
+                ]);
                 let before = ls_spawn_count();
                 assert!(!match kind {
                     0 => judge(&operation, object, &directory),
@@ -2674,6 +2696,17 @@ mod tests {
             let root = fixture();
             let directory = open(root.path());
             let hook = content_edit_hook(root.path(), ContentEdit::Create, acl);
+            // Fail native queries only after the initial evidence, preserving the existing
+            // fresh-listing assertions. The separate native recheck test covers no fallback.
+            let fallback = std::rc::Rc::new(RefCell::new(None));
+            let fallback_hook = fallback.clone();
+            let hook = AfterListing {
+                path: hook.path,
+                action: Box::new(move || {
+                    (hook.action)();
+                    *fallback_hook.borrow_mut() = Some(crate::macos_acl::NativeError::inject());
+                }),
+            };
             AFTER_NATIVE.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
             let operation = Operation::new();
             let before = ls_spawn_count();
@@ -2686,6 +2719,236 @@ mod tests {
             if let Some(acl) = acl {
                 edit_acl(root.path(), "-a", acl);
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recovery_over_no_acl_files_skips_walk_batches_and_grants_keep_the_listing() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        const FILES: usize = 12;
+        let root = fixture();
+        let objects = root.path().join("objects");
+        std::fs::create_dir(&objects).expect("object directory");
+        std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o700))
+            .expect("private object directory");
+        for index in 0..FILES {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(objects.join(format!("object-{index:02}")))
+                .expect("recovery fixture file");
+        }
+        let directory = open(root.path());
+        let object_directory = open(&objects);
+        // Exercise the storage evidence recovery needs on real files, with one fresh
+        // operation per file. Limit the registered walk to the fixture's ancestors so host
+        // directory ACLs cannot turn this no-ACL regression into a machine-dependent test.
+        let recover = |descriptor_backed| {
+            let mut paths = std::fs::read_dir(&objects)
+                .expect("enumerate recovery files")
+                .map(|entry| entry.expect("recovery entry").path())
+                .collect::<Vec<_>>();
+            paths.sort_unstable();
+            assert_eq!(paths.len(), FILES);
+            for path in paths {
+                let operation = Operation::new();
+                operation.register_walk(&[root.path().to_path_buf(), objects.clone()]);
+                assert!(judge(&operation, root.path(), &directory));
+                assert!(judge(&operation, &objects, &object_directory));
+                let expected = FileIdentity::from_metadata(
+                    &std::fs::symlink_metadata(&path).expect("recovery file identity"),
+                );
+                let admitted = if descriptor_backed {
+                    acl_admits_file(&path, &open(&path), expected, &operation)
+                } else {
+                    named_file_acl_admits(&path, &object_directory, expected, &operation)
+                };
+                if !admitted {
+                    assert_no_file_verdicts(&operation);
+                    return false;
+                }
+            }
+            true
+        };
+        for descriptor_backed in [false, true] {
+            let before = ls_spawn_count();
+            let batches = batch_attempt_count();
+            assert!(recover(descriptor_backed));
+            assert_eq!(ls_spawn_count(), before, "no ls for {FILES} recovered files");
+            assert_eq!(batch_attempt_count(), batches, "native walks do not attempt batches");
+
+            let granted = objects.join("object-00");
+            edit_acl(&granted, "+a", "group:everyone allow read");
+            let before = ls_spawn_count();
+            assert!(!recover(descriptor_backed));
+            assert_eq!(ls_spawn_count() - before, 1, "the granted entry keeps its ls oracle");
+            {
+                let _native_error = crate::macos_acl::NativeError::inject();
+                assert!(!recover(descriptor_backed), "the original listing also refuses");
+            }
+            edit_acl(&granted, "-a", "group:everyone allow read");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_walk_with_one_nonempty_acl_keeps_the_batched_listing_fallback() {
+        for (entry, admitted) in
+            [("group:everyone deny delete", true), ("group:everyone allow read", false)]
+        {
+            let root = fixture();
+            let child = root.path().join("child");
+            std::fs::create_dir(&child).expect("walk child");
+            let directory = open(&child);
+            edit_acl(&child, "+a", entry);
+            let operation = Operation::new();
+            operation.register_walk(&[root.path().to_path_buf(), child.clone()]);
+            let before = ls_spawn_count();
+            let batches = batch_attempt_count();
+            assert_eq!(judge(&operation, &child, &directory), admitted);
+            assert_eq!(batch_attempt_count() - batches, 1, "nonempty ACL keeps the walk batch");
+            assert!((1..=2).contains(&(ls_spawn_count() - before)));
+            edit_acl(&child, "-a", entry);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_content_rechecks_need_identical_acl_and_unchanged_object_state() {
+        for edit in [ContentEdit::Create, ContentEdit::Rename, ContentEdit::Remove] {
+            for acl in [None, Some("group:everyone allow read"), Some("group:everyone deny delete")]
+            {
+                let root = fixture();
+                let directory = open(root.path());
+                std::fs::write(root.path().join("child"), b"recovery fixture")
+                    .expect("child fixture");
+                let hook = content_edit_hook(root.path(), edit, acl);
+                AFTER_NATIVE.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+                let operation = Operation::new();
+                let before = ls_spawn_count();
+                let decisions = directory_probe_count();
+                assert_eq!(judge(&operation, root.path(), &directory), acl.is_none());
+                AFTER_NATIVE.with(|slot| assert!(slot.borrow().is_none(), "native hook ran"));
+                assert_eq!(ls_spawn_count() - before, usize::from(acl.is_some()));
+                assert_eq!(directory_probe_count() - decisions, 2, "fresh evidence required");
+                assert!(operation.judged.borrow().is_empty(), "never cache a content race");
+                if let Some(entry) = acl {
+                    edit_acl(root.path(), "-a", entry);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_native_content_recheck_refuses_an_edit_after_its_fresh_evidence() {
+        for acl in [None, Some("group:everyone allow read"), Some("group:everyone deny delete")] {
+            let root = fixture();
+            let path = root.path().join("directory");
+            std::fs::create_dir(&path).expect("fixture directory");
+            let directory = open(&path);
+            let content = content_edit_hook(&path, ContentEdit::Create, None);
+            let changed = path.clone();
+            let fresh = AfterListing {
+                path: path.clone(),
+                action: Box::new(move || match acl {
+                    Some(entry) => edit_acl(&changed, "+a", entry),
+                    None => {
+                        std::fs::rename(&changed, changed.with_extension("old"))
+                            .expect("replace directory after fresh evidence");
+                        std::fs::create_dir(&changed).expect("replacement directory");
+                    }
+                }),
+            };
+            let hook = AfterListing {
+                path: path.clone(),
+                action: Box::new(move || {
+                    (content.action)();
+                    AFTER_NATIVE.with(|slot| assert!(slot.borrow_mut().replace(fresh).is_none()));
+                }),
+            };
+            AFTER_NATIVE.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+            let operation = Operation::new();
+            let before = ls_spawn_count();
+            assert!(!judge(&operation, &path, &directory));
+            AFTER_NATIVE.with(|slot| assert!(slot.borrow().is_none(), "both queries ran"));
+            assert_eq!(ls_spawn_count(), before, "both queries used native evidence");
+            assert!(operation.judged.borrow().is_empty(), "raced evidence is never cached");
+            if let Some(entry) = acl {
+                edit_acl(&path, "-a", entry);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_native_recheck_matches_an_empty_listing_but_refuses_a_removed_deny_acl() {
+        for deny in [false, true] {
+            let root = fixture();
+            let directory = open(root.path());
+            if deny {
+                edit_acl(root.path(), "+a", "group:everyone deny delete");
+            }
+            let content = content_edit_hook(root.path(), ContentEdit::Create, None);
+            let fallback =
+                std::rc::Rc::new(RefCell::new(Some(crate::macos_acl::NativeError::inject())));
+            let fallback_hook = fallback.clone();
+            let changed = root.path().to_path_buf();
+            let hook = AfterListing {
+                path: changed.clone(),
+                action: Box::new(move || {
+                    (content.action)();
+                    if deny {
+                        edit_acl(&changed, "-a", "group:everyone deny delete");
+                    }
+                    fallback_hook.borrow_mut().take();
+                }),
+            };
+            AFTER_LISTING.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+            let operation = Operation::new();
+            let before = ls_spawn_count();
+            assert_eq!(judge(&operation, root.path(), &directory), !deny);
+            assert!(fallback.borrow().is_none(), "native evidence enabled for the recheck");
+            AFTER_LISTING.with(|slot| assert!(slot.borrow().is_none(), "listing hook ran"));
+            assert_eq!(ls_spawn_count() - before, 1, "only the original evidence used ls");
+            assert!(operation.judged.borrow().is_empty(), "never cache raced evidence");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn replacing_a_recovery_entry_during_native_evidence_is_refused_like_a_listing_race() {
+        for native in [false, true] {
+            let root = fixture();
+            let directory = open(root.path());
+            let path = root.path().join("object");
+            let file = File::create(&path).expect("recovery file");
+            let expected = identity_of(&file);
+            let changed = path.clone();
+            let hook = AfterListing {
+                path: path.clone(),
+                action: Box::new(move || {
+                    std::fs::rename(&changed, changed.with_extension("old"))
+                        .expect("retain original inode");
+                    File::create(&changed).expect("replacement recovery file");
+                }),
+            };
+            let slot = if native { &AFTER_NATIVE } else { &AFTER_LISTING };
+            slot.with(|slot| assert!(slot.borrow_mut().replace(hook).is_none()));
+            let _fallback = (!native).then(crate::macos_acl::NativeError::inject);
+            let operation = Operation::new();
+            operation.register_walk(&[
+                root.path().parent().expect("scratch parent").to_path_buf(),
+                root.path().to_path_buf(),
+            ]);
+            let before = ls_spawn_count();
+            assert!(!named_file_acl_admits(&path, &directory, expected, &operation));
+            slot.with(|slot| assert!(slot.borrow().is_none(), "replacement hook ran"));
+            assert_eq!(ls_spawn_count() - before, usize::from(!native));
+            assert_no_file_verdicts(&operation);
         }
     }
 

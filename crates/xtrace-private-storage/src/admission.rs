@@ -666,8 +666,8 @@ impl AdmittedPrivateRoot {
     /// descriptor for it, so validating a live database by opening and dropping a second
     /// descriptor silently drops SQLite's locks and lets another process delete the WAL out
     /// from under this one. On every supported Unix this check is therefore descriptor-free:
-    /// it uses `statat` plus a path-based ACL query (`lgetxattr` on Linux, `/bin/ls -ldeO` on
-    /// macOS) and never opens the file.
+    /// it uses `statat` plus a path-based ACL query (`lgetxattr` on Linux, native empty-ACL
+    /// evidence with `/bin/ls -ldeO` fallback on macOS) and never opens the file.
     pub fn validate_regular_file(&self, name: &str) -> Result<(), PrivateStorageError> {
         if self.validate_named_file_without_open(name)? {
             Ok(())
@@ -677,7 +677,8 @@ impl AdmittedPrivateRoot {
     }
 
     /// Stat-only admission of an optional private regular file: returns whether it exists.
-    /// No descriptor for the file is ever opened (Linux uses `lgetxattr`, macOS `/bin/ls`).
+    /// No descriptor for the file is ever opened (Linux uses `lgetxattr`, macOS native stat
+    /// with `/bin/ls` fallback).
     fn validate_named_file_without_open(&self, name: &str) -> Result<bool, PrivateStorageError> {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -1187,8 +1188,8 @@ fn open_directory_without_symlinks_until(
         return Err(PrivateStorageError::InvalidName);
     }
     // Register the walk's prefixes; the one batched ACL listing is taken lazily on the first
-    // memo miss (macOS only; see `Operation::spawn_batch_for` for why it cannot admit anything
-    // by itself).
+    // memo miss without native empty-ACL evidence (macOS only; see `Operation::spawn_batch_for`
+    // for why it cannot admit anything by itself).
     #[cfg(target_os = "macos")]
     {
         let mut prefix = PathBuf::from("/");
@@ -1917,6 +1918,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_quiet_walk_spawns_one_ls_not_one_per_component() {
+        // Keep the listing fallback's original bounds independently of native evidence.
+        let _native_error = crate::macos_acl::NativeError::inject();
         let leaf = nested_leaf();
         std::thread::sleep(std::time::Duration::from_millis(60));
         let directories = directory_count(leaf.path());
@@ -2096,6 +2099,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_scope_spawns_far_fewer_listings_than_the_same_calls_without_one() {
+        let _native_error = crate::macos_acl::NativeError::inject();
         const CALLS: usize = 10;
         let busy = private_scratch().path().to_path_buf();
         let leaf = nested_leaf();
@@ -2150,6 +2154,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_walk_registers_its_operands_and_spawns_only_when_a_directory_misses() {
+        let _native_error = crate::macos_acl::NativeError::inject();
         let leaf = nested_leaf();
         std::thread::sleep(std::time::Duration::from_millis(60));
         let spawns = probe::ls_spawn_count();
@@ -2335,6 +2340,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_scope_past_its_cap_lists_afresh() {
+        let _native_error = crate::macos_acl::NativeError::inject();
         let leaf = nested_leaf();
         std::thread::sleep(std::time::Duration::from_millis(60));
         let _scope = AdmissionScope::enter_with_cap(std::time::Duration::from_millis(1_500));
@@ -2381,6 +2387,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn tricky_directory_names_get_the_right_verdict_from_the_batched_listing() {
+        let _native_error = crate::macos_acl::NativeError::inject();
         let mut current =
             private_scratch().create_private_child(&unique_name("tricky")).expect("base");
         let mut chain = Vec::new();
