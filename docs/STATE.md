@@ -55,10 +55,12 @@ The Petclinic campaign in run `43024105219` passed 37 of 45 steps. The other eig
   Carry this to the next fix batch under the minor rule, preserving deadlines and bounded waiting on inherited pipes.
 
 Post-merge main CI [43042206403](https://github.com/Legend101Zz/X-trace/actions/runs/43042206403), attempt 4,
-completed with four failing jobs, all verified as apt DNS setup failures; tests were not reached in those jobs.
-Only the failed jobs were rerun as attempt 5, which is pending.
+completed with four jobs failing setup on Ubuntu mirror DNS. In release-tool-tests, apt setup failed before tests;
+in the other three jobs, some earlier tests ran but later browser-dependent checks were not reached. These setup
+errors establish no product-test failure. Only the failed jobs were rerun as attempt 5, which is pending.
 The first wave CI [43057483505](https://github.com/Legend101Zz/X-trace/actions/runs/43057483505) on `6a46c76`
-likewise failed apt DNS setup in release-tool-tests before tests; it provides no green acceptance.
+likewise failed apt DNS setup in release-tool-tests before tests; it provides no green acceptance. Wave exact-head
+run [43059725537](https://github.com/Legend101Zz/X-trace/actions/runs/43059725537) is pending.
 Broader feature work and merge remain gated on green main and exact-head CI. No macOS CI is requested.
 
 After infrastructure clears, finish [#3](https://github.com/Legend101Zz/X-trace/issues/3):
