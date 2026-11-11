@@ -224,12 +224,13 @@ jobs:
         if: matrix.project == 'petclinic' && always()
         run: |
           set -eu
+          umask 077
           mkdir -p "$RUNNER_TEMP/priv"
           # Publish test identities and counts, without assertion values or buffered stdout.
-          python3 -B -m unittest discover -s tools/qa -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-qa.log" 2>&1 || { python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-qa.log"; exit 1; }
-          python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-qa.log" | tr '\n' ' '; echo "(tools/qa)"
-          python3 -B -m unittest discover -s campaigns/lib -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-camp.log" 2>&1 || { python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-camp.log"; exit 1; }
-          python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-camp.log" | tr '\n' ' '; echo "(campaigns/lib)"
+          python3 -B -m tools.qa.unittest_run --result "$RUNNER_TEMP/priv/ut-qa.json" discover -s tools/qa -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-qa.log" 2>&1 || { python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-qa.json"; exit 1; }
+          python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-qa.json"
+          python3 -B -m tools.qa.unittest_run --result "$RUNNER_TEMP/priv/ut-camp.json" discover -s campaigns/lib -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-camp.log" 2>&1 || { python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-camp.json"; exit 1; }
+          python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-camp.json"
           python3 -B tools/qa/canary.py probe
           python3 -B tools/qa/canary.py gen --out "$RUNNER_TEMP/priv/canaries.json"
       - name: Instrumented scenarios through the packaged xtrace run

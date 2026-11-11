@@ -11,8 +11,15 @@ class WorkflowEvidence(unittest.TestCase):
         text = (ROOT / ".github/workflows/campaigns.yml").read_text()
         step = text[text.index("      - name: Private canaries and scanner self-check"):
                     text.index("      - name: Instrumented scenarios through the packaged xtrace run")]
-        for log in ("ut-qa.log", "ut-camp.log"):
-            self.assertIn(f'|| {{ python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/{log}"; exit 1; }}', step)
+        self.assertIn("umask 077", step)
+        for suite, start in (("ut-qa", "tools/qa"), ("ut-camp", "campaigns/lib")):
+            result = f'"$RUNNER_TEMP/priv/{suite}.json"'
+            self.assertIn(f"python3 -B -m tools.qa.unittest_run --result {result} "
+                          f"discover -s {start} -p 'test_*.py'", step)
+            self.assertIn(f'> "$RUNNER_TEMP/priv/{suite}.log" 2>&1', step)
+            self.assertIn(f'|| {{ python3 -B -m tools.qa.unittest_summary {result}; exit 1; }}', step)
+            self.assertIn(f'python3 -B -m tools.qa.unittest_summary {result}\n', step)
+            self.assertNotIn(f'unittest_summary "$RUNNER_TEMP/priv/{suite}.log"', step)
         self.assertNotIn("tail", step)
 
     def test_exports_use_real_analyzer_and_required_privacy_coverage(self):

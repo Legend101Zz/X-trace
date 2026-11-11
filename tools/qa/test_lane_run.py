@@ -51,7 +51,9 @@ class CheckoutFixture(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.checkout = pathlib.Path(temporary.name)
-        names = ["fails", "first", "second", "journey", "completed", "waiting", "also_waiting",
+        # first/second are declared in a.rs/b.rs below. Keep this fixture's
+        # positive attribution cases unique; duplicate binaries have regressions.
+        names = ["fails", "journey", "completed", "waiting", "also_waiting",
                  "done", "bad", "skip", "old", *[f"case{i}" for i in range(40)]]
         self.sources = {
             "crates/example/tests/journey.rs": "\n" * 40 + "\n".join(
@@ -1034,6 +1036,81 @@ class FailureDetailsTests(CheckoutFixture):
 
 
 class CheckoutLookupTests(unittest.TestCase):
+    def test_real_include_and_path_modules_keep_their_declared_contexts(self):
+        metadata = lane_run._checkout_metadata()
+        cases = [
+            ("recording_store::tests::published_reads::first_journal_creation_cannot_overtake_a_published_read",
+             "crates/xtrace-store/src/recording_published_read_tests.rs",
+             "recording_published_read_tests::published_reads::first_journal_creation_cannot_overtake_a_published_read"),
+            ("open_recording_durability::acknowledged_unfinished_batch_survives_a_running_daemon_restart",
+             "crates/xtrace-cli/tests/lifecycle/open_recording_durability.rs",
+             "lifecycle::open_recording_durability::acknowledged_unfinished_batch_survives_a_running_daemon_restart"),
+        ]
+        for name, path, wrong_name in cases:
+            with self.subTest(name=name):
+                self.assertIn(name, metadata.rust_tests)
+                self.assertNotIn(wrong_name, metadata.rust_tests)
+                self.assertEqual(lane_run._rust_failure_name(name, metadata, lane_run.CANARY_INDEX), name)
+                self.assertEqual(lane_run._rust_failure_name(wrong_name, metadata, lane_run.CANARY_INDEX),
+                                 lane_run.UNVERIFIED)
+                body = ["failures:", f"---- {name} stdout ----",
+                        f"thread 'worker' panicked at {path}:1:1:", "fixture message"]
+                report = lane_run.libtest_output.Report(
+                    "     Running tests/journey.rs (target/debug/deps/journey-0123456789abcdef)",
+                    (0, 1, 0), [name], body, [True] * len(body))
+                row, = lane_run._libtest_failures(report, metadata, lane_run.CANARY_INDEX)
+                self.assertEqual((row["test"], row["panicSites"]), (name, [f"{path}:1"]))
+                self.assertNotIn("testUnverifiedReason", row)
+
+    def test_nested_includes_and_path_modules_resolve_only_literal_head_files(self):
+        sources = {
+            "crates/example/Cargo.toml": '[package]\nname = "example"\n',
+            "crates/example/src/lib.rs": ('mod outer { include!("included.rs"); }\n'
+                                          '#[path = "mapped.rs"] mod actual;\n'
+                                          '// include!("comment.rs");\n'
+                                          'const TEXT: &str = "include!(\\"comment.rs\\");";\n'),
+            "crates/example/src/included.rs": ('include!("nested.rs");\n'
+                                               '#[test] fn included() {}\n'),
+            "crates/example/src/nested.rs": 'mod inner { #[test] fn nested() {} }\n',
+            "crates/example/src/mapped.rs": '#[test] fn mapped() {}\n',
+        }
+        metadata = lane_run.CheckoutMetadata(sources)
+        self.assertEqual(metadata.rust_tests, {"outer::included", "outer::inner::nested", "actual::mapped"})
+        for name in ("included::included", "nested::inner::nested", "mapped::mapped", "comment::included"):
+            self.assertEqual(lane_run._rust_failure_name(name, metadata, lane_run.CANARY_INDEX), lane_run.UNVERIFIED)
+        missing = lane_run.CheckoutMetadata({name: source for name, source in sources.items()
+                                            if not name.endswith("mapped.rs")})
+        self.assertNotIn("actual::mapped", missing.rust_tests)
+
+    def test_one_included_source_in_two_binary_roots_keeps_diagnostics_ambiguous(self):
+        metadata = lane_run.CheckoutMetadata({
+            "crates/example/Cargo.toml": '[package]\nname = "example"\n',
+            "crates/example/tests/first.rs": 'include!("shared/body.rs");\n',
+            "crates/example/tests/second.rs": 'include!("shared/body.rs");\n',
+            "crates/example/tests/shared/body.rs": '#[test] fn shared() {}\n',
+        })
+        self.assertEqual(metadata.rust_tests, {"shared"})
+        self.assertEqual({owner.path for owner in metadata.rust_test_owners["shared"]},
+                         {"tests/first.rs", "tests/second.rs"})
+        detail = lane_run.failure_details("test shared ... FAILED\n", False, metadata=metadata,
+                                          diagnostic_records=[lane_run.AdmissionDiagnostic("shared", ["Admission"])])
+        self.assertEqual(detail["observedDiagnostics"], [{
+            "test": lane_run.UNVERIFIED, "thread": "shared", "relevance": "unknown", "category": ["Admission"],
+            "testUnverifiedReason": "diagnostic-thread-ambiguous"}])
+
+    def test_one_source_declared_as_two_cargo_targets_keeps_both_owners(self):
+        metadata = lane_run.CheckoutMetadata({
+            "crates/example/Cargo.toml": ('[package]\nname = "example"\nautotests = false\n'
+                                         '[lib]\npath = "shared.rs"\n'
+                                         '[[test]]\nname = "integration"\npath = "shared.rs"\n'),
+            "crates/example/shared.rs": '#[test] fn shared() {}\n',
+        })
+        self.assertEqual(metadata.rust_tests, {"shared"})
+        self.assertEqual({owner.kind for owner in metadata.rust_test_owners["shared"]}, {"lib", "test"})
+        detail = lane_run.failure_details("test shared ... FAILED\n", False, metadata=metadata,
+                                          diagnostic_records=[lane_run.AdmissionDiagnostic("shared", ["Admission"])])
+        self.assertEqual(detail["observedDiagnostics"][0]["testUnverifiedReason"], "diagnostic-thread-ambiguous")
+
     def test_real_checkout_failing_test_name_and_location_survive_the_command_path(self):
         name = "honesty_strings_cover_every_stable_code"
         path = "crates/xtrace-domain/tests/honesty_strings.rs"
