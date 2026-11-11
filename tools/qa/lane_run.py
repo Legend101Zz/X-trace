@@ -25,6 +25,7 @@ import tempfile
 import time
 from collections import Counter, deque
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from enum import Enum
 
 from tools.qa import canary, libtest_output, rust_timing, store_profiles
@@ -366,6 +367,8 @@ class CheckoutMetadata:
         self.error_variants: set[str] = set()
         self.admission_sites: set[str] = set()
         self.listing_refusals: set[str] = set()
+        self.admission_objects: set[str] = set()
+        self.admission_callers: set[str] = set()
         self.java_files: dict[str, list[str]] = {}
         for name, source in sources.items():
             path = pathlib.PurePosixPath(name)
@@ -381,6 +384,10 @@ class CheckoutMetadata:
                 self.error_variants.update(_diagnostic_variants(source, "PrivateStorageError"))
                 self.admission_sites.update(_diagnostic_variants(source, "AdmissionSite"))
                 self.listing_refusals.update(_diagnostic_variants(source, "ListingRefusal"))
+                if name == "crates/xtrace-private-storage/src/diagnostic.rs":
+                    self.admission_objects.update(_diagnostic_variants(source, "AdmissionObject"))
+                if name == "crates/xtrace-private-storage/src/caller.rs":
+                    self.admission_callers.update(_diagnostic_variants(source, "AdmissionCaller"))
 
     def _read_tests(self, path: pathlib.PurePosixPath, source: str) -> None:
         test_path = bool(set(path.parts) & {"test", "tests", "__tests__"})
@@ -521,9 +528,21 @@ def _checkout_metadata() -> CheckoutMetadata:
 
 MAX_CI_RECORDS = 256
 MAX_CI_RECORD_BYTES = 2048
+# Match AdmissionContext's i64 exactly: retain every representable ancestor/child
+# offset while limiting published depth to at most 20 decimal characters.
+MIN_COMPONENT_DEPTH = -(2**63)
+MAX_COMPONENT_DEPTH = 2**63 - 1
 
 
-def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, index) -> list[tuple[str, list[str | int]]]:
+@dataclass
+class AdmissionDiagnostic:
+    thread: str
+    categories: list[str | int]
+    # Keep roles and JSON types: False equals 0 in Python's category deduplication.
+    fields: dict[str, str | int | bool] = field(default_factory=dict)
+
+
+def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, index) -> list[AdmissionDiagnostic]:
     """Read bounded product records. Raw output is never a diagnostic source."""
     if directory is None:
         return []
@@ -555,7 +574,11 @@ def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, 
                     continue
                 base_fields = {"thread", "error", "operation", "kind", "errno"}
                 context_fields = {"site", "changes", "listing"}
-                if not isinstance(record, dict) or set(record) not in (base_fields, base_fields | context_fields):
+                object_fields = {"object", "component_depth", "nlink_changed"}
+                caller_fields = {"store_phase", "store_site"}
+                if (not isinstance(record, dict)
+                        or set(record) - object_fields - caller_fields not in (base_fields, base_fields | context_fields)
+                        or set(record) & object_fields and not context_fields <= set(record)):
                     continue
                 thread, error, operation, kind, errno = (record[key] for key in
                                                         ("thread", "error", "operation", "kind", "errno"))
@@ -574,11 +597,22 @@ def _ci_diagnostics(directory: pathlib.Path | None, metadata: CheckoutMetadata, 
                             or not isinstance(listing, str) or listing not in metadata.listing_refusals):
                         continue
                     values.extend((site, changes, listing))
-                if any(_private(str(value), index) for value in values):
+                fields = {key: record[key] for key in
+                          ("object", "component_depth", "nlink_changed", "store_phase", "store_site") if key in record}
+                if ("object" in fields and (not isinstance(fields["object"], str)
+                                            or fields["object"] not in metadata.admission_objects)
+                        or "component_depth" in fields and (type(fields["component_depth"]) is not int
+                            or not MIN_COMPONENT_DEPTH <= fields["component_depth"] <= MAX_COMPONENT_DEPTH)
+                        or "nlink_changed" in fields and type(fields["nlink_changed"]) is not bool
+                        or any(key in fields and (not isinstance(fields[key], str)
+                                                  or fields[key] not in metadata.admission_callers)
+                               for key in ("store_phase", "store_site"))):
+                    continue
+                if any(_private(str(value), index) for value in [*values, *fields.values()]):
                     continue
                 name = (thread if isinstance(thread, str) and thread in metadata.rust_tests
                         and not _private(thread, index) else UNVERIFIED)
-                records.append((name, values))
+                records.append(AdmissionDiagnostic(name, values, fields))
     except (OSError, ValueError):
         return []
     return records
@@ -722,7 +756,7 @@ def _libtest_failures(report: libtest_output.Report, metadata: CheckoutMetadata,
 
 def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT_BYTES,
                     index=None, metadata: CheckoutMetadata | None = None,
-                    diagnostic_records: Sequence[tuple[str, list[str | int]]] = ()) -> dict | None:
+                    diagnostic_records: Sequence[AdmissionDiagnostic] = ()) -> dict | None:
     """Publish verified names/sites, bounded categories and counts; never prose."""
     index = CANARY_INDEX if index is None else index
     metadata = _checkout_metadata() if metadata is None else metadata
@@ -836,8 +870,9 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             row["withheldLines"] += 1
     # A product record attests an observation, never a test outcome or cause.
     # Exact thread matches may associate observations with independent failures.
-    observations: dict[tuple[str, str | None], dict] = {}
-    for name, categories in diagnostic_records[:MAX_CI_RECORDS]:
+    observations: dict[tuple, dict] = {}
+    for record in diagnostic_records[:MAX_CI_RECORDS]:
+        name, categories = record.thread, record.categories
         attributed = name in failing_threads
         reason = None
         if not attributed:
@@ -847,11 +882,16 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
                 reason = UnverifiedReason.DIAGNOSTIC_AMBIGUOUS.value
             else:
                 reason = UnverifiedReason.DIAGNOSTIC_NOT_FAILING.value
-        key = (name if attributed else UNVERIFIED, reason)
+        # Never combine distinct verified threads or overwrite differing facts.
+        # A passing diagnostic test may emit synthetic records into the same file.
+        key = (name, reason, tuple(record.fields.items()))
         if key not in observations:
-            row = {"test": key[0], "relevance": "unknown", "category": []}
+            row = {"test": name if attributed else UNVERIFIED, "relevance": "unknown", "category": [],
+                   **record.fields}
             if reason is not None:
                 row["testUnverifiedReason"] = reason
+                if name != UNVERIFIED:
+                    row["thread"] = name
             observations[key] = row
         row = observations[key]
         for value in categories:
@@ -877,6 +917,7 @@ def failure_details(text: str, timed_out: bool, *, budget: int = MAX_JOB_EXCERPT
             while len(_encoded(row)) > MAX_EXCERPT_BYTES and row["category"]:
                 row["category"].pop()
             if len(_encoded(row)) > MAX_EXCERPT_BYTES:
+                row.pop("thread", None)
                 row.update(test=UNVERIFIED, testUnverifiedReason=UnverifiedReason.EXCERPT_CAP.value)
     if timed_out:
         running: dict[str, None] = {}
