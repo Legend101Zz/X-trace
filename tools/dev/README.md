@@ -61,3 +61,16 @@ only; new or upgraded dependencies require a ticket.
 Only cache `target/*` and scratch `*` entries are eligible.
 Symlinks and nested mounts are refused before deletion.
 Dependency caches stay intact; cache maintenance commands are suggestions only.
+
+Before release, the owner runs `bash tools/dev/macos-release-check.sh` on a Mac
+from a clean checkout after prep. This is the local test exception from the
+2026-11-11 owner decision (W2-R27a); normal agent checks remain compile-only.
+The script header lists prerequisites. It runs release tooling, Node, web,
+Java tests on locally installed JDKs 17/21/25, Rust workspace tests, release
+diagnostic guards, and the arm64 package journey. It continues after a suite
+fails and prints each suite's exit code. Private logs stay in a new scratch
+directory. Exit 1 means a suite failed; exit 2 means coverage is incomplete.
+Missing JDKs, an unsupported package architecture, and the hosted-only
+other-UID check are named gaps. The manual macOS workflow retains the
+other-UID check; the local script alone cannot certify it.
+Hosted `macos.yml` now runs only on manual dispatch; Linux `ci-ok` gates development.
