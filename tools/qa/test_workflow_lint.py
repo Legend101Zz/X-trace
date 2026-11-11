@@ -65,6 +65,17 @@ class CiPullRequestTests(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow = workflow_lint.load(ROOT / ".github/workflows/ci.yml")
 
+    def test_full_qa_discovery_is_required_without_the_dev_tmpdir_override(self):
+        command = "python3 -B -m unittest discover -s tools/qa -p 'test_*.py'"
+        steps = self.workflow["jobs"]["gates"]["steps"]
+        step = next(step for step in steps if command in step.get("run", ""))
+        self.assertNotIn("if", step)
+        self.assertNotIn("continue-on-error", step)
+        self.assertIn("set -euo pipefail", step["run"])
+        self.assertIn(command, step["run"].splitlines())
+        self.assertNotIn("export TMPDIR", step["run"])
+        self.assertIn("tools.qa.test_release_floor", step["run"])
+
     def test_bounded_apt_installs_and_job_timeouts_are_preserved_in_both_workflows(self):
         installs = 0
         for filename in ("ci.yml", "macos.yml"):

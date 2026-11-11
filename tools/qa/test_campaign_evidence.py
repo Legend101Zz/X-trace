@@ -7,6 +7,14 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 class WorkflowEvidence(unittest.TestCase):
+    def test_failed_self_checks_publish_filtered_unittest_diagnostics(self):
+        text = (ROOT / ".github/workflows/campaigns.yml").read_text()
+        step = text[text.index("      - name: Private canaries and scanner self-check"):
+                    text.index("      - name: Instrumented scenarios through the packaged xtrace run")]
+        for log in ("ut-qa.log", "ut-camp.log"):
+            self.assertIn(f'|| {{ python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/{log}"; exit 1; }}', step)
+        self.assertNotIn("tail", step)
+
     def test_exports_use_real_analyzer_and_required_privacy_coverage(self):
         text = (ROOT / ".github/workflows/campaigns.yml").read_text()
         self.assertIn(":static-analyzer:installDist", text)

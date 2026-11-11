@@ -225,11 +225,11 @@ jobs:
         run: |
           set -eu
           mkdir -p "$RUNNER_TEMP/priv"
-          # a failing suite fails the step; the verdict line of each suite is printed explicitly
-          python3 -B -m unittest discover -s tools/qa -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-qa.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/priv/ut-qa.log"; exit 1; }
-          grep -E '^(Ran [0-9]+ tests|OK)' "$RUNNER_TEMP/priv/ut-qa.log" | tr '\n' ' '; echo "(tools/qa)"
-          python3 -B -m unittest discover -s campaigns/lib -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-camp.log" 2>&1 || { tail -n 40 "$RUNNER_TEMP/priv/ut-camp.log"; exit 1; }
-          grep -E '^(Ran [0-9]+ tests|OK)' "$RUNNER_TEMP/priv/ut-camp.log" | tr '\n' ' '; echo "(campaigns/lib)"
+          # Publish test identities and counts, without assertion values or buffered stdout.
+          python3 -B -m unittest discover -s tools/qa -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-qa.log" 2>&1 || { python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-qa.log"; exit 1; }
+          python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-qa.log" | tr '\n' ' '; echo "(tools/qa)"
+          python3 -B -m unittest discover -s campaigns/lib -p 'test_*.py' > "$RUNNER_TEMP/priv/ut-camp.log" 2>&1 || { python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-camp.log"; exit 1; }
+          python3 -B -m tools.qa.unittest_summary "$RUNNER_TEMP/priv/ut-camp.log" | tr '\n' ' '; echo "(campaigns/lib)"
           python3 -B tools/qa/canary.py probe
           python3 -B tools/qa/canary.py gen --out "$RUNNER_TEMP/priv/canaries.json"
       - name: Instrumented scenarios through the packaged xtrace run
