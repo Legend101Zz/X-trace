@@ -230,6 +230,44 @@ mod ci {
     const MAX_LINE: usize = 512;
     static RECORDS: AtomicUsize = AtomicUsize::new(0);
 
+    #[cfg(test)]
+    struct TestSink {
+        directory: tempfile::TempDir,
+        records: AtomicUsize,
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static TEST_SINK: std::cell::RefCell<Option<TestSink>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Redirect synthetic observations without changing the environment or shared budget.
+    #[cfg(test)]
+    pub(super) struct TestSinkGuard {
+        previous: Option<TestSink>,
+        // A thread-local override must be restored on the thread that installed it.
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    #[cfg(test)]
+    impl TestSinkGuard {
+        pub(super) fn enter() -> std::io::Result<Self> {
+            use std::os::unix::fs::PermissionsExt as _;
+            let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+            let sink = TestSink { directory, records: AtomicUsize::new(0) };
+            let previous = TEST_SINK.with(|slot| slot.replace(Some(sink)));
+            Ok(Self { previous, _thread: std::marker::PhantomData })
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for TestSinkGuard {
+        fn drop(&mut self) {
+            TEST_SINK.with(|slot| slot.replace(self.previous.take()));
+        }
+    }
+
     struct Record {
         bytes: [u8; MAX_LINE],
         len: usize,
@@ -446,6 +484,23 @@ mod ci {
 
     pub(super) fn record(failure: AdmissionFailure, context: Option<AdmissionContext>) {
         let _ = std::panic::catch_unwind(|| {
+            #[cfg(test)]
+            if TEST_SINK.with(|slot| {
+                let slot = slot.borrow();
+                let Some(sink) = slot.as_ref() else { return false };
+                if reserve(&sink.records) {
+                    let thread = std::thread::current();
+                    if let Ok(record) = line(failure, thread.name(), context) {
+                        if let Ok(record) = record.as_str() {
+                            let _ = append(sink.directory.path(), record);
+                        }
+                    }
+                }
+                // Exhaustion still consumes the observation; never fall back to CI.
+                true
+            }) {
+                return;
+            }
             if let Some(directory) = std::env::var_os("XTRACE_CI_DIAG_DIR") {
                 if reserve(&RECORDS) {
                     let thread = std::thread::current();
@@ -511,6 +566,7 @@ mod ci {
         #[test]
         fn contextual_record_contains_only_fixed_categories_and_a_difference_mask()
         -> Result<(), Box<dyn std::error::Error>> {
+            let _sink = TestSinkGuard::enter()?;
             use crate::diagnostic::{AdmissionContext, AdmissionSite, ListingRefusal};
             let failure = AdmissionFailure {
                 operation: AdmissionOperation::AclState,
@@ -546,6 +602,81 @@ mod ci {
             assert!(record.contains("\"store_phase\":\"Append\""));
             assert!(record.contains("\"store_site\":\"JournalPublish\""));
             assert!(record.len() <= MAX_LINE);
+            Ok(())
+        }
+
+        #[test]
+        fn synthetic_record_tests_leave_shared_sink_untouched()
+        -> Result<(), Box<dyn std::error::Error>> {
+            use crate::diagnostic::tests::rendering_keeps_only_fixed_operations_and_os_error_facts;
+            const CHILD: &str = "XTRACE_CI_DIAG_ISOLATION_CHILD";
+            if std::env::var_os(CHILD).is_some() {
+                contextual_record_contains_only_fixed_categories_and_a_difference_mask()?;
+                rendering_keeps_only_fixed_operations_and_os_error_facts()?;
+                test_sink_restores_nested_overrides_and_keeps_separate_budgets()?;
+                assert_eq!(RECORDS.load(Ordering::Relaxed), 0);
+                return Ok(());
+            }
+            let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+            let path = directory.path().join("private-storage.jsonl");
+            let original = "{\"shared-sink-canary\":true}\n";
+            std::fs::write(&path, original)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            let output = crate::test_process::output(
+                std::process::Command::new(std::env::current_exe()?)
+                    .args([
+                        "--exact",
+                        "diagnostic::ci::tests::synthetic_record_tests_leave_shared_sink_untouched",
+                    ])
+                    .env(CHILD, "1")
+                    .env("XTRACE_CI_DIAG_DIR", directory.path()),
+            )?;
+            assert!(output.status.success(), "isolation child failed: {}", output.status);
+            assert!(output.stderr.is_empty(), "isolation child must remain silent on stderr");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            assert_eq!(std::fs::read_to_string(&path)?, original);
+            assert_eq!(std::fs::read_dir(directory.path())?.count(), 1);
+            Ok(())
+        }
+
+        #[test]
+        fn test_sink_restores_nested_overrides_and_keeps_separate_budgets() -> std::io::Result<()> {
+            let outer = TestSinkGuard::enter()?;
+            let failure = AdmissionFailure {
+                operation: AdmissionOperation::AclState,
+                kind: None,
+                raw_os_error: None,
+            };
+            record(failure, None);
+            {
+                let _inner = TestSinkGuard::enter()?;
+                for _ in 0..MAX_RECORDS + 1 {
+                    record(failure, None);
+                }
+                TEST_SINK.with(|slot| {
+                    assert_eq!(
+                        slot.borrow().as_ref().map(|sink| sink.records.load(Ordering::Relaxed)),
+                        Some(MAX_RECORDS)
+                    );
+                });
+            }
+            record(failure, None);
+            TEST_SINK.with(|slot| {
+                let slot = slot.borrow();
+                let sink =
+                    slot.as_ref().ok_or_else(|| std::io::Error::other("outer sink missing"))?;
+                assert_eq!(sink.records.load(Ordering::Relaxed), 2);
+                assert_eq!(
+                    std::fs::read_to_string(sink.directory.path().join("private-storage.jsonl"))?
+                        .lines()
+                        .count(),
+                    2
+                );
+                Ok::<_, std::io::Error>(())
+            })?;
+            drop(outer);
+            TEST_SINK.with(|slot| assert!(slot.borrow().is_none()));
             Ok(())
         }
 
@@ -805,7 +936,9 @@ mod tests {
     }
 
     #[test]
-    fn rendering_keeps_only_fixed_operations_and_os_error_facts() {
+    pub(super) fn rendering_keeps_only_fixed_operations_and_os_error_facts() -> io::Result<()> {
+        #[cfg(all(feature = "ci-diagnostics", debug_assertions, unix))]
+        let _sink = ci::TestSinkGuard::enter()?;
         let error = AdmissionFailure::io(
             AdmissionOperation::NamedMetadata,
             io::Error::new(io::ErrorKind::PermissionDenied, "private-path/value-canary"),
@@ -834,5 +967,6 @@ mod tests {
             AdmissionFailure::check(AdmissionOperation::AclState).to_string(),
             "operation=AclState kind=None raw_os_error=None"
         );
+        Ok(())
     }
 }
