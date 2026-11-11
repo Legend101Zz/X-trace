@@ -133,6 +133,49 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(result["eventsOmitted"], 1)
         self.assertEqual(result["runningAtTimeout"][0]["binary"]["targetName"], "journey")
 
+    def test_checkpoint_round_trip_keeps_completed_rows_and_active_target_after_cap(self):
+        observed = observations()
+        with mock.patch.object(rust_timing, "MAX_EVENTS", 2):
+            for wall, line in ((2, FINISHED), (3, LIB), (4, OK), (5, JOURNEY)):
+                observed.line(line, wall)
+        state = json.loads(json.dumps(observed.snapshot()))
+        restored = rust_timing.Observations.restore(state, observed.targets, lambda value: False)
+        self.assertEqual(restored.finish(3000, True), observed.finish(3000, True))
+        self.assertEqual(restored.omitted, 1)
+
+    def test_checkpoint_restore_revalidates_names_and_rejects_invalid_timing_fields(self):
+        observed = observations()
+        observed.line(JOURNEY, 1)
+        state = json.loads(json.dumps(observed.snapshot()))
+        state["events"][0]["binary"]["targetName"] = "captured731"
+        state["active"][0]["targetName"] = "captured731"
+        restored = rust_timing.Observations.restore(state, observed.targets, lambda value: False)
+        result = restored.finish(3000, True)
+        self.assertEqual(result["events"][0]["binary"], lane_run.UNVERIFIED)
+        self.assertEqual(result["runningAtTimeout"][0]["binary"], lane_run.UNVERIFIED)
+        self.assertNotIn("captured731", json.dumps(result))
+        for key, value in (("compilation", "captured731"), ("executionStarted", float("nan")),
+                           ("omitted", True), ("harnessCompleted", "true")):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                rust_timing.Observations.restore({**state, key: value}, observed.targets, lambda value: False)
+
+    def test_checkpoint_persists_final_completion_without_publishing_private_output(self):
+        text = FINISHED + "\n" + JOURNEY + "\ncaptured731\n"
+        command = [sys.executable, "-B", "-c", f"import os; os.write(1, {text.encode()!r})"]
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryFile() as log:
+            checkpoint = pathlib.Path(temporary) / "timing.json"
+            proc, timed_out, result = rust_timing.run(command, log=log, cwd=None, env=os.environ.copy(),
+                                                    timeout=60, observations=observations(), checkpoint=checkpoint)
+            raw = checkpoint.read_text()
+            saved = json.loads(raw)
+            self.assertEqual(checkpoint.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(proc.returncode, 0)
+        self.assertFalse(timed_out)
+        self.assertIsNone(saved["state"]["active"])
+        self.assertEqual(saved["state"]["events"], result["events"])
+        self.assertEqual(saved["state"]["events"][-1]["observation"], "cargo-exit-upper-bound")
+        self.assertNotIn("captured731", raw)
+
     def test_real_pipe_preserves_order_counts_exit_code_and_private_output(self):
         text = "\n".join((FINISHED, LIB, "captured-value-731", OK, JOURNEY, FAILED)) + "\n"
         command = [sys.executable, "-B", "-c", f"import os; os.write(1, {text.encode()!r}); raise SystemExit(101)"]

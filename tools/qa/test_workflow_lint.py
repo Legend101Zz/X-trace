@@ -314,6 +314,16 @@ class MacosWorkflowTests(unittest.TestCase):
         upload = next(step for step in steps if step.get("uses", "").startswith("actions/upload-artifact@"))
         self.assertEqual(upload["with"]["path"], "${{ env.XTRACE_CI_PRIVATE_ROOT }}/frag/*.json")
 
+    def test_macos_rust_step_has_no_matching_outer_deadline(self):
+        job = self.workflow["jobs"]["macos-arm64"]
+        rust = next(step for step in job["steps"]
+                    if step.get("name") == "cargo test (locked workspace, no ignored tests)")
+        command = shlex.split(rust["run"].replace("${{ matrix.tuple }}", "jdk17-node22"))
+        args = lane_run.parser().parse_args(command[4:])
+        self.assertEqual(args.timeout, 3000)
+        self.assertNotIn("timeout-minutes", rust)
+        self.assertGreater(job["timeout-minutes"] * 60, args.timeout)
+
     def test_store_measurements_reach_the_uploaded_rust_fragment_on_success_and_timeout(self):
         steps = self.workflow["jobs"]["macos-arm64"]["steps"]
         rust = [s for s in steps if "--suite rust" in s.get("run", "")

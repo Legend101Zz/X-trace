@@ -1,6 +1,8 @@
 """Bounded Cargo test observations; output names require immutable checkout metadata."""
 from __future__ import annotations
 
+import json
+import math
 import os
 import pathlib
 import re
@@ -97,6 +99,66 @@ class Observations:
         self.harness_completed = False
         self.compilation = None
         self.execution_started = None
+        self.revision = 0
+
+    def _binary(self, value):
+        """Reattest checkpoint identities with the same HEAD targets as live output."""
+        allowed = [target.public() for target in self.targets]
+        allowed += [{**target.public(), "targetKind": "doctest"}
+                    for target in self.targets if target.kind == "lib"]
+        if (isinstance(value, dict) and value in allowed
+                and not any(self.private(part) for part in value.values())):
+            return value.copy()
+        return UNVERIFIED
+
+    def snapshot(self):
+        """Bounded private state; active identity survives the event cap."""
+        return {"events": self.events, "omitted": self.omitted, "unverified": self.unverified,
+                "active": self.active, "harnessCompleted": self.harness_completed,
+                "compilation": self.compilation, "executionStarted": self.execution_started}
+
+    @classmethod
+    def restore(cls, state, targets, private):
+        """Rebuild only typed timing facts, never copy checkpoint fields to a fragment."""
+        result = cls(targets, private)
+
+        def seconds(value):
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError("invalid timing offset")
+            return value
+
+        def optional(value):
+            return None if value is None else seconds(value)
+
+        if not isinstance(state, dict) or not isinstance(state.get("events"), list) or len(state["events"]) > MAX_EVENTS:
+            raise ValueError("invalid timing checkpoint")
+        for row in state["events"]:
+            event = row["event"]
+            if event not in {"start", "completion"}:
+                raise ValueError("invalid timing event")
+            rebuilt = {"binary": result._binary(row["binary"]), "event": event,
+                       "wallSeconds": seconds(row["wallSeconds"])}
+            if event == "completion":
+                observation = row["observation"]
+                if observation not in {"libtest-result", "next-cargo-target-upper-bound", "cargo-exit-upper-bound"}:
+                    raise ValueError("invalid timing boundary")
+                rebuilt.update(elapsedSeconds=seconds(row["elapsedSeconds"]), observation=observation)
+            result.events.append(rebuilt)
+        for key in ("omitted", "unverified"):
+            if type(state[key]) is not int or state[key] < 0:
+                raise ValueError("invalid timing count")
+            setattr(result, key, state[key])
+        active = state["active"]
+        if active is not None:
+            if not isinstance(active, list) or len(active) != 2:
+                raise ValueError("invalid active timing target")
+            result.active = result._binary(active[0]), seconds(active[1])
+        if type(state["harnessCompleted"]) is not bool:
+            raise ValueError("invalid harness state")
+        result.harness_completed = state["harnessCompleted"]
+        result.compilation = optional(state["compilation"])
+        result.execution_started = optional(state["executionStarted"])
+        return result
 
     def _emit(self, row):
         if len(self.events) < MAX_EVENTS:
@@ -119,9 +181,11 @@ class Observations:
         line = ANSI.sub("", line)
         if FINISHED.fullmatch(line) and self.compilation is None:
             self.compilation = round(wall, 3)
+            self.revision += 1
         running = RUNNING.fullmatch(line)
         docs = DOC_TESTS.fullmatch(line)
         if running or docs:
+            self.revision += 1
             self._complete(wall, "next-cargo-target-upper-bound")
             if self.execution_started is None:
                 self.execution_started = wall
@@ -137,6 +201,7 @@ class Observations:
                 binary = candidates[0].public()
                 if docs:
                     binary["targetKind"] = "doctest"
+                binary = self._binary(binary)
             else:
                 binary = UNVERIFIED
                 self.unverified += 1
@@ -147,6 +212,7 @@ class Observations:
             # A result is the harness's completion boundary, but destructors or
             # exit hooks may still hang. Keep its identity until Cargo advances.
             self._complete(wall, "libtest-result", retain=True)
+            self.revision += 1
 
     def finish(self, wall, timed_out):
         running = []
@@ -171,7 +237,7 @@ def is_test_command(command):
     return len(command) >= 2 and tuple(command[:2]) == ("cargo", "test") and "--no-run" not in command
 
 
-def run(command, *, log, cwd, env, timeout, observations):
+def run(command, *, log, cwd, env, timeout, observations, checkpoint=None):
     """Observe the same merged stream previously written directly to a private file.
 
     A shared pipe preserves the write order of Cargo boundaries and harness results.
@@ -179,6 +245,21 @@ def run(command, *, log, cwd, env, timeout, observations):
     the direct child on timeout preserves the lane's subprocess.run policy.
     """
     started = time.monotonic()
+    revision = -1
+
+    def persist():
+        nonlocal revision
+        if checkpoint is not None and observations.revision != revision:
+            # Replace a bounded snapshot atomically. A supervisor can use the
+            # previous complete snapshot even if SIGKILL interrupts this write.
+            payload = json.dumps({"started": started, "state": observations.snapshot()}).encode("ascii")
+            temporary = checkpoint.with_suffix(".tmp")
+            with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as stream:
+                stream.write(payload)
+            temporary.replace(checkpoint)
+            revision = observations.revision
+
+    persist()
     pending = b""
     oversized = False
     timed_out = False
@@ -200,8 +281,10 @@ def run(command, *, log, cwd, env, timeout, observations):
                             selector.unregister(key.fileobj)
                             if pending and not oversized:
                                 observations.line(pending.decode("utf-8", "replace"), time.monotonic() - started)
+                                persist()
                             continue
                         log.write(chunk)
+                        log.flush()  # supervisor recovery must see output before the wrapper exits
                         for part in chunk.splitlines(keepends=True):
                             if not oversized:
                                 pending += part
@@ -214,6 +297,7 @@ def run(command, *, log, cwd, env, timeout, observations):
                                                       time.monotonic() - started)
                                 pending = b""
                                 oversized = False
+                        persist()
                     # Cargo may exit while a descendant still holds a pipe. Do not
                     # add a wait that the former file-backed run did not have.
                     if not ready and proc.poll() is not None:
@@ -229,4 +313,7 @@ def run(command, *, log, cwd, env, timeout, observations):
             proc.wait()
             raise
     wall = time.monotonic() - started
-    return subprocess.CompletedProcess(command, 124 if timed_out else code), timed_out, observations.finish(wall, timed_out)
+    timing = observations.finish(wall, timed_out)
+    observations.revision += 1
+    persist()  # Also retain completion if the supervisor interrupts publication.
+    return subprocess.CompletedProcess(command, 124 if timed_out else code), timed_out, timing

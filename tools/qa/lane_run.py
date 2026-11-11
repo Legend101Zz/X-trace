@@ -14,12 +14,15 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import os
 import pathlib
 import re
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 from collections import Counter, deque
 from collections.abc import Sequence
 from enum import Enum
@@ -225,6 +228,7 @@ def diagnostics(text: str, *, command: Sequence[str] = (), metadata=None, index=
 MAX_EXCERPT_BYTES = 2048
 MAX_JOB_EXCERPT_BYTES = 24 * 1024
 MAX_PROGRESS_LINES = 12
+MAX_TIMING_CHECKPOINT_BYTES = 1024 * 1024
 WITHHELD = "withheld: privacy scan"
 CARGO_SECTION = re.compile(r"^---- (\S+) (?:stdout|stderr) ----$")
 CARGO_PANIC = re.compile(
@@ -914,12 +918,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not cmd:
         raise SystemExit("no command")
     log_path = log_dir / f"{suite}-{variant}-{step}.log"
+    recovery = os.environ.get("XTRACE_LANE_RECOVERY_DIR")
+    recovery = pathlib.Path(recovery) if recovery and rust_timing.is_test_command(cmd) else None
+    if recovery is not None:
+        log_path = recovery / "output.log"
     metadata = _checkout_metadata()
     diagnostic_directory = None
     child_env = os.environ.copy()
+    child_env.pop("XTRACE_LANE_RECOVERY_DIR", None)
     if "XTRACE_CI_DIAG_DIR" in child_env or (getattr(args, "ci_diagnostics", False) and rust_timing.is_test_command(cmd)):
-        import tempfile
-        diagnostic_directory = pathlib.Path(tempfile.mkdtemp(prefix="ci-diag-", dir=out))
+        diagnostic_directory = (recovery / "diagnostics" if recovery is not None
+                                else pathlib.Path(tempfile.mkdtemp(prefix="ci-diag-", dir=out)))
         child_env["XTRACE_CI_DIAG_DIR"] = str(diagnostic_directory)
     timed_out = False
     timing = None
@@ -931,7 +940,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                 observations = rust_timing.Observations(metadata.rust_targets,
                                                        lambda value: index is None or _private(value, index))
                 proc, timed_out, timing = rust_timing.run(
-                    cmd, log=log, cwd=args.cwd or None, env=child_env, timeout=args.timeout, observations=observations)
+                    cmd, log=log, cwd=args.cwd or None, env=child_env, timeout=args.timeout, observations=observations,
+                    **({"checkpoint": recovery / "timing.json"} if recovery is not None else {}))
                 if timed_out:
                     print(f"lane {suite}/{variant}/{step}: timeout after {args.timeout}s")
             elif _compiler_command(cmd):
@@ -948,6 +958,55 @@ def cmd_run(args: argparse.Namespace) -> int:
             timed_out = True
             proc = subprocess.CompletedProcess(cmd, 124)
             print(f"lane {suite}/{variant}/{step}: timeout after {args.timeout}s")
+    return finalize_run(args, cmd=cmd, log_path=log_path, metadata=metadata,
+                        diagnostic_directory=diagnostic_directory, code=proc.returncode,
+                        timed_out=timed_out, timing=timing)
+
+
+def prepare_recovery(root: pathlib.Path) -> pathlib.Path:
+    """Keep recovery state outside the uploaded fragment glob, owned by the supervisor."""
+    directory = pathlib.Path(tempfile.mkdtemp(prefix="lane-recovery-", dir=root))
+    (directory / "diagnostics").mkdir(mode=0o700)
+    with os.fdopen(os.open(directory / "output.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"):
+        pass
+    return directory
+
+
+def recover_timeout(args, directory: pathlib.Path, metadata: CheckoutMetadata, duration: float) -> int:
+    """Called only after the outer supervisor has stopped and reaped its owned tree."""
+    index = _excerpt_index(getattr(args, "canaries", ""))
+    private = lambda value: index is None or _private(value, index)
+    observations = rust_timing.Observations(metadata.rust_targets, private)
+    wall = duration
+    basis = "supervised-wrapper; timing-checkpoint-unavailable"
+    try:
+        with open(directory / "timing.json", "rb") as stream:
+            raw = stream.read(MAX_TIMING_CHECKPOINT_BYTES + 1)
+        if len(raw) > MAX_TIMING_CHECKPOINT_BYTES:
+            raise ValueError("oversize timing checkpoint")
+        checkpoint = json.loads(raw)
+        started = checkpoint["started"]
+        now = time.monotonic()
+        if type(started) not in (int, float) or not math.isfinite(started) or not 0 <= started <= now:
+            raise ValueError("invalid checkpoint clock")
+        observations = rust_timing.Observations.restore(checkpoint["state"], metadata.rust_targets, private)
+        wall = now - started
+        basis = "cargo-start-to-supervisor-cleanup"
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError):
+        pass  # Startup may have timed out before Cargo or its first checkpoint.
+    timing = observations.finish(wall, True)
+    timing["wallObservation"] = basis
+    cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
+    return finalize_run(args, cmd=cmd, log_path=directory / "output.log", metadata=metadata,
+                        diagnostic_directory=directory / "diagnostics", code=124, timed_out=True, timing=timing)
+
+
+def finalize_run(args, *, cmd, log_path, metadata, diagnostic_directory, code, timed_out, timing):
+    """The normal runner and supervisor recovery share every public validation and cap."""
+    suite, variant, step = (_check_name(args.suite, "suite"), _check_name(args.variant, "variant"),
+                            _check_name(args.step, "step"))
+    out = pathlib.Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
     text = log_path.read_text(encoding="utf-8", errors="replace")
     facts = parse_output(text)
     _, harness = _output_parts(text)
@@ -957,7 +1016,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         jc = junit_counts(pathlib.Path(args.cwd or "."), args.junit_glob)
         if jc is not None:
             facts.update(jc, counted=True)
-    status = "pass" if proc.returncode == 0 else "fail"
+    status = "pass" if code == 0 else "fail"
     if status == "pass" and args.min_passed and facts["passed"] is None:
         status = "fail"  # a count-less pass cannot satisfy a minimum
         print(f"lane {suite}/{variant}/{step}: no test count found (minimum {args.min_passed})")
@@ -975,7 +1034,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         facts["failingTests"] = [metadata.test(name, index) if index is not None else UNVERIFIED
                                  for name in facts["failingTests"]]
     frag = {"suite": suite, "variant": variant, "step": step, "status": status,
-            "exitCode": proc.returncode, **{k: v for k, v in facts.items() if k != "counted"}}
+            "exitCode": code, **{k: v for k, v in facts.items() if k != "counted"}}
     fragment_path = out / f"{suite}__{variant}__{step}.json"
     if timing is not None:
         frag["rustTiming"] = timing
@@ -991,8 +1050,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             if index is not None else None)
         if frag["failureDetails"] is None:
             frag["failureDetailsUnavailable"] = WITHHELD if index is None else "job excerpt cap"
-    fragment_path.write_bytes(_encoded(frag) + b"\n")
-    print(f"lane {suite}/{variant}/{step}: {status} exit={proc.returncode} "
+    temporary = fragment_path.with_suffix(".tmp")
+    temporary.write_bytes(_encoded(frag) + b"\n")
+    temporary.replace(fragment_path)
+    print(f"lane {suite}/{variant}/{step}: {status} exit={code} "
           f"passed={_fmt(facts['passed'])} failed={_fmt(facts['failed'])} ignored={_fmt(facts['ignored'])}")
     if timing is not None:
         publish_rust_timing(timing)
@@ -1011,7 +1072,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if facts["failingTruncated"] or facts["droppedInvalidNames"]:
         print(f"lane failing-test-overflow truncated={facts['failingTruncated']} "
               f"dropped-invalid={facts['droppedInvalidNames']}")
-    return 0 if status == "pass" else (proc.returncode or 1)
+    return 0 if status == "pass" else (code or 1)
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
@@ -1090,7 +1151,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
     return 0 if overall_ok else 1
 
 
-def main() -> int:
+def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
@@ -1113,7 +1174,11 @@ def main() -> int:
     m.add_argument("--out", required=True)
     m.add_argument("--step-summary", default="")
     m.add_argument("--job-result", action="append")
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> int:
+    args = parser().parse_args()
     return cmd_run(args) if args.cmd == "run" else cmd_merge(args)
 
 
