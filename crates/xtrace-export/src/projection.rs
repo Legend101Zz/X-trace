@@ -629,7 +629,18 @@ pub(crate) fn catalog_metadata(op: &PreparedOp) -> Value {
     if !op.handlers.is_empty() {
         metadata["handlers"] = Value::Array(op.handlers.iter().map(handler_json).collect());
     }
+    if !op.conflicts.is_empty() {
+        metadata["conflicts"] = Value::Array(op.conflicts.iter().map(conflict_json).collect());
+    }
     metadata
+}
+
+fn conflict_json(conflict: &Conflict) -> Value {
+    json!({
+        "kind": conflict.kind,
+        "subject": conflict.subject,
+        "claims": conflict.values.iter().map(|(id, value)| json!({"claim_id": id, "value": value})).collect::<Vec<_>>(),
+    })
 }
 
 /// An unknown extent is omitted, never replaced with the start line.

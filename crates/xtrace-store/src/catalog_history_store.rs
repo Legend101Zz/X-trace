@@ -12,7 +12,10 @@ use xtrace_application::catalog_discovery::history::{
     RevisionEntry, RunEntry,
 };
 use xtrace_application::{CatalogChangeKind, CatalogSourceAvailability, PortError, PortErrorKind};
-use xtrace_domain::catalog_discovery::{ClaimSourceEvidence, MAX_CLAIM_SOURCE_EVIDENCE};
+use xtrace_domain::catalog_discovery::{
+    ClaimSourceEvidence, MAX_CLAIM_SOURCE_EVIDENCE, MAX_DISCOVERY_CLAIM_BYTES,
+    MAX_DISCOVERY_RUN_CLAIM_BYTES, MAX_DISCOVERY_RUN_CLAIMS,
+};
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     CatalogRevisionId, ContentHash, CorrelationId, OperationId, ProjectId, RunId, SourceRevisionId,
@@ -371,7 +374,7 @@ struct StoredClaimFields {
 
 #[derive(Default)]
 struct OperationClaims {
-    json_bytes: usize,
+    canonical_bytes: usize,
     claims: Vec<([u8; 32], RevisionClaim)>,
 }
 
@@ -380,16 +383,15 @@ fn load_claims(
     project_id: ProjectId,
     revision_id: CatalogRevisionId,
 ) -> Result<BTreeMap<OperationId, Vec<RevisionClaim>>, PortError> {
-    // Match the discovery reader's per-operation limits. A revision can combine scopes.
-    const MAX_OPERATION_CLAIMS: usize = 4096;
-    const MAX_OPERATION_CLAIM_JSON_BYTES: usize = 4 * 1024 * 1024;
+    // A revision can combine scopes, so apply the writer's limits per operation.
+    // The claim count and catalog_claims JSON row cap also bound JSON to 64 MiB per operation.
     const MAX_CLAIM_JSON_BYTES: i64 = 16 * 1024;
-    // Stream the revision index without a SQL sort of claim payloads. The operation cap
-    // and the count and byte ceilings below bound the rows retained for the whole revision.
+    // Stream the revision index without a SQL sort or fetching the canonical CBOR payload.
     let mut statement = connection
         .prepare(
             "SELECT rc.operation_id, rc.claim_id, c.claim_digest, \
-                    CASE WHEN length(CAST(c.canonical_json AS BLOB)) <= ?3 THEN c.canonical_json END \
+                    length(c.canonical_bytes), \
+                    CASE WHEN length(CAST(c.canonical_json AS BLOB)) BETWEEN 1 AND ?3 THEN c.canonical_json END \
              FROM catalog_revision_claims rc \
              LEFT JOIN catalog_claims c ON c.project_id = rc.project_id \
                  AND c.operation_id = rc.operation_id AND c.claim_id = rc.claim_id \
@@ -403,14 +405,19 @@ fn load_claims(
     while let Some(row) = rows.next().map_err(map_sql)? {
         let operation_id = id(&row.get::<_, Vec<u8>>(0).map_err(map_sql)?)?;
         let operation = by_operation.entry(operation_id).or_default();
-        if operation.claims.len() >= MAX_OPERATION_CLAIMS {
+        if operation.claims.len() >= MAX_DISCOVERY_RUN_CLAIMS {
             return Err(corrupt());
         }
-        let json = row.get_ref(3).map_err(map_sql)?.as_str().map_err(|_| corrupt())?;
-        operation.json_bytes += json.len();
-        if operation.json_bytes > MAX_OPERATION_CLAIM_JSON_BYTES {
+        let canonical_bytes = row
+            .get::<_, Option<usize>>(3)
+            .map_err(map_sql)?
+            .filter(|len| (1..=MAX_DISCOVERY_CLAIM_BYTES).contains(len))
+            .ok_or_else(corrupt)?;
+        operation.canonical_bytes += canonical_bytes;
+        if operation.canonical_bytes > MAX_DISCOVERY_RUN_CLAIM_BYTES {
             return Err(corrupt());
         }
+        let json = row.get_ref(4).map_err(map_sql)?.as_str().map_err(|_| corrupt())?;
         let fields: StoredClaimFields = serde_json::from_str(json).map_err(|_| corrupt())?;
         if fields.source_evidence.len() > MAX_CLAIM_SOURCE_EVIDENCE
             || fields.confidence_basis_points.is_some_and(|bp| bp > 10_000)

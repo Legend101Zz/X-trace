@@ -73,7 +73,7 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
     let first = json!({"symbol": "First.get", "path": "First.java", "line_start": 4});
     let second =
         json!({"symbol": "Second.get", "path": "Second.java", "line_start": 8, "line_end": 12});
-    let input = xtrace_export::input_json::parse(&json!({
+    let mut doc = json!({
         "operations": [
             {
                 "operation_id": "legacy", "method": "GET", "route_template": "/legacy",
@@ -98,8 +98,18 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
                 }
             }
         ]
-    }))
-    .unwrap();
+    });
+    let summary = doc["operations"][1]["catalog_summary"].clone();
+    doc["operations"][0]["catalog_summary"] = summary;
+    let mut withheld = doc["operations"][0].clone();
+    withheld["operation_id"] = json!("withheld");
+    withheld["route_template"] = json!("/withheld");
+    withheld["claims_available"] = json!(false);
+    doc["operations"].as_array_mut().unwrap().push(withheld);
+    let input = xtrace_export::input_json::parse(&doc).unwrap();
+    assert!(input.operations[0].claims_available);
+    assert!(!input.operations[1].claims_available);
+    assert!(!input.operations[2].claims_available);
     let expected_legacy = json!({
         "operation_id": "legacy", "application_component": "", "binding_key": "",
         "effective_state": "unknown", "claims_projection": "available", "claim_count": 3,
@@ -129,13 +139,19 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
         "source_locations": "per-claim locations unavailable",
         "claim_confidence": "not available per claim"
     });
+    let mut expected_withheld = expected_summary.clone();
+    expected_withheld["operation_id"] = json!("withheld");
     for format in
         [ExportFormat::OpenApi, ExportFormat::Postman, ExportFormat::Curl, ExportFormat::Bundle]
     {
         let out = export(&input, &ExportRequest::new(format)).unwrap();
-        assert_eq!(out.operation_count, 2, "{format:?}");
+        assert_eq!(out.operation_count, 3, "{format:?}");
         let file = |path| text(out.files.iter().find(|f| f.path == path).unwrap());
-        for (route, expected) in [("legacy", &expected_legacy), ("summary", &expected_summary)] {
+        for (route, expected) in [
+            ("legacy", &expected_legacy),
+            ("summary", &expected_summary),
+            ("withheld", &expected_withheld),
+        ] {
             let postman = || {
                 let doc: Value = serde_json::from_str(file("collection.postman.json")).unwrap();
                 let item = doc["item"]
@@ -183,6 +199,9 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
                 out.omissions.iter().any(|o| o.operation_id == "summary" && o.reason == reason)
             );
             assert!(
+                out.omissions.iter().any(|o| o.operation_id == "withheld" && o.reason == reason)
+            );
+            assert!(
                 !out.omissions.iter().any(|o| o.operation_id == "legacy" && o.reason == reason)
             );
         }
@@ -199,6 +218,7 @@ fn mixed_serialized_claims_retain_independent_handler_locations() {
     let input = xtrace_export::input_json::parse(&json!({
         "operations": [{
             "operation_id": "mixed", "method": "GET", "route_template": "/mixed",
+            "catalog_summary": {"claim_count": 5, "handler_conflict": true},
             "claims": [
                 {"claim_id": "conflicting", "handler_symbol": symbol,
                     "handler": {"symbol": "Legacy.get", "path": "Legacy.java", "line_start": 4, "line_end": 6},
@@ -326,6 +346,23 @@ fn long_claim_symbols_still_pass_through_the_secret_gate() {
     }
 }
 
+#[test]
+fn conflicting_claim_values_pass_through_the_secret_gate() {
+    let mut input = spring_orders();
+    input.operations[1].claims[1].responses[0].description = "password=hunter2hunter2".into();
+    for format in
+        [ExportFormat::OpenApi, ExportFormat::Postman, ExportFormat::Curl, ExportFormat::Bundle]
+    {
+        assert!(
+            matches!(
+                export(&input, &ExportRequest::new(format)),
+                Err(xtrace_export::ExportError::SecretShaped { .. })
+            ),
+            "{format:?} accepted a secret-shaped conflicting response"
+        );
+    }
+}
+
 fn permute<T: Clone>(items: &[T], seed: u64) -> Vec<T> {
     let mut v = items.to_vec();
     let mut state = seed | 1;
@@ -419,6 +456,8 @@ fn export_omissions_listed_for_every_dropped_example() {
 
 #[test]
 fn bundle_composes_the_formats_and_preserves_format_specific_omissions() {
+    use serde_json::{Value, json};
+
     let input = spring_orders();
     let out = export(&input, &ExportRequest::new(ExportFormat::Bundle)).unwrap();
     assert_eq!(out.operation_count, 5);
@@ -428,6 +467,37 @@ fn bundle_composes_the_formats_and_preserves_format_specific_omissions() {
     .unwrap();
     assert_eq!(manifest["policy_digest"], input.revision.policy_digest);
     assert_eq!(manifest["catalog_hash"], input.revision.catalog_hash);
+    let file = |path| text(out.files.iter().find(|f| f.path == path).unwrap());
+    let collection: Value = serde_json::from_str(file("collection.postman.json")).unwrap();
+    let postman =
+        comment_metadata(collection["item"][0]["request"]["description"].as_str().unwrap());
+    let curl = comment_metadata(file("curl/001-get-orders.sh"));
+    let spec = export(&input, &ExportRequest::new(ExportFormat::OpenApi)).unwrap();
+    let spec: Value = serde_json::from_slice(&spec.files[0].bytes).unwrap();
+    let mut openapi = spec["paths"]["/orders"]["get"]["x-xtrace"].as_object().unwrap().clone();
+    let examples = openapi.remove("examples").unwrap();
+    assert_eq!(postman, Value::Object(openapi));
+    assert_eq!(curl, postman);
+    assert_eq!(
+        postman["conflicts"],
+        json!([
+            {"kind": "param_type", "subject": "query:page", "claims": [
+                {"claim_id": "c-list-a", "value": "integer"},
+                {"claim_id": "c-list-b", "value": "string"}
+            ]},
+            {"kind": "response_description", "subject": "200", "claims": [
+                {"claim_id": "c-list-a", "value": "A page of orders"},
+                {"claim_id": "c-list-b", "value": "All orders"}
+            ]}
+        ])
+    );
+    let mut yaml_metadata = postman;
+    yaml_metadata["examples"] = examples;
+    let yaml_block = xtrace_export::canonical::yaml(&json!({"x-xtrace": yaml_metadata}))
+        .lines()
+        .map(|line| format!("      {line}\n"))
+        .collect::<String>();
+    assert!(file("openapi.yaml").contains(&yaml_block));
     for (format, prefix, yaml) in [
         (ExportFormat::OpenApi, "", true),
         (ExportFormat::Postman, "", false),

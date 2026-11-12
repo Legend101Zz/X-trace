@@ -123,7 +123,12 @@ pub fn parse(doc: &Value) -> Result<ExportInput, String> {
             application_component: s(o, "application_component", &at)?,
             binding_key: s(o, "binding_key", &at)?,
             effective_state: state(&s(o, "effective_state", &at)?, &at)?,
-            claims_available: b(o, "claims_available", catalog_summary.is_none(), &at)?,
+            claims_available: b(
+                o,
+                "claims_available",
+                !claims.is_empty() || catalog_summary.is_none(),
+                &at,
+            )?,
             claims,
             catalog_summary,
         });

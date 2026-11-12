@@ -870,7 +870,9 @@ fn claim_transcript(route: &str, symbols: &[String]) -> String {
 
 #[test]
 fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
-    use xtrace_domain::catalog_discovery::MAX_DISCOVERY_RUN_CLAIMS;
+    use xtrace_domain::catalog_discovery::{
+        MAX_DISCOVERY_CLAIM_BYTES, MAX_DISCOVERY_RUN_CLAIM_BYTES, MAX_DISCOVERY_RUN_CLAIMS,
+    };
     use xtrace_domain::ids::Id as _;
     use xtrace_domain::{ClaimId, ContentHash};
 
@@ -878,7 +880,11 @@ fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
     let src = fx.repo.join("src");
     fs::create_dir(&src).unwrap();
     fs::write(src.join("Handlers.java"), "// handler\n".repeat(MAX_DISCOVERY_RUN_CLAIMS)).unwrap();
-    let symbols: Vec<_> = (1..=MAX_DISCOVERY_RUN_CLAIMS).map(|i| format!("Fixture.h{i}")).collect();
+    // Each source line yields a distinct hint. Long symbols make the writer's JSON
+    // exceed 4 MiB while the CBOR encoding still fits the run budget.
+    let symbol_prefix = "A".repeat(499);
+    let symbols: Vec<_> =
+        (1..=MAX_DISCOVERY_RUN_CLAIMS).map(|i| format!("Fixture{symbol_prefix}.h{i:04}")).collect();
     let analyzer = fx.write_analyzer(&claim_transcript("/many", &symbols));
     let scan = fx.scan(&analyzer);
     assert_eq!(scan.status.code(), Some(0), "{scan:?}");
@@ -907,28 +913,41 @@ fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
     let single = openapi_metadata(&full, "/single", "get");
     assert_eq!(single["claim_count"], 1);
     assert_eq!(single["claims"][0]["handler_symbol"], long_symbol);
-    let selected_id = single["operation_id"].as_str().unwrap();
-    let selected = fx.out_dir("selected");
-    let result = fx.export(&[
-        "--format",
-        "openapi",
-        "--revision",
-        &revision,
-        "--operations",
-        selected_id,
-        "--output",
-        selected.to_str().unwrap(),
-    ]);
-    assert_eq!(result.status.code(), Some(0), "{result:?}");
-    assert_eq!(json(&result)["operationCount"], 1);
-    assert_eq!(openapi_metadata(&selected, "/single", "get"), single);
-    let spec: Value = serde_json::from_str(&read(&selected, "openapi.json")).unwrap();
-    assert_eq!(spec["paths"].as_object().unwrap().keys().collect::<Vec<_>>(), ["/single"]);
+    for (name, expected) in [("many", &many), ("single", &single)] {
+        let selected = fx.out_dir(&format!("selected-{name}"));
+        let result = fx.export(&[
+            "--format",
+            "openapi",
+            "--revision",
+            &revision,
+            "--operations",
+            expected["operation_id"].as_str().unwrap(),
+            "--output",
+            selected.to_str().unwrap(),
+        ]);
+        assert_eq!(result.status.code(), Some(0), "{result:?}");
+        assert_eq!(json(&result)["operationCount"], 1);
+        let route = format!("/{name}");
+        assert_eq!(&openapi_metadata(&selected, &route, "get"), expected);
+        let spec: Value = serde_json::from_str(&read(&selected, "openapi.json")).unwrap();
+        assert_eq!(spec["paths"].as_object().unwrap().keys().collect::<Vec<_>>(), [&route]);
+    }
 
     let mut connection = rusqlite::Connection::open(fx.database()).unwrap();
     connection.pragma_update(None, "foreign_keys", true).unwrap();
     let revision_id = uuid::Uuid::parse_str(&revision).unwrap();
     let operation_id = uuid::Uuid::parse_str(many["operation_id"].as_str().unwrap()).unwrap();
+    let operation_id = operation_id.as_bytes().as_slice();
+    let (canonical_bytes, json_bytes): (usize, usize) = connection
+        .query_row(
+            "SELECT SUM(length(canonical_bytes)), SUM(length(CAST(canonical_json AS BLOB)))
+             FROM catalog_claims WHERE operation_id = ?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(canonical_bytes <= MAX_DISCOVERY_RUN_CLAIM_BYTES, "{canonical_bytes}");
+    assert!(json_bytes > MAX_DISCOVERY_RUN_CLAIM_BYTES, "{json_bytes}");
     let extra_id = ClaimId::new().as_uuid();
     let extra_id = extra_id.as_bytes().as_slice();
     let tx = connection.transaction().unwrap();
@@ -937,7 +956,7 @@ fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
         "INSERT INTO catalog_claims (claim_id, project_id, operation_id, claim_digest, canonical_bytes, canonical_json, first_revision_id, last_revision_id)
          SELECT ?1, project_id, operation_id, ?2, canonical_bytes, canonical_json, first_revision_id, last_revision_id
          FROM catalog_claims WHERE operation_id = ?3 ORDER BY claim_id LIMIT 1",
-        rusqlite::params![extra_id, ContentHash::of_bytes(extra_id).as_bytes().as_slice(), operation_id.as_bytes().as_slice()],
+        rusqlite::params![extra_id, ContentHash::of_bytes(extra_id).as_bytes().as_slice(), operation_id],
     ).unwrap(), 1);
     assert_eq!(
         tx.execute(
@@ -979,13 +998,54 @@ fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
         tx.execute("DELETE FROM catalog_claims WHERE claim_id = ?1", [extra_id]).unwrap(),
         1
     );
-    // JSON whitespace preserves the claim fields while exceeding only the operation byte cap.
-    assert_eq!(tx.execute(
-        "UPDATE catalog_claims SET canonical_json = canonical_json || ?1 WHERE operation_id = ?2",
-        rusqlite::params![" ".repeat(1024), operation_id.as_bytes().as_slice()],
-    ).unwrap(), MAX_DISCOVERY_RUN_CLAIMS);
     tx.commit().unwrap();
-    assert_rejected("too-many-claim-bytes");
+
+    let single_id =
+        uuid::Uuid::parse_str(single["claims"][0]["claim_id"].as_str().unwrap()).unwrap();
+    let single_id = single_id.as_bytes().as_slice();
+    let (valid_canonical, valid_json): (Vec<u8>, String) = connection
+        .query_row(
+            "SELECT canonical_bytes, canonical_json FROM catalog_claims WHERE claim_id = ?1",
+            [single_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let oversized_canonical = vec![0; MAX_DISCOVERY_CLAIM_BYTES + 1];
+    let oversized_json = format!("{valid_json:<width$}", width = 16 * 1024 + 1);
+    let update_single = |canonical: &[u8], json: &str| {
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE catalog_claims SET canonical_bytes = ?1, canonical_json = ?2
+                     WHERE claim_id = ?3",
+                    rusqlite::params![canonical, json, single_id],
+                )
+                .unwrap(),
+            1
+        );
+    };
+    // Bypass the fixture connection's CHECK constraints to exercise the history reader's
+    // row guards independently. The padded JSON is still valid JSON.
+    connection.pragma_update(None, "ignore_check_constraints", true).unwrap();
+    update_single(&oversized_canonical, &valid_json);
+    assert_rejected("oversized-canonical-row");
+    update_single(&valid_canonical, &oversized_json);
+    assert_rejected("oversized-json-row");
+    update_single(&valid_canonical, &valid_json);
+    connection.pragma_update(None, "ignore_check_constraints", false).unwrap();
+
+    // Every row still fits the schema. Their combined CBOR lengths exceed the run budget.
+    let bytes_per_claim = MAX_DISCOVERY_RUN_CLAIM_BYTES / MAX_DISCOVERY_RUN_CLAIMS + 1;
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE catalog_claims SET canonical_bytes = zeroblob(?1) WHERE operation_id = ?2",
+                rusqlite::params![bytes_per_claim, operation_id],
+            )
+            .unwrap(),
+        MAX_DISCOVERY_RUN_CLAIMS
+    );
+    assert_rejected("too-many-canonical-bytes");
 }
 
 #[test]

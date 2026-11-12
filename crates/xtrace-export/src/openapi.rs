@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value, json};
 
 use crate::canonical;
-use crate::projection::{Conflict, Prepared, PreparedOp};
+use crate::projection::{Prepared, PreparedOp};
 use crate::request::{EffectiveState, ExportError, ExportFile, ExportOutput, Omission};
 use crate::{sanitize, validate};
 
@@ -67,14 +67,6 @@ fn operation_ids(ops: &[&PreparedOp]) -> Vec<String> {
         .collect()
 }
 
-fn conflict_json(c: &Conflict) -> Value {
-    json!({
-        "kind": c.kind,
-        "subject": c.subject,
-        "claims": c.values.iter().map(|(id, v)| json!({"claim_id": id, "value": v})).collect::<Vec<_>>(),
-    })
-}
-
 fn example_value(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()))
 }
@@ -119,9 +111,6 @@ fn operation_json(op: &PreparedOp, operation_id: &str) -> Value {
     out.insert("responses".into(), Value::Object(responses));
 
     let mut x = crate::projection::catalog_metadata(op);
-    if !op.conflicts.is_empty() {
-        x["conflicts"] = Value::Array(op.conflicts.iter().map(conflict_json).collect());
-    }
     if !op.examples.is_empty() {
         x["examples"] = Value::Array(
             op.examples
