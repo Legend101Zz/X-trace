@@ -16,7 +16,7 @@ fn var_name(prefix: &str, name: &str) -> String {
     format!("{prefix}_{base}")
 }
 
-fn item(op: &PreparedOp, omissions: &mut Vec<Omission>) -> Value {
+fn item(op: &PreparedOp, omissions: &mut Vec<Omission>) -> Result<Value, ExportError> {
     let mut omit = |what: String, reason: &str| {
         omissions.push(Omission {
             operation_id: op.operation_id.clone(),
@@ -123,9 +123,14 @@ fn item(op: &PreparedOp, omissions: &mut Vec<Omission>) -> Value {
     request.insert("url".into(), url);
     let observation =
         if op.state == crate::request::EffectiveState::Observed { "observed" } else { "inferred" };
-    let metadata = crate::projection::catalog_metadata(op)
-        .map(|value| format!("\nx-xtrace catalog summary: {value}"))
-        .unwrap_or_default();
+    let metadata = if let Some(value) = crate::projection::catalog_metadata(op) {
+        if let Some(path) = sanitize::gate(&value) {
+            return Err(ExportError::SecretShaped { path });
+        }
+        format!("\nx-xtrace catalog metadata: {value}")
+    } else {
+        String::new()
+    };
     request.insert(
         "description".into(),
         json!(format!(
@@ -134,7 +139,7 @@ fn item(op: &PreparedOp, omissions: &mut Vec<Omission>) -> Value {
             op.state.name()
         )),
     );
-    json!({"name": format!("{} {}", op.method, op.path), "request": Value::Object(request)})
+    Ok(json!({"name": format!("{} {}", op.method, op.path), "request": Value::Object(request)}))
 }
 
 /// Renders `collection.postman.json`.
@@ -143,15 +148,9 @@ fn item(op: &PreparedOp, omissions: &mut Vec<Omission>) -> Value {
 ///
 /// Fails when the sanitizer gate finds a secret-shaped value.
 pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
-    for op in &prepared.ops {
-        if let Some(metadata) = crate::projection::catalog_metadata(op)
-            && let Some(path) = sanitize::gate(&metadata)
-        {
-            return Err(ExportError::SecretShaped { path });
-        }
-    }
     let mut omissions = prepared.omissions.clone();
-    let items: Vec<Value> = prepared.ops.iter().map(|op| item(op, &mut omissions)).collect();
+    let items: Vec<Value> =
+        prepared.ops.iter().map(|op| item(op, &mut omissions)).collect::<Result<_, _>>()?;
     let rev = &prepared.revision;
     let name = if rev.application_name.is_empty() {
         "X-trace catalog export".to_owned()

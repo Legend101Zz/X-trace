@@ -21,8 +21,8 @@ use xtrace_domain::{
     AppError, CatalogRevisionId, CorrelationId, ErrorCategory, ErrorCode, ProjectId, RetryAdvice,
 };
 use xtrace_export::{
-    CatalogSummaryInput, EffectiveState, ExportError, ExportFormat, ExportInput, ExportOutput,
-    ExportRequest, HandlerInput, OperationInput, RevisionInput,
+    ClaimInput, EffectiveState, ExportError, ExportFormat, ExportInput, ExportOutput,
+    ExportRequest, OperationInput, RevisionInput,
 };
 
 use crate::error::CliError;
@@ -110,8 +110,6 @@ fn state_of(view: &OperationView, confirmed: &BTreeSet<OperationIdentity>) -> Ef
     }
 }
 
-/// The read port exposes aggregates, not individual claims. Keep that boundary explicit:
-/// neither the first source nor the maximum confidence belongs to an arbitrary handler.
 fn operation_input(
     view: &OperationView,
     confirmed: &BTreeSet<OperationIdentity>,
@@ -127,32 +125,21 @@ fn operation_input(
         application_component: view.application_component.clone(),
         binding_key: view.binding_key.clone(),
         effective_state: state_of(view, confirmed),
-        claims_available: false,
-        claims: Vec::new(),
-        catalog_summary: Some(CatalogSummaryInput {
-            claim_count: view.claim_count,
-            handler_symbols: view.handlers.clone(),
-            handler_conflict: view.handler_conflict,
-            single_claim_handler: match (
-                view.claim_count,
-                view.handlers.as_slice(),
-                &view.source_path,
-                view.source_line,
-            ) {
-                (1, [symbol], Some(path), Some(line)) if !view.handler_conflict => {
-                    Some(HandlerInput {
-                        symbol: symbol.clone(),
-                        path: path.clone(),
-                        line_start: line,
-                        line_end: None,
-                    })
-                }
-                _ => None,
-            },
-            highest_confidence_basis_points: view.confidence_basis_points,
-            provenance: view.provenance.clone(),
-            limitation_codes: view.limitation_codes.clone(),
-        }),
+        claims_available: true,
+        claims: view
+            .claims
+            .iter()
+            .map(|claim| ClaimInput {
+                claim_id: claim.claim_id.to_string(),
+                provenance: claim.provenance.clone(),
+                handler_symbol: claim.handler_symbol.clone(),
+                confidence_basis_points: claim.confidence_basis_points,
+                limitation_codes: claim.limitation_codes.clone(),
+                source_evidence: Some(claim.source_evidence.clone()),
+                ..ClaimInput::default()
+            })
+            .collect(),
+        catalog_summary: None,
     }
 }
 
@@ -429,8 +416,8 @@ pub async fn run(args: ExportArgs) -> Result<i32, CliError> {
                 reason: o.reason.clone(),
             })
             .collect(),
-        note: "built from catalog summaries and linked endpoint observations; missing source \
-               extents and per-claim confidence are explicit; no request or response body was \
+        note: "built from persisted revision claims and linked endpoint observations; missing \
+               claim fields are explicit; no request or response body was \
                observed or retained, and nothing was sent anywhere",
     };
     let mut stdout = std::io::stdout().lock();

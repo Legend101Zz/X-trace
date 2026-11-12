@@ -1,17 +1,20 @@
 //! Read-only catalog history queries: revisions, runs, revision entries with their claims, and
 //! the endpoints recordings were linked to.
 //!
-//! Claim JSON is parsed here (and only here and in the discovery store) because the application
-//! projection deliberately omits it; nothing in this file writes.
+//! Claim JSON stays in the store. The application receives typed claim fields for export.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, OptionalExtension as _, params};
+use serde::Deserialize;
 use xtrace_application::catalog_discovery::history::{
-    CatalogHistoryPort, MAX_REVISION_OPERATIONS, ObservedOperation, OperationView, RevisionEntry,
-    RunEntry,
+    CatalogHistoryPort, MAX_REVISION_OPERATIONS, ObservedOperation, OperationView, RevisionClaim,
+    RevisionEntry, RunEntry,
 };
 use xtrace_application::{CatalogChangeKind, CatalogSourceAvailability, PortError, PortErrorKind};
+use xtrace_domain::catalog_discovery::{
+    ClaimSourceEvidence, MAX_CLAIM_SOURCE_EVIDENCE, MAX_DISCOVERY_RUN_CLAIMS,
+};
 use xtrace_domain::ids::Id as _;
 use xtrace_domain::{
     CatalogRevisionId, ContentHash, CorrelationId, OperationId, ProjectId, RunId, SourceRevisionId,
@@ -183,7 +186,7 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
         revision_id: CatalogRevisionId,
     ) -> Result<Vec<OperationView>, PortError> {
         let connection = self.store.lock().map_err(map_store)?;
-        let claims = load_claims(&connection, project_id, revision_id)?;
+        let mut claims = load_claims(&connection, project_id, revision_id)?;
         let mut statement = connection
             .prepare(
                 "SELECT e.operation_id, e.operation_version_id, e.change_kind, e.source_availability, \
@@ -238,7 +241,8 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
                 "unavailable" => CatalogSourceAvailability::Unavailable,
                 _ => return Err(corrupt()),
             };
-            let summary = claims.get(&operation_id).cloned().unwrap_or_default();
+            let claims = claims.remove(&operation_id).unwrap_or_default();
+            let summary = ClaimSummary::from_claims(&claims);
             views.push(OperationView {
                 operation_id,
                 operation_version_id: version.to_string(),
@@ -253,10 +257,14 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
                 limitation_codes: summary.limitations.into_iter().collect(),
                 handler_conflict: summary.handlers.len() > 1,
                 handlers: summary.handlers.into_iter().collect(),
-                claim_count: summary.claims,
+                claim_count: claims.len(),
                 source_path: summary.source.as_ref().map(|(path, _)| path.clone()),
                 source_line: summary.source.map(|(_, line)| line),
+                claims,
             });
+        }
+        if !claims.is_empty() {
+            return Err(corrupt());
         }
         Ok(views)
     }
@@ -318,68 +326,108 @@ fn run_entry(row: RunRow) -> Result<RunEntry, PortError> {
     })
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 struct ClaimSummary {
     provenance: BTreeSet<String>,
     limitations: BTreeSet<String>,
     handlers: BTreeSet<String>,
     confidence: u16,
-    claims: usize,
     source: Option<(String, u32)>,
+}
+
+impl ClaimSummary {
+    fn from_claims(claims: &[RevisionClaim]) -> Self {
+        let mut summary = Self::default();
+        for claim in claims {
+            summary.provenance.insert(claim.provenance.clone());
+            summary.limitations.extend(claim.limitation_codes.iter().cloned());
+            summary.handlers.extend(claim.handler_symbol.iter().cloned());
+            summary.confidence = summary.confidence.max(claim.confidence_basis_points.unwrap_or(0));
+            if summary.source.is_none() {
+                summary.source = match claim.source_evidence.first() {
+                    Some(
+                        ClaimSourceEvidence::StaticSnapshot { relative_path, start_line, .. }
+                        | ClaimSourceEvidence::LoadedClassBound { relative_path, start_line, .. }
+                        | ClaimSourceEvidence::RuntimeHint {
+                            relative_path: Some(relative_path),
+                            start_line: Some(start_line),
+                            ..
+                        },
+                    ) => Some((relative_path.clone(), *start_line)),
+                    _ => None,
+                };
+            }
+        }
+        summary
+    }
+}
+
+#[derive(Deserialize)]
+struct StoredClaimFields {
+    provenance: String,
+    handler_symbol: Option<String>,
+    confidence_basis_points: Option<u16>,
+    limitation_codes: Vec<String>,
+    source_evidence: Vec<ClaimSourceEvidence>,
 }
 
 fn load_claims(
     connection: &Connection,
     project_id: ProjectId,
     revision_id: CatalogRevisionId,
-) -> Result<BTreeMap<OperationId, ClaimSummary>, PortError> {
+) -> Result<BTreeMap<OperationId, Vec<RevisionClaim>>, PortError> {
+    // Use the run's claim-count limit and the discovery store's per-claim JSON ceiling.
+    // Reject over-limit and missing rows without fetching oversized payloads or truncating.
+    const MAX_CLAIM_JSON_BYTES: i64 = 16 * 1024;
     let mut statement = connection
         .prepare(
-            "SELECT rc.operation_id, c.canonical_json FROM catalog_revision_claims rc \
-             JOIN catalog_claims c ON c.project_id = rc.project_id AND c.claim_id = rc.claim_id \
-             WHERE rc.project_id = ?1 AND rc.revision_id = ?2 ORDER BY rc.operation_id, c.claim_digest",
+            "SELECT rc.operation_id, rc.claim_id, \
+                    CASE WHEN length(CAST(c.canonical_json AS BLOB)) <= ?3 THEN c.canonical_json END \
+             FROM catalog_revision_claims rc \
+             LEFT JOIN catalog_claims c ON c.project_id = rc.project_id \
+                 AND c.operation_id = rc.operation_id AND c.claim_id = rc.claim_id \
+             WHERE rc.project_id = ?1 AND rc.revision_id = ?2 \
+             ORDER BY rc.operation_id, c.claim_digest, rc.claim_id LIMIT ?4",
         )
         .map_err(map_sql)?;
     let rows = statement
-        .query_map(params![bytes(&project_id), bytes(&revision_id)], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(map_sql)?
-        .collect::<Result<Vec<_>, _>>()
+        .query_map(
+            params![
+                bytes(&project_id),
+                bytes(&revision_id),
+                MAX_CLAIM_JSON_BYTES,
+                i64::try_from(MAX_DISCOVERY_RUN_CLAIMS + 1).map_err(|_| corrupt())?
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
         .map_err(map_sql)?;
-    let mut by_operation: BTreeMap<OperationId, ClaimSummary> = BTreeMap::new();
-    for (operation, json) in rows {
-        let value: serde_json::Value = serde_json::from_str(&json).map_err(|_| corrupt())?;
-        let summary = by_operation.entry(id(&operation)?).or_default();
-        summary.claims += 1;
-        if let Some(provenance) = value.get("provenance").and_then(serde_json::Value::as_str) {
-            summary.provenance.insert(provenance.to_owned());
+    let mut by_operation: BTreeMap<OperationId, Vec<RevisionClaim>> = BTreeMap::new();
+    for (index, row) in rows.enumerate() {
+        let (operation, claim, json) = row.map_err(map_sql)?;
+        if index >= MAX_DISCOVERY_RUN_CLAIMS {
+            return Err(corrupt());
         }
-        if let Some(handler) = value.get("handler_symbol").and_then(serde_json::Value::as_str) {
-            summary.handlers.insert(handler.to_owned());
-        }
-        if let Some(codes) = value.get("limitation_codes").and_then(serde_json::Value::as_array) {
-            summary
-                .limitations
-                .extend(codes.iter().filter_map(serde_json::Value::as_str).map(str::to_owned));
-        }
-        if let Some(confidence) =
-            value.get("confidence_basis_points").and_then(serde_json::Value::as_u64)
+        let fields: StoredClaimFields =
+            serde_json::from_str(&json.ok_or_else(corrupt)?).map_err(|_| corrupt())?;
+        if fields.source_evidence.len() > MAX_CLAIM_SOURCE_EVIDENCE
+            || fields.confidence_basis_points.is_some_and(|bp| bp > 10_000)
         {
-            summary.confidence = summary.confidence.max(u16::try_from(confidence).unwrap_or(0));
+            return Err(corrupt());
         }
-        if summary.source.is_none()
-            && let Some(first) = value
-                .get("source_evidence")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|items| items.first())
-            && let (Some(path), Some(line)) = (
-                first.get("relative_path").and_then(serde_json::Value::as_str),
-                first.get("start_line").and_then(serde_json::Value::as_u64),
-            )
-        {
-            summary.source = Some((path.to_owned(), u32::try_from(line).unwrap_or(0)));
-        }
+        by_operation.entry(id(&operation)?).or_default().push(RevisionClaim {
+            claim_id: id(&claim)?,
+            provenance: fields.provenance,
+            handler_symbol: fields.handler_symbol,
+            confidence_basis_points: fields.confidence_basis_points,
+            limitation_codes: fields.limitation_codes,
+            source_evidence: fields.source_evidence,
+        });
     }
     Ok(by_operation)
 }

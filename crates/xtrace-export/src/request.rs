@@ -68,7 +68,7 @@ pub struct RevisionInput {
     pub ordinal: u32,
     /// Hex digest of the catalog content.
     pub catalog_hash: String,
-    /// Hex digest of the policy applied.
+    /// Hex digest of the policy applied, or empty when unknown.
     pub policy_digest: String,
     /// Application display name.
     pub application_name: String,
@@ -195,8 +195,13 @@ pub struct ClaimInput {
     pub responses: Vec<ResponseInput>,
     /// Examples.
     pub examples: Vec<ExampleInput>,
-    /// Handler.
+    /// Handler location from legacy input.
     pub handler: Option<HandlerInput>,
+    /// Handler symbol recorded on a claim, independent of its source evidence.
+    pub handler_symbol: Option<String>,
+    /// Persisted evidence items. An empty list means the claim recorded none.
+    /// Legacy input with no evidence projection leaves this as `None`.
+    pub source_evidence: Option<Vec<xtrace_domain::catalog_discovery::ClaimSourceEvidence>>,
     /// Request body media type, when the claim declares a body.
     pub request_body_media_type: Option<String>,
 }
@@ -214,7 +219,7 @@ pub struct CatalogSummaryInput {
     /// Location attributable to a handler only when exactly one claim exists.
     pub single_claim_handler: Option<HandlerInput>,
     /// Highest confidence across claims, not an individual claim's confidence.
-    pub highest_confidence_basis_points: u16,
+    pub highest_confidence_basis_points: Option<u16>,
     /// Distinct provenance labels.
     pub provenance: Vec<String>,
     /// Union of claim limitations.

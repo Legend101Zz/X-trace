@@ -7,6 +7,49 @@ mod common;
 use common::{spring_orders, text};
 use xtrace_export::{ExportFormat, ExportRequest, export};
 
+#[test]
+fn legacy_serialized_inputs_keep_summary_and_handler_gaps() {
+    use serde_json::{Value, json};
+
+    let input = xtrace_export::input_json::parse(&json!({
+        "revision": {"policy_digest": null},
+        "operations": [
+            {
+                "operation_id": "summary", "method": "GET", "route_template": "/summary",
+                "catalog_summary": {
+                    "claim_count": 2,
+                    "handler_symbols": ["First.get", "Second.get"],
+                    "highest_confidence_basis_points": 8200
+                }
+            },
+            {
+                "operation_id": "legacy", "method": "GET", "route_template": "/legacy",
+                "claims": [{
+                    "claim_id": "legacy-claim",
+                    "handler": {"symbol": "Legacy.get", "path": "Legacy.java", "line_start": 4}
+                }]
+            }
+        ]
+    }))
+    .unwrap();
+    let out = export(&input, &ExportRequest::new(ExportFormat::OpenApi)).unwrap();
+    let doc: Value = serde_json::from_slice(&out.files[0].bytes).unwrap();
+    assert_eq!(doc["info"]["x-xtrace"].get("policy_digest"), Some(&Value::Null));
+    let summary = &doc["paths"]["/summary"]["get"]["x-xtrace"];
+    assert_eq!(summary["claims_projection"], "unavailable");
+    assert_eq!(summary["handler_conflict"], true);
+    assert_eq!(summary["claim_count"], 2);
+    assert_eq!(summary["highest_confidence_basis_points"], 8200);
+    for field in ["claims", "handlers", "confidence_basis_points"] {
+        assert!(summary.get(field).is_none());
+    }
+    let legacy = &doc["paths"]["/legacy"]["get"]["x-xtrace"];
+    assert_eq!(legacy["handlers"][0]["line_start"], 4);
+    assert!(legacy["handlers"][0].get("line_end").is_none());
+    assert!(legacy.get("confidence_basis_points").is_none());
+    assert!(legacy.get("claims").is_none());
+}
+
 fn permute<T: Clone>(items: &[T], seed: u64) -> Vec<T> {
     let mut v = items.to_vec();
     let mut state = seed | 1;

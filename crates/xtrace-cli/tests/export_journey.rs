@@ -185,6 +185,18 @@ fn read(dir: &Path, name: &str) -> String {
     fs::read_to_string(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
+fn openapi_metadata(dir: &Path, route: &str, method: &str) -> Value {
+    let spec: Value = serde_json::from_str(&read(dir, "openapi.json")).unwrap();
+    spec["paths"][route][method]["x-xtrace"].clone()
+}
+
+fn comment_metadata(text: &str) -> Option<Value> {
+    text.lines().find_map(|line| {
+        let json = line.trim_start_matches("# ").strip_prefix("x-xtrace catalog metadata: ")?;
+        Some(serde_json::from_str(json).unwrap())
+    })
+}
+
 fn tree(dir: &Path) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
@@ -237,17 +249,23 @@ fn openapi_export_is_deterministic_private_and_describes_the_catalog() {
     // POST /orders has a linked recording, the others were only seen statically.
     assert_eq!(paths["/orders"]["post"]["x-xtrace"]["effective_state"], "observed");
     assert_eq!(paths["/orders/{id}"]["get"]["x-xtrace"]["effective_state"], "static_only");
-    let handler = &paths["/orders/{id}"]["get"]["x-xtrace"]["handlers"][0];
-    assert_eq!(handler["symbol"], "OrderController.get");
-    assert_eq!(handler["path"], "OrderController.java");
-    assert_eq!(handler["line_start"], 30);
-    assert!(handler.get("line_end").is_none(), "end line is unavailable, not the start line");
+    let metadata = &paths["/orders/{id}"]["get"]["x-xtrace"];
+    let claim = &metadata["claims"][0];
+    assert_eq!(metadata["claims_projection"], "available");
+    assert_eq!(metadata["claim_count"], 1);
+    assert_eq!(claim["handler_symbol"], "OrderController.get");
+    assert_eq!(claim["confidence_basis_points"], 5000);
+    let evidence = &claim["source_evidence"][0];
+    assert_eq!(evidence["relative_path"], "OrderController.java");
+    assert_eq!(evidence["start_line"], 30);
+    assert_eq!(evidence["end_line"], 31);
+    assert_eq!(evidence["verification"], "unverified");
     assert!(
         json(&first)["omissions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|o| o["what"] == "source" && o["reason"] == "source_end_line_unavailable")
+            .all(|o| o["reason"] != "source_end_line_unavailable")
     );
 
     // The output directory and its files are private.
@@ -445,8 +463,38 @@ fn secret_shaped_route_text_is_refused_by_every_format() {
     }
 }
 
+fn stored_claim(connection: &rusqlite::Connection, symbol: &str) -> (Vec<u8>, Value) {
+    let (id, json): (Vec<u8>, String) = connection
+        .query_row(
+            "SELECT claim_id, canonical_json FROM catalog_claims
+             WHERE json_extract(canonical_json, '$.handler_symbol') = ?1",
+            [symbol],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    (id, serde_json::from_str(&json).unwrap())
+}
+
+// The scripted analyzer emits one evidence item per claim. Extend the stored JSON to cover
+// evidence shapes the history reader can encounter beyond that analyzer's output.
+fn edit_claim_json(fx: &Fx, symbol: &str, edit: impl FnOnce(&mut Value)) -> String {
+    let connection = rusqlite::Connection::open(fx.database()).unwrap();
+    let (id, mut value) = stored_claim(&connection, symbol);
+    edit(&mut value);
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE catalog_claims SET canonical_json = ?1 WHERE claim_id = ?2",
+                rusqlite::params![value.to_string(), id],
+            )
+            .unwrap(),
+        1
+    );
+    uuid::Uuid::from_slice(&id).unwrap().to_string()
+}
+
 #[test]
-fn conflicting_handlers_are_summary_facts_never_synthetic_claim_locations() {
+fn export_distinct_claim_locations_and_confidences() {
     let transcript = TRANSCRIPT
         .replace(
             r#""method":"GET","routeParts":["/orders","/{id}"]"#,
@@ -454,6 +502,17 @@ fn conflicting_handlers_are_summary_facts_never_synthetic_claim_locations() {
         )
         .replace("OrderController.get", "AController.other");
     let fx = project_with_catalog(&transcript);
+    let additional = {
+        let connection = rusqlite::Connection::open(fx.database()).unwrap();
+        stored_claim(&connection, "FixtureAdminController.count").1["source_evidence"][0].clone()
+    };
+    let other_id = edit_claim_json(&fx, "AController.other", |claim| {
+        claim["source_evidence"].as_array_mut().unwrap().push(additional);
+    });
+    let create_id = edit_claim_json(&fx, "OrderController.create", |claim| {
+        claim["limitation_codes"] = serde_json::json!(["missing_response_schema"]);
+    });
+    let mut expected_claims = Value::Null;
     for format in ["openapi", "postman", "curl", "bundle"] {
         let out = fx.out_dir(&format!("conflict-{format}"));
         let result = fx.export(&["--format", format, "--output", out.to_str().unwrap()]);
@@ -467,29 +526,277 @@ fn conflicting_handlers_are_summary_facts_never_synthetic_claim_locations() {
         for symbol in ["AController.other", "OrderController.create"] {
             assert!(all.contains(symbol), "{format} lost {symbol}");
         }
-        let omissions = json(&result)["omissions"].as_array().unwrap().clone();
-        for reason in [
-            "handler_conflict_unresolved",
-            "per_claim_locations_unavailable",
-            "per_claim_confidence_unavailable",
-        ] {
-            assert!(omissions.iter().any(|o| o["reason"] == reason), "{omissions:?}");
-        }
+        let doc = json(&result);
+        let omissions = doc["omissions"].as_array().unwrap();
+        assert!(omissions.iter().any(|o| o["reason"] == "handler_conflict_unresolved"));
+        assert!(omissions.iter().all(|o| {
+            o["reason"] != "per_claim_locations_unavailable"
+                && o["reason"] != "per_claim_confidence_unavailable"
+        }));
+        let postman_metadata = || {
+            let doc: Value = serde_json::from_str(&read(&out, "collection.postman.json")).unwrap();
+            let request = doc["item"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == "POST /orders")
+                .unwrap();
+            comment_metadata(request["request"]["description"].as_str().unwrap()).unwrap()
+        };
+        let curl_metadata = || {
+            tree(&out)
+                .into_iter()
+                .filter(|(name, _)| name.ends_with("-post-orders.sh"))
+                .find_map(|(_, bytes)| comment_metadata(&String::from_utf8(bytes).unwrap()))
+                .unwrap()
+        };
+        let metadata = match format {
+            "openapi" => openapi_metadata(&out, "/orders", "post"),
+            "postman" => postman_metadata(),
+            "curl" => curl_metadata(),
+            "bundle" => {
+                let yaml = read(&out, "openapi.yaml");
+                for id in [&other_id, &create_id] {
+                    assert!(yaml.contains(id));
+                }
+                assert_eq!(postman_metadata(), curl_metadata());
+                postman_metadata()
+            }
+            _ => unreachable!(),
+        };
         if format == "openapi" {
-            let spec: Value = serde_json::from_str(&read(&out, "openapi.json")).unwrap();
-            let x = &spec["paths"]["/orders"]["post"]["x-xtrace"];
             assert_eq!(
-                x["handler_symbols"],
+                metadata["handler_symbols"],
                 serde_json::json!(["AController.other", "OrderController.create"])
             );
-            assert_eq!(x["handler_conflict"], true);
-            assert_eq!(x["claim_count"], 2);
-            assert_eq!(x["claims_projection"], "unavailable");
-            assert!(x["highest_confidence_basis_points"].as_u64().is_some());
-            assert!(x.get("confidence_basis_points").is_none());
-            assert!(x.get("handlers").is_none(), "no fabricated symbol/location pairs");
-            assert!(x.get("line_end").is_none(), "no fabricated one-line extent");
+            assert!(metadata.get("highest_confidence_basis_points").is_none());
+            assert!(metadata.get("confidence_basis_points").is_none());
+            assert!(metadata.get("handlers").is_none(), "locations belong to claims");
+            assert!(metadata.get("line_end").is_none(), "no operation-level range");
+            expected_claims = metadata["claims"].clone();
         }
+        assert_eq!(metadata["handler_conflict"], true);
+        assert_eq!(metadata["claim_count"], 2);
+        assert_eq!(metadata["claims_projection"], "available");
+        assert_eq!(metadata["claims"], expected_claims);
+        let claims = metadata["claims"].as_array().unwrap();
+        for (id, symbol, confidence, locations) in [
+            (
+                &other_id,
+                "AController.other",
+                5000,
+                &[("OrderController.java", 30, 31), ("FixtureAdminController.java", 20, 21)][..],
+            ),
+            (&create_id, "OrderController.create", 9000, &[("OrderController.java", 23, 24)][..]),
+        ] {
+            let claim = claims
+                .iter()
+                .find(|claim| claim["claim_id"].as_str() == Some(id.as_str()))
+                .unwrap();
+            assert_eq!(claim["handler_symbol"], symbol);
+            assert_eq!(claim["confidence_basis_points"], confidence);
+            assert_eq!(claim["provenance"], "static_inferred");
+            let evidence = claim["source_evidence"].as_array().unwrap();
+            assert_eq!(evidence.len(), locations.len());
+            for (evidence, (path, start, end)) in evidence.iter().zip(locations) {
+                assert_eq!(evidence["kind"], "static_snapshot");
+                assert_eq!(evidence["relative_path"], *path);
+                assert_eq!(evidence["start_line"], *start);
+                assert_eq!(evidence["end_line"], *end);
+                assert_eq!(evidence["verification"], "unverified");
+                assert!(evidence["source_revision_id"].as_str().is_some());
+                assert!(evidence["recorded_source_digest"].as_str().is_some());
+            }
+            if id == &create_id {
+                assert_eq!(
+                    claim["limitation_codes"],
+                    serde_json::json!(["missing_response_schema"])
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn export_revision_claims_survive_restart_without_cross_revision_leakage() {
+    use xtrace_application::catalog_discovery::history::CatalogHistoryPort;
+    use xtrace_domain::{CatalogRevisionId, ProjectId};
+    use xtrace_store::catalog_history_store::SqliteCatalogHistoryStore;
+    use xtrace_store::{OpenOptions, SqliteStore};
+
+    let fx = project_with_catalog(TRANSCRIPT);
+    let before = fx.out_dir("before");
+    let export = fx.export(&["--format", "openapi", "--output", before.to_str().unwrap()]);
+    assert_eq!(export.status.code(), Some(0), "{export:?}");
+    let first = json(&export);
+    let old_revision = first["revisionId"].as_str().unwrap();
+    let old_orders = openapi_metadata(&before, "/orders", "post");
+    let old_carried = openapi_metadata(&before, "/orders/{id}", "get");
+
+    let next = TRANSCRIPT
+        .lines()
+        .enumerate()
+        .filter(|(index, _)| *index != 2)
+        .map(|(_, line)| {
+            line.replace("OrderController.create", "OrderController.createUpdated")
+                .replace("\"claims\":3", "\"claims\":2")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let scan = fx.scan(&fx.write_analyzer(&next));
+    assert_eq!(scan.status.code(), Some(0), "{scan:?}");
+    let scan_doc = json(&scan);
+    let new_revision = scan_doc["catalogRevisionId"].as_str().unwrap();
+    assert_ne!(old_revision, new_revision);
+    assert_eq!(scan_doc["parentRevisionId"], old_revision);
+
+    // Every export opens the catalog in a new process.
+    let latest = fx.out_dir("latest");
+    let export = fx.export(&[
+        "--format",
+        "openapi",
+        "--revision",
+        new_revision,
+        "--output",
+        latest.to_str().unwrap(),
+    ]);
+    assert_eq!(export.status.code(), Some(0), "{export:?}");
+    assert_eq!(json(&export)["operationCount"], 3);
+    let new_orders = openapi_metadata(&latest, "/orders", "post");
+    assert_eq!(new_orders["operation_id"], old_orders["operation_id"]);
+    assert_eq!(new_orders["claim_count"], 1);
+    assert_ne!(new_orders["claims"][0]["claim_id"], old_orders["claims"][0]["claim_id"]);
+    assert_eq!(new_orders["claims"][0]["handler_symbol"], "OrderController.createUpdated");
+    let carried = openapi_metadata(&latest, "/orders/{id}", "get");
+    assert_eq!(carried["operation_id"], old_carried["operation_id"]);
+    assert_eq!(carried["effective_state"], "unknown");
+    assert_eq!(carried["claims_projection"], "available");
+    assert_eq!(carried["claim_count"], 0);
+    assert_eq!(carried["claims"], serde_json::json!([]));
+    assert_eq!(carried["handler_symbols"], serde_json::json!([]));
+    assert!(
+        !read(&latest, "openapi.json")
+            .contains(old_carried["claims"][0]["claim_id"].as_str().unwrap())
+    );
+
+    let historical = fx.out_dir("historical");
+    let export = fx.export(&[
+        "--format",
+        "openapi",
+        "--revision",
+        old_revision,
+        "--output",
+        historical.to_str().unwrap(),
+    ]);
+    assert_eq!(export.status.code(), Some(0), "{export:?}");
+    assert_eq!(tree(&historical), tree(&before));
+
+    let store =
+        SqliteStore::open(&fx.database(), OpenOptions::default().with_must_exist(true)).unwrap();
+    let history = SqliteCatalogHistoryStore::new(store);
+    let revision = CatalogRevisionId::from_uuid(uuid::Uuid::parse_str(new_revision).unwrap());
+    assert!(history.revision_operations(ProjectId::new(), revision).unwrap().is_empty());
+}
+
+#[test]
+fn export_missing_claim_fields_remain_unknown() {
+    let fx = project_with_catalog(TRANSCRIPT);
+    let id = edit_claim_json(&fx, "OrderController.get", |claim| {
+        let fields = claim.as_object_mut().unwrap();
+        fields.remove("handler_symbol");
+        fields.remove("confidence_basis_points");
+        claim["source_evidence"] = serde_json::json!([
+            {"kind": "runtime_hint", "relative_path": "OrderController.java",
+                "start_line": 30, "start_column": 3},
+            {"kind": "unavailable", "reason_code": "debug_metadata_absent"}
+        ]);
+    });
+    edit_claim_json(&fx, "OrderController.create", |claim| {
+        claim["source_evidence"] = serde_json::json!([]);
+    });
+    let out = fx.out_dir("missing");
+    let result = fx.export(&["--format", "openapi", "--output", out.to_str().unwrap()]);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    let metadata = openapi_metadata(&out, "/orders/{id}", "get");
+    let claim = &metadata["claims"][0];
+    assert_eq!(claim["claim_id"], id);
+    assert_eq!(claim.get("handler_symbol"), Some(&Value::Null));
+    assert_eq!(claim.get("confidence_basis_points"), Some(&Value::Null));
+    assert!(metadata.get("confidence_basis_points").is_none());
+    assert!(metadata.get("handlers").is_none());
+    let evidence = claim["source_evidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 2);
+    assert_eq!(evidence[0]["start_line"], 30);
+    assert_eq!(evidence[0]["verification"], "unverified");
+    assert_eq!(evidence[0].get("end_line"), Some(&Value::Null));
+    assert_eq!(evidence[0].get("end_column"), Some(&Value::Null));
+    assert_eq!(evidence[1]["kind"], "unavailable");
+    assert_eq!(evidence[1]["verification"], "unavailable");
+    assert_eq!(evidence[1]["reason_code"], "debug_metadata_absent");
+    assert_eq!(evidence[1].get("relative_path"), Some(&Value::Null));
+    assert_eq!(
+        openapi_metadata(&out, "/orders", "post")["claims"][0]["source_evidence"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn export_unsafe_claim_locations_are_not_disclosed() {
+    let fx = project_with_catalog(TRANSCRIPT);
+    let unsafe_paths = ["/outside/export-private.java", "../traversal.java", r"Q:\drive.java"];
+    edit_claim_json(&fx, "OrderController.get", |claim| {
+        let items = claim["source_evidence"].as_array_mut().unwrap();
+        let safe = items[0].clone();
+        for path in unsafe_paths {
+            let mut unsafe_item = safe.clone();
+            unsafe_item["relative_path"] = path.into();
+            items.push(unsafe_item);
+        }
+    });
+    for format in ["openapi", "postman", "curl", "bundle"] {
+        let out = fx.out_dir(&format!("unsafe-{format}"));
+        let result = fx.export(&["--format", format, "--output", out.to_str().unwrap()]);
+        assert_eq!(result.status.code(), Some(0), "{result:?}");
+        assert!(
+            json(&result)["omissions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["reason"] == "source_path_not_repo_relative")
+        );
+        for (_, bytes) in tree(&out) {
+            let text = String::from_utf8(bytes).unwrap();
+            for fragment in ["export-private.java", "traversal.java", "drive.java"] {
+                assert!(!text.contains(fragment), "{format} leaked {fragment}");
+            }
+        }
+        if format == "openapi" {
+            let metadata = openapi_metadata(&out, "/orders/{id}", "get");
+            let evidence = metadata["claims"][0]["source_evidence"].as_array().unwrap();
+            assert_eq!(evidence.len(), 4);
+            assert_eq!(evidence[0]["relative_path"], "OrderController.java");
+            assert_eq!(evidence[0]["start_line"], 30);
+            for omitted in &evidence[1..] {
+                assert_eq!(omitted["location_omitted"], "path_not_repo_relative");
+                for field in
+                    ["relative_path", "start_line", "start_column", "end_line", "end_column"]
+                {
+                    assert!(omitted.get(field).is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn secret_shaped_claim_evidence_is_refused_by_every_format() {
+    let fx = project_with_catalog(TRANSCRIPT);
+    edit_claim_json(&fx, "OrderController.get", |claim| {
+        claim["source_evidence"][0]["relative_path"] = "src/password:hunter2hunter2.java".into();
+    });
+    for format in ["openapi", "postman", "curl", "bundle"] {
+        assert_refused(&fx, format, "hunter2");
     }
 }
 
@@ -649,7 +956,7 @@ fn existing_output_is_refused_without_stale_or_mixed_files() {
 }
 
 #[test]
-fn bundle_contains_deterministic_payload_hashes_counts_and_explicit_policy_gap() {
+fn bundle_and_openapi_policy_digest_unknown_without_revision_provenance() {
     let fx = project_with_catalog(TRANSCRIPT);
     let a = fx.out_dir("bundle-a");
     let b = fx.out_dir("bundle-b");
@@ -677,8 +984,18 @@ fn bundle_contains_deterministic_payload_hashes_counts_and_explicit_policy_gap()
     let manifest: Value = serde_json::from_str(&read(&a, "manifest.json")).unwrap();
     assert_eq!(manifest["revision_id"], results[0]["revisionId"]);
     assert_eq!(manifest["catalog_hash"].as_str().unwrap().len(), 64);
-    assert!(manifest["policy_digest"].is_null());
+    assert_eq!(manifest.get("policy_digest"), Some(&Value::Null));
     assert!(manifest["omissions"].as_array().unwrap().iter().any(|o| o["what"] == "policy_digest" && o["reason"] == "not_available_in_catalog_view"));
+    assert!(read(&a, "openapi.yaml").contains("policy_digest: null"));
+    let openapi = fx.out_dir("openapi-policy");
+    let output = fx.export(&["--format", "openapi", "--output", openapi.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: Value = serde_json::from_str(&read(&openapi, "openapi.json")).unwrap();
+    let metadata = &document["info"]["x-xtrace"];
+    assert_eq!(metadata.get("policy_digest"), Some(&Value::Null));
+    assert!(metadata["omissions"].as_array().unwrap().iter().any(|o| {
+        o["what"] == "policy_digest" && o["reason"] == "not_available_in_catalog_view"
+    }));
     let files = manifest["files"].as_array().unwrap();
     assert_eq!(files.len(), 6);
     assert_eq!(tree(&a).len(), 8, "only payload, manifest and README");

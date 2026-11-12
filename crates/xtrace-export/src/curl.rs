@@ -91,7 +91,7 @@ struct Recipe {
     omissions: Vec<Omission>,
 }
 
-fn recipe(op: &PreparedOp, ordinal: u32) -> Recipe {
+fn recipe(op: &PreparedOp, ordinal: u32) -> Result<Recipe, ExportError> {
     let mut omissions = Vec::new();
     let mut omit = |what: String, reason: &str| {
         omissions.push(Omission {
@@ -224,7 +224,10 @@ fn recipe(op: &PreparedOp, ordinal: u32) -> Recipe {
     s.push_str(&format!("# route: {} {}\n", comment_safe(&op.method), comment_safe(&op.path)));
     s.push_str(&format!("# catalog state: {}\n", op.state.name()));
     if let Some(metadata) = crate::projection::catalog_metadata(op) {
-        s.push_str(&format!("# x-xtrace catalog summary: {metadata}\n"));
+        if let Some(path) = sanitize::gate(&metadata) {
+            return Err(ExportError::SecretShaped { path });
+        }
+        s.push_str(&format!("# x-xtrace catalog metadata: {metadata}\n"));
     }
     if mutating {
         s.push_str(&format!(
@@ -251,7 +254,7 @@ fn recipe(op: &PreparedOp, ordinal: u32) -> Recipe {
     s.push_str(" \\\n  ");
     s.push_str(&url);
     s.push('\n');
-    Recipe { script: s, omissions }
+    Ok(Recipe { script: s, omissions })
 }
 
 fn push_literal(url: &mut String, literal: &str, omit: &mut impl FnMut(String, &str)) {
@@ -293,7 +296,7 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
     all.push_str("set -u\n");
     for (i, op) in prepared.ops.iter().enumerate() {
         let name = file_name(i + 1, op);
-        let r = recipe(op, u32::try_from(i + 1).unwrap_or(u32::MAX));
+        let r = recipe(op, u32::try_from(i + 1).unwrap_or(u32::MAX))?;
         if let Some(path) = secret_in(&r.script) {
             return Err(ExportError::SecretShaped { path: format!("{name}:{path}") });
         }

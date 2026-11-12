@@ -6,8 +6,8 @@
 use serde_json::Value;
 
 use crate::request::{
-    ClaimInput, EffectiveState, ExampleInput, ExampleOrigin, ExportInput, HandlerInput,
-    OperationInput, ParamInput, ResponseInput, RevisionInput,
+    CatalogSummaryInput, ClaimInput, EffectiveState, ExampleInput, ExampleOrigin, ExportInput,
+    HandlerInput, OperationInput, ParamInput, ResponseInput, RevisionInput,
 };
 
 type Obj = serde_json::Map<String, Value>;
@@ -21,6 +21,14 @@ fn s(o: &Obj, key: &str, at: &str) -> Result<String, String> {
         Some(Value::String(v)) => Ok(v.clone()),
         Some(_) => Err(format!("{at}.{key}: expected a string")),
         None => Ok(String::new()),
+    }
+}
+
+fn optional_string(o: &Obj, key: &str, at: &str) -> Result<Option<String>, String> {
+    match o.get(key) {
+        Some(Value::String(v)) => Ok(Some(v.clone())),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("{at}.{key}: expected a string")),
     }
 }
 
@@ -91,7 +99,7 @@ pub fn parse(doc: &Value) -> Result<ExportInput, String> {
                 ordinal: u32::try_from(n(o, "ordinal", "revision")?.unwrap_or(0))
                     .map_err(|_| "revision.ordinal: too large".to_owned())?,
                 catalog_hash: s(o, "catalog_hash", "revision")?,
-                policy_digest: s(o, "policy_digest", "revision")?,
+                policy_digest: optional_string(o, "policy_digest", "revision")?.unwrap_or_default(),
                 application_name: s(o, "application_name", "revision")?,
             }
         }
@@ -105,6 +113,9 @@ pub fn parse(doc: &Value) -> Result<ExportInput, String> {
         for (j, c) in arr(o, "claims", &at)?.iter().enumerate() {
             claims.push(claim(c, &format!("{at}.claims[{j}]"))?);
         }
+        let catalog_summary = non_null(o, "catalog_summary")
+            .map(|summary| catalog_summary(summary, &format!("{at}.catalog_summary")))
+            .transpose()?;
         operations.push(OperationInput {
             operation_id: req(o, "operation_id", &at)?,
             method: req(o, "method", &at)?,
@@ -112,9 +123,9 @@ pub fn parse(doc: &Value) -> Result<ExportInput, String> {
             application_component: s(o, "application_component", &at)?,
             binding_key: s(o, "binding_key", &at)?,
             effective_state: state(&s(o, "effective_state", &at)?, &at)?,
-            claims_available: b(o, "claims_available", true, &at)?,
+            claims_available: b(o, "claims_available", catalog_summary.is_none(), &at)?,
             claims,
-            catalog_summary: None,
+            catalog_summary,
         });
     }
     Ok(ExportInput { revision: rev, operations, truncated: b(root, "truncated", false, "$")? })
@@ -125,6 +136,13 @@ fn claim(v: &Value, at: &str) -> Result<ClaimInput, String> {
     let mut out = ClaimInput {
         claim_id: req(o, "claim_id", at)?,
         provenance: s(o, "provenance", at)?,
+        handler_symbol: optional_string(o, "handler_symbol", at)?,
+        source_evidence: non_null(o, "source_evidence")
+            .map(|evidence| {
+                serde_json::from_value(evidence.clone())
+                    .map_err(|_| format!("{at}.source_evidence: invalid claim evidence"))
+            })
+            .transpose()?,
         confidence_basis_points: n(o, "confidence_basis_points", at)?
             .map(|x| {
                 u16::try_from(x).map_err(|_| format!("{at}.confidence_basis_points: too large"))
@@ -170,22 +188,60 @@ fn claim(v: &Value, at: &str) -> Result<ClaimInput, String> {
             value: s(eo, "value", &a)?,
         });
     }
-    if let Some(h) = o.get("handler") {
-        let a = format!("{at}.handler");
-        let ho = obj(h, &a)?;
-        let line = |k: &str| -> Result<u32, String> {
-            u32::try_from(n(ho, k, &a)?.unwrap_or(0)).map_err(|_| format!("{a}.{k}: too large"))
-        };
-        out.handler = Some(HandlerInput {
-            symbol: s(ho, "symbol", &a)?,
-            path: s(ho, "path", &a)?,
-            line_start: line("line_start")?,
-            line_end: n(ho, "line_end", &a)?
-                .map(|n| u32::try_from(n).map_err(|_| format!("{a}.line_end: too large")))
-                .transpose()?,
-        });
-    }
+    out.handler =
+        non_null(o, "handler").map(|value| handler(value, &format!("{at}.handler"))).transpose()?;
     Ok(out)
+}
+
+fn non_null<'a>(o: &'a Obj, key: &str) -> Option<&'a Value> {
+    o.get(key).filter(|value| !value.is_null())
+}
+
+fn handler(value: &Value, at: &str) -> Result<HandlerInput, String> {
+    let o = obj(value, at)?;
+    let line = |key| {
+        n(o, key, at)?
+            .map(|n| u32::try_from(n).map_err(|_| format!("{at}.{key}: too large")))
+            .transpose()
+    };
+    Ok(HandlerInput {
+        symbol: s(o, "symbol", at)?,
+        path: s(o, "path", at)?,
+        line_start: line("line_start")?.unwrap_or(0),
+        line_end: line("line_end")?,
+    })
+}
+
+fn catalog_summary(value: &Value, at: &str) -> Result<CatalogSummaryInput, String> {
+    let o = obj(value, at)?;
+    let strings = |key| {
+        arr(o, key, at)?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("{at}.{key}: expected an array of strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let count = n(o, "claim_count", at)?.ok_or_else(|| format!("{at}.claim_count: required"))?;
+    Ok(CatalogSummaryInput {
+        claim_count: usize::try_from(count).map_err(|_| format!("{at}.claim_count: too large"))?,
+        handler_symbols: strings("handler_symbols")?,
+        handler_conflict: b(o, "handler_conflict", false, at)?,
+        single_claim_handler: non_null(o, "single_claim_handler")
+            .map(|value| handler(value, &format!("{at}.single_claim_handler")))
+            .transpose()?,
+        highest_confidence_basis_points: n(o, "highest_confidence_basis_points", at)?
+            .map(|n| {
+                u16::try_from(n)
+                    .map_err(|_| format!("{at}.highest_confidence_basis_points: too large"))
+            })
+            .transpose()?,
+        provenance: strings("provenance")?,
+        limitation_codes: strings("limitation_codes")?,
+    })
 }
 
 #[cfg(test)]

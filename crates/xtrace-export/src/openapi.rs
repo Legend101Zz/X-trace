@@ -203,9 +203,17 @@ pub fn document(prepared: &Prepared) -> (Value, Vec<Omission>) {
             .or_default()
             .insert(op.method.to_ascii_lowercase(), operation_json(op, id));
     }
+    let rev = &prepared.revision;
+    let policy_digest = (!rev.policy_digest.is_empty()).then_some(rev.policy_digest.as_str());
+    if policy_digest.is_none() {
+        omissions.push(Omission {
+            operation_id: String::new(),
+            what: "policy_digest".to_owned(),
+            reason: "not_available_in_catalog_view".to_owned(),
+        });
+    }
     omissions.sort();
     omissions.dedup();
-    let rev = &prepared.revision;
     let title = if rev.application_name.is_empty() {
         "X-trace catalog export".to_owned()
     } else {
@@ -219,7 +227,7 @@ pub fn document(prepared: &Prepared) -> (Value, Vec<Omission>) {
             "x-xtrace": {
                 "revision_id": rev.revision_id,
                 "catalog_hash": rev.catalog_hash,
-                "policy_digest": rev.policy_digest,
+                "policy_digest": policy_digest,
                 "notice": "Generated from the X-trace catalog. effective_state says how each operation was learned; no request or response bodies were observed or retained.",
                 "omissions": omissions.iter().map(|o| json!({
                     "operation_id": o.operation_id, "what": o.what, "reason": o.reason,

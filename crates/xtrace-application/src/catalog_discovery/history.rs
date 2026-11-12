@@ -10,11 +10,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
+use xtrace_domain::catalog_discovery::ClaimSourceEvidence;
 use xtrace_domain::catalog_reconcile::{
     ObservedEndpoint, Reconciliation, StaticEndpoint, reconcile,
 };
 use xtrace_domain::{
-    CatalogRevisionId, ContentHash, OperationId, ProjectId, RunId, SourceRevisionId,
+    CatalogRevisionId, ClaimId, ContentHash, OperationId, ProjectId, RunId, SourceRevisionId,
 };
 
 use super::{CatalogChangeKind, CatalogSourceAvailability};
@@ -105,6 +106,27 @@ pub struct OperationView {
     pub source_path: Option<String>,
     /// 1-based line of the first claim.
     pub source_line: Option<u32>,
+    /// Exact claims linked to this operation in this revision. The serialized history view
+    /// retains its existing summary contract.
+    #[serde(skip)]
+    pub claims: Vec<RevisionClaim>,
+}
+
+/// Persisted claim fields for export. Source evidence is a producer assertion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevisionClaim {
+    /// Persisted claim identity.
+    pub claim_id: ClaimId,
+    /// Persisted provenance label.
+    pub provenance: String,
+    /// Handler symbol, when reported.
+    pub handler_symbol: Option<String>,
+    /// Confidence, when reported.
+    pub confidence_basis_points: Option<u16>,
+    /// Limitations recorded on this claim.
+    pub limitation_codes: Vec<String>,
+    /// Every evidence item recorded on this claim, including unavailable evidence.
+    pub source_evidence: Vec<ClaimSourceEvidence>,
 }
 
 /// An endpoint a recording matched, with the number of matching recordings.
@@ -511,6 +533,7 @@ mod tests {
             claim_count: 1,
             source_path: None,
             source_line: None,
+            claims: Vec::new(),
         }
     }
 
