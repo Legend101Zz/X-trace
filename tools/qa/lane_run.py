@@ -752,7 +752,7 @@ SPRING_ORDER_WAIT_MAX_BYTES = 64
 SPRING_ORDER_WAIT_RECORD = re.compile(rb"v1 ([a-z-]{1,32}) (0|[1-9][0-9]?) ([0-3])\n")
 
 
-def _spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index) -> dict:
+def spring_order_wait(directory: pathlib.Path, metadata: CheckoutMetadata, index) -> dict:
     """Rebuild a single deadline observation from the task's private diagnostic file."""
     unavailable = {"status": "unavailable"}
     if not metadata.rust_progress_test(SPRING_ORDER_WAIT_TEST, SPRING_ORDER_WAIT_TARGET, index):
@@ -1366,7 +1366,7 @@ def finalize_run(args, *, cmd, log_path, metadata, diagnostic_directory, code, t
     if status == "fail":
         frag["timedOut"] = timed_out
         if suite == "rust" and diagnostic_directory is not None and rust_timing.is_test_command(cmd):
-            frag["springPremainOrderWait"] = _spring_order_wait(diagnostic_directory, metadata, index)
+            frag["springPremainOrderWait"] = spring_order_wait(diagnostic_directory, metadata, index)
         frag["failureDetails"] = (failure_details(
             text, timed_out, budget=_remaining_excerpt_budget(out, fragment_path), index=index, metadata=metadata,
             diagnostic_records=_ci_diagnostics(diagnostic_directory, metadata, index))
