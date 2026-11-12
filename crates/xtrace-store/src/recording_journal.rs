@@ -16,6 +16,18 @@ use xtrace_protocol::xtf::XtfEventEnvelope;
 
 use super::*;
 
+// The parent module declares its wrapper after this module. Share its observer here.
+macro_rules! object_io {
+    ($source:ident, $site:ident, $id:expr, $call:expr) => {{
+        #[cfg(all(test, unix, debug_assertions))]
+        let result =
+            object_diagnostic::$source(object_diagnostic::ObjectIoSite::$site, $id, || $call);
+        #[cfg(not(all(test, unix, debug_assertions)))]
+        let result = ($call).map_err(|_| object_io_error($id));
+        result
+    }};
+}
+
 const LEGACY_MAGIC: &[u8; 8] = b"XTRTAIL1";
 const MAGIC: &[u8; 8] = b"XTRTAIL2";
 const BOUNDARY_BYTES: usize = HEADER_BYTES + 8 + 32;
@@ -40,6 +52,33 @@ thread_local! {
     static SYNC_ORDER: std::cell::RefCell<Vec<SyncKind>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(all(test, unix, debug_assertions))]
+thread_local! {
+    static SYNC_FAILURE: std::cell::Cell<Option<(SyncKind, rustix::io::Errno)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, unix, debug_assertions))]
+// Substitute a sync error only for the calling test and only while this guard lives.
+pub(crate) struct SyncFailure(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(all(test, unix, debug_assertions))]
+impl SyncFailure {
+    pub(crate) fn enter(kind: SyncKind, errno: rustix::io::Errno) -> Self {
+        SYNC_FAILURE.with(|slot| {
+            assert!(slot.get().is_none());
+            slot.set(Some((kind, errno)));
+        });
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[cfg(all(test, unix, debug_assertions))]
+impl Drop for SyncFailure {
+    fn drop(&mut self) {
+        SYNC_FAILURE.with(|slot| slot.set(None));
+    }
+}
+
 // Coordinate only journal mutation/publication, not the recording writer: a
 // reader must still complete while an append is waiting for its data sync.
 // Paths, rather than store instances, also cover independently opened readers.
@@ -52,7 +91,12 @@ pub(super) fn snapshot_lock(
     #[cfg(test)]
     let mut phase = work_profile::Phase::enter("snapshot_registry_mutex_wait");
     static LOCKS: OnceLock<Mutex<SnapshotLocks>> = OnceLock::new();
-    let mut locks = LOCKS.get_or_init(Mutex::default).lock().map_err(|_| object_io_error(id))?;
+    let mut locks = object_io!(
+        missing,
+        JournalSnapshotRegistryLock,
+        id,
+        LOCKS.get_or_init(Mutex::default).lock()
+    )?;
     #[cfg(test)]
     phase.switch("snapshot_registry_scan");
     locks.retain(|_, lock| lock.strong_count() != 0);
@@ -83,8 +127,12 @@ fn snapshot_file_lock(
 
     #[cfg(test)]
     let mut phase = work_profile::Phase::enter("flock_admission");
-    let file = xtrace_private_storage::open_private_directory_descriptor(root.path())
-        .map_err(|_| object_io_error(id))?;
+    let file = object_io!(
+        private,
+        JournalLockDirectoryOpen,
+        id,
+        xtrace_private_storage::open_private_directory_descriptor(root.path())
+    )?;
     let operation =
         if exclusive { FlockOperation::LockExclusive } else { FlockOperation::LockShared };
     #[cfg(test)]
@@ -97,7 +145,7 @@ fn snapshot_file_lock(
             Ok(()) => {
                 #[cfg(test)]
                 phase.switch("flock_revalidate");
-                root.revalidate().map_err(|_| object_io_error(id))?;
+                object_io!(private, JournalLockRevalidate, id, root.revalidate())?;
                 return Ok(file);
             }
             Err(rustix::io::Errno::WOULDBLOCK) => SNAPSHOT_CONTENDED.with(|hook| {
@@ -105,13 +153,13 @@ fn snapshot_file_lock(
                     hook();
                 }
             }),
-            Err(_) => return Err(object_io_error(id)),
+            Err(error) => return object_io!(direct, JournalFlock, id, Err(error)),
         }
     }
-    flock(&file, operation).map_err(|_| object_io_error(id))?;
+    object_io!(direct, JournalFlock, id, flock(&file, operation))?;
     #[cfg(test)]
     phase.switch("flock_revalidate");
-    root.revalidate().map_err(|_| object_io_error(id))?;
+    object_io!(private, JournalLockRevalidate, id, root.revalidate())?;
     Ok(file)
 }
 
@@ -157,6 +205,12 @@ fn durable_sync(
     #[cfg(not(test))]
     let count_only = false;
     if !count_only {
+        #[cfg(all(test, unix, debug_assertions))]
+        if let Some((_, errno)) =
+            SYNC_FAILURE.with(|slot| slot.get().filter(|(kind, _)| *kind == _kind))
+        {
+            return Err(errno.into());
+        }
         sync()?;
     }
     #[cfg(test)]
@@ -200,18 +254,26 @@ fn sync_directory_descriptor(file: &std::fs::File) -> std::io::Result<()> {
     })
 }
 
-fn sync_journal_directory(root: &AdmittedPrivateRoot) -> Result<(), PrivateStorageError> {
+fn sync_journal_directory(
+    root: &AdmittedPrivateRoot,
+    id: CorrelationId,
+) -> Result<(), RecordingStoreError> {
     #[cfg(unix)]
     let _admission_caller = CallerGuard::enter(Caller::JournalSync);
-    root.revalidate()?;
+    object_io!(private, JournalSyncDirectoryRevalidate, id, root.revalidate())?;
     #[cfg(unix)]
     {
-        let file = xtrace_private_storage::open_private_directory_descriptor(root.path())?;
-        sync_directory_descriptor(&file).map_err(|_| PrivateStorageError::Operation)?;
+        let file = object_io!(
+            private,
+            JournalSyncDirectoryOpen,
+            id,
+            xtrace_private_storage::open_private_directory_descriptor(root.path())
+        )?;
+        object_io!(direct, JournalDirectorySync, id, sync_directory_descriptor(&file))?;
     }
     #[cfg(not(unix))]
-    root.sync()?;
-    root.revalidate()
+    object_io!(private, JournalDirectorySync, id, root.sync())?;
+    object_io!(private, JournalSyncDirectoryRevalidate, id, root.revalidate())
 }
 
 #[cfg(test)]
@@ -258,24 +320,31 @@ fn directory(
     // The binding already owns and has just revalidated this capability.
     // Child APIs still rewalk ancestors and check the named child themselves.
     let root = &binding.private_root;
+    let open_child = || {
+        object_io!(private, JournalDirectoryOpen, id, root.open_private_child("journals")).map(Some)
+    };
     if create {
         if std::fs::symlink_metadata(binding.root.join("journals")).is_ok() {
-            return root.open_private_child("journals").map(Some).map_err(|_| object_io_error(id));
+            return open_child();
         }
         // A reader that found no journals retains a shared parent lock through
         // its SQLite snapshot. Creation must wait until that read completes.
         #[cfg(unix)]
         let _creation = snapshot_file_lock(root, true, id)?;
-        let child =
-            root.open_or_create_private_child("journals").map_err(|_| object_io_error(id))?;
+        let child = object_io!(
+            private,
+            JournalDirectoryOpenOrCreate,
+            id,
+            root.open_or_create_private_child("journals")
+        )?;
         // Each cold writer syncs this parent before acknowledging. In
         // particular it must do so again after an ambiguous creation failure.
         Ok(Some(child))
     } else {
         match std::fs::symlink_metadata(binding.root.join("journals")) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(_) => Err(object_io_error(id)),
-            Ok(_) => root.open_private_child("journals").map(Some).map_err(|_| object_io_error(id)),
+            Err(error) => object_io!(direct, JournalDirectoryMetadata, id, Err(error)),
+            Ok(_) => open_child(),
         }
     }
 }
@@ -298,13 +367,14 @@ fn read_boundary(
     let name = boundary_name(recording_id);
     match std::fs::symlink_metadata(root.path().join(&name)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(object_io_error(id)),
+        Err(error) => return object_io!(direct, CheckpointMetadata, id, Err(error)),
         Ok(metadata) if metadata.len() != BOUNDARY_BYTES as u64 => {
             return Err(object_corrupt_error(id));
         }
         Ok(_) => {}
     }
-    let bytes = root.read_bounded_file(&name, BOUNDARY_BYTES).map_err(|_| object_io_error(id))?;
+    let bytes =
+        object_io!(private, CheckpointRead, id, root.read_bounded_file(&name, BOUNDARY_BYTES))?;
     if bytes.len() != BOUNDARY_BYTES
         || blake3::hash(&bytes[..HEADER_BYTES + 8]).as_bytes() != &bytes[HEADER_BYTES + 8..]
         || &bytes[24..40] != recording_id.as_uuid().as_bytes()
@@ -332,13 +402,27 @@ fn prepare_boundary(
     let mut bytes = header.to_vec();
     bytes.extend_from_slice(&length.to_be_bytes());
     bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
-    let mut file = root.open_or_create_private_file(&pending).map_err(|_| object_io_error(id))?;
-    file.set_len(0).map_err(|_| object_io_error(id))?;
-    file.write_all(&bytes).map_err(|_| object_io_error(id))?;
+    let mut file = object_io!(
+        private,
+        CheckpointOpenOrCreate,
+        id,
+        root.open_or_create_private_file(&pending)
+    )?;
+    object_io!(direct, CheckpointTruncate, id, file.set_len(0))?;
+    object_io!(direct, CheckpointWrite, id, file.write_all(&bytes))?;
     commit_failpoint("journal-checkpoint-before-sync", id, false)?;
-    durable_sync(SyncKind::Checkpoint, || sync_recording_file(&file, FileSync::Filesystem))
-        .map_err(|_| object_io_error(id))?;
-    root.validate_file_binding(&pending, &file, true).map_err(|_| object_io_error(id))?;
+    object_io!(
+        direct,
+        CheckpointSync,
+        id,
+        durable_sync(SyncKind::Checkpoint, || sync_recording_file(&file, FileSync::Filesystem))
+    )?;
+    object_io!(
+        private,
+        CheckpointPendingBinding,
+        id,
+        root.validate_file_binding(&pending, &file, true)
+    )?;
     Ok(file)
 }
 
@@ -366,7 +450,7 @@ fn publish_boundary(
     let _snapshot = {
         #[cfg(test)]
         let _phase = work_profile::Phase::enter("publication_rwlock_wait");
-        lock.write().map_err(|_| object_io_error(id))?
+        object_io!(missing, JournalSnapshotWriteLock, id, lock.write())?
     };
     #[cfg(unix)]
     let directory = snapshot_file_lock(root, true, id)?;
@@ -375,20 +459,39 @@ fn publish_boundary(
         // The flock already owns an admitted descriptor for this directory.
         // Use that same inode for rename and sync, retaining source/target
         // admission and post-rename binding checks plus Apple's full sync.
-        root.validate_file_binding(&pending, file, false).map_err(|_| object_io_error(id))?;
+        object_io!(
+            private,
+            CheckpointPendingBinding,
+            id,
+            root.validate_file_binding(&pending, file, false)
+        )?;
         // The old target is discarded, not read. Stat-only admission already
         // checks owner, mode, ACL, filesystem, link count and stable identity.
         // Opening it and validating it twice more adds no publication evidence.
-        root.validate_optional_private_file(&name).map_err(|_| object_io_error(id))?;
-        root.revalidate().map_err(|_| object_io_error(id))?;
-        rustix::fs::renameat(&directory, pending.as_str(), &directory, name.as_str())
-            .map_err(|_| object_io_error(id))?;
-        root.validate_file_binding(&name, file, false).map_err(|_| object_io_error(id))?;
-        sync_directory_descriptor(&directory).map_err(|_| object_io_error(id))?;
-        root.revalidate().map_err(|_| object_io_error(id))
+        object_io!(
+            private,
+            CheckpointTargetAdmission,
+            id,
+            root.validate_optional_private_file(&name)
+        )?;
+        object_io!(private, CheckpointDirectoryRevalidate, id, root.revalidate())?;
+        object_io!(
+            direct,
+            CheckpointRename,
+            id,
+            rustix::fs::renameat(&directory, pending.as_str(), &directory, name.as_str())
+        )?;
+        object_io!(
+            private,
+            CheckpointPublishedBinding,
+            id,
+            root.validate_file_binding(&name, file, false)
+        )?;
+        object_io!(direct, CheckpointDirectorySync, id, sync_directory_descriptor(&directory))?;
+        object_io!(private, CheckpointDirectoryRevalidate, id, root.revalidate())
     }
     #[cfg(not(unix))]
-    root.rename_replace(&pending, &name).map_err(|_| object_io_error(id))
+    object_io!(private, CheckpointRename, id, root.rename_replace(&pending, &name))
 }
 
 fn load(
@@ -412,7 +515,7 @@ fn load_for_retry(
     let Some(root) = directory(binding, false, id)? else { return Ok(None) };
     let lock = snapshot_lock(&root, recording_id, id)?;
     let snapshot = {
-        let _snapshot = lock.read().map_err(|_| object_io_error(id))?;
+        let _snapshot = object_io!(missing, JournalSnapshotReadLock, id, lock.read())?;
         #[cfg(unix)]
         let _file_snapshot = snapshot_file_lock(&root, false, id)?;
         read_snapshot_files(&root, recording_id, id)?
@@ -514,14 +617,14 @@ fn read_snapshot_files(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(object_corrupt_error(id));
         }
-        Err(_) => return Err(object_io_error(id)),
+        Err(error) => return object_io!(direct, JournalNamedMetadata, id, Err(error)),
         Ok(metadata) if metadata.len() > MAX_JOURNAL_BYTES as u64 => {
             return Err(object_corrupt_error(id));
         }
         Ok(_) => {}
     }
     let bytes =
-        root.read_bounded_file(&name, MAX_JOURNAL_BYTES).map_err(|_| object_io_error(id))?;
+        object_io!(private, JournalRead, id, root.read_bounded_file(&name, MAX_JOURNAL_BYTES))?;
     Ok(Some((boundary, bytes)))
 }
 
@@ -680,10 +783,10 @@ impl SqliteRecordingStore<'_> {
         // Also sync an exact retry: a previous sync may have failed ambiguously.
         file.sync_all().map_err(|_| object_io_error(id))?;
         root.validate_file_binding(&name, &file, true).map_err(|_| object_io_error(id))?;
-        sync_journal_directory(&root).map_err(|_| object_io_error(id))?;
-        AdmittedPrivateRoot::open(&self.binding.root)
-            .and_then(|parent| sync_journal_directory(&parent))
-            .map_err(|_| object_io_error(id))
+        sync_journal_directory(&root, id)?;
+        let parent =
+            AdmittedPrivateRoot::open(&self.binding.root).map_err(|_| object_io_error(id))?;
+        sync_journal_directory(&parent, id)
     }
 
     pub(crate) fn capture_cap(
@@ -741,12 +844,14 @@ impl SqliteRecordingStore<'_> {
             events: commit.events.clone(),
         })
         .map_err(|error| map_xtf_error(error, id))?;
-        let root = directory(&self.binding, true, id)?.ok_or_else(|| object_io_error(id))?;
+        let root = directory(&self.binding, true, id)?;
+        let root = object_io!(missing, JournalDirectoryMissing, id, root.ok_or(()))?;
         #[cfg(test)]
         phase.switch("tail_file_admission");
         let name = name(request.recording_id);
-        let mut file = root.open_or_create_private_file(&name).map_err(|_| object_io_error(id))?;
-        let length = file.metadata().map_err(|_| object_io_error(id))?.len();
+        let mut file =
+            object_io!(private, JournalOpenOrCreate, id, root.open_or_create_private_file(&name))?;
+        let length = object_io!(direct, JournalFileMetadata, id, file.metadata())?.len();
         #[cfg(test)]
         phase.switch("journal_validation");
         let mut known = checkpoint
@@ -869,33 +974,41 @@ impl SqliteRecordingStore<'_> {
         {
             let boundary =
                 prepare_boundary(&root, request.recording_id, &known.header, known.length, id)?;
-            durable_sync(SyncKind::Journal, || sync_recording_file(&file, FileSync::Device))
-                .map_err(|_| object_io_error(id))?;
+            object_io!(
+                direct,
+                JournalSync,
+                id,
+                durable_sync(SyncKind::Journal, || sync_recording_file(&file, FileSync::Device))
+            )?;
             publish_boundary(&root, request.recording_id, &boundary, id)?;
         }
         let lock = snapshot_lock(&root, request.recording_id, id)?;
         #[cfg(test)]
         phase.switch("snapshot_write_wait");
-        let mutation = lock.write().map_err(|_| object_io_error(id))?;
+        let mutation = object_io!(missing, JournalSnapshotWriteLock, id, lock.write())?;
         #[cfg(unix)]
         let file_mutation = snapshot_file_lock(&root, true, id)?;
         #[cfg(test)]
         phase.switch("journal_append");
         // Remove only an incomplete, unacknowledged suffix before an exact retry.
         if length != known.length {
-            file.set_len(known.length).map_err(|_| object_io_error(id))?;
+            object_io!(direct, JournalTruncate, id, file.set_len(known.length))?;
         }
-        file.seek(SeekFrom::Start(known.length)).map_err(|_| object_io_error(id))?;
+        object_io!(direct, JournalSeek, id, file.seek(SeekFrom::Start(known.length)))?;
         if known.length == 0 {
-            file.write_all(&known.header).map_err(|_| object_io_error(id))?;
+            object_io!(direct, JournalHeaderWrite, id, file.write_all(&known.header))?;
         }
         for event in suffix {
             let bytes = &event.canonical_bytes;
             let length = u32::try_from(bytes.len()).map_err(|_| segment_validation_error(id))?;
-            file.write_all(&length.to_be_bytes())
-                .and_then(|()| file.write_all(bytes))
-                .and_then(|()| file.write_all(blake3::hash(bytes).as_bytes()))
-                .map_err(|_| object_io_error(id))?;
+            object_io!(
+                direct,
+                JournalWrite,
+                id,
+                file.write_all(&length.to_be_bytes())
+                    .and_then(|()| file.write_all(bytes))
+                    .and_then(|()| file.write_all(blake3::hash(bytes).as_bytes()))
+            )?;
         }
         #[cfg(unix)]
         drop(file_mutation);
@@ -911,15 +1024,23 @@ impl SqliteRecordingStore<'_> {
             }
         });
         commit_failpoint("journal-before-sync", id, false)?;
-        durable_sync(SyncKind::Journal, || sync_recording_file(&file, FileSync::Device))
-            .map_err(|_| object_io_error(id))?;
+        object_io!(
+            direct,
+            JournalSync,
+            id,
+            durable_sync(SyncKind::Journal, || sync_recording_file(&file, FileSync::Device))
+        )?;
         #[cfg(test)]
         phase.switch("tail_binding_admission");
-        root.validate_file_binding(&name, &file, true).map_err(|_| object_io_error(id))?;
+        object_io!(private, JournalBinding, id, root.validate_file_binding(&name, &file, true))?;
         if !cached {
-            AdmittedPrivateRoot::open(&self.binding.root)
-                .and_then(|parent| sync_journal_directory(&parent))
-                .map_err(|_| object_io_error(id))?;
+            let parent = object_io!(
+                private,
+                JournalParentOpen,
+                id,
+                AdmittedPrivateRoot::open(&self.binding.root)
+            )?;
+            sync_journal_directory(&parent, id)?;
         }
         // The publication directory barrier covers both the tail's creation
         // and checkpoint rename; a cold writer also persisted its parent.
@@ -948,7 +1069,7 @@ impl SqliteRecordingStore<'_> {
                 }
             });
             let lock = snapshot_lock(&root, recording_id, id)?;
-            let _snapshot = lock.write().map_err(|_| object_io_error(id))?;
+            let _snapshot = object_io!(missing, JournalSnapshotWriteLock, id, lock.write())?;
             #[cfg(unix)]
             let _file_snapshot = snapshot_file_lock(&root, true, id)?;
             let mut removed_boundary = false;
@@ -957,29 +1078,31 @@ impl SqliteRecordingStore<'_> {
             {
                 match std::fs::symlink_metadata(root.path().join(&name)) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(_) => return Err(object_io_error(id)),
+                    Err(error) => {
+                        return object_io!(direct, JournalCleanupMetadata, id, Err(error));
+                    }
                     Ok(_) => {}
                 }
-                root.remove_private_file(&name).map_err(|_| object_io_error(id))?;
+                object_io!(private, JournalCleanupRemove, id, root.remove_private_file(&name))?;
                 removed_boundary = true;
             }
             let name = name(recording_id);
             match std::fs::symlink_metadata(root.path().join(&name)) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     if removed_boundary {
-                        sync_journal_directory(&root).map_err(|_| object_io_error(id))?;
+                        sync_journal_directory(&root, id)?;
                     }
                     return Ok(());
                 }
-                Err(_) => return Err(object_io_error(id)),
+                Err(error) => return object_io!(direct, JournalCleanupMetadata, id, Err(error)),
                 Ok(_) => {}
             }
             // Repeat this barrier even if a prior attempt already unlinked the
             // checkpoint: its absence must be durable before the tail vanishes.
-            sync_journal_directory(&root).map_err(|_| object_io_error(id))?;
+            sync_journal_directory(&root, id)?;
             commit_failpoint("journal-cleanup-before-tail-removal", id, false)?;
-            root.remove_private_file(&name).map_err(|_| object_io_error(id))?;
-            sync_journal_directory(&root).map_err(|_| object_io_error(id))?;
+            object_io!(private, JournalCleanupRemove, id, root.remove_private_file(&name))?;
+            sync_journal_directory(&root, id)?;
         }
         Ok(())
     }

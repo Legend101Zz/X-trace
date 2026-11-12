@@ -110,6 +110,18 @@ class FloorEnvironmentTests(CheckoutFixture):
                     "admissionOperation": "AclState", "kind": None, "errno": None,
                     "context": {"site": "ProbeState", "changes": 1, "listing": "NotChecked", "object": "Directory",
                                 "componentDepth": -1, "nlinkChanged": False}}
+        journal_cases = [
+            (f"acknowledgement object io iteration=1 operation={operation} error=unavailable"
+             f" admission=unavailable kind={kind} errno={errno} context=unavailable",
+             site, "xtrace_store", {"iteration": 1, "operation": operation, "privateStorageError": None,
+                                    "admissionOperation": None, "kind": kind, "errno": errno, "context": None})
+            for operation, kind, errno in (
+                ("CheckpointWrite", "StorageFull", 28),
+                ("CheckpointSync", "PermissionDenied", 13),
+                ("JournalWrite", "StorageFull", 28),
+                ("JournalSync", "StorageFull", 28),
+            )
+        ]
         for payload, location, binary, published in (
             (valid, site, "xtrace_store", expected),
             ("acknowledgement object io iteration=10000 operation=StageFileWrite error=unavailable"
@@ -121,6 +133,9 @@ class FloorEnvironmentTests(CheckoutFixture):
              site, "xtrace_store", {"iteration": 1, "operation": "StagingRecordingSync",
                                     "privateStorageError": "Operation", "admissionOperation": None,
                                     "kind": "Other", "errno": None, "context": None}),
+            *journal_cases,
+            (journal_cases[-1][0].replace("operation=JournalSync", "operation=FixtureCANARY"),
+             site, "xtrace_store", None),
             (valid.replace("error=Admission", "error=/private/CANARY"), site, "xtrace_store", None),
             (valid.replace("Some(-1)", "Some(-9223372036854775809)"), site, "xtrace_store", None),
             (valid.replace("iteration=972", "iteration=10001"), site, "xtrace_store", None),

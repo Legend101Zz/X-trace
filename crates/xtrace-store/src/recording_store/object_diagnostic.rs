@@ -1,4 +1,4 @@
-//! Test-only facts at the points where segment object errors lose their source.
+//! Test-only facts where segment object and journal errors lose their source.
 
 use std::{cell::Cell, fmt, io, marker::PhantomData, rc::Rc};
 
@@ -26,6 +26,44 @@ pub(super) enum ObjectIoSite {
     StageFileSync,
     StageFileBinding,
     StageFileParentSync,
+    JournalSnapshotRegistryLock,
+    JournalSnapshotReadLock,
+    JournalSnapshotWriteLock,
+    JournalLockDirectoryOpen,
+    JournalFlock,
+    JournalLockRevalidate,
+    JournalDirectoryOpen,
+    JournalDirectoryOpenOrCreate,
+    JournalDirectoryMetadata,
+    JournalDirectoryMissing,
+    JournalParentOpen,
+    JournalSyncDirectoryOpen,
+    JournalSyncDirectoryRevalidate,
+    JournalDirectorySync,
+    CheckpointMetadata,
+    CheckpointRead,
+    CheckpointOpenOrCreate,
+    CheckpointTruncate,
+    CheckpointWrite,
+    CheckpointSync,
+    CheckpointPendingBinding,
+    CheckpointTargetAdmission,
+    CheckpointDirectoryRevalidate,
+    CheckpointRename,
+    CheckpointPublishedBinding,
+    CheckpointDirectorySync,
+    JournalNamedMetadata,
+    JournalRead,
+    JournalOpenOrCreate,
+    JournalFileMetadata,
+    JournalTruncate,
+    JournalSeek,
+    JournalHeaderWrite,
+    JournalWrite,
+    JournalSync,
+    JournalBinding,
+    JournalCleanupMetadata,
+    JournalCleanupRemove,
     CommitFailpoint,
 }
 
@@ -121,12 +159,13 @@ pub(super) fn private<T>(
     })
 }
 
-pub(super) fn direct<T>(
+pub(super) fn direct<T, E: Into<io::Error>>(
     site: ObjectIoSite,
     correlation_id: CorrelationId,
-    call: impl FnOnce() -> io::Result<T>,
+    call: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, RecordingStoreError> {
     call().map_err(|error| {
+        let error = error.into();
         observe(Observation {
             site: Some(site),
             kind: Some(error.kind()),
@@ -137,12 +176,12 @@ pub(super) fn direct<T>(
     })
 }
 
-pub(super) fn missing<T>(
+pub(super) fn missing<T, E>(
     site: ObjectIoSite,
     correlation_id: CorrelationId,
-    call: impl FnOnce() -> Result<T, ()>,
+    call: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, RecordingStoreError> {
-    call().map_err(|()| {
+    call().map_err(|_| {
         observe(Observation { site: Some(site), ..Observation::default() });
         object_io_error(correlation_id)
     })

@@ -2143,6 +2143,62 @@ mod tests {
         acknowledgement_failed(error)
     }
 
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    fn journal_sync_errors_prevent_acknowledgement_and_report_original_io_facts() {
+        use crate::recording_store::object_diagnostic::Scope;
+        use crate::recording_store::recording_journal::{SyncFailure, SyncKind};
+        use rustix::io::Errno;
+
+        for (sync, operation, kind, errno) in [
+            (SyncKind::Checkpoint, "CheckpointSync", "PermissionDenied", Errno::ACCESS),
+            (SyncKind::Journal, "JournalSync", "StorageFull", Errno::NOSPC),
+        ] {
+            let (directory, store, project) = fixture();
+            let adapter =
+                Arc::new(SqliteRecordingPersistence::new(store.clone(), directory.path()));
+            let capture = RecordingCaptureService::new(
+                adapter,
+                SegmentPolicy::default(),
+                std::num::NonZeroUsize::new(1).expect("retention"),
+            );
+            let recording_id = RecordingId::new();
+            capture.begin_recording(begin(project.id(), recording_id)).expect("begin");
+
+            // The first append also encounters an absent checkpoint on the cold read path.
+            let observation = Scope::enter();
+            let failure = {
+                let _sync_failure = SyncFailure::enter(sync, errno);
+                capture.record_events(RecordEvents {
+                    recording_id,
+                    events: vec![event(2, "unacknowledged-event")],
+                })
+            }
+            .expect_err("failed sync prevents acknowledgement");
+            assert_eq!(failure.kind(), PortErrorKind::Transport);
+            assert_eq!(
+                failure.message(),
+                "XTR-STORE-OBJECT-IO: segment object I/O could not be completed"
+            );
+            assert_eq!(
+                observation.report(1),
+                format!(
+                    "iteration=1 operation={operation} error=unavailable admission=unavailable kind={kind} errno={} context=unavailable",
+                    errno.raw_os_error()
+                )
+            );
+            drop(observation);
+            assert_eq!(
+                store
+                    .recording_store(directory.path())
+                    .expect("recording store")
+                    .journal_summary(recording_id, 1)
+                    .expect("read published tail"),
+                None
+            );
+        }
+    }
+
     #[test]
     fn sparse_acknowledged_batches_hit_admission_before_becoming_unreadable() {
         use xtrace_application::recording::{DEFAULT_SEGMENT_EVENT_BYTES, MAX_RECORDING_SEGMENTS};
