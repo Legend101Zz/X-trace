@@ -196,9 +196,10 @@ class FloorProgressTests(unittest.TestCase):
 
     def check_spring_deadline_summary(self, *, interrupt):
         gate = "rust-workspace"
-        valid = b"v1 attestation-mismatch 5 2\n"
-        log_only = b"v1 error-request 2 1\n"
-        private_values = ("captured-value-731", "/fixture/customer.txt", "b3:0123456789abcdef")
+        valid = b"v2 attestation-mismatch 5 2 present present not-observed\n"
+        log_only = b"v2 error-request 2 1 present unavailable present\n"
+        private_values = ("captured-value-731", "/fixture/customer.txt", "b3:0123456789abcdef",
+                          "BODY_CANARY_1D3", "XTR-JAVA-CAPTURE-DRAIN-EXPIRED")
         workload_output = log_only + ("\n".join(private_values) + "\n").encode()
         recovery = floor_progress.rust_directory(self.run_dir, gate)
         record = recovery / "diagnostics" / "spring-premain-order-wait.txt"
@@ -259,6 +260,7 @@ class FloorProgressTests(unittest.TestCase):
         expected = {
             "status": "observed", "phase": "attestation-mismatch", "state": "insufficient-matching-rows",
             "expectedRows": 3, "completeRows": 5, "completeRowsLimit": 16, "matchingRows": 2,
+            "captureMarkers": {"incomplete": "present", "drainExpired": "present", "otherIncomplete": "not-observed"},
         }
         if interrupt:
             self.assertIn("owned process tree drained", (logs / f"{gate}.log").read_text())
@@ -296,8 +298,27 @@ class FloorProgressTests(unittest.TestCase):
 
         record.unlink()
         self.assertEqual(observation(), floor_progress.UNAVAILABLE)  # The matching grammar in stdout is ignored.
-        private_roots.atomic_write_private(record, valid + workload_output)
-        self.assertEqual(observation(), floor_progress.UNAVAILABLE)
+        for malformed in (valid + workload_output,
+                          valid.replace(b" 5 2 ", b" 17 2 "),
+                          valid.replace(b" 5 2 ", b" 5 3 "),
+                          valid.replace(b"not-observed", b"BODY_CANARY_1D3"),
+                          valid.replace(b"present not-observed", b"unavailable not-observed")):
+            with self.subTest(record=malformed):
+                private_roots.atomic_write_private(record, malformed)
+                self.assertEqual(observation(), floor_progress.UNAVAILABLE)
+        for phase, state, expected_rows, complete, matching, markers in (
+            ("successful-request", "no-complete-segment-rows", 1, 0, 0, ("unavailable",) * 3),
+            ("error-request", "no-matching-marker", 2, 16, 0, ("not-observed",) * 3),
+            ("classfile-mutation", "insufficient-matching-rows", 4, 16, 3, ("present", "unavailable", "present")),
+        ):
+            with self.subTest(phase=phase):
+                private_roots.atomic_write_private(
+                    record, f"v2 {phase} {complete} {matching} {' '.join(markers)}\n".encode())
+                self.assertEqual(observation(), {
+                    "status": "observed", "phase": phase, "state": state, "expectedRows": expected_rows,
+                    "completeRows": complete, "completeRowsLimit": 16, "matchingRows": matching,
+                    "captureMarkers": dict(zip(("incomplete", "drainExpired", "otherIncomplete"), markers)),
+                })
         private_roots.atomic_write_private(record, valid)
         record.chmod(0o644)
         self.assertEqual(observation(), floor_progress.UNAVAILABLE)
