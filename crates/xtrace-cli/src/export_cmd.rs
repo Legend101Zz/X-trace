@@ -125,7 +125,7 @@ fn operation_input(
         application_component: view.application_component.clone(),
         binding_key: view.binding_key.clone(),
         effective_state: state_of(view, confirmed),
-        claims_available: true,
+        claims_available: view.claims_available,
         claims: view
             .claims
             .iter()

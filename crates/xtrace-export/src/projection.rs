@@ -665,7 +665,14 @@ fn summary_disagrees(
     let complete = summary.claim_count == claims.len();
     let handlers_complete = complete && handlers_known;
     let conflict = symbols.len() > 1;
-    if summary_set_disagrees(summary.handler_symbols.as_deref(), symbols, handlers_complete)
+    let handler_set_disagrees = summary.handler_symbols.as_ref().is_some_and(|values| {
+        let known: BTreeSet<_> =
+            values.iter().map(String::as_str).filter(|symbol| !symbol.is_empty()).collect();
+        let summary_complete = !values.iter().any(String::is_empty);
+        (summary_complete && !symbols.is_subset(&known))
+            || (handlers_complete && !known.is_subset(symbols))
+    });
+    if handler_set_disagrees
         || ((conflict || handlers_complete)
             && summary
                 .handler_conflict

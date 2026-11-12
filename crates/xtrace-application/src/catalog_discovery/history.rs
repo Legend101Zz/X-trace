@@ -106,6 +106,9 @@ pub struct OperationView {
     pub source_path: Option<String>,
     /// 1-based line of the first claim.
     pub source_line: Option<u32>,
+    /// Whether the revision supplies a claim projection for this entry.
+    #[serde(skip)]
+    pub claims_available: bool,
     /// Exact claims linked to this operation in this revision. The serialized history view
     /// retains its existing summary contract.
     #[serde(skip)]
@@ -533,6 +536,7 @@ mod tests {
             claim_count: 1,
             source_path: None,
             source_line: None,
+            claims_available: true,
             claims: Vec::new(),
         }
     }

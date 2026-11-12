@@ -481,22 +481,153 @@ fn stored_claim(connection: &rusqlite::Connection, symbol: &str) -> (Vec<u8>, Va
     (id, serde_json::from_str(&json).unwrap())
 }
 
-// The scripted analyzer emits one evidence item per claim. Extend the stored JSON to cover
-// evidence shapes the history reader can encounter beyond that analyzer's output.
-fn edit_claim_json(fx: &Fx, symbol: &str, edit: impl FnOnce(&mut Value)) -> String {
-    let connection = rusqlite::Connection::open(fx.database()).unwrap();
-    let (id, mut value) = stored_claim(&connection, symbol);
-    edit(&mut value);
+fn rebuild_fixture_claim(
+    value: &Value,
+) -> xtrace_domain::catalog_discovery::ValidatedEndpointClaim {
+    use xtrace_domain::catalog_discovery::ValidatedEndpointClaim;
+    use xtrace_domain::{EndpointIdentity, Transport};
+
+    ValidatedEndpointClaim::from_persisted(
+        value["claim_hint"].as_str().unwrap().to_owned(),
+        EndpointIdentity {
+            project_id: serde_json::from_value(value["project_id"].clone()).unwrap(),
+            application_component: value["application_component"].as_str().unwrap().to_owned(),
+            binding_key: value["binding_key"].as_str().unwrap().to_owned(),
+            method: serde_json::from_value(value["method"].clone()).unwrap(),
+            route_template: value["route_template"].as_str().unwrap().to_owned(),
+            transport: Transport::Http,
+        },
+        serde_json::from_value(value["provenance"].clone()).unwrap(),
+        serde_json::from_value(value["handler_symbol"].clone()).unwrap(),
+        serde_json::from_value(value["confidence_basis_points"].clone()).unwrap(),
+        serde_json::from_value(value["limitation_codes"].clone()).unwrap(),
+        serde_json::from_value(value["source_evidence"].clone()).unwrap(),
+    )
+    .unwrap()
+}
+
+fn replace_claim_payload(
+    connection: &rusqlite::Connection,
+    id: &[u8],
+    digest: &[u8],
+    canonical: &[u8],
+    json: &str,
+) {
     assert_eq!(
         connection
             .execute(
-                "UPDATE catalog_claims SET canonical_json = ?1 WHERE claim_id = ?2",
-                rusqlite::params![value.to_string(), id],
+                "UPDATE catalog_claims
+                 SET claim_digest = ?1, canonical_bytes = ?2, canonical_json = ?3
+                 WHERE claim_id = ?4",
+                rusqlite::params![digest, canonical, json, id],
             )
             .unwrap(),
         1
     );
+}
+
+// The scripted analyzer emits one evidence item per claim. Build consistent rows for evidence
+// shapes beyond that output using the domain's canonical encoder.
+fn edit_claim(fx: &Fx, symbol: &str, edit: impl FnOnce(&mut Value)) -> String {
+    let connection = rusqlite::Connection::open(fx.database()).unwrap();
+    let (id, mut value) = stored_claim(&connection, symbol);
+    edit(&mut value);
+    let claim = rebuild_fixture_claim(&value);
+    value["source_evidence"] = serde_json::json!(claim.source_evidence());
+    replace_claim_payload(
+        &connection,
+        &id,
+        claim.digest().unwrap().as_bytes(),
+        claim.canonical_bytes(),
+        &value.to_string(),
+    );
     uuid::Uuid::from_slice(&id).unwrap().to_string()
+}
+
+fn assert_corrupt_export(fx: &Fx, format: &str, revision: Option<&str>, name: &str) {
+    let out = fx.out_dir(name);
+    let mut args = vec!["--format", format, "--output", out.to_str().unwrap()];
+    if let Some(revision) = revision {
+        args.extend(["--revision", revision]);
+    }
+    let result = fx.export(&args);
+    assert_eq!(result.status.code(), Some(5), "{name}: {result:?}");
+    assert!(result.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&result.stderr).unwrap();
+    assert_eq!(error["code"], "XTR-CLI-STORE-UNAVAILABLE");
+    assert!(
+        error["message"].as_str().unwrap().contains("catalog history evidence is inconsistent")
+    );
+    assert!(!out.exists());
+}
+
+#[test]
+fn export_rejects_inconsistent_persisted_claims_without_output() {
+    use serde_json::json;
+
+    let fx = project_with_catalog(TRANSCRIPT);
+    let before = fx.out_dir("before-corruption");
+    let result = fx.export(&["--format", "openapi", "--output", before.to_str().unwrap()]);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    let connection = rusqlite::Connection::open(fx.database()).unwrap();
+    let (id, value) = stored_claim(&connection, "OrderController.get");
+    let (digest, canonical, original_json): (Vec<u8>, Vec<u8>, String) = connection
+        .query_row(
+            "SELECT claim_digest, canonical_bytes, canonical_json FROM catalog_claims WHERE claim_id = ?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let original = rebuild_fixture_claim(&value);
+    assert_eq!(original.canonical_bytes(), canonical);
+    assert_eq!(original.digest().unwrap().as_bytes().as_slice(), digest);
+
+    for (field, replacement) in [
+        ("handler_symbol", json!("OrderController.other")),
+        ("confidence_basis_points", json!(9100)),
+        ("limitation_codes", json!(["missing_response_schema"])),
+        ("provenance", json!("runtime_discovered")),
+        ("source_evidence", {
+            let mut evidence = value["source_evidence"].clone();
+            evidence[0]["end_column"] = json!(41);
+            evidence
+        }),
+    ] {
+        let mut edited = value.clone();
+        edited[field] = replacement;
+        assert_ne!(rebuild_fixture_claim(&edited).canonical_bytes(), canonical, "{field}");
+        replace_claim_payload(&connection, &id, &digest, &canonical, &edited.to_string());
+        assert_corrupt_export(&fx, "openapi", None, field);
+    }
+
+    let mut wrong_bytes = canonical.clone();
+    *wrong_bytes.last_mut().unwrap() ^= 1;
+    replace_claim_payload(&connection, &id, &digest, &wrong_bytes, &original_json);
+    assert_corrupt_export(&fx, "postman", None, "wrong-bytes");
+
+    let mut wrong_digest = digest.clone();
+    wrong_digest[0] ^= 1;
+    replace_claim_payload(&connection, &id, &wrong_digest, &canonical, &original_json);
+    assert_corrupt_export(&fx, "curl", None, "wrong-digest");
+
+    // All three representations agree here. The payload belongs to a different operation.
+    let mut wrong_operation = value.clone();
+    wrong_operation["route_template"] = json!("/other");
+    let claim = rebuild_fixture_claim(&wrong_operation);
+    replace_claim_payload(
+        &connection,
+        &id,
+        claim.digest().unwrap().as_bytes(),
+        claim.canonical_bytes(),
+        &wrong_operation.to_string(),
+    );
+    assert_corrupt_export(&fx, "bundle", None, "wrong-operation");
+
+    replace_claim_payload(&connection, &id, &digest, &canonical, &original_json);
+    let restored = fx.out_dir("restored");
+    let result = fx.export(&["--format", "openapi", "--output", restored.to_str().unwrap()]);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    assert_eq!(tree(&restored), tree(&before));
 }
 
 #[test]
@@ -512,10 +643,10 @@ fn export_distinct_claim_locations_and_confidences() {
         let connection = rusqlite::Connection::open(fx.database()).unwrap();
         stored_claim(&connection, "FixtureAdminController.count").1["source_evidence"][0].clone()
     };
-    let other_id = edit_claim_json(&fx, "AController.other", |claim| {
+    let other_id = edit_claim(&fx, "AController.other", |claim| {
         claim["source_evidence"].as_array_mut().unwrap().push(additional);
     });
-    let create_id = edit_claim_json(&fx, "OrderController.create", |claim| {
+    let create_id = edit_claim(&fx, "OrderController.create", |claim| {
         claim["limitation_codes"] = serde_json::json!(["missing_response_schema"]);
     });
     let mut expected_claims = Value::Null;
@@ -684,14 +815,64 @@ fn export_revision_claims_survive_restart_without_cross_revision_leakage() {
     let carried = openapi_metadata(&latest, "/orders/{id}", "get");
     assert_eq!(carried["operation_id"], old_carried["operation_id"]);
     assert_eq!(carried["effective_state"], "unknown");
-    assert_eq!(carried["claims_projection"], "available");
-    assert_eq!(carried["claim_count"], 0);
-    assert_eq!(carried["claims"], serde_json::json!([]));
-    assert_eq!(carried["handler_symbols"], serde_json::json!([]));
-    assert!(
-        !read(&latest, "openapi.json")
-            .contains(old_carried["claims"][0]["claim_id"].as_str().unwrap())
-    );
+    assert_eq!(carried["claims_projection"], "unavailable");
+    for field in ["claim_count", "claims", "handler_symbols", "handler_conflict", "handlers"] {
+        assert!(carried.get(field).is_none(), "{field}");
+    }
+    let assert_omission = |result: &Output| {
+        assert!(json(result)["omissions"].as_array().unwrap().iter().any(|item| {
+            item["operationId"] == carried["operation_id"]
+                && item["reason"] == "claims_projection_unavailable"
+        }));
+    };
+    assert_omission(&export);
+    let old_claim = old_carried["claims"][0]["claim_id"].as_str().unwrap();
+    assert!(!read(&latest, "openapi.json").contains(old_claim));
+
+    for format in ["postman", "curl", "bundle"] {
+        let out = fx.out_dir(format);
+        let result = fx.export(&[
+            "--format",
+            format,
+            "--revision",
+            new_revision,
+            "--output",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(result.status.code(), Some(0), "{result:?}");
+        assert_eq!(json(&result)["operationCount"], 3);
+        assert_omission(&result);
+        let files = tree(&out);
+        for (_, bytes) in &files {
+            assert!(!std::str::from_utf8(bytes).unwrap().contains(old_claim), "{format}");
+        }
+        if format != "curl" {
+            let doc: Value = serde_json::from_str(&read(&out, "collection.postman.json")).unwrap();
+            let item = doc["item"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == "GET /orders/{id}")
+                .unwrap();
+            assert_eq!(
+                comment_metadata(item["request"]["description"].as_str().unwrap()),
+                Some(carried.clone())
+            );
+        }
+        if format != "postman" {
+            let recipe =
+                files.iter().find(|(name, _)| name.ends_with("-get-orders-id.sh")).unwrap();
+            assert_eq!(
+                comment_metadata(std::str::from_utf8(&recipe.1).unwrap()),
+                Some(carried.clone())
+            );
+        }
+        if format == "bundle" {
+            let block = xtrace_export::canonical::yaml(&serde_json::json!({"x-xtrace": carried}));
+            let block = block.lines().map(|line| format!("      {line}\n")).collect::<String>();
+            assert!(read(&out, "openapi.yaml").contains(&block));
+        }
+    }
 
     let historical = fx.out_dir("historical");
     let export = fx.export(&[
@@ -709,13 +890,32 @@ fn export_revision_claims_survive_restart_without_cross_revision_leakage() {
         SqliteStore::open(&fx.database(), OpenOptions::default().with_must_exist(true)).unwrap();
     let history = SqliteCatalogHistoryStore::new(store);
     let revision = CatalogRevisionId::from_uuid(uuid::Uuid::parse_str(new_revision).unwrap());
+    let project = ProjectId::from_uuid(uuid::Uuid::parse_str(&fx.project_id).unwrap());
+    let current = history.revision_operations(project, revision).unwrap();
+    let previous = history
+        .revision_operations(
+            project,
+            CatalogRevisionId::from_uuid(uuid::Uuid::parse_str(old_revision).unwrap()),
+        )
+        .unwrap();
+    let before = previous.iter().find(|op| op.route_template == "/orders/{id}").unwrap();
+    let after = current.iter().find(|op| op.operation_id == before.operation_id).unwrap();
+    assert_eq!(after.operation_version_id, before.operation_version_id);
+    assert_eq!(after.change_kind, xtrace_application::CatalogChangeKind::Unknown);
+    assert_eq!(
+        after.source_availability,
+        xtrace_application::CatalogSourceAvailability::Unavailable
+    );
+    assert!(before.claims_available);
+    assert!(!after.claims_available);
+    assert!(after.claims.is_empty());
     assert!(history.revision_operations(ProjectId::new(), revision).unwrap().is_empty());
 }
 
 #[test]
 fn export_missing_claim_fields_remain_unknown() {
     let fx = project_with_catalog(TRANSCRIPT);
-    let id = edit_claim_json(&fx, "OrderController.get", |claim| {
+    let id = edit_claim(&fx, "OrderController.get", |claim| {
         let fields = claim.as_object_mut().unwrap();
         fields.remove("handler_symbol");
         fields.remove("confidence_basis_points");
@@ -725,7 +925,7 @@ fn export_missing_claim_fields_remain_unknown() {
             {"kind": "unavailable", "reason_code": "debug_metadata_absent"}
         ]);
     });
-    edit_claim_json(&fx, "OrderController.create", |claim| {
+    edit_claim(&fx, "OrderController.create", |claim| {
         claim["source_evidence"] = serde_json::json!([]);
     });
     let out = fx.out_dir("missing");
@@ -742,14 +942,17 @@ fn export_missing_claim_fields_remain_unknown() {
     assert!(metadata.get("handlers").is_none());
     let evidence = claim["source_evidence"].as_array().unwrap();
     assert_eq!(evidence.len(), 2);
-    assert_eq!(evidence[0]["start_line"], 30);
-    assert_eq!(evidence[0]["verification"], "unverified");
-    assert_eq!(evidence[0].get("end_line"), Some(&Value::Null));
-    assert_eq!(evidence[0].get("end_column"), Some(&Value::Null));
-    assert_eq!(evidence[1]["kind"], "unavailable");
-    assert_eq!(evidence[1]["verification"], "unavailable");
-    assert_eq!(evidence[1]["reason_code"], "debug_metadata_absent");
-    assert_eq!(evidence[1].get("relative_path"), Some(&Value::Null));
+    let unavailable = &evidence[0];
+    assert_eq!(unavailable["kind"], "unavailable");
+    assert_eq!(unavailable["verification"], "unavailable");
+    assert_eq!(unavailable["reason_code"], "debug_metadata_absent");
+    assert_eq!(unavailable.get("relative_path"), Some(&Value::Null));
+    let hint = &evidence[1];
+    assert_eq!(hint["kind"], "runtime_hint");
+    assert_eq!(hint["start_line"], 30);
+    assert_eq!(hint["verification"], "unverified");
+    assert_eq!(hint.get("end_line"), Some(&Value::Null));
+    assert_eq!(hint.get("end_column"), Some(&Value::Null));
     assert_eq!(
         openapi_metadata(&out, "/orders", "post")["claims"][0]["source_evidence"],
         serde_json::json!([])
@@ -757,57 +960,36 @@ fn export_missing_claim_fields_remain_unknown() {
 }
 
 #[test]
-fn export_unsafe_claim_locations_are_not_disclosed() {
+fn export_refuses_tampered_unsafe_claim_locations() {
     let fx = project_with_catalog(TRANSCRIPT);
+    let connection = rusqlite::Connection::open(fx.database()).unwrap();
+    let (id, mut claim) = stored_claim(&connection, "OrderController.get");
     let unsafe_paths = ["/outside/export-private.java", "../traversal.java", r"Q:\drive.java"];
-    edit_claim_json(&fx, "OrderController.get", |claim| {
-        let items = claim["source_evidence"].as_array_mut().unwrap();
-        let safe = items[0].clone();
-        for path in unsafe_paths {
-            let mut unsafe_item = safe.clone();
-            unsafe_item["relative_path"] = path.into();
-            items.push(unsafe_item);
-        }
-    });
+    let items = claim["source_evidence"].as_array_mut().unwrap();
+    let safe = items[0].clone();
+    for path in unsafe_paths {
+        let mut unsafe_item = safe.clone();
+        unsafe_item["relative_path"] = path.into();
+        items.push(unsafe_item);
+    }
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE catalog_claims SET canonical_json = ?1 WHERE claim_id = ?2",
+                rusqlite::params![claim.to_string(), id],
+            )
+            .unwrap(),
+        1
+    );
     for format in ["openapi", "postman", "curl", "bundle"] {
-        let out = fx.out_dir(&format!("unsafe-{format}"));
-        let result = fx.export(&["--format", format, "--output", out.to_str().unwrap()]);
-        assert_eq!(result.status.code(), Some(0), "{result:?}");
-        assert!(
-            json(&result)["omissions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|o| o["reason"] == "source_path_not_repo_relative")
-        );
-        for (_, bytes) in tree(&out) {
-            let text = String::from_utf8(bytes).unwrap();
-            for fragment in ["export-private.java", "traversal.java", "drive.java"] {
-                assert!(!text.contains(fragment), "{format} leaked {fragment}");
-            }
-        }
-        if format == "openapi" {
-            let metadata = openapi_metadata(&out, "/orders/{id}", "get");
-            let evidence = metadata["claims"][0]["source_evidence"].as_array().unwrap();
-            assert_eq!(evidence.len(), 4);
-            assert_eq!(evidence[0]["relative_path"], "OrderController.java");
-            assert_eq!(evidence[0]["start_line"], 30);
-            for omitted in &evidence[1..] {
-                assert_eq!(omitted["location_omitted"], "path_not_repo_relative");
-                for field in
-                    ["relative_path", "start_line", "start_column", "end_line", "end_column"]
-                {
-                    assert!(omitted.get(field).is_none());
-                }
-            }
-        }
+        assert_corrupt_export(&fx, format, None, &format!("unsafe-{format}"));
     }
 }
 
 #[test]
 fn secret_shaped_claim_evidence_is_refused_by_every_format() {
     let fx = project_with_catalog(TRANSCRIPT);
-    edit_claim_json(&fx, "OrderController.get", |claim| {
+    edit_claim(&fx, "OrderController.get", |claim| {
         claim["source_evidence"][0]["relative_path"] = "src/password:hunter2hunter2.java".into();
     });
     for format in ["openapi", "postman", "curl", "bundle"] {
@@ -998,11 +1180,11 @@ fn export_persisted_path_bearing_handler_symbols_across_formats() {
 
 #[test]
 fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
+    use xtrace_domain::ClaimId;
     use xtrace_domain::catalog_discovery::{
         MAX_DISCOVERY_CLAIM_BYTES, MAX_DISCOVERY_RUN_CLAIM_BYTES, MAX_DISCOVERY_RUN_CLAIMS,
     };
     use xtrace_domain::ids::Id as _;
-    use xtrace_domain::{ClaimId, ContentHash};
 
     let fx = fx();
     let src = fx.repo.join("src");
@@ -1077,14 +1259,18 @@ fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
     assert!(canonical_bytes <= MAX_DISCOVERY_RUN_CLAIM_BYTES, "{canonical_bytes}");
     assert!(json_bytes > MAX_DISCOVERY_RUN_CLAIM_BYTES, "{json_bytes}");
     let extra_id = ClaimId::new().as_uuid();
+    let (_, mut extra) = stored_claim(&connection, &symbols[0]);
+    extra["claim_hint"] = extra_id.to_string().into();
+    let extra = (rebuild_fixture_claim(&extra), extra.to_string());
+    assert!(canonical_bytes + extra.0.canonical_bytes().len() <= MAX_DISCOVERY_RUN_CLAIM_BYTES);
     let extra_id = extra_id.as_bytes().as_slice();
     let tx = connection.transaction().unwrap();
-    // The writer refuses oversized runs. Add one schema-valid row to exercise the read guard.
+    // Add a canonical claim within the byte budget to isolate the count guard.
     assert_eq!(tx.execute(
         "INSERT INTO catalog_claims (claim_id, project_id, operation_id, claim_digest, canonical_bytes, canonical_json, first_revision_id, last_revision_id)
-         SELECT ?1, project_id, operation_id, ?2, canonical_bytes, canonical_json, first_revision_id, last_revision_id
-         FROM catalog_claims WHERE operation_id = ?3 ORDER BY claim_id LIMIT 1",
-        rusqlite::params![extra_id, ContentHash::of_bytes(extra_id).as_bytes().as_slice(), operation_id],
+         SELECT ?1, project_id, operation_id, ?2, ?3, ?4, first_revision_id, last_revision_id
+         FROM catalog_claims WHERE operation_id = ?5 ORDER BY claim_id LIMIT 1",
+        rusqlite::params![extra_id, extra.0.digest().unwrap().as_bytes().as_slice(), extra.0.canonical_bytes(), extra.1, operation_id],
     ).unwrap(), 1);
     assert_eq!(
         tx.execute(
@@ -1096,25 +1282,7 @@ fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
         1
     );
     tx.commit().unwrap();
-    let assert_rejected = |name: &str| {
-        let out = fx.out_dir(name);
-        let result = fx.export(&[
-            "--format",
-            "openapi",
-            "--revision",
-            &revision,
-            "--output",
-            out.to_str().unwrap(),
-        ]);
-        assert_eq!(result.status.code(), Some(5), "{result:?}");
-        assert!(result.stdout.is_empty());
-        let error: Value = serde_json::from_slice(&result.stderr).unwrap();
-        assert_eq!(error["code"], "XTR-CLI-STORE-UNAVAILABLE");
-        assert!(
-            error["message"].as_str().unwrap().contains("catalog history evidence is inconsistent")
-        );
-        assert!(!out.exists());
-    };
+    let assert_rejected = |name: &str| assert_corrupt_export(&fx, "openapi", Some(&revision), name);
     assert_rejected("too-many-claims");
 
     let tx = connection.transaction().unwrap();
@@ -1162,17 +1330,49 @@ fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
     update_single(&valid_canonical, &valid_json);
     connection.pragma_update(None, "ignore_check_constraints", false).unwrap();
 
-    // Every row still fits the schema. Their combined CBOR lengths exceed the run budget.
-    let bytes_per_claim = MAX_DISCOVERY_RUN_CLAIM_BYTES / MAX_DISCOVERY_RUN_CLAIMS + 1;
-    assert_eq!(
-        connection
-            .execute(
-                "UPDATE catalog_claims SET canonical_bytes = zeroblob(?1) WHERE operation_id = ?2",
-                rusqlite::params![bytes_per_claim, operation_id],
+    // Grow valid rows past the canonical byte budget while staying within the count and row caps.
+    let candidates = {
+        let mut statement = connection
+            .prepare(
+                "SELECT claim_id, length(canonical_bytes), canonical_json
+             FROM catalog_claims WHERE operation_id = ?1 ORDER BY claim_id LIMIT 1536",
             )
-            .unwrap(),
-        MAX_DISCOVERY_RUN_CLAIMS
-    );
+            .unwrap();
+        statement
+            .query_map([operation_id], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, usize>(1)?, row.get::<_, String>(2)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let tx = connection.transaction().unwrap();
+    let mut total = canonical_bytes;
+    for (id, old_len, json) in candidates {
+        let mut value: Value = serde_json::from_str(&json).unwrap();
+        let evidence = value["source_evidence"].as_array_mut().unwrap();
+        for index in 0..7 {
+            evidence.push(serde_json::json!({
+                "kind": "runtime_hint",
+                "relative_path": format!("{}-{index}.java", "a".repeat(490)),
+            }));
+        }
+        let claim = rebuild_fixture_claim(&value);
+        value["source_evidence"] = serde_json::json!(claim.source_evidence());
+        replace_claim_payload(
+            &tx,
+            &id,
+            claim.digest().unwrap().as_bytes(),
+            claim.canonical_bytes(),
+            &value.to_string(),
+        );
+        total = total - old_len + claim.canonical_bytes().len();
+        if total > MAX_DISCOVERY_RUN_CLAIM_BYTES {
+            break;
+        }
+    }
+    assert!(total > MAX_DISCOVERY_RUN_CLAIM_BYTES);
+    tx.commit().unwrap();
     assert_rejected("too-many-canonical-bytes");
 }
 

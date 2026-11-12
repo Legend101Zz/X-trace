@@ -478,6 +478,31 @@ fn complete_and_partial_rows_check_reported_summary_facts_across_formats() {
             json!({"claim_count": 2, "handler_symbols": ["Second.get"]}),
             true,
         ),
+        ("complete-blank-summary", json!([known]), json!({"handler_symbols": [""]}), false),
+        (
+            "complete-blank-summary-extra",
+            json!([known]),
+            json!({"handler_symbols": ["", "Second.get"]}),
+            true,
+        ),
+        (
+            "partial-blank-summary",
+            json!([known]),
+            json!({"claim_count": 2, "handler_symbols": [""]}),
+            false,
+        ),
+        (
+            "partial-blank-summary-known-conflict",
+            json!([known]),
+            json!({"claim_count": 3, "handler_symbols": ["", "First.get", "Second.get"]}),
+            false,
+        ),
+        (
+            "partial-blank-summary-row-conflict",
+            json!([known, {"claim_id": "second", "handler_symbol": "Second.get"}]),
+            json!({"claim_count": 3, "handler_symbols": [""]}),
+            false,
+        ),
         (
             "partial-denied-conflict",
             json!([known, {"claim_id": "second", "handler_symbol": "Second.get"}]),
@@ -584,7 +609,8 @@ fn complete_and_partial_rows_check_reported_summary_facts_across_formats() {
             let row_conflict = match *route {
                 "denied-conflict"
                 | "partial-denied-conflict"
-                | "complete-denied-symbol-conflict" => Some(true),
+                | "complete-denied-symbol-conflict"
+                | "partial-blank-summary-row-conflict" => Some(true),
                 "handler"
                 | "conflict"
                 | "complete-agreeing-rows"
@@ -592,7 +618,9 @@ fn complete_and_partial_rows_check_reported_summary_facts_across_formats() {
                 | "limitations"
                 | "confidence"
                 | "consistent"
-                | "unknown-summary" => Some(false),
+                | "unknown-summary"
+                | "complete-blank-summary"
+                | "complete-blank-summary-extra" => Some(false),
                 _ => None,
             };
             assert_eq!(
@@ -601,7 +629,13 @@ fn complete_and_partial_rows_check_reported_summary_facts_across_formats() {
                 "{format:?} {route}"
             );
             let unresolved = row_conflict == Some(true)
-                || matches!(*route, "conflict" | "additional-handler" | "partial-extras");
+                || matches!(
+                    *route,
+                    "conflict"
+                        | "additional-handler"
+                        | "partial-extras"
+                        | "partial-blank-summary-known-conflict"
+                );
             assert_eq!(
                 out.omissions.iter().any(|o| {
                     o.operation_id == *route && o.reason == "handler_conflict_unresolved"
@@ -625,6 +659,11 @@ fn complete_and_partial_rows_check_reported_summary_facts_across_formats() {
             }
             if let Some(conflict) = summary.get("handler_conflict") {
                 assert_eq!(aggregate.get("handler_conflict"), Some(conflict));
+            }
+            if route.contains("blank-summary") {
+                let known_conflict =
+                    (*route == "partial-blank-summary-known-conflict").then_some(true);
+                assert_eq!(aggregate.get("handler_conflict"), Some(&json!(known_conflict)));
             }
             if let Some(location) = summary.get("single_claim_handler") {
                 assert_eq!(aggregate.get("single_claim_handler"), Some(location));
@@ -994,6 +1033,53 @@ fn mixed_serialized_claims_retain_independent_handler_locations() {
     assert!(claim("unsafe-path").get("handler_location").is_none());
     assert!(claim("unsafe-symbol").get("handler_location").is_none());
     assert_eq!(claim("unsafe-symbol")["handler_symbol"], Value::Null);
+}
+
+#[test]
+fn unsafe_claim_evidence_locations_are_omitted_across_formats() {
+    use serde_json::{Value, json};
+
+    let mut evidence = vec![json!({
+        "kind": "runtime_hint", "relative_path": "OrderController.java",
+        "start_line": 30, "start_column": 3, "end_line": 31, "end_column": 40
+    })];
+    for path in ["/outside/export-private.java", "../traversal.java", r"Q:\drive.java"] {
+        let mut item = evidence[0].clone();
+        item["relative_path"] = json!(path);
+        evidence.push(item);
+    }
+    let input = xtrace_export::input_json::parse(&json!({"operations": [{
+        "operation_id": "orders", "method": "GET", "route_template": "/orders",
+        "claims": [{"claim_id": "get-orders", "source_evidence": evidence}]
+    }]}))
+    .unwrap();
+    let mut expected = Value::Null;
+    for format in
+        [ExportFormat::OpenApi, ExportFormat::Postman, ExportFormat::Curl, ExportFormat::Bundle]
+    {
+        let out = export(&input, &ExportRequest::new(format)).unwrap();
+        assert!(out.omissions.iter().any(|o| o.reason == "source_path_not_repo_relative"));
+        for file in &out.files {
+            for fragment in ["export-private.java", "traversal.java", "drive.java"] {
+                assert!(!text(file).contains(fragment), "{format:?} leaked {fragment}");
+            }
+        }
+        let metadata = operation_metadata(&out, format, "orders", &expected);
+        let evidence = metadata["claims"][0]["source_evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 4);
+        assert_eq!(evidence[0]["relative_path"], "OrderController.java");
+        assert_eq!(evidence[0]["start_line"], 30);
+        for omitted in &evidence[1..] {
+            assert_eq!(omitted["location_omitted"], "path_not_repo_relative");
+            for field in ["relative_path", "start_line", "start_column", "end_line", "end_column"] {
+                assert!(omitted.get(field).is_none());
+            }
+        }
+        if format == ExportFormat::OpenApi {
+            expected = metadata.clone();
+        }
+        assert_eq!(metadata, expected);
+    }
 }
 
 #[test]
