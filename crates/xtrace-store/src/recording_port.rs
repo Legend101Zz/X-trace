@@ -2811,6 +2811,126 @@ mod tests {
     }
 
     #[test]
+    fn frame_verification_uses_one_query_per_decoded_segment() {
+        use crate::recording_store::FRAME_VERIFICATION_SQL_RUNS;
+
+        let events: Vec<_> = (2..=2_002)
+            .map(|sequence| node(sequence, &format!("frame-{sequence}"), "", K_ENTER))
+            .collect();
+        let persisted = persist(&events, 2_000, true);
+
+        let take_runs = || FRAME_VERIFICATION_SQL_RUNS.with(|runs| runs.take());
+        drop(take_runs());
+        let before_boundary = window(&persisted, 1, Some(1_999));
+        assert_eq!(take_runs(), [(0, 1)]);
+        assert_eq!(before_boundary.segment_count, "2");
+        assert_eq!(before_boundary.events[0].sequence, "2000");
+        assert!(before_boundary.has_more);
+        let last_frame = before_boundary.events[0].navigation.next;
+        assert!(matches!(last_frame, Nav::Target { .. }));
+
+        let after_boundary = window(&persisted, 1, Some(2_001));
+        assert_eq!(
+            take_runs(),
+            [(0, 1), (1, 1)],
+            "one execution for the lookbehind and one for the current segment"
+        );
+        assert_eq!(after_boundary.events[0].sequence, "2002");
+        assert_eq!(after_boundary.events[0].navigation.previous, last_frame);
+        assert_eq!(after_boundary.events[0].navigation.next, Nav::Boundary);
+        assert!(!after_boundary.has_more);
+        assert_eq!(after_boundary.frame_honesty, before_boundary.frame_honesty);
+    }
+
+    #[test]
+    fn frame_verification_range_preserves_missing_corrupt_and_legacy_frame_behavior() {
+        let events: Vec<_> = (2..=12)
+            .map(|sequence| node(sequence, &format!("frame-{sequence}"), "", K_ENTER))
+            .collect();
+        let persisted = persist(&events, 9, true);
+        let original_ids = frame_ids(&window(&persisted, 20, None));
+        let other_id = RecordingId::new();
+        let adapter = SqliteRecordingPersistence::new(persisted.store.clone(), &persisted.root);
+        adapter.begin_recording(&begin(persisted.project.id(), other_id)).expect("other recording");
+        adapter
+            .persist_segment(&PersistRecordingSegment {
+                project_id: persisted.project.id(),
+                recording_id: other_id,
+                segment_ordinal: 0,
+                events: events[..9].to_vec(),
+            })
+            .expect("same sequences and event digests in another recording");
+        let reader = SqliteRecordingReader::new(persisted.store.clone(), &persisted.root);
+        let other_window = || {
+            reader
+                .show_recording(&ShowWindowRequest {
+                    project_id: persisted.project.id(),
+                    recording_id: other_id,
+                    limit: 20,
+                    after_sequence: None,
+                })
+                .expect("other recording window")
+        };
+        let other_before = other_window();
+        {
+            let connection = persisted.store.lock().expect("connection");
+            let id = persisted.recording_id.as_uuid();
+            connection
+                .execute(
+                    "DELETE FROM recording_frame_index WHERE recording_id = ?1 AND recording_seq = ?2",
+                    rusqlite::params![id.as_bytes().as_slice(), 3_u64.to_be_bytes().as_slice()],
+                )
+                .expect("remove one row");
+            for (sequence, change) in [
+                (5_u64, "event_id_digest = zeroblob(32)"),
+                (6, "monotonic_ns = zeroblob(8)"),
+                (7, "segment_ordinal = 1"),
+                (8, "event_offset = event_offset + 1"),
+                (10, "indexed_v = 0, depth = 0"),
+            ] {
+                connection
+                    .execute(
+                        &format!(
+                            "UPDATE recording_frame_index SET {change} \
+                             WHERE recording_id = ?1 AND recording_seq = ?2"
+                        ),
+                        rusqlite::params![
+                            id.as_bytes().as_slice(),
+                            sequence.to_be_bytes().as_slice()
+                        ],
+                    )
+                    .expect("mutate only the requested recording's row");
+            }
+        }
+
+        let page = window(&persisted, 20, None);
+        assert_eq!(page.events.len(), events.len());
+        for (sequence, event) in (2..=12).zip(&page.events) {
+            assert_eq!(event.sequence, sequence.to_string());
+            if matches!(sequence, 3 | 5..=8) {
+                assert_eq!(event.frame_id, None);
+                assert_eq!(event.navigation, FrameNavigation::UNAVAILABLE);
+            } else {
+                assert_eq!(event.frame_id, Some(original_ids[&sequence]));
+            }
+        }
+        let target = |sequence| Nav::Target { frame_id: original_ids[&sequence] };
+        let partial = Nav::unavailable(Unav::PartialFrontier);
+        assert_eq!(nav_of(&page, 2).next, target(4));
+        assert_eq!(nav_of(&page, 4).previous, target(2));
+        assert_eq!(nav_of(&page, 4).next, partial);
+        assert_eq!(nav_of(&page, 9).previous, partial);
+        let legacy = Nav::unavailable(Unav::LegacyUnindexed);
+        let navigation = nav_of(&page, 10);
+        assert_eq!(navigation.previous, target(9));
+        assert_eq!(navigation.next, target(11));
+        assert_eq!((navigation.into, navigation.over, navigation.out), (legacy, legacy, legacy));
+        assert_eq!(page.events[8].depth, None);
+        assert!(page.frame_honesty.is_none());
+        assert_eq!(other_window(), other_before);
+    }
+
+    #[test]
     fn depth_and_parent_populated_for_nested_frames_and_orphan_is_a_flagged_root() {
         let persisted = persist(&tree(), 3, true);
         let window = window(&persisted, 50, None);

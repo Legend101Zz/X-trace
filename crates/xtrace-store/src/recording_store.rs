@@ -58,6 +58,7 @@ type CommitObserver = Option<Box<dyn Fn(&str)>>;
 thread_local! {
     static AFTER_READ_SNAPSHOT: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     static COMMIT_OBSERVER: std::cell::RefCell<CommitObserver> = const { std::cell::RefCell::new(None) };
+    pub(crate) static FRAME_VERIFICATION_SQL_RUNS: std::cell::RefCell<Vec<(u32, i32)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -71,7 +72,7 @@ fn after_read_snapshot() {
 #[path = "recording_limitations.rs"]
 mod recording_limitations;
 use crate::xtf::{
-    LogicalXtfSegment, XtfCodecError, XtfSegmentInput, compress_logical_bytes,
+    DecodedXtfSegment, LogicalXtfSegment, XtfCodecError, XtfSegmentInput, compress_logical_bytes,
     encode_logical_segment, max_compressed_segment_bytes, verify_compressed_segment,
 };
 
@@ -1141,9 +1142,7 @@ impl SqliteRecordingStore<'_> {
             phase.switch("read_frame_verification");
             index_verified_segment_frames(
                 &connection,
-                request.recording_id,
-                ordinal,
-                decoded.events(),
+                &decoded,
                 &mut verified_frame_ids,
                 correlation_id,
             )?;
@@ -3308,49 +3307,54 @@ pub(crate) fn navigate_indexed_frame(
     Ok(FrameNavigation { previous, next, into, over, out })
 }
 
-/// Row shape of `recording_frame_index`: frame id, segment ordinal, event
-/// offset, event id digest, monotonic nanoseconds.
-type FrameIndexRow = (Vec<u8>, i64, i64, Vec<u8>, Vec<u8>);
-
 fn index_verified_segment_frames(
     connection: &rusqlite::Connection,
-    recording_id: RecordingId,
-    segment_ordinal: u32,
-    envelopes: &[xtrace_protocol::xtf::XtfEventEnvelope],
+    decoded: &DecodedXtfSegment,
     verified_frame_ids: &mut HashMap<u64, xtrace_domain::FrameId>,
     correlation_id: CorrelationId,
 ) -> Result<(), RecordingStoreError> {
-    // A paginated read verifies the whole intersecting segment, including its
-    // lookbehind. Reuse this query for all envelopes instead of recompiling it
-    // for every event on every page.
+    let verified = decoded.verified();
+    let first_sequence = verified.first_recording_seq();
+    let sql_error =
+        |error| map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id);
+    // The XTF verifier proved a contiguous range. Big-endian BLOB bounds cover
+    // it in unsigned order, and the type and width filter preserves the domain
+    // of the exact sequence lookups even if stored keys are malformed.
     let mut statement = connection
         .prepare_cached(
-            "SELECT frame_id, segment_ordinal, event_offset, event_id_digest, monotonic_ns \
-         FROM recording_frame_index WHERE recording_id = ?1 AND recording_seq = ?2",
+            "SELECT recording_seq, frame_id, segment_ordinal, event_offset, event_id_digest, \
+                    monotonic_ns FROM recording_frame_index \
+             WHERE recording_id = ?1 AND recording_seq BETWEEN ?2 AND ?3 \
+               AND typeof(recording_seq) = 'blob' AND length(recording_seq) = 8 \
+             ORDER BY recording_seq",
         )
-        .map_err(|error| {
-            map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-        })?;
-    for (event_offset, envelope) in envelopes.iter().enumerate() {
-        let Some(event) = envelope.event.as_ref() else {
-            return Err(object_corrupt_error(correlation_id));
-        };
-        let indexed: Option<FrameIndexRow> = statement
-            .query_row(
-                rusqlite::params![
-                    recording_id.as_uuid().as_bytes().to_vec(),
-                    event.recording_seq.to_be_bytes().as_slice(),
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )
-            .optional()
-            .map_err(|error| {
-                map_store_error(StoreError::from_rusqlite(error, correlation_id), correlation_id)
-            })?;
-        let Some((frame_id, ordinal, offset, event_digest, monotonic)) = indexed else {
-            continue;
-        };
-        if u32::try_from(ordinal).ok() != Some(segment_ordinal)
+        .map_err(sql_error)?;
+    #[cfg(test)]
+    statement.reset_status(rusqlite::StatementStatus::Run);
+    let mut rows = statement
+        .query(rusqlite::params![
+            verified.recording_id().as_uuid().as_bytes().as_slice(),
+            first_sequence.to_be_bytes().as_slice(),
+            verified.last_recording_seq().to_be_bytes().as_slice(),
+        ])
+        .map_err(sql_error)?;
+    while let Some(row) = rows.next().map_err(sql_error)? {
+        let sequence = u64::from_be_bytes(row.get(0).map_err(sql_error)?);
+        let event_offset = sequence
+            .checked_sub(first_sequence)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| object_corrupt_error(correlation_id))?;
+        let event = decoded
+            .events()
+            .get(event_offset)
+            .and_then(|envelope| envelope.event.as_ref())
+            .ok_or_else(|| object_corrupt_error(correlation_id))?;
+        let frame_id: Vec<u8> = row.get(1).map_err(sql_error)?;
+        let ordinal: i64 = row.get(2).map_err(sql_error)?;
+        let offset: i64 = row.get(3).map_err(sql_error)?;
+        let event_digest: Vec<u8> = row.get(4).map_err(sql_error)?;
+        let monotonic: Vec<u8> = row.get(5).map_err(sql_error)?;
+        if u32::try_from(ordinal).ok() != Some(verified.segment_ordinal())
             || usize::try_from(offset).ok() != Some(event_offset)
             || event_digest.as_slice() != blake3::hash(event.event_id.as_bytes()).as_bytes()
             || monotonic.as_slice() != event.monotonic_ns.to_be_bytes()
@@ -3358,8 +3362,17 @@ fn index_verified_segment_frames(
             continue;
         }
         if let Ok(frame_id) = frame_id_from_bytes(&frame_id, correlation_id) {
-            verified_frame_ids.insert(event.recording_seq, frame_id);
+            verified_frame_ids.insert(sequence, frame_id);
         }
+    }
+    #[cfg(test)]
+    {
+        drop(rows);
+        // Count SQLite executions of the cached statement, including empty ranges.
+        FRAME_VERIFICATION_SQL_RUNS.with(|runs| {
+            let executions = statement.get_status(rusqlite::StatementStatus::Run);
+            runs.borrow_mut().push((verified.segment_ordinal(), executions));
+        });
     }
     Ok(())
 }
@@ -6995,6 +7008,100 @@ mod tests {
                 sequence
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frame_verification_range_includes_u64_max_and_ignores_nonmatching_keys() {
+        let recording_id = RecordingId::new();
+        let first = u64::MAX - 256;
+        let input = XtfSegmentInput {
+            project_id: ProjectId::new(),
+            recording_id,
+            segment_ordinal: 0,
+            events: (first..=u64::MAX).map(event).collect(),
+        };
+        let encoded = crate::xtf::encode_segment(&input).expect("encode high sequences");
+        let decoded = crate::xtf::decode_compressed_segment(
+            encoded.compressed_bytes(),
+            encoded.content_hash(),
+        )
+        .expect("verify high sequences");
+        let mut connection = rusqlite::Connection::open_in_memory().expect("SQLite connection");
+        // Permit malformed storage classes and lengths to exercise the query's key domain.
+        connection
+            .execute_batch(
+                "CREATE TABLE recording_frame_index (
+                    recording_id BLOB, recording_seq BLOB, frame_id BLOB, segment_ordinal INTEGER,
+                    event_offset INTEGER, event_id_digest BLOB, monotonic_ns BLOB,
+                    PRIMARY KEY (recording_id, recording_seq)
+                );",
+            )
+            .expect("test frame index");
+        let id = recording_id.as_uuid();
+        let max = u64::MAX.to_be_bytes();
+        let mut expected = HashMap::new();
+        for sequence in [first, u64::MAX - 1, u64::MAX] {
+            let frame_id = xtrace_domain::FrameId::new();
+            let invalid_id = [0_u8; 16];
+            let frame_uuid = frame_id.as_uuid();
+            let frame_bytes = if sequence == u64::MAX - 1 {
+                &invalid_id
+            } else {
+                expected.insert(sequence, frame_id);
+                frame_uuid.as_bytes()
+            };
+            connection
+                .execute(
+                    "INSERT INTO recording_frame_index VALUES (?1, ?2, ?3, 0, ?4, ?5, zeroblob(8))",
+                    rusqlite::params![
+                        id.as_bytes().as_slice(),
+                        sequence.to_be_bytes().as_slice(),
+                        frame_bytes.as_slice(),
+                        i64::try_from(sequence - first).expect("offset"),
+                        blake3::hash(format!("event-{sequence}").as_bytes()).as_bytes().as_slice(),
+                    ],
+                )
+                .expect("insert matching sequence key");
+        }
+        let mut long_key = first.to_be_bytes().to_vec();
+        long_key.push(0);
+        connection
+            .execute(
+                "WITH keys(seq) AS (VALUES (?2), (?3), (CAST(?4 AS TEXT)), (42), (?5))
+                 INSERT INTO recording_frame_index
+                 SELECT ?1, seq, zeroblob(16), 'invalid ordinal', 0, zeroblob(32), zeroblob(8)
+                 FROM keys",
+                rusqlite::params![
+                    id.as_bytes().as_slice(),
+                    &max[..7],
+                    long_key,
+                    max.as_slice(),
+                    (first - 1).to_be_bytes().as_slice(),
+                ],
+            )
+            .expect("insert nonmatching keys, including short and long BLOBs inside the bounds");
+
+        let correlation_id = CorrelationId::new();
+        let read = connection.transaction().expect("read transaction");
+        let mut actual = HashMap::new();
+        index_verified_segment_frames(&read, &decoded, &mut actual, correlation_id)
+            .expect("ignore nonmatching keys and the invalid frame ID");
+        assert_eq!(actual, expected);
+        read.commit().expect("end read");
+
+        connection
+            .execute(
+                "UPDATE recording_frame_index SET segment_ordinal = 'invalid ordinal'
+                 WHERE recording_id = ?1 AND recording_seq = ?2",
+                rusqlite::params![id.as_bytes().as_slice(), max.as_slice()],
+            )
+            .expect("corrupt a matching row's SQLite type");
+        let read = connection.transaction().expect("read transaction");
+        let error =
+            index_verified_segment_frames(&read, &decoded, &mut HashMap::new(), correlation_id)
+                .expect_err("a matching row's SQLite conversion error still propagates");
+        assert_eq!(error.code(), "XTR-STORE-RECORDING-SQLITE-VALIDATION");
     }
 
     #[cfg(unix)]
