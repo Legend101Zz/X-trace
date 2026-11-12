@@ -565,8 +565,13 @@ fn export_distinct_claim_locations_and_confidences() {
                 for id in [&other_id, &create_id] {
                     assert!(yaml.contains(id));
                 }
-                assert_eq!(postman_metadata(), curl_metadata());
-                postman_metadata()
+                let metadata = postman_metadata();
+                assert_eq!(metadata, curl_metadata());
+                let block =
+                    xtrace_export::canonical::yaml(&serde_json::json!({"x-xtrace": metadata}));
+                let block = block.lines().map(|line| format!("      {line}\n")).collect::<String>();
+                assert!(yaml.contains(&block));
+                metadata
             }
             _ => unreachable!(),
         };
@@ -618,6 +623,8 @@ fn export_distinct_claim_locations_and_confidences() {
                     claim["limitation_codes"],
                     serde_json::json!(["missing_response_schema"])
                 );
+            } else {
+                assert_eq!(claim.get("limitation_codes"), Some(&serde_json::json!([])));
             }
         }
     }
@@ -728,6 +735,8 @@ fn export_missing_claim_fields_remain_unknown() {
     let claim = &metadata["claims"][0];
     assert_eq!(claim["claim_id"], id);
     assert_eq!(claim.get("handler_symbol"), Some(&Value::Null));
+    assert_eq!(metadata.get("handler_symbols"), Some(&Value::Null));
+    assert_eq!(metadata.get("handler_conflict"), Some(&Value::Null));
     assert_eq!(claim.get("confidence_basis_points"), Some(&Value::Null));
     assert!(metadata.get("confidence_basis_points").is_none());
     assert!(metadata.get("handlers").is_none());
@@ -1282,18 +1291,32 @@ fn existing_output_is_refused_without_stale_or_mixed_files() {
 }
 
 #[test]
-fn bundle_and_openapi_policy_digest_unknown_without_revision_provenance() {
+fn all_formats_report_unknown_policy_digest_without_revision_provenance() {
+    let assert_policy_omission = |doc: &Value| {
+        let matching: Vec<_> = doc["omissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["what"].as_str().unwrap().rsplit(':').next() == Some("policy_digest"))
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0]["what"], "policy_digest");
+        assert_eq!(matching[0]["reason"], "not_available_in_catalog_view");
+    };
+    let note = "Omitted policy_digest (not_available_in_catalog_view).";
     let fx = project_with_catalog(TRANSCRIPT);
     let a = fx.out_dir("bundle-a");
     let b = fx.out_dir("bundle-b");
     let preview = fx.export(&["--format", "bundle", "--preview"]);
     assert_eq!(preview.status.code(), Some(0), "{preview:?}");
+    assert_policy_omission(&json(&preview));
     let mut results = Vec::new();
     for out in [&a, &b] {
         let result = fx.export(&["--format", "bundle", "--output", out.to_str().unwrap()]);
         assert_eq!(result.status.code(), Some(0), "{result:?}");
         assert_eq!(json(&result)["operationCount"], 3);
         results.push(json(&result));
+        assert_policy_omission(results.last().unwrap());
         assert_eq!(fs::metadata(out).unwrap().permissions().mode() & 0o777, 0o700);
         for (name, _) in tree(out) {
             assert_eq!(fs::metadata(out.join(name)).unwrap().permissions().mode() & 0o777, 0o600);
@@ -1311,17 +1334,33 @@ fn bundle_and_openapi_policy_digest_unknown_without_revision_provenance() {
     assert_eq!(manifest["revision_id"], results[0]["revisionId"]);
     assert_eq!(manifest["catalog_hash"].as_str().unwrap().len(), 64);
     assert_eq!(manifest.get("policy_digest"), Some(&Value::Null));
-    assert!(manifest["omissions"].as_array().unwrap().iter().any(|o| o["what"] == "policy_digest" && o["reason"] == "not_available_in_catalog_view"));
+    assert_policy_omission(&manifest);
+    let formats = manifest["formats"].as_array().unwrap();
+    assert_eq!(formats.len(), 3);
+    for format in formats {
+        assert_policy_omission(format);
+    }
     assert!(read(&a, "openapi.yaml").contains("policy_digest: null"));
     let openapi = fx.out_dir("openapi-policy");
     let output = fx.export(&["--format", "openapi", "--output", openapi.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_policy_omission(&json(&output));
     let document: Value = serde_json::from_str(&read(&openapi, "openapi.json")).unwrap();
     let metadata = &document["info"]["x-xtrace"];
     assert_eq!(metadata.get("policy_digest"), Some(&Value::Null));
-    assert!(metadata["omissions"].as_array().unwrap().iter().any(|o| {
-        o["what"] == "policy_digest" && o["reason"] == "not_available_in_catalog_view"
-    }));
+    assert_policy_omission(metadata);
+    for (format, path, bundle_path) in [
+        ("postman", "collection.postman.json", "collection.postman.json"),
+        ("curl", "all.sh", "curl/all.sh"),
+    ] {
+        let dir = fx.out_dir(format);
+        let output = fx.export(&["--format", format, "--output", dir.to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_policy_omission(&json(&output));
+        let artifact = read(&dir, path);
+        assert_eq!(artifact.matches(note).count(), 1);
+        assert_eq!(read(&a, bundle_path), artifact);
+    }
     let files = manifest["files"].as_array().unwrap();
     assert_eq!(files.len(), 6);
     assert_eq!(tree(&a).len(), 8, "only payload, manifest and README");

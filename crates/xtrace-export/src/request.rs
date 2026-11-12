@@ -185,6 +185,8 @@ pub struct ClaimInput {
     pub claim_id: String,
     /// Provenance label.
     pub provenance: String,
+    /// Whether an empty provenance label was explicitly supplied.
+    pub empty_provenance_reported: bool,
     /// Confidence in basis points.
     pub confidence_basis_points: Option<u16>,
     /// Limitation codes.
@@ -206,6 +208,18 @@ pub struct ClaimInput {
     pub source_evidence: Option<Vec<xtrace_domain::catalog_discovery::ClaimSourceEvidence>>,
     /// Request body media type, when the claim declares a body.
     pub request_body_media_type: Option<String>,
+}
+
+impl ClaimInput {
+    pub(crate) fn reported_provenance(&self) -> Option<&str> {
+        (self.empty_provenance_reported || !self.provenance.is_empty())
+            .then_some(self.provenance.as_str())
+    }
+
+    pub(crate) fn reported_limitations(&self) -> Option<&[String]> {
+        (self.empty_limitations_reported || !self.limitation_codes.is_empty())
+            .then_some(self.limitation_codes.as_slice())
+    }
 }
 
 /// Aggregate catalog facts, which may be supplied alongside individual claims.
@@ -243,7 +257,8 @@ pub struct OperationInput {
     pub binding_key: String,
     /// Effective state.
     pub effective_state: EffectiveState,
-    /// False when the claims projection was unavailable (claims is then empty).
+    /// Whether claim rows were supplied. An available list may be empty or partial.
+    /// Rows are ignored when the projection is unavailable.
     pub claims_available: bool,
     /// Claims.
     pub claims: Vec<ClaimInput>,

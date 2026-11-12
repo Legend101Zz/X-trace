@@ -14,6 +14,9 @@ use crate::sanitize;
 const MAX_LEGACY_HANDLER_SYMBOL_BYTES: usize = 200;
 // ValidatedEndpointClaim's bound for a recorded handler symbol.
 const MAX_CLAIM_HANDLER_SYMBOL_BYTES: usize = 512;
+pub(crate) const POLICY_DIGEST_FIELD: &str = "policy_digest";
+pub(crate) const POLICY_DIGEST_OMISSION_NOTE: &str =
+    "Omitted policy_digest (not_available_in_catalog_view).";
 
 /// A disagreement between claims that is reported, never merged.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,8 +91,8 @@ pub struct PreparedOp {
     pub provenance: Vec<String>,
     /// Lowest reported confidence for legacy-only claims.
     pub confidence_bp: Option<u16>,
-    /// Limitation codes, sorted unique.
-    pub limitation_codes: Vec<String>,
+    /// Reported limitation codes, sorted unique.
+    pub limitation_codes: Option<Vec<String>>,
     /// Conflicts.
     pub conflicts: Vec<Conflict>,
     /// Handlers sorted by (path, line, symbol).
@@ -113,6 +116,12 @@ pub struct Prepared {
     pub omissions: Vec<Omission>,
     /// YAML requested.
     pub yaml: bool,
+}
+
+impl Prepared {
+    pub(crate) fn policy_digest_omission(&self) -> Option<&Omission> {
+        self.omissions.iter().find(|omission| omission.what == POLICY_DIGEST_FIELD)
+    }
 }
 
 /// Method ordering used everywhere.
@@ -183,6 +192,9 @@ fn canonical_key(op: &PreparedOp) -> (String, u8, String, String, String, String
 #[must_use]
 pub fn prepare(input: &ExportInput, request: &ExportRequest) -> Prepared {
     let mut omissions: BTreeSet<Omission> = BTreeSet::new();
+    if input.revision.policy_digest.is_empty() {
+        omit(&mut omissions, "", POLICY_DIGEST_FIELD.to_owned(), "not_available_in_catalog_view");
+    }
     let wanted: Option<BTreeSet<&str>> =
         request.operation_ids.as_ref().map(|ids| ids.iter().map(String::as_str).collect());
     if let Some(wanted) = &wanted {
@@ -234,10 +246,9 @@ fn omit(set: &mut BTreeSet<Omission>, op: &str, what: String, reason: &str) {
 fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> PreparedOp {
     let method = op.method.to_ascii_uppercase();
     let path = normalize_path(&op.route_template);
-    let mut claims: Vec<_> = op.claims.iter().filter(|_| op.claims_available).collect();
+    let claims_available = op.claims_available;
+    let mut claims: Vec<_> = op.claims.iter().filter(|_| claims_available).collect();
     claims.sort_by(|a, b| a.claim_id.cmp(&b.claim_id));
-    let claims_available =
-        op.claims_available && (!claims.is_empty() || op.catalog_summary.is_none());
     if !claims_available {
         omit(omissions, &op.operation_id, "claims".to_owned(), "claims_projection_unavailable");
     }
@@ -393,9 +404,11 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
         omit(omissions, &op.operation_id, "examples".to_owned(), "no_scenario_or_claim_example");
     }
 
-    let mut provenance: BTreeSet<String> = claims.iter().map(|c| c.provenance.clone()).collect();
-    let mut limitation_codes: BTreeSet<String> =
-        claims.iter().flat_map(|c| c.limitation_codes.iter().cloned()).collect();
+    let provenance: BTreeSet<_> = claims.iter().filter_map(|c| c.reported_provenance()).collect();
+    let limitation_codes: BTreeSet<_> =
+        claims.iter().filter_map(|c| c.reported_limitations()).flatten().collect();
+    let limitations_reported = !limitation_codes.is_empty()
+        || (!claims.is_empty() && claims.iter().all(|c| c.reported_limitations().is_some()));
     // Keep the aggregate location list and minimum reported confidence for legacy consumers.
     let legacy_only = !claims.is_empty()
         && claims.iter().all(|c| c.source_evidence.is_none() && c.handler_symbol.is_none());
@@ -411,13 +424,14 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
         if let Some(symbols) = &mut summary.handler_symbols {
             symbols.sort();
             symbols.dedup();
-            if !claims_available && symbols.len() > 1 {
-                summary.handler_conflict = Some(true);
-            }
+            let was_nonempty = !symbols.is_empty();
             symbols.retain(|symbol| {
                 checked_handler_symbol(op, omissions, symbol, MAX_LEGACY_HANDLER_SYMBOL_BYTES)
                     .is_some()
             });
+            if was_nonempty && symbols.is_empty() {
+                summary.handler_symbols = None;
+            }
         }
         for values in [&mut summary.provenance, &mut summary.limitation_codes].into_iter().flatten()
         {
@@ -449,8 +463,6 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
             omit(omissions, &op.operation_id, "source".to_owned(), reason);
         }
         if !claims_available {
-            provenance.extend(summary.provenance.iter().flatten().cloned());
-            limitation_codes.extend(summary.limitation_codes.iter().flatten().cloned());
             handlers.extend(summary.single_claim_handler.iter().cloned());
             omit(
                 omissions,
@@ -485,13 +497,14 @@ fn prepare_op(op: &OperationInput, omissions: &mut BTreeSet<Omission>) -> Prepar
         params,
         responses,
         examples: examples.into_iter().collect(),
-        provenance: provenance.into_iter().collect(),
+        provenance: provenance.into_iter().map(str::to_owned).collect(),
         confidence_bp: if legacy_only {
             claims.iter().filter_map(|c| c.confidence_basis_points).min()
         } else {
             None
         },
-        limitation_codes: limitation_codes.into_iter().collect(),
+        limitation_codes: limitations_reported
+            .then(|| limitation_codes.into_iter().cloned().collect()),
         conflicts,
         handlers,
         request_media,
@@ -508,20 +521,22 @@ fn exact_claim_metadata(
 ) -> (Value, Vec<HandlerInput>) {
     let mut reported_symbols = BTreeSet::new();
     let mut safe_symbols = BTreeSet::new();
+    let mut handlers_known = true;
     let mut rows = Vec::with_capacity(claims.len());
     let mut handlers = Vec::new();
     for claim in claims {
-        let persisted_symbol = claim.handler_symbol.as_deref();
-        reported_symbols.extend(persisted_symbol.filter(|symbol| !symbol.is_empty()));
-        let safe_persisted_symbol = persisted_symbol.and_then(|symbol| {
+        let persisted_symbol = claim.handler_symbol.as_deref().filter(|symbol| !symbol.is_empty());
+        let legacy_symbol =
+            claim.handler.as_ref().map(|h| h.symbol.as_str()).filter(|s| !s.is_empty());
+        handlers_known &= persisted_symbol.is_some() || legacy_symbol.is_some();
+        reported_symbols.extend(persisted_symbol);
+        reported_symbols.extend(legacy_symbol);
+        let safe_persisted_symbol = claim.handler_symbol.as_deref().and_then(|symbol| {
             checked_handler_symbol(op, omissions, symbol, MAX_CLAIM_HANDLER_SYMBOL_BYTES)
         });
         safe_symbols.extend(safe_persisted_symbol);
-        let safe_legacy_symbol = claim.handler.as_ref().and_then(|handler| {
-            if !handler.symbol.is_empty() {
-                reported_symbols.insert(handler.symbol.as_str());
-            }
-            checked_handler_symbol(op, omissions, &handler.symbol, MAX_LEGACY_HANDLER_SYMBOL_BYTES)
+        let safe_legacy_symbol = legacy_symbol.and_then(|symbol| {
+            checked_handler_symbol(op, omissions, symbol, MAX_LEGACY_HANDLER_SYMBOL_BYTES)
         });
         safe_symbols.extend(safe_legacy_symbol);
         let evidence = claim.source_evidence.as_ref().map(|items| {
@@ -529,10 +544,10 @@ fn exact_claim_metadata(
         });
         let mut row = json!({
             "claim_id": claim.claim_id,
-            "provenance": claim.provenance,
+            "provenance": claim.reported_provenance(),
             "handler_symbol": safe_persisted_symbol,
             "confidence_basis_points": claim.confidence_basis_points,
-            "limitation_codes": claim.limitation_codes,
+            "limitation_codes": claim.reported_limitations(),
             "source_evidence": evidence,
         });
         if let Some(handler) = &claim.handler
@@ -546,29 +561,34 @@ fn exact_claim_metadata(
         }
         rows.push(row);
     }
-    let handler_conflict = reported_symbols.len() > 1;
-    if handler_conflict {
+    let partial =
+        op.catalog_summary.as_ref().is_some_and(|summary| summary.claim_count > rows.len());
+    let empty_complete = rows.is_empty() && !partial;
+    let handler_conflict = if reported_symbols.len() > 1 {
         omit(omissions, &op.operation_id, "handler".to_owned(), "handler_conflict_unresolved");
+        Some(true)
+    } else {
+        (empty_complete || (!rows.is_empty() && handlers_known)).then_some(false)
+    };
+    if partial {
+        omit(omissions, &op.operation_id, "claims".to_owned(), "claims_projection_partial");
     }
     let projection = match &op.catalog_summary {
-        Some(summary) if summary.claim_count > rows.len() => {
-            omit(omissions, &op.operation_id, "claims".to_owned(), "claims_projection_partial");
-            "partial"
-        }
         Some(summary) if summary.claim_count < rows.len() => {
             omit(omissions, &op.operation_id, "claims".to_owned(), "claim_count_mismatch");
             "inconsistent"
         }
-        Some(summary) if summary_disagrees(summary, claims, &reported_symbols) => {
+        Some(summary) if summary_disagrees(summary, claims, &reported_symbols, handlers_known) => {
             omit(omissions, &op.operation_id, "claims".to_owned(), "claim_summary_mismatch");
             "inconsistent"
         }
+        _ if partial => "partial",
         _ => "available",
     };
     let metadata = json!({
         "claims_projection": projection,
         "claim_count": rows.len(),
-        "handler_symbols": safe_symbols,
+        "handler_symbols": (empty_complete || !safe_symbols.is_empty()).then_some(safe_symbols),
         "handler_conflict": handler_conflict,
         "claims": rows,
     });
@@ -584,7 +604,7 @@ fn summary_handler_conflict(summary: &CatalogSummaryInput) -> Option<bool> {
 }
 
 /// A reported set must cover every known row value. Extra summary values are
-/// compatible when some rows lack the field.
+/// compatible when rows are missing or some supplied rows lack the field.
 fn summary_set_disagrees(
     summary: Option<&[String]>,
     rows: &BTreeSet<&str>,
@@ -600,20 +620,21 @@ fn summary_disagrees(
     summary: &CatalogSummaryInput,
     claims: &[&ClaimInput],
     symbols: &BTreeSet<&str>,
+    handlers_known: bool,
 ) -> bool {
-    let handlers_known = claims.iter().all(|claim| {
-        claim.handler_symbol.as_ref().is_some_and(|symbol| !symbol.is_empty())
-            || claim.handler.as_ref().is_some_and(|handler| !handler.symbol.is_empty())
-    });
+    let complete = summary.claim_count == claims.len();
+    let handlers_complete = complete && handlers_known;
     let conflict = symbols.len() > 1;
-    if summary_set_disagrees(summary.handler_symbols.as_deref(), symbols, handlers_known)
-        || ((conflict || handlers_known)
+    if summary_set_disagrees(summary.handler_symbols.as_deref(), symbols, handlers_complete)
+        || ((conflict || handlers_complete)
             && summary_handler_conflict(summary).is_some_and(|reported| reported != conflict))
     {
         return true;
     }
 
-    if let ([claim], Some(location)) = (claims, &summary.single_claim_handler) {
+    if let (1, [claim], Some(location)) =
+        (summary.claim_count, claims, &summary.single_claim_handler)
+    {
         if !location.symbol.is_empty()
             && handlers_known
             && !symbols.contains(location.symbol.as_str())
@@ -634,22 +655,28 @@ fn summary_disagrees(
         }
     }
 
-    let provenance: BTreeSet<_> =
-        claims.iter().map(|c| c.provenance.as_str()).filter(|label| !label.is_empty()).collect();
-    let limitations =
-        claims.iter().flat_map(|c| c.limitation_codes.iter().map(String::as_str)).collect();
+    let provenance = claims.iter().filter_map(|c| c.reported_provenance()).collect();
+    let limitations = claims
+        .iter()
+        .filter_map(|c| c.reported_limitations())
+        .flatten()
+        .map(String::as_str)
+        .collect();
     let highest = claims.iter().filter_map(|c| c.confidence_basis_points).max();
     summary_set_disagrees(
         summary.provenance.as_deref(),
         &provenance,
-        claims.iter().all(|c| !c.provenance.is_empty()),
+        complete && claims.iter().all(|c| c.reported_provenance().is_some()),
     ) || summary_set_disagrees(
         summary.limitation_codes.as_deref(),
         &limitations,
-        claims.iter().all(|c| c.empty_limitations_reported || !c.limitation_codes.is_empty()),
-    ) || summary.highest_confidence_basis_points.zip(highest).is_some_and(|(reported, known)| {
-        reported < known
-            || (reported != known && claims.iter().all(|c| c.confidence_basis_points.is_some()))
+        complete && claims.iter().all(|c| c.reported_limitations().is_some()),
+    ) || summary.highest_confidence_basis_points.is_some_and(|reported| {
+        if complete && claims.iter().all(|c| c.confidence_basis_points.is_some()) {
+            highest != Some(reported)
+        } else {
+            highest.is_some_and(|known| reported < known)
+        }
     })
 }
 
@@ -752,19 +779,20 @@ pub(crate) fn catalog_metadata(op: &PreparedOp) -> Value {
         metadata["catalog_summary"] = aggregate;
     } else if let Some(summary) = &op.catalog_summary {
         metadata["claim_count"] = json!(summary.claim_count);
-        metadata["handler_symbols"] = json!(summary.handler_symbols.as_deref().unwrap_or_default());
-        metadata["handler_conflict"] = json!(summary.handler_conflict.unwrap_or_default());
+        metadata["handler_symbols"] = json!(summary.handler_symbols);
+        metadata["handler_conflict"] = json!(summary.handler_conflict);
+        metadata["provenance"] = json!(summary.provenance);
+        metadata["limitation_codes"] = json!(summary.limitation_codes);
         metadata["highest_confidence_basis_points"] =
             json!(summary.highest_confidence_basis_points);
         metadata["source_locations"] = json!("per-claim locations unavailable");
         metadata["claim_confidence"] = json!("not available per claim");
     }
-    let summary_only = !op.claims_available && op.catalog_summary.is_some();
-    if !op.provenance.is_empty() || summary_only {
+    if !op.provenance.is_empty() {
         metadata["provenance"] = json!(op.provenance);
     }
-    if !op.limitation_codes.is_empty() || summary_only {
-        metadata["limitation_codes"] = json!(op.limitation_codes);
+    if let Some(codes) = &op.limitation_codes {
+        metadata["limitation_codes"] = json!(codes);
     }
     if let Some(bp) = op.confidence_bp {
         metadata["confidence_basis_points"] = json!(bp);

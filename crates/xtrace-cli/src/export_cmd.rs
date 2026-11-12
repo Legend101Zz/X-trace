@@ -135,6 +135,7 @@ fn operation_input(
                 handler_symbol: claim.handler_symbol.clone(),
                 confidence_basis_points: claim.confidence_basis_points,
                 limitation_codes: claim.limitation_codes.clone(),
+                empty_limitations_reported: claim.limitation_codes.is_empty(),
                 source_evidence: Some(claim.source_evidence.clone()),
                 ..ClaimInput::default()
             })

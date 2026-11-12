@@ -8,7 +8,7 @@
     {
       "name": "GET /orders",
       "request": {
-        "description": "operation: op-list\ncatalog state: conflicted\nx-xtrace-observation: inferred\nx-xtrace catalog metadata: {\"application_component\":\"orders\",\"binding_key\":\"spring:GET /orders\",\"claim_count\":2,\"claims\":[{\"claim_id\":\"c-list-a\",\"confidence_basis_points\":null,\"handler_symbol\":null,\"limitation_codes\":[],\"provenance\":\"static_analysis\",\"source_evidence\":null},{\"claim_id\":\"c-list-b\",\"confidence_basis_points\":null,\"handler_symbol\":null,\"limitation_codes\":[],\"provenance\":\"adapter_registration\",\"source_evidence\":null}],\"claims_projection\":\"available\",\"conflicts\":[{\"claims\":[{\"claim_id\":\"c-list-a\",\"value\":\"integer\"},{\"claim_id\":\"c-list-b\",\"value\":\"string\"}],\"kind\":\"param_type\",\"subject\":\"query:page\"},{\"claims\":[{\"claim_id\":\"c-list-a\",\"value\":\"A page of orders\"},{\"claim_id\":\"c-list-b\",\"value\":\"All orders\"}],\"kind\":\"response_description\",\"subject\":\"200\"}],\"effective_state\":\"conflicted\",\"handler_conflict\":false,\"handler_symbols\":[],\"operation_id\":\"op-list\",\"provenance\":[\"adapter_registration\",\"static_analysis\"]}",
+        "description": "operation: op-list\ncatalog state: conflicted\nx-xtrace-observation: inferred\nx-xtrace catalog metadata: {\"application_component\":\"orders\",\"binding_key\":\"spring:GET /orders\",\"claim_count\":2,\"claims\":[{\"claim_id\":\"c-list-a\",\"confidence_basis_points\":null,\"handler_symbol\":null,\"limitation_codes\":null,\"provenance\":\"static_analysis\",\"source_evidence\":null},{\"claim_id\":\"c-list-b\",\"confidence_basis_points\":null,\"handler_symbol\":null,\"limitation_codes\":null,\"provenance\":\"adapter_registration\",\"source_evidence\":null}],\"claims_projection\":\"available\",\"conflicts\":[{\"claims\":[{\"claim_id\":\"c-list-a\",\"value\":\"integer\"},{\"claim_id\":\"c-list-b\",\"value\":\"string\"}],\"kind\":\"param_type\",\"subject\":\"query:page\"},{\"claims\":[{\"claim_id\":\"c-list-a\",\"value\":\"A page of orders\"},{\"claim_id\":\"c-list-b\",\"value\":\"All orders\"}],\"kind\":\"response_description\",\"subject\":\"200\"}],\"effective_state\":\"conflicted\",\"handler_conflict\":null,\"handler_symbols\":null,\"operation_id\":\"op-list\",\"provenance\":[\"adapter_registration\",\"static_analysis\"]}",
         "header": [],
         "method": "GET",
         "url": {
@@ -31,7 +31,7 @@
     {
       "name": "GET /orders",
       "request": {
-        "description": "operation: op-zdup\ncatalog state: registered\nx-xtrace-observation: inferred\nx-xtrace catalog metadata: {\"application_component\":\"orders\",\"binding_key\":\"spring:GET /orders\",\"claim_count\":1,\"claims\":[{\"claim_id\":\"c-dup\",\"confidence_basis_points\":null,\"handler_symbol\":null,\"limitation_codes\":[],\"provenance\":\"static_analysis\",\"source_evidence\":null}],\"claims_projection\":\"available\",\"effective_state\":\"registered\",\"handler_conflict\":false,\"handler_symbols\":[],\"operation_id\":\"op-zdup\",\"provenance\":[\"static_analysis\"]}",
+        "description": "operation: op-zdup\ncatalog state: registered\nx-xtrace-observation: inferred\nx-xtrace catalog metadata: {\"application_component\":\"orders\",\"binding_key\":\"spring:GET /orders\",\"claim_count\":1,\"claims\":[{\"claim_id\":\"c-dup\",\"confidence_basis_points\":null,\"handler_symbol\":null,\"limitation_codes\":null,\"provenance\":\"static_analysis\",\"source_evidence\":null}],\"claims_projection\":\"available\",\"effective_state\":\"registered\",\"handler_conflict\":null,\"handler_symbols\":null,\"operation_id\":\"op-zdup\",\"provenance\":[\"static_analysis\"]}",
         "header": [],
         "method": "GET",
         "url": {
@@ -52,7 +52,7 @@
           "mode": "raw",
           "raw": "{\"sku\":\"A-1\",\"qty\":2}"
         },
-        "description": "operation: op-create\ncatalog state: observed\nx-xtrace-observation: observed\nx-xtrace catalog metadata: {\"application_component\":\"orders\",\"binding_key\":\"spring:POST /orders\",\"claim_count\":1,\"claims\":[{\"claim_id\":\"c-create\",\"confidence_basis_points\":null,\"handler_symbol\":null,\"limitation_codes\":[],\"provenance\":\"static_analysis\",\"source_evidence\":null}],\"claims_projection\":\"available\",\"effective_state\":\"observed\",\"handler_conflict\":false,\"handler_symbols\":[],\"operation_id\":\"op-create\",\"provenance\":[\"static_analysis\"]}",
+        "description": "operation: op-create\ncatalog state: observed\nx-xtrace-observation: observed\nx-xtrace catalog metadata: {\"application_component\":\"orders\",\"binding_key\":\"spring:POST /orders\",\"claim_count\":1,\"claims\":[{\"claim_id\":\"c-create\",\"confidence_basis_points\":null,\"handler_symbol\":null,\"limitation_codes\":null,\"provenance\":\"static_analysis\",\"source_evidence\":null}],\"claims_projection\":\"available\",\"effective_state\":\"observed\",\"handler_conflict\":null,\"handler_symbols\":null,\"operation_id\":\"op-create\",\"provenance\":[\"static_analysis\"]}",
         "header": [
           {
             "key": "Content-Type",
@@ -74,7 +74,7 @@
     {
       "name": "GET /orders/{id}",
       "request": {
-        "description": "operation: op-get-one\ncatalog state: registered\nx-xtrace-observation: inferred\nx-xtrace catalog metadata: {\"application_component\":\"orders\",\"binding_key\":\"spring:GET /orders/{id}\",\"claim_count\":1,\"claims\":[{\"claim_id\":\"c-get-one\",\"confidence_basis_points\":9000,\"handler_location\":{\"line_end\":31,\"line_start\":20,\"path\":\"src/main/java/demo/OrderController.java\",\"symbol\":\"OrderController.get\"},\"handler_symbol\":null,\"limitation_codes\":[],\"provenance\":\"static_analysis\",\"source_evidence\":null}],\"claims_projection\":\"available\",\"confidence_basis_points\":9000,\"effective_state\":\"registered\",\"handler_conflict\":false,\"handler_symbols\":[\"OrderController.get\"],\"handlers\":[{\"line_end\":31,\"line_start\":20,\"path\":\"src/main/java/demo/OrderController.java\",\"symbol\":\"OrderController.get\"}],\"operation_id\":\"op-get-one\",\"provenance\":[\"static_analysis\"]}",
+        "description": "operation: op-get-one\ncatalog state: registered\nx-xtrace-observation: inferred\nx-xtrace catalog metadata: {\"application_component\":\"orders\",\"binding_key\":\"spring:GET /orders/{id}\",\"claim_count\":1,\"claims\":[{\"claim_id\":\"c-get-one\",\"confidence_basis_points\":9000,\"handler_location\":{\"line_end\":31,\"line_start\":20,\"path\":\"src/main/java/demo/OrderController.java\",\"symbol\":\"OrderController.get\"},\"handler_symbol\":null,\"limitation_codes\":null,\"provenance\":\"static_analysis\",\"source_evidence\":null}],\"claims_projection\":\"available\",\"confidence_basis_points\":9000,\"effective_state\":\"registered\",\"handler_conflict\":false,\"handler_symbols\":[\"OrderController.get\"],\"handlers\":[{\"line_end\":31,\"line_start\":20,\"path\":\"src/main/java/demo/OrderController.java\",\"symbol\":\"OrderController.get\"}],\"operation_id\":\"op-get-one\",\"provenance\":[\"static_analysis\"]}",
         "header": [
           {
             "key": "Authorization",
@@ -103,7 +103,7 @@
     {
       "name": "DELETE /orders/{id}",
       "request": {
-        "description": "operation: op-delete\ncatalog state: registered\nx-xtrace-observation: inferred\nx-xtrace catalog metadata: {\"application_component\":\"orders\",\"binding_key\":\"spring:DELETE /orders/:id\",\"claim_count\":1,\"claims\":[{\"claim_id\":\"c-delete\",\"confidence_basis_points\":null,\"handler_symbol\":null,\"limitation_codes\":[],\"provenance\":\"static_analysis\",\"source_evidence\":null}],\"claims_projection\":\"available\",\"effective_state\":\"registered\",\"handler_conflict\":false,\"handler_symbols\":[],\"operation_id\":\"op-delete\",\"provenance\":[\"static_analysis\"]}",
+        "description": "operation: op-delete\ncatalog state: registered\nx-xtrace-observation: inferred\nx-xtrace catalog metadata: {\"application_component\":\"orders\",\"binding_key\":\"spring:DELETE /orders/:id\",\"claim_count\":1,\"claims\":[{\"claim_id\":\"c-delete\",\"confidence_basis_points\":null,\"handler_symbol\":null,\"limitation_codes\":null,\"provenance\":\"static_analysis\",\"source_evidence\":null}],\"claims_projection\":\"available\",\"effective_state\":\"registered\",\"handler_conflict\":null,\"handler_symbols\":null,\"operation_id\":\"op-delete\",\"provenance\":[\"static_analysis\"]}",
         "header": [],
         "method": "DELETE",
         "url": {

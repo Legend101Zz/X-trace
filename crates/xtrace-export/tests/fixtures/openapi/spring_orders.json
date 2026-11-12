@@ -71,7 +71,7 @@
               "claim_id": "c-list-a",
               "confidence_basis_points": null,
               "handler_symbol": null,
-              "limitation_codes": [],
+              "limitation_codes": null,
               "provenance": "static_analysis",
               "source_evidence": null
             },
@@ -79,7 +79,7 @@
               "claim_id": "c-list-b",
               "confidence_basis_points": null,
               "handler_symbol": null,
-              "limitation_codes": [],
+              "limitation_codes": null,
               "provenance": "adapter_registration",
               "source_evidence": null
             }
@@ -125,8 +125,8 @@
               "x-xtrace-observation": "inferred"
             }
           ],
-          "handler_conflict": false,
-          "handler_symbols": [],
+          "handler_conflict": null,
+          "handler_symbols": null,
           "operation_id": "op-list",
           "provenance": [
             "adapter_registration",
@@ -161,7 +161,7 @@
               "claim_id": "c-create",
               "confidence_basis_points": null,
               "handler_symbol": null,
-              "limitation_codes": [],
+              "limitation_codes": null,
               "provenance": "static_analysis",
               "source_evidence": null
             }
@@ -180,8 +180,8 @@
               "x-xtrace-observation": "inferred"
             }
           ],
-          "handler_conflict": false,
-          "handler_symbols": [],
+          "handler_conflict": null,
+          "handler_symbols": null,
           "operation_id": "op-create",
           "provenance": [
             "static_analysis"
@@ -218,15 +218,15 @@
               "claim_id": "c-delete",
               "confidence_basis_points": null,
               "handler_symbol": null,
-              "limitation_codes": [],
+              "limitation_codes": null,
               "provenance": "static_analysis",
               "source_evidence": null
             }
           ],
           "claims_projection": "available",
           "effective_state": "registered",
-          "handler_conflict": false,
-          "handler_symbols": [],
+          "handler_conflict": null,
+          "handler_symbols": null,
           "operation_id": "op-delete",
           "provenance": [
             "static_analysis"
@@ -280,7 +280,7 @@
                 "symbol": "OrderController.get"
               },
               "handler_symbol": null,
-              "limitation_codes": [],
+              "limitation_codes": null,
               "provenance": "static_analysis",
               "source_evidence": null
             }

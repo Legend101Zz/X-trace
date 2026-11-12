@@ -159,13 +159,6 @@ pub fn document(prepared: &Prepared) -> (Value, Vec<Omission>) {
     }
     let rev = &prepared.revision;
     let policy_digest = (!rev.policy_digest.is_empty()).then_some(rev.policy_digest.as_str());
-    if policy_digest.is_none() {
-        omissions.push(Omission {
-            operation_id: String::new(),
-            what: "policy_digest".to_owned(),
-            reason: "not_available_in_catalog_view".to_owned(),
-        });
-    }
     omissions.sort();
     omissions.dedup();
     let title = if rev.application_name.is_empty() {

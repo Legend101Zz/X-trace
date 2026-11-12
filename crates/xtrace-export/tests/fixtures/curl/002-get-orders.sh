@@ -3,7 +3,7 @@
 # operation: op-zdup
 # route: GET /orders
 # catalog state: registered
-# x-xtrace catalog metadata: {"application_component":"orders","binding_key":"spring:GET /orders","claim_count":1,"claims":[{"claim_id":"c-dup","confidence_basis_points":null,"handler_symbol":null,"limitation_codes":[],"provenance":"static_analysis","source_evidence":null}],"claims_projection":"available","effective_state":"registered","handler_conflict":false,"handler_symbols":[],"operation_id":"op-zdup","provenance":["static_analysis"]}
+# x-xtrace catalog metadata: {"application_component":"orders","binding_key":"spring:GET /orders","claim_count":1,"claims":[{"claim_id":"c-dup","confidence_basis_points":null,"handler_symbol":null,"limitation_codes":null,"provenance":"static_analysis","source_evidence":null}],"claims_projection":"available","effective_state":"registered","handler_conflict":null,"handler_symbols":null,"operation_id":"op-zdup","provenance":["static_analysis"]}
 # recipe 002
 set -eu
 : "${BASE_URL:?set BASE_URL, for example http://127.0.0.1:8080}"

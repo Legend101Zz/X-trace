@@ -53,6 +53,8 @@ fn legacy_serialized_inputs_keep_summary_and_handler_gaps() {
     assert_eq!(claim["claim_id"], "legacy-claim");
     assert_eq!(claim["handler_location"], legacy["handlers"][0]);
     assert_eq!(claim.get("confidence_basis_points"), Some(&Value::Null));
+    assert_eq!(claim.get("provenance"), Some(&Value::Null));
+    assert_eq!(claim.get("limitation_codes"), Some(&Value::Null));
     assert_eq!(claim.get("source_evidence"), Some(&Value::Null));
     assert_eq!(claim.get("handler_symbol"), Some(&Value::Null));
 }
@@ -100,6 +102,135 @@ fn operation_metadata(
             assert!(file("openapi.yaml").contains(&block), "bundle YAML for {route}");
             assert_eq!(postman(), curl());
             postman()
+        }
+    }
+}
+
+#[test]
+fn missing_null_and_explicit_empty_catalog_facts_across_formats() {
+    use serde_json::{Value, json};
+
+    let empty_summary = json!({
+        "claim_count": 0, "handler_symbols": [], "handler_conflict": false,
+        "provenance": [], "limitation_codes": []
+    });
+    let cases = [
+        (
+            "rows",
+            json!({"claims": [
+                {"claim_id": "absent"},
+                {"claim_id": "null", "provenance": null, "limitation_codes": null},
+                {"claim_id": "empty", "provenance": "", "limitation_codes": []}
+            ]}),
+        ),
+        ("summary-absent", json!({"catalog_summary": {"claim_count": 2}})),
+        (
+            "summary-null",
+            json!({"claims": null, "catalog_summary": {
+                "claim_count": 2, "handler_symbols": null, "handler_conflict": null,
+                "provenance": null, "limitation_codes": null
+            }}),
+        ),
+        ("omitted", json!({"catalog_summary": empty_summary})),
+        (
+            "withheld",
+            json!({"claims": [], "claims_available": false, "catalog_summary": empty_summary}),
+        ),
+        (
+            "complete",
+            json!({"claims": [], "claims_available": true, "catalog_summary": empty_summary}),
+        ),
+        ("complete-implicit", json!({"claims": [], "catalog_summary": empty_summary})),
+        (
+            "empty-partial",
+            json!({"claims": [], "claims_available": true, "catalog_summary": {"claim_count": 2}}),
+        ),
+    ];
+    let operations: Vec<_> = cases
+        .iter()
+        .map(|(route, input)| {
+            let mut op = input.clone();
+            op["operation_id"] = json!(route);
+            op["method"] = json!("GET");
+            op["route_template"] = json!(format!("/{route}"));
+            op
+        })
+        .collect();
+    let input = xtrace_export::input_json::parse(&json!({"operations": operations})).unwrap();
+    let mut openapi = Vec::new();
+    for format in
+        [ExportFormat::OpenApi, ExportFormat::Postman, ExportFormat::Curl, ExportFormat::Bundle]
+    {
+        let out = export(&input, &ExportRequest::new(format)).unwrap();
+        assert_eq!(out.operation_count, cases.len());
+        for (index, (route, source)) in cases.iter().enumerate() {
+            let expected = openapi.get(index).unwrap_or(&Value::Null);
+            let metadata = operation_metadata(&out, format, route, expected);
+            let omission = |reason| {
+                out.omissions.iter().any(|o| o.operation_id == *route && o.reason == reason)
+            };
+            match *route {
+                "rows" => {
+                    assert_eq!(metadata["claims_projection"], "available");
+                    assert_eq!(metadata.get("handler_symbols"), Some(&Value::Null));
+                    assert_eq!(metadata.get("handler_conflict"), Some(&Value::Null));
+                    let rows = metadata["claims"].as_array().unwrap();
+                    assert_eq!(rows.len(), 3);
+                    for (id, provenance, limitations) in [
+                        ("absent", Value::Null, Value::Null),
+                        ("null", Value::Null, Value::Null),
+                        ("empty", json!(""), json!([])),
+                    ] {
+                        let row = rows.iter().find(|row| row["claim_id"] == id).unwrap();
+                        assert_eq!(row.get("provenance"), Some(&provenance));
+                        assert_eq!(row.get("limitation_codes"), Some(&limitations));
+                    }
+                }
+                "complete" | "complete-implicit" | "empty-partial" => {
+                    let partial = *route == "empty-partial";
+                    assert_eq!(
+                        metadata["claims_projection"],
+                        if partial { "partial" } else { "available" }
+                    );
+                    assert_eq!(metadata["claim_count"], 0);
+                    assert_eq!(metadata.get("claims"), Some(&json!([])));
+                    assert_eq!(
+                        metadata.get("handler_symbols"),
+                        Some(&if partial { Value::Null } else { json!([]) })
+                    );
+                    assert_eq!(
+                        metadata.get("handler_conflict"),
+                        Some(&if partial { Value::Null } else { json!(false) })
+                    );
+                    assert_eq!(
+                        metadata["catalog_summary"]["claim_count"],
+                        source["catalog_summary"]["claim_count"]
+                    );
+                    assert!(metadata.get("claim_confidence").is_none());
+                    assert!(!omission("per_claim_confidence_unavailable"));
+                    assert!(!omission("claims_projection_unavailable"));
+                    assert!(!omission("claim_summary_mismatch"));
+                    assert_eq!(omission("claims_projection_partial"), partial);
+                }
+                _ => {
+                    assert_eq!(metadata["claims_projection"], "unavailable");
+                    assert!(metadata.get("claims").is_none());
+                    assert_eq!(metadata["claim_count"], source["catalog_summary"]["claim_count"]);
+                    assert_eq!(metadata["claim_confidence"], "not available per claim");
+                    assert!(omission("per_claim_confidence_unavailable"));
+                    assert!(omission("claims_projection_unavailable"));
+                    for field in
+                        ["handler_symbols", "handler_conflict", "provenance", "limitation_codes"]
+                    {
+                        assert_eq!(metadata.get(field), Some(&source["catalog_summary"][field]));
+                    }
+                }
+            }
+            if format == ExportFormat::OpenApi {
+                openapi.push(metadata);
+            } else {
+                assert_eq!(&metadata, expected, "{format:?} {route}");
+            }
         }
     }
 }
@@ -182,7 +313,7 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
                 "confidence_basis_points": 6500, "limitation_codes": ["missing_schema"],
                 "handler_location": second, "handler_symbol": null, "source_evidence": null},
             {"claim_id": "c", "provenance": "runtime_hint",
-                "confidence_basis_points": null, "limitation_codes": [],
+                "confidence_basis_points": null, "limitation_codes": null,
                 "handler_symbol": null, "source_evidence": null}
         ]
     });
@@ -263,7 +394,7 @@ fn legacy_claim_rows_and_summary_facts_agree_across_formats() {
 }
 
 #[test]
-fn equal_count_summary_checks_reported_facts_across_formats() {
+fn complete_and_partial_rows_check_reported_summary_facts_across_formats() {
     use serde_json::{Value, json};
 
     let known = json!({
@@ -329,11 +460,61 @@ fn equal_count_summary_checks_reported_facts_across_formats() {
             json!({"handler_symbols": null, "handler_conflict": null}),
             false,
         ),
+        (
+            "partial-handler",
+            json!([known]),
+            json!({"claim_count": 2, "handler_symbols": ["Second.get"]}),
+            true,
+        ),
+        (
+            "partial-denied-conflict",
+            json!([known, {"claim_id": "second", "handler_symbol": "Second.get"}]),
+            json!({"claim_count": 3, "handler_conflict": false}),
+            true,
+        ),
+        (
+            "partial-provenance",
+            json!([known]),
+            json!({"claim_count": 2, "provenance": ["runtime_hint"]}),
+            true,
+        ),
+        (
+            "partial-limitations",
+            json!([known]),
+            json!({"claim_count": 2, "limitation_codes": []}),
+            true,
+        ),
+        (
+            "partial-confidence",
+            json!([known]),
+            json!({"claim_count": 2, "highest_confidence_basis_points": 6500}),
+            true,
+        ),
+        (
+            "partial-extras",
+            json!([known]),
+            json!({"claim_count": 2, "handler_symbols": ["First.get", "Second.get"],
+                "handler_conflict": true, "provenance": ["runtime_hint", "static_analysis"],
+                "limitation_codes": ["missing_extent", "missing_schema"],
+                "highest_confidence_basis_points": 9000}),
+            false,
+        ),
+        (
+            "partial-unknowns",
+            json!([unknown]),
+            json!({"claim_count": 2, "handler_symbols": [], "handler_conflict": false,
+                "provenance": [], "limitation_codes": [], "highest_confidence_basis_points": null}),
+            false,
+        ),
     ];
     let mut operations = Vec::new();
     for (route, claims, summary, _) in &cases {
         let mut summary = summary.clone();
-        summary["claim_count"] = json!(claims.as_array().unwrap().len());
+        summary
+            .as_object_mut()
+            .unwrap()
+            .entry("claim_count")
+            .or_insert_with(|| json!(claims.as_array().unwrap().len()));
         operations.push(json!({
             "operation_id": route, "method": "GET", "route_template": format!("/{route}"),
             "claims": claims, "catalog_summary": summary
@@ -347,25 +528,49 @@ fn equal_count_summary_checks_reported_facts_across_formats() {
         let out = export(&input, &ExportRequest::new(format)).unwrap();
         assert_eq!(out.operation_count, cases.len());
         for (index, (route, claims, summary, inconsistent)) in cases.iter().enumerate() {
+            let row_count = claims.as_array().unwrap().len();
+            let summary_count = summary["claim_count"].as_u64().unwrap_or(row_count as u64);
+            let partial = summary_count > row_count as u64;
             let expected = openapi.get(index).unwrap_or(&Value::Null);
             let metadata = operation_metadata(&out, format, route, expected);
             assert_eq!(
                 metadata["claims_projection"],
-                if *inconsistent { "inconsistent" } else { "available" },
+                if *inconsistent {
+                    "inconsistent"
+                } else if partial {
+                    "partial"
+                } else {
+                    "available"
+                },
                 "{format:?} {route}"
             );
-            assert_eq!(
-                out.omissions.iter().any(|o| o.operation_id == *route
-                    && o.what == "claims"
-                    && o.reason == "claim_summary_mismatch"),
-                *inconsistent,
-                "{format:?} {route}"
-            );
+            let fields: &[_] = if format == ExportFormat::Bundle {
+                &["openapi:claims", "postman:claims", "curl:claims"]
+            } else {
+                &["claims"]
+            };
+            for field in fields {
+                for (reason, reported) in [
+                    ("claim_summary_mismatch", *inconsistent),
+                    ("claims_projection_partial", partial),
+                ] {
+                    assert_eq!(
+                        out.omissions
+                            .iter()
+                            .filter(|o| o.operation_id == *route
+                                && o.what == *field
+                                && o.reason == reason)
+                            .count(),
+                        usize::from(reported),
+                        "{format:?} {route} {field} {reason}"
+                    );
+                }
+            }
             let rows = metadata["claims"].as_array().unwrap();
-            assert_eq!(rows.len(), claims.as_array().unwrap().len());
+            assert_eq!(rows.len(), row_count);
             assert_eq!(metadata["claim_count"], rows.len());
             let aggregate = &metadata["catalog_summary"];
-            assert_eq!(aggregate["claim_count"], rows.len());
+            assert_eq!(aggregate["claim_count"], summary_count);
             for field in [
                 "handler_symbols",
                 "provenance",
@@ -387,10 +592,8 @@ fn equal_count_summary_checks_reported_facts_across_formats() {
             for claim in claims.as_array().unwrap() {
                 let row = rows.iter().find(|row| row["claim_id"] == claim["claim_id"]).unwrap();
                 for (field, value) in claim.as_object().unwrap() {
-                    if !value.is_null() {
-                        let field = if field == "handler" { "handler_location" } else { field };
-                        assert_eq!(row.get(field), Some(value), "{format:?} {route} {field}");
-                    }
+                    let field = if field == "handler" { "handler_location" } else { field };
+                    assert_eq!(row.get(field), Some(value), "{format:?} {route} {field}");
                 }
             }
             if format == ExportFormat::OpenApi {
@@ -494,7 +697,7 @@ fn mixed_serialized_claims_retain_independent_handler_locations() {
     }
     let claims = expected["claims"].as_array().unwrap();
     let claim = |id: &str| claims.iter().find(|c| c["claim_id"] == id).unwrap();
-    assert_eq!(expected["provenance"], json!([""]));
+    assert!(expected.get("provenance").is_none());
     assert_eq!(expected["handler_conflict"], true);
     assert_eq!(expected["catalog_summary"]["highest_confidence_basis_points"], Value::Null);
     assert!(expected.get("handlers").is_none());

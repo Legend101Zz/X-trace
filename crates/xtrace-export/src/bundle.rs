@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use crate::projection::Prepared;
+use crate::projection::{POLICY_DIGEST_FIELD, Prepared};
 use crate::{ExportError, ExportFile, ExportOutput, Omission, canonical, sanitize};
 
 fn omissions_json(omissions: &[Omission]) -> Vec<Value> {
@@ -30,7 +30,7 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
         ("curl", crate::curl::render(prepared)?),
     ];
     let mut files = Vec::new();
-    let mut omissions = Vec::new();
+    let mut omissions: Vec<_> = prepared.policy_digest_omission().into_iter().cloned().collect();
     let mut formats = Vec::new();
     for (format, output) in outputs {
         formats.push(json!({
@@ -39,11 +39,12 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
             "omissions": omissions_json(&output.omissions),
         }));
         // An OpenAPI duplicate may still be present in the other formats.
-        // Qualify omissions so a bundle never claims it dropped that operation everywhere.
+        // Keep format-specific omissions qualified. The policy digest applies to the whole bundle.
         omissions.extend(
             output
                 .omissions
                 .into_iter()
+                .filter(|o| o.what != POLICY_DIGEST_FIELD)
                 .map(|o| Omission { what: format!("{format}:{}", o.what), ..o }),
         );
         files.extend(output.files.into_iter().map(|mut file| {
@@ -55,13 +56,6 @@ pub fn render(prepared: &Prepared) -> Result<ExportOutput, ExportError> {
     }
     let policy_digest = (!prepared.revision.policy_digest.is_empty())
         .then_some(prepared.revision.policy_digest.as_str());
-    if policy_digest.is_none() {
-        omissions.push(Omission {
-            operation_id: String::new(),
-            what: "policy_digest".to_owned(),
-            reason: "not_available_in_catalog_view".to_owned(),
-        });
-    }
     omissions.sort();
     omissions.dedup();
     files.sort_by(|a, b| a.path.cmp(&b.path));

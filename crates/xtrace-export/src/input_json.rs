@@ -109,9 +109,12 @@ pub fn parse(doc: &Value) -> Result<ExportInput, String> {
     for (i, v) in arr(root, "operations", "$")?.iter().enumerate() {
         let at = format!("operations[{i}]");
         let o = obj(v, &at)?;
+        let claims_supplied = non_null(o, "claims").is_some();
         let mut claims = Vec::new();
-        for (j, c) in arr(o, "claims", &at)?.iter().enumerate() {
-            claims.push(claim(c, &format!("{at}.claims[{j}]"))?);
+        if claims_supplied {
+            for (j, c) in arr(o, "claims", &at)?.iter().enumerate() {
+                claims.push(claim(c, &format!("{at}.claims[{j}]"))?);
+            }
         }
         let catalog_summary = non_null(o, "catalog_summary")
             .map(|summary| catalog_summary(summary, &format!("{at}.catalog_summary")))
@@ -123,12 +126,8 @@ pub fn parse(doc: &Value) -> Result<ExportInput, String> {
             application_component: s(o, "application_component", &at)?,
             binding_key: s(o, "binding_key", &at)?,
             effective_state: state(&s(o, "effective_state", &at)?, &at)?,
-            claims_available: b(
-                o,
-                "claims_available",
-                !claims.is_empty() || catalog_summary.is_none(),
-                &at,
-            )?,
+            claims_available: optional_bool(o, "claims_available", &at)?.unwrap_or(true)
+                && claims_supplied,
             claims,
             catalog_summary,
         });
@@ -138,9 +137,11 @@ pub fn parse(doc: &Value) -> Result<ExportInput, String> {
 
 fn claim(v: &Value, at: &str) -> Result<ClaimInput, String> {
     let o = obj(v, at)?;
+    let provenance = optional_string(o, "provenance", at)?;
     let mut out = ClaimInput {
         claim_id: req(o, "claim_id", at)?,
-        provenance: optional_string(o, "provenance", at)?.unwrap_or_default(),
+        empty_provenance_reported: provenance.as_deref() == Some(""),
+        provenance: provenance.unwrap_or_default(),
         handler_symbol: optional_string(o, "handler_symbol", at)?,
         source_evidence: non_null(o, "source_evidence")
             .map(|evidence| {
@@ -206,6 +207,10 @@ fn non_null<'a>(o: &'a Obj, key: &str) -> Option<&'a Value> {
     o.get(key).filter(|value| !value.is_null())
 }
 
+fn optional_bool(o: &Obj, key: &str, at: &str) -> Result<Option<bool>, String> {
+    non_null(o, key).map(|_| b(o, key, false, at)).transpose()
+}
+
 fn handler(value: &Value, at: &str) -> Result<HandlerInput, String> {
     let o = obj(value, at)?;
     let line = |key| {
@@ -242,9 +247,7 @@ fn catalog_summary(value: &Value, at: &str) -> Result<CatalogSummaryInput, Strin
     Ok(CatalogSummaryInput {
         claim_count: usize::try_from(count).map_err(|_| format!("{at}.claim_count: too large"))?,
         handler_symbols: strings("handler_symbols")?,
-        handler_conflict: non_null(o, "handler_conflict")
-            .map(|_| b(o, "handler_conflict", false, at))
-            .transpose()?,
+        handler_conflict: optional_bool(o, "handler_conflict", at)?,
         single_claim_handler: non_null(o, "single_claim_handler")
             .map(|value| handler(value, &format!("{at}.single_claim_handler")))
             .transpose()?,
@@ -269,7 +272,7 @@ mod tests {
     fn parses_minimal_and_reports_the_bad_field() {
         let ok = parse(&json!({"operations": [{"operation_id": "a", "method": "GET", "route_template": "/x"}]})).unwrap();
         assert_eq!(ok.operations.len(), 1);
-        assert!(ok.operations[0].claims_available);
+        assert!(!ok.operations[0].claims_available);
         let err =
             parse(&json!({"operations": [{"operation_id": "a", "method": "GET"}]})).unwrap_err();
         assert_eq!(err, "operations[0].route_template: required");
