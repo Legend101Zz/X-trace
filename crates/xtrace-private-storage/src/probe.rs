@@ -52,6 +52,11 @@ use crate::policy::{DirectoryRole, FilesystemProfile};
 use crate::scope;
 use crate::{AdmissionFailure, AdmissionOperation as Step, PrivateStorageError};
 
+#[cfg(all(target_os = "linux", test))]
+use tests::DirectoryMetadata;
+#[cfg(not(all(target_os = "linux", test)))]
+type DirectoryMetadata = std::fs::Metadata;
+
 /// Most verdicts one operation or scope remembers; beyond it new verdicts are not stored.
 const SCOPE_MEMO_LIMIT: usize = 1024;
 
@@ -81,7 +86,7 @@ struct DirectoryState {
 }
 
 impl DirectoryState {
-    fn of(metadata: &std::fs::Metadata, role: DirectoryRole) -> Self {
+    fn of(metadata: &DirectoryMetadata, role: DirectoryRole) -> Self {
         use std::os::unix::fs::MetadataExt as _;
         let state = Self {
             device: metadata.dev(),
@@ -497,7 +502,7 @@ fn record_directory_probe(path: &Path) {
 }
 
 struct DirectorySnapshot {
-    metadata: std::fs::Metadata,
+    metadata: DirectoryMetadata,
     #[cfg(target_os = "linux")]
     race: Option<AdmissionContext>,
 }
@@ -529,6 +534,8 @@ fn directory_metadata(
             operation.record_failure(AdmissionFailure::check(Step::Identity));
             return None;
         }
+        #[cfg(all(target_os = "linux", test))]
+        let (opened, named) = tests::sample_directory_metadata(path, opened, named);
         if DirectoryState::of(&named, role) == DirectoryState::of(&opened, role) {
             return Some(DirectorySnapshot {
                 metadata: opened,
@@ -561,7 +568,8 @@ fn directory_metadata(
 }
 
 /// mtime is only a reason to obtain fresh evidence, never proof that an ACL stayed unchanged.
-fn directory_contents_changed(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+fn directory_contents_changed(before: &DirectoryMetadata, after: &DirectoryMetadata) -> bool {
+    #[cfg(not(all(target_os = "linux", test)))]
     use std::os::unix::fs::MetadataExt as _;
     (before.mtime(), before.mtime_nsec()) != (after.mtime(), after.mtime_nsec())
 }
@@ -806,9 +814,10 @@ struct LinuxDirectoryAcl {
 fn linux_directory_can_recheck(
     operation: &Operation,
     directory: &File,
-    before: &std::fs::Metadata,
-    after: &std::fs::Metadata,
+    before: &DirectoryMetadata,
+    after: &DirectoryMetadata,
 ) -> bool {
+    #[cfg(not(test))]
     use std::os::unix::fs::MetadataExt as _;
     // mkdir/rmdir can be visible in nlink while mtime still compares equal. Either signal
     // invalidates the state, but neither says anything about the safety of its ACLs.
@@ -1560,7 +1569,133 @@ fn report_acl_probe_cleanup(drained: bool) {
 #[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests assert on fixture setup")]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[cfg(target_os = "linux")]
+    pub(super) struct DirectoryMetadata {
+        raw: std::fs::Metadata,
+        sample: Option<LinuxMetadataSample>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl std::ops::Deref for DirectoryMetadata {
+        type Target = std::fs::Metadata;
+
+        fn deref(&self) -> &Self::Target {
+            &self.raw
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DirectoryMetadata {
+        // Scripted samples all have the same nonzero subsecond ctime.
+        pub(super) fn ctime(&self) -> i64 {
+            self.sample.map_or(self.raw.ctime(), |_| 1)
+        }
+
+        pub(super) fn ctime_nsec(&self) -> i64 {
+            self.sample.map_or(self.raw.ctime_nsec(), |_| 1)
+        }
+
+        pub(super) fn mtime(&self) -> i64 {
+            self.sample.map_or(self.raw.mtime(), |sample| sample.mtime)
+        }
+
+        pub(super) fn mtime_nsec(&self) -> i64 {
+            self.sample.map_or(self.raw.mtime_nsec(), |_| 0)
+        }
+
+        pub(super) fn nlink(&self) -> u64 {
+            self.sample.map_or(self.raw.nlink(), |sample| sample.nlink)
+        }
+    }
+
+    fn fixture_metadata(raw: std::fs::Metadata) -> DirectoryMetadata {
+        #[cfg(target_os = "linux")]
+        let raw = DirectoryMetadata { raw, sample: None };
+        raw
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    struct LinuxMetadataSample {
+        mtime: i64,
+        nlink: u64,
+    }
+
+    #[cfg(target_os = "linux")]
+    type LinuxMetadataPair = (LinuxMetadataSample, LinuxMetadataSample);
+
+    #[cfg(target_os = "linux")]
+    struct LinuxMetadataScript {
+        path: std::path::PathBuf,
+        pairs: std::vec::IntoIter<LinuxMetadataPair>,
+    }
+
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        static LINUX_METADATA_SCRIPT: RefCell<Option<LinuxMetadataScript>> = const { RefCell::new(None) };
+    }
+
+    // Only these three stat facts are scripted. Both reads and the identity checks have run,
+    // and the original metadata remains available for diagnostics.
+    #[cfg(target_os = "linux")]
+    pub(super) fn sample_directory_metadata(
+        path: &Path,
+        opened: std::fs::Metadata,
+        named: std::fs::Metadata,
+    ) -> (DirectoryMetadata, DirectoryMetadata) {
+        LINUX_METADATA_SCRIPT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(script) = slot.as_mut().filter(|script| script.path == path) {
+                let (opened_sample, named_sample) =
+                    script.pairs.next().expect("unexpected descriptor/name sample");
+                (
+                    DirectoryMetadata { raw: opened, sample: Some(opened_sample) },
+                    DirectoryMetadata { raw: named, sample: Some(named_sample) },
+                )
+            } else {
+                (fixture_metadata(opened), fixture_metadata(named))
+            }
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    struct LinuxMetadataSampling;
+
+    #[cfg(target_os = "linux")]
+    impl LinuxMetadataSampling {
+        fn install(path: &Path, pairs: Vec<LinuxMetadataPair>) -> Self {
+            assert_linux_hooks_consumed();
+            LINUX_METADATA_SCRIPT.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                assert!(slot.is_none());
+                *slot = Some(LinuxMetadataScript { path: path.to_path_buf(), pairs: pairs.into_iter() });
+            });
+            Self
+        }
+
+        fn assert_consumed(&self) {
+            assert_linux_hooks_consumed();
+            LINUX_METADATA_SCRIPT.with(|slot| {
+                let slot = slot.borrow();
+                assert!(
+                    slot.as_ref().is_some_and(|script| script.pairs.as_slice().is_empty()),
+                    "all scripted metadata pairs were read"
+                );
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LinuxMetadataSampling {
+        fn drop(&mut self) {
+            LINUX_METADATA_SCRIPT.with(|slot| *slot.borrow_mut() = None);
+            AFTER_DIRECTORY_PROBE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
 
     fn entry(device: u64, inode: u64) -> BatchEntry {
         BatchEntry {
@@ -1727,8 +1862,8 @@ mod tests {
         BETWEEN_DIRECTORY_READS.with(|slot| assert!(slot.borrow().is_none(), "append ran"));
         let after = directory.metadata().expect("directory after append");
         assert_eq!(
-            DirectoryState::of(&before, DirectoryRole::PrivateLeaf),
-            DirectoryState::of(&after, DirectoryRole::PrivateLeaf),
+            DirectoryState::of(&fixture_metadata(before), DirectoryRole::PrivateLeaf),
+            DirectoryState::of(&fixture_metadata(after), DirectoryRole::PrivateLeaf),
             "appending a regular file does not change its parent directory's ACL state"
         );
         assert_eq!(std::fs::read(&child).expect("read appended tail"), b"prefix-suffix");
@@ -1760,8 +1895,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn acl_edits_between_directory_reads_fail_closed_without_an_mtime_or_mode_change() {
-        use std::os::unix::fs::MetadataExt as _;
-
         for attribute in ["system.posix_acl_access", "system.posix_acl_default"] {
             let root = fixture();
             let path = root.path();
@@ -1800,15 +1933,13 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn linux_observe_content_change(path: &Path, before: &std::fs::Metadata) -> std::fs::Metadata {
-        use std::os::unix::fs::MetadataExt as _;
-
+    fn linux_observe_content_change(path: &Path, before: &DirectoryMetadata) -> DirectoryMetadata {
         let directory = open(path);
         let deadline = Instant::now() + ADMISSION_BUDGET;
         let marker =
             std::time::UNIX_EPOCH + Duration::from_secs(if before.mtime() == 1 { 2 } else { 1 });
         loop {
-            let after = directory.metadata().expect("after child change");
+            let after = fixture_metadata(directory.metadata().expect("after child change"));
             if directory_contents_changed(before, &after)
                 && (before.ctime(), before.ctime_nsec()) != (after.ctime(), after.ctime_nsec())
             {
@@ -1828,7 +1959,7 @@ mod tests {
         AfterListing {
             path: path.clone(),
             action: Box::new(move || {
-                let before = std::fs::symlink_metadata(&path).expect("before child change");
+                let before = fixture_metadata(std::fs::symlink_metadata(&path).expect("before child change"));
                 match edit {
                     ContentEdit::Create => {
                         std::fs::create_dir(path.join("created")).expect("create sibling directory")
@@ -1873,16 +2004,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn linux_create_child_with_unchanged_mtime(path: &Path, name: &str) {
-        use std::os::unix::fs::MetadataExt as _;
-
         let directory = open(path);
-        let before = directory.metadata().expect("before mkdir");
+        let before = fixture_metadata(directory.metadata().expect("before mkdir"));
         std::fs::create_dir(path.join(name)).expect("create child directory");
         linux_observe_content_change(path, &before);
         // Pin the stat shape independent of filesystem timestamp publication order. The link
         // count and ctime come from the real directory; only mtime is restored by the fixture.
         directory.set_modified(before.modified().expect("original mtime")).expect("restore mtime");
-        let after = directory.metadata().expect("after mkdir");
+        let after = fixture_metadata(directory.metadata().expect("after mkdir"));
         assert!(!directory_contents_changed(&before, &after));
         assert_eq!(after.nlink(), before.nlink() + 1);
         assert_ne!((before.ctime(), before.ctime_nsec()), (after.ctime(), after.ctime_nsec()));
@@ -2070,6 +2199,120 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug)]
+    enum LinuxAclInvalidation {
+        Mtime,
+        LinkCount,
+        ConvergedClosingRace,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_linux_acl_invalidation(invalidation: LinuxAclInvalidation, during_recheck: bool) {
+        const INITIAL: LinuxMetadataSample = LinuxMetadataSample { mtime: 1, nlink: 2 };
+        const RECOVERY: LinuxMetadataSample = LinuxMetadataSample { mtime: 2, nlink: 3 };
+
+        for attribute in [None, Some("system.posix_acl_access"), Some("system.posix_acl_default")] {
+            let root = fixture();
+            let path = root.path();
+            let directory = open(path);
+            let case = format!("{invalidation:?}, recheck={during_recheck}, attribute={attribute:?}");
+            let mut pairs = vec![(INITIAL, INITIAL)];
+            let opening = if during_recheck {
+                // Close the original sample with both content signals changed and open recovery
+                // in that state. Either signal suffices to reach the recheck under test.
+                pairs.extend([(RECOVERY, RECOVERY); 2]);
+                RECOVERY
+            } else {
+                INITIAL
+            };
+            let closing = match invalidation {
+                LinuxAclInvalidation::Mtime => {
+                    LinuxMetadataSample { mtime: opening.mtime + 1, ..opening }
+                }
+                LinuxAclInvalidation::LinkCount => {
+                    LinuxMetadataSample { nlink: opening.nlink + 1, ..opening }
+                }
+                LinuxAclInvalidation::ConvergedClosingRace => {
+                    let raced = LinuxMetadataSample { mtime: opening.mtime + 1, nlink: opening.nlink + 1 };
+                    pairs.push((opening, raced));
+                    opening
+                }
+            };
+            pairs.push((closing, closing)); // Closing pair, after retry if the pair raced.
+            pairs.push((closing, closing)); // Opening pair for the fresh evidence.
+            if attribute.is_none() {
+                pairs.push((closing, closing)); // Fresh ACLs must also close stably.
+            }
+
+            let sampling = LinuxMetadataSampling::install(path, pairs);
+            if let Some(attribute) = attribute {
+                let acl_descriptor = directory.try_clone().expect("clone fixture descriptor");
+                let edit = AfterListing {
+                    path: path.to_path_buf(),
+                    action: Box::new(move || {
+                        rustix::fs::fsetxattr(
+                            &acl_descriptor,
+                            attribute,
+                            &linux_acl(4),
+                            rustix::fs::XattrFlags::empty(),
+                        )
+                        .expect("install policy-compatible ACL after sampling both attributes");
+                    }),
+                };
+                if during_recheck {
+                    install_linux_hook(
+                        AfterListing {
+                            path: path.to_path_buf(),
+                            action: Box::new(move || install_linux_hook(edit, false)),
+                        },
+                        false,
+                    );
+                } else {
+                    install_linux_hook(edit, false);
+                }
+            }
+
+            let probes = directory_probe_count();
+            let operation = Operation::new();
+            assert_eq!(judge(&operation, path, &directory), attribute.is_none(), "{case}");
+            assert_eq!(
+                directory_probe_count() - probes,
+                2 + usize::from(during_recheck),
+                "the invalidated ACLs require another probe in {case}"
+            );
+            sampling.assert_consumed();
+            drop(sampling);
+
+            if attribute.is_some() {
+                assert_eq!(operation.failure(Step::AclState), PrivateStorageError::check(Step::AclState));
+                #[cfg(debug_assertions)]
+                assert!(matches!(
+                    operation.directory_refusal.get(),
+                    Some(AdmissionContext { site: AdmissionSite::RecheckAcl, .. })
+                ));
+                assert!(judge(&Operation::new(), path, &directory), "fresh traversal permits this ACL");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unchanged_ctime_mtime_and_link_changes_each_invalidate_acl_evidence() {
+        for during_recheck in [false, true] {
+            assert_linux_acl_invalidation(LinuxAclInvalidation::Mtime, during_recheck);
+            assert_linux_acl_invalidation(LinuxAclInvalidation::LinkCount, during_recheck);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_closing_snapshot_races_invalidate_acl_evidence_after_convergence() {
+        for during_recheck in [false, true] {
+            assert_linux_acl_invalidation(LinuxAclInvalidation::ConvergedClosingRace, during_recheck);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_link_count_recovery_refuses_a_changed_access_or_default_acl() {
         for attribute in ["system.posix_acl_access", "system.posix_acl_default"] {
@@ -2131,8 +2374,10 @@ mod tests {
                     let acl_hook = AfterListing {
                         path: changed_path.clone(),
                         action: Box::new(move || {
-                            let before = std::fs::symlink_metadata(&changed_path)
-                                .expect("before ACL and content change");
+                            let before = fixture_metadata(
+                                std::fs::symlink_metadata(&changed_path)
+                                    .expect("before ACL and content change"),
+                            );
                             std::fs::create_dir(changed_path.join("acl-child"))
                                 .expect("content change alongside ACL edit");
                             rustix::fs::fsetxattr(
@@ -3833,7 +4078,7 @@ mod tests {
         let root = fixture();
         let directory = open(root.path());
         let metadata = directory.metadata().expect("metadata");
-        let state = DirectoryState::of(&metadata, DirectoryRole::Traversed);
+        let state = DirectoryState::of(&fixture_metadata(metadata), DirectoryRole::Traversed);
         let durable = FilesystemProfile::Durable;
         let base = MemoKey::from_parts(state, "fs-a".to_owned(), 0x10, "apfs".to_owned(), durable);
         assert_eq!(
