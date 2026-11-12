@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: Suite to force (all runs every suite)
+        description: Run only the selected suite (all runs every available suite)
         type: choice
         default: all
         options: [all, meta, rust, java, node, web, tui]
@@ -42,11 +42,11 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Select suites from the changed paths
+      - name: Select lane suites
         id: plan
         env:
           BEFORE: ${{ github.event.before }}
-          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.suite || '' }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && (inputs.suite || 'all') || '' }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main:refs/remotes/origin/main || true
