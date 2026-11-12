@@ -115,6 +115,7 @@ fn revision_entry(row: RevisionRow) -> Result<RevisionEntry, PortError> {
 struct RevisionOperation {
     id: OperationId,
     version: uuid::Uuid,
+    version_digest: Option<ContentHash>,
     change_kind: CatalogChangeKind,
     source_availability: CatalogSourceAvailability,
     identity: EndpointIdentity,
@@ -199,9 +200,12 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
         let mut statement = connection
             .prepare(
                 "SELECT e.operation_id, e.operation_version_id, e.change_kind, e.source_availability, \
-                        o.application_component, o.binding_key, o.method, o.route_template, o.transport \
+                        o.application_component, o.binding_key, o.method, o.route_template, o.transport, \
+                        CASE WHEN length(v.version_digest) = 32 THEN v.version_digest END \
                  FROM catalog_revision_entries e \
                  JOIN catalog_operations o ON o.project_id = e.project_id AND o.operation_id = e.operation_id \
+                 LEFT JOIN catalog_operation_versions v ON v.project_id = e.project_id \
+                     AND v.operation_id = e.operation_id AND v.operation_version_id = e.operation_version_id \
                  WHERE e.project_id = ?1 AND e.revision_id = ?2 \
                  ORDER BY o.route_template, o.method, o.application_component, o.binding_key, e.operation_id \
                  LIMIT ?3",
@@ -225,6 +229,7 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
                         row.get::<_, String>(8)?,
+                        row.get::<_, Option<Vec<u8>>>(9)?,
                     ))
                 },
             )
@@ -258,6 +263,7 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
             operations.push(RevisionOperation {
                 id: id(&row.0)?,
                 version: uuid::Uuid::from_slice(&row.1).map_err(|_| corrupt())?,
+                version_digest: row.9.as_deref().map(hash).transpose()?,
                 change_kind,
                 source_availability,
                 identity: EndpointIdentity {
@@ -274,12 +280,28 @@ impl CatalogHistoryPort for SqliteCatalogHistoryStore {
         let mut claims = load_claims(&connection, project_id, revision_id, &identities)?;
         let mut views = Vec::with_capacity(operations.len());
         for op in operations {
-            let claims = claims.remove(&op.id).unwrap_or_default();
-            // The publisher retains omitted parent entries as unknown and unavailable,
-            // without linking the parent's claims into the new revision.
-            let claims_available = !(claims.is_empty()
-                && op.change_kind == CatalogChangeKind::Unknown
-                && op.source_availability == CatalogSourceAvailability::Unavailable);
+            let mut linked = claims.remove(&op.id).unwrap_or_default().claims;
+            // The history summary uses the first available location in claim digest order.
+            linked.sort_unstable_by_key(|(digest, claim)| (*digest, claim.claim_id));
+            let claims_available = match op.change_kind {
+                CatalogChangeKind::Added
+                | CatalogChangeKind::Changed
+                | CatalogChangeKind::Unchanged => {
+                    verify_published_claims(&op, &linked)?;
+                    true
+                }
+                CatalogChangeKind::Unknown
+                    if op.source_availability == CatalogSourceAvailability::Unavailable =>
+                {
+                    // An omitted parent entry retains its version without its claim links.
+                    if !linked.is_empty() {
+                        return Err(corrupt());
+                    }
+                    false
+                }
+                _ => true,
+            };
+            let claims: Vec<_> = linked.into_iter().map(|(_, claim)| claim).collect();
             let summary = ClaimSummary::from_claims(&claims);
             views.push(OperationView {
                 operation_id: op.id,
@@ -404,12 +426,34 @@ struct OperationClaims {
     claims: Vec<([u8; 32], RevisionClaim)>,
 }
 
+fn verify_published_claims(
+    operation: &RevisionOperation,
+    sorted_claims: &[([u8; 32], RevisionClaim)],
+) -> Result<(), PortError> {
+    if sorted_claims.is_empty() {
+        return Err(corrupt());
+    }
+    let expected = operation.version_digest.ok_or_else(corrupt)?;
+    let fingerprint = operation.identity.fingerprint().map_err(|_| corrupt())?;
+    // Match publish_revision's v1 digest over the fingerprint and ordered claim digests.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"xtrace.operation-version.v1\0");
+    hasher.update(fingerprint.as_bytes());
+    for (digest, _) in sorted_claims {
+        hasher.update(digest);
+    }
+    if hasher.finalize().as_bytes() != expected.as_bytes() {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
 fn load_claims(
     connection: &Connection,
     project_id: ProjectId,
     revision_id: CatalogRevisionId,
     identities: &BTreeMap<OperationId, &EndpointIdentity>,
-) -> Result<BTreeMap<OperationId, Vec<RevisionClaim>>, PortError> {
+) -> Result<BTreeMap<OperationId, OperationClaims>, PortError> {
     // A revision can combine scopes, so apply the writer's limits per operation.
     // The claim count and catalog_claims JSON row cap also bound JSON to 64 MiB per operation.
     // Stream the revision index without a SQL sort. Admit lengths before fetching each payload.
@@ -467,12 +511,5 @@ fn load_claims(
             },
         ));
     }
-    Ok(by_operation
-        .into_iter()
-        .map(|(id, mut operation)| {
-            // The history summary uses the first available location in claim digest order.
-            operation.claims.sort_unstable_by_key(|(digest, claim)| (*digest, claim.claim_id));
-            (id, operation.claims.into_iter().map(|(_, claim)| claim).collect())
-        })
-        .collect())
+    Ok(by_operation)
 }

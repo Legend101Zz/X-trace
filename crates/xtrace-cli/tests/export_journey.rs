@@ -529,19 +529,73 @@ fn replace_claim_payload(
 // The scripted analyzer emits one evidence item per claim. Build consistent rows for evidence
 // shapes beyond that output using the domain's canonical encoder.
 fn edit_claim(fx: &Fx, symbol: &str, edit: impl FnOnce(&mut Value)) -> String {
-    let connection = rusqlite::Connection::open(fx.database()).unwrap();
-    let (id, mut value) = stored_claim(&connection, symbol);
+    let mut connection = rusqlite::Connection::open(fx.database()).unwrap();
+    let tx = connection.transaction().unwrap();
+    let (id, mut value) = stored_claim(&tx, symbol);
     edit(&mut value);
     let claim = rebuild_fixture_claim(&value);
     value["source_evidence"] = serde_json::json!(claim.source_evidence());
     replace_claim_payload(
-        &connection,
+        &tx,
         &id,
         claim.digest().unwrap().as_bytes(),
         claim.canonical_bytes(),
         &value.to_string(),
     );
+    // These fixtures synthesize valid claim variants. Update the version's claim-set
+    // digest as the publisher would, leaving corruption tests to edit rows directly.
+    let (revision_id, operation_id): (Vec<u8>, Vec<u8>) = tx
+        .query_row(
+            "SELECT first_revision_id, operation_id FROM catalog_claims WHERE claim_id = ?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    refresh_fixture_version(&tx, &revision_id, &operation_id);
+    tx.commit().unwrap();
     uuid::Uuid::from_slice(&id).unwrap().to_string()
+}
+
+fn refresh_fixture_version(
+    connection: &rusqlite::Connection,
+    revision_id: &[u8],
+    operation_id: &[u8],
+) {
+    let (version_id, fingerprint): (Vec<u8>, Vec<u8>) = connection
+        .query_row(
+            "SELECT e.operation_version_id, o.endpoint_fingerprint FROM catalog_revision_entries e
+             JOIN catalog_operations o ON o.project_id = e.project_id AND o.operation_id = e.operation_id
+             WHERE e.revision_id = ?1 AND e.operation_id = ?2",
+            rusqlite::params![revision_id, operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"xtrace.operation-version.v1\0");
+    hasher.update(&fingerprint);
+    let mut statement = connection
+        .prepare(
+            "SELECT c.claim_digest FROM catalog_revision_claims rc
+             JOIN catalog_claims c ON c.project_id = rc.project_id
+                 AND c.operation_id = rc.operation_id AND c.claim_id = rc.claim_id
+             WHERE rc.revision_id = ?1 AND rc.operation_id = ?2 ORDER BY c.claim_digest",
+        )
+        .unwrap();
+    let digests = statement
+        .query_map(rusqlite::params![revision_id, operation_id], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap();
+    for digest in digests {
+        hasher.update(&digest.unwrap());
+    }
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE catalog_operation_versions SET version_digest = ?1 WHERE operation_version_id = ?2",
+                rusqlite::params![hasher.finalize().as_bytes().as_slice(), version_id],
+            )
+            .unwrap(),
+        1
+    );
 }
 
 fn assert_corrupt_export(fx: &Fx, format: &str, revision: Option<&str>, name: &str) {
@@ -628,6 +682,107 @@ fn export_rejects_inconsistent_persisted_claims_without_output() {
     let result = fx.export(&["--format", "openapi", "--output", restored.to_str().unwrap()]);
     assert_eq!(result.status.code(), Some(0), "{result:?}");
     assert_eq!(tree(&restored), tree(&before));
+}
+
+#[test]
+fn export_rejects_missing_published_claim_links_without_output() {
+    let fx = project_with_catalog(TRANSCRIPT);
+    // The second scan publishes two distinct claims for POST /orders and inherits
+    // GET /orders/{id} with no links in the new revision.
+    let next = TRANSCRIPT.replace(
+        r#""method":"GET","routeParts":["/orders","/{id}"]"#,
+        r#""method":"POST","routeParts":["/orders"]"#,
+    );
+    let scan = fx.scan(&fx.write_analyzer(&next));
+    assert_eq!(scan.status.code(), Some(0), "{scan:?}");
+    let scan = json(&scan);
+    let revision = scan["catalogRevisionId"].as_str().unwrap();
+    let formats = ["openapi", "postman", "curl", "bundle"];
+    let export_to = |format, out: &Path| {
+        let result = fx.export(&[
+            "--format",
+            format,
+            "--revision",
+            revision,
+            "--output",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(result.status.code(), Some(0), "{result:?}");
+        result
+    };
+    for format in formats {
+        export_to(format, &fx.out_dir(&format!("intact-{format}")));
+    }
+    let intact = fx.out_dir("intact-openapi");
+    let published = openapi_metadata(&intact, "/orders", "post");
+    assert_eq!(published["claims_projection"], "available");
+    assert_eq!(published["claim_count"], 2);
+    assert_eq!(published["handler_conflict"], true);
+    let inherited = openapi_metadata(&intact, "/orders/{id}", "get");
+    assert_eq!(inherited["effective_state"], "unknown");
+    assert_eq!(inherited["claims_projection"], "unavailable");
+    for field in ["claim_count", "claims", "handler_conflict"] {
+        assert!(inherited.get(field).is_none(), "{field}");
+    }
+
+    let parse_id = |value: &Value| uuid::Uuid::parse_str(value.as_str().unwrap()).unwrap();
+    let project = uuid::Uuid::parse_str(&fx.project_id).unwrap();
+    let revision_id = uuid::Uuid::parse_str(revision).unwrap();
+    let operation = parse_id(&published["operation_id"]);
+    let claim_ids = [
+        parse_id(&published["claims"][0]["claim_id"]),
+        parse_id(&published["claims"][1]["claim_id"]),
+    ];
+    let mut connection = rusqlite::Connection::open(fx.database()).unwrap();
+    connection.pragma_update(None, "foreign_keys", true).unwrap();
+    let (kind, availability): (String, String) = connection
+        .query_row(
+            "SELECT change_kind, source_availability FROM catalog_revision_entries
+             WHERE project_id = ?1 AND revision_id = ?2 AND operation_id = ?3",
+            rusqlite::params![project.as_bytes(), revision_id.as_bytes(), operation.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(kind, "changed");
+    assert_eq!(availability, "unverified");
+    for (case, claim_id) in ["partial", "missing"].into_iter().zip(claim_ids) {
+        assert_eq!(
+            connection
+                .execute(
+                    "DELETE FROM catalog_revision_claims
+                     WHERE project_id = ?1 AND revision_id = ?2 AND operation_id = ?3 AND claim_id = ?4",
+                    rusqlite::params![project.as_bytes(), revision_id.as_bytes(), operation.as_bytes(), claim_id.as_bytes()],
+                )
+                .unwrap(),
+            1
+        );
+        for format in formats {
+            assert_corrupt_export(&fx, format, Some(revision), &format!("{case}-{format}"));
+        }
+    }
+
+    let tx = connection.transaction().unwrap();
+    for claim_id in claim_ids {
+        assert_eq!(
+            tx.execute(
+                "INSERT INTO catalog_revision_claims (project_id, revision_id, operation_id, claim_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![project.as_bytes(), revision_id.as_bytes(), operation.as_bytes(), claim_id.as_bytes()],
+            )
+            .unwrap(),
+            1
+        );
+    }
+    tx.commit().unwrap();
+    for format in formats {
+        let restored = fx.out_dir(&format!("restored-{format}"));
+        let result = export_to(format, &restored);
+        assert!(json(&result)["omissions"].as_array().unwrap().iter().any(|item| {
+            item["operationId"] == inherited["operation_id"]
+                && item["reason"] == "claims_projection_unavailable"
+        }));
+        assert_eq!(tree(&restored), tree(&fx.out_dir(&format!("intact-{format}"))), "{format}");
+    }
 }
 
 #[test]
@@ -1281,6 +1436,7 @@ fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
         .unwrap(),
         1
     );
+    refresh_fixture_version(&tx, revision_id.as_bytes(), operation_id);
     tx.commit().unwrap();
     let assert_rejected = |name: &str| assert_corrupt_export(&fx, "openapi", Some(&revision), name);
     assert_rejected("too-many-claims");
@@ -1294,6 +1450,7 @@ fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
         tx.execute("DELETE FROM catalog_claims WHERE claim_id = ?1", [extra_id]).unwrap(),
         1
     );
+    refresh_fixture_version(&tx, revision_id.as_bytes(), operation_id);
     tx.commit().unwrap();
 
     let single_id =
@@ -1372,6 +1529,7 @@ fn revision_claim_limits_apply_per_operation_in_full_and_selected_exports() {
         }
     }
     assert!(total > MAX_DISCOVERY_RUN_CLAIM_BYTES);
+    refresh_fixture_version(&tx, revision_id.as_bytes(), operation_id);
     tx.commit().unwrap();
     assert_rejected("too-many-canonical-bytes");
 }
