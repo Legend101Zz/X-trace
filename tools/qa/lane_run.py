@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from tools.qa import canary, libtest_output, rust_timing, store_profiles
-from tools.release import ci_floor
+from tools.release import ci_floor, private_roots
 
 MAX_FAILING = 32
 SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
@@ -246,8 +246,8 @@ MAX_TIMING_CHECKPOINT_BYTES = 1024 * 1024
 WITHHELD = "withheld: privacy scan"
 CARGO_SECTION = libtest_output.SECTION
 CARGO_PANIC = libtest_output.PANIC
-CARGO_STATE = re.compile(r"^test (\S+) \.\.\.(?: (ok|FAILED|ignored))?$")
-CARGO_RUNNING = re.compile(r"^test (\S+) has been running for over \d+ seconds$")
+CARGO_STATE = rust_timing.TEST_STATE
+CARGO_RUNNING = rust_timing.TEST_RUNNING
 GRADLE_STATE = re.compile(r"^(?:[\w$.]+\.)?(\w+) > (\w+)(?:\((?P<params>[^\n]*)\))?"
                           r"(?:\[(?P<index>[^\n]*)\])? (?P<status>STARTED|PASSED|FAILED|SKIPPED)$")
 JAVA_SITE = re.compile(r"^\s*at [\w.$]+\((\w+\.java:\d+)\)\s*$")
@@ -561,6 +561,13 @@ class CheckoutMetadata:
         name = candidate if candidate in self.tests else candidate.rsplit("::", 1)[-1]
         return name if name in self.tests and not _private(name, index, verified_identifier=True) else UNVERIFIED
 
+    def rust_progress_test(self, name, binary, index) -> bool:
+        """Attest the full libtest name in the observed target, including module prefixes."""
+        return (index is not None and isinstance(name, str) and ci_floor._valid_test_id(name)
+                and any(isinstance(owner, rust_timing.Target) and owner.public() == binary
+                        for owner in self.rust_test_owners.get(name, ()))
+                and not _private(name, index, verified_identifier=True))
+
     def test_unverified_reason(self, candidate: str) -> UnverifiedReason:
         """Explain a name already rejected by test(), without retaining it."""
         if not self.files:
@@ -586,13 +593,13 @@ class CheckoutMetadata:
         return UNVERIFIED if _private(site, index, verified_identifier=True) else site
 
 
-def _checkout_metadata() -> CheckoutMetadata:
-    root = pathlib.Path(__file__).resolve().parents[2]
+def _checkout_metadata(root: pathlib.Path | None = None, revision: str = "HEAD") -> CheckoutMetadata:
+    root = root if root is not None else pathlib.Path(__file__).resolve().parents[2]
     try:
         # HEAD is the commit checked out by the lane. Capture its tree before
         # running the command; neither the index nor working files attest facts.
         # Object ids from this single tree listing pin every subsequent blob read.
-        with subprocess.Popen(["git", "-C", str(root), "ls-tree", "-r", "-z", "HEAD"],
+        with subprocess.Popen(["git", "-C", str(root), "ls-tree", "-r", "-z", revision],
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
             output, _ = proc.communicate()
             if proc.returncode:
@@ -1175,7 +1182,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                 index = _excerpt_index(getattr(args, "canaries", ""))
                 observations = rust_timing.Observations(
                     metadata.rust_targets,
-                    lambda value: index is None or _private(value, index, verified_identifier=True))
+                    lambda value: index is None or _private(value, index, verified_identifier=True),
+                    verified_test=(None if recovery is None else
+                                   lambda name, binary: metadata.rust_progress_test(name, binary, index)))
                 proc, timed_out, timing = rust_timing.run(
                     cmd, log=log, cwd=args.cwd or None, env=child_env, timeout=args.timeout, observations=observations,
                     **({"checkpoint": recovery / "timing.json"} if recovery is not None else {}))
@@ -1200,13 +1209,38 @@ def cmd_run(args: argparse.Namespace) -> int:
                         timed_out=timed_out, timing=timing)
 
 
-def prepare_recovery(root: pathlib.Path) -> pathlib.Path:
+def prepare_recovery(root: pathlib.Path, *, directory: pathlib.Path | None = None) -> pathlib.Path:
     """Keep recovery state outside the uploaded fragment glob, owned by the supervisor."""
-    directory = pathlib.Path(tempfile.mkdtemp(prefix="lane-recovery-", dir=root))
+    if directory is None:
+        directory = pathlib.Path(tempfile.mkdtemp(prefix="lane-recovery-", dir=root))
+    else:
+        private_roots.ensure_private_directory(directory, must_create=True)
+        # The store producer uses a fixed frag/ relative to XTRACE_CI_PRIVATE_ROOT.
+        (directory / "frag").mkdir(mode=0o700)
     (directory / "diagnostics").mkdir(mode=0o700)
     with os.fdopen(os.open(directory / "output.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"):
         pass
     return directory
+
+
+def restore_timing_checkpoint(stream, metadata, index, *, progress=False):
+    raw = stream.read(MAX_TIMING_CHECKPOINT_BYTES + 1)
+    if len(raw) > MAX_TIMING_CHECKPOINT_BYTES:
+        raise ValueError("oversize timing checkpoint")
+    checkpoint = json.loads(raw)
+    if progress and (not isinstance(checkpoint, dict) or set(checkpoint) != {"started", "state"}):
+        raise ValueError("invalid timing checkpoint")
+    started = checkpoint["started"]
+    now = time.monotonic()
+    if type(started) not in (int, float) or not math.isfinite(started) or not 0 <= started <= now:
+        raise ValueError("invalid checkpoint clock")
+    wall = now - started
+    observations = rust_timing.Observations.restore(
+        checkpoint["state"], metadata.rust_targets,
+        lambda value: index is None or _private(value, index, verified_identifier=True),
+        verified_test=(None if not progress else lambda name, binary: metadata.rust_progress_test(name, binary, index)),
+        max_wall=math.ceil(wall * 1000) / 1000 if progress else None)
+    return observations, wall
 
 
 def recover_timeout(args, directory: pathlib.Path, metadata: CheckoutMetadata, duration: float) -> int:
@@ -1218,16 +1252,7 @@ def recover_timeout(args, directory: pathlib.Path, metadata: CheckoutMetadata, d
     basis = "supervised-wrapper; timing-checkpoint-unavailable"
     try:
         with open(directory / "timing.json", "rb") as stream:
-            raw = stream.read(MAX_TIMING_CHECKPOINT_BYTES + 1)
-        if len(raw) > MAX_TIMING_CHECKPOINT_BYTES:
-            raise ValueError("oversize timing checkpoint")
-        checkpoint = json.loads(raw)
-        started = checkpoint["started"]
-        now = time.monotonic()
-        if type(started) not in (int, float) or not math.isfinite(started) or not 0 <= started <= now:
-            raise ValueError("invalid checkpoint clock")
-        observations = rust_timing.Observations.restore(checkpoint["state"], metadata.rust_targets, private)
-        wall = now - started
+            observations, wall = restore_timing_checkpoint(stream, metadata, index)
         basis = "cargo-start-to-supervisor-cleanup"
     except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError):
         pass  # Startup may have timed out before Cargo or its first checkpoint.

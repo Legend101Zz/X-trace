@@ -176,6 +176,49 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(saved["state"]["events"][-1]["observation"], "cargo-exit-upper-bound")
         self.assertNotIn("captured731", raw)
 
+    def test_rust_progress_is_persisted_before_wait_or_finalization(self):
+        observed = rust_timing.Observations(rust_timing.checkout_targets(SOURCES), lambda value: False,
+                                            verified_test=lambda name, binary: name == "fails")
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, (JOURNEY + "\nrunning 1 test\ntest fails ...\n"
+                            "test fails ... ok").encode())
+        os.close(write_fd)
+        child = mock.MagicMock()
+        child.__enter__.return_value = child
+        replace = pathlib.Path.replace
+
+        def interrupt_after_progress(source, destination):
+            path = replace(source, destination)
+            saved = json.loads(path.read_bytes())
+            if saved["state"]["lastTest"] is not None:
+                child.wait.assert_not_called()
+                raise KeyboardInterrupt
+            return path
+
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryFile() as log, \
+                os.fdopen(read_fd, "rb") as stream:
+            child.stdout = stream
+            checkpoint = pathlib.Path(temporary) / "timing.json"
+            with mock.patch.object(rust_timing.subprocess, "Popen", return_value=child), \
+                    mock.patch.object(pathlib.Path, "replace", new=interrupt_after_progress), \
+                    self.assertRaises(KeyboardInterrupt):
+                rust_timing.run(["cargo", "test"], log=log, cwd=None, env={}, timeout=60,
+                                observations=observed, checkpoint=checkpoint)
+            saved = json.loads(checkpoint.read_bytes())
+        child.kill.assert_called_once_with()
+        self.assertEqual(saved["state"]["lastTest"]["observation"], "start-reported")
+        self.assertEqual([row["event"] for row in saved["state"]["events"]], ["start"])
+
+    def test_progress_ignores_test_and_result_lines_in_captured_output(self):
+        observed = rust_timing.Observations(rust_timing.checkout_targets(SOURCES), lambda value: False,
+                                            verified_test=lambda name, binary: name == "fails")
+        for wall, line in enumerate((JOURNEY, "running 1 test", "test fails ... FAILED",
+                                     "failures:", "---- fails stdout ----", "test fails ... ok", OK)):
+            observed.line(line, wall)
+        progress = observed.progress()["lastBinary"]
+        self.assertEqual(progress["lastVerifiedTest"]["observation"], "failed")
+        self.assertFalse(progress["harnessResultObserved"])
+
     def test_real_pipe_preserves_order_counts_exit_code_and_private_output(self):
         text = "\n".join((FINISHED, LIB, "captured-value-731", OK, JOURNEY, FAILED)) + "\n"
         command = [sys.executable, "-B", "-c", f"import os; os.write(1, {text.encode()!r}); raise SystemExit(101)"]
