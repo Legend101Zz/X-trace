@@ -47,10 +47,22 @@ class T(unittest.TestCase):
         self.assertEqual(d["instrumented-run"][0], "pass")
         self.assertEqual(d["recordings-per-scenario"][0], "fail")
         self.assertIn("1/3 scenarios", d["recordings-per-scenario"][1])
-        self.assertIn("shared burst routes", d["recordings-per-scenario"][1])
+        self.assertIn("burst route groups", d["recordings-per-scenario"][1])
         self.assertIn('"source-binding-missing": 1', d["recordings-per-scenario"][1])
         self.assertEqual(d["source-identity"][0], "fail")
         self.assertIn("source-binding-missing", d["source-identity"][1])
+
+    def test_failed_readback_still_reports_unavailable_burst_details(self):
+        r = {"scenarios": [sc("burst", rec=False)], "api": {"ok": False, "reason": "recordings list HTTP 503"},
+             "burstRouteGroups": [{"problems": ["burst-recording-detail-unavailable(missing 2)", "no-source-file-line"]}],
+             "problemClasses": {"burst-recording-detail-unavailable": 1, "no-source-file-line": 1}}
+        d = by(s.instrumented_steps(r))
+        self.assertEqual(d["recordings-per-scenario"][0], "fail")
+        self.assertIn("recordings list HTTP 503", d["recordings-per-scenario"][1])
+        self.assertIn('"burst-recording-detail-unavailable": 1', d["recordings-per-scenario"][1])
+        self.assertEqual(d["source-identity"][0], "fail")
+        self.assertIn("burst-recording-detail-unavailable", d["source-identity"][1])
+        self.assertEqual(d["api-json-artifact"][0], "fail")
 
     def test_overhead_needs_five_repeats(self):
         agg = {"baseline": {"p50Ms": 1, "p95Ms": 2, "n": 14}, "instrumented": {"p50Ms": 2, "p95Ms": 3, "n": 14}, "p50Ratio": 2, "p95Ratio": 1.5}
